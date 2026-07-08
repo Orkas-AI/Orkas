@@ -59,6 +59,13 @@ type Issue = {
   source?: string;
 };
 
+type AudioTrack = {
+  absPath: string;
+  startSec: number;
+  declaredDurationSec?: number;
+  volume: number;
+};
+
 type CompositionMeta = {
   htmlPath: string;
   html: string;
@@ -67,7 +74,24 @@ type CompositionMeta = {
   width: number;
   height: number;
   durationSec: number;
-  audioTracks: Array<{ absPath: string; startSec: number }>;
+  audioTracks: AudioTrack[];
+};
+
+type MediaProbe = {
+  duration_seconds: number | null;
+  size_bytes: number | null;
+  video?: {
+    codec: string;
+    width?: number;
+    height?: number;
+    duration_seconds?: number;
+    avg_frame_rate?: string;
+  };
+  audio?: {
+    codec: string;
+    duration_seconds?: number;
+    bit_rate?: number;
+  };
 };
 
 const DEFAULT_WIDTH = 1920;
@@ -76,6 +100,10 @@ const DEFAULT_DURATION_SEC = 5;
 const MAX_RENDER_DURATION_SEC = 20 * 60;
 const MAX_FPS = 60;
 const RENDER_TIMEOUT_MS = 20 * 60 * 1000;
+const FFPROBE_TIMEOUT_MS = 30 * 1000;
+const AUDIO_DURATION_TOLERANCE_SEC = 0.5;
+const MEDIA_DURATION_TOLERANCE_SEC = 0.5;
+const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
 function round2(n: number): number {
   return Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
 }
@@ -127,6 +155,74 @@ function safeResolveLocalRef(compositionDirAbs: string, ref: string): string | n
   return abs;
 }
 
+function normalizedLocalRefPath(ref: string): string {
+  const noHash = normalizeRef(ref).split('#')[0].split('?')[0];
+  let decoded = noHash;
+  try { decoded = decodeURIComponent(noHash); } catch { /* keep raw */ }
+  return decoded.replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+function isKnownBundledVendorRef(ref: string): boolean {
+  return normalizedLocalRefPath(ref) === 'assets/vendor/gsap.min.js';
+}
+
+function isFileSync(absPath: string): boolean {
+  try { return fss.statSync(absPath).isFile(); } catch { return false; }
+}
+
+function builtinGsapVendorCandidates(): string[] {
+  const agentRel = path.join(
+    'marketplace',
+    'agents',
+    VIDEO_STUDIO_AGENT_ID,
+    'skills',
+    'stage-compose',
+    'scripts',
+    'vendor',
+    'gsap.min.js',
+  );
+  const sourceRel = path.join('resources', 'builtin', agentRel);
+  const roots = [
+    process.env.ORKAS_PC_DIR,
+    process.cwd(),
+    path.join(process.cwd(), 'PC'),
+    path.resolve(__dirname, '..', '..', '..'),
+    path.resolve(__dirname, '..', '..', '..', '..'),
+    path.resolve(__dirname, '..', '..', '..', '..', 'PC'),
+  ].filter((v): v is string => !!v);
+  const resourceRoots = [
+    process.env.ORKAS_BUILTIN_ROOT,
+    (process as unknown as { resourcesPath?: string }).resourcesPath
+      ? path.join((process as unknown as { resourcesPath: string }).resourcesPath, 'builtin')
+      : undefined,
+  ].filter((v): v is string => !!v);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const root of resourceRoots) {
+    const candidate = path.resolve(root, agentRel);
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  for (const root of roots) {
+    const candidate = path.resolve(root, sourceRel);
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    out.push(candidate);
+  }
+  return out;
+}
+
+async function prepareKnownBundledVendor(ref: string, targetAbsPath: string): Promise<boolean> {
+  if (!isKnownBundledVendorRef(ref)) return false;
+  if (isFileSync(targetAbsPath)) return true;
+  const source = builtinGsapVendorCandidates().find((candidate) => isFileSync(candidate));
+  if (!source) return false;
+  await fs.mkdir(path.dirname(targetAbsPath), { recursive: true });
+  await fs.copyFile(source, targetAbsPath);
+  return true;
+}
+
 function extractResourceRefs(html: string): Array<{ attr: string; ref: string }> {
   const refs: Array<{ attr: string; ref: string }> = [];
   const re = /\b(src|href|poster)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
@@ -161,6 +257,65 @@ function crfForQuality(quality: RenderQuality | undefined): number {
   if (quality === 'high') return 16;
   if (quality === 'standard') return 20;
   return 26;
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function nullablePositiveNumber(value: unknown): number | null {
+  return positiveNumber(value) ?? null;
+}
+
+async function probeMedia(ffprobe: string, mediaAbsPath: string, signal?: AbortSignal): Promise<MediaProbe | null> {
+  const r = await runProcess(ffprobe, [
+    '-v', 'error',
+    '-show_entries', 'format=duration,size:stream=codec_type,codec_name,width,height,duration,bit_rate,avg_frame_rate',
+    '-of', 'json',
+    mediaAbsPath,
+  ], { signal, timeoutMs: FFPROBE_TIMEOUT_MS });
+  if (r.aborted || r.timedOut || r.code !== 0) return null;
+
+  let parsed: {
+    format?: { duration?: string; size?: string };
+    streams?: Array<{
+      codec_type?: string;
+      codec_name?: string;
+      width?: number;
+      height?: number;
+      duration?: string;
+      bit_rate?: string;
+      avg_frame_rate?: string;
+    }>;
+  };
+  try {
+    parsed = JSON.parse(r.stdout) as typeof parsed;
+  } catch {
+    return null;
+  }
+  const video = parsed.streams?.find((stream) => stream.codec_type === 'video');
+  const audio = parsed.streams?.find((stream) => stream.codec_type === 'audio');
+  return {
+    duration_seconds: nullablePositiveNumber(parsed.format?.duration),
+    size_bytes: nullablePositiveNumber(parsed.format?.size),
+    ...(video ? {
+      video: {
+        codec: video.codec_name || '',
+        width: positiveNumber(video.width),
+        height: positiveNumber(video.height),
+        duration_seconds: positiveNumber(video.duration),
+        avg_frame_rate: video.avg_frame_rate,
+      },
+    } : {}),
+    ...(audio ? {
+      audio: {
+        codec: audio.codec_name || '',
+        duration_seconds: positiveNumber(audio.duration),
+        bit_rate: positiveNumber(audio.bit_rate),
+      },
+    } : {}),
+  };
 }
 
 async function loadCompositionMeta(compositionDirAbs: string): Promise<{ meta: CompositionMeta | null; issues: Issue[] }> {
@@ -215,7 +370,7 @@ async function loadCompositionMeta(compositionDirAbs: string): Promise<{ meta: C
   }
 
   const refs = extractResourceRefs(html);
-  const audioTracks: Array<{ absPath: string; startSec: number }> = [];
+  const audioTracks: AudioTrack[] = [];
   for (const item of refs) {
     if (isIgnorableRef(item.ref)) continue;
     if (isRemoteRef(item.ref)) {
@@ -247,7 +402,21 @@ async function loadCompositionMeta(compositionDirAbs: string): Promise<{ meta: C
       });
       continue;
     }
-    const exists = await fs.stat(abs).catch(() => null);
+    let exists = await fs.stat(abs).catch(() => null);
+    if ((!exists || !exists.isFile()) && isKnownBundledVendorRef(item.ref)) {
+      const prepared = await prepareKnownBundledVendor(item.ref, abs);
+      if (prepared) exists = await fs.stat(abs).catch(() => null);
+      else {
+        issues.push({
+          code: 'LOCAL_VENDOR_MISSING',
+          severity: 'error',
+          selector: `[${item.attr}="${item.ref}"]`,
+          message: `Built-in vendor resource could not be prepared: ${item.ref}`,
+          fixHint: 'Use the built-in stage-compose vendor path assets/vendor/gsap.min.js or remove the runtime dependency.',
+        });
+        continue;
+      }
+    }
     if (!exists || !exists.isFile()) {
       issues.push({
         code: 'LOCAL_RESOURCE_MISSING',
@@ -265,7 +434,16 @@ async function loadCompositionMeta(compositionDirAbs: string): Promise<{ meta: C
     const src = attrs.src;
     if (!src || isIgnorableRef(src) || isRemoteRef(src) || path.isAbsolute(src)) continue;
     const abs = safeResolveLocalRef(compositionDirAbs, src);
-    if (abs) audioTracks.push({ absPath: abs, startSec: Number(attrs['data-start']) || 0 });
+    if (abs) {
+      audioTracks.push({
+        absPath: abs,
+        startSec: Number(attrs['data-start']) || 0,
+        declaredDurationSec: htmlAttrNumber(attrs, 'data-duration') || undefined,
+        volume: Number.isFinite(Number(attrs['data-volume'])) && Number(attrs['data-volume']) >= 0
+          ? Number(attrs['data-volume'])
+          : 1,
+      });
+    }
   }
 
   return {
@@ -608,16 +786,19 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
       format: p.format ?? 'mp4',
       quality: p.quality,
       audioTracks: loaded.meta.audioTracks,
+      durationSec: loaded.meta.durationSec,
       signal: p.signal,
     });
     if (encoded.ok === false) return encoded;
     const st = await fs.stat(p.outputAbsPath);
+    const probe = bins.ffprobe ? await probeMedia(bins.ffprobe, p.outputAbsPath, p.signal) : null;
     return {
       ok: true,
       op: 'composition.render',
       path: p.outputAbsPath,
       bytes: st.size,
       media: `chat-media://local/${p.outputAbsPath}`,
+      probe,
       engine: 'orkas-native',
       fps,
       frames: totalFrames,
@@ -637,20 +818,38 @@ async function encodeFrames(opts: {
   fps: number;
   format: RenderFormat;
   quality?: RenderQuality;
-  audioTracks: Array<{ absPath: string; startSec: number }>;
+  audioTracks: AudioTrack[];
+  durationSec: number;
   signal?: AbortSignal;
 }): Promise<VideoStudioResult> {
   const args = ['-y', '-framerate', String(opts.fps), '-i', opts.framePattern];
-  const audio = opts.audioTracks.find((track) => fss.existsSync(track.absPath));
-  if (audio) args.push('-i', audio.absPath);
+  const audioTracks = opts.audioTracks.filter((track) => fss.existsSync(track.absPath));
+  for (const track of audioTracks) args.push('-i', track.absPath);
+  if (audioTracks.length) {
+    const duration = opts.durationSec.toFixed(3);
+    const filters: string[] = [];
+    audioTracks.forEach((track, index) => {
+      const inputIndex = index + 1;
+      const delayMs = Math.max(0, Math.round((track.startSec || 0) * 1000));
+      const volume = Number.isFinite(track.volume) && track.volume >= 0 ? track.volume : 1;
+      const delay = delayMs > 0 ? `adelay=${delayMs}|${delayMs},` : '';
+      filters.push(`[${inputIndex}:a]volume=${volume},${delay}apad,atrim=0:${duration}[a${index}]`);
+    });
+    if (audioTracks.length === 1) {
+      filters.push('[a0]anull[aout]');
+    } else {
+      filters.push(`${audioTracks.map((_track, index) => `[a${index}]`).join('')}amix=inputs=${audioTracks.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
+    }
+    args.push('-filter_complex', filters.join(';'), '-map', '0:v:0', '-map', '[aout]');
+  }
   if (opts.format === 'webm') {
     args.push('-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', String(crfForQuality(opts.quality) + 8));
-    if (audio) args.push('-c:a', 'libopus', '-shortest');
+    if (audioTracks.length) args.push('-c:a', 'libopus');
   } else {
     args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', String(crfForQuality(opts.quality)), '-movflags', '+faststart');
-    if (audio) args.push('-c:a', 'aac', '-shortest');
+    if (audioTracks.length) args.push('-c:a', 'aac');
   }
-  args.push(opts.outputAbsPath);
+  args.push('-t', opts.durationSec.toFixed(3), opts.outputAbsPath);
   const r = await runProcess(opts.ffmpeg, args, { signal: opts.signal, timeoutMs: RENDER_TIMEOUT_MS });
   if (r.aborted) return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_ABORTED', message: 'render aborted.' };
   if (r.timedOut) return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_TIMEOUT', message: 'ffmpeg encode timed out.' };
@@ -694,6 +893,123 @@ async function runProcess(
   });
 }
 
+async function buildMediaQa(
+  meta: CompositionMeta,
+  mediaProbe: MediaProbe | null,
+  ffprobe: string | undefined,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const issues: Issue[] = [];
+  const sourceAudioTracks: Array<{
+    path: string;
+    start_seconds: number;
+    volume: number;
+    declared_duration_seconds?: number;
+    source_duration_seconds?: number;
+    expected_duration_seconds?: number;
+    expected_end_seconds?: number;
+  }> = [];
+
+  if (!mediaProbe) {
+    issues.push({
+      code: 'MEDIA_PROBE_MISSING',
+      severity: meta.audioTracks.length ? 'error' : 'warning',
+      message: 'Final media could not be probed with ffprobe.',
+      source: 'orkas-native-media-qa',
+    });
+  } else {
+    if (!mediaProbe.video) {
+      issues.push({
+        code: 'VIDEO_STREAM_MISSING',
+        severity: 'error',
+        message: 'Final media does not contain a video stream.',
+        source: 'orkas-native-media-qa',
+      });
+    }
+    if (mediaProbe.duration_seconds !== null && Math.abs(mediaProbe.duration_seconds - meta.durationSec) > MEDIA_DURATION_TOLERANCE_SEC) {
+      issues.push({
+        code: 'MEDIA_DURATION_MISMATCH',
+        severity: 'error',
+        message: `Final media duration ${round2(mediaProbe.duration_seconds)}s does not match composition duration ${round2(meta.durationSec)}s.`,
+        source: 'orkas-native-media-qa',
+      });
+    }
+    const videoDuration = mediaProbe.video?.duration_seconds;
+    if (videoDuration !== undefined && Math.abs(videoDuration - meta.durationSec) > MEDIA_DURATION_TOLERANCE_SEC) {
+      issues.push({
+        code: 'VIDEO_DURATION_MISMATCH',
+        severity: 'error',
+        message: `Final video stream duration ${round2(videoDuration)}s does not match composition duration ${round2(meta.durationSec)}s.`,
+        source: 'orkas-native-media-qa',
+      });
+    }
+  }
+
+  let expectedAudioEndSec = 0;
+  for (const track of meta.audioTracks) {
+    const sourceProbe = ffprobe ? await probeMedia(ffprobe, track.absPath, signal) : null;
+    const sourceDurationSec = sourceProbe?.duration_seconds ?? sourceProbe?.audio?.duration_seconds;
+    const expectedCandidates = [
+      track.declaredDurationSec,
+      sourceDurationSec,
+    ].filter((v): v is number => typeof v === 'number' && Number.isFinite(v) && v > 0);
+    const expectedDurationSec = expectedCandidates.length ? Math.min(...expectedCandidates) : undefined;
+    const expectedEndSec = expectedDurationSec !== undefined
+      ? Math.min(meta.durationSec, track.startSec + expectedDurationSec)
+      : undefined;
+    if (expectedEndSec !== undefined) expectedAudioEndSec = Math.max(expectedAudioEndSec, expectedEndSec);
+    sourceAudioTracks.push({
+      path: track.absPath,
+      start_seconds: round2(track.startSec),
+      volume: round2(track.volume),
+      ...(track.declaredDurationSec !== undefined ? { declared_duration_seconds: round2(track.declaredDurationSec) } : {}),
+      ...(sourceDurationSec !== undefined ? { source_duration_seconds: round2(sourceDurationSec) } : {}),
+      ...(expectedDurationSec !== undefined ? { expected_duration_seconds: round2(expectedDurationSec) } : {}),
+      ...(expectedEndSec !== undefined ? { expected_end_seconds: round2(expectedEndSec) } : {}),
+    });
+  }
+
+  if (meta.audioTracks.length > 0) {
+    if (!mediaProbe?.audio) {
+      issues.push({
+        code: 'AUDIO_STREAM_MISSING',
+        severity: 'error',
+        message: 'Composition declares audio tracks, but final media has no audio stream.',
+        source: 'orkas-native-media-qa',
+      });
+    } else {
+      const actualAudioDurationSec = mediaProbe.audio.duration_seconds ?? mediaProbe.duration_seconds;
+      if (expectedAudioEndSec > 0 && actualAudioDurationSec !== null && actualAudioDurationSec !== undefined
+        && actualAudioDurationSec + AUDIO_DURATION_TOLERANCE_SEC < expectedAudioEndSec) {
+        issues.push({
+          code: 'AUDIO_STREAM_TOO_SHORT',
+          severity: 'error',
+          message: `Final audio stream duration ${round2(actualAudioDurationSec)}s is shorter than expected narration coverage ${round2(expectedAudioEndSec)}s.`,
+          source: 'orkas-native-media-qa',
+        });
+      }
+    }
+  }
+
+  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+  return {
+    ok: errorCount === 0,
+    issue_count: issues.length,
+    error_count: errorCount,
+    warning_count: issues.filter((issue) => issue.severity === 'warning').length,
+    media_duration_seconds: mediaProbe?.duration_seconds !== null && mediaProbe?.duration_seconds !== undefined
+      ? round2(mediaProbe.duration_seconds)
+      : null,
+    video_duration_seconds: mediaProbe?.video?.duration_seconds !== undefined ? round2(mediaProbe.video.duration_seconds) : null,
+    audio_duration_seconds: mediaProbe?.audio?.duration_seconds !== undefined
+      ? round2(mediaProbe.audio.duration_seconds)
+      : (mediaProbe?.audio && mediaProbe.duration_seconds !== null ? round2(mediaProbe.duration_seconds) : null),
+    expected_audio_end_seconds: expectedAudioEndSec > 0 ? round2(expectedAudioEndSec) : null,
+    source_audio_tracks: sourceAudioTracks,
+    issues,
+  };
+}
+
 export async function draftComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   const report: Record<string, unknown> = {
     ok: false,
@@ -730,8 +1046,23 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     return { ...render, report };
   }
 
+  const loaded = await loadCompositionMeta(p.compositionDirAbs);
+  const mediaProbe = ((render as { probe?: MediaProbe | null }).probe ?? null);
+  steps.media_probe = mediaProbe;
+  if (loaded.meta) {
+    const mediaQa = await buildMediaQa(loaded.meta, mediaProbe, bundledFfmpegPaths().ffprobe, p.signal);
+    steps.media_qa = mediaQa;
+    if (mediaQa.ok === false) {
+      report.error = { code: 'E_MEDIA_QA_BLOCKED', message: 'draft media QA failed.' };
+      await writeReportIfRequested(p.reportAbsPath, report);
+      return { ok: false, op: 'composition.draft', errorCode: 'E_MEDIA_QA_BLOCKED', message: 'draft media QA failed.', report };
+    }
+  }
+
   report.ok = true;
   report.media = { path: render.path, bytes: render.bytes };
+  report.next_action = 'open_gate_d';
+  report.advisory_policy = 'visual inspect warnings are advisory after ok:true; open Gate D instead of self-repairing.';
   await writeReportIfRequested(p.reportAbsPath, report);
   return {
     ok: true,
@@ -741,6 +1072,8 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     report_path: p.reportAbsPath || '',
     findings_path: p.findingsAbsPath || '',
     media: `chat-media://local/${render.path}`,
+    probe: mediaProbe,
+    next_action: 'open_gate_d',
     report,
   };
 }
