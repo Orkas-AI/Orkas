@@ -961,15 +961,12 @@ function _renderAgentRowMenuItems(menu, agentId, source = '') {
   const enabled = a ? a.enabled !== false : true;
   const isMock = _isAgentProfileMock(a || agentId);
   const isCustom = a?.source === 'custom' && !isMock;
-  // Dev mode lifts the source guard for marketplace edit / delete.
-  const canEdit = !isMock && (isCustom || (_isAgentPlatformSource(a?.source) && false));
-  // Dev-only entry on builtin: tag the label so the user knows this isn't a
-  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (_isAgentPlatformSource(a?.source) && false) ? t('common.dev_suffix') : '';
+  const canEditDefinition = !isMock && isCustom;
+  const canEdit = canEditDefinition || _canEditAgentMemory(a);
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
-    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit') + editLabelSuffix)}</div>`);
+    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
   // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). the open-source build
   // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
@@ -979,7 +976,7 @@ function _renderAgentRowMenuItems(menu, agentId, source = '') {
     items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
   }
   if (!isMock) items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
-  if (canEdit) {
+  if (canEditDefinition) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
   }
   menu.innerHTML = items.join('');
@@ -1251,7 +1248,19 @@ function _agentTextList(agent, key) {
 function _canEditAgentDefinition(agent) {
   const source = _agentSource(agent && agent.source);
   return !!agent && !_isAgentProfileMock(agent)
-    && (source === 'custom' || (_isAgentPlatformSource(source) && typeof isDevMode === 'function' && false));
+    && source === 'custom';
+}
+
+function _canEditAgentMemory(agent) {
+  const source = _agentSource(agent && agent.source);
+  return !!agent
+    && !_isAgentProfileMock(agent)
+    && !_isExternalCliAgent(agent)
+    && (_isCommanderAgent(agent) || source === 'custom' || _isAgentPlatformSource(source));
+}
+
+function _canEnterAgentEditMode(agent) {
+  return _isCommanderAgent(agent) || _canEditAgentDefinition(agent) || _canEditAgentMemory(agent);
 }
 
 async function _saveAgentTextList(agent, key, values) {
@@ -1432,8 +1441,7 @@ function _renderAgentDetailMemory(agent, editing = false) {
     .map((entry) => entry.title || entry.description)
     .filter(Boolean)
     .slice(0, 20);
-  const canEditMemory = !!editing && !_isAgentProfileMock(agent)
-    && (agent.source === 'custom' || _isCommanderAgent(agent));
+  const canEditMemory = !!editing && _canEditAgentMemory(agent);
   section.style.display = (memoryTags.length || canEditMemory) ? '' : 'none';
   section.querySelector('[data-agent-memory-add]')?.remove();
   const title = section.querySelector('.agents-detail-label');
@@ -1630,7 +1638,8 @@ function _renderAgentDetail(agent, editing) {
   const delBtn = document.getElementById('agent-delete-btn');
   const isMock = _isAgentProfileMock(agent);
   const isCustom = agent.source === 'custom' && !isMock;
-  const canEdit = isCommander || (!isMock && (isCustom || (_isAgentPlatformSource(agent.source) && false)));
+  const canEditDefinition = !isMock && isCustom;
+  const canEdit = isCommander || canEditDefinition || _canEditAgentMemory(agent);
   if (useBtn) {
     useBtn.style.display = editing ? 'none' : '';
     useBtn.disabled = isMock || agent.enabled === false;
@@ -1655,17 +1664,13 @@ function _renderAgentDetail(agent, editing) {
     uploadBtn.disabled = isCommander || isMock;
   }
   if (delBtn) {
-    delBtn.style.display = (!isCommander && (canEdit || isMock) && !editing) ? '' : 'none';
+    delBtn.style.display = (!isCommander && (canEditDefinition || isMock) && !editing) ? '' : 'none';
     delBtn.disabled = isCommander || isMock;
   }
   if (editBtn) {
     editBtn.style.display = (canEdit || isMock) ? '' : 'none';
     editBtn.disabled = isMock && !isCommander;
-    // Tag the "Edit" label on marketplace agents (dev-only entry); "Done" stays
-    // bare because the user is already in edit mode and the marker would be
-    // redundant noise.
-    const editSuffix = (!editing && _isAgentPlatformSource(agent.source) && false) ? t('common.dev_suffix') : '';
-    editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
+    editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
   }
   if (!isMock && !isCommander) _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
@@ -1721,8 +1726,7 @@ function _renderAgentOutputFormatSection(agent, editing = false) {
     return;
   }
 
-  const canEdit = !isMock && agent.source === 'custom'
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+  const canEdit = !isMock && agent.source === 'custom';
 
   slot.innerHTML = '';
   const mount = document.createElement('div');
@@ -1915,8 +1919,7 @@ async function _renderAgentDetailProjectDir(agent) {
   section.style.display = '';
   slot.dataset.agentId = agent.agent_id;
 
-  const canEdit = agent.source === 'custom'
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+  const canEdit = agent.source === 'custom';
 
   const renderInfo = (info) => {
     if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
@@ -2113,8 +2116,6 @@ function _toggleAgentFieldEditable(on) {
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
   if (_isAgentProfileMock(_selectedAgent.id)) return;
-  // Marketplace editing is dev-only; lift the source guard accordingly.
-  if (!_isCommanderAgent(_selectedAgent.id) && _isAgentPlatformSource(_selectedAgent.source) && !false) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {
@@ -2133,18 +2134,26 @@ async function _enterAgentEditMode() {
   // Re-fetch to show raw workflow (not rendered markdown) for editing.
   const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}`);
   const data = await res.json();
-  if (data.ok && data.agent) _renderAgentDetail(data.agent, true);
-  // External (cli-runtime) agents have no LLM-driven authoring — the
-  // CLI brings its own behaviour, and the edit chat would just sit
-  // empty. Hide the chat column so the user only sees the manual
-  // name + description editors. In-process agents keep the chat.
-  const isExternal = !!(data.ok && data.agent && data.agent.runtime?.kind === 'cli');
+  const agent = data.ok && data.agent ? { ...data.agent, source: _agentSource(data.agent.source) } : null;
+  if (!agent) {
+    _agentEditing = false;
+    return;
+  }
+  if (!_canEnterAgentEditMode(agent)) {
+    _agentEditing = false;
+    return;
+  }
+  _renderAgentDetail(agent, true);
+  // External agents have no LLM-driven authoring. Marketplace installs in
+  // the open-source build are memory-only edits. Both hide the edit chat.
+  const isExternal = !!(agent.runtime?.kind === 'cli');
+  const isMemoryOnly = !_canEditAgentDefinition(agent) && _canEditAgentMemory(agent);
   const chatCol = document.getElementById('agents-chat-col');
-  if (chatCol) chatCol.style.display = isExternal ? 'none' : '';
-  if (!isExternal) {
+  if (chatCol) chatCol.style.display = (isExternal || isMemoryOnly) ? 'none' : '';
+  if (!isExternal && !isMemoryOnly) {
     await _loadAgentChatHistory(_selectedAgent.id);
     setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
-  } else {
+  } else if (isExternal) {
     setTimeout(() => document.getElementById('agents-detail-name-input')?.focus(), 50);
   }
   // Wire field blur-save (one-time attach)
@@ -2207,7 +2216,7 @@ function _restoreAgentNameField() {
 
 function _scheduleAgentFieldSave(field, value) {
   if (!_selectedAgent) return;
-  if (_isAgentPlatformSource(_selectedAgent.source) && !false) return;
+  if (_isAgentPlatformSource(_selectedAgent.source)) return;
   _pendingAgentField = { field, value };
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = setTimeout(_flushAgentFieldSave, 800);

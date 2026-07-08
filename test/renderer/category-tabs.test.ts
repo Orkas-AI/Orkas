@@ -17,12 +17,18 @@ class FakeClassList {
 
 class FakeElement {
   innerHTML = '';
+  id = '';
+  className = '';
+  dataset: Record<string, string> = {};
   style: Record<string, string> = {};
   classList = new FakeClassList();
   focused = false;
   querySelectorAll() { return []; }
+  querySelector() { return null; }
   addEventListener() {}
+  appendChild() {}
   focus() { this.focused = true; }
+  getBoundingClientRect() { return { left: 0, right: 120, top: 0, bottom: 32, width: 120, height: 32 }; }
 }
 
 function loadCategoryRenderers() {
@@ -35,8 +41,17 @@ function loadCategoryRenderers() {
     console,
     setTimeout,
     createLogger: () => ({ warn: () => {}, error: () => {}, info: () => {} }),
-    document: { getElementById: (id: string) => el(id), querySelectorAll: () => [] },
-    window: { addEventListener: () => {}, orkas: { invoke: async () => ({ list: [] }) } },
+    document: {
+      getElementById: (id: string) => el(id),
+      createElement: (tag: string) => {
+        const node = new FakeElement();
+        node.dataset.tag = tag;
+        return node;
+      },
+      body: { appendChild: () => {} },
+      querySelectorAll: () => [],
+    },
+    window: { addEventListener: () => {}, innerWidth: 1024, innerHeight: 768, orkas: { invoke: async () => ({ list: [] }) } },
     escapeHtml: (s: unknown) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     } as Record<string, string>)[ch]),
@@ -247,6 +262,92 @@ describe('agent and skill category tabs', () => {
     expect(el('agents-grid').innerHTML).not.toContain('approved');
     expect(el('skills-grid').innerHTML).not.toContain('is-status');
     expect(el('skills-grid').innerHTML).not.toContain('reviewing');
+  });
+
+  it('shows memory-only edit for marketplace agents outside dev mode', () => {
+    const { context } = loadCategoryRenderers();
+    context.isDevMode = () => false;
+    vm.runInContext(`
+      _agentsCache = [{
+        agent_id: 'platform-agent',
+        name: 'Platform Agent',
+        source: 'marketplace',
+        category: 'general',
+        enabled: true
+      }];
+    `, context);
+
+    const menu: any = {
+      innerHTML: '',
+      dataset: {},
+      querySelectorAll: () => [],
+    };
+    context._renderAgentRowMenuItems(menu, 'platform-agent', 'marketplace');
+
+    expect(context._canEditAgentDefinition({ source: 'marketplace' })).toBe(false);
+    expect(context._canEditAgentMemory({ source: 'marketplace' })).toBe(true);
+    expect(context._canEditAgentMemory({ source: 'marketplace', runtime: { kind: 'cli', cli: 'codex' } })).toBe(false);
+    expect(menu.innerHTML).toContain('data-action="edit"');
+    expect(menu.innerHTML).not.toContain('data-action="delete"');
+  });
+
+  it('keeps marketplace agents memory-editable but definition-locked in dev mode', () => {
+    const { context } = loadCategoryRenderers();
+    context.isDevMode = () => true;
+    vm.runInContext(`
+      _agentsCache = [{
+        agent_id: 'platform-agent',
+        name: 'Platform Agent',
+        source: 'marketplace',
+        category: 'general',
+        enabled: true
+      }];
+    `, context);
+
+    const menu: any = {
+      innerHTML: '',
+      dataset: {},
+      querySelectorAll: () => [],
+    };
+    context._renderAgentRowMenuItems(menu, 'platform-agent', 'marketplace');
+
+    expect(context._canEditAgentDefinition({ source: 'marketplace' })).toBe(false);
+    expect(context._canEditAgentMemory({ source: 'marketplace' })).toBe(true);
+    expect(menu.innerHTML).toContain('data-action="edit"');
+    expect(menu.innerHTML).not.toContain('data-action="delete"');
+  });
+
+  it('keeps marketplace skills definition-locked even in dev mode', () => {
+    const { context, el } = loadCategoryRenderers();
+    const anchor = {
+      getBoundingClientRect: () => ({ left: 0, right: 120, top: 0, bottom: 32, width: 120, height: 32 }),
+      closest: () => ({ classList: new FakeClassList() }),
+    };
+    vm.runInContext(`
+      _skillsCache = [{
+        id: 'platform-skill-dev',
+        name: 'Platform Skill Dev',
+        source: 'marketplace',
+        category: 'general',
+        enabled: true
+      }, {
+        id: 'platform-skill-prod',
+        name: 'Platform Skill Prod',
+        source: 'marketplace',
+        category: 'general',
+        enabled: true
+      }];
+    `, context);
+
+    context.isDevMode = () => true;
+    context._openSkillRowMenu(anchor, 'platform-skill-dev', 'marketplace');
+    expect(el('skill-row-menu').innerHTML).not.toContain('data-action="edit"');
+    expect(el('skill-row-menu').innerHTML).not.toContain('data-action="delete"');
+
+    context.isDevMode = () => false;
+    context._openSkillRowMenu(anchor, 'platform-skill-prod', 'marketplace');
+    expect(el('skill-row-menu').innerHTML).not.toContain('data-action="edit"');
+    expect(el('skill-row-menu').innerHTML).not.toContain('data-action="delete"');
   });
 
   it('uses friendly external package display names while keeping the package key internal', () => {
