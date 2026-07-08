@@ -51,6 +51,7 @@ import { Mutex } from 'async-mutex';
 import { userMarketplaceInstallsFile, userMarketplaceDirCloud } from '../paths';
 import { createLogger } from '../logger';
 import { isExpiredMsTombstone } from '../util/tombstone_retention';
+import { minAppVersionFrom, type MinAppVersionSource } from '../util/app-version-compat';
 
 const log = createLogger('marketplace_installs');
 
@@ -105,6 +106,8 @@ export interface AgentInstall {
    *  These rows may start without server URLs; online resolution patches them
    *  into ordinary marketplace rows. */
   seed_source?: 'builtin' | string;
+  /** Minimum Orkas app version required to materialize/run this marketplace agent. */
+  min_app_version?: string;
 }
 
 export interface SkillInstall {
@@ -125,6 +128,8 @@ export interface SkillInstall {
   state?: string;
   /** Same as `AgentInstall.seed_source`. */
   seed_source?: 'builtin' | string;
+  /** Minimum Orkas app version required to materialize/run this marketplace skill. */
+  min_app_version?: string;
 }
 
 export const CURRENT_VERSION = 1;
@@ -195,12 +200,12 @@ export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'inst
     const manifest = await readInstalls(uid);
     const idx = manifest.agents.findIndex((a) => a.id === row.id);
     const previous = idx >= 0 ? manifest.agents[idx] : null;
-    const entry: AgentInstall = {
+    const entry: AgentInstall = _normalizeAgentRow({
       ...(previous || {}),
       ...row,
       version: normalizeInstallVersion(row.version || previous?.version),
       installed_at: row.installed_at || previous?.installed_at || Date.now(),
-    };
+    } as AgentInstall & MinAppVersionSource);
     if (idx >= 0) manifest.agents[idx] = entry;
     else manifest.agents.push(entry);
     delete manifest._deleted_at?.agents?.[row.id];
@@ -215,12 +220,12 @@ export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'inst
     const manifest = await readInstalls(uid);
     const idx = manifest.skills.findIndex((s) => s.id === row.id);
     const previous = idx >= 0 ? manifest.skills[idx] : null;
-    const entry: SkillInstall = {
+    const entry: SkillInstall = _normalizeSkillRow({
       ...(previous || {}),
       ...row,
       version: normalizeInstallVersion(row.version || previous?.version),
       installed_at: row.installed_at || previous?.installed_at || Date.now(),
-    };
+    } as SkillInstall & MinAppVersionSource);
     if (idx >= 0) manifest.skills[idx] = entry;
     else manifest.skills.push(entry);
     delete manifest._deleted_at?.skills?.[row.id];
@@ -283,12 +288,36 @@ function _isSkillRow(x: unknown): x is SkillInstall {
     && typeof r.installed_at === 'number';
 }
 
-function _normalizeAgentRow(row: AgentInstall): AgentInstall {
-  return { ...row, version: normalizeInstallVersion(row.version) };
+function _normalizeAgentRow(row: AgentInstall & MinAppVersionSource): AgentInstall {
+  const rest = { ...(row as AgentInstall & MinAppVersionSource & Record<string, unknown>) };
+  delete rest.min_app_version;
+  delete rest.minAppVersion;
+  delete rest.min_version;
+  delete rest.minVersion;
+  delete rest.min_pc_version;
+  delete rest.minPcVersion;
+  const minAppVersion = minAppVersionFrom(row);
+  return {
+    ...rest,
+    version: normalizeInstallVersion(row.version),
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
+  };
 }
 
-function _normalizeSkillRow(row: SkillInstall): SkillInstall {
-  return { ...row, version: normalizeInstallVersion(row.version) };
+function _normalizeSkillRow(row: SkillInstall & MinAppVersionSource): SkillInstall {
+  const rest = { ...(row as SkillInstall & MinAppVersionSource & Record<string, unknown>) };
+  delete rest.min_app_version;
+  delete rest.minAppVersion;
+  delete rest.min_version;
+  delete rest.minVersion;
+  delete rest.min_pc_version;
+  delete rest.minPcVersion;
+  const minAppVersion = minAppVersionFrom(row);
+  return {
+    ...rest,
+    version: normalizeInstallVersion(row.version),
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
+  };
 }
 
 function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown }): InstallsManifest['_deleted_at'] | null {

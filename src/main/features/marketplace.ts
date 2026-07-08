@@ -39,6 +39,7 @@
  */
 
 import AdmZip from 'adm-zip';
+import { app } from 'electron';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
@@ -47,6 +48,12 @@ import { sha256OfFile } from '../util/sha256';
 import { marketplaceContentTreeHash } from '../util/marketplace-tree-hash';
 import { logPathRef } from '../util/log-redact';
 import { fetchWithRetry } from '../util/retry';
+import {
+  minAppVersionFrom,
+  normalizeMinAppVersion,
+  satisfiesMinAppVersion,
+  type MinAppVersionSource,
+} from '../util/app-version-compat';
 
 import {
   userSkillsDir,
@@ -140,6 +147,12 @@ export interface MarketplaceAgent {
   default_install?: boolean | number;
   is_open_source?: boolean | number;
   status?: string;
+  min_app_version?: string;
+  minAppVersion?: string;
+  min_version?: string;
+  minVersion?: string;
+  min_pc_version?: string;
+  minPcVersion?: string;
 }
 
 export interface MarketplaceSkill {
@@ -156,6 +169,12 @@ export interface MarketplaceSkill {
   default_install?: boolean | number;
   is_open_source?: boolean | number;
   status?: string;
+  min_app_version?: string;
+  minAppVersion?: string;
+  min_version?: string;
+  minVersion?: string;
+  min_pc_version?: string;
+  minPcVersion?: string;
 }
 
 export interface AgentDetail {
@@ -178,6 +197,7 @@ export interface AgentDetail {
   default_install?: boolean;
   is_open_source?: boolean;
   status?: string;
+  min_app_version?: string;
 }
 
 export interface SkillDetail {
@@ -197,6 +217,7 @@ export interface SkillDetail {
   default_install?: boolean;
   is_open_source?: boolean;
   status?: string;
+  min_app_version?: string;
 }
 
 // ── listing ───────────────────────────────────────────────────────────────
@@ -397,9 +418,38 @@ export async function listMarketplaceProjects(
 // ── detail (cache-aware) ──────────────────────────────────────────────────
 // Detail-page entry. Caller provides the list-row's freshness pair so we can short-circuit
 // when cache is hot; we still fetch + repopulate cache on miss / stale.
-type MarketplaceFreshness = { version: string; published_at: number; updated_at?: number };
+type MarketplaceFreshness = {
+  version: string;
+  published_at: number;
+  updated_at?: number;
+} & MinAppVersionSource;
 type MarketplaceInstallKind = 'agent' | 'skill';
 type MarketplaceInstallOpts = { force?: boolean; name?: string };
+
+function _currentAppVersion(): string {
+  try { return app.getVersion(); } catch { return ''; }
+}
+
+function _normalizeMarketplaceMinAppVersion(...sources: Array<MinAppVersionSource | null | undefined>): string {
+  return minAppVersionFrom(...sources);
+}
+
+function _assertMarketplaceAppCompatible(kind: MarketplaceInstallKind, id: string, name: string | undefined, minAppVersion: string): void {
+  const min = normalizeMinAppVersion(minAppVersion);
+  if (!min) return;
+  const current = _currentAppVersion();
+  if (satisfiesMinAppVersion(current, min)) return;
+  throw new MarketplaceInstallError(
+    kind,
+    id,
+    name,
+    `requires Orkas >= ${min}; current ${current || 'unknown'}`,
+  );
+}
+
+function _isMarketplaceAppCompatible(minAppVersion: string): boolean {
+  return satisfiesMinAppVersion(_currentAppVersion(), minAppVersion);
+}
 
 export class MarketplaceInstallError extends Error {
   code = 'MARKETPLACE_INSTALL_FAILED';
@@ -530,16 +580,18 @@ export async function getAgentDetail(
         id: agentId, version: expect.version, category: '',
         published_at: expect.published_at, updated_at: expect.updated_at,
         agent_json: cached, agent_json_url: '', create_uid: '',
+        ...(_normalizeMarketplaceMinAppVersion(expect, cached) ? { min_app_version: _normalizeMarketplaceMinAppVersion(expect, cached) } : {}),
       };
     }
   }
   // Miss → fetch + repopulate.
-  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
+  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
     '/marketplace/agents/detail', { id: agentId },
   );
   await writeAgentCache(agentId, data.agent_json, {
     version: data.version, published_at: data.published_at, updated_at: data.updated_at,
   });
+  const minAppVersion = _normalizeMarketplaceMinAppVersion(data, data.agent_json);
   return {
     id: agentId, version: data.version, category: data.category,
     published_at: data.published_at, updated_at: data.updated_at,
@@ -547,6 +599,7 @@ export async function getAgentDetail(
     agent_skills_bundle_url: data.agent_skills_bundle_url || '',
     create_uid: data.create_uid || '', default_install: data.default_install === true,
     is_open_source: data.is_open_source === true, status: data.status || data.state || '',
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
   };
 }
 
@@ -560,19 +613,22 @@ export async function getSkillDetail(
       id: skillId, version: expect.version, category: '',
       published_at: expect.published_at, updated_at: expect.updated_at,
       cache_dir: getSkillCacheDir(skillId), bundle_url: '', create_uid: '',
+      ...(_normalizeMarketplaceMinAppVersion(expect) ? { min_app_version: _normalizeMarketplaceMinAppVersion(expect) } : {}),
     };
   }
   // Miss → fetch + write.
-  const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string }>(
+  const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
     '/marketplace/skills/bundle', { id: skillId },
   );
   await _fetchAndCacheSkill(skillId, meta);
+  const minAppVersion = _normalizeMarketplaceMinAppVersion(meta);
   return {
     id: skillId, name: meta.name || '', version: meta.version, category: meta.category,
     published_at: meta.published_at, updated_at: meta.updated_at,
     cache_dir: getSkillCacheDir(skillId), bundle_url: meta.bundle_url,
     create_uid: meta.create_uid || '', default_install: meta.default_install === true,
     is_open_source: meta.is_open_source === true, status: meta.status || meta.state || '',
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
   };
 }
 
@@ -676,9 +732,10 @@ async function _installMarketplaceAgentLocked(
     if (!detail.agent_json_url) {
       // Cache-hit path returns url='' (and create_uid=''); re-fetch via detail endpoint to
       // capture both — needed for manifest + `_install.json` author badge.
-      const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
+      const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
         '/marketplace/agents/detail', { id: agentId },
       );
+      const minAppVersion = _normalizeMarketplaceMinAppVersion(fresh, fresh.agent_json);
       detail = {
         id: agentId, version: fresh.version, category: fresh.category,
         published_at: fresh.published_at, updated_at: fresh.updated_at,
@@ -688,9 +745,11 @@ async function _installMarketplaceAgentLocked(
         default_install: fresh.default_install === true,
         is_open_source: fresh.is_open_source === true,
         status: fresh.status || fresh.state || '',
+        ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       };
       agentName = agentName || _agentJsonName(detail.agent_json);
     }
+    _assertMarketplaceAppCompatible('agent', agentId, agentName, detail.min_app_version || '');
 
     // 1. Install dependent skills FIRST, in parallel. Any failure throws — the agent body
     //    and manifest entry are never touched, so retry is a clean re-run (previously-installed
@@ -709,7 +768,7 @@ async function _installMarketplaceAgentLocked(
         try {
           // Direct hit on /skills/bundle for meta — avoids paging /skills/list (O(catalog) lookup
           // that breaks once the catalog grows past 500 skills).
-          const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; name?: string; status?: string; state?: string }>(
+          const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; name?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
             '/marketplace/skills/bundle', { id: sid },
           );
           depSkillName = meta.name || depSkillName;
@@ -718,6 +777,7 @@ async function _installMarketplaceAgentLocked(
             version: meta.version,
             published_at: meta.published_at,
             updated_at: meta.updated_at,
+            ...(_normalizeMarketplaceMinAppVersion(meta) ? { min_app_version: _normalizeMarketplaceMinAppVersion(meta) } : {}),
           }, { force: opts.force === true, name: depSkillName });
           log.info(`  dep-installed skill ${sid}`);
         } catch (err) {
@@ -773,6 +833,7 @@ async function _installMarketplaceAgentLocked(
         ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
         ...(detail.status ? { status: detail.status } : {}),
+        ...(detail.min_app_version ? { min_app_version: detail.min_app_version } : {}),
         ...(installContentSha ? { content_sha: installContentSha } : {}),
         ...(installTreeHash ? { content_tree_hash: installTreeHash } : {}),
       }, null, 2), 'utf8');
@@ -787,6 +848,7 @@ async function _installMarketplaceAgentLocked(
       installed_at: installedAt,
       ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
       ...(detail.status ? { status: detail.status } : {}),
+      min_app_version: detail.min_app_version || '',
     });
     invalidateCoreAgentSkills();
     log.info('installed marketplace agent', { agentId, version: detail.version, target: logPathRef(target) });
@@ -818,10 +880,11 @@ async function _installMarketplaceSkillLocked(
     let detail = await getSkillDetail(skillId, expect);
     skillName = skillName || detail.name || '';
     if (!detail.bundle_url) {
-      const fresh = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string }>(
+      const fresh = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
         '/marketplace/skills/bundle', { id: skillId },
       );
       skillName = skillName || fresh.name || '';
+      const minAppVersion = _normalizeMarketplaceMinAppVersion(fresh);
       detail = {
         ...detail,
         name: fresh.name || detail.name,
@@ -832,8 +895,10 @@ async function _installMarketplaceSkillLocked(
         default_install: fresh.default_install === true,
         is_open_source: fresh.is_open_source === true,
         status: fresh.status || fresh.state || '',
+        ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       };
     }
+    _assertMarketplaceAppCompatible('skill', skillId, skillName, detail.min_app_version || '');
 
     const cacheDir = getSkillCacheDir(skillId);
     const uid = getActiveUserId();
@@ -871,6 +936,7 @@ async function _installMarketplaceSkillLocked(
         ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
         ...(detail.status ? { status: detail.status } : {}),
+        ...(detail.min_app_version ? { min_app_version: detail.min_app_version } : {}),
         ...(skillContentSha ? { content_sha: skillContentSha } : {}),
         ...(skillTreeHash ? { content_tree_hash: skillTreeHash } : {}),
       }, null, 2), 'utf8');
@@ -884,6 +950,7 @@ async function _installMarketplaceSkillLocked(
       installed_at: installedAt,
       ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
       ...(detail.status ? { status: detail.status } : {}),
+      min_app_version: detail.min_app_version || '',
     });
     log.info('installed marketplace skill', { skillId, version: detail.version, target: logPathRef(target) });
     return { ok: true, id: skillId };
@@ -967,10 +1034,14 @@ async function _seedAgentSkillDependencies(
       return { seeded, blocked: true };
     }
     try {
-      const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string; name?: string }>(
+      const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string; name?: string; min_app_version?: string; minAppVersion?: string }>(
         '/marketplace/skills/bundle', { id: sid },
       );
       _assertApprovedDependencySkill(sid, meta.name || sid, meta);
+      const minAppVersion = _normalizeMarketplaceMinAppVersion(meta);
+      if (!_isMarketplaceAppCompatible(minAppVersion)) {
+        throw new Error(`requires Orkas >= ${minAppVersion}; current ${_currentAppVersion() || 'unknown'}`);
+      }
       if (!shouldContinue()) return { seeded, blocked: true };
       await addSkillInstall(uid, {
         id: sid,
@@ -981,6 +1052,7 @@ async function _seedAgentSkillDependencies(
         create_uid: meta.create_uid || '',
         ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
         default_install: meta.default_install === true,
+        ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       });
       seeded++;
       installedSkills.add(sid);
@@ -1118,8 +1190,8 @@ export async function ensureDefaultInstalls(
       return { seeded_agents: 0, seeded_skills: 0, skipped: true };
     }
     const data = await postJson<{
-      agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid?: string; status?: string; state?: string }[];
-      skills: { id: string; version: string; published_at: number; updated_at?: number; bundle_url: string; create_uid?: string; status?: string; state?: string }[];
+      agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }[];
+      skills: { id: string; version: string; published_at: number; updated_at?: number; bundle_url: string; create_uid?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }[];
     }>('/marketplace/defaults', {});
     if (!canContinue()) return { seeded_agents: 0, seeded_skills: 0 };
     const manifest = await readInstalls(uid);
@@ -1134,6 +1206,11 @@ export async function ensureDefaultInstalls(
       if (!a || !a.id) continue;
       if (deletedAgents.has(a.id)) continue;
       try {
+        const minAppVersion = _normalizeMarketplaceMinAppVersion(a);
+        if (!_isMarketplaceAppCompatible(minAppVersion)) {
+          log.info(`skip default agent ${a.id}; requires Orkas >= ${minAppVersion}`);
+          continue;
+        }
         const depSeed = await _seedAgentSkillDependencies(uid, a.id, installedSkills, deletedSkills, canContinue);
         if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
         seededSkills += depSeed.seeded;
@@ -1147,6 +1224,7 @@ export async function ensureDefaultInstalls(
           create_uid: a.create_uid || '',
           ...((a.status || a.state) ? { status: a.status || a.state } : {}),
           default_install: true,
+          ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
         });
         seededAgents++;
         installedAgents.add(a.id);
@@ -1159,6 +1237,11 @@ export async function ensureDefaultInstalls(
       if (!s || !s.id) continue;
       if (installedSkills.has(s.id) || deletedSkills.has(s.id)) continue;
       try {
+        const minAppVersion = _normalizeMarketplaceMinAppVersion(s);
+        if (!_isMarketplaceAppCompatible(minAppVersion)) {
+          log.info(`skip default skill ${s.id}; requires Orkas >= ${minAppVersion}`);
+          continue;
+        }
         await addSkillInstall(uid, {
           id: s.id, version: s.version || '1.0.0',
           published_at: s.published_at || 0,
@@ -1167,6 +1250,7 @@ export async function ensureDefaultInstalls(
           create_uid: s.create_uid || '',
           ...((s.status || s.state) ? { status: s.status || s.state } : {}),
           default_install: true,
+          ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
         });
         seededSkills++;
         installedSkills.add(s.id);
@@ -1183,8 +1267,12 @@ export async function ensureDefaultInstalls(
       seeded_at: Date.now(),
       checked_at: Date.now(),
       version: 1,
-      agent_ids: (data.agents || []).map((a) => a.id),
-      skill_ids: (data.skills || []).map((s) => s.id),
+      agent_ids: (data.agents || [])
+        .filter((a) => _isMarketplaceAppCompatible(_normalizeMarketplaceMinAppVersion(a)))
+        .map((a) => a.id),
+      skill_ids: (data.skills || [])
+        .filter((s) => _isMarketplaceAppCompatible(_normalizeMarketplaceMinAppVersion(s)))
+        .map((s) => s.id),
     }, null, 2), 'utf8');
     log.info(`seeded default installs: ${seededAgents} agent(s) + ${seededSkills} skill(s)`);
     return { seeded_agents: seededAgents, seeded_skills: seededSkills };
