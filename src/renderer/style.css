@@ -1889,65 +1889,98 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 /* Time-bucket headers inside #conversation-list (today / yesterday /
-   last 7 / last 30 / older). Uppercase tracking + muted color so the eye
-   skips them as section labels rather than tappable rows. */
+   last 7 / last 30 / older). Muted color keeps them scannable as section
+   labels; lazy old buckets add button affordance without becoming cards. */
 .conv-list-section-header {
   padding: 10px 10px 4px 10px;
   font-size: 10.5px;
   font-weight: 600;
   color: #94a3b8;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
+  line-height: 1;
   user-select: none;
 }
 .conv-list-section-header:first-child { padding-top: 4px; }
 .conv-list-section-header.is-collapsible {
   width: 100%;
-  min-height: 30px;
-  padding: 5px 8px;
-  border: 1px solid rgba(15, 23, 42, 0.06);
-  border-radius: 6px;
-  background: rgba(248, 250, 252, 0.75);
+  min-height: 28px;
+  padding: 3px 6px 3px 4px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
   font-family: inherit;
   text-align: left;
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 6px;
-  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  gap: 5px;
+  color: #8b9ab1;
+  transition: background 0.12s, color 0.12s;
 }
 .conv-list-section-header.is-collapsible:hover {
-  background: var(--surface-2);
-  border-color: rgba(15, 23, 42, 0.10);
+  background: rgba(148, 163, 184, 0.08);
   color: var(--text-2);
 }
+.conv-list-section-header.is-collapsible:focus-visible {
+  outline: 2px solid rgba(91, 87, 214, 0.26);
+  outline-offset: 1px;
+}
 .conv-list-section-caret {
-  width: 14px;
-  height: 14px;
+  width: 22px;
+  height: 22px;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  color: #64748b;
+  border-radius: 6px;
+  color: #6f7f97;
+  transition: background 0.12s, color 0.12s, box-shadow 0.12s;
+}
+.conv-list-section-header.is-collapsible:hover .conv-list-section-caret {
+  background: var(--surface);
+  color: var(--primary-text);
+  box-shadow: inset 0 0 0 1px rgba(28, 45, 89, 0.08);
 }
 .conv-list-section-caret-icon {
-  width: 13px;
-  height: 13px;
-  stroke-width: 2.2;
+  width: 14px;
+  height: 14px;
+  stroke-width: 2.15;
+}
+.conv-list-section-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conv-list-section-rule {
+  flex: 1 1 auto;
+  min-width: 12px;
+  height: 1px;
+  margin-left: 3px;
+  background: linear-gradient(90deg, rgba(148, 163, 184, 0.26), rgba(148, 163, 184, 0));
 }
 .conv-list-section-count {
-  margin-left: auto;
-  min-width: 18px;
-  padding: 1px 6px;
+  flex: 0 0 auto;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 7px;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.12);
-  font-size: 10px;
-  font-weight: 600;
-  color: #94a3b8;
+  background: #eef2f7;
+  font-size: 10.5px;
+  font-weight: 650;
+  color: #7f8fa8;
   letter-spacing: 0;
+  line-height: 18px;
   text-align: center;
 }
 .project-conv-list .conv-list-section-header {
   font-size: 10px;
+}
+.project-conv-list .conv-list-section-header.is-collapsible {
+  margin: 2px 0;
 }
 
 .conv-item {

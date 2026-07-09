@@ -3547,8 +3547,9 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
         data-conv-bucket-toggle="1" data-conv-bucket="${escapeHtml(b)}" data-conv-bucket-scope="${escapeHtml(scope)}"
         aria-expanded="${expanded ? 'true' : 'false'}">
         <span class="conv-list-section-caret" aria-hidden="true">${_uiIconHtml(expanded ? 'chevron-down' : 'chevron-right', 'conv-list-section-caret-icon')}</span>
-        <span data-i18n="${headerKey}">${escapeHtml(t(headerKey))}</span>
+        <span class="conv-list-section-label" data-i18n="${headerKey}">${escapeHtml(t(headerKey))}</span>
         <span class="conv-list-section-count">${bucketItems.length}</span>
+        <span class="conv-list-section-rule" aria-hidden="true"></span>
       </button>`);
       if (!expanded) continue;
     } else {
