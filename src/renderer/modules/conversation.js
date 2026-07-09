@@ -1123,6 +1123,11 @@ const _SCENARIO_CONFIGS = {
     agentId: '79df9cc89f5f',
     agentNames: ['VideoStudio'],
   },
+  ui_design: {
+    templateKey: 'new_chat.quick.tmpl.ui_design',
+    agentId: 'bcfcb4921dce',
+    agentNames: ['UIDesigner'],
+  },
   seo_geo: {
     templateKey: 'new_chat.quick.tmpl.seo_geo',
     agentId: 'e064dca9e1bd',
@@ -1138,11 +1143,6 @@ const _SCENARIO_CONFIGS = {
     agentId: 'a316881746f9',
     agentNames: ['ProductDeveloper'],
   },
-  education: {
-    templateKey: 'new_chat.quick.tmpl.education',
-    agentId: '54fc8129a8c4',
-    agentNames: ['LearningTutor'],
-  },
 };
 // English fallback templates — used when the i18n table doesn't yet carry
 // the scenario template key (Step 9 backfills the full set). Each template
@@ -1150,10 +1150,10 @@ const _SCENARIO_CONFIGS = {
 const _SCENARIO_TEMPLATES_FALLBACK_EN = {
   data: 'Deep research [topic]: gather recent sources, compare evidence, cite links, and produce a structured report.',
   video: 'Make a video for [topic/materials]: confirm the style, plan the script/timeline, produce a draft, and ask me to review it.',
+  ui_design: 'Design the UI for [screen / product / workflow]: define the layout, visual direction, states, responsive behavior, and deliver an HTML-first draft.',
   seo_geo: 'Analyze SEO and GEO for [website/page URL]: crawl the page, diagnose technical/content/schema issues, find opportunities, and produce an action plan.',
   office: 'Organize [document/materials]: turn it into a polished document, table, presentation, or PDF-ready deliverable.',
   rnd: 'Build [software/app/feature]: clarify requirements, design the implementation plan, write the code, test it, and verify completion.',
-  education: '[topic or material] Tutor me step by step. Explain the concept, ask guiding questions, and give me a practice plan.',
 };
 
 function _pickGreetingKey(date) {

@@ -48,6 +48,7 @@
     sparkles: '<path d="M12 3l1.4 3.6L17 8l-3.6 1.4L12 13l-1.4-3.6L7 8l3.6-1.4z"></path><path d="M19 13l.9 2.1L22 16l-2.1.9L19 19l-.9-2.1L16 16l2.1-.9z"></path><path d="M5 14l.8 1.7L7.5 16.5l-1.7.8L5 19l-.8-1.7-1.7-.8 1.7-.8z"></path>',
     plug: '<path d="M12 22v-5"></path><path d="M9 8V2"></path><path d="M15 8V2"></path><path d="M6 8h12v4a6 6 0 0 1-12 0z"></path>',
     'book-open': '<path d="M12 7v14"></path><path d="M3 5.5A3.5 3.5 0 0 1 6.5 2H12v19H6.5A3.5 3.5 0 0 1 3 17.5z"></path><path d="M21 5.5A3.5 3.5 0 0 0 17.5 2H12v19h5.5a3.5 3.5 0 0 0 3.5-3.5z"></path>',
+    palette: '<path d="M12 22a10 10 0 1 1 10-10 5 5 0 0 1-5 5h-2.4a1.6 1.6 0 0 0-1.3 2.5l.3.4A1.4 1.4 0 0 1 12 22z"></path><circle cx="7.5" cy="10" r="1" fill="currentColor" stroke="none"></circle><circle cx="10" cy="6.8" r="1" fill="currentColor" stroke="none"></circle><circle cx="14" cy="6.8" r="1" fill="currentColor" stroke="none"></circle><circle cx="16.5" cy="10" r="1" fill="currentColor" stroke="none"></circle>',
     globe: '<circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a14 14 0 0 1 0 18"></path><path d="M12 3a14 14 0 0 0 0 18"></path>',
     database: '<ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"></path><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"></path>',
     'layout-grid': '<rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect>',

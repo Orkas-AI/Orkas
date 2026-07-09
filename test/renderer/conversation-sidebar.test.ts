@@ -1038,7 +1038,7 @@ describe('new chat quick-start scenarios', () => {
       dispatchEvent() {},
     };
     const chip = {
-      dataset: { scenario: 'education' },
+      dataset: { scenario: 'ui_design' },
       addEventListener(type: string, fn: Function) {
         if (type === 'click') clickHandler = fn;
       },
@@ -1066,7 +1066,7 @@ describe('new chat quick-start scenarios', () => {
     await clickHandler!();
 
     expect(context.getChatRecipient('new-chat')).toMatchObject({ kind: 'commander' });
-    expect(input.value).toContain('Tutor me step by step');
+    expect(input.value).toContain('Design the UI');
     expect(input.focused).toBe(true);
     expect(toasts).toHaveLength(0);
   });
