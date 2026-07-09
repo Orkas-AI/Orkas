@@ -1526,6 +1526,8 @@
   "marketplace.status_rejected": "审核不通过",
   "marketplace.status_archived": "归档",
   "marketplace.install": "安装",
+  "marketplace.requires_app": "需 Orkas {version}+",
+  "marketplace.app_update_required": "需要 Orkas {minimum} 或更高版本（当前 {current}），请更新 Orkas 后再安装。",
   "marketplace.installed": "已安装",
   "marketplace.installing": "安装中…",
   "marketplace.update": "更新",

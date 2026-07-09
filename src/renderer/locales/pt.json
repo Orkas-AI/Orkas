@@ -1510,6 +1510,8 @@
   "marketplace.status_rejected": "Rejeitado",
   "marketplace.status_archived": "Arquivado",
   "marketplace.install": "Instalar",
+  "marketplace.requires_app": "Requer Orkas {version}+",
+  "marketplace.app_update_required": "Requer o Orkas {minimum} ou mais recente (atual {current}). Atualize o Orkas e instale novamente.",
   "marketplace.installed": "Instalado",
   "marketplace.installing": "Instalando…",
   "marketplace.update": "Atualizar",

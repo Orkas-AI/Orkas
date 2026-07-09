@@ -82,6 +82,11 @@ function _mpErrorFromResponse(res, fallbackMessage) {
   if (res && res.marketplaceId) err.marketplaceId = res.marketplaceId;
   if (res && res.marketplaceName) err.marketplaceName = res.marketplaceName;
   if (res && res.marketplaceReason) err.marketplaceReason = res.marketplaceReason;
+  if (res && res.marketplaceAppUpdateRequired) {
+    err.marketplaceAppUpdateRequired = true;
+    err.marketplaceMinAppVersion = res.marketplaceMinAppVersion || '';
+    err.marketplaceCurrentAppVersion = res.marketplaceCurrentAppVersion || '';
+  }
   if (res && res.qualityReport) err.qualityReport = res.qualityReport;
   return err;
 }
@@ -192,6 +197,38 @@ function _mpMinAppVersion(row) {
     || '';
   return typeof value === 'string' ? value.trim() : '';
 }
+
+// Renderer-local mirror of util/app-version-compat; classic scripts cannot import it.
+function _mpVersionTokens(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return [];
+  return text.replace(/^v/i, '').split(/[.+_-]/).filter(Boolean)
+    .map((p) => (/^\d+$/.test(p) ? Number(p) : p.toLowerCase()));
+}
+
+function _mpCompareVersions(a, b) {
+  const aa = _mpVersionTokens(a);
+  const bb = _mpVersionTokens(b);
+  if (!aa.length || !bb.length) return 0;
+  const n = Math.max(aa.length, bb.length);
+  for (let i = 0; i < n; i++) {
+    const x = aa[i] ?? 0;
+    const y = bb[i] ?? 0;
+    if (x === y) continue;
+    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
+    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  return 0;
+}
+
+function _mpItemAppCompatible(item) {
+  const min = _mpMinAppVersion(item);
+  if (!min) return true;
+  const current = _mpState && _mpState.appVersion;
+  if (!current) return true;
+  return _mpCompareVersions(current, min) >= 0;
+}
+
 function _mpInstallMetaRows(kind) {
   const ids = kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds;
   const map = kind === 'agent' ? _mpState.installedAgentMeta : _mpState.installedSkillMeta;
@@ -283,6 +320,7 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
 
   _mpState = {
     view: 'grid',
+    appVersion: (_mpState && _mpState.appVersion) || '',
     tab: (initialTab === 'skill' || initialTab === 'oss') ? initialTab : 'agent',
     category: '',
     // Open-source projects专区 (curated, config-as-code; isolated from the
@@ -354,6 +392,16 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
 
   // Best-effort cache sweep — never blocks the UI.
   window.orkas.invoke('marketplace.sweepCache').catch(() => { /* ignore */ });
+
+  if (!_mpState.appVersion && window.orkas && typeof window.orkas.env === 'function') {
+    window.orkas.env().then((env) => {
+      const v = env && env.version;
+      if (typeof v === 'string' && v && _mpState) {
+        _mpState.appVersion = v;
+        _mpRender();
+      }
+    }).catch(() => { /* ignore */ });
+  }
 
   const deepLinkItem = opts && opts.detailItem && opts.detailItem.id ? opts.detailItem : null;
   const deepLinkKind = opts && opts.detailKind ? opts.detailKind : _mpState.tab;
@@ -1314,6 +1362,7 @@ function _mpCardHtml(item, lang) {
   const avatar = kind === 'agent'
     ? renderAvatarHtml(item.icon, item.color, { size: 32, seed: item.id, extraClass: 'marketplace-card-avatar' })
     : '';
+  const appCompatible = status.installed || status.updateAvailable || _mpItemAppCompatible(item);
   let btnClass = 'btn btn-sm btn-primary';
   let btnLabel = t('marketplace.install');
   let btnAttrs = `data-mp-install="${escapeHtml(kind)}" data-mp-id="${escapeHtml(item.id)}"`;
@@ -1323,6 +1372,10 @@ function _mpCardHtml(item, lang) {
     btnLabel = status.updateAvailable ? t('marketplace.updating') : t('marketplace.installing');
     btnAttrs = 'disabled';
     btnSpinner = '<span class="marketplace-btn-spinner"></span>';
+  } else if (!appCompatible) {
+    btnClass = 'btn btn-sm is-disabled';
+    btnLabel = t('marketplace.requires_app').replace('{version}', _mpMinAppVersion(item));
+    btnAttrs = 'disabled title="' + escapeHtml(btnLabel) + '"';
   } else if (status.updateAvailable) {
     btnClass = 'btn btn-sm btn-primary';
     btnLabel = t('marketplace.update');
@@ -1463,6 +1516,7 @@ function _mpRenderDetail() {
   const installBtn = panel.querySelector('[data-mp-detail-install]');
   installBtn.dataset.id = item.id;
   installBtn.dataset.kind = kind;
+  installBtn.title = '';
   // When installed, repurpose the primary button as Uninstall (local-only — does NOT touch
   // the server row). When installing/uninstalling, disabled with progress text + inline
   // spinner so the user sees "still working" instead of a static label.
@@ -1486,6 +1540,14 @@ function _mpRenderDetail() {
     installBtn.classList.add('btn-danger');
     installBtn.disabled = false;
     installBtn.dataset.action = 'uninstall';
+  } else if (!_mpItemAppCompatible(item)) {
+    const label = t('marketplace.requires_app').replace('{version}', _mpMinAppVersion(item));
+    installBtn.textContent = label;
+    installBtn.title = label;
+    installBtn.classList.remove('btn-primary', 'btn-danger');
+    installBtn.classList.add('is-disabled');
+    installBtn.disabled = true;
+    installBtn.dataset.action = '';
   } else {
     installBtn.textContent = t('marketplace.install');
     installBtn.classList.remove('is-disabled', 'btn-danger');
@@ -1775,7 +1837,11 @@ function _mpInstallFailedName(kind, item, err) {
 function _mpInstallFailedText(kind, item, err) {
   const failedKind = err?.marketplaceKind || kind;
   const failedName = _mpInstallFailedName(kind, item, err);
-  const reason = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
+  const reason = (err && err.marketplaceAppUpdateRequired)
+    ? t('marketplace.app_update_required')
+        .replace('{minimum}', String(err.marketplaceMinAppVersion || _mpMinAppVersion(item) || ''))
+        .replace('{current}', String(err.marketplaceCurrentAppVersion || ''))
+    : _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
   const tmpl = t('marketplace.install_failed_resource');
   if (tmpl && tmpl !== 'marketplace.install_failed_resource') {
     return tmpl

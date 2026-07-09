@@ -444,6 +444,7 @@ function _assertMarketplaceAppCompatible(kind: MarketplaceInstallKind, id: strin
     id,
     name,
     `requires Orkas >= ${min}; current ${current || 'unknown'}`,
+    { appUpdateRequired: true, minAppVersion: min, currentAppVersion: current || '' },
   );
 }
 
@@ -457,8 +458,19 @@ export class MarketplaceInstallError extends Error {
   marketplaceId: string;
   marketplaceName: string;
   marketplaceReason: string;
+  /** Set when the install was blocked because the client app is older than
+   *  the item's min_app_version. The renderer can then show localized copy. */
+  appUpdateRequired = false;
+  minAppVersion = '';
+  currentAppVersion = '';
 
-  constructor(kind: MarketplaceInstallKind, id: string, name: string | undefined, reason: string) {
+  constructor(
+    kind: MarketplaceInstallKind,
+    id: string,
+    name: string | undefined,
+    reason: string,
+    extra?: { appUpdateRequired?: boolean; minAppVersion?: string; currentAppVersion?: string },
+  ) {
     const label = kind === 'agent' ? 'agent' : 'skill';
     const cleanName = String(name || '').trim();
     const displayName = cleanName || (id || '').trim();
@@ -468,6 +480,9 @@ export class MarketplaceInstallError extends Error {
     this.marketplaceId = id;
     this.marketplaceName = cleanName;
     this.marketplaceReason = reason;
+    if (extra?.appUpdateRequired) this.appUpdateRequired = true;
+    if (extra?.minAppVersion) this.minAppVersion = extra.minAppVersion;
+    if (extra?.currentAppVersion) this.currentAppVersion = extra.currentAppVersion;
   }
 }
 
@@ -477,6 +492,9 @@ export function getMarketplaceInstallErrorInfo(err: unknown): {
   name?: string;
   reason: string;
   qualityReport?: QualityReport;
+  appUpdateRequired?: boolean;
+  minAppVersion?: string;
+  currentAppVersion?: string;
 } {
   const e = err as Partial<MarketplaceInstallError> & { message?: string; qualityReport?: QualityReport };
   return {
@@ -485,6 +503,11 @@ export function getMarketplaceInstallErrorInfo(err: unknown): {
     name: e.marketplaceName,
     reason: e.marketplaceReason || e.message || String(err),
     qualityReport: e.qualityReport,
+    ...(e.appUpdateRequired ? {
+      appUpdateRequired: true,
+      minAppVersion: e.minAppVersion || '',
+      currentAppVersion: e.currentAppVersion || '',
+    } : {}),
   };
 }
 

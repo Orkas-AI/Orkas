@@ -1526,6 +1526,8 @@
   "marketplace.status_rejected": "非承認",
   "marketplace.status_archived": "アーカイブ",
   "marketplace.install": "インストール",
+  "marketplace.requires_app": "Orkas {version}+ が必要",
+  "marketplace.app_update_required": "Orkas {minimum} 以降が必要です（現在 {current}）。Orkas を更新してからインストールしてください。",
   "marketplace.installed": "インストール済み",
   "marketplace.installing": "インストール中…",
   "marketplace.update": "更新",

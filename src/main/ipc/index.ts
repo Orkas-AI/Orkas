@@ -2830,6 +2830,9 @@ export function register(): void {
         marketplaceId?: string;
         marketplaceName?: string;
         marketplaceReason?: string;
+        marketplaceAppUpdateRequired?: boolean;
+        marketplaceMinAppVersion?: string;
+        marketplaceCurrentAppVersion?: string;
         qualityReport?: unknown;
       } = {
         ok: false,
@@ -2845,6 +2848,11 @@ export function register(): void {
         if (installInfo.id) out.marketplaceId = installInfo.id;
         if (installInfo.name) out.marketplaceName = installInfo.name;
         if (installInfo.reason) out.marketplaceReason = installInfo.reason;
+      }
+      if (installInfo.appUpdateRequired) {
+        out.marketplaceAppUpdateRequired = true;
+        out.marketplaceMinAppVersion = installInfo.minAppVersion || '';
+        out.marketplaceCurrentAppVersion = installInfo.currentAppVersion || '';
       }
       return out;
     }

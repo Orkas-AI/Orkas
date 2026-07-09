@@ -44,6 +44,8 @@ function loadMarketplaceRenderer(): any {
       'marketplace.install_failed': 'Install failed: {reason}',
       'marketplace.install_failed_resource': 'Install failed: {kind}: {name}. {reason}',
       'marketplace.action_failed_retry_later': 'Marketplace is temporarily unavailable. Please try again later.',
+      'marketplace.app_update_required': 'Requires Orkas {minimum} or newer (current {current}). Update Orkas, then install.',
+      'marketplace.requires_app': 'Needs Orkas {version}+',
       'marketplace_request.kind_agent': 'Agent',
       'marketplace_request.kind_skill': 'Skill',
     } as Record<string, string>)[key] || key,
@@ -89,6 +91,41 @@ describe('marketplace install error display', () => {
     expect(text).toBe('Install failed: Skill: missing-friendly-skill. not_found');
     expect(text).not.toContain('Skill: ResearchTutor');
     expect(text).not.toContain('stale-skill-id');
+  });
+
+  it('shows a localized update prompt for a min-app-version block, not a raw string', () => {
+    const ctx = loadMarketplaceRenderer();
+    const text = ctx._mpInstallFailedText(
+      'agent',
+      { id: 'agent-1', name: 'VideoStudio' },
+      {
+        marketplaceKind: 'agent',
+        marketplaceAppUpdateRequired: true,
+        marketplaceMinAppVersion: '1.6.0',
+        marketplaceCurrentAppVersion: '1.5.1',
+        message: 'requires Orkas >= 1.6.0; current 1.5.1',
+      },
+    );
+
+    expect(text).toBe(
+      'Install failed: Agent: VideoStudio. Requires Orkas 1.6.0 or newer (current 1.5.1). Update Orkas, then install.',
+    );
+    expect(text).not.toContain('requires Orkas >= 1.6.0');
+  });
+
+  it('gates the install button by client app version', () => {
+    const ctx = loadMarketplaceRenderer();
+    expect(ctx._mpCompareVersions('1.5.1', '1.6.0')).toBeLessThan(0);
+    expect(ctx._mpCompareVersions('1.6.0', '1.6.0')).toBe(0);
+    expect(ctx._mpCompareVersions('1.7.0', '1.6.0')).toBeGreaterThan(0);
+
+    vm.runInContext('_mpState = { appVersion: "1.5.1" }', ctx);
+    expect(ctx._mpItemAppCompatible({ min_app_version: '1.6.0' })).toBe(false);
+    expect(ctx._mpItemAppCompatible({ min_app_version: '1.5.0' })).toBe(true);
+    expect(ctx._mpItemAppCompatible({ min_app_version: '' })).toBe(true);
+
+    vm.runInContext('_mpState = { appVersion: "" }', ctx);
+    expect(ctx._mpItemAppCompatible({ min_app_version: '1.6.0' })).toBe(true);
   });
 
   it('maps transport failures to user-facing marketplace copy', () => {
