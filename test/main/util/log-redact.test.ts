@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { redactPaths } from '../../../src/main/util/redact';
 import { logErrorSummary, maskId, safeUrlAction } from '../../../src/main/util/log-redact';
 
 describe('log-redact', () => {
@@ -28,5 +29,16 @@ describe('log-redact', () => {
     expect(summary).toHaveProperty('message_hash');
     expect(JSON.stringify(summary)).not.toContain('private prompt fragment');
     expect(JSON.stringify(summary)).not.toContain('sk-secret1234567890');
+  });
+
+  it('redacts local paths in subprocess stderr tails', () => {
+    const out = redactPaths(
+      "ffmpeg failed for /Users/user/Private Clips/demo.mov and C:\\Users\\user\\Videos\\secret.mp4",
+    );
+
+    expect(out).toContain('<path>');
+    expect(out).not.toContain('/Users/user');
+    expect(out).not.toContain('user\\Videos');
+    expect(out).not.toContain('secret.mp4');
   });
 });

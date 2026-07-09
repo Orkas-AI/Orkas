@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import type { BrowserWindow as ElectronBrowserWindow } from 'electron';
 
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
+import { redactPaths } from '../util/redact';
 import { createLogger } from '../logger';
 
 const log = createLogger('video-studio');
@@ -854,8 +855,9 @@ async function encodeFrames(opts: {
   if (r.aborted) return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_ABORTED', message: 'render aborted.' };
   if (r.timedOut) return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_TIMEOUT', message: 'ffmpeg encode timed out.' };
   if (r.code !== 0) {
-    log.warn('ffmpeg encode failed', { code: r.code, stderr: r.stderr.slice(-500) });
-    return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_ENCODE_FAILED', message: `ffmpeg exited ${r.code}. ${r.stderr.slice(-1200)}` };
+    const stderrTail = redactPaths(r.stderr.slice(-1200));
+    log.warn('ffmpeg encode failed', { code: r.code, stderr_chars: r.stderr.length, stderr_tail: stderrTail.slice(-500) });
+    return { ok: false, op: 'composition.render', errorCode: 'E_RENDER_ENCODE_FAILED', message: `ffmpeg exited ${r.code}. ${stderrTail}` };
   }
   return { ok: true, op: 'composition.render' };
 }
