@@ -103,12 +103,63 @@ describe("web-fetch › classifyFetchContent", () => {
     expect(issue).toMatchObject({ code: "JS_OR_NAV_SHELL" });
   });
 
+  it("marks a real Cloudflare interstitial challenge as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://protected.example.com/article",
+      "Just a moment...",
+      '<html><head><title>Just a moment...</title></head><body><div class="cf-browser-verification"></div>' +
+        "<p>Enable JavaScript and cookies to continue</p><script>window.__cf_chl_opt={};</script></body></html>",
+      "Just a moment... Enable JavaScript and cookies to continue",
+    );
+
+    expect(issue).toMatchObject({ code: "WAF_OR_BOT_CHECK" });
+  });
+
+  it("marks a Chinese security-verification wall as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://www.example.cn/news/123",
+      "安全验证",
+      "<html><title>安全验证</title><body>请完成验证后访问</body></html>",
+      "安全验证 请完成验证后访问",
+    );
+
+    expect(issue).toMatchObject({ code: "WAF_OR_BOT_CHECK" });
+  });
+
   it("does not classify normal article text as failed content", () => {
     const issue = classifyFetchContent(
       "https://example.com/article",
       "Quarterly results",
       "<html><title>Quarterly results</title><article>Revenue grew 20 percent.</article></html>",
       "Quarterly results\nRevenue grew 20 percent.",
+    );
+
+    expect(issue).toBeNull();
+  });
+
+  it("does not flag a normal page that merely loads Cloudflare CDN / Insights assets (look-alike)", () => {
+    const issue = classifyFetchContent(
+      "https://example.com/docs",
+      "API Reference",
+      '<html><head><title>API Reference</title>' +
+        '<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>' +
+        '<script defer src="https://static.cloudflareinsights.com/beacon.min.js"></script></head>' +
+        "<body><article>Call the endpoint with a bearer token.</article></body></html>",
+      "API Reference\nCall the endpoint with a bearer token.",
+    );
+
+    expect(issue).toBeNull();
+  });
+
+  it("does not flag a normal page with a reCAPTCHA-protected contact form (look-alike)", () => {
+    const issue = classifyFetchContent(
+      "https://example.com/contact",
+      "Contact us",
+      '<html><head><title>Contact us</title>' +
+        '<script src="https://www.google.com/recaptcha/api.js" async defer></script></head>' +
+        '<body><h1>Contact us</h1><form><div class="g-recaptcha" data-sitekey="abc"></div>' +
+        "<p>We usually reply within one business day.</p></form></body></html>",
+      "Contact us\nWe usually reply within one business day.",
     );
 
     expect(issue).toBeNull();

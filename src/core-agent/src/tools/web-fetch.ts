@@ -122,7 +122,13 @@ export function classifyFetchContent(url: string, title: string | undefined, raw
   const head = `${title || ""}\n${raw.slice(0, 6000)}\n${text.slice(0, 3000)}`;
   const compactText = text.replace(/\s+/g, "");
 
-  if (/_waf_[a-z0-9]+|captcha|cloudflare|access denied|bot detection|人机验证|安全验证|访问验证|验证码|反爬/i.test(head)) {
+  // Match anti-bot/WAF *challenge* markers, not infrastructure names. Bare
+  // `cloudflare`/`captcha`/`access denied` false-positived on any normal page
+  // that merely loads a Cloudflare CDN/Insights asset (cdnjs.cloudflare.com,
+  // static.cloudflareinsights.com) or a reCAPTCHA widget, wrongly telling the
+  // model "do not retry, this is a bot wall". These phrases only appear on the
+  // actual challenge/block page.
+  if (/_waf_[a-z0-9]+|cf-browser-verification|__cf_chl|cf_chl_opt|Attention Required!\s*\|\s*Cloudflare|Cloudflare Ray ID|Checking your browser before access|Just a moment\.\.\.|Enable JavaScript and cookies to continue|Verify (?:you are|you're)(?: a)? human|complete the security check|you don'?t have permission to access|人机(?:身份)?验证|安全验证|访问验证|滑动验证|请完成验证|反爬/i.test(head)) {
     return {
       code: "WAF_OR_BOT_CHECK",
       message:
