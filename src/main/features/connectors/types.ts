@@ -39,6 +39,13 @@ export type ConnectorStatus =
   | { kind: 'disconnected' }
   | { kind: 'error'; message: string; at: number };
 
+export interface ConnectorAuthError {
+  code: string;
+  message: string;
+  reason?: string;
+  at: number;
+}
+
 export interface ConnectorInstance {
   /** Stable id chosen by the user at install time (e.g. "github-personal"). Becomes the prefix on
    *  every tool name emitted into the AgentRunner tool list: `<id>__<tool_name>`. */
@@ -58,6 +65,9 @@ export interface ConnectorInstance {
   tools_cache: ToolSchema[];
   tools_cached_at: number;
   status: ConnectorStatus;
+  /** Sticky non-sensitive auth failure marker. When a provider has definitively
+   *  rejected a grant, boot/list/refresh paths must not keep retrying it. */
+  auth_error?: ConnectorAuthError;
   /** OAuth grant when this instance was created via OAuth; absent for API-key installs.
    *  The manager rewrites the transport env at spawn time using `oauth_grant.access_token`;
    *  refresh logic in `oauth.ts::refreshIfStale` runs before connect / after a 401. */

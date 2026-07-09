@@ -427,6 +427,35 @@ describe('features/connectors/manager authorization recovery', () => {
       kind: 'error',
       message: expect.stringContaining('Authorization expired'),
     });
+    expect(registry.load(TEST_UID).connections.notion.auth_error).toMatchObject({
+      code: 'connector_reconnect_required',
+      message: expect.stringContaining('Authorization expired'),
+    });
+  });
+
+  it('does not retry persisted DCR reconnect-required rows on bootstrap', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = notionInstance();
+    inst.oauth_grant.refresh_token = null;
+    (inst.oauth_grant as any).server_managed = true;
+    (inst.oauth_grant as any).server_grant_id = 'grant-1';
+    inst.status = {
+      kind: 'error',
+      message: 'connector_reconnect_required: 授权已失效，请重新连接',
+      at: Date.now(),
+    };
+    delete (inst as any).dcr_client;
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(mocks.dcr.refreshDcrServerManaged).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.notion.auth_error).toMatchObject({
+      code: 'connector_reconnect_required',
+      message: expect.stringContaining('授权已失效'),
+    });
   });
 
   it('removes the connector row if a refresh response no longer includes required scopes', async () => {
@@ -469,6 +498,14 @@ describe('features/connectors/manager authorization recovery', () => {
       message: expect.stringContaining('invalid_grant'),
     });
     expect(registry.load(TEST_UID).connections.notion).toBeTruthy();
+    expect(registry.load(TEST_UID).connections.notion.auth_error).toMatchObject({
+      code: 'connector_reconnect_required',
+      message: expect.stringContaining('invalid_grant'),
+    });
+
+    mocks.dcr.refreshDcrServerManaged.mockClear();
+    await manager.bootstrap(TEST_UID);
+    expect(mocks.dcr.refreshDcrServerManaged).not.toHaveBeenCalled();
   });
 
   it('adopts legacy DCR refresh tokens into server-managed grants', async () => {

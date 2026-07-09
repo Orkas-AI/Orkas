@@ -78,9 +78,18 @@ function _missingRequiredScopes(entry: CatalogEntry, grant: OAuthGrant | undefin
 function _storedAuthorizationProblem(inst: ConnectorInstance): { message: string; reason: string } | null {
   const entry = findCatalogEntry(inst.id);
   if (!entry) return null;
+  if (inst.auth_error?.message) {
+    return {
+      message: inst.auth_error.message,
+      reason: inst.auth_error.reason || inst.auth_error.code || 'authorization_error',
+    };
+  }
   const statusError = inst.status?.kind === 'error' ? inst.status.message : '';
   if (statusError && _isGoogleAuthFailure(entry, statusError)) {
     return { message: statusError, reason: 'google_auth_error' };
+  }
+  if (statusError && _isStickyDcrAuthStatus(entry, statusError)) {
+    return { message: statusError, reason: 'dcr_auth_error' };
   }
   return null;
 }
@@ -137,6 +146,15 @@ function _isDcrAuthFailure(entry: CatalogEntry, err: unknown): boolean {
   return /DCR refresh HTTP\s+4\d\d|invalid_grant|connector_reconnect_required|access_token expired|no oauth_grant|transport unresolved/i.test(msg);
 }
 
+function _isStickyDcrAuthStatus(entry: CatalogEntry, err: unknown): boolean {
+  if (entry.auth_mode !== 'mcp_dcr') return false;
+  const code = _connectorErrorCode(err);
+  if (code === 'connector_reconnect_required') return true;
+  if (code === 'connector_refresh_failed') return false;
+  const msg = (err as Error | null)?.message || String(err || '');
+  return /DCR refresh HTTP\s+4\d\d|invalid_grant|connector_reconnect_required|access_token expired|no oauth_grant|reconnect required|授权已失效|Authorization expired/i.test(msg);
+}
+
 function _isTransientConnectorFailure(err: unknown): boolean {
   const code = _connectorErrorCode(err);
   const retryable = _connectorRetryable(err);
@@ -164,6 +182,7 @@ function _asConnectedFromCache(inst: ConnectorInstance): ConnectorInstance {
   if (inst.status?.kind === 'connected') return inst;
   return {
     ...inst,
+    auth_error: undefined,
     status: { kind: 'connected', since: _now() },
   };
 }
@@ -244,9 +263,16 @@ async function _markAuthorizationError(uid: string, id: string, message: string,
     try { await conn.close(); } catch { /* swallow */ }
     _conns.delete(id);
   }
+  const at = _now();
   const updated = await registry.update(uid, id, (cur) => ({
     ...cur,
-    status: { kind: 'error', message, at: _now() },
+    auth_error: {
+      code: _connectorErrorCode(message) || 'connector_reconnect_required',
+      message,
+      reason,
+      at,
+    },
+    status: { kind: 'error', message, at },
     updated_at: _nowIso(),
   }));
   if (updated) log.warn('connector authorization requires reconnect', { id, reason });
@@ -496,6 +522,7 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
       transport,
       tools_cache: tools,
       tools_cached_at: _now(),
+      auth_error: undefined,
       status: { kind: 'connected', since: _now() },
       updated_at: _nowIso(),
     }));
@@ -516,6 +543,7 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
           transport,
           tools_cache: tools,
           tools_cached_at: _now(),
+          auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
         }));
@@ -538,6 +566,7 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
           transport: retryTransport,
           tools_cache: tools,
           tools_cached_at: _now(),
+          auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
         }));
@@ -587,7 +616,7 @@ export async function bootstrap(uid: string): Promise<void> {
     }
     const problem = _storedAuthorizationProblem(inst);
     if (problem) {
-      if (!_hasStatusError(inst, problem.message)) {
+      if (!inst.auth_error?.message || !_hasStatusError(inst, problem.message)) {
         try {
           await _markAuthorizationError(uid, inst.id, problem.message, `bootstrap_${problem.reason}`);
         } catch (err) {
@@ -616,7 +645,7 @@ export function listInstances(uid: string): ConnectorInstance[] {
   }).map((inst) => {
     const problem = _storedAuthorizationProblem(inst);
     if (problem) {
-      if (!_hasStatusError(inst, problem.message)) {
+      if (!inst.auth_error?.message || !_hasStatusError(inst, problem.message)) {
         _markAuthorizationErrorSoon(uid, inst.id, problem.message, `list_${problem.reason}`);
       }
       return {
@@ -644,7 +673,7 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
     }
     const problem = _storedAuthorizationProblem(inst);
     if (problem) {
-      if (!_hasStatusError(inst, problem.message)) {
+      if (!inst.auth_error?.message || !_hasStatusError(inst, problem.message)) {
         _markAuthorizationErrorSoon(uid, inst.id, problem.message, `get_${problem.reason}`);
       }
       return {
