@@ -556,6 +556,31 @@ export class Session {
     return this.turnState;
   }
 
+  /**
+   * Swap the entire message array (e.g. after healing orphan or merging parallel
+   * tool_result blocks) while keeping the rolling history summary + resources
+   * intact — only the turn *indices* are re-derived from the new messages.
+   *
+   * Without this, a heal that merges the N separate tool_result messages a
+   * multi-tool turn produces would `clear()` (nulling turnState) and the next
+   * turn would rebuild an empty turnState, silently dropping the accumulated
+   * context summary and resource ledger. Merging tool_result blocks does not add
+   * or remove turns, so re-deriving indices keeps summaryThroughTurnId aligned.
+   */
+  protected replaceMessagesPreservingContext(messages: Message[]): void {
+    const prev = this.turnState;
+    this.messages = messages.slice();
+    this.turnState = prev
+      ? this.rebuildTurnStateFromMessages({
+          historySummary: prev.historySummary,
+          summaryVersion: prev.summaryVersion,
+          summaryThroughTurnId: prev.summaryThroughTurnId,
+          resources: prev.resources,
+          nextTurnId: prev.nextTurnId,
+        })
+      : null;
+  }
+
   private rebuildTurnStateFromMessages(preserve?: {
     historySummary?: string;
     summaryVersion?: number;

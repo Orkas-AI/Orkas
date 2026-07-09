@@ -123,9 +123,13 @@ export class PersistentSession extends Session {
    * `model/core-agent/session-store.ts`).
    */
   healAndPersist(): boolean {
-    const changed = this.healOrphanToolUses();
-    if (changed) this.flushToDisk();
-    return changed;
+    // Heal the cached in-memory session only. We deliberately do NOT flushToDisk:
+    // by this point memory has been trimmed to the rolling window, and flushToDisk
+    // rewrites the whole jsonl from that window — which would drop history older
+    // than the window from the append-only log. The append log stays intact and
+    // the constructor's load-time heal re-applies the same (idempotent) fix on the
+    // next reload, where memory holds the full history so a flush is lossless.
+    return this.healOrphanToolUses();
   }
 
   /**
@@ -325,8 +329,10 @@ export class PersistentSession extends Session {
 
     if (!changed) return false;
 
-    super.clear();
-    for (const mm of fixed) super.addMessage(mm.role, mm.content);
+    // Preserve the rolling summary + resources across the merge — clearing and
+    // re-adding would null turnState and drop them (see method doc). On the load
+    // path turnState is still null here, so this is a plain message swap.
+    this.replaceMessagesPreservingContext(fixed);
     return true;
   }
 

@@ -468,6 +468,67 @@ describe("PersistentSession", () => {
       expect(fresh.getMessages()[2].content[0].type).toBe("tool_result");
     });
 
+    it("heals memory without rewriting the append-only jsonl (P0-1 no truncation)", () => {
+      // A benign multi-tool turn (2 parallel tool_results) makes heal consolidate
+      // the two tool_result messages in memory. healAndPersist must NOT flush that
+      // shorter view over the append-only log — doing so would drop any history
+      // older than the trimmed in-memory window.
+      const s = new PersistentSession({ sessionFile: file });
+      s.beginUserTurn([{ type: "text", text: "go" }]);
+      s.addAssistantMessage([
+        { type: "tool_use", id: "a", name: "a", input: {} },
+        { type: "tool_use", id: "b", name: "b", input: {} },
+      ]);
+      s.addToolResult("a", "ra", undefined, false);
+      s.addToolResult("b", "rb", undefined, false);
+
+      const diskBefore = fs.readFileSync(file, "utf-8").trim().split("\n").length;
+      expect(diskBefore).toBe(4); // user, assistant, tool_result(a), tool_result(b)
+
+      expect(s.healAndPersist()).toBe(true); // merges the two tool_result messages
+      const mem = s.getMessages();
+      expect(mem).toHaveLength(3);
+      expect(
+        mem[2].content.filter((c) => (c as { type?: string }).type === "tool_result"),
+      ).toHaveLength(2);
+
+      // Append log is intact — not rewritten to the merged/trimmed view.
+      const diskAfter = fs.readFileSync(file, "utf-8").trim().split("\n").length;
+      expect(diskAfter).toBe(diskBefore);
+    });
+
+    it("preserves the history summary + resource ledger across a multi-tool heal (P0-1)", () => {
+      const s = new PersistentSession({ sessionFile: file });
+      // Turn 1, then roll it into a summary + record a produced resource.
+      s.beginUserTurn([{ type: "text", text: "turn one" }]);
+      s.addAssistantMessage([{ type: "tool_use", id: "t1", name: "a", input: {} }]);
+      s.addToolResult("t1", "r1", undefined, false);
+      s.completeActiveTurn();
+      s.applyHistorySummary("rolling summary", [1]);
+      s.addHistoryResource({ kind: "final_output", path: "/w/report.mov", name: "report.mov" });
+
+      // Turn 2: two parallel tool_results — the benign heal trigger that used to
+      // clear() and wipe turnState (summary + resources) on the next turn.
+      s.beginUserTurn([{ type: "text", text: "turn two" }]);
+      s.addAssistantMessage([
+        { type: "tool_use", id: "t2a", name: "a", input: {} },
+        { type: "tool_use", id: "t2b", name: "b", input: {} },
+      ]);
+      s.addToolResult("t2a", "r2a", undefined, false);
+      s.addToolResult("t2b", "r2b", undefined, false);
+
+      expect(s.getSerializedContextState()?.historySummary).toBe("rolling summary");
+      expect(s.getSerializedContextState()?.resources).toHaveLength(1);
+
+      expect(s.healAndPersist()).toBe(true);
+
+      const after = s.getSerializedContextState();
+      expect(after?.historySummary).toBe("rolling summary");
+      expect(after?.resources).toHaveLength(1);
+      expect(after?.resources[0].name).toBe("report.mov");
+      expect(JSON.stringify(s.getMessagesForModel())).toContain("rolling summary");
+    });
+
     it("merges parallel tool_results split across adjacent user messages", () => {
       // The runner's `addToolResult` writes one user message per tool_use_id.
       // So an assistant turn with 3 parallel tool_calls produces 3 adjacent
