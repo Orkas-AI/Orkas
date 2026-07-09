@@ -313,7 +313,7 @@ function _formatValidationWarnings(
 
 const MAX_PROCESS_ITEMS_PER_TURN = 300;
 const MAX_WORKER_TURNS = 100; // hard ceiling against runaway loops
-// The commander orchestrates long multi-step builds (e.g. a hyperframes video:
+// The commander orchestrates long multi-step builds (e.g. a VideoStudio video:
 // read several SKILL.md, scaffold, lint, render, fix, re-render) that legitimately
 // exceed core-agent's default 50 tool rounds in a single turn. Raise its per-turn
 // tool-loop cap so such a build isn't truncated mid-task; the identical-call

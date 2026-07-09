@@ -117,12 +117,9 @@ function resolveFfmpegBinary(kind: 'ffmpeg' | 'ffprobe'): string | undefined {
 
 /**
  * Bundled ffmpeg/ffprobe absolute paths, or undefined when not vendored for
- * this platform. HyperFrames render REQUIRES system ffmpeg+ffprobe and ships
- * neither; pointing it at these via `HYPERFRAMES_FFMPEG_PATH` /
- * `HYPERFRAMES_FFPROBE_PATH` makes rendering deterministic instead of relying
- * on whatever the user's machine happens to have. When undefined (e.g. a dev
- * checkout before the vendor step), callers should leave the override unset so
- * HyperFrames falls back to scanning common install dirs.
+ * this platform. VideoStudio skill scripts use these paths for deterministic
+ * local media probing and ffmpeg operations instead of relying on whatever the
+ * user's machine happens to have.
  */
 export function bundledFfmpegPaths(): { ffmpeg?: string; ffprobe?: string } {
   const result: { ffmpeg?: string; ffprobe?: string } = {};

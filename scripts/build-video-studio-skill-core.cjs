@@ -35,10 +35,6 @@ const outputs = [
     entry: path.join(scriptCoreSrcDir, 'video_decide.ts'),
     outfile: path.join(agentSkillsDir, 'stage-plan', 'scripts', 'lib', 'video_decide_core.cjs'),
   },
-  {
-    entry: path.join(scriptCoreSrcDir, 'video_render.ts'),
-    outfile: path.join(agentSkillsDir, 'stage-compose', 'scripts', 'lib', 'video_render_core.cjs'),
-  },
 ];
 
 const aliasMainLogger = {

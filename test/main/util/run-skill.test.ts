@@ -100,9 +100,9 @@ describe('run-skill.cjs', () => {
   });
 
   it('resolves current-agent private marketplace scripts from the installed agent directory', () => {
-    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'compose_preview');
 
-    const r = runSkill('stage-compose', 'render_composition', ['--op', 'inspect'], {
+    const r = runSkill('stage-compose', 'compose_preview', ['--op', 'inspect'], {
       ORKAS_UID: 'u1',
       ORKAS_AGENT_ID: 'agent-a',
     });
@@ -113,9 +113,9 @@ describe('run-skill.cjs', () => {
   });
 
   it('does not expose another agent private marketplace skill', () => {
-    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'compose_preview');
 
-    const r = runSkill('stage-compose', 'render_composition', [], {
+    const r = runSkill('stage-compose', 'compose_preview', [], {
       ORKAS_UID: 'u1',
       ORKAS_AGENT_ID: 'agent-b',
     });
@@ -129,9 +129,9 @@ describe('run-skill.cjs', () => {
   });
 
   it('requires ORKAS_UID before resolving agent private marketplace skills', () => {
-    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'compose_preview');
 
-    const r = runSkill('stage-compose', 'render_composition', [], {
+    const r = runSkill('stage-compose', 'compose_preview', [], {
       ORKAS_AGENT_ID: 'agent-a',
     });
 

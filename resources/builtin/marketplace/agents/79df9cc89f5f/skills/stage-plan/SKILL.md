@@ -9,7 +9,7 @@ category: creation
 
 # stage-plan
 
-How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans more than one production line. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler then walks deterministically. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / transcribe / silence / ocr / extract_frame via `bin/run-skill.cjs`), this skill provides the plan validator script, and the producers handle compose / generate / edit.
+How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans more than one production line. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler then walks deterministically. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / silence / ocr / scenes / quality / extract_frame via `bin/run-skill.cjs`) plus the built-in `video_studio` transcription op, this skill provides the plan validator script, and the producers handle compose / generate / edit.
 
 ## How to call ingest scripts
 

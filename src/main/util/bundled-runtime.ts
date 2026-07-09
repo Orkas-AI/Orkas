@@ -35,7 +35,7 @@ function runtimeRoots(): string[] {
   return roots;
 }
 
-function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg'): string[] {
+function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg' | 'whisper'): string[] {
   const dirs: string[] = [];
   for (const runtimeRoot of runtimeRoots()) {
     const root = path.join(runtimeRoot, kind);
@@ -115,14 +115,68 @@ function resolveFfmpegBinary(kind: 'ffmpeg' | 'ffprobe'): string | undefined {
   return undefined;
 }
 
+function resolveWhisperBinary(): string | undefined {
+  const configured = process.env.ORKAS_WHISPER_CPP || process.env.ORKAS_WHISPER_CLI;
+  if (isFile(configured)) return configured;
+
+  const names = process.platform === 'win32'
+    ? [
+      'whisper-cli.exe',
+      path.join('bin', 'whisper-cli.exe'),
+      'main.exe',
+      path.join('bin', 'main.exe'),
+    ]
+    : [
+      'whisper-cli',
+      path.join('bin', 'whisper-cli'),
+      'main',
+      path.join('bin', 'main'),
+    ];
+  for (const dir of runtimeVariantDirs('whisper')) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (isFile(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function resolveWhisperModel(modelHint?: string): string | undefined {
+  const hinted = modelHint || process.env.ORKAS_WHISPER_MODEL;
+  if (isFile(hinted)) return path.resolve(hinted);
+
+  const normalizedHint = modelHint
+    ? String(modelHint).replace(/^ggml-/, '').replace(/\.bin$/i, '').trim()
+    : '';
+  const names = [
+    modelHint,
+    normalizedHint ? `ggml-${normalizedHint}.bin` : '',
+    'ggml-large-v3.bin',
+    'ggml-medium.bin',
+    'ggml-small.bin',
+    'ggml-base.bin',
+    'ggml-tiny.bin',
+  ].filter((name): name is string => !!name);
+  for (const dir of runtimeVariantDirs('whisper')) {
+    for (const name of names) {
+      const candidates = [
+        path.join(dir, name),
+        path.join(dir, 'models', name),
+      ];
+      for (const candidate of candidates) {
+        if (isFile(candidate)) return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
 /**
  * Bundled ffmpeg/ffprobe absolute paths, or undefined when not vendored for
- * this platform. HyperFrames render REQUIRES system ffmpeg+ffprobe and ships
- * neither; pointing it at these via `HYPERFRAMES_FFMPEG_PATH` /
- * `HYPERFRAMES_FFPROBE_PATH` makes rendering deterministic instead of relying
- * on whatever the user's machine happens to have. When undefined (e.g. a dev
- * checkout before the vendor step), callers should leave the override unset so
- * HyperFrames falls back to scanning common install dirs.
+ * this platform. VideoStudio native render/edit/media analysis paths use these
+ * binaries instead of relying on whatever the user's machine happens to have.
+ * When undefined (e.g. a dev checkout before the vendor step), callers should
+ * surface a clear missing-runtime error or use their own explicit fallback.
  */
 export function bundledFfmpegPaths(): { ffmpeg?: string; ffprobe?: string } {
   const result: { ffmpeg?: string; ffprobe?: string } = {};
@@ -130,6 +184,20 @@ export function bundledFfmpegPaths(): { ffmpeg?: string; ffprobe?: string } {
   const ffprobe = resolveFfmpegBinary('ffprobe');
   if (ffmpeg) result.ffmpeg = ffmpeg;
   if (ffprobe) result.ffprobe = ffprobe;
+  return result;
+}
+
+/**
+ * Bundled whisper.cpp paths. The app treats speech transcription as a native
+ * VideoStudio capability, so default installs can vendor `resources/runtime/whisper`
+ * without requiring users to hand-set ORKAS_WHISPER_*.
+ */
+export function bundledWhisperPaths(modelHint?: string): { cli?: string; model?: string } {
+  const result: { cli?: string; model?: string } = {};
+  const cli = resolveWhisperBinary();
+  const model = resolveWhisperModel(modelHint);
+  if (cli) result.cli = cli;
+  if (model) result.model = model;
   return result;
 }
 

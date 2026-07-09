@@ -129,7 +129,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
 
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
-  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HyperFrames-compatible HTML composition lint/inspect/render and speech transcription fallback orchestration.' },
+  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML composition lint/inspect/render/draft and speech transcription fallback orchestration.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
   { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },

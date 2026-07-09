@@ -19,7 +19,7 @@ After Gate B approves the script/storyboard, keep the production turn narrow:
 
 1. Read only the approved `project/script.md`, `project/shotlist.json`, and this skill if not already loaded for the current turn. Also read `frontend-design`; read `design-system-importer` only when a concrete style source or explicit named reference exists. Do not read `composition-design-review` until the draft returns `ok: true` and its trigger applies.
 2. If standalone narration is needed, call `generate_speech` once to `project/composition/assets/narration.mp3`.
-3. Write `project/composition/design-contract.json`, then model-author `project/composition/index.html` directly. For narrated work, also write `project/composition/scene-map.json` from the approved script/shotlist so timing QA can verify voiceover-to-visual alignment. If narration line timing is known, write `project/composition/narration-map.json`.
+3. Write `project/composition/design-contract.json`, then model-author `project/composition/index.html` directly. For narrated work, also write `project/composition/scene-map.json` from the approved script/shotlist so timing QA can verify voiceover-to-visual alignment. If scenes use `narration_ref` or lack inline narration text with numeric windows, write `project/composition/narration-map.json` before draft.
 4. Decide whether to open the optional HTML Preview Gate before rendering mp4. Use the preview gate when expected render rework is expensive: target duration >= 45s, scene count >= 7, render cost is likely slow, or the composition has dense text, complex SVG/GSAP, many branded/supplied assets, or a prior draft failure. Skip it for short/simple work: target duration < 20s, scene count <= 4, no narration/timing complexity, and no obvious visual-risk signal. The subject category alone never forces the preview gate.
 5. If the HTML Preview Gate is needed, run `video_studio` `op: "composition.inspect"` and `op: "composition.snapshot"` to `project/composition/preview/first-frame.png`, then show the first-frame image, inspect headline, `index.html` path, and why preview was inserted. Options: approve HTML preview, revise HTML/design, or render draft anyway. Stop. On approval, continue to the draft command. On revise, modify only `design-contract.json`, `scene-map.json`, or `index.html`, then rerun inspect/snapshot and reopen the same preview gate.
 6. Run the draft command with `video_studio` `op: "composition.draft"`. Before rendering, the production path prepares declared local vendor assets, checks `contract_html` design-contract/scene-map/HTML consistency, blocks remote runtime resources, verifies local assets, checks shotlist/source alignment, and checks narration mapping. Then it runs lint, inspect, render, audio/media QA, sampled-frame QA, and writes one QA report.
@@ -99,17 +99,17 @@ For narrated or tightly timed work, write `project/composition/scene-map.json` b
 
 If the approved shotlist beat is intentionally merged into a longer visual scene, add `source_alignment.merge_reason` or per-scene `source_shots`. When audio exists, every scene must include either concise `narration` text or a `narration_ref`/`source_shots` mapping to the approved script/shotlist.
 
-When TTS or a transcription step gives line timing, add `project/composition/narration-map.json`:
+When scenes use `narration_ref`, add `project/composition/narration-map.json` before draft:
 
 ```json
 {
   "lines": [
-    { "id": "n01", "start": 0.0, "duration": 3.2, "text": "Meet Orkas 1.5.0." }
+    { "id": "n01", "scene_id": "hook", "start": 0.0, "end": 3.2, "text": "Meet Orkas 1.5.0." }
   ]
 }
 ```
 
-Then use `"narration_ref": "n01"` or a comma-separated list on the matching scene. Draft QA uses this map before falling back to coarse text-length timing, so voiceover/visual drift is caught earlier.
+Then use `"narration_ref": "n01"` or a comma-separated list on the matching scene. Timed media refs such as `"assets/narration.mp3#t=0.0,3.2"` are also valid when the map line includes `scene_id` or matching start/end. If no map is present, every narrated scene must include inline `narration`/`narration_text` plus numeric start/duration or start/end; otherwise draft QA blocks Gate D.
 
 ## Composition contract (the minimum that renders)
 
@@ -162,7 +162,7 @@ Canonical minimal `index.html` (16:9, 10s):
 - **SVG-first visual layer**: prefer inline SVG for non-text motion graphics such as diagrams, connectors, nodes, progress paths, charts, orbit lines, icon-like marks, and background geometry. Keep readable prose in normal HTML text boxes unless the SVG text is large, simple, and verified.
 - **Use GSAP only when time-based motion is needed**: static SVG, CSS layout, and simple held states do not need GSAP. When animation is needed, keep GSAP as the timeline/orchestration layer that animates SVG groups or a small set of HTML containers. Do not build dozens of absolutely positioned HTML nodes/cards/lines when one SVG graph can carry the visual.
 - **No remote runtime resources**: `index.html` must not load CDN scripts, remote fonts, remote images, or remote CSS during render. Fetch or copy required runtime files into `project/composition/assets/` during authoring, then reference them with relative paths such as `./assets/vendor/gsap.min.js`. Draft QA blocks `http://` and `https://` references.
-- **Local GSAP vendor**: if `index.html` references `./assets/vendor/gsap.min.js`, the render script prepares the built-in offline GSAP vendor in the workspace composition directory. It auto-replaces the old managed VideoStudio shim when found, keeps compatible existing GSAP files, and blocks incompatible user-provided vendor files before rendering. Do not manually patch `assets/vendor/gsap.min.js` inside a composition; fix HTML/scene-map/design-contract issues, or report the vendor blocker.
+- **Local GSAP vendor**: if `index.html` references `./assets/vendor/gsap.min.js`, the native `video_studio` draft/render path prepares the built-in offline GSAP vendor in the workspace composition directory. It keeps compatible existing GSAP files and blocks missing or incompatible vendor files before rendering. Do not manually patch `assets/vendor/gsap.min.js` inside a composition; fix HTML/scene-map/design-contract issues, or report the vendor blocker.
 
 ## Design contract before HTML
 

@@ -2,10 +2,10 @@
 /**
  * Vendor ffmpeg + ffprobe into `PC/resources/runtime/ffmpeg/<platform>-<arch>/`.
  *
- * HyperFrames render (the `render_composition` local backend) and VideoStudio's
- * deterministic media scripts require ffmpeg + ffprobe. Rather than depend on
- * whatever the user's machine happens to have, we ship our own and point the app
- * at them via util/bundled-runtime.ts `bundledFfmpegPaths`.
+ * VideoStudio's native render path and deterministic media scripts require
+ * ffmpeg + ffprobe. Rather than depend on whatever the user's machine happens
+ * to have, we ship our own and point the app at them via util/bundled-runtime.ts
+ * `bundledFfmpegPaths`.
  *
  * Source of the binaries: the `ffmpeg-static` and `@ffprobe-installer/ffprobe`
  * devDependencies (their install scripts fetch the prebuilt binary for the

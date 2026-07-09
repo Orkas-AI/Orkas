@@ -132,8 +132,8 @@ describe('normalizeTranscriptWords', () => {
     ]);
   });
 
-  it('reads a top-level array of {text,start,end} (the real hyperframes transcribe shape)', () => {
-    // Verified against `npx hyperframes transcribe --json` output (small.en).
+  it('reads a top-level array of {text,start,end} (legacy transcript shape)', () => {
+    // Kept for backward compatibility with older transcript JSON artifacts.
     expect(
       normalizeTranscriptWords([
         { text: 'So,', start: 0.12, end: 0.41 },

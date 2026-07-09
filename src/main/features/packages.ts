@@ -16,12 +16,12 @@
  * {
  *   "version": 1,
  *   "packages": [{
- *     "name": "hyperframes",            // dir name under packages/
+ *     "name": "demo-cli",               // dir name under packages/
  *     "repo_url": "https://github.com/...",
  *     "commit": "<sha>",
  *     "kind": "skill" | "cli" | "both",
  *     "skill_roots": [".", "skills"],   // rel dirs whose children (or self) hold SKILL.md
- *     "bin_entries": [{"name": "hyperframes", "target": "bin/cli.js", "runtime": "node" | "python" | "sh" | "native"}],
+ *     "bin_entries": [{"name": "demo-cli", "target": "bin/cli.js", "runtime": "node" | "python" | "sh" | "native"}],
  *     "deps_consent": true,             // D3: user approved dependency installs for this package
  *     "enabled": true,
  *     "installed_at": "<iso>", "updated_at": "<iso>"

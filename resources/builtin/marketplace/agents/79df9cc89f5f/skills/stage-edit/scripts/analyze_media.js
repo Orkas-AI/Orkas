@@ -3,7 +3,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const OPS = new Set(['transcribe', 'silence', 'ocr', 'scenes', 'quality']);
+const OPS = new Set(['silence', 'ocr', 'scenes', 'quality']);
 
 function fail(code, message, extra = {}) {
   process.stderr.write(JSON.stringify({ ok: false, code, message, ...extra }) + '\n');
@@ -15,7 +15,7 @@ function help() {
     ok: true,
     script: 'analyze_media',
     ops: [...OPS],
-    usage: 'stage-edit analyze_media -- --op <transcribe|silence|ocr|scenes|quality> --input <media>',
+    usage: 'stage-edit analyze_media -- --op <silence|ocr|scenes|quality> --input <media>. Use video_studio op "speech.transcribe" for transcription.',
   };
 }
 
@@ -40,8 +40,6 @@ function parseArgs(args) {
     else if (a === '--input' || a === '--input-path' || a === '-i') { out.inputPath = nextValue(args, i, a); i += 1; }
     else if (a.startsWith('--input=')) out.inputPath = a.slice('--input='.length);
     else if (a.startsWith('--input-path=')) out.inputPath = a.slice('--input-path='.length);
-    else if (a === '--model') { out.model = nextValue(args, i, a); i += 1; }
-    else if (a.startsWith('--model=')) out.model = a.slice('--model='.length);
     else if (a === '--interval-sec') { out.intervalSec = parseNumber(nextValue(args, i, a), a); i += 1; }
     else if (a.startsWith('--interval-sec=')) out.intervalSec = parseNumber(a.slice('--interval-sec='.length), '--interval-sec');
     else if (a === '--max-frames') { out.maxFrames = parseNumber(nextValue(args, i, a), a); i += 1; }
@@ -79,7 +77,6 @@ module.exports = async function analyzeMediaScript({ args }) {
   const result = await analyzeMedia({
     op: opts.op,
     inputAbsPath: resolveInput(opts.inputPath),
-    ...(opts.model ? { model: opts.model } : {}),
     ...(typeof opts.intervalSec === 'number' ? { intervalSec: opts.intervalSec } : {}),
     ...(typeof opts.maxFrames === 'number' ? { maxFrames: opts.maxFrames } : {}),
     ...(typeof opts.threshold === 'number' ? { threshold: opts.threshold } : {}),

@@ -2,7 +2,8 @@
  * video_edit — local backend for the `edit_video` tool (deterministic real-
  * footage editing). Runs the bundled ffmpeg/ffprobe (see util/bundled-runtime
  * `bundledFfmpegPaths`) — zero new dependencies, no network, no npx. This is
- * the "C 剪辑" capability axis; render_composition (HyperFrames) stays separate.
+ * the "C 剪辑" capability axis; COMPOSE rendering is owned by the native
+ * `video_studio` tool.
  *
  * Multi-op (per the design decision that edit_video is one multi-sub-op tool):
  *   probe | trim | concat | burnsubs | overlay | extract_frame
@@ -153,7 +154,7 @@ export interface EditParams {
    *  for silence) and the smallest kept sliver (default 0.3s). */
   padSec?: number;
   minKeepSec?: number;
-  /** remove_fillers: the analyze_media transcribe JSON (word-level timings) and the
+  /** remove_fillers: the video_studio speech.transcribe JSON (word-level timings) and the
    *  filler tokens to drop (default um/uh/...). */
   transcriptAbsPath?: string;
   fillers?: string[];
@@ -931,12 +932,12 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
 
   if (p.op === 'remove_fillers') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'remove_fillers requires input_path');
-    if (!p.transcriptAbsPath) return fail('E_EDIT_ARG', 'remove_fillers requires transcript_path (the analyze_media transcribe JSON with word timings)');
+    if (!p.transcriptAbsPath) return fail('E_EDIT_ARG', 'remove_fillers requires transcript_path (the video_studio speech.transcribe JSON with word timings)');
     let json: unknown;
     try { json = JSON.parse(await fs.readFile(p.transcriptAbsPath, 'utf8')); }
     catch (err) { return fail('E_EDIT_TRANSCRIPT_PARSE', `could not read/parse transcript_path: ${(err as Error).message}`); }
     const words = normalizeTranscriptWords(json);
-    if (!words.length) return fail('E_EDIT_NO_WORDS', 'transcript had no word-level timings — re-run analyze_media transcribe (--json) on this clip.');
+    if (!words.length) return fail('E_EDIT_NO_WORDS', 'transcript had no word-level timings — re-run video_studio op:"speech.transcribe" with timestamps:"word" on this clip.');
     const padSec = finiteNum(p.padSec);
     const minKeepSec = finiteNum(p.minKeepSec);
     const removeSpans = fillerSpansFromWords(
@@ -988,7 +989,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       return fail(
         'E_EDIT_BASE_HAS_AUDIO',
         'The base video already has an audio track, so mixing narration onto it would STACK a second voice (the "two voices" defect). '
-        + 'Render the base SILENT first — for a compose segment, remove the narration <audio> from its index.html so render_composition produces no audio, then re-mix. '
+        + 'Render the base SILENT first — for a compose segment, remove the narration <audio> from its index.html so the native composition draft has no audio, then re-mix. '
         + "If layering is intended (e.g. music under a talking-head's built-in lip-synced voice) pass on_existing_audio='mix'; "
         + "to drop the base audio and keep only this narration pass on_existing_audio='replace'.",
       );

@@ -1,9 +1,8 @@
 /**
- * video_analyze — local backend for the `analyze_media` tool. Transcription
- * (and later scene/silence analysis) over real footage. Runs `hyperframes
- * transcribe`, which uses a self-managed whisper.cpp binary + model (NOT Python
- * / torch — spike-verified), so this adds ZERO new dependencies, same runtime
- * pattern as render_composition.
+ * video_analyze — local backend for the `analyze_media` tool. Handles
+ * frame/text/quality analysis over real footage. Spoken transcription is owned
+ * by the built-in `video_studio` tool (`op: "speech.transcribe"`) so this
+ * script stays independent from external render/transcription CLIs.
  *
  * Multi-op (room to grow: scenes / silence / highlights later). The tool layer
  * owns path-sandbox validation.
@@ -13,7 +12,6 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { runHyperframesCapture } from './hyperframes_runtime';
 import {
   measureSilenceCoverage,
   assessVoiceoverCoverage,
@@ -24,15 +22,8 @@ import {
 } from './video_edit';
 import type { QualityThresholds } from './video_decide';
 import { ocrImageText, ocrImagesText } from './ocr_runtime';
-import { redactPaths } from './redact';
-import { createLogger } from './logger-shim';
-
-const log = createLogger('video-analyze');
 
 const round2 = (n: number): number => Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
-
-/** Minimum interval between forwarded transcribe output lines. */
-const TRANSCRIBE_LINE_EMIT_MIN_MS = 3_000;
 
 /** Best-effort progress JSONL on stderr (same protocol as video_edit); the
  *  direct-CLI runner forwards these lines to the user-facing tool progress. */
@@ -45,15 +36,11 @@ function emitAnalyzeProgress(op: AnalyzeOp, event: Record<string, unknown>): voi
   }
 }
 
-export type AnalyzeOp = 'transcribe' | 'silence' | 'ocr' | 'scenes' | 'quality';
+export type AnalyzeOp = 'silence' | 'ocr' | 'scenes' | 'quality';
 
 export interface AnalyzeParams {
   op: AnalyzeOp;
   inputAbsPath: string;
-  /** whisper.cpp model: tiny.en / base.en / small.en / medium.en / large-v3.
-   *  `.en` variants are English-only; large-v3 is multilingual (use it for
-   *  non-English / Chinese audio). */
-  model?: string;
   /** op:"ocr" only — seconds between sampled frames (default 2.5). */
   intervalSec?: number;
   /** op:"ocr" only — cap on sampled frames (default 16). */
@@ -180,51 +167,6 @@ export async function analyzeMedia(p: AnalyzeParams): Promise<AnalyzeResult> {
     });
     if (r.ok === false) return { ok: false, errorCode: r.errorCode, message: r.message };
     return { ok: true, op: 'quality', summary: { op: 'quality', ...r.report } };
-  }
-
-  if (p.op === 'transcribe') {
-    const args = ['transcribe', p.inputAbsPath, '--json'];
-    if (p.model) args.push('--model', p.model);
-    // Run in the input's dir so the emitted transcript.json lands in scope.
-    let lastLineEmitMs = 0;
-    const r = await runHyperframesCapture(args, {
-      cwd: path.dirname(p.inputAbsPath),
-      ...(p.signal ? { signal: p.signal } : {}),
-      // Generous: the first non-English transcribe downloads the large-v3 model
-      // (~3GB) before processing; a tight timeout would fail mid-download.
-      timeoutMs: 45 * 60 * 1000,
-      onHeartbeat: (elapsedSec) => emitAnalyzeProgress('transcribe', { status: 'heartbeat', elapsed_sec: elapsedSec }),
-      // Surface hyperframes' own progress lines (model download, transcribe
-      // stages) — stderr only; stdout is the JSON product.
-      onLine: (line, stream) => {
-        if (stream !== 'stderr') return;
-        const text = line.trim();
-        if (!text) return;
-        const now = Date.now();
-        if (now - lastLineEmitMs < TRANSCRIBE_LINE_EMIT_MIN_MS) return;
-        lastLineEmitMs = now;
-        emitAnalyzeProgress('transcribe', { status: 'output', detail: redactPaths(text).slice(0, 200) });
-      },
-    });
-    if (r.aborted) return { ok: false, errorCode: 'E_ANALYZE_ABORTED', message: 'transcribe aborted.' };
-    if (r.timedOut) return { ok: false, errorCode: 'E_ANALYZE_TIMEOUT', message: 'transcribe timed out.' };
-
-    const out = r.stdout.trim();
-    if (out) {
-      try {
-        const parsed = JSON.parse(out) as { ok?: boolean; error?: unknown };
-        if (parsed && parsed.ok === false) {
-          return { ok: false, errorCode: 'E_ANALYZE_FAILED', message: String(parsed.error ?? 'transcribe failed') };
-        }
-        return { ok: true, op: 'transcribe', summary: parsed };
-      } catch { /* fall through to exit-code handling */ }
-    }
-    if (r.code !== 0) {
-      const tail = r.stderr.trim().slice(-1000);
-      log.warn(`hyperframes transcribe exited ${r.code}: ${redactPaths(tail.slice(-300))}`);
-      return { ok: false, errorCode: 'E_ANALYZE_FAILED', message: `transcribe failed (exit ${r.code}). ${tail || 'No diagnostic output.'}` };
-    }
-    return { ok: false, errorCode: 'E_ANALYZE_NO_OUTPUT', message: 'transcribe produced no parseable output.' };
   }
 
   if (p.op === 'ocr') {
