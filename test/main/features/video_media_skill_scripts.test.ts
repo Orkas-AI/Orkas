@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 
 function pcDir() {
-  return path.basename(process.cwd()) === 'PC'
+  return fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
     ? process.cwd()
     : path.resolve(process.cwd(), 'PC');
 }
@@ -31,6 +31,7 @@ function runSkill(
   extraEnv: Record<string, string> = {},
 ) {
   const dir = pcDir();
+  const workspaceRoot = path.join(os.tmpdir(), 'orkas-video-skill-workspace');
   return spawnSync(
     process.execPath,
     [path.join(dir, 'bin', 'run-skill.cjs'), skillId, script, '--', ...args],
@@ -41,7 +42,7 @@ function runSkill(
         ...process.env,
         ORKAS_PC_DIR: dir,
         ORKAS_RUN_SKILL_DIR: skillDir(skillId),
-        ORKAS_WORKSPACE_ROOT: path.dirname(dir),
+        ORKAS_WORKSPACE_ROOT: workspaceRoot,
         ...extraEnv,
       },
     },

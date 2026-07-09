@@ -798,30 +798,24 @@ describe('skills › listSkills', () => {
     expect(found?.default_install).toBe(true);
   });
 
-  it('updates marketplace skill display name in dev without renaming install dir', async () => {
-    const prevDevtools = process.env.ORKAS_DEVTOOLS;
-    process.env.ORKAS_DEVTOOLS = '1';
-    try {
-      const dir = path.join(builtinSkillsDir(), 'platform-excel');
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'SKILL.md'),
-        '---\nname: "Old platform skill"\ndescription: "platform"\n---\n\nUse when editing spreadsheets.\n');
+  it('keeps marketplace skill metadata read-only in the open build', async () => {
+    const dir = path.join(builtinSkillsDir(), 'platform-excel');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: "Old platform skill"\ndescription: "platform"\n---\n\nUse when editing spreadsheets.\n');
 
-      const s = await loadSkills();
-      const result = await s.applySkillMetadataForEdit('platform-excel', { name: 'Excel / XLSX' });
+    const s = await loadSkills();
+    const result = await s.applySkillMetadataForEdit('platform-excel', { name: 'Excel / XLSX' });
 
-      expect(result.ok).toBe(true);
-      expect(result.skillId).toBe('platform-excel');
-      expect(fs.existsSync(dir)).toBe(true);
-      expect(fs.existsSync(path.join(builtinSkillsDir(), 'Excel / XLSX'))).toBe(false);
-      const after = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
-      expect(s.parseSkillFrontmatter(after).name).toBe('Excel / XLSX');
-      expect((await s.listSkills()).find((x) => x.id === 'platform-excel')?.name)
-        .toBe('Excel / XLSX');
-    } finally {
-      if (prevDevtools === undefined) delete process.env.ORKAS_DEVTOOLS;
-      else process.env.ORKAS_DEVTOOLS = prevDevtools;
-    }
+    expect(result.ok).toBe(false);
+    expect(result.skillId).toBe('platform-excel');
+    expect(result.written).toBe(false);
+    expect(fs.existsSync(dir)).toBe(true);
+    expect(fs.existsSync(path.join(builtinSkillsDir(), 'Excel / XLSX'))).toBe(false);
+    const after = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
+    expect(s.parseSkillFrontmatter(after).name).toBe('Old platform skill');
+    expect((await s.listSkills()).find((x) => x.id === 'platform-excel')?.name)
+      .toBe('Old platform skill');
   });
 
   it('cache-only invalidator picks up marketplace file rewrites', async () => {

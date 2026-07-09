@@ -30,10 +30,10 @@ describe('new chat home surface', () => {
     expect(newChatScenarioOrder(html)).toEqual([
       'data',
       'video',
+      'ui_design',
       'seo_geo',
       'office',
       'rnd',
-      'education',
     ]);
     expect(html).not.toContain('data-scenario="ecommerce"');
     expect(html).not.toContain('data-scenario="creation"');
