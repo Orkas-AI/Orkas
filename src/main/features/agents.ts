@@ -1733,7 +1733,10 @@ async function _applyAgentUpdates(
     if (v === null) {
       delete (data as { enabled_connectors?: unknown }).enabled_connectors;
     } else if (Array.isArray(v)) {
-      const ids = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      const ids = v
+        .filter((s): s is string => typeof s === 'string')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0 && safeId(s));
       (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
     }
   }
