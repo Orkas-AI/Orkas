@@ -232,10 +232,10 @@ function _connectorErrorFallback(kind) {
 
 function _formatConnectorStatusError(message) {
   const msg = String(message || '');
-  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg)) {
+  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated|\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg)) {
     return _connectorErrorFallback('network');
   }
-  if (/invalid_grant|connector_reconnect_required|reconnect required|grant not found/i.test(msg)) {
+  if (/invalid_grant|connector_reconnect_required|reconnect required|grant not found|授权已失效|Authorization expired|認証の有効期限|A autorização expirou/i.test(msg)) {
     return _connectorErrorFallback('reconnect');
   }
   return msg;

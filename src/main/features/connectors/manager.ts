@@ -100,6 +100,16 @@ function _isMissingRequiredScopesError(err: unknown): boolean {
   return code === 'missing_required_scopes' || /missing_required_scopes|missing required scopes/i.test(msg);
 }
 
+function _connectorErrorCode(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === 'string' ? code : '';
+}
+
+function _connectorRetryable(err: unknown): boolean | null {
+  const retryable = (err as { retryable?: unknown } | null)?.retryable;
+  return typeof retryable === 'boolean' ? retryable : null;
+}
+
 function _isGoogleEntry(entry: CatalogEntry): boolean {
   return entry.oauth?.provider_id === 'google';
 }
@@ -111,19 +121,35 @@ function _isGitHubEntry(entry: CatalogEntry): boolean {
 function _isGoogleAuthFailure(entry: CatalogEntry, err: unknown): boolean {
   if (!_isGoogleEntry(entry)) return false;
   if (_isMissingRequiredScopesError(err)) return true;
+  const code = _connectorErrorCode(err);
+  if (code === 'connector_reconnect_required') return true;
+  if (code === 'connector_refresh_failed') return false;
   const msg = (err as Error | null)?.message || String(err || '');
-  return /refresh HTTP\s+4\d\d|refresh_failed|invalid refresh response|access_token expired|no oauth_grant|transport unresolved|connector_unauthorized/i.test(msg);
+  return /refresh HTTP\s+4\d\d|invalid refresh response|access_token expired|no oauth_grant|transport unresolved|connector_unauthorized/i.test(msg);
 }
 
 function _isDcrAuthFailure(entry: CatalogEntry, err: unknown): boolean {
   if (entry.auth_mode !== 'mcp_dcr') return false;
+  const code = _connectorErrorCode(err);
+  if (code === 'connector_reconnect_required') return true;
+  if (code === 'connector_refresh_failed') return false;
   const msg = (err as Error | null)?.message || String(err || '');
-  return /DCR refresh HTTP\s+4\d\d|invalid_grant|access_token expired|no oauth_grant|transport unresolved/i.test(msg);
+  return /DCR refresh HTTP\s+4\d\d|invalid_grant|connector_reconnect_required|access_token expired|no oauth_grant|transport unresolved/i.test(msg);
 }
 
 function _isTransientConnectorFailure(err: unknown): boolean {
+  const code = _connectorErrorCode(err);
+  const retryable = _connectorRetryable(err);
+  if (code === 'connector_reconnect_required') return false;
+  if (code === 'connector_refresh_failed') return retryable !== false;
+  if (retryable === true) return true;
   const msg = (err as Error | null)?.message || String(err || '');
-  return /fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg);
+  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg)) {
+    return true;
+  }
+  // Generic bridge refresh failures are not proof that the user's grant is dead;
+  // explicit reconnect signals use connector_reconnect_required / invalid_grant wording.
+  return /\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg);
 }
 
 function _hasEstablishedConnectorState(inst: ConnectorInstance): boolean {

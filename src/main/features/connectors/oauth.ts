@@ -50,6 +50,12 @@ interface PendingFlow {
   timer: NodeJS.Timeout;
 }
 
+interface ConnectorRefreshErrorBody {
+  msg?: string;
+  error_code?: string;
+  retryable?: boolean;
+}
+
 export interface GooglePickerResult {
   grant: OAuthGrant;
   pickedFileIds: string[];
@@ -77,6 +83,18 @@ function _missingRequiredScopes(requiredScopes: string[] | undefined, grantedSco
   if (!Array.isArray(requiredScopes) || !requiredScopes.length) return [];
   const granted = new Set((grantedScopes || []).filter(Boolean));
   return requiredScopes.filter((scope) => !granted.has(scope));
+}
+
+function _refreshErrorFromBody(body: ConnectorRefreshErrorBody, fallback: string): Error {
+  const errorCode = typeof body.error_code === 'string' ? body.error_code : '';
+  const message = body.msg || fallback;
+  const err = new Error(errorCode ? `${errorCode}: ${message}` : message) as Error & {
+    code?: string;
+    retryable?: boolean;
+  };
+  if (errorCode) err.code = errorCode;
+  if (typeof body.retryable === 'boolean') err.retryable = body.retryable;
+  return err;
 }
 
 /** Externally callable cancel — wired to the renderer's "取消" link so a user who closed the
@@ -314,15 +332,16 @@ export async function refreshIfStale(
   const body = await res.json() as {
     code: number;
     msg?: string;
+    error_code?: string;
+    retryable?: boolean;
     access_token?: string;
     refresh_token?: string;
     expires_in?: number;
     token_type?: string;
     scope?: string;
   };
-  if (body.code !== 0 || !body.access_token) {
-    throw new Error(body.msg || 'invalid refresh response');
-  }
+  if (body.code !== 0) throw _refreshErrorFromBody(body, 'invalid refresh response');
+  if (!body.access_token) throw new Error('invalid refresh response');
   const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
   const scopes = body.scope ? body.scope.split(/[\s,]+/).filter(Boolean) : grant.scopes;
   void uid;
@@ -409,6 +428,8 @@ async function refreshGithubServerManaged(
   const body = await res.json() as {
     code: number;
     msg?: string;
+    error_code?: string;
+    retryable?: boolean;
     access_token?: string;
     grant_id?: string;
     server_managed?: boolean;
@@ -417,9 +438,8 @@ async function refreshGithubServerManaged(
     scope?: string;
     account_label?: string;
   };
-  if (body.code !== 0 || !body.access_token || !body.grant_id) {
-    throw new Error(body.msg || 'invalid github refresh response');
-  }
+  if (body.code !== 0) throw _refreshErrorFromBody(body, 'invalid github refresh response');
+  if (!body.access_token || !body.grant_id) throw new Error('invalid github refresh response');
   const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
   return {
     access_token: body.access_token,

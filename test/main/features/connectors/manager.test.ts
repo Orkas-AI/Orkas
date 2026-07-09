@@ -354,6 +354,81 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections['bing-webmaster'].status).toMatchObject({ kind: 'connected' });
   });
 
+  it('preserves established server-bridge connectors when refresh_failed is localized by Server', async () => {
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      throw new Error('刷新授权失败');
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const bing = bingWebmasterInstance(['webmaster.read']);
+    bing.oauth_grant.expires_at = Date.now() - 1;
+    await registry.upsert(TEST_UID, bing);
+    await manager.refreshTools(TEST_UID, 'bing-webmaster');
+    expect(registry.load(TEST_UID).connections['bing-webmaster'].status).toMatchObject({ kind: 'connected' });
+
+    const github = githubInstance();
+    github.oauth_grant.expires_at = Date.now() - 1;
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      const err = new Error('Failed to refresh authorization') as Error & { code?: string; retryable?: boolean };
+      err.code = 'connector_refresh_failed';
+      err.retryable = true;
+      throw err;
+    });
+    await registry.upsert(TEST_UID, github);
+    await manager.refreshTools(TEST_UID, 'github');
+    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
+  });
+
+  it('preserves established DCR connectors when server-managed refresh returns generic refresh_failed', async () => {
+    mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
+      const err = new Error('Failed to refresh authorization') as Error & { code?: string; retryable?: boolean };
+      err.code = 'connector_refresh_failed';
+      err.retryable = true;
+      throw err;
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = notionInstance();
+    inst.oauth_grant.refresh_token = null;
+    (inst.oauth_grant as any).server_managed = true;
+    (inst.oauth_grant as any).server_grant_id = 'grant-1';
+    delete (inst as any).dcr_client;
+    await registry.upsert(TEST_UID, inst);
+    await manager.refreshTools(TEST_UID, 'notion');
+
+    expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
+  });
+
+  it('keeps structured DCR reconnect-required rows visible for reconnect', async () => {
+    mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
+      const err = new Error('Authorization expired. Please reconnect') as Error & { code?: string; retryable?: boolean };
+      err.code = 'connector_reconnect_required';
+      err.retryable = false;
+      throw err;
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = notionInstance();
+    inst.oauth_grant.refresh_token = null;
+    (inst.oauth_grant as any).server_managed = true;
+    (inst.oauth_grant as any).server_grant_id = 'grant-1';
+    delete (inst as any).dcr_client;
+    await registry.upsert(TEST_UID, inst);
+    await manager.refreshTools(TEST_UID, 'notion');
+
+    const row = manager.listInstances(TEST_UID).find((inst) => inst.id === 'notion');
+    expect(row?.status).toMatchObject({
+      kind: 'error',
+      message: expect.stringContaining('Authorization expired'),
+    });
+  });
+
   it('removes the connector row if a refresh response no longer includes required scopes', async () => {
     mocks.oauth.refreshIfStale = vi.fn(async (_uid, _entry, grant) => ({
       ...(grant as object),

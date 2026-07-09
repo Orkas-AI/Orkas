@@ -75,6 +75,12 @@ interface AuthServerMetadata {
   token_endpoint_auth_methods_supported?: string[];
 }
 
+interface ConnectorRefreshErrorBody {
+  msg?: string;
+  error_code?: string;
+  retryable?: boolean;
+}
+
 /** Format `fetch` errors so the underlying cause (DNS / TLS / refused / …) surfaces in logs.
  *  Node undici flattens every transport-level failure to `TypeError: fetch failed` with the
  *  real reason hung off `err.cause`; logging just `err.message` loses the diagnostic. */
@@ -100,6 +106,18 @@ function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<
     undefined,
     `${label} timed out after ${Math.round(DCR_HTTP_TIMEOUT_MS / 1000)}s`,
   );
+}
+
+function _refreshErrorFromBody(body: ConnectorRefreshErrorBody, fallback: string): Error {
+  const errorCode = typeof body.error_code === 'string' ? body.error_code : '';
+  const message = body.msg || fallback;
+  const err = new Error(errorCode ? `${errorCode}: ${message}` : message) as Error & {
+    code?: string;
+    retryable?: boolean;
+  };
+  if (errorCode) err.code = errorCode;
+  if (typeof body.retryable === 'boolean') err.retryable = body.retryable;
+  return err;
 }
 
 /** Fetch `<base>/.well-known/<name>`, falling back to root-level discovery if path-suffixed
@@ -545,6 +563,8 @@ export async function storeDcrServerManaged(
   const body = await res.json() as {
     code: number;
     msg?: string;
+    error_code?: string;
+    retryable?: boolean;
     access_token?: string;
     grant_id?: string;
     server_managed?: boolean;
@@ -553,7 +573,7 @@ export async function storeDcrServerManaged(
     scope?: string;
     account_label?: string;
   };
-  if (body.code !== 0) throw new Error(body.msg || 'DCR server-managed store failed');
+  if (body.code !== 0) throw _refreshErrorFromBody(body, 'DCR server-managed store failed');
   return _grantFromServerPayload(provider, grant, body);
 }
 
@@ -578,6 +598,8 @@ export async function refreshDcrServerManaged(
   const body = await res.json() as {
     code: number;
     msg?: string;
+    error_code?: string;
+    retryable?: boolean;
     access_token?: string;
     grant_id?: string;
     server_managed?: boolean;
@@ -586,7 +608,7 @@ export async function refreshDcrServerManaged(
     scope?: string;
     account_label?: string;
   };
-  if (body.code !== 0) throw new Error(body.msg || 'DCR server-managed refresh failed');
+  if (body.code !== 0) throw _refreshErrorFromBody(body, 'DCR server-managed refresh failed');
   return _grantFromServerPayload(provider, grant, body);
 }
 
