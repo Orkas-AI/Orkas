@@ -189,6 +189,15 @@ describe('agents › normalizeAgent', () => {
     expect(norm?.skill_list).toEqual(['ok-one', 'also_ok']);
   });
 
+  it('trims and validates enabled connector ids', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      enabled_connectors: [' github ', '', '../evil', 42, 'notion'],
+    } as any, 'custom');
+    expect(norm?.enabled_connectors).toEqual(['github', 'notion']);
+  });
+
   it('normalizes rich profile fields and design aliases', async () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({

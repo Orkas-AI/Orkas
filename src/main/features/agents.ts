@@ -883,7 +883,10 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   // share the commander's connector visibility; filtering keeps malformed JSON
   // from injecting weird ids into the detail UI.
   if (Array.isArray(raw.enabled_connectors)) {
-    const filtered = raw.enabled_connectors.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    const filtered = raw.enabled_connectors
+      .filter((v): v is string => typeof v === 'string')
+      .map((v) => v.trim())
+      .filter((v) => v.length > 0 && safeId(v));
     if (filtered.length) agent.enabled_connectors = filtered;
   }
   // interactive — tolerant boolean coerce (LLMs sometimes emit "true"/"false"
