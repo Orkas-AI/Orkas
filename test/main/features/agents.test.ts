@@ -1273,6 +1273,17 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['ok-1', 'ok_2']);
   });
 
+  it('filters invalid enabled connector ids on write', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('abc', {
+      enabled_connectors: [' github ', '../bad', 42 as any, 'notion'],
+    });
+    expect(updated?.enabled_connectors).toEqual(['github', 'notion']);
+    const raw = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8'));
+    expect(raw.enabled_connectors).toEqual(['github', 'notion']);
+  });
+
   it('writes skill_list = [] as explicit zero (kept, not dropped)', async () => {
     writeSkillOnDisk('a');
     writeCustomAgent('abc', { name: 'N', skill_list: ['a'] });
