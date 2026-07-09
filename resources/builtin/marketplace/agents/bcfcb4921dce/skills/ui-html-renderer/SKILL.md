@@ -72,6 +72,7 @@ The HTML draft should be self-contained unless the repo already has an asset pip
 - Accessible labels for controls and icons.
 - Visible focus states.
 - Text that wraps, truncates, or scales deliberately without overlap.
+- Parseable HTML structure and inline JavaScript that does not block first render.
 
 Use semantic HTML where practical. Add lightweight JavaScript only for preview interactions such as tabs, filters, menus, theme toggles, or sample state changes.
 
@@ -186,8 +187,11 @@ For reviews:
 
 When possible:
 
+- Before preview, run a cheap HTML sanity pass: confirm the artifact has a doctype or intentional fragment boundary, one meaningful root/page container, balanced critical tags, and no obvious unclosed `<script>`, `<style>`, `<main>`, `<section>`, `<div>`, or form controls.
+- Validate inline JavaScript syntax with an available parser/checker or by loading the artifact in the embedded preview and inspecting console/runtime errors. Fix any syntax error or uncaught initialization error that prevents first paint.
 - Inspect the Orkas embedded artifact preview, generated HTML/CSS/JS, DOM structure, screenshots, or equivalent non-external viewport checks.
 - Do not open the system browser by default. Use an external browser only when the user explicitly asks for it or the target app workflow already requires an external browser.
+- Confirm the rendered body is non-blank and contains the primary page region, primary action, and expected visible text.
 - Check desktop and mobile widths.
 - Inspect screenshots for blank areas, overlap, clipped text, broken assets, and unreadable contrast.
 - Interact with tabs, menus, toggles, filters, and primary actions if present.

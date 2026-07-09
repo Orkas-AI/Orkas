@@ -43,6 +43,7 @@ The artifact fails the craft pass if any P0 is present:
 - **Keyboard/accessibility failure**: interactive controls are not keyboard reachable, focus-visible is absent, icon-only controls lack names, or native elements are replaced with inert divs.
 - **Unsafe live data**: live-ready artifacts persist tokens, credentials, cookies, auth headers, raw provider responses, or secret-like fields.
 - **Text/layout collision**: text overlaps controls, is clipped without intent, or mobile layout hides the primary action.
+- **Broken HTML/runtime**: invalid or malformed HTML, unclosed critical tags, inline JavaScript syntax/runtime errors, or missing root content causes a blank or unusable first render.
 - **False capability claim**: the response claims Figma import, connector refresh, external-browser validation, or accessibility checks happened when they did not.
 - **Invented evidence**: sample metrics, placeholder records, inferred copy, or guessed assets are presented as observed source content or production data.
 
@@ -77,6 +78,7 @@ Before final delivery, internally verify this matrix:
 ```markdown
 ## Craft Check
 - HTML default:
+- HTML syntax/runtime:
 - Source/design fidelity:
 - State coverage:
 - Accessibility:
@@ -100,6 +102,7 @@ Use automated checks only when an HTML file/app screen exists and the environmen
 - Visual regression: when a source screenshot or prior HTML screenshot exists, use screenshot comparison or viewport screenshots to catch blank render, source drift, clipped text, overlap, broken assets, and unintended layout shifts.
 - Component stories: when Storybook or a local component preview exists, check the relevant states/stories rather than only the full page.
 - DOM/source inspection: when browser automation is unavailable, inspect the generated HTML/CSS/JS for semantic elements, labels, state markup, media queries, and unsafe persisted data.
+- HTML syntax/runtime: when possible, parse the generated HTML, check inline script syntax, inspect console/runtime errors, and confirm the rendered body is non-blank with the primary region visible.
 
 Automated tools are evidence, not a substitute for design judgment. If a tool cannot run, state that validation was reasoned from source/HTML and list the remaining risks.
 
@@ -107,7 +110,8 @@ Automated tools are evidence, not a substitute for design judgment. If a tool ca
 
 1. Inspect the rendered HTML or app screen when possible.
 2. Compare it to `ui-design-source` and `ui-design-contract` outputs if present.
-3. Check P0 first; fix P0 rather than merely listing it.
-4. Check P1/P2 according to scope.
-5. Use optional automated checks only when available and relevant.
-6. If verification cannot run, say which checks were reasoned from source/HTML and which still require rendered inspection.
+3. Check HTML syntax/runtime and first render before visual polish; a blank artifact is a P0 even if the design direction is good.
+4. Check P0 first; fix P0 rather than merely listing it.
+5. Check P1/P2 according to scope.
+6. Use optional automated checks only when available and relevant.
+7. If verification cannot run, say which checks were reasoned from source/HTML and which still require rendered inspection.
