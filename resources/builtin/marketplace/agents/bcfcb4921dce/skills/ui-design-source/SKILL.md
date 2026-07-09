@@ -1,8 +1,8 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-design-source
-description_zh: "处理 Figma 链接/导出、设计稿截图、PDF、JSON、现有 HTML 或设计说明，把来源抽取成 frame map、组件/变量/资产/交互清单、保真边界和 UIDesigner HTML 实现交接；没有真实访问能力时不假装已导入。"
-description_en: "Handle Figma links/exports, design screenshots, PDFs, JSON, existing HTML, or design notes by extracting a frame map, components/variables/assets/interactions, fidelity boundaries, and UIDesigner HTML implementation handoff; never pretend a design source was imported when access is unavailable."
+description_zh: "处理 Figma 链接/导出、设计稿截图、PDF、JSON、现有 HTML 或设计说明，把来源抽取成 frame map、源图到 HTML 检查点、组件/变量/资产/交互清单、保真边界和 UIDesigner 实现交接；没有真实访问能力时不假装已导入。"
+description_en: "Handle Figma links/exports, design screenshots, PDFs, JSON, existing HTML, or design notes by extracting a frame map, source-to-HTML checkpoints, components/variables/assets/interactions, fidelity boundaries, and UIDesigner implementation handoff; never pretend a design source was imported when access is unavailable."
 category: rnd
 ---
 
@@ -68,6 +68,18 @@ For Figma-like sources, look specifically for:
 - Exportable assets and which assets must be replaced or recreated.
 - Prototype links, overlays, interactions, transitions, and disabled/error states.
 
+## Source-To-HTML Checkpoints
+
+For screenshot/design-to-HTML work, use a staged pass inspired by strong screenshot-to-code workflows, but keep UIDesigner's HTML-first and evidence-first rules:
+
+1. Inventory the source before styling: visible text, major regions, controls, repeated patterns, image/icon assets, data shape, and unknown areas.
+2. Choose the target stack from the user's request or repo context. Standalone drafts default to self-contained HTML/CSS; only use Tailwind, Bootstrap, React, Vue, or a component library when the target project already uses it or the user asks.
+3. Create a source-to-HTML mapping for each major region: source region, intended HTML section/component, preserved details, intentional changes, and fidelity risk.
+4. Render critical states, not just the happy path: loading, populated, empty, error, disabled, selected, hover/focus, validation, and mobile behavior when relevant.
+5. Compare the HTML against the source/contract after rendering. Fix drift in layout, hierarchy, visible copy, density, and component role before decorative polish.
+
+Do not fill missing screenshot content with dashboard metrics, sidebars, fake records, or template blocks. If sample data is necessary, label it as sample and keep it out of observed evidence.
+
 ## Fidelity Modes
 
 Choose one mode and state it:
@@ -96,6 +108,13 @@ Map design components to implementation components:
 ```
 
 Use local app components when implementing in a repo. For standalone HTML, define semantic HTML/CSS components with the same roles and states.
+
+When a design source exposes component metadata, keep the mapping implementation-neutral:
+
+- Prefer semantic roles and props over library-specific names.
+- Record variant axes such as size, emphasis, state, density, and destructive/success semantics.
+- Preserve accessibility intent such as label relationships, focus order, landmark roles, and keyboard affordances.
+- Treat shadcn/Radix/Headless UI/React Spectrum/Ant/MUI-style components as behavioral references only unless the local repo already uses them.
 
 ## Handoff To Other Skills
 

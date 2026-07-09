@@ -1,8 +1,8 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-design-contract
-description_zh: "把截图、参考图、品牌材料、PRD 或“做成这种感觉”的诉求转成 UIDesigner 可复用的设计契约，覆盖 DESIGN.md 九段、source screen contract、keep/change/do-not-copy 边界和 HTML 实现交接。"
-description_en: "Turn screenshots, references, brand material, PRDs, or 'make it feel like this' briefs into a reusable UIDesigner contract across a nine-section DESIGN.md shape, source screen contract, keep/change/do-not-copy boundaries, and HTML implementation handoff."
+description_zh: "把截图、参考图、品牌材料、PRD 或“做成这种感觉”的诉求转成 UIDesigner 可复用的设计契约，覆盖 DESIGN.md 兼容结构、source screen contract、tokens、keep/change/do-not-copy 边界和 HTML 实现交接。"
+description_en: "Turn screenshots, references, brand material, PRDs, or 'make it feel like this' briefs into a reusable UIDesigner contract across a DESIGN.md-compatible shape, source screen contract, tokens, keep/change/do-not-copy boundaries, and HTML implementation handoff."
 category: rnd
 ---
 
@@ -63,9 +63,11 @@ For screenshot or image-based work, extract this before choosing a new layout:
 
 The screenshot is the contract for information architecture. Do not replace an input page, landing view, editor, chat surface, form, or simple settings screen with a dashboard, table, chart, sidebar, or operational cockpit unless those elements are visible or explicitly requested.
 
-## DESIGN.md Shape
+## DESIGN.md Compatibility
 
-When a reusable visual system is needed, create or summarize a `DESIGN.md` using these nine headings:
+When a reusable visual system is needed, create or summarize a `DESIGN.md`-compatible contract. The goal is not to copy a public brand document; it is to give coding agents a durable, versionable design source of truth for this product.
+
+Include compact metadata when useful: name, version, source, fidelity mode, and token format. Then use these nine headings:
 
 1. `## 1. Visual Theme & Atmosphere`
 2. `## 2. Color`
@@ -81,6 +83,10 @@ Keep each section operational. Prefer constraints the next HTML pass can obey:
 
 - Good: "single warm amber accent for primary actions; no purple-blue glow".
 - Weak: "premium, modern, elegant".
+
+If token detail matters, express it in role-based or DTCG-like terms that `ui-design-system` can turn into CSS variables: color roles (`bg`, `surface`, `text`, `accent`), typography roles (`title`, `body`, `label`), spacing scale (`xs` to `lg`), and radius roles (`control`, `panel`).
+
+Do not import public `DESIGN.md` files or brand analyses wholesale. Use them only to understand structure, vocabulary, and quality bar; the actual contract must be grounded in the user's source, repo, and ownership boundaries.
 
 ## Reference Boundaries
 
@@ -105,6 +111,7 @@ Before `ui-html-renderer` writes the artifact, hand off:
 - Responsive requirements.
 - Asset rules and do-not-copy constraints.
 - Acceptance gates the HTML must prove.
+- State/story coverage for components that need reusable variants.
 
 For standalone drafts, the contract can be embedded as a visible "Design System" or "Handoff" section only when useful. For app screens, keep the artifact focused on the product experience and mention the contract in the final handoff.
 
@@ -119,6 +126,8 @@ Before rendering or final delivery, check:
 - Any selected reference pack is named, justified, and rejected patterns are recorded when they could mislead the output.
 - The contract names anti-patterns to avoid.
 - The next HTML pass has enough concrete token and component guidance to execute without guessing.
+- Tokens and component rules are specific enough to produce HTML/CSS, not only mood adjectives.
+- Public reference systems are treated as structure and quality inspiration, not as copied brand identity.
 
 ## Output Shape
 
@@ -134,6 +143,7 @@ Use this compact shape in the final handoff when a separate file is not created:
 - Do not copy:
 - Tokens:
 - Components:
+- State/story coverage:
 - Reference pack, if used:
 - Rejected patterns:
 - Responsive:

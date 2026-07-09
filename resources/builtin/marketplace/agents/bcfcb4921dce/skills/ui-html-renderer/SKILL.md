@@ -75,6 +75,25 @@ The HTML draft should be self-contained unless the repo already has an asset pip
 
 Use semantic HTML where practical. Add lightweight JavaScript only for preview interactions such as tabs, filters, menus, theme toggles, or sample state changes.
 
+## Stack And Dependency Boundaries
+
+Choose the rendering stack from the task and repo, not from public examples:
+
+- Standalone UIDesigner drafts default to plain HTML, CSS, and minimal JavaScript.
+- If the target repo already uses Tailwind, Bootstrap, shadcn/ui, Radix, Headless UI, Ant Design, MUI, Carbon, React Spectrum, Vue libraries, or another system, follow that local system.
+- Do not introduce Tailwind, daisyUI, Bootstrap, shadcn/ui, Storybook, or any component package just because a reference project is popular.
+- Treat public libraries as behavior and state references unless the user explicitly asks to adopt them.
+
+## Source-To-HTML Rendering Workflow
+
+For screenshot/design-to-HTML tasks:
+
+1. Start from the `ui-design-source` map and `ui-design-contract`, not from a generic template.
+2. Build the major regions first: app shell, navigation, content groups, controls, repeated items, and primary action.
+3. Add tokenized styling after the structure is faithful: colors, type roles, spacing, radius, borders, elevation, and motion.
+4. Add representative states/stories in-place or as a compact state gallery when the component is reusable.
+5. Compare the rendered result against the source/contract and fix mismatches before adding decorative polish.
+
 ## What To Render
 
 For product screens:
@@ -113,6 +132,8 @@ For component systems:
 - Table/list rows.
 - Feedback states.
 - Dialog/drawer/popover examples when needed.
+- Component stories or state gallery for reusable pieces.
+- DTCG/CSS variable mapping when the system is intended to last beyond one mockup.
 
 For logo or identity drafts:
 
@@ -171,6 +192,7 @@ When possible:
 - Inspect screenshots for blank areas, overlap, clipped text, broken assets, and unreadable contrast.
 - Interact with tabs, menus, toggles, filters, and primary actions if present.
 - Run the `ui-craft-checks` matrix for HTML default, source/design fidelity, state coverage, accessibility, forms, typography, motion, responsive behavior, live/security, and anti-template tells.
+- Run optional axe-core/pa11y, screenshot comparison, Storybook, or DOM/source checks only when already available or explicitly requested; do not install dependencies for verification by default.
 
 If verification cannot run, state that clearly and list the checks the artifact was designed to satisfy.
 

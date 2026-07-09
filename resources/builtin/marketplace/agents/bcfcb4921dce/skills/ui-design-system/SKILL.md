@@ -1,8 +1,8 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-design-system
-description_zh: "把产品目标或现有界面转成可实现的 UI 系统，覆盖 token、组件、shadcn 风格映射、设计系统审查和实现交付。"
-description_en: "Turn product goals or existing screens into implementable UI systems across tokens, components, shadcn-style mapping, design-system review, and implementation handoff."
+description_zh: "把产品目标或现有界面转成可实现的 UI 系统，覆盖 DESIGN.md/DTCG 风格 token、组件状态、组件库行为映射、设计系统审查和 HTML/实现交付。"
+description_en: "Turn product goals or existing screens into implementable UI systems across DESIGN.md/DTCG-style tokens, component states, component-library behavior mapping, design-system review, and HTML/implementation handoff."
 category: rnd
 ---
 
@@ -13,6 +13,8 @@ Use this skill when creating, extending, or auditing a product UI system. It ada
 Pair this skill with `ui-design-contract` when the user provides references, screenshots, brand material, or asks for a reusable direction. The contract defines what the system must preserve; this skill turns it into tokens and components.
 
 When `ui-reference-packs` selects a design-system pack, treat it as advisory style DNA. Translate it into the local token model and component map; do not copy named-brand assets, exact layouts, or proprietary product chrome.
+
+Use public UI libraries and design systems as behavior references, not default dependencies. shadcn/ui, Radix, Headless UI, React Spectrum, Ant Design, MUI, Carbon, and similar systems can inform component states, keyboard behavior, density, and token discipline; only implement with one of them when the target app already uses it or the user explicitly asks.
 
 ## Design System Job
 
@@ -56,6 +58,10 @@ For screenshot-based redesigns, the source screen is the contract. Preserve its 
 ## Token Model
 
 Define tokens by role, not by vague color or size names.
+
+For reusable systems, keep tokens close to the Design Tokens Community Group (DTCG) and Style Dictionary mental model: a token has a name, value, type, purpose, and optional mode. For example: `color.bg` (`color`, page background), `color.accent` (`color`, primary action/selected state), and `space.md` (`dimension`, default component gap). Do not require external build tooling unless the repo already uses it.
+
+When writing CSS, export the same intent as custom properties such as `--color-bg`, `--color-accent`, `--space-md`, and `--radius-control`. This preserves portability without forcing Style Dictionary into every project.
 
 Typography:
 
@@ -108,6 +114,18 @@ Map UI to components before styling:
 
 For each component, define variants, states, content limits, keyboard behavior, and responsive behavior.
 
+## Component State And Story Model
+
+Borrow Storybook's useful discipline without requiring Storybook to be installed:
+
+- Define each reusable component in isolation before composing full pages.
+- Cover realistic stories/states: default, hover, focus, disabled, loading, empty, error, selected, destructive, compact, long text, and mobile.
+- Record inputs/props/content limits so a future implementation can reproduce the design.
+- For forms, include pristine, touched, invalid, submitted-pending, success, and recovery states.
+- For data components, include populated, empty, loading, partial, error, stale, and overflow states.
+
+If the target repo already has Storybook, component docs, or a registry, align names and states with that source instead of inventing a parallel system.
+
 ## Handoff Shape
 
 For design-system work, return or implement:
@@ -126,6 +144,7 @@ For design-system work, return or implement:
 - Spacing:
 - Radius/border/elevation:
 - Motion:
+- DTCG/CSS variable mapping:
 
 ## Components
 - Navigation:
@@ -133,6 +152,7 @@ For design-system work, return or implement:
 - Forms:
 - Feedback:
 - Overlays:
+- States/stories:
 
 ## HTML Design Draft
 - File or artifact:

@@ -1,8 +1,8 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-craft-checks
-description_zh: "UIDesigner 的 HTML 设计质量门槛；在交付前或 review/polish 时检查可访问性、状态覆盖、表单验证、动效克制、排版层级、响应式/RTL、反 AI 模板味和截图/设计源保真。"
-description_en: "UIDesigner's HTML craft quality gate; use before delivery or during review/polish to check accessibility, state coverage, form validation, motion discipline, typography hierarchy, responsive/RTL behavior, anti-AI-template tells, and screenshot/design-source fidelity."
+description_zh: "UIDesigner 的 HTML 设计质量门槛；在交付前或 review/polish 时检查可访问性、状态覆盖、表单验证、动效克制、排版层级、响应式/RTL、反 AI 模板味、截图/设计源保真，并按条件使用可选自动检查。"
+description_en: "UIDesigner's HTML craft quality gate; use before delivery or during review/polish to check accessibility, state coverage, form validation, motion discipline, typography hierarchy, responsive/RTL behavior, anti-AI-template tells, screenshot/design-source fidelity, and optional automated checks when available."
 category: rnd
 ---
 
@@ -44,6 +44,7 @@ The artifact fails the craft pass if any P0 is present:
 - **Unsafe live data**: live-ready artifacts persist tokens, credentials, cookies, auth headers, raw provider responses, or secret-like fields.
 - **Text/layout collision**: text overlaps controls, is clipped without intent, or mobile layout hides the primary action.
 - **False capability claim**: the response claims Figma import, connector refresh, external-browser validation, or accessibility checks happened when they did not.
+- **Invented evidence**: sample metrics, placeholder records, inferred copy, or guessed assets are presented as observed source content or production data.
 
 ## P1 Gates
 
@@ -57,6 +58,7 @@ Fix or explicitly note these before handoff:
 - **Responsive behavior**: navigation, filters, tables, side panels, fixed boards, and action bars need a defined mobile behavior.
 - **RTL/bidi readiness**: for multilingual or unknown user-generated content, prefer logical properties and isolate unknown-direction text with `dir="auto"` or `<bdi>`.
 - **AI-template tells**: remove unjustified purple-blue glow gradients, generic 3-card rows, stock-placeholder imagery, oversized rounded cards everywhere, decorative blobs, and empty marketing adjectives.
+- **Weak component stories**: reusable components lack meaningful variants/states, making later implementation or review depend on guesswork.
 
 ## P2 Polish
 
@@ -84,10 +86,22 @@ Before final delivery, internally verify this matrix:
 - Responsive:
 - Live/security:
 - Anti-template:
+- Optional automation:
 - Remaining risks:
 ```
 
 For simple final answers, summarize only failures and verification performed. Do not clutter the user-facing artifact with a checklist unless it is a review page, handoff, QA report, or requested by the user.
+
+## Optional Automated Checks
+
+Use automated checks only when an HTML file/app screen exists and the environment already supports the tool or the user asks for stronger validation. Do not install new dependencies just to satisfy this skill.
+
+- Accessibility: if axe-core, pa11y, Playwright accessibility helpers, or an equivalent existing checker is available, run it and fix actionable violations around labels, names, landmarks, contrast, focus order, and keyboard reachability.
+- Visual regression: when a source screenshot or prior HTML screenshot exists, use screenshot comparison or viewport screenshots to catch blank render, source drift, clipped text, overlap, broken assets, and unintended layout shifts.
+- Component stories: when Storybook or a local component preview exists, check the relevant states/stories rather than only the full page.
+- DOM/source inspection: when browser automation is unavailable, inspect the generated HTML/CSS/JS for semantic elements, labels, state markup, media queries, and unsafe persisted data.
+
+Automated tools are evidence, not a substitute for design judgment. If a tool cannot run, state that validation was reasoned from source/HTML and list the remaining risks.
 
 ## How To Apply
 
@@ -95,4 +109,5 @@ For simple final answers, summarize only failures and verification performed. Do
 2. Compare it to `ui-design-source` and `ui-design-contract` outputs if present.
 3. Check P0 first; fix P0 rather than merely listing it.
 4. Check P1/P2 according to scope.
-5. If verification cannot run, say which checks were reasoned from source/HTML and which still require rendered inspection.
+5. Use optional automated checks only when available and relevant.
+6. If verification cannot run, say which checks were reasoned from source/HTML and which still require rendered inspection.
