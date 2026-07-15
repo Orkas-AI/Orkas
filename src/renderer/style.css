@@ -5921,7 +5921,9 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-msg-produced.is-expanded {
   max-height: 168px;
   overflow-y: auto;
-  overscroll-behavior: contain;
+  /* Let wheel input reach the conversation history when this footer does not
+     overflow or has reached a scroll boundary. */
+  overscroll-behavior: auto;
   padding-right: 2px;
   scrollbar-gutter: stable;
 }
