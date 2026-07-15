@@ -55,6 +55,7 @@ describe('conversation produced chips', () => {
     expect(styleSource).toContain('.chat-msg-produced.is-expanded');
     expect(styleSource).toContain('max-height: 168px;');
     expect(styleSource).toContain('overflow-y: auto;');
+    expect(styleSource).toContain('overscroll-behavior: auto;');
   });
 
   it('dedupes same-basename chips to the more specific final path', () => {
