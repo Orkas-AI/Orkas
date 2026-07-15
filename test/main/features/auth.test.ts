@@ -69,6 +69,20 @@ describe('auth › maskKey', () => {
   });
 });
 
+describe('auth › external navigation', () => {
+  it('rejects dangerous and credential-bearing URLs', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect(a.openExternalUrl('javascript:alert(1)')).toEqual({
+      ok: false,
+      error: 'url must be a safe external link',
+    });
+    expect(a.openExternalUrl('https://user:password@example.com/')).toEqual({
+      ok: false,
+      error: 'url must be a safe external link',
+    });
+  });
+});
+
 describe('auth › FEATURED_PROVIDERS', () => {
   it('lists the curated API-key providers in CATALOG order', async () => {
     const a = await import('../../../src/main/features/auth');

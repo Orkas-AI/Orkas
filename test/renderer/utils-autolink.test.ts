@@ -220,10 +220,10 @@ describe('markdown media links', () => {
     expect(out).toContain('title="&quot;preview&quot;"');
   });
 
-  it('keeps non-media markdown links as anchors', () => {
+  it('renders non-media private-protocol references as inert text', () => {
     const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
-    expect(out).toContain('<a ');
-    expect(out).toContain('href="chat-media://local/Users/test/notes.txt"');
+    expect(out).toBe('clip');
+    expect(out).not.toContain('<a ');
     expect(out).not.toContain('<video ');
     expect(out).not.toContain('<audio ');
   });

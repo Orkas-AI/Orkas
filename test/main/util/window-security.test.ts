@@ -4,6 +4,7 @@ import {
   hardenedWebPreferences,
   installExternalNavigationGuard,
   safeExternalHttpUrl,
+  safeExternalUserActionUrl,
 } from '../../../src/main/util/window-security';
 
 describe('window security baseline', () => {
@@ -41,6 +42,36 @@ describe('window security baseline', () => {
     }
   });
 
+  it('strictly validates user-clicked mail, phone, and XMPP links', () => {
+    for (const value of [
+      'https://example.test/docs?q=1',
+      'mailto:alice@example.com',
+      'mailto:alice@example.com?subject=Hello',
+      'tel:+86-13800138000',
+      'sms:+8613800138000',
+      'callto:+1 (555) 0100',
+      'xmpp:alice@example.com',
+    ]) {
+      expect(safeExternalUserActionUrl(value), value).toBe(value);
+    }
+
+    for (const value of [
+      'mailto:not-an-address',
+      'mailto:alice@example.com?subject=Hello%0AInjected',
+      'mailto:alice@example.com?attach=/etc/passwd',
+      'tel:$(open evil)',
+      'sms:+123?body=hello',
+      'xmpp:alice@example.com?message',
+      'file:///etc/passwd',
+      'javascript:alert(1)',
+      'chat-app://cid/a/b/index.html',
+      'kb-file://kb/private.pdf',
+      'blob:https://example.test/id',
+    ]) {
+      expect(safeExternalUserActionUrl(value), value).toBeNull();
+    }
+  });
+
   it('denies every window.open and opens only safe URLs externally', async () => {
     let openHandler!: (details: { url: string }) => { action: 'deny' };
     let navigateHandler!: (event: { preventDefault(): void }, url: string) => void;
@@ -52,6 +83,7 @@ describe('window security baseline', () => {
     installExternalNavigationGuard(webContents, openExternal);
 
     expect(openHandler({ url: 'https://example.test/a' })).toEqual({ action: 'deny' });
+    expect(openHandler({ url: 'mailto:alice@example.test' })).toEqual({ action: 'deny' });
     expect(openHandler({ url: 'javascript:alert(1)' })).toEqual({ action: 'deny' });
     await Promise.resolve();
     await Promise.resolve();

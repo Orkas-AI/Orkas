@@ -61,21 +61,27 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
-// Safe-URI allow-list. Mirrors DOMPurify's default scheme regex plus the
+// Safe resource-URI allow-list. Mirrors DOMPurify's default scheme regex plus the
 // app's own privileged schemes (chat-media / chat-app / kb-file, registered
 // in main/index.ts) and blob: (attachment object URLs), so media / artifact /
-// KB links survive sanitization. Scheme-less (relative / anchor / path) refs
+// KB resources survive sanitization. Scheme-less (relative / anchor / path) refs
 // pass via the `[^a-z]` / trailing-non-scheme-char branches; javascript: /
 // data: / vbscript: / file: do NOT match and are dropped.
 const _SAFE_URI_RE = /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|chat-media|chat-app|kb-file|blob):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
 
-// Return the href if it is a safe URI, else '' (dropped). Used by the link
-// builders below so a `javascript:`/`data:` href never reaches the DOM even
-// before DOMPurify runs; callers still escapeHtml() the result into the
-// attribute to prevent quote breakout on otherwise-allowed schemes.
+// Clickable top-level links are intentionally narrower than resource URLs.
+// App-private/blob/relative paths may be valid iframe or media sources but
+// must never navigate the privileged renderer. Hash anchors stay in-page.
+const _SAFE_EXTERNAL_LINK_RE = /^(?:https?|mailto|tel|callto|sms|xmpp):/i;
+
+// Return the href if it is a supported external link or in-page anchor, else
+// '' (render as text). Main performs stricter per-protocol validation before
+// asking the OS to open any external application.
 function _safeHref(url) {
   const u = String(url === null || url === undefined ? '' : url).trim();
-  return _SAFE_URI_RE.test(u) ? u : '';
+  if (!u || /[\u0000-\u001f\u007f]/.test(u)) return '';
+  if (u.charAt(0) === '#') return u;
+  return _SAFE_EXTERNAL_LINK_RE.test(u) ? u : '';
 }
 
 // XSS sanitizer for HTML that ends up in innerHTML and may carry untrusted
@@ -108,9 +114,14 @@ function sanitizeHtml(html) {
   }
   if (!_sanitizeHookInstalled && typeof DP.addHook === 'function') {
     // Any link opening a new browsing context must carry rel=noopener noreferrer.
+    // Resource protocols remain valid for img/video/iframe attributes, but
+    // strip them from anchors so the UI never advertises a link that the
+    // top-level navigation boundary must reject.
     DP.addHook('afterSanitizeAttributes', (node) => {
-      if (node.tagName === 'A' && node.getAttribute && node.getAttribute('target')) {
-        node.setAttribute('rel', 'noopener noreferrer');
+      if (node.tagName === 'A' && node.getAttribute) {
+        const href = node.getAttribute('href');
+        if (href && !_safeHref(href)) node.removeAttribute('href');
+        if (node.getAttribute('target')) node.setAttribute('rel', 'noopener noreferrer');
       }
     });
     _sanitizeHookInstalled = true;
@@ -1387,7 +1398,10 @@ function inlineFormat(text) {
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
         // breakout). text stays raw so nested image/emphasis still render;
         // DOMPurify scrubs any raw HTML in the text at the output layer.
-        return `<a href="${escapeHtml(_safeHref(url))}" target="_blank" rel="noopener"${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
+        const href = _safeHref(url);
+        if (!href) return txt;
+        const target = href.charAt(0) === '#' ? '' : ' target="_blank" rel="noopener"';
+        return `<a href="${escapeHtml(href)}"${target}${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
       })
     // <url> and <email> autolinks
     .replace(/<((?:https?:\/\/|mailto:)[^>\s]+)>/g,
@@ -1411,21 +1425,35 @@ function inlineFormat(text) {
 // caring about the level of support.
 const renderMarkdown = renderMarkdownFull;
 
-// Route http(s) link clicks through main's shell.openExternal so they always
-// land in the system browser regardless of `target=` / Electron version /
+// Route supported external link clicks through main's strict validator +
+// shell.openExternal so they always land in the system handler regardless of
+// `target=` / Electron version /
 // rel=noopener quirks. Covers chat bubbles, KB viewer, skill detail, agent
-// workflow — anywhere renderMarkdown emits `<a href="http...">`. Main's
+// workflow — anywhere renderMarkdown emits a supported external link. Main's
 // setWindowOpenHandler / will-navigate (see main/index.ts) is the safety net
-// for clicks that arrive before this script evaluates or when window.orkas
-// hasn't been wired yet (then we don't preventDefault and let main handle it).
+// for HTTP(S) clicks that arrive before this script evaluates.
 // Guarded for Node test env where `document` is undefined; the click router
 // is a renderer-only side effect and irrelevant to the autolink fixtures.
 if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const a = e.target && e.target.closest && e.target.closest('a[href]');
   if (!a) return;
-  const href = a.getAttribute('href');
-  if (!/^https?:\/\//i.test(href || '')) return;
-  if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+  const href = String(a.getAttribute('href') || '').trim();
+  if (href.charAt(0) === '#') {
+    e.preventDefault();
+    let id = '';
+    try { id = decodeURIComponent(href.slice(1)); } catch (_) { return; }
+    const target = id && (document.getElementById(id)
+      || (document.getElementsByName && document.getElementsByName(id)[0]));
+    if (target && typeof target.scrollIntoView === 'function') target.scrollIntoView({ block: 'start' });
+    return;
+  }
+  if (!_SAFE_EXTERNAL_LINK_RE.test(href)) { e.preventDefault(); return; }
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') {
+    // The main navigation guard can still route HTTP(S). Never let a custom
+    // OS-handler scheme fall through without the stricter IPC validation.
+    if (!/^https?:\/\//i.test(href)) e.preventDefault();
+    return;
+  }
   e.preventDefault();
   window.orkas.invoke('auth.openExternal', { url: href }).catch(() => {});
 });
@@ -1778,6 +1806,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     sanitizeSvgIconHtml,
     _safeHref,
     _SAFE_URI_RE,
+    _SAFE_EXTERNAL_LINK_RE,
     renderMarkdown,
     renderDashboard,
     _parseDashboardSpec,

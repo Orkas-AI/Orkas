@@ -199,7 +199,8 @@ function createWindow(): BrowserWindow {
   //   - `<a href>` clicks without a target   → will-navigate (otherwise
   //     Electron navigates the current window away and replaces the UI).
   // The guard opens only safe HTTP(S) targets and blocks every other
-  // top-level navigation from replacing the privileged renderer document.
+  // top-level navigation. Explicit mail/phone links use the validated IPC
+  // path instead of weakening this final security boundary.
   installExternalNavigationGuard(
     win.webContents,
     (url) => shell.openExternal(url),

@@ -63,6 +63,7 @@ import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
+import { safeExternalUserActionUrl } from '../util/window-security';
 import { getActiveUserId } from './users';
 import {
   FEATURED_API_PROVIDERS,
@@ -1105,15 +1106,15 @@ function deriveOAuthLabel(creds: Record<string, unknown>): string {
 }
 
 /**
- * Open a URL in the user's default browser. Uses the platform-native
- * handler (`open` / `start` / `xdg-open`) instead of Electron's BrowserWindow
- * so the OAuth consent page renders in the user's real browser, where they
- * are already logged in and where extensions work.
+ * Open a user-clicked URL in its platform-native handler (browser, mail,
+ * phone, etc.) instead of Electron's BrowserWindow. The validator is strict
+ * because shell.openExternal delegates to OS applications.
  */
 export function openExternalUrl(url: string): { ok: boolean; error?: string } {
-  const target = String(url || '').trim();
-  if (!target) return { ok: false, error: 'url required' };
-  if (!/^https?:\/\//i.test(target)) return { ok: false, error: 'url must be http(s)' };
+  const raw = String(url || '').trim();
+  if (!raw) return { ok: false, error: 'url required' };
+  const target = safeExternalUserActionUrl(raw);
+  if (!target) return { ok: false, error: 'url must be a safe external link' };
   // Electron's shell.openExternal is the official cross-platform API:
   // macOS uses open(1), Windows uses ShellExecuteW, Linux uses
   // xdg-open — supersedes our old hand-rolled shell commands (Windows
