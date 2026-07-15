@@ -10,10 +10,9 @@
 //      DOM and a quoted URL can't break out of `href="..."` even before
 //      DOMPurify runs.
 //
-// Per PC/CLAUDE.md §9 (text-processing parsers need both matching and
-// look-alike non-matching fixtures), this pins both the safe shapes that MUST
-// survive (http/https/mailto/tel + the app's chat-media/chat-app/kb-file/blob
-// schemes + relative refs) and the dangerous shapes that MUST be dropped.
+// The matching and look-alike non-matching fixtures below pin both the
+// clickable shapes that MUST survive and resource-only/private shapes that
+// MUST NOT become top-level links. Media protocols remain valid for src.
 
 import { afterEach, describe, it, expect, vi } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -41,21 +40,26 @@ describe('_safeHref — safe URI allow-list', () => {
       'http://x.com',
       'mailto:a@b.com',
       'tel:+1234567890',
+      'sms:+1234567890',
+      'callto:+1234567890',
+      'xmpp:a@b.com',
     ]) expect(_safeHref(u)).toBe(u);
   });
 
-  it("keeps the app's privileged schemes (media/artifact/KB/blob)", () => {
+  it("does not expose the app's resource-only schemes as top-level links", () => {
     for (const u of [
       'chat-media://local/Users/test/car.png',
       'chat-app://app/123/index.html',
       'kb-file://doc/intro.md',
       'blob:https://app/9f2c-uuid',
-    ]) expect(_safeHref(u)).toBe(u);
+      'cid:part-1',
+    ]) expect(_safeHref(u)).toBe('');
   });
 
-  it('keeps scheme-less relative / anchor / path refs', () => {
-    for (const u of ['/abs/path', './rel', '../up', '#anchor', 'plain/path']) {
-      expect(_safeHref(u)).toBe(u);
+  it('keeps in-page anchors but drops ambiguous relative/path refs', () => {
+    expect(_safeHref('#anchor')).toBe('#anchor');
+    for (const u of ['/abs/path', './rel', '../up', 'plain/path']) {
+      expect(_safeHref(u)).toBe('');
     }
   });
 
@@ -87,7 +91,8 @@ describe('inlineFormat — markdown link XSS hardening', () => {
   it('drops a javascript: link href (no live scheme in output)', () => {
     const out = inlineFormat('[tap](javascript:alert(document.cookie))');
     expect(out).not.toMatch(/href="javascript:/i);
-    expect(out).toContain('href=""');
+    expect(out).not.toContain('<a ');
+    expect(out).toContain('tap');
   });
 
   it('escapes a quote in the URL so it cannot break out of href=""', () => {
@@ -97,9 +102,15 @@ describe('inlineFormat — markdown link XSS hardening', () => {
     expect(out).toContain('&quot;');
   });
 
-  it('preserves the app chat-media scheme in a markdown link', () => {
+  it('renders a non-media app protocol reference as inert text', () => {
     const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
-    expect(out).toContain('href="chat-media://local/Users/test/notes.txt"');
+    expect(out).toBe('clip');
+  });
+
+  it('keeps anchors in-page and external schemes in a separate browsing context', () => {
+    expect(inlineFormat('[section](#details)')).toContain('href="#details"');
+    expect(inlineFormat('[section](#details)')).not.toContain('target="_blank"');
+    expect(inlineFormat('[mail](mailto:a@b.com)')).toContain('target="_blank"');
   });
 
   it('escapes the href in <url> autolinks', () => {
