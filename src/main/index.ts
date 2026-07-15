@@ -40,6 +40,7 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session,
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
 import { desktopPlatform, osVersion } from './system_info';
+import { hardenedWebPreferences, installExternalNavigationGuard } from './util/window-security';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
 const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -172,19 +173,16 @@ function createWindow(): BrowserWindow {
     title: '',
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
-    webPreferences: {
+    webPreferences: hardenedWebPreferences({
       // preload sits next to index.ts in PC/src/main/ — just __dirname + 'preload.js'.
       preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
       devTools: dev,
       // Enables Chromium's built-in PDF viewer (PDFium) inside iframes.
       // Required for `<iframe src="kb-file:///.../report.pdf">` in the KB
       // viewer. Has no effect on other plugin types since Electron strips
       // the NPAPI / NaCl code path.
       plugins: true,
-    },
+    }),
   });
   windowState.watchWindowState(win);
   if (restored.isMaximized) win.maximize();
@@ -200,23 +198,13 @@ function createWindow(): BrowserWindow {
   //   - `target="_blank"` / `window.open()`  → setWindowOpenHandler
   //   - `<a href>` clicks without a target   → will-navigate (otherwise
   //     Electron navigates the current window away and replaces the UI).
-  // Non-http(s) is always rejected (`file://` only fires through the
-  // initial loadFile, which doesn't reach this handler).
-  const openIfExternal = (raw: string): boolean => {
-    const url = String(raw || '').trim();
-    if (!/^https?:\/\//i.test(url)) return false;
-    shell.openExternal(url).catch((err: unknown) => {
-      log.warn('openExternal failed', { url, error: (err as Error)?.message || String(err) });
-    });
-    return true;
-  };
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    openIfExternal(url);
-    return { action: 'deny' };
-  });
-  win.webContents.on('will-navigate', (event, url) => {
-    if (openIfExternal(url)) event.preventDefault();
-  });
+  // The guard opens only safe HTTP(S) targets and blocks every other
+  // top-level navigation from replacing the privileged renderer document.
+  installExternalNavigationGuard(
+    win.webContents,
+    (url) => shell.openExternal(url),
+    (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
+  );
 
   // Hijack Cmd/Ctrl+R / F5 uniformly:
   //   - Packaged: refresh disabled (the App doesn't need reload).
