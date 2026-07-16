@@ -6,12 +6,19 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const require = createRequire(import.meta.url);
-const { verifyRuntimeRoot, verifyWindowsVcImportClosure } = require('../../../bin/runtime-gate.cjs') as {
+const {
+  verifyFfmpegRuntimeDir,
+  verifyRuntimeRoot,
+  verifyWhisperRuntimeDir,
+  verifyWindowsVcImportClosure,
+} = require('../../../bin/runtime-gate.cjs') as {
+  verifyFfmpegRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string[];
   verifyRuntimeRoot: (root: string, platform: string, arch: string, options?: {
     allowedKeys?: string[];
     whisperContract?: any;
     windowsVcContract?: any;
   }) => string[];
+  verifyWhisperRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string;
   verifyWindowsVcImportClosure: (root: string, arch: string) => string;
 };
 
@@ -193,6 +200,29 @@ function writeFfmpegRuntime(root: string, key: string): void {
   }, null, 2));
 }
 
+function writeDarwinFfmpegRuntime(root: string, key: string): Record<'ffmpeg' | 'ffprobe', string> {
+  const dir = path.join(root, 'ffmpeg', key);
+  fs.mkdirSync(dir, { recursive: true });
+  const binaries = {
+    ffmpeg: Buffer.from('original ffmpeg Mach-O fixture'),
+    ffprobe: Buffer.from('original ffprobe Mach-O fixture'),
+  };
+  const files = {} as Record<'ffmpeg' | 'ffprobe', string>;
+  for (const [name, bytes] of Object.entries(binaries) as Array<[keyof typeof binaries, Buffer]>) {
+    files[name] = path.join(dir, name);
+    fs.writeFileSync(files[name], bytes);
+  }
+  fs.writeFileSync(path.join(dir, 'NOTICE.txt'), 'test notice\n');
+  fs.writeFileSync(path.join(dir, '.orkas-ffmpeg-ready.json'), JSON.stringify({
+    schema: 1,
+    platformKey: key,
+    verification: 'pinned-sha256',
+    capabilities: ['libass', 'ass', 'subtitles'],
+    binaries: Object.fromEntries(Object.entries(binaries).map(([name, bytes]) => [name, record(bytes)])),
+  }, null, 2));
+  return files;
+}
+
 function record(bytes: Buffer): { bytes: number; sha256: string } {
   return { bytes: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
 }
@@ -284,6 +314,24 @@ function writeWhisperRuntime(root: string, key: string, contract: any): void {
   }, null, 2));
 }
 
+function darwinWhisperContract(key: string): any {
+  const cli = Buffer.from('original whisper Mach-O fixture');
+  const model = Buffer.from('test whisper model');
+  const license = Buffer.from('test license');
+  return {
+    schema: 1,
+    version: 'test-whisper-darwin',
+    model: { name: 'test-model', relativePath: 'models/test.bin', ...record(model), testBytes: model },
+    licenses: { 'LICENSE.whisper.cpp': { ...record(license), testBytes: license } },
+    targets: {
+      [key]: {
+        source: 'test',
+        files: { 'bin/whisper-cli': { ...record(cli), executable: true, testBytes: cli } },
+      },
+    },
+  };
+}
+
 function writeAllRuntimes(root: string, key: string, contract: any, withNodeCompanions = true): void {
   writeRuntime(root, 'python', key);
   writeRuntime(root, 'uv', key);
@@ -342,6 +390,68 @@ describe('runtime-gate', () => {
       whisperContract: contract,
       windowsVcContract: windowsVcContract(key),
     })).toThrow(/ffmpeg runtime hash\/size mismatch/);
+  });
+
+  it('accepts signed Darwin FFmpeg mutations only after expected-team signature verification', () => {
+    const root = path.join(tmpDir, 'runtime');
+    const key = 'darwin-arm64';
+    const files = writeDarwinFfmpegRuntime(root, key);
+    fs.appendFileSync(files.ffmpeg, 'Developer ID signature');
+    fs.appendFileSync(files.ffprobe, 'Developer ID signature');
+    const verified: string[] = [];
+
+    expect(verifyFfmpegRuntimeDir(root, 'darwin', 'arm64', {
+      checkArch: false,
+      allowSignedDarwinRuntime: true,
+      expectedTeamIdentifier: 'TEAM123',
+      verifySignedDarwinBinary(file: string, team: string) {
+        expect(team).toBe('TEAM123');
+        verified.push(path.basename(file));
+      },
+    })).toHaveLength(2);
+    expect(verified.sort()).toEqual(['ffmpeg', 'ffprobe']);
+  });
+
+  it('rejects signed Darwin FFmpeg mutations when signature verification fails', () => {
+    const root = path.join(tmpDir, 'runtime');
+    const key = 'darwin-arm64';
+    const files = writeDarwinFfmpegRuntime(root, key);
+    fs.appendFileSync(files.ffmpeg, 'untrusted mutation');
+
+    expect(() => verifyFfmpegRuntimeDir(root, 'darwin', 'arm64', {
+      checkArch: false,
+      allowSignedDarwinRuntime: true,
+      expectedTeamIdentifier: 'TEAM123',
+      verifySignedDarwinBinary() {
+        throw new Error('wrong signing team');
+      },
+    })).toThrow(/wrong signing team/);
+  });
+
+  it('keeps non-executable Whisper assets byte-exact after Darwin signing', () => {
+    const root = path.join(tmpDir, 'runtime');
+    const key = 'darwin-arm64';
+    const contract = darwinWhisperContract(key);
+    writeWhisperRuntime(root, key, contract);
+    const cli = path.join(root, 'whisper', key, 'bin', 'whisper-cli');
+    fs.appendFileSync(cli, 'Developer ID signature');
+
+    expect(verifyWhisperRuntimeDir(root, 'darwin', 'arm64', {
+      checkArch: false,
+      whisperContract: contract,
+      allowSignedDarwinRuntime: true,
+      expectedTeamIdentifier: 'TEAM123',
+      verifySignedDarwinBinary: () => undefined,
+    })).toBe(cli);
+
+    fs.appendFileSync(path.join(root, 'whisper', key, 'models', 'test.bin'), 'tampered');
+    expect(() => verifyWhisperRuntimeDir(root, 'darwin', 'arm64', {
+      checkArch: false,
+      whisperContract: contract,
+      allowSignedDarwinRuntime: true,
+      expectedTeamIdentifier: 'TEAM123',
+      verifySignedDarwinBinary: () => undefined,
+    })).toThrow(/whisper runtime hash\/size mismatch/);
   });
 
   it('fails when a foreign-platform FFmpeg payload remains in the package', () => {

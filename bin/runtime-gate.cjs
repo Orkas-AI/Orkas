@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -115,6 +115,45 @@ function sha256File(file) {
   const hash = crypto.createHash('sha256');
   hash.update(fs.readFileSync(file));
   return hash.digest('hex');
+}
+
+function verifyDarwinCodeSignature(file, expectedTeamIdentifier) {
+  const codesign = '/usr/bin/codesign';
+  const verify = spawnSync(codesign, ['--verify', '--strict', file], {
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  if (verify.error || verify.status !== 0) {
+    const detail = `${verify.stderr || ''}${verify.stdout || ''}`.trim();
+    throw new Error(`[native-deps-gate] signed Darwin runtime signature is invalid: ${file}`
+      + `${detail ? `: ${detail}` : verify.error ? `: ${verify.error.message}` : ''}`);
+  }
+
+  const describe = spawnSync(codesign, ['-dv', '--verbose=2', file], {
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  if (describe.error || describe.status !== 0) {
+    throw new Error(`[native-deps-gate] cannot read signed Darwin runtime identity: ${file}`
+      + `${describe.error ? `: ${describe.error.message}` : ''}`);
+  }
+  const output = `${describe.stderr || ''}\n${describe.stdout || ''}`;
+  const team = /^TeamIdentifier=(.+)$/m.exec(output)?.[1]?.trim() || '';
+  if (!team || team === 'not set' || team !== expectedTeamIdentifier) {
+    throw new Error(`[native-deps-gate] signed Darwin runtime TeamIdentifier mismatch: expected `
+      + `${expectedTeamIdentifier}, got ${team || 'missing'}: ${file}`);
+  }
+}
+
+function acceptSignedDarwinRuntimeMutation(file, targetPlatform, options = {}) {
+  if (targetPlatform !== 'darwin' || options.allowSignedDarwinRuntime !== true) return false;
+  const expectedTeamIdentifier = String(options.expectedTeamIdentifier || '').trim();
+  if (!expectedTeamIdentifier || expectedTeamIdentifier === 'not set') {
+    throw new Error('[native-deps-gate] signed Darwin runtime validation requires an expected TeamIdentifier');
+  }
+  const verifier = options.verifySignedDarwinBinary || verifyDarwinCodeSignature;
+  verifier(file, expectedTeamIdentifier);
+  return true;
 }
 
 function listDirs(dir) {
@@ -312,7 +351,10 @@ function verifyFfmpegRuntimeDir(runtimeRoot, targetPlatform, targetArch, options
     requiredFile(`${name} runtime executable`, file);
     const expected = marker.binaries && marker.binaries[name];
     const stat = fs.statSync(file);
-    if (!expected || expected.bytes !== stat.size || expected.sha256 !== sha256File(file)) {
+    const rawHashMatches = expected
+      && expected.bytes === stat.size
+      && expected.sha256 === sha256File(file);
+    if (!rawHashMatches && (!expected || !acceptSignedDarwinRuntimeMutation(file, targetPlatform, options))) {
       throw new Error(`[native-deps-gate] ${name} runtime hash/size mismatch: ${file}`);
     }
     assertExecutableArch(file, targetPlatform, targetArch, options);
@@ -351,8 +393,15 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
     requiredFile(`whisper runtime file ${relativePath}`, file);
     const actual = { bytes: fs.statSync(file).size, sha256: sha256File(file) };
     const recorded = marker.files && marker.files[relativePath];
-    if (actual.bytes !== expected.bytes || actual.sha256 !== expected.sha256
-      || !recorded || recorded.bytes !== actual.bytes || recorded.sha256 !== actual.sha256) {
+    const markerMatchesContract = recorded
+      && recorded.bytes === expected.bytes
+      && recorded.sha256 === expected.sha256;
+    const rawHashMatches = actual.bytes === expected.bytes && actual.sha256 === expected.sha256;
+    const acceptedSignedMutation = !rawHashMatches
+      && expected.executable === true
+      && markerMatchesContract
+      && acceptSignedDarwinRuntimeMutation(file, targetPlatform, options);
+    if (!markerMatchesContract || (!rawHashMatches && !acceptedSignedMutation)) {
       throw new Error(`[native-deps-gate] whisper runtime hash/size mismatch: ${file}`);
     }
     if (expected.executable) {
