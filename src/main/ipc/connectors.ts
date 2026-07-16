@@ -154,7 +154,7 @@ export const invokeHandlers = {
     payload: { display_name?: unknown; transport?: unknown },
     ctx: { userId: string },
   ) => {
-    // Validation (shape, https/localhost rule, header/env hygiene) lives in
+    // Validation (shape, HTTPS/explicit-loopback rule, header/env hygiene) lives in
     // custom-transport.ts — this handler stays logic-free per CLAUDE.md §2.
     const instance = await connectors.addCustomInstance(ctx.userId, {
       display_name: payload?.display_name as string,
