@@ -688,9 +688,10 @@ function activeTurnsForState(state: CidState): ActiveTurn[] {
     });
   }
   turns.sort((a, b) => a.order - b.order);
-  return turns.map(({ actor, turn_id, started_at_ms }) => ({
+  return turns.map(({ actor, turn_id, msg_id, started_at_ms }) => ({
     actor,
     turn_id,
+    ...(msg_id ? { msg_id } : {}),
     started_at_ms,
   }));
 }
@@ -1166,6 +1167,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.seg !== undefined ? { seg: params.seg } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
+    ...(params.turn_id ? { turn_id: params.turn_id } : {}),
   };
 
   // Persist: main jsonl + each recipient + sender (so sender sees own history

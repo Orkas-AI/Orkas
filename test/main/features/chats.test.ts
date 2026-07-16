@@ -1308,6 +1308,7 @@ describe('chats › sweepStaleProcessing', () => {
       expect.objectContaining({
         from: '79df9cc89f5f',
         to: ['user'],
+        system_kind: 'reply_interrupted',
         text: expect.any(String),
         model_text: expect.stringContaining('interrupted'),
       }),

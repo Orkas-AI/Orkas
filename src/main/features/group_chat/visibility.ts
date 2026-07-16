@@ -62,6 +62,14 @@ export interface GroupMessage {
   unknown_mentions?: string[];
   /** Plain `@token` list (raw text mentions). */
   mentions?: string[];
+  /** Stable actor-execution id that produced this record. Live process,
+   * terminal bus events, persisted history and renderer placeholders all use
+   * this value to refer to the same reply. Older records may omit it. */
+  turn_id?: string;
+  /** Host-generated status records are not model replies. Kept explicit so
+   * recovery/reconciliation never claims a live actor placeholder merely
+   * because the status row has the same sender. */
+  system_kind?: 'reply_interrupted';
   /** Markdown text body. */
   text: string;
   /** Internal model-facing text. UI renders `text`; workers use this when

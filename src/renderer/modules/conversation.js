@@ -2361,6 +2361,54 @@ function _normalizeCreatedSkills(gm) {
   return null;
 }
 
+function _groupMessageSystemKind(gm) {
+  const explicit = String(gm?.system_kind || gm?._system_kind || '');
+  if (explicit) return explicit;
+  // Compatibility for interruption rows written by the first release that
+  // persisted them without an explicit discriminator. `model_text` is a
+  // stable host-authored English protocol string regardless of UI locale.
+  const modelText = String(gm?.model_text || '');
+  if (modelText.startsWith('The previous assistant run was interrupted by an application exit or crash')) {
+    return 'reply_interrupted';
+  }
+  return '';
+}
+
+// An interruption status is useful while the old turn is genuinely stopped.
+// Once the same actor continues without another visible user message, the
+// status has been superseded and must not remain as a second assistant bubble.
+// Keep this record-level pass shared by cold history, polling and reconcile so
+// those paths agree about which persisted rows should have DOM nodes.
+function _collapseSupersededInterruptionRecords(records) {
+  if (!Array.isArray(records) || !records.length) return [];
+  const out = [];
+  const pendingByActor = new Map();
+  for (const gm of records) {
+    if (!gm) continue;
+    const actor = String(gm.from || gm._from || '');
+    const isUser = actor === 'user' || gm.role === 'user';
+    if (isUser) {
+      pendingByActor.clear();
+      out.push(gm);
+      continue;
+    }
+    if (_groupMessageSystemKind(gm) === 'reply_interrupted') {
+      const previousIndex = pendingByActor.get(actor);
+      if (previousIndex !== undefined) out[previousIndex] = null;
+      pendingByActor.set(actor, out.length);
+      out.push(gm);
+      continue;
+    }
+    const supersededIndex = pendingByActor.get(actor);
+    if (supersededIndex !== undefined) {
+      out[supersededIndex] = null;
+      pendingByActor.delete(actor);
+    }
+    out.push(gm);
+  }
+  return out.filter(Boolean);
+}
+
 function _groupMsgToLegacy(gm) {
   if (!gm || typeof gm !== 'object') return gm;
   if (gm.role !== undefined) return gm; // already legacy shape
@@ -2391,6 +2439,8 @@ function _groupMsgToLegacy(gm) {
     ...(Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length ? { marketplace_requests: gm.marketplace_requests } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
+    ...(gm.turn_id ? { _turn_id: gm.turn_id } : {}),
+    ...(_groupMessageSystemKind(gm) ? { _system_kind: _groupMessageSystemKind(gm) } : {}),
   };
   return out;
 }
@@ -2427,6 +2477,10 @@ function _syncRenderedGroupMessageIdentity(el, message) {
   if (msgId && !el.dataset.msgId) el.dataset.msgId = String(msgId);
   const from = message.from || message._from;
   if (from && !el.dataset.fromActor) el.dataset.fromActor = String(from);
+  const turnId = message.turn_id || message.turnId || message._turn_id;
+  if (turnId && !el.dataset.turnId) el.dataset.turnId = String(turnId);
+  const systemKind = message.system_kind || message._system_kind;
+  if (systemKind && !el.dataset.systemKind) el.dataset.systemKind = String(systemKind);
   const tsInput = message.ts || message.time;
   if (tsInput) {
     el.dataset.ts = String(_msTs(tsInput));
@@ -4519,8 +4573,10 @@ async function _loadOlderConversationHistory(cid, before) {
     const knownIds = new Set(Array.from(container.querySelectorAll('.chat-message[data-msg-id]'))
       .map((el) => el.dataset.msgId)
       .filter(Boolean));
-    const page = (Array.isArray(data.history) ? data.history : [])
-      .filter((gm) => gm && !gm.dispatch && (!gm.id || !knownIds.has(String(gm.id))))
+    const page = _collapseSupersededInterruptionRecords(
+      (Array.isArray(data.history) ? data.history : [])
+        .filter((gm) => gm && !gm.dispatch && (!gm.id || !knownIds.has(String(gm.id)))),
+    )
       .map(_groupMsgToLegacy)
       .sort((a, b) => _msTs(a && a.time) - _msTs(b && b.time));
     const fragment = document.createDocumentFragment();
@@ -4531,6 +4587,7 @@ async function _loadOlderConversationHistory(cid, before) {
     }));
     if (row) container.insertBefore(fragment, row);
     else container.insertBefore(fragment, container.firstChild);
+    _removeSupersededInterruptionBubbles(container);
     _setLoadEarlierHistory(container, cid, data.next_cursor);
     // The user deliberately requested older history, so reveal the new page
     // rather than preserving the previous top loader as the viewport anchor.
@@ -4620,8 +4677,9 @@ async function loadConversationHistory(cid, opts = {}) {
     // agent's visibility slice still carries dispatches so the agent has the
     // dispatch text in its own context.
     const renderStartedAt = performance.now();
-    const visibleGroupHistory = (data.history || [])
-      .filter(_isVisibleGroupHistoryRecord);
+    const visibleGroupHistory = _collapseSupersededInterruptionRecords(
+      (data.history || []).filter(_isVisibleGroupHistoryRecord),
+    );
     const history = visibleGroupHistory
       .map(_groupMsgToLegacy)
       // Defensive sort by ts: jsonl is append-ordered (already chronological),
@@ -4806,7 +4864,9 @@ function _scheduleHistoryReconcileAfterStream(cid, opts = {}) {
       const res = await apiFetch(_historyRequestUrl(cid));
       const data = await res.json();
       if (!data.ok || !Array.isArray(data.history)) return;
-      const visible = data.history.filter(_isVisibleGroupHistoryRecord);
+      const visible = _collapseSupersededInterruptionRecords(
+        data.history.filter(_isVisibleGroupHistoryRecord),
+      );
       for (const gm of visible.slice(-8)) {
         if (!gm || !gm.id) continue;
         const el = _findRenderedMessageForHistoryRecord(container, gm);
@@ -4825,7 +4885,9 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   if (!container) return false;
   let changed = false;
   try { await _refreshGroupMembers(cid); } catch (_) { /* best effort */ }
-  const visible = rawMessages.filter((gm) => _isVisibleGroupHistoryRecord(gm) && gm.from !== 'user');
+  const visible = _collapseSupersededInterruptionRecords(
+    rawMessages.filter((gm) => _isVisibleGroupHistoryRecord(gm) && gm.from !== 'user'),
+  );
   for (const gm of visible) {
     if (!gm.id) continue;
     const existing = _findRenderedMessageForHistoryRecord(container, gm);
@@ -4836,7 +4898,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
       }
       continue;
     }
-    const ph = _consumeActorPlaceholder(cid, String(gm.from || ''));
+    const ph = _consumePlaceholderForHistoryRecord(cid, gm);
     if (ph && ph.parentElement) {
       _finalizeActorPlaceholder(ph, gm, cid, true);
       changed = true;
@@ -5474,6 +5536,8 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (typeof opts.msgIndex === 'number') msgDiv.dataset.msgIndex = String(opts.msgIndex);
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
+  if (message._turn_id) msgDiv.dataset.turnId = String(message._turn_id);
+  if (message._system_kind) msgDiv.dataset.systemKind = String(message._system_kind);
   msgDiv.dataset.ts = String(_msTs(message.time));
   if (role === 'user') {
     msgDiv.dataset.retryContent = String(rawContent || '');
@@ -7950,6 +8014,29 @@ function _previousChatMessage(el) {
   return prev || null;
 }
 
+function _removeSupersededInterruptionBubbles(container) {
+  if (!container?.querySelectorAll) return;
+  const pendingByActor = new Map();
+  const messages = Array.from(container.querySelectorAll(':scope > .chat-message'));
+  for (const el of messages) {
+    if (_hasChatMessageClass(el, 'user')) {
+      pendingByActor.clear();
+      continue;
+    }
+    if (!_hasChatMessageClass(el, 'assistant')) continue;
+    const actor = String(el.dataset.fromActor || el.dataset.from || '');
+    if (el.dataset.systemKind === 'reply_interrupted') {
+      const previous = pendingByActor.get(actor);
+      if (previous?.parentElement === container) previous.remove();
+      pendingByActor.set(actor, el);
+      continue;
+    }
+    const superseded = pendingByActor.get(actor);
+    if (superseded?.parentElement === container) superseded.remove();
+    pendingByActor.delete(actor);
+  }
+}
+
 function _isLivePlaceholderMessage(el) {
   return _hasChatMessageClass(el, 'assistant')
     && el?.dataset?.placeholder === '1'
@@ -9445,6 +9532,9 @@ function _setPlaceholderActor(ph, actorId, opts = {}) {
       ph.style.display = 'none';
     }
   }
+  if (actorId && ph.parentElement) {
+    _removeSupersededInterruptionBubbles(ph.parentElement);
+  }
 }
 
 function _refreshActorPlaceholders(cid, actorId) {
@@ -9528,12 +9618,13 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
   return ph;
 }
 
-function _consumeActorPlaceholder(cid, actorId, turnId) {
+function _consumeActorPlaceholder(cid, actorId, turnId, opts = {}) {
   const tid = _normaliseTurnId(turnId);
+  const allowActorFallback = opts.allowActorFallback !== false;
   const k = _phKey(cid, actorId, tid);
   let ph = _groupPlaceholders.get(k);
   _groupPlaceholders.delete(k);
-  if (!ph && tid) {
+  if (!ph && tid && allowActorFallback) {
     const legacyK = _phKey(cid, actorId);
     const legacyPh = _groupPlaceholders.get(legacyK);
     if (legacyPh && legacyPh.parentElement && legacyPh.dataset.finalized !== '1'
@@ -9542,7 +9633,7 @@ function _consumeActorPlaceholder(cid, actorId, turnId) {
       _groupPlaceholders.delete(legacyK);
     }
   }
-  if (!ph) {
+  if (!ph && allowActorFallback) {
     // Segment/final events should carry the same turn id that seeded the live
     // placeholder, but reconnect/runtime recovery paths can leave the DOM with
     // only actor identity. Do not strand a same-actor live bubble in "writing"
@@ -9565,6 +9656,24 @@ function _consumeActorPlaceholder(cid, actorId, turnId) {
   // turn-2 deltas would overwrite turn-1's persisted content.
   if (ph) ph.dataset.finalized = '1';
   return ph || null;
+}
+
+// Polling/history reconciliation has no terminal bus-event envelope to prove
+// which live placeholder a persisted row belongs to. Only claim the exact
+// actor execution recorded on the message itself. Actor-only fallback is
+// intentionally forbidden here: a boot-time interruption status uses the same
+// sender as a newly resumed VideoStudio (or other long-running) turn, and the
+// old fallback finalized the current placeholder with that stale status. Later
+// process events then created another placeholder, visibly splitting one reply
+// across multiple bubbles. Legacy records without `turn_id` are appended as
+// canonical history rows; their live placeholder is resolved by the terminal
+// bus event or the normal end-of-stream history reconcile.
+function _consumePlaceholderForHistoryRecord(cid, gm) {
+  if (gm?.system_kind || gm?._system_kind) return null;
+  const actorId = String(gm?.from || gm?._from || '');
+  const turnId = _normaliseTurnId(gm?.turn_id || gm?.turnId || gm?._turn_id);
+  if (!actorId || !turnId) return null;
+  return _consumeActorPlaceholder(cid, actorId, turnId, { allowActorFallback: false });
 }
 
 // Transform a streaming placeholder bubble into its finalized form:

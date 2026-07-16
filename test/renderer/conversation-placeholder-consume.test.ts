@@ -32,10 +32,58 @@ function extractFunctionUntil(name: string, nextName: string): string {
 
 class FakePlaceholder {
   dataset: Record<string, string>;
-  parentElement = {};
+  parentElement: any = {};
 
   constructor(dataset: Record<string, string>) {
     this.dataset = { ...dataset };
+  }
+}
+
+class FakeChatMessage extends FakePlaceholder {
+  readonly classList: { contains: (name: string) => boolean };
+  readonly processLines: string[];
+  removed = false;
+
+  constructor(
+    classes: string[],
+    dataset: Record<string, string>,
+    processLines: string[] = [],
+  ) {
+    super(dataset);
+    const names = new Set(classes);
+    this.classList = { contains: (name: string) => names.has(name) };
+    this.processLines = processLines;
+  }
+
+  remove() {
+    this.removed = true;
+    this.parentElement?.removeChild(this);
+    this.parentElement = null;
+  }
+}
+
+class FakeHistoryContainer {
+  messages: FakeChatMessage[] = [];
+
+  append(...messages: FakeChatMessage[]) {
+    for (const message of messages) {
+      message.parentElement = this;
+      this.messages.push(message);
+    }
+  }
+
+  prepend(message: FakeChatMessage) {
+    message.parentElement = this;
+    this.messages.unshift(message);
+  }
+
+  removeChild(message: FakeChatMessage) {
+    this.messages = this.messages.filter((candidate) => candidate !== message);
+  }
+
+  querySelectorAll(selector: string) {
+    if (selector !== ':scope > .chat-message') throw new Error(`unexpected selector: ${selector}`);
+    return this.messages.slice();
   }
 }
 
@@ -66,15 +114,22 @@ class FakeDanglingPlaceholder {
 
 function loadPlaceholderHelpers(): {
   placeholders: Map<string, FakePlaceholder>;
-  consume: (cid: string, actorId: string, turnId?: string) => FakePlaceholder | null;
+  consume: (
+    cid: string,
+    actorId: string,
+    turnId?: string,
+    opts?: { allowActorFallback?: boolean },
+  ) => FakePlaceholder | null;
+  consumeHistory: (cid: string, gm: Record<string, unknown>) => FakePlaceholder | null;
   key: (cid: string, actorId: string, turnId?: string) => string;
 } {
   const fns = [
     'const _groupPlaceholders = new Map();',
     extractFunction('_normaliseTurnId'),
     extractFunction('_phKey'),
-    extractFunction('_consumeActorPlaceholder'),
-    '({ placeholders: _groupPlaceholders, consume: _consumeActorPlaceholder, key: _phKey });',
+    extractFunctionUntil('_consumeActorPlaceholder', '_consumePlaceholderForHistoryRecord'),
+    extractFunctionUntil('_consumePlaceholderForHistoryRecord', '_finalizeActorPlaceholder'),
+    '({ placeholders: _groupPlaceholders, consume: _consumeActorPlaceholder, consumeHistory: _consumePlaceholderForHistoryRecord, key: _phKey });',
   ].join('\n');
   return vm.runInNewContext(fns, {});
 }
@@ -105,6 +160,21 @@ function loadActivityHelpers() {
       wallNow = wall;
       monotonicNow = monotonic;
     },
+  };
+}
+
+function loadInterruptionHelpers() {
+  return vm.runInNewContext([
+    extractFunctionUntil('_groupMessageSystemKind', '_collapseSupersededInterruptionRecords'),
+    extractFunctionUntil('_collapseSupersededInterruptionRecords', '_groupMsgToLegacy'),
+    extractFunction('_isChatMessageEl'),
+    extractFunction('_hasChatMessageClass'),
+    extractFunction('_removeSupersededInterruptionBubbles'),
+    '({ systemKind: _groupMessageSystemKind, collapse: _collapseSupersededInterruptionRecords, removeBubbles: _removeSupersededInterruptionBubbles });',
+  ].join('\n'), { Map }) as {
+    systemKind: (message: Record<string, unknown>) => string;
+    collapse: (messages: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
+    removeBubbles: (container: FakeHistoryContainer) => void;
   };
 }
 
@@ -157,6 +227,41 @@ describe('conversation actor placeholder consume', () => {
     expect(placeholders.get(key('cid-1', 'agent-1', 'turn-2'))).toBe(agent);
   });
 
+  it('does not let an uncorrelated polled row consume a live same-actor turn', () => {
+    const { placeholders, consumeHistory, key } = loadPlaceholderHelpers();
+    const active = new FakePlaceholder({ fromActor: 'video-studio', turnId: 'turn-live' });
+    placeholders.set(key('cid-1', 'video-studio', 'turn-live'), active);
+
+    expect(consumeHistory('cid-1', {
+      id: 'interruption-row',
+      from: 'video-studio',
+      system_kind: 'reply_interrupted',
+    })).toBeNull();
+    expect(consumeHistory('cid-1', {
+      id: 'legacy-row-without-turn',
+      from: 'video-studio',
+    })).toBeNull();
+    expect(active.dataset.finalized).toBeUndefined();
+    expect(placeholders.get(key('cid-1', 'video-studio', 'turn-live'))).toBe(active);
+  });
+
+  it('claims a polled terminal row only for its exact persisted turn id', () => {
+    const { placeholders, consumeHistory, key } = loadPlaceholderHelpers();
+    const old = new FakePlaceholder({ fromActor: 'video-studio', turnId: 'turn-old' });
+    const active = new FakePlaceholder({ fromActor: 'video-studio', turnId: 'turn-live' });
+    placeholders.set(key('cid-1', 'video-studio', 'turn-old'), old);
+    placeholders.set(key('cid-1', 'video-studio', 'turn-live'), active);
+
+    expect(consumeHistory('cid-1', {
+      id: 'terminal-row',
+      from: 'video-studio',
+      turn_id: 'turn-old',
+    })).toBe(old);
+    expect(old.dataset.finalized).toBe('1');
+    expect(active.dataset.finalized).toBeUndefined();
+    expect(placeholders.get(key('cid-1', 'video-studio', 'turn-live'))).toBe(active);
+  });
+
   it('keeps process-bearing abort placeholders until the persisted message consumes them', () => {
     const processPlaceholder = new FakeDanglingPlaceholder(2);
     const emptyPlaceholder = new FakeDanglingPlaceholder(0);
@@ -186,6 +291,139 @@ describe('conversation actor placeholder consume', () => {
 
     expect(processPlaceholder.removed).toBe(true);
     expect(placeholders.size).toBe(0);
+  });
+});
+
+describe('conversation interruption bubble collapse', () => {
+  it('recognizes legacy host-authored interruption rows', () => {
+    const { systemKind } = loadInterruptionHelpers();
+    expect(systemKind({
+      model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply.',
+    })).toBe('reply_interrupted');
+  });
+
+  it('removes a superseded same-actor interruption without crossing a user message', () => {
+    const { collapse } = loadInterruptionHelpers();
+    const interruption = { id: 'status', from: 'video-studio', system_kind: 'reply_interrupted' };
+    const resumed = { id: 'answer', from: 'video-studio', turn_id: 'turn-2' };
+
+    expect(collapse([interruption, resumed]).map((row) => row.id)).toEqual(['answer']);
+    expect(collapse([
+      interruption,
+      { ...interruption, id: 'status-new' },
+      resumed,
+    ]).map((row) => row.id)).toEqual(['answer']);
+    expect(collapse([
+      interruption,
+      { id: 'user-2', from: 'user' },
+      resumed,
+    ]).map((row) => row.id)).toEqual(['status', 'user-2', 'answer']);
+  });
+
+  it('keeps exactly one VideoStudio bubble through stale polling, resumed progress, and terminal persistence', () => {
+    const { placeholders, consumeHistory, key } = loadPlaceholderHelpers();
+    const { removeBubbles } = loadInterruptionHelpers();
+    const history = new FakeHistoryContainer();
+    const staleInterruptions = Array.from({ length: 6 }, (_, index) => new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      {
+        fromActor: 'video-studio',
+        msgId: `interruption-${index + 1}`,
+        systemKind: 'reply_interrupted',
+      },
+    ));
+    const progressLines = [
+      'Captured frame 841/4950.',
+      'Captured frame 901/4950.',
+      'Captured frame 1681/4950.',
+    ];
+    const live = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      {
+        fromActor: 'video-studio',
+        placeholder: '1',
+        turnId: 'video-turn-live',
+      },
+      progressLines,
+    );
+    history.append(...staleInterruptions, live);
+    placeholders.set(key('cid-video', 'video-studio', 'video-turn-live'), live);
+
+    // Startup polling can replay one or several interruption rows written by
+    // earlier app exits. None may finalize the currently resumed actor turn.
+    for (const interruption of staleInterruptions) {
+      expect(consumeHistory('cid-video', {
+        id: interruption.dataset.msgId,
+        from: 'video-studio',
+        system_kind: 'reply_interrupted',
+      })).toBeNull();
+    }
+    expect(live.dataset.finalized).toBeUndefined();
+    expect(placeholders.get(key('cid-video', 'video-studio', 'video-turn-live'))).toBe(live);
+
+    // Learning the resumed placeholder's actor identity performs the same DOM
+    // cleanup as the production renderer. Even repeated crashes must not leave
+    // a stack of assistant bubbles above the continuing progress rail.
+    removeBubbles(history);
+    expect(history.messages).toEqual([live]);
+    expect(staleInterruptions.every((message) => message.removed)).toBe(true);
+    expect(live.processLines).toEqual(progressLines);
+
+    live.processLines.push('Captured frame 4921/4950.');
+    expect(consumeHistory('cid-video', {
+      id: 'video-final',
+      from: 'video-studio',
+      turn_id: 'video-turn-live',
+    })).toBe(live);
+    expect(live.dataset.finalized).toBe('1');
+    expect(live.processLines.at(-1)).toBe('Captured frame 4921/4950.');
+    expect(history.messages).toHaveLength(1);
+  });
+
+  it('collapses an interruption loaded from an older page against a newer same-actor bubble', () => {
+    const { removeBubbles } = loadInterruptionHelpers();
+    const history = new FakeHistoryContainer();
+    const resumed = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      { fromActor: 'video-studio', msgId: 'resumed-answer', turnId: 'turn-2' },
+    );
+    history.append(resumed);
+
+    // Older-history paging prepends records after the newer page is already
+    // mounted. The record-only collapse cannot see across that page boundary,
+    // so the DOM pass must remove the stale bubble.
+    const olderInterruption = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      { fromActor: 'video-studio', msgId: 'old-status', systemKind: 'reply_interrupted' },
+    );
+    history.prepend(olderInterruption);
+    removeBubbles(history);
+
+    expect(olderInterruption.removed).toBe(true);
+    expect(history.messages).toEqual([resumed]);
+  });
+
+  it('preserves a genuine prior-turn interruption when a user message starts the resumed turn', () => {
+    const { removeBubbles } = loadInterruptionHelpers();
+    const history = new FakeHistoryContainer();
+    const interrupted = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      { fromActor: 'video-studio', msgId: 'prior-status', systemKind: 'reply_interrupted' },
+    );
+    const user = new FakeChatMessage(
+      ['chat-message', 'user'],
+      { msgId: 'continue-request' },
+    );
+    const resumed = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      { fromActor: 'video-studio', msgId: 'next-answer', turnId: 'turn-next' },
+    );
+    history.append(interrupted, user, resumed);
+
+    removeBubbles(history);
+
+    expect(interrupted.removed).toBe(false);
+    expect(history.messages).toEqual([interrupted, user, resumed]);
   });
 });
 

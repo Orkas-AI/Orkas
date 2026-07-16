@@ -526,7 +526,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     });
 
     try {
-      await bus.enqueue({
+      const trigger = await bus.enqueue({
         uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
         text: 'ACTIVE_TURN_TEST',
       });
@@ -541,6 +541,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       expect(running.activeTurns[0]).toMatchObject({
         actor: 'commander',
         turn_id: processEv.turn_id,
+        msg_id: trigger.id,
         started_at_ms: expect.any(Number),
       });
       expect(running.activeTurns[0].started_at_ms).toBeLessThanOrEqual(Date.now());
@@ -553,6 +554,13 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
       const finalEv = events.find((ev) => ev.type === 'message' && ev.turn_end && ev.msg?.from === 'commander');
       expect(finalEv?.turn_id).toBe(processEv.turn_id);
+      expect(finalEv?.msg?.turn_id).toBe(processEv.turn_id);
+      const paths = await import('../../../../src/main/paths');
+      const persisted = fs.readFileSync(
+        path.join(paths.userChatsDir(TEST_UID), `${TEST_CID}.jsonl`),
+        'utf8',
+      ).trim().split('\n').map((line) => JSON.parse(line));
+      expect(persisted.find((row) => row.id === finalEv?.msg?.id)?.turn_id).toBe(processEv.turn_id);
       expect(bus.runtimeSnapshot(TEST_UID, TEST_CID).activeTurns).toEqual([]);
     } finally {
       streamGate.releaseActiveTurn?.();

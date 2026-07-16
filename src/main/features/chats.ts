@@ -2200,6 +2200,7 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
         ts,
         from: senderId,
         to: ['user'],
+        system_kind: 'reply_interrupted',
         text: t('chat.reply_interrupted'),
         model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
       };
