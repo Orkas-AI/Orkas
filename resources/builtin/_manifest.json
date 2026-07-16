@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "8269c65bbdbcc72062cbbfe345636b27421c7b1481210ce7ee5663665ef134d3",
+  "content_tree_sha256": "9a8f77dd4dfce8ea3a8095c9e1e5ef2af9a2f31419ebbff3ad7d4b659a30601a",
   "files": [
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -14,8 +14,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
-      "bytes": 34234,
-      "sha256": "224be07c5f780c001125371daf6882c62b432bb16e19b3ab729a071bba8507ab"
+      "bytes": 32676,
+      "sha256": "f23aa1d487fb89a536e11dc7df36bc93e32762df78f5de0c9b09bb8e9e141201"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -93,6 +93,16 @@
       "sha256": "d45a918c2ffdfc742c65d2526c94f58027f3eb1aa2a3218ed8a3d44df9bb84a3"
     },
     {
+      "path": "marketplace/agents/79df9cc89f5f/skills/gate-control/scripts/resolve-transition.mjs",
+      "bytes": 11036,
+      "sha256": "53dd393e3faa3237cab6a73a0cae16ba2f28f69a622e353a385f6f8a89fbc184"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/gate-control/SKILL.md",
+      "bytes": 6472,
+      "sha256": "1ec3005acffbf5a75dc7e51159c977b0002800efa94f6552d0edcc4a8191b620"
+    },
+    {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-assemble/SKILL.md",
       "bytes": 16135,
       "sha256": "76871d22ad3026bf67fd8f3c1c2dbdac52ee3eaa9cf39e83891050ff38b2370c"
@@ -104,8 +114,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md",
-      "bytes": 51298,
-      "sha256": "d34a8bbbaaa98438993f509f595a9d5e7281c7fa371bf35a88152af754aa994f"
+      "bytes": 47300,
+      "sha256": "386cba7fb2993aca87c6e652d37cc06adb149cd5a2687f7b373edc637a447bec"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-consistency/SKILL.md",
@@ -677,11 +687,12 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.0.47",
+        "version": "1.0.48",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
           "frontend-design",
+          "gate-control",
           "stage-assemble",
           "stage-compose",
           "stage-consistency",
@@ -696,6 +707,7 @@
           "composition-design-review",
           "design-system-importer",
           "frontend-design",
+          "gate-control",
           "stage-assemble",
           "stage-compose",
           "stage-consistency",

@@ -41,7 +41,7 @@ describe('builtin-resource-gate', () => {
 
     expect(gate.verifyBuiltinRoot(root, { allowIgnoredJunk: true }))
       .toBe('resource:builtin:manifest-v1');
-    expect(manifest.files).toHaveLength(127);
+    expect(manifest.files).toHaveLength(129);
     expect(manifest.inventory.system_skills).toHaveLength(5);
     expect(manifest.inventory.marketplace_agents).toHaveLength(4);
     expect(manifest.inventory.marketplace_skills).toHaveLength(4);
