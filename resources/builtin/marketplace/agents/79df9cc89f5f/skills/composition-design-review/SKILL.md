@@ -58,6 +58,7 @@ Fix:
 - Repeated layout, transition, or card pattern three or more times in a row.
 - Palette uses extra chromatic colors beyond the contract.
 - Type hierarchy is flat or labels feel like UI residue instead of video graphics.
+- English titles, body copy, captions, subtitles, or CTAs are forced to all caps, or two or more English text roles in one scene use all caps without an explicit user, brand, or art-direction reason. Restore the approved natural casing and use scale, weight, width, color, or spacing for hierarchy; keep all caps only for one short metadata label, acronym, or code.
 - Scene density is too high for phone viewing.
 - Style-source adaptation is vague: it borrows mood words but no concrete tokens.
 

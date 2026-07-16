@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "5f9d72aaf7c24f8b533b35872019035f42dc79ec500a7b30a3921e343f54f087",
+  "content_tree_sha256": "b0aa8dc347fb09ecd29a1c43f348aebcc7579b8d697f81796e89f739ec3a0d82",
   "files": [
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -14,8 +14,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
-      "bytes": 31743,
-      "sha256": "799f6712df800fcaf401d4c45e9560405718662e2233a75a7259283bad0e9bb3"
+      "bytes": 32307,
+      "sha256": "2b5a98f6cf67d9fe16e7fb9228c312a217de4755d30a73c0580e04efbceb65c7"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -64,8 +64,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/composition-design-review/SKILL.md",
-      "bytes": 6272,
-      "sha256": "f49fb4498bec6e626e6dbb00c61ece2070e9412e1c498d0893c6c5dae2b9b6ee"
+      "bytes": 6638,
+      "sha256": "e01f3e58c5dd0e89fcfc4c7720a741dccf0dd896fa95b099c931722fd5182c33"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/design-system-importer/SKILL.md",
@@ -79,8 +79,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/references/visual-primitives.md",
-      "bytes": 7573,
-      "sha256": "77343403effb6fabfbeb7313ea1367536f91b3b64bbe3c6f5df21ac46490ef77"
+      "bytes": 7769,
+      "sha256": "de41211f415eccf5f71b73f0dc038ee8e365a294ea77dd2d8ad48d28a3252963"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/references/worked-compositions.md",
@@ -89,8 +89,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/SKILL.md",
-      "bytes": 18320,
-      "sha256": "6f1800d3f8e99bef91b65c48a065d62657e7c898683b021f89a6007cba19006f"
+      "bytes": 18960,
+      "sha256": "d45a918c2ffdfc742c65d2526c94f58027f3eb1aa2a3218ed8a3d44df9bb84a3"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-assemble/SKILL.md",
@@ -104,8 +104,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md",
-      "bytes": 46030,
-      "sha256": "8b0c987d598455ae0537c538d39ba8590a8f101f05c0a29205c5611bda56e5ec"
+      "bytes": 46367,
+      "sha256": "165c208266e025e9afccbef2cc3fbff9081012b4ddc341475a13bc3ae6155d7c"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-consistency/SKILL.md",
@@ -677,7 +677,7 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.0.44",
+        "version": "1.0.45",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",

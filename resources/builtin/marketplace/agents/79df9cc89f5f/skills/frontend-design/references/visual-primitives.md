@@ -49,12 +49,12 @@ body {
   font-size: 38px;
   line-height: 1;
   font-weight: 650;
-  letter-spacing: .12em;
-  text-transform: uppercase;
+  letter-spacing: .06em;
 }
 ```
 
 Derive tokens from the design contract. Do not paste this palette into unrelated work.
+Preserve the authored case by default. All caps is an optional accent for one short metadata label, acronym, or code—not the default treatment for labels and never a broad selector for titles, body copy, captions, or CTAs.
 
 ## 2. Topic-derived background field
 
