@@ -51,6 +51,13 @@ import {
 import { limitNameDisplayText } from '../util/name-limit';
 
 const log = createLogger('chats');
+// A boot-time stale-state sweep may run twice: once before the first window
+// and again as a deferred cross-user maintenance pass. Only a state whose
+// activity predates this main-process module can belong to a previous crash.
+// Without this cutoff, the deferred pass can wake several minutes later while
+// a newly-started long VideoStudio turn is legitimately running and manufacture
+// a false "reply interrupted" message in the middle of that live bubble.
+const PROCESS_BOOT_CUTOFF_MS = Date.now();
 import * as search from './search';
 import {
   ensureRunningConversationRegistry,
@@ -2178,11 +2185,26 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       candidates.push(...await _conversationStateCandidates(uid));
     }
   }
+  // Loaded lazily to avoid the chats ↔ bus module cycle during startup. The
+  // CJS path deliberately shares the same in-memory runtime map as send().
+  const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
   await _runBounded(candidates, 32, async ({ uid, cid, file }) => {
     try {
       const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
       if (raw?.status !== 'running') {
         if (pruneJournalRows) await untrackRunningConversation(uid, cid);
+        return;
+      }
+      const lastActiveMs = Date.parse(String(raw.last_active_at || ''));
+      if (Number.isFinite(lastActiveMs) && lastActiveMs >= PROCESS_BOOT_CUTOFF_MS) {
+        // This state was created or refreshed by the current process. It is
+        // never stale startup residue, even if this deferred sweep was queued
+        // before the user started the turn.
+        return;
+      }
+      if (!bus.isQuiescent(uid, cid)) {
+        // Belt-and-braces for legacy/malformed timestamps and turn-start races:
+        // live in-memory work always wins over disk maintenance.
         return;
       }
       await setStatus(uid, cid, 'idle');

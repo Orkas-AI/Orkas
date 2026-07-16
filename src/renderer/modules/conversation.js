@@ -4883,7 +4883,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   if (!cid || cid !== currentCid || !Array.isArray(rawMessages)) return false;
   const container = document.getElementById('chat-history');
   if (!container) return false;
-  let changed = false;
+  let changed = _removeSupersededInterruptionBubbles(container) > 0;
   try { await _refreshGroupMembers(cid); } catch (_) { /* best effort */ }
   const visible = _collapseSupersededInterruptionRecords(
     rawMessages.filter((gm) => _isVisibleGroupHistoryRecord(gm) && gm.from !== 'user'),
@@ -4904,11 +4904,18 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
       changed = true;
       continue;
     }
+    // An uncorrelated interruption row can be stale while a newer exact turn
+    // for the same actor is live (or can itself be a false row from deferred
+    // boot maintenance). Do not append a second bubble mid-stream. Once the
+    // runtime settles, normal history reconciliation either removes the row as
+    // superseded by the final message or renders it when it was genuine.
+    if (_shouldDeferInterruptedHistoryRecord(cid, gm)) continue;
     const legacy = _groupMsgToLegacy(gm);
     const bubble = appendChatMessage(legacy, true, { cid, archive: true });
     if (bubble) bubble.dataset.fromActor = String(gm.from || '');
     changed = true;
   }
+  if (_removeSupersededInterruptionBubbles(container) > 0) changed = true;
   if (changed) {
     try { if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid); } catch (_) {}
     _scheduleConversationInfoFileRefresh(cid);
@@ -8015,26 +8022,50 @@ function _previousChatMessage(el) {
 }
 
 function _removeSupersededInterruptionBubbles(container) {
-  if (!container?.querySelectorAll) return;
+  if (!container?.querySelectorAll) return 0;
   const pendingByActor = new Map();
+  const liveByActor = new Set();
+  let removed = 0;
   const messages = Array.from(container.querySelectorAll(':scope > .chat-message'));
   for (const el of messages) {
     if (_hasChatMessageClass(el, 'user')) {
       pendingByActor.clear();
+      liveByActor.clear();
       continue;
     }
     if (!_hasChatMessageClass(el, 'assistant')) continue;
     const actor = String(el.dataset.fromActor || el.dataset.from || '');
     if (el.dataset.systemKind === 'reply_interrupted') {
+      // A boot-maintenance race used to append a false interruption below a
+      // still-running placeholder. Never show that as a second bubble. The
+      // polling path defers the record too; this DOM guard repairs an already
+      // mounted row from an earlier poll without discarding the process rail.
+      if (liveByActor.has(actor)) {
+        el.remove();
+        removed += 1;
+        continue;
+      }
       const previous = pendingByActor.get(actor);
-      if (previous?.parentElement === container) previous.remove();
+      if (previous?.parentElement === container) {
+        previous.remove();
+        removed += 1;
+      }
       pendingByActor.set(actor, el);
       continue;
     }
     const superseded = pendingByActor.get(actor);
-    if (superseded?.parentElement === container) superseded.remove();
+    if (superseded?.parentElement === container) {
+      superseded.remove();
+      removed += 1;
+    }
     pendingByActor.delete(actor);
+    if (el.dataset.placeholder === '1' && el.dataset.finalized !== '1') {
+      liveByActor.add(actor);
+    } else {
+      liveByActor.delete(actor);
+    }
   }
+  return removed;
 }
 
 function _isLivePlaceholderMessage(el) {
@@ -9660,20 +9691,44 @@ function _consumeActorPlaceholder(cid, actorId, turnId, opts = {}) {
 
 // Polling/history reconciliation has no terminal bus-event envelope to prove
 // which live placeholder a persisted row belongs to. Only claim the exact
-// actor execution recorded on the message itself. Actor-only fallback is
-// intentionally forbidden here: a boot-time interruption status uses the same
-// sender as a newly resumed VideoStudio (or other long-running) turn, and the
-// old fallback finalized the current placeholder with that stale status. Later
-// process events then created another placeholder, visibly splitting one reply
-// across multiple bubbles. Legacy records without `turn_id` are appended as
-// canonical history rows; their live placeholder is resolved by the terminal
-// bus event or the normal end-of-stream history reconcile.
+// actor execution recorded on the message itself. General actor-only fallback
+// is intentionally forbidden: an old interruption status can share a sender
+// with a newly resumed VideoStudio turn. The sole legacy exception is a real
+// boot-recovery interruption claiming an actor-only placeholder that itself has
+// no turn id; it cannot collide with a process-driven, turn-keyed live bubble.
 function _consumePlaceholderForHistoryRecord(cid, gm) {
-  if (gm?.system_kind || gm?._system_kind) return null;
   const actorId = String(gm?.from || gm?._from || '');
   const turnId = _normaliseTurnId(gm?.turn_id || gm?.turnId || gm?._turn_id);
-  if (!actorId || !turnId) return null;
+  if (!actorId) return null;
+  const systemKind = _groupMessageSystemKind(gm);
+  if (systemKind === 'reply_interrupted') {
+    if (turnId) {
+      return _consumeActorPlaceholder(cid, actorId, turnId, { allowActorFallback: false });
+    }
+    // Old state.json files persisted only `in_flight`, so a genuine boot
+    // recovery placeholder has the actor-only key and no turn id. Claim only
+    // that exact legacy placeholder. A newly resumed/process-driven turn is
+    // keyed by turn id and must never be finalized by this uncorrelated row.
+    const legacy = _groupPlaceholders.get(_phKey(cid, actorId));
+    if (!legacy?.parentElement || legacy.dataset.finalized === '1'
+        || _normaliseTurnId(legacy.dataset.turnId)) return null;
+    return _consumeActorPlaceholder(cid, actorId, undefined, { allowActorFallback: false });
+  }
+  if (systemKind || !turnId) return null;
   return _consumeActorPlaceholder(cid, actorId, turnId, { allowActorFallback: false });
+}
+
+function _shouldDeferInterruptedHistoryRecord(cid, gm) {
+  if (_groupMessageSystemKind(gm) !== 'reply_interrupted') return false;
+  const actorId = String(gm?.from || gm?._from || '');
+  if (!actorId) return false;
+  for (const [key, ph] of _groupPlaceholders.entries()) {
+    if (!key.startsWith(`${cid}:`)) continue;
+    if (String(ph?.dataset?.fromActor || '') !== actorId) continue;
+    if (ph?.dataset?.finalized === '1') continue;
+    if (ph?.parentElement) return true;
+  }
+  return false;
 }
 
 // Transform a streaming placeholder bubble into its finalized form:

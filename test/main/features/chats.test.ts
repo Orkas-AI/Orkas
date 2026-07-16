@@ -1196,6 +1196,29 @@ describe('chats › autoTitle on first send', () => {
 });
 
 describe('chats › sweepStaleProcessing', () => {
+  const staleActiveAt = () => new Date(Date.now() - 60_000).toISOString();
+
+  it('does not interrupt a conversation that started in the current process before the deferred sweep', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const stateFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id, 'state.json');
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      status: 'running',
+      last_active_at: new Date().toISOString(),
+      in_flight: ['79df9cc89f5f'],
+    }));
+
+    expect((await chats.sweepStaleProcessing()).swept).toBe(0);
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
+    expect(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`),
+      'utf8',
+    )).toBe('');
+  });
+
   it('uses the indexed active-user fallback once when the journal is missing', async () => {
     const chats = await loadChats();
     const active = await chats.createConversation(TEST_UID);
@@ -1208,7 +1231,7 @@ describe('chats › sweepStaleProcessing', () => {
       const file = path.join(tmpDir, uid, 'cloud', 'chats', cid, 'state.json');
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify({
-        version: 1, status: 'running', last_active_at: new Date().toISOString(), in_flight: ['commander'],
+        version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: ['commander'],
       }));
     }
 
@@ -1233,7 +1256,7 @@ describe('chats › sweepStaleProcessing', () => {
       const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', cid, 'state.json');
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify({
-        version: 1, status: 'running', last_active_at: new Date().toISOString(), in_flight: [],
+        version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: [],
       }));
     }
     const paths = await import('../../../src/main/paths');
@@ -1262,7 +1285,7 @@ describe('chats › sweepStaleProcessing', () => {
       tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id, 'state.json');
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({
-      version: 1, status: 'running', last_active_at: new Date().toISOString(), in_flight: [],
+      version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: [],
     }));
     const paths = await import('../../../src/main/paths');
     const journal = paths.userRunningConversationsFile(TEST_UID);
@@ -1283,7 +1306,7 @@ describe('chats › sweepStaleProcessing', () => {
     const stateFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id, 'state.json');
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({
-      version: 1, status: 'running', last_active_at: new Date().toISOString(), in_flight: ['79df9cc89f5f'],
+      version: 1, status: 'running', last_active_at: staleActiveAt(), in_flight: ['79df9cc89f5f'],
     }));
     fs.writeFileSync(path.join(path.dirname(stateFile), 'members.json'), JSON.stringify({
       version: 1,

@@ -121,15 +121,17 @@ function loadPlaceholderHelpers(): {
     opts?: { allowActorFallback?: boolean },
   ) => FakePlaceholder | null;
   consumeHistory: (cid: string, gm: Record<string, unknown>) => FakePlaceholder | null;
+  deferHistory: (cid: string, gm: Record<string, unknown>) => boolean;
   key: (cid: string, actorId: string, turnId?: string) => string;
 } {
   const fns = [
     'const _groupPlaceholders = new Map();',
     extractFunction('_normaliseTurnId'),
     extractFunction('_phKey'),
+    extractFunction('_groupMessageSystemKind'),
     extractFunctionUntil('_consumeActorPlaceholder', '_consumePlaceholderForHistoryRecord'),
     extractFunctionUntil('_consumePlaceholderForHistoryRecord', '_finalizeActorPlaceholder'),
-    '({ placeholders: _groupPlaceholders, consume: _consumeActorPlaceholder, consumeHistory: _consumePlaceholderForHistoryRecord, key: _phKey });',
+    '({ placeholders: _groupPlaceholders, consume: _consumeActorPlaceholder, consumeHistory: _consumePlaceholderForHistoryRecord, deferHistory: _shouldDeferInterruptedHistoryRecord, key: _phKey });',
   ].join('\n');
   return vm.runInNewContext(fns, {});
 }
@@ -174,7 +176,7 @@ function loadInterruptionHelpers() {
   ].join('\n'), { Map }) as {
     systemKind: (message: Record<string, unknown>) => string;
     collapse: (messages: Array<Record<string, unknown>>) => Array<Record<string, unknown>>;
-    removeBubbles: (container: FakeHistoryContainer) => void;
+    removeBubbles: (container: FakeHistoryContainer) => number;
   };
 }
 
@@ -228,7 +230,7 @@ describe('conversation actor placeholder consume', () => {
   });
 
   it('does not let an uncorrelated polled row consume a live same-actor turn', () => {
-    const { placeholders, consumeHistory, key } = loadPlaceholderHelpers();
+    const { placeholders, consumeHistory, deferHistory, key } = loadPlaceholderHelpers();
     const active = new FakePlaceholder({ fromActor: 'video-studio', turnId: 'turn-live' });
     placeholders.set(key('cid-1', 'video-studio', 'turn-live'), active);
 
@@ -237,12 +239,36 @@ describe('conversation actor placeholder consume', () => {
       from: 'video-studio',
       system_kind: 'reply_interrupted',
     })).toBeNull();
+    expect(deferHistory('cid-1', {
+      id: 'interruption-row',
+      from: 'video-studio',
+      system_kind: 'reply_interrupted',
+    })).toBe(true);
     expect(consumeHistory('cid-1', {
       id: 'legacy-row-without-turn',
       from: 'video-studio',
     })).toBeNull();
     expect(active.dataset.finalized).toBeUndefined();
     expect(placeholders.get(key('cid-1', 'video-studio', 'turn-live'))).toBe(active);
+  });
+
+  it('claims a genuine boot interruption only from its actor-only legacy placeholder', () => {
+    const { placeholders, consumeHistory, key } = loadPlaceholderHelpers();
+    const interrupted = new FakePlaceholder({ fromActor: 'video-studio' });
+    const resumed = new FakePlaceholder({ fromActor: 'video-studio', turnId: 'turn-live' });
+    placeholders.set(key('cid-old', 'video-studio'), interrupted);
+    placeholders.set(key('cid-live', 'video-studio', 'turn-live'), resumed);
+    const status = {
+      id: 'interruption-row',
+      from: 'video-studio',
+      system_kind: 'reply_interrupted',
+    };
+
+    expect(consumeHistory('cid-old', status)).toBe(interrupted);
+    expect(interrupted.dataset.finalized).toBe('1');
+    expect(consumeHistory('cid-live', status)).toBeNull();
+    expect(resumed.dataset.finalized).toBeUndefined();
+    expect(placeholders.get(key('cid-live', 'video-studio', 'turn-live'))).toBe(resumed);
   });
 
   it('claims a polled terminal row only for its exact persisted turn id', () => {
@@ -378,6 +404,53 @@ describe('conversation interruption bubble collapse', () => {
     expect(live.dataset.finalized).toBe('1');
     expect(live.processLines.at(-1)).toBe('Captured frame 4921/4950.');
     expect(history.messages).toHaveLength(1);
+  });
+
+  it('does not append a false interruption below a currently running VideoStudio bubble', () => {
+    const { placeholders, consumeHistory, deferHistory, key } = loadPlaceholderHelpers();
+    const { removeBubbles } = loadInterruptionHelpers();
+    const history = new FakeHistoryContainer();
+    const live = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      {
+        fromActor: 'video-studio',
+        placeholder: '1',
+        turnId: 'turn-that-kept-running',
+      },
+      ['read_file · 完成', 'video_studio · 完成', '正在整理当前轮工具上下文'],
+    );
+    history.append(live);
+    placeholders.set(key('cid-video', 'video-studio', 'turn-that-kept-running'), live);
+    const falseInterruption = {
+      id: 'false-boot-status',
+      from: 'video-studio',
+      system_kind: 'reply_interrupted',
+    };
+
+    // This is the exact screenshot order: the live bubble already exists,
+    // then deferred boot maintenance writes an uncorrelated interruption.
+    const claimed = consumeHistory('cid-video', falseInterruption);
+    expect(claimed).toBeNull();
+    expect(deferHistory('cid-video', falseInterruption)).toBe(true);
+    if (!claimed && !deferHistory('cid-video', falseInterruption)) {
+      history.append(new FakeChatMessage(
+        ['chat-message', 'assistant'],
+        { fromActor: 'video-studio', systemKind: 'reply_interrupted' },
+      ));
+    }
+
+    expect(live.dataset.finalized).toBeUndefined();
+    expect(history.messages).toEqual([live]);
+
+    // Also repair a row mounted by an older renderer before this guard ran.
+    const alreadyMounted = new FakeChatMessage(
+      ['chat-message', 'assistant'],
+      { fromActor: 'video-studio', systemKind: 'reply_interrupted' },
+    );
+    history.append(alreadyMounted);
+    expect(removeBubbles(history)).toBe(1);
+    expect(alreadyMounted.removed).toBe(true);
+    expect(history.messages).toEqual([live]);
   });
 
   it('collapses an interruption loaded from an older page against a newer same-actor bubble', () => {
