@@ -1,6 +1,6 @@
 {
   "name": "orkas",
-  "version": "2026.7.9",
+  "version": "2026.7.17",
   "private": true,
   "description": "Orkas desktop — Electron + Node one-piece app",
   "main": "bootstrap.cjs",
