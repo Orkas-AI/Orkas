@@ -1562,6 +1562,8 @@
   <script src="./modules/user-workspace.js"></script>
   <script src="./modules/local-agents.js"></script>
   <script src="./vendor/pinyin-firstletter/data.js"></script>
+  <!-- DOMPurify must load before utils.js so inline connector SVGs are sanitized, not disabled. -->
+  <script src="./vendor/dompurify/purify.min.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
   <script src="./modules/agents.js"></script>
   <script src="./modules/auto-title.js"></script>
