@@ -47,7 +47,7 @@ Orkas is an open-source, local-first AI workforce. A super-powered **Commander**
 ## Download
 
 - **Get the app** → [orkas.ai](https://orkas.ai?source=github) (macOS · Windows installers)
-- **Run from source** → see [Quick start](#quick-start) below
+- **Run from source** → see [Quick start](#quick-start) below (currently required on Linux)
 
 ---
 
@@ -96,7 +96,7 @@ Yes — MIT licensed. Bring your own model keys; you only ever pay your model pr
 
 ## Quick start
 
-Prefer the packaged app? Use the production installer links:
+Packaged installers are currently available for macOS and Windows. Linux users should follow the source instructions below.
 
 - **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=github&os=mac&arch=arm64&download=1)
 - **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=github&os=mac&arch=x64&download=1)
