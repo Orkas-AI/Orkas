@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "b0aa8dc347fb09ecd29a1c43f348aebcc7579b8d697f81796e89f739ec3a0d82",
+  "content_tree_sha256": "8269c65bbdbcc72062cbbfe345636b27421c7b1481210ce7ee5663665ef134d3",
   "files": [
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -14,8 +14,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
-      "bytes": 32307,
-      "sha256": "2b5a98f6cf67d9fe16e7fb9228c312a217de4755d30a73c0580e04efbceb65c7"
+      "bytes": 34234,
+      "sha256": "224be07c5f780c001125371daf6882c62b432bb16e19b3ab729a071bba8507ab"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -104,8 +104,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md",
-      "bytes": 46367,
-      "sha256": "165c208266e025e9afccbef2cc3fbff9081012b4ddc341475a13bc3ae6155d7c"
+      "bytes": 51298,
+      "sha256": "d34a8bbbaaa98438993f509f595a9d5e7281c7fa371bf35a88152af754aa994f"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-consistency/SKILL.md",
@@ -677,7 +677,7 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.0.45",
+        "version": "1.0.47",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
