@@ -38,7 +38,7 @@ interface ClientConnectorInstance {
   id: string;
   display_name: string;
   origin?: 'catalog' | 'custom';
-  transport:
+  transport?:
     | { kind: 'stdio'; summary: string }
     | { kind: 'streamable-http'; summary: string };
   enabled_subtools: string[] | null;
@@ -51,15 +51,17 @@ interface ClientConnectorInstance {
   enabled?: boolean;
 }
 
-function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] {
-  if (inst.transport.kind === 'stdio') {
-    const command = path.basename(inst.transport.command || '');
-    const argCount = inst.transport.args?.length ?? 0;
+function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] | undefined {
+  const transport = inst.transport;
+  if (!transport) return undefined;
+  if (transport.kind === 'stdio') {
+    const command = path.basename(transport.command || '');
+    const argCount = transport.args?.length ?? 0;
     const suffix = argCount === 1 ? '1 arg' : `${argCount} args`;
     return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command };
   }
   try {
-    const url = new URL(inst.transport.url);
+    const url = new URL(transport.url);
     url.username = '';
     url.password = '';
     url.search = '';
@@ -77,7 +79,7 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
     id: inst.id,
     display_name: inst.display_name,
     ...(inst.origin ? { origin: inst.origin } : {}),
-    transport,
+    ...(transport ? { transport } : {}),
     enabled_subtools: inst.enabled_subtools,
     tools_cache: inst.tools_cache,
     tools_cached_at: inst.tools_cached_at,

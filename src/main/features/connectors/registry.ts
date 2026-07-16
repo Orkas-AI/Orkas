@@ -43,6 +43,7 @@ const _writeMutex = new Mutex();
 
 const EMPTY: ConnectorsFile = { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
 const CONNECTOR_SECRET_NAMESPACE = 'connectors.instance';
+const SECRETS_UNAVAILABLE_MESSAGE = 'connector_reconnect_required';
 
 // On-disk shape: ConnectorInstance with all token-bearing fields collapsed into one
 // locally encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
@@ -126,6 +127,7 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
   const dec = _tryDecrypt(uid, disk.id, secrets_enc);
   if (dec === null) {
     log.warn('decrypt secrets_enc failed (known formats) — instance left without transport/grant', { id: disk.id });
+    out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
     (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
     return { instance: out, migrated: false };
   }
@@ -145,6 +147,7 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
     }
   } catch (err) {
     log.warn('parse secrets_enc payload failed', { id: disk.id, error: (err as Error).message });
+    out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
     (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
     return { instance: out, migrated: false };
   }

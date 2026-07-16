@@ -106,6 +106,13 @@ describe('features/connectors/registry', () => {
 
     const loaded = registry.load(uid);
     expect(loaded.connections.gmail.oauth_grant).toBeUndefined();
+    expect(loaded.connections.gmail.status).toMatchObject({
+      kind: 'error',
+      message: 'connector_reconnect_required',
+    });
+    const beforePatch = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(beforePatch.connections.gmail.status.kind).toBe('connected');
+    expect(beforePatch.connections.gmail.secrets_enc).toBe(originalSecrets);
 
     await registry.update(uid, 'gmail', (cur) => ({
       ...cur,

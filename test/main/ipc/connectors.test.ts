@@ -103,6 +103,17 @@ describe('ipc/connectors renderer DTO', () => {
     expect(json).not.toContain('header-secret');
   });
 
+  it('keeps an undecryptable connector row listable without a transport', async () => {
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const inst = baseInstance(undefined);
+    inst.status = { kind: 'error', message: 'connector_reconnect_required', at: 1 };
+
+    const dto = _toClientInstanceForTest(inst);
+
+    expect(dto.transport).toBeUndefined();
+    expect(dto.status).toEqual(inst.status);
+  });
+
   it('returns the latest connector status after refresh', async () => {
     const degraded = {
       ...baseInstance({
