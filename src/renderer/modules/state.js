@@ -53,6 +53,17 @@ function _handleModifiedComposerEnter(e) {
   return true;
 }
 
+// Keep sidebar navigation independent from private analytics. The commercial
+// build decorates this boundary with click tracking; the open build still
+// needs the routing wrapper because every sidebar handler calls it.
+function _setViewFromSidebar(targetView) {
+  setView(targetView);
+}
+
+// Public agent creation has no analytics dependency, but its click handler
+// intentionally keeps the same hook as the commercial build.
+function _trackAgentCreateOpen() {}
+
 // Per-conversation queued messages (sent sequentially, one at a time).
 // key: cid, value: Array<{ id, content, skill }>
 const messageQueues = new Map();
