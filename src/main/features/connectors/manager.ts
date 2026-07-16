@@ -21,12 +21,7 @@ import { findCatalogEntry } from './catalog';
 import { applyTemplate } from './apply-template';
 import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './availability';
 import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
-import {
-  startMcpDcrOAuth,
-  refreshDcrIfStale,
-  refreshDcrServerManaged,
-  storeDcrServerManaged,
-} from './oauth-dcr';
+import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import { isConnectorUsable } from './types';
@@ -411,12 +406,8 @@ async function _refreshGrantIfStale(
       const needsGithubServerAdoption = entry.oauth?.provider_id === 'github'
         && !!inst.oauth_grant.refresh_token
         && !inst.oauth_grant.server_grant_id;
-      const needsDcrServerAdoption = entry.auth_mode === 'mcp_dcr'
-        && !!inst.oauth_grant.refresh_token
-        && !inst.oauth_grant.server_grant_id;
       if (!opts.force
         && !needsGithubServerAdoption
-        && !needsDcrServerAdoption
         && inst.oauth_grant.expires_at
         && inst.oauth_grant.expires_at - Date.now() > REFRESH_BUFFER_MS) {
         return inst.oauth_grant;
@@ -433,17 +424,12 @@ async function _refreshGrantIfStale(
       let next: OAuthGrant;
       try {
         if (entry.auth_mode === 'mcp_dcr') {
-          if (inst.oauth_grant.server_grant_id) {
-            next = await refreshDcrServerManaged(entry.id, inst.oauth_grant, opts);
-          } else {
-            if (!inst.dcr_client) throw new Error('DCR instance missing dcr_client credentials');
-            if (inst.oauth_grant.refresh_token) {
-              const force = opts.force || !inst.oauth_grant.expires_at || inst.oauth_grant.expires_at - Date.now() <= REFRESH_BUFFER_MS;
-              next = await storeDcrServerManaged(entry.id, inst.dcr_client, inst.oauth_grant, { force });
-            } else {
-              next = await refreshDcrIfStale(inst.dcr_client, inst.oauth_grant);
-            }
+          if (!inst.dcr_client) {
+            const err = new Error('connector_reconnect_required: DCR client credentials are not available locally; reconnect required') as Error & { code?: string };
+            err.code = 'connector_reconnect_required';
+            throw err;
           }
+          next = await refreshDcrIfStale(inst.dcr_client, inst.oauth_grant, opts);
         } else {
           next = await refreshIfStale(uid, entry, inst.oauth_grant, opts);
         }
@@ -486,15 +472,11 @@ async function _refreshGrantIfStale(
       if (next !== inst.oauth_grant) {
         try {
           await registry.update(uid, instId, (cur) => {
-            const updated = {
+            return {
               ...cur,
               oauth_grant: next,
               updated_at: _nowIso(),
             };
-            if (entry.auth_mode === 'mcp_dcr' && next.server_managed) {
-              delete (updated as ConnectorInstance).dcr_client;
-            }
-            return updated;
           });
           log.info('refresh grant persisted', {
             id: instId,
@@ -650,7 +632,7 @@ async function _connectAndCacheTools(
       }
     }
     if (_shouldForceRefreshAfterConnectFailure(entry, inst, statusErr)) {
-      log.info('MCP endpoint rejected server-managed token; forcing grant refresh and retrying', { id: inst.id });
+      log.info('MCP endpoint rejected OAuth token; forcing grant refresh and retrying', { id: inst.id });
       try {
         const grant = await _refreshGrantIfStale(uid, entry!, inst.id, { force: true });
         const retryTransport = applyTemplate(entry!, grant);
@@ -669,7 +651,7 @@ async function _connectAndCacheTools(
         }), statusPatches);
       } catch (retryErr) {
         statusErr = retryErr;
-        log.warn('server-managed forced refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
+        log.warn('forced OAuth refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
       }
     }
     const degraded = await _markDegradedOnTransientFailure(
@@ -690,7 +672,10 @@ function _shouldForceRefreshAfterConnectFailure(
   err: unknown,
 ): boolean {
   if (!entry) return false;
-  if (!inst.oauth_grant?.server_grant_id || !inst.oauth_grant.server_managed) return false;
+  const canRefresh = entry.auth_mode === 'mcp_dcr'
+    ? !!inst.dcr_client && !!inst.oauth_grant?.refresh_token
+    : !!inst.oauth_grant?.server_grant_id && !!inst.oauth_grant.server_managed;
+  if (!canRefresh) return false;
   const msg = (err as Error).message || '';
   return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg);
 }
@@ -860,7 +845,7 @@ export async function connectViaOAuth(uid: string, catalogId: string): Promise<C
     try {
       const result = await startMcpDcrOAuth(uid, entry);
       grant = result.grant;
-      dcrClient = result.grant.server_managed ? undefined : result.client;
+      dcrClient = result.client;
     } catch (err) {
       if (_isMissingRequiredScopesError(err)) {
         await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');

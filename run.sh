@@ -41,6 +41,9 @@ echo "[Orkas] Starting Orkas (global prod)"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"
 node "$APP_DIR/scripts/ensure-dev-dependencies.cjs"
+# macOS source runs need the same connector callback declaration that electron-builder adds to
+# packaged apps. This never starts a local server; it only registers the `orkas://` OS protocol.
+node "$APP_DIR/scripts/prepare-source-protocol.cjs" || true
 
 cd "$APP_DIR"
 pkill -9 -f "$APP_DIR/node_modules/electron/dist" >/dev/null 2>&1 || true

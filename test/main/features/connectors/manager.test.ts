@@ -36,8 +36,6 @@ const mocks = vi.hoisted(() => ({
   dcr: {
     startMcpDcrOAuth: undefined as any,
     refreshDcrIfStale: undefined as any,
-    refreshDcrServerManaged: undefined as any,
-    storeDcrServerManaged: undefined as any,
   },
 }));
 
@@ -65,8 +63,6 @@ vi.mock('../../../../src/main/features/connectors/oauth', () => ({
 vi.mock('../../../../src/main/features/connectors/oauth-dcr', () => ({
   startMcpDcrOAuth: (...args: any[]) => mocks.dcr.startMcpDcrOAuth(...args),
   refreshDcrIfStale: (...args: any[]) => mocks.dcr.refreshDcrIfStale(...args),
-  refreshDcrServerManaged: (...args: any[]) => mocks.dcr.refreshDcrServerManaged(...args),
-  storeDcrServerManaged: (...args: any[]) => mocks.dcr.storeDcrServerManaged(...args),
 }));
 
 /** Restore default (passthrough) behavior for every mock slot. Fresh spies each
@@ -81,8 +77,6 @@ function resetMockBehaviors() {
   mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => grant);
   mocks.dcr.startMcpDcrOAuth = vi.fn();
   mocks.dcr.refreshDcrIfStale = vi.fn(async (_client: unknown, grant: unknown) => grant);
-  mocks.dcr.refreshDcrServerManaged = vi.fn(async (_provider: unknown, grant: unknown) => grant);
-  mocks.dcr.storeDcrServerManaged = vi.fn(async (_provider: unknown, _client: unknown, grant: unknown) => grant);
 }
 
 async function writeGoogleConnectorsConfig(value: unknown): Promise<void> {
@@ -255,8 +249,14 @@ function sentryInstance() {
       expires_at: null,
       scopes: [],
       token_type: 'Bearer',
-      server_grant_id: 'grant-1',
-      server_managed: true,
+    },
+    dcr_client: {
+      client_id: 'sentry-client-id',
+      client_secret: 'sentry-client-secret',
+      authorization_endpoint: 'https://mcp.sentry.dev/oauth/authorize',
+      token_endpoint: 'https://mcp.sentry.dev/oauth/token',
+      registration_endpoint: 'https://mcp.sentry.dev/oauth/register',
+      resource: 'https://mcp.sentry.dev/mcp',
     },
     created_at: now,
     updated_at: now,
@@ -685,8 +685,8 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections.github.oauth_grant).toBeTruthy();
   });
 
-  it('degrades established DCR connectors when server-managed refresh returns generic refresh_failed', async () => {
-    mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
+  it('degrades established DCR connectors when local provider refresh returns a transient failure', async () => {
+    mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
       const err = new Error('Failed to refresh authorization') as Error & { code?: string; retryable?: boolean };
       err.code = 'connector_refresh_failed';
       err.retryable = true;
@@ -697,10 +697,6 @@ describe('features/connectors/manager authorization recovery', () => {
     const manager = await import('../../../../src/main/features/connectors/manager');
 
     const inst = notionInstance();
-    inst.oauth_grant.refresh_token = null;
-    (inst.oauth_grant as any).server_managed = true;
-    (inst.oauth_grant as any).server_grant_id = 'grant-1';
-    delete (inst as any).dcr_client;
     await registry.upsert(TEST_UID, inst);
     await manager.refreshTools(TEST_UID, 'notion');
 
@@ -710,7 +706,7 @@ describe('features/connectors/manager authorization recovery', () => {
   });
 
   it('keeps structured DCR reconnect-required rows visible for reconnect', async () => {
-    mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
+    mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
       const err = new Error('Authorization expired. Please reconnect') as Error & { code?: string; retryable?: boolean };
       err.code = 'connector_reconnect_required';
       err.retryable = false;
@@ -721,10 +717,6 @@ describe('features/connectors/manager authorization recovery', () => {
     const manager = await import('../../../../src/main/features/connectors/manager');
 
     const inst = notionInstance();
-    inst.oauth_grant.refresh_token = null;
-    (inst.oauth_grant as any).server_managed = true;
-    (inst.oauth_grant as any).server_grant_id = 'grant-1';
-    delete (inst as any).dcr_client;
     await registry.upsert(TEST_UID, inst);
     await manager.refreshTools(TEST_UID, 'notion');
 
@@ -757,7 +749,7 @@ describe('features/connectors/manager authorization recovery', () => {
 
     await manager.bootstrap(TEST_UID);
 
-    expect(mocks.dcr.refreshDcrServerManaged).not.toHaveBeenCalled();
+    expect(mocks.dcr.refreshDcrIfStale).not.toHaveBeenCalled();
     expect(registry.load(TEST_UID).connections.notion.auth_error).toMatchObject({
       code: 'connector_reconnect_required',
       message: expect.stringContaining('授权已失效'),
@@ -783,7 +775,7 @@ describe('features/connectors/manager authorization recovery', () => {
   });
 
   it('keeps DCR refresh invalid_grant rows visible for reconnect', async () => {
-    mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
+    mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
       throw new Error('DCR refresh HTTP 400: {"error":"invalid_grant","error_description":"Grant not found"}');
     });
 
@@ -791,10 +783,6 @@ describe('features/connectors/manager authorization recovery', () => {
     const manager = await import('../../../../src/main/features/connectors/manager');
 
     const inst = notionInstance();
-    inst.oauth_grant.refresh_token = null;
-    (inst.oauth_grant as any).server_managed = true;
-    (inst.oauth_grant as any).server_grant_id = 'grant-1';
-    delete (inst as any).dcr_client;
     await registry.upsert(TEST_UID, inst);
     await manager.refreshTools(TEST_UID, 'notion');
 
@@ -809,18 +797,16 @@ describe('features/connectors/manager authorization recovery', () => {
       message: expect.stringContaining('invalid_grant'),
     });
 
-    mocks.dcr.refreshDcrServerManaged.mockClear();
+    mocks.dcr.refreshDcrIfStale.mockClear();
     await manager.bootstrap(TEST_UID);
-    expect(mocks.dcr.refreshDcrServerManaged).not.toHaveBeenCalled();
+    expect(mocks.dcr.refreshDcrIfStale).not.toHaveBeenCalled();
   });
 
-  it('adopts legacy DCR refresh tokens into server-managed grants', async () => {
-    mocks.dcr.storeDcrServerManaged = vi.fn(async (_provider, _client, grant) => ({
+  it('persists rotated local DCR grants without dropping the local client credentials', async () => {
+    mocks.dcr.refreshDcrIfStale = vi.fn(async (_client, grant) => ({
       ...(grant as object),
-      access_token: 'server-access-token',
-      refresh_token: null,
-      server_managed: true,
-      server_grant_id: 'grant-1',
+      access_token: 'refreshed-access-token',
+      refresh_token: 'rotated-refresh-token',
       expires_at: Date.now() + 60 * 60 * 1000,
     }));
 
@@ -832,19 +818,17 @@ describe('features/connectors/manager authorization recovery', () => {
 
     const stored = registry.load(TEST_UID).connections.notion;
     const grant = stored.oauth_grant;
-    expect(mocks.dcr.storeDcrServerManaged).toHaveBeenCalledWith(
-      'notion',
+    expect(mocks.dcr.refreshDcrIfStale).toHaveBeenCalledWith(
       expect.objectContaining({ client_id: 'client-id' }),
       expect.objectContaining({ refresh_token: 'refresh-token' }),
-      { force: true },
+      {},
     );
-    expect(grant?.refresh_token).toBeNull();
-    expect(grant?.server_managed).toBe(true);
-    expect(grant?.server_grant_id).toBe('grant-1');
-    expect(stored.dcr_client).toBeUndefined();
+    expect(grant?.access_token).toBe('refreshed-access-token');
+    expect(grant?.refresh_token).toBe('rotated-refresh-token');
+    expect(stored.dcr_client).toMatchObject({ client_id: 'client-id' });
   });
 
-  it('force refreshes server-managed Notion grants when the MCP endpoint rejects the access token', async () => {
+  it('force refreshes local Notion grants when the MCP endpoint rejects the access token', async () => {
     // Condition-based connect (reject the STALE token, accept the force-refreshed
     // one) so the assertion holds regardless of how many times / in what order
     // connect is invoked.
@@ -855,18 +839,16 @@ describe('features/connectors/manager authorization recovery', () => {
       }
     });
     const closeMock = vi.fn(async () => {});
-    const refreshDcrServerManaged = vi.fn(async (_provider, grant) => ({
+    const refreshDcrIfStale = vi.fn(async (_client, grant) => ({
       ...(grant as object),
       access_token: 'refreshed-notion-access',
-      refresh_token: null,
-      server_managed: true,
-      server_grant_id: 'grant-1',
+      refresh_token: 'rotated-notion-refresh',
       expires_at: Date.now() + 60 * 60 * 1000,
     }));
     mocks.mcp.connect = connectMock;
     mocks.mcp.listTools = vi.fn(async () => [{ name: 'notion_search', description: '', input_schema: {} }]);
     mocks.mcp.close = closeMock;
-    mocks.dcr.refreshDcrServerManaged = refreshDcrServerManaged;
+    mocks.dcr.refreshDcrIfStale = refreshDcrIfStale;
 
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
@@ -875,12 +857,9 @@ describe('features/connectors/manager authorization recovery', () => {
     inst.oauth_grant = {
       ...inst.oauth_grant,
       access_token: 'stale-notion-access',
-      refresh_token: null,
+      refresh_token: 'stale-notion-refresh',
       expires_at: Date.now() + 60 * 60 * 1000,
-      server_managed: true,
-      server_grant_id: 'grant-1',
     } as any;
-    delete (inst as any).dcr_client;
 
     await registry.upsert(TEST_UID, inst);
     const tools = await manager.refreshTools(TEST_UID, 'notion');
@@ -888,9 +867,9 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(tools).toEqual([{ name: 'notion_search', description: '', input_schema: {} }]);
     expect(connectMock).toHaveBeenCalled();
     expect(closeMock).toHaveBeenCalled();
-    expect(refreshDcrServerManaged).toHaveBeenCalledWith(
-      'notion',
-      expect.objectContaining({ server_grant_id: 'grant-1', access_token: 'stale-notion-access' }),
+    expect(refreshDcrIfStale).toHaveBeenCalledWith(
+      expect.objectContaining({ client_id: 'client-id' }),
+      expect.objectContaining({ access_token: 'stale-notion-access', refresh_token: 'stale-notion-refresh' }),
       { force: true },
     );
     const stored = registry.load(TEST_UID).connections.notion;
@@ -910,24 +889,14 @@ describe('features/connectors/manager authorization recovery', () => {
       if (!failedOnce) { failedOnce = true; throw new Error('fetch failed'); }
     });
     const closeMock = vi.fn(async () => {});
-    const refreshDcrServerManaged = vi.fn(async (_provider, grant) => grant);
     mocks.mcp.connect = connectMock;
     mocks.mcp.listTools = vi.fn(async () => [{ name: 'notion_search', description: '', input_schema: {} }]);
     mocks.mcp.close = closeMock;
-    mocks.dcr.refreshDcrServerManaged = refreshDcrServerManaged;
 
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
     const inst = notionInstance();
-    inst.oauth_grant = {
-      ...inst.oauth_grant,
-      access_token: 'notion-access',
-      refresh_token: null,
-      expires_at: Date.now() + 60 * 60 * 1000,
-      server_managed: true,
-      server_grant_id: 'grant-1',
-    } as any;
-    delete (inst as any).dcr_client;
+    inst.oauth_grant.expires_at = Date.now() + 60 * 60 * 1000;
 
     await registry.upsert(TEST_UID, inst);
     const tools = await manager.refreshTools(TEST_UID, 'notion');
@@ -938,7 +907,7 @@ describe('features/connectors/manager authorization recovery', () => {
     // invariant (exact connect counts are brittle implementation detail).
     expect(connectMock).toHaveBeenCalled();
     expect(closeMock).toHaveBeenCalled();
-    expect(refreshDcrServerManaged).not.toHaveBeenCalled();
+    expect(mocks.dcr.refreshDcrIfStale).not.toHaveBeenCalled();
     expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
   });
 
@@ -946,29 +915,15 @@ describe('features/connectors/manager authorization recovery', () => {
     // The scenario is "transient failures CONTINUE" — every connect fails.
     const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
     const closeMock = vi.fn(async () => {});
-    const refreshDcrServerManaged = vi.fn(async (_provider, grant) => ({
-      ...(grant as object),
-      access_token: 'refreshed-notion-access',
-      expires_at: Date.now() + 60 * 60 * 1000,
-    }));
     mocks.mcp.connect = connectMock;
     mocks.mcp.listTools = vi.fn(async () => [{ name: 'notion_search', description: '', input_schema: {} }]);
     mocks.mcp.close = closeMock;
-    mocks.dcr.refreshDcrServerManaged = refreshDcrServerManaged;
 
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
     const inst = notionInstance();
     inst.tools_cache = [{ name: 'notion_search', description: '', input_schema: {} }];
-    inst.oauth_grant = {
-      ...inst.oauth_grant,
-      access_token: 'notion-access',
-      refresh_token: null,
-      expires_at: Date.now() + 60 * 60 * 1000,
-      server_managed: true,
-      server_grant_id: 'grant-1',
-    } as any;
-    delete (inst as any).dcr_client;
+    inst.oauth_grant.expires_at = Date.now() + 60 * 60 * 1000;
 
     await registry.upsert(TEST_UID, inst);
     const tools = await manager.refreshTools(TEST_UID, 'notion');
@@ -976,9 +931,9 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(tools).toEqual([{ name: 'notion_search', description: '', input_schema: {} }]);
     // Despite every connect failing, this is still a network problem, not an
     // auth rejection. Keep the established state and do not force-refresh the
-    // server-managed grant just because the MCP endpoint was unreachable.
+    // local grant just because the MCP endpoint was unreachable.
     expect(connectMock).toHaveBeenCalled();
-    expect(refreshDcrServerManaged).not.toHaveBeenCalled();
+    expect(mocks.dcr.refreshDcrIfStale).not.toHaveBeenCalled();
     // Established state kept (cached tools still served above) — but recorded as unverified, with
     // the real reason, rather than asserting a connection that never succeeded.
     const notionRow = registry.load(TEST_UID).connections.notion;

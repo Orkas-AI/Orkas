@@ -176,6 +176,10 @@ import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
+import {
+  consumeColdLaunchConnectorCallback,
+  registerConnectorProtocol,
+} from './features/connectors/protocol';
 import * as windowState from './features/window_state';
 // Server-backed account, multi-device sync, remote-control relay, and
 // auto-update features are stripped in the open-source build. Connectors remain available
@@ -999,6 +1003,9 @@ const gotLock = IS_PACKAGED_LAUNCH_SMOKE || app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+  // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
+  // this connector-only receiver outside the removed account protocol module.
+  registerConnectorProtocol();
   app.whenReady().then(async () => {
     await runBootSelfCheck();
     // Source-run macOS uses Electron.app's own Info.plist, so set the dock
@@ -1055,6 +1062,7 @@ if (!gotLock) {
     }, CONNECTORS_BOOTSTRAP_DELAY_MS);
     connectorsTimer.unref?.();
     createWindow();
+    await consumeColdLaunchConnectorCallback();
 
     // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
     //

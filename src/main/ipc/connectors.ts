@@ -10,9 +10,10 @@
  *   connectors.refresh       → { tools, instance }
  *   connectors.set_subtools  → { instance }
  *
- * Catalog installs are OAuth-only — no API-key fallback, no BYO client credentials; Server
- * holds every provider's `client_id` / `client_secret`. Custom MCP servers are the separate,
- * explicitly user-authored path: `connectors.add_custom` is the single validated route
+ * Catalog installs are OAuth-only — no API-key fallback. Server-bridge providers use an
+ * Orkas-registered OAuth app; MCP DCR providers issue a per-device client whose credentials stay
+ * in the encrypted local registry. Custom MCP servers are the separate, explicitly user-authored
+ * path: `connectors.add_custom` is the single validated route
  * (features/connectors/custom-transport.ts), the renderer form is the consent surface, and the
  * stored transport lives inside `secrets_enc`. See docs/plans/open-ecosystem-architecture.md §C.
  */

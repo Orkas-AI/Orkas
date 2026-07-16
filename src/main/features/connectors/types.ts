@@ -118,9 +118,9 @@ export interface ConnectorInstance {
    *  The manager rewrites the transport env at spawn time using `oauth_grant.access_token`;
    *  refresh logic in `oauth.ts::refreshIfStale` runs before connect / after a 401. */
   oauth_grant?: OAuthGrant;
-  /** DCR-issued client identity for legacy local MCP-spec auth (`auth_mode === 'mcp_dcr'`).
-   *  New rotating DCR grants are server-managed; this field remains only so older local grants
-   *  can be adopted on the next refresh. */
+  /** DCR-issued client identity for MCP-spec auth (`auth_mode === 'mcp_dcr'`). The public build
+   *  stores this with the grant inside the encrypted local registry and never uploads it to the
+   *  Orkas account service. */
   dcr_client?: DcrClientCredentials;
   created_at: string;
   updated_at: string;
@@ -182,9 +182,8 @@ export type TransportTemplate =
 //    self-registers via Dynamic Client Registration (RFC 7591) at runtime, runs the OAuth
 //    handshake from PC, uses the `/api/connectors/oauth/dcr-callback` Server endpoint **only**
 //    as an HTTPS callback intermediate (Server stashes code+state in a 5-min KV, deep-links
-//    PC). After the first exchange, rotating DCR refresh grants are moved to Server and PC keeps
-//    only a server grant handle. Used for Notion, Atlassian, Cloudflare suite, … — the modern
-//    path.
+//    PC). The DCR client and rotating refresh grant remain encrypted on this device; Server is
+//    never a credential store for this mode. Used for Notion, Atlassian, Cloudflare suite, … .
 
 export interface OAuthConfig {
   /** Server-bridge only: matches the Server's `biz/connectors/oauth/<provider>.py` module name
@@ -192,10 +191,9 @@ export interface OAuthConfig {
   provider_id: string;
 }
 
-/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Legacy local
- *  instances may still store this on the ConnectorInstance until the grant is adopted by Server.
- *  All endpoints captured at first connect — re-discovery on every refresh would add latency
- *  and assumes provider doesn't rotate URLs (which they shouldn't). */
+/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Stored locally
+ *  with the connector's encrypted secrets. All endpoints are captured at first connect —
+ *  re-discovery on every refresh would add latency and assumes stable provider endpoints. */
 export interface DcrClientCredentials {
   client_id: string;
   /** Most providers issue one; some omit (public clients). */

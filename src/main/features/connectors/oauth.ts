@@ -22,9 +22,8 @@
  * GitHub refresh is therefore serialized by Server, while other server-bridge providers still
  * refresh through the generic proxy path.
  *
- * **No localhost HTTP listener** — §1 hard rule. The earlier draft of this file bound an
- * ephemeral 127.0.0.1 port; that approach was scrapped in favor of the existing `orkas://`
- * deep-link infrastructure (same as account login). Don't bring the listener back.
+ * The public build never creates an HTTP callback listener. Authorization returns through the
+ * production HTTPS bridge and the connector-only `orkas://` receiver.
  */
 import { shell } from 'electron';
 

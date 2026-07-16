@@ -14326,21 +14326,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .connector-card.is-disabled { opacity: 0.55; }
 .connector-card.is-disabled .connector-card-icon { filter: saturate(0.4); }
 
-/* Inline spinner inside the "连接" button — shown post-deep-link return while the IPC is
-   running through `/oauth/exchange` + MCP `initialize` + `list_tools` (3 network roundtrips,
-   ~hundreds of ms to a few seconds). Button stays clickable; spinner just signals progress. */
-.btn-spinner {
-  display: inline-block;
-  width: 10px;
-  height: 10px;
-  margin-right: 6px;
-  border-radius: 50%;
-  border: 2px solid rgba(255, 255, 255, 0.5);
-  border-top-color: rgba(255, 255, 255, 0.95);
-  vertical-align: -1px;
-  animation: marketplace-upload-spin 0.8s linear infinite;
-}
-
 .connector-card-foot {
   margin-top: auto;
   display: flex;

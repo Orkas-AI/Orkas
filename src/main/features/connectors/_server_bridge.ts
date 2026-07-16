@@ -6,11 +6,10 @@
  *   - `tokenStore.getDeviceId()` — stable per-machine UUID
  *   - `tokenStore.authHeaders()` — `{user_id, session_id}` for the logged-in user
  *
- * `features/account/` is stripped from the open-source build (no account backend). Connectors still need the
- * first two pieces because the Server bridges every connector OAuth flow regardless of login
- * state (`/connectors/oauth/exchange` accepts a `device_id`-only request, per PC/CLAUDE.md §6.5
- * "open-source connectors" section). The third piece is always empty here because there is no Orkas
- * session in the open-source build, but exposing the same signature keeps the call sites identical.
+ * `features/account/` is stripped from the public build (no account backend). Connectors still
+ * need the first two pieces for the pinned global HTTPS callback/bridge. Server-bridge exchange
+ * and refresh accept `channel=open` plus this stable device id; the third piece is always empty
+ * because this build never has an Orkas account session.
  *
  * Where each piece comes from:
  *   - `accountApiBase` aliases `features/marketplace.apiBase()` (global prod only — single
@@ -71,8 +70,8 @@ export const tokenStore = {
   },
 
   authHeaders(): Record<string, string> {
-    // The open-source build has no Orkas account session. The Server's `/connectors/oauth/exchange`
-    // endpoint accepts device_id-only requests for this build (per PC/CLAUDE.md §6.5).
+    // Never synthesize account headers. Server-bridge routes derive a pseudonymous owner only
+    // when the canonical client channel is `open` and the request carries this device id.
     return {};
   },
 };

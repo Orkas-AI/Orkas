@@ -493,7 +493,7 @@ function _renderCatalogCard(entry, instance) {
   let action = '';
   const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
   if (isConnecting) {
-    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect"><span class="btn-spinner"></span>${escapeHtml(t('connectors.action.connecting'))}</button>`;
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect">${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (isOAuthPending) {
     action = `<button class="btn btn-sm" disabled>${escapeHtml(t('connectors.action.unavailable'))}</button>`;
   } else if (isVisibleDisabled) {
