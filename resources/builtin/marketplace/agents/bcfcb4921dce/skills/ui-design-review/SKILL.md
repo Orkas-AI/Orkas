@@ -12,7 +12,7 @@ Use this skill when the task is to review, critique, QA, or polish an existing U
 
 Pair this skill with `ui-craft-checks` for launch-readiness, HTML QA, screenshot/design-source fidelity, accessibility, state coverage, forms, motion, typography, responsive behavior, live-ready artifacts, and anti-template polish.
 
-For polish requests, do not restart the design from scratch. Inspect the current artifact, preserve the user's content and contract, then make the smallest set of high-impact fixes that improves hierarchy, responsiveness, accessibility, and visual craft.
+For polish requests, use `ui-artifact-workspace` when the target is a standalone artifact. Do not restart the design from scratch. Inspect the canonical directory, manifest, current render, and source files; preserve the user's content and contract, then make the smallest set of high-impact fixes that improves hierarchy, responsiveness, accessibility, and visual craft in place.
 
 ## Review Stance
 

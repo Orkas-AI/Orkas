@@ -17,6 +17,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
@@ -340,7 +341,21 @@ export interface ReconcileResult {
   enqueuedUpsert: number;
   enqueuedDelete: number;
   unchanged: number;
+  /** Files whose persisted sha1 was reusable from matching size + mtime. */
+  reusedHashes?: number;
+  /** True when admission cancellation stopped the scan before a complete
+   * filesystem snapshot was available. No queue mutations are made then. */
+  cancelled?: boolean;
 }
+
+interface ReconcileFileMeta {
+  kind: kb.KbKind;
+  sha1: string;
+  bytes: number;
+  mtime: number;
+}
+
+const RECONCILE_FILE_CONCURRENCY = 4;
 
 /**
  * Walk `<uid>/cloud/contexts/**` and diff against `kb_files`. Enqueue upsert
@@ -350,17 +365,29 @@ export interface ReconcileResult {
  * Skipped from the walk: dot-prefixed entries (e.g. `.kb/`), the root-level
  * `_INDEX.md`, and any filename whose extension is not in the supported set.
  */
-export async function reconcile(uid: string): Promise<ReconcileResult> {
+export async function reconcile(uid: string, signal?: AbortSignal): Promise<ReconcileResult> {
+  const startedAt = Date.now();
   const root = userContextsDir(uid);
-  fs.mkdirSync(root, { recursive: true });
+  await fsp.mkdir(root, { recursive: true });
 
-  const onDisk = walk(root, '');
+  const indexedRows = kb.listFiles(uid);
+  const indexedByPath = new Map(indexedRows.map((row) => [row.rel_path, row]));
+  const scan = await walk(root, '', indexedByPath, signal);
+  if (!scan.complete) {
+    log.info('library reconcile cancelled before snapshot completed', {
+      user_id: maskId(uid),
+      discovered: scan.files.size,
+      ms: Date.now() - startedAt,
+    });
+    return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0, cancelled: true };
+  }
+  const onDisk = scan.files;
   let enqueuedUpsert = 0;
   let enqueuedDelete = 0;
   let unchanged = 0;
 
   for (const [relPath, meta] of onDisk) {
-    const existing = kb.getFileByPath(uid, relPath);
+    const existing = indexedByPath.get(relPath);
     const needsWork =
       !existing ||
       existing.sha1 !== meta.sha1 ||
@@ -374,7 +401,7 @@ export async function reconcile(uid: string): Promise<ReconcileResult> {
     }
   }
 
-  for (const row of kb.listFiles(uid)) {
+  for (const row of indexedRows) {
     if (!onDisk.has(row.rel_path)) {
       enqueue(uid, row.rel_path, 'delete');
       enqueuedDelete += 1;
@@ -389,19 +416,95 @@ export async function reconcile(uid: string): Promise<ReconcileResult> {
       unchanged,
     });
   }
-  return { enqueuedUpsert, enqueuedDelete, unchanged };
+  log.info('library reconcile scan complete', {
+    user_id: maskId(uid),
+    files: onDisk.size,
+    reused_hashes: scan.reusedHashes,
+    hashed_files: onDisk.size - scan.reusedHashes,
+    ms: Date.now() - startedAt,
+  });
+  return { enqueuedUpsert, enqueuedDelete, unchanged, reusedHashes: scan.reusedHashes };
 }
 
-function walk(root: string, rel: string): Map<string, { kind: kb.KbKind; sha1: string; bytes: number; mtime: number }> {
-  const out = new Map<string, { kind: kb.KbKind; sha1: string; bytes: number; mtime: number }>();
+async function hashReconcileFile(
+  full: string,
+  kind: kb.KbKind,
+  existing: kb.KbFileRow | undefined,
+  signal?: AbortSignal,
+): Promise<{ meta: ReconcileFileMeta | null; reliable: boolean; reusedHash: boolean }> {
+  if (signal?.aborted) return { meta: null, reliable: false, reusedHash: false };
+  try {
+    const st = await fsp.stat(full);
+    if (!st.isFile()) return { meta: null, reliable: true, reusedHash: false };
+    if (signal?.aborted) return { meta: null, reliable: false, reusedHash: false };
+    const mtime = st.mtimeMs / 1000;
+    if (
+      existing?.sha1
+      && existing.bytes === st.size
+      && Math.abs(existing.mtime - mtime) < 0.001
+    ) {
+      return {
+        meta: { kind, sha1: existing.sha1, bytes: st.size, mtime },
+        reliable: true,
+        reusedHash: true,
+      };
+    }
+    const hash = crypto.createHash('sha1');
+    const stream = fs.createReadStream(full, { signal });
+    for await (const chunk of stream) {
+      if (signal?.aborted) {
+        stream.destroy();
+        return { meta: null, reliable: false, reusedHash: false };
+      }
+      hash.update(chunk as Buffer);
+    }
+    return {
+      meta: {
+        kind,
+        sha1: hash.digest('hex'),
+        bytes: st.size,
+        mtime: st.mtimeMs / 1000,
+      },
+      reliable: true,
+      reusedHash: false,
+    };
+  } catch (err) {
+    if (signal?.aborted || (err as NodeJS.ErrnoException).name === 'AbortError') {
+      return { meta: null, reliable: false, reusedHash: false };
+    }
+    // A file disappearing during the snapshot is a valid absence. Permission
+    // or transient I/O failures make the snapshot unsafe for delete decisions.
+    return {
+      meta: null,
+      reliable: (err as NodeJS.ErrnoException).code === 'ENOENT',
+      reusedHash: false,
+    };
+  }
+}
+
+async function walk(
+  root: string,
+  rel: string,
+  indexedByPath: ReadonlyMap<string, kb.KbFileRow>,
+  signal?: AbortSignal,
+): Promise<{ files: Map<string, ReconcileFileMeta>; complete: boolean; reusedHashes: number }> {
+  const out = new Map<string, ReconcileFileMeta>();
+  const candidates: Array<{ relPath: string; full: string; kind: kb.KbKind }> = [];
+  let reliable = true;
+  let reusedHashes = 0;
   const stack: string[] = [rel];
   while (stack.length) {
+    if (signal?.aborted) return { files: out, complete: false, reusedHashes };
     const cur = stack.pop()!;
     const abs = cur ? path.join(root, cur) : root;
     let items: fs.Dirent[];
-    try { items = fs.readdirSync(abs, { withFileTypes: true }); }
-    catch { continue; }
+    try { items = await fsp.readdir(abs, { withFileTypes: true }); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') reliable = false;
+      continue;
+    }
     for (const e of items) {
+      if (signal?.aborted) return { files: out, complete: false, reusedHashes };
       // `.kb/` (vector DB), `.organize-snapshots/`, `.organize-state.json`, DS_Store — all hidden.
       if (e.name.startsWith('.')) continue;
       // Root-level `_INDEX.md` is generated for human browsing, not KB content.
@@ -413,18 +516,32 @@ function walk(root: string, rel: string): Map<string, { kind: kb.KbKind; sha1: s
       if (!e.isFile()) continue;
       const kind = kindFor(e.name);
       if (!kind) continue;
-      let st: fs.Stats;
-      try { st = fs.statSync(full); } catch { continue; }
-      // Read + hash — for typical KB sizes (≤ 100s of MB total) this is fast
-      // and avoids the "mtime only" false-negative when a file is touched but
-      // content is unchanged.
-      let buf: Buffer;
-      try { buf = fs.readFileSync(full); } catch { continue; }
-      const sha1 = crypto.createHash('sha1').update(buf).digest('hex');
-      out.set(r, { kind, sha1, bytes: st.size, mtime: st.mtimeMs / 1000 });
+      candidates.push({ relPath: r, full, kind });
     }
   }
-  return out;
+
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(RECONCILE_FILE_CONCURRENCY, candidates.length) },
+    async () => {
+      while (!signal?.aborted) {
+        const index = cursor++;
+        if (index >= candidates.length) return;
+        const candidate = candidates[index];
+        const result = await hashReconcileFile(
+          candidate.full,
+          candidate.kind,
+          indexedByPath.get(candidate.relPath),
+          signal,
+        );
+        if (!result.reliable) reliable = false;
+        if (result.reusedHash) reusedHashes += 1;
+        if (result.meta) out.set(candidate.relPath, result.meta);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return { files: out, complete: reliable && !signal?.aborted, reusedHashes };
 }
 
 // ── Test hooks ──────────────────────────────────────────────────────────

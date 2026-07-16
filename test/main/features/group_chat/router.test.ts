@@ -78,6 +78,18 @@ describe('group_chat router › parseMentions', () => {
     expect(parseMentions('   > @alice from somewhere\nplain @bob'))
       .toEqual(['bob']);
   });
+
+  it('ignores mentions across multiple separately quoted messages', () => {
+    const text = [
+      '> first reply asked @alice',
+      '',
+      '> second reply asked @bob',
+      '> and referenced @carol',
+      '',
+      '@reviewer compare all replies',
+    ].join('\n');
+    expect(parseMentions(text)).toEqual(['reviewer']);
+  });
 });
 
 describe('group_chat router › resolveRecipients', () => {

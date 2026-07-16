@@ -3,17 +3,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-// activateUser fires sweepSessions fire-and-forget; in real boot it races
-// safely with subsequent writes, but in unit tests the sweep can wipe the
-// gmember-*.jsonl files we just created (cid not yet in _index.json when
-// the sweep snapshots cids). Stub it out for the whole file.
-vi.mock('../../../src/main/features/sessions_sweep', () => ({
-  sweepSessions: vi.fn(async () => ({
-    scanned: 0, orphan_cid: 0, ephemeral_on_cloud: 0, legacy: 0,
-    local_aged_out: 0, errors: 0,
-  })),
-}));
-
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';

@@ -36,6 +36,17 @@ describe('autoTitle — set A (produces clean title)', () => {
     expect(autoTitle('本地修改，顺便看下提交')).toBe('本地修改');
   });
 
+  it('keeps punctuation inside an HTTPS URL', () => {
+    expect(autoTitle('你根据 https://orkas.ai')).toBe('你根据 https://orkas.ai');
+    expect(autoTitle('分析 https://x.co/a?q=one,two')).toBe('分析 https://x.co/a?q=one,two');
+    expect(autoTitle('查看 www.orkas.ai 的内容')).toBe('查看 www.orkas.ai 的内容');
+  });
+
+  it('still cuts at sentence punctuation immediately after a URL', () => {
+    expect(autoTitle('根据 https://orkas.ai，分析首页内容')).toBe('根据 https://orkas.ai');
+    expect(autoTitle('Review https://orkas.ai, then summarize')).toBe('Review https://orkas.ai');
+  });
+
   it('keeps full text when input lacks any filler', () => {
     expect(autoTitle('搜索下最新一个月的ai圈的主要事件'))
       .toBe('搜索下最新一个月的ai圈的主要事件');
@@ -88,5 +99,9 @@ describe('autoTitle — set B (must NOT over-strip / must NOT crash)', () => {
 
   it('preserves non-filler English starting words', () => {
     expect(autoTitle('Search the latest AI news')).toBe('Search the latest AI news');
+  });
+
+  it('does not treat a look-alike scheme as an HTTP URL', () => {
+    expect(autoTitle('检查 httpsx://orkas.ai 的内容')).toBe('检查 httpsx://orkas');
   });
 });

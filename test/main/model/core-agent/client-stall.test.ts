@@ -16,6 +16,7 @@ import * as path from 'node:path';
 const h = vi.hoisted(() => ({
   makeStream: null as null | (() => AsyncGenerator),
   lastBuildRunnerParams: null as null | Record<string, unknown>,
+  runStreamCalls: 0,
 }));
 
 vi.mock('electron', () => ({
@@ -29,7 +30,11 @@ vi.mock('electron', () => ({
 // `h.makeStream` — read at runStream() call time, so no module reset is needed.
 vi.mock('../../../../src/main/model/core-agent/runner', () => ({
   buildRunner: async (params: Record<string, unknown>) => ({
-    runner: { runStream: () => { h.lastBuildRunnerParams = params; return h.makeStream!(); } },
+    runner: { runStream: () => {
+      h.runStreamCalls += 1;
+      h.lastBuildRunnerParams = params;
+      return h.makeStream!();
+    } },
     resolvedSystemPrompt: 'sys',
     entryId: 'e1',
     profileId: 'p1',
@@ -41,9 +46,6 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
   }),
 }));
 
-vi.mock('../../../../src/main/features/devtools', () => ({
-  startRecording: () => ({ record() {}, finish() {}, setActiveCandidate() {} }),
-}));
 vi.mock('../../../../src/main/model/core-agent/session-store', () => ({
   getSession: async () => null,
 }));
@@ -57,6 +59,7 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-client-stall-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  h.runStreamCalls = 0;
 });
 
 afterEach(() => {

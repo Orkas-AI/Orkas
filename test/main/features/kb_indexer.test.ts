@@ -309,6 +309,17 @@ describe('kb_indexer › reconcile', () => {
     expect(r.unchanged).toBe(1);
   });
 
+  it('reuses the stored hash when size and mtime are unchanged', async () => {
+    writeCtx('a.md', 'stable');
+    const idx = await import('../../../src/main/features/kb_indexer');
+    await idx.reconcile(TEST_UID);
+    await idx.drain(TEST_UID);
+
+    const r = await idx.reconcile(TEST_UID);
+    expect(r.unchanged).toBe(1);
+    expect(r.reusedHashes).toBe(1);
+  });
+
   it('enqueues delete when file disappears from disk', async () => {
     writeCtx('a.md', 'x');
     writeCtx('b.md', 'y');
@@ -353,5 +364,25 @@ describe('kb_indexer › reconcile', () => {
     });
     const r = await idx.reconcile(TEST_UID);
     expect(r.enqueuedUpsert).toBe(1);
+  });
+
+  it('does not enqueue deletes from a cancelled partial filesystem snapshot', async () => {
+    const kb = await import('../../../src/main/features/kb_vector');
+    const idx = await import('../../../src/main/features/kb_indexer');
+    await kb.setFileStatus(TEST_UID, 'missing.md', 'ready', {
+      kind: 'text', bytes: 1, mtime: 1, sha1: 'known', chunks: 1,
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    const r = await idx.reconcile(TEST_UID, controller.signal);
+    expect(r).toEqual({
+      enqueuedUpsert: 0,
+      enqueuedDelete: 0,
+      unchanged: 0,
+      cancelled: true,
+    });
+    await idx.drain(TEST_UID);
+    expect(kb.getFileByPath(TEST_UID, 'missing.md')).not.toBeNull();
   });
 });

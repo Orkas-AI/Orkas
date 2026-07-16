@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -94,7 +96,7 @@ function writePythonPipShims(exe: string): void {
 
 function runEnsure(root: string, manifest: string, key: string, kind = 'python') {
   const [platform, arch] = key.split('-');
-  return spawnSync(process.execPath, [
+  return spawnSync(TEST_NODE, [
     path.join(process.cwd(), 'bin', 'ensure-runtime.cjs'),
     '--root', root,
     '--manifest', manifest,
@@ -110,7 +112,7 @@ function runEnsure(root: string, manifest: string, key: string, kind = 'python')
 
 function runEnsureMutable(root: string, manifest: string, key: string) {
   const [platform, arch] = key.split('-');
-  return spawnSync(process.execPath, [
+  return spawnSync(TEST_NODE, [
     path.join(process.cwd(), 'bin', 'ensure-runtime.cjs'),
     '--root', root,
     '--manifest', manifest,

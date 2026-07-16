@@ -12,7 +12,7 @@ const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
   _viewerAbsPathFromChatMediaLocalUrl: (src: string) => string;
-  _viewerCanAddToLibrary: (nameOrKind: string) => boolean;
+  _viewerCanAddToLibrary: (name: string, options?: { projectScoped?: boolean }) => boolean;
   _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number; duration?: number; ended?: boolean }) => { autoplay: boolean; startTime: number };
   _viewerVideoSeekTarget: (startTime: number, duration?: number) => number;
 };
@@ -137,6 +137,8 @@ describe('chat-file-viewer › _viewerCanAddToLibrary', () => {
     expect(_viewerCanAddToLibrary('/tmp/page.html')).toBe(true);
     expect(_viewerCanAddToLibrary('/tmp/photo.png')).toBe(true);
     expect(_viewerCanAddToLibrary('/tmp/movie.mp4')).toBe(false);
+    expect(_viewerCanAddToLibrary('/tmp/movie.mp4', { projectScoped: true })).toBe(true);
+    expect(_viewerCanAddToLibrary('/tmp/voice.mp3', { projectScoped: true })).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/archive.zip')).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/no-extension')).toBe(false);
   });

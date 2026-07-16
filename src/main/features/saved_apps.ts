@@ -29,6 +29,7 @@ import * as chatAttachments from './chat_attachments';
 import { t } from '../i18n';
 import { createLogger } from '../logger';
 import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { isPathAllowed } from '../util/path-sandbox';
 
 const log = createLogger('saved_apps');
 
@@ -50,7 +51,12 @@ const BUNDLE_RESOURCE_EXTS: ReadonlySet<string> = new Set([
   '.mp3', '.wav', '.ogg', '.mp4', '.webm', '.glb', '.gltf', '.txt', '.md', '.csv', '.xml',
 ]);
 const HTML_ENTRY_EXTS: ReadonlySet<string> = new Set(['.html', '.htm']);
-const BUNDLE_TRIGGER_EXTS: ReadonlySet<string> = new Set(BUNDLE_RESOURCE_EXTS);
+// Only application source files express an intent to save the surrounding
+// HTML bundle. Images, media, fonts, manifests, data, and models remain valid
+// copied resources but never advertise "Save as app" on their own.
+const BUNDLE_TRIGGER_EXTS: ReadonlySet<string> = new Set([
+  '.html', '.htm', '.css', '.js', '.mjs',
+]);
 const BUNDLE_EXCLUDED_DIRS: ReadonlySet<string> = new Set([
   '.git', '.hg', '.svn', 'node_modules', 'dist', 'build', '.next', '.vite', 'coverage',
 ]);
@@ -537,6 +543,17 @@ export function resolveSavedAppIndex(
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     return { ok: false, code: 'bad_input', error: 'path traversal blocked' };
   }
+  try {
+    const rootStat = fs.lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      return { ok: false, code: 'not_found', error: 'app not found' };
+    }
+  } catch {
+    return { ok: false, code: 'not_found', error: 'app not found' };
+  }
+  if (!isPathAllowed(abs, [root])) {
+    return { ok: false, code: 'not_found', error: 'app not found' };
+  }
   let st: fs.Stats;
   try { st = fs.statSync(abs); }
   catch { return { ok: false, code: 'not_found', error: 'app not found' }; }
@@ -580,6 +597,17 @@ export function resolveSavedAppFilePath(
   const relCheck = path.relative(root, abs);
   if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     return { ok: false, code: 'forbidden', error: 'path traversal blocked' };
+  }
+  try {
+    const rootStat = fs.lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      return { ok: false, code: 'not_found', error: 'not found' };
+    }
+  } catch {
+    return { ok: false, code: 'not_found', error: 'not found' };
+  }
+  if (!isPathAllowed(abs, [root])) {
+    return { ok: false, code: 'forbidden', error: 'symlink escape blocked' };
   }
   let st: fs.Stats;
   try { st = fs.statSync(abs); }
@@ -728,7 +756,7 @@ export async function openForEditing(
   const up = await chatAttachments.uploadAttachment(userId, conv.conversation_id, SOURCE_BUNDLE_NAME, Buffer.from(bundle, 'utf8'));
   if (!up.ok) {
     // Roll back the conversation we just created so no empty conv is orphaned.
-    try { await chats.deleteConversation(userId, conv.conversation_id); }
+    try { await chats.deleteConversation(userId, conv.conversation_id, conv.project_id || null); }
     catch (err) {
       log.warn('openForEditing rollback deleteConversation failed', {
         user_id: maskId(userId),

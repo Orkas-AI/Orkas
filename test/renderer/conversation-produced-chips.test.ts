@@ -5,6 +5,9 @@ import * as vm from 'node:vm';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
 const styleSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+const conversationInfoSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
+const viewerSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/chat-file-viewer.js'), 'utf8');
+const utilsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/utils.js'), 'utf8');
 
 function extractFunction(name: string): string {
   const marker = `function ${name}`;
@@ -31,10 +34,6 @@ function loadOrderProducedPaths(): (paths: string[]) => Array<{ path: string; ba
   return vm.runInNewContext(`
     const _PRODUCED_DELIVERABLE_EXTS = new Set([
       'pptx', 'ppt', 'key',
-      'html', 'htm',
-      'svg', 'png', 'jpg', 'jpeg', 'webp', 'gif',
-      'mp4', 'mov', 'webm',
-      'md', 'txt', 'json',
       'docx', 'doc', 'pages',
       'xlsx', 'xls', 'numbers', 'csv',
       'pdf',
@@ -48,13 +47,32 @@ function loadOrderProducedPaths(): (paths: string[]) => Array<{ path: string; ba
 }
 
 describe('conversation produced chips', () => {
-  it('keeps chat bubbles capped at 10 files and expands overflow in place', () => {
-    expect(source).toContain('const _PRODUCED_VISIBLE_LIMIT = 10;');
-    expect(source).toContain("row.classList.add('is-expanded')");
-    expect(source).not.toContain("window.ConversationInfo.openAndSetTab('files')");
-    expect(styleSource).toContain('.chat-msg-produced.is-expanded');
-    expect(styleSource).toContain('max-height: 168px;');
+  it('renders every deliverable inside a height-capped scrolling footer', () => {
+    expect(source).not.toContain('_PRODUCED_VISIBLE_LIMIT');
+    expect(source).not.toContain('chat-msg-produced-more');
+    expect(styleSource).toContain('max-height: min(102px, 36vh);');
     expect(styleSource).toContain('overflow-y: auto;');
+    expect(styleSource).toContain('overscroll-behavior: auto;');
+  });
+
+  it('mounts compact file rows with a separate trailing menu at the bottom of the bubble', () => {
+    expect(source).toContain('function _mountMessageProducedFooter');
+    expect(source).toContain('bubble.appendChild(node)');
+    expect(source).toContain('<div class="chat-msg-produced-item"');
+    expect(source).toContain('class="chat-msg-produced-main"');
+    expect(source).toContain('class="chat-msg-produced-menu-btn"');
+    expect(styleSource).toContain('.chat-msg-produced {');
+    expect(styleSource).toContain('flex-direction: column;');
+    expect(styleSource).toContain('border-top: 1px solid rgba(148, 163, 184, 0.2);');
+    expect(styleSource).toContain('width: 100%;');
+  });
+
+  it('reuses the task-detail Files menu for produced-file actions', () => {
+    expect(source).toContain('window.ConversationInfo.openFileMenu(menuBtn, p, base');
+    expect(conversationInfoSource).toContain('function openFileMenu(anchorBtn, absPath, displayName, options = {})');
+    expect(conversationInfoSource).toContain("data-action=\"add-to-chat\"");
+    expect(conversationInfoSource).toContain("data-action=\"add-to-library\"");
+    expect(conversationInfoSource).toContain("data-action=\"delete\"");
   });
 
   it('dedupes same-basename chips to the more specific final path', () => {
@@ -88,5 +106,13 @@ describe('chat video layout', () => {
     expect(styleSource).toContain('aspect-ratio: 16 / 9;');
     expect(styleSource).toContain('width: min(640px, 100%);');
     expect(styleSource).toContain('.chat-msg-attach-video-shell');
+  });
+
+  it('wires bubble and floating-player surfaces to the shared playback toggle', () => {
+    expect(source).toContain('data-chat-video-playback-surface="attachment_bubble"');
+    expect(utilsSource).toContain('data-chat-video-playback-surface="markdown_bubble"');
+    expect((viewerSource.match(/data-chat-video-playback-surface="floating_player"/g) || [])).toHaveLength(2);
+    expect(utilsSource).toContain("target.closest('[data-chat-video-playback-surface]')");
+    expect(utilsSource).toContain('_toggleChatVideoFromSurface(e, surface)');
   });
 });

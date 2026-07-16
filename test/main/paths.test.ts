@@ -111,6 +111,30 @@ describe('paths › cloud-synced per-user', () => {
     expect(p.userSessionFile('u1', sid))
       .toBe(path.join(p.WS_ROOT, 'u1', 'cloud', 'sessions', `${sid}.jsonl`));
   });
+
+  it('project-contained runtime layout mirrors top-level cloud domains', async () => {
+    const p = await import('../../src/main/paths');
+    const uid = 'u1';
+    const pid = 'p1';
+    const cid = 'c1';
+    const root = path.join(p.WS_ROOT, uid, 'cloud', 'projects', pid);
+    expect(p.projectChatIndexFile(uid, pid)).toBe(path.join(root, 'chats', '_index.json'));
+    expect(p.projectChatJsonlFile(uid, pid, cid)).toBe(path.join(root, 'chats', 'c1.jsonl'));
+    expect(p.projectGroupChatVisibilityFile(uid, pid, cid, 'commander'))
+      .toBe(path.join(root, 'chats', cid, 'visibility', 'commander.jsonl'));
+    expect(p.projectSessionFile(uid, pid, 'gconv-c1'))
+      .toBe(path.join(root, 'sessions', 'gconv-c1.jsonl'));
+    expect(p.projectChatAttachmentDir(uid, pid, cid))
+      .toBe(path.join(root, 'chat_attachments', cid));
+    expect(p.projectArtifactDir(uid, pid, cid, 'art1'))
+      .toBe(path.join(root, 'chat_artifacts', cid, 'art1'));
+    expect(p.projectAutoTaskConfigFile(uid, pid, 'at_12345678'))
+      .toBe(path.join(root, 'auto_tasks', 'at_12345678', 'config.json'));
+    expect(p.projectFilesDir(uid, pid)).toBe(path.join(root, 'contexts'));
+    expect(p.projectLegacyFilesDir(uid, pid)).toBe(path.join(root, 'files'));
+    expect(p.projectLibraryVectorDbPath(uid, pid))
+      .toBe(path.join(p.WS_ROOT, uid, 'local', 'projects', pid, 'contexts', '.kb', 'vector.db'));
+  });
 });
 
 describe('paths › local (per-user, not synced)', () => {

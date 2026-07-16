@@ -255,89 +255,78 @@ function runElectronInstall(reason) {
   }
 }
 
-function electronDownloadArch() {
-  const envArch = process.env.npm_config_arch || '';
-  if (envArch) return envArch;
-  return process.arch;
+function sha256File(file) {
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(file));
+  return hash.digest('hex');
 }
 
-function electronDownloadPlatform() {
-  return process.env.npm_config_platform || process.platform;
-}
-
-function downloadElectronZip(expected) {
-  const script = `
-const { downloadArtifact } = require('@electron/get');
-const path = require('node:path');
-downloadArtifact({
-  version: ${JSON.stringify(expected)},
-  artifactName: 'electron',
-  platform: ${JSON.stringify(electronDownloadPlatform())},
-  arch: ${JSON.stringify(electronDownloadArch())},
-  checksums: require(${JSON.stringify(path.join(ELECTRON_DIR, 'checksums.json'))}),
-}).then((p) => process.stdout.write(String(p))).catch((err) => {
-  console.error(err && err.stack || err);
-  process.exit(1);
-});
-`;
-  const res = spawnSync(process.execPath, ['-e', script], {
-    cwd: PC_DIR,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    shell: false,
-  });
-  if (res.error) {
-    console.warn('[Orkas] Electron zip lookup failed to start:', res.error.message);
-    return '';
+function findFileByName(root, name) {
+  if (!root || !fs.existsSync(root)) return '';
+  const pending = [root];
+  while (pending.length) {
+    const dir = pending.pop();
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const candidate = path.join(dir, entry.name);
+      if (entry.isDirectory()) pending.push(candidate);
+      else if (entry.isFile() && entry.name === name) return candidate;
+    }
   }
-  if (res.status !== 0) {
-    const err = String(res.stderr || '').trim();
-    console.warn('[Orkas] Electron zip lookup failed:', err || `exit ${res.status}`);
-    return '';
-  }
-  return String(res.stdout || '').trim();
+  return '';
 }
 
-function repairElectronByUnzip(reason) {
-  if (process.platform === 'win32') return false;
-  const expected = electronExpectedVersion();
-  if (!expected) return false;
+function powershellQuote(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
 
-  const zip = downloadElectronZip(expected);
-  if (!zip || !fs.existsSync(zip)) return false;
+function repairWindowsElectronFromCache() {
+  if (process.platform !== 'win32') return false;
 
-  const relPath = electronPlatformPath();
+  const version = electronExpectedVersion();
+  const archiveName = `electron-v${version}-win32-${process.arch}.zip`;
+  let expectedSha = '';
+  try {
+    const checksums = JSON.parse(fs.readFileSync(path.join(ELECTRON_DIR, 'checksums.json'), 'utf8'));
+    expectedSha = String(checksums[archiveName] || '').toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!version || !expectedSha) return false;
+
+  const cacheRoot = process.env.electron_config_cache
+    || (process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'electron', 'Cache'));
+  const archive = findFileByName(cacheRoot, archiveName);
+  if (!archive) return false;
+
+  const actualSha = sha256File(archive);
+  if (actualSha !== expectedSha) {
+    console.warn(`[Orkas] Ignoring Electron cache with a checksum mismatch: ${archiveName}`);
+    return false;
+  }
+
   const distDir = path.join(ELECTRON_DIR, 'dist');
-  const tmpDir = path.join(ELECTRON_DIR, `.dist-extract-${process.pid}`);
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  fs.mkdirSync(tmpDir, { recursive: true });
-
-  console.log(`[Orkas] Electron install script did not complete (${reason}); extracting cached Electron archive...`);
-  const unzip = spawnSync('unzip', ['-q', '-o', zip, '-d', tmpDir], {
+  console.log('[Orkas] Electron npm extraction was incomplete; repairing from the verified download cache...');
+  fs.rmSync(distDir, { recursive: true, force: true });
+  const command = `Expand-Archive -LiteralPath ${powershellQuote(archive)} -DestinationPath ${powershellQuote(distDir)} -Force`;
+  const result = spawnSync('powershell.exe', [
+    '-NoLogo',
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-Command', command,
+  ], {
     cwd: PC_DIR,
     stdio: 'inherit',
     shell: false,
+    timeout: 10 * 60 * 1000,
   });
-  if (unzip.error) {
-    console.warn('[Orkas] unzip failed to start:', unzip.error.message);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (result.error || result.status !== 0) {
+    console.warn('[Orkas] Verified Electron cache extraction failed:', result.error?.message || `exit ${result.status}`);
     return false;
   }
-  if (unzip.status !== 0) {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    return false;
-  }
-
-  if (!electronDistReady(tmpDir, relPath, expected)) {
-    console.warn('[Orkas] Extracted Electron archive is incomplete.');
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    return false;
-  }
-
-  fs.rmSync(distDir, { recursive: true, force: true });
-  fs.renameSync(tmpDir, distDir);
-  fs.writeFileSync(ELECTRON_PATH_TXT, relPath, 'utf8');
-  return true;
+  fs.writeFileSync(ELECTRON_PATH_TXT, 'electron.exe', 'utf8');
+  return electronReady();
 }
 
 function ensureElectronReady(reason = 'missing binary') {
@@ -345,7 +334,7 @@ function ensureElectronReady(reason = 'missing binary') {
 
   runElectronInstall(reason);
   if (electronReady()) return;
-  if (repairElectronByUnzip(reason) && electronReady()) return;
+  if (repairWindowsElectronFromCache()) return;
 
   const bin = electronBinaryPath() || '<missing path.txt>';
   console.error('[Orkas] Electron is still incomplete after repair.');

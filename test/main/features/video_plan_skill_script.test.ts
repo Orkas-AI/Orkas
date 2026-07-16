@@ -5,6 +5,8 @@ import { spawnSync } from 'node:child_process';
 
 import { describe, expect, it } from 'vitest';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 function validPlan() {
   return {
     aspect: '9:16',
@@ -69,7 +71,7 @@ function runVideoPlan(cwd: string, args: string[], extraEnv: Record<string, stri
     : path.resolve(process.cwd(), 'PC');
   const skillDir = path.join(pcDir, 'resources', 'builtin', 'marketplace', 'agents', '79df9cc89f5f', 'skills', 'stage-plan');
   return spawnSync(
-    process.execPath,
+    TEST_NODE,
     [path.join(pcDir, 'bin', 'run-skill.cjs'), 'stage-plan', 'video_plan', '--', ...args],
     {
       cwd,
@@ -98,6 +100,23 @@ describe('stage-plan video_plan skill script', () => {
     expect(out.ok).toBe(true);
     expect(out.valid).toBe(true);
     expect(out.text).toContain('plan VALID');
+  });
+
+  it('keeps legacy empty tracks executable and reports them as disabled', () => {
+    const plan = validPlan() as any;
+    plan.tracks = {
+      narration: { voice: null, segments: [] },
+      music: {},
+      captions: { lines: [] },
+    };
+    const cwd = makeProject(plan);
+    const res = runVideoPlan(cwd, ['--op', 'validate', '--plan', 'project/plan.json']);
+    expect(res.status, res.stderr).toBe(0);
+    const out = parseJsonOutput(res.stdout);
+    expect(out.valid).toBe(true);
+    expect(out.warnings.map((warning: { code: string }) => warning.code)).toEqual(
+      expect.arrayContaining(['W_EMPTY_TRACK_DISABLED', 'W_CAPTIONS_EMPTY']),
+    );
   });
 
   it('returns a non-zero exit for an invalid EDL', () => {

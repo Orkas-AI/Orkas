@@ -76,6 +76,12 @@ describe("Errors", () => {
       expect(isRetryableError(new AuthError("auth"))).toBe(false);
     });
 
+    it("does not retry a statusless invalidated OAuth credential error", () => {
+      const err = new Error("Encountered invalidated oauth token for user, failing request");
+      expect(isRetryableError(err)).toBe(false);
+      expect(classifyRetryableError(err)).toBeNull();
+    });
+
     it("returns false for 400 ProviderError", () => {
       expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(false);
     });

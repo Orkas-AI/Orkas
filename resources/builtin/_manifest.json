@@ -1,0 +1,802 @@
+{
+  "schema": 1,
+  "content_tree_sha256": "5f9d72aaf7c24f8b533b35872019035f42dc79ec500a7b30a3921e343f54f087",
+  "files": [
+    {
+      "path": "marketplace/agents/78900d8758bc/_meta.json",
+      "bytes": 57,
+      "sha256": "97e313c20825961e28ef820629d65c9741f1637f7714024455119b9073732c80"
+    },
+    {
+      "path": "marketplace/agents/78900d8758bc/agent.json",
+      "bytes": 8655,
+      "sha256": "c325a71e2ea2c08734624bed48ae5597ee744cb0c2063cc31d5ee2f3c7c8880f"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/agent.json",
+      "bytes": 31743,
+      "sha256": "799f6712df800fcaf401d4c45e9560405718662e2233a75a7259283bad0e9bb3"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
+      "bytes": 6675,
+      "sha256": "16db7de302905d85bd7b433e4f133ffbb486600913a939bb4167540e6768bc7b"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/logger-shim.ts",
+      "bytes": 1069,
+      "sha256": "29422640a6699ac7d0cfeb3d5ce33255eb465902dbd70725065fed03dd376a2d"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/ocr_runtime.ts",
+      "bytes": 26015,
+      "sha256": "bd34a96aba20eed7dde4651e8ff8040ed85b9eafb40288756cad7495e5eaa820"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/paths.ts",
+      "bytes": 47253,
+      "sha256": "06ebdec5ff4bbef9f003a8b4083cc6fafe81fbe3ac49c47b803dea6c1fa291b7"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/redact.ts",
+      "bytes": 770,
+      "sha256": "160dae82317e7f785442fa479adeba55ef15a72d93a9f582e65d75291bbe44a0"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_analyze.ts",
+      "bytes": 10819,
+      "sha256": "abe2e07b2f3d98a2c3c3e0d0eff2b0102b127ef486a3932fa447c24c1c12e7f8"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_decide.ts",
+      "bytes": 19530,
+      "sha256": "a1deb6c3c93d0b0d94abdc57b7ea57b0d00ae5a20cf6ead10ba644040de9ba52"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit.ts",
+      "bytes": 51604,
+      "sha256": "5aec85ef506feee67ffae179773d20474c32a1f059441b679c149d2d4b8a9811"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl.ts",
+      "bytes": 38515,
+      "sha256": "5c3b3ea42fdd309b078afa9a85003f44ebb4dd9a61d3fa904724732fbd363072"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/composition-design-review/SKILL.md",
+      "bytes": 6272,
+      "sha256": "f49fb4498bec6e626e6dbb00c61ece2070e9412e1c498d0893c6c5dae2b9b6ee"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/design-system-importer/SKILL.md",
+      "bytes": 4459,
+      "sha256": "c297643cee42e99ba89bff3d1b50ff58888ba7503f73ed561f18db6ee762c042"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/references/html-generation-playbook.md",
+      "bytes": 6124,
+      "sha256": "8d5ed78d1d497f2295c38b2394e03ef58be7713d63e8fd56cf21f27a666c7f99"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/references/visual-primitives.md",
+      "bytes": 7573,
+      "sha256": "77343403effb6fabfbeb7313ea1367536f91b3b64bbe3c6f5df21ac46490ef77"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/references/worked-compositions.md",
+      "bytes": 4874,
+      "sha256": "d24abaf48f5f2a8af6502d1ea670d3afd1f4b2d707b9cc441f85ac8def9a1693"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/SKILL.md",
+      "bytes": 18320,
+      "sha256": "6f1800d3f8e99bef91b65c48a065d62657e7c898683b021f89a6007cba19006f"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-assemble/SKILL.md",
+      "bytes": 16135,
+      "sha256": "76871d22ad3026bf67fd8f3c1c2dbdac52ee3eaa9cf39e83891050ff38b2370c"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/scripts/vendor/gsap.min.js",
+      "bytes": 72925,
+      "sha256": "c3a03a345e45bc954cd48c43f11572891f5dca7a5d99348d5bc14753a728618c"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md",
+      "bytes": 46030,
+      "sha256": "8b0c987d598455ae0537c538d39ba8590a8f101f05c0a29205c5611bda56e5ec"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-consistency/SKILL.md",
+      "bytes": 7509,
+      "sha256": "7c08fd77facab68383a2585de79824bc95c33a5af788a703137918f014744525"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-decide/SKILL.md",
+      "bytes": 5761,
+      "sha256": "4978e53993e2ad4590fba947892f0a8d75f0cbaa0c8a7c01966d254fb1b49443"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/analyze_media.js",
+      "bytes": 4485,
+      "sha256": "d9d5186aa8fa445f8cab044b6e6d1158a717cd1fdde7c87b1d456c9e68dbecd5"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/edit_video.js",
+      "bytes": 12625,
+      "sha256": "92e983179264ef521da4bc3a805b5ff4a20b30a30ca223c900847d35003175a6"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_analyze_core.cjs",
+      "bytes": 42236,
+      "sha256": "812de0ea27b241584b20e2bef3175ed075f52ec7d03c619698e0b574dc55a97b"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_edit_core.cjs",
+      "bytes": 43243,
+      "sha256": "cdf8b58db77256cd7095f9422540ab43c0e0389e7cefcda581765716ef900a75"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/SKILL.md",
+      "bytes": 17238,
+      "sha256": "e0a34aada627491ac140113ee7c590a22e7b5db3c2716aea62b8ad1cc6ab8ea5"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-generate/SKILL.md",
+      "bytes": 7876,
+      "sha256": "96725560e397689d32869f84a7abb31168d0ba411933bfbcce02015d7414dad8"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/scripts/lib/video_decide_core.cjs",
+      "bytes": 10458,
+      "sha256": "ff742ff38a330556492ca72629ef317459d265f42f951e3703ae972c24570dfd"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/scripts/lib/video_edl_core.cjs",
+      "bytes": 22766,
+      "sha256": "7ca418efaa04089b56f7ae58547d90bcf8626c52eeb649964e02b198cdb6ccee"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/scripts/video_plan.js",
+      "bytes": 9305,
+      "sha256": "2eaf74389cd437d8eeb75c61a53da3573aebbdc6010edc3621de821a01b78ece"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/SKILL.md",
+      "bytes": 18488,
+      "sha256": "ac1cc779f1fce1b76aacd2630feaf306274992005d56d6a69173d1fb8fa9d5a3"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/video-craft/SKILL.md",
+      "bytes": 12880,
+      "sha256": "2d4638ce562e0d0b11b749892ed0ead2df6186240ce5e104ecca3cd3203283e2"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/video-router/SKILL.md",
+      "bytes": 3826,
+      "sha256": "64cb69eab12530dd144e8f75154e8f08b5cf1cc26c2e962651e64d660fbec607"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/agent.json",
+      "bytes": 15578,
+      "sha256": "f8bd4debe28d05f0b6a3e2050745a0ff1151b8fecea7e905be0bec47b4cef21a"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-artifact-workspace/SKILL.md",
+      "bytes": 12876,
+      "sha256": "e3d44538fe914d5f6bf1f3d76085ad82c058683a115bcade048070eaf2dff845"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-color/SKILL.md",
+      "bytes": 3140,
+      "sha256": "5d1d4c01a579df758fc4258bef8961fa9a1ad46887e6f1737025b8622941be17"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-controls-accessibility/SKILL.md",
+      "bytes": 6350,
+      "sha256": "9942ca94840bc1d420a0531c090bda4e988efd200ace34dfef64776e5b69167e"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-craft-checks/SKILL.md",
+      "bytes": 10418,
+      "sha256": "9a04d9631501349909b30fa0665a81f6a8d5744daa65e556326a0f94fc1dce84"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-contract/SKILL.md",
+      "bytes": 8403,
+      "sha256": "cbdb3afaa2f59c41590ee82829649b79a5f01f19808170ae81f0937771472915"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-executor/scripts/validate-html-artifact.mjs",
+      "bytes": 6888,
+      "sha256": "3bd4e26442c4eaf16e0a36f30752b701ed4aff2f545fda624f4cc0a7af5a55b8"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-executor/SKILL.md",
+      "bytes": 8725,
+      "sha256": "0147a223e2917c2cc282616a7c8fa3fa7099f78c817c611ed0edecb577c4ae32"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-review/SKILL.md",
+      "bytes": 4676,
+      "sha256": "8855d3f0652f1d365db644c280014b6168c0c96368981f309916c8a6dd44f863"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-source/SKILL.md",
+      "bytes": 7767,
+      "sha256": "da13ec835d926afe7b84b0c58c0e79bda75631526a521aafa847f497c460bbe5"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-system/SKILL.md",
+      "bytes": 8067,
+      "sha256": "eb65d4076caafa56375ee2fc06f223f32193aa9b9d56afdc5dfe43046a45293b"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-html-renderer/SKILL.md",
+      "bytes": 19501,
+      "sha256": "084394274e21bfaa893c4c1cea029e0d6cfd12325f23c6c0dab8df3a21444c3d"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-live-artifact/SKILL.md",
+      "bytes": 4887,
+      "sha256": "e3643bbd128caa000c0913d605f31f24320d2bc8677480ce3dede6880191fec9"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-reference-packs/references/design-system-packs.md",
+      "bytes": 6589,
+      "sha256": "225271150ed7e30f6d7631807819a92a3d7a56b181469e8fdb51bb2c9df72303"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-reference-packs/references/pattern-library.md",
+      "bytes": 5012,
+      "sha256": "11e0c9c7caaab4884afa66af04c76d1a3e8c02208056a09ea1eacced72c272b3"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-reference-packs/SKILL.md",
+      "bytes": 4423,
+      "sha256": "edde6cfae4ee2b8aa8e0b924bad52460b2360adedd14a49f605d2a328f5e6844"
+    },
+    {
+      "path": "marketplace/agents/bcfcb4921dce/skills/ui-taste/SKILL.md",
+      "bytes": 6387,
+      "sha256": "3e60b232f5f28128e8f04a93cec6fdc6895e3c9a93b0607a9b11ae5d5bb723e6"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/agent.json",
+      "bytes": 15534,
+      "sha256": "10a603b1a9aa4b72787aebcdd907b2e1d294cd3d17bdc52cf04e15b3489c74da"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/README.md",
+      "bytes": 8105,
+      "sha256": "d5d728ceb105c6007268c6d3cdd26cff82a38bd28ff0f5954904456c6ea4e097"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-probe/scripts/geo_probe.py",
+      "bytes": 10034,
+      "sha256": "556c28039b00ebbb547b42b911f961848b24bef88c2662deb10619eae3c93cd0"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-probe/SKILL.md",
+      "bytes": 3764,
+      "sha256": "cc6c4aded4be00a4b170580f78aa9f9bb0a65e497bd91da5a130e538d9321e0d"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-probe/test/test_geo_probe.py",
+      "bytes": 7924,
+      "sha256": "f429436e499838a7d9cfe8b52dd873eefce39be777cd6fa2155f50c52b69e139"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-score/scripts/geo_score.py",
+      "bytes": 9283,
+      "sha256": "0cea03b53b629f56c2d7ddbc44e69ae4061a73c8e99608b700b60b250878be53"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-score/SKILL.md",
+      "bytes": 2965,
+      "sha256": "11f34d6567aaea81b6e45601b911188fd4e3c3be930574e0e4acdf658aae2e59"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/geo-score/test/test_geo_score.py",
+      "bytes": 5978,
+      "sha256": "05643564db962f4f5b5515144e3ab1bbf12d8cc1c236d73add75860cd9584a90"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-content/scripts/content.py",
+      "bytes": 8385,
+      "sha256": "8fa3fee1ae761facac22ff09c94a267479ee59b15e7514a53c7c4e4a8fb48874"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-content/SKILL.md",
+      "bytes": 2953,
+      "sha256": "6951ca400c3725358b4031e9ca8494c07d9e08978e9071d7010cf3797e0ecc26"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-content/test/test_content.py",
+      "bytes": 7708,
+      "sha256": "9b7488c6ebc5ef661717a976b5ed74e994bbc8763848547485e0c3ddfeb344be"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/crawl.py",
+      "bytes": 21871,
+      "sha256": "c3b030eef9d586bd315a43c1d02b955300bdcc088b9483e05e8e72bfed224ddf"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/scripts/url_safety.py",
+      "bytes": 7629,
+      "sha256": "350ace20546baea6eeb392e08f3c73e14960262876abf03b3097d90255a175bb"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/SKILL.md",
+      "bytes": 4388,
+      "sha256": "5833a44e9207c4d9c9632ad41f268f8f11e81fe2ab975cef31cb57ab0d877fcd"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/test/test_crawl.py",
+      "bytes": 17485,
+      "sha256": "a4d0eb340e323bcadc779a29000a2dcce172ec6d1f9eb19484949203dcb520c6"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-cwv/scripts/cwv.py",
+      "bytes": 8029,
+      "sha256": "1a88c647fcc12102cc597497b179df765f2d22dbb987540004f0357033763236"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-cwv/SKILL.md",
+      "bytes": 2873,
+      "sha256": "49e3acbabaf598e3b8a4126eab72a9f0840465e566ea0173b99f8de699dfaaba"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-cwv/test/test_cwv.py",
+      "bytes": 6312,
+      "sha256": "fd77ce45bad270fbd8c80e406cf6b3170ddc772ddd7acac5de581ae35ca2c6d3"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-monitor/scripts/monitor.py",
+      "bytes": 17270,
+      "sha256": "7fd71a539ea6cb6e56a1f05df1e2614c82098eb86a2bd40dfde8d175eb641732"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-monitor/SKILL.md",
+      "bytes": 3222,
+      "sha256": "867747a2395c7047a14ae348667c21a6f878e60889d24a4651d0b0a22b59ef12"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-monitor/test/test_monitor.py",
+      "bytes": 18044,
+      "sha256": "9d131700d37c0dcccee2ad78d9240fea49cc2526bbc64b6519a5525c1f47156d"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-opportunity/scripts/opportunity.py",
+      "bytes": 14166,
+      "sha256": "82bb342ce2f66382c6f300840abf9b30f41bf7866247838e8f19070299aa3fca"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-opportunity/SKILL.md",
+      "bytes": 2820,
+      "sha256": "e031a879ecef4855f7f6650812740d4bb31f51a216051ec658e11a78b521b58d"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-opportunity/test/test_opportunity.py",
+      "bytes": 11548,
+      "sha256": "347aa309a54737a541693319602f1115af4d4a5083f50480abc681f36beda45a"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-report/scripts/report.py",
+      "bytes": 24051,
+      "sha256": "910a2b0fd52815f5c581be0618831bf6a0fc9d928302f5f9b2ee1a70e4ea084c"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-report/SKILL.md",
+      "bytes": 3253,
+      "sha256": "5f50f5a5037cb35446d4787bbcdbbeb9fc21b2690364d883c386f4bc680f3a4d"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-report/test/test_report.py",
+      "bytes": 17320,
+      "sha256": "fb6f3cf866644cba46ef2fc45d93b03df0755d07423f0ca5a63bc636b955b980"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-schema/scripts/schema.py",
+      "bytes": 9207,
+      "sha256": "324b0cd5458e164edc6a946206e91e1f67fb476ddc21aaf98e6bad43e3e3879f"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-schema/SKILL.md",
+      "bytes": 3116,
+      "sha256": "7cd97c7adf6bcd8ac0431ec886ade1905aeae0f487b36f9cfa96a0a489f833c7"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-schema/test/test_schema.py",
+      "bytes": 6365,
+      "sha256": "d064ea0839bcfe9c02ada09841cb1d2ee32ce60d800baa996af53d978337bc5a"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/scripts/audit.py",
+      "bytes": 12165,
+      "sha256": "47ab1be058edcce608128922d4e21803174e6838e2d8eab7c3e773beb4661879"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/SKILL.md",
+      "bytes": 3180,
+      "sha256": "732914ece598b68d755ff3e8c061eebf71348b6b69e00f59863f7c92831331c0"
+    },
+    {
+      "path": "marketplace/agents/e064dca9e1bd/skills/seo-tech-audit/test/test_audit.py",
+      "bytes": 7733,
+      "sha256": "a745ba98d614856ddfa633f2600c65595520bd3e588ccd552b118ea7b0cc78ba"
+    },
+    {
+      "path": "marketplace/skills/6743aa0797a2/_meta.json",
+      "bytes": 64,
+      "sha256": "33595bddd2938219c0b712e70bbb5fb2a237355566b45cfd358d1959b3a58b17"
+    },
+    {
+      "path": "marketplace/skills/6743aa0797a2/references/brand-dna-template.md",
+      "bytes": 2732,
+      "sha256": "f4f075f71190e6e5690c0148253d7500fab3c0eb5814d8ceba3182ab34cf945c"
+    },
+    {
+      "path": "marketplace/skills/6743aa0797a2/SKILL.md",
+      "bytes": 4772,
+      "sha256": "d5e622a858d65e3295f5af198748074de261d50bccf72b7527419ade4e6a0da6"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/_meta.json",
+      "bytes": 64,
+      "sha256": "33595bddd2938219c0b712e70bbb5fb2a237355566b45cfd358d1959b3a58b17"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/classification-rules.md",
+      "bytes": 1856,
+      "sha256": "c3d07c160f99012b6365e41fc2b301d9f263c7b8c27cc498fc00fbedaa15bdf8"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/dedup-strategy.md",
+      "bytes": 1430,
+      "sha256": "cc4899954739bf6b0e6051fa04ec0ad17c224b5c43618b38e5c976f02a6f8e98"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/directory-organizing.md",
+      "bytes": 2659,
+      "sha256": "23bcc5febc584e8953c1061f6ebb2477a051f455fe2746590f17d6ca62184af8"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/extraction-rules.md",
+      "bytes": 2911,
+      "sha256": "a48024cfc274a6aa73bd08a3ef44912ccc2ecfa6725d1450603db46820b7a056"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/knowledge-flow.md",
+      "bytes": 3109,
+      "sha256": "e20fa1e851231607fae8a111cbb9f04dceb4b0c50d2fe55e861ea5f1c57a615b"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/references/output-schema.md",
+      "bytes": 3694,
+      "sha256": "298070a110cf4829068d8f171282d3290d8dbf5f78b04655f85a842e2d898fa3"
+    },
+    {
+      "path": "marketplace/skills/9be6fda271a5/SKILL.md",
+      "bytes": 8664,
+      "sha256": "e748cf1c5dadd8ec51ce2473dce6acac9767ba810e5a2367543aeefca408084f"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/_meta.json",
+      "bytes": 118,
+      "sha256": "d0b17c52e4669df6f890c6f8cbc18b35d27f3489ba394afa4ae556580c56a919"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/references/fetching.md",
+      "bytes": 3172,
+      "sha256": "b4255e71ad9b95edd42229eba4931d09260d6b5be27bc9e95559356801b15588"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/references/metrics.md",
+      "bytes": 3104,
+      "sha256": "1d3a81fa93509217ab55236b4cf6167d18316a57bf0ee3f4d214db94fccb5e92"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/scripts/analyze_performance.py",
+      "bytes": 5530,
+      "sha256": "5c887a60ae8c6df813f7c3aa82fd1563909865f39a8261605afdcdc16d99d3d5"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/scripts/calculate_metrics.py",
+      "bytes": 4991,
+      "sha256": "4afab388d6246e24a33da945505418999ecee9cc6d3844ab828fb6dbc2d702c2"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/scripts/fetch.py",
+      "bytes": 3450,
+      "sha256": "26df67a46f8727ec248aaa21f98cefa412e3b795a8c96fd4b01402a9f35151eb"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/scripts/social_fetch_core.py",
+      "bytes": 32598,
+      "sha256": "9b4880c06a9bf45cf2afc8b2cb3ce18deba8595dae5875d01616d337acb1a51d"
+    },
+    {
+      "path": "marketplace/skills/e7f5c0e6f1be/SKILL.md",
+      "bytes": 6217,
+      "sha256": "7e1be014da084abb05fd3c0bbe65eed2577112d73a5835c5deeca571954b09f9"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/_meta.json",
+      "bytes": 118,
+      "sha256": "d36f057dc9cb42541f30906497f175c9d51db7d3da1edc494fb41708849120b6"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/citation-style.md",
+      "bytes": 1845,
+      "sha256": "14cfa4463fe0aeddebad46b67e370c5456f49817369373f7da9d1566df0a3df1"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/evidence-standards.md",
+      "bytes": 2443,
+      "sha256": "80f69ae5ea062e13aefd8e5d5043fb72f5adbddb6506532beb239d6666247d3b"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/report-structure.md",
+      "bytes": 2534,
+      "sha256": "088739d2a69a69f4a1f9a30a028b7d01ecebcf2f8a5df21531e3983b9514c271"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/research-workflow.md",
+      "bytes": 2687,
+      "sha256": "3b7992954170cc2654188e720db0dc1f655157db7d8dcb4ef4e4b79835e4666e"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/scholarly-evidence.md",
+      "bytes": 4816,
+      "sha256": "4ab2501a9ec17cd65a6517a79056d7e0969390adb678c7f9dd069542da43bb47"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/references/source-quality.md",
+      "bytes": 1993,
+      "sha256": "4191a650985f683646290236d7c61829a47a60244be51b3ac8e543053252fb90"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/scripts/academic.py",
+      "bytes": 11806,
+      "sha256": "33ca61c9b9182efbf36ff9d1970fc1b3f463e8057412f38557534d015a3dcf87"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/scripts/caps.py",
+      "bytes": 7570,
+      "sha256": "53ef286b48fec6c1ca06af8d495b2a6a20093681057ff7aac647494573804399"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/scripts/citations.py",
+      "bytes": 12696,
+      "sha256": "1f61d8d7f2fae78199e4ab2cf249d9b63577d34fb80238578c192b438843c7da"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/scripts/compress.py",
+      "bytes": 14061,
+      "sha256": "a4fd5bee1ec4b37be926c9fd5f1fa42c711638af9908a15bbe469f6881f4d94f"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/SKILL.md",
+      "bytes": 9426,
+      "sha256": "aa88e3dbe2e7527af5ceb8f97580f1039026cb3d99d6b62113742e78215aed5a"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/test/test_academic.py",
+      "bytes": 9285,
+      "sha256": "f32d159b2c2b9dc0509f2b742c09d5f39aabf270105e885f2018bab7b2123f6f"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/test/test_caps.py",
+      "bytes": 6245,
+      "sha256": "3fb2bf180c44f5fb4b22a47c40b7d1775dd1e340979422ab52cf84abb71bb30f"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/test/test_citations.py",
+      "bytes": 10950,
+      "sha256": "eee7c399d47691ff49f420cc6d858086ba7e22ccf625b9202b2c393fd4b5857b"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/test/test_compress.py",
+      "bytes": 10863,
+      "sha256": "42f4ad45828d6e2ce0705549260545a28d2455bb121b9bebb0b412a7173d29e3"
+    },
+    {
+      "path": "marketplace/skills/ee99fbb42964/test/test_pipeline.py",
+      "bytes": 6925,
+      "sha256": "9bde4837822605373873aef1d96304b50f9fed2517442ee4543da761645784e8"
+    },
+    {
+      "path": "system/skills/_system.json",
+      "bytes": 338,
+      "sha256": "0d02397e0baa3aebc729c464003d8b524906ce982a846450461bb0e5a5a57b89"
+    },
+    {
+      "path": "system/skills/agent-creator/SKILL.md",
+      "bytes": 38770,
+      "sha256": "723d94ae76ce6279e1d3c8a9a16aa525d295dc15883fa98b753a126110b21e94"
+    },
+    {
+      "path": "system/skills/autotask-creator/SKILL.md",
+      "bytes": 6940,
+      "sha256": "a41ed0214f01df760e51c9fee755d683f31cb1f830e2b93569653eba067259be"
+    },
+    {
+      "path": "system/skills/coding/SKILL.md",
+      "bytes": 5760,
+      "sha256": "761ea597ef98dabb183c4e3802fcc582bfdfbb3b30fb231ad9650b4a70943dc7"
+    },
+    {
+      "path": "system/skills/package-installer/SKILL.md",
+      "bytes": 5317,
+      "sha256": "647e22ac279f7c5ad6267e7e4d8736b72a86734836e4ad7e81337db4e6f69865"
+    },
+    {
+      "path": "system/skills/skill-creator/SKILL.md",
+      "bytes": 43357,
+      "sha256": "9542e4777946420c9c469ebb220f5ad0de08dcbb14e6b0e52083fc09137a0a90"
+    }
+  ],
+  "inventory": {
+    "system_skills": [
+      {
+        "id": "agent-creator",
+        "update_at": 1781361000000
+      },
+      {
+        "id": "autotask-creator",
+        "update_at": 1780908069946
+      },
+      {
+        "id": "coding",
+        "update_at": 1783054632453
+      },
+      {
+        "id": "package-installer",
+        "update_at": 1781568000000
+      },
+      {
+        "id": "skill-creator",
+        "update_at": 1781406695433
+      }
+    ],
+    "marketplace_agents": [
+      {
+        "id": "78900d8758bc",
+        "name": "DeepResearcher",
+        "version": "1.0.6",
+        "skill_list": [
+          "6743aa0797a2",
+          "9be6fda271a5",
+          "e7f5c0e6f1be",
+          "ee99fbb42964"
+        ],
+        "embedded_skills": []
+      },
+      {
+        "id": "79df9cc89f5f",
+        "name": "VideoStudio",
+        "version": "1.0.44",
+        "skill_list": [
+          "composition-design-review",
+          "design-system-importer",
+          "frontend-design",
+          "stage-assemble",
+          "stage-compose",
+          "stage-consistency",
+          "stage-decide",
+          "stage-edit",
+          "stage-generate",
+          "stage-plan",
+          "video-craft",
+          "video-router"
+        ],
+        "embedded_skills": [
+          "composition-design-review",
+          "design-system-importer",
+          "frontend-design",
+          "stage-assemble",
+          "stage-compose",
+          "stage-consistency",
+          "stage-decide",
+          "stage-edit",
+          "stage-generate",
+          "stage-plan",
+          "video-craft",
+          "video-router"
+        ]
+      },
+      {
+        "id": "bcfcb4921dce",
+        "name": "UIDesigner",
+        "version": "1.3.0",
+        "skill_list": [
+          "ui-artifact-workspace",
+          "ui-color",
+          "ui-controls-accessibility",
+          "ui-craft-checks",
+          "ui-design-contract",
+          "ui-design-executor",
+          "ui-design-review",
+          "ui-design-source",
+          "ui-design-system",
+          "ui-html-renderer",
+          "ui-live-artifact",
+          "ui-reference-packs",
+          "ui-taste"
+        ],
+        "embedded_skills": [
+          "ui-artifact-workspace",
+          "ui-color",
+          "ui-controls-accessibility",
+          "ui-craft-checks",
+          "ui-design-contract",
+          "ui-design-executor",
+          "ui-design-review",
+          "ui-design-source",
+          "ui-design-system",
+          "ui-html-renderer",
+          "ui-live-artifact",
+          "ui-reference-packs",
+          "ui-taste"
+        ]
+      },
+      {
+        "id": "e064dca9e1bd",
+        "name": "SeoGeoAgent",
+        "version": "1.0.2",
+        "skill_list": [
+          "geo-probe",
+          "geo-score",
+          "seo-content",
+          "seo-crawl",
+          "seo-cwv",
+          "seo-monitor",
+          "seo-opportunity",
+          "seo-report",
+          "seo-schema",
+          "seo-tech-audit"
+        ],
+        "embedded_skills": [
+          "geo-probe",
+          "geo-score",
+          "seo-content",
+          "seo-crawl",
+          "seo-cwv",
+          "seo-monitor",
+          "seo-opportunity",
+          "seo-report",
+          "seo-schema",
+          "seo-tech-audit"
+        ]
+      }
+    ],
+    "marketplace_skills": [
+      {
+        "id": "6743aa0797a2",
+        "name": "brand-research",
+        "version": "1.0.1",
+        "updated_at": "2026-07-04T00:00:00"
+      },
+      {
+        "id": "9be6fda271a5",
+        "name": "material-organizer",
+        "version": "1.0.1",
+        "updated_at": "2026-07-04T00:00:00"
+      },
+      {
+        "id": "e7f5c0e6f1be",
+        "name": "social-data",
+        "version": "1.0.2",
+        "updated_at": "2026-07-16T11:00:00"
+      },
+      {
+        "id": "ee99fbb42964",
+        "name": "deep-research",
+        "version": "1.0.3",
+        "updated_at": "2026-07-04T00:00:00"
+      }
+    ]
+  }
+}

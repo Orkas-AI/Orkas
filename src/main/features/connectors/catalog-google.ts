@@ -60,6 +60,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/google-workspace-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://www.googleapis.com/',
     },
   },
   {
@@ -77,6 +78,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gmail-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://gmail.googleapis.com/',
     },
   },
   {
@@ -94,6 +96,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gcal-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://www.googleapis.com/calendar/v3',
     },
   },
   {
@@ -111,6 +114,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gdocs-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://docs.googleapis.com/v1',
     },
   },
   {
@@ -128,6 +132,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gsheets-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://sheets.googleapis.com/v4',
     },
   },
   {
@@ -145,6 +150,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gtasks-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://tasks.googleapis.com/tasks/v1',
     },
   },
   {
@@ -162,6 +168,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gsearch-console-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+      proxy_target_url: 'https://www.googleapis.com/webmasters/v3',
     },
   },
 ];

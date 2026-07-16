@@ -21,6 +21,7 @@ const ConversationInfo = (() => {
   let _loadingSource = '';
   let _loadingSeq = 0;
   let _error = '';
+  let _fileMenuScrollHost = null;
   let _snapshot = {
     conversation: null,
     history: [],
@@ -42,17 +43,11 @@ const ConversationInfo = (() => {
     'sql', 'graphql', 'gql',
   ]);
   const _CI_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+  const _CI_VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv']);
+  const _CI_AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'opus', 'm4a', 'aac', 'flac']);
   const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
   const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
   const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
-  const _CI_LIBRARY_IMPORT_EXTS = new Set([
-    ..._CI_TEXT_EXTS,
-    ..._CI_IMAGE_EXTS,
-    ..._CI_OFFICE_WORD_EXTS,
-    ..._CI_OFFICE_SHEET_EXTS,
-    ..._CI_OFFICE_PRESENTATION_EXTS,
-    'pdf',
-  ]);
 
   function _label(key, fallback, vars) {
     try {
@@ -172,7 +167,8 @@ const ConversationInfo = (() => {
   function _kindForName(name) {
     const ext = _extForName(name);
     if (_CI_IMAGE_EXTS.has(ext)) return 'image';
-    if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
+    if (_CI_VIDEO_EXTS.has(ext)) return 'video';
+    if (_CI_AUDIO_EXTS.has(ext)) return 'audio';
     if (ext === 'pdf') return 'pdf';
     if (_CI_OFFICE_WORD_EXTS.has(ext)) return 'docx';
     if (_CI_OFFICE_SHEET_EXTS.has(ext)) return 'spreadsheet';
@@ -182,12 +178,34 @@ const ConversationInfo = (() => {
     return 'unsupported';
   }
 
-  function _canAddEntryToLibrary(nameOrKind) {
-    const raw = String(nameOrKind || '');
-    if (!raw || raw === 'dir') return false;
-    const ext = _extForName(raw);
-    if (ext) return _CI_LIBRARY_IMPORT_EXTS.has(ext);
-    return ['image', 'pdf', 'docx', 'spreadsheet', 'presentation', 'text'].includes(raw);
+  function _fileOperationPolicy() {
+    return typeof window !== 'undefined' ? window.FileOperationPolicy : null;
+  }
+
+  function _canAddEntryToLibrary(name, projectScoped = false) {
+    const policy = _fileOperationPolicy();
+    return !!(policy && policy.canAddToLibrary(name, { projectScoped }));
+  }
+
+  function _canAddEntryToChat(name) {
+    const policy = _fileOperationPolicy();
+    return !!(policy && policy.canAddToChat(name));
+  }
+
+  function _canShareEntry(name) {
+    const policy = _fileOperationPolicy();
+    return !!(policy && policy.canShare(name));
+  }
+
+  function _isProjectConversation(cid) {
+    const target = String(cid || '');
+    const snapshotConversation = _snapshot.conversation;
+    if (snapshotConversation
+      && (!target || target === _cid || snapshotConversation.conversation_id === target)
+      && snapshotConversation.project_id) return true;
+    if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
+    const conversation = conversations.find((item) => item && item.conversation_id === target);
+    return !!(conversation && conversation.project_id);
   }
 
   function _formatBytes(bytes) {
@@ -208,7 +226,9 @@ const ConversationInfo = (() => {
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
     const [historyData, filesData, attachmentData, syncEnabled] = await Promise.all([
-      _fetchJson(`/api/conversations/${enc}/history?limit=500`),
+      _fetchJson(typeof _historyRequestUrl === 'function'
+        ? _historyRequestUrl(cid)
+        : `/api/conversations/${enc}/history?limit=10`),
       _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
@@ -235,18 +255,15 @@ const ConversationInfo = (() => {
 
   async function _loadFileSnapshot(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, filesData] = await Promise.all([
-      _fetchJson(`/api/conversations/${enc}/history?limit=500`),
-      _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
-        _infoLog.warn('file list load failed', { cid, error: err && err.message });
-        return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
-      }),
-    ]);
-    // syncEnabled is intentionally omitted so a partial file refresh preserves
-    // the value from the last full _load instead of clobbering it.
+    const filesData = await _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
+      _infoLog.warn('file list load failed', { cid, error: err && err.message });
+      return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
+    });
+    // A file-only refresh used to fetch the complete history again just to
+    // preserve the existing snapshot. The original panel load already owns
+    // that history; generated files are authoritative in the workspace scan.
+    // Leave history/conversation/syncEnabled untouched in the caller's merge.
     return {
-      conversation: historyData.conversation || null,
-      history: Array.isArray(historyData.history) ? historyData.history : [],
       files: Array.isArray(filesData.items) ? filesData.items : [],
       fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
       fileRootExists: filesData.rootExists === true,
@@ -710,12 +727,14 @@ const ConversationInfo = (() => {
       .map((file) => ({ path: file.path, name: _baseName(file.path) }));
   }
 
-  async function _fallbackImportAttachments(entries) {
+  async function _fallbackImportAttachments(entries, cidOverride) {
+    const targetCid = cidOverride || _cid;
+    if (!targetCid) return;
     const rejected = [];
     const imported = [];
     for (const entry of entries) {
       try {
-        const res = await apiFetch(`/api/conversations/${encodeURIComponent(_cid)}/attachments/import`, {
+        const res = await apiFetch(`/api/conversations/${encodeURIComponent(targetCid)}/attachments/import`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path: entry.path, name: entry.name }),
@@ -736,7 +755,7 @@ const ConversationInfo = (() => {
         }));
       }
     }
-    if (imported.length) await refreshAttachments(_cid);
+    if (imported.length) await refreshAttachments(targetCid);
     if (rejected.length) {
       await uiAlert(_label('chat.attach_rejected_prefix', 'The following files could not be uploaded:\n\n{list}', {
         list: rejected.join('\n'),
@@ -744,9 +763,10 @@ const ConversationInfo = (() => {
     }
   }
 
-  function _fileActionPayload(absPath) {
+  function _fileActionPayload(absPath, cidOverride) {
     const payload = { path: absPath };
-    if (_cid) payload.cid = _cid;
+    const targetCid = cidOverride || _cid;
+    if (targetCid) payload.cid = targetCid;
     return payload;
   }
 
@@ -789,20 +809,24 @@ const ConversationInfo = (() => {
       delete menu.dataset.filePath;
       delete menu.dataset.fileName;
     }
-    document.querySelectorAll('.conversation-info-file.is-menu-open, .conversation-info-dir-summary.is-menu-open')
+    document.querySelectorAll('.conversation-info-file.is-menu-open, .conversation-info-dir-summary.is-menu-open, .chat-msg-produced-item.is-menu-open')
       .forEach((row) => row.classList && row.classList.remove && row.classList.remove('is-menu-open'));
     if (document.removeEventListener) {
       document.removeEventListener('mousedown', _onFileMenuOutside, true);
       document.removeEventListener('keydown', _onFileMenuKeyDown, true);
     }
     if (window.removeEventListener) window.removeEventListener('resize', _closeFileMenu);
+    if (_fileMenuScrollHost && _fileMenuScrollHost.removeEventListener) {
+      _fileMenuScrollHost.removeEventListener('scroll', _closeFileMenu);
+    }
+    _fileMenuScrollHost = null;
   }
 
   function _onFileMenuOutside(ev) {
     const menu = document.getElementById('conversation-info-file-menu');
     if (!menu || menu.style.display === 'none') return;
     if (menu.contains(ev.target)) return;
-    if (ev.target && ev.target.closest && ev.target.closest('.conversation-info-file-menu-btn')) return;
+    if (ev.target && ev.target.closest && ev.target.closest('.conversation-info-file-menu-btn, .chat-msg-produced-menu-btn')) return;
     _closeFileMenu();
   }
 
@@ -810,7 +834,7 @@ const ConversationInfo = (() => {
     if (ev.key === 'Escape') _closeFileMenu();
   }
 
-  async function _openFileMenu(anchorBtn, absPath, displayName, kind) {
+  async function _openFileMenu(anchorBtn, absPath, displayName, kind, options = {}) {
     if (!anchorBtn || !absPath) return;
     const menu = _ensureFileMenu();
     const sameFile = menu.dataset.filePath === absPath && menu.style.display !== 'none';
@@ -819,6 +843,8 @@ const ConversationInfo = (() => {
 
     const name = displayName || _baseName(absPath);
     const entryKind = kind === 'dir' ? 'dir' : 'file';
+    const targetCid = options.cid || _cid;
+    const projectScoped = _isProjectConversation(targetCid);
     const revealLabel = _label('conversation_info.file_reveal_action', 'Show in folder');
     const addLabel = _label('conversation_info.file_add_to_chat_action', 'Add to chat');
     const addLibraryLabel = _label('conversation_info.file_add_to_library_action', 'Add to Library');
@@ -826,15 +852,13 @@ const ConversationInfo = (() => {
     const deleteLabel = _label('common.delete', 'Delete');
     let canSaveApp = false;
     try {
-      const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _fileActionPayload(absPath));
+      const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _fileActionPayload(absPath, targetCid));
       canSaveApp = !!(inspected && inspected.ok !== false && inspected.canSave);
     } catch (_) { canSaveApp = false; }
-    // Directory entries omit "add to chat" — only individual files can be
-    // attached to the active conversation.
-    const addItem = entryKind === 'file'
+    const addItem = entryKind === 'file' && _canAddEntryToChat(name || absPath)
       ? `<div class="ctx-row-menu-item" data-action="add-to-chat">${escapeHtml(addLabel)}</div>`
       : '';
-    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(name || absPath)
+    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(name || absPath, projectScoped)
       ? `<div class="ctx-row-menu-item" data-action="add-to-library">${escapeHtml(addLibraryLabel)}</div>`
       : '';
     const saveAppItem = canSaveApp
@@ -850,16 +874,23 @@ const ConversationInfo = (() => {
     menu.dataset.filePath = absPath;
     menu.dataset.fileName = name;
     menu.dataset.entryKind = entryKind;
-    const row = anchorBtn.closest('.conversation-info-file, .conversation-info-dir-summary');
+    const row = anchorBtn.closest('.conversation-info-file, .conversation-info-dir-summary, .chat-msg-produced-item');
     if (row) row.classList.add('is-menu-open');
     _positionFileMenu(menu, anchorBtn);
+    _fileMenuScrollHost = anchorBtn.closest('.chat-msg-produced');
+    if (_fileMenuScrollHost && _fileMenuScrollHost.addEventListener) {
+      _fileMenuScrollHost.addEventListener('scroll', _closeFileMenu, { passive: true });
+    }
 
     menu.querySelectorAll('.ctx-row-menu-item').forEach((item) => {
       item.addEventListener('click', async (e) => {
         e.stopPropagation();
         const action = item.dataset.action || '';
         _closeFileMenu();
-        await _runFileMenuAction(action, absPath, name, entryKind);
+        await _runFileMenuAction(action, absPath, name, entryKind, {
+          cid: targetCid,
+          onDeleted: typeof options.onDeleted === 'function' ? options.onDeleted : null,
+        });
       });
     });
     document.addEventListener('mousedown', _onFileMenuOutside, true);
@@ -867,9 +898,9 @@ const ConversationInfo = (() => {
     window.addEventListener('resize', _closeFileMenu);
   }
 
-  async function _revealEntry(absPath) {
+  async function _revealEntry(absPath, cidOverride) {
     try {
-      const res = await window.orkas.invoke('workspace.revealPath', _fileActionPayload(absPath));
+      const res = await window.orkas.invoke('workspace.revealPath', _fileActionPayload(absPath, cidOverride));
       if (!res || !res.ok) {
         await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not show in folder: {reason}', {
           reason: (res && res.error) || 'failed',
@@ -882,24 +913,25 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _addEntryToChat(absPath, kind) {
-    if (!_cid) return;
+  async function _addEntryToChat(absPath, kind, cidOverride) {
+    const targetCid = cidOverride || _cid;
+    if (!targetCid) return;
     const entries = _attachmentEntriesForPath(absPath, kind);
     if (!entries.length) {
       await uiAlert(_label('conversation_info.dir_add_empty', 'No files in this folder can be added'));
       return;
     }
     if (typeof window.addChatAttachmentsFromPaths === 'function') {
-      await window.addChatAttachmentsFromPaths(_cid, entries);
+      await window.addChatAttachmentsFromPaths(targetCid, entries);
       return;
     }
-    await _fallbackImportAttachments(entries);
+    await _fallbackImportAttachments(entries, targetCid);
   }
 
-  async function _addEntryToLibrary(absPath) {
+  async function _addEntryToLibrary(absPath, cidOverride) {
     if (!_canAddEntryToLibrary(absPath)) return;
     try {
-      const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath));
+      const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
       if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
       if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
         loadContexts();
@@ -914,9 +946,9 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _saveEntryAsApp(absPath) {
+  async function _saveEntryAsApp(absPath, cidOverride) {
     try {
-      const res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath));
+      const res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
       if (!res || res.ok === false) throw new Error((res && res.error) || 'failed');
       const message = _label('apps.saved_toast', 'Saved to My Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
@@ -927,7 +959,7 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _deleteEntry(absPath, displayName, kind) {
+  async function _deleteEntry(absPath, displayName, kind, options = {}) {
     const name = displayName || _baseName(absPath);
     const isDir = kind === 'dir';
     const confirmTitle = isDir
@@ -943,7 +975,7 @@ const ConversationInfo = (() => {
     if (!ok) return;
 
     try {
-      const res = await window.orkas.invoke('workspace.deletePath', _fileActionPayload(absPath));
+      const res = await window.orkas.invoke('workspace.deletePath', _fileActionPayload(absPath, options.cid));
       if (!res || !res.ok) {
         await uiAlert(_label(isDir ? 'conversation_info.dir_delete_failed' : 'conversation_info.file_delete_failed', 'Could not delete: {reason}', {
           reason: (res && res.error) || 'failed',
@@ -957,7 +989,8 @@ const ConversationInfo = (() => {
         files: (_snapshot.files || []).filter((item) => !_pathIsSameOrInside(deletedPath, item && item.path)),
       };
       _renderBody();
-      refresh(_cid, { silent: true });
+      if (_cid) refresh(_cid, { silent: true });
+      if (typeof options.onDeleted === 'function') options.onDeleted(deletedPath);
     } catch (err) {
       await uiAlert(_label(isDir ? 'conversation_info.dir_delete_failed' : 'conversation_info.file_delete_failed', 'Could not delete: {reason}', {
         reason: String(err && err.message || err),
@@ -965,12 +998,12 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _runFileMenuAction(action, absPath, displayName, kind) {
-    if (action === 'reveal') return _revealEntry(absPath);
-    if (action === 'save-as-app') return _saveEntryAsApp(absPath);
-    if (action === 'add-to-library') return _addEntryToLibrary(absPath);
-    if (action === 'add-to-chat') return _addEntryToChat(absPath, kind);
-    if (action === 'delete') return _deleteEntry(absPath, displayName, kind);
+  async function _runFileMenuAction(action, absPath, displayName, kind, options = {}) {
+    if (action === 'reveal') return _revealEntry(absPath, options.cid);
+    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid);
+    if (action === 'add-to-library') return _addEntryToLibrary(absPath, options.cid);
+    if (action === 'add-to-chat') return _addEntryToChat(absPath, kind, options.cid);
+    if (action === 'delete') return _deleteEntry(absPath, displayName, kind, options);
   }
 
   async function _openAttachment(name) {
@@ -1095,6 +1128,9 @@ const ConversationInfo = (() => {
     _syncChrome();
     _renderBody();
   }
+  function openFileMenu(anchorBtn, absPath, displayName, options = {}) {
+    return _openFileMenu(anchorBtn, absPath, displayName, 'file', options);
+  }
 
   return {
     bind,
@@ -1106,6 +1142,7 @@ const ConversationInfo = (() => {
     close,
     toggle,
     openAndSetTab,
+    openFileMenu,
   };
 })();
 

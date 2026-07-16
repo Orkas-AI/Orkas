@@ -40,8 +40,7 @@ fi
 echo "[Orkas] Starting Orkas (global prod)"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"
-node "$APP_DIR/bin/ensure-runtime.cjs" --root "$APP_DIR/resources/runtime"
-node "$APP_DIR/scripts/fetch-officecli.cjs"
+node "$APP_DIR/scripts/ensure-dev-dependencies.cjs"
 
 cd "$APP_DIR"
 pkill -9 -f "$APP_DIR/node_modules/electron/dist" >/dev/null 2>&1 || true
@@ -61,4 +60,4 @@ fi
 # This is ANGLE fallback noise when probing driver attributes and has no
 # functional impact. Filter only that stderr line; pass through everything else.
 # If `unbuffer` is unavailable, default line buffering is fine (macOS bash built-in).
-exec npm start 2> >(grep -v --line-buffered "EGL Driver message" >&2)
+exec npm run start:electron 2> >(grep -v --line-buffered "EGL Driver message" >&2)

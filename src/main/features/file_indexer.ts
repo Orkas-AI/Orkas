@@ -39,7 +39,8 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { userChatAttachmentsDir, userFileCacheDir } from '../paths';
+import { userChatAttachmentsDir, userFileCacheDir, projectChatAttachmentsDir } from '../paths';
+import { listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
@@ -159,8 +160,12 @@ function cacheDirFor(userId: string, absPath: string): string {
 }
 
 function deriveScope(userId: string, absPath: string): { source: SourceScope; cid?: string } {
-  const attachmentsRoot = userChatAttachmentsDir(userId);
-  if (absPath.startsWith(attachmentsRoot + path.sep)) {
+  const attachmentRoots = [
+    userChatAttachmentsDir(userId),
+    ...listProjectIds(userId).map((pid) => projectChatAttachmentsDir(userId, pid)),
+  ];
+  for (const attachmentsRoot of attachmentRoots) {
+    if (!absPath.startsWith(attachmentsRoot + path.sep)) continue;
     // layout: <attachmentsRoot>/<cid>/<file>  — cid is the first dir segment
     const rest = absPath.slice(attachmentsRoot.length + 1);
     const segs = rest.split(path.sep).filter(Boolean);

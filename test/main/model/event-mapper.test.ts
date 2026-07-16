@@ -19,6 +19,7 @@ type AgentRunEvent =
       name: string;
       id: string;
       result: string;
+      persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;
       errorCode?: string;
       errorSeverity?: 'recoverable' | 'error';
@@ -37,6 +38,7 @@ type AgentRunEvent =
       };
     }
   | { type: 'retry'; attempt: number; reason: string }
+  | { type: 'provider_fallback'; reason: 'auth'; providerId: string }
   | {
       type: 'context_status';
       phase:
@@ -280,6 +282,26 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(retryProgress.text).not.toContain('finish_reason');
   });
 
+  it('provider auth fallback is visible and does not look like a network retry', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        { type: 'provider_fallback', reason: 'auth', providerId: 'openai-codex' },
+        { type: 'done', result: { text: '', meta: { error: null } } },
+      ]);
+      const progress = out.find((e) => e.type === 'progress');
+      expect(progress.text).toContain('OpenAI Codex 模型凭证已失效');
+      expect(progress.text).toContain('备用模型继续执行');
+      expect(progress.text).not.toContain('网络异常');
+      expect(progress.event).toEqual({
+        stream: 'provider',
+        data: { phase: 'fallback', reason: 'auth', provider_id: 'openai-codex' },
+      });
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
   it('tool_end with isError → end event flags isError + carries preview', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'bash', id: 'c3', input: { command: 'false' } },
@@ -324,7 +346,31 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(endEvent.event.data.result_path).toBeUndefined();
   });
 
-  it('tool_end with spilled <persisted-output> result → end event carries `result_path`', async () => {
+  it('tool_end uses model-hidden persisted-output metadata for the UI path', async () => {
+    const marker = '<persisted-output ref="bash.0123456789abcdef" tool="bash" size="71234">bounded preview</persisted-output>';
+    const out = await collect([
+      { type: 'tool_start', name: 'bash', id: 'c2-new', input: { command: 'curl big' } },
+      {
+        type: 'tool_end',
+        name: 'bash',
+        id: 'c2-new',
+        result: marker,
+        persistedOutput: {
+          path: '/Users/x/.orkas/data/u1/local/tool-results/u1-conv-cid/bash.0123456789abcdef.txt',
+          size: 71234,
+          ref: 'bash.0123456789abcdef',
+        },
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.result_path)
+      .toBe('/Users/x/.orkas/data/u1/local/tool-results/u1-conv-cid/bash.0123456789abcdef.txt');
+    expect(endEvent.event.data.result_size).toBe(71234);
+    expect(endEvent.event.data.output).toBeUndefined();
+  });
+
+  it('legacy path-bearing <persisted-output> markers remain expandable', async () => {
     // tool-result-cap.ts rewrites oversized tool results into this
     // marker shape; the model + the event mapper both consume it. The
     // renderer's click-to-expand uses `result_path` to IPC-read the

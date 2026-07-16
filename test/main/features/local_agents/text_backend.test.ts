@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 
 import { makeTextBackend } from '../../../../src/main/features/local_agents/backends/_text';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 describe('local_agents/backends/_text', () => {
   it('streams stdout, emits stderr lines, and reports completion', async () => {
     const backend = makeTextBackend({
@@ -20,7 +22,7 @@ describe('local_agents/backends/_text', () => {
     const events: any[] = [];
 
     await backend.run({
-      binPath: process.execPath,
+      binPath: TEST_NODE,
       prompt: 'hello',
       cwd: process.cwd(),
       signal: new AbortController().signal,
@@ -28,7 +30,7 @@ describe('local_agents/backends/_text', () => {
       onEvent: event => events.push(event),
     });
 
-    expect(events[0]).toMatchObject({ type: 'process-info', cmd: process.execPath });
+    expect(events[0]).toMatchObject({ type: 'process-info', cmd: TEST_NODE });
     expect(events.some(event => event.type === 'stderr-line' && event.line === 'warn line')).toBe(true);
     expect(events.some(event => event.type === 'text-delta' && String(event.text).includes('reply:hello'))).toBe(true);
     expect(events.at(-1)).toMatchObject({
@@ -51,7 +53,7 @@ describe('local_agents/backends/_text', () => {
     const events: any[] = [];
 
     await backend.run({
-      binPath: process.execPath,
+      binPath: TEST_NODE,
       prompt: '',
       cwd: process.cwd(),
       signal: new AbortController().signal,

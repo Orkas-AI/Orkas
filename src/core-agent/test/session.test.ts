@@ -1,5 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { Session } from "../src/agent/session.js";
+import {
+  Session,
+  ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
+  ACTIVE_CHECKPOINT_ERROR_RESULT_MAX_CHARS,
+  ACTIVE_PROCESS_TRIGGER_TOKENS,
+  ACTIVE_CHECKPOINT_TOOL_INPUT_MAX_CHARS,
+  ACTIVE_CHECKPOINT_TOOL_RESULT_MAX_CHARS,
+  ARCHIVED_TOOL_RESULT_MARKER,
+  COMPLETED_WORK_MAX_ENTRIES,
+  COMPLETED_WORK_MODEL_MAX_CHARS,
+  COMPLETED_WORK_MODEL_MAX_ENTRIES,
+  EXECUTION_PLAN_AUDIT_MAX_ENTRIES,
+} from "../src/agent/session.js";
 
 describe("Session", () => {
   it("starts empty", () => {
@@ -177,11 +189,11 @@ describe("Session", () => {
     expect(JSON.stringify(view)).toContain("Second task");
   });
 
-  it("history archive candidate triggers at 15 turns and retains the newest two raw turns", () => {
+  it("history archive candidate triggers by structured size and retains the newest two raw turns", () => {
     const session = new Session();
     for (let i = 0; i < 15; i++) {
-      session.beginUserTurn([{ type: "text", text: `User ${i}` }]);
-      session.addAssistantMessage([{ type: "text", text: `Answer ${i}` }]);
+      session.beginUserTurn([{ type: "text", text: `User ${i} ${"large ".repeat(400)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Answer ${i} ${"body ".repeat(400)}` }]);
       session.completeActiveTurn();
     }
 
@@ -202,6 +214,57 @@ describe("Session", () => {
     expect(serialized).toContain("User 14");
     expect(serialized).toContain("Answer 14");
     expect(serialized).toContain("Fresh task");
+  });
+
+  it("does not use completed-turn count as a history compaction trigger", () => {
+    const session = new Session();
+    for (let i = 0; i < 50; i++) {
+      session.beginUserTurn([{ type: "text", text: `User ${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Answer ${i}` }]);
+      session.completeActiveTurn();
+    }
+
+    expect(session.getPendingHistoryArchive()).toBeNull();
+  });
+
+  it("includes the existing rolling summary in the 12K history high-water mark", () => {
+    const session = new Session();
+    for (let i = 0; i < 15; i++) {
+      session.beginUserTurn([{ type: "text", text: `Seed ${i} ${"large ".repeat(400)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Seed answer ${i} ${"body ".repeat(400)}` }]);
+      session.completeActiveTurn();
+    }
+    const initial = session.getPendingHistoryArchive()!;
+    session.applyHistorySummary("s".repeat(8_000), initial.turnIds);
+
+    let next = session.getPendingHistoryArchive();
+    for (let i = 0; !next && i < 30; i++) {
+      session.beginUserTurn([{ type: "text", text: `New ${i} ${"request ".repeat(200)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `New answer ${i} ${"response ".repeat(200)}` }]);
+      session.completeActiveTurn();
+      next = session.getPendingHistoryArchive();
+    }
+
+    expect(next).toBeTruthy();
+    expect(next!.summaryTokens).toBeGreaterThan(0);
+    expect(next!.rawTokens).toBeLessThan(12_000);
+    expect(next!.rawTokens + next!.summaryTokens).toBeGreaterThanOrEqual(12_000);
+  });
+
+  it("previews a history summary without mutating turn state", () => {
+    const session = new Session();
+    for (let i = 0; i < 15; i++) {
+      session.beginUserTurn([{ type: "text", text: `User ${i} ${"large ".repeat(400)}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Answer ${i} ${"body ".repeat(400)}` }]);
+      session.completeActiveTurn();
+    }
+    const candidate = session.getPendingHistoryArchive()!;
+    const before = JSON.stringify(session.getSerializedContextState());
+    const projected = session.previewHistorySummaryTokens("Projected summary", candidate.turnIds);
+
+    expect(projected).toBeLessThan(session.estimateModelTokens());
+    expect(JSON.stringify(session.getSerializedContextState())).toBe(before);
+    expect(session.getPendingHistoryArchive()?.turnIds).toEqual(candidate.turnIds);
   });
 
   it("active checkpoint candidate archives older complete tool step groups and keeps the recent tail", () => {
@@ -229,6 +292,206 @@ describe("Session", () => {
     expect(serialized).toContain("result-3");
     expect(serialized).toContain("call-4");
     expect(serialized).toContain("result-4");
+  });
+
+  it("preserves a mid-turn interrupt steer that an active checkpoint archives past", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Render the explainer video" }]);
+    // Three tool-step groups, then the user steers mid-run, then three more.
+    for (let i = 0; i < 3; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `pre-${i}`, name: "bash", input: { command: `pre-${i}` } }]);
+      session.addToolResult(`pre-${i}`, `pre-result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+    session.addMessage("user", [{ type: "text", text: "STEER: switch the output to 720p" }]);
+    for (let i = 0; i < 3; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `post-${i}`, name: "bash", input: { command: `post-${i}` } }]);
+      session.addToolResult(`post-${i}`, `post-result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+
+    // Checkpoint retains the newest two groups and archives the rest — including
+    // a group AFTER the steer, so checkpointThroughMessageIndex covers the steer.
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).toBeTruthy();
+    expect(candidate!.checkpointThroughMessageIndex).toBeGreaterThan(0);
+    session.applyActiveCheckpointSummary("Earlier render steps summarized", candidate!.checkpointThroughMessageIndex);
+
+    const serialized = JSON.stringify(session.getMessagesForModel());
+    // The steer survives verbatim (the bug dropped it entirely).
+    expect(serialized).toContain("STEER: switch the output to 720p");
+    // Sanity: the checkpoint really did archive a group past the steer.
+    expect(serialized).not.toContain("pre-result-0");
+    // Recent tail is still raw.
+    expect(serialized).toContain("post-result-2");
+    // The steer must remain the latest user directive, not a stale echo.
+    expect(session.getMessagesForModel().filter((m) => m.role === "user"
+      && m.content.some((c) => c.type === "text" && c.text.includes("STEER: switch the output to 720p"))))
+      .toHaveLength(1);
+  });
+
+  it("builds active checkpoint input from bounded projections without mutating raw tool data", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Current projection task" }]);
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{
+        type: "tool_use",
+        id: `projection-${i}`,
+        name: "large_tool",
+        input: { command: `INPUT_HEAD_${i}${"i".repeat(6_000)}INPUT_TAIL_${i}` },
+      }]);
+      const isError = i === 1;
+      session.addToolResult(
+        `projection-${i}`,
+        `${isError ? "ERROR" : "RESULT"}_HEAD_${i}${isError ? "e".repeat(15_000) : "r".repeat(15_000)}${isError ? "ERROR" : "RESULT"}_TAIL_${i}`,
+        undefined,
+        isError,
+      );
+    }
+
+    const rawBefore = JSON.stringify(session.getMessages());
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate?.groups.length).toBeGreaterThanOrEqual(3);
+    const projection = JSON.stringify(candidate?.messages || []);
+
+    expect(projection).toContain("INPUT_HEAD_0");
+    expect(projection).toContain("INPUT_TAIL_0");
+    expect(projection).toContain("RESULT_HEAD_0");
+    expect(projection).toContain("RESULT_TAIL_0");
+    expect(projection).toContain("ERROR_HEAD_1");
+    expect(projection).toContain("ERROR_TAIL_1");
+    expect(projection).toContain("chars omitted]");
+    expect(projection).not.toContain("i".repeat(ACTIVE_CHECKPOINT_TOOL_INPUT_MAX_CHARS + 1));
+    expect(projection).not.toContain("r".repeat(ACTIVE_CHECKPOINT_TOOL_RESULT_MAX_CHARS + 1));
+    expect(projection).not.toContain("e".repeat(ACTIVE_CHECKPOINT_ERROR_RESULT_MAX_CHARS + 1));
+    expect(rawBefore).toContain("i".repeat(5_000));
+    expect(rawBefore).toContain("r".repeat(10_000));
+    expect(rawBefore).toContain("e".repeat(10_000));
+    expect(JSON.stringify(session.getMessages())).toBe(rawBefore);
+  });
+
+  it("keeps exact-fact bullets cumulative when later checkpoints omit prior epochs", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Retain every exact fact" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "fact-1", name: "probe", input: {} }]);
+    session.addToolResult("fact-1", "FACT-1=amber", undefined, false);
+
+    const first = session.applyActiveCheckpointSummary(
+      `${ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING}\n- FACT-1=amber\n\nNext steps:\n- continue`,
+      2,
+    );
+    expect(first).toContain("- FACT-1=amber");
+
+    session.addAssistantMessage([{ type: "tool_use", id: "fact-2", name: "probe", input: {} }]);
+    session.addToolResult("fact-2", "FACT-2=birch", undefined, false);
+    const second = session.applyActiveCheckpointSummary(
+      `**${ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING}**\n- FACT-2=birch\n\nNext steps:\n- continue`,
+      4,
+    );
+    expect(second.indexOf("- FACT-1=amber")).toBeLessThan(second.indexOf("- FACT-2=birch"));
+
+    session.addAssistantMessage([{ type: "tool_use", id: "fact-3", name: "probe", input: {} }]);
+    session.addToolResult("fact-3", "FACT-3=cobalt", undefined, false);
+    const third = session.applyActiveCheckpointSummary("Completed newer work but omitted the ledger.", 6);
+    expect(third).toContain(ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING);
+    expect(third).toContain("- FACT-1=amber");
+    expect(third).toContain("- FACT-2=birch");
+    expect(third.match(/FACT-1=amber/g)).toHaveLength(1);
+
+    const modelView = JSON.stringify(session.getMessagesForModel());
+    expect(modelView).toContain("FACT-1=amber");
+    expect(modelView).toContain("FACT-2=birch");
+    expect(modelView).not.toContain("FACT-3=cobalt");
+  });
+
+  it("previews an active checkpoint without pruning or mutating metadata", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Current large task" }]);
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `preview-${i}`, name: "bash", input: { command: `cmd-${i}` } }]);
+      session.addToolResult(`preview-${i}`, `result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+    const candidate = session.getPendingActiveCheckpoint()!;
+    const beforeState = JSON.stringify(session.getSerializedContextState());
+    const beforeRaw = JSON.stringify(session.getMessages());
+    const projected = session.previewActiveCheckpointTokens("Projected active summary", candidate.checkpointThroughMessageIndex);
+
+    expect(projected).toBeLessThan(session.estimateModelTokens());
+    expect(JSON.stringify(session.getSerializedContextState())).toBe(beforeState);
+    expect(JSON.stringify(session.getMessages())).toBe(beforeRaw);
+  });
+
+  it("active checkpoint trigger tracks only the live tail, not cumulative raw", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Current large task" }]);
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `call-${i}`, name: "bash", input: { command: `cmd-${i}` } }]);
+      session.addToolResult(`call-${i}`, `result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+    // Before any checkpoint the whole raw process is counted → trigger is hot.
+    const rawBefore = session.estimateActiveProcessTokens();
+    expect(rawBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).toBeTruthy();
+    session.applyActiveCheckpointSummary("Older tool work summarized", candidate!.checkpointThroughMessageIndex);
+
+    // After the older groups are folded into the summary the estimate reflects
+    // only the retained tail (+summary), so it drops well below the trigger and
+    // the checkpoint does not immediately re-fire (this is the fix: previously the
+    // estimate stayed at the cumulative raw size and kept the trigger hot).
+    const liveAfter = session.estimateActiveProcessTokens();
+    expect(liveAfter).toBeLessThan(rawBefore);
+    expect(liveAfter).toBeLessThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(session.getPendingActiveCheckpoint()).toBeNull();
+  });
+
+  it("physical pruning frees archived tool_result bytes while preserving structure and indices", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Current large task" }]);
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `call-${i}`, name: "bash", input: { command: `cmd-${i}` } }]);
+      session.addToolResult(`call-${i}`, `result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+    const lengthBefore = session.length;
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate?.groups).toHaveLength(3);
+    session.applyActiveCheckpointSummary("Older tool work summarized", candidate!.checkpointThroughMessageIndex);
+
+    // Array length (hence every absolute message index) is unchanged.
+    expect(session.length).toBe(lengthBefore);
+
+    const raw = session.getMessages();
+    const findResult = (id: string) =>
+      raw
+        .flatMap((m) => m.content)
+        .find((c) => (c as { type?: string }).type === "tool_result" && (c as { toolUseId?: string }).toolUseId === id) as
+        | { type: string; toolUseId: string; content: string }
+        | undefined;
+
+    // Archived tool_results (0,1,2) keep their type/toolUseId (so pairing and
+    // turn-boundary detection stay valid) but drop the heavy payload.
+    for (const id of ["call-0", "call-1", "call-2"]) {
+      const r = findResult(id);
+      expect(r).toBeTruthy();
+      expect(r!.type).toBe("tool_result");
+      expect(r!.content).toBe(ARCHIVED_TOOL_RESULT_MARKER);
+      expect(r!.content).not.toContain("xxxxx");
+    }
+    // Retained tail (3,4) keeps full content.
+    for (const id of ["call-3", "call-4"]) {
+      expect(findResult(id)!.content).toContain("x".repeat(1_000));
+    }
+
+    // The projected model view is unchanged: archived work excluded, summary +
+    // retained tail included.
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Older tool work summarized");
+    expect(view).not.toContain("result-0");
+    expect(view).toContain("result-4");
+
+    // Turn tracking survives pruning — a fresh turn starts cleanly, proving the
+    // pruned tool_results did NOT become spurious turn starters.
+    session.beginUserTurn([{ type: "text", text: "Next task" }]);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("Next task");
   });
 
   it("starting a new turn closes a prior interrupted active turn instead of dropping it", () => {
@@ -436,7 +699,7 @@ describe("Session", () => {
   // function_call and OpenAI / Anthropic reject with
   // "No tool call found for function call output with call_id ...".
   // Reproduced as the user-reported bug at runner.ts:374 (mid-turn
-  // compaction triggered by the 80% context guard) where post-compact
+  // compaction triggered by the 82% context guard) where post-compact
   // heal hadn't run yet.
   it("compact drops leading orphan tool_result whose tool_use was sliced off", () => {
     const session = new Session();
@@ -534,7 +797,7 @@ describe("Session", () => {
   });
 
   // estimateTokens: CJK-aware heuristic. Anchors the fix for the latent
-  // under-estimation bug that let the runner's 80% compaction guard skip
+  // under-estimation bug that let the runner's 82% compaction guard skip
   // pure-Chinese sessions even when they were well over budget.
   it("estimateTokens: ASCII follows the ~4 chars/token rule", () => {
     const session = new Session();
@@ -557,5 +820,453 @@ describe("Session", () => {
     // 100 CJK + 400 ASCII → 100*1.5 + 400/4 = 150 + 100 = 250
     session.addUserMessage("中".repeat(100) + "a".repeat(400));
     expect(session.estimateTokens()).toBe(250);
+  });
+});
+
+describe("Session getMessagesForModel turnContext (P2 per-turn ephemeral)", () => {
+  const textOf = (msg: { content: Array<{ type: string; text?: string }> }) =>
+    msg.content.map((c) => (c.type === "text" ? c.text ?? "" : "")).join("\n");
+
+  it("injects turnContext into the active turn's user message, view-only, never persisted", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "do the task" }]);
+
+    const view = session.getMessagesForModel({ turnContext: "ORCH-LEDGER-XYZ" });
+    const active = view[view.length - 1];
+    expect(active.role).toBe("user");
+    const t = textOf(active);
+    // Ephemeral block is prepended before the real user text.
+    expect(t).toContain("ORCH-LEDGER-XYZ");
+    expect(t).toContain("do the task");
+    expect(t.indexOf("ORCH-LEDGER-XYZ")).toBeLessThan(t.indexOf("do the task"));
+
+    // No turnContext → no injection anywhere in the view.
+    expect(JSON.stringify(session.getMessagesForModel())).not.toContain("ORCH-LEDGER-XYZ");
+    // Raw / persisted messages NEVER carry the ephemeral block.
+    expect(JSON.stringify(session.getMessages())).not.toContain("ORCH-LEDGER-XYZ");
+  });
+
+  it("does not inject when turnContext is blank/whitespace", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "hi" }]);
+    expect(JSON.stringify(session.getMessagesForModel({ turnContext: "   " })))
+      .toBe(JSON.stringify(session.getMessagesForModel()));
+  });
+
+  it("appends turnContext for legacy (no turn-tracking) sessions, still view-only", () => {
+    const session = new Session();
+    session.addUserMessage("hello"); // no beginUserTurn → turnState stays null
+    const view = session.getMessagesForModel({ turnContext: "CTX-LEGACY" });
+    expect(JSON.stringify(view)).toContain("CTX-LEGACY");
+    expect(JSON.stringify(session.getMessages())).not.toContain("CTX-LEGACY");
+  });
+});
+
+describe("Session execution plan anchor", () => {
+  it("keeps objective and steps outside raw history and injects them at the model tail", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Implement the long-running import safely" }]);
+    const plan = session.updateExecutionPlan({
+      explanation: "Initial milestones",
+      steps: [
+        { step: "Inspect the importer", status: "completed" },
+        { step: "Implement bounded streaming", status: "in_progress" },
+        { step: "Run regression tests", status: "pending" },
+      ],
+    });
+    session.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "read_file", input: { path: "import.ts" } }]);
+    session.addToolResult("call-1", "source bytes", undefined, false);
+
+    const view = session.getMessagesForModel();
+    const tail = JSON.stringify(view[view.length - 1]);
+    expect(tail).toContain("Execution plan anchor");
+    expect(tail).toContain("Implement the long-running import safely");
+    expect(tail).toContain("Implement bounded streaming");
+    expect(tail).toContain("in_progress");
+    expect(plan.objective).toBe("Implement the long-running import safely");
+
+    expect(JSON.stringify(session.getMessages())).not.toContain("Execution plan anchor");
+    expect(JSON.stringify(session.getMessagesForSummary())).not.toContain("Execution plan anchor");
+  });
+
+  it("survives an active checkpoint even when the checkpoint omits the goal", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Do not lose this exact original objective" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Collect evidence", status: "completed" },
+        { step: "Apply the change", status: "in_progress" },
+      ],
+    });
+    session.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: { command: "inspect" } }]);
+    session.addToolResult("call-1", "x".repeat(2_000), undefined, false);
+    session.applyActiveCheckpointSummary("Only process progress, deliberately no objective.", 2);
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Current turn checkpoint");
+    expect(view).toContain("Only process progress");
+    expect(view).toContain("Execution plan anchor");
+    expect(view).toContain("Do not lose this exact original objective");
+  });
+
+  it("durably appends a newer user instruction before an optional explicit objective replacement", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Original task" }]);
+    session.updateExecutionPlan({ steps: [{ step: "First step", status: "in_progress" }] });
+    session.addAssistantMessage([{ type: "text", text: "Partial result" }]);
+    session.completeActiveTurn();
+
+    session.beginUserTurn([{ type: "text", text: "Actually switch to the replacement task" }]);
+    let view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Reconciliation required");
+    expect(session.getExecutionPlan()?.objective).toBe("Original task");
+
+    session.updateExecutionPlan({
+      steps: [{ step: "Replacement step", status: "in_progress" }],
+    });
+    expect(session.getExecutionPlan()?.objective).toContain("Original task");
+    expect(session.getExecutionPlan()?.objective).toContain("Actually switch to the replacement task");
+    expect(session.getExecutionPlan()?.objective).toContain("Newer user instruction — authoritative");
+
+    session.updateExecutionPlan({
+      replaceObjective: true,
+      steps: [{ step: "Replacement step", status: "in_progress" }],
+    });
+    view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Reconciliation: current");
+    expect(session.getExecutionPlan()?.objective).toBe("Actually switch to the replacement task");
+  });
+
+  it("detects an interrupt-steer inside the same active turn", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Initial in-flight goal" }]);
+    session.updateExecutionPlan({ steps: [{ step: "Work", status: "in_progress" }] });
+
+    session.addMessage("user", [{ type: "text", text: "Pause that and account for this new constraint" }]);
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("Reconciliation required");
+
+    session.updateExecutionPlan({ steps: [{ step: "Account for constraint", status: "in_progress" }] });
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Reconciliation: current");
+    expect(session.getExecutionPlan()?.objective).toContain("Initial in-flight goal");
+    expect(session.getExecutionPlan()?.objective).toContain("Pause that and account for this new constraint");
+    expect(session.getExecutionPlan()?.objective).toContain("Newer user instruction — authoritative");
+  });
+
+  it("rejects milestone removal or renaming under the same user instruction", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the full investigation and final report" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Collect all required evidence", status: "in_progress" },
+        { step: "Validate findings and deliver the final report", status: "pending" },
+      ],
+    });
+
+    expect(() => session.updateExecutionPlan({
+      explanation: "Narrow the scope and claim completion",
+      steps: [
+        { step: "Collect initial evidence", status: "completed" },
+        { step: "Summarize preliminary findings", status: "completed" },
+      ],
+    })).toThrow("cannot remove or rename existing milestones");
+
+    expect(session.getExecutionPlan()).toMatchObject({
+      revision: 1,
+      steps: [
+        { id: 1, step: "Collect all required evidence", status: "in_progress" },
+        { id: 2, step: "Validate findings and deliver the final report", status: "pending" },
+      ],
+    });
+  });
+
+  it("keeps stable step ids while updating statuses and appending discovered work", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the migration" }]);
+    const initial = session.updateExecutionPlan({
+      steps: [
+        { step: "Inspect callers", status: "in_progress" },
+        { step: "Migrate storage", status: "pending" },
+      ],
+    });
+
+    const updated = session.updateExecutionPlan({
+      steps: [
+        { step: "Inspect callers", status: "completed" },
+        { step: "Migrate storage", status: "in_progress" },
+        { step: "Verify restart recovery", status: "pending" },
+      ],
+    });
+
+    expect(initial.steps.map((step) => step.id)).toEqual([1, 2]);
+    expect(updated.steps).toEqual([
+      {
+        id: 1,
+        step: "Inspect callers",
+        status: "completed",
+        completionEvidence: { verification: "unverified", workEntryIds: [] },
+      },
+      { id: 2, step: "Migrate storage", status: "in_progress" },
+      { id: 3, step: "Verify restart recovery", status: "pending" },
+    ]);
+    expect(updated.nextStepId).toBe(4);
+  });
+
+  it("does not regress completed milestones under the same user instruction", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Finish the release" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Run compatibility tests", status: "completed" },
+        { step: "Publish artifacts", status: "in_progress" },
+      ],
+    });
+
+    expect(() => session.updateExecutionPlan({
+      steps: [
+        { step: "Run compatibility tests", status: "pending" },
+        { step: "Publish artifacts", status: "in_progress" },
+      ],
+    })).toThrow("cannot regress completed milestone 1");
+  });
+
+  it("retains an explicit all-completed plan after the active turn completes", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Produce the verified report" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Collect evidence", status: "completed" },
+        { step: "Produce the verified report", status: "completed" },
+      ],
+    });
+    session.addAssistantMessage([{ type: "text", text: "Finished." }]);
+
+    session.completeActiveTurn();
+
+    expect(session.getExecutionPlan()).toMatchObject({
+      revision: 1,
+      steps: [
+        { id: 1, step: "Collect evidence", status: "completed" },
+        { id: 2, step: "Produce the verified report", status: "completed" },
+      ],
+    });
+  });
+
+  it("requires a newer real user instruction to clear or replace an explicit plan", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the original task" }]);
+    session.updateExecutionPlan({
+      steps: [{ step: "Complete every success criterion", status: "in_progress" }],
+    });
+
+    expect(() => session.clearExecutionPlan()).toThrow("cannot clear an explicit plan");
+    expect(() => session.updateExecutionPlan({
+      replaceObjective: true,
+      steps: [{ step: "Do less work", status: "completed" }],
+    })).toThrow("replace_objective requires a newer real user instruction");
+
+    session.addMessage("user", [{ type: "text", text: "Cancel the original task" }]);
+    session.clearExecutionPlan();
+    expect(session.getExecutionPlan()).toBeUndefined();
+  });
+
+  it("keeps a bounded deterministic work ledger and collapses exact repeats", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Research the issue without repeating calls" }]);
+    const first = session.recordCompletedWork({
+      toolCallId: "call-1",
+      tool: "skill_manage",
+      inputDigest: "10:abc",
+      inputSummary: '{"action":"read","id":"research"}',
+      status: "succeeded",
+      resultSummary: "skill loaded",
+      checkpointEpoch: 0,
+    });
+    session.recordCompletedWork({
+      toolCallId: "call-2",
+      tool: "skill_manage",
+      inputDigest: "10:abc",
+      inputSummary: '{"action":"read","id":"research"}',
+      status: "succeeded",
+      resultSummary: "skill loaded again",
+      checkpointEpoch: 1,
+    });
+
+    expect(first?.id).toBe(1);
+    expect(session.getCompletedWorkLedger()).toEqual([expect.objectContaining({
+      id: 1,
+      lastObservationId: 2,
+      repeatCount: 2,
+      checkpointEpoch: 1,
+      resultSummary: "skill loaded again",
+    })]);
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Completed work ledger");
+    expect(view).toContain("skill_manage");
+    expect(view).toContain("x2");
+    expect(JSON.stringify(session.getMessages())).not.toContain("Completed work ledger");
+  });
+
+  it("bounds the sidecar ledger and its model projection independently", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Run a long bounded investigation" }]);
+    for (let index = 1; index <= COMPLETED_WORK_MAX_ENTRIES + 14; index++) {
+      session.recordCompletedWork({
+        tool: "probe",
+        inputDigest: `digest-${index}`,
+        inputSummary: JSON.stringify({ index, query: "q".repeat(80) }),
+        status: "succeeded",
+        resultSummary: `result-${index}-${"r".repeat(200)}`,
+      });
+    }
+
+    const ledger = session.getCompletedWorkLedger();
+    expect(ledger).toHaveLength(COMPLETED_WORK_MAX_ENTRIES);
+    expect(ledger[0].id).toBe(15);
+    expect(ledger.at(-1)?.id).toBe(COMPLETED_WORK_MAX_ENTRIES + 14);
+
+    const ledgerText = session.getMessagesForModel()
+      .flatMap((message) => message.content)
+      .find((content) => content.type === "text" && content.text.startsWith("[Completed work ledger"));
+    expect(ledgerText?.type).toBe("text");
+    if (ledgerText?.type !== "text") throw new Error("missing completed-work projection");
+    expect(ledgerText.text.length).toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_CHARS);
+    expect(ledgerText.text.match(/^#\d+ /gm)?.length ?? 0)
+      .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_ENTRIES);
+    expect(ledgerText.text).toContain(`#${COMPLETED_WORK_MAX_ENTRIES + 14}`);
+    expect(ledgerText.text).not.toContain("#14 ");
+  });
+
+  it("attaches observed or unverified ledger evidence to completed plan steps", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Implement and verify the migration" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Implement migration", status: "in_progress" },
+        { step: "Verify migration", status: "pending" },
+      ],
+    });
+    session.recordCompletedWork({
+      tool: "bash",
+      inputDigest: "20:def",
+      inputSummary: '{"command":"npm test"}',
+      status: "succeeded",
+      resultSummary: "tests passed",
+      checkpointEpoch: 0,
+    });
+
+    const observed = session.updateExecutionPlan({
+      steps: [
+        { step: "Implement migration", status: "completed" },
+        { step: "Verify migration", status: "in_progress" },
+      ],
+    });
+    expect(observed.steps[0].completionEvidence).toEqual({
+      verification: "observed",
+      workEntryIds: [1],
+    });
+
+    const unverified = session.updateExecutionPlan({
+      steps: [
+        { step: "Implement migration", status: "completed" },
+        { step: "Verify migration", status: "completed" },
+      ],
+    });
+    expect(unverified.steps[0].completionEvidence?.verification).toBe("observed");
+    expect(unverified.steps[1].completionEvidence).toEqual({
+      verification: "unverified",
+      workEntryIds: [],
+    });
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("completion unverified by tool ledger");
+  });
+
+  it("treats an exact repeated call as fresh evidence without duplicating its ledger row", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Verify both migration stages" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Verify stage one", status: "in_progress" },
+        { step: "Verify stage two", status: "pending" },
+      ],
+    });
+    const work = {
+      tool: "bash",
+      inputDigest: "sha256:same-verification",
+      inputSummary: '{"command":"npm test"}',
+      status: "succeeded" as const,
+      resultSummary: "tests passed",
+    };
+    session.recordCompletedWork(work);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Verify stage one", status: "completed" },
+        { step: "Verify stage two", status: "in_progress" },
+      ],
+    });
+    session.recordCompletedWork(work);
+    const final = session.updateExecutionPlan({
+      steps: [
+        { step: "Verify stage one", status: "completed" },
+        { step: "Verify stage two", status: "completed" },
+      ],
+    });
+
+    expect(session.getCompletedWorkLedger()).toEqual([expect.objectContaining({
+      id: 1,
+      lastObservationId: 2,
+      repeatCount: 2,
+    })]);
+    expect(final.steps[1].completionEvidence).toEqual({
+      verification: "observed",
+      workEntryIds: [1],
+    });
+  });
+
+  it("retains bounded plan revisions and a clear tombstone", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the auditable task" }]);
+    session.updateExecutionPlan({
+      steps: [{ step: "Do the work", status: "in_progress" }],
+    });
+    session.updateExecutionPlan({
+      steps: [{ step: "Do the work", status: "completed" }],
+    });
+    session.addMessage("user", [{ type: "text", text: "The result is accepted; clear the plan" }]);
+    session.clearExecutionPlan();
+
+    expect(session.getExecutionPlan()).toBeUndefined();
+    expect(session.getExecutionPlanAudit().map((record) => record.action))
+      .toEqual(["update", "update", "clear"]);
+    expect(session.getExecutionPlanAudit().at(-1)).toMatchObject({
+      action: "clear",
+      objective: "Complete the auditable task",
+      steps: [{ id: 1, step: "Do the work", status: "completed" }],
+    });
+  });
+
+  it("caps retained plan audit history", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Keep a bounded plan audit" }]);
+    for (let index = 0; index < EXECUTION_PLAN_AUDIT_MAX_ENTRIES + 4; index++) {
+      session.updateExecutionPlan({
+        explanation: `revision ${index}`,
+        steps: [{ step: "Complete the bounded audit", status: "in_progress" }],
+      });
+    }
+    const audit = session.getExecutionPlanAudit();
+    expect(audit).toHaveLength(EXECUTION_PLAN_AUDIT_MAX_ENTRIES);
+    expect(audit[0].revision).toBe(5);
+    expect(audit.at(-1)?.revision).toBe(EXECUTION_PLAN_AUDIT_MAX_ENTRIES + 4);
+  });
+
+  it("rejects ambiguous concurrent in-progress milestones", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Long task" }]);
+    expect(() => session.updateExecutionPlan({
+      steps: [
+        { step: "A", status: "in_progress" },
+        { step: "B", status: "in_progress" },
+      ],
+    })).toThrow("at most one in_progress");
   });
 });

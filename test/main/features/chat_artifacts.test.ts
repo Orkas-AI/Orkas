@@ -253,6 +253,19 @@ describe('chat_artifacts › resolveArtifactFilePath', () => {
     expect(got.mime).toMatch(/javascript/);
   });
 
+  it('rejects a served asset symlink that escapes the artifact root', async () => {
+    const { m, artifactId } = await seed();
+    const outside = path.join(tmpDir, 'outside.js');
+    const linked = path.join(cidDir(), artifactId, 'assets', 'app.js');
+    fs.writeFileSync(outside, 'secret');
+    fs.rmSync(linked);
+    fs.symlinkSync(outside, linked);
+
+    const got = m.resolveArtifactFilePath(UID, CID, artifactId, 'assets/app.js');
+    expect(got.ok).toBe(false);
+    if (!got.ok) expect(got.code).toBe('forbidden');
+  });
+
   it('rejects: path traversal (../)', async () => {
     const { m, artifactId } = await seed();
     const got = m.resolveArtifactFilePath(UID, CID, artifactId, '../../etc/passwd');

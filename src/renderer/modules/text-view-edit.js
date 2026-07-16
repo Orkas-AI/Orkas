@@ -222,11 +222,11 @@ async function _tveSave(state) {
     if (state.source.projectId) payload.projectId = state.source.projectId;
     const res = await window.orkas.invoke('produced.writeText', payload);
     if (!res || !res.ok) {
-      await uiAlert(_tveLabel('contexts.save_failed_with', `Save failed: ${(res && res.error) || 'unknown'}`, { reason: (res && res.error) || 'unknown' }));
+      await uiAlert(_tveLabel('contexts.save_failed', 'Save failed. Please try again.'));
       return;
     }
   } catch (err) {
-    await uiAlert(_tveLabel('contexts.save_failed_with', `Save failed: ${err && err.message || err}`, { reason: err && err.message || String(err) }));
+    await uiAlert(_tveLabel('contexts.save_failed', 'Save failed. Please try again.'));
     return;
   }
   state.content = next;

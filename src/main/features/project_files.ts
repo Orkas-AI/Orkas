@@ -1,14 +1,16 @@
 /**
  * Project-scoped files.
  *
- * Storage: `<uid>/cloud/projects/<pid>/files/<relative/path>`.
+ * Storage: `<uid>/cloud/projects/<pid>/contexts/<relative/path>`.
  * These files belong to the project, not a single conversation, so every
  * conversation inside the project receives a lightweight file-list prompt and
  * file tools get read-only access to this directory.
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import { Semaphore } from 'async-mutex';
 
 import { projectFilesDir } from '../paths';
 import { createLogger } from '../logger';
@@ -55,6 +57,7 @@ const MAX_BYTES_IMAGE = 20 * 1024 * 1024;
 const MAX_BYTES_PDF = 100 * 1024 * 1024;
 const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
 const MAX_FILENAME_LEN = 200;
+const PROJECT_TREE_CACHE_TTL_MS = 30_000;
 
 export type ProjectFileKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'image' | 'video';
 
@@ -181,20 +184,13 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
   return dir;
 }
 
-function _notifyDirty(projectId: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('projects', `cloud/projects/${projectId}/files`);
-  } catch { /* features/sync stripped */ }
+function _notifyDirty(userId: string, projectId: string): void {
+  invalidateProjectFileTree(userId, projectId);
 }
 
 function _notifyDeleted(projectId: string, relPath: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
-    void sync?.markDeleted?.(`cloud/projects/${projectId}/files/${relPath}`);
-  } catch { /* features/sync stripped */ }
+  void projectId;
+  void relPath;
 }
 
 function infoFor(absPath: string, root?: string): ProjectFileInfo | null {
@@ -215,21 +211,6 @@ function infoFor(absPath: string, root?: string): ProjectFileInfo | null {
   };
 }
 
-function dirInfoFor(absPath: string, root: string, children: ProjectLibraryNode[]): ProjectDirInfo | null {
-  let st: fs.Stats;
-  try { st = fs.statSync(absPath); }
-  catch { return null; }
-  if (!st.isDirectory()) return null;
-  return {
-    name: path.basename(absPath),
-    relPath: relPathFor(root, absPath),
-    type: 'dir',
-    path: absPath,
-    mtime: Math.floor(st.mtimeMs / 1000),
-    children,
-  };
-}
-
 function sortDirents(items: fs.Dirent[]): fs.Dirent[] {
   return items.slice().sort((a, b) => {
     if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
@@ -237,26 +218,61 @@ function sortDirents(items: fs.Dirent[]): fs.Dirent[] {
   });
 }
 
-function walkProjectTree(absDir: string, root: string): ProjectLibraryNode[] {
-  let items: fs.Dirent[];
-  try { items = fs.readdirSync(absDir, { withFileTypes: true }); }
-  catch { return []; }
-  const out: ProjectLibraryNode[] = [];
-  for (const e of sortDirents(items)) {
-    if (e.name.startsWith('.')) continue;
-    const abs = path.join(absDir, e.name);
-    if (e.isDirectory()) {
-      const info = dirInfoFor(abs, root, walkProjectTree(abs, root));
-      if (info) out.push(info);
-      continue;
-    }
-    if (!e.isFile()) continue;
-    const ext = path.extname(e.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
-    const info = infoFor(abs, root);
-    if (info) out.push(info);
+// Project trees can contain hundreds of files. User-facing list/tree IPC must
+// never run a recursive synchronous stat walk on Electron's main event loop.
+// Limit individual filesystem operations globally while allowing independent
+// branches to make progress.
+const _projectTreeIo = new Semaphore(8);
+
+async function _treeReadDir(absDir: string): Promise<fs.Dirent[]> {
+  try {
+    return await _projectTreeIo.runExclusive(() => fsp.readdir(absDir, { withFileTypes: true }));
+  } catch {
+    return [];
   }
-  return out;
+}
+
+async function _treeStat(absPath: string): Promise<fs.Stats | null> {
+  try { return await _projectTreeIo.runExclusive(() => fsp.stat(absPath)); }
+  catch { return null; }
+}
+
+async function walkProjectTreeAsync(absDir: string, root: string): Promise<ProjectLibraryNode[]> {
+  const items = sortDirents(await _treeReadDir(absDir));
+  const nodes = await Promise.all(items.map(async (entry): Promise<ProjectLibraryNode | null> => {
+    if (entry.name.startsWith('.')) return null;
+    const abs = path.join(absDir, entry.name);
+    if (entry.isDirectory()) {
+      const [children, st] = await Promise.all([
+        walkProjectTreeAsync(abs, root),
+        _treeStat(abs),
+      ]);
+      if (!st?.isDirectory()) return null;
+      return {
+        name: entry.name,
+        relPath: relPathFor(root, abs),
+        type: 'dir',
+        path: abs,
+        mtime: Math.floor(st.mtimeMs / 1000),
+        children,
+      };
+    }
+    if (!entry.isFile()) return null;
+    const ext = path.extname(entry.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) return null;
+    const st = await _treeStat(abs);
+    if (!st?.isFile()) return null;
+    return {
+      name: entry.name,
+      relPath: relPathFor(root, abs),
+      type: 'file',
+      path: abs,
+      bytes: st.size,
+      kind: kindOfName(entry.name),
+      mtime: Math.floor(st.mtimeMs / 1000),
+    };
+  }));
+  return nodes.filter((node): node is ProjectLibraryNode => node !== null);
 }
 
 function flattenFiles(nodes: ProjectLibraryNode[]): ProjectFileInfo[] {
@@ -268,26 +284,81 @@ function flattenFiles(nodes: ProjectLibraryNode[]): ProjectFileInfo[] {
   return out;
 }
 
-function filesUnderEntry(absPath: string, root: string): ProjectFileInfo[] {
-  let st: fs.Stats;
-  try { st = fs.statSync(absPath); }
-  catch { return []; }
+async function filesUnderEntry(absPath: string, root: string): Promise<ProjectFileInfo[]> {
+  const st = await _treeStat(absPath);
+  if (!st) return [];
   if (st.isFile()) {
     const info = infoFor(absPath, root);
     return info ? [info] : [];
   }
-  if (st.isDirectory()) return flattenFiles(walkProjectTree(absPath, root));
+  if (st.isDirectory()) return flattenFiles(await walkProjectTreeAsync(absPath, root));
   return [];
+}
+
+interface ProjectTreeCacheEntry {
+  generation: number;
+  expiresAt: number;
+  tree: ProjectLibraryNode[];
+}
+
+const _projectTreeCache = new Map<string, ProjectTreeCacheEntry>();
+const _projectTreeInFlight = new Map<string, Promise<ProjectLibraryNode[]>>();
+const _projectTreeGeneration = new Map<string, number>();
+
+function _projectTreeKey(userId: string, projectId: string): string {
+  return `${userId}\x00${projectId}`;
+}
+
+/** Invalidate one project's derived tree after a supported write, or every
+ * tree for a user after a project-domain sync pull. The TTL is a correctness
+ * fallback for direct filesystem edits that bypass both paths. */
+export function invalidateProjectFileTree(userId: string, projectId?: string): void {
+  const prefix = `${userId}\x00`;
+  const keys = projectId
+    ? [_projectTreeKey(userId, projectId)]
+    : Array.from(new Set([
+      ..._projectTreeCache.keys(),
+      ..._projectTreeInFlight.keys(),
+      ..._projectTreeGeneration.keys(),
+    ])).filter((key) => key.startsWith(prefix));
+  for (const key of keys) {
+    _projectTreeCache.delete(key);
+    _projectTreeInFlight.delete(key);
+    _projectTreeGeneration.set(key, (_projectTreeGeneration.get(key) || 0) + 1);
+  }
 }
 
 export async function listProjectFileTree(userId: string, projectId: string): Promise<ProjectLibraryNode[]> {
   let dir: string;
+  let pid: string;
   try {
-    const pid = safeProjectId(projectId);
+    pid = safeProjectId(projectId);
     if (!await projectExists(userId, pid)) return [];
     dir = projectFilesDir(userId, pid);
   } catch { return []; }
-  return walkProjectTree(dir, dir);
+  const key = _projectTreeKey(userId, pid);
+  const generation = _projectTreeGeneration.get(key) || 0;
+  const cached = _projectTreeCache.get(key);
+  if (cached && cached.generation === generation && cached.expiresAt > Date.now()) {
+    return cached.tree;
+  }
+  const existing = _projectTreeInFlight.get(key);
+  if (existing) return existing;
+  const run = walkProjectTreeAsync(dir, dir).then((tree) => {
+    if ((_projectTreeGeneration.get(key) || 0) === generation) {
+      _projectTreeCache.set(key, {
+        generation,
+        expiresAt: Date.now() + PROJECT_TREE_CACHE_TTL_MS,
+        tree,
+      });
+    }
+    return tree;
+  });
+  _projectTreeInFlight.set(key, run);
+  try { return await run; }
+  finally {
+    if (_projectTreeInFlight.get(key) === run) _projectTreeInFlight.delete(key);
+  }
 }
 
 export async function listProjectFiles(userId: string, projectId: string): Promise<ProjectFileInfo[]> {
@@ -332,7 +403,7 @@ export async function uploadProjectFile(
   const info = infoFor(target, dir);
   if (!info) return { ok: false, error: 'write failed' };
   projectLibraryIndexer.enqueue(userId, pid, info.relPath, 'upsert');
-  _notifyDirty(pid);
+  _notifyDirty(userId, pid);
   log.info(`upload user=${userId} pid=${pid} name=${info.relPath} kind=${info.kind} bytes=${info.bytes}`);
   return { ok: true, info };
 }
@@ -362,7 +433,7 @@ export async function createProjectDir(
   }
   try { fs.mkdirSync(abs, { recursive: false }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
-  _notifyDirty(pid);
+  _notifyDirty(userId, pid);
   return { ok: true, path: safePath };
 }
 
@@ -392,7 +463,7 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   try {
     if (fs.existsSync(dir) && fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
-  _notifyDirty(pid);
+  _notifyDirty(userId, pid);
   return { ok: true };
 }
 
@@ -414,7 +485,7 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
   catch { return { ok: false, error: 'not_found' }; }
   if (!st.isFile() && !st.isDirectory()) return { ok: false, error: 'not_found' };
 
-  const files = filesUnderEntry(abs, root);
+  const files = await filesUnderEntry(abs, root);
   try {
     if (st.isDirectory()) fs.rmSync(abs, { recursive: true, force: false });
     else fs.unlinkSync(abs);
@@ -426,7 +497,7 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
     try { invalidateFileCache(userId, file.path); }
     catch (err) { log.warn(`invalidate cache ${file.path}: ${(err as Error).message}`); }
   }
-  _notifyDirty(pid);
+  _notifyDirty(userId, pid);
   return { ok: true };
 }
 
@@ -469,6 +540,115 @@ export async function resolveProjectFileAbsPath(
   return { ok: true, absPath: abs, kind: kindOfName(safeName) };
 }
 
+/** Resolve a project Library file or folder for internal transfer workflows. */
+export async function resolveProjectEntryAbsPath(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ absPath: string; type: 'file' | 'dir' }>> {
+  let safeName: string;
+  let pid: string;
+  try {
+    safeName = safeDirPath(name);
+    pid = safeProjectId(projectId);
+    if (!await projectExists(userId, pid)) return { ok: false, error: 'not_found' };
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  const root = path.resolve(projectFilesDir(userId, pid));
+  let absPath: string;
+  try { absPath = resolveUnder(root, safeName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  let st: fs.Stats;
+  try { st = fs.lstatSync(absPath); }
+  catch { return { ok: false, error: 'not_found' }; }
+  if (st.isSymbolicLink()) return { ok: false, error: 'symlink_not_supported' };
+  if (st.isFile()) return { ok: true, absPath, type: 'file' };
+  if (st.isDirectory()) return { ok: true, absPath, type: 'dir' };
+  return { ok: false, error: 'not_found' };
+}
+
+function validateProjectCopySource(sourceAbs: string): Result<{ fileCount: number; bytes: number }> {
+  const stack = [sourceAbs];
+  let fileCount = 0;
+  let bytes = 0;
+  while (stack.length) {
+    const current = stack.pop()!;
+    let st: fs.Stats;
+    try { st = fs.lstatSync(current); }
+    catch { return { ok: false, error: 'not_found' }; }
+    if (st.isSymbolicLink()) return { ok: false, error: 'symlink_not_supported' };
+    if (st.isDirectory()) {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+      catch { return { ok: false, error: 'read_failed' }; }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.')) return { ok: false, error: 'unsupported_destination' };
+        stack.push(path.join(current, entry.name));
+      }
+      continue;
+    }
+    if (!st.isFile()) return { ok: false, error: 'unsupported_destination' };
+    const ext = path.extname(current).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext) || st.size > maxBytesFor(current)) {
+      return { ok: false, error: 'unsupported_destination' };
+    }
+    fileCount += 1;
+    bytes += st.size;
+  }
+  return { ok: true, fileCount, bytes };
+}
+
+/** Copy a trusted internal entry into a project Library and refresh the
+ * project tree/index state. Existing targets are never overwritten. */
+export async function copyProjectEntryFromPath(
+  userId: string,
+  projectId: string,
+  sourceAbs: string,
+  targetName: string,
+): Promise<Result<{ name: string; fileCount: number; bytes: number }>> {
+  let pid: string;
+  let root: string;
+  let sourceStat: fs.Stats;
+  try {
+    pid = safeProjectId(projectId);
+    root = await ensureProjectFilesDir(userId, pid);
+    sourceStat = fs.lstatSync(sourceAbs);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (sourceStat.isSymbolicLink() || (!sourceStat.isFile() && !sourceStat.isDirectory())) {
+    return { ok: false, error: 'unsupported_destination' };
+  }
+
+  let safeTarget: string;
+  try { safeTarget = sourceStat.isDirectory() ? safeDirPath(targetName) : safeFileName(targetName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  const targetAbs = resolveUnder(root, safeTarget);
+  if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
+  try {
+    if (!fs.statSync(path.dirname(targetAbs)).isDirectory()) return { ok: false, error: 'not_found' };
+  } catch { return { ok: false, error: 'not_found' }; }
+  const checked = validateProjectCopySource(sourceAbs);
+  if (checked.ok === false) return { ok: false, error: checked.error };
+
+  try {
+    fs.cpSync(sourceAbs, targetAbs, {
+      recursive: sourceStat.isDirectory(),
+      errorOnExist: true,
+      force: false,
+      dereference: false,
+    });
+  } catch (err) {
+    try { fs.rmSync(targetAbs, { recursive: true, force: true }); } catch { /* best-effort rollback */ }
+    return { ok: false, error: (err as Error).message };
+  }
+
+  const copiedFiles = await filesUnderEntry(targetAbs, root);
+  for (const file of copiedFiles) {
+    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'upsert');
+    try { invalidateFileCache(userId, file.path); } catch { /* new path; best effort */ }
+  }
+  _notifyDirty(userId, pid);
+  return { ok: true, name: safeTarget, fileCount: checked.fileCount, bytes: checked.bytes };
+}
+
 export async function readProjectTextFile(
   userId: string,
   projectId: string,
@@ -509,7 +689,7 @@ export async function updateProjectTextFile(
   try { invalidateFileCache(userId, r.absPath); }
   catch (err) { log.warn(`invalidate cache ${r.absPath}: ${(err as Error).message}`); }
   projectLibraryIndexer.enqueue(userId, projectId, name, 'upsert');
-  _notifyDirty(projectId);
+  _notifyDirty(userId, projectId);
   return { ok: true, name };
 }
 
@@ -552,7 +732,7 @@ export async function renameProjectFile(
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(dst)) return { ok: false, error: 'target_exists' };
   if (!fs.existsSync(path.dirname(dst))) return { ok: false, error: 'not_found' };
-  const movedFiles = filesUnderEntry(src, root);
+  const movedFiles = await filesUnderEntry(src, root);
   try { fs.renameSync(src, dst); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 
@@ -567,7 +747,7 @@ export async function renameProjectFile(
     projectLibraryIndexer.enqueue(userId, pid, nextRel, 'upsert');
     _notifyDeleted(pid, file.relPath);
   }
-  _notifyDirty(pid);
+  _notifyDirty(userId, pid);
   if (type === 'dir') return { ok: true, oldName: safeOld, name: safeNext, type };
   const info = infoFor(dst, root);
   if (!info) return { ok: false, error: 'rename failed' };

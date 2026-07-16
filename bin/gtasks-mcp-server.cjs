@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Tasks MCP server (stdio). Wraps `tasks.googleapis.com` v1.
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');

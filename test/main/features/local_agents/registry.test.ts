@@ -7,6 +7,7 @@ import {
   detectAll,
   detectOne,
   invalidateCache,
+  localCliSearchDirs,
   LOCAL_CLI_TYPES,
 } from '../../../../src/main/features/local_agents/registry';
 
@@ -173,5 +174,28 @@ describe('local_agents/registry', () => {
     // Force re-detect bypasses cache.
     const fresh = await detectAll({ force: true });
     expect(fresh.find(e => e.type === 'opencode')!.available).toBe(false);
+  });
+});
+
+describe('local_agents/registry › Windows GUI search paths', () => {
+  it('covers npm, WindowsApps, pnpm, Volta, nvm, and the Codex app directory', () => {
+    const dirs = localCliSearchDirs('codex', 'win32', {
+      APPDATA: 'C:\\Users\\alice\\AppData\\Roaming',
+      LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local',
+      VOLTA_HOME: 'C:\\Users\\alice\\.volta',
+      PNPM_HOME: 'D:\\pnpm',
+      NVM_SYMLINK: 'C:\\Program Files\\nodejs',
+    }, 'C:\\Users\\alice');
+
+    expect(dirs).toEqual(expect.arrayContaining([
+      'C:\\Users\\alice\\AppData\\Roaming\\npm',
+      'C:\\Users\\alice\\AppData\\Local\\Microsoft\\WindowsApps',
+      'C:\\Users\\alice\\AppData\\Local\\pnpm',
+      'C:\\Users\\alice\\.local\\bin',
+      'C:\\Users\\alice\\.volta\\bin',
+      'D:\\pnpm',
+      'C:\\Program Files\\nodejs',
+      'C:\\Users\\alice\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin',
+    ]));
   });
 });

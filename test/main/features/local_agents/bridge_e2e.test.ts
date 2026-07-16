@@ -9,6 +9,8 @@ import * as path from 'node:path';
 // bridge host. Pins the riskiest seam: SDK absolute-path requires + zod
 // schemas + the socket RPC roundtrip.
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 const TEST_UID = 'u-bridge-e2e';
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -38,7 +40,7 @@ class McpStdioClient {
   private buf = '';
   private waiters = new Map<number, (msg: any) => void>();
   constructor(env: Record<string, string>) {
-    this.child = spawn(process.execPath, [path.join(process.cwd(), 'bin', 'orkas-bridge.cjs')], {
+    this.child = spawn(TEST_NODE, [path.join(process.cwd(), 'bin', 'orkas-bridge.cjs')], {
       env: { ...process.env, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -88,7 +90,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       runId: `e2e${Date.now().toString(36)}`,
       configDir: path.join(tmpDir, 'rundir'),
       sandboxEnv: {
-        ORKAS_NODE: process.execPath,
+        ORKAS_NODE: TEST_NODE,
         ORKAS_PC_DIR: process.cwd(),
         ORKAS_WORKSPACE_ROOT: tmpDir,
         ELECTRON_RUN_AS_NODE: '1',

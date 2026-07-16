@@ -323,7 +323,13 @@ async function initUserWorkspace() {
   _mountWorkspaceChipInBar(document.querySelector('#panel-conversation .chat-bottom-bar'), 'conversation');
   _mountWorkspaceChipInBar(document.querySelector('#panel-project .chat-bottom-bar'), 'project');
 
-  await _refreshAllWorkspaceInfo();
+  // Before `_restoreLastView` runs there is no active conversation/project,
+  // so all three targets resolve to the same default scope. Read that config
+  // once instead of issuing three identical startup IPC/disk reads.
+  await _fetchWorkspaceInfo('new-chat');
+  _wsInfoByTarget.conversation = { ..._wsInfoByTarget['new-chat'] };
+  _wsInfoByTarget.project = { ..._wsInfoByTarget['new-chat'] };
+  _updateAllChips();
 }
 
 function _mountWorkspaceChipInBar(bar, target) {
@@ -350,7 +356,11 @@ function _mountWorkspaceChipInBar(bar, target) {
  *  conversation, or switching tabs while one is mounted). Also called by
  *  projects.js when the commander chip's project pick changes. */
 async function refreshWorkspaceChip() {
-  await _refreshAllWorkspaceInfo();
+  const target = (typeof currentView !== 'undefined' && currentView === 'project')
+    ? 'project'
+    : ((typeof currentView !== 'undefined' && currentView === 'conversation') ? 'conversation' : 'new-chat');
+  await _fetchWorkspaceInfo(target);
+  _updateChipForTarget(target);
 }
 
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {

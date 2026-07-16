@@ -10,12 +10,12 @@ category: rnd
 
 Use this skill when the user provides Figma material, design-export files, screenshots of design tools, PDFs, JSON, existing HTML, or asks for design-to-HTML/code fidelity. It adapts OpenDesign/Figma handoff discipline for UIDesigner without requiring a live Figma runtime.
 
-This skill turns design-source evidence into a compact handoff for `ui-design-contract`, `ui-reference-packs`, `ui-design-system`, and `ui-html-renderer`.
+This skill turns design-source evidence into a compact handoff for `ui-design-executor`. Add a durable contract, reference pack, design-system, or deep renderer skill only when its specialist trigger is present; do not fan an ordinary screenshot task out to all of them.
 
 ## Access Rules
 
 - If a Figma connector, MCP, plugin API, or exported file is actually available, inspect it with the available tool or file reader.
-- If the user only provides a Figma URL and no available Figma access exists, ask for a screenshot/export or continue only from visible notes. Do not claim "Figma imported", "frames inspected", or "variables read".
+- If the user only provides a Figma URL and no available Figma access exists, ask for a screenshot/export or continue only from visible notes. Do not claim "Figma imported", "frames inspected", or "variables read". Keep requested `exact`/1:1 work blocked until inspectable evidence arrives. Offer an `adaptive` provisional scaffold only as an explicit user choice, label it non-fidelity work, and never call it 1:1.
 - If the design source is an image or PDF, treat it like a screenshot: extract what is visible, label uncertain text/spacing, and preserve information architecture.
 - If the design source is HTML/CSS, inspect the rendered surface when possible and use source files only to clarify tokens/components.
 
@@ -118,11 +118,10 @@ When a design source exposes component metadata, keep the mapping implementation
 
 ## Handoff To Other Skills
 
-- Send evidence and unknowns to `ui-design-contract`.
-- Use `ui-reference-packs` only if the source lacks a clear style system or the user asks for a named style direction.
-- Send tokens/components to `ui-design-system`.
-- Send fidelity mode, frame map, and source-to-HTML mapping to `ui-html-renderer`.
-- Use `ui-design-review` after rendering to check visual drift, responsive behavior, and state coverage.
+- Send the compact source map, fidelity mode, and unknowns directly to `ui-design-executor` for ordinary single-screen work.
+- Add `ui-design-contract` only for a durable multi-screen/brand direction, conflicting references, or a genuinely vague system.
+- Add `ui-reference-packs` only if the source lacks a clear style system or the user asks for a named direction.
+- Add `ui-design-system` only for reusable tokens/components, `ui-html-renderer` for complex runtime/fidelity work, and `ui-design-review` for a formal review.
 
 ## Safety And Ownership
 

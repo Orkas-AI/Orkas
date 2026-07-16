@@ -54,7 +54,7 @@ export async function listClearableBuckets(): Promise<ClearableBucket[]> {
 
 /** Wipe one bucket (`<uid>/local/cache/<name>/`). Returns bytes freed. No-op when missing. */
 export async function clearBucket(name: string): Promise<number> {
-  if (!name || name.includes('/') || name.includes('\\') || name === '..') {
+  if (!name || name.includes('/') || name.includes('\\') || name === '.' || name === '..') {
     throw new Error('invalid bucket name');
   }
   const dir = path.join(userLocalCacheDir(getActiveUserId()), name);

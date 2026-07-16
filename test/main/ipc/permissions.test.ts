@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 
 // Capture the `orkas.invoke` handler that register() attaches to ipcMain,
 // so we can drive it the same way renderer → preload → ipcMain would.
@@ -54,10 +55,28 @@ afterEach(() => {
 
 function call(channel: string, payload: unknown = {}): ReturnType<InvokeFn> {
   if (!invokeHandler) throw new Error('invoke handler not registered');
-  return invokeHandler({}, { channel, payload });
+  return invokeHandler({ sender: trustedIpcSender() }, { channel, payload });
 }
 
 describe('ipc › permissions.* routes', () => {
+  it('rejects calls from any sender other than the renderer entry document', async () => {
+    if (!invokeHandler) throw new Error('invoke handler not registered');
+    const res = await invokeHandler(
+      { sender: { getURL: () => 'https://evil.example/index.html' } },
+      { channel: 'permissions.getLocalExec', payload: {} },
+    );
+    expect(res).toMatchObject({ ok: false, code: 'E_IPC_SENDER' });
+  });
+
+  it('rejects malformed envelopes before routing a privileged call', async () => {
+    if (!invokeHandler) throw new Error('invoke handler not registered');
+    const res = await invokeHandler(
+      { sender: trustedIpcSender() },
+      { channel: '../permissions.getLocalExec', payload: [] },
+    );
+    expect(res).toMatchObject({ ok: false, code: 'E_IPC_REQUEST' });
+  });
+
   it('permissions.getLocalExec defaults to granted on a fresh install', async () => {
     const res = await call('permissions.getLocalExec');
     expect(res.ok).toBe(true);

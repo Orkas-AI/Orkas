@@ -35,6 +35,19 @@ export type ToolResultImage = {
 /** Result returned from a tool execution. */
 export type ToolResult = {
   content: string;
+  /** Host-only handoff for process output that was streamed to a session temp
+   * file instead of being truncated at the in-memory capture threshold. The
+   * final host result transformer must content-address/adopt this file before
+   * the result enters model context. Never expose this path in `content`. */
+  streamedOutput?: {
+    path: string;
+    size: number;
+    sourceTruncated?: boolean;
+  };
+  /** Host-only metadata for an oversized result persisted outside model
+   *  context. The runner forwards it to UI events, but only `content` enters
+   *  the conversation, so the model never learns the backing path. */
+  persistedOutput?: { path: string; size: number; ref: string };
   /** Optional image payload. Delivered to the model as a user message
    *  immediately following the tool_result message (works across providers
    *  even when the provider's tool_result channel doesn't accept images). */

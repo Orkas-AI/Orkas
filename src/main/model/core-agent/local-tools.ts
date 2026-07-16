@@ -56,6 +56,11 @@ import {
 } from '../../../core-agent/src/tools/builtin';
 import { buildSandboxEnv, decodeProcessOutput, killProcessTree } from '../../../core-agent/src/sandbox/executor';
 import {
+  ProcessOutputCapture,
+  discardStreamedToolOutput,
+  type CapturedProcessOutput,
+} from '../../../core-agent/src/sandbox/output-capture';
+import {
   getLocalExecGranted,
   getLocalExecMode,
   localAccessAllowsOutsideWorkspace,
@@ -70,12 +75,12 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
 import {
-  chatAttachmentDir,
   userMarketplaceAgentsDir,
   userMarketplaceSkillsDir,
   userSystemSkillsDir,
   userSkillsDir,
 } from '../../paths';
+import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
@@ -97,6 +102,11 @@ import {
   startInteractiveCliSession,
 } from './interactive-cli-sessions';
 import type { InteractiveCliSessionView } from './interactive-cli-sessions';
+import { VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
+import {
+  browserAutomationHitWaf,
+  browserRuntimeInstallRequiresExplicitRequest,
+} from './browser-automation-guard';
 
 const log = createLogger('local-tools');
 
@@ -140,6 +150,9 @@ export interface LocalToolsOpts {
    * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** Validates and records the complete list declared through
+   * `publish_outputs`; returns only paths accepted by the active turn. */
+  onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
@@ -241,7 +254,11 @@ const BASH_PRODUCED_SKIP_DIRS = new Set([
 ]);
 const BASH_PRODUCED_SKIP_FILES = new Set([
   '.DS_Store',
+  '.orkas-output-manifest',
 ]);
+const BASH_OUTPUT_MANIFEST_NAME = '.orkas-output-manifest';
+const BASH_OUTPUT_MANIFEST_MAX_BYTES = 256 * 1024;
+const BASH_OUTPUT_MANIFEST_MAX_FILES = 500;
 
 type BashFileSnapshotEntry = { mtimeMs: number; size: number };
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
@@ -510,24 +527,63 @@ async function emitBashProducedFiles(
   before: BashFileSnapshot,
   root: string,
   command: string,
+  manifestedPaths: readonly string[] = [],
 ): Promise<void> {
   if (!opts.onFileWritten) return;
   const after = collectBashFileSnapshot(root);
   const isExternalDownload = _buildExternalDownloadSkipper(command, root);
+  const discovered = new Set<string>(manifestedPaths);
   for (const [abs, next] of after) {
     const prev = before.get(abs);
     if (prev && prev.mtimeMs === next.mtimeMs && prev.size === next.size) continue;
     if (isExternalDownload(abs)) continue;
+    discovered.add(abs);
+  }
+  for (const abs of discovered) {
     try { await opts.onFileWritten(abs); }
     catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
   }
 }
 
-function withBashOutputEnv(ctx: ToolContext, outputDir: string): () => void {
+function readBashOutputManifest(manifestPath: string, root: string): string[] {
+  let st: fs.Stats;
+  try { st = fs.statSync(manifestPath); }
+  catch { return []; }
+  if (!st.isFile() || st.size <= 0 || st.size > BASH_OUTPUT_MANIFEST_MAX_BYTES) return [];
+
+  let body = '';
+  try { body = fs.readFileSync(manifestPath, 'utf8'); }
+  catch { return []; }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const rawLine of body.split(/\r?\n/)) {
+    if (out.length >= BASH_OUTPUT_MANIFEST_MAX_FILES) break;
+    let declared = rawLine.trim();
+    if (!declared) continue;
+    if (declared.startsWith('"')) {
+      try {
+        const parsed = JSON.parse(declared);
+        if (typeof parsed === 'string') declared = parsed;
+      } catch { continue; }
+    }
+    const abs = path.isAbsolute(declared) ? path.normalize(declared) : path.resolve(root, declared);
+    if (!_sameOrInside(root, abs) || seen.has(abs)) continue;
+    try {
+      const fileStat = fs.lstatSync(abs);
+      if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
+    } catch { continue; }
+    seen.add(abs);
+    out.push(abs);
+  }
+  return out;
+}
+
+function withBashOutputEnv(ctx: ToolContext, outputDir: string, manifestPath: string): () => void {
   const original = ctx.state.sandboxEnv as Record<string, string> | undefined;
   ctx.state.sandboxEnv = {
     ...(original ?? {}),
     ORKAS_OUTPUT_DIR: outputDir,
+    ORKAS_OUTPUT_MANIFEST: manifestPath,
   };
   return () => {
     if (original) ctx.state.sandboxEnv = original;
@@ -756,6 +812,23 @@ async function executeDirectOrkasCli(
   const env = buildSandboxEnv(sandboxEnv);
 
   return await new Promise<ToolResult>((resolve) => {
+    const spoolDir = typeof ctx.state.toolResultSpoolDir === 'string'
+      ? ctx.state.toolResultSpoolDir
+      : undefined;
+    const stdoutCapture = spoolDir
+      ? new ProcessOutputCapture({
+        spoolDir,
+        prefix: 'orkas-cli-stdout',
+        memoryBytes: ORKAS_DIRECT_OUTPUT_LIMIT,
+      })
+      : null;
+    const stderrCapture = spoolDir
+      ? new ProcessOutputCapture({
+        spoolDir,
+        prefix: 'orkas-cli-stderr',
+        memoryBytes: ORKAS_DIRECT_OUTPUT_LIMIT,
+      })
+      : null;
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let totalBytes = 0;
@@ -788,25 +861,73 @@ async function executeDirectOrkasCli(
     };
 
     const finishFromChunks = (code: number | null) => {
-      let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
-      let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
-      if (outputLimitExceeded) {
-        if (truncatedKind === 'stdout') stdout += '\n... [output truncated by sandbox]';
-        else stderr += '\n... [output truncated by sandbox]';
+      if (settled) return;
+      let stdout: string;
+      let stderr: string;
+      let capturedStdout: CapturedProcessOutput | null = null;
+      let capturedStderr: CapturedProcessOutput | null = null;
+      if (stdoutCapture && stderrCapture) {
+        const decode = (bytes: Buffer) => decodeProcessOutput(bytes, process.platform, env);
+        capturedStdout = stdoutCapture.finish({
+          decode,
+          normalizeSpoolToUtf8: process.platform === 'win32',
+        });
+        capturedStderr = stderrCapture.finish({
+          decode,
+          normalizeSpoolToUtf8: process.platform === 'win32',
+        });
+        stdout = capturedStdout.text;
+        stderr = capturedStderr.text;
+      } else {
+        stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
+        stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
+        if (outputLimitExceeded) {
+          if (truncatedKind === 'stdout') stdout += '\n... [output truncated by sandbox]';
+          else stderr += '\n... [output truncated by sandbox]';
+        }
       }
+      const discardCaptured = () => {
+        discardStreamedToolOutput(capturedStdout?.streamedOutput);
+        discardStreamedToolOutput(capturedStderr?.streamedOutput);
+      };
       if (timedOut) {
+        discardCaptured();
         finish({ content: bashMsg('timeout', { ms: timeoutMs }), isError: true });
         return;
       }
       if (outputLimitExceeded) {
-        finish({ content: stderr || stdout, isError: code !== 0 });
+        const useStderr = truncatedKind === 'stderr';
+        const selected = useStderr ? capturedStderr : capturedStdout;
+        discardStreamedToolOutput(useStderr
+          ? capturedStdout?.streamedOutput
+          : capturedStderr?.streamedOutput);
+        finish({
+          content: useStderr ? stderr : stdout,
+          ...(selected?.streamedOutput ? { streamedOutput: selected.streamedOutput } : {}),
+          isError: true,
+        });
         return;
       }
       if (code !== 0) {
-        finish({ content: stderr || stdout || bashMsg('exit_code', { code: code ?? 'null' }), isError: true });
+        const useStderr = (capturedStderr?.bytes ?? Buffer.byteLength(stderr)) > 0;
+        const selected = useStderr ? capturedStderr : capturedStdout;
+        discardStreamedToolOutput(useStderr
+          ? capturedStdout?.streamedOutput
+          : capturedStderr?.streamedOutput);
+        finish({
+          content: (useStderr ? stderr : stdout) || bashMsg('exit_code', { code: code ?? 'null' }),
+          ...(selected?.streamedOutput ? { streamedOutput: selected.streamedOutput } : {}),
+          isError: true,
+        });
         return;
       }
-      finish({ content: stdout });
+      discardStreamedToolOutput(capturedStderr?.streamedOutput);
+      finish({
+        content: stdout,
+        ...(capturedStdout?.streamedOutput
+          ? { streamedOutput: capturedStdout.streamedOutput }
+          : {}),
+      });
     };
 
     const killChild = () => {
@@ -821,6 +942,15 @@ async function executeDirectOrkasCli(
 
     const append = (kind: 'stdout' | 'stderr', data: Buffer) => {
       if (outputLimitExceeded) return;
+      const capture = kind === 'stdout' ? stdoutCapture : stderrCapture;
+      if (capture) {
+        if (!capture.append(data)) {
+          outputLimitExceeded = true;
+          truncatedKind = kind;
+          killChild();
+        }
+        return;
+      }
       totalBytes += data.length;
       if (totalBytes > ORKAS_DIRECT_OUTPUT_LIMIT) {
         outputLimitExceeded = true;
@@ -886,6 +1016,8 @@ async function executeDirectOrkasCli(
     }
 
     child.on('error', (err) => {
+      stdoutCapture?.discard();
+      stderrCapture?.discard();
       finish({ content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true });
     });
     child.on('close', (code) => {
@@ -911,8 +1043,10 @@ async function executeCoreBashWithOutputTracking(
 ): Promise<ToolResult> {
   const outputDir = workingDir;
   const command = String(input.command ?? '');
+  const manifestPath = path.join(outputDir, BASH_OUTPUT_MANIFEST_NAME);
+  try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort stale cleanup */ }
   const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
-  const restoreEnv = withBashOutputEnv(ctx, outputDir);
+  const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
   try {
     const direct = parseOrkasCliInvocation(input, ctx);
@@ -923,9 +1057,13 @@ async function executeCoreBashWithOutputTracking(
     const result = direct && !macWriteSandboxActive
       ? await executeDirectOrkasCli(direct, input, ctx, workingDir)
       : await coreBashTool.execute(input, ctx);
-    if (!result.isError) await emitBashProducedFiles(opts, before, outputDir, command);
+    if (!result.isError) {
+      const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
+      await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
+    }
     return translateFixedBashError(result);
   } finally {
+    try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort */ }
     restoreWritableRoots();
     restoreEnv();
   }
@@ -943,7 +1081,7 @@ function allowedRootsFor(opts: LocalToolsOpts): string[] {
       if (ws) roots.push(ws);
     } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
     if (opts.cid) {
-      try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
+      try { roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
       catch (err) { log.warn('edit_file resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
     }
   }
@@ -1761,8 +1899,55 @@ function guardInteractiveNoBrowserAuthFlow(command: string, allowNoBrowserAuth: 
   );
 }
 
+const VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS: RegExp[] = [
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|ci|add)\b/i,
+  /\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+install\b/i,
+  /\bpython3?\s+-m\s+http\.server\b/i,
+  /\bphp\s+-S\s+\S+/i,
+  /\bruby\s+-run\s+-e\s+httpd\b/i,
+  /\b(?:npx|pnpm\s+dlx|bunx)\s+(?:serve|http-server|vite)\b/i,
+  /\b(?:chromium|chromium-browser|google-chrome|chrome)(?:\s|[^;&|])*--headless\b/i,
+  /\b(?:puppeteer(?:-core)?|playwright)\b/i,
+];
+
+function videoStudioUnmanagedRuntimeError(command: string, cwd?: string): string | null {
+  const inspect = (text: string): boolean => VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS.some((pattern) => pattern.test(text));
+  if (inspect(command)) {
+    return errText(
+      'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
+      'VideoStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native video_studio composition.lint/inspect/snapshot operations and their persisted findings instead.',
+    );
+  }
+  const scriptRe = /\b(?:python3?|node|bash|sh|zsh)\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))/gi;
+  let match: RegExpExecArray | null;
+  while ((match = scriptRe.exec(command)) !== null) {
+    const scriptRef = unquoteShellToken(match[1]);
+    if (!scriptRef || scriptRef.startsWith('-')) continue;
+    const abs = path.isAbsolute(scriptRef) ? scriptRef : path.resolve(cwd || process.cwd(), scriptRef);
+    try {
+      const st = fs.statSync(abs);
+      if (st.isFile() && st.size <= 512 * 1024 && inspect(fs.readFileSync(abs, 'utf8'))) {
+        return errText(
+          'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
+          'the requested script starts or installs an unmanaged browser/server runtime. Use native video_studio QA operations instead.',
+        );
+      }
+    } catch {
+      // Missing scripts fail naturally when executed.
+    }
+  }
+  return null;
+}
+
+function guardVideoStudioUnmanagedRuntime(opts: LocalToolsOpts, command: string, cwd?: string): string | null {
+  return opts.agentId === VIDEO_STUDIO_AGENT_ID
+    ? videoStudioUnmanagedRuntimeError(command, cwd)
+    : null;
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
+  const wafBlockedCommands = new Set<string>();
   const windowsShellDescription = process.platform === 'win32'
     ? 'On Windows, commands run through PowerShell by default: use `$env:NAME` for ' +
       'environment variables and avoid POSIX-only syntax such as `&&`, heredocs, ' +
@@ -1779,15 +1964,65 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'workspace are surfaced as produced-file chips, except for files clearly created ' +
       'by external download/clone commands such as git clone, gh repo clone, curl, or wget. ' +
       'Use the absolute $ORKAS_OUTPUT_DIR path for final generated outputs. ' +
+      'Complex scripts may append one final output path per line to $ORKAS_OUTPUT_MANIFEST so outputs in skipped/cache directories are still tracked. ' +
       windowsShellDescription +
       'Scratch/cache files should stay in temporary or cache directories. ' +
       'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
       'background with `&`, set run_in_background=true instead of shell-backgrounding it; ' +
       'inherited stdout/stderr can otherwise keep the tool waiting.',
-    inputSchema: coreBashTool.inputSchema,
+    inputSchema: {
+      ...(coreBashTool.inputSchema as Record<string, unknown>),
+      properties: {
+        ...(((coreBashTool.inputSchema as Record<string, unknown>).properties || {}) as Record<string, unknown>),
+        allow_browser_runtime_install: {
+          type: 'boolean',
+          description: 'Set true only when the user explicitly requested installing Playwright/Puppeteer or another browser automation runtime. Leave false for ordinary web research or one-off page actions.',
+        },
+      },
+    },
     async execute(input, ctx) {
       const mode = getLocalExecMode();
       const command = String(input.command ?? '');
+      const commandKey = command.trim();
+      if (wafBlockedCommands.has(commandKey)) {
+        return {
+          content: errText(
+            'E_BROWSER_WAF_USER_ACTION_REQUIRED',
+            'this exact browser automation command already reached an anti-bot/WAF challenge. Do not retry or install another browser runtime. Ask the user to complete the site interaction manually, or use an accessible official source/search result.',
+          ),
+          isError: true,
+        } as ToolResult;
+      }
+      if (browserRuntimeInstallRequiresExplicitRequest(command)
+        && input.allow_browser_runtime_install !== true) {
+        return {
+          content: errText(
+            'E_BROWSER_RUNTIME_INSTALL_REQUIRES_EXPLICIT_USER_REQUEST',
+            'do not install Playwright/Puppeteer for ad-hoc browsing or to work around a site challenge. Use web_search/web_fetch or an existing browser capability. Only retry with allow_browser_runtime_install=true when the user explicitly requested browser automation runtime installation.',
+          ),
+          isError: true,
+        } as ToolResult;
+      }
+      const finalizeBrowserResult = (result: ToolResult): ToolResult => {
+        if (!browserAutomationHitWaf(command, String(result.content || ''))) return result;
+        if (commandKey) wafBlockedCommands.add(commandKey);
+        return {
+          content: errText(
+            'E_BROWSER_WAF_USER_ACTION_REQUIRED',
+            'the browser reached an anti-bot/WAF or human-verification page instead of the requested content. Stop browser retries; ask the user to complete the interaction manually, or use an accessible official source/search result.',
+          ),
+          isError: true,
+        } as ToolResult;
+      };
+      const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, ctx.workingDir);
+      if (unmanagedRuntimeErr) {
+        log.warn('bash VideoStudio unmanaged runtime reject', {
+          user_id: maskId(opts.userId),
+          cid: maskId(opts.cid),
+          command_chars: command.length,
+        });
+        return { content: unmanagedRuntimeErr, isError: true };
+      }
       const protectedMention = protectedRootMentionedByCommand(opts, command);
       if (protectedMention) {
         log.warn('bash protected root reject', {
@@ -1887,15 +2122,17 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       //               Best-effort cleanup: any rmdir failure (concurrent
       //               bash on same cwd, ENOTEMPTY, EACCES) is silently
       //               swallowed.
-      if (!ctx.workingDir) return translateFixedBashError(await coreBashTool.execute(input, ctx));
+      if (!ctx.workingDir) {
+        return finalizeBrowserResult(translateFixedBashError(await coreBashTool.execute(input, ctx)));
+      }
       const workingDir = path.resolve(ctx.workingDir);
       if (fs.existsSync(workingDir)) {
-        return executeCoreBashWithOutputTracking(opts, input, ctx, workingDir);
+        return finalizeBrowserResult(await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir));
       }
       try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
       catch { /* let spawn produce the canonical error */ }
       try {
-        return await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir);
+        return finalizeBrowserResult(await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir));
       } finally {
         try {
           if (fs.readdirSync(ctx.workingDir).length === 0) {
@@ -1914,6 +2151,8 @@ async function gateInteractiveCliStart(
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
   const mode = getLocalExecMode();
+  const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, settings?.workingDir);
+  if (unmanagedRuntimeErr) return { content: unmanagedRuntimeErr, isError: true };
   const protectedMention = protectedRootMentionedByCommand(opts, command);
   if (protectedMention) {
     log.warn('interactive_cli_start protected root reject', {
@@ -2421,6 +2660,75 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
+/** Declare the complete user-facing deliverable set for the current turn.
+ * This tool does not read or write files. The group-chat owner validates each
+ * normalized path against files actually written during the active turn. */
+function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'publish_outputs',
+    description:
+      'Declare the complete final deliverable list for this turn after all file generation is finished. ' +
+      'Include every file the user should see in the message footer; exclude source assets, previews, caches, logs, and other working files. ' +
+      'Use an empty paths list when this turn created only working files and has no user-facing file deliverable. ' +
+      'Only files actually written in this turn are accepted. A later call replaces the earlier declaration.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        paths: {
+          type: 'array',
+          items: { type: 'string' },
+          maxItems: 50,
+          description: 'Complete list of final file paths, absolute or relative to $working_dir; empty means no file deliverable.',
+        },
+      },
+      required: ['paths'],
+    },
+    async execute(input, ctx) {
+      if (!input || !Array.isArray(input.paths)) {
+        return { content: errText('E_BAD_INPUT', '`paths` must be an array'), isError: true };
+      }
+      const rawPaths = input.paths;
+      const normalized: string[] = [];
+      const seen = new Set<string>();
+      for (const raw of rawPaths.slice(0, 50)) {
+        if (typeof raw !== 'string' || !raw.trim()) continue;
+        const abs = resolveAbs(ctx, raw.trim());
+        if (seen.has(abs)) continue;
+        seen.add(abs);
+        normalized.push(abs);
+      }
+      if (rawPaths.length > 0 && normalized.length === 0) {
+        return { content: errText('E_BAD_INPUT', '`paths` must be empty or contain valid file paths'), isError: true };
+      }
+      if (!opts.onOutputsPublished) {
+        return { content: errText('E_OUTPUT_PUBLICATION_UNAVAILABLE', 'this conversation cannot publish file outputs'), isError: true };
+      }
+      try {
+        const accepted = await opts.onOutputsPublished(normalized);
+        const acceptedSet = new Set(Array.isArray(accepted) ? accepted.map((p) => path.resolve(p)) : []);
+        const acceptedCount = normalized.filter((p) => acceptedSet.has(p)).length;
+        if (normalized.length > 0 && !acceptedCount) {
+          return {
+            content: errText(
+              'E_OUTPUT_NOT_PRODUCED',
+              'none of the requested paths were written in this turn; publish only successful current-turn outputs',
+            ),
+            isError: true,
+          };
+        }
+        return {
+          content: JSON.stringify({ published: acceptedCount, requested: normalized.length }),
+        };
+      } catch (err) {
+        return {
+          content: errText('E_OUTPUT_PUBLICATION_FAILED', (err as Error).message || String(err)),
+          isError: true,
+        };
+      }
+    },
+  };
+}
+
 /** `markdown_to_pdf` — zero-dependency built-in channel. */
 function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
   return {
@@ -2471,10 +2779,7 @@ function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
           ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
           ...(footerText ? { footerText } : {}),
         });
-        if (opts.onFileWritten) {
-          try { await opts.onFileWritten(finalPath); }
-          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
-        }
+        if (opts.onFileWritten) await opts.onFileWritten(finalPath);
         const base = `PDF written: ${finalPath}`;
         return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
       } catch (err) {
@@ -2530,10 +2835,7 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
           ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
           ...(footerText ? { footerText } : {}),
         });
-        if (opts.onFileWritten) {
-          try { await opts.onFileWritten(finalPath); }
-          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
-        }
+        if (opts.onFileWritten) await opts.onFileWritten(finalPath);
         const base = `PDF written: ${finalPath}`;
         return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
       } catch (err) {
@@ -2849,6 +3151,7 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
     createMarkdownToPdfTool(opts),
     createHtmlToPdfTool(opts),
   ];
+  if (opts.onOutputsPublished) tools.push(createPublishOutputsTool(opts));
   // `create_artifact` only makes sense on a conversation surface that
   // renders the embedded result and routes interactions back — i.e. a `cid`
   // plus an `onArtifactCreated` sink (group chat). Edit chats / ad-hoc runs

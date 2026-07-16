@@ -61,7 +61,7 @@ const _DRAFT_KEY = (cid) => `draft_${cid}`;
 
 // Polling: detect assistant responses even after page refresh / reconnect
 const pollTimers = new Map();    // cid → setInterval id
-const pollMsgCounts = new Map(); // cid → last known message count
+const pollMsgCounts = new Map(); // cid → last known visible message identity
 
 // Per-conversation cached enabled state of the bound agent. Backend stamps
 // `agent_enabled` on the conversation payload at history-load time; this
@@ -82,25 +82,50 @@ const convAgentEnabledByCid = new Map();
 // "open conv mid-turn without a local ctrl" path common).
 function _isPolledAssistantMsg(m) { return !!(m && m.from && m.from !== 'user'); }
 function _isPolledUserMsg(m) { return !!(m && m.from === 'user'); }
+function _polledMessageKey(m) {
+  if (!m) return '';
+  return String(m.id || `${m.from || ''}\u0000${m.ts || ''}\u0000${m.text || ''}`);
+}
 
 function startPolling(cid) {
   if (pollTimers.has(cid)) return;
   const timer = setInterval(async () => {
-    if (!pollTimers.has(cid)) return;
+    // Timer identity, rather than mere map membership, is the cancellation
+    // token. `clearInterval` prevents future callbacks but cannot cancel a
+    // history request that an earlier tick already started; the cid may also
+    // be stopped and re-started while that request is in flight.
+    if (pollTimers.get(cid) !== timer) return;
     try {
-      const res = await apiFetch(`/api/conversations/${cid}/history?limit=500`);
+      const historyUrl = typeof _historyRequestUrl === 'function'
+        ? _historyRequestUrl(cid)
+        : `/api/conversations/${cid}/history?limit=10`;
+      const res = await apiFetch(historyUrl);
       const data = await res.json();
+      // The live stream may have completed while either await above was in
+      // flight. Never let that stale poll fall through to _onPolledResponse:
+      // it would reload the whole transcript after the final bubble was
+      // already painted, causing a visible "Loading…" flash on every reply.
+      if (pollTimers.get(cid) !== timer) return;
       if (!data.ok || !data.history) return;
-      const msgs = data.history.filter((m) => !(m && m.dispatch));
+      // Same visibility filter as loadConversationHistory (drops `dispatch`
+      // records AND redundant routing-only commander tails) so the polled
+      // count matches what's actually rendered — a mismatch makes polling
+      // think a "new" message arrived and reload on a loop.
+      const msgs = data.history.filter((m) => (
+        typeof _isVisibleGroupHistoryRecord === 'function'
+          ? _isVisibleGroupHistoryRecord(m)
+          : !(m && m.dispatch)
+      ));
       const last = msgs[msgs.length - 1];
-      const known = pollMsgCounts.get(cid) || 0;
+      const known = pollMsgCounts.get(cid) || '';
+      const lastKey = _polledMessageKey(last);
       const hasServerRuntime = !!data.conversation
         && Object.prototype.hasOwnProperty.call(data.conversation, 'processing');
       const runtimeBusy = hasServerRuntime
         ? data.conversation.processing === true
         : isGroupConversationBusy(cid);
 
-      if (msgs.length > known && _isPolledAssistantMsg(last)) {
+      if (lastKey && lastKey !== known && _isPolledAssistantMsg(last)) {
         // New visible assistant message arrived. While the commander is
         // still orchestrating, this may be a mid-turn reply while other
         // actors are still running; reloading history then detaches live
@@ -108,10 +133,11 @@ function startPolling(cid) {
         // once runtime is idle; the live stream owns in-flight DOM updates.
         if (runtimeBusy) {
           const recovered = await window.ConversationRuntime?.recoverPolledMessages?.(cid, msgs);
-          if (recovered) pollMsgCounts.set(cid, msgs.length);
+          if (pollTimers.get(cid) !== timer) return;
+          if (recovered) pollMsgCounts.set(cid, lastKey);
           return;
         }
-        pollMsgCounts.set(cid, msgs.length);
+        pollMsgCounts.set(cid, lastKey);
         stopPolling(cid);
         _onPolledResponse(cid, last);
         return;
@@ -121,7 +147,7 @@ function startPolling(cid) {
       // terminal state_changed event. Once main says runtime is idle, use the
       // persisted last assistant message to settle any leftover placeholder.
       if (!runtimeBusy && isConvPending(cid) && _isPolledAssistantMsg(last)) {
-        pollMsgCounts.set(cid, msgs.length);
+        pollMsgCounts.set(cid, lastKey);
         stopPolling(cid);
         _onPolledResponse(cid, last);
         return;
@@ -236,14 +262,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function bindStaticHandlers() {
   // Sidebar nav
-  document.getElementById('new-chat-btn').addEventListener('click', () => setView('new-chat'));
-  document.getElementById('auto-btn')?.addEventListener('click', () => setView('auto'));
-  document.getElementById('agents-btn').addEventListener('click', () => setView('agents'));
-  document.getElementById('skills-btn').addEventListener('click', () => setView('skills'));
-  document.getElementById('connectors-btn')?.addEventListener('click', () => setView('connectors'));
-  document.getElementById('apps-btn')?.addEventListener('click', () => setView('apps'));
-  document.getElementById('contexts-btn').addEventListener('click', () => setView('contexts'));
-  document.getElementById('settings-btn')?.addEventListener('click', () => setView('settings'));
+  document.getElementById('new-chat-btn').addEventListener('click', () => _setViewFromSidebar('new-chat'));
+  document.getElementById('auto-btn')?.addEventListener('click', () => _setViewFromSidebar('auto'));
+  document.getElementById('agents-btn').addEventListener('click', () => _setViewFromSidebar('agents'));
+  document.getElementById('skills-btn').addEventListener('click', () => _setViewFromSidebar('skills'));
+  document.getElementById('connectors-btn')?.addEventListener('click', () => _setViewFromSidebar('connectors'));
+  document.getElementById('apps-btn')?.addEventListener('click', () => _setViewFromSidebar('apps'));
+  document.getElementById('contexts-btn').addEventListener('click', () => _setViewFromSidebar('contexts'));
+  document.getElementById('settings-btn')?.addEventListener('click', () => _setViewFromSidebar('settings'));
 
   // Global search trigger + Cmd+K
   _bindGlobalSearch();
@@ -307,8 +333,15 @@ function bindStaticHandlers() {
     setView('agents', null, { entryPoint: 'new_chat_external_agent' });
     openAgentModal({ initialTab: 'external' });
   });
-  document.getElementById('create-agent-btn')?.addEventListener('click', () => openAgentModal());
-  document.getElementById('agents-more-btn')?.addEventListener('click', () => openMarketplace('agent'));
+  document.getElementById('create-agent-btn')?.addEventListener('click', () => {
+    _trackAgentCreateOpen('agents_create_button');
+    openAgentModal();
+  });
+  document.getElementById('agents-more-btn')?.addEventListener('click', () => {
+    const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+    if (typeof load !== 'function') return;
+    load('marketplace').then(() => openMarketplace('agent')).catch(() => {});
+  });
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
     if (_selectedAgent && !_agentsCache?.some((a) => a.agent_id === _selectedAgent.id && a.enabled === false)) {
@@ -349,68 +382,6 @@ function bindStaticHandlers() {
     if (_agentsCache) renderAgentsGrid(_agentsCache);
   });
 
-  // Skill buttons
-  document.getElementById('create-skill-btn')?.addEventListener('click', () => openSkillModal());
-  document.getElementById('skills-more-btn')?.addEventListener('click', () => openMarketplace('skill'));
-  document.getElementById('skill-use-btn')?.addEventListener('click', () => {
-    if (_selectedSkill && !_skillsCache?.some((s) => s.id === _selectedSkill.id && s.enabled === false)) {
-      useSkill(_selectedSkill.id, _selectedSkill.name);
-    }
-  });
-  document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
-  document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
-  document.getElementById('skill-upload-marketplace-btn')?.addEventListener('click', () => {
-    // Upload is allowed for both custom AND builtin (dev mode) — same as
-    // the agent upload handler above; see comment there.
-    if (_selectedSkill && typeof openMarketplaceUpload === 'function') {
-      openMarketplaceUpload('skill', _selectedSkill.id, _selectedSkill.source);
-    }
-  });
-  // Skill name editing is now wired inline by `_toggleSkillNameEditable`
-  // (input + blur listeners attached on first edit-mode entry, gated by
-  // `_skillEditMode`) — no top-level click handler.
-  document.getElementById('skill-chat-clear-btn')?.addEventListener('click', clearSkillChat);
-
-  // Detail-view chrome: "← Back to skill library" + collapsible-section
-  // toggle + Esc to return + outside-click to close the ⋯ menu.
-  document.getElementById('skills-back-btn')?.addEventListener('click', () => _onSkillsBack());
-  document.getElementById('skills-source-toggle')?.addEventListener('click', () => _toggleSkillsSource());
-  document.addEventListener('keydown', (e) => {
-    if (e.key !== 'Escape') return;
-    const skillsPanel = document.getElementById('panel-skills');
-    if (!skillsPanel || !skillsPanel.classList.contains('active')) return;
-    const detail = document.getElementById('skills-detail-view');
-    if (detail && detail.style.display !== 'none') {
-      _onSkillsBack();
-      e.preventDefault();
-    }
-  });
-  document.addEventListener('click', (e) => {
-    const menu = document.getElementById('skill-row-menu');
-    if (!menu || menu.style.display === 'none') return;
-    if (menu.contains(e.target)) return;
-    if (e.target.closest('[data-skill-more]')) return;
-    _closeSkillRowMenu();
-  });
-  window.addEventListener('scroll', _closeSkillRowMenu, true);
-  window.addEventListener('resize', _closeSkillRowMenu);
-  window.addEventListener('i18n-change', () => {
-    _closeSkillRowMenu();
-    if (_skillsCache) renderSkillsGrid(_skillsCache);
-  });
-
-  // Inline skill chat — input auto-grow only here; send/plain Enter are wired
-  // lazily by createChatController when edit mode first opens (avoids double-
-  // binding and keeps the skill controller as the single source of truth).
-  const skillChatInput = document.getElementById('skills-chat-input');
-  skillChatInput?.addEventListener('input', () => autoGrow(skillChatInput, 120));
-
-  bindSkillPicker();
-
-  document.getElementById('ctx-tmp-new-btn')?.addEventListener('click', createNewCtxTmpDraft);
-  document.getElementById('ctx-tmp-new-name')?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveCtxTmpNew(); }
-  });
 }
 
 function autoGrow(el, maxPx) {

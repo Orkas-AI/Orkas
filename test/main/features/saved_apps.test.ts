@@ -144,6 +144,59 @@ describe('saved_apps › saveFromPath', () => {
     expect(fs.existsSync(path.join(dir, 'linked.txt'))).toBe(false);
   });
 
+  it('keeps images as bundle resources but never treats an image as a save trigger', async () => {
+    const root = path.join(tmpDir, 'workspace', 'image-assets');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Image assets</title>');
+    fs.writeFileSync(path.join(root, 'styles.css'), 'body{}');
+    const imageNames = [
+      'logo.svg', 'frame.png', 'photo.jpg', 'photo.jpeg', 'cover.webp',
+      'animation.gif', 'poster.avif', 'bitmap.bmp', 'favicon.ico',
+    ];
+    for (const name of imageNames) fs.writeFileSync(path.join(root, 'assets', name), 'fake image');
+
+    const { savedApps } = await mods();
+    for (const name of imageNames) {
+      expect(savedApps.inspectBundleFromPath(path.join(root, 'assets', name), { fenceRoots: [path.join(tmpDir, 'workspace')] }))
+        .toMatchObject({ ok: true, canSave: false });
+    }
+    expect(savedApps.saveFromPath(UID, path.join(root, 'assets', 'frame.png'), { fenceRoots: [path.join(tmpDir, 'workspace')] }).ok)
+      .toBe(false);
+
+    const saved = savedApps.saveFromPath(UID, path.join(root, 'styles.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    for (const name of imageNames) {
+      expect(fs.existsSync(path.join(APPS_ROOT(), saved.id, 'assets', name))).toBe(true);
+    }
+  });
+
+  it('keeps non-source assets in the bundle without treating them as save triggers', async () => {
+    const root = path.join(tmpDir, 'workspace', 'resource-assets');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Resource assets</title>');
+    fs.writeFileSync(path.join(root, 'styles.css'), 'body{}');
+    const resourceNames = [
+      'data.json', 'site.webmanifest', 'font.woff', 'font.woff2', 'font.ttf',
+      'module.wasm', 'sound.mp3', 'sound.wav', 'sound.ogg', 'clip.mp4', 'clip.webm',
+      'model.glb', 'model.gltf', 'notes.txt', 'readme.md', 'table.csv', 'feed.xml',
+    ];
+    for (const name of resourceNames) fs.writeFileSync(path.join(root, name), `fake ${name}`);
+
+    const { savedApps } = await mods();
+    for (const name of resourceNames) {
+      expect(savedApps.inspectBundleFromPath(path.join(root, name), { fenceRoots: [path.join(tmpDir, 'workspace')] }))
+        .toMatchObject({ ok: true, canSave: false });
+    }
+
+    const saved = savedApps.saveFromPath(UID, path.join(root, 'styles.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    for (const name of resourceNames) {
+      expect(fs.existsSync(path.join(APPS_ROOT(), saved.id, name))).toBe(true);
+    }
+  });
+
   it('supports non-index HTML entries', async () => {
     const root = path.join(tmpDir, 'workspace', 'arcade');
     fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
@@ -328,6 +381,22 @@ describe('saved_apps › resolveSavedAppFilePath', () => {
     const exe = savedApps.resolveSavedAppFilePath(UID, saved.id, 'shell.exe');
     expect(exe.ok).toBe(false);
     if (!exe.ok) expect(exe.code).toBe('forbidden');
+  });
+
+  it('rejects an app resource symlink that escapes the saved bundle', async () => {
+    const aid = await makeArtifact('Symlink guard', [{ path: 'assets/app.js', content: 'safe' }]);
+    const { savedApps } = await mods();
+    const saved = savedApps.saveFromArtifact(UID, CID, aid);
+    if (!saved.ok) throw new Error('save failed');
+    const outside = path.join(tmpDir, 'outside.js');
+    const linked = path.join(APPS_ROOT(), saved.id, 'assets', 'app.js');
+    fs.writeFileSync(outside, 'secret');
+    fs.rmSync(linked);
+    fs.symlinkSync(outside, linked);
+
+    const resolved = savedApps.resolveSavedAppFilePath(UID, saved.id, 'assets/app.js');
+    expect(resolved.ok).toBe(false);
+    if (!resolved.ok) expect(resolved.code).toBe('forbidden');
   });
 });
 

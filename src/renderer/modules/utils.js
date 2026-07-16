@@ -1174,7 +1174,7 @@ function _markdownVideoHtml(src, label, title) {
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1205,7 +1205,23 @@ function _markdownAudioHtml(src, label, title) {
 
 function _markdownImageHtml(src, alt, title) {
   const t = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}>`;
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}></span>`;
+}
+
+function _notifyChatImageSettled(node) {
+  if (!node || typeof CustomEvent === 'undefined') return;
+  node.dispatchEvent(new CustomEvent('chat-image-settled', { bubbles: true }));
+}
+
+function _settleChatImageLayout(img, state = 'loaded') {
+  if (!img || !img.classList) return;
+  const shell = img.closest?.('.chat-image-shell');
+  if (shell) {
+    shell.classList.remove('is-loading');
+    shell.classList.toggle('is-error', state === 'error');
+    shell.classList.toggle('is-loaded', state !== 'error');
+  }
+  _notifyChatImageSettled(img);
 }
 
 function _missingMarkdownImageLabel() {
@@ -1255,7 +1271,9 @@ function _replaceMissingMarkdownImage(img) {
 
   chip.appendChild(icon);
   chip.appendChild(text);
-  img.replaceWith(chip);
+  const shell = img.closest?.('.chat-md-img-shell');
+  (shell || img).replaceWith(chip);
+  _notifyChatImageSettled(chip);
 }
 
 function _replaceMissingMarkdownVideo(video) {
@@ -1288,6 +1306,14 @@ function _replaceMissingMarkdownVideo(video) {
   video.replaceWith(chip);
 }
 
+if (typeof document !== 'undefined') document.addEventListener('load', (e) => {
+  const target = e.target;
+  if (!target || target.nodeType !== 1 || target.tagName !== 'IMG') return;
+  if (target.classList?.contains('chat-md-img') || target.classList?.contains('chat-msg-attach-thumb')) {
+    _settleChatImageLayout(target);
+  }
+}, true);
+
 if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
   const target = e.target;
   if (!target || target.nodeType !== 1) return;
@@ -1295,34 +1321,90 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
     _replaceMissingMarkdownImage(target);
     return;
   }
+  if (target.tagName === 'IMG' && target.classList?.contains('chat-msg-attach-thumb')) {
+    _settleChatImageLayout(target, 'error');
+    return;
+  }
   if (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
     _replaceMissingMarkdownVideo(target);
   }
 }, true);
 
+const _CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX = 48;
+
+// Chromium retargets clicks from the closed native media-controls shadow DOM
+// to the <video> element. Keep the bottom control strip native so seeking,
+// volume, and play-button clicks are not turned into a second surface toggle.
+function _chatVideoNativeControlsHit(clientY, rectTop, rectBottom) {
+  const y = Number(clientY);
+  const top = Number(rectTop);
+  const bottom = Number(rectBottom);
+  if (!Number.isFinite(y) || !Number.isFinite(top) || !Number.isFinite(bottom) || bottom <= top) return false;
+  const guard = Math.min(_CHAT_VIDEO_NATIVE_CONTROLS_GUARD_PX, bottom - top);
+  return y >= bottom - guard && y <= bottom;
+}
+
+function _chatVideoClickHitsNativeControls(e, video) {
+  if (!e || !video || e.target !== video || !video.controls || typeof video.getBoundingClientRect !== 'function') return false;
+  const rect = video.getBoundingClientRect();
+  return _chatVideoNativeControlsHit(e.clientY, rect.top, rect.bottom);
+}
+
+function _toggleChatVideoFromSurface(e, surface) {
+  if (!e || !surface || typeof surface.querySelector !== 'function') return false;
+  const video = surface.querySelector('video');
+  if (!video || _chatVideoClickHitsNativeControls(e, video)) return false;
+
+  const target = e.target;
+  const interactive = target && target.closest
+    ? target.closest('a, button, input, select, textarea, label, [role="button"], [contenteditable="true"]')
+    : null;
+  if (interactive) return false;
+
+  const shouldPlay = !!(video.paused || video.ended);
+  e.preventDefault();
+  e.stopPropagation();
+  if (shouldPlay) {
+    if (video.ended) {
+      try { video.currentTime = 0; } catch (_) {}
+    }
+    try {
+      const promise = video.play();
+      if (promise && typeof promise.catch === 'function') promise.catch(() => {});
+    } catch (_) { /* user can still use the native controls */ }
+  } else {
+    try { video.pause(); } catch (_) {}
+  }
+  return true;
+}
+
 if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const target = e.target;
   const btn = target && target.closest ? target.closest('[data-chat-md-video-open="1"]') : null;
-  if (!btn) return;
-  e.preventDefault();
-  e.stopPropagation();
-  const src = btn.getAttribute('data-video-src') || '';
-  const absPath = _chatMediaLocalPathFromUrl(src);
-  if (!absPath || typeof openChatFileViewer !== 'function') return;
-  const name = absPath.split(/[\\/]/).pop() || 'video';
-  const shell = btn.closest('.chat-md-video-shell');
-  const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video') : null;
-  const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
-  const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
-  const ended = !!(video && video.ended);
-  const playbackOpts = { autoplay: true, startTime, duration, ended };
-  try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
-  try { if (window.Monitor) (() => {})('chat_md_video_floating_open'); } catch (_) {}
-  if (typeof openChatVideoUrlViewer === 'function') {
-    openChatVideoUrlViewer(src, name, playbackOpts);
+  if (btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    const src = btn.getAttribute('data-video-src') || '';
+    const absPath = _chatMediaLocalPathFromUrl(src);
+    if (!absPath || typeof openChatFileViewer !== 'function') return;
+    const name = absPath.split(/[\\/]/).pop() || 'video';
+    const shell = btn.closest('.chat-md-video-shell');
+    const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video') : null;
+    const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+    const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
+    const ended = !!(video && video.ended);
+    const playbackOpts = { autoplay: true, startTime, duration, ended };
+    try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
+    if (typeof openChatVideoUrlViewer === 'function') {
+      openChatVideoUrlViewer(src, name, playbackOpts);
+      return;
+    }
+    openChatFileViewer(absPath, name, playbackOpts);
     return;
   }
-  openChatFileViewer(absPath, name, playbackOpts);
+
+  const surface = target && target.closest ? target.closest('[data-chat-video-playback-surface]') : null;
+  if (surface) _toggleChatVideoFromSurface(e, surface);
 }, true);
 
 // Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK
@@ -1801,6 +1883,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _markdownVideoHtml,
     _markdownAudioHtml,
     _chatMediaLocalPathFromUrl,
+    _chatVideoNativeControlsHit,
     escapeHtml,
     sanitizeHtml,
     sanitizeSvgIconHtml,

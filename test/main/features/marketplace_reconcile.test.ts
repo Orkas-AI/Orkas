@@ -9,6 +9,7 @@ import AdmZip from 'adm-zip';
 const postJsonMock = vi.hoisted(() => vi.fn());
 const extractBundleSafelyMock = vi.hoisted(() => vi.fn());
 const devtoolsMock = vi.hoisted(() => ({ isDev: false }));
+const electronMock = vi.hoisted(() => ({ appVersion: '1.5.1' }));
 
 vi.mock('../../../src/main/features/marketplace', () => ({
   postJson: postJsonMock,
@@ -16,6 +17,9 @@ vi.mock('../../../src/main/features/marketplace', () => ({
 }));
 vi.mock('../../../src/main/features/devtools', () => ({
   isDevEnv: () => devtoolsMock.isDev,
+}));
+vi.mock('electron', () => ({
+  app: { getVersion: () => electronMock.appVersion },
 }));
 
 let tmpDir: string;
@@ -51,6 +55,7 @@ beforeEach(() => {
     }
   });
   devtoolsMock.isDev = false;
+  electronMock.appVersion = '1.5.1';
 });
 
 afterEach(async () => {
@@ -295,6 +300,37 @@ describe('marketplace reconcile', () => {
         status: 'approved',
       }),
     ]);
+  });
+
+  it('does not auto-pull agent or skill installs when their minimum is declared but the PC version is missing', async () => {
+    electronMock.appVersion = '';
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'reconcile-version-agent',
+        version: '1.0.0',
+        min_app_version: '1.0.0',
+        published_at: 100,
+        agent_json_url: 'https://example.test/reconcile-version-agent.json',
+      }],
+      skills: [{
+        id: 'reconcile-version-skill',
+        version: '1.0.0',
+        min_app_version: '1.0.0',
+        published_at: 200,
+        bundle_url: 'https://example.test/reconcile-version-skill.zip',
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    await expect(reconcile.reconcileInstalls('u1')).resolves.toMatchObject({
+      pulled_agents: 0,
+      pulled_skills: 0,
+      failed: [],
+    });
+    expect(extractBundleSafelyMock).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', 'reconcile-version-agent'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'reconcile-version-skill'))).toBe(false);
   });
 
   it('prunes a local-only skill when a newer manifest tombstone exists', async () => {

@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { resolveCliCommand } from './spawn-command.js';
 
 /** Minimum CLI versions; absent entry = no minimum. */
 export const MIN_VERSIONS: Record<string, string> = {
@@ -82,9 +83,11 @@ export async function detectVersion(binPath: string, timeoutMs = 5000): Promise<
 
     let stdout = '';
     let stderr = '';
-    const child = spawn(binPath, ['--version'], {
+    const launch = resolveCliCommand(binPath, ['--version']);
+    const child = spawn(launch.command, launch.args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
     });
 
     child.stdout?.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });

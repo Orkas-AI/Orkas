@@ -310,19 +310,50 @@ function _startQueueItemEdit(cid, row) {
 
 let _draftSaveTimer = null;
 
+function _readDraftData(cid) {
+  try {
+    const raw = cid ? localStorage.getItem(_DRAFT_KEY(cid)) : null;
+    const data = raw ? JSON.parse(raw) : null;
+    return data && typeof data === 'object' ? data : {};
+  } catch (_) { return {}; }
+}
+
+function _writeDraftData(cid, text, references) {
+  if (!cid) return;
+  const safeText = typeof text === 'string' ? text : '';
+  const safeReferences = Array.isArray(references) ? references.slice(0, 20) : [];
+  try {
+    if (safeText || safeReferences.length) {
+      localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({
+        text: safeText,
+        ...(safeReferences.length ? { references: safeReferences } : {}),
+      }));
+    } else {
+      localStorage.removeItem(_DRAFT_KEY(cid));
+    }
+  } catch (_) {}
+}
+
+// Quote/reference chips are part of the destination task's draft. Persist
+// them immediately so cross-task transfer survives navigation or reload even
+// when the destination textarea is still empty.
+function _persistQuoteDraft(cid) {
+  if (!cid) return;
+  const previous = _readDraftData(cid);
+  const input = cid === currentCid ? document.getElementById('chat-input') : null;
+  const text = input ? input.value : (typeof previous.text === 'string' ? previous.text : '');
+  const references = typeof _getQuotes === 'function' ? _getQuotes(cid) : [];
+  _writeDraftData(cid, text, references);
+}
+
 function _saveDraft(cid) {
   if (!cid) return;
   if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
   _draftSaveTimer = setTimeout(() => {
     const input = document.getElementById('chat-input');
     const text = input ? input.value : '';
-    try {
-      if (text) {
-        localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({ text }));
-      } else {
-        localStorage.removeItem(_DRAFT_KEY(cid));
-      }
-    } catch (_) {}
+    const references = typeof _getQuotes === 'function' ? _getQuotes(cid) : [];
+    _writeDraftData(cid, text, references);
   }, 180);
 }
 
@@ -335,11 +366,7 @@ function _clearDraft(cid) {
 function _restoreDraft(cid) {
   const input = document.getElementById('chat-input');
   if (!input) return;
-  let data = null;
-  try {
-    const raw = cid ? localStorage.getItem(_DRAFT_KEY(cid)) : null;
-    data = raw ? JSON.parse(raw) : null;
-  } catch (_) {}
+  const data = _readDraftData(cid);
   const text = (data && typeof data.text === 'string') ? data.text : '';
   const use = data && data.use
     ? data.use
@@ -348,6 +375,12 @@ function _restoreDraft(cid) {
       : null);
   input.value = text;
   autoGrow(input, 200);
+  if (typeof _quotesByCid !== 'undefined') {
+    const references = Array.isArray(data.references) ? data.references.slice(0, 20) : [];
+    if (references.length) _quotesByCid.set(cid, references);
+    else _quotesByCid.delete(cid);
+    if (cid === currentCid && typeof _renderQuotePreview === 'function') _renderQuotePreview();
+  }
   if (use && typeof _chatUseSelectionsFromText === 'function' && !_chatUseSelectionsFromText(text).length) {
     try { input.setSelectionRange(0, 0); } catch (_) {}
     setChatUseSelection('conversation', use, { focus: false });

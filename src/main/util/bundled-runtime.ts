@@ -46,6 +46,18 @@ function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg' | 'whisper
   ];
 }
 
+function whisperRuntimeEnabled(dir: string): boolean {
+  try {
+    const marker = JSON.parse(fs.readFileSync(path.join(dir, '.orkas-whisper-ready.json'), 'utf8')) as {
+      capability?: { status?: string };
+    };
+    return marker.capability?.status !== 'disabled';
+  } catch {
+    // Development payloads created before capability markers remain usable.
+    return true;
+  }
+}
+
 function resolvePythonExecutable(): string | undefined {
   const configured = process.env.ORKAS_BUNDLED_PYTHON || process.env.ORKAS_PYTHON;
   if (isFile(configured)) return configured;
@@ -99,6 +111,19 @@ function resolveNodeExecutable(): string | undefined {
   return undefined;
 }
 
+/** Look up a bare executable name on the process PATH, returning its absolute
+ *  path. Used only as a last-resort fallback when no vendored binary exists. */
+function resolveOnSystemPath(name: string): string | undefined {
+  const raw = process.env.PATH || process.env.Path || '';
+  if (!raw) return undefined;
+  for (const dir of raw.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    if (isFile(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 function resolveFfmpegBinary(kind: 'ffmpeg' | 'ffprobe'): string | undefined {
   const envName = kind === 'ffmpeg' ? 'ORKAS_BUNDLED_FFMPEG' : 'ORKAS_BUNDLED_FFPROBE';
   const configured = process.env[envName];
@@ -112,7 +137,11 @@ function resolveFfmpegBinary(kind: 'ffmpeg' | 'ffprobe'): string | undefined {
     const nested = path.join(dir, 'bin', name);
     if (isFile(nested)) return nested;
   }
-  return undefined;
+  // Defense-in-depth: a box that lacks the vendored binary but has a system
+  // ffmpeg/ffprobe on PATH should still work rather than hard-fail with
+  // E_FFMPEG_MISSING. The vendored build is capability-verified (libass); a
+  // system binary may lack filters, so the vendored copy always wins above.
+  return resolveOnSystemPath(name);
 }
 
 function resolveWhisperBinary(): string | undefined {
@@ -133,6 +162,7 @@ function resolveWhisperBinary(): string | undefined {
       path.join('bin', 'main'),
     ];
   for (const dir of runtimeVariantDirs('whisper')) {
+    if (!whisperRuntimeEnabled(dir)) continue;
     for (const name of names) {
       const candidate = path.join(dir, name);
       if (isFile(candidate)) return candidate;
@@ -151,6 +181,7 @@ function resolveWhisperModel(modelHint?: string): string | undefined {
   const names = [
     modelHint,
     normalizedHint ? `ggml-${normalizedHint}.bin` : '',
+    'ggml-base-q5_1.bin',
     'ggml-large-v3.bin',
     'ggml-medium.bin',
     'ggml-small.bin',
@@ -158,6 +189,7 @@ function resolveWhisperModel(modelHint?: string): string | undefined {
     'ggml-tiny.bin',
   ].filter((name): name is string => !!name);
   for (const dir of runtimeVariantDirs('whisper')) {
+    if (!whisperRuntimeEnabled(dir)) continue;
     for (const name of names) {
       const candidates = [
         path.join(dir, name),
@@ -227,7 +259,47 @@ export function bundledRuntimePathEntries(): string[] {
   // bundled Node on machines without a user-installed toolchain.
   const node = resolveNodeExecutable();
   if (node) pushPathDir(entries, seen, path.dirname(node));
+  // ffmpeg/ffprobe + whisper dirs go LAST (python stays entries[0]). This puts
+  // the resolved media binaries on the sandbox/bash PATH so a skill subprocess —
+  // or a stray shell `ffprobe` — resolves to the vendored copy instead of
+  // failing with "'ffprobe' is not recognized" on a box with no system ffmpeg.
+  const { ffmpeg, ffprobe } = bundledFfmpegPaths();
+  if (ffmpeg) pushPathDir(entries, seen, path.dirname(ffmpeg));
+  if (ffprobe) pushPathDir(entries, seen, path.dirname(ffprobe));
+  const { cli: whisperCli } = bundledWhisperPaths();
+  if (whisperCli) pushPathDir(entries, seen, path.dirname(whisperCli));
   return entries;
+}
+
+export interface MediaRuntimeStatus {
+  ffmpeg?: string;
+  ffprobe?: string;
+  whisperCli?: string;
+  whisperModel?: string;
+  missing: Array<'ffmpeg' | 'ffprobe' | 'whisper_cli' | 'whisper_model'>;
+}
+
+/**
+ * Preflight the media runtime VideoStudio depends on. Reports which binaries
+ * resolve (bundled → env override → system PATH for ffmpeg/ffprobe; bundled →
+ * env for whisper) so a caller can fail fast with one actionable message
+ * instead of discovering a missing binary mid-render/transcribe.
+ */
+export function mediaRuntimeStatus(modelHint?: string): MediaRuntimeStatus {
+  const ff = bundledFfmpegPaths();
+  const wh = bundledWhisperPaths(modelHint);
+  const missing: MediaRuntimeStatus['missing'] = [];
+  if (!ff.ffmpeg) missing.push('ffmpeg');
+  if (!ff.ffprobe) missing.push('ffprobe');
+  if (!wh.cli) missing.push('whisper_cli');
+  if (!wh.model) missing.push('whisper_model');
+  return {
+    ...(ff.ffmpeg ? { ffmpeg: ff.ffmpeg } : {}),
+    ...(ff.ffprobe ? { ffprobe: ff.ffprobe } : {}),
+    ...(wh.cli ? { whisperCli: wh.cli } : {}),
+    ...(wh.model ? { whisperModel: wh.model } : {}),
+    missing,
+  };
 }
 
 /** Absolute path to the bundled Node executable, or undefined when not present. */
@@ -260,5 +332,14 @@ export function bundledRuntimeEnv(): Record<string, string> {
   if (python) env.ORKAS_PYTHON = python;
   if (uv) env.ORKAS_UV = uv;
   if (node) env.ORKAS_BUNDLED_NODE = node;
+  // Export the resolved media binaries so skill subprocesses inherit them via
+  // env (their own resolver checks these first) instead of independently
+  // re-resolving and hard-failing when process.resourcesPath is unavailable.
+  const { ffmpeg, ffprobe } = bundledFfmpegPaths();
+  if (ffmpeg) env.ORKAS_BUNDLED_FFMPEG = ffmpeg;
+  if (ffprobe) env.ORKAS_BUNDLED_FFPROBE = ffprobe;
+  const { cli: whisperCli, model: whisperModel } = bundledWhisperPaths();
+  if (whisperCli) env.ORKAS_WHISPER_CPP = whisperCli;
+  if (whisperModel) env.ORKAS_WHISPER_MODEL = whisperModel;
   return env;
 }

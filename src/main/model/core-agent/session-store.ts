@@ -33,11 +33,13 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import {
-  sessionCloudToolResultsDir,
   sessionToolResultsDir,
-  userSessionFile,
   userLocalSessionFile,
 } from '../../paths';
+import {
+  cloudSessionFileFor,
+  cloudSessionToolResultsDirFor,
+} from '../../util/project-layout';
 import { getActiveUserId } from '../../features/users';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
@@ -118,7 +120,7 @@ export function resolveSessionPath(userId: string, sessionId: string): string {
   }
   return isEphemeralSessionId(sessionId)
     ? userLocalSessionFile(userId, sessionId)
-    : userSessionFile(userId, sessionId);
+    : cloudSessionFileFor(userId, sessionId);
 }
 
 export function sessionFileFor(sessionId: string): string {
@@ -130,7 +132,7 @@ export function toolResultsDirForSession(userId: string, sessionId: string): str
   resolveSessionPath(userId, sessionId);
   return isEphemeralSessionId(sessionId)
     ? sessionToolResultsDir(userId, sessionId)
-    : sessionCloudToolResultsDir(userId, sessionId);
+    : cloudSessionToolResultsDirFor(userId, sessionId);
 }
 
 /**

@@ -5,6 +5,8 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -17,7 +19,7 @@ afterEach(() => {
 
 function runFetch(args: string[], env: NodeJS.ProcessEnv = {}) {
   return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, [
+    const child = spawn(TEST_NODE, [
       path.join(process.cwd(), 'scripts', 'fetch-officecli.cjs'),
       ...args,
     ], {
@@ -34,7 +36,7 @@ function runFetch(args: string[], env: NodeJS.ProcessEnv = {}) {
 
 describe('fetch-officecli.cjs', () => {
   it('fails check mode when the selected OfficeCLI binary is missing', () => {
-    const r = spawnSync(process.execPath, [
+    const r = spawnSync(TEST_NODE, [
       path.join(process.cwd(), 'scripts', 'fetch-officecli.cjs'),
       `--root=${tmpDir}`,
       '--platform=darwin-arm64',

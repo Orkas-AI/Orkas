@@ -469,7 +469,7 @@ async function _mveSave(state) {
   const next = state.draft;
   const res = await _mveWriteSource(state.source, next);
   if (!res.ok) {
-    await uiAlert(t('contexts.save_failed_with', { reason: res.error || 'unknown' }));
+    await uiAlert(t('contexts.save_failed'));
     return;
   }
   state.content = next;
@@ -545,7 +545,7 @@ async function _mveToggleTask(state, lineIdx, liEl, boxEl) {
   if (!res.ok) {
     if (liEl) liEl.classList.toggle('is-done', wasChecked);
     if (boxEl) boxEl.checked = wasChecked;
-    await uiAlert(t('contexts.todo.save_failed', { reason: res.error || 'unknown' }));
+    await uiAlert(t('contexts.todo.save_failed'));
     return;
   }
   state.content = next;

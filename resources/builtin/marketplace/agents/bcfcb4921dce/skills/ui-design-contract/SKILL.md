@@ -1,16 +1,18 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-design-contract
-description_zh: "把截图、参考图、品牌材料、PRD 或“做成这种感觉”的诉求转成 UIDesigner 可复用的设计契约，覆盖 DESIGN.md 兼容结构、source screen contract、tokens、keep/change/do-not-copy 边界和 HTML 实现交接。"
-description_en: "Turn screenshots, references, brand material, PRDs, or 'make it feel like this' briefs into a reusable UIDesigner contract across a DESIGN.md-compatible shape, source screen contract, tokens, keep/change/do-not-copy boundaries, and HTML implementation handoff."
+description_zh: "为多屏、品牌、长期复用或参考冲突的 UIDesigner 任务建立持久设计契约，覆盖 DESIGN.md、source screen contract、tokens、keep/change/do-not-copy 边界和实现交接；普通单屏截图任务使用紧凑执行器即可。"
+description_en: "Create durable UIDesigner design contracts for multi-screen, brand, long-lived, or conflicting-reference work across DESIGN.md, source-screen rules, tokens, keep/change/do-not-copy boundaries, and implementation handoff; ordinary single-screen screenshot work stays on the compact executor."
 category: rnd
 ---
 
 # ui-design-contract
 
-Use this skill before rendering when the user provides screenshots, visual references, brand material, existing UI, Figma notes, PRDs, or vague taste direction. It adapts OpenDesign-style `DESIGN.md` and reference-contract discipline into UIDesigner's HTML-first workflow.
+Use this skill before rendering when the direction must persist across multiple screens/components, brand or system work, conflicting references, formal handoff, or a genuinely vague visual system. Ordinary single-screen screenshots and clear briefs use `ui-design-executor`'s compact source/visual thesis instead of loading a full durable contract.
 
 The contract is not extra ceremony. It prevents generic templates, protects the user's reference intent, and gives the HTML artifact a stable design source of truth.
+
+For standalone work, keep any long-lived `DESIGN.md` inside the canonical directory chosen by `ui-artifact-workspace`. On later revisions, read and update that contract in place only when the accepted design direction actually changes.
 
 When the source is a Figma link/export, design JSON, PDF, or design-tool screenshot, use `ui-design-source` first so the contract is grounded in inspectable frames, components, variables, and fidelity boundaries.
 
@@ -18,9 +20,9 @@ When a visual benchmark or page pattern is needed, pair this skill with `ui-refe
 
 ## When To Create A Contract
 
-Create a compact contract before HTML when any of these are true:
+Create a compact durable contract before HTML when any of these are true:
 
-- The user provides a screenshot or image and asks for redesign, restoration, polishing, or page generation.
+- The screenshot/reference spans multiple screens, must establish a reusable direction, or contains conflicting evidence that a compact executor snapshot cannot resolve.
 - The user says "make it feel like this", "参考这个", "做同款但不照抄", or gives brand/style references.
 - The request spans more than one screen, component family, or visual system.
 - The user asks for a design system, brand board, logo/identity board, or implementation handoff.
@@ -100,7 +102,7 @@ When references conflict, choose one recommended direction and name the tradeoff
 
 ## HTML Implementation Handoff
 
-Before `ui-html-renderer` writes the artifact, hand off:
+Before `ui-design-executor` writes the artifact, hand off:
 
 - Contract name or direction.
 - Source of truth: screenshot, repo tokens, user brief, brand reference, or inferred system.
@@ -112,6 +114,7 @@ Before `ui-html-renderer` writes the artifact, hand off:
 - Asset rules and do-not-copy constraints.
 - Acceptance gates the HTML must prove.
 - State/story coverage for components that need reusable variants.
+- Fixed decisions that ordinary follow-up edits must preserve, plus any deliberately open axes.
 
 For standalone drafts, the contract can be embedded as a visible "Design System" or "Handoff" section only when useful. For app screens, keep the artifact focused on the product experience and mention the contract in the final handoff.
 
@@ -151,4 +154,4 @@ Use this compact shape in the final handoff when a separate file is not created:
 - HTML acceptance gates:
 ```
 
-If the user asks for actual files or a long-running design system, write `DESIGN.md` beside the HTML artifact or inside the target project according to local conventions.
+If the user asks for actual files or a long-running design system, write `DESIGN.md` beside the entry file in the canonical artifact directory or inside the target project according to local conventions.

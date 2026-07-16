@@ -35,23 +35,34 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { userSessionsDir, userLocalSessionsDir } from '../paths';
+import { userSessionsDir, userLocalSessionsDir, projectSessionsDir, sessionToolResultsDir } from '../paths';
+import { listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
-import { listConversations } from './chats';
-import { isEphemeralSessionId, toolResultsDirForSession } from '../model/core-agent/session-store';
+import { logErrorRef } from '../util/log-redact';
+import { listActiveConversationIds } from './chats';
+import { isEphemeralSessionId } from '../model/core-agent/session-store';
 
 const log = createLogger('sessions-sweep');
 
 const EPHEMERAL_AGE_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days (matches logger / marketplace_cache)
 const LEGACY_KINDS = new Set(['sub', 'organizer', 'conv']);
 
-interface SweepResult {
+export interface SweepResult {
   scanned: number;
   orphan_cid: number;         // gconv/gmember whose cid is no longer registered
   ephemeral_on_cloud: number; // ephemeral kinds that leaked into cloud/sessions/
   legacy: number;             // sub / organizer / conv leftovers
   local_aged_out: number;     // local/sessions/ files older than EPHEMERAL_AGE_MS
   errors: number;
+  cancelled?: boolean;
+}
+
+const SWEEP_YIELD_EVERY = 100;
+
+async function yieldForSweep(index: number, signal?: AbortSignal): Promise<boolean> {
+  if (index === 0 || index % SWEEP_YIELD_EVERY !== 0) return !signal?.aborted;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  return !signal?.aborted;
 }
 
 // Pull the kind segment out of `<kind>-<tail>` (CLAUDE.md §5; uid is no longer in session_id).
@@ -84,8 +95,13 @@ function classify(baseName: string): { kind: string; cid?: string } | null {
   return { kind };
 }
 
-async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
-  const dir = userSessionsDir(userId);
+async function sweepCloudDir(
+  dir: string,
+  result: SweepResult,
+  activeCids: ReadonlySet<string> | null,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) { result.cancelled = true; return; }
   let names: string[];
   try { names = await fsp.readdir(dir); }
   catch (err) {
@@ -94,16 +110,9 @@ async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
     }
     return;
   }
-  // Materialize the active cid set once — listConversations does a JSON
-  // read; doing it per-file would be n× wasteful.
-  const activeCids = new Set<string>();
-  try {
-    const convs = await listConversations(userId);
-    for (const c of convs) activeCids.add(c.conversation_id);
-  } catch (err) {
-    log.warn(`listConversations failed; orphan-cid sweep degraded: ${(err as Error).message}`);
-  }
-  for (const name of names) {
+  for (let index = 0; index < names.length; index++) {
+    if (!await yieldForSweep(index, signal)) { result.cancelled = true; return; }
+    const name = names[index];
     if (!name.endsWith('.jsonl')) continue;
     result.scanned++;
     const sid = name.slice(0, -'.jsonl'.length);
@@ -118,13 +127,19 @@ async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
       reason = 'ephemeral_on_cloud';
     } else if (LEGACY_KINDS.has(info.kind)) {
       reason = 'legacy';
-    } else if ((info.kind === 'gconv' || info.kind === 'gmember') && info.cid && !activeCids.has(info.cid)) {
+    } else if (
+      activeCids
+      && (info.kind === 'gconv' || info.kind === 'gmember')
+      && info.cid
+      && !activeCids.has(info.cid)
+    ) {
       reason = 'orphan_cid';
     }
     if (!reason) continue;
     try {
       await fsp.unlink(path.join(dir, name));
-      await fsp.rm(toolResultsDirForSession(userId, sid), { recursive: true, force: true });
+      await fsp.unlink(path.join(dir, `${sid}.jsonl.context.json`)).catch(() => {});
+      await fsp.rm(path.join(dir, `${sid}.tool-results`), { recursive: true, force: true });
       result[reason]++;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -135,7 +150,34 @@ async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
   }
 }
 
-async function sweepLocalByAge(userId: string, result: SweepResult, now: number): Promise<void> {
+async function sweepCloud(userId: string, result: SweepResult, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) { result.cancelled = true; return; }
+  // One conversation snapshot serves the global sessions directory and all
+  // project session roots. On profiles with several projects the previous
+  // per-root load repeatedly read/merged every conversation index. If the
+  // snapshot fails, keep cid-bound sessions rather than treating an empty
+  // fallback set as proof that every session is orphaned.
+  let activeCids: Set<string> | null = null;
+  try {
+    activeCids = new Set(await listActiveConversationIds(userId));
+  } catch (err) {
+    log.warn('listActiveConversationIds failed; orphan-cid sweep degraded', { error: logErrorRef(err) });
+  }
+  if (signal?.aborted) { result.cancelled = true; return; }
+  await sweepCloudDir(userSessionsDir(userId), result, activeCids, signal);
+  for (const pid of listProjectIds(userId)) {
+    if (signal?.aborted) { result.cancelled = true; return; }
+    await sweepCloudDir(projectSessionsDir(userId, pid), result, activeCids, signal);
+  }
+}
+
+async function sweepLocalByAge(
+  userId: string,
+  result: SweepResult,
+  now: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (signal?.aborted) { result.cancelled = true; return; }
   const dir = userLocalSessionsDir(userId);
   let names: string[];
   try { names = await fsp.readdir(dir); }
@@ -145,7 +187,9 @@ async function sweepLocalByAge(userId: string, result: SweepResult, now: number)
     }
     return;
   }
-  for (const name of names) {
+  for (let index = 0; index < names.length; index++) {
+    if (!await yieldForSweep(index, signal)) { result.cancelled = true; return; }
+    const name = names[index];
     if (!name.endsWith('.jsonl')) continue;
     const full = path.join(dir, name);
     let st: fs.Stats;
@@ -155,7 +199,7 @@ async function sweepLocalByAge(userId: string, result: SweepResult, now: number)
     try {
       await fsp.unlink(full);
       const sid = name.slice(0, -'.jsonl'.length);
-      await fsp.rm(toolResultsDirForSession(userId, sid), { recursive: true, force: true });
+      await fsp.rm(sessionToolResultsDir(userId, sid), { recursive: true, force: true });
       result.local_aged_out++;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -168,17 +212,17 @@ async function sweepLocalByAge(userId: string, result: SweepResult, now: number)
 
 /** Run the sweep for a specific uid. Logs a summary line at the end; safe
  *  to call from startup without awaiting (errors don't propagate). */
-export async function sweepSessions(userId: string): Promise<SweepResult> {
+export async function sweepSessions(userId: string, signal?: AbortSignal): Promise<SweepResult> {
   const t0 = Date.now();
   const result: SweepResult = {
     scanned: 0, orphan_cid: 0, ephemeral_on_cloud: 0, legacy: 0,
     local_aged_out: 0, errors: 0,
   };
-  await sweepCloud(userId, result);
-  await sweepLocalByAge(userId, result, Date.now());
+  await sweepCloud(userId, result, signal);
+  if (!result.cancelled) await sweepLocalByAge(userId, result, Date.now(), signal);
   const removed = result.orphan_cid + result.ephemeral_on_cloud
                 + result.legacy + result.local_aged_out;
-  if (removed > 0 || result.errors > 0) {
+  if (removed > 0 || result.errors > 0 || result.cancelled) {
     log.info('sweep complete', {
       uid: userId,
       scanned: result.scanned,
@@ -187,6 +231,7 @@ export async function sweepSessions(userId: string): Promise<SweepResult> {
       legacy: result.legacy,
       local_aged_out: result.local_aged_out,
       errors: result.errors,
+      cancelled: !!result.cancelled,
       ms: Date.now() - t0,
     });
   }

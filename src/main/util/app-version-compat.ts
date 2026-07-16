@@ -56,5 +56,6 @@ export function minAppVersionFrom(...sources: Array<MinAppVersionSource | null |
 export function satisfiesMinAppVersion(currentVersion: string, minAppVersion: string): boolean {
   const min = normalizeMinAppVersion(minAppVersion);
   if (!min) return true;
+  if (!versionTokens(currentVersion).length) return false;
   return compareVersions(currentVersion, min) >= 0;
 }

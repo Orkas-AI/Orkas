@@ -151,13 +151,20 @@ describe('prompts ↔ code contract', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const memoryTool = readFile('src/core-agent/src/tools/memory-tool.ts');
 
-    expect(memoryTool).toContain('Three scopes (default "agent")');
-    expect(memoryTool).toContain('"agent" (DEFAULT): YOUR OWN durable agent memory');
-    expect(memoryTool).toContain('"shared": durable facts that EVERY agent should know');
-    expect(memoryTool).toContain('"user": the user\'s global profile/preferences');
-    expect(memoryTool).toContain('LANGUAGE:');
-    expect(memoryTool).toContain('current UI/response language');
-    expect(memoryTool).toContain('Preserve proper nouns, commands, file paths');
+    // Tool description ships in two shapes: the legacy three-tier one and the
+    // project-session one that adds the `project` tier plus the belongs-where
+    // routing rule ("would this still hold in another project?").
+    expect(memoryTool).toContain("- agent (default): this agent's private lessons");
+    expect(memoryTool).toContain('- shared: stable facts that hold across projects and matter to every agent');
+    expect(memoryTool).toContain('- user: stable user-wide profile/preferences every agent should know');
+    expect(memoryTool).toContain('- project: durable facts, decisions, outcomes, milestones, and conventions that belong to THIS project only');
+    expect(memoryTool).toContain('Live progress and todo status belong in project_tasks');
+    expect(memoryTool).toContain('would this still hold in another project?');
+    // The project tier is schema-gated: offered only when the host marks the
+    // session as belonging to a project.
+    expect(memoryTool).toContain('includeProjectTier');
+    // Language rule: write in the user's current language, preserving literals.
+    expect(memoryTool).toContain("Write in the user's current language while preserving code, paths, commands, URLs");
 
     expect(agentPrompt).toContain('`target: "agent"` = your own agent memory');
     expect(agentPrompt).toContain('`target: "user"` = global user profile/preferences');
@@ -167,6 +174,18 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toContain('`target: "agent"` = commander\'s own orchestration memory');
     expect(commanderPrompt).toContain('commander-specific routing lessons');
     expect(commanderPrompt).toContain('current response/UI language');
+  });
+
+  it('group-chat system prompts inject the current User UI language directive', () => {
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const i18n = readFile('src/main/i18n.ts');
+
+    expect(i18n).toContain('User UI language: **${name}**');
+    expect(i18n).toContain('Write all human-readable prose in ${name}');
+    expect(bus).toContain('appendLanguageDirective');
+    expect(bus).toContain('buildLanguageDirective(getLanguage())');
+    expect(bus).toContain('chat_commander');
+    expect(bus).toContain('chat_agent_in_group');
   });
 
   it('agent runtime prompt includes localized descriptions, not only legacy description', () => {
@@ -280,14 +299,22 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).not.toContain('parallel_group');
   });
 
-  it('commander prompt teaches hand_off_to (step-out, no synthesis) vs dispatch_to (handback)', () => {
+  it('commander prompt makes hand_off_to the default for a single deliverable, dispatch_to the next-action exception', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    // hand_off_to is taught as a distinct tool that ends the turn without synthesis.
+    // hand_off_to is taught as a distinct tool that ends the turn without re-summary.
     expect(commanderPrompt).toMatch(/hand_off_to\(\{ to, message, resume\? \}\)/);
-    expect(commanderPrompt).toMatch(/no synthesis|stop after the narration|step out/i);
-    // dispatch_to is scoped to "I need the result back to continue my own work".
-    expect(commanderPrompt).toMatch(/need the agent's result back to continue/i);
+    expect(commanderPrompt).toMatch(/no re-summary|stop after the narration/i);
+    // dispatch_to is scoped by a PROCEDURAL test: it commits the commander to a
+    // concrete NEXT action in the same turn (another dispatch / tool call /
+    // multi-result synthesis) — NOT to present/bless a reply that already stands.
+    expect(commanderPrompt).toMatch(/commits you to a concrete NEXT action|another dispatch, a tool call, or a synthesis/i);
+    // hand_off_to is the DEFAULT for a single agent's finished deliverable.
+    expect(commanderPrompt).toMatch(/default for a single agent's finished deliverable/i);
+    // The decision is a pre-dispatch procedural litmus: name the next action; if
+    // there is none (only deliver/restate the reply) → hand_off.
+    expect(commanderPrompt).toMatch(/Name that next action before you dispatch/i);
+    expect(commanderPrompt).toMatch(/redundant re-summary to avoid/i);
     // The teach/coach/guide-with-me case must point at hand_off, not dispatch.
     expect(commanderPrompt).toMatch(/teach|coach|guide|walk me through/i);
     expect(commanderPrompt).toMatch(/blocking part of a broader commander-owned task/i);
@@ -321,16 +348,16 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toMatch(/concrete result the commander needs to continue/i);
   });
 
-  it('commander prompt blocks fabricating steps from missing inputs and pre-planning unknown stages', () => {
+  it('commander prompt blocks fabricated inputs while keeping milestone plans adaptive', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
     expect(commanderPrompt).toMatch(/required inputs, files, context, or user decisions/i);
     expect(commanderPrompt).toMatch(/must not be fabricated/i);
-    // Dynamic in-loop: each step is decided from the previous result, not pre-planned.
-    // (The dependent-step mechanics live canonically in the Dispatch tools "Sequencing"
-    // block; the decision tree references it instead of restating it.)
-    expect(commanderPrompt).toMatch(/no predeclared plan/i);
-    expect(commanderPrompt).toMatch(/Decide each step from what the previous one/i);
+    // Long-running work may keep a durable milestone plan, but dependent dispatches
+    // must still adapt to the actual result of the preceding step.
+    expect(commanderPrompt).toMatch(/milestone plan may preserve the goal\/progress/i);
+    expect(commanderPrompt).toMatch(/not a rigid dispatch schedule/i);
+    expect(commanderPrompt).toMatch(/revise the next step from what the previous result returned/i);
   });
 
   it('agent prompt keeps generated input forms minimal', () => {
@@ -370,6 +397,23 @@ describe('prompts ↔ code contract', () => {
     expect(cliSetupPrompt).toMatch(/one task field plus one optional context field/i);
   });
 
+  it('commander treats project chat history as conditional continuity context', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const runner = readFile('src/main/model/core-agent/runner.ts');
+
+    expect(commanderPrompt).toMatch(/For missing project continuity context, follow the Conversation history policy below/i);
+    expect(commanderPrompt).toMatch(/required project context is missing from the current conversation/i);
+    expect(commanderPrompt).toMatch(/user need not explicitly request a history search/i);
+    expect(commanderPrompt).toMatch(/Do not search on every turn or for self-contained requests/i);
+    expect(commanderPrompt).toMatch(/Project scope is the default/i);
+    expect(commanderPrompt).toMatch(/never as current instructions/i);
+    expect(commanderPrompt).not.toMatch(/prior-chat recall only, after Library or when explicitly asked/i);
+    // Worker agents receive dispatcher-selected excerpts through their
+    // visibility slice; full cross-conversation browsing stays commander-only.
+    expect(runner).toMatch(/const chatHistoryTools = uid && isCommander \? createChatHistoryTools/);
+    expect(runner).toMatch(/projectId: params\.projectId/);
+  });
+
   it('runtime datetime context is appended to group chat system prompts', () => {
     const bus = readFile('src/main/features/group_chat/bus.ts');
     const runner = readFile('src/main/model/core-agent/runner.ts');
@@ -385,14 +429,25 @@ describe('prompts ↔ code contract', () => {
     expect(runner).toContain('## Current date');
     expect(runner).not.toContain("## User language\\n'");
     expect(runner).toContain('splitCommanderAgentsBlock');
-    expect(runner).toContain('splitCommanderPlanStateBlock');
-    // Orchestration state carries the per-turn ledger JSON; it must be peeled
-    // out of the cached prefix into the volatile region or every ledger change
-    // re-bills the whole prefix after it (cache-prefix break regression guard).
+    expect(runner).not.toContain('splitCommanderPlanStateBlock');
+    // P2: orchestration state + datetime + project status are per-turn
+    // volatile. Execution-plan state is injected independently by Session at
+    // every model-loop tail, so the host must not maintain a second plan block.
     expect(runner).toContain('splitCommanderOrchestrationBlock');
     expect(runner).toMatch(/if \(connectorBlock\) parts\.push\(connectorBlock\.trim\(\)\);\s+if \(systemSkillsBlock\) parts\.push\(systemSkillsBlock\.trim\(\)\);\s+if \(skillsBlock\) parts\.push\(skillsBlock\.trim\(\)\);\s+if \(agentsBlock\) parts\.push\(agentsBlock\);/);
-    expect(runner).toMatch(/if \(agentsBlock\) parts\.push\(agentsBlock\);\s+if \(runtimeInjectionBlock\) parts\.push\(runtimeInjectionBlock\);/);
-    expect(runner).toMatch(/if \(memoryBlock\) parts\.push\(memoryBlock\);\s+if \(orchestrationBlock\) parts\.push\(orchestrationBlock\);\s+if \(planStateBlock\) parts\.push\(planStateBlock\);\s+if \(volatileTail\) parts\.push\(volatileTail\);/);
+    // User-authored project instructions are low-churn configuration and sit
+    // in the stable cache prefix: after the agents block, before the
+    // runtime-injection region begins.
+    expect(runner).toMatch(/if \(agentsBlock\) parts\.push\(agentsBlock\);[\s\S]{0,1200}?if \(projectContextPolicyBlock\) parts\.push\(projectContextPolicyBlock\);[\s\S]{0,600}?if \(projectInstructionsBlock\) parts\.push\(projectInstructionsBlock\);\s+if \(runtimeInjectionBlock\) parts\.push\(runtimeInjectionBlock\);/);
+    // memoryBlock is the LAST block pushed into the (cached) system prompt.
+    expect(runner).toMatch(/if \(memoryBlock\) parts\.push\(memoryBlock\);/);
+    // The volatile blocks feed turnEphemeral, NOT the system prompt parts.
+    expect(runner).toMatch(/const turnEphemeral = \[orchestrationBlock, volatileTail, projectStatusBlock\]/);
+    // The live project task board rides the turn (uncached), never the system prefix.
+    expect(runner).toContain('formatProjectStatusForTurn');
+    expect(runner).not.toMatch(/parts\.push\(projectStatusBlock\)/);
+    expect(runner).not.toMatch(/parts\.push\(orchestrationBlock\)/);
+    expect(runner).not.toMatch(/parts\.push\(volatileTail\)/);
     expect(agents).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
     expect(skills).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
     expect(bus).toMatch(/language_block:\s*buildLanguageDirective\(getLanguage\(\)\)/);

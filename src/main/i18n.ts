@@ -166,7 +166,7 @@ function rendererLocaleFile(lang: Lang): string {
   return path.join(SRC_ROOT, 'renderer', 'locales', `${lang}.json`);
 }
 
-function loadRendererTable(lang: Lang): Table {
+export function getRendererTable(lang: Lang): Table {
   const cached = _rendererTables[lang];
   if (cached) return cached;
   let table: Table = {};
@@ -182,7 +182,17 @@ function loadRendererTable(lang: Lang): Table {
 /** Returns all renderer tables for the renderer-side i18n module. */
 export function getRendererTables(): Record<Lang, Table> {
   const out = {} as Record<Lang, Table>;
-  for (const lang of SUPPORTED_LANGS) out[lang] = loadRendererTable(lang);
+  for (const lang of SUPPORTED_LANGS) out[lang] = getRendererTable(lang);
+  return out;
+}
+
+/** Minimal synchronous preload bundle: active UI language plus its fallback.
+ * Other locale tables stay off the first-paint IPC payload and are fetched
+ * through `config.getLocales` only if the user switches language later. */
+export function getRendererBootTables(lang: Lang): Partial<Record<Lang, Table>> {
+  const out: Partial<Record<Lang, Table>> = { [lang]: getRendererTable(lang) };
+  const fallback = LOCALE_BY_CODE[lang]?.fallback;
+  if (fallback && fallback !== lang) out[fallback] = getRendererTable(fallback);
   return out;
 }
 

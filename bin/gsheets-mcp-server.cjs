@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Sheets MCP server (stdio). Wraps `sheets.googleapis.com` v4.
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');

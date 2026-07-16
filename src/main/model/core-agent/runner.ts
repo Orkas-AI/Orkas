@@ -17,7 +17,7 @@
  * to the SDK's default-provider + env-var auth path.
  */
 
-import type { AgentTool, HistoryResource, LLMProvider } from '#core-agent';
+import type { AgentTool, HistoryResource, LLMProvider, ToolContext, ToolResult } from '#core-agent';
 import * as path from 'node:path';
 
 import {
@@ -33,7 +33,7 @@ import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
-import { getSession, memoryScopeForSession, toolResultsDirForSession } from './session-store';
+import { getSession, memoryScopeForSession, sessionKindOf, toolResultsDirForSession } from './session-store';
 import {
   addEntry,
   replaceEntry,
@@ -42,6 +42,12 @@ import {
   formatForSystemPrompt as formatMemoryForSystemPrompt,
   type MemoryScope,
 } from '../../features/memory';
+import {
+  formatProjectContextPolicyForSystemPrompt,
+  formatProjectInstructionsForSystemPrompt,
+  writeProjectInstructions,
+} from '../../features/projects';
+import * as projectTasks from '../../features/project_tasks';
 import * as metacognition from '../../features/metacognition';
 import { appendAgentSkill, listAgents } from '../../features/agents';
 const log = createLogger('model/runner');
@@ -51,21 +57,22 @@ import { officeCliAvailable } from '../../features/office/office_engine';
 import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
+import { createVideoStudioTool } from './video-studio-tool';
 import { createResearchRerankTool } from './research-rerank-tool';
 import { isToolVisibleToAgent } from './tool-catalog';
 import { createWebSearchOverrideTool } from './search-tools';
 import {
   agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
-  artifactDir,
   userMarketplaceAgentSkillsDir,
   userSystemSkillsDir,
 } from '../../paths';
+import { artifactDirForConversation } from '../../util/project-layout';
 import {
-  wrapToolWithCap,
-  MAX_RESULT_CHARS_BY_TOOL,
-  DEFAULT_MAX_RESULT_CHARS,
+  capToolResult,
+  DEFAULT_INLINE_RESULT_TOKENS,
 } from '../../util/tool-result-cap';
+import { createToolResultTools } from './tool-result-tools';
 import {
   buildMoonshotModel,
   buildDeepSeekModel,
@@ -164,6 +171,9 @@ export interface BuildRunnerParams {
   /** Stable id for the current visible actor/model turn. Used by delete_file
    *  confirmation UI so batching never crosses prior conversation turns. */
   turnId?: string;
+  /** Current real user text, used by tools that must bind an approval action
+   * to explicit user intent rather than merely to the existence of a turn. */
+  userMessage?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Resolved once at
@@ -215,6 +225,8 @@ export interface BuildRunnerParams {
    * `markdown_to_pdf` / `html_to_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** Turn owner validation hook for the `publish_outputs` tool. */
+  onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -290,21 +302,6 @@ function splitCommanderAgentsBlock(prompt: string): { stable: string; agentsBloc
   };
 }
 
-function splitCommanderPlanStateBlock(prompt: string): { stable: string; planStateBlock: string } {
-  const marker = '\n\n### Current plan state';
-  const idx = prompt.indexOf(marker);
-  if (idx < 0) return { stable: prompt, planStateBlock: '' };
-  const blockStart = idx + 2;
-  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
-  const blockEnd = nextSection < 0
-    ? prompt.length
-    : blockStart + marker.trimStart().length + nextSection;
-  return {
-    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
-    planStateBlock: prompt.slice(blockStart, blockEnd).trim().replace(/^### Current plan state/, '## Current plan state'),
-  };
-}
-
 function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeInjectionBlock: string } {
   const marker = '\n\n## Runtime injection';
   const idx = prompt.indexOf(marker);
@@ -324,10 +321,9 @@ function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeIn
  * the TOP of chat_commander.md, far ahead of `## Runtime injection` — any
  * ledger change invalidates the whole Anthropic cache prefix after it (~7-9K
  * tokens re-billed at full input price per turn). Relocating the whole H2
- * section to the volatile region keeps the cached prefix stable, matching the
- * `### Current plan state` treatment and CLAUDE.md's "runtime-volatile prompt
- * fields go in one trailing section" rule. The header is already H2 so no
- * heading rewrite is needed.
+ * section to the volatile region keeps the cached prefix stable and follows
+ * CLAUDE.md's "runtime-volatile prompt fields go in one trailing section"
+ * rule. The header is already H2 so no heading rewrite is needed.
  */
 function splitCommanderOrchestrationBlock(prompt: string): { stable: string; orchestrationBlock: string } {
   const marker = '\n\n## Orchestration state';
@@ -350,6 +346,11 @@ export const _splitCommanderOrchestrationBlock = splitCommanderOrchestrationBloc
 export async function buildRunner(params: BuildRunnerParams): Promise<{
   runner: AgentRunnerInstance;
   resolvedSystemPrompt: string;
+  /** Per-turn volatile blocks (orchestration ledger / plan / datetime) peeled
+   *  OUT of the system prompt to keep the cache prefix stable; the caller
+   *  forwards this as `runStream({ turnEphemeral })` so it rides this turn's
+   *  user message instead. Empty for runs with no volatile blocks. */
+  turnEphemeral: string;
   entryId?: string;
   profileId?: string;
   providerId: string;
@@ -434,6 +435,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Cross-session memory eligibility + per-agent scope (null = not eligible →
   // no tool, no injection). See memoryScopeForSession for the per-kind rule.
   const memoryAgentScope = memoryScopeForSession(params.sessionId, agentId);
+  // The commander (the project's orchestrator conversation, `gconv`) owns the
+  // two project-wide stores: it may WRITE project instructions (ORKAS.md, via
+  // the `project_instructions` tool) and project memory. Dispatched sub-agents
+  // (gmember / gworker / cli) get read-only access to both. Derived from the
+  // immutable session id, so it can't drift mid-session.
+  const isCommander = sessionKindOf(params.sessionId) === 'gconv';
   const agentDisplayNameById = new Map<string, string>();
   if (uid) {
     try {
@@ -466,7 +473,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           if (uid && params.cid) {
             recordHistoryResource({
               kind: 'final_output',
-              path: path.join(artifactDir(uid, params.cid, a.id), 'index.html'),
+              path: path.join(artifactDirForConversation(uid, params.cid, a.id), 'index.html'),
               name: a.title || a.id,
               note: 'Interactive app artifact entry point.',
             });
@@ -476,11 +483,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : undefined;
 
   if (uid && memoryAgentScope) {
-    // Cross-session memory. `agent` tier binds to THIS caller's scope so the
-    // model can never reach another agent's store; `shared`/`user` are global.
+    // Cross-session memory. `agent` tier binds to THIS caller's scope and
+    // `project` to THIS conversation's project, so the model can never reach
+    // another agent's or project's store; `shared`/`user` are global. The
+    // `project` tier exists only in project sessions — outside a project it is
+    // absent from the tool schema entirely (see memory-tool.ts).
     const scopeId = memoryAgentScope; // narrowed to string
-    const toScope = (tier: 'agent' | 'shared' | 'user'): MemoryScope =>
-      tier === 'agent' ? { agent: scopeId } : tier === 'shared' ? 'memory' : 'user';
+    const projectScopeId = params.projectId || '';
+    const toScope = (tier: 'agent' | 'project' | 'shared' | 'user'): MemoryScope =>
+      tier === 'agent' ? { agent: scopeId }
+      : tier === 'project' ? { project: projectScopeId }
+      : tier === 'shared' ? 'memory' : 'user';
     const memoryHandler: MemoryToolHandler = {
       add: (tier, content) => addEntry(uid, toScope(tier), content),
       replace: (tier, oldText, content) => replaceEntry(uid, toScope(tier), oldText, content),
@@ -488,7 +501,69 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       list: (tier) => listEntries(uid, toScope(tier)),
     };
     const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
-    injectedTools.push(createCrossSessionMemoryTool(memoryHandler));
+    // Project memory: commander read+write, sub-agents read-only (list only).
+    injectedTools.push(createCrossSessionMemoryTool(memoryHandler, {
+      includeProjectTier: !!projectScopeId,
+      projectTierReadOnly: !!projectScopeId && !isCommander,
+    }));
+  }
+
+  // Project tasks: the project's shared, structured work backlog. Real work
+  // sessions in a project only (commander + agents) — gated like the memory
+  // project tier (`memoryAgentScope`), so edit / one-shot / reflection sessions
+  // never get it. Owner is a display NAME here (best-effort — the store
+  // validates a resolved id when the UI supplies one; the name is kept for
+  // display).
+  if (uid && memoryAgentScope && params.projectId) {
+    const pid = params.projectId;
+    const cid = params.cid || '';
+    const toView = (task: import('../../features/project_tasks').ProjectTask) => projectTasks.taskView(task);
+    const projectTasksHandler = {
+      list: async () => {
+        const tasks = await projectTasks.listTasks(uid, pid);
+        return { ok: true, tasks: tasks.map(toView), progress: projectTasks.computeProgress(tasks) };
+      },
+      create: async (input: { title: string; detail?: string; owner?: string; status?: projectTasks.TaskStatus }) => {
+        const r = await projectTasks.createTask(uid, pid, {
+          title: input.title,
+          ...(input.detail !== undefined ? { detail: input.detail } : {}),
+          ...(input.status !== undefined ? { status: input.status } : {}),
+          ...(input.owner ? { owner_agent: input.owner } : {}),
+          created_by: 'agent',
+          ...(cid ? { origin_cid: cid } : {}),
+        });
+        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
+      },
+      update: async (taskId: string, patch: { title?: string; detail?: string; status?: projectTasks.TaskStatus; owner?: string; result_ref?: string }) => {
+        const r = await projectTasks.updateTask(uid, pid, taskId, {
+          ...(patch.title !== undefined ? { title: patch.title } : {}),
+          ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
+          ...(patch.status !== undefined ? { status: patch.status } : {}),
+          ...(patch.owner !== undefined ? { owner_agent: patch.owner } : {}),
+          ...(patch.result_ref !== undefined ? { result_ref: patch.result_ref } : {}),
+        });
+        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
+      },
+      complete: async (taskId: string, resultRef?: string) => {
+        const r = await projectTasks.completeTask(uid, pid, taskId, resultRef);
+        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
+      },
+    };
+    const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
+    injectedTools.push(createProjectTasksTool(projectTasksHandler));
+
+    // Project instructions (ORKAS.md): the project's goal + rules. Commander
+    // writes; sub-agents read it from their system prompt but don't get this
+    // tool. Injected for the commander only, so there is no other write path.
+    if (isCommander) {
+      const { createProjectInstructionsTool } = await import('../../../core-agent/src/tools/project-instructions-tool');
+      injectedTools.push(createProjectInstructionsTool({
+        set: async (instructions: string) => {
+          const r = await writeProjectInstructions(uid, pid, instructions);
+          return r.ok ? { ok: true } : { ok: false, error: (r as { error: string }).error };
+        },
+      }));
+    }
   }
 
   // Metacognition tool (per-agent, only if enabled via env var)
@@ -522,6 +597,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...systemSkillReadRoots,
     ...agentPrivateSkillReadRoots,
   ];
+  const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
+  const localReadOnlyDenyRoots = [
+    ...fileReadOnlyExtraRoots,
+    ...(toolResultsDir ? [toolResultsDir] : []),
+  ];
 
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
@@ -536,6 +616,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // writable lane (`extraRoots`), while read-only roots are visible through
     // fileTools below.
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+    ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
   });
@@ -555,12 +636,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-        ...(fileReadOnlyExtraRoots.length || params.sessionId
-          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, toolResultsDirForSession(uid, params.sessionId)] }
+        ...(fileReadOnlyExtraRoots.length || toolResultsDir
+          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, ...(toolResultsDir ? [toolResultsDir] : [])] }
           : {}),
+        ...(toolResultsDir ? { toolResultsRoot: toolResultsDir } : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
     : [];
+
+  // Persisted oversized outputs have their own capability boundary. The model
+  // receives opaque refs and can only search or read bounded cursor chunks;
+  // generic read_file is explicitly denied for this root below.
+  const toolResultTools = toolResultsDir ? createToolResultTools({ toolResultsDir }) : [];
 
   // Library tools (kb_list + kb_search + kb_read). Read-only, no localExec
   // required. Injected for every main conv + group_chat actor; agent-edit
@@ -572,15 +659,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(params.projectId ? { projectId: params.projectId } : {}),
   }) : [];
 
-  // Conversation-history tools (chat_search + chat_read). Read-only and
-  // lower-priority than KB: useful for "what did we discuss before" recall,
-  // not an authoritative facts source.
-  const chatHistoryTools = uid ? createChatHistoryTools({
+  // Conversation-history tools (chat_search + chat_read). Commander-only:
+  // agent workers receive the material they need through their visibility
+  // slice / dispatcher payload and must never browse full conversation logs.
+  // Project commanders search their own project by default; Library remains
+  // authoritative for durable document facts.
+  const chatHistoryTools = uid && isCommander ? createChatHistoryTools({
     userId: uid,
     ...(params.cid ? { currentCid: params.cid } : {}),
+    ...(params.projectId ? { projectId: params.projectId } : {}),
   }) : [];
 
-  // Image / video generation. Shares the localExec access mode with
+  // Media generation. Shares the localExec access mode with
   // local-tools (writing image bytes is the same blast radius as write_file).
   // Skipped when uid is unknown — generators need the
   // workspace + attachment scope to validate paths.
@@ -588,11 +678,30 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? [createImageGenTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
+  const videoStudioTools: AgentTool[] = uid
+    ? [createVideoStudioTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(params.userMessage ? { userMessage: params.userMessage } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+
   // Deep-research-owned tools (ownerAgent gate). Pure local compute (embedding
   // + ranking), so no uid / workspace scope and no Tool Execution Access needed;
   // hidden from the commander and every other actor via isToolVisibleToAgent.
@@ -659,7 +768,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : '';
   const connectorMetaTools = uid && exposure !== 'none'
     ? await createConnectorMetaTools(
-        { userId: uid, ...(params.cid ? { cid: params.cid } : {}) },
+        {
+          userId: uid,
+          ...(params.cid ? { cid: params.cid } : {}),
+        },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
     : [];
@@ -672,9 +784,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...kbTools,
     ...chatHistoryTools,
     ...imageGenTools,
+    ...videoStudioTools,
     ...deepResearchTools,
     ...officeTools,
     ...searchOverrideTools,
+    ...toolResultTools,
     ...(params.extraTools || []),
     ...connectorMetaTools,
   ];
@@ -686,42 +800,40 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // produced it. Caller-supplied extraTools / core-agent builtins aren't in the
   // catalog, so `isToolVisibleToAgent` returns true for them (unaffected).
   const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
+  const visibleToolNameSet = new Set(visibleTools.map((tool) => tool.name));
+  const builtinTools = mod.getBuiltinTools();
 
-  // Cap each tool's result size + persist oversized outputs. Single wrap point
-  // so every tool (including core-agent's builtins like web_search/web_fetch
-  // injected inside AgentRunner) is covered. Read-type tools cap at 100K (a
-  // >100K read spills + stays re-pageable via charStart/charEnd); a tool still
-  // exempts itself only by an Infinity entry in MAX_RESULT_CHARS_BY_TOOL.
-  // `uid` being empty happens in ad-hoc test scenarios; skip wrapping there —
-  // no per-session tool-results dir to resolve and no LLM in the loop that would
-  // over-feed context anyway.
-  const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
-  const wrappedTools = uid
-    ? visibleTools.map((t) =>
-        wrapToolWithCap(t, {
-          maxChars: MAX_RESULT_CHARS_BY_TOOL[t.name] ?? DEFAULT_MAX_RESULT_CHARS,
+  // Apply one simple 8K per-result policy at AgentRunner's FINAL result
+  // boundary. Keeping this as a result transformer (instead of pre-wrapping
+  // the current tool list) also covers core builtins and tools AgentRunner adds
+  // later, notably skill_manage. AgentRunner supplies a shared 16K-per-model-
+  // step ledger through ctx.state and shrinks it when context headroom is low.
+  // `uid` can be empty in ad-hoc tests; without a session Result Store we leave
+  // outputs untouched.
+  const transformToolResult = uid
+    ? (toolName: string, result: ToolResult, ctx: ToolContext): ToolResult =>
+        capToolResult(toolName, result, ctx, {
+          maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS,
           toolResultsDir,
-        }),
-      )
-    : visibleTools;
+        })
+    : undefined;
 
   // Final tool name set the AgentRunner will see — core-agent builtins
   // (read_file/write_file/bash/list_files/web_search/web_fetch) merged with
-  // our wrappedTools via last-write-wins. Used by the snapshot below and by
+  // our visibleTools via last-write-wins. Used by the snapshot below and by
   // the catalog-drift test (`tool-catalog.test.ts`); we no longer render a
   // `## Available tools` block into the system prompt because the model
   // already receives every tool's compact description + JSON schema via the
   // SDK tool-use protocol — the prompt block was an information subset
   // duplicating ~800 chars per call without giving the model anything new.
-  const builtinTools = mod.getBuiltinTools();
   const extraToolNameSet = new Set((params.extraTools ?? []).map((t) => t.name));
   const finalToolNames = Array.from(new Set([
     ...builtinTools.map((t) => t.name),
-    ...wrappedTools.map((t) => t.name),
+    ...visibleTools.map((t) => t.name),
   ]));
 
   // Snapshot the final tool definitions for the dev archive. Last-write-wins
-  // merge: builtins first, then wrappedTools override by name. Source label
+  // merge: builtins first, then visibleTools override by name. Source label
   // tracks where each definition came from so the debug panel can call out
   // injected vs. caller-supplied tools.
   const toolDefMap = new Map<string, ToolDefSnapshot>();
@@ -737,8 +849,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   for (const t of builtinTools) {
     toolDefMap.set(t.name, snapshotTool(t, 'core-agent'));
   }
-  for (const t of wrappedTools) {
-    toolDefMap.set(t.name, snapshotTool(t, extraToolNameSet.has(t.name) ? 'extra' : 'orkas'));
+  for (const t of visibleTools) {
+    toolDefMap.set(
+      t.name,
+      snapshotTool(
+        t,
+        extraToolNameSet.has(t.name) ? 'extra' : visibleToolNameSet.has(t.name) ? 'orkas' : 'core-agent',
+      ),
+    );
   }
   const toolDefs: ToolDefSnapshot[] = Array.from(toolDefMap.values())
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -746,7 +864,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Finalize system prompt. Cache-friendly order:
   //   [base prompt] → [connectors] → [system skills] → [skills]
   //   → [agents] → [runtime injection] → [memory] → [orchestration state]
-  //   → [plan state] → [volatile datetime tail].
+  //   → [volatile datetime tail].
   // Everything from [runtime injection] onward is the turn-volatile region;
   // the stable prefix above it is what the provider prompt-cache reuses.
   // Tool list is no longer in the prompt (see toolsBlock removal note above)
@@ -754,30 +872,59 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const parts: string[] = [];
   const { stable: stableSystemPrompt, volatileTail } = splitVolatilePromptTail(params.systemPrompt);
   const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
-  const { stable: stableWithoutPlan, planStateBlock } = splitCommanderPlanStateBlock(stableWithoutAgents);
-  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutPlan);
+  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutAgents);
   // Orchestration state carries the per-turn `orchestration_ledger` JSON; it
   // must leave the cached prefix or it invalidates the whole prefix after it
   // every commander turn a ledger is live. Peel it here and re-emit it in the
-  // volatile region below (matches plan state).
+  // volatile region below.
   const { stable: stableWithoutOrchestration, orchestrationBlock } = splitCommanderOrchestrationBlock(stableWithoutRuntime);
   if (stableWithoutOrchestration) parts.push(stableWithoutOrchestration);
   if (connectorBlock) parts.push(connectorBlock.trim());
   if (systemSkillsBlock) parts.push(systemSkillsBlock.trim());
   if (skillsBlock) parts.push(skillsBlock.trim());
   if (agentsBlock) parts.push(agentsBlock);
+  // Static rules for resolving conflicts among the user-managed project
+  // layers. Always present in real project work sessions, even when ORKAS.md,
+  // memory, or the task backlog is empty.
+  const projectContextPolicyBlock = (uid && memoryAgentScope && params.projectId)
+    ? formatProjectContextPolicyForSystemPrompt()
+    : '';
+  if (projectContextPolicyBlock) parts.push(projectContextPolicyBlock);
+  // User-authored project instructions (read side): low-churn configuration,
+  // so it stays in the stable cache prefix (before the runtime injection).
+  // Gated on memoryAgentScope like memory: edit/one-shot sessions get neither.
+  const projectInstructionsBlock = (uid && memoryAgentScope && params.projectId)
+    ? formatProjectInstructionsForSystemPrompt(uid, params.projectId)
+    : '';
+  if (projectInstructionsBlock) parts.push(projectInstructionsBlock);
   if (runtimeInjectionBlock) parts.push(runtimeInjectionBlock);
   // Cross-session memory (read side): the user's stored profile + notes as
   // background context. It is more turn-volatile than resource indexes, so
-  // it sits after connectors / skills / agents but before per-plan state.
+  // it sits after connectors / skills / agents but before per-turn state.
   // Empty string when nothing is stored (no tokens for new users).
   // Re-read each turn — a mid-conversation write shows up next turn.
-  const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope) : '';
+  // Project sessions additionally render the project's own notes section.
+  const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope, params.projectId) : '';
   if (memoryBlock) parts.push(memoryBlock);
-  if (orchestrationBlock) parts.push(orchestrationBlock);
-  if (planStateBlock) parts.push(planStateBlock);
-  if (volatileTail) parts.push(volatileTail);
   const resolvedSystemPrompt = parts.join('\n\n');
+  // P2: the truly per-turn-volatile blocks — the orchestration ledger (~7-9K
+  // JSON that changes every commander turn) and the datetime tail — do NOT go
+  // into the system prompt. Even peeled to the tail they bust the
+  // Anthropic single-block system cache (and therefore the whole history
+  // prefix) every turn. Instead they ride on THIS turn's user message
+  // (core-agent AgentRunParams.turnEphemeral → getMessagesForModel), the
+  // uncached tail after all history, so the system + history cache prefix stays
+  // byte-stable across turns. See Common/docs/plans/context-cost-optimization.md.
+  // Live project task board (project sessions only). Rides the turn — NOT the
+  // cached system prefix — because it changes as tasks update. The goal/rules
+  // stay in ORKAS.md (prefix) and decisions in the memory block; this is the
+  // task layer. See features/project_tasks.ts::formatProjectStatusForTurn.
+  const projectStatusBlock = (uid && memoryAgentScope && params.projectId)
+    ? await projectTasks.formatProjectStatusForTurn(uid, params.projectId)
+    : '';
+  const turnEphemeral = [orchestrationBlock, volatileTail, projectStatusBlock]
+    .filter((b) => b && b.trim())
+    .join('\n\n');
 
   // Evolution (the self-evolving skill store) is per-agent: when an
   // agentId is present we write into that agent's private directory
@@ -885,7 +1032,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     config,
     providers,
     session,
-    ...(wrappedTools.length ? { tools: wrappedTools } : {}),
+    ...(visibleTools.length ? { tools: visibleTools } : {}),
+    ...(transformToolResult ? { transformToolResult } : {}),
+    ...(toolResultsDir ? { toolContextState: { toolResultSpoolDir: toolResultsDir } } : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
     ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
@@ -894,6 +1043,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   return {
     runner,
     resolvedSystemPrompt,
+    turnEphemeral,
     entryId: primary?.entryId,
     profileId: primary?.profileId,
     providerId,

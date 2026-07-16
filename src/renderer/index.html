@@ -92,6 +92,7 @@
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
+              <div class="chat-quote-preview" id="new-chat-quote-preview" style="display:none"></div>
               <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files." rows="2"></textarea>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
@@ -601,7 +602,6 @@
               <div class="project-detail-header-main">
                 <div class="project-detail-header-title-row">
                   <h1 class="project-detail-title" id="project-detail-title"></h1>
-                  <span class="project-detail-header-count" id="project-detail-header-count"></span>
                   <input type="text" class="project-detail-title-input" id="project-detail-title-input"
                          style="display:none" autocomplete="off" spellcheck="false" />
                 </div>
@@ -621,6 +621,7 @@
                   <div class="chat-input-overlay">
                     <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
                   </div>
+                  <div class="chat-quote-preview" id="project-chat-quote-preview" style="display:none"></div>
                   <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
                   <!-- Bottom bar: attach | divider | recipient | workspace (JS-injected) | skill | spacer | mic | send. -->
                   <div class="chat-bottom-bar">
@@ -644,54 +645,149 @@
 
                 <!-- Tabbed workspace: project tasks and automation. Agents
                      and Library live in the right rail. -->
-                <div class="project-detail-tabs" role="tablist">
-                  <button type="button" class="project-detail-tab is-active" data-project-tab="tasks" data-i18n="project.tab_tasks">Tasks</button>
-                  <button type="button" class="project-detail-tab" data-project-tab="auto" data-i18n="project.tab_auto">Automation</button>
-                </div>
-                <div class="project-detail-tab-panel" data-project-panel="tasks">
-                  <div class="project-tasks-head">
-                    <span class="project-tasks-count" id="project-tasks-count"></span>
+                <section class="project-workbench">
+                  <div class="project-detail-tabs">
+                    <div class="project-detail-tab-group" role="tablist">
+                      <button type="button" class="project-detail-tab is-active" data-project-tab="tasks">
+                        <span data-i18n="project.tab_tasks">Tasks</span>
+                        <span class="project-detail-tab-count" id="project-tasks-count">0</span>
+                      </button>
+                      <button type="button" class="project-detail-tab" data-project-tab="auto">
+                        <span data-i18n="project.tab_auto">Automation</span>
+                        <span class="project-detail-tab-count" id="project-auto-tab-count">0</span>
+                      </button>
+                    </div>
                   </div>
-                  <div class="project-tasks-list" id="project-tasks-list"></div>
-                  <div class="project-tasks-empty empty muted" id="project-tasks-empty" data-i18n="project.tasks_empty">No tasks yet</div>
-                </div>
-                <div class="project-detail-tab-panel" data-project-panel="auto" hidden>
-                  <div class="project-auto-tab-head">
-                    <span class="project-auto-tab-count" id="project-auto-tab-count"></span>
-                    <button type="button" class="btn btn-sm" id="project-auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
+                  <div class="project-detail-tab-panel" data-project-panel="tasks">
+                    <div class="project-tasks-list" id="project-tasks-list"></div>
+                    <div class="project-tasks-empty empty muted" id="project-tasks-empty" data-i18n="project.tasks_empty">No tasks yet</div>
                   </div>
-                  <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
-                  <div class="auto-list" id="project-auto-list"></div>
-                  <div class="empty muted" id="project-auto-empty" data-i18n="auto.empty">No auto tasks yet</div>
-                </div>
+                  <div class="project-detail-tab-panel" data-project-panel="auto" hidden>
+                    <div class="project-auto-tab-head">
+                      <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
+                      <button type="button" class="btn btn-sm" id="project-auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
+                    </div>
+                    <div class="auto-list" id="project-auto-list"></div>
+                    <div class="empty muted" id="project-auto-empty" data-i18n="auto.empty">No auto tasks yet</div>
+                  </div>
+                </section>
               </div>
               <aside class="project-detail-side" aria-label="Project resources">
-                <section class="project-side-card project-side-agents">
-                  <div class="project-side-card-head">
+                <section class="project-side-card project-side-context">
+                  <div class="project-side-card-head project-side-card-head-tabs">
                     <div class="project-side-card-title-wrap">
-                      <span class="project-side-card-title" data-i18n="project.bindings.agents_title">Agents</span>
-                      <span class="project-side-card-count" id="project-detail-agents-count"></span>
+                      <span class="project-side-card-title" data-i18n="project.context.title">Context</span>
                     </div>
-                    <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
-                            data-i18n-title="project.bindings.add_agent" title="Add"
-                            data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">+</button>
+                    <div class="project-side-tabs" role="tablist" data-project-side-tabs="context">
+                      <button type="button" class="project-side-tab is-active" data-project-side-tab="instructions">
+                        <span data-i18n="project.context.instructions_tab">Instructions</span>
+                      </button>
+                      <button type="button" class="project-side-tab" data-project-side-tab="memory">
+                        <span data-i18n="project.context.memory_tab">Memory</span>
+                        <span class="project-side-tab-count" id="project-memory-count"></span>
+                      </button>
+                    </div>
+                    <button type="button" class="project-side-icon-btn" id="project-memory-add-btn"
+                            data-project-context-action="memory" hidden
+                            data-i18n-title="project.memory.add" title="Add memory"
+                            data-i18n-aria-label="project.memory.add" aria-label="Add memory">
+                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                    </button>
                   </div>
-                  <div class="project-side-card-list project-agent-rail-list" id="project-agents-list"></div>
-                  <div class="empty muted" id="project-agents-empty" data-i18n="project.bindings.empty_agents_short">No agents yet</div>
+                  <div class="project-side-panel project-side-instructions-panel" data-project-side-panel="instructions">
+                    <p class="project-context-help" data-i18n="project.instructions.subtitle">Set project goals, priorities, and rules. The AI follows them in every conversation.</p>
+                    <textarea class="project-instructions-input" id="project-instructions-input" rows="5"
+                              data-i18n-placeholder="project.instructions.placeholder"
+                              placeholder="Rules and context every conversation in this project should follow"></textarea>
+                    <div class="project-instructions-foot">
+                      <span class="project-instructions-counter muted" id="project-instructions-counter"></span>
+                      <button type="button" class="btn btn-sm btn-primary" id="project-instructions-save-btn"
+                              data-i18n="project.instructions.save" disabled>Save</button>
+                    </div>
+                  </div>
+                  <div class="project-side-panel project-side-memory-panel" data-project-side-panel="memory" hidden>
+                    <p class="project-context-help" data-i18n="project.memory.subtitle">Record project facts, decisions, and progress for the AI to reference in future conversations.</p>
+                    <div class="project-memory-editor" id="project-memory-editor" hidden>
+                      <textarea class="project-memory-editor-input" id="project-memory-editor-input" rows="3" maxlength="2500"
+                                data-i18n-placeholder="project.memory.placeholder" placeholder="Record a durable fact, decision, or project update"></textarea>
+                      <div class="project-memory-editor-foot">
+                        <span class="project-memory-editor-counter muted" id="project-memory-editor-counter">0/2500</span>
+                        <span class="project-memory-editor-actions">
+                          <button type="button" class="btn btn-sm" id="project-memory-editor-cancel" data-i18n="project.memory.cancel">Cancel</button>
+                          <button type="button" class="btn btn-sm btn-primary" id="project-memory-editor-save" data-i18n="project.memory.save">Save</button>
+                        </span>
+                      </div>
+                    </div>
+                    <div class="project-side-card-list project-memory-list" id="project-memory-list"></div>
+                    <div class="empty muted" id="project-memory-empty" data-i18n="project.memory.empty">No project memory yet</div>
+                  </div>
                 </section>
 
-                <section class="project-side-card project-side-library">
-                  <div class="contexts-section-header project-side-card-head project-library-side-head">
-                    <span class="project-side-card-title" data-i18n="project.files.title">Library</span>
-                    <span class="contexts-section-count" id="project-detail-files-count"></span>
+                <section class="project-side-card project-side-resources">
+                  <div class="project-side-card-head project-side-card-head-tabs">
+                    <div class="project-side-card-title-wrap">
+                      <span class="project-side-card-title" data-i18n="project.resources.title">Resources</span>
+                    </div>
+                    <div class="project-side-tabs" role="tablist" data-project-side-tabs="resources">
+                      <button type="button" class="project-side-tab is-active" data-project-side-tab="agents">
+                        <span data-i18n="project.resources.agents_tab">Agents</span>
+                        <span class="project-side-tab-count" id="project-detail-agents-count"></span>
+                      </button>
+                      <button type="button" class="project-side-tab" data-project-side-tab="files">
+                        <span data-i18n="project.resources.files_tab">Library</span>
+                        <span class="project-side-tab-count" id="project-detail-files-count"></span>
+                      </button>
+                    </div>
+                    <button type="button" class="project-side-icon-btn" id="project-add-agent-btn"
+                            data-project-resource-action="agents"
+                            data-i18n-title="project.bindings.add_agent" title="Add"
+                            data-i18n-aria-label="project.bindings.add_agent" aria-label="Add">
+                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                    </button>
                     <button type="button" class="project-side-icon-btn project-library-add-btn ctx-row-menu-btn ctx-root-menu-btn" id="project-library-root-menu-btn"
+                            data-project-resource-action="files" hidden
                             data-i18n-title="contexts.menu.more_actions" title="More actions"
-                            data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">+</button>
+                            data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
+                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                    </button>
                   </div>
-                  <div class="project-files-status muted" id="project-files-status"></div>
-                  <div class="contexts-tree project-library-tree project-side-card-list project-library-side-list" id="project-files-list">
-                    <div class="empty" data-i18n="project.files.empty">No project files</div>
+                  <div class="project-side-panel project-side-agents-panel" data-project-side-panel="agents">
+                    <div class="project-side-card-list project-agent-rail-list" id="project-agents-list"></div>
+                    <div class="empty muted" id="project-agents-empty" data-i18n="project.bindings.empty_agents_short">No agents yet</div>
                   </div>
+                  <div class="project-side-panel project-side-files-panel" data-project-side-panel="files" hidden>
+                    <div class="project-files-status muted" id="project-files-status"></div>
+                    <div class="contexts-tree project-library-tree project-side-card-list project-library-side-list" id="project-files-list">
+                      <div class="empty" data-i18n="project.files.empty">No project files</div>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="project-side-card project-side-tasks">
+                  <div class="project-side-card-head">
+                    <div class="project-side-card-title-wrap">
+                      <span class="project-side-card-title" data-i18n="project.todo.title">To-do</span>
+                      <span class="project-side-card-count" id="project-todo-count"></span>
+                    </div>
+                    <button type="button" class="project-side-icon-btn" id="project-todo-add-btn"
+                            data-i18n-title="project.todo.add" title="Add task"
+                            data-i18n-aria-label="project.todo.add" aria-label="Add task">
+                      <span data-ui-icon="plus" data-ui-icon-class="project-side-add-icon"></span>
+                    </button>
+                  </div>
+                  <div class="project-todo-add project-memory-editor" id="project-todo-add" hidden>
+                    <textarea class="project-memory-editor-input" id="project-todo-input" rows="3" maxlength="200"
+                              data-i18n-placeholder="project.todo.placeholder" placeholder="Add a task…"></textarea>
+                    <div class="project-memory-editor-foot">
+                      <span class="project-memory-editor-counter muted" id="project-todo-counter">0/200</span>
+                      <span class="project-memory-editor-actions">
+                        <button type="button" class="btn btn-sm" id="project-todo-cancel" data-i18n="project.todo.cancel">Cancel</button>
+                        <button type="button" class="btn btn-sm btn-primary" id="project-todo-save" data-i18n="project.todo.save" disabled>Save</button>
+                      </span>
+                    </div>
+                  </div>
+                  <div class="project-side-card-list project-todo-list" id="project-todo-list"></div>
+                  <div class="empty muted" id="project-todo-empty" data-i18n="project.todo.empty">No tasks yet</div>
                 </section>
               </aside>
             </div>
@@ -706,10 +802,10 @@
                     <div class="contexts-editor-path" id="project-library-editor-path"></div>
                     <div class="project-library-modal-actions">
                       <div class="detail-actions" id="project-library-viewer-actions"></div>
-                      <button type="button" class="project-library-modal-close" data-action="project-library-viewer-close"
+                      <button type="button" class="modal-close-btn project-library-modal-close" data-action="project-library-viewer-close"
                               data-i18n-title="project.bindings.picker_close" title="Close"
                               data-i18n-aria-label="project.bindings.picker_close" aria-label="Close">
-                        <span data-ui-icon="x" data-ui-icon-class="project-library-modal-close-icon"></span>
+                        <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
                       </button>
                     </div>
                   </div>
@@ -780,7 +876,9 @@
               <span class="contexts-section-count" id="contexts-tree-count"></span>
               <button type="button" class="ctx-row-menu-btn ctx-root-menu-btn" id="ctx-root-menu-btn"
                       data-i18n-title="contexts.menu.more_actions" title="More actions"
-                      data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">⋯</button>
+                      data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">
+                <span data-ui-icon="more-horizontal" data-ui-icon-class="ctx-row-menu-icon"></span>
+              </button>
             </div>
             <div class="ctx-upload-status" id="ctx-upload-status" style="display:none">
               <span class="ctx-upload-spinner"></span>
@@ -1430,7 +1528,9 @@
   <script src="./modules/state.js"></script>
   <script src="./modules/dialogs.js"></script>
   <script src="./modules/ipc-shim.js"></script>
+  <script src="./modules/lazy-features.js"></script>
   <script src="./modules/i18n.js"></script>
+  <script src="./modules/chat-use.js"></script>
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/delete-file-confirm.js"></script>
   <script src="./modules/boot.js"></script>
@@ -1439,6 +1539,7 @@
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/icons.js"></script>
+  <script src="./modules/file-operation-policy.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
   <script src="./modules/md-view-edit.js"></script>
   <script src="./modules/text-view-edit.js"></script>
@@ -1447,32 +1548,27 @@
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/name-limit.js"></script>
   <script src="./modules/projects.js"></script>
-  <script src="./modules/project-detail.js"></script>
   <script src="./modules/conv-bucket.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/artifact-security.js"></script>
   <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/conversation-info.js"></script>
   <script src="./modules/queue-draft.js"></script>
-  <script src="./modules/skills.js"></script>
   <script src="./modules/connectors.js"></script>
   <script src="./modules/bridge.js"></script>
   <script src="./modules/bash_permission.js"></script>
-  <script src="./modules/contexts.js"></script>
-  <script src="./modules/kb-picker.js"></script>
   <script src="./modules/search.js"></script>
   <script src="./modules/user-workspace.js"></script>
   <script src="./modules/local-agents.js"></script>
   <script src="./vendor/pinyin-firstletter/data.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
   <script src="./modules/agents.js"></script>
-  <script src="./modules/saved-apps.js"></script>
-  <script src="./modules/auto.js"></script>
   <script src="./modules/auto-title.js"></script>
+  <script src="./modules/auto-events.js"></script>
   <script src="./modules/utils.js"></script>
   <script src="./modules/validation-report-view.js"></script>
   <script src="./modules/oss.js"></script>
-  <script src="./modules/marketplace.js"></script>
   <script src="./modules/settings_tabs.js"></script>
 
   <!--
@@ -1511,10 +1607,7 @@
       },
     };
   </script>
-  <script src="./vendor/mathjax/tex-chtml.js" defer></script>
   <script src="./modules/math.js"></script>
-  <script src="./modules/settings.js"></script>
-  <script src="./modules/memory.js"></script>
   <script src="./modules/sidebar-resize.js"></script>
 </body>
 </html>

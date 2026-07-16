@@ -19,7 +19,7 @@ import type { AgentTool, ToolContext, ToolResult, ToolResultImage } from '#core-
 import { getLocalExecGranted } from '../../features/permissions';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { getWorkspacePath } from '../../features/user_workspace';
-import { chatAttachmentDir } from '../../paths';
+import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { officeCliAvailable, runOfficeCli, closeOfficeFile, OfficeCliError } from '../../features/office/office_engine';
 import {
@@ -68,7 +68,7 @@ function allowedRootsFor(opts: OfficeToolsOpts): string[] {
       if (ws) roots.push(ws);
     } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
     if (opts.cid) {
-      try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
+      try { roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
       catch (err) { log.warn('resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
     }
   }

@@ -1,14 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
 type StreamStartFn = (
-  event: { sender: { isDestroyed: () => boolean; send: (channel: string, payload: unknown) => void } },
+  event: { sender: { getURL: () => string; isDestroyed: () => boolean; send: (channel: string, payload: unknown) => void } },
   req: { requestId: string; channel: string; payload?: unknown },
 ) => Promise<void>;
+type StreamCancelFn = (
+  event: { sender: { getURL: () => string } },
+  requestId: unknown,
+) => void;
 
 let streamStartHandler: StreamStartFn | null = null;
+let streamCancelHandler: StreamCancelFn | null = null;
 
 const groupChatMock = vi.hoisted(() => ({
   subscribers: new Set<(ev: unknown) => void>(),
@@ -23,8 +29,9 @@ const groupChatMock = vi.hoisted(() => ({
 vi.mock('electron', () => ({
   ipcMain: {
     handle: vi.fn(),
-    on: (channel: string, fn: StreamStartFn) => {
-      if (channel === 'orkas.streamStart') streamStartHandler = fn;
+    on: (channel: string, fn: StreamStartFn | StreamCancelFn) => {
+      if (channel === 'orkas.streamStart') streamStartHandler = fn as StreamStartFn;
+      if (channel === 'orkas.streamCancel') streamCancelHandler = fn as StreamCancelFn;
     },
   },
   shell: { openExternal: vi.fn(async () => undefined), showItemInFolder: vi.fn() },
@@ -56,6 +63,7 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   streamStartHandler = null;
+  streamCancelHandler = null;
   groupChatMock.subscribers.clear();
   groupChatMock.quiescent = false;
   groupChatMock.releaseSend = null;
@@ -84,13 +92,93 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 }
 
 describe('ipc › conversations.sendStream', () => {
+  it('ignores stream starts from an untrusted sender', async () => {
+    if (!streamStartHandler) throw new Error('stream handler not registered');
+    const sent = vi.fn();
+    await streamStartHandler(
+      {
+        sender: {
+          getURL: () => 'https://evil.example/index.html',
+          isDestroyed: () => false,
+          send: sent,
+        },
+      },
+      {
+        requestId: 'untrusted',
+        channel: 'conversations.sendStream',
+        payload: { cid: 'c123abc', content: 'go' },
+      },
+    );
+    expect(sent).not.toHaveBeenCalled();
+    expect(groupChatMock.subscribers.size).toBe(0);
+  });
+
+  it('does not let a second sender cancel another sender\'s stream', async () => {
+    if (!streamStartHandler || !streamCancelHandler) throw new Error('stream handlers not registered');
+    const owner = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const other = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    let settled = false;
+    const run = streamStartHandler(
+      { sender: owner },
+      {
+        requestId: 'owned-stream',
+        channel: 'conversations.sendStream',
+        payload: { cid: 'c123abc', content: 'go' },
+      },
+    ).finally(() => { settled = true; });
+    await groupChatMock.sendStarted;
+
+    streamCancelHandler({ sender: other }, 'owned-stream');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+
+    streamCancelHandler({ sender: owner }, 'owned-stream');
+    await run;
+    expect(settled).toBe(true);
+    groupChatMock.releaseSend?.();
+  });
+
+  it('rejects a duplicate request id without replacing the original owner', async () => {
+    if (!streamStartHandler || !streamCancelHandler) throw new Error('stream handlers not registered');
+    const first = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const duplicateSent = vi.fn();
+    const second = trustedIpcSender({ isDestroyed: () => false, send: duplicateSent });
+    const original = streamStartHandler(
+      { sender: first },
+      {
+        requestId: 'same-id',
+        channel: 'conversations.sendStream',
+        payload: { cid: 'c123abc', content: 'go' },
+      },
+    );
+    await groupChatMock.sendStarted;
+
+    await streamStartHandler(
+      { sender: second },
+      {
+        requestId: 'same-id',
+        channel: 'conversations.sendStream',
+        payload: { cid: 'c123abc', content: 'duplicate' },
+      },
+    );
+    expect(duplicateSent).toHaveBeenNthCalledWith(1, 'stream:same-id', {
+      type: 'error',
+      text: 'duplicate stream request id',
+    });
+    expect(duplicateSent).toHaveBeenNthCalledWith(2, 'stream:same-id', { type: 'done' });
+
+    streamCancelHandler({ sender: first }, 'same-id');
+    await original;
+    groupChatMock.releaseSend?.();
+  });
+
   it('relays group bus events before groupChat.send resolves', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sent: Array<{ channel: string; payload: any }> = [];
-    const sender = {
+    const sender = trustedIpcSender({
       isDestroyed: () => false,
       send: (channel: string, payload: unknown) => sent.push({ channel, payload }),
-    };
+    });
 
     const run = streamStartHandler(
       { sender },
@@ -123,10 +211,10 @@ describe('ipc › conversations.sendStream', () => {
   it('keeps relaying group bus events after groupChat.send resolves while the bus is still active', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sent: Array<{ channel: string; payload: any }> = [];
-    const sender = {
+    const sender = trustedIpcSender({
       isDestroyed: () => false,
       send: (channel: string, payload: unknown) => sent.push({ channel, payload }),
-    };
+    });
 
     const run = streamStartHandler(
       { sender },

@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 // Integration tests for bin/orkas-pkg.cjs — install/scan/registry/shim
 // lifecycle against real local git repos (git clone accepts a local path
 // source, so no network involved). The registry written here is the
@@ -50,7 +52,7 @@ function makeRepo(name: string, files: Record<string, string>): string {
 
 function runPkgWithEnv(extraEnv: Record<string, string>, ...args: string[]) {
   const pcRoot = process.cwd();
-  const r = spawnSync(process.execPath, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
+  const r = spawnSync(TEST_NODE, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
     cwd: pcRoot,
     encoding: 'utf8',
     env: {
@@ -78,7 +80,7 @@ function runPkg(...args: string[]) {
 
 function runPkgInput(input: string, ...args: string[]) {
   const pcRoot = process.cwd();
-  const r = spawnSync(process.execPath, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
+  const r = spawnSync(TEST_NODE, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
     cwd: pcRoot,
     encoding: 'utf8',
     input,

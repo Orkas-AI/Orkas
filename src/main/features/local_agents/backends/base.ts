@@ -16,6 +16,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { resolveCliCommand } from '../spawn-command.js';
 
 /** All event types a backend can emit. The runner persists these to
  *  `events.jsonl` verbatim and forwards them to the renderer through
@@ -150,11 +151,13 @@ export function spawnCli(
   cwd: string,
   env?: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
-  const child = spawn(binPath, args, {
+  const launch = resolveCliCommand(binPath, args);
+  const child = spawn(launch.command, launch.args, {
     cwd,
     env: env ?? process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments,
     detached: process.platform !== 'win32',
   });
   // Swallow EPIPE during cancel; the OS will close the pipe when the

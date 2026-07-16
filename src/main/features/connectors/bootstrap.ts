@@ -1,7 +1,8 @@
 /**
  * Startup entry for the connectors feature. Called once from `main/index.ts` inside
- * `app.whenReady()` after the active uid is settled. Reconnects every persisted instance
- * best-effort — failures land as `status:error` on the registry but never block boot.
+ * `app.whenReady()` after the active uid is settled. Healthy instances reuse their persisted
+ * tool schemas; only uncached, stale, or repair-needed rows connect during bootstrap. The first
+ * real tool call reconnects a cached instance on demand.
  *
  * Process-quit hook calls `manager.shutdownAll()` so stdio subprocesses (MCP servers) exit
  * cleanly instead of becoming zombies — symmetrical to the cleanup that `local_agents/runner.ts`

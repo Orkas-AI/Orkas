@@ -304,22 +304,118 @@ export async function rewriteJsonlLine<T extends object>(
   });
 }
 
+const JSONL_TAIL_CHUNK_BYTES = 64 * 1024;
+
+function _parseJsonlRecord<T>(line: string): T | undefined {
+  const trimmed = line.trim();
+  if (!trimmed) return undefined;
+  try { return JSON.parse(trimmed) as T; } catch { return undefined; }
+}
+
+function _appendJsonlRecord<T>(out: T[], line: string): void {
+  const record = _parseJsonlRecord<T>(line);
+  if (record !== undefined) out.push(record);
+}
+
+export interface JsonlPage<T> {
+  records: T[];
+  /** Byte offset at which an older page ends; null means the file start. */
+  nextCursor: number | null;
+}
+
+/**
+ * Return one newest-first-selected JSONL page in chronological order.
+ *
+ * `before` is an exclusive byte cursor emitted by a previous call. It keeps
+ * pagination on the file tail: loading an older page never rereads or parses
+ * the newer records already mounted in the conversation view.
+ */
+export async function readJsonlPage<T = Record<string, any>>(
+  filePath: string,
+  limit = 200,
+  before?: number | null,
+): Promise<JsonlPage<T>> {
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fsp.open(filePath, 'r');
+  } catch {
+    return { records: [], nextCursor: null };
+  }
+
+  try {
+    const size = (await handle.stat()).size;
+    const requestedEnd = before === null || before === undefined ? Number.NaN : Number(before);
+    let position = Number.isSafeInteger(requestedEnd)
+      ? Math.max(0, Math.min(requestedEnd, size))
+      : size;
+    let carry = Buffer.alloc(0);
+    const newestFirst: T[] = [];
+    let oldestRecordStart = -1;
+
+    while (position > 0 && newestFirst.length < wanted) {
+      const bytes = Math.min(JSONL_TAIL_CHUNK_BYTES, position);
+      position -= bytes;
+      const block = Buffer.allocUnsafe(bytes);
+      const { bytesRead } = await handle.read(block, 0, bytes, position);
+      const joined = carry.length
+        ? Buffer.concat([block.subarray(0, bytesRead), carry])
+        : block.subarray(0, bytesRead);
+
+      let end = joined.length;
+      for (let i = joined.length - 1; i >= 0 && newestFirst.length < wanted; i -= 1) {
+        if (joined[i] !== 0x0a) continue; // '\n'
+        const record = _parseJsonlRecord<T>(joined.subarray(i + 1, end).toString('utf8'));
+        if (record !== undefined) {
+          newestFirst.push(record);
+          oldestRecordStart = position + i + 1;
+        }
+        end = i;
+      }
+      carry = joined.subarray(0, end);
+    }
+
+    if (newestFirst.length < wanted && carry.length) {
+      const record = _parseJsonlRecord<T>(carry.toString('utf8'));
+      if (record !== undefined) {
+        newestFirst.push(record);
+        oldestRecordStart = 0;
+      }
+    }
+
+    return {
+      records: newestFirst.reverse(),
+      nextCursor: oldestRecordStart > 0 ? oldestRecordStart : null,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 /**
  * Read a JSONL file, returning the last `limit` valid records.
- * Malformed lines are silently skipped, matching Python behavior.
+ *
+ * History consumers normally need only a bounded tail. Reading from the end
+ * keeps a years-long conversation log from being fully loaded, split and
+ * parsed merely to display its newest messages. Each candidate line is
+ * decoded only after its complete byte range has been assembled, so UTF-8
+ * characters that straddle a disk-read boundary remain intact.
+ *
+ * Non-positive limits retain the historical full-file behavior. Malformed
+ * lines are silently skipped, matching the previous Python-compatible read.
  */
 export async function readJsonl<T = Record<string, any>>(filePath: string, limit = 200): Promise<T[]> {
-  let text: string;
-  try {
-    text = await fsp.readFile(filePath, 'utf8');
-  } catch {
-    return [];
+  if (!Number.isFinite(limit) || limit < 1) {
+    let text: string;
+    try {
+      text = await fsp.readFile(filePath, 'utf8');
+    } catch {
+      return [];
+    }
+    const out: T[] = [];
+    for (const line of text.split('\n')) _appendJsonlRecord(out, line);
+    return out.slice(-limit);
   }
-  const out: T[] = [];
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try { out.push(JSON.parse(trimmed) as T); } catch { /* skip */ }
-  }
-  return out.slice(-limit);
+
+  return (await readJsonlPage<T>(filePath, limit)).records;
 }

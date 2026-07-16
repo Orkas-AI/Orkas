@@ -28,6 +28,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.doUnmock('@earendil-works/pi-ai/oauth');
+  vi.doUnmock('#core-agent');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -70,7 +71,7 @@ describe('auth › maskKey', () => {
 });
 
 describe('auth › external navigation', () => {
-  it('rejects dangerous and credential-bearing URLs', async () => {
+  it('rejects non-http and credential-bearing URLs', async () => {
     const a = await import('../../../src/main/features/auth');
     expect(a.openExternalUrl('javascript:alert(1)')).toEqual({
       ok: false,
@@ -345,13 +346,13 @@ describe('auth › entries (priority list)', () => {
     const p1 = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'one');
     const p2 = await a.addApiKey('openai', 'sk-xxxxxxxxxxxx', 'one');
     const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
-    const r2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: p2.profileId });
+    const r2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: p2.profileId });
     expect(r1.entryId).toBeTruthy();
     expect(r2.entryId).not.toBe(r1.entryId);
 
     const { entries } = await a.listEntries();
     expect(entries.map((e) => `${e.provider}:${e.model}`)).toEqual([
-      'openai:gpt-5',
+      'openai:gpt-5.5',
       'anthropic:claude-opus-4-8',
     ]);
   });
@@ -379,7 +380,7 @@ describe('auth › entries (priority list)', () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
     await expect(
-      a.addEntry({ provider: 'openai', model: 'gpt-5', profileId: p.profileId }),
+      a.addEntry({ provider: 'openai', model: 'gpt-5.5', profileId: p.profileId }),
     ).rejects.toThrow();
   });
 
@@ -405,7 +406,7 @@ describe('auth › entries (priority list)', () => {
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
     const q = await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
     const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
-    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: q.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: q.profileId });
 
     const res = await a.reorderEntries([e2.entryId, e1.entryId]);
     expect(res.entries.map((e) => e.entryId)).toEqual([e2.entryId, e1.entryId]);
@@ -443,7 +444,7 @@ describe('auth › entries (priority list)', () => {
     // the credential after adding the entry (leaves a dangling entry, which
     // should be skipped, not returned).
     const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p2.profileId });
-    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5',          profileId: p1.profileId });
     // Remove credential p2 directly via removeCredential; since that cascades,
     // it also drops e1. To simulate a dangling entry without cascade, reach
     // into the json file.
@@ -522,7 +523,7 @@ describe('auth › pickChatEntryGroup + 冷却联动', () => {
     const p1 = await a.addApiKey('anthropic', 'k-top-xxxxxxxx');
     const p2 = await a.addApiKey('openai',    'k-fallback-xxx');
     await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p1.profileId });
-    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5', profileId: p2.profileId });
+    const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5.5', profileId: p2.profileId });
 
     cd.markCooldown(p1.profileId, 'auth', 'cold');
     const group = await a.pickChatEntryGroup();

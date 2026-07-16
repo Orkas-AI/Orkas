@@ -29,7 +29,10 @@ const modelAbortMock = vi.hoisted(() => vi.fn(() => 0));
 // Records every model turn the bus drives, so tests can assert WHAT a given
 // session actually received as its turn input (`opts.message`) — e.g. that a
 // G8b handback turn carried the worker's full reply, not a summary.
-const _recordedCalls = vi.hoisted(() => [] as Array<{ sid: string; message: string }>);
+const _recordedCalls = vi.hoisted(() => [] as Array<{
+  sid: string;
+  message: string;
+}>);
 // Records the result each tool's execute() returned — lets a test assert that a
 // G8d in-process dispatch tool (run_worker) handed its sub-run's full reply back
 // synchronously as the tool result, not via an async re-wake.
@@ -38,7 +41,10 @@ const _recordedToolResults = vi.hoisted(() => [] as Array<{ name: string; conten
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(opts: any) {
     const sid = opts.sessionId || '';
-    _recordedCalls.push({ sid, message: String(opts.message || '') });
+    _recordedCalls.push({
+      sid,
+      message: String(opts.message || ''),
+    });
     // Ephemeral worker sessions have a random id (`gworker-<cid>-<rand>`); a
     // test can't pre-script them by id, so route any gworker turn to a fixed
     // `gworker-*` script slot.
@@ -633,7 +639,6 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     // 1) The agent ran a top-level turn (its persistent gmember session).
     const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
     expect(_recordedCalls.some((c) => c.sid === agentSid), 'the agent should run a top-level turn').toBe(true);
-
     // 2) The agent answered the USER directly — its reply is a visible bubble.
     const lines = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf-8')
       .split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -784,6 +789,12 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     );
     expect(tutorActive.length, 'tutor must surface in active_turns for the thinking placeholder').toBeGreaterThan(0);
     expect(
+      tutorActive.every((e: any) => e.active_turns
+        .filter((t: any) => t.actor === tutorId)
+        .every((t: any) => Number.isFinite(t.started_at_ms) && t.started_at_ms > 0)),
+      'nested active turns must expose a stable execution start for elapsed-time recovery',
+    ).toBe(true);
+    expect(
       tutorActive.every((e: any) => !e.active_turns.some((t: any) => t.actor === 'commander')),
       'the suspended commander must not co-appear in active_turns while the tutor runs',
     ).toBe(true);
@@ -810,6 +821,101 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(_recordedCalls.some((c) => c.sid === tutorSid), 'follow-up should run the tutor again').toBe(true);
     const commanderCallsAfter = _recordedCalls.filter((c) => c.sid === state.buildGconvSessionId(cid)).length;
     expect(commanderCallsAfter, 'commander must NOT run for the no-@ follow-up while handed off').toBe(commanderCallsBefore);
+  }, 15_000);
+
+  it('hand_off_to after failed planning attempts leaves no empty commander tail', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const specialistReply = 'VIDEO-STUDIO-RESULT: review form is ready.';
+    const toolEvent = (id: string, name: string, phase: 'start' | 'end', isError?: boolean) => ({
+      type: 'event',
+      event: {
+        stream: 'tool',
+        data: { id, name, phase, ...(isError === undefined ? {} : { isError }) },
+      },
+    });
+    const contextProgress = (stream: 'context' | 'compaction', phase: string, text: string) => ({
+      type: 'progress',
+      text,
+      event: { stream, data: { phase } },
+    });
+
+    // Mirrors d33b828f234c from the reported run: research triggered context
+    // compaction, the commander narrated a visible pre-dispatch segment, three
+    // execution-plan calls failed, and hand_off_to delivered the final answer.
+    // The old whole-turn process array was attached again to an empty tail;
+    // the generic compaction-visibility rule forced that tail to persist.
+    _setScript(state.buildGconvSessionId(cid), [
+      contextProgress('context', 'active_process_compaction_start', '正在整理当前轮工具上下文...'),
+      contextProgress('context', 'active_process_compaction_done', '当前轮工具上下文整理完成'),
+      contextProgress('compaction', 'done', 'compacted 19480→2442 tokens'),
+      toolEvent('plan-1', 'manage_execution_plan', 'start'),
+      toolEvent('plan-1', 'manage_execution_plan', 'end', true),
+      toolEvent('plan-2', 'manage_execution_plan', 'start'),
+      toolEvent('plan-2', 'manage_execution_plan', 'end', true),
+      { type: 'delta', text: '资料搜集已基本完备，我来整合素材并交给 @Writer。' },
+      toolEvent('plan-3', 'manage_execution_plan', 'start'),
+      toolEvent('plan-3', 'manage_execution_plan', 'end', true),
+      toolEvent('handoff-1', 'hand_off_to', 'start'),
+      { type: '__call_tool__', name: 'hand_off_to', input: { to: AGENT_NAME, message: 'compose the video' } },
+      toolEvent('handoff-1', 'hand_off_to', 'end', false),
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: specialistReply },
+    ]);
+
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'make the video' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(rows.some((row: any) => row.from === AGENT_ID && row.text === specialistReply)).toBe(true);
+    const commanderRows = rows.filter((row: any) => row.from === 'commander');
+    expect(commanderRows, 'only the narrated pre-dispatch segment should persist').toHaveLength(1);
+    expect(commanderRows[0].text).toContain('资料搜集已基本完备');
+    expect(commanderRows[0].process.some((item: any) => item.event?.stream === 'compaction'),
+      'pre-dispatch compaction belongs to the pre-dispatch segment').toBe(true);
+    expect(commanderRows[0].process.some((item: any) => item.event?.data?.name === 'manage_execution_plan'),
+      'pre-dispatch planning attempts belong to the pre-dispatch segment').toBe(true);
+    expect(commanderRows.some((row: any) => !String(row.text || '').trim()),
+      'terminal delivery must not persist an empty commander process/runtime record').toBe(false);
+    expect(events.some((ev) => ev.type === 'turn_silent'
+      && ev.actor === 'commander'
+      && ev.reason === 'terminal_handoff'),
+    'renderer must receive an explicit terminal-handoff cleanup signal').toBe(true);
+  }, 15_000);
+
+  it('terminal hand_off_to without narration is not resurrected by context compaction', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+
+    _setScript(state.buildGconvSessionId(cid), [
+      {
+        type: 'progress',
+        text: 'compacted 19480→2442 tokens',
+        event: { stream: 'compaction', data: { tokensBefore: 19480, tokensAfter: 2442 } },
+      },
+      { type: '__call_tool__', name: 'hand_off_to', input: { to: AGENT_NAME, message: 'compose the video' } },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: 'VIDEO-STUDIO-RESULT: ready.' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'make the video' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(rows.some((row: any) => row.from === AGENT_ID)).toBe(true);
+    expect(rows.filter((row: any) => row.from === 'commander'),
+      'compaction observability must not override an explicit terminal delivery').toEqual([]);
   }, 15_000);
 
   it('manual @ to another agent while handed off makes that agent the sticky floor', async () => {

@@ -38,8 +38,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
-import { artifactDir, chatArtifactCidDir } from '../paths';
+import {
+  artifactDirForConversation,
+  chatArtifactCidDirForConversation,
+  chatArtifactRelPath,
+} from '../util/project-layout';
 import { createLogger } from '../logger';
+import { isPathAllowed } from '../util/path-sandbox';
 
 const log = createLogger('chat_artifacts');
 
@@ -137,24 +142,17 @@ function safeRelPath(rel: unknown): string {
   return segs.join('/');
 }
 
-function artifactRelPath(cid: string, artifactId: string, rel = ''): string {
-  return ['cloud/chat_artifacts', cid, artifactId, rel].filter(Boolean).join('/');
+function notifyArtifactDirty(userId: string, cid: string, artifactId: string): void {
+  void userId;
+  void cid;
+  void artifactId;
 }
 
-function notifyArtifactDirty(cid: string, artifactId: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('chat_artifacts', artifactRelPath(cid, artifactId));
-  } catch { /* features/sync stripped */ }
-}
-
-function notifyArtifactDeleted(cid: string, artifactId: string, rel: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
-    void sync?.markDeleted?.(artifactRelPath(cid, artifactId, rel));
-  } catch { /* features/sync stripped */ }
+function notifyArtifactDeleted(userId: string, cid: string, artifactId: string, rel: string): void {
+  void userId;
+  void cid;
+  void artifactId;
+  void rel;
 }
 
 function listArtifactFilesRel(dir: string, prefix = ''): string[] {
@@ -341,7 +339,7 @@ export function createArtifact(
   let finalDir = '';
   for (let attempt = 0; attempt < 5; attempt++) {
     const candidate = crypto.randomBytes(9).toString('base64url'); // 12 url-safe chars
-    const dir = artifactDir(userId, safeConvId, candidate);
+    const dir = artifactDirForConversation(userId, safeConvId, candidate);
     if (!fs.existsSync(dir)) { artifactId = candidate; finalDir = dir; break; }
   }
   if (!artifactId) return { ok: false, error: 'could not allocate an artifact id' };
@@ -363,7 +361,7 @@ export function createArtifact(
     return { ok: false, error: `failed to write artifact: ${(err as Error).message}` };
   }
   log.info(`createArtifact user=${userId} cid=${safeConvId} id=${artifactId} files=${prepared.length} bytes=${totalBytes} agent=${meta.agentId}`);
-  notifyArtifactDirty(safeConvId, artifactId);
+  notifyArtifactDirty(userId, safeConvId, artifactId);
   return { ok: true, artifactId, title };
 }
 
@@ -412,11 +410,18 @@ export function resolveArtifactDir(
   let safeId: string;
   try { safeConvId = safeCid(cid); safeId = safeArtifactId(artifactId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
-  const dir = artifactDir(userId, safeConvId, safeId);
+  const dir = artifactDirForConversation(userId, safeConvId, safeId);
   let st: fs.Stats;
-  try { st = fs.statSync(dir); }
+  try {
+    const lst = fs.lstatSync(dir);
+    if (lst.isSymbolicLink()) return { ok: false, code: 'not_found', error: 'artifact not found' };
+    st = fs.statSync(dir);
+  }
   catch { return { ok: false, code: 'not_found', error: 'artifact not found' }; }
   if (!st.isDirectory()) return { ok: false, code: 'not_found', error: 'artifact not found' };
+  if (!isPathAllowed(dir, [chatArtifactCidDirForConversation(userId, safeConvId)])) {
+    return { ok: false, code: 'not_found', error: 'artifact not found' };
+  }
   return { ok: true, dirPath: dir };
 }
 
@@ -428,7 +433,7 @@ export function readArtifactMeta(userId: string, cid: string, artifactId: string
   try { safeConvId = safeCid(cid); safeId = safeArtifactId(artifactId); }
   catch { return undefined; }
   try {
-    const raw = fs.readFileSync(path.join(artifactDir(userId, safeConvId, safeId), META_FILENAME), 'utf8');
+    const raw = fs.readFileSync(path.join(artifactDirForConversation(userId, safeConvId, safeId), META_FILENAME), 'utf8');
     const obj = JSON.parse(raw) as Partial<ArtifactMeta>;
     if (obj && typeof obj === 'object') {
       return {
@@ -479,11 +484,22 @@ export function resolveArtifactFilePath(
     return { ok: false, code: 'forbidden', error: `extension not served: ${ext || '(none)'}` };
   }
 
-  const root = path.resolve(artifactDir(userId, safeConvId, safeId));
+  const root = path.resolve(artifactDirForConversation(userId, safeConvId, safeId));
   const abs = path.resolve(root, rel);
   const relCheck = path.relative(root, abs);
   if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     return { ok: false, code: 'forbidden', error: 'path traversal blocked' };
+  }
+  try {
+    const rootStat = fs.lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      return { ok: false, code: 'not_found', error: 'not found' };
+    }
+  } catch {
+    return { ok: false, code: 'not_found', error: 'not found' };
+  }
+  if (!isPathAllowed(abs, [root])) {
+    return { ok: false, code: 'forbidden', error: 'symlink escape blocked' };
   }
   let st: fs.Stats;
   try { st = fs.statSync(abs); }
@@ -499,7 +515,7 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return 0; }
-  const dir = chatArtifactCidDir(userId, safeConvId);
+  const dir = chatArtifactCidDirForConversation(userId, safeConvId);
   let count = 0;
   const deleted: Array<{ artifactId: string; rel: string }> = [];
   try {
@@ -516,6 +532,6 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
-  for (const item of deleted) notifyArtifactDeleted(safeConvId, item.artifactId, item.rel);
+  for (const item of deleted) notifyArtifactDeleted(userId, safeConvId, item.artifactId, item.rel);
   return count;
 }

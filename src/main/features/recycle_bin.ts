@@ -17,10 +17,17 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { createLogger } from '../logger';
 import { projectMetaFile, userCloudRoot, userRecycleDir, userSyncRecycleDir } from '../paths';
+import {
+  cloudRelForAbs,
+  conversationMessageReadFile,
+  findAutoTaskLocation,
+  globalAutoTaskLocation,
+  listAutoTaskLocations,
+} from '../util/project-layout';
 import { safeId, writeJson } from '../storage';
 import { t } from '../i18n';
 import {
-  CLAUSE_RE, EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE,
+  EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE, findTitleClauseBoundary,
 } from '../util/auto-title';
 import {
   logErrorRef,
@@ -262,9 +269,17 @@ async function migrateLegacySyncRecycle(uid: string): Promise<void> {
 }
 
 function chatJsonlCid(relPath: string): string | null {
-  const m = /^cloud\/chats\/([^/]+)\.jsonl$/.exec(relPath);
+  const m = /^cloud\/chats\/([^/]+)\.jsonl$/.exec(relPath)
+    || /^cloud\/projects\/[^/]+\/chats\/([^/]+)\.jsonl$/.exec(relPath);
   const cid = m?.[1] || '';
   return safeId(cid) ? cid : null;
+}
+
+function projectChatJsonlInfo(relPath: string): { pid: string; cid: string } | null {
+  const m = /^cloud\/projects\/([^/]+)\/chats\/([^/]+)\.jsonl$/.exec(relPath);
+  const pid = m?.[1] || '';
+  const cid = m?.[2] || '';
+  return safeId(pid) && safeId(cid) ? { pid, cid } : null;
 }
 
 function editConversationRootFromRelPath(relPath: string): { kind: 'agent' | 'skill'; id: string } | null {
@@ -286,15 +301,24 @@ function projectRootDeletedId(relPath: string): string | null {
 }
 
 function autoTaskRootDeletedId(relPath: string): string | null {
-  const m = /^cloud\/auto_tasks\/([^/]+)\/config\.json$/.exec(relPath);
+  const m = /^cloud\/auto_tasks\/([^/]+)\/config\.json$/.exec(relPath)
+    || /^cloud\/projects\/[^/]+\/auto_tasks\/([^/]+)\/config\.json$/.exec(relPath);
   const taskId = m?.[1] || '';
   return safeId(taskId) ? taskId : null;
+}
+
+function projectAutoTaskConfigInfo(relPath: string): { pid: string; taskId: string } | null {
+  const m = /^cloud\/projects\/([^/]+)\/auto_tasks\/([^/]+)\/config\.json$/.exec(relPath);
+  const pid = m?.[1] || '';
+  const taskId = m?.[2] || '';
+  return safeId(pid) && safeId(taskId) ? { pid, taskId } : null;
 }
 
 function chatCidFromRelPath(relPath: string): string | null {
   const jsonlCid = chatJsonlCid(relPath);
   if (jsonlCid) return jsonlCid;
-  const m = /^cloud\/chats\/([^/]+)\//.exec(relPath);
+  const m = /^cloud\/chats\/([^/]+)\//.exec(relPath)
+    || /^cloud\/projects\/[^/]+\/(?:chats|chat_attachments|chat_artifacts)\/([^/]+)(?:\/|$)/.exec(relPath);
   const cid = m?.[1] || '';
   return safeId(cid) && cid !== 'agent' && cid !== 'skill' ? cid : null;
 }
@@ -306,7 +330,8 @@ function projectIdFromRelPath(relPath: string): string | null {
 }
 
 function autoTaskIdFromRelPath(relPath: string): string | null {
-  const m = /^cloud\/auto_tasks\/([^/]+)\//.exec(relPath);
+  const m = /^cloud\/auto_tasks\/([^/]+)\//.exec(relPath)
+    || /^cloud\/projects\/[^/]+\/auto_tasks\/([^/]+)\//.exec(relPath);
   const taskId = m?.[1] || '';
   return safeId(taskId) ? taskId : null;
 }
@@ -389,28 +414,45 @@ export async function collectCloudEntryFiles(uid: string, relPath: string): Prom
 async function expandRecycleRelPaths(uid: string, relPaths: string[]): Promise<string[]> {
   const out = new Set(relPaths.filter(isSafeCloudRelPath));
   const cids = new Set<string>();
+  const projectChatRoots = new Map<string, string>();
   const projectIds = new Set<string>();
   const autoTaskIds = new Set<string>();
+  const projectAutoTaskRoots = new Map<string, string>();
   for (const relPath of out) {
     const cid = chatJsonlCid(relPath);
     if (cid) cids.add(cid);
+    const projectChat = projectChatJsonlInfo(relPath);
+    if (projectChat) projectChatRoots.set(projectChat.cid, projectChat.pid);
     const pid = projectRootDeletedId(relPath);
     if (pid) projectIds.add(pid);
     const taskId = autoTaskRootDeletedId(relPath);
     if (taskId) autoTaskIds.add(taskId);
+    const projectTask = projectAutoTaskConfigInfo(relPath);
+    if (projectTask) projectAutoTaskRoots.set(projectTask.taskId, projectTask.pid);
   }
 
   for (const cid of cids) {
+    const projectPid = projectChatRoots.get(cid);
     for (const relDir of [
       `cloud/chats/${cid}`,
       `cloud/chat_attachments/${cid}`,
       `cloud/chat_artifacts/${cid}`,
+      ...(projectPid ? [
+        `cloud/projects/${projectPid}/chats/${cid}`,
+        `cloud/projects/${projectPid}/chat_attachments/${cid}`,
+        `cloud/projects/${projectPid}/chat_artifacts/${cid}`,
+      ] : []),
     ]) {
       for (const relPath of await collectCloudFilesUnder(uid, relDir)) out.add(relPath);
     }
     const commanderSession = `cloud/sessions/gconv-${cid}.jsonl`;
     if ((await collectCloudEntryFiles(uid, commanderSession)).length) out.add(commanderSession);
     for (const relPath of await collectCloudFilesUnder(uid, `cloud/sessions/gconv-${cid}.tool-results`)) out.add(relPath);
+    if (projectPid) {
+      const projectCommanderSession = `cloud/projects/${projectPid}/sessions/gconv-${cid}.jsonl`;
+      if ((await collectCloudEntryFiles(uid, projectCommanderSession)).length) out.add(projectCommanderSession);
+      for (const relPath of await collectCloudFilesUnder(uid, `cloud/projects/${projectPid}/sessions/gconv-${cid}.tool-results`)) out.add(relPath);
+    }
     for (const relPath of await collectCloudFilesMatching(
       uid,
       'cloud/sessions',
@@ -421,12 +463,28 @@ async function expandRecycleRelPaths(uid: string, relPaths: string[]): Promise<s
       'cloud/sessions',
       (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.tool-results'),
     )) out.add(relPath);
+    if (projectPid) {
+      for (const relPath of await collectCloudFilesMatching(
+        uid,
+        `cloud/projects/${projectPid}/sessions`,
+        (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.jsonl'),
+      )) out.add(relPath);
+      for (const relPath of await collectCloudFilesUnderMatchingDirs(
+        uid,
+        `cloud/projects/${projectPid}/sessions`,
+        (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.tool-results'),
+      )) out.add(relPath);
+    }
   }
   for (const pid of projectIds) {
     for (const relPath of await collectCloudFilesUnder(uid, `cloud/projects/${pid}`)) out.add(relPath);
   }
   for (const taskId of autoTaskIds) {
     for (const relPath of await collectCloudFilesUnder(uid, `cloud/auto_tasks/${taskId}`)) out.add(relPath);
+    const projectPid = projectAutoTaskRoots.get(taskId);
+    if (projectPid) {
+      for (const relPath of await collectCloudFilesUnder(uid, `cloud/projects/${projectPid}/auto_tasks/${taskId}`)) out.add(relPath);
+    }
   }
   return Array.from(out);
 }
@@ -559,8 +617,12 @@ function metadataProjectTitle(metadata: SyncRecycleMetadata | undefined, pid: st
   return titleFromJson(row, ['name', 'title']);
 }
 
-async function chatJsonlTitle(uid: string, batchId: string | undefined, cid: string): Promise<string> {
-  const text = await readDisplayText(uid, batchId, `cloud/chats/${cid}.jsonl`);
+async function chatJsonlTitle(uid: string, batchId: string | undefined, cid: string, pid?: string): Promise<string> {
+  const text = await readDisplayText(
+    uid,
+    batchId,
+    pid ? `cloud/projects/${pid}/chats/${cid}.jsonl` : `cloud/chats/${cid}.jsonl`,
+  );
   if (!text) return '';
   let firstUserText = '';
   let firstText = '';
@@ -583,13 +645,18 @@ async function conversationTitle(
   batchId: string | undefined,
   metadata: SyncRecycleMetadata | undefined,
   cid: string,
+  pid?: string,
 ): Promise<string> {
   if (!cid) return '';
   const fromMetadata = metadataChatTitle(metadata, cid);
   if (fromMetadata) return fromMetadata;
-  const meta = await readDisplayJson(uid, batchId, `cloud/chats/${cid}/meta.json`);
+  const meta = await readDisplayJson(
+    uid,
+    batchId,
+    pid ? `cloud/projects/${pid}/chats/${cid}/meta.json` : `cloud/chats/${cid}/meta.json`,
+  );
   return titleFromJson(meta, ['title'])
-    || await chatJsonlTitle(uid, batchId, cid)
+    || await chatJsonlTitle(uid, batchId, cid, pid)
     || cid;
 }
 
@@ -605,9 +672,13 @@ async function projectTitle(
     || pid;
 }
 
-async function autoTaskTitle(uid: string, batchId: string | undefined, taskId: string): Promise<string> {
+async function autoTaskTitle(uid: string, batchId: string | undefined, taskId: string, pid?: string): Promise<string> {
   if (!taskId) return '';
-  const cfg = await readDisplayJson(uid, batchId, `cloud/auto_tasks/${taskId}/config.json`);
+  const cfg = await readDisplayJson(
+    uid,
+    batchId,
+    pid ? `cloud/projects/${pid}/auto_tasks/${taskId}/config.json` : `cloud/auto_tasks/${taskId}/config.json`,
+  );
   return titleFromJson(cfg, ['title'])
     || cleanTitle(typeof cfg?.content === 'string' ? cfg.content.split(/\r?\n/, 1)[0] : '')
     || taskId;
@@ -631,9 +702,13 @@ async function savedAppTitle(uid: string, batchId: string | undefined, appId: st
   return titleFromJson(obj, ['title']) || appId;
 }
 
-async function artifactTitle(uid: string, batchId: string | undefined, cid: string, artifactId: string): Promise<string> {
+async function artifactTitle(uid: string, batchId: string | undefined, cid: string, artifactId: string, pid?: string): Promise<string> {
   if (!cid || !artifactId) return '';
-  const obj = await readDisplayJson(uid, batchId, `cloud/chat_artifacts/${cid}/${artifactId}/__orkas-meta.json`);
+  const obj = await readDisplayJson(
+    uid,
+    batchId,
+    pid ? `cloud/projects/${pid}/chat_artifacts/${cid}/${artifactId}/__orkas-meta.json` : `cloud/chat_artifacts/${cid}/${artifactId}/__orkas-meta.json`,
+  );
   return titleFromJson(obj, ['title']) || artifactId;
 }
 
@@ -728,6 +803,7 @@ async function buildRecycleDisplayItems(
 ): Promise<RecycleDisplayItem[]> {
   const paths = items.map((item) => item.path).filter(isSafeCloudRelPath);
   const chatRoots = new Set<string>();
+  const projectChatRoots = new Map<string, string>();
   const editConversationRoots = new Map<string, { kind: 'agent' | 'skill'; id: string }>();
   const projectRoots = new Set<string>();
   const taskRoots = new Set<string>();
@@ -758,6 +834,8 @@ async function buildRecycleDisplayItems(
     if (editRoot) editConversationRoots.set(`${editRoot.kind}:${editRoot.id}`, editRoot);
     const cid = chatJsonlCid(relPath);
     if (cid) chatRoots.add(cid);
+    const projectChat = projectChatJsonlInfo(relPath);
+    if (projectChat) projectChatRoots.set(projectChat.cid, projectChat.pid);
     const pid = projectRootDeletedId(relPath);
     if (pid) projectRoots.add(pid);
     const taskId = autoTaskRootDeletedId(relPath);
@@ -795,11 +873,13 @@ async function buildRecycleDisplayItems(
   }
 
   for (const cid of chatRoots) {
+    const pid = projectChatRoots.get(cid);
     add({
       category: 'conversation',
       id: cid,
-      path: `cloud/chats/${cid}.jsonl`,
-      title: await conversationTitle(uid, batchId, metadata, cid),
+      path: pid ? `cloud/projects/${pid}/chats/${cid}.jsonl` : `cloud/chats/${cid}.jsonl`,
+      title: await conversationTitle(uid, batchId, metadata, cid, pid),
+      detail: pid ? await projectTitle(uid, batchId, metadata, pid) : undefined,
     });
   }
   for (const root of editConversationRoots.values()) {
@@ -924,7 +1004,73 @@ async function buildRecycleDisplayItems(
       const pid = parts[1] || '';
       if (projectRoots.has(pid)) continue;
       const project = safeId(pid) ? await projectTitle(uid, batchId, metadata, pid) : '';
-      if (parts[2] === 'files') {
+      if (parts[2] === 'chats') {
+        const cid = (parts[3] || '').replace(/\.jsonl$/, '');
+        if (chatRoots.has(cid)) continue;
+        if (safeId(cid)) {
+          add({
+            category: 'conversation',
+            id: cid,
+            path: relPath,
+            title: await conversationTitle(uid, batchId, metadata, cid, pid),
+            detail: project || undefined,
+          });
+        }
+      } else if (parts[2] === 'chat_attachments') {
+        const cid = parts[3] || '';
+        if (chatRoots.has(cid)) continue;
+        add({
+          category: 'attachment',
+          id: relPath,
+          path: relPath,
+          title: parts.slice(4).join('/') || fallback,
+          detail: compactDetail([
+            safeId(cid) ? await conversationTitle(uid, batchId, metadata, cid, pid) : '',
+            project,
+          ]),
+        });
+      } else if (parts[2] === 'chat_artifacts') {
+        const cid = parts[3] || '';
+        const artifactId = parts[4] || '';
+        if (chatRoots.has(cid)) continue;
+        add({
+          category: 'artifact',
+          id: artifactId || relPath,
+          path: relPath,
+          title: await artifactTitle(uid, batchId, cid, artifactId, pid) || artifactId || fallback,
+          detail: compactDetail([
+            safeId(cid) ? await conversationTitle(uid, batchId, metadata, cid, pid) : '',
+            project,
+            parts.slice(5).filter((p) => p !== '__orkas-meta.json').join('/'),
+          ]),
+        });
+      } else if (parts[2] === 'auto_tasks') {
+        const taskId = parts[3] || '';
+        if (taskRoots.has(taskId)) continue;
+        add({
+          category: parts[4] === 'attachments' ? 'attachment' : 'auto_task',
+          id: relPath,
+          path: relPath,
+          title: parts[4] === 'attachments' ? (parts.slice(5).join('/') || fallback) : await autoTaskTitle(uid, batchId, taskId, pid),
+          detail: compactDetail([
+            safeId(taskId) ? await autoTaskTitle(uid, batchId, taskId, pid) : '',
+            project,
+          ]),
+        });
+      } else if (parts[2] === 'sessions') {
+        const file = parts[3] || fallback;
+        const cid = /^gconv-([A-Za-z0-9_-]+)\.jsonl$/.exec(file)?.[1]
+          || /^gmember-([A-Za-z0-9]+)-/.exec(file)?.[1]
+          || '';
+        if (chatRoots.has(cid)) continue;
+        add({
+          category: 'conversation',
+          id: safeId(cid) ? cid : file,
+          path: relPath,
+          title: safeId(cid) ? await conversationTitle(uid, batchId, metadata, cid, pid) : file,
+          detail: compactDetail([project, fallback]),
+        });
+      } else if (parts[2] === 'contexts' || parts[2] === 'files') {
         add({
           category: 'project_file',
           id: relPath,
@@ -1075,13 +1221,36 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
     } catch {
       // Missing or malformed _index.json should not block file protection.
     }
+    for (const pid of Array.from(projectIds)) {
+      try {
+        const indexFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/_index.json`);
+        const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
+        if (Array.isArray(rows)) {
+          for (const row of rows) {
+            if (!row || typeof row !== 'object') continue;
+            const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
+            if (!cids.has(cid)) continue;
+            chatRowsByCid.set(cid, { ...row, project_id: row.project_id || pid });
+          }
+        }
+      } catch {
+        // Missing project chat index is fine; meta fallback below may still work.
+      }
+    }
     for (const cid of cids) {
       const metaFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/chats/${cid}/meta.json`);
       const row = await readJsonObject(metaFile);
-      if (!row) continue;
-      chatRowsByCid.set(cid, { ...chatRowsByCid.get(cid), ...row, conversation_id: cid });
-      const pid = typeof row.project_id === 'string' ? row.project_id : '';
-      if (safeId(pid)) projectIds.add(pid);
+      if (row) {
+        chatRowsByCid.set(cid, { ...chatRowsByCid.get(cid), ...row, conversation_id: cid });
+        const pid = typeof row.project_id === 'string' ? row.project_id : '';
+        if (safeId(pid)) projectIds.add(pid);
+      }
+      for (const pid of Array.from(projectIds)) {
+        const projectMetaFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/${cid}/meta.json`);
+        const projectRow = await readJsonObject(projectMetaFile);
+        if (!projectRow) continue;
+        chatRowsByCid.set(cid, { ...chatRowsByCid.get(cid), ...projectRow, conversation_id: cid, project_id: projectRow.project_id || pid });
+      }
     }
   }
   chatIndexRows.push(...chatRowsByCid.values());
@@ -1090,6 +1259,8 @@ export async function snapshotRecycleMetadata(uid: string, relPaths: string[]): 
     const cfg = await readJsonObject(resolveCloudRelPath(userCloudRoot(uid), `cloud/auto_tasks/${taskId}/config.json`));
     const pid = typeof cfg?.project_id === 'string' ? cfg.project_id : '';
     if (safeId(pid)) projectIds.add(pid);
+    const projectTask = projectAutoTaskConfigInfo(relPaths.find((rel) => autoTaskIdFromRelPath(rel) === taskId) || '');
+    if (projectTask) projectIds.add(projectTask.pid);
   }
 
   const projectRows: Record<string, any>[] = [];
@@ -1136,7 +1307,7 @@ function titleFromText(value: string): string {
     if (text === before) break;
   }
   text = text.trim();
-  const clauseIdx = text.search(CLAUSE_RE);
+  const clauseIdx = findTitleClauseBoundary(text);
   if (clauseIdx >= 4) text = text.slice(0, clauseIdx);
   text = text.trim() || raw;
   if (text.length > TITLE_MAX) text = text.slice(0, TITLE_MAX) + '…';
@@ -1215,46 +1386,58 @@ async function reactivateChatIndexRows(
   }
   const legacyProjectId = legacyProjectIds.size === 1 ? Array.from(legacyProjectIds)[0] : '';
 
-  const indexFile = resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
-  let rows: any[];
-  try {
-    const raw = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
-    if (!Array.isArray(raw)) return [];
-    rows = raw;
-  } catch {
-    rows = [];
-  }
-
   const reactivated = new Set<string>();
   const restoredIso = restoredAt.toISOString();
-  const rowsByCid = new Map<string, any>();
-  for (const row of rows) {
-    if (!row || typeof row !== 'object') continue;
-    const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
-    if (safeId(cid)) rowsByCid.set(cid, row);
-  }
-  let changed = false;
+  const buckets = new Map<string, { rows: any[]; rowsByCid: Map<string, any>; changed: boolean }>();
+  const bucketFor = async (relPath: string) => {
+    const projectChat = projectChatJsonlInfo(relPath);
+    const indexFile = projectChat
+      ? resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectChat.pid}/chats/_index.json`)
+      : resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+    const existing = buckets.get(indexFile);
+    if (existing) return existing;
+    let rows: any[] = [];
+    try {
+      const raw = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
+      rows = Array.isArray(raw) ? raw : [];
+    } catch {
+      rows = [];
+    }
+    const rowsByCid = new Map<string, any>();
+    for (const row of rows) {
+      if (!row || typeof row !== 'object') continue;
+      const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
+      if (safeId(cid)) rowsByCid.set(cid, row);
+    }
+    const bucket = { rows, rowsByCid, changed: false };
+    buckets.set(indexFile, bucket);
+    return bucket;
+  };
 
   for (const [cid, relPath] of cidToRelPath) {
-    const row = rowsByCid.get(cid);
+    const projectChat = projectChatJsonlInfo(relPath);
+    const bucket = await bucketFor(relPath);
+    const row = bucket.rowsByCid.get(cid);
     const metadataRow = metadataRows.get(cid);
     if (!row && !metadataRow) {
       const restoredRow = await deriveChatIndexRowFromArchive(uid, batch.id, cid, relPath, restoredIso);
       if (!restoredRow) continue;
-      rows.unshift(restoredRow);
-      rowsByCid.set(cid, restoredRow);
+      if (projectChat && !restoredRow.project_id) restoredRow.project_id = projectChat.pid;
+      bucket.rows.unshift(restoredRow);
+      bucket.rowsByCid.set(cid, restoredRow);
       reactivated.add(relPath);
-      changed = true;
+      bucket.changed = true;
       continue;
     }
 
     if (!row) {
       const restoredRow: Record<string, any> = { ...metadataRow, conversation_id: cid };
+      if (projectChat && !restoredRow.project_id) restoredRow.project_id = projectChat.pid;
       delete restoredRow.deleted_at;
-      rows.unshift(restoredRow);
-      rowsByCid.set(cid, restoredRow);
+      bucket.rows.unshift(restoredRow);
+      bucket.rowsByCid.set(cid, restoredRow);
       reactivated.add(relPath);
-      changed = true;
+      bucket.changed = true;
       continue;
     }
 
@@ -1271,14 +1454,16 @@ async function reactivateChatIndexRows(
     } else if (canRepairLegacyProject) {
       row.project_id = legacyProjectId;
     }
+    if (projectChat && !row.project_id) row.project_id = projectChat.pid;
     delete row.deleted_at;
     if (rowDeleted && !metadataRow) row.updated_at = restoredIso;
     reactivated.add(relPath);
-    changed = true;
+    bucket.changed = true;
   }
 
-  if (changed) {
-    await writeJson(indexFile, rows);
+  for (const [indexFile, bucket] of buckets) {
+    if (!bucket.changed) continue;
+    await writeJson(indexFile, bucket.rows);
   }
   return Array.from(reactivated);
 }
@@ -1540,14 +1725,14 @@ export async function createAppRecycleBatchForConversation(
   cid: string,
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(cid)) return null;
-  return createAppRecycleBatch(uid, [`cloud/chats/${cid}.jsonl`], { kind: 'conversation' });
+  return createAppRecycleBatch(uid, [cloudRelForAbs(uid, conversationMessageReadFile(uid, cid))], { kind: 'conversation' });
 }
 
 export async function createAppRecycleBatchForConversations(
   uid: string,
   cids: string[],
 ): Promise<SyncRecycleBatch | null> {
-  const rels = Array.from(new Set(cids.filter(safeId).map((cid) => `cloud/chats/${cid}.jsonl`)));
+  const rels = Array.from(new Set(cids.filter(safeId).map((cid) => cloudRelForAbs(uid, conversationMessageReadFile(uid, cid)))));
   return createAppRecycleBatch(uid, rels, { kind: 'conversations' });
 }
 
@@ -1556,34 +1741,43 @@ export async function createAppRecycleBatchForAutoTask(
   taskId: string,
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(taskId)) return null;
-  return createAppRecycleBatch(uid, [`cloud/auto_tasks/${taskId}/config.json`], { kind: 'auto_task' });
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  return createAppRecycleBatch(uid, [loc.configRelPath], { kind: 'auto_task' });
 }
 
 async function conversationIdsForProject(uid: string, projectId: string): Promise<string[]> {
   try {
-    const indexFile = resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+    const indexFile = resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectId}/chats/_index.json`);
     const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
     if (!Array.isArray(rows)) return [];
     return rows
-      .filter((row: any) => row && row.project_id === projectId && safeId(row.conversation_id) && !row.deleted_at)
+      .filter((row: any) => row && safeId(row.conversation_id) && !row.deleted_at)
       .map((row: any) => row.conversation_id);
   } catch {
-    return [];
+    // Fallback for legacy layouts that still kept project rows in the global index.
+    try {
+      const indexFile = resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
+      const rows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
+      if (!Array.isArray(rows)) return [];
+      return rows
+        .filter((row: any) => row && row.project_id === projectId && safeId(row.conversation_id) && !row.deleted_at)
+        .map((row: any) => row.conversation_id);
+    } catch {
+      return [];
+    }
   }
 }
 
 async function autoTaskIdsForProject(uid: string, projectId: string): Promise<string[]> {
   const out: string[] = [];
-  let entries: fs.Dirent[] = [];
-  try {
-    entries = await fsp.readdir(resolveCloudRelPath(userCloudRoot(uid), 'cloud/auto_tasks'), { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !safeId(entry.name)) continue;
-    const cfg = await readJsonObject(resolveCloudRelPath(userCloudRoot(uid), `cloud/auto_tasks/${entry.name}/config.json`));
-    if (cfg?.project_id === projectId) out.push(entry.name);
+  for (const loc of listAutoTaskLocations(uid)) {
+    if (!safeId(loc.taskId)) continue;
+    if (loc.projectId === projectId) {
+      out.push(loc.taskId);
+      continue;
+    }
+    const cfg = await readJsonObject(loc.configFile);
+    if (cfg?.project_id === projectId) out.push(loc.taskId);
   }
   return out;
 }
@@ -1596,8 +1790,11 @@ export async function createAppRecycleBatchForProject(
   const rels = new Set<string>([`cloud/projects/${projectId}`]);
   const conversationIds = await conversationIdsForProject(uid, projectId);
   const autoTaskIds = await autoTaskIdsForProject(uid, projectId);
-  for (const cid of conversationIds) rels.add(`cloud/chats/${cid}.jsonl`);
-  for (const taskId of autoTaskIds) rels.add(`cloud/auto_tasks/${taskId}/config.json`);
+  for (const cid of conversationIds) rels.add(`cloud/projects/${projectId}/chats/${cid}.jsonl`);
+  for (const taskId of autoTaskIds) {
+    const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+    rels.add(loc.configRelPath);
+  }
   log.info('project recycle cascade prepared', {
     user_id: maskId(uid),
     project_id: maskId(projectId),

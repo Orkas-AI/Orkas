@@ -37,7 +37,7 @@ Translate pack DNA into UIDesigner roles:
 - Color: `bg`, `surface`, `surface-raised`, `text`, `text-muted`, `border`, `accent`, semantic roles, chart roles.
 - Type: `display`, `title`, `body`, `label`, `data`, `caption`.
 - Spacing: compact 4/8 scale for tools; 8pt editorial rhythm for content/marketing.
-- Shape: default radius 8px or less unless the pack's product context requires sharper or softer controls.
+- Shape: derive radius from the selected product context and Visual Thesis; prefer restrained geometry for dense work tools, but allow sharper or softer controls when the subject and interaction model justify them.
 - Motion: state-change motion first; ambient motion only for brand/storytelling.
 
 ## Rejection Examples

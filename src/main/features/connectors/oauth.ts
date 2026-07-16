@@ -29,8 +29,10 @@
 import { shell } from 'electron';
 
 import { accountApiBase, tokenStore } from './_server_bridge';
+import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
+import { fetchWithTimeout } from '../../util/abort';
 import type { CatalogEntry, OAuthGrant } from './types';
 
 const log = createLogger('connectors:oauth');
@@ -38,8 +40,10 @@ const log = createLogger('connectors:oauth');
 // 10 minutes — comfortably covers a slow provider consent screen + 2FA. The Server side enforces
 // its own short TTLs on state / exchange_code (see Server/biz/connectors/oauth_flow_mgr.py).
 const FLOW_TIMEOUT_MS = 10 * 60 * 1000;
+const OAUTH_HTTP_TIMEOUT_MS = 60_000;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
-const GITHUB_REFRESH_RETRY_DELAY_MS = 400;
+const OAUTH_RETRY_MAX_ATTEMPTS = 3;
+const OAUTH_RETRY_BASE_DELAY_MS = 400;
 
 interface PendingFlow {
   kind: 'connector_oauth' | 'google_picker';
@@ -71,6 +75,14 @@ function _flowError(reason: string, code?: string): Error {
   return err;
 }
 
+function _isRetryableBridgeStatus(status: number): boolean {
+  return status >= 500 && status <= 599;
+}
+
+function _exchangeHttpCode(status: number): string {
+  return _isRetryableBridgeStatus(status) ? 'exchange_http_5xx' : 'exchange_http_4xx';
+}
+
 function _cancelPending(reason: string, code?: string): void {
   if (!_pending) return;
   const p = _pending;
@@ -97,11 +109,84 @@ function _refreshErrorFromBody(body: ConnectorRefreshErrorBody, fallback: string
   return err;
 }
 
+async function _bridgeErrorFromResponse(res: Response, label: string): Promise<Error> {
+  const text = await res.text().catch(() => '');
+  let body: ConnectorRefreshErrorBody | null = null;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object') body = parsed as ConnectorRefreshErrorBody;
+  } catch { /* non-JSON error body */ }
+  if (body && (typeof body.error_code === 'string' || typeof body.retryable === 'boolean')) {
+    const err = _refreshErrorFromBody(body, `${label} HTTP ${res.status}`) as Error & { retryable?: boolean };
+    err.message = `refresh HTTP ${res.status}: ${err.message}`;
+    if (typeof err.retryable !== 'boolean' && _isRetryableBridgeStatus(res.status)) err.retryable = true;
+    return err;
+  }
+  return new Error(`refresh HTTP ${res.status}: ${text}`);
+}
+
+function fetchOAuthJson(label: string, url: string, init: RequestInit): Promise<Response> {
+  return fetchWithTimeout(
+    url,
+    init,
+    OAUTH_HTTP_TIMEOUT_MS,
+    undefined,
+    `${label} timed out after ${Math.round(OAUTH_HTTP_TIMEOUT_MS / 1000)}s`,
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+async function _bridgeRetryBackoff(attempt: number): Promise<void> {
+  const base = OAUTH_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+  await sleep(base + Math.floor(Math.random() * OAUTH_RETRY_BASE_DELAY_MS));
+}
+
+async function postConnectorBridgeJson(
+  label: string,
+  url: string,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  for (let attempt = 1; attempt <= OAUTH_RETRY_MAX_ATTEMPTS; attempt += 1) {
+    const last = attempt === OAUTH_RETRY_MAX_ATTEMPTS;
+    let res: Response;
+    try {
+      res = await fetchOAuthJson(label, url, {
+        method: 'POST',
+        headers: withCommonHeaders({
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...tokenStore.authHeaders(),
+        }),
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      if (last) throw err;
+      log.warn('connector bridge fetch failed; retrying', { label, attempt, error: (err as Error).message });
+      await _bridgeRetryBackoff(attempt);
+      continue;
+    }
+    if (!last && _isRetryableBridgeStatus(res.status)) {
+      await res.text().catch(() => undefined);
+      log.warn('connector bridge returned transient status; retrying', { label, attempt, status: res.status });
+      await _bridgeRetryBackoff(attempt);
+      continue;
+    }
+    return res;
+  }
+  throw new Error(`${label} exhausted attempts`);
+}
+
 /** Externally callable cancel — wired to the renderer's "取消" link so a user who closed the
  *  browser without completing OAuth can unfreeze the card without waiting for the timeout. */
 export function cancelInFlightOAuth(): boolean {
   if (!_pending) return false;
-  _cancelPending('cancelled by user');
+  _cancelPending('cancelled by user', 'user_cancelled');
   return true;
 }
 
@@ -114,7 +199,7 @@ export async function startOAuth(
   if (!entry.oauth) throw new Error(`catalog entry ${entry.id} has no oauth config`);
   // Pre-empt any prior in-flight flow — the user clicking another card while one is open is a
   // legitimate UX path (cancel the old one and start over).
-  _cancelPending('superseded by a new OAuth start');
+  _cancelPending('superseded by a new OAuth start', 'superseded');
 
   const providerId = entry.oauth.provider_id;
   const startUrl = new URL(`${accountApiBase()}/connectors/oauth/${encodeURIComponent(providerId)}/start`);
@@ -132,7 +217,7 @@ export async function startOAuth(
   });
   return new Promise<OAuthGrant>((resolve, reject) => {
     const timer = setTimeout(() => {
-      _cancelPending('OAuth flow timed out');
+      _cancelPending('OAuth flow timed out', 'flow_timeout');
     }, FLOW_TIMEOUT_MS);
     timer.unref?.();
     _pending = {
@@ -144,7 +229,7 @@ export async function startOAuth(
       timer,
     };
     shell.openExternal(startUrl.toString()).catch((err) => {
-      _cancelPending(`failed to open browser: ${(err as Error).message}`);
+      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });
 }
@@ -154,7 +239,7 @@ export async function startOAuth(
  *  `drive.file` by itself (`trigger_onepick=true`), so it is separate from the normal connector
  *  sign-in flow that also asks for `openid email` for account labeling. */
 export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<GooglePickerResult> {
-  _cancelPending('superseded by a new OAuth start');
+  _cancelPending('superseded by a new OAuth start', 'superseded');
 
   const startUrl = new URL(`${accountApiBase()}/connectors/oauth/google/picker/start`);
   startUrl.searchParams.set('d', tokenStore.getDeviceId());
@@ -166,7 +251,7 @@ export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<Googl
   log.info('opening Google Sheets picker url', { file_id_count: cleanFileIds.length });
   return new Promise<GooglePickerResult>((resolve, reject) => {
     const timer = setTimeout(() => {
-      _cancelPending('OAuth flow timed out');
+      _cancelPending('OAuth flow timed out', 'flow_timeout');
     }, FLOW_TIMEOUT_MS);
     timer.unref?.();
     _pending = {
@@ -178,7 +263,7 @@ export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<Googl
       timer,
     };
     shell.openExternal(startUrl.toString()).catch((err) => {
-      _cancelPending(`failed to open browser: ${(err as Error).message}`);
+      _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });
 }
@@ -194,13 +279,13 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   let url: URL;
   try { url = new URL(rawUrl); }
   catch (err) {
-    _cancelPending(`malformed callback URL: ${(err as Error).message}`);
+    _cancelPending(`malformed callback URL: ${(err as Error).message}`, 'malformed_callback');
     return;
   }
   void pending;
   const status = url.searchParams.get('status');
   const reason = url.searchParams.get('reason') || '';
-  if (status === 'cancelled') { _cancelPending('user cancelled at provider'); return; }
+  if (status === 'cancelled') { _cancelPending('user cancelled at provider', 'user_cancelled'); return; }
   if (status === 'error') {
     const code = reason === 'missing_required_scopes' ? 'missing_required_scopes' : undefined;
     const message = reason === 'missing_required_scopes' ? reason : `server error: ${reason || 'unknown'}`;
@@ -208,24 +293,20 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
     return;
   }
   const exchangeCode = url.searchParams.get('exchange_code');
-  if (!exchangeCode) { _cancelPending('missing exchange_code'); return; }
+  if (!exchangeCode) { _cancelPending('missing exchange_code', 'missing_exchange_code'); return; }
 
   try {
-    const res = await fetch(`${accountApiBase()}/connectors/oauth/exchange`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-        ...tokenStore.authHeaders(),
-      },
-      body: JSON.stringify({
+    const res = await postConnectorBridgeJson(
+      'connector OAuth exchange',
+      `${accountApiBase()}/connectors/oauth/exchange`,
+      {
         exchange_code: exchangeCode,
         device_id: tokenStore.getDeviceId(),
-      }),
-    });
+      },
+    );
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`exchange HTTP ${res.status}: ${text}`);
+      throw _flowError(`exchange HTTP ${res.status}: ${text}`, _exchangeHttpCode(res.status));
     }
     // Server's `api/response.py::json_response(code, msg, data)` **spreads** the data dict into
     // the top-level body (see Web/CLAUDE.md §3 "Read res.code, not res.data.code"); the payload
@@ -245,7 +326,7 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
       picked_file_ids?: string;
     };
     if (body.code !== 0 || !body.access_token) {
-      throw new Error(body.msg || 'invalid exchange response');
+      throw _flowError(body.msg || 'invalid exchange response', 'invalid_exchange_response');
     }
     const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
     const scopes = body.scope ? body.scope.split(/[\s,]+/).filter(Boolean) : [];
@@ -290,7 +371,13 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   } catch (err) {
     log.warn('connector OAuth exchange failed', { error: (err as Error).message });
     const code = (err as { code?: unknown }).code;
-    _cancelPending(`exchange failed: ${(err as Error).message}`, typeof code === 'string' ? code : undefined);
+    // A thrown network/timeout error carries no code of its own — still tag the stage so these do
+    // not fall into the untyped bucket. The renderer's error_type derives network/timeout from the
+    // message, so `exchange_failed` + error_type is enough to tell them apart.
+    _cancelPending(
+      `exchange failed: ${(err as Error).message}`,
+      typeof code === 'string' && code ? code : 'exchange_failed',
+    );
   }
 }
 
@@ -311,22 +398,17 @@ export async function refreshIfStale(
     throw new Error('access_token expired and no refresh_token available; reconnect required');
   }
   if (!entry.oauth) throw new Error('no oauth config');
-  const res = await fetch(`${accountApiBase()}/connectors/oauth/refresh`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      ...tokenStore.authHeaders(),
-    },
-    body: JSON.stringify({
+  const res = await postConnectorBridgeJson(
+    'connector OAuth refresh',
+    `${accountApiBase()}/connectors/oauth/refresh`,
+    {
       provider: entry.oauth.provider_id,
       refresh_token: grant.refresh_token,
       device_id: tokenStore.getDeviceId(),
-    }),
-  });
+    },
+  );
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`refresh HTTP ${res.status}: ${text}`);
+    throw await _bridgeErrorFromResponse(res, 'connector OAuth refresh');
   }
   // Same flat shape as the exchange endpoint — see comment above.
   const body = await res.json() as {
@@ -356,36 +438,12 @@ export async function refreshIfStale(
   return next;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-  });
-}
-
 async function fetchGithubRefresh(body: Record<string, unknown>): Promise<Response> {
-  const url = `${accountApiBase()}/connectors/oauth/refresh`;
-  let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          ...tokenStore.authHeaders(),
-        },
-        body: JSON.stringify(body),
-      });
-    } catch (err) {
-      lastErr = err;
-      if (attempt === 0) {
-        log.warn('GitHub server-managed refresh fetch failed; retrying once', { error: (err as Error).message });
-        await sleep(GITHUB_REFRESH_RETRY_DELAY_MS);
-      }
-    }
-  }
-  throw lastErr;
+  return postConnectorBridgeJson(
+    'connector OAuth refresh',
+    `${accountApiBase()}/connectors/oauth/refresh`,
+    body,
+  );
 }
 
 async function refreshGithubServerManaged(
@@ -422,8 +480,7 @@ async function refreshGithubServerManaged(
     } : {}),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`refresh HTTP ${res.status}: ${text}`);
+    throw await _bridgeErrorFromResponse(res, "connector OAuth refresh");
   }
   const body = await res.json() as {
     code: number;

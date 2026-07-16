@@ -110,6 +110,14 @@ function t(key, vars) {
 
 function getLang() { return _currentLang; }
 
+async function _ensureLanguageTable(lang) {
+  if (_tables[lang]) return;
+  const localesRes = await window.orkas.getLocales();
+  if (localesRes && localesRes.ok && localesRes.tables) {
+    _tables = { ..._tables, ...localesRes.tables };
+  }
+}
+
 async function initI18n() {
   if (_ready) return _currentLang;
   try {
@@ -134,6 +142,7 @@ async function setLang(lang) {
   if (!isSupportedLang(lang)) return _currentLang;
   if (lang === _currentLang) return _currentLang;
   try {
+    await _ensureLanguageTable(lang);
     const res = await window.orkas.setLanguage(lang);
     if (res && res.ok && res.language) {
       _currentLang = res.language;
@@ -155,6 +164,7 @@ async function refreshLangFromMain() {
     const res = await window.orkas.getLanguage();
     const next = res && res.ok && isSupportedLang(res.language) ? res.language : _currentLang;
     if (next === _currentLang) return _currentLang;
+    await _ensureLanguageTable(next);
     _currentLang = next;
     applyDomI18n();
     _setDocumentLang(_currentLang);

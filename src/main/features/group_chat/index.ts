@@ -9,16 +9,22 @@
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { userChatsDir, groupChatVisibilityFile } from '../../paths';
+import {
+  conversationLayout,
+  conversationMessageFile,
+  conversationMessageReadFile,
+} from '../../util/project-layout';
 import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
+import { logErrorRef } from '../../util/log-redact';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir, setStatus,
+  setCodingProjectDir, setStatus, actorSessionId,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
 import {
@@ -35,10 +41,11 @@ export const busIsQuiescent = isQuiescent;
 export async function runtimeStatus(
   userId: string,
   cid: string,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string }>; active_recipient?: string }> {
+  projectIdHint?: string | null,
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; started_at_ms: number }>; active_recipient?: string }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
-    const state = await readState(userId, cid);
+    const state = await readState(userId, cid, projectIdHint);
     const runtime = runtimeSnapshot(userId, cid);
     const diskInFlight = Array.isArray(state.in_flight)
       ? state.in_flight.filter(Boolean)
@@ -75,7 +82,7 @@ export async function runtimeStatus(
  *  if subscribe runs after send, those first events are lost. */
 export const subscribeBus = subscribe;
 
-import type { ChatUseSelection, GroupMessage } from './visibility';
+import type { ChatUseSelection, ChatMessageReference, GroupMessage } from './visibility';
 import {
   type ChatFormPayload, encodeSubmission, buildMention,
 } from './router';
@@ -85,7 +92,7 @@ import * as marketplace from '../marketplace';
 const log = createLogger('group_chat.facade');
 
 function mainJsonlFile(uid: string, cid: string): string {
-  return path.join(userChatsDir(uid), `${cid}.jsonl`);
+  return conversationMessageFile(uid, cid);
 }
 
 // ── Send (from human) ────────────────────────────────────────────────────
@@ -97,12 +104,134 @@ export interface SendInput {
   model_text?: string;
   attachments?: string[];
   use_selections?: ChatUseSelection[];
+  references?: Array<{ source_cid: string; source_msg_id: string }>;
+}
+
+async function _resolveMessageReferences(
+  userId: string,
+  requested: SendInput['references'],
+): Promise<ChatMessageReference[]> {
+  const inputs = Array.isArray(requested) ? requested.slice(0, 20) : [];
+  if (!inputs.length) return [];
+  const chats = await import('../chats');
+  const attachmentsFeature = await import('../chat_attachments');
+  const rowsByCid = new Map<string, GroupMessage[]>();
+  const titleByCid = new Map<string, string>();
+  const namesByCid = new Map<string, Map<string, string>>();
+  const out: ChatMessageReference[] = [];
+  const seen = new Set<string>();
+  let remainingChars = 40_000;
+  let remainingFiles = 40;
+
+  const loadSource = async (sourceCid: string): Promise<GroupMessage[]> => {
+    if (rowsByCid.has(sourceCid)) return rowsByCid.get(sourceCid) || [];
+    const conv = await chats.getConversation(userId, sourceCid);
+    if (!conv) {
+      rowsByCid.set(sourceCid, []);
+      return [];
+    }
+    const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(userId, sourceCid), 100_000);
+    rowsByCid.set(sourceCid, rows);
+    titleByCid.set(sourceCid, conv.title || sourceCid);
+    try {
+      const members = await readMembers(userId, sourceCid);
+      namesByCid.set(sourceCid, new Map(members.actors.map((actor) => [actor.id, actor.name || actor.id])));
+    } catch { namesByCid.set(sourceCid, new Map()); }
+    return rows;
+  };
+
+  const attachmentNames = (
+    stored: ChatMessageReference['attachments'] | undefined,
+    source: GroupMessage | undefined,
+  ): string[] => {
+    const fromSnapshot = Array.isArray(stored)
+      ? stored.map((item) => typeof item === 'string' ? item : item?.name)
+      : [];
+    const fromSource = Array.isArray(source?.attachments) ? source.attachments : [];
+    return Array.from(new Set([...fromSnapshot, ...fromSource]
+      .filter((name): name is string => typeof name === 'string' && !!name.trim())));
+  };
+
+  const pushReference = async (
+    ref: ChatMessageReference,
+    authoritativeSource?: GroupMessage,
+  ): Promise<void> => {
+    if (out.length >= 20 || remainingChars <= 0) return;
+    const sourceCid = ref.source_cid;
+    const sourceMsgId = ref.source_msg_id;
+    if (!safeId(sourceCid) || !safeId(sourceMsgId)) return;
+    const identity = `${sourceCid}:${sourceMsgId}`;
+    if (seen.has(identity)) return;
+    seen.add(identity);
+
+    const text = String(ref.text || authoritativeSource?.text || '')
+      .slice(0, Math.min(12_000, remainingChars));
+    const resolvedAttachments: NonNullable<ChatMessageReference['attachments']> = [];
+    for (const name of attachmentNames(ref.attachments, authoritativeSource)) {
+      if (remainingFiles <= 0) break;
+      const resolved = attachmentsFeature.resolveAttachmentAbsPath(userId, sourceCid, name);
+      resolvedAttachments.push({
+        name,
+        ...(resolved.ok ? { kind: resolved.kind } : {}),
+      });
+      remainingFiles -= 1;
+    }
+    const produced = (Array.isArray(ref.produced) ? ref.produced : authoritativeSource?.produced || [])
+      .slice(0, Math.max(0, remainingFiles));
+    remainingFiles -= produced.length;
+    if (!text.trim() && !resolvedAttachments.length && !produced.length) return;
+    remainingChars -= text.length;
+    const { attachments: _storedAttachments, produced: _storedProduced, ...base } = ref;
+    out.push({
+      ...base,
+      text,
+      ...(resolvedAttachments.length ? { attachments: resolvedAttachments } : {}),
+      ...(produced.length ? { produced } : {}),
+    });
+  };
+
+  for (const item of inputs) {
+    if (out.length >= 20 || remainingChars <= 0) break;
+    const sourceCid = typeof item?.source_cid === 'string' ? item.source_cid : '';
+    const sourceMsgId = typeof item?.source_msg_id === 'string' ? item.source_msg_id : '';
+    if (!safeId(sourceCid) || !safeId(sourceMsgId)) continue;
+    const source = (await loadSource(sourceCid)).find((msg) => msg.id === sourceMsgId);
+    if (!source || source.deleted_at || source.dispatch || !source.text?.trim()) continue;
+    // The renderer localizes the reserved user/commander labels. Persist only
+    // real member display names here so snapshots stay locale-independent.
+    const fromName = source.from === USER_ID
+      ? ''
+      : namesByCid.get(sourceCid)?.get(source.from);
+    await pushReference({
+      source_cid: sourceCid,
+      source_title: titleByCid.get(sourceCid) || sourceCid,
+      source_msg_id: sourceMsgId,
+      from_actor: source.from,
+      ...(fromName ? { from_name: fromName } : {}),
+      source_ts: source.ts,
+      text: source.text,
+    }, source);
+
+    // A referenced message may itself contain a flat reference bundle.
+    // Expand that bundle one level into the destination, rehydrate any
+    // attachment locators from their original conversations, and dedupe by
+    // source cid/message id. Since every newly-written bundle is already
+    // flat, one expansion level also prevents cycles and recursive growth.
+    for (const nested of source.references || []) {
+      if (out.length >= 20 || remainingChars <= 0) break;
+      if (!safeId(nested.source_cid) || !safeId(nested.source_msg_id)) continue;
+      const nestedSource = (await loadSource(nested.source_cid))
+        .find((msg) => msg.id === nested.source_msg_id && !msg.deleted_at && !msg.dispatch);
+      await pushReference(nested, nestedSource);
+    }
+  }
+  return out;
 }
 
 export async function send(
   input: SendInput,
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
-  const { userId, cid, text, model_text, attachments, use_selections } = input;
+  const { userId, cid, text, model_text, attachments, use_selections, references } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
   await seedReservedActors(userId, cid);
@@ -113,12 +242,18 @@ export async function send(
     const chats = await import('../chats');
     const conv = await chats.getConversation(userId, cid);
     if (conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
-      await chats.updateConversation(userId, cid, { title: chats.autoTitle(text) });
+      await chats.updateConversation(
+        userId,
+        cid,
+        { title: chats.autoTitle(text) },
+        conv.project_id || null,
+      );
     }
   } catch (err) {
     log.warn(`auto-title failed user=${userId} cid=${cid}: ${(err as Error).message}`);
   }
   try {
+    const resolvedReferences = await _resolveMessageReferences(userId, references);
     const msg = await enqueue({
       uid: userId, cid,
       fromActorId: USER_ID,
@@ -126,6 +261,7 @@ export async function send(
       ...(model_text && model_text.trim() ? { model_text } : {}),
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
       ...(use_selections && use_selections.length ? { use_selections } : {}),
+      ...(resolvedReferences.length ? { references: resolvedReferences } : {}),
     });
     return { ok: true, msg };
   } catch (err) {
@@ -148,10 +284,14 @@ export async function dropConv(userId: string, cid: string): Promise<void> {
 
 // ── Members + plan ───────────────────────────────────────────────────────
 
-export async function listMembers(userId: string, cid: string) {
+export async function listMembers(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+) {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid', actors: [] };
-  await seedReservedActors(userId, cid);
-  const m = await readMembers(userId, cid);
+  await seedReservedActors(userId, cid, projectIdHint);
+  const m = await readMembers(userId, cid, projectIdHint);
   // Enrich agent actors with the current `interactive` flag so the renderer
   // can decide on its own whether to auto-target the input box at this agent
   // when its plan step goes in_progress. Read from the live agent file each
@@ -329,7 +469,7 @@ export async function markFormSubmittedAndDispatch(
     log.warn(`form-submit project_dir hook failed: ${(err as Error).message}`);
   }
 
-  const sliceFile = groupChatVisibilityFile(userId, cid, agentId);
+  const sliceFile = conversationLayout(userId, cid).visibilityFile(agentId);
   if (fs.existsSync(sliceFile)) {
     const slice = await readJsonl<GroupMessage>(sliceFile, 100_000);
     const sIdx = slice.findIndex((m) => m.id === msgId);
@@ -479,7 +619,7 @@ async function _patchMarketplaceRequest(
   // card state for reasoning, and the main jsonl is the renderer source.
   try {
     await _rewriteMarketplaceRequestInFile(
-      groupChatVisibilityFile(userId, cid, target.from),
+      conversationLayout(userId, cid).visibilityFile(target.from),
       msgId,
       requestId,
       patch,
@@ -626,5 +766,95 @@ export async function resolveMarketplaceInstallRequest(
 
 export async function readMessages(userId: string, cid: string, limit = 500): Promise<GroupMessage[]> {
   if (!safeId(cid)) return [];
-  return readJsonl<GroupMessage>(mainJsonlFile(userId, cid), limit);
+  return (await readJsonl<GroupMessage>(conversationMessageReadFile(userId, cid), limit))
+    .filter((msg) => !msg.deleted_at);
+}
+
+function _deletedMessageRevision(message: GroupMessage, deletedAt: string): GroupMessage {
+  return {
+    id: message.id,
+    ts: message.ts,
+    from: message.from,
+    to: Array.isArray(message.to) ? message.to : [],
+    text: '',
+    deleted_at: deletedAt,
+    deleted_by_user: true,
+    _v: Math.max(0, Number(message._v) || 0) + 1,
+  };
+}
+
+async function _tombstoneMessagesInFile(file: string, ids: ReadonlySet<string>, deletedAt: string): Promise<number> {
+  if (!fs.existsSync(file)) return 0;
+  const rows = await readJsonl<GroupMessage>(file, 100_000);
+  let changed = 0;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (!row || !ids.has(row.id) || row.deleted_at) continue;
+    const rewritten = await rewriteJsonlLine<GroupMessage>(file, index, (current) => {
+      if (!current || current.id !== row.id || current.deleted_at) return null;
+      return _deletedMessageRevision(current, deletedAt);
+    });
+    if (rewritten.ok) changed += 1;
+  }
+  return changed;
+}
+
+/** Delete visible messages as versioned tombstones in the main log and all
+ * actor slices. Persistent model sessions are purged so the next turn is
+ * rebuilt from the filtered slices rather than retaining deleted context. */
+export async function deleteMessages(
+  userId: string,
+  cid: string,
+  messageIds: string[],
+): Promise<{ ok: boolean; deleted: string[]; error?: string }> {
+  if (!safeId(cid)) return { ok: false, deleted: [], error: 'invalid cid' };
+  const ids = Array.from(new Set((Array.isArray(messageIds) ? messageIds : [])
+    .filter((id) => typeof id === 'string' && safeId(id)))).slice(0, 100);
+  if (!ids.length) return { ok: false, deleted: [], error: 'no messages selected' };
+  const runtime = await runtimeStatus(userId, cid);
+  if (runtime.processing) return { ok: false, deleted: [], error: 'conversation is running' };
+
+  const mainFile = conversationMessageReadFile(userId, cid);
+  const mainRows = await readJsonl<GroupMessage>(mainFile, 100_000);
+  const existing = new Set(mainRows
+    .filter((msg) => ids.includes(msg.id) && !msg.deleted_at && !msg.dispatch)
+    .map((msg) => msg.id));
+  if (!existing.size) return { ok: false, deleted: [], error: 'messages not found' };
+
+  const deletedAt = nowIso();
+  await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
+  const layout = conversationLayout(userId, cid);
+  try {
+    const entries = await fsp.readdir(layout.visibilityDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+      await _tombstoneMessagesInFile(path.join(layout.visibilityDir, entry.name), existing, deletedAt);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('message delete slice rewrite failed', { userId, cid, error: logErrorRef(err) });
+    }
+  }
+
+  try {
+    const members = await readMembers(userId, cid);
+    const sessions = await import('../../model/core-agent/session-store');
+    for (const actor of members.actors) {
+      if (actor.kind !== 'commander' && actor.kind !== 'agent') continue;
+      const sid = actorSessionId(cid, actor);
+      sessions.evictSession(sid);
+      sessions.deleteSessionFileForUser(userId, sid);
+    }
+  } catch (err) {
+    log.warn('message delete session reset failed', { userId, cid, error: logErrorRef(err) });
+  }
+  try {
+    const cliSessions = await import('../local_agents/sessions');
+    await cliSessions.clearForConversation(userId, cid);
+  } catch (err) {
+    log.warn('message delete cli session reset failed', { userId, cid, error: logErrorRef(err) });
+  }
+
+  log.info(`messages-deleted user=${userId} cid=${cid} count=${existing.size}`);
+  return { ok: true, deleted: Array.from(existing) };
 }

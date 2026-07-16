@@ -60,7 +60,13 @@ type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'tr
 interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; transport?: Transport }
 
 const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
-type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: string };
+interface PreservedSecrets {
+  ciphertext: string;
+  /** Canonical plaintext that produced `ciphertext`. Missing means decryption
+   * failed; the blob may only be reused while no replacement secrets exist. */
+  plaintext?: string;
+}
+type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: PreservedSecrets };
 
 // Secret-owner resolver. The open-source build stores connector secrets under the local uid.
 function _secretOwner(uid: string): string {
@@ -120,7 +126,7 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
   const dec = _tryDecrypt(uid, disk.id, secrets_enc);
   if (dec === null) {
     log.warn('decrypt secrets_enc failed (known formats) — instance left without transport/grant', { id: disk.id });
-    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = secrets_enc;
+    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
     return { instance: out, migrated: false };
   }
   try {
@@ -128,9 +134,18 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
     if (blob.oauth_grant) out.oauth_grant = blob.oauth_grant;
     if (blob.dcr_client) out.dcr_client = blob.dcr_client;
     if (blob.transport) out.transport = blob.transport;
+    // Metadata-only writes dominate connector startup. Keep the exact sealed
+    // value when its plaintext is unchanged so status/tool-cache updates do
+    // not repeatedly invoke the local secret backend.
+    if (!dec.migrated) {
+      (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = {
+        ciphertext: secrets_enc,
+        plaintext: dec.json,
+      };
+    }
   } catch (err) {
     log.warn('parse secrets_enc payload failed', { id: disk.id, error: (err as Error).message });
-    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = secrets_enc;
+    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
     return { instance: out, migrated: false };
   }
   return { instance: out, migrated: dec.migrated };
@@ -144,10 +159,16 @@ function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk
     if (oauth_grant) blob.oauth_grant = oauth_grant;
     if (dcr_client) blob.dcr_client = dcr_client;
     if (transport) blob.transport = transport;
-    onDisk.secrets_enc = localSecrets.encryptLocalSecret(_secretContext(uid, inst.id), JSON.stringify(blob));
+    const plaintext = JSON.stringify(blob);
+    const preserved = (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS];
+    const ciphertext = preserved?.plaintext === plaintext
+      ? preserved.ciphertext
+      : localSecrets.encryptLocalSecret(_secretContext(uid, inst.id), plaintext);
+    onDisk.secrets_enc = ciphertext;
+    (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext, plaintext };
   } else {
     const preserved = (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS];
-    if (preserved) onDisk.secrets_enc = preserved;
+    if (preserved && preserved.plaintext === undefined) onDisk.secrets_enc = preserved.ciphertext;
   }
   return onDisk;
 }
@@ -325,6 +346,40 @@ export async function update(
   });
   if (next) _notifyChanged();
   return next;
+}
+
+export type ConnectorInstancePatch = (inst: ConnectorInstance) => ConnectorInstance;
+
+/** Apply several per-instance patches under one registry lock and persist the
+ *  aggregate file once. Intended for startup probes, where each connection
+ *  independently discovers status/tools but none needs an intermediate disk
+ *  snapshot. Secret-rotation paths continue to use `update` immediately. */
+export async function updateMany(
+  uid: string,
+  patches: ReadonlyMap<string, readonly ConnectorInstancePatch[]>,
+): Promise<Record<string, ConnectorInstance>> {
+  const updated = await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const out: Record<string, ConnectorInstance> = {};
+    for (const [id, instancePatches] of patches) {
+      const existing = cur.connections[id];
+      if (!existing || !instancePatches.length) continue;
+      let next = existing;
+      for (const patch of instancePatches) next = patch(next);
+      log.info('registry.updateMany', {
+        id,
+        patches: instancePatches.length,
+        rt_before: _rt(existing.oauth_grant),
+        rt_after: _rt(next.oauth_grant),
+      });
+      cur.connections[id] = next;
+      out[id] = next;
+    }
+    if (Object.keys(out).length) _writeSync(uid, cur);
+    return out;
+  });
+  if (Object.keys(updated).length) _notifyChanged();
+  return updated;
 }
 
 export function isValidInstanceId(id: unknown): id is string {

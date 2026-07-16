@@ -173,45 +173,6 @@ function _normalizeFeedbackFieldText(value) {
     .trim();
 }
 
-function _tailFeedbackText(value, max) {
-  const text = _normalizeFeedbackFieldText(value);
-  const limit = Math.max(0, Number(max) || 0);
-  if (!text || limit <= 0) return '';
-  if (text.length <= limit) return text;
-  return text.slice(text.length - limit);
-}
-
-function _buildFailedAssistantFeedbackContent(details, max = 300) {
-  const errorText = _normalizeFeedbackFieldText(details && details.errorText);
-  const replyText = _normalizeFeedbackFieldText(details && details.replyText);
-  return _tailFeedbackText([replyText, errorText].filter(Boolean).join('\n'), max);
-}
-
-function _isInternalFeedbackSubmitError(value) {
-  const text = _normalizeFeedbackFieldText(value);
-  if (!text) return true;
-  return /(?:^|[\s(:])account:\/pms\/feedback\/submit\b/i.test(text)
-    || /\/pms\/feedback\/submit\b/i.test(text)
-    || /\btimed out after \d+\s*(?:ms|s)\b/i.test(text)
-    || /^(?:failed to fetch|networkerror|load failed|fetch failed)$/i.test(text)
-    || /^HTTP\s+\d{3}$/i.test(text)
-    || /^code\s+\d+$/i.test(text)
-    || /^feedback submit failed$/i.test(text);
-}
-
-function _feedbackSubmitDisplayMessage(value) {
-  if (typeof userErrorMessage === 'function') {
-    return userErrorMessage(value, {
-      fallbackText: t('chat.unknown_error'),
-      authKey: 'chat.report_login_required',
-    });
-  }
-  const raw = _normalizeFeedbackFieldText(value);
-  if (raw === t('chat.report_login_required')) return raw;
-  if (_isInternalFeedbackSubmitError(raw)) return t('chat.unknown_error');
-  return raw;
-}
-
 function _skillsForDisplayNameRewrite() {
   return (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache)) ? _skillsCache : [];
 }
@@ -424,18 +385,26 @@ function insertChatUseTokenIntoComposer(inputOrId, selection) {
   return api.insertUse(selection);
 }
 
-function _chatRichSerializeNode(node) {
+function _chatRichSerializeNode(node, isRoot = true) {
   if (!node) return '';
   if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
   if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return '';
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node;
     if (el.dataset?.chatUseChip === '1') return el.dataset.token || '';
-    if (el.tagName === 'BR') return '\n';
+    // A "bogus" <br> is a display-only filler that renders the trailing empty
+    // line contenteditable would otherwise collapse; it carries no value, so a
+    // render→serialize round-trip must not turn it back into a newline.
+    if (el.tagName === 'BR') return el.dataset?.chatBogus === '1' ? '' : '\n';
   }
   let out = '';
-  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child); });
-  if (node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
+  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child, false); });
+  // The DIV/P newline separates *sibling* blocks (e.g. browser line-wrapping
+  // divs). It must not fire for the root editor itself, or every non-empty
+  // value would gain a phantom trailing "\n" that (a) makes "abc" and "abc\n"
+  // serialize identically and (b) can't be told apart from a real trailing
+  // newline when we decide whether to render a filler line.
+  if (!isRoot && node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
     if (out && !out.endsWith('\n')) out += '\n';
   }
   return out;
@@ -553,6 +522,32 @@ function _chatRichCreateUseChip(selection, rawToken) {
   return chip;
 }
 
+// contenteditable + `white-space: pre-wrap` collapses a trailing newline: a
+// value ending in "\n" (or a lone "\n" just typed) renders no empty last line,
+// so the caret can't sit on it and the box never grows/scrolls to reveal it.
+// Browsers solve this with a filler <br>; we mirror that with a marked "bogus"
+// <br> that serialization drops (see _chatRichSerializeNode). Keep exactly one,
+// always at the very end, and only when the content actually ends in a newline.
+function _chatRichEnsureTrailingBreak(editor) {
+  if (!editor) return;
+  const stale = editor.querySelector ? editor.querySelector('br[data-chat-bogus="1"]') : null;
+  if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+  if (_chatRichSerializeNode(editor).endsWith('\n')) {
+    const br = document.createElement('br');
+    br.dataset.chatBogus = '1';
+    editor.appendChild(br);
+  }
+}
+
+/** Reconcile every non-IME native edit before serializing it. The display-only trailing filler can
+ * become stale when the user types after a trailing newline or deletes that newline with Backspace;
+ * leaving it in the DOM creates a phantom visual line even though serialization correctly drops it. */
+function _chatRichHandleEditorInput(api) {
+  if (!api || api.composing) return;
+  api.ensureTrailingBreak();
+  api.syncFromEditor(true);
+}
+
 function _chatRichRenderValue(editor, value) {
   const src = String(value || '');
   editor.textContent = '';
@@ -564,6 +559,7 @@ function _chatRichRenderValue(editor, value) {
     last = token.end;
   });
   if (last < src.length) editor.appendChild(document.createTextNode(src.slice(last)));
+  _chatRichEnsureTrailingBreak(editor);
 }
 
 function _chatRichInputTarget(inputId) {
@@ -633,6 +629,11 @@ function _chatRichCreateApi(textarea, editor) {
     lastValue: null,
     pendingSelection: null,
     syncingFromEditor: false,
+    // True between compositionstart/compositionend (IME). While composing we
+    // must not rebuild the editor DOM or thrash its layout, or the in-flight
+    // composition gets dropped and the user has to retype — hence the guards in
+    // renderFromTextarea/the input listeners and a single reconcile on end.
+    composing: false,
     focus() {
       editor.focus();
       const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : (textarea.value || '').length;
@@ -661,6 +662,9 @@ function _chatRichCreateApi(textarea, editor) {
       this.setTextareaSelection(sel.start, sel.end, { pending: false });
     },
     renderFromTextarea(opts = {}) {
+      // Rebuilding the contenteditable mid-composition drops the IME buffer;
+      // compositionend runs one reconcile once the text has committed.
+      if (this.composing) return;
       const value = String(textarea.value || '');
       const changed = value !== this.lastValue;
       let shouldAutoGrow = !!(opts && opts.forceHeight);
@@ -699,7 +703,38 @@ function _chatRichCreateApi(textarea, editor) {
       editor.style.height = 'auto';
       const next = Math.min(editor.scrollHeight || 0, max);
       if (next > 0) editor.style.height = `${next}px`;
-      editor.style.overflowY = (editor.scrollHeight || 0) > max ? 'auto' : 'hidden';
+      const overflow = (editor.scrollHeight || 0) > max;
+      editor.style.overflowY = overflow ? 'auto' : 'hidden';
+      // Once the editor scrolls internally, growing/wrapping no longer keeps the
+      // caret in view on its own (resetting height to 'auto' above also resets
+      // scrollTop), so the newly typed line ends up clipped below the fold.
+      if (overflow && document.activeElement === editor) this.scrollCaretIntoView();
+    },
+    // Keep the caret's line inside the scroll viewport. Range client rects are
+    // empty exactly at a trailing <br> boundary (the just-created empty line),
+    // so fall back to scrolling to the bottom when the caret is at content end.
+    scrollCaretIntoView() {
+      const sel = window.getSelection ? window.getSelection() : null;
+      if (!sel || sel.rangeCount < 1) return;
+      const range = sel.getRangeAt(0);
+      if (!editor.contains(range.endContainer)) return;
+      const editorRect = editor.getBoundingClientRect();
+      const rects = range.getClientRects();
+      let rect = rects && rects.length ? rects[rects.length - 1] : null;
+      if (!rect || !rect.height) {
+        const bounding = range.getBoundingClientRect();
+        if (bounding && bounding.height) rect = bounding;
+      }
+      if (rect && rect.height) {
+        if (rect.bottom > editorRect.bottom) editor.scrollTop += (rect.bottom - editorRect.bottom) + 2;
+        else if (rect.top < editorRect.top) editor.scrollTop -= (editorRect.top - rect.top) + 2;
+        return;
+      }
+      const idx = _chatRichSelectionIndexes(editor);
+      if (idx && idx.end >= _chatRichSerializeNode(editor).length) editor.scrollTop = editor.scrollHeight;
+    },
+    ensureTrailingBreak() {
+      _chatRichEnsureTrailingBreak(editor);
     },
     insertUse(selection) {
       if (typeof _chatUseTokenFor !== 'function') return false;
@@ -725,10 +760,22 @@ function _chatRichCreateApi(textarea, editor) {
   };
 
   textarea.addEventListener('input', () => {
-    if (api.syncingFromEditor) return;
+    if (api.syncingFromEditor || api.composing) return;
     api.renderFromTextarea();
   });
-  editor.addEventListener('input', () => api.syncFromEditor(true));
+  editor.addEventListener('input', () => {
+    // Native IME keeps mutating the editor while composing; stay out of its way
+    // and reconcile once on compositionend.
+    _chatRichHandleEditorInput(api);
+  });
+  editor.addEventListener('compositionstart', () => { api.composing = true; });
+  editor.addEventListener('compositionend', () => {
+    api.composing = false;
+    // The committed text is now in the editor DOM; mirror it into the textarea
+    // and recompute height/scroll exactly once.
+    api.ensureTrailingBreak();
+    api.syncFromEditor(true);
+  });
   editor.addEventListener('focus', () => {
     api.renderFromTextarea();
     api.syncTextareaSelectionFromEditor();
@@ -745,6 +792,7 @@ function _chatRichCreateApi(textarea, editor) {
     if (!text) return;
     e.preventDefault();
     _chatRichInsertText(editor, text);
+    api.ensureTrailingBreak();
     api.syncFromEditor(true);
   });
   editor.addEventListener('keydown', (e) => {
@@ -774,6 +822,9 @@ function _chatRichCreateApi(textarea, editor) {
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
       e.preventDefault();
       _chatRichInsertText(editor, '\n');
+      // A lone trailing "\n" renders no line; add the filler <br> before we
+      // measure height so the new line shows and the caret scrolls into view.
+      api.ensureTrailingBreak();
       api.syncFromEditor(true);
       return;
     }
@@ -967,8 +1018,8 @@ function _saveRecipientMap() {
 // DOMContentLoaded init branch below — which may invoke _renderQuotePreview
 // synchronously when the document is already loaded — doesn't hit a TDZ on
 // the binding. The helper functions live further down with the rest of the
-// quote infrastructure (_setQuote / _getQuote / _clearQuote / _renderQuotePreview).
-const _quoteByCid = new Map();   // cid → { fromActor, fromName, msgId, text, produced[] } | undefined
+// quote infrastructure (_addQuote / _getQuotes / _clearQuotes / _renderQuotePreview).
+const _quotesByCid = new Map();   // cid → Array<{ fromActor, fromName, msgId, text, produced[] }>
 
 function _normRecipient(next) {
   if (!next || (next.kind !== 'commander' && next.kind !== 'agent')) return null;
@@ -1090,6 +1141,7 @@ function _renderRecipientChip(target) {
 
 // Hooks called by setView (boot.js) so the chip mirrors the active context.
 function onEnterNewChatView() {
+  if (typeof _exitMessageSelection === 'function') _exitMessageSelection();
   // The new-chat input is the only place the recipient is ephemeral. Reset
   // to commander only when the textarea is empty — if the user has typed
   // anything, treat that as an in-progress message whose target they
@@ -1384,6 +1436,7 @@ function _initEmptyStateScenarios() {
   });
 }
 function onEnterConversationView() {
+  if (_messageSelectionState && _messageSelectionState.cid !== currentCid) _exitMessageSelection();
   _renderRecipientChip('conversation');
   _refreshChatHeader();
   // Workspace chip scope follows the active conv's project (resolved on
@@ -1454,7 +1507,7 @@ function _forgetCidRecipient(cid) {
   if (infoTimer) clearTimeout(infoTimer);
   _conversationInfoFileRefreshTimers.delete(cid);
   // Drop any pending quote for the deleted conv (memory only — no localStorage).
-  _quoteByCid.delete(cid);
+  _quotesByCid.delete(cid);
 }
 
 // ─── Auto-recipient: route genuine human-in-loop interactive threads ─────
@@ -1796,7 +1849,7 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     const activeCommander = activeTurns.some((t) => t.actor === 'commander');
     if (!activeCommander) _removeEmptyActorPlaceholder(cid, 'commander');
     for (const turn of activeTurns) {
-      _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id);
+      _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
     }
   } else {
     if (!inFlight.includes('commander')) _removeEmptyActorPlaceholder(cid, 'commander');
@@ -2223,7 +2276,7 @@ const _groupMembersCache = new Map(); // cid → Actor[]
 async function _refreshGroupMembers(cid) {
   if (!cid) return [];
   try {
-    const res = await apiFetch(`/api/conversations/${cid}/members`);
+    const res = await apiFetch(_membersRequestUrl(cid));
     const data = await res.json();
     if (data?.ok && Array.isArray(data.actors)) {
       _groupMembersCache.set(cid, data.actors);
@@ -2330,6 +2383,7 @@ function _groupMsgToLegacy(gm) {
     ...(label ? { _from_label: label } : {}),
     ...(Array.isArray(gm.attachments) && gm.attachments.length ? { attachments: gm.attachments } : {}),
     ...(Array.isArray(gm.produced) && gm.produced.length ? { produced: gm.produced } : {}),
+    ...(Array.isArray(gm.references) && gm.references.length ? { references: gm.references } : {}),
     ...(gm.form ? { form: gm.form } : {}),
     ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
     ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
@@ -2383,6 +2437,7 @@ function _syncRenderedGroupMessageIdentity(el, message) {
     }
   }
   _stampRenderedGroupMessage(el, message);
+  _syncBubbleReferenceActionState(el);
 }
 
 function _findRenderedGroupMessage(container, message, exclude = null) {
@@ -2979,6 +3034,7 @@ window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload
 };
 
 async function _chatAttachRefreshFromServer(cid) {
+  const startedAt = performance.now();
   try {
     const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments`);
     const data = await res.json();
@@ -2992,6 +3048,11 @@ async function _chatAttachRefreshFromServer(cid) {
       return { name: info.name, kind: info.kind, bytes: info.bytes, dataUrl, status: 'ready' };
     });
     _chatAttachSet(cid, items);
+    _convLog.info('conversation detail attachments ready', {
+      cid,
+      ms: Math.round(performance.now() - startedAt),
+      count: items.length,
+    });
   } catch (err) {
     _convLog.warn('refresh attachments failed', err);
   }
@@ -3006,7 +3067,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
     if (kind === 'image' && cid) {
       const url = _chatMediaUrl(cid, n);
       return `<span class="chat-msg-attach is-image" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <img class="chat-msg-attach-thumb" src="${url}" alt="${label}" />
+        <span class="chat-image-shell chat-msg-attach-thumb-shell is-loading"><img class="chat-msg-attach-thumb" src="${url}" alt="${label}" /></span>
         <span class="chat-msg-attach-label">${label}</span>
       </span>`;
     }
@@ -3014,7 +3075,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
       const url = _chatMediaUrl(cid, n);
       const floatingTitle = escapeHtml(_chatVideoFloatingTitle());
       return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <span class="chat-msg-attach-video-shell">
+        <span class="chat-msg-attach-video-shell" data-chat-video-playback-surface="attachment_bubble">
           <video class="chat-msg-attach-video" width="320" height="180" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
           <button type="button" class="chat-msg-attach-video-float" data-attach-video-open="1" aria-label="${floatingTitle}" title="${floatingTitle}">${_uiIconHtml('maximize', 'ui-icon chat-msg-attach-video-float-svg')}</button>
         </span>
@@ -3057,7 +3118,6 @@ const _PRODUCED_DELIVERABLE_EXTS = new Set([
   'pdf',
   'zip',
 ]);
-const _PRODUCED_VISIBLE_LIMIT = 10;
 
 function _producedDeliverableRank(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
@@ -3103,25 +3163,32 @@ function _renderMessageProducedHtml(absPaths) {
   // localized "preview" hint instead of the raw OS path (which exposes
   // the user's home directory and is hostile UX in mixed-locale contexts).
   const hint = t('chat.produced_preview_title');
+  const moreHint = t('contexts.menu.more_actions');
   const ordered = _orderProducedPaths(absPaths);
-  const items = ordered.map((e, idx) => {
+  const items = ordered.map((e) => {
     const icon = _iconForProduced(e.base);
-    const overflow = idx >= _PRODUCED_VISIBLE_LIMIT ? ' is-produced-overflow' : '';
-    return `<span class="chat-msg-produced-item${overflow}" data-produced-path="${escapeHtml(e.path)}" title="${escapeHtml(hint)}">
-      <span class="chat-msg-produced-icon">${icon}</span>
-      <span class="chat-msg-produced-label">${escapeHtml(e.base)}</span>
-    </span>`;
+    return `<div class="chat-msg-produced-item" data-produced-path="${escapeHtml(e.path)}">
+      <button type="button" class="chat-msg-produced-main" title="${escapeHtml(hint)}">
+        <span class="chat-msg-produced-icon">${icon}</span>
+        <span class="chat-msg-produced-label">${escapeHtml(e.base)}</span>
+      </button>
+      <button type="button" class="chat-msg-produced-menu-btn" title="${escapeHtml(moreHint)}" aria-label="${escapeHtml(moreHint)}">⋯</button>
+    </div>`;
   });
-  // A long, noisy chip row collapses past the visible limit behind a "more"
-  // toggle. Clicking expands the rest in place; the expanded row gets its own
-  // scroll container in CSS so the message body does not balloon forever.
-  let moreHtml = '';
-  const hiddenCount = ordered.length - _PRODUCED_VISIBLE_LIMIT;
-  if (hiddenCount > 0) {
-    const moreLabel = t('chat.produced_show_more', { count: hiddenCount });
-    moreHtml = `<button type="button" class="chat-msg-produced-more" data-role="produced-more">${escapeHtml(moreLabel)}</button>`;
-  }
-  return `<div class="chat-msg-produced">${items.join('')}${moreHtml}</div>`;
+  return `<div class="chat-msg-produced">${items.join('')}</div>`;
+}
+
+function _mountMessageProducedFooter(msgDiv, absPaths) {
+  if (!msgDiv || !Array.isArray(absPaths) || !absPaths.length) return;
+  const bubble = msgDiv.querySelector('.chat-bubble');
+  if (!bubble || bubble.querySelector('.chat-msg-produced')) return;
+  const wrap = document.createElement('div');
+  wrap.innerHTML = _renderMessageProducedHtml(absPaths);
+  const node = wrap.firstElementChild;
+  if (!node) return;
+  bubble.appendChild(node);
+  msgDiv.dataset.produced = JSON.stringify(absPaths);
+  _hydrateMessageProducedChips(msgDiv);
 }
 
 // Render a "view details" chip on an assistant bubble when a new agent was
@@ -3199,6 +3266,12 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
       if (!sid) return;
       if (window.Monitor) (() => {})('created_skill_chip_open', { skill_id: sid });
       setView('skills');
+      const featureLoader = typeof loadRendererFeature === 'function'
+        ? loadRendererFeature
+        : window.loadRendererFeature;
+      if (typeof featureLoader === 'function') {
+        try { await featureLoader('skills'); } catch { return; }
+      }
       // Pre-check SKILL.md is readable; covers both "skill was deleted" and
       // "skill row exists but its files are missing" (entering the detail
       // would render a 'file not found' shell otherwise).
@@ -3213,27 +3286,47 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
 }
 
 function _hydrateMessageProducedChips(msgDiv) {
-  const chips = msgDiv.querySelectorAll('.chat-msg-produced-item');
-  chips.forEach((chip) => {
-    chip.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const p = chip.dataset.producedPath;
-      if (!p) return;
-      if (typeof openChatFileViewer === 'function') {
+  const rows = msgDiv.querySelectorAll('.chat-msg-produced-item[data-produced-path]');
+  rows.forEach((row) => {
+    const main = row.querySelector('.chat-msg-produced-main');
+    const menuBtn = row.querySelector('.chat-msg-produced-menu-btn');
+    if (main && main.dataset.bound !== '1') {
+      main.dataset.bound = '1';
+      main.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const p = row.dataset.producedPath;
+        if (!p) return;
+        if (typeof openChatFileViewer === 'function') {
+          const base = p.split(/[\\/]/).pop() || p;
+          openChatFileViewer(p, base, currentCid ? { cid: currentCid } : undefined);
+        }
+      });
+    }
+    if (menuBtn && menuBtn.dataset.bound !== '1') {
+      menuBtn.dataset.bound = '1';
+      menuBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const p = row.dataset.producedPath;
+        if (!p || !window.ConversationInfo || typeof window.ConversationInfo.openFileMenu !== 'function') return;
         const base = p.split(/[\\/]/).pop() || p;
-        openChatFileViewer(p, base, currentCid ? { cid: currentCid } : undefined);
-      }
-    });
+        window.ConversationInfo.openFileMenu(menuBtn, p, base, {
+          cid: currentCid || '',
+          onDeleted: () => {
+            row.remove();
+            const footer = msgDiv.querySelector('.chat-msg-produced');
+            if (footer && !footer.querySelector('.chat-msg-produced-item')) footer.remove();
+            try {
+              const produced = JSON.parse(msgDiv.dataset.produced || '[]');
+              msgDiv.dataset.produced = JSON.stringify(
+                Array.isArray(produced) ? produced.filter((item) => item !== p) : [],
+              );
+            } catch (_) { msgDiv.dataset.produced = '[]'; }
+          },
+        });
+      });
+    }
   });
-  const more = msgDiv.querySelector('.chat-msg-produced-more[data-role="produced-more"]');
-  if (more) {
-    more.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const row = more.closest('.chat-msg-produced');
-      if (row) row.classList.add('is-expanded');
-      more.remove();
-    });
-  }
 }
 
 function _showFileMissingToast(name) {
@@ -3439,14 +3532,128 @@ function _initNewChatAttachInput() {
 // ─── Conversation list ───
 
 let _loadConversationsInFlight = null;
-async function loadConversations() {
-  if (_loadConversationsInFlight) return _loadConversationsInFlight;
+let _loadConversationsMode = '';
+let _conversationDeferredBuckets = { last30: 0, older: 0 };
+const _loadedConversationProjectIds = new Set();
+const _conversationProjectPages = new Map();
+const _projectConversationLoads = new Map();
+const _oldConversationPages = {
+  last30: { initialized: false, total: 0, nextOffset: 0, loading: false },
+  older: { initialized: false, total: 0, nextOffset: 0, loading: false },
+};
+
+function _startupConversationParams() {
+  let activeCid = '';
+  try {
+    const saved = JSON.parse(localStorage.getItem('last_view') || 'null');
+    if (saved && saved.view === 'conversation') activeCid = String(saved.cid || '');
+  } catch (_) {}
+  const expanded = (typeof _projectsExpanded === 'object' && _projectsExpanded)
+    ? Object.keys(_projectsExpanded).filter((pid) => _projectsExpanded[pid])
+    : [];
+  const params = new URLSearchParams({ mode: 'startup' });
+  if (activeCid) params.set('active_cid', activeCid);
+  if (expanded.length) params.set('expanded_projects', expanded.join(','));
+  return params.toString();
+}
+
+function _replaceConversationSlice(rows, shouldReplace) {
+  const incoming = Array.isArray(rows) ? rows : [];
+  const keep = (Array.isArray(conversations) ? conversations : []).filter((c) => !shouldReplace(c));
+  conversations = keep.concat(incoming);
+}
+
+function _appendConversationSlice(rows) {
+  const byCid = new Map((Array.isArray(conversations) ? conversations : [])
+    .filter((c) => c && c.conversation_id)
+    .map((c) => [c.conversation_id, c]));
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (row && row.conversation_id) byCid.set(row.conversation_id, row);
+  }
+  conversations = Array.from(byCid.values());
+}
+
+function _projectConversationPageInfo(projectId) {
+  return _conversationProjectPages.get(String(projectId || '')) || null;
+}
+
+function _projectConversationHasMore(projectId) {
+  const page = _projectConversationPageInfo(projectId);
+  return !!page && Number.isSafeInteger(page.nextOffset) && page.nextOffset >= 0;
+}
+
+function _projectConversationTotal(projectId) {
+  const page = _projectConversationPageInfo(projectId);
+  return page ? Number(page.total) || 0 : 0;
+}
+
+async function loadConversations(options = {}) {
+  // Routine refreshes retain the bounded startup slice. A caller must opt in
+  // explicitly when its UI genuinely needs every conversation.
+  const startup = !(options && options.full === true);
+  if (_loadConversationsInFlight) {
+    if (startup || _loadConversationsMode === 'full') return _loadConversationsInFlight;
+    await _loadConversationsInFlight;
+    return loadConversations(options);
+  }
+  _loadConversationsMode = startup ? 'startup' : 'full';
   _loadConversationsInFlight = (async () => {
     try {
-      const res = await apiFetch('/api/conversations/list');
+      const url = startup
+        ? `/api/conversations/list?${_startupConversationParams()}`
+        : '/api/conversations/list';
+      const res = await apiFetch(url);
       const data = await res.json();
       if (data.ok) {
         conversations = data.conversations || [];
+        _conversationDeferredBuckets = startup
+          ? { last30: Number(data.deferred_unprojected?.last30) || 0, older: Number(data.deferred_unprojected?.older) || 0 }
+          : { last30: 0, older: 0 };
+        _loadedConversationProjectIds.clear();
+        _conversationProjectPages.clear();
+        if (startup) {
+          const pagination = data.project_pagination && typeof data.project_pagination === 'object'
+            ? data.project_pagination : {};
+          for (const pid of data.loaded_project_ids || []) {
+            const key = String(pid);
+            const info = pagination[key] || {};
+            const next = info.next_offset === null ? null : Number(info.next_offset);
+            const nextOffset = Number.isSafeInteger(next) && next >= 0 ? next : null;
+            _conversationProjectPages.set(key, {
+              initialized: true,
+              total: Number(info.total) || 0,
+              nextOffset,
+            });
+            if (nextOffset === null) _loadedConversationProjectIds.add(key);
+          }
+          for (const bucket of ['last30', 'older']) {
+            _oldConversationPages[bucket] = {
+              initialized: false,
+              total: Number(_conversationDeferredBuckets[bucket]) || 0,
+              nextOffset: 0,
+              loading: false,
+            };
+          }
+        } else if (Array.isArray(_projectsCache)) {
+          for (const p of _projectsCache) {
+            if (!p || !p.project_id) continue;
+            _loadedConversationProjectIds.add(p.project_id);
+            _conversationProjectPages.set(p.project_id, {
+              initialized: true,
+              total: (conversations || []).filter((c) => c && c.project_id === p.project_id).length,
+              nextOffset: null,
+            });
+          }
+          for (const bucket of ['last30', 'older']) {
+            _oldConversationPages[bucket] = {
+              initialized: true,
+              total: (conversations || []).filter((c) => !c.project_id
+                && timeBucket(_conversationActivityIso(c), new Date()) === bucket).length,
+              nextOffset: null,
+              loading: false,
+            };
+          }
+        }
         renderConversationList();
       }
     } catch (e) {
@@ -3454,12 +3661,67 @@ async function loadConversations() {
       if (window.Monitor) (() => {})('load_conversations', { error_message: (e && e.message) || String(e) });
     } finally {
       _loadConversationsInFlight = null;
+      _loadConversationsMode = '';
     }
   })();
   return _loadConversationsInFlight;
 }
 
-// Open build: no remote-control activity channel.
+async function loadConversationProject(projectId, options = {}) {
+  const pid = String(projectId || '');
+  const append = options && options.append === true;
+  const currentPage = _conversationProjectPages.get(pid);
+  if (!pid || (!append && currentPage?.initialized)) return;
+  if (append && !_projectConversationHasMore(pid)) return;
+  const existing = _projectConversationLoads.get(pid);
+  if (existing) return existing;
+  const run = (async () => {
+    const offset = append ? currentPage.nextOffset : 0;
+    const res = await apiFetch(`/api/conversations/list?mode=project&project_id=${encodeURIComponent(pid)}&offset=${offset}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'project conversation list failed');
+    if (append) _appendConversationSlice(data.conversations);
+    else _replaceConversationSlice(data.conversations, (c) => c && c.project_id === pid);
+    const next = data.next_offset === null ? null : Number(data.next_offset);
+    const nextOffset = Number.isSafeInteger(next) && next >= 0 ? next : null;
+    _conversationProjectPages.set(pid, {
+      initialized: true,
+      total: Number(data.total) || 0,
+      nextOffset,
+    });
+    if (nextOffset === null) _loadedConversationProjectIds.add(pid);
+    else _loadedConversationProjectIds.delete(pid);
+    renderConversationList();
+  })();
+  _projectConversationLoads.set(pid, run);
+  try { await run; } finally { if (_projectConversationLoads.get(pid) === run) _projectConversationLoads.delete(pid); }
+}
+
+async function _loadOldUnprojectedConversations(bucket) {
+  if (bucket !== 'last30' && bucket !== 'older') return;
+  const page = _oldConversationPages[bucket];
+  if (!page || page.loading || (page.initialized && page.nextOffset === null)) return;
+  page.loading = true;
+  const offset = page.initialized ? page.nextOffset : 0;
+  const run = (async () => {
+    const res = await apiFetch(`/api/conversations/list?mode=old_unprojected&bucket=${bucket}&offset=${offset}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'old conversation list failed');
+    if (page.initialized) _appendConversationSlice(data.conversations);
+    else _replaceConversationSlice(data.conversations, (c) => c && !c.project_id && !c.pinned_at
+      && timeBucket(_conversationActivityIso(c), new Date()) === bucket);
+    const next = data.next_offset === null ? null : Number(data.next_offset);
+    page.initialized = true;
+    page.total = Number(data.total) || 0;
+    page.nextOffset = Number.isSafeInteger(next) && next >= 0 ? next : null;
+    _conversationDeferredBuckets[bucket] = page.total;
+    renderConversationList();
+  })();
+  try { await run; } finally { page.loading = false; }
+}
+
+// Keep the subscription hook stable for callers; the open-source build has no
+// remote conversation activity channel to bind here.
 let _relayActivityWatchStarted = false;
 function startRelayActivitySubscription() {
   if (_relayActivityWatchStarted) return;
@@ -3534,10 +3796,13 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
   const parts = [];
   const scope = _conversationBucketScope(itemOpts);
   const lazyOldBuckets = itemOpts.lazyOldBuckets !== false;
+  const deferredBucketCounts = itemOpts.deferredBucketCounts || {};
+  const loadMoreBuckets = itemOpts.loadMoreBuckets || {};
   for (const c of pinned) parts.push(_renderConversationSidebarItem(c, itemOpts));
   for (const b of _BUCKET_ORDER) {
     const bucketItems = buckets[b];
-    if (!bucketItems.length) continue;
+    const deferredCount = Math.max(0, Number(deferredBucketCounts[b]) || 0);
+    if (!bucketItems.length && !deferredCount) continue;
     const headerKey = `sidebar.bucket.${b}`;
     const collapsible = lazyOldBuckets && _isLazyConversationBucket(b);
     const bucketKey = _conversationBucketKey(scope, b);
@@ -3548,7 +3813,7 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
         aria-expanded="${expanded ? 'true' : 'false'}">
         <span class="conv-list-section-caret" aria-hidden="true">${_uiIconHtml(expanded ? 'chevron-down' : 'chevron-right', 'conv-list-section-caret-icon')}</span>
         <span class="conv-list-section-label" data-i18n="${headerKey}">${escapeHtml(t(headerKey))}</span>
-        <span class="conv-list-section-count">${bucketItems.length}</span>
+        <span class="conv-list-section-count">${Math.max(bucketItems.length, deferredCount)}</span>
         <span class="conv-list-section-rule" aria-hidden="true"></span>
       </button>`);
       if (!expanded) continue;
@@ -3556,6 +3821,11 @@ function _renderConversationTimeBucketList(items, itemOpts = {}) {
       parts.push(`<div class="conv-list-section-header" data-i18n="${headerKey}">${escapeHtml(t(headerKey))}</div>`);
     }
     for (const c of bucketItems) parts.push(_renderConversationSidebarItem(c, itemOpts));
+    if (loadMoreBuckets[b]) {
+      parts.push(`<button type="button" class="conversation-list-load-more" data-conv-bucket-more="1"
+        data-conv-bucket="${escapeHtml(b)}" data-conv-bucket-scope="${escapeHtml(scope)}">
+        ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`);
+    }
   }
   return parts.join('');
 }
@@ -3703,7 +3973,7 @@ async function _toggleConversationPinned(cid, pinned) {
   try {
     const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/pin`, {
       method: 'POST',
-      body: JSON.stringify({ pinned }),
+      body: JSON.stringify({ pinned, project_id: _projectIdForConversation(cid) }),
     });
     const data = await res.json();
     if (!data || data.ok === false || !data.conversation) {
@@ -3751,7 +4021,7 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
   try {
     const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/rename`, {
       method: 'POST',
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, project_id: _projectIdForConversation(cid) }),
     });
     const data = await res.json();
     if (!data || data.ok === false || !data.conversation) {
@@ -3822,11 +4092,34 @@ function _cancelConversationHeaderRename(cid) {
 async function _deleteConversationWithConfirm(cid, opts = {}) {
   if (!cid) return;
   if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
+  const conversation = Array.isArray(conversations)
+    ? conversations.find((item) => item && item.conversation_id === cid)
+    : null;
   abortConvStream(cid);
   _forgetConvLocal(cid);
-  await apiFetch(`/api/conversations/${encodeURIComponent(cid)}`, { method: 'DELETE' });
+  const projectId = _projectIdForConversation(cid);
+  await apiFetch(`/api/conversations/${encodeURIComponent(cid)}?project_id=${encodeURIComponent(projectId)}`, {
+    method: 'DELETE',
+  });
   if (currentCid === cid) setView('new-chat');
-  await loadConversations();
+  conversations = (Array.isArray(conversations) ? conversations : [])
+    .filter((item) => item && item.conversation_id !== cid);
+  if (conversation?.project_id) {
+    const page = _conversationProjectPages.get(conversation.project_id);
+    if (page) {
+      page.total = Math.max(0, (Number(page.total) || 0) - 1);
+      if (page.nextOffset !== null) page.nextOffset = Math.max(0, page.nextOffset - 1);
+    }
+  } else if (conversation && !conversation.pinned_at) {
+    const bucket = timeBucket(_conversationActivityIso(conversation), new Date());
+    const page = _oldConversationPages[bucket];
+    if (_isLazyConversationBucket(bucket) && page?.initialized) {
+      page.total = Math.max(0, (Number(page.total) || 0) - 1);
+      if (page.nextOffset !== null) page.nextOffset = Math.max(0, page.nextOffset - 1);
+      _conversationDeferredBuckets[bucket] = page.total;
+    }
+  }
+  renderConversationList();
   if (typeof opts.afterDelete === 'function') await opts.afterDelete(cid);
 }
 
@@ -3951,6 +4244,25 @@ function _bindConversationSidebarItems(container, opts = {}) {
       }
     });
   });
+  container.querySelectorAll('[data-conv-bucket-more="1"]').forEach((btn) => {
+    if (btn.dataset.moreBound === '1') return;
+    btn.dataset.moreBound = '1';
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const scope = btn.dataset.convBucketScope || 'sidebar';
+      const bucket = btn.dataset.convBucket || '';
+      try {
+        if (typeof opts.onBucketLoadMore === 'function') {
+          await opts.onBucketLoadMore(scope, bucket);
+        }
+      } finally {
+        if (btn.isConnected) btn.disabled = false;
+      }
+    });
+  });
   container.querySelectorAll('input.conv-item-title-input').forEach((input) => {
     if (input.dataset.renameBound === '1') return;
     input.dataset.renameBound = '1';
@@ -4010,7 +4322,9 @@ function renderConversationList() {
   // mental picture (projected convs live "inside" their project, the rest
   // sit in the catch-all section).
   const unprojected = (conversations || []).filter((c) => !c || !c.project_id);
-  if (!unprojected.length) {
+  const hasDeferredUnprojected = _conversationDeferredBuckets.last30 > 0
+    || _conversationDeferredBuckets.older > 0;
+  if (!unprojected.length && !hasDeferredUnprojected) {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.conv_empty">${escapeHtml(t('sidebar.conv_empty'))}</div>`;
     // Still re-render the projects section so its badges refresh (the call
     // is cheap when the cache is already loaded).
@@ -4019,9 +4333,41 @@ function renderConversationList() {
     if (typeof _refreshAutoExpandedTaskConvs === 'function') _refreshAutoExpandedTaskConvs();
     return;
   }
-  container.innerHTML = _renderConversationTimeBucketList(unprojected, { bucketScope: 'sidebar' });
+  container.innerHTML = _renderConversationTimeBucketList(unprojected, {
+    bucketScope: 'sidebar',
+    deferredBucketCounts: _conversationDeferredBuckets,
+    loadMoreBuckets: {
+      last30: _oldConversationPages.last30.initialized
+        && _oldConversationPages.last30.nextOffset !== null,
+      older: _oldConversationPages.older.initialized
+        && _oldConversationPages.older.nextOffset !== null,
+    },
+  });
 
-  _bindConversationSidebarItems(container, { onBucketToggle: renderConversationList });
+  _bindConversationSidebarItems(container, {
+    onBucketToggle(scope, bucket) {
+      const key = _conversationBucketKey(scope, bucket);
+      const page = _oldConversationPages[bucket];
+      const needsLoad = scope === 'sidebar'
+        && _conversationExpandedBuckets.has(key)
+        && page && !page.initialized && page.total > 0;
+      if (!needsLoad) {
+        renderConversationList();
+        return;
+      }
+      _loadOldUnprojectedConversations(bucket).catch((err) => {
+        _convLog.warn('load deferred conversation bucket failed', err);
+        _conversationExpandedBuckets.delete(key);
+        renderConversationList();
+      });
+    },
+    onBucketLoadMore(scope, bucket) {
+      if (scope !== 'sidebar') return;
+      return _loadOldUnprojectedConversations(bucket).catch((err) => {
+        _convLog.warn('load more deferred conversations failed', err);
+      });
+    },
+  });
 
   // Re-render the projects section (it consumes the same `conversations`
   // global to group projected items by project).
@@ -4111,6 +4457,90 @@ function _shouldShowConvCreateAgentInline(hasUserMsg, isStreaming, hasAgentMsg) 
 // Single observer wired once — any childList change on chat-history
 // (history load, send, stream final, spacer add/remove) re-runs ensure.
 let _createAgentInlineObserver = null;
+// Conversation detail history is deliberately page-sized. Each "older"
+// request carries the previous page's opaque byte cursor, so both disk reads
+// and first paint stay bounded even for very long JSONL transcripts.
+const HISTORY_PAGE_SIZE = 10;
+
+function _historyRequestUrl(cid, before = null) {
+  let url = `/api/conversations/${encodeURIComponent(cid)}/history?limit=${HISTORY_PAGE_SIZE}`;
+  if (Number.isSafeInteger(before) && before >= 0) url += `&before=${before}`;
+  // The sidebar already knows the physical owner. Main treats this only as a
+  // validated lookup hint and falls back safely if sync moved the conversation.
+  url += `&project_id=${encodeURIComponent(_projectIdForConversation(cid))}`;
+  return url;
+}
+
+function _membersRequestUrl(cid) {
+  return `/api/conversations/${encodeURIComponent(cid)}/members?project_id=${encodeURIComponent(_projectIdForConversation(cid))}`;
+}
+
+function _historyNextCursor(value) {
+  const cursor = Number(value);
+  return Number.isSafeInteger(cursor) && cursor > 0 ? cursor : null;
+}
+
+function _setLoadEarlierHistory(container, cid, nextCursor) {
+  if (!container) return;
+  const existing = container.querySelector('.chat-history-load-earlier');
+  const cursor = _historyNextCursor(nextCursor);
+  if (cursor === null) {
+    if (existing) existing.remove();
+    return;
+  }
+  const row = existing || document.createElement('div');
+  row.className = 'chat-history-load-earlier';
+  let button = row.querySelector('button');
+  if (!button) {
+    button = document.createElement('button');
+    button.type = 'button';
+    row.appendChild(button);
+  }
+  button.disabled = false;
+  button.textContent = t('chat.history_load_earlier');
+  button.onclick = () => _loadOlderConversationHistory(cid, cursor);
+  if (!existing) container.insertBefore(row, container.firstChild);
+}
+
+async function _loadOlderConversationHistory(cid, before) {
+  if (!cid || cid !== currentCid) return;
+  const container = document.getElementById('chat-history');
+  if (!container) return;
+  const row = container.querySelector('.chat-history-load-earlier');
+  const button = row?.querySelector('button');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  try {
+    const res = await apiFetch(_historyRequestUrl(cid, before));
+    const data = await res.json();
+    if (!data?.ok) throw new Error(data?.error || 'load failed');
+    if (cid !== currentCid) return;
+
+    const knownIds = new Set(Array.from(container.querySelectorAll('.chat-message[data-msg-id]'))
+      .map((el) => el.dataset.msgId)
+      .filter(Boolean));
+    const page = (Array.isArray(data.history) ? data.history : [])
+      .filter((gm) => gm && !gm.dispatch && (!gm.id || !knownIds.has(String(gm.id))))
+      .map(_groupMsgToLegacy)
+      .sort((a, b) => _msTs(a && a.time) - _msTs(b && b.time));
+    const fragment = document.createDocumentFragment();
+    page.forEach((msg) => appendChatMessage(msg, false, {
+      cid,
+      container: fragment,
+      historyHydration: true,
+    }));
+    if (row) container.insertBefore(fragment, row);
+    else container.insertBefore(fragment, container.firstChild);
+    _setLoadEarlierHistory(container, cid, data.next_cursor);
+    // The user deliberately requested older history, so reveal the new page
+    // rather than preserving the previous top loader as the viewport anchor.
+    container.scrollTop = 0;
+  } catch (err) {
+    _convLog.warn('load older conversation history failed', err);
+    if (button) button.disabled = false;
+  }
+}
+
 function _ensureCreateAgentInlineObserver() {
   if (_createAgentInlineObserver) return;
   const target = document.getElementById('chat-history');
@@ -4121,6 +4551,7 @@ function _ensureCreateAgentInlineObserver() {
 }
 
 async function loadConversationHistory(cid, opts = {}) {
+  const perfStartedAt = performance.now();
   const container = document.getElementById('chat-history');
   const preserveScroll = opts && opts.preserveScroll === true;
   const scrollSnapshot = preserveScroll ? _captureHistoryReloadScroll(container) : null;
@@ -4130,25 +4561,42 @@ async function loadConversationHistory(cid, opts = {}) {
   }
   _ensureCreateAgentInlineObserver();
   try {
+    // Start the independent IPC requests first. Agent names are still ready
+    // before transcript rendering, but a cold summary-cache fill no longer
+    // serializes ahead of the history round trip.
+    const historyStartedAt = performance.now();
+    const historyPromise = apiFetch(_historyRequestUrl(cid));
+    const membersStartedAt = performance.now();
+    const membersPromise = _refreshGroupMembers(cid).then((actors) => {
+      _convLog.info('conversation detail members ready', {
+        cid,
+        ms: Math.round(performance.now() - membersStartedAt),
+        count: Array.isArray(actors) ? actors.length : 0,
+      });
+      return actors;
+    }).catch((err) => {
+      _convLog.warn('conversation detail members refresh failed', err);
+      return [];
+    });
     // Warm `_agentsCache` if a chat-first session never visited the agents
     // tab — `_buildMentionRe` / `_groupActorLabel` both read it for current
     // names. Without this, a user who lands straight in a conversation gets
     // multi-word `@<name>` highlighting truncated to the first whitespace.
+    const agentsStartedAt = performance.now();
     if (typeof loadAgents === 'function'
         && typeof _agentsCache !== 'undefined' && !_agentsCache) {
-      try { await loadAgents(); } catch (_) { /* non-fatal */ }
+      try { await loadAgents(false, { summary: true }); } catch (_) { /* non-fatal */ }
     }
-    // History + members are two independent IPC calls (only `cid` in
-    // common). The contract is "members must be ready BEFORE the forEach
-    // below runs" — not "before the history fetch returns". Issue both
-    // in parallel and await together so the cold-open RTT is one round
-    // instead of two. `_refreshGroupMembers` swallows its own errors,
-    // so the Promise.all only rejects on the history fetch.
-    const [res] = await Promise.all([
-      apiFetch(`/api/conversations/${cid}/history?limit=500`),
-      _refreshGroupMembers(cid),
-    ]);
+    const agentsReadyMs = Math.round(performance.now() - agentsStartedAt);
+    // Member avatars and deleted-Agent fallback names are secondary detail.
+    // Start their refresh with history, but do not make the 10-row transcript
+    // wait for member-file reads and per-Agent enrichment. The startup Agent
+    // summary covers normal labels; completion repaints header/placeholders.
+    const res = await historyPromise;
+    const historyResponseMs = Math.round(performance.now() - historyStartedAt);
+    const parseStartedAt = performance.now();
     const data = await res.json();
+    const jsonParseMs = Math.round(performance.now() - parseStartedAt);
     if (!data.ok) throw new Error(data.error || 'load failed');
     const convMeta = data.conversation || {};
     _serverFloorByCid.set(cid, typeof convMeta.active_recipient === 'string' ? convMeta.active_recipient : '');
@@ -4166,12 +4614,14 @@ async function loadConversationHistory(cid, opts = {}) {
     // placeholders for any additional actors — no orphan window.
     _groupPlaceholders.clear();
     // Drop internal plan-step dispatch messages (commander → agent
-    // hand-off). The user already saw the plan announcement; surfacing
-    // these adds noise (e.g. "@<agent-name> <user request>") in the user's view.
-    // The agent's visibility slice still carries them so the agent has
-    // the dispatch text in its own context.
+    // hand-off) AND redundant routing-only commander tails (the "second
+    // commander bubble" — read agent.json + hand_off_to, no prose). The user
+    // already saw the narration seg bubble; surfacing these adds noise. The
+    // agent's visibility slice still carries dispatches so the agent has the
+    // dispatch text in its own context.
+    const renderStartedAt = performance.now();
     const visibleGroupHistory = (data.history || [])
-      .filter((gm) => !(gm && gm.dispatch));
+      .filter(_isVisibleGroupHistoryRecord);
     const history = visibleGroupHistory
       .map(_groupMsgToLegacy)
       // Defensive sort by ts: jsonl is append-ordered (already chronological),
@@ -4182,8 +4632,31 @@ async function loadConversationHistory(cid, opts = {}) {
       container.innerHTML = `<div class="empty">${escapeHtml(t('chat.empty'))}</div>`;
     } else {
       container.innerHTML = '';
-      history.forEach((msg, idx) => appendChatMessage(msg, false, { cid, msgIndex: idx }));
+      // The history array is already time-sorted above. Stage it off-DOM and
+      // bypass the live-event dedupe/sorted-insertion work: doing either for
+      // every persisted row turns even a small paged cold open into repeated DOM
+      // tree scans. Live messages and recovery paths still use the guarded
+      // incremental insertion path below.
+      const historyFragment = document.createDocumentFragment();
+      history.forEach((msg, idx) => appendChatMessage(msg, false, {
+        cid,
+        msgIndex: idx,
+        container: historyFragment,
+        historyHydration: true,
+      }));
+      container.appendChild(historyFragment);
     }
+    _setLoadEarlierHistory(container, cid, data.next_cursor);
+    const renderMs = Math.round(performance.now() - renderStartedAt);
+    _convLog.info('conversation detail first paint', {
+      cid,
+      total_ms: Math.round(performance.now() - perfStartedAt),
+      agents_ms: agentsReadyMs,
+      history_response_ms: historyResponseMs,
+      json_ms: jsonParseMs,
+      render_ms: renderMs,
+      rows: history.length,
+    });
     await _evaluateAutoRecipient(cid);
 
     // Detect unanswered user message (e.g. after page refresh while server was processing).
@@ -4217,12 +4690,12 @@ async function loadConversationHistory(cid, opts = {}) {
       && processingFresh
       && (lastMsg?.role === 'user' || inFlightActors.length > 0);
     if (shouldRecoverRunningUi) {
-      pollMsgCounts.set(cid, history.length);
+      pollMsgCounts.set(cid, String(lastMsg?._msg_id || ''));
       const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
       pendingConvs.set(cid, { loadingEl, needsIndicator: false });
       if (hasActiveTurnsField) {
         for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id);
+          _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
         }
       } else {
         for (const actorId of inFlightActors) {
@@ -4248,7 +4721,7 @@ async function loadConversationHistory(cid, opts = {}) {
         state = { loadingEl: null, needsIndicator: false, controller: null, aborted: false };
         pendingConvs.set(cid, state);
       }
-      pollMsgCounts.set(cid, history.length);
+      pollMsgCounts.set(cid, String(lastMsg?._msg_id || ''));
       if (state.loadingEl) {
         const emptyEl = container.querySelector('.empty');
         if (emptyEl) emptyEl.remove();
@@ -4259,7 +4732,7 @@ async function loadConversationHistory(cid, opts = {}) {
       }
       if (hasActiveTurnsField) {
         for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, state.loadingEl, turn.turn_id, turn.msg_id);
+          _ensureActorPlaceholder(cid, turn.actor, state.loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
         }
       } else {
         for (const actorId of inFlightActors) {
@@ -4289,6 +4762,7 @@ async function loadConversationHistory(cid, opts = {}) {
     if (cid === currentCid && !isConvPending(cid) && (messageQueues.get(cid) || []).length) {
       _dispatchNextQueued(cid);
     }
+    void membersPromise;
   } catch (e) {
     if (!preserveScroll) {
       container.innerHTML = `<div class="empty">${escapeHtml(t('chat.load_failed', { msg: e.message || '' }))}</div>`;
@@ -4329,10 +4803,10 @@ function _scheduleHistoryReconcileAfterStream(cid, opts = {}) {
     const container = document.getElementById('chat-history');
     if (!container) return;
     try {
-      const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/history?limit=500`);
+      const res = await apiFetch(_historyRequestUrl(cid));
       const data = await res.json();
       if (!data.ok || !Array.isArray(data.history)) return;
-      const visible = data.history.filter((gm) => !(gm && gm.dispatch));
+      const visible = data.history.filter(_isVisibleGroupHistoryRecord);
       for (const gm of visible.slice(-8)) {
         if (!gm || !gm.id) continue;
         const el = _findRenderedMessageForHistoryRecord(container, gm);
@@ -4351,7 +4825,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   if (!container) return false;
   let changed = false;
   try { await _refreshGroupMembers(cid); } catch (_) { /* best effort */ }
-  const visible = rawMessages.filter((gm) => gm && !gm.dispatch && gm.from !== 'user');
+  const visible = rawMessages.filter((gm) => _isVisibleGroupHistoryRecord(gm) && gm.from !== 'user');
   for (const gm of visible) {
     if (!gm.id) continue;
     const existing = _findRenderedMessageForHistoryRecord(container, gm);
@@ -4425,7 +4899,7 @@ async function _renderRelayUserMessagesIfMissing(cid) {
   if (!container) return;
   let data;
   try {
-    const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/history?limit=500`);
+    const res = await apiFetch(_historyRequestUrl(cid));
     data = await res.json();
   } catch (_) { return; }
   if (!data || !data.ok || !Array.isArray(data.history)) return;
@@ -4498,9 +4972,9 @@ function _restoreHistoryReloadScroll(container, snapshot) {
 // ─── Sticky-bottom auto-scroll ─────────────────────────────────────────────
 // Track per-container "is the user pinned to the bottom?" so streaming
 // content (process info / token deltas / new bubbles) auto-scrolls down
-// only while the user wants to follow. Mid-stream scroll-up suspends
-// auto-stick; scrolling back to (near) bottom resumes it. Tab-switch back
-// re-applies the stick if it was on at the moment of going hidden.
+// only while the user wants to follow. Any mid-stream scroll gesture
+// suspends auto-stick; scrolling back to (near) bottom resumes it. Tab-switch
+// back re-applies the stick if it was on at the moment of going hidden.
 //
 // Why a threshold (32 px) instead of strict equality: programmatic scrolls
 // (`scrollTop = scrollHeight`) and Chromium's sub-pixel rounding leave a
@@ -4528,6 +5002,18 @@ function _markStickyPausedByUser(el) {
   el._stickyUserPaused = true;
   el._stickyEnabled = false;
 }
+// The send-time spacer is only a positioning aid: it lets a short outgoing
+// message sit near the top before the reply has enough height of its own.
+// Keeping that artificial scroll range for the whole run makes a downward
+// wheel / trackpad gesture at the pinned edge appear to do nothing. As soon
+// as the user expresses any scroll intent, remove the spacer and let the
+// browser's real transcript height own scrolling for the rest of the turn.
+function _releaseChatScrollPinForUser(el) {
+  if (!el || !el._scrollPinActive) return false;
+  _setChatScrollOffset(false, el);
+  _markStickyPausedByUser(el);
+  return true;
+}
 function _isStickyPausedByUser(el) {
   if (!el || !el._stickyUserPaused) return false;
   if (_isNearFollowTarget(el)) {
@@ -4543,10 +5029,14 @@ function _bindStickToBottom(el) {
   if (el._stickyEnabled === undefined) el._stickyEnabled = true;
   el.addEventListener('wheel', (ev) => {
     const dy = Number(ev?.deltaY || 0);
-    if (dy < 0 || (dy !== 0 && !_isNearFollowTarget(el))) _markStickyPausedByUser(el);
+    const releasedPin = dy !== 0 && _releaseChatScrollPinForUser(el);
+    if (releasedPin || dy < 0 || (dy !== 0 && !_isNearFollowTarget(el))) {
+      _markStickyPausedByUser(el);
+    }
   }, { passive: true });
   el.addEventListener('touchmove', () => {
-    if (!_isNearFollowTarget(el)) _markStickyPausedByUser(el);
+    const releasedPin = _releaseChatScrollPinForUser(el);
+    if (releasedPin || !_isNearFollowTarget(el)) _markStickyPausedByUser(el);
   }, { passive: true });
   el.addEventListener('scroll', () => {
     const nearBottom = _isNearFollowTarget(el);
@@ -4592,6 +5082,13 @@ function _stickBottomFromMsg(msg) {
   _stickBottomIfPinned(msg.parentElement);
 }
 
+if (typeof document !== 'undefined') {
+  document.addEventListener('chat-image-settled', (event) => {
+    const msg = event.target?.closest?.('.chat-message');
+    if (msg) _stickBottomFromMsg(msg);
+  });
+}
+
 function _streamMathSignatureForText(text) {
   const src = String(text || '');
   if (!src || (src.indexOf('$') < 0 && src.indexOf('\\') < 0)) return '';
@@ -4622,6 +5119,20 @@ function _streamingStableMediaKey(kind, src) {
   return `${normalizedKind}\x1f${normalizedSrc}`;
 }
 
+const _STREAMING_MANAGED_MEDIA_SELECTOR = '.chat-md-img-shell, .chat-md-video-shell, .chat-md-audio-card';
+
+function _streamingStandaloneMediaKind(node) {
+  const tag = String(node?.tagName || '').toLowerCase();
+  if (tag === 'img') return 'image-node';
+  if (tag === 'video') return 'video-node';
+  if (tag === 'audio') return 'audio-node';
+  return '';
+}
+
+function _streamingIsManagedMediaChild(node) {
+  return !!(node && typeof node.closest === 'function' && node.closest(_STREAMING_MANAGED_MEDIA_SELECTOR));
+}
+
 function _streamingCollectStableMedia(root) {
   const stable = new Map();
   if (!root || typeof root.querySelectorAll !== 'function') return stable;
@@ -4632,6 +5143,10 @@ function _streamingCollectStableMedia(root) {
     list.push(node);
     stable.set(key, list);
   };
+  root.querySelectorAll('.chat-md-img-shell').forEach((shell) => {
+    const image = shell && shell.querySelector ? shell.querySelector('img.chat-md-img[src]') : null;
+    add('image', image && image.getAttribute ? image.getAttribute('src') : '', shell);
+  });
   root.querySelectorAll('.chat-md-video-shell').forEach((shell) => {
     const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video[src]') : null;
     add('video', video && video.getAttribute ? video.getAttribute('src') : '', shell);
@@ -4639,6 +5154,14 @@ function _streamingCollectStableMedia(root) {
   root.querySelectorAll('.chat-md-audio-card').forEach((card) => {
     const audio = card && card.querySelector ? card.querySelector('audio.chat-md-audio[src]') : null;
     add('audio', audio && audio.getAttribute ? audio.getAttribute('src') : '', card);
+  });
+  // Dashboard Image nodes and sanitized raw HTML media do not use the
+  // markdown media shells above. Preserve them directly so a stream repaint
+  // cannot restart image decoding or reset native audio/video playback.
+  root.querySelectorAll('img[src], video[src], audio[src]').forEach((media) => {
+    if (_streamingIsManagedMediaChild(media)) return;
+    const kind = _streamingStandaloneMediaKind(media);
+    add(kind, media && media.getAttribute ? media.getAttribute('src') : '', media);
   });
   return stable;
 }
@@ -4678,8 +5201,30 @@ function _streamingSyncStableMediaNode(existing, fresh) {
   return existing;
 }
 
+function _streamingSyncStableImageNode(existing, fresh) {
+  if (!existing || !fresh) return existing;
+  const existingImage = existing.querySelector
+    ? existing.querySelector('img.chat-md-img[src]')
+    : null;
+  const freshImage = fresh.querySelector
+    ? fresh.querySelector('img.chat-md-img[src]')
+    : null;
+  if (existingImage && freshImage) _streamingCopyElementAttributes(existingImage, freshImage);
+  // The existing shell owns the real image request and its settled state.
+  // Copying the fresh shell would reset a decoded image back to `is-loading`;
+  // because the reused <img> does not load twice, it would then stay hidden.
+  return existing;
+}
+
 function _streamingRestoreStableMedia(nextRoot, stable) {
   if (!nextRoot || !stable || !stable.size || typeof nextRoot.querySelectorAll !== 'function') return;
+  nextRoot.querySelectorAll('.chat-md-img-shell').forEach((freshShell) => {
+    const image = freshShell && freshShell.querySelector ? freshShell.querySelector('img.chat-md-img[src]') : null;
+    const key = _streamingStableMediaKey('image', image && image.getAttribute ? image.getAttribute('src') : '');
+    const reusable = key ? stable.get(key) : null;
+    const existing = reusable && reusable.shift ? reusable.shift() : null;
+    if (existing && freshShell.replaceWith) freshShell.replaceWith(_streamingSyncStableImageNode(existing, freshShell));
+  });
   nextRoot.querySelectorAll('.chat-md-video-shell').forEach((freshShell) => {
     const video = freshShell && freshShell.querySelector ? freshShell.querySelector('video.chat-md-video[src]') : null;
     const key = _streamingStableMediaKey('video', video && video.getAttribute ? video.getAttribute('src') : '');
@@ -4693,6 +5238,17 @@ function _streamingRestoreStableMedia(nextRoot, stable) {
     const reusable = key ? stable.get(key) : null;
     const existing = reusable && reusable.shift ? reusable.shift() : null;
     if (existing && freshCard.replaceWith) freshCard.replaceWith(_streamingSyncStableMediaNode(existing, freshCard));
+  });
+  nextRoot.querySelectorAll('img[src], video[src], audio[src]').forEach((freshMedia) => {
+    if (_streamingIsManagedMediaChild(freshMedia)) return;
+    const kind = _streamingStandaloneMediaKind(freshMedia);
+    const src = freshMedia && freshMedia.getAttribute ? freshMedia.getAttribute('src') : '';
+    const key = _streamingStableMediaKey(kind, src);
+    const reusable = key ? stable.get(key) : null;
+    const existing = reusable && reusable.shift ? reusable.shift() : null;
+    if (!existing || !freshMedia.replaceWith) return;
+    _streamingCopyElementAttributes(existing, freshMedia);
+    freshMedia.replaceWith(existing);
   });
 }
 
@@ -4807,6 +5363,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     : document.getElementById('chat-history');
   if (!container) return null;
   const archive = opts.archive !== false;   // default on for backwards compat
+  const historyHydration = opts.historyHydration === true;
 
   // Dedupe by `_msg_id`: when the user switches conv tabs during a
   // streaming turn, the same persisted message can reach the renderer
@@ -4820,7 +5377,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // one. Idempotent re-render is the right contract — return the
   // existing node so callers that want to mutate it (chip mounting /
   // dataset writes) still find the right target.
-  if (message && message._msg_id) {
+  if (!historyHydration && message && message._msg_id) {
     const existing = container.querySelector(
       `.chat-message[data-msg-id="${CSS.escape(String(message._msg_id))}"]`,
     );
@@ -4829,10 +5386,12 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       return existing;
     }
   }
-  const existingBySig = _findRenderedGroupMessage(container, message);
-  if (existingBySig) {
-    _syncRenderedGroupMessageIdentity(existingBySig, message);
-    return existingBySig;
+  if (!historyHydration) {
+    const existingBySig = _findRenderedGroupMessage(container, message);
+    if (existingBySig) {
+      _syncRenderedGroupMessageIdentity(existingBySig, message);
+      return existingBySig;
+    }
   }
 
   const emptyEl = container.querySelector('.empty');
@@ -4869,8 +5428,11 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const attachmentsHtml = (role === 'user' && Array.isArray(message.attachments) && message.attachments.length)
     ? _renderMessageAttachmentsHtml(message.attachments, attachmentCid)
     : '';
-  const producedHtml = (role === 'assistant' && Array.isArray(message.produced) && message.produced.length)
-    ? _renderMessageProducedHtml(message.produced)
+  const producedPaths = (role === 'assistant' && Array.isArray(message.produced) && message.produced.length)
+    ? message.produced
+    : null;
+  const referencesHtml = (role === 'user' && Array.isArray(message.references) && message.references.length)
+    ? _renderMessageReferencesHtml(message.references)
     : '';
   const failedAssistant = role === 'assistant' && _isFailedAssistantContent(rawContent, message);
   const createdAgentsList = role === 'assistant' ? _normalizeCreatedAgents(message) : null;
@@ -4902,13 +5464,12 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from${_isActorDetailTarget(headerActorId) ? ' is-agent-link' : ''}"${_actorLinkAttrs(headerActorId)}>${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
     ? `<div class="chat-plan-announce">${_uiIconHtml('clipboard-list', 'ui-icon chat-plan-announce-icon')}<span>${escapeHtml(t('chat.plan_announce'))}</span></div>` : '';
-  // Below-bubble action row holds produced-file chips + created-agent chip
-  // + archive button (the legacy `.chat-meta` slot). Lives OUTSIDE the
-  // bubble so chips read as a footer, not as inline body content.
+  // Deliverables mount last inside the bubble as a footer strip. The separate
+  // action row remains for created-agent/skill links and message actions.
   msgDiv.innerHTML = `
     ${headerHtml}
-    <div class="chat-bubble">${planAnnHtml}${contentHtml}${attachmentsHtml}</div>
-    <div class="chat-msg-actions" data-role="msg-actions">${producedHtml}${createdAgentHtml}${createdSkillHtml}</div>
+    <div class="chat-bubble">${planAnnHtml}${referencesHtml}${contentHtml}${attachmentsHtml}</div>
+    <div class="chat-msg-actions" data-role="msg-actions">${createdAgentHtml}${createdSkillHtml}</div>
   `;
   if (typeof opts.msgIndex === 'number') msgDiv.dataset.msgIndex = String(opts.msgIndex);
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
@@ -4930,14 +5491,22 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (Array.isArray(message.produced) && message.produced.length) {
     msgDiv.dataset.produced = JSON.stringify(message.produced);
   }
-  _insertByTimestamp(container, msgDiv);
+  if (Array.isArray(message.attachments) && message.attachments.length) {
+    msgDiv.dataset.attachments = JSON.stringify(message.attachments);
+  }
+  if (Array.isArray(message.references) && message.references.length) {
+    msgDiv.dataset.referenceCount = String(message.references.length);
+    msgDiv.dataset.references = JSON.stringify(message.references.slice(0, 20));
+  }
+  if (historyHydration) container.appendChild(msgDiv);
+  else _insertByTimestamp(container, msgDiv);
   if (role === 'user') _moveUserBeforeOrphanLivePlaceholder(container, msgDiv);
   if (!isHtmlSnippet && typeof typesetMath === 'function') {
     const md = msgDiv.querySelector('.markdown-body');
     if (md) typesetMath(md);
   }
   if (attachmentsHtml) _hydrateMessageAttachmentThumbs(msgDiv, attachmentCid);
-  if (producedHtml) _hydrateMessageProducedChips(msgDiv);
+  if (referencesHtml) _hydrateMessageReferenceFiles(msgDiv);
   _hydrateActorHeaderLinks(msgDiv);
   if (createdAgentHtml) _hydrateMessageCreatedAgentChip(msgDiv);
   if (createdSkillHtml) _hydrateMessageCreatedSkillChip(msgDiv);
@@ -4966,12 +5535,22 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     const bubble = msgDiv.querySelector('.chat-bubble');
     if (bubble) window.mountMessageArtifacts(bubble, message.artifacts, opts.cid || currentCid);
   }
-  // Archive button is only for finalised assistant replies (raw markdown,
-  // not an HTML placeholder / status stub).
+  if (producedPaths) _mountMessageProducedFooter(msgDiv, producedPaths);
+  // Every assistant reply gets actions. Archive remains limited to final
+  // raw-markdown replies; sanitized HTML status stubs are not archivable.
   if (role === 'assistant' && failedAssistant) {
     _attachFailedAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent));
-  } else if (role === 'assistant' && !isHtmlSnippet && archive) {
-    _attachBubbleArchiveBtn(msgDiv, () => rawContent);
+  } else if (role === 'assistant') {
+    _attachAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent), {
+      archive: !isHtmlSnippet && archive,
+    });
+  } else if (role === 'user') {
+    _attachBubbleActions(msgDiv, () => (
+      _textFromBubbleWithout(
+        msgDiv,
+        '.chat-reference-bundle, .chat-msg-attachments, .chat-input-form, .chat-artifacts, iframe',
+      ) || String(displayContent || '')
+    ), { archive: false });
   }
   // Persisted-process trail is independent of body type — it must render
   // for HTML-stub bodies too (e.g. CLI warning spans),
@@ -5000,6 +5579,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (role === 'assistant' && autoScroll !== false) {
     _scheduleConversationInfoFileRefresh(opts.cid || currentCid);
   }
+  if (!historyHydration && _messageSelectionState?.cid === currentCid) _syncMessageSelectionUi();
   return msgDiv;
 }
 
@@ -5262,7 +5842,7 @@ async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision
     }
     if (updated.status === 'installed') {
       if (updated.kind === 'agent') { try { loadAgents?.(true); } catch (_) {} }
-      else { try { loadSkills?.(true); } catch (_) {} }
+      else if (typeof loadSkills === 'function') { try { loadSkills(true); } catch (_) {} }
     }
     const submissionText = data.submission && data.submission.text;
     if (submissionText) await sendInCurrentConversation(submissionText);
@@ -5324,11 +5904,11 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
 }
 
 // ─── Quote-reply (per-cid) ───────────────────────────────────────────────
-// Feishu-style: clicking the quote button on an assistant bubble captures
-// its text + chip-tracked produced files into a per-cid payload. The payload
-// renders as a preview block above the textarea (with × to drop), survives
-// conv switch (in-memory, not localStorage — drafts are ephemeral), and is
-// prepended as a markdown blockquote when the user finally hits send.
+// Clicking quote on assistant bubbles appends their text + chip-tracked
+// produced files to a per-cid collection. The collection renders above the
+// textarea, supports per-item removal, and is persisted with the destination
+// task's draft. On send it travels as structured `references`; the legacy
+// markdown serializer remains below only for old queued/tested draft shapes.
 // Routing reuses the existing recipient picker — quote does NOT change the
 // recipient.
 //
@@ -5338,59 +5918,195 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
 // stream-finalize path) lets the quote handler stay zero-arg without
 // plumbing message into every _attachBubbleArchiveBtn call site.
 //
-// `_quoteByCid` itself is declared early (above `_recipientByCid`'s neighbour
+// `_quotesByCid` itself is declared early (above `_recipientByCid`'s neighbour
 // block) so the DOMContentLoaded init can call _renderQuotePreview before
 // this section evaluates without hitting a TDZ.
 
-function _setQuote(cid, payload) {
-  if (!cid) return;
-  if (!payload) _quoteByCid.delete(cid);
-  else _quoteByCid.set(cid, payload);
-  if (cid === currentCid) _renderQuotePreview();
+function _quoteIdentity(payload) {
+  if (!payload) return '';
+  const msgId = String(payload.msgId || '');
+  const sourceCid = String(payload.sourceCid || '');
+  if (msgId) return `id:${sourceCid}:${msgId}`;
+  return `content:${String(payload.fromActor || '')}\n${String(payload.text || '')}\n${JSON.stringify(payload.produced || [])}`;
 }
-function _getQuote(cid) { return cid ? _quoteByCid.get(cid) || null : null; }
-function _clearQuote(cid) { _setQuote(cid, null); }
 
-// Render (or hide) the preview block for the active cid. Idempotent — safe
-// to call on conv switch / i18n change / quote set / quote clear.
-function _renderQuotePreview() {
-  const wrap = document.getElementById('chat-quote-preview');
+function _conversationTitleForCid(cid) {
+  const conv = Array.isArray(conversations)
+    ? conversations.find((item) => item && item.conversation_id === cid)
+    : null;
+  return (conv && conv.title) || t('chat.reference_unknown_task');
+}
+
+function _referenceDisplayName(ref) {
+  if (!ref) return t('chat.from_agent_unknown');
+  const actor = ref.from_actor || ref.fromActor || '';
+  if (actor === 'user') return t('chat.from_user');
+  if (actor === 'commander') return t('chat.from_commander');
+  return ref.from_name || ref.fromName || _groupActorLabel(actor) || t('chat.from_agent_unknown');
+}
+
+function _quotePreviewAttribution(quote, targetCid) {
+  const fromName = _referenceDisplayName(quote);
+  const sourceCid = String(quote?.sourceCid || '');
+  if (!sourceCid || sourceCid === String(targetCid || '')) {
+    return t('chat.quote_from', { name: fromName });
+  }
+  const sourceTitle = quote.sourceTitle || _conversationTitleForCid(sourceCid);
+  return t('chat.reference_from_task', { title: sourceTitle, name: fromName });
+}
+
+function _renderMessageReferencesHtml(references) {
+  const refs = Array.isArray(references) ? references.slice(0, 20) : [];
+  if (!refs.length) return '';
+  const sourceTitle = refs[0].source_title || t('chat.reference_unknown_task');
+  const title = t('chat.reference_bundle_title', { title: sourceTitle });
+  const rows = refs.map((ref) => {
+    const name = _referenceDisplayName(ref);
+    const text = String(ref.text || '').replace(/\s+/g, ' ').trim();
+    return `<div class="chat-reference-message">
+      <span class="chat-reference-author">${escapeHtml(name)}</span>
+      <span class="chat-reference-text">${escapeHtml(text)}</span>
+    </div>`;
+  }).join('');
+  const attachmentFiles = refs.flatMap((ref) => (Array.isArray(ref.attachments) ? ref.attachments : [])
+    .map((attachment) => ({
+      name: typeof attachment === 'string' ? attachment : attachment?.name,
+      sourceCid: ref.source_cid || '',
+    })))
+    .filter((item) => item.name && item.sourceCid)
+    .slice(0, 20)
+    .map((item) => `<button type="button" class="chat-reference-file is-attachment" data-attach-name="${escapeHtml(item.name)}" data-attach-cid="${escapeHtml(item.sourceCid)}" title="${escapeHtml(item.name)}">${_chatFileIconHtml(item.name)}<span>${escapeHtml(item.name)}</span></button>`)
+    .join('');
+  const producedFiles = refs.flatMap((ref) => Array.isArray(ref.produced) ? ref.produced : [])
+    .slice(0, Math.max(0, 20 - refs.reduce((count, ref) => count + (ref.attachments?.length || 0), 0)))
+    .map((file) => {
+      const base = String(file || '').split(/[\\/]/).pop() || file;
+      return `<span class="chat-reference-file">${_chatFileIconHtml(base)}<span>${escapeHtml(base)}</span></span>`;
+  }).join('');
+  const files = `${attachmentFiles}${producedFiles}`;
+  return `<div class="chat-reference-bundle">
+    <div class="chat-reference-title">${escapeHtml(title)}</div>
+    <div class="chat-reference-list">${rows}</div>
+    ${files ? `<div class="chat-reference-files">${files}</div>` : ''}
+  </div>`;
+}
+
+function _hydrateMessageReferenceFiles(msgDiv) {
+  msgDiv.querySelectorAll('.chat-reference-file.is-attachment[data-attach-name][data-attach-cid]').forEach((chip) => {
+    if (chip.dataset.bound === '1') return;
+    chip.dataset.bound = '1';
+    chip.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const name = chip.dataset.attachName || '';
+      const cid = chip.dataset.attachCid || '';
+      if (!name || !cid || typeof openChatFileViewer !== 'function') return;
+      try {
+        const result = await window.orkas.invoke('attachments.absPath', { cid, name });
+        if (!result?.ok || !result.path) {
+          _showFileMissingToast(name);
+          return;
+        }
+        openChatFileViewer(result.path, name, { cid });
+      } catch (_) { _showFileMissingToast(name); }
+    });
+  });
+}
+
+function _addQuote(cid, payload) {
+  if (!cid || !payload) return false;
+  const quotes = _quotesByCid.get(cid) || [];
+  const sourceCid = payload.sourceCid || currentCid || '';
+  const identity = _quoteIdentity({ ...payload, sourceCid });
+  if (quotes.some((quote) => _quoteIdentity(quote) === identity)) return false;
+  _quotesByCid.set(cid, quotes.concat({
+    ...payload,
+    sourceCid,
+    sourceTitle: payload.sourceTitle || (
+      typeof _conversationTitleForCid === 'function'
+        ? _conversationTitleForCid(payload.sourceCid || currentCid || '')
+        : ''
+    ),
+    attachments: Array.isArray(payload.attachments) ? payload.attachments.slice() : [],
+    references: Array.isArray(payload.references) ? payload.references.slice(0, 20) : [],
+    referenceCount: Math.max(0, Number(payload.referenceCount) || payload.references?.length || 0),
+    produced: Array.isArray(payload.produced) ? payload.produced.slice() : [],
+  }));
+  if (typeof _persistQuoteDraft === 'function') _persistQuoteDraft(cid);
+  _renderQuotePreview(cid);
+  return true;
+}
+
+function _removeQuoteAt(cid, index) {
+  if (!cid) return;
+  const quotes = _quotesByCid.get(cid) || [];
+  if (!Number.isInteger(index) || index < 0 || index >= quotes.length) return;
+  const next = quotes.filter((_, quoteIndex) => quoteIndex !== index);
+  if (next.length) _quotesByCid.set(cid, next);
+  else _quotesByCid.delete(cid);
+  if (typeof _persistQuoteDraft === 'function') _persistQuoteDraft(cid);
+  _renderQuotePreview(cid);
+}
+function _getQuotes(cid) { return cid ? _quotesByCid.get(cid) || [] : []; }
+function _clearQuotes(cid) {
+  if (!cid) return;
+  _quotesByCid.delete(cid);
+  if (typeof _persistQuoteDraft === 'function') _persistQuoteDraft(cid);
+  _renderQuotePreview(cid);
+}
+
+function _quotePreviewTarget(cid = currentCid) {
+  if (cid === DRAFT_CID) return { cid, id: 'new-chat-quote-preview' };
+  if (String(cid || '').startsWith('projchat-')) return { cid, id: 'project-chat-quote-preview' };
+  if (!cid || cid !== currentCid) return null;
+  return { cid, id: 'chat-quote-preview' };
+}
+
+// Render (or hide) the matching conversation, commander-draft, or project-
+// draft preview. Idempotent — safe on view changes and quote mutations.
+function _renderQuotePreview(cid = currentCid) {
+  const target = _quotePreviewTarget(cid);
+  if (!target) return;
+  const wrap = document.getElementById(target.id);
   if (!wrap) return;
-  const q = _getQuote(currentCid);
-  if (!q) {
+  const quotes = _getQuotes(target.cid);
+  if (!quotes.length) {
     wrap.style.display = 'none';
     wrap.innerHTML = '';
-    _updateChatInputReserve();
+    if (target.id === 'chat-quote-preview') _updateChatInputReserve();
     return;
   }
-  // fromName resolved at render time (not at click time) so renames after
-  // capture flow through naturally; fall back to the click-time snapshot
-  // when the actor was deleted between capture and render.
-  const liveName = q.fromActor === 'commander'
-    ? (t('chat.from_commander'))
-    : _groupActorLabel(q.fromActor);
-  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown'));
-  const trunc = String(q.text || '');
-  const fileChips = (q.produced || []).map((p) => {
-    const base = String(p || '').split(/[\\/]/).pop() || p;
-    return `<span class="chat-quote-file" title="${escapeHtml(p)}">${_chatFileIconHtml(base)}<span class="chat-quote-file-label">${escapeHtml(base)}</span></span>`;
+  wrap.innerHTML = quotes.map((q, index) => {
+    // Resolve attribution at render time so agent renames flow through;
+    // retain the click-time snapshot if the actor was deleted after capture.
+    const attribution = _quotePreviewAttribution(q, target.cid);
+    const fileChips = (q.produced || []).map((p) => {
+      const base = String(p || '').split(/[\\/]/).pop() || p;
+      return `<span class="chat-quote-file" title="${escapeHtml(p)}">${_chatFileIconHtml(base)}<span class="chat-quote-file-label">${escapeHtml(base)}</span></span>`;
+    }).concat((q.attachments || []).map((attachment) => {
+      const name = typeof attachment === 'string' ? attachment : attachment?.name;
+      return name ? `<span class="chat-quote-file" title="${escapeHtml(name)}">${_chatFileIconHtml(name)}<span class="chat-quote-file-label">${escapeHtml(name)}</span></span>` : '';
+    })).join('');
+    return `<div class="chat-quote-item">
+      <div class="chat-quote-header">
+        <span class="chat-quote-from">${escapeHtml(attribution)}</span>
+        <button type="button" class="chat-quote-close" data-quote-index="${index}" title="${escapeHtml(t('chat.quote_remove_title'))}">×</button>
+      </div>
+      <div class="chat-quote-body">${escapeHtml(String(q.text || ''))}</div>
+      ${q.referenceCount ? `<div class="chat-quote-nested">${escapeHtml(t('chat.quote_includes_references', { count: q.referenceCount }))}</div>` : ''}
+      ${fileChips ? `<div class="chat-quote-files">${fileChips}</div>` : ''}
+    </div>`;
   }).join('');
-  wrap.innerHTML = `
-    <div class="chat-quote-header">
-      <span class="chat-quote-from">${escapeHtml(t('chat.quote_from', { name: fromName }))}</span>
-      <button type="button" class="chat-quote-close" title="${escapeHtml(t('chat.quote_remove_title'))}">×</button>
-    </div>
-    <div class="chat-quote-body">${escapeHtml(trunc)}</div>
-    ${fileChips ? `<div class="chat-quote-files">${fileChips}</div>` : ''}
-  `;
   wrap.style.display = '';
-  _updateChatInputReserve();
-  const closeBtn = wrap.querySelector('.chat-quote-close');
-  if (closeBtn) closeBtn.addEventListener('click', () => _clearQuote(currentCid));
+  if (target.id === 'chat-quote-preview') _updateChatInputReserve();
+  wrap.querySelectorAll('.chat-quote-close').forEach((closeBtn) => {
+    closeBtn.addEventListener('click', () => {
+      _removeQuoteAt(target.cid, Number(closeBtn.dataset.quoteIndex));
+    });
+  });
 }
 
-// Prepend the active quote as a markdown blockquote so the receiving agent
-// sees it as inbound message body (no special parsing needed). File paths
+// Prepend active quotes as markdown blockquotes so the receiving agent sees
+// them in the inbound message body (no special parsing needed). File paths
 // land as absolute paths — same shape `produced[]` already stores; the agent
 // can `read_file('<abs>')` directly without any cwd assumptions.
 //
@@ -5405,16 +6121,44 @@ function _renderQuotePreview() {
 // user pressing send.
 function applyQuotePrefix(raw, target) {
   if (target !== 'conversation') return raw;
-  const q = _getQuote(currentCid);
-  if (!q) return raw;
-  const bodyLines = String(q.text || '').split('\n').map((l) => `> ${l}`).join('\n');
-  let block = bodyLines;
-  if (Array.isArray(q.produced) && q.produced.length) {
+  const quotes = _getQuotes(currentCid);
+  if (!quotes.length) return raw;
+  const blocks = quotes.map((q) => {
+    const bodyLines = String(q.text || '').split('\n').map((l) => `> ${l}`).join('\n');
+    if (!Array.isArray(q.produced) || !q.produced.length) return bodyLines;
     const filesHead = t('chat.quote_files_label');
     const fileLines = q.produced.map((p) => `> - \`${p}\``).join('\n');
-    block += `\n>\n> ${filesHead}\n${fileLines}`;
-  }
+    return `${bodyLines}\n>\n> ${filesHead}\n${fileLines}`;
+  });
+  const block = blocks.join('\n\n');
   return raw ? `${block}\n\n${raw}` : block;
+}
+
+function _referenceSnapshotsForQuotes(quotes) {
+  const out = [];
+  const seen = new Set();
+  const push = (ref) => {
+    if (!ref?.source_cid || !ref?.source_msg_id || out.length >= 20) return;
+    const identity = `${ref.source_cid}:${ref.source_msg_id}`;
+    if (seen.has(identity)) return;
+    seen.add(identity);
+    out.push(ref);
+  };
+  for (const quote of Array.isArray(quotes) ? quotes : []) {
+    push({
+      source_cid: quote.sourceCid || '',
+      source_title: quote.sourceTitle || _conversationTitleForCid(quote.sourceCid || ''),
+      source_msg_id: quote.msgId || '',
+      from_actor: quote.fromActor || '',
+      ...(quote.fromName ? { from_name: quote.fromName } : {}),
+      source_ts: quote.ts || '',
+      text: quote.text || '',
+      ...(quote.attachments?.length ? { attachments: quote.attachments.slice() } : {}),
+      ...(quote.produced?.length ? { produced: quote.produced.slice() } : {}),
+    });
+    for (const nested of quote.references || []) push(nested);
+  }
+  return out;
 }
 
 function _messageTextForActions(msgDiv, fallback = '') {
@@ -5440,44 +6184,72 @@ function _failedAssistantErrorText(msgDiv) {
     .filter(Boolean);
   if (errorLines.length) return errorLines.join('\n');
 
+  const explicitFailureLines = Array.from(bubble.querySelectorAll('[style*="var(--danger)"]'))
+    .map((el) => _normalizeFeedbackFieldText(el.textContent || ''))
+    .filter(Boolean);
+  if (explicitFailureLines.length) return explicitFailureLines.join('\n');
+
   const bubbleText = _normalizeFeedbackFieldText(bubble.textContent || '');
   const modelMatch = bubbleText.match(/(?:模型调用失败|model\s+(?:call|invocation)\s+failed)[:：]?\s*[^\n]*/i);
   if (modelMatch) return modelMatch[0].trim();
   const sendMatch = bubbleText.match(/(?:发送失败|send failed)[:：]?\s*[^\n]*/i);
   if (sendMatch) return sendMatch[0].trim();
-  return bubbleText;
+  // Do not fall back to the entire bubble: it can include tool process output,
+  // local paths, and the otherwise successful reply. Keep a stable failure
+  // class when no explicit error node is available.
+  return bubbleText ? 'Assistant response failed' : '';
 }
 
-function _failedAssistantReplyText(msgDiv, getContent) {
-  const bodyText = _textFromBubbleWithout(
-    msgDiv,
-    '.msg-error, .stream-process, .stream-aborted-note, .chat-input-form, .chat-artifacts, iframe',
-  );
-  const errorText = _failedAssistantErrorText(msgDiv);
-  if (bodyText && bodyText !== errorText) return bodyText;
+let _bubbleActionMenuListenersBound = false;
+let _openBubbleActionMenu = null;
 
-  const fallback = typeof getContent === 'function' ? _normalizeFeedbackFieldText(getContent() || '') : '';
-  if (fallback && fallback !== errorText) return fallback;
-  return '';
+function _closeBubbleActionMenus() {
+  const menu = _openBubbleActionMenu;
+  if (!menu) return;
+  menu.hidden = true;
+  const owner = menu.closest('.chat-bubble-actions');
+  const trigger = owner?.querySelector('.bubble-more-btn');
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  _openBubbleActionMenu = null;
 }
 
-function _failedAssistantFeedbackDetails(msgDiv, getContent) {
-  const actorId = msgDiv ? (msgDiv.dataset.fromActor || msgDiv.dataset.from || '') : '';
-  const actorName = actorId ? (_groupActorLabel(actorId) || actorId) : '';
-  const msgId = msgDiv ? (msgDiv.dataset.msgId || '') : '';
-  return {
-    cid: currentCid || '',
-    actor: actorName,
-    msgId,
-    errorText: _failedAssistantErrorText(msgDiv),
-    replyText: _failedAssistantReplyText(msgDiv, getContent),
-  };
+function _bindBubbleActionMenuDismiss() {
+  if (_bubbleActionMenuListenersBound) return;
+  _bubbleActionMenuListenersBound = true;
+  document.addEventListener('mousedown', (event) => {
+    if (event.target?.closest?.('.chat-bubble-actions')) return;
+    _closeBubbleActionMenus();
+  }, true);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') _closeBubbleActionMenus();
+  });
+  window.addEventListener('resize', () => _closeBubbleActionMenus());
+  window.addEventListener('scroll', () => _closeBubbleActionMenus(), true);
+}
+
+function _wireBubbleActionMenu(actions) {
+  const trigger = actions?.querySelector('.bubble-more-btn');
+  const menu = actions?.querySelector('.chat-bubble-more-menu');
+  if (!trigger || !menu) return;
+  _bindBubbleActionMenuDismiss();
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (_openBubbleActionMenu === menu) {
+      _closeBubbleActionMenus();
+      return;
+    }
+    _closeBubbleActionMenus();
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    _openBubbleActionMenu = menu;
+  });
+  menu.addEventListener('click', () => _closeBubbleActionMenus());
 }
 
 function _attachBubbleRetryBtn(actions, msgDiv) {
   if (!actions || actions.querySelector('.bubble-retry-btn')) return;
   const retryBtn = document.createElement('button');
-  retryBtn.className = 'bubble-retry-btn';
+  retryBtn.className = 'bubble-action-btn bubble-retry-btn';
   retryBtn.title = t('chat.retry_btn_title');
   retryBtn.textContent = t('chat.retry_btn');
   retryBtn.addEventListener('click', async (e) => {
@@ -5487,31 +6259,310 @@ function _attachBubbleRetryBtn(actions, msgDiv) {
   actions.appendChild(retryBtn);
 }
 
-function _attachBubbleReportBtn(actions, msgDiv, getContent) {
-  if (!actions || actions.querySelector('.bubble-report-btn')) return;
-  const reportBtn = document.createElement('button');
-  reportBtn.className = 'bubble-report-btn';
-  reportBtn.title = t('chat.report_btn_title');
-  if (msgDiv && msgDiv.dataset.feedbackReported === '1') {
-    reportBtn.disabled = true;
-    reportBtn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.report_done'))}</span>`;
-  } else {
-    reportBtn.textContent = t('chat.report_btn');
-  }
-  reportBtn.addEventListener('click', async (e) => {
-    e.stopPropagation();
-    await _reportFailedAssistantMessage(msgDiv, reportBtn, getContent);
-  });
-  actions.appendChild(reportBtn);
-}
-
 function _attachFailedAssistantActions(msgDiv, getContent) {
   if (!msgDiv) return;
   msgDiv.dataset.failed = '1';
   _attachBubbleActions(msgDiv, getContent, {
     archive: false,
     retry: true,
-    report: true,
+  });
+}
+
+function _attachAssistantActions(msgDiv, getContent, opts = {}) {
+  _attachBubbleActions(msgDiv, getContent, {
+    archive: opts.archive !== false,
+  });
+}
+
+let _messageSelectionState = null; // { cid, selected:Set<string> }
+
+function _selectedMessageElements() {
+  if (!_messageSelectionState || _messageSelectionState.cid !== currentCid) return [];
+  return Array.from(document.querySelectorAll('#chat-history .chat-message[data-msg-id]'))
+    .filter((msg) => _messageSelectionState.selected.has(msg.dataset.msgId || ''));
+}
+
+function _messageReferencePayload(msgDiv) {
+  if (!msgDiv) return null;
+  const msgId = msgDiv.dataset.msgId || '';
+  const text = _textFromBubbleWithout(
+    msgDiv,
+    '.chat-reference-bundle, .chat-msg-produced, .chat-msg-attachments, .stream-process, .chat-input-form, .chat-artifacts, iframe',
+  );
+  if (!msgId || !text) return null;
+  const fromActor = msgDiv.dataset.fromActor || msgDiv.dataset.from || (msgDiv.classList.contains('user') ? 'user' : '');
+  let produced = [];
+  let attachments = [];
+  let references = [];
+  try {
+    const parsed = JSON.parse(msgDiv.dataset.produced || '[]');
+    if (Array.isArray(parsed)) produced = parsed;
+  } catch (_) {}
+  try {
+    const parsed = JSON.parse(msgDiv.dataset.attachments || '[]');
+    if (Array.isArray(parsed)) attachments = parsed.map((item) => (
+      typeof item === 'string' ? { name: item } : item
+    )).filter((item) => item?.name);
+  } catch (_) {}
+  try {
+    const parsed = JSON.parse(msgDiv.dataset.references || '[]');
+    if (Array.isArray(parsed)) references = parsed.slice(0, 20);
+  } catch (_) {}
+  return {
+    sourceCid: currentCid,
+    sourceTitle: _conversationTitleForCid(currentCid),
+    msgId,
+    fromActor,
+    fromName: _referenceDisplayName({ fromActor }),
+    ts: msgDiv.dataset.ts || '',
+    text,
+    attachments,
+    references,
+    referenceCount: references.length,
+    produced,
+  };
+}
+
+function _closeReferenceTargetPicker() {
+  document.getElementById('chat-reference-target-overlay')?.remove();
+}
+
+async function _transferSelectedReferences(targetCid, payloads, opts = {}) {
+  if (!targetCid || !payloads.length) return;
+  for (const payload of payloads) _addQuote(targetCid, payload);
+  _closeReferenceTargetPicker();
+  _exitMessageSelection();
+  if (opts.conversation) {
+    conversations = (Array.isArray(conversations) ? conversations : []).filter((c) => c.conversation_id !== targetCid);
+    conversations.unshift(opts.conversation);
+    renderConversationList();
+  }
+  setView('conversation', targetCid, opts.fresh ? { skipLoad: true } : undefined);
+  _renderQuotePreview();
+  document.getElementById('chat-input')?.focus();
+}
+
+function _referenceTargetProject(projectId) {
+  if (!projectId || !Array.isArray(_projectsCache)) return null;
+  return _projectsCache.find((project) => project && project.project_id === projectId) || null;
+}
+
+function _referenceTargetAreaLabel(conversation) {
+  const projectId = conversation?.project_id || '';
+  if (!projectId) return t('chat.reference_area_commander');
+  return _referenceTargetProject(projectId)?.name || t('chat.reference_area_project');
+}
+
+function _referenceTargetActivity(conversation) {
+  return String(conversation?.last_active_at || conversation?.updated_at || conversation?.created_at || '');
+}
+
+function _referenceNewTaskDraftCid(projectId = '') {
+  return projectId ? `projchat-${projectId}` : DRAFT_CID;
+}
+
+function _stageReferencesForNewTask(payloads, projectId = '') {
+  if (!Array.isArray(payloads) || !payloads.length) return;
+  const draftCid = _referenceNewTaskDraftCid(projectId);
+  for (const payload of payloads) _addQuote(draftCid, payload);
+  _closeReferenceTargetPicker();
+  _exitMessageSelection();
+  if (projectId) {
+    setView('project', projectId);
+    _renderQuotePreview(draftCid);
+    document.getElementById('project-chat-input')?.focus();
+    return;
+  }
+  setView('new-chat');
+  _renderQuotePreview(DRAFT_CID);
+  document.getElementById('new-chat-input')?.focus();
+}
+
+async function _loadReferenceTargetConversations() {
+  try {
+    const res = await apiFetch('/api/conversations/list');
+    const data = await res.json();
+    if (!data?.ok || !Array.isArray(data.conversations)) {
+      throw new Error(data?.error || t('chat.load_failed', { msg: t('chat.unknown_error') }));
+    }
+    return data.conversations;
+  } catch (err) {
+    _convLog.warn('reference target full list failed', { error: err?.message || String(err) });
+    return Array.isArray(conversations) ? conversations.slice() : [];
+  }
+}
+
+async function _openReferenceTargetPicker(payloads) {
+  if (!Array.isArray(payloads) || !payloads.length) return;
+  const loads = [_loadReferenceTargetConversations()];
+  if (typeof loadProjects === 'function') loads.push(loadProjects());
+  const [targetConversations] = await Promise.all(loads);
+  _closeReferenceTargetPicker();
+  const sourceProjectId = _projectIdForConversation(currentCid);
+  const overlay = document.createElement('div');
+  overlay.id = 'chat-reference-target-overlay';
+  overlay.className = 'modal-overlay open chat-reference-target-overlay';
+  overlay.innerHTML = `<div class="chat-reference-target-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('chat.reference_target_title', { count: payloads.length }))}">
+    <div class="chat-reference-target-header">
+      <h2>${escapeHtml(t('chat.reference_target_title', { count: payloads.length }))}</h2>
+      <button type="button" class="modal-close-btn chat-reference-target-close" title="${escapeHtml(t('common.close'))}" aria-label="${escapeHtml(t('common.close'))}">${_uiIconHtml('x', 'modal-close-icon') || '×'}</button>
+    </div>
+    <div class="chat-reference-target-body">
+      <button type="button" class="chat-reference-new-task" data-new-task="1">
+        <span class="chat-reference-leading-plus" aria-hidden="true">+</span>
+        <span class="chat-reference-new-task-label">${escapeHtml(t('chat.reference_new_task'))}</span>
+        <span class="chat-reference-row-arrow" aria-hidden="true">›</span>
+      </button>
+      <section class="chat-reference-existing" aria-labelledby="chat-reference-existing-title">
+        <div class="chat-reference-existing-head">
+          <h3 id="chat-reference-existing-title">${escapeHtml(t('chat.reference_existing_tasks'))}</h3>
+          <span data-reference-list-hint>${escapeHtml(t('chat.reference_recent_tasks_hint'))}</span>
+        </div>
+        <label class="chat-reference-target-search-wrap">
+          <input type="search" class="chat-reference-target-search" placeholder="${escapeHtml(t('chat.reference_target_search'))}" />
+        </label>
+        <div class="chat-reference-target-list"></div>
+      </section>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const list = overlay.querySelector('.chat-reference-target-list');
+  const search = overlay.querySelector('.chat-reference-target-search');
+  const hint = overlay.querySelector('[data-reference-list-hint]');
+  const render = () => {
+    const needle = String(search.value || '').trim().toLowerCase();
+    const matches = (Array.isArray(targetConversations) ? targetConversations : [])
+      .filter((conv) => conv && conv.conversation_id !== currentCid)
+      .filter((conv) => {
+        if (!needle) return true;
+        return String(conv.title || '').toLowerCase().includes(needle);
+      })
+      .sort((a, b) => _referenceTargetActivity(b).localeCompare(_referenceTargetActivity(a)));
+    const tasks = needle ? matches.slice(0, 80) : matches.slice(0, 5);
+    if (hint) hint.textContent = needle
+      ? t('chat.reference_search_results_count', { count: matches.length })
+      : t('chat.reference_recent_tasks_hint');
+    list.innerHTML = `${tasks.map((conv) => `<button type="button" class="chat-reference-target-item" data-target-cid="${escapeHtml(conv.conversation_id)}">
+        <span class="chat-reference-target-main">
+          <strong>${escapeHtml(conv.title || t('chat.untitled'))}</strong>
+          <small>${escapeHtml(_referenceTargetAreaLabel(conv))}</small>
+        </span>
+        <span class="chat-reference-row-arrow" aria-hidden="true">›</span>
+      </button>`).join('')}
+      ${tasks.length ? '' : `<div class="chat-reference-target-empty">${escapeHtml(t('chat.reference_no_tasks'))}</div>`}`;
+    list.querySelectorAll('[data-target-cid]').forEach((item) => {
+      item.addEventListener('click', () => _transferSelectedReferences(item.dataset.targetCid, payloads));
+    });
+  };
+  overlay.querySelector('[data-new-task]')?.addEventListener('click', () => {
+    _stageReferencesForNewTask(payloads, sourceProjectId);
+  });
+  overlay.querySelector('.chat-reference-target-close')?.addEventListener('click', _closeReferenceTargetPicker);
+  overlay.addEventListener('mousedown', (event) => { if (event.target === overlay) _closeReferenceTargetPicker(); });
+  overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') _closeReferenceTargetPicker(); });
+  search.addEventListener('input', render);
+  render();
+}
+
+function _updateMessageSelectionToolbar() {
+  const bar = document.getElementById('chat-message-selection-bar');
+  if (!bar || !_messageSelectionState) return;
+  const count = _messageSelectionState.selected.size;
+  const countEl = bar.querySelector('[data-selection-count]');
+  if (countEl) countEl.textContent = t('chat.message_selected_count', { count });
+  bar.querySelectorAll('[data-requires-selection]').forEach((btn) => { btn.disabled = count === 0; });
+}
+
+function _toggleMessageSelection(msg) {
+  const id = msg?.dataset?.msgId || '';
+  if (!id || !_messageSelectionState || _messageSelectionState.cid !== currentCid) return;
+  if (_messageSelectionState.selected.has(id)) _messageSelectionState.selected.delete(id);
+  else _messageSelectionState.selected.add(id);
+  _syncMessageSelectionUi();
+}
+
+function _messageBubbleSelectionClick(event, msg) {
+  if (!_messageSelectionState || !msg?.classList?.contains('is-message-selectable')) return;
+  if (event.target?.closest?.('a, button, input, textarea, select, label, summary, iframe, video, audio, [role="button"], [contenteditable="true"]')) return;
+  const selection = typeof window.getSelection === 'function' ? window.getSelection() : null;
+  if (selection && !selection.isCollapsed) return;
+  _toggleMessageSelection(msg);
+}
+
+function _syncMessageSelectionUi() {
+  const active = !!_messageSelectionState && _messageSelectionState.cid === currentCid;
+  const pane = document.querySelector('#panel-conversation .chat-main-pane');
+  pane?.classList.toggle('is-message-selecting', active);
+  const messages = document.querySelectorAll('#chat-history .chat-message[data-msg-id]');
+  messages.forEach((msg) => {
+    msg.classList.toggle('is-message-selectable', active);
+    const bubble = msg.querySelector(':scope > .chat-bubble');
+    if (bubble && bubble.dataset.selectionClickBound !== '1') {
+      bubble.dataset.selectionClickBound = '1';
+      bubble.addEventListener('click', (event) => _messageBubbleSelectionClick(event, msg));
+    }
+    let check = msg.querySelector(':scope > .chat-message-select-check');
+    if (active && !check) {
+      check = document.createElement('button');
+      check.type = 'button';
+      check.className = 'chat-message-select-check';
+      check.innerHTML = '<span>✓</span>';
+      check.addEventListener('click', (event) => {
+        event.stopPropagation();
+        _toggleMessageSelection(msg);
+      });
+      msg.prepend(check);
+    }
+    if (!active && check) check.remove();
+    const selected = active && _messageSelectionState.selected.has(msg.dataset.msgId || '');
+    msg.classList.toggle('is-message-selected', selected);
+    if (check) check.setAttribute('aria-pressed', selected ? 'true' : 'false');
+  });
+
+  let bar = document.getElementById('chat-message-selection-bar');
+  if (!active) {
+    bar?.remove();
+    return;
+  }
+  if (!bar && pane) {
+    bar = document.createElement('div');
+    bar.id = 'chat-message-selection-bar';
+    bar.className = 'chat-message-selection-bar';
+    bar.innerHTML = `<button type="button" class="btn btn-sm" data-selection-cancel>${escapeHtml(t('common.cancel'))}</button>
+      <span class="chat-message-selection-count" data-selection-count></span>
+      <span class="chat-message-selection-spacer"></span>
+      <button type="button" class="btn btn-sm" data-selection-reference data-requires-selection>${escapeHtml(t('chat.reference_to'))}</button>`;
+    pane.insertBefore(bar, pane.querySelector('.chat-input-wrapper'));
+    bar.querySelector('[data-selection-cancel]').addEventListener('click', _exitMessageSelection);
+    bar.querySelector('[data-selection-reference]').addEventListener('click', () => {
+      const payloads = _selectedMessageElements().map(_messageReferencePayload).filter(Boolean);
+      _openReferenceTargetPicker(payloads);
+    });
+  }
+  _updateMessageSelectionToolbar();
+}
+
+function _enterMessageSelection(msgDiv) {
+  const msgId = msgDiv?.dataset?.msgId || '';
+  if (!currentCid || !msgId) return;
+  _messageSelectionState = { cid: currentCid, selected: new Set([msgId]) };
+  _syncMessageSelectionUi();
+}
+
+function _exitMessageSelection() {
+  _messageSelectionState = null;
+  _syncMessageSelectionUi();
+}
+
+// Copy works immediately for optimistic user bubbles. Quote/select require a
+// persisted message id because cross-task references and deletion are
+// resolved server-side from that stable locator. The bus echo stamps the id
+// moments later and `_syncRenderedGroupMessageIdentity` enables both buttons.
+function _syncBubbleReferenceActionState(msgDiv) {
+  if (!msgDiv?.querySelector) return;
+  const hasPersistedId = !!msgDiv.dataset.msgId;
+  msgDiv.querySelectorAll('.bubble-quote-btn, .bubble-select-btn').forEach((button) => {
+    button.disabled = !hasPersistedId;
   });
 }
 
@@ -5521,7 +6572,7 @@ function _attachFailedAssistantActions(msgDiv, getContent) {
 function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const includeArchive = opts.archive !== false;
   const includeRetry = opts.retry === true;
-  const includeReport = opts.report === true;
+  const mode = includeRetry ? 'failed' : (includeArchive ? 'assistant' : 'user');
   // Archive button lives in the `.chat-msg-actions` row below the bubble
   // (alongside produced-file chips). Lazily create the row if a caller
   // (e.g. streaming placeholders that didn't allocate one) needs it.
@@ -5534,43 +6585,82 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   }
   const existingActions = actionsRow.querySelector('.chat-bubble-actions');
   if (existingActions) {
-    if (includeRetry) _attachBubbleRetryBtn(existingActions, msgDiv);
-    if (includeReport) _attachBubbleReportBtn(existingActions, msgDiv, getContent);
-    return;
+    if (existingActions.dataset.mode === mode) {
+      _syncBubbleReferenceActionState(msgDiv);
+      return;
+    }
+    existingActions.remove();
   }
   const actions = document.createElement('span');
   actions.className = 'chat-bubble-actions';
+  actions.dataset.mode = mode;
+  const quoteButton = `<button type="button" class="bubble-action-btn bubble-quote-btn" title="${escapeHtml(t('chat.quote_btn_title'))}">${escapeHtml(t('chat.quote_btn'))}</button>`;
+  const overflowItems = `<button type="button" role="menuitem" class="chat-bubble-menu-item bubble-copy-btn" title="${escapeHtml(t('chat.copy_btn_title'))}">${escapeHtml(t('chat.copy_btn'))}</button>
+    <button type="button" role="menuitem" class="chat-bubble-menu-item bubble-select-btn" title="${escapeHtml(t('chat.message_select_title'))}">${escapeHtml(t('chat.message_select'))}</button>
+    ${includeArchive ? `<button type="button" role="menuitem" class="chat-bubble-menu-item bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>` : ''}`;
   actions.innerHTML = `
-    ${includeArchive ? `<button class="bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>` : ''}
-    <button class="bubble-copy-btn" title="${escapeHtml(t('chat.copy_btn_title'))}">${escapeHtml(t('chat.copy_btn'))}</button>
-    <button class="bubble-quote-btn" title="${escapeHtml(t('chat.quote_btn_title'))}">${escapeHtml(t('chat.quote_btn'))}</button>
+    <span class="chat-bubble-direct-actions">${quoteButton}</span>
+    <span class="chat-bubble-more-wrap">
+      <button type="button" class="bubble-more-btn" title="${escapeHtml(t('chat.more_actions'))}" aria-label="${escapeHtml(t('chat.more_actions'))}" aria-haspopup="menu" aria-expanded="false"><span aria-hidden="true">···</span></button>
+      <span class="chat-bubble-more-menu" role="menu" hidden>${overflowItems}</span>
+    </span>
   `;
+  const directActions = actions.querySelector('.chat-bubble-direct-actions');
   const btn = actions.querySelector('.bubble-archive-btn');
   const copyBtn = actions.querySelector('.bubble-copy-btn');
   const quoteBtn = actions.querySelector('.bubble-quote-btn');
-  if (includeRetry) _attachBubbleRetryBtn(actions, msgDiv);
-  if (includeReport) _attachBubbleReportBtn(actions, msgDiv, getContent);
+  const selectBtn = actions.querySelector('.bubble-select-btn');
+  if (includeRetry) _attachBubbleRetryBtn(directActions, msgDiv);
+  _wireBubbleActionMenu(actions);
   quoteBtn.addEventListener('click', (e) => {
     e.stopPropagation();
+    if (quoteBtn.disabled) return;
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
     if (!text.trim()) return;
-    const fromActor = msgDiv.dataset.fromActor || '';
+    const fromActor = msgDiv.dataset.fromActor || (msgDiv.classList.contains('user') ? 'user' : '');
     const msgId = msgDiv.dataset.msgId || '';
     let produced = [];
+    let attachments = [];
+    let references = [];
     try {
       const raw = msgDiv.dataset.produced || '';
       if (raw) produced = JSON.parse(raw);
       if (!Array.isArray(produced)) produced = [];
     } catch (_) { produced = []; }
-    const fromName = fromActor === 'commander'
-      ? (t('chat.from_commander'))
-      : (_groupActorLabel(fromActor) || '');
-    _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
+    try {
+      const parsed = JSON.parse(msgDiv.dataset.attachments || '[]');
+      if (Array.isArray(parsed)) attachments = parsed.map((item) => (
+        typeof item === 'string' ? { name: item } : item
+      )).filter((item) => item?.name);
+    } catch (_) { attachments = []; }
+    try {
+      const parsed = JSON.parse(msgDiv.dataset.references || '[]');
+      if (Array.isArray(parsed)) references = parsed.slice(0, 20);
+    } catch (_) { references = []; }
+    const fromName = _referenceDisplayName({ fromActor });
+    const added = _addQuote(currentCid, {
+      sourceCid: currentCid,
+      sourceTitle: _conversationTitleForCid(currentCid),
+      fromActor,
+      fromName,
+      msgId,
+      ts: msgDiv.dataset.ts || '',
+      text,
+      attachments,
+      references,
+      referenceCount: references.length,
+      produced,
+    });
     const input = document.getElementById('chat-input');
     if (input) { input.focus(); }
-    if (window.Monitor) (() => {})('bubble_quote', { cid: currentCid, has_files: produced.length > 0 });
+    void added;
   });
-  copyBtn.addEventListener('click', async (e) => {
+  selectBtn?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (selectBtn.disabled) return;
+    _enterMessageSelection(msgDiv);
+  });
+  copyBtn?.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
     if (!text.trim() || copyBtn.disabled) return;
@@ -5578,7 +6668,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     const orig = copyBtn.innerHTML;
     try {
       await navigator.clipboard.writeText(text);
-      copyBtn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.copy_done'))}</span>`;
+      copyBtn.textContent = t('chat.copy_done');
     } catch (err) {
       copyBtn.textContent = t('chat.copy_failed');
     }
@@ -5586,6 +6676,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   });
   if (!btn) {
     actionsRow.appendChild(actions);
+    _syncBubbleReferenceActionState(msgDiv);
     return;
   }
   btn.addEventListener('click', async (e) => {
@@ -5595,6 +6686,18 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     // Open the KB picker with a default filename derived from the first
     // ~20 visible chars; user confirms directory + filename before any
     // network call happens.
+    if (typeof pickKbLocation !== 'function' || typeof deriveKbArchiveName !== 'function') {
+      const loader = typeof loadRendererFeature === 'function'
+        ? loadRendererFeature
+        : window.loadRendererFeature;
+      if (typeof loader !== 'function') return;
+      try {
+        await loader('kb-picker');
+      } catch (err) {
+        _convLog.warn('KB picker load failed', { error: err?.message || String(err) });
+        return;
+      }
+    }
     const projectId = _projectIdForConversation(currentCid);
     const targetScope = projectId ? { type: 'project', projectId } : { type: 'global' };
     const pick = await pickKbLocation({
@@ -5613,7 +6716,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
         content: text,
       });
       if (data.ok) {
-        btn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.archive_done'))}</span>`;
+        btn.textContent = t('chat.archive_done');
         if (data.scope === 'global' && currentView === 'contexts' && typeof loadContexts === 'function') {
           loadContexts();
         }
@@ -5631,77 +6734,11 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000);
   });
   actionsRow.appendChild(actions);
+  _syncBubbleReferenceActionState(msgDiv);
 }
 
 function _attachBubbleArchiveBtn(msgDiv, getContent) {
-  _attachBubbleActions(msgDiv, getContent, { archive: true });
-}
-
-function _setReportButtonLoading(btn, loading) {
-  if (!btn) return;
-  if (loading) {
-    btn.disabled = true;
-    btn.setAttribute('aria-busy', 'true');
-    btn.innerHTML = `<span class="bubble-action-spinner" aria-hidden="true"></span><span>${escapeHtml(t('chat.report_running'))}</span>`;
-  } else {
-    btn.removeAttribute('aria-busy');
-  }
-}
-
-async function _reportFailedAssistantMessage(msgDiv, btn, getContent) {
-  if (!msgDiv || !currentCid) return;
-  if (btn && btn.disabled) return;
-  if (!window.orkas || typeof window.orkas.invoke !== 'function') {
-    await uiAlert(t('chat.report_failed_with_reason', { reason: t('chat.unknown_error') }));
-    return;
-  }
-
-  const details = _failedAssistantFeedbackDetails(msgDiv, getContent);
-  const content = _buildFailedAssistantFeedbackContent(details, 300);
-  if (!content.trim()) return;
-
-  const startedAt = performance.now();
-  const originalHtml = btn ? btn.innerHTML : '';
-  _convLog.info('failed assistant report submit', {
-    cid: currentCid || '',
-    msgId: details.msgId || '',
-    actor: details.actor || '',
-    contentLength: content.length,
-  });
-  _convTrackClick('message_report', {
-    conversation_id: currentCid || '',
-    has_message_id: !!details.msgId,
-    content_length: content.length,
-  });
-  _setReportButtonLoading(btn, true);
-
-  try {
-    throw new Error(t('chat.unknown_error'));
-  } catch (err) {
-    const message = err && err.message ? err.message : String(err);
-    const displayMessage = _feedbackSubmitDisplayMessage(err);
-    if (btn) {
-      btn.innerHTML = originalHtml || escapeHtml(t('chat.report_btn'));
-      btn.disabled = false;
-      btn.removeAttribute('aria-busy');
-    }
-    await uiAlert(displayMessage === t('chat.unknown_error')
-      ? displayMessage
-      : t('chat.report_failed_with_reason', { reason: displayMessage }));
-    _convTrackEvent('message_report_result', {
-      result: 'failure',
-      conversation_id: currentCid || '',
-      content_length: content.length,
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
-    _convTrackError('message_report', {
-      conversation_id: currentCid || '',
-      error_type: message === t('chat.report_login_required') ? 'auth' : 'unknown',
-      error_code: err && err.code != null ? err.code : undefined,
-      error_message: message,
-    });
-    _convLog.warn('failed assistant report submit failed', { error: message });
-  }
+  _attachAssistantActions(msgDiv, getContent, { archive: true });
 }
 
 function _findUserMessageForRetry(msgDiv) {
@@ -5736,7 +6773,7 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
   if (!msgDiv || !currentCid) return;
   if (btn && btn.disabled) return;
   if (btn) btn.disabled = true;
-  const orig = btn ? btn.textContent : '';
+  const orig = btn ? btn.innerHTML : '';
   try {
     const userMsgEl = _findUserMessageForRetry(msgDiv);
     const payload = _retryPayloadFromUserMessage(userMsgEl);
@@ -5744,12 +6781,11 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
       await uiAlert(t('chat.retry_no_source'));
       return;
     }
-    if (window.Monitor) (() => {})('bubble_retry', { cid: currentCid });
-    if (btn) btn.textContent = t('chat.retry_running');
+    if (btn) btn.innerHTML = `<span class="bubble-action-spinner" aria-hidden="true"></span><span>${escapeHtml(t('chat.retry_running'))}</span>`;
     await sendInConversation(currentCid, payload.content, payload.extra);
   } finally {
     if (btn) {
-      btn.textContent = orig || t('chat.retry_btn');
+      btn.innerHTML = orig || escapeHtml(t('chat.retry_btn'));
       btn.disabled = false;
     }
   }
@@ -5760,8 +6796,16 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
 async function handleNewChatSubmit() {
   const input = document.getElementById('new-chat-input');
   const raw = (input.value || '').trim();
-  if (!raw) return;
+  const quotes = _getQuotes(DRAFT_CID).slice();
+  if (!raw && !quotes.length) return;
+  if (typeof unresolvedOssTemplatePlaceholder === 'function'
+    && unresolvedOssTemplatePlaceholder(input)) {
+    await uiAlert(t('oss.task_required'));
+    return;
+  }
   if (!ensureModelConfigured()) return;
+  const references = _referenceSnapshotsForQuotes(quotes);
+  const requestText = raw || t('chat.reference_default_prompt');
   const useSelections = (typeof consumeChatUseSelections === 'function')
     ? consumeChatUseSelections('new-chat')
     : [];
@@ -5769,7 +6813,7 @@ async function handleNewChatSubmit() {
   // here and conv-create doesn't reset it before we can transfer.
   const recipientSnapshot = _recipientSnapshotForSend('new-chat');
   _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
-  const content = applyRecipientPrefix(transformWithChatUse(raw), 'new-chat', {
+  const content = applyRecipientPrefix(transformWithChatUse(requestText), 'new-chat', {
     recipientSnapshot,
   });
   const draftItems = _chatAttachList(DRAFT_CID);
@@ -5808,7 +6852,7 @@ async function handleNewChatSubmit() {
     // Use the shared `_autoTitle` so this matches backend `autoTitle` —
     // otherwise the optimistic + backend-refreshed titles disagree and
     // the sidebar entry flips on the next loadConversations.
-    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(raw) : raw;
+    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(requestText) : requestText;
     conv.title = _autoTitle(titleSeed);
     // Backend `createConversation` returns `created_at`/`updated_at` but
     // NOT the derived `last_active_at` (that lives only in `listConversations`'
@@ -5852,6 +6896,7 @@ async function handleNewChatSubmit() {
   if (draftNames.length && !attachments.length) await _chatAttachClear(DRAFT_CID, { deleteFiles: true });
   else _chatAttachClear(DRAFT_CID);
   _chatAttachClear(convId);
+  _clearQuotes(DRAFT_CID);
 
   input.value = '';
   autoGrow(input, 260);
@@ -5874,6 +6919,7 @@ async function handleNewChatSubmit() {
   const extra = {
     ...(attachments.length ? { attachments } : {}),
     ...(useSelections.length ? { use_selections: useSelections } : {}),
+    ...(references.length ? { references } : {}),
   };
   await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
 }
@@ -5884,9 +6930,12 @@ async function handleChatSubmit() {
   if (!currentCid) return;
   // A bare quote with no extra text is a legitimate "look at this" forward;
   // only reject when both the textarea AND the quote are empty.
-  if (!raw && !_getQuote(currentCid)) return;
+  if (!raw && !_getQuotes(currentCid).length) return;
   if (!ensureModelConfigured()) return;
   const cid = currentCid;
+  const quotes = _getQuotes(cid).slice();
+  const references = _referenceSnapshotsForQuotes(quotes);
+  const requestText = raw || t('chat.reference_default_prompt');
   const useSelections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('conversation')
     : [];
@@ -5908,22 +6957,23 @@ async function handleChatSubmit() {
   // If this conversation is already streaming OR has queued items waiting,
   // enqueue the new message instead of sending it now. Keep the raw text so
   // inline skill / connector tokens are expanded fresh when it is sent.
-  // Quote is baked into the queued content here (rather than carried as a
-  // sidecar field on the queue entry) — by the time the queue dispatches,
-  // the user may have already cleared/replaced the quote in the preview;
-  // capture-at-enqueue keeps each queued message tied to the quote that was
-  // visible when the user pressed send.
+  // References are captured into the queue sidecar at enqueue time. This
+  // keeps each queued message tied to the selection visible when Send was
+  // pressed, even if the composer draft is changed before queue drain.
   const recipientSnapshot = _takeRecipientSnapshotForSend('conversation');
   if (isConvPending(cid) || (messageQueues.get(cid) || []).length) {
     if (attachments.length) {
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
-    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), null, {
+    enqueueMessage(cid, requestText, null, {
       recipient: recipientSnapshot,
-      extra: useSelections.length ? { use_selections: useSelections } : undefined,
+      extra: {
+        ...(useSelections.length ? { use_selections: useSelections } : {}),
+        ...(references.length ? { references } : {}),
+      },
     });
-    _clearQuote(cid);
+    _clearQuotes(cid);
     input.value = '';
     autoGrow(input, 200);
     _clearDraft(cid);
@@ -5931,11 +6981,11 @@ async function handleChatSubmit() {
   }
 
   const content = applyRecipientPrefix(
-    applyQuotePrefix(transformWithChatUse(raw), 'conversation'),
+    transformWithChatUse(requestText),
     'conversation',
     { recipientSnapshot },
   );
-  _clearQuote(cid);
+  _clearQuotes(cid);
   input.value = '';
   autoGrow(input, 200);
   _clearDraft(cid);
@@ -5947,6 +6997,7 @@ async function handleChatSubmit() {
   const extra = {
     ...(attachments.length ? { attachments } : {}),
     ...(useSelections.length ? { use_selections: useSelections } : {}),
+    ...(references.length ? { references } : {}),
   };
   await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
 }
@@ -6251,7 +7302,7 @@ function _makeConvChatController(cid, options = {}) {
     inputEl: 'chat-input',
     sendBtnEl: 'chat-send-btn',
     getCurrentId: () => cid,
-    historyEndpoint: (id) => `/api/conversations/${id}/history`,
+    historyEndpoint: (id) => _historyRequestUrl(id),
     streamEndpoint: (id) => `/api/conversations/${id}/send/stream`,
     features: {
       archive: true,
@@ -6464,8 +7515,9 @@ function _removeEmptyActorPlaceholder(cid, actorId, turnId) {
   }
 }
 
-function _settleDanglingActorPlaceholders(cid) {
+function _settleDanglingActorPlaceholders(cid, opts = {}) {
   if (!cid) return;
+  const preserveProcess = opts.preserveProcess === true;
   // Single source of truth: persisted jsonl. At stream-end any chat-message
   // that doesn't anchor to a `message` event (no `data-msg-id`) AND wasn't
   // explicitly frozen by `turn_silent` (no `data-frozen-silent="1"`) is
@@ -6491,21 +7543,40 @@ function _settleDanglingActorPlaceholders(cid) {
   // opt-out is set by the `turn_silent` event handler and lets process-only
   // trails (commander emitting plan_set with no prose) survive.
   //
-  // Map cleanup (state hygiene) — entries pointing to bubbles we're about
-  // to remove, and any stale entries for this cid in general.
-  for (const key of Array.from(_groupPlaceholders.keys())) {
-    if (key.startsWith(`${cid}:`)) _groupPlaceholders.delete(key);
-  }
   const container = document.getElementById('chat-history');
   if (!container) return;
   const orphans = container.querySelectorAll(
     '.chat-message[data-from-actor]:not([data-msg-id]):not([data-frozen-silent="1"])',
   );
-  if (!orphans.length) return;
+  const preserved = new Set();
   for (const el of Array.from(orphans)) {
+    const processBody = el.querySelector('[data-role="process"]');
+    const hasProcess = !!processBody && processBody.children.length > 0;
+    const finalBody = el.querySelector('[data-role="final"]');
+    const hasFinalText = !!finalBody && (finalBody.textContent || '').trim().length > 0;
+    // User abort closes the renderer stream before the main process has
+    // finished unwinding and persisting the terminal message. Keep the live
+    // bubble (and its map entry) during that gap so the later `message` event
+    // can consume/finalize it in place. Empty queued-worker placeholders are
+    // still removed immediately.
+    if (preserveProcess && (hasProcess || hasFinalText)) {
+      preserved.add(el);
+      continue;
+    }
     el.remove();
   }
-  _convLog.info('orphan placeholders purged', { cid, count: orphans.length });
+  // Map cleanup (state hygiene). Retain only connected process-bearing
+  // placeholders explicitly preserved above; everything else is stale after
+  // stream termination.
+  for (const [key, ph] of Array.from(_groupPlaceholders.entries())) {
+    if (!key.startsWith(`${cid}:`)) continue;
+    if (preserved.has(ph) && ph?.parentElement) continue;
+    _groupPlaceholders.delete(key);
+  }
+  const purgedCount = orphans.length - preserved.size;
+  if (purgedCount > 0) {
+    _convLog.info('orphan placeholders purged', { cid, count: purgedCount, preserved: preserved.size });
+  }
 }
 
 function _nowForStreamYield() {
@@ -7035,6 +8106,7 @@ const _PROCESS_KIND_ICON = {
   think: 'diamond',
   live: 'live',
   out: 'output',
+  context: 'info',
   meta: 'dot',
   warn: 'warning',
   err: 'x-circle',
@@ -7070,6 +8142,12 @@ function _formatProcessDuration(ms) {
   if (hours > 0) return t('chat.stream.duration_hms', { h: hours, m: minutes, s: seconds });
   if (minutes > 0) return t('chat.stream.duration_ms', { m: minutes, s: seconds });
   return t('chat.stream.duration_s', { s: seconds });
+}
+
+function _formatToolDuration(ms) {
+  const value = Math.max(0, Number(ms) || 0);
+  if (value < 1000) return `${Math.round(value)}ms`;
+  return _formatProcessDuration(value);
 }
 
 function _runtimeDurationFromEvent(evt) {
@@ -7135,7 +8213,7 @@ function _eventProcessKind(evt, text) {
   }
   if (stream === 'item') return 'think';
   if (stream === 'plan') return 'plan';
-  if (stream === 'context' || stream === 'compaction') return 'info';
+  if (stream === 'context' || stream === 'compaction') return 'context';
   if (stream === 'runtime') return 'bound';
   if (stream === 'tool') return data.isError && !recoverableToolGuard ? 'err' : 'tool';
   if (stream === 'command_output') return (!data.stdout && data.stderr) ? 'warn' : 'out';
@@ -7176,6 +8254,110 @@ function _processEventName(evt) {
     return String(data.tool || '');
   }
   return '';
+}
+
+// Delegation tools. A commander turn whose end-of-turn trail carries one of
+// these (plus the reads it used to decide the routing) "only routed" — its
+// narration already landed as a seg bubble, so the trail is redundant. Kept in
+// sync with the OrchestrationLedger source_tool set (group_chat/state.ts) and
+// bus.ts's `processItemsAreRoutingOnly` guard.
+const _ROUTING_TOOL_NAMES = new Set(['hand_off_to', 'dispatch_to', 'run_worker']);
+// Read-only file tools the commander uses to inform routing (e.g. reading the
+// target agent's agent.json before hand_off_to). Routing support, not
+// user-visible "real work", so they don't by themselves keep the freeze path.
+const _ROUTING_SUPPORT_TOOL_NAMES = new Set(['read_file', 'search_files', 'grep_files', 'stat_file']);
+
+// True when a silent turn's process trail (one `dataset.eventName` per line, ''
+// for non-tool lines) is nothing but routing: at least one delegation tool, and
+// every other line is that delegation, a routing-support read, or a non-tool
+// line (progress / thinking / context / runtime). Such a trail is dropped like
+// an empty turn instead of frozen into a redundant process-only bubble. Any real
+// work (plan_set, write_file, bash, generate_image, …) makes it NOT routing-only,
+// so the freeze path still preserves it. Mirror of bus.ts's ProcessItem version.
+function _isRoutingOnlyEventNames(eventNames) {
+  if (!Array.isArray(eventNames)) return false;
+  let sawRoutingTool = false;
+  for (const raw of eventNames) {
+    const name = String(raw || '');
+    if (_ROUTING_TOOL_NAMES.has(name)) { sawRoutingTool = true; continue; }
+    if (!name) continue; // non-tool line (progress / context / runtime / thinking)
+    if (_ROUTING_SUPPORT_TOOL_NAMES.has(name)) continue; // routing-support read
+    return false; // a real-work tool → keep (freeze)
+  }
+  return sawRoutingTool;
+}
+
+function _shouldDiscardSilentPlaceholder(reason, eventNames) {
+  // Explicit source semantics win over process-trail inference. A terminal
+  // hand-off has already delivered the answer in the target agent's bubble,
+  // regardless of which planning/prep tools ran before it.
+  return reason === 'terminal_handoff' || _isRoutingOnlyEventNames(eventNames);
+}
+
+// Persisted-record variant of `_isRoutingOnlyEventNames`: reads each stored
+// ProcessItem's tool name (`{type:'event', event}` / `{type:'progress'}`).
+function _isRoutingOnlyProcessItems(processItems) {
+  if (!Array.isArray(processItems) || !processItems.length) return false;
+  return _isRoutingOnlyEventNames(processItems.map((item) => {
+    if (!item || typeof item !== 'object') return '';
+    return item.event ? _processEventName(item.event) : '';
+  }));
+}
+
+// A successful hand_off_to is stronger than the routing-only heuristic: by
+// contract the target agent's bubble is the final delivery, so an empty
+// commander tail is redundant even when its process trail also contains prep,
+// planning attempts, or other control-plane tools. This full-event predicate is
+// used for legacy jsonl records written before the bus started carrying the
+// explicit `turn_silent.reason='terminal_handoff'` signal.
+function _processItemsContainSuccessfulTerminalHandoff(processItems) {
+  if (!Array.isArray(processItems) || !processItems.length) return false;
+  return processItems.some((item) => {
+    const evt = item && typeof item === 'object' ? item.event : null;
+    if (_processEventName(evt) !== 'hand_off_to') return false;
+    const data = evt && typeof evt.data === 'object' ? evt.data : {};
+    const phase = String(data.phase || data.status || '').toLowerCase();
+    // In-process tool results use phase=end + isError. CLI-backed tools use
+    // phase=result. A nameless legacy event has no completion proof and stays
+    // on the conservative path.
+    return (phase === 'end' || phase === 'result') && data.isError !== true;
+  });
+}
+
+// A persisted commander record that ONLY routed: a routing-only process trail
+// (a delegation call + the reads used to decide it) and no user-facing side
+// effect. Its narration and pre-dispatch process are owned by the preceding seg
+// bubble, so this tail record — empty text, or just an abort marker — is the same
+// redundant "second commander bubble" the live turn_silent handler drops.
+// History reload / session switch-back render straight from jsonl, so filter it
+// here too — jsonl written before the bus-side guard (or by an un-upgraded main
+// process) may still carry these whole-turn process arrays.
+function _isRedundantRoutingOnlyCommanderRecord(gm) {
+  if (!gm || gm.from !== 'commander') return false;
+  const routingOnly = _isRoutingOnlyProcessItems(gm.process);
+  const terminalHandoff = _processItemsContainSuccessfulTerminalHandoff(gm.process);
+  if (!routingOnly && !terminalHandoff) return false;
+  // Never drop a record that carries a user-facing side effect.
+  if (gm.form
+      || (Array.isArray(gm.produced) && gm.produced.length)
+      || _normalizeCreatedAgents(gm) || _normalizeCreatedSkills(gm)
+      || (Array.isArray(gm.artifacts) && gm.artifacts.length)
+      || (Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length)) {
+    return false;
+  }
+  // A terminal-handoff compatibility match may have arbitrary prep tools in
+  // its trail. Preserve real prose defensively; the regression record is an
+  // empty tail (its narration, if any, was already emitted as a seg bubble).
+  if (terminalHandoff && String(gm.text || '').trim()) return false;
+  return true;
+}
+
+// Single visibility predicate for persisted group-history records: drops
+// internal commander→agent `dispatch` records AND redundant routing-only
+// commander tails. Used by every history-render / reconcile / poll site so
+// their record counts stay in agreement (a mismatch triggers reload loops).
+function _isVisibleGroupHistoryRecord(gm) {
+  return !!gm && !gm.dispatch && !_isRedundantRoutingOnlyCommanderRecord(gm);
 }
 
 function _streamingAppendProgress(msg, text, kindHint, eventName) {
@@ -7250,11 +8432,30 @@ function _streamingUpdateActivity(msg, text, opts = {}) {
   }
 }
 
+function _activityMonotonicNow() {
+  return (typeof performance !== 'undefined' && typeof performance.now === 'function')
+    ? performance.now()
+    : Date.now();
+}
+
 function _streamingPaintActivityMeta(msg) {
   const meta = msg.querySelector('[data-role="activity-meta"]');
   if (!meta) return;
-  const t0 = Number(msg.dataset.activityStart) || Date.now();
-  const secs = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+  const wallNow = Date.now();
+  const rawT0 = Number(msg.dataset.activityStart);
+  const t0 = Number.isFinite(rawT0) && rawT0 > 0 ? rawT0 : wallNow;
+  const wallElapsedMs = Math.max(0, wallNow - t0);
+  const monotonicNow = _activityMonotonicNow();
+  let clock = msg._activityClock;
+  if (!clock || !Number.isFinite(clock.elapsedMs) || !Number.isFinite(clock.monotonicAt)) {
+    clock = { elapsedMs: wallElapsedMs, monotonicAt: monotonicNow };
+    msg._activityClock = clock;
+  } else {
+    const monotonicDelta = Math.max(0, monotonicNow - clock.monotonicAt);
+    clock.elapsedMs = Math.max(wallElapsedMs, clock.elapsedMs + monotonicDelta);
+    clock.monotonicAt = monotonicNow;
+  }
+  const secs = Math.max(0, Math.floor(clock.elapsedMs / 1000));
   const mm = Math.floor(secs / 60);
   const ss = String(secs % 60).padStart(2, '0');
   const tools = Number(msg.dataset.activityTools) || 0;
@@ -7290,6 +8491,12 @@ function _streamingUpdateActivityFromEvent(msg, evt) {
   if (cliType === 'idle') {
     const secs = Math.max(1, Math.round(Number(data.stalledMs || 0) / 1000));
     _streamingUpdateActivity(msg, t('chat.activity_waiting', { secs }));
+    return;
+  }
+  const phase = String(data.phase || data.status || '');
+  const contextDone = stream === 'context' && (phase.endsWith('_done') || phase.endsWith('_failed'));
+  if ((stream === 'tool' && phase === 'end') || stream === 'compaction' || contextDone) {
+    _streamingUpdateActivity(msg, t('chat.activity_thinking'));
     return;
   }
   const isToolUse = (cliType === 'tool-event' && data.phase !== 'result')
@@ -7340,7 +8547,7 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   msg.dataset.finalText = display || '';
   delete msg.dataset.streamBuf;
   delete msg.dataset.streamDisplay;
-  if (archive) _attachBubbleArchiveBtn(msg, () => msg.dataset.finalText || '');
+  _attachAssistantActions(msg, () => msg.dataset.finalText || '', { archive });
 
   // Preserve the live preview line (keeps the full trace) — just freeze it.
   const live = msg.querySelector('.stream-process-live');
@@ -7450,6 +8657,7 @@ function _streamingMarkAborted(msg) {
 }
 
 function _finishStreamingMsg(cid) {
+  const wasAborted = pendingConvs.get(cid)?.aborted === true;
   _stopRuntimeActorRecovery(cid);
   _stopGroupEventObserver(cid);
   _lastGroupWorkEventAt.delete(cid);
@@ -7470,7 +8678,7 @@ function _finishStreamingMsg(cid) {
   // the cleaned content or is removed entirely if both process + final
   // were empty.
   if (cid === currentCid) {
-    _settleDanglingActorPlaceholders(cid);
+    _settleDanglingActorPlaceholders(cid, { preserveProcess: wasAborted });
     _updateConvSendUI(cid);
   }
   // Drain the next queued message for this conversation, if any.
@@ -7875,6 +9083,9 @@ function createChatController(config) {
     const attachmentCidForBubble = typeof extraBody?.attachment_cid === 'string'
       ? extraBody.attachment_cid
       : undefined;
+    const referencesForBubble = Array.isArray(extraBody?.references)
+      ? extraBody.references
+      : undefined;
     const userMsgEl = _appendHistoryMessage(
       {
         role: 'user',
@@ -7887,6 +9098,7 @@ function createChatController(config) {
         time: nowIsoLocal(),
         ...(attachmentsForBubble ? { attachments: attachmentsForBubble } : {}),
         ...(attachmentCidForBubble ? { attachment_cid: attachmentCidForBubble } : {}),
+        ...(referencesForBubble ? { references: referencesForBubble } : {}),
       },
       false,
       id,
@@ -8164,12 +9376,30 @@ function _eventTurnId(evData) {
 function _normaliseActiveTurns(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
-    .map((t) => ({
-      actor: String(t?.actor || t?.actor_id || ''),
-      turn_id: _normaliseTurnId(t?.turn_id || t?.turnId),
-      msg_id: _normaliseTurnId(t?.msg_id || t?.msgId || t?.source_msg_id || t?.sourceMsgId),
-    }))
+    .map((t) => {
+      const startedAtMs = Number(t?.started_at_ms ?? t?.startedAtMs);
+      return {
+        actor: String(t?.actor || t?.actor_id || ''),
+        turn_id: _normaliseTurnId(t?.turn_id || t?.turnId),
+        msg_id: _normaliseTurnId(t?.msg_id || t?.msgId || t?.source_msg_id || t?.sourceMsgId),
+        started_at_ms: Number.isFinite(startedAtMs) && startedAtMs > 0 ? startedAtMs : 0,
+      };
+    })
     .filter((t) => t.actor && t.turn_id);
+}
+
+// A live placeholder is disposable DOM: history reconciliation, task switches,
+// and reconnect recovery may replace it while the same backend turn continues.
+// Seed each replacement from the bus-owned turn start, and only ever move an
+// existing start earlier, so a late recovery snapshot cannot reset the clock.
+function _seedPlaceholderActivityStart(ph, startedAtMs) {
+  if (!ph) return;
+  const next = Number(startedAtMs);
+  if (!Number.isFinite(next) || next <= 0) return;
+  const current = Number(ph.dataset.activityStart);
+  if (!Number.isFinite(current) || current <= 0 || next < current) {
+    ph.dataset.activityStart = String(next);
+  }
 }
 
 function _stampPlaceholderTriggerMsg(ph, msgId) {
@@ -8227,7 +9457,7 @@ function _refreshActorPlaceholders(cid, actorId) {
   }
 }
 
-function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId) {
+function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId, startedAtMs) {
   const tid = _normaliseTurnId(turnId);
   const sourceMsgId = _normaliseTurnId(triggerMsgId);
   const k = _phKey(cid, actorId, tid);
@@ -8235,6 +9465,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId)
   let ph = _groupPlaceholders.get(k);
   if (ph && ph.parentElement) {
     _stampPlaceholderTriggerMsg(ph, sourceMsgId);
+    _seedPlaceholderActivityStart(ph, startedAtMs);
     return ph;
   }
 
@@ -8246,6 +9477,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId)
       _groupPlaceholders.delete(legacyK);
       legacyPh.dataset.turnId = tid;
       _stampPlaceholderTriggerMsg(legacyPh, sourceMsgId);
+      _seedPlaceholderActivityStart(legacyPh, startedAtMs);
       _setPlaceholderActor(legacyPh, actorId, { cid, allowFallback });
       _groupPlaceholders.set(k, legacyPh);
       return legacyPh;
@@ -8266,6 +9498,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId)
       && (!fallbackPh.dataset.turnId || !tid || fallbackPh.dataset.turnId === tid)) {
     if (tid) fallbackPh.dataset.turnId = tid;
     _stampPlaceholderTriggerMsg(fallbackPh, sourceMsgId);
+    _seedPlaceholderActivityStart(fallbackPh, startedAtMs);
     _setPlaceholderActor(fallbackPh, actorId, { cid, allowFallback });
     _groupPlaceholders.set(k, fallbackPh);
     return fallbackPh;
@@ -8286,6 +9519,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId)
   }
   ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true, triggerMsgId: sourceMsgId });
   if (tid) ph.dataset.turnId = tid;
+  _seedPlaceholderActivityStart(ph, startedAtMs);
   _setPlaceholderActor(ph, actorId, { cid, allowFallback });
   _groupPlaceholders.set(k, ph);
   if (actorId && actorId !== 'commander' && !_knownGroupActorLabel(cid, actorId)) {
@@ -8413,25 +9647,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     ph.appendChild(actionsRow);
   }
 
-  // Produced-files chips (assistant local-exec output) — chip-style inside
-  // the actions row, NOT inside the bubble. Click → reveal in OS file
-  // manager via `workspace.revealPath` IPC.
-  if (Array.isArray(gm.produced) && gm.produced.length) {
-    if (!actionsRow.querySelector('.chat-msg-produced')) {
-      const wrap = document.createElement('div');
-      wrap.innerHTML = _renderMessageProducedHtml(gm.produced);
-      const node = wrap.firstElementChild;
-      if (node) {
-        actionsRow.appendChild(node);
-        _hydrateMessageProducedChips(ph);
-      }
-    }
-    // Mirror dataset.produced so the 引用 button can read it (same contract
-    // as appendChatMessage above; without this, post-stream finalize would
-    // leave the chip row in place but the quote payload would carry no files).
-    ph.dataset.produced = JSON.stringify(gm.produced);
-  }
-
   // Created-agent chips (commander quick-create / quick-edit) — same actions row.
   const gmCreated = _normalizeCreatedAgents(gm);
   if (gmCreated) {
@@ -8475,6 +9690,9 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   if (Array.isArray(gm.artifacts) && gm.artifacts.length && typeof window.mountMessageArtifacts === 'function') {
     const bubble = ph.querySelector('.chat-bubble');
     if (bubble) window.mountMessageArtifacts(bubble, gm.artifacts, cid);
+  }
+  if (Array.isArray(gm.produced) && gm.produced.length) {
+    _mountMessageProducedFooter(ph, gm.produced);
   }
   _scheduleConversationInfoFileRefresh(cid);
 }
@@ -8531,7 +9749,9 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // but only for the conv the user is currently viewing — this branch
     // is the catch-all so background-conv creates still propagate.
     if (_normalizeCreatedAgents(evData.msg)) { try { loadAgents?.(true); } catch (_) {} }
-    if (_normalizeCreatedSkills(evData.msg)) { try { loadSkills?.(true); } catch (_) {} }
+    if (_normalizeCreatedSkills(evData.msg) && typeof loadSkills === 'function') {
+      try { loadSkills(true); } catch (_) {}
+    }
   }
   // Cross-cid leakage guard: per-cid controllers stay alive when the user
   // navigates away mid-stream (a legit pattern — let the conv finish in
@@ -8604,7 +9824,9 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         // newly-created agent is missing from the agents tab and the @
         // picker until a manual refresh.
         if (_normalizeCreatedAgents(gm)) { try { loadAgents?.(true); } catch (_) {} }
-        if (_normalizeCreatedSkills(gm)) { try { loadSkills?.(true); } catch (_) {} }
+        if (_normalizeCreatedSkills(gm) && typeof loadSkills === 'function') {
+          try { loadSkills(true); } catch (_) {}
+        }
       }
       if (isTurnEnd) _evaluateAutoRecipient(cid);
     } else {
@@ -8739,7 +9961,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     setGroupConversationBusy(cid, st.status === 'running' || inFlight.length > 0 || activeTurns.length > 0);
     if (hasActiveTurnsField) {
       for (const turn of activeTurns) {
-        _ensureActorPlaceholder(cid, turn.actor, streamingMsg, turn.turn_id, turn.msg_id);
+        _ensureActorPlaceholder(cid, turn.actor, streamingMsg, turn.turn_id, turn.msg_id, turn.started_at_ms);
       }
     } else if (inFlight.length) {
       for (const actorId of inFlight) {
@@ -8831,18 +10053,28 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const processBody = ph.querySelector('[data-role="process"]');
         const procLines = processBody ? Array.from(processBody.children) : [];
         const hasProcess = procLines.length > 0;
-        // A silent turn whose ENTIRE process trail is the `hand_off_to`
-        // routing call carries nothing worth showing: the commander already
-        // announced the delegation in its own prose message, and the
-        // delegate's reply follows. Freezing it leaves a redundant,
-        // out-of-order process-only bubble (it settles at the silent turn's
-        // end — AFTER the delegate has already rendered — so it reads as the
-        // commander "speaking again" below the reply). Treat it like an empty
-        // turn and drop the bubble. Any real work in the trail (a plan_set,
-        // a read, a non-handoff tool) keeps the freeze path.
-        const handoffOnly = hasProcess
-          && procLines.every((el) => el.dataset && el.dataset.eventName === 'hand_off_to');
-        if (hasProcess && !handoffOnly) {
+        // A silent turn that ONLY routed (a delegation call, plus the reads the
+        // commander did to decide the routing) carries nothing worth showing:
+        // the commander already announced the delegation in its own prose
+        // message (a seg bubble), and the delegate's reply follows. Freezing it
+        // leaves a redundant, out-of-order process-only bubble (it settles at
+        // the silent turn's end — AFTER the delegate has already rendered — so
+        // it reads as the commander "speaking again" below the reply). Treat it
+        // like an empty turn and drop the bubble. Any real work in the trail
+        // (a plan_set, write_file, bash, a non-routing tool) keeps the freeze
+        // path. A common trigger is `read_file <agent>/agent.json` before
+        // `hand_off_to`, which the old "every line is hand_off_to" check missed.
+        const eventNames = procLines.map((el) => (el.dataset && el.dataset.eventName) || '');
+        const routingOnly = hasProcess && _isRoutingOnlyEventNames(eventNames);
+        // Do not infer terminal-delivery semantics from the tool mix. The main
+        // process marks a successful hand_off_to explicitly because prep tools
+        // (including failed manage_execution_plan calls) may precede it. In
+        // that case the target agent's bubble is already the answer, so even a
+        // process-bearing commander placeholder must be removed.
+        const terminalHandoff = evData.reason === 'terminal_handoff';
+        const discardPlaceholder = hasProcess
+          && _shouldDiscardSilentPlaceholder(evData.reason, eventNames);
+        if (hasProcess && !discardPlaceholder) {
           // Freeze the bubble: hide thinking dots, leave process rail as
           // a folded "completed thinking" bubble. Empty final body = no main text.
           // `data-frozen-silent="1"` opts this bubble out of the stream-end
@@ -8857,7 +10089,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
           _convLog.info('turn_silent received (frozen)', { cid, actor: actorId });
         } else if (ph.parentElement) {
           ph.remove();
-          _convLog.info('turn_silent received (removed)', { cid, actor: actorId, handoffOnly });
+          _convLog.info('turn_silent received (removed)', { cid, actor: actorId, routingOnly, terminalHandoff });
         }
       }
     }
@@ -9165,13 +10397,29 @@ function _formatEventLine(evt) {
 
   if (stream === 'runtime') {
     const duration = data?.duration_ms ?? data?.durationMs ?? data?.elapsedMs;
-    return t('chat.stream.runtime_total', { duration: _formatProcessDuration(duration) });
+    const parts = [t('chat.stream.runtime_total', { duration: _formatProcessDuration(duration) })];
+    const timingParts = [
+      ['provider_ms', 'chat.stream.runtime_model'],
+      ['tool_ms', 'chat.stream.runtime_tools'],
+      ['compaction_ms', 'chat.stream.runtime_context'],
+      ['retry_wait_ms', 'chat.stream.runtime_retry'],
+    ];
+    for (const [key, label] of timingParts) {
+      const value = Number(data?.[key]);
+      if (Number.isFinite(value) && value > 0) {
+        parts.push(t(label, { duration: _formatProcessDuration(value) }));
+      }
+    }
+    return parts.join(' · ');
   }
 
   if (stream === 'tool') {
     const name = data?.name || data?.toolName || 'tool';
     const phase = data?.phase || data?.status;
     const p = phaseCn(phase);
+    const duration = phase === 'end' && Number.isFinite(Number(data?.duration_ms))
+      ? _formatToolDuration(data.duration_ms)
+      : '';
     const isError = !!data?.isError;
     const args = data?.arguments || data?.args;
     // On start → show arguments (bash command / file path / JSON fallback).
@@ -9199,7 +10447,7 @@ function _formatEventLine(evt) {
     detail = detail.replace(/\s+/g, ' ').trim();
     if (detail.length > 160) detail = detail.slice(0, 160) + '…';
     const detailStr = detail ? ' · ' + detail : '';
-    return `${name}${p ? ' · ' + p : ''}${detailStr}`;
+    return `${name}${p ? ' · ' + p : ''}${duration ? ' · ' + duration : ''}${detailStr}`;
   }
 
   if (stream === 'command_output') {

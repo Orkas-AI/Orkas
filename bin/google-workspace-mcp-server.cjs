@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Workspace MCP server (stdio). This is the independent one-click connector: one OAuth
 // grant with the union of Google Workspace scopes, one connector instance, and one MCP process
 // exposing the Gmail / Calendar / Docs / Sheets / Tasks tools together. The five per-service

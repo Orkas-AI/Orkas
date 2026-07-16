@@ -17,7 +17,8 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { userSessionFile, userSessionsDir } from '../paths';
+import { userSessionsDir, projectSessionsDir } from '../paths';
+import { cloudSessionFileFor, listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
 import { listConversations, type Conversation } from './chats';
 import { buildGmemberSessionId } from './group_chat/state';
@@ -64,18 +65,19 @@ export function listAgentGmemberFiles(
   agentId: string,
 ): Array<{ cid: string; file: string }> {
   if (!agentId) return [];
-  let dir: string;
-  try { dir = userSessionsDir(uid); } catch { return []; }
-  let names: string[];
-  try { names = fs.readdirSync(dir); } catch { return []; }
   const prefix = 'gmember-';
   const suffix = `-${agentId}.jsonl`;
   const out: Array<{ cid: string; file: string }> = [];
-  for (const name of names) {
-    if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
-    const cid = name.slice(prefix.length, -suffix.length);
-    if (!cid) continue;
-    out.push({ cid, file: path.join(dir, name) });
+  const dirs = [userSessionsDir(uid), ...listProjectIds(uid).map((pid) => projectSessionsDir(uid, pid))];
+  for (const dir of dirs) {
+    let names: string[];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
+      const cid = name.slice(prefix.length, -suffix.length);
+      if (!cid) continue;
+      out.push({ cid, file: path.join(dir, name) });
+    }
   }
   return out;
 }
@@ -181,7 +183,7 @@ function renderSignalEntry(sig: Signal): TranscriptEntry | null {
 
 function readSessionJsonl(uid: string, sessionId: string): any[] {
   let file: string;
-  try { file = userSessionFile(uid, sessionId); } catch { return []; }
+  try { file = cloudSessionFileFor(uid, sessionId); } catch { return []; }
   let raw: string;
   try { raw = fs.readFileSync(file, 'utf8'); }
   catch { return []; }

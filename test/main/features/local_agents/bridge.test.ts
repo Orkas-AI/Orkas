@@ -22,6 +22,8 @@ vi.mock('../../../../src/main/features/kb_embed', () => ({
 // Connector methods are covered by their own feature tests; here we pin the
 // bridge-specific contracts (token, path discipline, scope plumbing, gating).
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 const TEST_UID = 'u-bridge';
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -95,7 +97,7 @@ async function startTestBridge(opts: { projectId?: string } = {}) {
     runId: `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
     configDir: path.join(tmpDir, 'rundir'),
     sandboxEnv: {
-      ORKAS_NODE: process.execPath,
+      ORKAS_NODE: TEST_NODE,
       ORKAS_PC_DIR: process.cwd(),
       ORKAS_WORKSPACE_ROOT: tmpDir,
       ELECTRON_RUN_AS_NODE: '1',
@@ -186,7 +188,7 @@ describe('local_agents/bridge › auth + skills', () => {
     try {
       const cfg = JSON.parse(fs.readFileSync(bridge.mcpConfigPath, 'utf8'));
       const server = cfg.mcpServers.orkas;
-      expect(server.command).toBe(process.execPath);
+      expect(server.command).toBe(TEST_NODE);
       expect(server.args[0]).toContain(path.join('bin', 'orkas-bridge.cjs'));
       expect(JSON.stringify(cfg)).not.toContain(bridge.token);
       expect(JSON.stringify(cfg)).not.toContain(bridge.socketPath);

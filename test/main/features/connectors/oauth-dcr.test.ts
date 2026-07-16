@@ -5,6 +5,11 @@ const electronMock = vi.hoisted(() => ({
 }));
 
 vi.mock('electron', () => ({
+  app: {
+    isPackaged: false,
+    getVersion: () => '1.5.1',
+    getAppPath: () => process.cwd(),
+  },
   shell: { openExternal: electronMock.openExternal },
 }));
 

@@ -7,6 +7,8 @@ const _contextsLog = createLogger('contexts');
 
 let _ctxTree = [];                  // tree of {name, path, type:'dir'|'file', children?, bytes?, mtime?}
 let _ctxExpanded = new Set();       // dir paths that are open
+let _ctxSelected = new Set();       // file-system style row selection (single / Cmd-Ctrl / Shift range)
+let _ctxSelectionAnchor = null;     // last selected visible row for Shift range
 let _ctxActive = null;              // {id} — currently opened file in right-pane
 let _ctxMveController = null;       // active mountMdViewEdit controller for the right-pane md viewer
 let _ctxOfficeBlobUrl = null;       // object URL for the current sandboxed Office preview iframe
@@ -21,6 +23,7 @@ let _kbEventsAbort = null;
 let _kbStatusRefreshTimer = null;
 let _kbReconcileInFlight = false;
 const _kbVectorizeStartedAtByPath = new Map();
+const CTX_INTERNAL_DRAG_TYPE = 'application/x-context-path';
 
 function _ctxUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -254,8 +257,7 @@ function _kbStatusChipHtml(relpath) {
     return `<span class="ctx-kb-chip is-processing" title="${escapeHtml(label)}"><span class="ctx-kb-spinner"></span></span>`;
   }
   if (st.status === 'failed') {
-    const err = st.error ? `${t('contexts.kb.failed')}: ${st.error}` : t('contexts.kb.failed');
-    return `<span class="ctx-kb-chip is-failed" data-kb-reprocess title="${escapeHtml(err)}">!</span>`;
+    return `<span class="ctx-kb-chip is-failed" data-kb-reprocess title="${escapeHtml(t('contexts.kb.failed'))}">!</span>`;
   }
   return '';
 }
@@ -270,6 +272,15 @@ function _collectCtxFilePaths(nodes, out = []) {
   return out;
 }
 
+function _collectCtxEntryPaths(nodes, out = []) {
+  for (const node of nodes || []) {
+    if (!node?.path) continue;
+    out.push(node.path);
+    if (node.type === 'dir') _collectCtxEntryPaths(node.children || [], out);
+  }
+  return out;
+}
+
 // ── Tree render ──
 
 // Total file count across the tree — drives the new Surface D page-header
@@ -277,6 +288,26 @@ function _collectCtxFilePaths(nodes, out = []) {
 function _ctxTotalFiles() {
   try { return _collectCtxFilePaths(_ctxTree).length; } catch (_) { return 0; }
 }
+
+function _sortCtxNodes(nodes) {
+  return (nodes || []).slice().sort((a, b) => {
+    const aDir = a?.type === 'dir';
+    const bDir = b?.type === 'dir';
+    if (aDir !== bDir) return aDir ? -1 : 1;
+    return String(a?.name || '').localeCompare(String(b?.name || ''), undefined, {
+      sensitivity: 'base',
+      numeric: true,
+    });
+  });
+}
+
+function _ctxFileIconHtml(name) {
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') {
+    return window.fileKindIconHtml(name);
+  }
+  return _ctxUiIconHtml('file', 'skill-tree-node-svg');
+}
+
 function _refreshCtxCounts() {
   const n = _ctxTotalFiles();
   const treeEl = document.getElementById('contexts-tree-count');
@@ -290,22 +321,36 @@ function renderCtxTree() {
     return;
   }
   if (!_ctxTree.length) {
+    _ctxSelected.clear();
+    _ctxSelectionAnchor = null;
     container.innerHTML = `<div class="empty">${escapeHtml(t('contexts.empty'))}</div>`;
+    // The root remains a valid destination even before the first file exists.
+    // Binding here lets users populate an empty Library by dragging files in
+    // from Finder / Explorer instead of having to use the upload menu first.
+    _bindCtxTreeHandlers(container);
     _refreshCtxCounts();
+    _renderCtxBatchBar();
     return;
   }
+  const existing = new Set(_collectCtxEntryPaths(_ctxTree));
+  for (const rel of Array.from(_ctxSelected)) {
+    if (!existing.has(rel)) _ctxSelected.delete(rel);
+  }
+  if (_ctxSelectionAnchor && !existing.has(_ctxSelectionAnchor)) _ctxSelectionAnchor = null;
   container.innerHTML = _renderCtxNodes(_ctxTree);
   _bindCtxTreeHandlers(container);
   _refreshCtxCounts();
+  _renderCtxBatchBar();
 }
 
 function _renderCtxNodes(nodes, depth = 0) {
   const indent = 10 + depth * 14;
   const moreTitle = escapeHtml(t('contexts.menu.more_actions'));
-  return nodes.map(n => {
+  return _sortCtxNodes(nodes).map(n => {
     const isPendingRename = _ctxPendingRename && _ctxPendingRename.path === n.path;
     if (n.type === 'dir') {
       const open = _ctxExpanded.has(n.path);
+      const selected = _ctxSelected.has(n.path) ? ' is-selected' : '';
       const caretCls = open ? 'skill-tree-caret' : 'skill-tree-caret collapsed';
       const icon = open
         ? _ctxUiIconHtml('folder-open', 'skill-tree-node-svg')
@@ -318,17 +363,18 @@ function _renderCtxNodes(nodes, depth = 0) {
         : `<span class="skill-tree-label">${escapeHtml(n.name)}</span>`;
       return `
         <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="dir" draggable="true">
-          <div class="skill-tree-node skill-tree-dir" style="padding-left:${indent}px">
+          <div class="skill-tree-node skill-tree-dir${selected}" style="padding-left:${indent}px" title="${escapeHtml(n.path)}">
             <span class="${caretCls}"></span>
             <span class="skill-tree-icon icon-folder">${icon}</span>
             ${labelHtml}
-            <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
+            <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">${_ctxUiIconHtml('more-horizontal', 'ctx-row-menu-icon')}</button>
           </div>
           ${childrenHtml}
         </div>
       `;
     }
     const active = _ctxActive && _ctxActive.id === n.path ? ' active' : '';
+    const selected = _ctxSelected.has(n.path) ? ' is-selected' : '';
     const ext = (n.name.split('.').pop() || '').toLowerCase();
     const chip = _kbStatusChipHtml(n.path);
     // Inline-rename mode for a freshly-created "untitled.md" or for the rename
@@ -341,16 +387,181 @@ function _renderCtxNodes(nodes, depth = 0) {
       : `<span class="skill-tree-main"><span class="skill-tree-label">${escapeHtml(n.name)}</span>${mtime ? `<span class="skill-tree-meta">${escapeHtml(mtime)}</span>` : ''}</span>`;
     return `
       <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="file" draggable="true">
-        <div class="skill-tree-node skill-tree-file${active}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px">
+        <div class="skill-tree-node skill-tree-file${active}${selected}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px" title="${escapeHtml(n.path)}">
           <span class="skill-tree-caret skill-tree-caret-empty"></span>
-          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${_ctxUiIconHtml('file', 'skill-tree-node-svg')}</span>
+          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${_ctxFileIconHtml(n.name)}</span>
           ${labelHtml}
           ${chip}
-          <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
+          <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">${_ctxUiIconHtml('more-horizontal', 'ctx-row-menu-icon')}</button>
         </div>
       </div>
     `;
   }).join('');
+}
+
+function _syncCtxSelectionDom(container) {
+  (container || document.getElementById('contexts-tree'))?.querySelectorAll('.ctx-tree-wrap[data-path]').forEach((wrap) => {
+    wrap.querySelector(':scope > .skill-tree-node')?.classList.toggle('is-selected', _ctxSelected.has(wrap.dataset.path));
+  });
+  _renderCtxBatchBar();
+}
+
+function _selectCtxEntry(rel, event, container) {
+  const toggle = !!(event?.metaKey || event?.ctrlKey);
+  const range = !!event?.shiftKey;
+  if (range && _ctxSelectionAnchor) {
+    const visible = Array.from(container.querySelectorAll('.ctx-tree-wrap[data-path]'))
+      .filter((wrap) => wrap.offsetParent !== null)
+      .map((wrap) => wrap.dataset.path);
+    const start = visible.indexOf(_ctxSelectionAnchor);
+    const end = visible.indexOf(rel);
+    if (start >= 0 && end >= 0) {
+      if (!toggle) _ctxSelected.clear();
+      const [lo, hi] = start <= end ? [start, end] : [end, start];
+      for (const path of visible.slice(lo, hi + 1)) _ctxSelected.add(path);
+    }
+  } else if (toggle) {
+    if (_ctxSelected.has(rel)) _ctxSelected.delete(rel);
+    else _ctxSelected.add(rel);
+    _ctxSelectionAnchor = rel;
+  } else {
+    _ctxSelected.clear();
+    _ctxSelected.add(rel);
+    _ctxSelectionAnchor = rel;
+  }
+  _syncCtxSelectionDom(container);
+  return toggle || range;
+}
+
+function _ctxSelectionFor(rel) {
+  if (_ctxSelected.has(rel)) return Array.from(_ctxSelected);
+  _ctxSelected.clear();
+  _ctxSelected.add(rel);
+  _ctxSelectionAnchor = rel;
+  _syncCtxSelectionDom();
+  return [rel];
+}
+
+function _renderCtxBatchBar() {
+  const host = document.getElementById('contexts-tree-col');
+  if (!host) return;
+  let bar = document.getElementById('contexts-batch-bar');
+  if (_ctxSelected.size < 2) {
+    bar?.remove();
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'contexts-batch-bar';
+    bar.className = 'library-batch-bar';
+    host.appendChild(bar);
+  }
+  bar.innerHTML = `
+    <span class="library-batch-count">${escapeHtml(t('contexts.transfer.selected_count', { count: _ctxSelected.size }))}</span>
+    <button type="button" class="btn btn-sm btn-primary" data-library-batch-organize>${escapeHtml(t('contexts.transfer.title'))}</button>
+    <button type="button" class="library-batch-clear" data-library-batch-clear title="${escapeHtml(t('contexts.transfer.clear_selection'))}" aria-label="${escapeHtml(t('contexts.transfer.clear_selection'))}">${_ctxUiIconHtml('x', 'library-batch-clear-icon')}</button>
+  `;
+  bar.querySelector('[data-library-batch-organize]')?.addEventListener('click', () => _openCtxTransfer(Array.from(_ctxSelected), 'batch'));
+  bar.querySelector('[data-library-batch-clear]')?.addEventListener('click', () => {
+    _ctxSelected.clear();
+    _ctxSelectionAnchor = null;
+    _syncCtxSelectionDom();
+  });
+}
+
+function _ctxHasDragType(dataTransfer, type) {
+  try { return Array.from(dataTransfer?.types || []).includes(type); }
+  catch (_) { return false; }
+}
+
+function _ctxDragKind(dataTransfer) {
+  if (_ctxHasDragType(dataTransfer, CTX_INTERNAL_DRAG_TYPE)) return 'internal';
+  if (_ctxHasDragType(dataTransfer, 'Files') || (dataTransfer?.files?.length || 0) > 0) return 'external';
+  return '';
+}
+
+function _ctxDropPayload(dataTransfer) {
+  let src = '';
+  try { src = dataTransfer?.getData?.(CTX_INTERNAL_DRAG_TYPE) || ''; }
+  catch (_) { /* protected drag data — rely on the advertised types */ }
+  if (src) return { kind: 'internal', src, files: [] };
+  const files = Array.from(dataTransfer?.files || []).filter(Boolean);
+  if (_ctxHasDragType(dataTransfer, 'Files') || files.length) {
+    return { kind: 'external', src: '', files };
+  }
+  return { kind: '', src: '', files: [] };
+}
+
+function _ctxExternalDropTargetDir(target) {
+  const wrap = target?.closest?.('.ctx-tree-wrap');
+  if (!wrap) return '';
+  const rel = String(wrap.dataset?.path || '');
+  if (wrap.dataset?.type === 'dir') return rel;
+  const slash = rel.lastIndexOf('/');
+  return slash >= 0 ? rel.slice(0, slash) : '';
+}
+
+function _ctxClearDropHighlights(container) {
+  container.classList.remove('is-root-drag-over');
+  container.querySelectorAll('.skill-tree-node.is-drag-over')
+    .forEach((node) => node.classList.remove('is-drag-over'));
+}
+
+function _ctxShowExternalDropTarget(container, targetDir) {
+  _ctxClearDropHighlights(container);
+  if (!targetDir) {
+    container.classList.add('is-root-drag-over');
+    return;
+  }
+  const targetWrap = Array.from(container.querySelectorAll('.ctx-tree-wrap[data-type="dir"]'))
+    .find((wrap) => wrap.dataset?.path === targetDir);
+  targetWrap?.querySelector(':scope > .skill-tree-node')?.classList.add('is-drag-over');
+}
+
+async function _handleCtxDrop(dataTransfer, targetDir) {
+  const payload = _ctxDropPayload(dataTransfer);
+  if (payload.kind === 'internal') {
+    await _handleCtxMove(payload.src, targetDir);
+    return true;
+  }
+  if (payload.kind === 'external' && payload.files.length) {
+    await handleCtxUpload(payload.files, targetDir);
+    return true;
+  }
+  return false;
+}
+
+function _ctxParentDir(relPath) {
+  const rel = String(relPath || '');
+  const slash = rel.lastIndexOf('/');
+  return slash >= 0 ? rel.slice(0, slash) : '';
+}
+
+function _ctxActiveFileDir() {
+  return _ctxParentDir(_ctxActive?.id || '');
+}
+
+function _bindCtxDetailDrop(container, getTargetDir = _ctxActiveFileDir) {
+  if (!container || container.dataset.externalDropBound) return;
+  container.dataset.externalDropBound = '1';
+  container.addEventListener('dragover', (e) => {
+    if (_ctxDragKind(e.dataTransfer) !== 'external') return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'copy';
+    container.classList.add('is-external-drag-over');
+  });
+  container.addEventListener('dragleave', (e) => {
+    if (e.currentTarget.contains(e.relatedTarget)) return;
+    container.classList.remove('is-external-drag-over');
+  });
+  container.addEventListener('drop', async (e) => {
+    if (_ctxDragKind(e.dataTransfer) !== 'external') return;
+    e.preventDefault();
+    e.stopPropagation();
+    container.classList.remove('is-external-drag-over');
+    await _handleCtxDrop(e.dataTransfer, getTargetDir());
+  });
 }
 
 function _bindCtxTreeHandlers(container) {
@@ -397,6 +608,7 @@ function _bindCtxTreeHandlers(container) {
     node.addEventListener('click', async (e) => {
       if (e.target.closest('[data-menu]')) {
         e.stopPropagation();
+        _ctxSelectionFor(rel);
         _openCtxRowMenu(e.target.closest('[data-menu]'), kind, rel);
         return;
       }
@@ -406,6 +618,8 @@ function _bindCtxTreeHandlers(container) {
         return;
       }
       e.stopPropagation();
+      const selectionOnly = _selectCtxEntry(rel, e, container);
+      if (selectionOnly) return;
       if (kind === 'dir') {
         if (_ctxExpanded.has(rel)) _ctxExpanded.delete(rel);
         else _ctxExpanded.add(rel);
@@ -421,7 +635,7 @@ function _bindCtxTreeHandlers(container) {
     // drop) runs in `_handleCtxMove`.
     wrap.addEventListener('dragstart', (e) => {
       e.stopPropagation();
-      e.dataTransfer.setData('application/x-context-path', rel);
+      e.dataTransfer.setData(CTX_INTERNAL_DRAG_TYPE, rel);
       e.dataTransfer.effectAllowed = 'move';
       wrap.classList.add('is-dragging');
     });
@@ -429,9 +643,12 @@ function _bindCtxTreeHandlers(container) {
 
     if (kind === 'dir') {
       const hover = (e) => {
+        const dragKind = _ctxDragKind(e.dataTransfer);
+        if (!dragKind) return;
         e.preventDefault();
         e.stopPropagation();
-        e.dataTransfer.dropEffect = 'move';
+        e.dataTransfer.dropEffect = dragKind === 'internal' ? 'move' : 'copy';
+        if (dragKind === 'external') _ctxClearDropHighlights(container);
         node.classList.add('is-drag-over');
       };
       const leave = (e) => {
@@ -444,37 +661,49 @@ function _bindCtxTreeHandlers(container) {
       node.addEventListener('dragenter', hover);
       node.addEventListener('dragleave', leave);
       node.addEventListener('drop', async (e) => {
+        if (!_ctxDragKind(e.dataTransfer)) return;
         e.preventDefault();
         e.stopPropagation();
         node.classList.remove('is-drag-over');
-        const src = e.dataTransfer.getData('application/x-context-path');
-        if (src) await _handleCtxMove(src, rel);
+        _ctxClearDropHighlights(container);
+        await _handleCtxDrop(e.dataTransfer, rel);
       });
     }
   });
 
-  // Root drop zone — empty area of the tree container itself accepts drops
-  // to move items back to the root. Suppressed when dragging from the root
-  // (no-op move) is left to `_handleCtxMove`'s validation.
+  // The whole tree is an external-file drop zone. Folder rows keep their
+  // exact target above; drops over an existing file use that file's parent,
+  // and all other tree space targets the root. Internal moves remain limited
+  // to folder rows or bare root space.
   if (!container.dataset.dndRootBound) {
     container.dataset.dndRootBound = '1';
     container.addEventListener('dragover', (e) => {
-      // Only highlight when dragging over the bare container (not over a row).
-      if (e.target.closest('.ctx-tree-wrap')) return;
+      const dragKind = _ctxDragKind(e.dataTransfer);
+      if (!dragKind) return;
+      const overEntry = e.target.closest('.ctx-tree-wrap');
+      if (dragKind === 'internal' && overEntry) return;
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      container.classList.add('is-root-drag-over');
+      e.dataTransfer.dropEffect = dragKind === 'internal' ? 'move' : 'copy';
+      if (dragKind === 'external') {
+        _ctxShowExternalDropTarget(container, _ctxExternalDropTargetDir(e.target));
+      } else {
+        container.classList.add('is-root-drag-over');
+      }
     });
     container.addEventListener('dragleave', (e) => {
       if (e.currentTarget.contains(e.relatedTarget)) return;
-      container.classList.remove('is-root-drag-over');
+      _ctxClearDropHighlights(container);
     });
     container.addEventListener('drop', async (e) => {
-      if (e.target.closest('.ctx-tree-wrap')) return;
+      const dragKind = _ctxDragKind(e.dataTransfer);
+      if (!dragKind) return;
+      const overEntry = e.target.closest('.ctx-tree-wrap');
+      if (dragKind === 'internal' && overEntry) return;
       e.preventDefault();
-      container.classList.remove('is-root-drag-over');
-      const src = e.dataTransfer.getData('application/x-context-path');
-      if (src) await _handleCtxMove(src, '');
+      e.stopPropagation();
+      const targetDir = dragKind === 'external' ? _ctxExternalDropTargetDir(e.target) : '';
+      _ctxClearDropHighlights(container);
+      await _handleCtxDrop(e.dataTransfer, targetDir);
     });
   }
 }
@@ -492,9 +721,9 @@ async function reprocessCtxKbFile(rel) {
       body: JSON.stringify({ path: rel }),
     });
     const data = await res.json();
-    if (!data.ok) await uiAlert(data.error || t('contexts.kb.reprocess_failed'));
-  } catch (e) {
-    await uiAlert(t('contexts.kb.reprocess_failed_with', { reason: e.message || e }));
+    if (!data.ok) await uiAlert(t('contexts.kb.reprocess_failed'));
+  } catch (_) {
+    await uiAlert(t('contexts.kb.reprocess_failed'));
   }
 }
 
@@ -513,14 +742,15 @@ function _updateCtxKbChip(rel) {
 }
 
 async function deleteCtxEntry(rel, kind) {
+  const name = String(rel || '').split('/').pop() || rel;
   const prompt = kind === 'dir'
-    ? t('contexts.dir.del_confirm', { rel })
-    : t('contexts.file.del_confirm', { rel });
+    ? t('contexts.dir.del_confirm', { name })
+    : t('contexts.file.del_confirm', { name });
   if (!(await uiConfirm(prompt))) return;
   try {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.delete_failed')); return; }
+    if (!data.ok) { await uiAlert(t('contexts.delete_failed')); return; }
     if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
       _clearCtxViewer();
     }
@@ -532,8 +762,8 @@ async function deleteCtxEntry(rel, kind) {
       if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
     }
     await loadContexts();
-  } catch (e) {
-    await uiAlert(t('contexts.delete_failed_with', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.delete_failed'));
   }
 }
 
@@ -548,6 +778,13 @@ function renameCtxEntry(rel /*, kind */) {
   // the menu was triggered from its own ⋯ button; the parent chain is open.
   _ctxPendingRename = { path: rel };
   renderCtxTree();
+}
+
+function _ctxMenuItemsHtml(items) {
+  return items.map((it) => `
+    ${it.dividerBefore ? '<div class="ctx-row-menu-divider" role="separator"></div>' : ''}
+    <div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}" data-action="${escapeHtml(it.action)}">${escapeHtml(it.label)}</div>
+  `).join('');
 }
 
 // Open the per-row ⋯ popover menu. `kind` ∈ 'root' | 'dir' | 'file'.
@@ -570,9 +807,7 @@ function _openCtxRowMenu(anchorBtn, kind, relPath) {
   _closeCtxRowMenu();
 
   const items = _ctxMenuItemsFor(kind, relPath);
-  menu.innerHTML = items.map(it =>
-    `<div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}" data-action="${escapeHtml(it.action)}">${escapeHtml(it.label)}</div>`
-  ).join('');
+  menu.innerHTML = _ctxMenuItemsHtml(items);
   menu.dataset.anchorPath = relPath;
   menu.dataset.anchorKind = kind;
   // While menu open, force the source row's ⋯ button visible so it doesn't
@@ -634,19 +869,21 @@ function _ctxMenuItemsFor(kind, relPath) {
       { action: 'new_text',   label: t('contexts.menu.new_text') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
+      { action: 'organize',   label: t('contexts.transfer.title'), dividerBefore: true },
       { action: 'rename',     label: t('contexts.menu.rename') },
-      { action: 'delete',     label: t('contexts.menu.delete'), danger: true },
+      { action: 'delete',     label: t('contexts.menu.delete'), danger: true, dividerBefore: true },
     ];
   }
   // file
   const items = [];
-  items.push({ action: 'ask_commander', label: t('contexts.menu.ask_commander') });
   if (CTX_TEXT_EXTS.has(_ctxExtOf(relPath))) {
     items.push({ action: 'edit', label: t('contexts.menu.edit') });
   }
-  items.push({ action: 'open_in_system', label: t('contexts.menu.open_in_system') });
   items.push({ action: 'rename', label: t('contexts.menu.rename') });
   items.push({ action: 'delete', label: t('contexts.menu.delete'), danger: true });
+  items.push({ action: 'ask_commander', label: t('contexts.menu.ask_commander'), dividerBefore: true });
+  items.push({ action: 'organize', label: t('contexts.transfer.title') });
+  items.push({ action: 'open_in_system', label: t('contexts.menu.open_in_system'), dividerBefore: true });
   return items;
 }
 
@@ -662,10 +899,40 @@ async function _runCtxMenuAction(action, kind, relPath) {
     }
     case 'rename':     return renameCtxEntry(relPath, kind);
     case 'delete':     return deleteCtxEntry(relPath, kind);
+    case 'organize':   return _openCtxTransfer(_ctxSelectionFor(relPath), 'menu');
     case 'edit':       { await openCtxFile(relPath); _enterCtxEdit(); return; }
     case 'open_in_system': return revealCtxFile(relPath);
     case 'ask_commander': return askCommanderAboutCtxFile(relPath);
   }
+}
+
+async function _openCtxTransfer(paths, entryPoint) {
+  if (!window.LibraryTransfer?.open || !paths?.length) return;
+  await window.LibraryTransfer.open({
+    source: { scope: 'global' },
+    paths,
+    entryPoint,
+    onComplete: async (result) => {
+      const successful = (result.results || []).filter((row) => row.ok);
+      if (result.mode === 'move') {
+        for (const row of successful) {
+          if (result.destination?.scope === 'global') {
+            _applyCtxPathChange(row.source, row.destination, result.destination.dir || '');
+          } else {
+            for (const key of Array.from(_ctxDrafts.keys())) {
+              if (key === row.source || key.startsWith(row.source + '/')) _ctxDrafts.delete(key);
+            }
+            if (_ctxActive && (_ctxActive.id === row.source || _ctxActive.id.startsWith(row.source + '/'))) {
+              _clearCtxViewer();
+            }
+          }
+        }
+      }
+      _ctxSelected.clear();
+      _ctxSelectionAnchor = null;
+      await loadContexts();
+    },
+  });
 }
 
 // Open a fresh GLOBAL commander conversation with this KB file attached as a
@@ -684,22 +951,66 @@ async function askCommanderAboutCtxFile(relPath) {
       window.COMMANDER_DRAFT_CID,
       () => { if (typeof setView === 'function') setView('new-chat'); },
     );
-  } catch (e) {
-    if (typeof uiAlert === 'function') await uiAlert(t('contexts.ask_commander_failed', { reason: (e && e.message) || e }));
+  } catch (_) {
+    if (typeof uiAlert === 'function') await uiAlert(t('contexts.ask_commander_failed'));
   }
 }
 
 // Move src to live under targetDir (empty string = root). Defends against
 // no-op moves, dropping into self, or dropping into own descendants. On
 // backend conflict / failure shows a uiAlert.
+function _ctxFlashMovedEntry(relPath) {
+  const wraps = document.querySelectorAll('.contexts-tree .ctx-tree-wrap[data-path]');
+  const wrap = Array.from(wraps).find((el) => el.dataset.path === relPath);
+  const node = wrap?.querySelector(':scope > .skill-tree-node');
+  if (!node) return;
+  node.scrollIntoView?.({ block: 'nearest' });
+  node.classList.remove('is-move-complete');
+  requestAnimationFrame(() => node.classList.add('is-move-complete'));
+  setTimeout(() => node.classList.remove('is-move-complete'), 1500);
+}
+
+function _ctxMoveTargetLabel(targetDir) {
+  if (!targetDir) return t('contexts.root_label');
+  const parts = String(targetDir).split('/');
+  return parts[parts.length - 1] || t('contexts.root_label');
+}
+
+function _applyCtxPathChange(srcRel, dst, targetDir = '') {
+  if (_ctxActive && (_ctxActive.id === srcRel || _ctxActive.id.startsWith(srcRel + '/'))) {
+    _ctxActive.id = dst + _ctxActive.id.slice(srcRel.length);
+  }
+  for (const expanded of Array.from(_ctxExpanded)) {
+    if (expanded === srcRel || expanded.startsWith(srcRel + '/')) {
+      _ctxExpanded.delete(expanded);
+      _ctxExpanded.add(dst + expanded.slice(srcRel.length));
+    }
+  }
+  if (targetDir) _ctxExpanded.add(targetDir);
+  for (const [key, val] of Array.from(_ctxDrafts.entries())) {
+    if (key === srcRel) {
+      _ctxDrafts.set(dst, val);
+      _ctxDrafts.delete(srcRel);
+    } else if (key.startsWith(srcRel + '/')) {
+      _ctxDrafts.set(dst + key.slice(srcRel.length), val);
+      _ctxDrafts.delete(key);
+    }
+  }
+  _retargetCtxViewerAfterRename(srcRel, dst);
+}
+
 async function _handleCtxMove(srcRel, targetDir) {
   if (!srcRel) return;
   const base = srcRel.includes('/') ? srcRel.slice(srcRel.lastIndexOf('/') + 1) : srcRel;
   const dst = targetDir ? `${targetDir}/${base}` : base;
   if (dst === srcRel) return;
+  const sourceWrap = Array.from(document.querySelectorAll('.contexts-tree .ctx-tree-wrap[data-path]'))
+    .find((el) => el.dataset.path === srcRel);
+  const trackResult = () => {};
   // Reject moves into self or own subtree (only meaningful for dirs but the
   // check is cheap and correct for files too).
   if (targetDir === srcRel || targetDir.startsWith(srcRel + '/')) {
+    trackResult('failure', 'invalid_target', false);
     await uiAlert(t('contexts.dnd.invalid_self'));
     return;
   }
@@ -710,27 +1021,26 @@ async function _handleCtxMove(srcRel, targetDir) {
       body: JSON.stringify({ src: srcRel, dst }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.entry.rename_failed')); return; }
-    // Carry over expanded / active state so the moved item stays visible.
-    if (_ctxActive && _ctxActive.id === srcRel) _ctxActive.id = dst;
-    if (_ctxExpanded.has(srcRel)) { _ctxExpanded.delete(srcRel); _ctxExpanded.add(dst); }
-    if (targetDir) _ctxExpanded.add(targetDir);
-    // Re-key drafts + retarget viewer the same way `_commitInlineRename`
-    // does — drag-drop moves are renames too as far as the open viewer
-    // is concerned.
-    for (const [key, val] of Array.from(_ctxDrafts.entries())) {
-      if (key === srcRel) {
-        _ctxDrafts.set(dst, val);
-        _ctxDrafts.delete(srcRel);
-      } else if (key.startsWith(srcRel + '/')) {
-        _ctxDrafts.set(dst + key.slice(srcRel.length), val);
-        _ctxDrafts.delete(key);
-      }
+    if (!data.ok) {
+      const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
+      trackResult('failure', errorCode);
+      const message = errorCode === 'target_exists'
+        ? t('contexts.dnd.target_exists', { name: base })
+        : t('contexts.dnd.move_failed');
+      await uiAlert(message);
+      return;
     }
-    _retargetCtxViewerAfterRename(srcRel, dst);
+    _applyCtxPathChange(srcRel, dst, targetDir);
     await loadContexts();
+    _ctxFlashMovedEntry(dst);
+    if (typeof uiToast === 'function') {
+      uiToast(t('contexts.dnd.moved_to', { target: _ctxMoveTargetLabel(targetDir) }), { variant: 'success' });
+    }
+    trackResult('success');
   } catch (e) {
-    await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
+    trackResult('failure', 'move_failed');
+    _contextsLog.warn('move library entry failed', e);
+    await uiAlert(t('contexts.dnd.move_failed'));
   }
 }
 
@@ -776,7 +1086,7 @@ async function _commitInlineRename(rel, nextBase) {
       body: JSON.stringify({ src: rel, dst }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.entry.rename_failed')); await loadContexts(); return; }
+    if (!data.ok) { await uiAlert(_ctxRenameFailureMessage(data.error)); await loadContexts(); return; }
     if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
     // Re-key any drafts (file rename: one entry; dir rename: every entry
     // under the old prefix) so the draft survives the rename. Iterate a
@@ -792,10 +1102,21 @@ async function _commitInlineRename(rel, nextBase) {
     }
     _retargetCtxViewerAfterRename(rel, dst);
     await loadContexts();
-  } catch (e) {
-    await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.entry.rename_failed'));
     await loadContexts();
   }
+}
+
+function _ctxRenameFailureMessage(error) {
+  const code = String(error || '');
+  if (code === 'destination already exists' || code === 'target_exists') {
+    return t('contexts.entry.rename_target_exists');
+  }
+  if (code === 'destination has unsupported extension') {
+    return t('contexts.entry.rename_unsupported');
+  }
+  return t('contexts.entry.rename_failed');
 }
 
 // Opens the "new directory" modal scoped to `parentDir` (relative, '' for
@@ -838,13 +1159,19 @@ async function saveCtxNew() {
       body: JSON.stringify({ path: joined }),
     });
     const data = await res.json();
-    if (!data.ok) { msg.textContent = data.error || t('contexts.dir.create_failed'); msg.className = 'form-msg err'; return; }
+    if (!data.ok) {
+      msg.textContent = data.error === 'path exists and is not a directory'
+        ? t('contexts.entry.name_exists')
+        : t('contexts.dir.create_failed');
+      msg.className = 'form-msg err';
+      return;
+    }
     _ctxExpanded.add(joined);
     closeCtxNewModal();
     if (_ctxNewTargetDir) _ctxExpanded.add(_ctxNewTargetDir);
     await loadContexts();
-  } catch (e) {
-    msg.textContent = t('contexts.network_error', { reason: e.message || e });
+  } catch (_) {
+    msg.textContent = t('contexts.dir.create_failed');
     msg.className = 'form-msg err';
   }
 }
@@ -870,7 +1197,7 @@ async function createCtxNewTextFile(parentDir = '') {
       body: JSON.stringify({ path: fullPath, content: '' }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.file.create_failed')); return; }
+    if (!data.ok) { await uiAlert(t('contexts.file.create_failed')); return; }
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
@@ -879,8 +1206,8 @@ async function createCtxNewTextFile(parentDir = '') {
     // next renderCtxTree() call.
     _showCtxTextViewer(fullPath, '');
     _enterCtxEdit();
-  } catch (e) {
-    await uiAlert(t('contexts.network_error', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.file.create_failed'));
   }
 }
 
@@ -906,14 +1233,14 @@ async function createCtxNewTodoFile(parentDir = '') {
       body: JSON.stringify({ path: fullPath, content: template }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.file.create_failed')); return; }
+    if (!data.ok) { await uiAlert(t('contexts.file.create_failed')); return; }
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
     _showCtxTextViewer(fullPath, template);
     _enterCtxEdit();
-  } catch (e) {
-    await uiAlert(t('contexts.network_error', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.file.create_failed'));
   }
 }
 
@@ -962,6 +1289,28 @@ function _ctxUploadErrorCode(reason) {
   return 'upload_failed';
 }
 
+function _ctxLibraryDirectoryLabel(existingDir) {
+  const dir = String(existingDir || '').replace(/^\/+|\/+$/g, '');
+  const leaf = dir || t('contexts.root_label');
+  return `${t('contexts.title')} / ${leaf}`;
+}
+
+async function _ctxAlertDuplicateUploads(rows) {
+  if (!rows.length) return;
+  const dirs = Array.from(new Set(rows.map((row) => _ctxLibraryDirectoryLabel(row.existingDir))));
+  await uiAlert(t('contexts.upload_duplicate', { dirs: dirs.join('\n') }));
+}
+
+async function _ctxAlertUploadFailures(rows) {
+  if (!rows.length) return;
+  const names = rows
+    .map((row) => String((row && (row.name || row.target)) || '').trim())
+    .filter(Boolean);
+  await uiAlert(names.length
+    ? t('contexts.upload_failed', { list: names.join('\n') })
+    : t('contexts.upload_failed_generic'));
+}
+
 async function handleCtxUpload(fileList, targetDir = '') {
   const files = Array.from(fileList || []);
   _contextsLog.info(`upload: ${files.length} file(s), targetDir="${targetDir || '(root)'}"`);
@@ -1004,7 +1353,13 @@ async function handleCtxUpload(fileList, targetDir = '') {
       const data = await res.json();
       if (!data.ok) {
         delete _kbStatusByPath[target];
-        return { ok: false, name: file.name, reason: data.error || 'unknown' };
+        return {
+          ok: false,
+          name: file.name,
+          reason: data.error || 'unknown',
+          code: data.code || '',
+          existingDir: typeof data.existingDir === 'string' ? data.existingDir : '',
+        };
       }
       if (window.Monitor) (() => {})('library_file_upload', { file_size_bytes: file.size || 0, file_ext: ext });
       return { ok: true, name: file.name };
@@ -1023,15 +1378,15 @@ async function handleCtxUpload(fileList, targetDir = '') {
 
   const rejected = results.filter((r) => !r.ok);
   for (const r of rejected) {
-    _contextsLog.warn('upload failed', r.name, r.reason);
-    if (window.Monitor) (() => {})('library_file_upload', { error_message: _ctxUploadErrorCode(r.reason) });
+    const errorCode = _ctxUploadErrorCode(r.code || r.reason);
+    _contextsLog.warn(`upload failed: ${errorCode}`);
   }
   const extRejected = rejected.filter((r) => r.reason === 'ext');
   const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
-  const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden');
+  const duplicateRejected = rejected.filter((r) => r.code === 'duplicate_content');
+  const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden' && r.code !== 'duplicate_content');
   if (extRejected.length) {
     await uiAlert(t('contexts.upload_rejected', {
-      exts: CTX_ALLOWED_EXTS.join(' / '),
       list: extRejected.map((r) => r.name || '').join('\n'),
     }));
   }
@@ -1040,11 +1395,8 @@ async function handleCtxUpload(fileList, targetDir = '') {
       list: hiddenRejected.map((r) => r.name || '').join('\n'),
     }));
   }
-  if (failed.length) {
-    await uiAlert(t('contexts.upload_failed', {
-      name: failed.map((r) => `${r.name || ''}: ${r.reason || 'unknown'}`).join('\n'),
-    }));
-  }
+  await _ctxAlertDuplicateUploads(duplicateRejected);
+  await _ctxAlertUploadFailures(failed);
 }
 
 async function handleCtxNativeUpload(targetDir = '') {
@@ -1061,7 +1413,7 @@ async function handleCtxNativeUpload(targetDir = '') {
     await loadContexts();
   } catch (err) {
     _contextsLog.warn('native upload failed', err);
-    await uiAlert(err.message || String(err));
+    await uiAlert(t('contexts.upload_picker_failed'));
     return;
   } finally {
     if (statusEl) statusEl.style.display = 'none';
@@ -1070,7 +1422,6 @@ async function handleCtxNativeUpload(targetDir = '') {
   const extRejected = files.filter((r) => r && r.ok === false && r.reason === 'ext');
   if (extRejected.length) {
     await uiAlert(t('contexts.upload_rejected', {
-      exts: CTX_ALLOWED_EXTS.join(' / '),
       list: extRejected.map((r) => r.name || '').join('\n'),
     }));
   }
@@ -1080,11 +1431,15 @@ async function handleCtxNativeUpload(targetDir = '') {
       list: hiddenRejected.map((r) => r.name || '').join('\n'),
     }));
   }
-  const failed = files.filter((r) => !r || (r.ok === false && r.reason !== 'ext' && r.reason !== 'hidden'));
-  if (failed.length) {
-    const list = failed.map((r) => `${r.name || ''}: ${r.error || r.reason || 'unknown'}`).join('\n');
-    await uiAlert(t('contexts.upload_failed', { name: list }));
-  }
+  const duplicateRejected = files.filter((r) => r && r.ok === false && r.code === 'duplicate_content');
+  await _ctxAlertDuplicateUploads(duplicateRejected);
+  const failed = files.filter((r) => !r || (
+    r.ok === false
+    && r.reason !== 'ext'
+    && r.reason !== 'hidden'
+    && r.code !== 'duplicate_content'
+  ));
+  await _ctxAlertUploadFailures(failed);
 }
 
 // ── Viewer (right pane) ──
@@ -1145,12 +1500,12 @@ async function openCtxFile(rel) {
     if (kind === 'text') {
       const res = await apiFetch(`/api/contexts/read?path=${encodeURIComponent(rel)}`);
       const data = await res.json();
-      if (!data.ok) { await uiAlert(data.error || t('contexts.read_failed')); return; }
+      if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
       _showCtxTextViewer(rel, data.content || '');
     } else if (kind === 'image') {
       const res = await apiFetch(`/api/contexts/image?path=${encodeURIComponent(rel)}`);
       const data = await res.json();
-      if (!data.ok) { await uiAlert(data.error || t('contexts.read_failed')); return; }
+      if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
       _showCtxImageViewer(rel, data.base64, data.mediaType, data.bytes);
     } else if (kind === 'pdf') {
       // Let Chromium's built-in PDFium render inline via the kb-file://
@@ -1164,8 +1519,8 @@ async function openCtxFile(rel) {
       _showCtxBinaryViewer(rel, kind);
       revealCtxFile(rel);
     }
-  } catch (e) {
-    await uiAlert(t('contexts.read_failed_with', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.read_failed'));
   }
 }
 
@@ -1216,7 +1571,7 @@ async function _showCtxOfficeViewer(rel) {
   els.bodyEl.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
   const res = await apiFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
   const data = await res.json();
-  if (!data.ok) { await uiAlert(data.error || t('contexts.read_failed')); return; }
+  if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
   if (_ctxOfficeBlobUrl) {
     try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
   }
@@ -1240,9 +1595,9 @@ async function revealCtxFile(rel) {
       body: JSON.stringify({ path: rel }),
     });
     const data = await res.json();
-    if (!data.ok) await uiAlert(data.error || t('contexts.reveal_failed'));
-  } catch (e) {
-    await uiAlert(t('contexts.reveal_failed_with', { reason: e.message || e }));
+    if (!data.ok) await uiAlert(t('contexts.reveal_failed'));
+  } catch (_) {
+    await uiAlert(t('contexts.reveal_failed'));
   }
 }
 
@@ -1367,16 +1722,17 @@ function _showCtxBinaryViewer(rel, kind) {
 async function _deleteCtxFromViewer() {
   if (!_ctxActive) return;
   const rel = _ctxActive.id;
-  if (!(await uiConfirm(t('contexts.file.del_confirm', { rel })))) return;
+  const name = String(rel || '').split('/').pop() || rel;
+  if (!(await uiConfirm(t('contexts.file.del_confirm', { name })))) return;
   try {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.delete_failed')); return; }
+    if (!data.ok) { await uiAlert(t('contexts.delete_failed')); return; }
     _ctxClearDraft(rel);
     _clearCtxViewer();
     await loadContexts();
-  } catch (e) {
-    await uiAlert(t('contexts.delete_failed_with', { reason: e.message || e }));
+  } catch (_) {
+    await uiAlert(t('contexts.delete_failed'));
   }
 }
 
@@ -1392,6 +1748,11 @@ function _clearCtxViewer() {
 // ── Init bindings ──
 
 function initCtxBindings() {
+  _bindCtxDetailDrop(document.getElementById('contexts-editor-col'));
+  document.getElementById('ctx-tmp-new-btn')?.addEventListener('click', createNewCtxTmpDraft);
+  document.getElementById('ctx-tmp-new-name')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveCtxTmpNew(); }
+  });
   // Root ⋯ menu — entry point for new_text / new_folder / upload at root.
   // The "anchor" path is empty string for root.
   document.getElementById('ctx-root-menu-btn')?.addEventListener('click', (e) => {

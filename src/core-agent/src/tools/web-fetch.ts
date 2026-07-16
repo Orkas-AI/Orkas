@@ -7,9 +7,12 @@
  */
 import { defineTool, type AgentTool } from "./base.js";
 
-const DEFAULT_MAX_CHARS = 50_000;
 const DEFAULT_TIMEOUT_MS = 60_000;
-const MAX_RESPONSE_BYTES = 2_000_000;
+/** Network/body safety bound, separate from the 8K model-context policy. The
+ * complete decoded/extracted result below this limit reaches the host Result
+ * Store; responses above it fail explicitly instead of returning a silent,
+ * misleading prefix as if it were the full page. */
+export const MAX_WEB_FETCH_RESPONSE_BYTES = 16 * 1024 * 1024;
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
@@ -174,14 +177,21 @@ export const webFetchTool: AgentTool = defineTool({
       url: { type: "string", description: "The HTTP or HTTPS URL to fetch." },
       maxChars: {
         type: "number",
-        description: `Maximum characters to return (default: ${DEFAULT_MAX_CHARS}). Truncates if exceeded.`,
+        description: "Optional explicit character limit. Omit it to return the complete extracted body to the host Result Store.",
       },
     },
     required: ["url"],
   },
   async execute(input) {
     const url = (input.url as string).trim();
-    const maxChars = (input.maxChars as number | undefined) ?? DEFAULT_MAX_CHARS;
+    const requestedMaxChars = Number(input.maxChars);
+    const maxChars = Number.isFinite(requestedMaxChars) && requestedMaxChars > 0
+      ? Math.trunc(requestedMaxChars)
+      : null;
+    const applyExplicitLimit = (text: string): string =>
+      maxChars !== null && text.length > maxChars
+        ? text.slice(0, maxChars) + "\n...(truncated at the explicitly requested maxChars)"
+        : text;
 
     if (!url) {
       return { content: "Error: url is required", isError: true };
@@ -214,6 +224,16 @@ export const webFetchTool: AgentTool = defineTool({
         }
 
         const contentType = resp.headers.get("content-type") ?? "";
+        const declaredLength = Number(resp.headers.get("content-length"));
+        if (Number.isFinite(declaredLength) && declaredLength > MAX_WEB_FETCH_RESPONSE_BYTES) {
+          await resp.body?.cancel().catch(() => undefined);
+          return {
+            content:
+              `E_FETCH_RESPONSE_TOO_LARGE: response declares ${declaredLength} bytes; ` +
+              `hard safety limit is ${MAX_WEB_FETCH_RESPONSE_BYTES} bytes. No partial page was returned.`,
+            isError: true,
+          };
+        }
 
         // Read response body with size limit. Keep the timeout active until
         // the body is consumed; slow pages often send headers quickly and then
@@ -228,12 +248,17 @@ export const webFetchTool: AgentTool = defineTool({
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          chunks.push(value);
           totalBytes += value.byteLength;
-          if (totalBytes > MAX_RESPONSE_BYTES) {
-            reader.cancel();
-            break;
+          if (totalBytes > MAX_WEB_FETCH_RESPONSE_BYTES) {
+            await reader.cancel().catch(() => undefined);
+            return {
+              content:
+                `E_FETCH_RESPONSE_TOO_LARGE: response exceeded ${MAX_WEB_FETCH_RESPONSE_BYTES} bytes while streaming. ` +
+                `No partial page was returned.`,
+              isError: true,
+            };
           }
+          chunks.push(value);
         }
 
         const buf = Buffer.concat(chunks);
@@ -244,27 +269,22 @@ export const webFetchTool: AgentTool = defineTool({
         if (contentType.includes("json")) {
           try {
             const pretty = JSON.stringify(JSON.parse(raw), null, 2);
-            const truncated = pretty.length > maxChars ? pretty.slice(0, maxChars) + "\n...(truncated)" : pretty;
-            return { content: truncated };
+            return { content: applyExplicitLimit(pretty) };
           } catch {
-            const truncated = raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
-            return { content: truncated };
+            return { content: applyExplicitLimit(raw) };
           }
         }
 
         // Plain text: return as-is
         if (contentType.includes("text/plain")) {
-          const truncated = raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
-          return { content: truncated };
+          return { content: applyExplicitLimit(raw) };
         }
 
         // HTML: extract text
         const title = extractTitle(raw);
         let text = htmlToText(raw);
         const issue = classifyFetchContent(url, title, raw, text);
-        if (text.length > maxChars) {
-          text = text.slice(0, maxChars) + "\n...(truncated)";
-        }
+        text = applyExplicitLimit(text);
 
         const header = title ? `Title: ${title}\nURL: ${url}\n\n` : `URL: ${url}\n\n`;
         if (issue) {

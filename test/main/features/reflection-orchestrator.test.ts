@@ -3,15 +3,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-// Same race as in reflection-transcript.test.ts: activateUser fires
-// sweepSessions fire-and-forget and would wipe our test session files.
-vi.mock('../../../src/main/features/sessions_sweep', () => ({
-  sweepSessions: vi.fn(async () => ({
-    scanned: 0, orphan_cid: 0, ephemeral_on_cloud: 0, legacy: 0,
-    local_aged_out: 0, errors: 0,
-  })),
-}));
-
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
@@ -114,6 +105,27 @@ describe('reflection-orchestrator › pickAgentsForCycle', () => {
     const picked = await mod.pickAgentsForCycle(TEST_UID, ['cool', 'dirty', 'stale', 'idle'], state, NOW, isDirty);
     const ids = picked.map((p) => p.agentId).sort();
     expect(ids).toEqual(['dirty', 'stale']);
+  });
+
+  it('stops catalog checks at a cooperative cancellation point', async () => {
+    const mod = await loadModule();
+    const controller = new AbortController();
+    const checked: string[] = [];
+    const picked = await mod.pickAgentsForCycle(
+      TEST_UID,
+      ['a', 'b', 'c'],
+      { lastReflectedAt: {} },
+      NOW,
+      async (_uid, id) => {
+        checked.push(id);
+        controller.abort();
+        return true;
+      },
+      controller.signal,
+    );
+
+    expect(checked).toEqual(['a']);
+    expect(picked.map((row) => row.agentId)).toEqual(['a']);
   });
 });
 

@@ -26,6 +26,7 @@
 
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { hardenedWebPreferences } from './window-security';
 
 // ── Markdown → HTML ──────────────────────────────────────────────────────
 
@@ -263,12 +264,7 @@ export async function htmlToPdf(
 
   const win = new BrowserWindow({
     show: false,
-    webPreferences: {
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-      webSecurity: true,
-    },
+    webPreferences: hardenedWebPreferences(),
   });
 
   try {

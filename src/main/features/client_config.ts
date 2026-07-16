@@ -10,9 +10,9 @@ import { getActiveUserId, hasActiveUser } from './users';
 import { userRemoteConfigFile } from '../paths';
 import { readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
-import { getCurrentDevice } from '../util/device';
 import { fetchWithRetry } from '../util/retry';
 import { desktopPlatform } from '../system_info';
+import { withCommonHeaders } from './api_common';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
 
@@ -386,14 +386,7 @@ function apiBase(_app: ElectronAppLike): string {
 
 function buildUrl(app: ElectronAppLike): string {
   const url = new URL(`${apiBase(app)}/config/client`);
-  const device = getCurrentDevice();
-  url.searchParams.set('platform', clientConfigPlatform());
-  url.searchParams.set('version', app.getVersion());
-  url.searchParams.set('channel', channel(app));
   url.searchParams.set('region', region());
-  url.searchParams.set('os', process.platform);
-  url.searchParams.set('arch', process.arch);
-  url.searchParams.set('device_id', device.id || device.name);
   return url.toString();
 }
 
@@ -434,7 +427,7 @@ export async function refresh(
     clientConfig.markRefreshAttempt();
     try {
       const { app } = runtimeApp ? { app: runtimeApp } : await loadElectronRuntime();
-      const headers: Record<string, string> = {};
+      const headers: Record<string, string> = withCommonHeaders();
       if (current.etag) headers['If-None-Match'] = current.etag;
       const res = await fetchWithRetry('client-config:refresh', buildUrl(app), { method: 'GET', headers });
       const etag = res.headers.get('etag') || '';

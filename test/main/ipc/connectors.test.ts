@@ -103,4 +103,36 @@ describe('ipc/connectors renderer DTO', () => {
     expect(json).not.toContain('header-secret');
   });
 
+  it('returns the latest connector status after refresh', async () => {
+    const degraded = {
+      ...baseInstance({
+        kind: 'streamable-http',
+        url: 'https://example.com/mcp',
+        headers: {},
+      }),
+      status: { kind: 'degraded', message: 'fetch failed', at: 1 },
+      tools_cache: [{ name: 'cached', description: '', input_schema: {} }],
+    };
+    const refreshTools = vi.fn(async () => degraded.tools_cache);
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      refreshTools,
+      getInstance: vi.fn(() => degraded),
+      isValidInstanceId: vi.fn(() => true),
+    }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    const out = await invokeHandlers['connectors.refresh']({ id: 'custom-secret' }, { userId: 'u-ipc' });
+
+    expect(refreshTools).toHaveBeenCalledWith('u-ipc', 'custom-secret');
+    expect(out.tools).toEqual(degraded.tools_cache);
+    expect(out.instance.status).toMatchObject({ kind: 'degraded', message: 'fetch failed' });
+  });
 });

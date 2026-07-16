@@ -41,8 +41,13 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session,
 import './install-data-root.cjs';
 import { desktopPlatform, osVersion } from './system_info';
 import { hardenedWebPreferences, installExternalNavigationGuard } from './util/window-security';
+import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
+const PACKAGED_LAUNCH_SMOKE_FILE = app.isPackaged
+  ? String(process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE || '').trim()
+  : '';
+const IS_PACKAGED_LAUNCH_SMOKE = !!PACKAGED_LAUNCH_SMOKE_FILE;
 const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MARKETPLACE_SERVER_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
@@ -51,6 +56,13 @@ const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
 // environment: global prod. This keeps local data paths and OS app grouping
 // stable across run modes.
 app.setName('Orkas');
+try {
+  if (IS_PACKAGED_LAUNCH_SMOKE) {
+    app.setPath('userData', path.join(path.dirname(PACKAGED_LAUNCH_SMOKE_FILE), 'user-data'));
+  }
+} catch {
+  /* userData may be unavailable in unusual test hosts; the default is fine. */
+}
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
@@ -92,7 +104,13 @@ protocol.registerSchemesAsPrivileged([
 
 import * as paths from './paths';
 import { parseByteRange } from './util/http-range';
-import { registerDeferred, runBootPhases } from './util/boot_init';
+import {
+  configureBootAdmission,
+  noteBootUserActivity,
+  registerDeferred,
+  runBootPhases,
+} from './util/boot_init';
+import { getBootDeviceProfile } from './util/boot-device-profile';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
 // (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
@@ -145,9 +163,9 @@ import * as agentsFeature from './features/agents';
 import * as contextsFeature from './features/contexts';
 import * as chatsFeature from './features/chats';
 import * as searchFeature from './features/search';
-import * as authFeature from './features/auth';
+import * as projectFilesFeature from './features/project_files';
 import * as appConfig from './features/config';
-import { getRendererTables } from './i18n';
+import { getRendererBootTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as systemSkills from './features/system_skills';
@@ -171,12 +189,14 @@ function createWindow(): BrowserWindow {
     height: 800,
     ...restored.bounds,
     title: '',
+    show: !IS_PACKAGED_LAUNCH_SMOKE,
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
     webPreferences: hardenedWebPreferences({
       // preload sits next to index.ts in PC/src/main/ — just __dirname + 'preload.js'.
       preload: path.join(__dirname, 'preload.js'),
       devTools: dev,
+      additionalArguments: IS_PACKAGED_LAUNCH_SMOKE ? ['--orkas-packaged-launch-smoke'] : [],
       // Enables Chromium's built-in PDF viewer (PDFium) inside iframes.
       // Required for `<iframe src="kb-file:///.../report.pdf">` in the KB
       // viewer. Has no effect on other plugin types since Electron strips
@@ -236,6 +256,52 @@ function registerIpc(): void {
     return { ok: true, pong: 'pong', ts: storage.nowIso() };
   });
 
+  if (IS_PACKAGED_LAUNCH_SMOKE) {
+    let recorded = false;
+    ipcMain.handle('orkas.packagedLaunchSmokeReady', (event, payload) => {
+      if (recorded) return { ok: true };
+      const owner = BrowserWindow.fromWebContents(event.sender);
+      const readyState = String(payload?.rendererReadyState || '');
+      if (!owner || owner.isDestroyed()) throw new Error('launch smoke sender is not an active BrowserWindow');
+      if (payload?.preloadLoaded !== true || payload?.ping !== 'pong') {
+        throw new Error('launch smoke preload/IPC proof is incomplete');
+      }
+      if (readyState !== 'interactive' && readyState !== 'complete') {
+        throw new Error(`launch smoke renderer is not ready: ${readyState || '(missing)'}`);
+      }
+      const appAsar = path.join(process.resourcesPath, 'app.asar');
+      // Electron's patched `fs` exposes an ASAR as a virtual directory, so
+      // stat().isFile() is false even for a healthy physical archive. Prove
+      // the archive is present and that this running main module was actually
+      // resolved from inside it.
+      const mainLoadedFromAsar = __dirname.split(path.sep).includes('app.asar');
+      if (!fs.existsSync(appAsar) || !mainLoadedFromAsar) {
+        throw new Error(`launch smoke main process was not loaded from app.asar: ${appAsar}`);
+      }
+      const record = {
+        status: 'ready',
+        appIsPackaged: app.isPackaged,
+        appAsar: true,
+        preloadLoaded: true,
+        rendererLoaded: true,
+        ipcPing: 'pong',
+        rendererReadyState: readyState,
+        version: app.getVersion(),
+        platform: process.platform,
+        arch: process.arch,
+        readyAt: new Date().toISOString(),
+      };
+      const marker = path.resolve(PACKAGED_LAUNCH_SMOKE_FILE);
+      const temp = `${marker}.${process.pid}.tmp`;
+      fs.mkdirSync(path.dirname(marker), { recursive: true });
+      fs.writeFileSync(temp, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+      fs.renameSync(temp, marker);
+      recorded = true;
+      setImmediate(() => app.quit());
+      return { ok: true };
+    });
+  }
+
   ipcMain.handle('orkas.env', () => {
     const systemVersion = osVersion();
     const platform = desktopPlatform();
@@ -281,17 +347,23 @@ function registerIpc(): void {
   // populate _currentLang + _tables synchronously at module load — first
   // paint shows the user's preferred language with no English flash. Using
   // sendSync (and not the async `config.getLanguage` IPC) is the whole point:
-  // an async round-trip schedules a microtask, paint slips through. Reads
-  // ~100 KB of locale JSON per renderer boot; SSD-fast.
+  // an async round-trip schedules a microtask, paint slips through. Only
+  // the active language + fallback cross this synchronous boundary;
+  // other locale tables load asynchronously if the user switches language.
   ipcMain.on('orkas:bootI18n', (event) => {
     try {
       const lang = appConfig.getLanguage();
-      event.returnValue = { ok: true, lang, tables: getRendererTables() };
+      event.returnValue = { ok: true, lang, tables: getRendererBootTables(lang) };
     } catch (err) {
       log.warn('bootI18n failed', { error: (err as Error)?.message });
       event.returnValue = { ok: false };
     }
   });
+
+  // Renderer reports throttled keyboard/pointer/wheel activity. Background
+  // boot work uses this only as an admission hint; no interaction payload is
+  // collected or persisted.
+  ipcMain.on('orkas.userActivity', () => noteBootUserActivity());
 
   ipcMain.handle('orkas.diagnostics', async () => {
     const sample = {
@@ -374,12 +446,16 @@ async function runBootSelfCheck(): Promise<void> {
   } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
 
   // Stage 2: clear stale processing=true conversations from a previous crash.
-  try { await chatsFeature.sweepStaleProcessing(); }
+  try { await chatsFeature.sweepStaleProcessing(users.getActiveUserId()); }
   catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
 
 }
 
 async function runBootMaintenanceSweeps(): Promise<void> {
+  // Full cross-user/unindexed recovery stays out of the pre-window self-check.
+  try { await chatsFeature.sweepStaleProcessing(); }
+  catch (err) { log.warn('full chats sweep failed', { error: (err as Error).message }); }
+
   // file_cache orphan sweep — stat-based maintenance, not needed before the
   // first BrowserWindow exists.
   try {
@@ -691,34 +767,14 @@ function registerKbFileProtocol(): void {
       // unusual normalisations (`kb-file://<seg>/...`, `kb-file:///…`) by
       // extracting the pathname via `new URL`; standard-scheme URLs parse
       // cleanly once a host is present.
-      let rel = '';
-      try {
-        const u = new URL(reqUrl);
-        rel = decodeURIComponent(u.pathname || '').replace(/^\/+/, '');
-      } catch {
-        // Last resort: string split after the scheme + slashes + host.
-        const after = reqUrl.replace(/^kb-file:\/*/i, '');
-        const noHost = after.includes('/') ? after.slice(after.indexOf('/') + 1) : after;
-        rel = decodeURIComponent(noHost.split('?')[0].split('#')[0]);
-      }
-      if (!rel) {
-        log.warn('kb-file: empty rel', { reqUrl });
-        return new Response('bad request: empty path', { status: 400 });
-      }
       const uid = users.getActiveUserId();
       const root = path.resolve(paths.userContextsDir(uid));
-      const abs = path.resolve(root, rel);
-      const relCheck = path.relative(root, abs);
-      if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
-        log.warn('kb-file: traversal blocked', { reqUrl, rel });
-        return new Response('forbidden', { status: 403 });
+      const resolved = resolveContainedProtocolFile(reqUrl, 'kb-file', root);
+      if (resolved.ok === false) {
+        log.warn('kb-file: rejected', { reqUrl, code: resolved.error });
+        return new Response(resolved.error.replace('_', ' '), { status: resolved.status });
       }
-      let st: fs.Stats | undefined;
-      try { st = fs.statSync(abs); } catch { /* falls through to 404 below */ }
-      if (!st || !st.isFile()) {
-        log.warn('kb-file: not found', { reqUrl, rel, abs });
-        return new Response('not found', { status: 404 });
-      }
+      const { absPath: abs, stat: st } = resolved;
       log.info('kb-file: serving', { reqUrl, abs, bytes: st.size });
       const ext = path.extname(abs).toLowerCase();
       const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
@@ -939,7 +995,7 @@ function registerChatAppProtocol(): void {
 }
 
 // Single-instance lock prevents double-launch from duplicating the backend.
-const gotLock = app.requestSingleInstanceLock();
+const gotLock = IS_PACKAGED_LAUNCH_SMOKE || app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
@@ -975,9 +1031,19 @@ if (!gotLock) {
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
     });
-    const CLIENT_CONFIG_STARTUP_DELAY_MS = 8_000;
-    const CONNECTORS_BOOTSTRAP_DELAY_MS = 5_000;
     const BOOT_BACKGROUND_DEFER_MS = 6_000;
+    const bootDevice = getBootDeviceProfile();
+    const BOOT_HEAVY_DISK_DELAY_MS = bootDevice.heavyDiskOffsetMs;
+    const BOOT_POST_STARTUP_DELAY_MS = bootDevice.postStartupOffsetMs;
+    const CLIENT_CONFIG_STARTUP_DELAY_MS = 8_000;
+    const CONNECTORS_BOOTSTRAP_DELAY_MS = bootDevice.connectorBootstrapDelayMs;
+    log.info('boot device profile', {
+      tier: bootDevice.tier,
+      logical_cpus: bootDevice.logicalCpus,
+      total_memory_gib: Math.round((bootDevice.totalMemoryBytes / (1024 ** 3)) * 10) / 10,
+      heavy_disk_delay_ms: BOOT_HEAVY_DISK_DELAY_MS,
+      post_startup_delay_ms: BOOT_POST_STARTUP_DELAY_MS,
+    });
     clientConfigFeature.start({
       startupDelayMs: CLIENT_CONFIG_STARTUP_DELAY_MS,
       forceStartupRefresh: false,
@@ -1002,16 +1068,32 @@ if (!gotLock) {
     // Replaces the pre-existing `setImmediate(...)` / `setTimeout(...)` /
     // `import().then()` / async-IIFE soup that had grown around here.
 
-    registerDeferred('auth:warmup', () => authFeature.warmup());
-    registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps());
-    registerDeferred('search:reconcile', () => searchFeature.reconcileAll());
-    registerDeferred('kb:reconcile', async () => {
-      // Picks up files dropped into contexts/ via Finder while the app was
-      // off + any divergence from a just-synced vector.db. UI gets live
-      // updates through the `kb.events` stream as files transition status.
-      const { reconcile } = await import('./features/kb_indexer');
-      await reconcile(users.getActiveUserId());
+    configureBootAdmission({
+      isRuntimeBusy: () => {
+        try {
+          // CJS require intentionally shares bus.ts's global Symbol-backed
+          // runtime map with the normal send path.
+          const bus = require('./features/group_chat/bus') as typeof import('./features/group_chat/bus');
+          return bus.hasActiveWork(users.getActiveUserId());
+        } catch {
+          return false;
+        }
+      },
     });
+
+    const idleDisk = {
+      resourceClass: 'disk' as const,
+      preferIdle: true,
+      maxSliceMs: 15_000,
+    };
+    const idleProcess = {
+      resourceClass: 'process' as const,
+      preferIdle: true,
+      maxSliceMs: 20_000,
+    };
+    // Small schedulers/cache reads may share the first deferred cohort. Disk
+    // walkers below are serial barriers so low-end devices do not receive a
+    // simultaneous search + KB + marketplace + system-skill I/O burst.
     registerDeferred('marketplace:prime-cache', async () => {
       // Primes the in-memory category cache from disk/fallback only; the lazy
       // path in features/marketplace_biz.ts refreshes from Server when needed.
@@ -1020,14 +1102,36 @@ if (!gotLock) {
     });
     registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
 
-    // Deferred after the renderer has had a few seconds to paint. Per-agent
-    // metacognitive reflection (single 12h-chained loop; the delay just stops
-    // the first cycle from racing first paint) and the auto-tasks per-task
-    // setTimeout scheduler bootstrap.
+    registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('search:reconcile', (signal) => searchFeature.reconcileActive(signal), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('kb:reconcile', async (signal) => {
+      // Picks up files dropped into contexts/ via Finder while the app was
+      // off + any divergence from a just-synced vector.db. UI gets live
+      // updates through the `kb.events` stream as files transition status.
+      const { reconcile } = await import('./features/kb_indexer');
+      await reconcile(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred(
+      'system-skills:reconcile',
+      () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }),
+      'serial',
+      BOOT_HEAVY_DISK_DELAY_MS,
+      idleProcess,
+    );
+
+    // Maintenance that can scan hundreds of sessions or invoke model-backed
+    // reflection starts after the measured 30-second startup window. The two
+    // tasks share a serial cohort so their disk walks cannot overlap.
+    registerDeferred('chats:index-repair', async (signal) => {
+      await chatsFeature.repairConversationIndex(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
+    registerDeferred('sessions:gc', async (signal) => {
+      const mod = await import('./features/sessions_sweep');
+      await mod.sweepSessions(users.getActiveUserId(), signal);
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
-    });
-    registerDeferred('system-skills:reconcile', () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }));
+    }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
     registerDeferred('builtin-marketplace:seed', () => seedBuiltinMarketplaceForCurrentUser('startup'));
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 

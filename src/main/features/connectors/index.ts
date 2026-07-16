@@ -6,6 +6,7 @@ export {
   addCustomInstance,
   removeInstance,
   refreshTools,
+  verifyUsableConnectors,
   setEnabledSubtools,
   authorizeGoogleSheetsFiles,
   callTool,

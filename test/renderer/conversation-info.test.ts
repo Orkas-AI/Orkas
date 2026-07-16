@@ -86,6 +86,8 @@ function renderFilesResult(snapshot: {
   };
   context.window.window = context.window;
   vm.createContext(context);
+  const policySource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/file-operation-policy.js'), 'utf8');
+  vm.runInContext(policySource, context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
   vm.runInContext(source, context);
   context.window.ConversationInfo.bind('c1');
@@ -239,7 +241,7 @@ describe('ConversationInfo files tab', () => {
       let fetchCount = 0;
       context.apiFetch = async (url: string) => {
         fetchCount += 1;
-        const slowVisibleRefresh = fetchCount <= 2;
+        const slowVisibleRefresh = fetchCount <= 1;
         const payload = url.includes('/history')
           ? { ok: true, conversation: { title: 'Current title' }, history: [] }
           : {

@@ -3,11 +3,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
 
-const skillsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/skills.js'), 'utf8');
+const skillsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/chat-use.js'), 'utf8');
 
 function loadChatUseHelpers() {
   const start = skillsSource.indexOf('// ─── Chat-input inline use chips');
-  const end = skillsSource.indexOf('function renderSkillsList', start);
+  const end = skillsSource.indexOf('// Chat composers are part of the startup shell', start);
   if (start < 0 || end < 0) throw new Error('missing chat use helper block');
   const block = skillsSource.slice(start, end);
   return vm.runInNewContext(`
@@ -41,6 +41,8 @@ function loadChatUseHelpers() {
       normalize: _normalizeChatUseSelection,
       tokenFor: _chatUseTokenFor,
       tokens: _findChatUseTokens,
+      partsFromText: chatUseMessagePartsFromText,
+      textFromParts: chatUseTextFromMessageParts,
       transform: transformWithChatUse,
       display: formatChatUseTextForDisplay,
       mirror: _renderChatUseMirrorHtml,
@@ -79,6 +81,33 @@ describe('chat use inline chips', () => {
     expect(h.mirror(text, (s: string) => s)).toContain('chat-use-inline-chip is-skill');
     expect(h.mirror(text, (s: string) => s)).toContain('Skill: ');
     expect(h.mirror(text, (s: string) => s)).toContain('Docs');
+  });
+
+  it('round-trips interleaved text and multiple resources through JSON message parts', () => {
+    const h = loadChatUseHelpers();
+    const text = [
+      h.tokenFor({ kind: 'skill', id: 'brand-research', name: 'Brand Research' }),
+      ' bird ',
+      h.tokenFor({ kind: 'skill', id: 'content-writer', name: 'Content Writer' }),
+      ' utility bill ',
+      h.tokenFor({ kind: 'connector', id: 'github', name: 'GitHub' }),
+    ].join('');
+
+    const parts = h.partsFromText(text);
+    expect(parts).toEqual([
+      { type: 'use', kind: 'skill', id: 'brand-research', name: 'Brand Research' },
+      { type: 'text', text: ' bird ' },
+      { type: 'use', kind: 'skill', id: 'content-writer', name: 'Content Writer' },
+      { type: 'text', text: ' utility bill ' },
+      { type: 'use', kind: 'connector', id: 'github', name: 'GitHub' },
+    ]);
+    expect(h.textFromParts(parts)).toBe(text);
+  });
+
+  it('rejects malformed persisted message parts', () => {
+    const h = loadChatUseHelpers();
+    expect(h.textFromParts([{ type: 'use', kind: 'tool', id: 'bad', name: 'Bad' }])).toBe('');
+    expect(h.textFromParts([{ type: 'text', text: 'plain text without a use part' }])).toBe('');
   });
 
   it('escapes token delimiters in names', () => {

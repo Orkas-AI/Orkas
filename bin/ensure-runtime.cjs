@@ -17,10 +17,10 @@ const path = require('node:path');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
-const { verifyRuntimeDir } = require('./runtime-gate.cjs');
+const { MANIFEST_RUNTIME_KINDS, verifyRuntimeDir } = require('./runtime-gate.cjs');
 
 const MARKER = '.orkas-runtime.json';
-const KINDS = ['python', 'uv', 'node'];
+const KINDS = MANIFEST_RUNTIME_KINDS;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 function die(message, extra) {

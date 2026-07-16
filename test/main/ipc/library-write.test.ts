@@ -126,6 +126,45 @@ describe('library.importProduced', () => {
     await projectLibrary.drain(TEST_UID);
   });
 
+  it('imports a produced video into a project Library but not the global Library', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const userWorkspace = await import('../../../src/main/features/user_workspace');
+    const projectLibrary = await import('../../../src/main/features/project_library_indexer');
+    const { projectFilesDir, userContextsDir } = await import('../../../src/main/paths');
+    const { _libraryImportProducedForTest } = await import('../../../src/main/ipc/index');
+
+    const project = await projects.createProject(TEST_UID, 'Produced Video Import');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const projectConversation = await chats.createConversation(TEST_UID, { projectId });
+    const projectWorkspace = userWorkspace.getWorkspacePath(TEST_UID, projectId);
+    fs.mkdirSync(projectWorkspace, { recursive: true });
+    const projectVideo = path.join(projectWorkspace, 'demo.mp4');
+    fs.writeFileSync(projectVideo, 'fake video bytes');
+
+    const projectResult = await _libraryImportProducedForTest({
+      cid: projectConversation.conversation_id,
+      path: projectVideo,
+    }, ctx());
+    expect(projectResult).toMatchObject({ ok: true, scope: 'project', projectId });
+    expect(fs.readFileSync(path.join(projectFilesDir(TEST_UID, projectId), 'demo.mp4'), 'utf8')).toBe('fake video bytes');
+
+    const globalConversation = await chats.createConversation(TEST_UID);
+    const globalWorkspace = userWorkspace.getWorkspacePath(TEST_UID);
+    fs.mkdirSync(globalWorkspace, { recursive: true });
+    const globalVideo = path.join(globalWorkspace, 'global.mp4');
+    fs.writeFileSync(globalVideo, 'global video bytes');
+    const globalResult = await _libraryImportProducedForTest({
+      cid: globalConversation.conversation_id,
+      path: globalVideo,
+    }, ctx());
+    expect(globalResult.ok).toBe(false);
+    expect(fs.existsSync(path.join(userContextsDir(TEST_UID), 'global.mp4'))).toBe(false);
+
+    await projectLibrary.drain(TEST_UID);
+  });
+
   it('rejects unsupported produced files before importing into a project Library', async () => {
     const projects = await import('../../../src/main/features/projects');
     const chats = await import('../../../src/main/features/chats');

@@ -13,12 +13,16 @@
  * then clobbers the developer's real `users.json` and spawns a new uid
  * skeleton under `PC/data/`.
  *
+ * The same applies to an `ORKAS_WORKSPACE_ROOT` inherited from the parent
+ * shell, which is why the assignment below is unconditional rather than a
+ * fallback — see the comment there.
+ *
  * Per-test isolation (`test.isolate: true` in `vitest.config.ts`) plus each
  * test's own `vi.resetModules()` + dynamic `await import()` still works on
  * top of this — those tests override env first, then re-import paths, and
  * get their own tmp. Tests that *don't* bother with env setup simply
  * inherit this global tmp, which is harmless (they write junk into a
- * throwaway dir) and — crucially — never write to the real `PC/data/`.
+ * throwaway dir) and — crucially — never write to the real data root.
  *
  * We intentionally do NOT clean the tmp dir on exit: vitest shells aren't
  * guaranteed to reach a finalizer on crashes, and the OS tmp reaper will
@@ -38,7 +42,20 @@ import * as path from 'node:path';
 // silently skips purgeGroupDir, breaking the delete-cascade tests.
 import 'tsx/cjs';
 
-if (!process.env.ORKAS_WORKSPACE_ROOT) {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-vitest-'));
-  process.env.ORKAS_WORKSPACE_ROOT = tmp;
-}
+// Unconditional. An inherited value is exactly the case that must not win:
+// `index.ts` exports `ORKAS_WORKSPACE_ROOT` into the app's own environment, so
+// every process Orkas spawns — including a coding agent asked to work on this
+// repo — inherits the live data root. Honouring it here froze `WS_ROOT` to
+// `~/.orkas/data` and let the suite write signals, uid skeletons, and a
+// rewritten `current_user_id` straight into the user's real profile.
+const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-vitest-'));
+process.env.ORKAS_WORKSPACE_ROOT = tmpRoot;
+
+// Same inheritance, sharper edge: `users.activateUser()` pins
+// `CORE_AGENT_AUTH_DIR` to the active user's `<uid>/local/config/`, and the
+// app exports it to children. `src/core-agent/test/auth.test.ts` deletes the
+// auth store it resolves to and restores it afterwards — so an inherited
+// value has the suite round-tripping the user's real encrypted credentials,
+// which a crash mid-test would take with it. Tests that need the real
+// resolution order unset this themselves.
+process.env.CORE_AGENT_AUTH_DIR = path.join(tmpRoot, 'core-agent-auth');

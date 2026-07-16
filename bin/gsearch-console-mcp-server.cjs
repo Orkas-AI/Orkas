@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Search Console MCP server (stdio) — wraps the Search Console REST API behind the MCP
 // tool-use protocol. Spawned as a child process by `features/connectors/mcp-client.ts`; OAuth
 // access_token is injected through `GOOGLE_ACCESS_TOKEN` env (see `apply-template.ts`). Mirrors

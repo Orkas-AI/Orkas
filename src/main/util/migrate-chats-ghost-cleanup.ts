@@ -12,13 +12,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { userChatsDir, userLocalConfigDir } from '../paths';
+import { userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile } from '../paths';
+import { listProjectIds } from './project-layout';
 import { nowIso, safeId, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 
 const log = createLogger('migrate');
 
-const MIGRATION_TAG = 'chats-index-ghost-tombstones-v1';
+const MIGRATION_TAG = 'chats-index-ghost-tombstones-v2';
 const RECENT_MISSING_GRACE_MS = 5 * 60 * 1000;
 const EMPTY_FILE_GRACE_MS = 24 * 60 * 60 * 1000;
 
@@ -77,69 +78,74 @@ export function migrateChatsGhostCleanup(uid: string, nowMs = Date.now()): Chats
   };
   if (alreadyApplied(uid)) return stats;
 
-  const file = path.join(userChatsDir(uid), '_index.json');
-  if (!fs.existsSync(file)) {
-    return stats;
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (err) {
-    stats.warnings += 1;
-    log.warn(`chat ghost cleanup read/parse failed uid=${uid}: ${(err as Error).message}`);
-    stamp(uid);
-    return stats;
-  }
-  if (!Array.isArray(parsed)) {
-    stamp(uid);
-    return stats;
-  }
-
   const deletedAt = nowIso();
-  let changed = false;
-  for (const item of parsed) {
-    if (!item || typeof item !== 'object') continue;
-    const row = item as Record<string, unknown>;
-    const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
-    if (!safeId(cid)) continue;
-    stats.scanned += 1;
-    if (typeof row.deleted_at === 'string' && row.deleted_at) {
-      stats.alreadyDeleted += 1;
-      continue;
-    }
+  const roots = [
+    { index: path.join(userChatsDir(uid), '_index.json'), dir: userChatsDir(uid) },
+    ...listProjectIds(uid).map((pid) => ({ index: projectChatIndexFile(uid, pid), dir: projectChatsDir(uid, pid) })),
+  ];
+  let foundIndex = false;
+  for (const root of roots) {
+    const file = root.index;
+    if (!fs.existsSync(file)) continue;
+    foundIndex = true;
 
-    const jsonl = path.join(userChatsDir(uid), `${cid}.jsonl`);
-    let st: fs.Stats | null = null;
-    try { st = fs.statSync(jsonl); } catch { /* missing is handled below */ }
-
-    if (!st || !st.isFile()) {
-      if (rowAgeMs(row, nowMs) < RECENT_MISSING_GRACE_MS) {
-        stats.skippedRecent += 1;
-        continue;
-      }
-      tombstone(row, deletedAt);
-      stats.tombstoned += 1;
-      changed = true;
-      continue;
-    }
-
-    if (st.size === 0 && rowAgeMs(row, nowMs) >= EMPTY_FILE_GRACE_MS) {
-      tombstone(row, deletedAt);
-      stats.tombstoned += 1;
-      changed = true;
-    }
-  }
-
-  if (changed) {
+    let parsed: unknown;
     try {
-      writeJsonSync(file, parsed);
-      log.info(`chat ghost cleanup uid=${uid} tombstoned=${stats.tombstoned}`);
+      parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (err) {
       stats.warnings += 1;
-      log.warn(`chat ghost cleanup write failed uid=${uid}: ${(err as Error).message}`);
+      log.warn(`chat ghost cleanup read/parse failed uid=${uid}: ${(err as Error).message}`);
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+
+    let changed = false;
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue;
+      const row = item as Record<string, unknown>;
+      const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
+      if (!safeId(cid)) continue;
+      stats.scanned += 1;
+      if (typeof row.deleted_at === 'string' && row.deleted_at) {
+        stats.alreadyDeleted += 1;
+        continue;
+      }
+
+      const jsonl = path.join(root.dir, `${cid}.jsonl`);
+      let st: fs.Stats | null = null;
+      try { st = fs.statSync(jsonl); } catch { /* missing is handled below */ }
+
+      if (!st || !st.isFile()) {
+        if (rowAgeMs(row, nowMs) < RECENT_MISSING_GRACE_MS) {
+          stats.skippedRecent += 1;
+          continue;
+        }
+        tombstone(row, deletedAt);
+        stats.tombstoned += 1;
+        changed = true;
+        continue;
+      }
+
+      if (st.size === 0 && rowAgeMs(row, nowMs) >= EMPTY_FILE_GRACE_MS) {
+        tombstone(row, deletedAt);
+        stats.tombstoned += 1;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      try {
+        writeJsonSync(file, parsed);
+        log.info(`chat ghost cleanup uid=${uid} tombstoned=${stats.tombstoned}`);
+      } catch (err) {
+        stats.warnings += 1;
+        log.warn(`chat ghost cleanup write failed uid=${uid}: ${(err as Error).message}`);
+      }
     }
   }
-  stamp(uid);
+  // A first launch can precede the initial cloud pull. Do not consume this
+  // one-shot migration until at least one physical index existed, otherwise a
+  // later sync can restore the exact ghost rows this pass was meant to clean.
+  if (foundIndex) stamp(uid);
   return stats;
 }

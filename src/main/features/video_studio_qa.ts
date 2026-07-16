@@ -3,14 +3,25 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { NativeImage as ElectronNativeImage } from 'electron';
 
+import { parseHtmlStructure } from './video_studio_html_check';
+
 export type Issue = {
   code: string;
   severity: 'error' | 'warning' | 'info';
+  disposition?: 'fatal' | 'blocking' | 'advisory';
+  confidence?: 'high' | 'medium' | 'low';
   selector?: string;
   message: string;
   fixHint?: string;
   source?: string;
+  sceneId?: string;
+  role?: string;
+  sampleTimeSec?: number;
+  activeScene?: boolean;
+  evidence?: Record<string, unknown>;
 };
+
+export const VIDEO_STUDIO_INSPECTOR_VERSION = 2;
 
 export type AudioTrack = {
   absPath: string;
@@ -39,7 +50,12 @@ export type JsonLoad = {
 
 export type DraftRepairBudget = {
   compositionDirAbs: string;
+  /** Authoritative ledger. Tool callers may place this outside the agent's
+   * writable workspace so deleting the human-readable audit cannot reset the
+   * retry budget. */
   statePath: string;
+  /** Human-readable mirror kept beside the composition for diagnostics. */
+  auditStatePath: string;
   state: DraftRepairState;
   summary: DraftRepairSummary;
   blocked: boolean;
@@ -70,6 +86,7 @@ export type FrameSamplePlan = {
   label: string;
   timeSec: number;
   frameIndex: number;
+  sceneId?: string;
 };
 
 export type FrameSampleEvidence = {
@@ -78,10 +95,18 @@ export type FrameSampleEvidence = {
   frame_index: number;
   path: string;
   hash: string;
+  perceptual_hash?: string;
   brightness: number;
   contrast: number;
   width: number;
   height: number;
+  expected_scene_id?: string;
+  visible_scene_ids?: string[];
+  visible_roles?: string[];
+  visible_text?: string;
+  capture_source_width?: number;
+  capture_source_height?: number;
+  capture_scale_factor?: number;
 };
 
 export type FrameEvidence = {
@@ -91,12 +116,42 @@ export type FrameEvidence = {
   samples: FrameSampleEvidence[];
 };
 
+export type DesignReviewInputOptions = {
+  contractLoad: JsonLoad;
+  sceneMapLoad: JsonLoad;
+  contractHtml?: Record<string, unknown> | null;
+  inspectDisposition?: Record<string, unknown> | null;
+  frameEvidence?: FrameEvidence | null;
+  visualRegression?: Record<string, unknown> | null;
+};
+
 export const DRAFT_REPAIR_MAX_PASSES = 2;
+
+// Environmental draft failures are machine/runtime conditions the model cannot
+// fix by editing the composition: a machine too weak to render, missing bundled
+// binaries, or a user abort. They must NOT consume the content-repair budget, or
+// a constrained machine bricks the composition after a few identical machine-side
+// failures with nothing to repair. Kept deliberately narrow — ambiguous timeouts
+// and encode failures stay budget-consuming, since those can be a content-side
+// runaway (e.g. an infinite script) the model can actually fix.
+const ENVIRONMENTAL_DRAFT_FAILURE_CODES = new Set([
+  'E_RENDER_TOO_HEAVY',
+  'E_FFMPEG_MISSING',
+  'E_FFPROBE_MISSING',
+  'E_RENDER_ABORTED',
+  'E_CAPTURE_GEOMETRY_INVALID',
+]);
+
+export function isEnvironmentalDraftFailure(code: string): boolean {
+  return ENVIRONMENTAL_DRAFT_FAILURE_CODES.has(code);
+}
 
 const DRAFT_VISUAL_ADVISORY_CODES = new Set([
   'FONT_TOO_SMALL',
   'PALETTE_LARGE',
+  'ONE_NOTE_PALETTE',
   'LOW_CONTRAST',
+  'TEXT_DENSITY_HIGH',
   'TEXT_BOX_OVERFLOW',
   'TEXT_OCCLUDED',
   'TEXT_OVERFLOW',
@@ -107,7 +162,56 @@ const DRAFT_VISUAL_ADVISORY_CODES = new Set([
   'CONTENT_CLIPPED',
   'SAFE_AREA_VIOLATION',
   'ELEMENT_OUT_OF_CANVAS',
+  'VISUAL_COMPLEXITY_HIGH',
 ]);
+
+const DESIGN_CONTRACT_SECTIONS = [
+  'aesthetic',
+  'visual_direction',
+  'layout_boxes',
+  'typography_tokens',
+  'color_tokens',
+  'motion_budget',
+  'scene_variation',
+];
+
+const AESTHETIC_FIELDS = [
+  'subject_world',
+  'one_job',
+  'signature_device',
+  'aesthetic_risk',
+  'anti_template_check',
+];
+
+const VISUAL_DIRECTION_FIELDS = [
+  'visual_tradition',
+  'lazy_defaults_rejected',
+  'video_scale',
+  'depth_layer_rule',
+  'motion_verb_rule',
+  'rhythm_pattern',
+];
+
+const GENERIC_AESTHETIC_RE = /\b(?:modern tech|clean modern|sleek|premium|minimalist|minimal|futuristic|dynamic|engaging|professional|high[- ]end|beautiful|polished)\b/i;
+const HARD_PREVIEW_DESIGN_CODES = new Set([
+  'AESTHETIC_THESIS_INCOMPLETE',
+  'GENERIC_AESTHETIC_THESIS',
+  'VISUAL_DIRECTION_INCOMPLETE',
+  'SCENE_DEPTH_LAYERS_MISSING',
+  'SCENE_MOTION_VERBS_MISSING',
+]);
+
+const PREVIEW_REQUIRED_DESIGN_SECTIONS = new Set([
+  'aesthetic',
+  'visual_direction',
+  'motion_budget',
+  'scene_variation',
+]);
+
+function designSeverity(code: string, hard = true): Issue['severity'] {
+  if (code === 'DESIGN_CONTRACT_BUDGET_INCOMPLETE') return hard ? 'error' : 'warning';
+  return HARD_PREVIEW_DESIGN_CODES.has(code) ? 'error' : 'warning';
+}
 
 function round2(n: number): number {
   return Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
@@ -120,6 +224,33 @@ function shortText(value: unknown, max = 220): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasContent(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim().length >= 4;
+  if (Array.isArray(value)) return value.length > 0;
+  if (isRecord(value)) return Object.values(value).some(hasContent);
+  return value !== null && value !== undefined && value !== false;
+}
+
+function textFrom(value: unknown): string {
+  const out: string[] = [];
+  const visit = (item: unknown) => {
+    if (typeof item === 'string') {
+      const s = item.trim();
+      if (s) out.push(s);
+      return;
+    }
+    if (Array.isArray(item)) {
+      item.slice(0, 24).forEach(visit);
+      return;
+    }
+    if (isRecord(item)) {
+      Object.values(item).slice(0, 48).forEach(visit);
+    }
+  };
+  visit(value);
+  return out.join(' ').replace(/\s+/g, ' ').trim();
 }
 
 function numberFrom(value: unknown): number {
@@ -181,20 +312,83 @@ export function parseFindingsPayload(findings: string): { errorCount: number; wa
 
 export function summarizeDraftInspectDisposition(findings: string): Record<string, unknown> {
   const parsed = parseFindingsPayload(findings);
+  const normalizedIssues = dedupeInspectIssues(normalizeDraftInspectIssueSeverities(parsed.issues));
   const advisoryIssues: Issue[] = [];
   const blockingIssues: Issue[] = [];
-  for (const issue of parsed.issues) {
-    const code = String(issue.code || '').toUpperCase();
-    const isVisual = DRAFT_VISUAL_ADVISORY_CODES.has(code);
-    if (issue.severity === 'error' && !isVisual) blockingIssues.push(issue);
+  for (const issue of normalizedIssues) {
+    if (issue.severity === 'error') blockingIssues.push(issue);
     else advisoryIssues.push(issue);
   }
   return {
     blocking_error_count: blockingIssues.length,
+    fatal_error_count: blockingIssues.filter((issue) => issue.disposition === 'fatal').length,
     advisory_count: advisoryIssues.length,
     blocking_issues: blockingIssues.slice(0, 12),
     advisory_issues: advisoryIssues.slice(0, 12),
   };
+}
+
+const BLOCKING_VISUAL_CODES = new Set([
+  'FONT_TOO_SMALL',
+  'LOW_CONTRAST',
+  'TEXT_BOX_OVERFLOW',
+  'TEXT_OCCLUDED',
+  'TEXT_OVERFLOW',
+  'TEXT_CLIPPED',
+  'CONTENT_OVERLAP',
+  'CONTENT_OCCLUDED',
+  'CONTENT_OVERFLOW',
+  'CONTENT_CLIPPED',
+  'SAFE_AREA_VIOLATION',
+  'ELEMENT_OUT_OF_CANVAS',
+]);
+
+/** Native browser heuristics are enforceable only when they carry high-
+ * confidence evidence from the active scene. Structural errors and explicit
+ * non-native semantic errors remain fail-closed. */
+export function normalizeDraftInspectIssueSeverities(issues: Issue[]): Issue[] {
+  return issues.map((issue) => {
+    const code = String(issue.code || '').toUpperCase();
+    const isVisual = DRAFT_VISUAL_ADVISORY_CODES.has(code);
+    const role = String(issue.role || '').toLowerCase();
+    const selector = String(issue.selector || '').toLowerCase();
+    const decorative = /(?:background|decoration|decorative|texture|glow|particle|ornament)/.test(role)
+      || /(?:background|\bbg\b|decor|glow|particle|arc|orb|texture)/.test(selector);
+    const semanticVisual = BLOCKING_VISUAL_CODES.has(code)
+      && (code !== 'ELEMENT_OUT_OF_CANVAS' || !decorative);
+    const nativeHeuristic = issue.source === 'orkas-native-inspect';
+    const trustworthyNativeFinding = nativeHeuristic
+      && issue.confidence === 'high'
+      && issue.activeScene !== false
+      && !!issue.evidence;
+    const blocking = isVisual
+      ? semanticVisual && (nativeHeuristic ? trustworthyNativeFinding : issue.severity === 'error')
+      : issue.severity === 'error';
+    return {
+      ...issue,
+      severity: blocking ? 'error' as const : issue.severity === 'info' ? 'info' as const : 'warning' as const,
+      disposition: blocking ? (isVisual ? 'blocking' as const : 'fatal' as const) : 'advisory' as const,
+    };
+  });
+}
+
+export function dedupeInspectIssues(issues: Issue[]): Issue[] {
+  const seen = new Set<string>();
+  const deduped: Issue[] = [];
+  for (const issue of issues) {
+    const sample = typeof issue.sampleTimeSec === 'number' ? issue.sampleTimeSec.toFixed(2) : '';
+    const key = [
+      String(issue.code || '').toUpperCase(),
+      issue.sceneId || '',
+      issue.selector || '',
+      sample,
+      issue.message.replace(/^\[[\d.]+s\]\s*/, ''),
+    ].join('\0');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(issue);
+  }
+  return deduped;
 }
 
 async function readJsonIfExists(absPath: string): Promise<JsonLoad> {
@@ -224,12 +418,23 @@ export async function loadShotlist(compositionDirAbs: string): Promise<JsonLoad>
 }
 
 function jsonCanvas(value: unknown): { width: number; height: number; duration: number; fps: number } {
-  const canvas = isRecord(value) && isRecord(value.canvas) ? value.canvas : {};
+  const record = isRecord(value) ? value : {};
+  const canvas = isRecord(record.canvas) ? record.canvas : {};
   return {
     width: numberFrom(canvas.width),
     height: numberFrom(canvas.height),
-    duration: numberFrom(canvas.duration ?? canvas.duration_sec ?? canvas.duration_seconds),
-    fps: numberFrom(canvas.fps),
+    duration: numberFrom(
+      canvas.duration
+      ?? canvas.duration_sec
+      ?? canvas.duration_seconds
+      ?? canvas.duration_s
+      ?? record.duration
+      ?? record.duration_sec
+      ?? record.duration_seconds
+      ?? record.duration_s
+      ?? record.narration_total_duration_s,
+    ),
+    fps: numberFrom(canvas.fps ?? record.fps),
   };
 }
 
@@ -248,6 +453,14 @@ function extractScenes(value: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(value)) return value.filter(isRecord);
   if (!isRecord(value)) return [];
   if (Array.isArray(value.scenes)) return value.scenes.filter(isRecord);
+  if (isRecord(value.scenes)) {
+    return Object.entries(value.scenes)
+      .filter(([, scene]) => isRecord(scene))
+      .map(([id, scene]) => ({
+        ...(scene as Record<string, unknown>),
+        ...((scene as Record<string, unknown>).id ? {} : { id }),
+      }));
+  }
   if (Array.isArray(value.shots)) return value.shots.filter(isRecord);
   if (isRecord(value.timeline) && Array.isArray(value.timeline.scenes)) return value.timeline.scenes.filter(isRecord);
   return [];
@@ -261,8 +474,272 @@ function extractShotlistShots(value: unknown): Array<Record<string, unknown>> {
   return [];
 }
 
+function hueFromHex(hex: string): number | null {
+  const clean = hex.replace('#', '');
+  if (!/^[0-9a-f]{6}$/i.test(clean)) return null;
+  const r = parseInt(clean.slice(0, 2), 16) / 255;
+  const g = parseInt(clean.slice(2, 4), 16) / 255;
+  const b = parseInt(clean.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  if (d < 0.08) return null;
+  let h = 0;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+
+function extractHexColors(value: unknown): string[] {
+  const found = new Set<string>();
+  const visit = (item: unknown) => {
+    if (typeof item === 'string') {
+      const matches = item.match(/#[0-9a-f]{6}\b/gi);
+      if (matches) {
+        for (const color of matches) found.add(color.toLowerCase());
+      }
+      return;
+    }
+    if (Array.isArray(item)) {
+      item.slice(0, 48).forEach(visit);
+      return;
+    }
+    if (isRecord(item)) {
+      Object.values(item).slice(0, 96).forEach(visit);
+    }
+  };
+  visit(value);
+  return [...found];
+}
+
+function circularHueSpread(hues: number[]): number {
+  if (hues.length <= 1) return 0;
+  const sorted = [...hues].sort((a, b) => a - b);
+  let largestGap = 0;
+  for (let i = 0; i < sorted.length; i += 1) {
+    const current = sorted[i];
+    const next = sorted[(i + 1) % sorted.length] + (i === sorted.length - 1 ? 360 : 0);
+    largestGap = Math.max(largestGap, next - current);
+  }
+  return 360 - largestGap;
+}
+
+function sceneLayoutKey(scene: Record<string, unknown>): string {
+  return String(
+    scene.layout_type
+    || scene.layout
+    || scene.visual_layout
+    || scene.scene_type
+    || scene.kind
+    || '',
+  ).trim().toLowerCase();
+}
+
+function addDesignContractAdvisories(
+  issues: Issue[],
+  contract: unknown,
+  sceneMap: unknown,
+  sourceSelector = 'composition-manifest.json#art_direction',
+): void {
+  if (!isRecord(contract)) return;
+
+  const missingSections = DESIGN_CONTRACT_SECTIONS.filter((key) => !hasContent(contract[key]));
+  if (missingSections.length) {
+    const code = 'DESIGN_CONTRACT_BUDGET_INCOMPLETE';
+    const missingPreviewRequiredSections = missingSections.filter((key) => PREVIEW_REQUIRED_DESIGN_SECTIONS.has(key));
+    issues.push({
+      code,
+      severity: designSeverity(code, missingPreviewRequiredSections.length > 0),
+      selector: sourceSelector,
+      message: `Design contract is missing low-cost aesthetic budget fields: ${missingSections.join(', ')}.`,
+      fixHint: 'Add compact aesthetic, layout, type, color, motion, and scene-variation budgets before writing HTML.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const aesthetic = isRecord(contract.aesthetic) ? contract.aesthetic : {};
+  const aestheticForChecks: Record<string, unknown> = {
+    ...aesthetic,
+    // frontend-design originally documented anti_template_check, while some
+    // manifests used the shorter anti_template key. Treat them as aliases so a
+    // real anti-template thesis is not reported missing just because the field
+    // name drifted between skill text and native QA.
+    anti_template_check: hasContent(aesthetic.anti_template_check)
+      ? aesthetic.anti_template_check
+      : aesthetic.anti_template,
+  };
+  const missingAesthetic = AESTHETIC_FIELDS.filter((key) => !hasContent(aestheticForChecks[key]));
+  if (missingAesthetic.length) {
+    const code = 'AESTHETIC_THESIS_INCOMPLETE';
+    issues.push({
+      code,
+      severity: designSeverity(code),
+      selector: `${sourceSelector}.aesthetic`,
+      message: `Aesthetic thesis is too thin for distinctive HTML generation: ${missingAesthetic.join(', ')} missing.`,
+      fixHint: 'Name the subject-specific visual world, signature device, risk, and rejected generic move.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const aestheticText = textFrom(aesthetic);
+  if (aestheticText && GENERIC_AESTHETIC_RE.test(aestheticText) && !hasContent(aesthetic.signature_device)) {
+    const code = 'GENERIC_AESTHETIC_THESIS';
+    issues.push({
+      code,
+      severity: designSeverity(code),
+      selector: `${sourceSelector}.aesthetic`,
+      message: 'Aesthetic thesis uses generic style language without a concrete signature device.',
+      fixHint: 'Replace generic descriptors with a visual behavior that belongs to this brief.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const visualDirection = isRecord(contract.visual_direction) ? contract.visual_direction : {};
+  const missingVisualDirection = VISUAL_DIRECTION_FIELDS.filter((key) => !hasContent(visualDirection[key]));
+  if (hasContent(contract.visual_direction) && missingVisualDirection.length) {
+    const code = 'VISUAL_DIRECTION_INCOMPLETE';
+    issues.push({
+      code,
+      severity: designSeverity(code),
+      selector: `${sourceSelector}.visual_direction`,
+      message: `Visual direction is missing HyperFrames-style pre-authoring fields: ${missingVisualDirection.join(', ')}.`,
+      fixHint: 'Name the design tradition, rejected lazy defaults, video-scale rule, depth-layer rule, motion-verb rule, and rhythm pattern before HTML authoring.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const typography = isRecord(contract.typography_tokens) ? contract.typography_tokens : {};
+  const typographyText = textFrom(typography).toLowerCase();
+  const missingRoles = ['title', 'body', 'label'].filter((role) => !typographyText.includes(role) && !hasContent(typography[role]));
+  if (hasContent(contract.typography_tokens) && missingRoles.length) {
+    issues.push({
+      code: 'TYPOGRAPHY_ROLES_THIN',
+      severity: 'warning',
+      selector: `${sourceSelector}.typography_tokens`,
+      message: `Typography tokens do not clearly name readable video roles: ${missingRoles.join(', ')}.`,
+      fixHint: 'Use role-based type tokens with video-size floors, not only font names or mood words.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const scenes = extractScenes(contract).length ? extractScenes(contract) : extractScenes(sceneMap);
+  const scenesMissingDepth = scenes.filter((scene) => !hasContent(scene.depth_layers)).slice(0, 4);
+  if (scenes.length && scenesMissingDepth.length) {
+    const code = 'SCENE_DEPTH_LAYERS_MISSING';
+    issues.push({
+      code,
+      severity: designSeverity(code),
+      selector: `${sourceSelector}.scenes`,
+      message: `Scene art direction is missing background/midground/foreground depth layers for ${scenesMissingDepth.map(sceneLabel).join(', ')}.`,
+      fixHint: 'Give each non-trivial scene a topic-derived background field, dominant midground hero, and foreground accent/metadata layer.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  const scenesMissingMotionVerbs = scenes
+    .filter((scene) => !hasContent(scene.motion_verbs) && !hasContent(scene.motion_choreography))
+    .slice(0, 4);
+  if (scenes.length && scenesMissingMotionVerbs.length) {
+    const code = 'SCENE_MOTION_VERBS_MISSING';
+    issues.push({
+      code,
+      severity: designSeverity(code),
+      selector: `${sourceSelector}.scenes`,
+      message: `Scene art direction is missing motion verbs/choreography for ${scenesMissingMotionVerbs.map(sceneLabel).join(', ')}.`,
+      fixHint: 'Assign concrete verbs such as draw, lock, drift, slam, count up, or reveal to primary scene elements before writing GSAP.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+
+  let repeatedLayoutRun = 1;
+  let previousLayout = '';
+  for (const scene of scenes) {
+    const key = sceneLayoutKey(scene);
+    if (key && key === previousLayout) repeatedLayoutRun += 1;
+    else repeatedLayoutRun = 1;
+    previousLayout = key;
+    if (key && repeatedLayoutRun >= 3) {
+      const code = 'SCENE_VARIATION_LOW';
+      issues.push({
+        code,
+        severity: designSeverity(code),
+        selector: `${sourceSelector}.scenes`,
+        message: `Three or more consecutive scenes use the same layout grammar "${key}".`,
+        fixHint: 'Vary at least one of framing, focal zone, diagram grammar, or transition family.',
+        source: 'orkas-native-design-contract',
+      });
+      break;
+    }
+  }
+
+  const hues = extractHexColors(contract.color_tokens).map(hueFromHex).filter((hue): hue is number => hue !== null);
+  if (hues.length >= 3 && circularHueSpread(hues) < 28) {
+    issues.push({
+      code: 'ONE_NOTE_PALETTE',
+      severity: 'warning',
+      selector: `${sourceSelector}.color_tokens`,
+      message: 'Color tokens appear to come from a single narrow hue family.',
+      fixHint: 'Keep brand colors, but add purposeful neutral/supporting accents for hierarchy, data meaning, or scene variation.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+}
+
 function sceneLabel(scene: Record<string, unknown>, index: number): string {
   return shortText(scene.id || scene.title || scene.headline || scene.name || `scene-${index + 1}`, 80);
+}
+
+function sceneId(scene: Record<string, unknown>): string {
+  return String(scene.id || scene.scene_id || scene.sceneId || '').trim();
+}
+
+function semanticHookSummary(html: string, scenes: Array<Record<string, unknown>>): Record<string, unknown> {
+  const structure = parseHtmlStructure(html);
+  const sceneHooks = structure.tags
+    .map((tag) => String(tag.attrs['data-scene-id'] || '').trim())
+    .filter(Boolean);
+  const roleHooks = structure.tags
+    .map((tag) => String(tag.attrs['data-role'] || '').trim())
+    .filter(Boolean);
+  const expectedIds = scenes.map(sceneId).filter(Boolean);
+  const uniqueSceneHooks = [...new Set(sceneHooks)];
+  const matchedIds = expectedIds.filter((id) => uniqueSceneHooks.includes(id));
+  const duplicateIds = uniqueSceneHooks.filter((id) => sceneHooks.filter((hook) => hook === id).length > 1);
+  return {
+    expected_scene_count: expectedIds.length,
+    scene_hook_count: sceneHooks.length,
+    unique_scene_hook_count: uniqueSceneHooks.length,
+    matched_scene_count: matchedIds.length,
+    missing_scene_ids: expectedIds.filter((id) => !uniqueSceneHooks.includes(id)),
+    duplicate_scene_ids: duplicateIds,
+    role_hook_count: roleHooks.length,
+    roles: [...new Set(roleHooks)].slice(0, 24),
+    coverage: expectedIds.length ? round2(matchedIds.length / expectedIds.length) : (sceneHooks.length ? 1 : 0),
+  };
+}
+
+function sceneVisibilitySummary(html: string, scenes: Array<Record<string, unknown>>): Record<string, unknown> {
+  const structure = parseHtmlStructure(html);
+  const expectedIds = new Set(scenes.map(sceneId).filter(Boolean));
+  const hiddenSceneIds = structure.tags
+    .filter((tag) => expectedIds.has(String(tag.attrs['data-scene-id'] || '').trim()))
+    .filter((tag) => /(?:^|;)\s*display\s*:\s*none\s*(?:;|$)/i.test(String(tag.attrs.style || '')))
+    .map((tag) => String(tag.attrs['data-scene-id'] || '').trim());
+  const scriptText = structure.tags
+    .filter((tag) => tag.tagName === 'script' && tag.rawText)
+    .map((tag) => tag.rawText)
+    .join('\n');
+  // Accept the common deterministic activation forms. Opacity/autoAlpha
+  // alone cannot revive an element whose inline style is display:none.
+  const hasDisplayActivation = /\bdisplay\s*:\s*["'`]?(?:block|flex|grid|inline|inline-block)["'`]?/i.test(scriptText)
+    || /\.style\.display\s*=\s*["'`](?:block|flex|grid|inline|inline-block)["'`]/i.test(scriptText)
+    || /removeProperty\s*\(\s*["'`]display["'`]\s*\)/i.test(scriptText);
+  return {
+    hidden_scene_ids: [...new Set(hiddenSceneIds)],
+    hidden_scene_count: new Set(hiddenSceneIds).size,
+    display_activation_detected: hasDisplayActivation,
+  };
 }
 
 function flattenSceneText(scene: unknown): string[] {
@@ -283,7 +760,7 @@ function flattenSceneText(scene: unknown): string[] {
     }
   };
   if (isRecord(scene)) {
-    for (const key of ['headline', 'title', 'subtitle', 'body', 'copy', 'caption', 'label', 'text']) {
+    for (const key of ['approved_copy', 'headline', 'title', 'subtitle', 'body', 'copy', 'caption', 'label', 'text']) {
       if (scene[key]) visit(scene[key], key);
     }
   }
@@ -291,11 +768,51 @@ function flattenSceneText(scene: unknown): string[] {
 }
 
 function htmlUsesGsap(html: string): boolean {
-  return /\bgsap\s*\./.test(html);
+  const structure = parseHtmlStructure(html);
+  return structure.tags.some((tag) => tag.tagName === 'script' && /\bgsap\s*\./.test(tag.rawText || ''));
 }
 
 function htmlHasLocalGsapVendorScript(html: string): boolean {
-  return /<script\b[^>]*\bsrc\s*=\s*["']\.?\/?assets\/vendor\/gsap\.min\.js["'][^>]*>/i.test(html);
+  const structure = parseHtmlStructure(html);
+  return structure.tags.some((tag) => tag.tagName === 'script'
+    && String(tag.attrs.src || '').replace(/^\.\//, '') === 'assets/vendor/gsap.min.js');
+}
+
+function htmlHasRegisteredGsapTimeline(html: string): boolean {
+  const scripts = parseHtmlStructure(html).tags
+    .filter((tag) => tag.tagName === 'script' && !tag.attrs.src)
+    .map((tag) => tag.rawText || '')
+    .join('\n');
+  return /(?:window\.)?__timelines\s*\[[^\]]+\]\s*=/.test(scripts)
+    || /(?:window\.)?__timelines\.[A-Za-z_$][\w$]*\s*=/.test(scripts);
+}
+
+function htmlHasPausedGsapTimeline(html: string): boolean {
+  const scripts = parseHtmlStructure(html).tags
+    .filter((tag) => tag.tagName === 'script' && !tag.attrs.src)
+    .map((tag) => tag.rawText || '')
+    .join('\n');
+  return /\bgsap\s*\.\s*timeline\s*\(\s*\{[^}]*\bpaused\s*:\s*true\b/i.test(scripts);
+}
+
+function htmlImperativeMediaControl(html: string): string[] {
+  const scripts = parseHtmlStructure(html).tags
+    .filter((tag) => tag.tagName === 'script' && !tag.attrs.src)
+    .map((tag) => tag.rawText || '')
+    .join('\n');
+  const found: string[] = [];
+  if (/\bnew\s+Audio\s*\(/i.test(scripts) || /createElement\s*\(\s*['"]audio['"]\s*\)/i.test(scripts)) found.push('imperative audio construction');
+  if (/\.\s*(?:play|pause)\s*\(/i.test(scripts)) found.push('play/pause call');
+  if (/\.\s*currentTime\s*=/i.test(scripts)) found.push('currentTime assignment');
+  return [...new Set(found)];
+}
+
+function htmlUsesSeekUnsafeTimelineCallback(html: string): boolean {
+  const scripts = parseHtmlStructure(html).tags
+    .filter((tag) => tag.tagName === 'script' && !tag.attrs.src)
+    .map((tag) => tag.rawText || '')
+    .join('\n');
+  return /\.\s*(?:call|add)\s*\(\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/i.test(scripts);
 }
 
 function contractAudio(value: unknown): Record<string, unknown> | null {
@@ -365,14 +882,14 @@ function sceneSourceShots(scene: Record<string, unknown>): string[] {
 }
 
 function sceneStartSec(scene: Record<string, unknown>): number {
-  return numberFrom(scene.start ?? scene.start_sec);
+  return numberFrom(scene.start ?? scene.start_sec ?? scene.start_s);
 }
 
 function sceneDurationSec(scene: Record<string, unknown>): number {
-  const duration = numberFrom(scene.duration ?? scene.duration_sec);
+  const duration = numberFrom(scene.duration ?? scene.duration_sec ?? scene.duration_s);
   if (duration > 0) return duration;
   const start = sceneStartSec(scene);
-  const end = numberFrom(scene.end ?? scene.end_sec);
+  const end = numberFrom(scene.end ?? scene.end_sec ?? scene.end_s);
   return end > start ? end - start : 0;
 }
 
@@ -380,7 +897,7 @@ function sceneEndSec(scene: Record<string, unknown>): number {
   const start = sceneStartSec(scene);
   const duration = sceneDurationSec(scene);
   if (duration > 0) return start + duration;
-  return numberFrom(scene.end ?? scene.end_sec);
+  return numberFrom(scene.end ?? scene.end_sec ?? scene.end_s);
 }
 
 function sceneKeyCandidates(scene: Record<string, unknown>): string[] {
@@ -546,21 +1063,23 @@ export async function runContractHtmlQa(
   }));
   const contract = contractLoad.value;
   const sceneMap = sceneMapLoad.value;
+  const contractSelector = path.basename(contractLoad.path) || 'composition-manifest.json';
+  const timelineSelector = path.basename(sceneMapLoad.path) || contractSelector;
 
   if (!contractLoad.exists) {
     issues.push({
       code: 'DESIGN_CONTRACT_MISSING',
       severity: 'error',
-      selector: 'design-contract.json',
-      message: 'project/composition/design-contract.json is required before drafting model-authored HTML.',
+      selector: contractSelector,
+      message: 'A validated composition contract is required before drafting model-authored HTML.',
       source: 'orkas-native-contract-html',
     });
   } else if (contractLoad.error || !isRecord(contract)) {
     issues.push({
       code: 'DESIGN_CONTRACT_PARSE_FAILED',
       severity: 'error',
-      selector: 'design-contract.json',
-      message: `Could not parse design-contract.json: ${contractLoad.error || 'not a JSON object'}`,
+      selector: contractSelector,
+      message: `Could not parse ${contractSelector}: ${contractLoad.error || 'not a JSON object'}`,
       source: 'orkas-native-contract-html',
     });
   }
@@ -568,8 +1087,8 @@ export async function runContractHtmlQa(
     issues.push({
       code: 'SCENE_MAP_PARSE_FAILED',
       severity: 'error',
-      selector: 'scene-map.json',
-      message: `Could not parse scene-map.json: ${sceneMapLoad.error || 'not a JSON object'}`,
+      selector: timelineSelector,
+      message: `Could not parse ${timelineSelector}: ${sceneMapLoad.error || 'not a JSON object'}`,
       source: 'orkas-native-contract-html',
     });
   }
@@ -582,6 +1101,53 @@ export async function runContractHtmlQa(
       source: 'orkas-native-contract-html',
     });
   }
+  if (htmlUsesGsap(meta.html) && !htmlHasRegisteredGsapTimeline(meta.html)) {
+    issues.push({
+      code: 'GSAP_TIMELINE_NOT_REGISTERED',
+      severity: 'error',
+      selector: 'index.html',
+      message: 'GSAP is used but no timeline is registered on window.__timelines[compositionId], so deterministic frame seeking would repeat or freeze frames.',
+      fixHint: 'Create one paused gsap.timeline and assign it to window.__timelines using the exact data-composition-id.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  if (htmlUsesGsap(meta.html) && !htmlHasPausedGsapTimeline(meta.html)) {
+    issues.push({
+      code: 'GSAP_TIMELINE_NOT_PAUSED',
+      severity: 'error',
+      selector: 'index.html',
+      message: 'GSAP timeline creation must include paused:true so the renderer, not wall-clock time, controls every frame.',
+      fixHint: 'Use gsap.timeline({ paused: true }) and position tweens with explicit timeline times.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  const imperativeMedia = htmlImperativeMediaControl(meta.html);
+  if (imperativeMedia.length) {
+    issues.push({
+      code: 'IMPERATIVE_MEDIA_CONTROL',
+      severity: 'error',
+      selector: 'index.html',
+      message: `Composition scripts use renderer-owned media operations: ${imperativeMedia.join(', ')}.`,
+      fixHint: 'Declare audio/video with data-start/data-duration/data-track-index; the renderer owns play, pause, and seeking.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  if (htmlUsesGsap(meta.html) && htmlUsesSeekUnsafeTimelineCallback(meta.html)) {
+    issues.push({
+      code: 'GSAP_CALLBACK_NOT_SEEKABLE',
+      severity: 'error',
+      selector: 'index.html',
+      message: 'GSAP timeline callbacks such as tl.call() or function-valued tl.add() are not deterministic under frame seeking.',
+      fixHint: 'Replace callback-driven scene switching with positioned set/to/fromTo opacity or autoAlpha tweens.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  addDesignContractAdvisories(
+    issues,
+    contract,
+    sceneMap,
+    contractSelector === 'composition-manifest.json' ? 'composition-manifest.json#art_direction' : contractSelector,
+  );
 
   const contractCanvas = jsonCanvas(contract);
   const sceneMapCanvas = jsonCanvas(sceneMap);
@@ -591,8 +1157,8 @@ export async function runContractHtmlQa(
       issues.push({
         code: 'CONTRACT_SCENE_MAP_CANVAS_MISMATCH',
         severity: 'error',
-        selector: 'design-contract.json',
-        message: `design-contract canvas ${key}=${contractCanvas[key]} but scene-map canvas ${key}=${sceneMapCanvas[key]}.`,
+        selector: contractSelector,
+        message: `Composition contract sources disagree on ${key}: ${contractCanvas[key]} vs ${sceneMapCanvas[key]}.`,
         source: 'orkas-native-contract-html',
       });
     }
@@ -608,13 +1174,60 @@ export async function runContractHtmlQa(
         code: 'CANVAS_CONTRACT_MISMATCH',
         severity: 'error',
         selector: '[data-composition-id]',
-        message: `index.html root ${key}=${rootCanvas[key]} but contract/scene-map expects ${expected[key]}.`,
+        message: `index.html root ${key}=${rootCanvas[key]} but the canonical composition contract expects ${expected[key]}.`,
         source: 'orkas-native-contract-html',
       });
     }
   }
 
   const scenes = extractScenes(sceneMap).length ? extractScenes(sceneMap) : extractScenes(contract);
+  const semanticHooks = semanticHookSummary(meta.html, scenes);
+  const sceneVisibility = sceneVisibilitySummary(meta.html, scenes);
+  const missingSceneIds = Array.isArray(semanticHooks.missing_scene_ids) ? semanticHooks.missing_scene_ids as string[] : [];
+  const duplicateSceneIds = Array.isArray(semanticHooks.duplicate_scene_ids) ? semanticHooks.duplicate_scene_ids as string[] : [];
+  if (missingSceneIds.length) {
+    issues.push({
+      code: 'SEMANTIC_SCENE_HOOKS_MISSING',
+      severity: 'error',
+      selector: 'index.html',
+      message: `HTML is missing data-scene-id hooks for: ${missingSceneIds.slice(0, 8).join(', ')}.`,
+      fixHint: 'Put data-scene-id on each scene root so preview and design QA can report scene-specific findings.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  if (duplicateSceneIds.length) {
+    issues.push({
+      code: 'SEMANTIC_SCENE_HOOKS_DUPLICATE',
+      severity: 'error',
+      selector: 'index.html',
+      message: `data-scene-id should identify one scene root; duplicate ids: ${duplicateSceneIds.slice(0, 8).join(', ')}.`,
+      source: 'orkas-native-contract-html',
+    });
+  }
+  if (scenes.length && Number(semanticHooks.role_hook_count || 0) === 0) {
+    issues.push({
+      code: 'SEMANTIC_ROLE_HOOKS_MISSING',
+      severity: 'error',
+      selector: 'index.html',
+      message: 'HTML has no data-role hooks for title, body, label, focal visual, or supporting visual elements.',
+      fixHint: 'Add compact data-role markers to important elements; they improve scene-specific QA without changing layout.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+  const matchedSceneCount = Number(semanticHooks.matched_scene_count || 0);
+  const hiddenSceneCount = Number(sceneVisibility.hidden_scene_count || 0);
+  if (matchedSceneCount > 0
+      && hiddenSceneCount >= matchedSceneCount
+      && sceneVisibility.display_activation_detected !== true) {
+    issues.push({
+      code: 'SCENE_ROOTS_NEVER_DISPLAYED',
+      severity: 'error',
+      selector: 'index.html',
+      message: 'Every semantic scene root starts with display:none, but no script activates display. Opacity animation alone would render blank frames.',
+      fixHint: 'Set each active scene root to display:block/flex/grid before animating opacity, or avoid display:none on timeline-driven scene roots.',
+      source: 'orkas-native-contract-html',
+    });
+  }
   const duration = expected.duration || meta.durationSec;
   let prevEnd = -1;
   scenes.forEach((scene, index) => {
@@ -624,7 +1237,7 @@ export async function runContractHtmlQa(
       issues.push({
         code: 'SCENE_TIMING_INVALID',
         severity: 'error',
-        selector: sceneMapLoad.exists ? 'scene-map.json' : 'design-contract.json',
+        selector: sceneMapLoad.exists ? timelineSelector : contractSelector,
         message: `Scene "${sceneLabel(scene, index)}" needs numeric start plus positive duration or end.`,
         source: 'orkas-native-contract-html',
       });
@@ -634,7 +1247,7 @@ export async function runContractHtmlQa(
       issues.push({
         code: 'SCENE_TIMING_OUT_OF_RANGE',
         severity: 'error',
-        selector: sceneMapLoad.exists ? 'scene-map.json' : 'design-contract.json',
+        selector: sceneMapLoad.exists ? timelineSelector : contractSelector,
         message: `Scene "${sceneLabel(scene, index)}" ends beyond the composition duration.`,
         source: 'orkas-native-contract-html',
       });
@@ -643,7 +1256,7 @@ export async function runContractHtmlQa(
       issues.push({
         code: 'SCENE_TIMING_OVERLAP',
         severity: 'error',
-        selector: sceneMapLoad.exists ? 'scene-map.json' : 'design-contract.json',
+        selector: sceneMapLoad.exists ? timelineSelector : contractSelector,
         message: `Scene "${sceneLabel(scene, index)}" starts before the prior scene ends.`,
         source: 'orkas-native-contract-html',
       });
@@ -651,7 +1264,7 @@ export async function runContractHtmlQa(
     prevEnd = Math.max(prevEnd, start + sceneDuration);
   });
 
-  const htmlSearch = normalizeForSearch(meta.html);
+  const htmlSearch = normalizeForSearch(parseHtmlStructure(meta.html).textContent);
   for (const [index, scene] of scenes.slice(0, 16).entries()) {
     for (const text of flattenSceneText(scene).slice(0, 5)) {
       const needle = normalizeForSearch(text);
@@ -675,12 +1288,16 @@ export async function runContractHtmlQa(
     issue_count: issues.length,
     contract_path: contractLoad.path,
     scene_map_path: sceneMapLoad.path,
+    ...(contractLoad.path === sceneMapLoad.path ? { manifest_path: contractLoad.path } : {}),
+    semantic_hooks: semanticHooks,
+    scene_visibility: sceneVisibility,
     issues,
   };
 }
 
 export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad: JsonLoad): Promise<Record<string, unknown>> {
   const issues: Issue[] = [];
+  const timelineSelector = path.basename(sceneMapLoad.path) || 'composition-manifest.json';
   const scenes = extractScenes(sceneMapLoad.value);
   const shots = extractShotlistShots(shotlistLoad.value);
   if (!shotlistLoad.exists) {
@@ -699,8 +1316,8 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
     issues.push({
       code: 'SCENE_MAP_REQUIRED_FOR_SOURCE_ALIGNMENT',
       severity: 'error',
-      selector: 'scene-map.json',
-      message: 'shotlist.json exists, but scene-map.json has no scenes to map approved beats.',
+      selector: timelineSelector,
+      message: `shotlist.json exists, but ${timelineSelector} has no scenes to map approved beats.`,
       source: 'orkas-native-source-alignment',
     });
   }
@@ -713,12 +1330,42 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
     const refs = Array.isArray(scene.source_shots) ? scene.source_shots : [];
     refs.forEach((ref) => mappedShotCount.add(String(ref)));
   }
+  const shotIds = new Set(shots.map((shot) => String(shot.id || shot.shot_id || shot.scene_id || '').trim()).filter(Boolean));
+  const unknownShotRefs = [...mappedShotCount].filter((ref) => shotIds.size > 0 && !shotIds.has(ref));
+  if (shotIds.size > 0 && mappedShotCount.size === 0) {
+    issues.push({
+      code: 'SOURCE_SHOT_MAPPING_EMPTY',
+      severity: 'error',
+      selector: timelineSelector,
+      message: 'The approved shotlist has shot ids, but every manifest scene has an empty source_shots mapping.',
+      source: 'orkas-native-source-alignment',
+    });
+  }
+  if (unknownShotRefs.length) {
+    issues.push({
+      code: 'SOURCE_SHOT_REFERENCE_UNKNOWN',
+      severity: 'error',
+      selector: timelineSelector,
+      message: `Manifest source_shots reference unknown approved shot ids: ${unknownShotRefs.slice(0, 8).join(', ')}.`,
+      source: 'orkas-native-source-alignment',
+    });
+  }
   if (shots.length > scenes.length && !mergeReason && mappedShotCount.size < shots.length) {
     issues.push({
       code: 'SHOTLIST_SCENE_MAP_MISMATCH',
       severity: 'error',
-      selector: 'scene-map.json',
-      message: `shotlist has ${shots.length} shots but scene-map has ${scenes.length} scenes. Add source_alignment.merge_reason or per-scene source_shots when intentionally merging beats.`,
+      selector: timelineSelector,
+      message: `shotlist has ${shots.length} shots but the canonical manifest has ${scenes.length} scenes. Add source_alignment.merge_reason or per-scene source_shots when intentionally merging beats.`,
+      source: 'orkas-native-source-alignment',
+    });
+  }
+  const missingShotIds = [...shotIds].filter((id) => !mappedShotCount.has(id));
+  if (missingShotIds.length > 0 && !mergeReason) {
+    issues.push({
+      code: 'SOURCE_SHOT_COVERAGE_INCOMPLETE',
+      severity: 'error',
+      selector: timelineSelector,
+      message: `Approved shot ids are not represented by source_shots: ${missingShotIds.slice(0, 8).join(', ')}. Map them or declare source_alignment.merge_reason.`,
       source: 'orkas-native-source-alignment',
     });
   }
@@ -735,6 +1382,79 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
   };
 }
 
+export async function runDeliveryRequirementsQa(
+  meta: CompositionMeta,
+  sceneMapLoad: JsonLoad,
+  shotlistLoad: JsonLoad,
+  compositionDirAbs: string,
+): Promise<Record<string, unknown>> {
+  const issues: Issue[] = [];
+  if (!shotlistLoad.exists) return { ok: true, skipped: true, reason: 'shotlist_missing', issues };
+  const shotlist = isRecord(shotlistLoad.value) ? shotlistLoad.value : {};
+  const requiredString = (field: string): string => {
+    const value = typeof shotlist[field] === 'string' ? String(shotlist[field]).trim() : '';
+    if (!value) issues.push({
+      code: 'DELIVERY_REQUIREMENT_MISSING',
+      severity: 'error',
+      selector: `shotlist.json#${field}`,
+      message: `Gate B shotlist must declare ${field}.`,
+      source: 'orkas-native-delivery-requirements',
+    });
+    return value.toLowerCase();
+  };
+  const audioMode = requiredString('audio_mode');
+  const captionMode = requiredString('caption_mode');
+  const musicMode = requiredString('music_mode');
+  const videoLanguage = requiredString('video_language');
+  const targetDuration = Number(shotlist.target_duration_seconds);
+  if (!(Number.isFinite(targetDuration) && targetDuration > 0)) {
+    issues.push({
+      code: 'DELIVERY_TARGET_DURATION_MISSING', severity: 'error', selector: 'shotlist.json#target_duration_seconds',
+      message: 'Gate B shotlist must declare a positive target_duration_seconds.', source: 'orkas-native-delivery-requirements',
+    });
+  } else if (Math.abs(meta.durationSec - targetDuration) > 0.15) {
+    issues.push({
+      code: 'DELIVERY_TARGET_DURATION_MISMATCH', severity: 'error', selector: 'composition-manifest.json#composition.duration',
+      message: `Composition duration ${meta.durationSec}s does not match the approved ${targetDuration}s delivery target.`, source: 'orkas-native-delivery-requirements',
+    });
+  }
+  const sceneMap = isRecord(sceneMapLoad.value) ? sceneMapLoad.value : {};
+  const canvas = isRecord(sceneMap.canvas) ? sceneMap.canvas : {};
+  const manifestLanguage = String(canvas.language || '').trim().toLowerCase();
+  if (videoLanguage && manifestLanguage && videoLanguage !== manifestLanguage) {
+    issues.push({
+      code: 'DELIVERY_LANGUAGE_MISMATCH', severity: 'error', selector: 'composition-manifest.json#composition.language',
+      message: `Composition language ${manifestLanguage} does not match approved video_language ${videoLanguage}.`, source: 'orkas-native-delivery-requirements',
+    });
+  }
+  if (captionMode && !/^(?:none|off|disabled)$/.test(captionMode)) {
+    const hasBurnedInCaptions = /data-role\s*=\s*["']caption["']/i.test(meta.html);
+    const sidecarCandidates = ['captions.vtt', 'captions.srt', 'subtitles.vtt', 'subtitles.srt'];
+    const hasSidecar = (await Promise.all(sidecarCandidates.map((name) => fs.stat(path.join(compositionDirAbs, name)).catch(() => null))))
+      .some((stat) => stat?.isFile());
+    if (!hasBurnedInCaptions && !hasSidecar) issues.push({
+      code: 'DELIVERY_CAPTIONS_MISSING', severity: 'error', selector: 'index.html',
+      message: `caption_mode=${captionMode} requires burned-in data-role="caption" elements or a captions sidecar file.`, source: 'orkas-native-delivery-requirements',
+    });
+  }
+  const audio = isRecord(sceneMap.audio) ? sceneMap.audio : {};
+  const tracks = Array.isArray(audio.tracks) ? audio.tracks.filter(isRecord) : [];
+  if (/^(?:required|yes|on|music)$/.test(musicMode) && !tracks.some((track) => track.kind === 'music')) {
+    issues.push({
+      code: 'DELIVERY_MUSIC_MISSING', severity: 'error', selector: 'composition-manifest.json#audio.tracks',
+      message: 'music_mode requires a declarative music track, but none is present.', source: 'orkas-native-delivery-requirements',
+    });
+  }
+  if (audioMode && /^(?:narration|voice|voiceover|tts)$/.test(audioMode) && !tracks.some((track) => track.kind === 'narration')) {
+    issues.push({
+      code: 'DELIVERY_NARRATION_MISSING', severity: 'error', selector: 'composition-manifest.json#audio.tracks',
+      message: `audio_mode=${audioMode} requires a narration track.`, source: 'orkas-native-delivery-requirements',
+    });
+  }
+  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+  return { ok: errorCount === 0, error_count: errorCount, issue_count: issues.length, issues };
+}
+
 export async function runAudioTimingQa(
   meta: CompositionMeta,
   contractLoad: JsonLoad,
@@ -745,6 +1465,8 @@ export async function runAudioTimingQa(
   const issues: Issue[] = [];
   const contract = contractLoad.value;
   const sceneMap = sceneMapLoad.value;
+  const contractSelector = path.basename(contractLoad.path) || 'composition-manifest.json';
+  const timelineSelector = path.basename(sceneMapLoad.path) || contractSelector;
   const ownsNarration = compositionOwnsNarration(contract, sceneMap);
   const scenes = extractScenes(sceneMapLoad.value);
   const narrationPath = narrationPathFromSources(contract, sceneMap);
@@ -764,8 +1486,8 @@ export async function runAudioTimingQa(
     issues.push({
       code: 'NARRATION_DECLARED_BUT_SILENT',
       severity: 'error',
-      selector: meta.audioTracks.length ? narrationPath || 'design-contract.json' : 'index.html',
-      message: 'design-contract.json declares composition-owned narration, but the composition has no usable narration audio track.',
+      selector: meta.audioTracks.length ? narrationPath || contractSelector : 'index.html',
+      message: 'The canonical manifest declares composition-owned narration, but the composition has no usable narration audio track.',
       source: 'orkas-native-audio-timing',
     });
   }
@@ -773,8 +1495,8 @@ export async function runAudioTimingQa(
     issues.push({
       code: 'SCENE_MAP_REQUIRED_FOR_AUDIO_TIMING',
       severity: 'error',
-      selector: 'scene-map.json',
-      message: 'Narrated compositions require scene-map.json so voiceover-to-visual alignment is auditable.',
+      selector: timelineSelector,
+      message: 'Narrated compositions require canonical scene mappings so voiceover-to-visual alignment is auditable.',
       source: 'orkas-native-audio-timing',
     });
   }
@@ -782,8 +1504,8 @@ export async function runAudioTimingQa(
     issues.push({
       code: 'SCENE_MAP_PARSE_FAILED',
       severity: 'error',
-      selector: 'scene-map.json',
-      message: `Could not parse scene-map.json: ${sceneMapLoad.error}`,
+      selector: timelineSelector,
+      message: `Could not parse ${timelineSelector}: ${sceneMapLoad.error}`,
       source: 'orkas-native-audio-timing',
     });
   }
@@ -807,7 +1529,7 @@ export async function runAudioTimingQa(
       issues.push({
         code: 'SCENE_NARRATION_MAPPING_MISSING',
         severity: 'error',
-        selector: 'scene-map.json',
+        selector: timelineSelector,
         message: `${missing.length} scene(s) have no narration, narration_ref, or source_shots mapping.`,
         source: 'orkas-native-audio-timing',
       });
@@ -825,7 +1547,7 @@ export async function runAudioTimingQa(
         issues.push({
           code: 'NARRATION_REF_MISSING',
           severity: 'error',
-          selector: 'scene-map.json',
+          selector: timelineSelector,
           message: `Scene "${sceneLabel(scene, scenes.indexOf(scene))}" references narration line(s) not found in narration-map.json: ${missingRefs.join(', ')}.`,
           source: 'orkas-native-audio-timing',
         });
@@ -841,7 +1563,7 @@ export async function runAudioTimingQa(
         issues.push({
           code: 'NARRATION_LINE_START_DRIFT',
           severity: 'error',
-          selector: 'scene-map.json',
+          selector: timelineSelector,
           message: `Scene "${sceneLabel(scene, scenes.indexOf(scene))}" starts at ${round2(actualStart)}s but narration-map starts at ${round2(expectedStart)}s (${round2(startDrift)}s drift).`,
           source: 'orkas-native-audio-timing',
         });
@@ -850,7 +1572,7 @@ export async function runAudioTimingQa(
         issues.push({
           code: 'NARRATION_LINE_OVERFLOWS_SCENE',
           severity: 'error',
-          selector: 'scene-map.json',
+          selector: timelineSelector,
           message: `Scene "${sceneLabel(scene, scenes.indexOf(scene))}" ends at ${round2(actualEnd)}s but referenced narration line(s) run until ${round2(expectedEnd)}s.`,
           source: 'orkas-native-audio-timing',
         });
@@ -883,7 +1605,7 @@ export async function runAudioTimingQa(
         issues.push({
           code: 'AUDIO_TIMING_DRIFT',
           severity: 'error',
-          selector: 'scene-map.json',
+          selector: timelineSelector,
           message: `Scene "${sceneLabel(scene, scenes.indexOf(scene))}" starts at ${round2(actualStart)}s but estimated narration timing is ${round2(expectedStart)}s (${round2(drift)}s drift).`,
           source: 'orkas-native-audio-timing',
         });
@@ -894,7 +1616,7 @@ export async function runAudioTimingQa(
     issues.push({
       code: 'AUDIO_TIMING_ESTIMATE_SKIPPED',
       severity: 'warning',
-      selector: 'scene-map.json',
+      selector: timelineSelector,
       message: 'Scenes use narration references or source_shots without inline narration text, so draft QA can verify mapping presence but cannot estimate timing drift.',
       source: 'orkas-native-audio-timing',
     });
@@ -923,7 +1645,11 @@ function draftRepairStatePath(compositionDirAbs: string): string {
 
 async function draftContentSignature(compositionDirAbs: string): Promise<string> {
   const hash = crypto.createHash('sha256');
-  for (const name of ['design-contract.json', 'scene-map.json', 'narration-map.json', 'index.html']) {
+  const hasManifest = !!(await fs.stat(path.join(compositionDirAbs, 'composition-manifest.json')).catch(() => null));
+  const names = hasManifest
+    ? ['composition-manifest.json', 'narration-map.json', 'index.html']
+    : ['design-contract.json', 'scene-map.json', 'narration-map.json', 'index.html'];
+  for (const name of names) {
     const abs = path.join(compositionDirAbs, name);
     const st = await fs.stat(abs).catch(() => null);
     if (!st || !st.isFile()) continue;
@@ -965,23 +1691,64 @@ function repairBudgetSummary(statePath: string, state: DraftRepairState): DraftR
   };
 }
 
-export async function initDraftRepairBudget(compositionDirAbs: string): Promise<DraftRepairBudget> {
-  const statePath = draftRepairStatePath(compositionDirAbs);
+export async function initDraftRepairBudget(
+  compositionDirAbs: string,
+  authoritativeStatePath?: string,
+): Promise<DraftRepairBudget> {
+  const auditStatePath = draftRepairStatePath(compositionDirAbs);
+  const statePath = authoritativeStatePath ? path.resolve(authoritativeStatePath) : auditStatePath;
   const raw = await readJsonIfExists(statePath);
-  const state = normalizeRepairState(raw.value);
-  const summary = repairBudgetSummary(statePath, state);
-  return {
+  // One-time migration: when a private authoritative ledger is introduced,
+  // preserve any failures already recorded in the old composition-local
+  // audit instead of granting a fresh budget.
+  const auditRaw = statePath === auditStatePath ? raw : await readJsonIfExists(auditStatePath);
+  let state = normalizeRepairState(raw.exists ? raw.value : auditRaw.value);
+  // Content-change reset: the repair budget exists to stop the model from
+  // re-failing the SAME composition; it must not permanently brick a
+  // composition that has since been edited. When the current source signature
+  // differs from the one recorded at the last failure, those failures are stale
+  // — start fresh instead of blocking. The per-failure signature was already
+  // captured (recordDraftFailure) but never consulted until now; persist the
+  // reset so recordDraftFailure, which counts from disk, restarts from zero.
+  if (state.status === 'failed' && isRecord(state.last_error)) {
+    const recordedSig = typeof state.last_error.content_signature === 'string'
+      ? state.last_error.content_signature
+      : '';
+    if (recordedSig && recordedSig !== await draftContentSignature(compositionDirAbs)) {
+      state = normalizeRepairState({ status: 'ok', failed_attempts: 0, history: state.history });
+      await writeRepairState(statePath, state);
+      if (auditStatePath !== statePath) await writeRepairState(auditStatePath, state);
+    }
+  }
+  const summary = repairBudgetSummary(auditStatePath, state);
+  const budget: DraftRepairBudget = {
     compositionDirAbs,
     statePath,
+    auditStatePath,
     state,
     summary,
     blocked: state.status === 'failed' && summary.budget_exhausted,
   };
+  // Restore a deleted audit mirror from the private ledger, or materialise the
+  // private ledger during migration. This write is intentionally best-effort
+  // only in the sense that failures still surface to the caller; silently
+  // resetting the retry counter would be worse than stopping the draft.
+  if (statePath !== auditStatePath && (!raw.exists || !auditRaw.exists)) {
+    await writeRepairStateCopies(budget, state);
+  }
+  return budget;
 }
 
 async function writeRepairState(statePath: string, state: DraftRepairState): Promise<void> {
   await fs.mkdir(path.dirname(statePath), { recursive: true });
   await fs.writeFile(statePath, JSON.stringify(state, null, 2), 'utf8');
+}
+
+async function writeRepairStateCopies(repairBudget: DraftRepairBudget, state: DraftRepairState): Promise<void> {
+  await writeRepairState(repairBudget.statePath, state);
+  if (repairBudget.auditStatePath !== repairBudget.statePath) {
+    await writeRepairState(repairBudget.auditStatePath, state);
+  }
 }
 
 export async function recordDraftFailure(
@@ -1010,9 +1777,9 @@ export async function recordDraftFailure(
     last_error: entry,
     history: [...previous.history, entry].slice(-12),
   };
-  await writeRepairState(repairBudget.statePath, next);
+  await writeRepairStateCopies(repairBudget, next);
   repairBudget.state = next;
-  repairBudget.summary = repairBudgetSummary(repairBudget.statePath, next);
+  repairBudget.summary = repairBudgetSummary(repairBudget.auditStatePath, next);
   repairBudget.blocked = repairBudget.summary.budget_exhausted;
   return repairBudget.summary;
 }
@@ -1038,9 +1805,9 @@ export async function recordDraftSuccess(
       content_signature: await draftContentSignature(repairBudget.compositionDirAbs),
     },
   };
-  await writeRepairState(repairBudget.statePath, next);
+  await writeRepairStateCopies(repairBudget, next);
   repairBudget.state = next;
-  repairBudget.summary = repairBudgetSummary(repairBudget.statePath, next);
+  repairBudget.summary = repairBudgetSummary(repairBudget.auditStatePath, next);
   repairBudget.blocked = false;
   return repairBudget.summary;
 }
@@ -1051,18 +1818,73 @@ export function samplePlanKey(label: string): string {
 
 export function buildDraftFrameSamplePlan(meta: CompositionMeta, sceneMap: unknown, fps: number): FrameSamplePlan[] {
   const duration = Math.max(0.1, meta.durationSec);
-  const raw: Array<{ label: string; timeSec: number }> = [
-    { label: 'first-frame', timeSec: 0 },
+  const scenes = extractScenes(sceneMap);
+  const firstId = scenes[0] ? sceneId(scenes[0]) : '';
+  const raw: Array<{ label: string; timeSec: number; sceneId?: string }> = [
+    { label: 'first-frame', timeSec: 0, ...(firstId ? { sceneId: firstId } : {}) },
+  ];
+  scenes.forEach((scene, index) => {
+    const start = Math.max(0, sceneStartSec(scene));
+    const sceneDuration = Math.max(0, sceneDurationSec(scene));
+    const id = sceneId(scene) || undefined;
+    raw.push({
+      label: `${sceneLabel(scene, index)}-mid`,
+      timeSec: sceneDuration > 0 ? start + sceneDuration / 2 : start,
+      ...(id ? { sceneId: id } : {}),
+    });
+  });
+  const lastId = scenes.length ? sceneId(scenes[scenes.length - 1]) : '';
+  raw.push(
     { label: 'quarter', timeSec: duration * 0.25 },
     { label: 'midpoint', timeSec: duration * 0.5 },
     { label: 'three-quarter', timeSec: duration * 0.75 },
-    { label: 'payoff-frame', timeSec: Math.max(0, duration - 0.05) },
-  ];
-  extractScenes(sceneMap).slice(0, 8).forEach((scene, index) => {
-    const start = Math.max(0, numberFrom(scene.start ?? scene.start_sec));
-    const sceneDuration = Math.max(0, numberFrom(scene.duration ?? scene.duration_sec));
-    raw.push({ label: `${sceneLabel(scene, index)}-start`, timeSec: start });
-    if (sceneDuration > 0.2) raw.push({ label: `${sceneLabel(scene, index)}-mid`, timeSec: start + sceneDuration / 2 });
+    { label: 'payoff-frame', timeSec: Math.max(0, duration - 0.05), ...(lastId ? { sceneId: lastId } : {}) },
+  );
+
+  const totalFrames = Math.max(1, Math.ceil(duration * fps));
+  const seen = new Set<number>();
+  const out: FrameSamplePlan[] = [];
+  for (const item of raw) {
+    const t = Math.max(0, Math.min(duration - 0.001, item.timeSec));
+    const frameIndex = Math.max(0, Math.min(totalFrames - 1, Math.floor(t * fps)));
+    if (seen.has(frameIndex)) continue;
+    seen.add(frameIndex);
+    out.push({ label: samplePlanKey(item.label), timeSec: round2(frameIndex / fps), frameIndex, ...(item.sceneId ? { sceneId: item.sceneId } : {}) });
+  }
+  return out;
+}
+
+export function buildPreviewFrameSamplePlan(meta: CompositionMeta, sceneMap: unknown, fps = 30): FrameSamplePlan[] {
+  const duration = Math.max(0.1, meta.durationSec);
+  const scenes = extractScenes(sceneMap);
+  const firstSceneId = scenes[0] ? sceneId(scenes[0]) : '';
+  const raw: Array<{ label: string; timeSec: number; sceneId?: string }> = [{
+    label: 'first-frame',
+    timeSec: 0,
+    ...(firstSceneId ? { sceneId: firstSceneId } : {}),
+  }];
+  if (scenes.length) {
+    for (const [index, scene] of scenes.entries()) {
+      const start = Math.max(0, sceneStartSec(scene));
+      const sceneDuration = Math.max(0, sceneDurationSec(scene));
+      raw.push({
+        label: `${sceneLabel(scene, index)}-mid`,
+        timeSec: sceneDuration > 0 ? start + sceneDuration / 2 : start,
+        ...(sceneId(scene) ? { sceneId: sceneId(scene) } : {}),
+      });
+    }
+  } else {
+    raw.push(
+      { label: 'quarter', timeSec: duration * 0.25 },
+      { label: 'midpoint', timeSec: duration * 0.5 },
+      { label: 'three-quarter', timeSec: duration * 0.75 },
+    );
+  }
+  const lastSceneId = scenes.length ? sceneId(scenes[scenes.length - 1]) : '';
+  raw.push({
+    label: 'payoff-frame',
+    timeSec: Math.max(0, duration - 0.05),
+    ...(lastSceneId ? { sceneId: lastSceneId } : {}),
   });
 
   const totalFrames = Math.max(1, Math.ceil(duration * fps));
@@ -1073,13 +1895,77 @@ export function buildDraftFrameSamplePlan(meta: CompositionMeta, sceneMap: unkno
     const frameIndex = Math.max(0, Math.min(totalFrames - 1, Math.floor(t * fps)));
     if (seen.has(frameIndex)) continue;
     seen.add(frameIndex);
-    out.push({ label: samplePlanKey(item.label), timeSec: round2(frameIndex / fps), frameIndex });
-    if (out.length >= 14) break;
+    out.push({ label: samplePlanKey(item.label), timeSec: round2(frameIndex / fps), frameIndex, ...(item.sceneId ? { sceneId: item.sceneId } : {}) });
   }
   return out;
 }
 
-export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; brightness: number; contrast: number; width: number; height: number } {
+/** Layout inspection samples stable per-scene frames. It intentionally avoids
+ * global quarter marks and exact scene boundaries, which commonly land inside
+ * entrance/exit tweens and create transient false positives. */
+export function buildInspectFrameSamplePlan(meta: CompositionMeta, sceneMap: unknown, fps = 30): FrameSamplePlan[] {
+  const duration = Math.max(0.1, meta.durationSec);
+  const scenes = extractScenes(sceneMap);
+  const raw: Array<{ label: string; timeSec: number; sceneId?: string }> = scenes.length
+    ? scenes.map((scene, index) => {
+      const start = Math.max(0, sceneStartSec(scene));
+      const sceneDuration = Math.max(0.1, sceneDurationSec(scene));
+      const stableOffset = Math.max(0.05, Math.min(sceneDuration - 0.05, sceneDuration * 0.5));
+      const id = sceneId(scene) || undefined;
+      return {
+        label: `${sceneLabel(scene, index)}-stable`,
+        timeSec: start + stableOffset,
+        ...(id ? { sceneId: id } : {}),
+      };
+    })
+    : [0.25, 0.5, 0.75].map((ratio) => ({ label: `fallback-${ratio}`, timeSec: duration * ratio }));
+  const totalFrames = Math.max(1, Math.ceil(duration * fps));
+  const seen = new Set<number>();
+  const out: FrameSamplePlan[] = [];
+  for (const item of raw) {
+    const t = Math.max(0, Math.min(duration - 0.001, item.timeSec));
+    const frameIndex = Math.max(0, Math.min(totalFrames - 1, Math.floor(t * fps)));
+    if (seen.has(frameIndex)) continue;
+    seen.add(frameIndex);
+    out.push({
+      label: samplePlanKey(item.label),
+      timeSec: round2(frameIndex / fps),
+      frameIndex,
+      ...(item.sceneId ? { sceneId: item.sceneId } : {}),
+    });
+  }
+  return out;
+}
+
+function perceptualHash(bitmap: Buffer, width: number, height: number): string {
+  const cols = 16;
+  const rows = 9;
+  const stride = Math.max(1, Math.floor(bitmap.length / Math.max(1, width * height)));
+  const values: number[] = [];
+  for (let row = 0; row < rows; row += 1) {
+    const y = Math.min(height - 1, Math.floor(((row + 0.5) * height) / rows));
+    for (let col = 0; col < cols; col += 1) {
+      const x = Math.min(width - 1, Math.floor(((col + 0.5) * width) / cols));
+      const offset = Math.max(0, (y * width + x) * stride);
+      const b = bitmap[offset] ?? 0;
+      const g = bitmap[offset + 1] ?? b;
+      const r = bitmap[offset + 2] ?? b;
+      values.push((0.2126 * r) + (0.7152 * g) + (0.0722 * b));
+    }
+  }
+  const mean = values.reduce((sum, value) => sum + value, 0) / Math.max(1, values.length);
+  let out = '';
+  for (let i = 0; i < values.length; i += 4) {
+    let nibble = 0;
+    for (let bit = 0; bit < 4; bit += 1) {
+      if ((values[i + bit] ?? 0) >= mean) nibble |= 1 << (3 - bit);
+    }
+    out += nibble.toString(16);
+  }
+  return out;
+}
+
+export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; perceptual_hash: string; brightness: number; contrast: number; width: number; height: number } {
   const size = image.getSize();
   const bitmap = image.toBitmap();
   const pixelCount = Math.max(1, size.width * size.height);
@@ -1098,6 +1984,7 @@ export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; 
   const variance = Math.max(0, (sumSq / pixelCount) - mean * mean);
   return {
     hash: crypto.createHash('sha256').update(bitmap).digest('hex'),
+    perceptual_hash: perceptualHash(bitmap, size.width, size.height),
     brightness: round2(mean),
     contrast: round2(Math.sqrt(variance)),
     width: size.width,
@@ -1113,22 +2000,197 @@ export async function writeFrameContactSheet(evidenceDirAbs: string, samples: Fr
   const rows = Math.max(1, Math.ceil(samples.length / cols));
   const width = cols * thumbW + (cols + 1) * gap;
   const height = rows * (thumbH + 36) + (rows + 1) * gap;
-  const items = samples.map((sample, index) => {
+  const items = await Promise.all(samples.map(async (sample, index) => {
     const col = index % cols;
     const row = Math.floor(index / cols);
     const x = gap + col * (thumbW + gap);
     const y = gap + row * (thumbH + 36 + gap);
-    const href = path.basename(sample.path).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    // SVGs loaded through <img> cannot fetch external subresources in Chromium.
+    // Embed every captured PNG so the contact sheet is a self-contained image.
+    const frameBytes = await fs.readFile(sample.path);
+    const href = `data:image/png;base64,${frameBytes.toString('base64')}`;
     const label = `${sample.label} @ ${sample.time_seconds}s`.replace(/&/g, '&amp;').replace(/</g, '&lt;');
     return `<image href="${href}" x="${x}" y="${y}" width="${thumbW}" height="${thumbH}" preserveAspectRatio="xMidYMid meet"/><text x="${x}" y="${y + thumbH + 24}" fill="#111" font-family="system-ui, sans-serif" font-size="16">${label}</text>`;
-  }).join('\n');
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#fff"/>\n${items}\n</svg>\n`;
+  }));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#fff"/>\n${items.join('\n')}\n</svg>\n`;
   const out = path.join(evidenceDirAbs, 'contact-sheet.svg');
   await fs.writeFile(out, svg, 'utf8');
   return out;
 }
 
-export function summarizeVideoFrameQa(frameEvidence: FrameEvidence | null, durationSec: number): Record<string, unknown> {
+export async function writeVisualBaseline(baselineAbsPath: string, frameEvidence: FrameEvidence): Promise<string> {
+  const manifest = {
+    version: 1,
+    sample_count: frameEvidence.samples.length,
+    samples: frameEvidence.samples.map((sample) => ({
+      label: sample.label,
+      time_seconds: sample.time_seconds,
+      width: sample.width,
+      height: sample.height,
+      hash: sample.hash,
+      perceptual_hash: sample.perceptual_hash || '',
+      brightness: sample.brightness,
+      contrast: sample.contrast,
+    })),
+  };
+  await fs.mkdir(path.dirname(baselineAbsPath), { recursive: true });
+  await fs.writeFile(baselineAbsPath, JSON.stringify(manifest, null, 2), 'utf8');
+  return baselineAbsPath;
+}
+
+function hashDifference(a: string, b: string): number | null {
+  const left = String(a || '').trim().toLowerCase();
+  const right = String(b || '').trim().toLowerCase();
+  if (!left || left.length !== right.length || !/^[0-9a-f]+$/.test(left) || !/^[0-9a-f]+$/.test(right)) return null;
+  let changedBits = 0;
+  for (let i = 0; i < left.length; i += 1) {
+    let xor = parseInt(left[i], 16) ^ parseInt(right[i], 16);
+    while (xor) {
+      changedBits += xor & 1;
+      xor >>= 1;
+    }
+  }
+  return round2(changedBits / (left.length * 4));
+}
+
+export async function compareVisualBaseline(
+  baselineAbsPath: string,
+  frameEvidence: FrameEvidence | null,
+): Promise<Record<string, unknown>> {
+  const issues: Issue[] = [];
+  if (!frameEvidence?.samples.length) {
+    return { ok: true, skipped: true, status: 'no_samples', baseline_path: baselineAbsPath, changed: false, issues };
+  }
+  const loaded = await readJsonIfExists(baselineAbsPath);
+  if (!loaded.exists) {
+    return { ok: true, skipped: true, status: 'baseline_missing', baseline_path: baselineAbsPath, changed: false, issues };
+  }
+  if (loaded.error || !isRecord(loaded.value) || !Array.isArray(loaded.value.samples)) {
+    issues.push({
+      code: 'VISUAL_BASELINE_PARSE_FAILED',
+      severity: 'warning',
+      selector: baselineAbsPath,
+      message: `Visual baseline could not be parsed: ${loaded.error || 'samples array missing'}.`,
+      source: 'orkas-native-visual-regression',
+    });
+    return { ok: true, skipped: true, status: 'baseline_invalid', baseline_path: baselineAbsPath, changed: false, issues };
+  }
+
+  const baselineSamples = (loaded.value.samples as unknown[]).filter(isRecord);
+  const baselineByLabel = new Map(baselineSamples.map((sample) => [String(sample.label || ''), sample]));
+  const comparisons: Array<Record<string, unknown>> = [];
+  for (const sample of frameEvidence.samples) {
+    const baseline = baselineByLabel.get(sample.label);
+    if (!baseline) continue;
+    const perceptualDelta = hashDifference(sample.perceptual_hash || '', String(baseline.perceptual_hash || ''));
+    const brightnessDelta = round2(Math.abs(sample.brightness - numberFrom(baseline.brightness)));
+    const contrastDelta = round2(Math.abs(sample.contrast - numberFrom(baseline.contrast)));
+    const dimensionsChanged = sample.width !== numberFrom(baseline.width) || sample.height !== numberFrom(baseline.height);
+    const changed = dimensionsChanged
+      || (perceptualDelta !== null && perceptualDelta > 0.28)
+      || brightnessDelta > 24
+      || contrastDelta > 18;
+    comparisons.push({
+      label: sample.label,
+      changed,
+      perceptual_delta: perceptualDelta,
+      brightness_delta: brightnessDelta,
+      contrast_delta: contrastDelta,
+      dimensions_changed: dimensionsChanged,
+    });
+  }
+  if (!comparisons.length) {
+    issues.push({
+      code: 'VISUAL_BASELINE_NO_MATCHING_SAMPLES',
+      severity: 'warning',
+      selector: baselineAbsPath,
+      message: 'Visual baseline has no sample labels matching the current preview/draft plan.',
+      source: 'orkas-native-visual-regression',
+    });
+  }
+  const changedLabels = comparisons.filter((item) => item.changed === true).map((item) => String(item.label));
+  if (changedLabels.length) {
+    issues.push({
+      code: 'VISUAL_BASELINE_CHANGED',
+      severity: 'warning',
+      selector: baselineAbsPath,
+      message: `Visual baseline changed at: ${changedLabels.slice(0, 8).join(', ')}. Review intentionally; this advisory does not trigger an automatic rerender.`,
+      source: 'orkas-native-visual-regression',
+    });
+  }
+  return {
+    ok: true,
+    skipped: false,
+    status: changedLabels.length ? 'changed' : 'pass',
+    baseline_path: baselineAbsPath,
+    changed: changedLabels.length > 0,
+    matched_sample_count: comparisons.length,
+    changed_labels: changedLabels,
+    comparisons,
+    warning_count: issues.length,
+    issues,
+  };
+}
+
+function reviewIssueList(value: unknown, key: string): Issue[] {
+  if (!isRecord(value) || !Array.isArray(value[key])) return [];
+  return (value[key] as unknown[]).filter(isRecord).map((issue) => ({
+    code: String(issue.code || 'UNKNOWN'),
+    severity: issue.severity === 'error' || issue.severity === 'info' ? issue.severity : 'warning',
+    selector: typeof issue.selector === 'string' ? issue.selector : undefined,
+    message: String(issue.message || ''),
+    source: typeof issue.source === 'string' ? issue.source : undefined,
+  }));
+}
+
+export function buildDesignReviewInputs(opts: DesignReviewInputOptions): Record<string, unknown> {
+  const contract = isRecord(opts.contractLoad.value) ? opts.contractLoad.value : {};
+  const sceneMap = isRecord(opts.sceneMapLoad.value) ? opts.sceneMapLoad.value : {};
+  const scenes = extractScenes(sceneMap).length ? extractScenes(sceneMap) : extractScenes(contract);
+  const contractIssues = reviewIssueList(opts.contractHtml, 'issues').filter((issue) => issue.severity !== 'info');
+  const inspectIssues = reviewIssueList(opts.inspectDisposition, 'advisory_issues');
+  const allIssues = [...contractIssues, ...inspectIssues];
+  const issueCodes = [...new Set(allIssues.map((issue) => issue.code))];
+  const focus: string[] = [];
+  if (issueCodes.some((code) => code.includes('CONTRAST'))) focus.push('contrast hierarchy');
+  if (issueCodes.some((code) => code.includes('SAFE_AREA') || code.includes('OVERFLOW'))) focus.push('safe-area and text fit');
+  if (issueCodes.some((code) => code.includes('SCENE_VARIATION') || code.includes('COMPLEXITY'))) focus.push('scene grammar and visual density');
+  if (issueCodes.some((code) => code.includes('PALETTE'))) focus.push('palette hierarchy');
+  if (issueCodes.some((code) => code.includes('SEMANTIC'))) focus.push('scene/role QA coverage');
+  if ((opts.visualRegression as { changed?: boolean } | null)?.changed) focus.push('intentional baseline changes');
+
+  return {
+    version: 1,
+    contract_path: opts.contractLoad.path,
+    scene_map_path: opts.sceneMapLoad.exists ? opts.sceneMapLoad.path : '',
+    aesthetic: contract.aesthetic || null,
+    color_tokens: contract.color_tokens || null,
+    typography_tokens: contract.typography_tokens || null,
+    motion_budget: contract.motion_budget || null,
+    scene_variation: contract.scene_variation || null,
+    scenes: {
+      count: scenes.length,
+      ids: scenes.map((scene, index) => sceneId(scene) || sceneLabel(scene, index)).slice(0, 24),
+      layout_sequence: scenes.map(sceneLayoutKey).filter(Boolean).slice(0, 24),
+    },
+    semantic_hooks: isRecord(opts.contractHtml) ? opts.contractHtml.semantic_hooks || null : null,
+    preview_assets: {
+      contact_sheet: opts.frameEvidence?.contact_sheet || '',
+      frame_paths: opts.frameEvidence?.frame_paths || [],
+    },
+    advisory_count: allIssues.length,
+    advisory_codes: issueCodes,
+    advisories: allIssues.slice(0, 16),
+    review_focus: focus,
+    visual_regression: opts.visualRegression || null,
+  };
+}
+
+export function summarizeVideoFrameQa(
+  frameEvidence: FrameEvidence | null,
+  durationSec: number,
+  opts: { sceneCount?: number; expectedSceneIds?: string[]; requireSemanticCoverage?: boolean; minimumSamples?: number } = {},
+): Record<string, unknown> {
   const issues: Issue[] = [];
   const samples = frameEvidence?.samples || [];
   if (!samples.length) {
@@ -1139,6 +2201,28 @@ export function summarizeVideoFrameQa(frameEvidence: FrameEvidence | null, durat
       source: 'orkas-native-video-qa',
     });
   }
+  const expectedMinimum = opts.minimumSamples
+    ?? Math.max(1, Number(opts.sceneCount || 0));
+  if (samples.length && samples.length < expectedMinimum) {
+    issues.push({
+      code: 'VIDEO_SAMPLE_COVERAGE_INSUFFICIENT',
+      severity: 'error',
+      message: `Captured ${samples.length} distinct evidence frame(s); this composition requires at least ${expectedMinimum}.`,
+      source: 'orkas-native-video-qa',
+    });
+  }
+  if (opts.requireSemanticCoverage && opts.expectedSceneIds?.length) {
+    const evidenced = new Set(samples.map((sample) => sample.expected_scene_id).filter(Boolean));
+    const missingSceneIds = opts.expectedSceneIds.filter((id) => !evidenced.has(id));
+    if (missingSceneIds.length) {
+      issues.push({
+        code: 'VIDEO_SCENE_EVIDENCE_MISSING',
+        severity: 'error',
+        message: `No semantic evidence frame was captured for scene(s): ${missingSceneIds.slice(0, 12).join(', ')}.`,
+        source: 'orkas-native-video-qa',
+      });
+    }
+  }
   for (const sample of samples) {
     if (sample.brightness < 4 || sample.brightness > 251 || sample.contrast < 1.5) {
       issues.push({
@@ -1147,6 +2231,30 @@ export function summarizeVideoFrameQa(frameEvidence: FrameEvidence | null, durat
         message: `Sample "${sample.label}" at ${sample.time_seconds}s appears blank or nearly flat (brightness=${sample.brightness}, contrast=${sample.contrast}).`,
         source: 'orkas-native-video-qa',
       });
+    }
+    if (opts.requireSemanticCoverage && sample.expected_scene_id) {
+      const visibleSceneIds = sample.visible_scene_ids || [];
+      if (!visibleSceneIds.includes(sample.expected_scene_id)) {
+        issues.push({
+          code: 'EXPECTED_SCENE_NOT_VISIBLE',
+          severity: 'error',
+          sceneId: sample.expected_scene_id,
+          message: `Sample "${sample.label}" at ${sample.time_seconds}s does not show expected scene "${sample.expected_scene_id}".`,
+          source: 'orkas-native-video-qa',
+        });
+      }
+    }
+    if (opts.requireSemanticCoverage && sample.label === 'first-frame') {
+      const roles = sample.visible_roles || [];
+      const visibleText = String(sample.visible_text || '').trim();
+      if (!roles.includes('title') || !visibleText) {
+        issues.push({
+          code: 'HOOK_PROMISE_NOT_VISIBLE',
+          severity: 'error',
+          message: 'The first frame must expose a visible data-role="title" and readable promise text.',
+          source: 'orkas-native-video-qa',
+        });
+      }
     }
   }
   let runStart = 0;
@@ -1175,6 +2283,8 @@ export function summarizeVideoFrameQa(frameEvidence: FrameEvidence | null, durat
     contact_sheet: frameEvidence?.contact_sheet || '',
     frame_paths: frameEvidence?.frame_paths || [],
     samples,
+    expected_minimum_samples: expectedMinimum,
+    semantic_coverage_required: opts.requireSemanticCoverage === true,
     issues,
   };
 }

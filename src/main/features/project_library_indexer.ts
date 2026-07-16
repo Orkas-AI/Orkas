@@ -1,7 +1,7 @@
 /**
  * Project-scoped Library vector index.
  *
- * Project Library source files live under `<uid>/cloud/projects/<pid>/files/`.
+ * Project Library source files live under `<uid>/cloud/projects/<pid>/contexts/`.
  * The derived vector store is machine-local under `<uid>/local/projects/<pid>/`
  * so project assets can sync independently from embeddings, mirroring the
  * global Library/KB design.

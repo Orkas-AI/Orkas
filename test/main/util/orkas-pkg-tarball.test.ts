@@ -13,6 +13,7 @@ import * as path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const PKG_PATH = path.join(process.cwd(), 'bin', 'orkas-pkg.cjs');
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const pkg = require(PKG_PATH) as {
   classifySource: (s: string) => { kind: string; owner?: string; repo?: string; ref?: string };
   githubTarballUrl: (cls: { owner: string; repo: string; ref?: string }) => string;
@@ -110,7 +111,7 @@ describe('install routing without git', () => {
     const emptyBin = path.join(tmpDir, 'empty-bin');
     fs.mkdirSync(emptyBin, { recursive: true });
 
-    const r = spawnSync(process.execPath, [PKG_PATH, 'install', 'https://gitlab.com/foo/bar.git'], {
+    const r = spawnSync(TEST_NODE, [PKG_PATH, 'install', 'https://gitlab.com/foo/bar.git'], {
       encoding: 'utf8',
       env: {
         // Empty PATH ⇒ `git --version` ENOENTs ⇒ gitAvailable() === false.
@@ -134,7 +135,7 @@ describe.skipIf(!process.env.ORKAS_PKG_NET_TEST || process.platform === 'win32')
     fs.mkdirSync(wsRoot, { recursive: true });
     // Isolated bin with ONLY tar (symlinked) — so `git --version` ENOENTs and
     // the tarball branch is exercised, while extraction still has tar. `node`
-    // is found via the absolute process.execPath regardless of PATH.
+    // is found via the absolute test Node path regardless of PATH.
     const onlyTarBin = path.join(tmpDir, 'only-tar-bin');
     fs.mkdirSync(onlyTarBin, { recursive: true });
     const tarPath = spawnSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).stdout.trim();
@@ -142,7 +143,7 @@ describe.skipIf(!process.env.ORKAS_PKG_NET_TEST || process.platform === 'win32')
 
     // octocat/Hello-World is tiny and stable but has no SKILL.md / CLI entry,
     // so a successful download+extract reaches the scan stage and exits 65.
-    const r = spawnSync(process.execPath, [PKG_PATH, 'install', 'https://github.com/octocat/Hello-World'], {
+    const r = spawnSync(TEST_NODE, [PKG_PATH, 'install', 'https://github.com/octocat/Hello-World'], {
       encoding: 'utf8',
       env: { PATH: onlyTarBin, ORKAS_WORKSPACE_ROOT: wsRoot, ORKAS_UID: 'u1', ORKAS_PC_DIR: process.cwd() },
     });

@@ -9,8 +9,6 @@ function loadUserError() {
   const context: any = {
     window: {},
     t: (key: string) => ({
-      'chat.report_failed': 'Feedback failed.',
-      'chat.report_login_required': 'Please sign in before sending feedback.',
       'marketplace.action_failed_retry_later': 'Marketplace is temporarily unavailable. Please try again later.',
     } as Record<string, string>)[key] || key,
   };
@@ -34,12 +32,16 @@ describe('renderer user-error mapping', () => {
     expect(ctx.userErrorMessage({
       code: ctx.window.USER_ERROR_CODE.AUTH_REQUIRED,
       error: 'not logged in',
-    }, { authKey: 'chat.report_login_required' })).toBe('Please sign in before sending feedback.');
+    }, { fallbackKey: 'marketplace.action_failed_retry_later' })).toBe(
+      'Marketplace is temporarily unavailable. Please try again later.',
+    );
 
     expect(ctx.userErrorMessage({
       code: 50001,
       error: 'login required',
-    }, { authKey: 'chat.report_login_required' })).toBe('Please sign in before sending feedback.');
+    }, { fallbackKey: 'marketplace.action_failed_retry_later' })).toBe(
+      'Marketplace is temporarily unavailable. Please try again later.',
+    );
 
     expect(ctx.userErrorMessage({ error: 'invalid category' }, {
       fallbackKey: 'marketplace.action_failed_retry_later',

@@ -9,6 +9,7 @@ import {
 } from '../../../../src/main/model/core-agent/tool-catalog';
 import {
   getBuiltinTools,
+  createExecutionPlanTool,
   SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
   TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
   toToolDefinition,
@@ -60,6 +61,18 @@ function enumerateAllInjectedTools(): AgentTool[] {
 
   // core-agent builtins (always merged into AgentRunner's tool map)
   tools.push(...getBuiltinTools());
+  tools.push(createExecutionPlanTool({
+    update: () => ({
+      version: 1,
+      objective: 'task',
+      objectiveTurnId: 1,
+      updatedTurnId: 1,
+      revision: 1,
+      steps: [{ step: 'work', status: 'in_progress' }],
+      updatedAt: 1,
+    }),
+    clear: () => {},
+  }));
 
   // injected (memory + metacognition)
   tools.push(
@@ -80,7 +93,12 @@ function enumerateAllInjectedTools(): AgentTool[] {
   // local + file + kb + image gen.
   // Pass cid + onArtifactCreated so `create_artifact` is included — runner.ts
   // wires both through for group-chat turns (see local-tools.createLocalTools).
-  tools.push(...createLocalTools({ userId: 'testuid', cid: 'testcid', onArtifactCreated: () => {} }));
+  tools.push(...createLocalTools({
+    userId: 'testuid',
+    cid: 'testcid',
+    onArtifactCreated: () => {},
+    onOutputsPublished: (paths) => paths,
+  }));
   tools.push(...createFileTools({ userId: 'testuid', cid: 'testcid' }));
   tools.push(...createKbTools({ userId: 'testuid' }));
   tools.push(...createChatHistoryTools({ userId: 'testuid' }));
@@ -224,6 +242,7 @@ describe('tool-catalog', () => {
       grep_files: ['pattern', 'glob', 'output_mode'],
       write_file: ['write', 'path', 'content'],
       edit_file: ['old_string', 'new_string', 'unique', 'e_stale'],
+      publish_outputs: ['complete', 'final', 'paths', 'this turn'],
       create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
       delete_file: ['confirmation', 'confirmation_token', 'path'],
       interactive_cli_start: ['live user stdin', 'command', 'purpose'],

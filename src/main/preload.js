@@ -66,10 +66,11 @@ function logRecord(record) {
 // Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
+const PUSH_EVENT_CHANNELS = new Set();
 const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'client-config:', 'delete_file.', 'bridge:', 'bash:'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
-  return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
+  return PUSH_EVENT_CHANNELS.has(channel) || PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
 }
 
 /** Subscribe to a main-initiated push event. Returns an `unsubscribe()` function.
@@ -116,7 +117,7 @@ function stream(channel, payload, onEvent) {
   });
 
   const cancel = () => {
-    if (settled) return;
+    if (settled || cancelled) return;
     cancelled = true;
     ipcRenderer.send('orkas.streamCancel', requestId);
   };
@@ -149,6 +150,7 @@ contextBridge.exposeInMainWorld('orkas', {
   diagnostics: () => ipcRenderer.invoke('orkas.diagnostics'),
   env: () => ipcRenderer.invoke('orkas.env'),
   relaunch: () => ipcRenderer.invoke('orkas.relaunch'),
+  reportUserActivity: () => ipcRenderer.send('orkas.userActivity'),
   getNativeSearchEnabled: () => invoke('devtools.getNativeSearchEnabled'),
   setNativeSearchEnabled: (enabled) => invoke('devtools.setNativeSearchEnabled', { enabled }),
   getLanguage: () => invoke('config.getLanguage'),
@@ -161,3 +163,21 @@ contextBridge.exposeInMainWorld('orkas', {
   onPushEvent,
   log: logRecord,
 });
+
+// Final-package launch smoke. The main process adds this private renderer
+// argument only when the release validator starts an isolated hidden window.
+// A successful ping proves the preload bridge and main IPC handler both ran;
+// DOMContentLoaded proves the packaged renderer was read and initialized.
+if (process.argv.includes('--orkas-packaged-launch-smoke')) {
+  window.addEventListener('DOMContentLoaded', () => {
+    ipcRenderer.invoke('orkas.ping')
+      .then((ping) => ipcRenderer.invoke('orkas.packagedLaunchSmokeReady', {
+        preloadLoaded: true,
+        ping: ping && ping.pong,
+        rendererReadyState: document.readyState,
+      }))
+      .catch((error) => {
+        console.error('[packaged-launch-smoke] preload/renderer readiness failed', error);
+      });
+  }, { once: true });
+}

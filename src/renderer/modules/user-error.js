@@ -37,12 +37,13 @@ function isUserTechnicalError(errLike) {
     || code === USER_ERROR_CODE.NETWORK_UNAVAILABLE
     || code === USER_ERROR_CODE.SERVER_UNAVAILABLE
     || code === USER_ERROR_CODE.BAD_RESPONSE
+    || code === USER_ERROR_CODE.AUTH_REQUIRED
   ) {
     return true;
   }
 
   const text = _userErrorRawMessage(errLike).toLowerCase();
-  return /(?:^|[\s(:])(?:account|marketplace|sync|relay):\//.test(text)
+  return /(?:^|[\s(:])marketplace:\//.test(text)
     || /\btimed out after \d+\s*(?:ms|s)\b|\btimeout\b|\btimed out\b/.test(text)
     || /\bfailed to fetch\b|\bfetch failed\b|networkerror|load failed|econnreset|econnrefused|eai_again|enotfound/.test(text)
     || /^http\s+\d{3}$/i.test(text)
@@ -53,10 +54,6 @@ function isUserTechnicalError(errLike) {
 function userErrorMessage(errLike, opts) {
   opts = opts || {};
   const code = _userErrorCode(errLike);
-  if (code === USER_ERROR_CODE.AUTH_REQUIRED) {
-    return _userErrorLabel(opts.authKey || 'chat.report_login_required', opts.authFallback || 'Please sign in and try again.');
-  }
-
   const fallback = opts.fallbackKey
     ? _userErrorLabel(opts.fallbackKey, opts.fallbackText || '')
     : (opts.fallbackText || '');

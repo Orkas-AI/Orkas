@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Docs MCP server (stdio). Wraps `docs.googleapis.com` REST API.
 // V1: read full document + create empty doc. `update_document` deferred (batchUpdate's request[]
 // schema is complex; defer until we see real workflow demand).

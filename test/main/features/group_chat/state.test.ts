@@ -174,6 +174,39 @@ describe('group_chat state › markInFlight does NOT touch status', () => {
   });
 });
 
+describe('group_chat state › compact running registry', () => {
+  it('tracks running before state persistence and removes it after idle', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    const paths = await import('../../../../src/main/paths');
+    await s.setStatus(TEST_UID, TEST_CID, 'running');
+
+    const running = JSON.parse(fs.readFileSync(
+      paths.userRunningConversationsFile(TEST_UID), 'utf8'));
+    expect(running).toEqual({
+      version: 1,
+      items: [{ conversation_id: TEST_CID }],
+    });
+
+    await s.setStatus(TEST_UID, TEST_CID, 'idle');
+    const idle = JSON.parse(fs.readFileSync(
+      paths.userRunningConversationsFile(TEST_UID), 'utf8'));
+    expect(idle).toEqual({ version: 1, items: [] });
+  });
+
+  it('serialises concurrent conversation starts without losing entries', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await Promise.all([
+      s.transitionStatus(TEST_UID, 'cid-a', () => 'running'),
+      s.transitionStatus(TEST_UID, 'cid-b', () => 'running'),
+    ]);
+
+    const registry = await s.readRunningConversationRegistry(TEST_UID);
+    expect(registry.valid).toBe(true);
+    expect(registry.items.map((item) => item.conversation_id).sort())
+      .toEqual(['cid-a', 'cid-b']);
+  });
+});
+
 describe('group_chat state › touchActivity (stuck-turn watchdog heartbeat)', () => {
   // `touchActivity` is what keeps `processing_since` (= last_active_at) fresh
   // during a long single turn so the renderer's 12-min stuck-turn watchdog

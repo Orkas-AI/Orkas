@@ -86,6 +86,9 @@ async function refreshModelConfigSnapshot() {
   try {
     const res = await window.orkas.invoke('auth.listEntries');
     if (res && res.ok && Array.isArray(res.entries)) {
+      window.dispatchEvent(new CustomEvent('orkas:model-entries-changed', {
+        detail: { entries: res.entries },
+      }));
       trackModelConfigSnapshot(res.entries);
     }
   } catch (err) {

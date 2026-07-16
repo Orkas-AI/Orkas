@@ -39,6 +39,7 @@ vi.mock('../../src/main/features/search', () => ({
     searchCalls.push({ action: 'drop', userId, path });
   },
   dropChatConversation: vi.fn(),
+  invalidateChatDisplayCatalog: vi.fn(),
 }));
 
 vi.mock('../../src/main/features/sync', () => ({
@@ -110,7 +111,7 @@ describe('PC core regression unit coverage', () => {
     });
     const second = await auth.addEntry({
       provider: 'openai',
-      model: 'gpt-5.4',
+      model: 'gpt-5.6-terra',
       profileId: backup.profileId,
     });
 
@@ -119,8 +120,8 @@ describe('PC core regression unit coverage', () => {
     await auth.reorderEntries([second.entryId, first.entryId]);
     entries = (await auth.listEntries()).entries;
     expect(entries.map((entry) => entry.entryId)).toEqual([second.entryId, first.entryId]);
-    await auth.updateEntryModel(second.entryId, 'gpt-5.5-pro');
-    expect((await auth.listEntries()).entries[0].model).toBe('gpt-5.5-pro');
+    await auth.updateEntryModel(second.entryId, 'gpt-5.6-luna');
+    expect((await auth.listEntries()).entries[0].model).toBe('gpt-5.6-luna');
 
     const search = searchAuth.addSearchProfile({
       provider: 'tavily',

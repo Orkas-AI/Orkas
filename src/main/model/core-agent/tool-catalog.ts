@@ -96,6 +96,9 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'ocr_file',      group: 'fs', summary: 'Run local OCR on PDF pages or image files when visual text is not available through read_file/stat_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched); optional `glob` scope + `output_mode` files/count.' },
+  { name: 'tool_result_search', group: 'fs', summary: 'Search a persisted oversized tool result by opaque ref and return bounded matching excerpts.' },
+  { name: 'tool_result_read_chunk', group: 'fs', summary: 'Read one bounded cursor chunk from a persisted oversized tool result by opaque ref.' },
+  { name: 'publish_outputs', group: 'fs', summary: 'Declare the complete set of current-turn files that should appear as final deliverables in the message footer.' },
   { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
 
   // Shell
@@ -124,12 +127,12 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'research_rerank', group: 'kb', ownerAgent: DEEP_RESEARCH_AGENT_IDS, summary: 'Semantically rerank candidate research passages against a sub-question by local embedding similarity — the second stage after the deep-research compress skill\'s lexical filter, surfacing on-topic passages that share no keywords. Read-only, local, no Tool Execution Access. Owned by the deep-research + data-research agents (hidden from the commander).' },
 
   // Conversation history
-  { name: 'chat_search',   group: 'chat', summary: 'Search prior conversation messages after Library is insufficient or the user asks about previous chats.' },
-  { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from one conversation.' },
+  { name: 'chat_search',   group: 'chat', summary: 'Search prior messages for missing continuity context; project conversations default to same-project history.' },
+  { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from a known conversation.' },
 
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
-  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML composition lint/inspect/render/draft and speech transcription fallback orchestration.' },
+  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML preview, QA-gated draft/export, and speech transcription fallback orchestration.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
   { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },
@@ -142,8 +145,11 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'call_connector_tool',  group: 'connector', summary: 'Invoke an action on a connector; call list_connector_tools first to learn the action name and schema.' },
   { name: 'add_custom_connector', group: 'connector', summary: 'Commander-only: add a user-described custom MCP server (requires a user confirmation dialog before install).' },
 
-  // Cross-session state
+  // Task-local and cross-session state
+  { name: 'manage_execution_plan', group: 'meta', summary: 'Manage the durable current-task objective and milestone statuses for long/tool-heavy work; session-local and independent of context summaries.' },
   { name: 'cross_session_memory', group: 'meta', summary: 'Read/write user profile, shared facts, and agent memory that persist across sessions.' },
+  { name: 'project_instructions', group: 'meta', summary: "Replace the project's standing goal + rules (ORKAS.md, the Project instructions block); commander-only, project sessions." },
+  { name: 'project_tasks',        group: 'meta', summary: "Read/update the project's shared structured task backlog; project sessions only." },
   { name: 'metacognition',        group: 'meta', summary: 'Read/write metacognition (COMPETENCE / LEARNING_STRATEGIES); env-flag gated.' },
 
   // NB: the commander's group-dispatch tools (dispatch_to / run_worker) and other
@@ -164,7 +170,7 @@ const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
   { group: 'video', title: 'Video' },
   { group: 'web',       title: 'Web' },
   { group: 'connector', title: 'Connectors (third-party services)' },
-  { group: 'meta',      title: 'Cross-session state' },
+  { group: 'meta',      title: 'Task / cross-session state' },
 ];
 
 const CATALOG_BY_NAME: ReadonlyMap<string, ToolCatalogEntry> = new Map(

@@ -8,12 +8,14 @@ const UID = 'auto-task-sync-user';
 let tmpDir: string;
 let prevWs: string | undefined;
 let dirty: Array<{ domain: string; relPath: string }>;
+let deleted: string[];
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-auto-sync-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   dirty = [];
+  deleted = [];
   vi.resetModules();
 });
 
@@ -28,6 +30,7 @@ describe('auto tasks sync dirty notifications', () => {
   it('marks task config mutations dirty', async () => {
     const autoTasks = await import('../../../src/main/features/auto_tasks');
     autoTasks._setSyncDirtyNotifierForTest((domain, relPath) => dirty.push({ domain, relPath }));
+    autoTasks._setSyncDeletedNotifierForTest((relPath) => deleted.push(relPath));
 
     const created = await autoTasks.createTask(UID, {
       id: 'at_1234abcd',
@@ -45,13 +48,14 @@ describe('auto tasks sync dirty notifications', () => {
       { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_1234abcd/config.json' },
       { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_1234abcd/config.json' },
       { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_1234abcd/config.json' },
-      { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_1234abcd/config.json' },
     ]);
+    expect(deleted).toEqual(['cloud/auto_tasks/at_1234abcd/config.json']);
   });
 
   it('marks task attachment mutations dirty', async () => {
     const autoTasks = await import('../../../src/main/features/auto_tasks');
     autoTasks._setSyncDirtyNotifierForTest((domain, relPath) => dirty.push({ domain, relPath }));
+    autoTasks._setSyncDeletedNotifierForTest((relPath) => deleted.push(relPath));
 
     await autoTasks.uploadAttachment(UID, 'at_abcdef12', 'brief.txt', Buffer.from('brief'));
     await autoTasks.deleteAttachment(UID, 'at_abcdef12', 'brief.txt');
@@ -59,7 +63,7 @@ describe('auto tasks sync dirty notifications', () => {
 
     expect(dirty).toEqual([
       { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_abcdef12/attachments/brief.txt' },
-      { domain: 'auto_tasks', relPath: 'cloud/auto_tasks/at_abcdef12/attachments/brief.txt' },
     ]);
+    expect(deleted).toEqual(['cloud/auto_tasks/at_abcdef12/attachments/brief.txt']);
   });
 });

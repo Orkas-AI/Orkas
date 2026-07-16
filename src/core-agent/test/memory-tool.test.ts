@@ -208,3 +208,56 @@ describe('cross_session_memory › error handling', () => {
     expect(JSON.parse(result.content).error).toMatch(/blocked/);
   });
 });
+
+describe('cross_session_memory › project tier', () => {
+  it('adds the "project" target and a routing block only when includeProjectTier', () => {
+    const withProject = createCrossSessionMemoryTool(mockHandler(), { includeProjectTier: true });
+    expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
+    expect(withProject.description).toContain('project:');
+
+    const without = createCrossSessionMemoryTool(mockHandler());
+    expect((without.inputSchema as any).properties.target.enum).not.toContain('project');
+  });
+
+  it('commander (read+write) can write the project tier', async () => {
+    const handler = mockHandler();
+    const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true });
+    const result = await tool.execute({ action: 'add', target: 'project', content: 'decided X' }, dummyCtx);
+    expect(result.isError).toBeFalsy();
+    expect(handler.add).toHaveBeenCalledWith('project', 'decided X');
+  });
+
+  it('read-only sub-agent may list the project tier but not add/replace/remove', async () => {
+    const handler = mockHandler();
+    const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
+
+    // Description tells the model the project tier is read-only for it.
+    expect(tool.description).toContain('READ-ONLY');
+    expect(tool.description).toContain('already present in your system context');
+    expect(tool.description).toContain('Do not list it merely to reload context');
+
+    // list is allowed (read).
+    const listed = await tool.execute({ action: 'list', target: 'project' }, dummyCtx);
+    expect(listed.isError).toBeFalsy();
+    expect(handler.list).toHaveBeenCalledWith('project');
+
+    // writes are rejected before reaching the handler.
+    for (const input of [
+      { action: 'add', target: 'project', content: 'x' },
+      { action: 'replace', target: 'project', old_text: 'a', content: 'b' },
+      { action: 'remove', target: 'project', old_text: 'a' },
+    ]) {
+      const res = await tool.execute(input, dummyCtx);
+      expect(res.isError).toBe(true);
+      expect(JSON.parse(res.content).error).toMatch(/read-only/);
+    }
+    expect(handler.add).not.toHaveBeenCalled();
+    expect(handler.replace).not.toHaveBeenCalled();
+    expect(handler.remove).not.toHaveBeenCalled();
+
+    // read-only applies to the project tier only — the agent's own tier still writes.
+    const ownAdd = await tool.execute({ action: 'add', target: 'agent', content: 'lesson' }, dummyCtx);
+    expect(ownAdd.isError).toBeFalsy();
+    expect(handler.add).toHaveBeenCalledWith('agent', 'lesson');
+  });
+});

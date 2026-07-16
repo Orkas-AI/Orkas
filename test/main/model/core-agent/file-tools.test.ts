@@ -9,6 +9,8 @@ import { makeMinimalXlsx, makeMinimalPptx } from '../../../fixtures/make-minimal
 
 const UID = 'u-ftools-001';
 const CID = 'conv-x';
+const PROJECT_ID = 'projfiletools';
+const PROJECT_CID = 'conv-project-x';
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -52,6 +54,35 @@ async function buildTools() {
   const tools = mod.createFileTools({ userId: UID, cid: CID });
   fs.mkdirSync(attachmentDir(), { recursive: true });
   return { tools, wsDir, attDir: attachmentDir() };
+}
+
+async function buildProjectTools() {
+  const mod = await import('../../../../src/main/model/core-agent/file-tools');
+  const ws = await import('../../../../src/main/features/user_workspace');
+  const paths = await import('../../../../src/main/paths');
+  const wsDir = path.join(tmpDir, 'project-ws');
+  fs.mkdirSync(wsDir, { recursive: true });
+  const r = ws.setWorkspacePath(UID, wsDir);
+  if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+
+  fs.mkdirSync(path.dirname(paths.projectMetaFile(UID, PROJECT_ID)), { recursive: true });
+  fs.writeFileSync(paths.projectMetaFile(UID, PROJECT_ID), JSON.stringify({
+    project_id: PROJECT_ID,
+    name: 'Project File Tools',
+  }), 'utf8');
+  fs.mkdirSync(path.dirname(paths.projectChatIndexFile(UID, PROJECT_ID)), { recursive: true });
+  fs.writeFileSync(paths.projectChatIndexFile(UID, PROJECT_ID), JSON.stringify([{
+    conversation_id: PROJECT_CID,
+    project_id: PROJECT_ID,
+    title: 'Project conversation',
+    created_at: '2026-07-09T00:00:00.000Z',
+    updated_at: '2026-07-09T00:00:00.000Z',
+  }]), 'utf8');
+
+  const attDir = paths.projectChatAttachmentDir(UID, PROJECT_ID, PROJECT_CID);
+  fs.mkdirSync(attDir, { recursive: true });
+  const tools = mod.createFileTools({ userId: UID, cid: PROJECT_CID, projectId: PROJECT_ID });
+  return { tools, wsDir, attDir };
 }
 
 function getTool(tools: any[], name: string) {
@@ -300,6 +331,23 @@ describe('file-tools › ocr_file', () => {
 });
 
 describe('file-tools › read_file scope guards', () => {
+  it('rejects generic reads from the persisted tool-result root', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const resultRoot = path.join(tmpDir, 'tool-results');
+    fs.mkdirSync(resultRoot, { recursive: true });
+    const stored = path.join(resultRoot, 'web_fetch.0123456789abcdef.txt');
+    fs.writeFileSync(stored, 'large stored result');
+    const tools = mod.createFileTools({
+      userId: UID,
+      readOnlyExtraRoots: [resultRoot],
+      toolResultsRoot: resultRoot,
+    });
+    const result = await run(getTool(tools, 'read_file'), { path: stored });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_TOOL_RESULT_REF_REQUIRED');
+    expect(result.content).toContain('tool_result_read_chunk');
+  });
+
   it('rejects paths outside the scope with E_PATH_OUT_OF_SCOPE', async () => {
     const perm = await import('../../../../src/main/features/permissions');
     perm.setLocalExecMode('workspace_approval');
@@ -381,6 +429,20 @@ describe('file-tools › read_file scope guards', () => {
     const r = await run(getTool(tools, 'read_file'), { path: path.join(wsDir, 'ghost.md') });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_NOT_FOUND');
+  });
+
+  it('allows project-scoped conversation attachments', async () => {
+    const { tools, attDir } = await buildProjectTools();
+    const p = path.join(attDir, 'project-note.md');
+    fs.writeFileSync(p, 'project attachment body');
+
+    const read = await run(getTool(tools, 'read_file'), { path: p });
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain('project attachment body');
+
+    const search = await run(getTool(tools, 'search_files'), { query: 'project-note' });
+    expect(search.isError).toBeFalsy();
+    expect(search.content).toContain('project-note.md');
   });
 
   it('honours extraRoots — paths under an extra root are allowed', async () => {

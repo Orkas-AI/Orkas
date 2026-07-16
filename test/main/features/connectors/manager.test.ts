@@ -321,6 +321,288 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections['bing-webmaster']).toBeTruthy();
   });
 
+  it('projects stale transport-unresolved rows as degraded on list, without mutating them', async () => {
+    // Two invariants, both new. The row must surface as recoverable (`degraded`) so it stays
+    // routable and the next use repairs it — but listing must NOT write. This used to rewrite the
+    // row to `connected` and fire-and-forget persist that, so merely enumerating connectors (which
+    // happens on every agent turn via resolveVisibleConnectors) laundered a real failure into a
+    // green card that nothing had verified.
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const inst = sentryInstance();
+    (inst as any).status = { kind: 'error', message: 'transport unresolved', at: Date.now() };
+
+    await registry.upsert(TEST_UID, inst);
+
+    const row = manager.listInstances(TEST_UID).find((item) => item.id === 'sentry');
+    expect(row?.status.kind).toBe('degraded');
+    expect((row?.status as any).retry_after).toBeUndefined();
+
+    // The read is pure: disk still holds the original row, untouched.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(registry.load(TEST_UID).connections.sentry.status).toMatchObject({
+      kind: 'error',
+      message: 'transport unresolved',
+    });
+  });
+
+  it('ignores synced connectors unknown to this app version without mutating them', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await registry.upsert(TEST_UID, futureCatalogInstance());
+
+    expect(manager.listInstances(TEST_UID).map((item) => item.id)).not.toContain('future-dcr');
+    expect(manager.getInstance(TEST_UID, 'future-dcr')).toBeNull();
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(registry.load(TEST_UID).connections['future-dcr'].status).toMatchObject({
+      kind: 'connected',
+    });
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+
+  it('reuses a healthy persisted tool cache at bootstrap and connects only on first tool call', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.mcp.listTools).not.toHaveBeenCalled();
+    expect(manager.listInstances(TEST_UID)[0]?.tools_cache).toEqual([
+      expect.objectContaining({ name: 'github_search_repositories' }),
+    ]);
+
+    await manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'orkas' });
+
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.listTools).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.callTool).toHaveBeenCalledWith(
+      'github_search_repositories',
+      { query: 'orkas' },
+    );
+  });
+
+  it('reports the real reason when an on-demand connect fails transiently, not "connector unavailable"', async () => {
+    // Regression: the exact production failure. The Server's session store went away, so
+    // `/connectors/oauth/refresh` answered 503 系统繁忙 for every connector. The refresh error was
+    // classified transient (correctly — 5xx is not an auth failure), the row was therefore NOT
+    // marked `status:error`, and `callTool` keyed its message off `kind === 'error'` alone — so it
+    // threw a bare `connector unavailable`, dropping the one string that explained everything. The
+    // agent surfaced that to the user, who had no way to tell a backend outage from a dead grant.
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      throw new Error('refresh HTTP 503: {"code":1,"msg":"系统繁忙，请稍后重试"}');
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = bingWebmasterInstance(['webmaster.read']);
+    inst.oauth_grant.expires_at = Date.now() - 1; // stale → forces the refresh, which 503s
+    await registry.upsert(TEST_UID, inst);
+
+    await expect(
+      manager.callTool(TEST_UID, 'bing-webmaster', 'list_sites', {}),
+    ).rejects.toThrow(/503.*系统繁忙/);
+    // …and it names which connector failed, so a multi-connector agent turn is attributable.
+    await expect(
+      manager.callTool(TEST_UID, 'bing-webmaster', 'list_sites', {}),
+    ).rejects.toThrow(/bing-webmaster/);
+  });
+
+  it('opens a circuit breaker after repeated transient failures instead of retrying every call', async () => {
+    // Each connect attempt is bounded on its own (3 tries in postConnectorBridgeJson), but nothing
+    // bounded them ACROSS calls: a degraded connector stays routed to the model, so every tool call
+    // re-ran the full refresh — 3 requests each, forever, against a backend already known to be
+    // down. An agent turn could fire dozens. This pins the ceiling.
+    const refresh = vi.fn(async () => {
+      throw new Error('refresh HTTP 503: {"code":1,"msg":"系统繁忙，请稍后重试"}');
+    });
+    mocks.oauth.refreshIfStale = refresh;
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = bingWebmasterInstance(['webmaster.read']);
+    inst.oauth_grant.expires_at = Date.now() - 1;
+    await registry.upsert(TEST_UID, inst);
+
+    // First call: pays the refresh, fails, opens the circuit.
+    await expect(manager.callTool(TEST_UID, 'bing-webmaster', 'list_sites', {})).rejects.toThrow(/503/);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    const opened = registry.load(TEST_UID).connections['bing-webmaster'].status as any;
+    expect(opened.failures).toBe(1);
+    expect(opened.retry_after).toBeGreaterThan(Date.now());
+
+    // Every subsequent call inside the cooldown must touch NO network at all…
+    for (let i = 0; i < 5; i += 1) {
+      await expect(manager.callTool(TEST_UID, 'bing-webmaster', 'list_sites', {})).rejects.toThrow(/not retrying/);
+    }
+    expect(refresh).toHaveBeenCalledTimes(1);  // ← still 1: the ceiling held across 5 more calls
+
+    // …while still telling the caller the real reason, not just "wait".
+    await expect(manager.callTool(TEST_UID, 'bing-webmaster', 'list_sites', {})).rejects.toThrow(/503.*系统繁忙/);
+  });
+
+  it('backs off further on each consecutive failure and resets the breaker on success', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      throw new Error('refresh HTTP 503: {"code":1,"msg":"系统繁忙"}');
+    });
+
+    const inst = bingWebmasterInstance(['webmaster.read']);
+    inst.oauth_grant.expires_at = Date.now() - 1;
+    await registry.upsert(TEST_UID, inst);
+
+    // refreshTools is the user pressing 重试 — it deliberately ignores the cooldown, so it is also
+    // the lever this test uses to drive consecutive failures.
+    await manager.refreshTools(TEST_UID, 'bing-webmaster').catch(() => {});
+    const first = registry.load(TEST_UID).connections['bing-webmaster'].status as any;
+    await manager.refreshTools(TEST_UID, 'bing-webmaster').catch(() => {});
+    const second = registry.load(TEST_UID).connections['bing-webmaster'].status as any;
+
+    expect(first.failures).toBe(1);
+    expect(second.failures).toBe(2);
+    // Ladder grows (30s → 1m). Jitter is ±20%, so compare windows rather than exact values.
+    expect(second.retry_after - Date.now()).toBeGreaterThan(first.retry_after - Date.now());
+
+    // A success clears the breaker entirely — no lingering failure count.
+    mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => ({
+      ...(grant as object),
+      access_token: 'fresh',
+      expires_at: Date.now() + 60 * 60 * 1000,
+    }));
+    await manager.refreshTools(TEST_UID, 'bing-webmaster');
+    const healed = registry.load(TEST_UID).connections['bing-webmaster'].status as any;
+    expect(healed.kind).toBe('connected');
+    expect(healed.failures).toBeUndefined();
+    expect(healed.retry_after).toBeUndefined();
+  });
+
+  it('skips bootstrap connects for connectors still in cooldown, so a restart cannot re-stampede', async () => {
+    // The cooldown is persisted rather than in-memory precisely for this: quitting and reopening
+    // the app during an outage used to start the retry storm over from zero on every launch.
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = githubInstance();
+    (inst as any).status = {
+      kind: 'degraded',
+      message: 'refresh HTTP 503: {"code":1,"msg":"系统繁忙"}',
+      at: Date.now(),
+      failures: 4,
+      retry_after: Date.now() + 10 * 60 * 1000,
+    };
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    // Panel entry must not be an end-run around the ceiling either.
+    expect(await manager.verifyUsableConnectors(TEST_UID, 'test')).toBe(0);
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+  });
+
+  it('verifies only connectors whose last successful connect aged out, and skips the rest', async () => {
+    // Cost guard for `verifyUsableConnectors`: the Connectors panel calls this on entry, and each
+    // verification is an OAuth refresh + process spawn + list_tools. (Verification stops before any tool invocation.) A recently-verified row must still cost nothing, or opening the panel would stampede every
+    // connector — and hammer a backend that is already failing.
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const fresh = githubInstance();
+    (fresh as any).status = { kind: 'connected', since: Date.now() };  // verified just now
+    await registry.upsert(TEST_UID, fresh);
+
+    expect(await manager.verifyUsableConnectors(TEST_UID, 'test')).toBe(0);
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+
+    // Same row, but last verified 6h ago → now due.
+    const stale = githubInstance();
+    (stale as any).status = { kind: 'connected', since: Date.now() - 6 * 60 * 60 * 1000 };
+    await registry.upsert(TEST_UID, stale);
+
+    expect(await manager.verifyUsableConnectors(TEST_UID, 'test')).toBe(1);
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent first tool calls onto one on-demand connection', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    await manager.bootstrap(TEST_UID);
+    let releaseConnect!: () => void;
+    mocks.mcp.connect = vi.fn(() => new Promise<void>((resolve) => { releaseConnect = resolve; }));
+
+    const first = manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'one' });
+    const second = manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'two' });
+    await vi.waitFor(() => expect(mocks.mcp.connect).toHaveBeenCalledTimes(1));
+    releaseConnect();
+    await Promise.all([first, second]);
+
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.listTools).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.callTool).toHaveBeenCalledTimes(2);
+  });
+
+  it('still repairs an unfinished connector row even when it has cached tools', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const inst = sentryInstance();
+    inst.status = { kind: 'connecting' };
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.listTools).toHaveBeenCalledTimes(1);
+    expect(registry.load(TEST_UID).connections.sentry.status).toMatchObject({ kind: 'connected' });
+  });
+
+  it('caps bootstrap connection concurrency and batches final status persistence', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    for (let i = 0; i < 7; i++) {
+      const now = new Date().toISOString();
+      await registry.upsert(TEST_UID, {
+        id: `custom-startup-${i}`,
+        display_name: `Custom startup ${i}`,
+        origin: 'custom',
+        transport: { kind: 'stdio', command: 'node', args: ['server.js'] },
+        enabled_subtools: null,
+        tools_cache: [],
+        tools_cached_at: 0,
+        status: { kind: 'connecting' },
+        created_at: now,
+        updated_at: now,
+      });
+    }
+    let active = 0;
+    let maxActive = 0;
+    mocks.mcp.connect = vi.fn(async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active--;
+    });
+    const updateManySpy = vi.spyOn(registry, 'updateMany');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(maxActive).toBeGreaterThan(1);
+    expect(maxActive).toBeLessThanOrEqual(3);
+    expect(updateManySpy).toHaveBeenCalledTimes(1);
+    expect((updateManySpy.mock.calls[0][1] as Map<string, unknown>).size).toBe(7);
+    expect(Object.values(registry.load(TEST_UID).connections).every(
+      (inst) => inst.status.kind === 'connected' && inst.tools_cache.length === 1,
+    )).toBe(true);
+  });
+
   it('clears the previous connector row when reauthorization returns missing required scopes', async () => {
     mocks.oauth.startOAuth = vi.fn(async () => {
       const err = new Error('missing_required_scopes') as Error & { code?: string };
@@ -354,7 +636,27 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections['bing-webmaster'].status).toMatchObject({ kind: 'connected' });
   });
 
-  it('preserves established server-bridge connectors when refresh_failed is localized by Server', async () => {
+  it('degrades (not errors, not "connected") an established connector when the refresh bridge replies 5xx', async () => {
+    mocks.oauth.refreshIfStale = vi.fn(async () => {
+      throw new Error('refresh HTTP 503: {"code":1,"msg":"系统繁忙，请稍后重试"}');
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = bingWebmasterInstance(['webmaster.read']);
+    inst.oauth_grant.expires_at = Date.now() - 1;
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.refreshTools(TEST_UID, 'bing-webmaster');
+    const row = registry.load(TEST_UID).connections['bing-webmaster'];
+    expect(row.status.kind).toBe('degraded');
+    expect((row.status as { message: string }).message).toContain('503');
+    expect(row.oauth_grant).toBeTruthy();
+    expect(row.oauth_grant?.refresh_token).toBe(inst.oauth_grant.refresh_token);
+  });
+
+  it('degrades established server-bridge connectors when refresh_failed is localized by Server', async () => {
     mocks.oauth.refreshIfStale = vi.fn(async () => {
       throw new Error('刷新授权失败');
     });
@@ -366,7 +668,8 @@ describe('features/connectors/manager authorization recovery', () => {
     bing.oauth_grant.expires_at = Date.now() - 1;
     await registry.upsert(TEST_UID, bing);
     await manager.refreshTools(TEST_UID, 'bing-webmaster');
-    expect(registry.load(TEST_UID).connections['bing-webmaster'].status).toMatchObject({ kind: 'connected' });
+    expect(registry.load(TEST_UID).connections['bing-webmaster'].status.kind).toBe('degraded');
+    expect(registry.load(TEST_UID).connections['bing-webmaster'].oauth_grant).toBeTruthy();
 
     const github = githubInstance();
     github.oauth_grant.expires_at = Date.now() - 1;
@@ -378,10 +681,11 @@ describe('features/connectors/manager authorization recovery', () => {
     });
     await registry.upsert(TEST_UID, github);
     await manager.refreshTools(TEST_UID, 'github');
-    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
+    expect(registry.load(TEST_UID).connections.github.status.kind).toBe('degraded');
+    expect(registry.load(TEST_UID).connections.github.oauth_grant).toBeTruthy();
   });
 
-  it('preserves established DCR connectors when server-managed refresh returns generic refresh_failed', async () => {
+  it('degrades established DCR connectors when server-managed refresh returns generic refresh_failed', async () => {
     mocks.dcr.refreshDcrServerManaged = vi.fn(async () => {
       const err = new Error('Failed to refresh authorization') as Error & { code?: string; retryable?: boolean };
       err.code = 'connector_refresh_failed';
@@ -400,7 +704,9 @@ describe('features/connectors/manager authorization recovery', () => {
     await registry.upsert(TEST_UID, inst);
     await manager.refreshTools(TEST_UID, 'notion');
 
-    expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
+    const row = registry.load(TEST_UID).connections.notion;
+    expect(row.status.kind).toBe('degraded');
+    expect(row.oauth_grant).toBeTruthy();
   });
 
   it('keeps structured DCR reconnect-required rows visible for reconnect', async () => {
@@ -636,7 +942,7 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
   });
 
-  it('preserves established Notion state when transient MCP failures continue after retry', async () => {
+  it('degrades but keeps Notion tools/grant when transient MCP failures continue after retry', async () => {
     // The scenario is "transient failures CONTINUE" — every connect fails.
     const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
     const closeMock = vi.fn(async () => {});
@@ -673,10 +979,15 @@ describe('features/connectors/manager authorization recovery', () => {
     // server-managed grant just because the MCP endpoint was unreachable.
     expect(connectMock).toHaveBeenCalled();
     expect(refreshDcrServerManaged).not.toHaveBeenCalled();
-    expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
+    // Established state kept (cached tools still served above) — but recorded as unverified, with
+    // the real reason, rather than asserting a connection that never succeeded.
+    const notionRow = registry.load(TEST_UID).connections.notion;
+    expect(notionRow.status.kind).toBe('degraded');
+    expect((notionRow.status as { message: string }).message).toContain('fetch failed');
+    expect(notionRow.tools_cache.length).toBeGreaterThan(0);
   });
 
-  it('preserves established GitHub state when transient MCP failures continue after retry', async () => {
+  it('degrades but keeps GitHub grant when transient MCP failures continue after retry', async () => {
     const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
     mocks.mcp.connect = connectMock;
     mocks.mcp.close = vi.fn(async () => {});
@@ -695,11 +1006,12 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(tools).toEqual([{ name: 'github_search_repositories', description: '', input_schema: {} }]);
     expect(connectMock).toHaveBeenCalled();
     expect(mocks.oauth.refreshIfStale).not.toHaveBeenCalled();
-    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
+    expect(registry.load(TEST_UID).connections.github.status.kind).toBe('degraded');
+    // The un-rotated grant must survive the degrade — that is the whole point of not hard-erroring.
     expect(registry.load(TEST_UID).connections.github.oauth_grant?.access_token).toBe('ghu-token');
   });
 
-  it('heals stale GitHub reconnect errors when the latest failure is transient', async () => {
+  it('degrades stale GitHub reconnect errors when the latest failure is transient', async () => {
     const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
     mocks.mcp.connect = connectMock;
     mocks.mcp.close = vi.fn(async () => {});
@@ -715,10 +1027,12 @@ describe('features/connectors/manager authorization recovery', () => {
 
     expect(tools).toEqual([{ name: 'github_search_repositories', description: '', input_schema: {} }]);
     expect(connectMock).toHaveBeenCalled();
-    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
+    // The sticky reconnect wording is cleared (the latest failure was transient, so the grant is
+    // not proven dead), but the row lands on `degraded` — not a fabricated `connected`.
+    expect(registry.load(TEST_UID).connections.github.status.kind).toBe('degraded');
   });
 
-  it('heals persisted transient Notion errors with cached tools on list', async () => {
+  it('projects persisted transient Notion errors with cached tools as degraded on list', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
     const inst = notionInstance();
@@ -728,9 +1042,22 @@ describe('features/connectors/manager authorization recovery', () => {
     await registry.upsert(TEST_UID, inst);
 
     const row = manager.listInstances(TEST_UID).find((item) => item.id === 'notion');
-    expect(row?.status).toMatchObject({ kind: 'connected' });
-    await vi.waitFor(() => {
-      expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
+    expect(row?.status.kind).toBe('degraded');
+    // The reason is carried onto the projection, so the card can show it.
+    expect((row?.status as { message: string }).message).toContain('fetch failed');
+
+    // Repeated reads are temporally pure: compatibility projection must not keep opening a fresh
+    // cooldown that prevents this legacy row from ever being repaired automatically.
+    const again = manager.listInstances(TEST_UID).find((item) => item.id === 'notion');
+    expect(again?.status).toEqual(row?.status);
+    expect((again?.status as any).retry_after).toBeUndefined();
+    expect((again?.status as any).failures).toBeUndefined();
+
+    // …and listing left disk alone.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({
+      kind: 'error',
+      message: 'fetch failed',
     });
   });
 

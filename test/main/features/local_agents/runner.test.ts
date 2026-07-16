@@ -215,7 +215,35 @@ describe('local_agents/runner', () => {
     const done = events.find(e => e.type === 'done');
     expect(done?.status).toBe('missing_cli');
     expect(done?.error).toMatch(/no claude on PATH/);
+    expect(done?.cliError).toBe('not_found');
+    expect(result.cliError).toBe('not_found');
     expect(result.runId).toBe(''); // no persistence for missing
+  });
+
+  it('preserves recognition details when the CLI exists but its version cannot be read', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'claude', available: false, path: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd', version: null,
+      error: 'version_unknown', errorDetail: 'version output could not be parsed',
+    });
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'claude', prompt: 'hi', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(result).toMatchObject({
+      status: 'missing_cli',
+      cliError: 'version_unknown',
+      cliPath: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      cliError: 'version_unknown',
+      cliPath: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\claude.cmd',
+    });
   });
 
   it('persists prompt + events.jsonl + meta.json on a completed run', async () => {

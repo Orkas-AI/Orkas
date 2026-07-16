@@ -154,6 +154,18 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).toContain('interactive: true');
   });
 
+  it('renders no marker lines for a plain agent (no inputs, non-interactive)', async () => {
+    writeAgent(customAgentsDir(), 'plain-agent', {
+      name: 'PlainAgent',
+      description_zh: 'P',
+      description_en: 'P',
+    });
+    const text = await buildBlock(TEST_UID);
+    expect(text).toContain('@PlainAgent (Source: custom, id: plain-agent) — P');
+    expect(text).not.toContain('interactive:');
+    expect(text).not.toContain('inputs: read agent.json');
+  });
+
   it('renders compact agent descriptions in the index', async () => {
     writeAgent(customAgentsDir(), 'long-desc', {
       name: 'LongDesc',

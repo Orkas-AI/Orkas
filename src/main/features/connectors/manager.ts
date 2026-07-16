@@ -1,10 +1,11 @@
 /**
  * Connector manager — process-level singleton holding live MCP client connections.
  *
- * On boot: read registry, reconnect every instance best-effort (failures land as `status:error`
- * but don't block app startup). On shutdown: close all connections cleanly so stdio
- * subprocesses exit instead of leaking. Tool calls route here from the AgentRunner's tools[]
- * array via `tools-adapter.ts`.
+ * On boot: read the registry and reuse persisted tool schemas for healthy instances. Only rows
+ * that need first-time discovery, catalog-cache refresh, or state repair are connected. A real
+ * tool call reconnects its one instance on demand. On shutdown: close live connections cleanly
+ * so stdio subprocesses exit instead of leaking. Tool calls route here from the AgentRunner's
+ * meta-tools via `tools-adapter.ts`.
  *
  * Every instance uses OAuth — there is no API-key path. The `connectViaOAuth` entry point runs
  * the full PKCE/browser/code-exchange flow, persists the grant, applies the catalog's transport
@@ -28,11 +29,14 @@ import {
 } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
+import { isConnectorUsable } from './types';
 import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
 
 const log = createLogger('connectors:manager');
 
 const _conns = new Map<string, McpConnection>();
+const _verifyLocks = new Map<string, Promise<number>>();
+const _onDemandConnectLocks = new Map<string, Promise<McpConnection>>();
 let _bootedFor: string | null = null;
 
 /** Per-instance in-flight refresh dedupe. **Why:** OAuth refresh_tokens (GitHub App `ghr_*`,
@@ -50,6 +54,28 @@ const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
 
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const CONNECT_RETRY_DELAY_MS = 500;
+const BOOTSTRAP_CONNECT_CONCURRENCY = 3;
+const VERIFY_TTL_MS = 5 * 60 * 1000;
+const RETRY_BACKOFF_BASE_MS = 30 * 1000;
+const RETRY_BACKOFF_MAX_MS = 30 * 60 * 1000;
+
+type StatusPatchCollector = Map<string, registry.ConnectorInstancePatch[]>;
+
+async function _runBounded<T>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      await worker(items[index]);
+    }
+  });
+  await Promise.all(runners);
+}
 
 function _now(): number { return Date.now(); }
 function _nowIso(): string { return new Date().toISOString(); }
@@ -161,65 +187,118 @@ function _isTransientConnectorFailure(err: unknown): boolean {
   if (code === 'connector_reconnect_required') return false;
   if (code === 'connector_refresh_failed') return retryable !== false;
   if (retryable === true) return true;
+  if (retryable === false) return false;
   const msg = (err as Error | null)?.message || String(err || '');
   if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg)) {
     return true;
   }
   // Generic bridge refresh failures are not proof that the user's grant is dead;
   // explicit reconnect signals use connector_reconnect_required / invalid_grant wording.
-  return /\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg);
+  if (/\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg)) {
+    return true;
+  }
+  // A 5xx from the connector OAuth bridge is a temporary service failure,
+  // not evidence that the user's provider grant is invalid.
+  return /refresh HTTP\s+5\d\d\b/i.test(msg);
 }
 
 function _hasEstablishedConnectorState(inst: ConnectorInstance): boolean {
-  return inst.status?.kind === 'connected' || (Array.isArray(inst.tools_cache) && inst.tools_cache.length > 0);
+  return inst.status?.kind === 'connected'
+    || inst.status?.kind === 'degraded'
+    || (Array.isArray(inst.tools_cache) && inst.tools_cache.length > 0);
 }
 
 function _isTransientStatusError(inst: ConnectorInstance): boolean {
   return inst.status?.kind === 'error' && _isTransientConnectorFailure(inst.status.message);
 }
 
-function _asConnectedFromCache(inst: ConnectorInstance): ConnectorInstance {
-  if (inst.status?.kind === 'connected') return inst;
+function _isUnknownCatalogInstance(inst: ConnectorInstance): boolean {
+  return inst.origin !== 'custom' && !findCatalogEntry(inst.id);
+}
+
+function _isRecoverableTransportUnresolved(inst: ConnectorInstance): boolean {
+  if (inst.status?.kind !== 'error' || !/transport unresolved/i.test(inst.status.message)) return false;
+  if (inst.origin === 'custom') return false;
+  const entry = findCatalogEntry(inst.id);
+  return !!entry?.transport_template && !!inst.oauth_grant && _hasEstablishedConnectorState(inst);
+}
+
+function _lastVerifiedAt(inst: ConnectorInstance): number | undefined {
+  if (inst.status?.kind === 'connected') return inst.status.since;
+  if (inst.status?.kind === 'degraded') return inst.status.last_verified_at;
+  return undefined;
+}
+
+function _consecutiveFailures(inst: ConnectorInstance): number {
+  return inst.status?.kind === 'degraded' ? (inst.status.failures || 0) : 0;
+}
+
+function _retryAfterFor(failures: number): number {
+  const step = Math.min(RETRY_BACKOFF_BASE_MS * 2 ** Math.max(0, failures - 1), RETRY_BACKOFF_MAX_MS);
+  const jitter = step * 0.2 * (Math.random() * 2 - 1);
+  return _now() + Math.round(step + jitter);
+}
+
+function _asDegradedFromCache(inst: ConnectorInstance, message: string): ConnectorInstance {
+  const failures = _consecutiveFailures(inst) + 1;
   return {
     ...inst,
-    auth_error: undefined,
-    status: { kind: 'connected', since: _now() },
+    status: {
+      kind: 'degraded',
+      message,
+      at: _now(),
+      last_verified_at: _lastVerifiedAt(inst),
+      failures,
+      retry_after: _retryAfterFor(failures),
+    },
   };
 }
 
-async function _preserveEstablishedStateOnTransientFailure(
+function _isInRetryCooldown(inst: ConnectorInstance): boolean {
+  return inst.status?.kind === 'degraded' && (inst.status.retry_after || 0) > _now();
+}
+
+function _cooldownMessage(id: string, inst: ConnectorInstance): string {
+  const status = inst.status?.kind === 'degraded' ? inst.status : null;
+  const waitS = Math.ceil(Math.max(0, (status?.retry_after || 0) - _now()) / 1000);
+  return `connector ${id} unavailable: ${status?.message || 'not verified'}`
+    + ` (${status?.failures || 0} consecutive failures; not retrying for another ${waitS}s)`;
+}
+
+async function _markDegradedOnTransientFailure(
   uid: string,
   inst: ConnectorInstance,
   err: unknown,
   reason: string,
+  statusPatches?: StatusPatchCollector,
 ): Promise<ConnectorInstance | null> {
   if (!_isTransientConnectorFailure(err) || !_hasEstablishedConnectorState(inst)) return null;
-  log.warn('preserving established connector state after transient failure', {
+  const message = (err as Error).message;
+  log.warn('connector degraded after transient failure; keeping grant and cached tools for retry', {
     id: inst.id,
     reason,
-    error: (err as Error).message,
+    error: message,
   });
   const current = registry.load(uid).connections[inst.id] || inst;
-  if (current.status?.kind !== 'connected') {
-    const healed = await _patchStatus(uid, current, (cur) => ({
-      ..._asConnectedFromCache(cur),
-      updated_at: _nowIso(),
-    }));
-    return healed;
-  }
-  return current;
+  return _patchStatus(uid, current, (cur) => ({
+    ..._asDegradedFromCache(cur, message),
+    updated_at: _nowIso(),
+  }), statusPatches);
 }
 
-function _normalizeTransientStatusForList(uid: string, inst: ConnectorInstance): ConnectorInstance {
-  if (!_isTransientStatusError(inst) || !_hasEstablishedConnectorState(inst)) return inst;
-  const healed = _asConnectedFromCache(inst);
-  void _patchStatus(uid, inst, (cur) => ({
-    ..._asConnectedFromCache(cur),
-    updated_at: _nowIso(),
-  })).catch((err) => {
-    log.warn('failed to heal transient connector status', { id: inst.id, error: (err as Error).message });
-  });
-  return healed;
+function _normalizeTransientStatusForList(inst: ConnectorInstance): ConnectorInstance {
+  if (inst.status?.kind !== 'error') return inst;
+  const recoverable = _isTransientStatusError(inst) || _isRecoverableTransportUnresolved(inst);
+  if (!recoverable || !_hasEstablishedConnectorState(inst)) return inst;
+  return {
+    ...inst,
+    status: {
+      kind: 'degraded',
+      message: inst.status.message,
+      at: inst.status.at,
+      last_verified_at: _lastVerifiedAt(inst),
+    },
+  };
 }
 
 async function _removeStoredInstance(uid: string, id: string, reason: string): Promise<void> {
@@ -472,31 +551,47 @@ async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<
   return { transport, grant };
 }
 
-/** Atomic patch of the per-instance status field. Used in every error / success branch below
- *  instead of `registry.upsert(snapshot)` to avoid clobbering fields written concurrently by
- *  the refresh path (most importantly `oauth_grant`). When the row was deleted between entry
- *  and patch (`removeInstance` raced us), `update` returns null and we fall back to the caller's
- *  stale `inst` — harmless since nobody downstream looks up by id again. */
+/** Patch the per-instance status/tools fields. Normal calls persist atomically;
+ *  bootstrap supplies a collector and flushes all discovered patches once via
+ *  `registry.updateMany`. Both forms apply patches to the latest registry row,
+ *  so a concurrently refreshed `oauth_grant` is never clobbered. */
 async function _patchStatus(
   uid: string,
   inst: ConnectorInstance,
   patch: (cur: ConnectorInstance) => ConnectorInstance,
+  statusPatches?: StatusPatchCollector,
 ): Promise<ConnectorInstance> {
+  if (statusPatches) {
+    const pending = statusPatches.get(inst.id) || [];
+    let current = inst;
+    for (const apply of pending) current = apply(current);
+    pending.push(patch);
+    statusPatches.set(inst.id, pending);
+    return patch(current);
+  }
   const updated = await registry.update(uid, inst.id, patch);
   return updated ?? inst;
 }
 
-async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Promise<ConnectorInstance> {
+async function _connectAndCacheTools(
+  uid: string,
+  inst: ConnectorInstance,
+  statusPatches?: StatusPatchCollector,
+): Promise<ConnectorInstance> {
   const entry = findCatalogEntry(inst.id);
   let transport: Transport;
   try {
     const resolved = await _resolveTransport(uid, inst);
     if (!resolved) {
+      if (_isUnknownCatalogInstance(inst)) {
+        log.warn('skipping synced connector unsupported by this app version', { id: inst.id });
+        return inst;
+      }
       return _patchStatus(uid, inst, (cur) => ({
         ...cur,
         status: { kind: 'error', message: 'transport unresolved', at: _now() },
         updated_at: _nowIso(),
-      }));
+      }), statusPatches);
     }
     transport = resolved.transport;
   } catch (err) {
@@ -504,13 +599,15 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
     if (_isMissingRequiredScopesError(err) || (entry && !_isTransientConnectorFailure(err) && _isGoogleAuthFailure(entry, err))) {
       return inst;
     }
-    const preserved = await _preserveEstablishedStateOnTransientFailure(uid, inst, err, 'resolve_transport');
-    if (preserved) return preserved;
+    const degraded = await _markDegradedOnTransientFailure(
+      uid, inst, err, 'resolve_transport', statusPatches,
+    );
+    if (degraded) return degraded;
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
       status: { kind: 'error', message: (err as Error).message, at: _now() },
       updated_at: _nowIso(),
-    }));
+    }), statusPatches);
   }
   const conn = new McpConnection(inst.id, transport);
   try {
@@ -525,7 +622,7 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
       auth_error: undefined,
       status: { kind: 'connected', since: _now() },
       updated_at: _nowIso(),
-    }));
+    }), statusPatches);
   } catch (err) {
     log.warn('connect+list failed', { id: inst.id, error: (err as Error).message });
     try { await conn.close(); } catch { /* swallow */ }
@@ -546,7 +643,7 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
           auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
-        }));
+        }), statusPatches);
       } catch (retryErr) {
         statusErr = retryErr;
         log.warn('connect+list transient retry failed', { id: inst.id, error: (retryErr as Error).message });
@@ -569,19 +666,21 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
           auth_error: undefined,
           status: { kind: 'connected', since: _now() },
           updated_at: _nowIso(),
-        }));
+        }), statusPatches);
       } catch (retryErr) {
         statusErr = retryErr;
         log.warn('server-managed forced refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
       }
     }
-    const preserved = await _preserveEstablishedStateOnTransientFailure(uid, inst, statusErr, 'connect_list');
-    if (preserved) return preserved;
+    const degraded = await _markDegradedOnTransientFailure(
+      uid, inst, statusErr, 'connect_list', statusPatches,
+    );
+    if (degraded) return degraded;
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
       status: { kind: 'error', message: (statusErr as Error).message, at: _now() },
       updated_at: _nowIso(),
-    }));
+    }), statusPatches);
   }
 }
 
@@ -596,6 +695,34 @@ function _shouldForceRefreshAfterConnectFailure(
   return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg);
 }
 
+export async function verifyUsableConnectors(uid: string, reason = 'manual'): Promise<number> {
+  if (!uid) return 0;
+  const existing = _verifyLocks.get(uid);
+  if (existing) return existing;
+  const run = (async () => {
+    const now = Date.now();
+    const due = listInstances(uid).filter((inst) => {
+      if (!isConnectorUsable(inst.status) || !isConnectorRuntimeEnabled(inst.id)) return false;
+      if (_conns.get(inst.id)?.isConnected || _isInRetryCooldown(inst)) return false;
+      return now - (_lastVerifiedAt(inst) || 0) >= VERIFY_TTL_MS;
+    });
+    if (!due.length) return 0;
+    log.info('verifying connectors with stale verification', { reason, due: due.length });
+    let verified = 0;
+    await _runBounded(due, BOOTSTRAP_CONNECT_CONCURRENCY, async (inst) => {
+      const updated = await _connectAndCacheTools(uid, inst).catch((err) => {
+        log.warn('connector verification threw', { id: inst.id, error: (err as Error).message });
+        return null;
+      });
+      if (updated?.status?.kind === 'connected') verified += 1;
+    });
+    return verified;
+  })();
+  _verifyLocks.set(uid, run);
+  try { return await run; }
+  finally { _verifyLocks.delete(uid); }
+}
+
 export async function bootstrap(uid: string): Promise<void> {
   if (!uid || _bootedFor === uid) return;
   _bootedFor = uid;
@@ -605,9 +732,14 @@ export async function bootstrap(uid: string): Promise<void> {
     log.info('no connectors to bootstrap');
     return;
   }
-  const validInstances: ConnectorInstance[] = [];
+  const connectCandidates: ConnectorInstance[] = [];
+  let reusedCached = 0;
   for (const id of ids) {
     const inst = file.connections[id];
+    if (_isUnknownCatalogInstance(inst)) {
+      log.warn('skipping synced connector unsupported by this app version', { id });
+      continue;
+    }
     try {
       if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_bootstrap')) continue;
     } catch (err) {
@@ -626,17 +758,42 @@ export async function bootstrap(uid: string): Promise<void> {
       continue;
     }
     if (!isConnectorRuntimeEnabled(inst.id)) continue;
-    validInstances.push(inst);
+    // A healthy persisted row already has everything needed to expose the connector to the
+    // model. Keeping every MCP process/socket warm made the deferred bootstrap take 10s+ for a
+    // typical multi-connector setup and merely moved startup contention into the first minute.
+    // `callTool` establishes this one connection on first use (and refreshes stale OAuth grants),
+    // so do network/process work here only when local discovery or state repair is actually due.
+    if (
+      inst.status?.kind === 'connected'
+      && inst.tools_cache.length > 0
+    ) {
+      reusedCached += 1;
+      continue;
+    }
+    if (_isInRetryCooldown(inst)) continue;
+    connectCandidates.push(inst);
   }
-  await Promise.all(validInstances.map((inst) => _connectAndCacheTools(uid, inst).catch(() => {})));
+  const statusPatches: StatusPatchCollector = new Map();
+  await _runBounded(connectCandidates, BOOTSTRAP_CONNECT_CONCURRENCY, async (inst) => {
+    await _connectAndCacheTools(uid, inst, statusPatches).catch(() => {});
+  });
+  await registry.updateMany(uid, statusPatches);
   const connected = Array.from(_conns.values()).filter((c) => c.isConnected).length;
-  log.info('connectors bootstrap done', { total: ids.length, connected });
+  log.info('connectors bootstrap done', {
+    total: ids.length,
+    reused_cached: reusedCached,
+    connect_candidates: connectCandidates.length,
+    connected,
+    concurrency: BOOTSTRAP_CONNECT_CONCURRENCY,
+    persisted_statuses: statusPatches.size,
+  });
 }
 
 export function listInstances(uid: string): ConnectorInstance[] {
   if (!uid) return [];
   const file = registry.load(uid);
   return Object.values(file.connections).filter((inst) => {
+    if (_isUnknownCatalogInstance(inst)) return false;
     if (_hasMissingRequiredScopes(inst)) {
       _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_list');
       return false;
@@ -653,7 +810,7 @@ export function listInstances(uid: string): ConnectorInstance[] {
         status: { kind: 'error' as const, message: problem.message, at: _now() },
       };
     }
-    return _normalizeTransientStatusForList(uid, inst);
+    return _normalizeTransientStatusForList(inst);
   }).sort((a, b) =>
     (a.display_name || a.id).localeCompare(b.display_name || b.id, undefined, {
       sensitivity: 'base',
@@ -667,6 +824,7 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
   const file = registry.load(uid);
   const inst = file.connections[id] || null;
   if (inst) {
+    if (_isUnknownCatalogInstance(inst)) return null;
     if (_hasMissingRequiredScopes(inst)) {
       _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_get');
       return null;
@@ -681,7 +839,7 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
         status: { kind: 'error', message: problem.message, at: _now() },
       };
     }
-    return _normalizeTransientStatusForList(uid, inst);
+    return _normalizeTransientStatusForList(inst);
   }
   return inst;
 }
@@ -929,6 +1087,13 @@ export async function callTool(
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
+  const liveConn = _conns.get(id);
+  const grantForCooldown = inst.oauth_grant;
+  const grantStaleForCooldown = !!(grantForCooldown?.expires_at
+    && grantForCooldown.expires_at - Date.now() <= REFRESH_BUFFER_MS);
+  if ((!liveConn?.isConnected || grantStaleForCooldown) && _isInRetryCooldown(inst)) {
+    throw new Error(_cooldownMessage(id, inst));
+  }
   // Stale-token guard: the transport snapshots the bearer at connect time (for streamable-http)
   // or injects it into env at spawn time (for stdio). A long-lived connection past the
   // `expires_at` deadline will keep using the dead token on every request — fine for short-lived
@@ -946,18 +1111,48 @@ export async function callTool(
     conn = undefined;
   }
   if (!conn || !conn.isConnected) {
-    const resolved = await _resolveTransport(uid, inst);
-    if (!resolved) throw new Error('transport unresolved');
-    conn = new McpConnection(id, resolved.transport);
-    await conn.connect();
-    _conns.set(id, conn);
+    // Reuse the full connect/list/retry/auth-repair path that bootstrap used
+    // before healthy cached connectors became lazy. This keeps the optimization
+    // from weakening first-call recovery, refreshes the target's schemas, and
+    // persists a real failure for the Connectors UI. Coalesce concurrent model
+    // calls so only one stdio child/socket is created for this instance.
+    let pending = _onDemandConnectLocks.get(id);
+    if (!pending) {
+      pending = (async () => {
+        const current = _conns.get(id);
+        if (current?.isConnected) return current;
+        const updated = await _connectAndCacheTools(uid, inst!);
+        const connected = _conns.get(id);
+        if (!connected?.isConnected) {
+          throw new Error(_connectFailureMessage(id, updated));
+        }
+        return connected;
+      })();
+      _onDemandConnectLocks.set(id, pending);
+      void pending.finally(() => {
+        if (_onDemandConnectLocks.get(id) === pending) _onDemandConnectLocks.delete(id);
+      }).catch(() => {});
+    }
+    conn = await pending;
   }
   return conn.callTool(name, args);
+}
+
+function _connectFailureMessage(id: string, updated: ConnectorInstance): string {
+  const status = updated.status;
+  if (status?.kind === 'error' || status?.kind === 'degraded') {
+    return `connector ${id} unavailable: ${status.message}`;
+  }
+  if (updated.auth_error?.message) {
+    return `connector ${id} unavailable: ${updated.auth_error.message}`;
+  }
+  return `connector ${id} unavailable: connect failed with status ${status?.kind ?? 'unknown'}`;
 }
 
 export async function shutdownAll(): Promise<void> {
   const all = Array.from(_conns.values());
   _conns.clear();
+  _onDemandConnectLocks.clear();
   await Promise.all(all.map((c) => c.close().catch(() => {})));
   _bootedFor = null;
 }
