@@ -152,6 +152,14 @@ After each task the agent reflects and updates these; on the next task `meta/` i
 
 ---
 
+## Contributors
+
+Thanks to the people who help improve Orkas:
+
+- [BlueSkyID666](https://github.com/BlueSkyID666)
+
+---
+
 ## Acknowledgments
 
 Some core modules draw on these open-source projects — special thanks to:
