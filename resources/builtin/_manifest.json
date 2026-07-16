@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "9a8f77dd4dfce8ea3a8095c9e1e5ef2af9a2f31419ebbff3ad7d4b659a30601a",
+  "content_tree_sha256": "16de3f76b9557283deea7e57900c1fc1bc4ee1d5abcca2cbc31c7a61a7265eeb",
   "files": [
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -14,8 +14,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
-      "bytes": 32676,
-      "sha256": "f23aa1d487fb89a536e11dc7df36bc93e32762df78f5de0c9b09bb8e9e141201"
+      "bytes": 32675,
+      "sha256": "723b029216e6aae9e73b9e02d3a8dc87e6db4ffe39943c9b899d0050cb217cb4"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -687,7 +687,7 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.0.48",
+        "version": "1.1.0",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
