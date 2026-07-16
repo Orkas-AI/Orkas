@@ -25,7 +25,7 @@ quality/
 1. Append a `RuleDef` entry to `rules/red-flags.ts::RED_FLAGS`.
 2. Add at least one positive + one negative fixture in
    `test/main/quality/red-flags.test.ts` per `PC/CLAUDE.md` §9 fixture rule.
-3. Run `npm test` (NOT `npx vitest` — the sqlite ABI swap is in `npm test` only).
+3. Run `npm test` (NOT `npx vitest` — the wrapper runs Vitest through Electron's embedded Node so native addons use the app ABI).
 4. Bump `VALIDATOR_VERSION` in `types.ts` if the change is observable by callers (existing reports written under the old version stay valid).
 
 ## Levels

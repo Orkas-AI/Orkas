@@ -20,8 +20,8 @@ let _memData = {};
 //   { target /* scope-key */, mode:'edit'|'add', oldText? } — null when closed.
 let _memEditor = null;
 
-function _memIc(name) {
-  return (typeof uiIconHtml === 'function') ? uiIconHtml(name) : '';
+function _memIc(name, className) {
+  return (typeof uiIconHtml === 'function') ? uiIconHtml(name, className) : '';
 }
 
 function _memToast(msg, variant) {
@@ -396,7 +396,7 @@ function _memModalHeader(title, step, sub) {
         </div>
         ${sub ? `<p class="memory-modal-sub">${escapeHtml(sub)}</p>` : ''}
       </div>
-      <button type="button" class="memory-icon-btn is-muted" data-mem-action="modal-close">${_memIc('x')}</button>
+      <button type="button" class="modal-close-btn" data-mem-action="modal-close" title="${escapeHtml(t('common.close'))}" aria-label="${escapeHtml(t('common.close'))}">${_memIc('x', 'modal-close-icon')}</button>
     </div>
   `;
 }
@@ -668,16 +668,31 @@ function _memFmtSize(bytes) {
 
 // ── Wiring ───────────────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', () => {
+function _memInitSettingsEntry() {
   const card = document.getElementById('memory-entry-card');
-  if (card) {
+  if (card && card.dataset.bound !== '1') {
+    card.dataset.bound = '1';
     card.addEventListener('click', () => {
       if (typeof setView === 'function') setView('memory');
     });
   }
   // Fill the entry-card description (with live count) on first paint.
   _memRefreshEntryCount();
-});
+
+  const tabBtn = document.querySelector('[data-settings-tab="data"]');
+  if (tabBtn && tabBtn.dataset.memoryBound !== '1') {
+    tabBtn.dataset.memoryBound = '1';
+    tabBtn.addEventListener('click', _memRefreshEntryCount);
+  }
+}
+
+// This module is normally loaded lazily after DOMContentLoaded. Bind
+// immediately in that case; retain the event path for eager/test loading.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _memInitSettingsEntry, { once: true });
+} else {
+  _memInitSettingsEntry();
+}
 
 // Re-render the page + close any open modal on language switch so dynamic copy
 // follows the active language (static data-i18n is handled by applyDomI18n).
@@ -701,9 +716,3 @@ async function _memRefreshEntryCount() {
   }
   desc.textContent = t('memory.entry_desc', { n });
 }
-
-// Keep the entry-card count fresh when the settings panel is shown.
-document.addEventListener('DOMContentLoaded', () => {
-  const tabBtn = document.querySelector('[data-settings-tab="data"]');
-  if (tabBtn) tabBtn.addEventListener('click', _memRefreshEntryCount);
-});

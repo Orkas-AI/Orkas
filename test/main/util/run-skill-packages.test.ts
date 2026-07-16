@@ -5,6 +5,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 // run-skill.cjs resolution across the external-packages root (registry-
 // driven) + package-local dependency preference. Companion to
 // test/main/util/run-skill.test.ts (custom/marketplace roots).
@@ -63,7 +65,7 @@ function writePackagePythonSkill(pkgName: string, skillId: string): void {
 
 function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
   const pcRoot = process.cwd();
-  return spawnSync(process.execPath, [
+  return spawnSync(TEST_NODE, [
     path.join(pcRoot, 'bin', 'run-skill.cjs'),
     skillRef,
     scriptBase,

@@ -25,8 +25,9 @@ import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
   agentDir, agentDefinitionFile, agentRuntimeStatsFile,
   userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
-  userAgentRuntimeConfigFile, chatAttachmentDir,
+  userAgentRuntimeConfigFile, userMemoryDir, userAgentCatalogCacheFile,
 } from '../paths';
+import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
@@ -52,7 +53,7 @@ import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   nowIso, genAgentId, safeId,
-  readJson, writeJson,
+  readJson, writeJson, writeJsonSync,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
 import {
@@ -1086,11 +1087,44 @@ export async function setAgentCliProjectDir(
   return getCliProjectDirInfoForAgent(userId, agent);
 }
 
+const AGENT_CATALOG_CACHE_VERSION = 2;
+const AGENT_ENRICHED_CACHE_TTL_MS = 2_000;
+
 interface AgentListCache { stamp: string; data: Agent[] }
+interface AgentEnrichedCache { specs: Agent[]; uid: string; expiresAt: number; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
+let _agentEnrichedCache: AgentEnrichedCache | null = null;
+
+function _agentCatalogCacheFile(): string {
+  return userAgentCatalogCacheFile(getActiveUserId());
+}
+
+function _readPersistedAgentCatalog(stamp: string): Agent[] | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(_agentCatalogCacheFile(), 'utf8'));
+    if (raw?.version !== AGENT_CATALOG_CACHE_VERSION || raw?.stamp !== stamp || !Array.isArray(raw.data)) return null;
+    return raw.data as Agent[];
+  } catch {
+    return null;
+  }
+}
+
+function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
+  try {
+    writeJsonSync(_agentCatalogCacheFile(), {
+      version: AGENT_CATALOG_CACHE_VERSION,
+      stamp,
+      data,
+    });
+  } catch (err) {
+    log.warn(`agent catalog cache write failed: ${(err as Error).message}`);
+  }
+}
 
 function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
+  _agentEnrichedCache = null;
+  try { fs.rmSync(_agentCatalogCacheFile(), { force: true }); } catch { /* cache is best-effort */ }
   if (opts.markDirty === false) return;
   // Notify the sync engine (lazy-require — stripped in the open-source build builds). Every cache-invalidate
   // is also a disk-mutation point, so co-locating the dirty signal here covers all the
@@ -1138,55 +1172,157 @@ function _agentDirStamp(): string {
   return stamp;
 }
 
-export async function listAgents(): Promise<Agent[]> {
+function _childDirectoryIds(dir: string): Set<string> {
+  try {
+    return new Set(fs.readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name));
+  } catch {
+    return new Set();
+  }
+}
+
+function _enrichAgentSpecs(uid: string, specs: Agent[]): Promise<Agent[]> {
+  if (
+    _agentEnrichedCache
+    && _agentEnrichedCache.uid === uid
+    && _agentEnrichedCache.specs === specs
+    && _agentEnrichedCache.expiresAt > Date.now()
+  ) {
+    return Promise.resolve(_agentEnrichedCache.data);
+  }
+  return _skillSpecsForDisplay().then((displaySkillSpecs) => {
+    // Most installed agents live under local/marketplace and have neither
+    // memory nor runtime stats. Two directory reads identify the sparse set
+    // that can have overlays, avoiding two failed file opens per catalog row.
+    const cloudAgentIds = _childDirectoryIds(userAgentsDir(uid));
+    const memoryAgentIds = _childDirectoryIds(path.join(userMemoryDir(uid), 'agents'));
+    const data = specs
+      .map((agent) => _withDisplaySkillRefs(agent, displaySkillSpecs))
+      .map((agent) => (
+        cloudAgentIds.has(agent.agent_id) || memoryAgentIds.has(agent.agent_id)
+          ? _withAgentMemoryEntries(uid, agent)
+          : agent
+      ))
+      .map((agent) => (
+        cloudAgentIds.has(agent.agent_id) ? _withAgentRuntimeStats(uid, agent) : agent
+      ));
+    _agentEnrichedCache = {
+      specs,
+      uid,
+      expiresAt: Date.now() + AGENT_ENRICHED_CACHE_TTL_MS,
+      data,
+    };
+    return data;
+  });
+}
+
+/** Read the normalized catalog specs once. Full listings add mutable display
+ * overlays below; chat-startup summaries deliberately do not. */
+async function _listAgentSpecs(): Promise<Agent[]> {
   const stamp = _agentDirStamp();
   let specs: Agent[];
   if (_agentListCache && _agentListCache.stamp === stamp) {
     specs = _agentListCache.data;
   } else {
-    specs = [];
-    const seen = new Set<string>();
-    const sources: Array<[AgentSource, string]> = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]];
-    for (const [source, dir] of sources) {
-      if (!fs.existsSync(dir)) continue;
-      const entries = (await fsp.readdir(dir, { withFileTypes: true }))
-        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-        .sort((a, b) => a.name.localeCompare(b.name));
-      for (const e of entries) {
-        const full = path.join(dir, e.name, 'agent.json');
-        if (!fs.existsSync(full)) continue;
-        let data: AgentRaw;
-        try { data = await readJson<AgentRaw>(full); } catch { continue; }
-        const norm = normalizeAgent(data, source);
-        if (!norm) continue;
-        if (isMarketplaceSource(source)) {
-          // Marketplace-installed agents carry `_install.json` with version + freshness.
-          // Author uid may also be present there for install/reconcile compatibility, but the
-          // global UI intentionally does not surface it.
-          _applyMarketplaceInstallMeta(norm, path.join(dir, e.name));
-        }
-        if (seen.has(norm.agent_id)) {
-          if (source === 'custom') {
-            log.warn(`id conflict: marketplace and custom both define "${norm.agent_id}" — marketplace wins, rename one`);
+    const persisted = _readPersistedAgentCatalog(stamp);
+    if (persisted) {
+      specs = persisted;
+    } else {
+      specs = [];
+      const seen = new Set<string>();
+      const sources: Array<[AgentSource, string]> = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]];
+      for (const [source, dir] of sources) {
+        if (!fs.existsSync(dir)) continue;
+        const entries = (await fsp.readdir(dir, { withFileTypes: true }))
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+          .sort((a, b) => a.name.localeCompare(b.name));
+        for (const e of entries) {
+          const full = path.join(dir, e.name, 'agent.json');
+          if (!fs.existsSync(full)) continue;
+          let data: AgentRaw;
+          try { data = await readJson<AgentRaw>(full); } catch { continue; }
+          const norm = normalizeAgent(data, source);
+          if (!norm) continue;
+          if (isMarketplaceSource(source)) {
+            // Marketplace-installed agents carry `_install.json` with version + freshness.
+            // Author uid may also be present there for install/reconcile compatibility, but the
+            // global UI intentionally does not surface it.
+            _applyMarketplaceInstallMeta(norm, path.join(dir, e.name));
           }
-          continue;
+          if (seen.has(norm.agent_id)) {
+            if (source === 'custom') {
+              log.warn(`id conflict: marketplace and custom both define "${norm.agent_id}" — marketplace wins, rename one`);
+            }
+            continue;
+          }
+          seen.add(norm.agent_id);
+          specs.push(norm);
         }
-        seen.add(norm.agent_id);
-        specs.push(norm);
       }
+      _writePersistedAgentCatalog(stamp, specs);
     }
     _agentListCache = { stamp, data: specs };
+    _agentEnrichedCache = null;
   }
+  return specs;
+}
+
+/** The chat-first renderer needs identities for mentions, actor labels and
+ * avatars — not workflows, profiles, memory entries or skill metadata. Keep
+ * that startup IPC payload intentionally small; the full list remains the
+ * Agents-tab contract. */
+export type AgentSummary = Pick<
+  Agent,
+  'agent_id' | 'name' | 'source' | 'icon' | 'color' | 'category' | 'runtime'
+> & { enabled: boolean };
+
+/** Minimal data needed for global agent search. This deliberately avoids the
+ * full-list enrichments (workflow display skills, memory and runtime stats). */
+export type AgentSearchListing = Pick<
+  Agent,
+  'agent_id' | 'name' | 'source' | 'description_zh' | 'description_en'
+> & { enabled: boolean };
+
+export async function listAgentSummaries(): Promise<AgentSummary[]> {
+  const specs = await _listAgentSpecs();
+  const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+  return specs.map((agent) => ({
+    agent_id: agent.agent_id,
+    name: agent.name,
+    source: agent.source,
+    icon: agent.icon,
+    color: agent.color,
+    category: agent.category,
+    runtime: agent.runtime,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
+}
+
+export async function listAgentSearchListings(): Promise<AgentSearchListing[]> {
+  const specs = await _listAgentSpecs();
+  const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
+  return specs.map((agent) => ({
+    agent_id: agent.agent_id,
+    name: agent.name,
+    source: agent.source,
+    description_zh: agent.description_zh,
+    description_en: agent.description_en,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
+}
+
+export async function listAgents(): Promise<Agent[]> {
+  const specs = await _listAgentSpecs();
   // Overlay per-user enabled overrides outside the cache so toggles take
   // effect immediately without busting the disk-spec cache. Cheap — one
   // small JSON file read per call.
   const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
-  const displaySkillSpecs = await _skillSpecsForDisplay();
-  return specs
-    .map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }))
-    .map((a) => _withDisplaySkillRefs(a, displaySkillSpecs))
-    .map((a) => _withAgentMemoryEntries(getActiveUserId(), a))
-    .map((a) => _withAgentRuntimeStats(getActiveUserId(), a));
+  const enriched = await _enrichAgentSpecs(getActiveUserId(), specs);
+  return enriched.map((agent) => ({
+    ...agent,
+    enabled: !disabledAgentIds.has(agent.agent_id),
+  }));
 }
 
 /**
@@ -2464,7 +2600,7 @@ function agentEditReadOnlyRoots(userId: string, attachmentCid?: string): string[
   } catch (err) {
     log.warn(`agent edit open skill read roots unavailable: ${(err as Error).message}`);
   }
-  if (attachmentCid) roots.push(chatAttachmentDir(userId, attachmentCid));
+  if (attachmentCid) roots.push(chatAttachmentDirForConversation(userId, attachmentCid));
   return roots;
 }
 

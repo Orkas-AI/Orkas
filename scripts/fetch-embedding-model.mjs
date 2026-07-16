@@ -21,19 +21,25 @@ import { createRequire } from 'node:module';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pcRoot = path.resolve(here, '..');
+const require = createRequire(import.meta.url);
+const {
+  EMBEDDING_MODEL_CONTRACT,
+  verifyEmbeddingModelArchive,
+  verifyEmbeddingModelRoot,
+} = require('../bin/packaged-resource-gate.cjs');
 const destDir = path.join(pcRoot, 'resources', 'embedding-model');
-const MODEL = 'fast-bge-small-zh-v1.5';
+const MODEL = EMBEDDING_MODEL_CONTRACT.id;
 const modelDir = path.join(destDir, MODEL);
-const tarballUrl = `https://storage.googleapis.com/qdrant-fastembed/${MODEL}.tar.gz`;
+const tarballUrl = EMBEDDING_MODEL_CONTRACT.source;
 const tarballPath = path.join(destDir, `${MODEL}.tar.gz`);
 
-// Required files inside the extracted model dir — fastembed's FlagEmbedding.init
-// checks for these at load time. If any are missing the download is redone.
-const REQUIRED = ['config.json', 'tokenizer.json', 'model_optimized.onnx'];
-
 function allFilesPresent() {
-  if (!fs.existsSync(modelDir)) return false;
-  return REQUIRED.every((f) => fs.existsSync(path.join(modelDir, f)));
+  try {
+    verifyEmbeddingModelRoot(destDir);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function download(url, outPath) {
@@ -84,7 +90,6 @@ async function extract(tgzPath, dstDir) {
   // Use the `tar` npm package if available (transitive dep of fastembed);
   // fall back to the system `tar` CLI if not (pre-install phase).
   try {
-    const require = createRequire(import.meta.url);
     const tar = require('tar');
     await tar.x({ file: tgzPath, cwd: dstDir });
     return;
@@ -108,6 +113,8 @@ async function main() {
   console.log(`[embedding-model] fetching ${tarballUrl}`);
   try {
     await download(tarballUrl, tarballPath);
+    verifyEmbeddingModelArchive(tarballPath);
+    fs.rmSync(modelDir, { recursive: true, force: true });
     await extract(tarballPath, destDir);
     fs.rmSync(tarballPath, { force: true });
   } catch (err) {
@@ -119,9 +126,7 @@ async function main() {
     throw err;
   }
 
-  if (!allFilesPresent()) {
-    throw new Error(`[embedding-model] extraction completed but required files missing in ${modelDir}`);
-  }
+  verifyEmbeddingModelRoot(destDir);
   console.log(`[embedding-model] ready at ${modelDir}`);
 }
 

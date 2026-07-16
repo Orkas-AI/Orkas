@@ -343,7 +343,7 @@ async function _settingsRefreshProviders() {
 }
 
 async function _settingsRefreshEntries() {
-  const res = await window.orkas.invoke('auth.listEntries');
+  const res = await window.orkas.invoke('auth.listEntries', { includeUnavailable: true });
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
   if (typeof trackModelConfigSnapshot === 'function') trackModelConfigSnapshot(_settingsState.entries);
 }
@@ -621,8 +621,8 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   const overlay   = document.getElementById('oauth-flow-modal');
   const title     = document.getElementById('oauth-flow-title');
   const body      = document.getElementById('oauth-flow-body');
-  const cancelBtn = document.getElementById('oauth-flow-cancel-btn');
-  if (!overlay || !title || !body || !cancelBtn) return;
+  const closeBtn  = document.getElementById('oauth-flow-close-btn');
+  if (!overlay || !title || !body || !closeBtn) return;
 
   // OAuth back-end may be different from the user-picked provider (e.g.
   // openai → openai-codex). `oauthProvider` is the id we actually log into.
@@ -648,7 +648,7 @@ async function _settingsStartOAuthFlow(provider, modelId) {
     document.removeEventListener('keydown', onKey, true);
   };
   const onKey = (e) => { if (e.key === 'Escape') closeFlow(); };
-  cancelBtn.onclick = closeFlow;
+  closeBtn.onclick = closeFlow;
   document.addEventListener('keydown', onKey, true);
 
   _settingsLog.info('oauth start', { provider: oauthProviderId });
@@ -818,6 +818,18 @@ function _settingsRenderEntries() {
   });
 }
 
+function _settingsEntryModelState(entry, list) {
+  const unavailable = entry.modelAvailable === false;
+  return {
+    unavailable,
+    options: list.map(m => ({ value: m.id, label: m.name || m.id })),
+    value: unavailable ? '' : entry.model,
+    placeholder: unavailable
+      ? t('settings.entries.model_unavailable')
+      : (entry.modelName || entry.model),
+  };
+}
+
 function _settingsRenderEntryRow(entry, idx) {
   const row = document.createElement('div');
   row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
@@ -842,24 +854,26 @@ function _settingsRenderEntryRow(entry, idx) {
   main.appendChild(primary);
 
   // Inline model picker — lets users switch the entry's model without
-  // deleting + re-adding. The list is the provider's valid model set
-  // (auth.listModels applies the curated whitelist for OAuth-backed
-  // providers so users can't pick something the API will reject).
+  // deleting + re-adding. auth.listModels is the complete whitelist; a saved
+  // model that left the catalog remains visible only as a remediation row and
+  // is never injected back into these options.
   const modelEl = primary.querySelector('.entry-model-select');
-  const modelSel = _aiSelectMount(modelEl, { placeholder: entry.modelName || entry.model });
+  const initialModelState = _settingsEntryModelState(entry, []);
+  const modelUnavailable = initialModelState.unavailable;
+  const modelSel = _aiSelectMount(modelEl, {
+    placeholder: initialModelState.placeholder,
+  });
   // Prevent drag from starting when interacting with the picker.
   modelEl.addEventListener('mousedown', (e) => e.stopPropagation());
   modelEl.setAttribute('draggable', 'false');
   (async () => {
     const res = await window.orkas.invoke('auth.listModels', { provider: entry.provider });
     const list = (res && res.ok && Array.isArray(res.models)) ? res.models : [];
-    const options = list.map(m => ({ value: m.id, label: m.name || m.id }));
-    // Fall back: include the current model even if it's no longer in the
-    // curated list, so we don't visually drop what the entry points at.
-    if (!options.some(o => o.value === entry.model)) {
-      options.unshift({ value: entry.model, label: entry.modelName || entry.model });
-    }
-    modelSel.setOptions(options, { value: entry.model });
+    const modelState = _settingsEntryModelState(entry, list);
+    modelSel.setOptions(modelState.options, {
+      value: modelState.value,
+      placeholder: modelState.placeholder,
+    });
     modelSel.onChange(async (val) => {
       if (!val || val === entry.model) return;
       _settingsTrackModelSelect('configured_model_entry', entry.provider, val);
@@ -898,6 +912,10 @@ function _settingsRenderEntryRow(entry, idx) {
 
   const status = document.createElement('div');
   status.className = 'entry-status';
+  if (modelUnavailable) {
+    status.className += ' error';
+    status.textContent = t('settings.entries.model_unavailable');
+  }
   main.appendChild(status);
   row.appendChild(main);
 
@@ -1195,9 +1213,9 @@ function _settingsRenderSearchEntries() {
 
 // ── Image generation API key section ────────────────────────────────────
 //
-// Same pattern as the search section but the provider list is the
-// image-gen capability map (provider_catalog.IMAGE_GEN_BY_PROVIDER).
-// Model id is fixed per-provider on the main side — never user-overridable.
+// Multi-model providers are flattened into individual choices. The picker
+// shows DouBao · Seedream 5.0 Lite / Pro directly, while the main process
+// still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
   { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
@@ -1248,7 +1266,7 @@ async function _settingsClickAddImageKey() {
   if (!apiKey)   { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
   _settingsSetStatus('settings-image-status', 'busy', t('settings.image.adding'));
   try {
-    const res = await window.orkas.invoke('imageAuth.add', { provider, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('imageAuth.add', { provider, model, apiKey, label: 'default' });
     if (!res || !res.ok) {
       _settingsSetStatus('settings-image-status', 'error', (res && res.error) || t('settings.image.add_failed'));
       return;
@@ -1300,7 +1318,7 @@ function _settingsRenderImageEntries() {
     delBtn.className = 'btn btn-sm btn-danger';
     delBtn.textContent = t('settings.delete');
     delBtn.addEventListener('click', async () => {
-      const ok = await uiConfirm(t('settings.image.confirm_delete', { provider: _imageProviderLabel(p.provider) }));
+      const ok = await uiConfirm(t('settings.image.confirm_delete', { provider: _imageProviderLabel(p.provider, p.model) }));
       if (!ok) return;
       const res = await window.orkas.invoke('imageAuth.remove', { id: p.id });
       if (res && res.ok) {
@@ -1453,7 +1471,7 @@ function _settingsRenderVideoEntries() {
     delBtn.className = 'btn btn-sm btn-danger';
     delBtn.textContent = t('settings.delete');
     delBtn.addEventListener('click', async () => {
-      const ok = await uiConfirm(t('settings.video.confirm_delete', { provider: _videoProviderLabel(p.provider) }));
+      const ok = await uiConfirm(t('settings.video.confirm_delete', { provider: _videoProviderLabel(p.provider, p.model) }));
       if (!ok) return;
       const res = await window.orkas.invoke('videoAuth.remove', { id: p.id });
       if (res && res.ok) {

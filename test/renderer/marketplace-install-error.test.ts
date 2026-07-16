@@ -124,8 +124,11 @@ describe('marketplace install error display', () => {
     expect(ctx._mpItemAppCompatible({ min_app_version: '1.5.0' })).toBe(true);
     expect(ctx._mpItemAppCompatible({ min_app_version: '' })).toBe(true);
 
+    // A declared minimum fails closed until the PC provides its current version.
     vm.runInContext('_mpState = { appVersion: "" }', ctx);
-    expect(ctx._mpItemAppCompatible({ min_app_version: '1.6.0' })).toBe(true);
+    expect(ctx._mpItemAppCompatible({ kind: 'agent', min_app_version: '1.6.0' })).toBe(false);
+    expect(ctx._mpItemAppCompatible({ kind: 'skill', min_app_version: '1.6.0' })).toBe(false);
+    expect(ctx._mpItemAppCompatible({ min_app_version: '' })).toBe(true);
   });
 
   it('maps transport failures to user-facing marketplace copy', () => {

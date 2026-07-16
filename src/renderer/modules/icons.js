@@ -9,6 +9,8 @@
   const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'opus', 'flac', 'm4a', 'aac']);
   const TEXT_EXTS = new Set(['md', 'markdown', 'txt', 'log', 'rst', 'tex']);
   const DATA_EXTS = new Set(['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xlsm', 'xls', 'xml', 'ini', 'conf']);
+  const SPREADSHEET_EXTS = new Set(['xlsx', 'xlsm', 'xls', 'csv', 'tsv']);
+  const PRESENTATION_EXTS = new Set(['pptx', 'pptm', 'ppt']);
   const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar']);
   const CODE_EXTS = new Set([
     'py', 'pyi', 'ipynb',
@@ -118,6 +120,8 @@
     audio: wrapFileIcon('audio', '<path d="M9 18V6l9-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="15.5" cy="16" r="2.5"></circle>'),
     pdf: wrapFileIcon('pdf', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M8.8 15.5h6.4"></path><path d="M9.8 12h4.4"></path>'),
     doc: wrapFileIcon('doc', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9.5 11h5"></path><path d="M9.5 14h5"></path><path d="M9.5 17h3.5"></path>'),
+    spreadsheet: wrapFileIcon('spreadsheet', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><rect x="9" y="10.5" width="6" height="7" rx=".7"></rect><path d="M9 13.8h6M12 10.5v7"></path>'),
+    presentation: wrapFileIcon('presentation', '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><rect x="9" y="10.5" width="6" height="4.8" rx=".7"></rect><path d="M12 15.3V18M10 18h4"></path>'),
     text: wrapFileIcon('text', '<path d="M6.5 4.5h11v15h-11z"></path><path d="M9 9h6"></path><path d="M9 12h6"></path><path d="M9 15h4"></path>'),
     data: wrapFileIcon('data', '<rect x="4.5" y="5.5" width="15" height="13" rx="2"></rect><path d="M4.5 10h15"></path><path d="M9.5 5.5v13"></path><path d="M14.5 5.5v13"></path>'),
     archive: wrapFileIcon('archive', '<path d="M5 8.5 12 5l7 3.5-7 3.5L5 8.5z"></path><path d="M5 8.5v7L12 19l7-3.5v-7"></path><path d="M12 12v7"></path>'),
@@ -134,15 +138,18 @@
   function normalizeFileKind(kind, ext) {
     const raw = String(kind || '').toLowerCase();
     if (raw === 'docx' || raw === 'doc') return 'doc';
-    if (raw === 'spreadsheet') return 'data';
-    if (raw === 'presentation' || raw === 'legacy_office') return 'doc';
+    if (raw === 'spreadsheet') return 'spreadsheet';
+    if (raw === 'presentation') return 'presentation';
+    if (raw === 'legacy_office') return 'doc';
     if (raw === 'binary') return 'file';
-    if (['image', 'video', 'audio', 'pdf', 'doc', 'text', 'data', 'archive', 'code', 'file'].includes(raw)) return raw;
+    if (['image', 'video', 'audio', 'pdf', 'doc', 'spreadsheet', 'presentation', 'text', 'data', 'archive', 'code', 'file'].includes(raw)) return raw;
     if (IMAGE_EXTS.has(ext)) return 'image';
     if (VIDEO_EXTS.has(ext)) return 'video';
     if (AUDIO_EXTS.has(ext)) return 'audio';
     if (ext === 'pdf') return 'pdf';
-    if (ext === 'docx' || ext === 'docm' || ext === 'doc' || ext === 'pptx' || ext === 'pptm' || ext === 'ppt') return 'doc';
+    if (ext === 'docx' || ext === 'docm' || ext === 'doc') return 'doc';
+    if (SPREADSHEET_EXTS.has(ext)) return 'spreadsheet';
+    if (PRESENTATION_EXTS.has(ext)) return 'presentation';
     if (TEXT_EXTS.has(ext)) return 'text';
     if (DATA_EXTS.has(ext)) return 'data';
     if (ARCHIVE_EXTS.has(ext)) return 'archive';

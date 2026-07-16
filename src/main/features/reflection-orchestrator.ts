@@ -4,9 +4,9 @@
  * Replaces the old startup-only `reflection-trigger.ts` and the per-turn
  * `runner.evaluateReflection` path. Per `Common/docs/plans/reflection-redesign.md`:
  *
- *   - One scheduler: fire on boot (deferred via util/boot_init.ts so the
- *     first cycle doesn't race first-paint) and every `CYCLE_INTERVAL_MS`
- *     thereafter via a setTimeout chain.
+ *   - One scheduler: fire after the measured startup window (offset via
+ *     util/boot_init.ts) and every `CYCLE_INTERVAL_MS` thereafter via a
+ *     setTimeout chain.
  *   - Per-agent gating: 4h min cooldown, dirty gate (signals.jsonl or
  *     session jsonl newer than lastReflectedAt), 7-day max-gap fallback.
  *   - Per-cycle cap: at most `MAX_AGENTS_PER_CYCLE`; eligible-but-deferred
@@ -14,22 +14,26 @@
  *   - Sequential execution; failures isolate per-agent and don't advance
  *     `lastReflectedAt`, so the next cycle retries.
  *
- * Background work; never awaited by the boot path. Tests inject `reflect`,
- * `now`, and timing knobs via `runOneCycle`.
+ * Background work; every cycle enters through the shared boot/background
+ * admission queue. Tests inject `reflect`, `now`, and timing knobs via
+ * `runOneCycle`.
  */
 
 import * as fs from 'node:fs';
-import { userReflectionStateFile, userLocalConfigDir, userSessionFile } from '../paths';
+import { userReflectionStateFile, userLocalConfigDir } from '../paths';
 import { writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
+import { logErrorRef } from '../util/log-redact';
 import { listAgents } from './agents';
 import { listConversations, type Conversation } from './chats';
 import * as metacognition from './metacognition';
 import { buildTranscript, listAgentGmemberFiles } from './reflection-transcript';
 import { querySignals } from './expert_signals';
 import { buildRunner } from '../model/core-agent/runner';
+import { cloudSessionFileFor } from '../util/project-layout';
 import { getLanguage } from './config';
 import { getLocaleMeta } from '../i18n';
+import { scheduleBootBackground, type ScheduledBootBackgroundTask } from '../util/boot_init';
 
 const log = createLogger('reflection-orchestrator');
 
@@ -99,9 +103,11 @@ export async function pickAgentsForCycle(
   state: ReflectionState,
   now: number,
   isDirty: (uid: string, agentId: string, sinceMs: number) => Promise<boolean>,
+  signal?: AbortSignal,
 ): Promise<AgentDecision[]> {
   const out: AgentDecision[] = [];
   for (const id of agentIds) {
+    if (signal?.aborted) break;
     const lastIso = state.lastReflectedAt[id];
     const lastMs = lastIso ? Date.parse(lastIso) : NaN;
     const hasLast = !Number.isNaN(lastMs);
@@ -183,7 +189,7 @@ export async function isAgentDirty(uid: string, agentId: string, sinceMs: number
 
 function _sessionNewerThan(uid: string, sessionId: string, sinceMs: number): boolean {
   let file: string;
-  try { file = userSessionFile(uid, sessionId); } catch { return false; }
+  try { file = cloudSessionFileFor(uid, sessionId); } catch { return false; }
   try {
     const stat = fs.statSync(file);
     return stat.mtimeMs >= sinceMs;
@@ -240,12 +246,15 @@ export interface RunCycleOpts {
   now?: () => number;
   /** Override dirty check (test seam). */
   isDirty?: (uid: string, agentId: string, sinceMs: number) => Promise<boolean>;
+  /** Cooperative cancellation between catalog checks and agent reflections. */
+  signal?: AbortSignal;
 }
 
 /** Run one reflection cycle: enumerate agents, pick eligible (capped),
  *  reflect sequentially. Returns the count actually reflected — useful for
  *  tests and logging. */
 export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise<number> {
+  if (opts.signal?.aborted) return 0;
   if (!uid) {
     log.debug('no active uid, skipping cycle');
     return 0;
@@ -268,7 +277,7 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   // long agent list later in the loop hits issues.
   const agentIds = [DEFAULT_AGENT_ID, ...agents.map((a) => a.agent_id)];
   const state = readReflectionState(uid);
-  const eligible = await pickAgentsForCycle(uid, agentIds, state, now, dirtyFn);
+  const eligible = await pickAgentsForCycle(uid, agentIds, state, now, dirtyFn, opts.signal);
 
   if (eligible.length === 0) {
     log.debug(`cycle: nothing eligible (${agentIds.length} agents scanned)`);
@@ -278,6 +287,7 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
 
   let completed = 0;
   for (const { agentId, sinceMs, reason } of eligible) {
+    if (opts.signal?.aborted) break;
     try {
       await reflect(uid, agentId, sinceMs);
       // Stamp success — read fresh state in case another writer touched it.
@@ -303,28 +313,37 @@ export interface LoopHandle {
 }
 
 /** Start the reflection loop: run one cycle now, then every
- *  `CYCLE_INTERVAL_MS` until stopped. The boot path calls this once via
- *  the deferred boot phase (util/boot_init.ts). */
+ *  `CYCLE_INTERVAL_MS` until stopped. The boot path itself is offset beyond
+ *  startup by util/boot_init.ts before it calls this function. */
 export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopHandle {
-  let timer: NodeJS.Timeout | null = null;
+  let scheduled: ScheduledBootBackgroundTask | null = null;
   let stopped = false;
 
-  const cycle = async () => {
-    if (stopped) return;
-    try { await runOneCycle(uid, opts); }
-    catch (err) { log.error(`cycle threw: ${(err as Error).message}`); }
-    if (stopped) return;
-    timer = setTimeout(cycle, CYCLE_INTERVAL_MS);
+  const scheduleCycle = (delayMs: number): void => {
+    scheduled = scheduleBootBackground('reflection:cycle', async (signal) => {
+      if (stopped || signal?.aborted) return;
+      try { await runOneCycle(uid, { ...opts, signal }); }
+      catch (err) { log.error('cycle threw', { error: logErrorRef(err) }); }
+    }, delayMs, {
+      resourceClass: 'model',
+      preferIdle: true,
+      maxSliceMs: 30_000,
+    });
+    void scheduled.promise.finally(() => {
+      scheduled = null;
+      if (!stopped) scheduleCycle(CYCLE_INTERVAL_MS);
+    });
   };
 
-  // Fire-and-forget; the boot deferred phase already adds enough latency
-  // to keep the first cycle clear of first-paint.
-  cycle();
+  // Delay makes a cycle eligible; the coordinator still waits for a quiet
+  // interaction window before the disk/model work begins.
+  scheduleCycle(0);
 
   return {
     stop() {
       stopped = true;
-      if (timer) { clearTimeout(timer); timer = null; }
+      scheduled?.cancel();
+      scheduled = null;
     },
   };
 }

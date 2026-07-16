@@ -13,6 +13,8 @@ import {
   killProcessTree,
 } from "../src/sandbox/executor.js";
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 describe("SandboxExecutor", () => {
   const shQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 
@@ -62,7 +64,7 @@ describe("SandboxExecutor", () => {
       timeoutMs: 500,
     });
     const started = Date.now();
-    const result = await sandbox.execute(`${quote(process.execPath)} -e ${quote(script)}`);
+    const result = await sandbox.execute(`${quote(TEST_NODE)} -e ${quote(script)}`);
     expect(result.timedOut).toBe(true);
     expect(Date.now() - started).toBeLessThan(5000);
   }, 10000);
@@ -95,6 +97,57 @@ describe("SandboxExecutor", () => {
     expect(result.stdout).toContain("[output truncated by sandbox]");
   });
 
+  it("streams output beyond the memory limit to a complete spool file", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-spool-test-"));
+    const output = "x".repeat(1_000);
+    try {
+      const sandbox = new SandboxExecutor({
+        workingDir: tmpDir,
+        maxOutputBytes: 100,
+        outputSpoolDir: path.join(tmpDir, "results"),
+        maxSpoolBytes: 5_000,
+      });
+      const script = `process.stdout.write(${JSON.stringify(output)})`;
+      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
+
+      expect(result.outputLimitExceeded).toBe(false);
+      expect(result.stdoutBytes).toBe(Buffer.byteLength(output));
+      expect(result.stdout).toContain("full output streamed to Result Store");
+      expect(result.stdoutStreamedOutput).toMatchObject({
+        size: Buffer.byteLength(output),
+      });
+      expect(result.stdoutStreamedOutput?.sourceTruncated).toBeUndefined();
+      await expect(fs.readFile(result.stdoutStreamedOutput!.path, "utf8")).resolves.toBe(output);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("marks the stored prefix incomplete only at the hard spool limit", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-spool-cap-test-"));
+    try {
+      const sandbox = new SandboxExecutor({
+        workingDir: tmpDir,
+        maxOutputBytes: 100,
+        outputSpoolDir: path.join(tmpDir, "results"),
+        maxSpoolBytes: 500,
+      });
+      const script = `process.stdout.write(${JSON.stringify("x".repeat(1_000))})`;
+      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
+
+      expect(result.outputLimitExceeded).toBe(true);
+      expect(result.stdoutBytes).toBe(500);
+      expect(result.stdout).toContain("stored prefix is incomplete");
+      expect(result.stdoutStreamedOutput).toMatchObject({
+        size: 500,
+        sourceTruncated: true,
+      });
+      await expect(fs.stat(result.stdoutStreamedOutput!.path)).resolves.toMatchObject({ size: 500 });
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it("uses correct working directory", async () => {
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-test-"));
     await fs.writeFile(path.join(tmpDir, "marker.txt"), "found");
@@ -125,7 +178,7 @@ describe("SandboxExecutor", () => {
         workingDir: allowedDir,
         allowedDirs: [allowedDir],
       });
-      const result = await sandbox.execute(`${shQuote(process.execPath)} -e ${shQuote(script)}`);
+      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
       expect(result.exitCode).not.toBe(0);
       await expect(fs.readFile(allowedFile, "utf8")).resolves.toBe("ok");
       await expect(fs.access(deniedFile)).rejects.toThrow();

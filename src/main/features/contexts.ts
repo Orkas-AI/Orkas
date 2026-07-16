@@ -100,7 +100,14 @@ function _filenameWeight(s: string): number {
   return w;
 }
 
-export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | { ok: false; error: string };
+export interface ResultError {
+  ok: false;
+  error: string;
+  code?: string;
+  existingDir?: string;
+}
+
+export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | ResultError;
 
 export interface ContextNode {
   name: string;
@@ -176,6 +183,13 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
  *  the "ask the commander about this file" flow to import the KB file as a chat
  *  attachment. Throws on an invalid or missing path. */
 export function resolveContextFileAbsPath(relpath: string): string {
+  return resolvePath(relpath, { mustExist: true });
+}
+
+/** Resolve either a file or folder for internal Library transfer workflows.
+ * Renderer callers still pass only relative paths through IPC; absolute paths
+ * never cross the bridge. */
+export function resolveContextEntryAbsPath(relpath: string): string {
   return resolvePath(relpath, { mustExist: true });
 }
 
@@ -351,9 +365,12 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
     return null;
   }
   if (!existing) return null;
+  const existingDir = path.posix.dirname(existing.rel_path.replace(/\\/g, '/'));
   return {
     ok: false,
-    error: t('errors.kb_duplicate_sha1', { existingPath: existing.rel_path }),
+    error: t('errors.kb_duplicate_sha1'),
+    code: 'duplicate_content',
+    existingDir: existingDir === '.' ? '' : existingDir,
   };
 }
 
@@ -545,6 +562,87 @@ export function createContextDir(relpath: string): Result<{ path: string; existe
   catch (err) { return { ok: false, error: (err as Error).message }; }
   invalidateIndex();
   return { ok: true, path: relpath };
+}
+
+function validateContextCopySource(sourceAbs: string): Result<{ fileCount: number; bytes: number }> {
+  const stack = [sourceAbs];
+  let fileCount = 0;
+  let bytes = 0;
+  while (stack.length) {
+    const current = stack.pop()!;
+    let st: fs.Stats;
+    try { st = fs.lstatSync(current); }
+    catch { return { ok: false, error: 'not_found' }; }
+    if (st.isSymbolicLink()) return { ok: false, error: 'symlink_not_supported' };
+    if (st.isDirectory()) {
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+      catch { return { ok: false, error: 'read_failed' }; }
+      for (const entry of entries) {
+        if (entry.name.startsWith('.') || CONTEXTS_IGNORE.has(entry.name)) {
+          return { ok: false, error: 'unsupported_destination' };
+        }
+        stack.push(path.join(current, entry.name));
+      }
+      continue;
+    }
+    if (!st.isFile()) return { ok: false, error: 'unsupported_destination' };
+    if (!isAllowedName(path.basename(current)) || st.size > MAX_FILE_BYTES) {
+      return { ok: false, error: 'unsupported_destination' };
+    }
+    fileCount += 1;
+    bytes += st.size;
+  }
+  return { ok: true, fileCount, bytes };
+}
+
+/** Copy a trusted internal source entry into the global Library without the
+ * upload-time content-dedup gate. An explicit Copy action is allowed to create
+ * duplicate bytes under a new user-chosen path. */
+export function copyContextEntryFromPath(
+  sourceAbs: string,
+  targetRel: string,
+): Result<{ path: string; fileCount: number; bytes: number }> {
+  let targetAbs: string;
+  try { targetAbs = resolvePath(targetRel); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
+  const targetParent = path.dirname(targetAbs);
+  try {
+    if (!fs.statSync(targetParent).isDirectory()) return { ok: false, error: 'not_found' };
+  } catch { return { ok: false, error: 'not_found' }; }
+
+  let sourceStat: fs.Stats;
+  try { sourceStat = fs.lstatSync(sourceAbs); }
+  catch { return { ok: false, error: 'not_found' }; }
+  if (sourceStat.isSymbolicLink() || (!sourceStat.isFile() && !sourceStat.isDirectory())) {
+    return { ok: false, error: 'unsupported_destination' };
+  }
+  if (sourceStat.isFile() && !isAllowedName(path.basename(targetAbs))) {
+    return { ok: false, error: 'unsupported_destination' };
+  }
+  const checked = validateContextCopySource(sourceAbs);
+  if (checked.ok === false) return { ok: false, error: checked.error };
+  try {
+    fs.cpSync(sourceAbs, targetAbs, {
+      recursive: sourceStat.isDirectory(),
+      errorOnExist: true,
+      force: false,
+      dereference: false,
+    });
+  } catch (err) {
+    try { fs.rmSync(targetAbs, { recursive: true, force: true }); } catch { /* best-effort rollback */ }
+    return { ok: false, error: (err as Error).message };
+  }
+
+  invalidateIndex();
+  const uid = getActiveUserId();
+  for (const rel of _collectRelsUnder(targetAbs, targetRel)) {
+    search.upsertContext(uid, rel);
+    kbIndexer.enqueue(uid, rel, 'upsert');
+    notifyDirtyContext(rel);
+  }
+  return { ok: true, path: targetRel, fileCount: checked.fileCount, bytes: checked.bytes };
 }
 
 export function renameContextEntry(srcRel: string, dstRel: string): Result<{ src: string; dst: string }> {

@@ -8,7 +8,7 @@ category: creation
 
 # stage-generate
 
-How to produce a video whose **primary visuals are AI-generated footage** — as opposed to designed HTML graphics (composition skill) or cutting the user's real footage (editing skill). Host-neutral: describe the outcome; use generic built-in generation/speech capabilities — in Orkas `generate_image` (stills), `generate_video` (clips; supports image-to-video and built-in audio), `generate_speech` (narration) — and assemble through the VideoStudio `stage-edit edit_video` skill script.
+How to produce a video whose **primary visuals are AI-generated footage** — as opposed to designed HTML graphics (composition skill) or cutting the user's real footage (editing skill). Host-neutral: describe the outcome; use generic built-in generation/speech capabilities — in Orkas `generate_image` (stills), `generate_video` (clips; supports image-to-video and built-in audio), `generate_speech` (narration) — and assemble through the VideoStudio `stage-edit edit_video` skill script. VideoStudio's billable image/video calls are host-controlled: every call belongs to a signed `project/plan.json` generate segment and carries `production_plan_path` plus `production_segment_id`.
 
 ## Pattern A — talking-head / spokesperson (口播 / 数字人)
 
@@ -57,6 +57,9 @@ If the brief seems to need more (a long story, many scenes, many characters), DO
 ## Rules
 
 - **Cost/time discipline:** every generated clip is a hosted, billable, multi-second call. State the exact shot/character count in the approval-gate proposal; never start generating before the user has approved the count.
+- **Native Gate C:** after Gate B calls `production.approve_plan`, call `production.status` and show one `gate_c_decision` form for the exact generate-segment count and configured external provider. State that provider billing and balance cannot be verified locally. In its later approval turn call `production.approve_generation` before dispatching. A provider call without the current plan/segment signature is rejected; a completed transaction is reused. A `pending` transaction after interruption is uncertain: `production.status` cannot query the provider, and the current Gate C approval cannot dispatch it again. Report the uncertainty; if the user still wants another paid attempt, open a fresh Gate C and require a new output path. A failed attempt likewise requires a new explicit Gate C. Never invent a transaction-recovery provider call.
+- **Exact settings:** each video segment's EDL spec fixes `media_kind`, prompt, `operation:"generate"|"edit"`, every reference path/URL, top-level plan aspect, `generation_duration_sec`, resolution, quality, and `generate_audio`. Never substitute `text_to_video`, `duration_sec`, or `audio`; those aliases are rejected. Each image/portrait/keyframe is also a distinct `media_kind:"image"` segment whose size and references are signed and has no operation. Do not add, remove, reorder, or change those values between Gate C and the provider call.
+- Opening a fresh Gate C is a gate-only turn: make no host or generation call after presenting it. Only the later explicit approval turn calls `production.approve_generation`, then retries with a new output path.
 - **Audio (talking-head):** a generated talking-head clip's built-in audio is **lip-synced** to its mouth. Treat it as the final voice: keep it through assembly and finalize. NEVER add or mux a separately-synthesized narration over a clip that already speaks — it desyncs from the lips. Synthesize narration ONLY for a silent clip, or for b-roll / off-screen voiceover where no mouth is visible.
 - **Brief drives params:** pass the requested aspect ratio and per-shot duration to each generation call.
 

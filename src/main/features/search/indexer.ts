@@ -20,9 +20,10 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import {
-  userContextsDir, userChatsDir,
-  userContextsIndexPath, userChatsIndexPath,
+  userContextsDir, userChatsDir, projectChatsDir,
+  projectChatIndexFile, userContextsIndexPath, userChatsIndexPath,
 } from '../../paths';
+import { conversationMessageReadFile, listProjectIds } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
 
@@ -33,6 +34,9 @@ import { loadIndex, saveIndex, type Index, type IndexKind, type Doc } from './st
 
 const FLUSH_DELAY_MS = 1000;
 const CTX_IGNORE = new Set(['_INDEX.md', '.DS_Store', '__pycache__', '.git', 'node_modules']);
+const CONTEXT_STAT_CONCURRENCY = 32;
+const CHAT_STAT_CONCURRENCY = 32;
+const CPU_YIELD_EVERY = 250;
 
 // Runtime-extended index: indexer caches BM25 avgdl on the object; storage
 // schema doesn't persist these, so they live as optional extras.
@@ -84,6 +88,8 @@ interface ChatMessage {
 const _cache = new Map<string, CacheEntry>();
 const _flushTimers = new Map<string, NodeJS.Timeout>();
 const _locks = new Map<string, Mutex>();
+const _currentContextIndexes = new Set<string>();
+const _currentChatIndexes = new Set<string>();
 
 function _getLock(idxPath: string): Mutex {
   let m = _locks.get(idxPath);
@@ -192,12 +198,18 @@ function _putDoc(idx: RuntimeIndex, docId: string, doc: Doc, text: string): void
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-async function _readJsonl(file: string): Promise<ChatMessage[]> {
+async function _readJsonl(file: string, signal?: AbortSignal): Promise<ChatMessage[] | null> {
   let text: string;
   try { text = await fsp.readFile(file, 'utf8'); }
-  catch { return []; }
+  catch { return null; }
   const out: ChatMessage[] = [];
-  for (const line of text.split('\n')) {
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0 && i % CPU_YIELD_EVERY === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (signal?.aborted) return null;
+    }
+    const line = lines[i];
     if (!line.trim()) continue;
     try { out.push(JSON.parse(line)); } catch { /* skip malformed */ }
   }
@@ -234,28 +246,52 @@ export { _msgText as readMsgText };
 
 interface ContextFileInfo { rel: string; mtime: number; size: number }
 
-async function _walkContexts(dir: string, rel = '', out: ContextFileInfo[] = []): Promise<ContextFileInfo[]> {
-  let items;
-  try { items = await fsp.readdir(dir, { withFileTypes: true }); }
-  catch { return out; }
-  const dirTasks: Array<Promise<ContextFileInfo[]>> = [];
-  const fileTasks: Array<Promise<void>> = [];
-  for (const e of items) {
-    if (CTX_IGNORE.has(e.name) || e.name.startsWith('.')) continue;
-    const r = rel ? `${rel}/${e.name}` : e.name;
-    const full = path.join(dir, e.name);
-    if (e.isDirectory()) dirTasks.push(_walkContexts(full, r, out));
-    else if (e.isFile()) {
-      fileTasks.push((async () => {
-        try {
-          const st = await fsp.stat(full);
-          out.push({ rel: r, mtime: st.mtimeMs, size: st.size });
-        } catch { /* skip */ }
-      })());
+async function _scanContexts(
+  root: string,
+  signal?: AbortSignal,
+): Promise<{ files: ContextFileInfo[]; complete: boolean }> {
+  const candidates: Array<{ rel: string; full: string }> = [];
+  const stack: Array<{ dir: string; rel: string }> = [{ dir: root, rel: '' }];
+  let reliable = true;
+  while (stack.length) {
+    if (signal?.aborted) return { files: [], complete: false };
+    const current = stack.pop()!;
+    let items: fs.Dirent[];
+    try { items = await fsp.readdir(current.dir, { withFileTypes: true }); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') reliable = false;
+      continue;
+    }
+    for (const entry of items) {
+      if (CTX_IGNORE.has(entry.name) || entry.name.startsWith('.')) continue;
+      const rel = current.rel ? `${current.rel}/${entry.name}` : entry.name;
+      const full = path.join(current.dir, entry.name);
+      if (entry.isDirectory()) stack.push({ dir: full, rel });
+      else if (entry.isFile()) candidates.push({ rel, full });
     }
   }
-  await Promise.all([...dirTasks, ...fileTasks]);
-  return out;
+  const results = await _mapBounded(candidates, CONTEXT_STAT_CONCURRENCY, async (candidate) => {
+    if (signal?.aborted) return { file: null, reliable: false };
+    try {
+      const st = await fsp.stat(candidate.full);
+      return {
+        file: { rel: candidate.rel, mtime: st.mtimeMs, size: st.size } satisfies ContextFileInfo,
+        reliable: true,
+      };
+    } catch (err) {
+      return {
+        file: null,
+        reliable: (err as NodeJS.ErrnoException).code === 'ENOENT',
+      };
+    }
+  }, signal);
+  const files: ContextFileInfo[] = [];
+  for (const result of results) {
+    if (!result) continue;
+    if (!result.reliable) reliable = false;
+    if (result.file) files.push(result.file);
+  }
+  return { files, complete: reliable && !signal?.aborted };
 }
 
 function _putContextDoc(idx: RuntimeIndex, f: ContextFileInfo): void {
@@ -268,26 +304,67 @@ function _putContextDoc(idx: RuntimeIndex, f: ContextFileInfo): void {
   idx.files[f.rel] = { mtime: f.mtime, size: f.size };
 }
 
-export async function reconcileContextsIndex(userId?: string): Promise<void> {
+export interface SearchReconcileResult {
+  scanned: number;
+  updated: number;
+  deleted: number;
+  cancelled?: boolean;
+}
+
+export async function reconcileContextsIndex(
+  userId?: string,
+  signal?: AbortSignal,
+): Promise<SearchReconcileResult> {
+  const startedAt = Date.now();
   const uid = userId || getActiveUserId();
   const idxPath = userContextsIndexPath(uid);
-  const found = await _walkContexts(userContextsDir(uid));
+  const scan = await _scanContexts(userContextsDir(uid), signal);
+  if (!scan.complete) {
+    log.info(`context reconcile cancelled scanned=${scan.files.length} ms=${Date.now() - startedAt}`);
+    return { scanned: scan.files.length, updated: 0, deleted: 0, cancelled: true };
+  }
+  let updated = 0;
+  let deleted = 0;
   await _getLock(idxPath).runExclusive(async () => {
+    if (signal?.aborted) return;
     const entry = await _getEntry(idxPath, 'context');
     const seen = new Set<string>();
     let dirty = false;
-    for (const f of found) {
+    for (let i = 0; i < scan.files.length; i++) {
+      const f = scan.files[i];
       seen.add(f.rel);
       const known = entry.idx.files[f.rel];
       if (known && known.mtime === f.mtime && known.size === f.size) continue;
       _putContextDoc(entry.idx, f);
+      updated += 1;
       dirty = true;
+      if (i > 0 && i % CPU_YIELD_EVERY === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
     for (const fk of Object.keys(entry.idx.files)) {
-      if (!seen.has(fk)) { _dropDocsByFileKey(entry.idx, fk); dirty = true; }
+      if (!seen.has(fk)) {
+        _dropDocsByFileKey(entry.idx, fk);
+        deleted += 1;
+        dirty = true;
+      }
     }
     if (dirty) { entry.dirty = true; _markDirty(idxPath); }
+    _currentContextIndexes.add(uid);
   });
+  if (signal?.aborted && !_currentContextIndexes.has(uid)) {
+    return { scanned: scan.files.length, updated: 0, deleted: 0, cancelled: true };
+  }
+  log.info(`context reconcile complete scanned=${scan.files.length} updated=${updated} deleted=${deleted} ms=${Date.now() - startedAt}`);
+  return { scanned: scan.files.length, updated, deleted };
+}
+
+export function isContextsIndexCurrent(userId: string): boolean {
+  return _currentContextIndexes.has(userId);
+}
+
+export function invalidateContextsIndex(userId: string): void {
+  _currentContextIndexes.delete(userId);
 }
 
 export function upsertContext(userId: string, relPath: string): void {
@@ -327,23 +404,111 @@ export function dropContext(userId: string, relPath: string): void {
 
 type ChatStyleKind = 'chat';
 
-async function _listUserChats(userId: string): Promise<ChatFileInfo[]> {
-  const root = userChatsDir(userId);
-  let items;
-  try { items = await fsp.readdir(root, { withFileTypes: true }); }
-  catch { return []; }
-  const files = items.filter((e) => e.isFile() && e.name.endsWith('.jsonl'));
-  return Promise.all(files.map(async (e) => {
-    const file = path.join(root, e.name);
-    const fileKey = e.name.replace(/\.jsonl$/i, '');
-    const st = await fsp.stat(file);
-    return { fileKey, file, mtime: st.mtimeMs, size: st.size };
-  }));
+async function _mapBounded<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+  signal?: AbortSignal,
+): Promise<Array<R | undefined>> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    while (true) {
+      if (signal?.aborted) return;
+      const index = next++;
+      if (index >= items.length) return;
+      out[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(runners);
+  return out;
 }
+
+async function _listUserChats(
+  userId: string,
+  statFile: (file: string) => Promise<Pick<fs.Stats, 'mtimeMs' | 'size'>> = fsp.stat,
+  signal?: AbortSignal,
+): Promise<{ files: ChatFileInfo[]; complete: boolean }> {
+  const roots = [userChatsDir(userId), ...listProjectIds(userId).map((pid) => projectChatsDir(userId, pid))];
+  const candidates: Array<{ fileKey: string; file: string }> = [];
+  let reliable = true;
+  for (const root of roots) {
+    if (signal?.aborted) return { files: [], complete: false };
+    let items;
+    try { items = await fsp.readdir(root, { withFileTypes: true }); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') reliable = false;
+      continue;
+    }
+    for (const e of items) {
+      if (!e.isFile() || !e.name.endsWith('.jsonl')) continue;
+      const file = path.join(root, e.name);
+      const fileKey = e.name.replace(/\.jsonl$/i, '');
+      candidates.push({ fileKey, file });
+    }
+  }
+  const found = await _mapBounded(candidates, CHAT_STAT_CONCURRENCY, async ({ fileKey, file }) => {
+    try {
+      const st = await statFile(file);
+      return {
+        info: { fileKey, file, mtime: st.mtimeMs, size: st.size } satisfies ChatFileInfo,
+        reliable: true,
+      };
+    } catch (err) {
+      return { info: null, reliable: (err as NodeJS.ErrnoException).code === 'ENOENT' };
+    }
+  }, signal);
+  const files: ChatFileInfo[] = [];
+  for (const result of found) {
+    if (!result) continue;
+    if (!result.reliable) reliable = false;
+    if (result.info) files.push(result.info);
+  }
+  return { files, complete: reliable && !signal?.aborted };
+}
+
+async function _statStamp(file: string): Promise<string> {
+  try {
+    const st = await fsp.stat(file);
+    return `${Math.round(st.mtimeMs)}:${st.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+/**
+ * The aggregate conversation indexes change for normal app writes and sync
+ * pulls. Comparing this small catalog (plus the handful of chat roots) is
+ * much cheaper than statting every historical JSONL before every search.
+ *
+ * Direct edits to an existing JSONL bypass this marker, so the scheduled
+ * full reconcile remains the eventual repair path. New/deleted files still
+ * change a chat-root mtime and immediately invalidate the snapshot.
+ */
+async function _chatSourceStamp(userId: string): Promise<string> {
+  const projectIds = listProjectIds(userId);
+  const paths = [
+    userChatsDir(userId),
+    path.join(userChatsDir(userId), '_index.json'),
+    ...projectIds.flatMap((pid) => [projectChatsDir(userId, pid), projectChatIndexFile(userId, pid)]),
+  ];
+  const stats = await Promise.all(paths.map(_statStamp));
+  return `v1|projects=${projectIds.join(',')}|${stats.join('|')}`;
+}
+
+export const __searchIndexerTestHooks = {
+  listUserChats: async (
+    userId: string,
+    statFile?: (file: string) => Promise<Pick<fs.Stats, 'mtimeMs' | 'size'>>,
+  ) => (await _listUserChats(userId, statFile)).files,
+  chatSourceStamp: _chatSourceStamp,
+  chatStatConcurrency: CHAT_STAT_CONCURRENCY,
+  contextStatConcurrency: CONTEXT_STAT_CONCURRENCY,
+};
 
 function _chatIdxPath(uid: string): string { return userChatsIndexPath(uid); }
 function _chatJsonlFile(uid: string, cid: string): string {
-  return path.join(userChatsDir(uid), `${cid}.jsonl`);
+  return conversationMessageReadFile(uid, cid);
 }
 
 function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
@@ -352,44 +517,126 @@ function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
 
 async function _reindexChatFile(
   idx: RuntimeIndex, fileKey: string, file: string, mtimeMs: number, size: number,
-): Promise<void> {
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const msgs = await _readJsonl(file, signal);
+  if (!msgs || signal?.aborted) return false;
   _dropDocsByFileKey(idx, fileKey);
-  const msgs = await _readJsonl(file);
-  msgs.forEach((m, i) => {
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i];
     const text = _msgText(m);
-    if (!text) return;
+    if (!text) continue;
     const doc: Doc = {
       fileKey, kind: 'chat', msg_index: i, cid: fileKey,
       role: _msgRole(m), time: _msgTime(m), len: text.length,
     };
     _putDoc(idx, _docId('chat', fileKey, i), doc, text);
-  });
+    if (i > 0 && i % CPU_YIELD_EVERY === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  }
   idx.files[fileKey] = { mtime: mtimeMs, size };
+  return true;
 }
 
-export async function reconcileChatsIndex(userId: string): Promise<void> {
+export async function reconcileChatsIndex(
+  userId: string,
+  signal?: AbortSignal,
+): Promise<SearchReconcileResult> {
+  const startedAt = Date.now();
   const idxPath = _chatIdxPath(userId);
-  const files = await _listUserChats(userId);
+  const [sourceStampBefore, scan] = await Promise.all([
+    _chatSourceStamp(userId),
+    _listUserChats(userId, fsp.stat, signal),
+  ]);
+  if (!scan.complete || signal?.aborted) {
+    log.info(`chat reconcile cancelled scanned=${scan.files.length} ms=${Date.now() - startedAt}`);
+    return { scanned: scan.files.length, updated: 0, deleted: 0, cancelled: true };
+  }
+  let updated = 0;
+  let deleted = 0;
+  let cancelled = false;
+  let completed = false;
   await _getLock(idxPath).runExclusive(async () => {
+    if (signal?.aborted) { cancelled = true; return; }
     const entry = await _getEntry(idxPath, 'chat');
     const seen = new Set<string>();
     let dirty = false;
     const toUpdate: ChatFileInfo[] = [];
-    for (const f of files) {
+    for (const f of scan.files) {
       seen.add(f.fileKey);
       const known = entry.idx.files[f.fileKey];
       if (known && known.mtime === f.mtime && known.size === f.size) continue;
       toUpdate.push(f);
     }
     for (const f of toUpdate) {
-      await _reindexChatFile(entry.idx, f.fileKey, f.file, f.mtime, f.size);
+      if (signal?.aborted) { cancelled = true; break; }
+      if (!await _reindexChatFile(entry.idx, f.fileKey, f.file, f.mtime, f.size, signal)) {
+        cancelled = true;
+        break;
+      }
+      updated += 1;
       dirty = true;
     }
-    for (const fk of Object.keys(entry.idx.files)) {
-      if (!seen.has(fk)) { _dropDocsByFileKey(entry.idx, fk); dirty = true; }
+    if (!cancelled) {
+      for (const fk of Object.keys(entry.idx.files)) {
+        if (!seen.has(fk)) {
+          _dropDocsByFileKey(entry.idx, fk);
+          deleted += 1;
+          dirty = true;
+        }
+      }
+    }
+    // If the catalog moved while the potentially long JSONL pass was
+    // running, do not bless a mixed snapshot. The next search will retry.
+    const sourceStampAfter = cancelled ? undefined : await _chatSourceStamp(userId);
+    const completedSourceStamp = !cancelled && sourceStampBefore === sourceStampAfter ? sourceStampAfter : undefined;
+    completed = Boolean(completedSourceStamp);
+    if (entry.idx.sourceStamp !== completedSourceStamp) {
+      entry.idx.sourceStamp = completedSourceStamp;
+      dirty = true;
     }
     if (dirty) { entry.dirty = true; _markDirty(idxPath); }
   });
+  const result = {
+    scanned: scan.files.length,
+    updated,
+    deleted,
+    ...(cancelled ? { cancelled: true } : {}),
+  };
+  if (completed) _currentChatIndexes.add(userId);
+  log.info(`chat reconcile ${cancelled ? 'cancelled' : 'complete'} scanned=${result.scanned} updated=${updated} deleted=${deleted} ms=${Date.now() - startedAt}`);
+  return result;
+}
+
+/** Return true when the persisted/in-memory chat index agrees with the small
+ * conversation catalog. A true result intentionally avoids a full history
+ * directory walk on the query path. */
+export async function isChatsIndexCurrent(userId: string): Promise<boolean> {
+  const entry = await _getEntry(_chatIdxPath(userId), 'chat');
+  if (!entry.idx.sourceStamp) {
+    _currentChatIndexes.delete(userId);
+    return false;
+  }
+  const current = entry.idx.sourceStamp === await _chatSourceStamp(userId);
+  if (current) _currentChatIndexes.add(userId);
+  else _currentChatIndexes.delete(userId);
+  return current;
+}
+
+/** Fast query-path gate. This is deliberately separate from
+ * isChatsIndexCurrent(), whose public/test contract is an explicit source
+ * fingerprint check. */
+export function isChatsIndexTrusted(userId: string): boolean {
+  return _currentChatIndexes.has(userId);
+}
+
+/** Sync is the only normal path that can replace source JSONLs without also
+ * applying the incremental search-index mutations. Normal app writes keep a
+ * verified process snapshot current through indexChatMessage/dropChatConversation
+ * and must not trigger a redundant history scan on the next query. */
+export function invalidateChatsIndex(userId: string): void {
+  _currentChatIndexes.delete(userId);
 }
 
 /**

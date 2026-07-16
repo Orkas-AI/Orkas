@@ -46,6 +46,11 @@ export interface TurnFinishedEvent {
    * Distinguishes "tool-only turn (final empty is normal)" from "config /
    * auth error (the LLM produced literally nothing)". */
   activityEvents: number;
+  /** A successful `hand_off_to` already delivered the answer in the target
+   * agent's own bubble. An empty commander tail is therefore intentionally
+   * silent, not the generic "tool-only commander turn" that needs a process
+   * bubble. */
+  terminalDelivery?: boolean;
 }
 
 /** Outcome of an `onTurnFinished` call. Tells the bus what to do with the
@@ -83,8 +88,11 @@ export async function onTurnFinished(
 /** Decide persist vs silent for a turn.
  *
  * commander empty-final policy: the user is waiting on commander, so silent is
- * forbidden — even a tool-only turn must persist an empty bubble carrying the
- * process rail. Real config / auth errors surface as an errorBubble.
+ * normally forbidden — even a tool-only turn must persist an empty bubble
+ * carrying the process rail. The exception is a successful terminal delivery:
+ * `hand_off_to` has already put the answer in the target agent's bubble, so a
+ * second empty commander bubble would be redundant. Real config / auth errors
+ * surface as an errorBubble.
  *
  * agent empty-final → always persist '(no reply)'.
  */
@@ -116,6 +124,7 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   }
   // Empty final, no side effects.
   if (evt.actor.kind === 'commander') {
+    if (evt.terminalDelivery) return { kind: 'silent' };
     if (!evt.errText) return { kind: 'persist', text: '' };
     if (evt.errText === 'empty response' && evt.activityEvents > 0) {
       return { kind: 'persist', text: '' };

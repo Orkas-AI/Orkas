@@ -13,7 +13,7 @@ describe('util/app-error', () => {
       code: AppErrorCode.AUTH_REQUIRED,
     });
 
-    expect(normalizeAppError(new Error('account:/pms/feedback/submit timed out after 60s'))).toMatchObject({
+    expect(normalizeAppError(new Error('marketplace:/marketplace/projects/list timed out after 60s'))).toMatchObject({
       code: AppErrorCode.NETWORK_TIMEOUT,
     });
 

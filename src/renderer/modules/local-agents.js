@@ -14,8 +14,9 @@
 // single brand label (the user can rename to disambiguate two
 // instances of the same CLI bound to different project directories).
 //
-// Detection pre-warms 500ms after script load so the first modal
-// open doesn't pay the cold detection cost.
+// Detection starts when the External Agent selector/runtime picker is opened
+// and is cached thereafter. Startup must not spawn five version probes for a
+// surface the user may never visit.
 
 const _localAgentsLog = createLogger('local-agents');
 
@@ -146,9 +147,6 @@ function setExternalCliValue(cliType) {
   if (!_extCliSelectApi) return;
   _extCliSelectApi.setValue(cliType || EXT_CLI_NONE);
 }
-
-// Pre-warm the registry cache.
-setTimeout(() => { loadLocalCliEntries().catch(() => { /* warm-up best-effort */ }); }, 500);
 
 window.loadLocalCliEntries = loadLocalCliEntries;
 window.getCliDefaults = getCliDefaults;

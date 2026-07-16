@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 let tmpDir: string;
 
 beforeEach(() => {
@@ -38,7 +40,7 @@ function writeManifest(root: string, key: string): void {
 
 function runSlim(root: string, key: string) {
   const [platform, arch] = key.split('-');
-  return spawnSync(process.execPath, [
+  return spawnSync(TEST_NODE, [
     path.join(process.cwd(), 'scripts', 'slim-runtime.cjs'),
     '--root', root,
     '--platform', platform,

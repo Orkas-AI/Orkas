@@ -140,6 +140,49 @@ describe('validateEdl — per-source spec requirements', () => {
     expect(r.warnings).toContain('W_GENERATE_CHARACTERS');
     expect(r.warnings).toContain('W_GENERATE_REFS');
   });
+
+  it('blocks malformed Gate C provider settings and reference lists', () => {
+    const p = validPlan();
+    p.segments[1] = {
+      id: 'gen',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 12,
+      spec: {
+        media_kind: 'video',
+        prompt: 'hero walks in',
+        operation: 'reroll',
+        reference_image_paths: 'frames/hero.png',
+        generation_duration_sec: 20,
+      },
+    } as never;
+    p.cost_estimate = { billable_generations: 1 };
+    const r = codes(p);
+    expect(r.errors).toContain('E_SPEC_GENERATE_REFERENCE');
+    expect(r.errors).toContain('E_SPEC_GENERATE_SETTINGS');
+  });
+
+  it('blocks provider aliases that would silently execute different defaults', () => {
+    const p = validPlan();
+    p.segments[1] = {
+      id: 'gen',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 5,
+      spec: {
+        media_kind: 'video',
+        prompt: 'city establishing shot',
+        duration_sec: 5,
+        audio: false,
+      },
+    } as never;
+    p.cost_estimate = { billable_generations: 1 };
+    expect(codes(p).errors).toContain('E_SPEC_GENERATE_SETTINGS_ALIAS');
+  });
 });
 
 describe('validateEdl — promise consistency', () => {
@@ -160,13 +203,19 @@ describe('validateEdl — promise consistency', () => {
     expect(r.warnings).toContain('W_DURATION_DRIFT');
   });
 
-  it('warns when generate segments exist but cost is not estimated', () => {
+  it('blocks when Gate C cost does not exactly match generate segments', () => {
     const p = validPlan();
     p.segments[1] = { id: 'gen', order: 2, role: 'body', layer: 'primary', source: 'generate', target_sec: 12, spec: { prompt: 'a cat' } };
     p.cost_estimate = { billable_generations: 0 };
     const r = codes(p);
-    expect(r.ok).toBe(true);
-    expect(r.warnings).toContain('W_COST_MISSING');
+    expect(r.ok).toBe(false);
+    expect(r.errors).toContain('E_COST_COUNT_MISMATCH');
+  });
+
+  it('requires an explicit provided media kind', () => {
+    const p = validPlan();
+    p.segments[0] = { id: 'asset', order: 1, role: 'hook', layer: 'primary', source: 'provided', target_sec: 8, spec: { asset_id: 'clipA' } };
+    expect(codes(p).errors).toContain('E_SPEC_PROVIDED_KIND');
   });
 });
 
@@ -239,6 +288,31 @@ describe('assessDelivery — promise preservation / anti-slideshow', () => {
     expect(assessDelivery(base('video')).motion_ratio).toBe(0.5); // provided video is motion
   });
 
+  it('does not let a provided still satisfy a real-source-footage promise', () => {
+    const p = validPlan();
+    p.segments = [
+      { id: 'still', order: 1, role: 'hook', layer: 'primary', source: 'provided', target_sec: 10, spec: { asset_id: 'poster.png', kind: 'image' } },
+      { id: 'card', order: 2, role: 'body', layer: 'primary', source: 'compose', target_sec: 10, spec: { kind: 'card' } },
+    ];
+    const validation = validateEdl(p);
+    const assessment = assessDelivery(p);
+    expect(validation.errors.map((issue) => issue.code)).toContain('E_PROMISE_NO_SOURCE');
+    expect(assessment.source_present).toBe(false);
+    expect(assessment.source_ok).toBe(false);
+  });
+
+  it('does not count a generated still as motion', () => {
+    const p = validPlan();
+    p.delivery_promise = { type: 'motion_led', source_required: false, motion_min_ratio: 0.5 };
+    p.segments = [
+      { id: 'still', order: 1, role: 'hook', layer: 'primary', source: 'generate', target_sec: 10, spec: { prompt: 'poster', media_kind: 'image' } },
+      { id: 'card', order: 2, role: 'body', layer: 'primary', source: 'compose', target_sec: 10, spec: { kind: 'card' } },
+    ];
+    p.cost_estimate = { billable_generations: 1 };
+    expect(assessDelivery(p).motion_ratio).toBe(0);
+    expect(assessDelivery(p).verdict).toBe('fail');
+  });
+
   it('applies the per-type default motion floor when the plan sets none (motion_led → 0.7)', () => {
     const p = validPlan();
     p.delivery_promise = { type: 'motion_led', source_required: false } as never; // no motion_min_ratio
@@ -247,6 +321,25 @@ describe('assessDelivery — promise preservation / anti-slideshow', () => {
     const a = assessDelivery(p);
     expect(a.motion_min_ratio).toBe(0.7);
     expect(a.verdict).toBe('fail');
+  });
+
+  it('does not apply a real-footage floor to compose-led HTML motion', () => {
+    const p = validPlan();
+    p.delivery_promise = { type: 'compose_led', source_required: false, motion_min_ratio: 0.2 };
+    p.segments = [
+      { id: 'a', order: 1, role: 'hook', layer: 'primary', source: 'compose', target_sec: 10, spec: { kind: 'diagram' } },
+      { id: 'b', order: 2, role: 'body', layer: 'primary', source: 'compose', target_sec: 10, spec: { kind: 'kinetic-type' } },
+    ];
+
+    const validation = validateEdl(p);
+    const assessment = assessDelivery(p);
+    expect(validation.ok).toBe(true);
+    expect(validation.warnings.map((warning) => warning.code)).toContain('W_COMPOSE_MOTION_FLOOR_IGNORED');
+    expect(assessment.motion_min_ratio).toBe(0);
+    expect(assessment.motion_ok).toBe(true);
+    expect(assessment.verdict).toBe('pass');
+    expect(summarizeEdl(p)).toContain('HTML-motion=native-QA');
+    expect(summarizeEdl(p)).not.toContain('motion≥20%');
   });
 
   it('warns on a long run of the same source on the primary track (one-note slideshow)', () => {
@@ -266,6 +359,49 @@ describe('assessDelivery — promise preservation / anti-slideshow', () => {
 });
 
 describe('validateEdl — editable caption/narration data (language-driven separability)', () => {
+  it('treats null and legacy empty track objects as disabled without blocking', () => {
+    const p = validPlan();
+    p.tracks = {
+      narration: { voice: null, segments: [] } as never,
+      music: {},
+      captions: null,
+    };
+
+    const r = validateEdl(p);
+    expect(r.ok).toBe(true);
+    expect(r.errors).toEqual([]);
+    expect(r.warnings.map((warning) => warning.code)).toContain('W_EMPTY_TRACK_DISABLED');
+    const summary = summarizeEdl(p);
+    expect(summary).not.toContain('Narration:');
+    expect(summary).not.toContain('Music:');
+    expect(summary).not.toContain('Captions:');
+  });
+
+  it('requires a synthesis selection when narration has actual lines', () => {
+    const p = validPlan() as unknown as { tracks: { narration: unknown } };
+    p.tracks.narration = { voice: null, segments: [{ text: 'hello' }] };
+    expect(codes(p).errors).toContain('E_NARRATION_SYNTHESIS');
+  });
+
+  it('accepts a runtime-discovered synthesis selection', () => {
+    const p = validPlan();
+    p.tracks!.narration = {
+      synthesis: {
+        route_ref: 'provider:doubao',
+        voice_ref: 'provider:doubao:voice:test-vivi',
+        display_name: 'Vivi',
+        language: 'zh-CN',
+        speed: 1,
+      },
+      segments: [{ text: 'hello', start_sec: 0, target_sec: 8 }],
+    };
+    const r = validateEdl(p);
+    expect(r.ok).toBe(true);
+    expect(r.warnings.map((warning) => warning.code)).not.toContain('W_NARRATION_LEGACY_VOICE');
+    expect(summarizeEdl(p)).toContain('Vivi (provider:doubao)');
+    expect(summarizeEdl(p)).toContain('language=zh-CN');
+  });
+
   it('accepts inline caption lines and per-line narration produced_path', () => {
     const p = validPlan();
     p.tracks!.captions = { style: 'bold-bottom', lines: [
@@ -339,7 +475,7 @@ describe('summarizeEdl', () => {
     expect(out).toMatch(/2\. \[body\] compose stat-card/);
     // overlay nested under its `over` target
     expect(out).toContain('└ overlay: compose lower-third');
-    expect(out).toContain('Narration: voice=zh_male_jieshuoxiaoming_uranus_bigtts');
+    expect(out).toContain('Narration: voice=legacy:zh_male_jieshuoxiaoming_uranus_bigtts');
     expect(out).toContain('ducked under narration');
     expect(out).toContain('Cost: 0 billable generation(s)');
   });

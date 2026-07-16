@@ -174,6 +174,9 @@ function _ensureLightbox() {
   const folderIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
     ? window.uiIconHtml('folder', 'chat-lightbox-folder-icon')
     : '';
+  const closeIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('x', 'modal-close-icon')
+    : '×';
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
@@ -184,7 +187,7 @@ function _ensureLightbox() {
       <button type="button" class="chat-lightbox-reveal" aria-label="${revealLabel}" title="${revealLabel}" hidden>
         ${folderIcon}
       </button>
-      <button type="button" class="chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">×</button>
+      <button type="button" class="modal-close-btn chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">${closeIcon}</button>
     </div>
   `;
   document.body.appendChild(root);

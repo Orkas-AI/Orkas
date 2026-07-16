@@ -1,90 +1,66 @@
 #!/usr/bin/env node
 /**
- * Test wrapper that handles better-sqlite3 ABI swapping around vitest.
+ * Run Vitest with Electron's embedded Node runtime.
  *
- * Flow:
- *   1. Swap `better-sqlite3` .node to current Node ABI (vitest can load it)
- *   2. Spawn vitest with user-provided args
- *   3. On ANY exit path (success / failure / SIGINT / SIGTERM / uncaught),
- *      swap .node back to Electron ABI so the app can start afterwards.
- *
- * Why: vitest 4 requires require(ESM), which Electron 32's bundled Node 20.18
- * doesn't support — so we can't run tests under Electron-as-Node. Running
- * them under plain Node means the .node must briefly match Node's ABI.
- * Leaving it in Node ABI would break `./run.sh` / `npm start`.
- *
- * The signal handlers guarantee recovery even when the user hits Ctrl+C.
- * Only `kill -9` and power loss can leave the module in Node ABI — in that
- * case run `npm run rebuild:sqlite:electron` manually.
+ * The application loads native addons such as better-sqlite3 under Electron.
+ * Running tests under the same runtime keeps one native ABI in node_modules and
+ * avoids rebuilding the addon before and after every test run.
  */
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const swapScript = resolve(here, 'swap-sqlite-abi.mjs');
-
-function describeResult(result) {
-  const parts = [];
-  if (typeof result.status === 'number') parts.push(`exit ${result.status}`);
-  if (result.signal) parts.push(`signal ${result.signal}`);
-  if (result.error) parts.push(`error ${result.error.message}`);
-  return parts.join(', ') || 'unknown termination';
-}
-
-function swap(mode) {
-  const r = spawnSync(process.execPath, [swapScript, mode], { stdio: 'inherit' });
-  if (r.status !== 0) {
-    console.error(`[run-tests] ABI swap to ${mode} failed (${describeResult(r)}).`);
-    if (mode === 'electron') {
-      console.error('[run-tests] Recover manually: npm run rebuild:sqlite:electron');
-    }
-    return false;
-  }
-  return true;
-}
-
-let restored = false;
-function restoreElectron() {
-  if (restored) return;
-  restored = true;
-  swap('electron');
-}
-
-// Best-effort recovery on any process-ending event that gives us a tick.
-// SIGKILL / power loss / kernel panic will still bypass this — document in
-// MEMORY / CLAUDE.md so humans know the manual fallback.
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
-  process.on(sig, () => {
-    restoreElectron();
-    process.exit(130);
-  });
-}
-process.on('uncaughtException', (err) => {
-  console.error('[run-tests] uncaughtException:', err);
-  restoreElectron();
-  process.exit(1);
-});
-process.on('unhandledRejection', (err) => {
-  console.error('[run-tests] unhandledRejection:', err);
-  restoreElectron();
-  process.exit(1);
-});
-
-if (!swap('node')) {
-  // If we couldn't swap to node ABI, don't pretend to run tests — but also
-  // don't leave the module in an unknown state; try to restore electron.
-  restoreElectron();
-  process.exit(2);
-}
-
+const require_ = createRequire(import.meta.url);
+const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
-const child = spawn(process.execPath, [vitestBin, ...process.argv.slice(2)], {
+
+const child = spawn(electronBin, [vitestBin, ...process.argv.slice(2)], {
   stdio: 'inherit',
+  env: {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: '1',
+    // Test files that need to launch standalone JS helpers must not reuse
+    // Electron's process.execPath: if they replace the child environment and
+    // drop ELECTRON_RUN_AS_NODE, macOS launches another GUI app. Preserve the
+    // outer npm/node executable as the explicit test-helper runtime.
+    ORKAS_TEST_NODE: process.execPath,
+  },
 });
 
-child.on('exit', (code, signal) => {
-  restoreElectron();
-  if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 0);
+let forwardedSignal = null;
+const signalHandlers = new Map();
+
+function removeSignalHandlers() {
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+  signalHandlers.clear();
+}
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+  const handler = () => {
+    if (forwardedSignal) return;
+    forwardedSignal = signal;
+    if (!child.killed) child.kill(signal);
+  };
+  signalHandlers.set(signal, handler);
+  process.on(signal, handler);
+}
+
+child.once('error', (error) => {
+  removeSignalHandlers();
+  console.error(`[run-tests] failed to start Electron's Node runtime: ${error.message}`);
+  process.exitCode = 1;
+});
+
+child.once('exit', (code, signal) => {
+  removeSignalHandlers();
+  const terminalSignal = forwardedSignal || signal;
+  if (terminalSignal) {
+    process.kill(process.pid, terminalSignal);
+    return;
+  }
+  process.exit(code ?? 1);
 });

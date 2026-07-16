@@ -240,4 +240,26 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('call-secret-123456');
     expect(serialized).not.toContain('private progress');
   });
+
+  it('reports compaction attempts and failures separately from successful compactions', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status',
+      phase: 'active_process_compaction_start',
+      data: { groups: 3 },
+    }, 1010);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status',
+      phase: 'active_process_compaction_failed',
+      data: { disabledReason: 'unsupported_reasoning_parameter', error: 'private provider body' },
+    }, 1020);
+    const summary = client.summarizeModelRunForLog(stats, 1030);
+    expect(summary).toMatchObject({
+      compactionCount: 0,
+      compactionAttemptCount: 1,
+      compactionFailureCount: 1,
+    });
+    expect(JSON.stringify(summary)).not.toContain('private provider body');
+  });
 });

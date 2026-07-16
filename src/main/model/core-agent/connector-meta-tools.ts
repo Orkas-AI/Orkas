@@ -73,16 +73,22 @@ function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): s
   // `<id>__<tool>` prefix). Falls back to display_name alone when the catalog has no
   // description (shouldn't happen for shipped connectors).
   //
-  // No status suffix: `resolveVisibleConnectors` filters to `status.kind === 'connected'` so
-  // every line is implicitly healthy. Disconnected / errored / connecting instances are hidden
-  // from the LLM entirely — see tools-adapter.ts for the filter + rationale.
+  // `resolveVisibleConnectors` routes `connected` AND `degraded` (the latter so a tool call can
+  // heal it), so a line is NOT implicitly healthy — a degraded one must say so. Without this the
+  // model reads a clean list, calls a connector that has been unable to reach its backend for
+  // days, gets one opaque failure, and silently downgrades its conclusions instead of telling the
+  // user the data source was never readable. Disconnected / errored / connecting instances remain
+  // hidden entirely — see tools-adapter.ts for the filter + rationale.
   const catalog = findCatalogEntry(instance.id);
   const descKey = `description_${lang}` as 'description_zh' | 'description_en';
   const desc = catalog ? (catalog[descKey] || '') : '';
   const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
+  const warn = instance.status.kind === 'degraded'
+    ? ` — ⚠️ UNVERIFIED: the last connection attempt failed (${instance.status.message}). Calls may fail; if one does, report this to the user rather than working around it.`
+    : '';
   return desc
-    ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}`
-    : `- **${instance.id}** — ${instance.display_name}${acct}`;
+    ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}${warn}`
+    : `- **${instance.id}** — ${instance.display_name}${acct}${warn}`;
 }
 
 /** Render the `## Connectors` system-prompt block — pure enumeration (one line per connector).
@@ -316,7 +322,9 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
         if (inst.status.kind === 'connected') {
           return { content: `Connected "${inst.display_name}" (id: ${inst.id}). Its tools are now available via list_connector_tools({connector_id: "${inst.id}"}).` };
         }
-        const msg = inst.status.kind === 'error' ? inst.status.message : inst.status.kind;
+        const msg = (inst.status.kind === 'error' || inst.status.kind === 'degraded')
+          ? inst.status.message
+          : inst.status.kind;
         return { content: `Added "${inst.display_name}" (id: ${inst.id}) but it could not connect yet: ${msg}. The user can retry it from the Connectors panel.` };
       } catch (err) {
         return errResult('E_INSTALL_FAILED', `could not add connector: ${(err as Error).message}`);

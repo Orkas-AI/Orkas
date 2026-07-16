@@ -196,6 +196,10 @@ function _renderProjectRow(p, convs) {
           : `<div class="conv-item conv-item-nested" data-cid="${escapeHtml(c.conversation_id)}"><div class="conv-item-title" title="${escapeHtml(c.title || t('chat.new_conv_title'))}">${escapeHtml(c.title || t('chat.new_conv_title'))}</div></div>`;
       }
     }
+    if (typeof _projectConversationHasMore === 'function' && _projectConversationHasMore(p.project_id)) {
+      html += `<button type="button" class="conversation-list-load-more" data-project-conv-more="${escapeHtml(p.project_id)}">
+        ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
+    }
     html += '</div>';
   }
   return html;
@@ -205,6 +209,22 @@ function _isProjectSelected(pid) {
   return currentView === 'project'
     && typeof _projectDetailPid !== 'undefined'
     && _projectDetailPid === pid;
+}
+
+/** Paint cached identity before the deferred project-detail script is parsed.
+ * The panel markup is already eager, so first click can acknowledge the target
+ * in the same frame instead of showing an anonymous blank surface. */
+function primeProjectDetailShell(pid) {
+  const project = Array.isArray(_projectsCache)
+    ? _projectsCache.find((item) => item && item.project_id === pid)
+    : null;
+  const title = document.getElementById('project-detail-title');
+  const content = document.getElementById('project-detail-content');
+  if (title) title.textContent = project?.name || '';
+  if (content) {
+    content.classList.add('is-loading');
+    content.setAttribute('aria-busy', 'true');
+  }
 }
 
 // ── Event wiring ────────────────────────────────────────────────────────
@@ -217,6 +237,19 @@ function _bindProjectsHandlers(container) {
   // Inline-rename inputs (at most one).
   container.querySelectorAll('input.project-rename-input[data-rename-pid]').forEach((input) => {
     _bindInlineRenameInput(input);
+  });
+
+  container.querySelectorAll('[data-project-conv-more]').forEach((button) => {
+    button.addEventListener('click', async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const pid = button.dataset.projectConvMore || '';
+      if (!pid || button.disabled) return;
+      button.disabled = true;
+      try { await loadConversationProject(pid, { append: true }); }
+      catch (err) { _projectsLog.warn('load more project conversations failed', err); }
+      finally { if (button.isConnected) button.disabled = false; }
+    });
   });
 
   // Project rows: first click selects/opens the project detail. Once that
@@ -262,13 +295,21 @@ function _bindProjectsHandlers(container) {
   }
 }
 
-function _toggleProjectExpand(pid) {
-  _projectsExpanded[pid] = !_projectsExpanded[pid];
+async function _toggleProjectExpand(pid) {
+  const expanding = !_projectsExpanded[pid];
+  _projectsExpanded[pid] = expanding;
   _projectsTrackClick('project_expand_toggle', {
     project_id: pid,
     expanded: !!_projectsExpanded[pid],
   });
   _saveProjectsExpanded();
+  if (expanding && typeof loadConversationProject === 'function') {
+    try {
+      await loadConversationProject(pid);
+    } catch (err) {
+      _projectsLog.warn('load project conversations failed', err);
+    }
+  }
   renderProjectsSection();
 }
 
@@ -729,3 +770,5 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 });
+
+if (typeof window !== 'undefined') window.primeProjectDetailShell = primeProjectDetailShell;

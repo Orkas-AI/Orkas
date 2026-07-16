@@ -30,7 +30,9 @@
   const DEFAULT_FRAME_HEIGHT = 420;   // px, until the artifact reports its own
   const MAX_FRAME_HEIGHT = 640;       // px, clamp; the iframe scrolls past this
   const MIN_FRAME_HEIGHT = 80;        // px
-  const SANDBOX = 'allow-scripts allow-same-origin allow-forms';
+  const artifactSecurity = window.OrkasArtifactSecurity;
+  if (!artifactSecurity) throw new Error('artifact-security.js must load before chat-artifact.js');
+  const SANDBOX = artifactSecurity.SANDBOX;
   // `allow-same-origin` is safe: the artifact's origin (`chat-app://cid`) is
   // never the renderer's (`file://...`), so the same-origin policy already
   // blocks `parent.*` — the flag only lets the artifact keep a usable origin
@@ -119,10 +121,9 @@
     if (_listenerBound) return;
     _listenerBound = true;
     window.addEventListener('message', (ev) => {
-      const data = ev && ev.data;
-      if (!data || typeof data !== 'object' || data.__orkasArtifact !== true) return;
       const frame = _findArtifactFrame(ev.source);
-      if (!frame) return; // not one of ours (or a stale/removed iframe)
+      if (!frame || !artifactSecurity.trustedArtifactMessage(ev, frame)) return;
+      const data = ev.data;
       const cid = frame.dataset.artifactCid || '';
       const artifactId = frame.dataset.artifactId || '';
       const agentId = frame.dataset.artifactAgent || '';
@@ -134,8 +135,8 @@
         return;
       }
       if (type === 'open-external') {
-        const url = String(data.url || '').trim();
-        if (/^https?:\/\//i.test(url)) { try { window.open(url, '_blank', 'noopener'); } catch (_) {} }
+        const url = artifactSecurity.safeExternalHttpUrl(data.url);
+        if (url) { try { window.open(url, '_blank', 'noopener'); } catch (_) {} }
         return;
       }
       if (type === 'submit' || type === 'sendToChat') {
@@ -187,7 +188,7 @@
       <div class="chat-artifact-viewer-stage" role="dialog" aria-modal="true">
         <div class="chat-artifact-viewer-header">
           <div class="chat-artifact-viewer-title"></div>
-          <button type="button" class="chat-artifact-viewer-close" aria-label="${_esc(_t('common.close', 'Close'))}" title="${_esc(_t('common.close', 'Close'))}">×</button>
+          <button type="button" class="modal-close-btn chat-artifact-viewer-close" aria-label="${_esc(_t('common.close', 'Close'))}" title="${_esc(_t('common.close', 'Close'))}">${typeof window.uiIconHtml === 'function' ? window.uiIconHtml('x', 'modal-close-icon') : '×'}</button>
         </div>
         <iframe class="chat-artifact-viewer-frame chat-artifact-frame" sandbox="${SANDBOX}" referrerpolicy="no-referrer"></iframe>
       </div>`;

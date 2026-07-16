@@ -10,6 +10,8 @@
 // `window.*`. Loaded after `agents.js` in index.html.
 
 (function () {
+  const artifactSecurity = window.OrkasArtifactSecurity;
+  if (!artifactSecurity) throw new Error('artifact-security.js must load before saved-apps.js');
   const _appsLog = (typeof createLogger === 'function') ? createLogger('saved-apps') : { warn: () => {}, error: () => {} };
   let _appsCache = null; // last fetched list (for the i18n-change re-render)
   let _appViewerEl = null;
@@ -61,9 +63,9 @@
       <div class="saved-app-viewer-stage">
         <div class="saved-app-viewer-header">
           <span class="saved-app-viewer-title"></span>
-          <button type="button" class="saved-app-viewer-close" aria-label="${_esc(closeLabel)}" title="${_esc(closeLabel)}">×</button>
+          <button type="button" class="modal-close-btn saved-app-viewer-close" aria-label="${_esc(closeLabel)}" title="${_esc(closeLabel)}">${typeof window.uiIconHtml === 'function' ? window.uiIconHtml('x', 'modal-close-icon') : '×'}</button>
         </div>
-        <iframe class="saved-app-viewer-frame" sandbox="allow-scripts allow-same-origin allow-forms" title=""></iframe>
+        <iframe class="saved-app-viewer-frame" sandbox="${artifactSecurity.SANDBOX}" referrerpolicy="no-referrer" title=""></iframe>
       </div>
     `;
     document.body.appendChild(root);
@@ -78,12 +80,11 @@
       if (btn) { btn.setAttribute('aria-label', label); btn.setAttribute('title', label); }
     });
     window.addEventListener('message', (ev) => {
-      if (!_appViewerFrame || ev.source !== _appViewerFrame.contentWindow) return;
-      const data = ev && ev.data;
-      if (!data || typeof data !== 'object' || data.__orkasArtifact !== true) return;
+      if (!_appViewerFrame || !artifactSecurity.trustedArtifactMessage(ev, _appViewerFrame)) return;
+      const data = ev.data;
       if (String(data.type || '') !== 'open-external') return;
-      const url = String(data.url || '').trim();
-      if (/^https?:\/\//i.test(url)) { try { window.open(url, '_blank', 'noopener'); } catch (_) {} }
+      const url = artifactSecurity.safeExternalHttpUrl(data.url);
+      if (url) { try { window.open(url, '_blank', 'noopener'); } catch (_) {} }
     });
     return root;
   }

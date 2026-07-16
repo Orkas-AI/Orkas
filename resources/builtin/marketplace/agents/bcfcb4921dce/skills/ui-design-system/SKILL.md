@@ -91,9 +91,9 @@ Spacing and density:
 
 Shape and elevation:
 
-- Default radius should be 8px or less unless the existing system says otherwise.
+- Derive radius from the existing system or Visual Thesis. Compact operational controls often benefit from restrained radius, while consumer, playful, or tactile products may justify softer geometry; do not force one house value across domains.
 - Use borders and contrast before large shadows.
-- Do not stack cards inside cards. Use full-width sections, panes, rows, or repeated item cards.
+- Avoid stacking cards inside cards when grouping, spacing, panes, or rows communicate the same hierarchy more clearly. Nested surfaces are valid when they represent a real containment or interaction boundary.
 
 Motion:
 
@@ -160,4 +160,4 @@ For design-system work, return or implement:
 - States represented:
 ```
 
-If the user asked for a design draft, pair this with `ui-html-renderer`. The system is incomplete until it is visible in HTML.
+If the user asked for a design draft, return to `ui-design-executor` for the visible implementation. Add `ui-html-renderer` only when the HTML/runtime complexity separately triggers it.

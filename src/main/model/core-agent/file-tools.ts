@@ -47,7 +47,8 @@ import {
   UnsupportedFileKindError,
 } from '../../features/file_indexer';
 import { ocrFile } from '../../features/ocr_runtime';
-import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
+import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
+import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { localAccessAllowsOutsideWorkspace, localAccessRequiresSensitiveApproval } from '../../features/permissions';
@@ -107,6 +108,10 @@ export interface FileToolsOpts {
    *  channels for those resources, and a sandbox-level lock keeps the LLM
    *  honest even when its prompt strays. */
   readOnlyExtraRoots?: readonly string[];
+  /** Session-scoped persisted tool-result root. It is visible for path scope
+   *  checks but generic read_file must never use it; retrieval is only through
+   *  tool_result_search / tool_result_read_chunk. */
+  toolResultsRoot?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat at runTurn so workspace resolution
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
@@ -128,7 +133,7 @@ function allowedRoots(opts: FileToolsOpts): string[] {
     if (ws) roots.push(ws);
   } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
-    try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
+    try { roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
     catch (err) { log.warn('resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
   }
   if (opts.extraRoots?.length) {
@@ -289,6 +294,15 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       if (disabledSkillErr) {
         log.warn('read_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
+      }
+      if (opts.toolResultsRoot && isInsideRoot(opts.toolResultsRoot, abs)) {
+        return {
+          content: errText(
+            'E_TOOL_RESULT_REF_REQUIRED',
+            'Persisted tool results cannot be read by path. Use the ref from <persisted-output> with tool_result_search or tool_result_read_chunk.',
+          ),
+          isError: true,
+        };
       }
 
       try { fs.statSync(abs); }
@@ -644,7 +658,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' });
       } catch { /* workspace unavailable → skip */ }
       if (opts.cid) {
-        rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
+        rootKinds.push({ root: chatAttachmentDirForConversation(opts.userId, opts.cid), source: 'attachment' });
       }
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
         if (root) rootKinds.push({ root, source: 'extra' });
@@ -815,7 +829,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try { rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' }); }
       catch { /* workspace unavailable */ }
-      if (opts.cid) rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
+      if (opts.cid) rootKinds.push({ root: chatAttachmentDirForConversation(opts.userId, opts.cid), source: 'attachment' });
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
         if (root) rootKinds.push({ root, source: 'extra' });
       }
@@ -1050,4 +1064,9 @@ export function createFileTools(opts: FileToolsOpts): AgentTool[] {
     createGrepFilesTool(opts),
     createListFilesTool(opts),
   ];
+}
+
+function isInsideRoot(root: string, candidate: string): boolean {
+  const rel = path.relative(path.resolve(root), path.resolve(candidate));
+  return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
 }

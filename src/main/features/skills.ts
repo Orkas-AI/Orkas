@@ -24,8 +24,9 @@ import * as path from 'node:path';
 
 import {
   userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT, SRC_ROOT,
-  userMarketplaceSkillsDir, userSystemSkillsDir, chatAttachmentDir,
+  userMarketplaceSkillsDir, userSystemSkillsDir, userSkillCatalogCacheFile,
 } from '../paths';
+import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
@@ -497,11 +498,61 @@ function removeSkillSidecarDescriptionsSync(dir: string): void {
 }
 
 // Module-level cache for `listSkills`.
-interface SkillListCache { stamp: string; data: SkillListing[] }
+const SKILL_CATALOG_CACHE_VERSION = 2;
+const SKILL_PERSISTED_TRUST_MS = 2_000;
+
+interface SkillListCache {
+  stamp: string;
+  rootStamp: string;
+  trustUntil: number;
+  data: SkillListing[];
+}
 let _skillListCache: SkillListCache | null = null;
+
+function _skillCatalogCacheFile(): string {
+  return userSkillCatalogCacheFile(getActiveUserId());
+}
+
+function _skillRootStamp(): string {
+  let stamp = '';
+  for (const dir of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
+    try { stamp += `${dir}:${fs.statSync(dir).mtimeMs};`; }
+    catch { stamp += `${dir}:0;`; }
+  }
+  return stamp;
+}
+
+function _readPersistedSkillCatalog(rootStamp: string): { stamp: string; data: SkillListing[] } | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(_skillCatalogCacheFile(), 'utf8'));
+    if (
+      raw?.version !== SKILL_CATALOG_CACHE_VERSION
+      || raw?.rootStamp !== rootStamp
+      || typeof raw?.stamp !== 'string'
+      || !Array.isArray(raw?.data)
+    ) return null;
+    return { stamp: raw.stamp, data: raw.data as SkillListing[] };
+  } catch {
+    return null;
+  }
+}
+
+function _writePersistedSkillCatalog(rootStamp: string, stamp: string, data: SkillListing[]): void {
+  try {
+    writeJsonSync(_skillCatalogCacheFile(), {
+      version: SKILL_CATALOG_CACHE_VERSION,
+      rootStamp,
+      stamp,
+      data,
+    });
+  } catch (err) {
+    log.warn(`skill catalog cache write failed: ${(err as Error).message}`);
+  }
+}
 
 function _invalidateSkillListCache(opts: { markDirty?: boolean } = {}): void {
   _skillListCache = null;
+  try { fs.rmSync(_skillCatalogCacheFile(), { force: true }); } catch { /* cache is best-effort */ }
   if (opts.markDirty === false) return;
   // Sync engine dirty signal (lazy-require — stripped in the open-source build). Mirrors the pattern in
   // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
@@ -565,7 +616,10 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
         status = _resolveSkillStatus(meta, sidecar);
       } catch { /* ignore */ }
     }
-    return { id: skillId, name, ...descPair, category, ...(status ? { status } : {}), source, dir: d };
+    return {
+      id: skillId, name, ...descPair, category,
+      ...(status ? { status } : {}), source, dir: d,
+    };
   }
   return null;
 }
@@ -597,9 +651,33 @@ function _skillDirStamp(): string {
  *  below filter this: `listSkills` drops owner-private entries (the user
  *  panel), `listAgentPrivateSkills` keeps only them (dev inspection). */
 async function _allSkillListingsCached(): Promise<SkillListing[]> {
+  const rootStamp = _skillRootStamp();
+  if (
+    _skillListCache
+    && _skillListCache.rootStamp === rootStamp
+    && _skillListCache.trustUntil > Date.now()
+  ) {
+    return _skillListCache.data;
+  }
+  if (!_skillListCache) {
+    const persisted = _readPersistedSkillCatalog(rootStamp);
+    if (persisted) {
+      _skillListCache = {
+        stamp: persisted.stamp,
+        rootStamp,
+        trustUntil: Date.now() + SKILL_PERSISTED_TRUST_MS,
+        data: persisted.data,
+      };
+      return persisted.data;
+    }
+  }
   const stamp = _skillDirStamp();
   let out: SkillListing[];
-  if (_skillListCache && _skillListCache.stamp === stamp) {
+  if (
+    _skillListCache
+    && _skillListCache.rootStamp === rootStamp
+    && _skillListCache.stamp === stamp
+  ) {
     out = _skillListCache.data;
   } else {
     out = [];
@@ -676,7 +754,13 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         });
       }
     }
-    _skillListCache = { stamp, data: out };
+    _skillListCache = {
+      stamp,
+      rootStamp,
+      trustUntil: 0,
+      data: out,
+    };
+    _writePersistedSkillCatalog(rootStamp, stamp, out);
   }
   return out;
 }
@@ -708,7 +792,8 @@ export async function listAgentPrivateSkills(): Promise<SkillListing[]> {
  *  build re-renders the skills system-prompt block. */
 export function setSkillEnabledForActiveUser(skillId: string, enabled: boolean): void {
   setSkillEnabled(getActiveUserId(), skillId, enabled);
-  _invalidateSkillListCache();
+  // `enabled` is overlaid outside the catalog cache, so toggling it must not
+  // discard and rebuild the unchanged SKILL.md snapshot.
   invalidateCoreAgentSkills();
 }
 
@@ -893,7 +978,10 @@ export async function getCustomSkill(skillId: string): Promise<CustomSkill | nul
       status = _resolveSkillStatus(meta, sidecar);
     } catch { /* ignore */ }
   }
-  return { id: skillId, name, ...descPair, category, status, source: 'custom', dir: d };
+  return {
+    id: skillId, name, ...descPair, category,
+    status, source: 'custom', dir: d,
+  };
 }
 
 export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
@@ -2870,7 +2958,7 @@ export async function sendToSkillChat(
       // before driving `orkas-pkg`; ordinary SkillRegistry no longer loads
       // repo-shipped builtin skills.
       userSystemSkillsDir(userId),
-      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
+      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDirForConversation(userId, attachmentCtx.attachmentCid)] : []),
     ],
     attachmentMetadata: attachmentCtx.attachmentMetadata,
     ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
@@ -3018,7 +3106,7 @@ export async function* streamSendToSkillChat(
       // before driving `orkas-pkg`; ordinary SkillRegistry no longer loads
       // repo-shipped builtin skills.
       userSystemSkillsDir(userId),
-      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
+      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDirForConversation(userId, attachmentCtx.attachmentCid)] : []),
     ],
       attachmentMetadata: attachmentCtx.attachmentMetadata,
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),

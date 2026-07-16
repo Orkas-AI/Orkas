@@ -10,25 +10,37 @@
     "#core-agent": "./src/core-agent/src/index.ts"
   },
   "scripts": {
-    "start": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && node scripts/fetch-ffmpeg.cjs && electron .",
+    "prestart": "node scripts/ensure-dev-dependencies.cjs",
+    "start": "electron .",
+    "prestart:electron": "node scripts/ensure-dev-dependencies.cjs",
+    "start:electron": "electron .",
     "stop": "pkill -9 -f \"$PWD/node_modules/electron/dist\" || true",
     "smoke": "tsx src/main/smoke.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/run-tests.mjs run",
+    "test": "npm run test:js && npm run test:resources",
+    "test:js": "node scripts/run-tests.mjs run",
+    "test:resources": "node scripts/run-python-tests.mjs resources/builtin resources/test -q",
+    "test:coverage": "node scripts/run-tests.mjs run --coverage",
     "test:watch": "node scripts/run-tests.mjs",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:fetch": "node scripts/fetch-officecli.cjs",
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.cjs",
-    "rebuild:sqlite:electron": "node scripts/swap-sqlite-abi.mjs electron",
-    "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
-    "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
+    "vc:fetch": "node scripts/fetch-win-vc-runtime.cjs --platform win32 --arch x64",
+    "whisper:fetch": "node scripts/fetch-whisper.cjs",
+    "runtime:prepare:dev": "node scripts/ensure-dev-dependencies.cjs",
+    "builtin:manifest": "node scripts/update-builtin-manifest.cjs",
+    "builtin:manifest:check": "node scripts/update-builtin-manifest.cjs --check",
+    "rebuild:sqlite:electron": "node scripts/ensure-sqlite-electron-abi.mjs",
+    "postinstall": "node scripts/ensure-sqlite-electron-abi.mjs && node scripts/fetch-embedding-model.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepack": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && node scripts/fetch-ffmpeg.cjs && node scripts/swap-sqlite-abi.mjs electron"
+    "prepack": "node scripts/ensure-dev-dependencies.cjs"
   },
   "devDependencies": {
     "@ffprobe-installer/ffprobe": "^2.1.2",
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^4.1.5",
+    "7zip-bin": "^5.2.0",
     "electron": "^41.7.1",
     "ffmpeg-static": "^5.3.0",
     "typescript": "^6.0.3",
@@ -45,8 +57,10 @@
     "jimp": "^1.6.1",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^5.6.205",
+    "socks-proxy-agent": "^8.0.5",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
+    "undici": "^7.28.0",
     "zod": "^3.24.0"
   },
   "overrides": {
@@ -70,6 +84,12 @@
     "files": [
       "bootstrap.cjs",
       "bin/**/*",
+      "!bin/builtin-resource-gate.cjs",
+      "!bin/ensure-runtime.cjs",
+      "!bin/native-package-gate.cjs",
+      "!bin/packaged-entrypoint-gate.cjs",
+      "!bin/packaged-resource-gate.cjs",
+      "!bin/runtime-gate.cjs",
       "src/main/**/*.{js,ts,mjs,md,json}",
       "src/renderer/**/*",
       "src/resources/icons/**/*",
@@ -122,7 +142,10 @@
         "from": "resources/builtin",
         "to": "builtin",
         "filter": [
-          "**/*"
+          "**/*",
+          "!**/.DS_Store",
+          "!**/__pycache__/**",
+          "!**/*.pyc"
         ]
       },
       {
@@ -137,7 +160,9 @@
         "from": "resources/mac-locales",
         "to": ".",
         "filter": [
-          "**/*"
+          "en.lproj/InfoPlist.strings",
+          "ja.lproj/InfoPlist.strings",
+          "zh-Hans.lproj/InfoPlist.strings"
         ]
       }
     ],
@@ -175,6 +200,15 @@
     "win": {
       "target": "nsis",
       "icon": "src/resources/icons/icon.ico",
+      "extraFiles": [
+        {
+          "from": "resources/runtime/vc/win32-x64",
+          "to": ".",
+          "filter": [
+            "*.dll"
+          ]
+        }
+      ],
       "signtoolOptions": {
         "signingHashAlgorithms": [
           "sha256"

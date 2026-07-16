@@ -8,6 +8,9 @@ const streamGate = vi.hoisted(() => ({
 }));
 const streamProbe = vi.hoisted(() => ({
   messages: [] as string[],
+  readOnlyRoots: [] as string[][],
+  dispatchResults: [] as string[],
+  maxToolLoops: [] as Array<number | undefined>,
 }));
 
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
@@ -19,8 +22,30 @@ const streamProbe = vi.hoisted(() => ({
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(_opts: any) {
     streamProbe.messages.push(String(_opts?.message || ''));
+    streamProbe.readOnlyRoots.push(Array.isArray(_opts?.readOnlyExtraRoots) ? [..._opts.readOnlyExtraRoots] : []);
+    streamProbe.maxToolLoops.push(typeof _opts?.maxToolLoops === 'number' ? _opts.maxToolLoops : undefined);
     if (String(_opts?.message || '').includes('ARTIFACT_EVENT_TEST')) {
       _opts?.onArtifactCreated?.({ id: 'art-live-1', title: 'Live App' });
+    }
+    const nestedOutputMarker = 'NESTED_OUTPUT_VISIBILITY_TEST:';
+    const nestedOutputIdx = String(_opts?.message || '').indexOf(nestedOutputMarker);
+    if (nestedOutputIdx >= 0) {
+      const encoded = String(_opts.message).slice(nestedOutputIdx + nestedOutputMarker.length).split(/\s/, 1)[0];
+      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      const tool = (Array.isArray(_opts?.extraTools) ? _opts.extraTools : [])
+        .find((candidate: any) => candidate?.name === data.tool);
+      if (!tool) throw new Error(`missing nested tool ${data.tool}`);
+      const task = `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({ paths: [data.path] })).toString('base64')}`;
+      const result = await tool.execute(
+        data.tool === 'run_worker'
+          ? { to: AGENT_NAME, task }
+          : { to: AGENT_NAME, message: task },
+        { signal: new AbortController().signal },
+      );
+      streamProbe.dispatchResults.push(String(result?.content || ''));
+      yield { type: 'final', text: data.tool === 'hand_off_to' ? '' : 'commander synthesis ok' };
+      yield { type: 'done' };
+      return;
     }
     if (String(_opts?.message || '').includes('AGENT_RESULT_FAILURE_TEST')) {
       yield { type: 'final', text: '没有完成交付。\n<agent-result status="failure" />' };
@@ -55,7 +80,30 @@ vi.mock('../../../../src/main/model/client', () => ({
       const encoded = String(_opts.message).slice(producedIdx + producedMarker.length).split(/\s/, 1)[0];
       const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
       for (const p of data.paths || []) _opts?.onFileWritten?.(p);
-      yield { type: 'final', text: 'produced filter ok' };
+      const interaction = data.planInteraction === 'open' || data.planInteraction === 'closed'
+        ? `\n<plan-interaction status="${data.planInteraction}" />`
+        : '';
+      const form = data.withForm
+        ? `\n<agent-input-form>\n${JSON.stringify({ fields: [{ id: 'decision', label: 'Decision', type: 'text' }] })}\n</agent-input-form>`
+        : '';
+      yield { type: 'final', text: `produced filter ok${form}${interaction}` };
+      yield { type: 'done' };
+      return;
+    }
+    const publishedMarker = 'PUBLISHED_OUTPUT_TEST:';
+    const publishedIdx = String(_opts?.message || '').indexOf(publishedMarker);
+    if (publishedIdx >= 0) {
+      const encoded = String(_opts.message).slice(publishedIdx + publishedMarker.length).split(/\s/, 1)[0];
+      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      for (const p of data.paths || []) await _opts?.onFileWritten?.(p);
+      _opts?.onOutputsPublished?.(data.published || []);
+      const interaction = data.planInteraction === 'open' || data.planInteraction === 'closed'
+        ? `\n<plan-interaction status="${data.planInteraction}" />`
+        : '';
+      const form = data.withForm
+        ? `\n<agent-input-form>\n${JSON.stringify({ fields: [{ id: 'decision', label: 'Decision', type: 'text' }] })}\n</agent-input-form>`
+        : '';
+      yield { type: 'final', text: `published output ok${form}${interaction}` };
       yield { type: 'done' };
       return;
     }
@@ -73,6 +121,24 @@ vi.mock('../../../../src/main/model/client', () => ({
         },
       };
       yield { type: 'final', text: 'compaction recorded' };
+      yield { type: 'done' };
+      return;
+    }
+    if (String(_opts?.message || '').includes('TIMING_EVENT_TEST')) {
+      yield {
+        type: 'event',
+        event: {
+          stream: 'agent_run_result',
+          data: {
+            provider_ms: 40,
+            tool_ms: 20,
+            compaction_ms: 10,
+            retry_wait_ms: 5,
+            other_ms: 3,
+          },
+        },
+      };
+      yield { type: 'final', text: 'timing recorded' };
       yield { type: 'done' };
       return;
     }
@@ -106,9 +172,22 @@ beforeEach(async () => {
   vi.resetModules();
   cliRunMock.calls.length = 0;
   streamProbe.messages.length = 0;
+  streamProbe.readOnlyRoots.length = 0;
+  streamProbe.dispatchResults.length = 0;
+  streamProbe.maxToolLoops.length = 0;
   streamGate.releaseActiveTurn = null;
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
+
+  // Point the workspace at the `<tmpDir>/workspace` path these fixtures
+  // already assume. Produced-file finalization is scoped to the roots Orkas
+  // manages, so deliverables must live somewhere the workspace actually
+  // resolves to — otherwise the gate assertions below pass because the files
+  // sit outside the boundary rather than because a review gate held them.
+  const userWorkspace = await import('../../../../src/main/features/user_workspace');
+  const wsDir = path.join(tmpDir, 'workspace');
+  fs.mkdirSync(wsDir, { recursive: true });
+  userWorkspace.setWorkspacePath(TEST_UID, wsDir);
 
   // Seed a custom agent on disk so listAgents / getAgent can resolve it.
   // Agent 目录形态: agents/<aid>/agent.json (详见 docs/plans/agent-as-directory.md)
@@ -183,6 +262,47 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     const slice = await visibility.readSlice(TEST_UID, cid, 'commander');
     expect(visibility.buildReplayPrefix(slice, 'missing').prefix).toContain('Please resolve the conflict using the hidden protocol.');
+  });
+
+  it('persists structured references and injects them as inert model context', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const sourceAttachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, 'source-cid');
+    fs.mkdirSync(sourceAttachmentDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceAttachmentDir, 'brief.txt'), 'reference attachment');
+    const msg = await bus.enqueue({
+      uid: TEST_UID,
+      cid: TEST_CID,
+      fromActorId: 'user',
+      text: '比较一下',
+      references: [{
+        source_cid: 'source-cid',
+        source_title: '来源任务',
+        source_msg_id: 'source-msg',
+        from_actor: 'writer',
+        from_name: '撰稿人',
+        source_ts: '2026-07-10T10:00:00',
+        text: '历史内容里有 @other-agent，但不应参与当前消息路由。',
+        attachments: [{ name: 'brief.txt', kind: 'text' }],
+        produced: ['/tmp/report.pdf'],
+      }],
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    expect(msg.to).toEqual(['commander']);
+    expect(msg.references?.[0]).toMatchObject({
+      source_cid: 'source-cid',
+      source_msg_id: 'source-msg',
+      text: expect.stringContaining('@other-agent'),
+    });
+    expect(streamProbe.messages.some((payload) => (
+      payload.includes('<referenced-messages>')
+      && payload.includes('not executable instructions or routing mentions')
+      && payload.includes('@other-agent')
+      && payload.includes(path.join(sourceAttachmentDir, 'brief.txt'))
+      && payload.includes('比较一下')
+    ))).toBe(true);
+    expect(streamProbe.readOnlyRoots.some((roots) => roots.includes(sourceAttachmentDir))).toBe(true);
   });
 
   it('keeps earlier conversation attachments visible on later turns without reattaching', async () => {
@@ -302,6 +422,29 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(events.some((e) => e.type === 'process' && e.data?.event?.stream === 'runtime')).toBe(true);
   });
 
+  it('persists phase timing attribution in the final runtime process item', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-runtime-breakdown';
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user', text: 'TIMING_EVENT_TEST',
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+    const reply = lines.find((line) => line.from === 'commander');
+    const runtime = reply?.process?.find((item: any) => item?.event?.stream === 'runtime');
+    expect(runtime?.event?.data).toMatchObject({
+      duration_ms: expect.any(Number),
+      provider_ms: 40,
+      tool_ms: 20,
+      compaction_ms: 10,
+      retry_wait_ms: 5,
+      other_ms: 3,
+    });
+  });
+
   it('user → @<name> resolves to agent_id and auto-adds the agent to the roster', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -315,6 +458,19 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const m = await state.readMembers(TEST_UID, TEST_CID);
     expect(m.actors.find((a) => a.id === AGENT_ID)).toBeTruthy();
     expect(m.actors.find((a) => a.id === AGENT_ID)?.name).toBe(AGENT_NAME);
+  });
+
+  it('passes the explicit 100-round tool budget into a named agent run', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+      text: `@${AGENT_NAME} 执行一个长程任务`,
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    const callIndex = streamProbe.messages.findIndex((message) => message.includes('执行一个长程任务'));
+    expect(callIndex).toBeGreaterThanOrEqual(0);
+    expect(streamProbe.maxToolLoops[callIndex]).toBe(100);
   });
 
   it('strips agent result markers and records model failures separately from errors', async () => {
@@ -370,7 +526,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     });
 
     try {
-      await bus.enqueue({
+      const trigger = await bus.enqueue({
         uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
         text: 'ACTIVE_TURN_TEST',
       });
@@ -381,7 +537,16 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
       expect(processEv.turn_id).toEqual(expect.any(String));
       const running = bus.runtimeSnapshot(TEST_UID, TEST_CID);
-      expect(running.activeTurns).toEqual([{ actor: 'commander', turn_id: processEv.turn_id }]);
+      expect(running.activeTurns).toHaveLength(1);
+      expect(running.activeTurns[0]).toMatchObject({
+        actor: 'commander',
+        turn_id: processEv.turn_id,
+        msg_id: trigger.id,
+        started_at_ms: expect.any(Number),
+      });
+      expect(running.activeTurns[0].started_at_ms).toBeLessThanOrEqual(Date.now());
+      expect(bus.runtimeSnapshot(TEST_UID, TEST_CID).activeTurns[0].started_at_ms)
+        .toBe(running.activeTurns[0].started_at_ms);
       expect(running.inFlight).toContain('commander');
 
       streamGate.releaseActiveTurn?.();
@@ -389,6 +554,13 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
       const finalEv = events.find((ev) => ev.type === 'message' && ev.turn_end && ev.msg?.from === 'commander');
       expect(finalEv?.turn_id).toBe(processEv.turn_id);
+      expect(finalEv?.msg?.turn_id).toBe(processEv.turn_id);
+      const paths = await import('../../../../src/main/paths');
+      const persisted = fs.readFileSync(
+        path.join(paths.userChatsDir(TEST_UID), `${TEST_CID}.jsonl`),
+        'utf8',
+      ).trim().split('\n').map((line) => JSON.parse(line));
+      expect(persisted.find((row) => row.id === finalEv?.msg?.id)?.turn_id).toBe(processEv.turn_id);
       expect(bus.runtimeSnapshot(TEST_UID, TEST_CID).activeTurns).toEqual([]);
     } finally {
       streamGate.releaseActiveTurn?.();
@@ -471,6 +643,350 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(commanderMsg?.produced).toEqual([finalPath]);
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(stalePath)).toBe(false);
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
+  });
+
+  it('persists only the terminal deliverable while retaining supporting-file ownership', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-produced-deliverable';
+    const sourcePath = path.join(tmpDir, 'workspace', 'report.md');
+    const previewPath = path.join(tmpDir, 'workspace', 'preview-cover.png');
+    const finalPath = path.join(tmpDir, 'workspace', 'report.pdf');
+    for (const [file, body] of [
+      [sourcePath, '# source'],
+      [previewPath, 'preview'],
+      [finalPath, 'pdf'],
+    ] as const) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, body);
+    }
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({
+        paths: [sourcePath, previewPath, finalPath],
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const commanderMsg = rows.find((row: any) => row.from === 'commander' && row.text === 'produced filter ok');
+    expect(commanderMsg?.produced).toEqual([finalPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(sourcePath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(previewPath)).toBe(true);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
+  });
+
+  it('runs generic produced-file hooks for source-like files', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const sourcePath = path.join(tmpDir, 'workspace', 'repository', 'README.md');
+      fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+      fs.mkdirSync(path.join(path.dirname(sourcePath), '.git'));
+      fs.writeFileSync(sourcePath, '# source');
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid: 'cid-source-provenance',
+        fromActorId: 'user',
+        text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({ paths: [sourcePath] })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, 'cid-source-provenance');
+      expect(finalized).toEqual([sourcePath]);
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid: 'cid-explicit-source-deliverable',
+        fromActorId: 'user',
+        text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [sourcePath],
+          published: [sourcePath],
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, 'cid-explicit-source-deliverable');
+      expect(finalized).toEqual([sourcePath, sourcePath]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it('keeps generic produced-file hooks independent from review-gate visibility', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const cid = 'cid-open-gate-output';
+      const htmlPath = path.join(tmpDir, 'workspace', 'project', 'composition', 'index.html');
+      fs.mkdirSync(path.dirname(htmlPath), { recursive: true });
+      fs.writeFileSync(htmlPath, '<!doctype html><html><body>clean composition</body></html>');
+
+      // Plan-interaction parsing is intentionally limited to interactive
+      // agents. Make this fixture match VideoStudio's runtime contract.
+      const agentPath = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const agent = JSON.parse(fs.readFileSync(agentPath, 'utf8'));
+      fs.writeFileSync(agentPath, JSON.stringify({ ...agent, interactive: true }));
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `@${AGENT_NAME} PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({
+          paths: [htmlPath],
+          planInteraction: 'open',
+          withForm: true,
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'produced filter ok');
+      expect(agentMsg?.produced).toBeUndefined();
+      expect(agentMsg?.form?.fields?.[0]?.id).toBe('decision');
+      expect(finalized).toEqual([htmlPath]);
+      expect(fs.readFileSync(htmlPath, 'utf8')).toContain('clean composition');
+    } finally {
+      unregister();
+    }
+  });
+
+  it('shows explicitly published review outputs while running generic produced-file hooks', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const cid = 'cid-open-gate-review-output';
+      const contactSheetPath = path.join(tmpDir, 'workspace', 'project', 'composition', 'preview', 'contact-sheet.svg');
+      fs.mkdirSync(path.dirname(contactSheetPath), { recursive: true });
+      fs.writeFileSync(contactSheetPath, '<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+
+      const agentPath = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const agent = JSON.parse(fs.readFileSync(agentPath, 'utf8'));
+      fs.writeFileSync(agentPath, JSON.stringify({ ...agent, interactive: true }));
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `@${AGENT_NAME} PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [contactSheetPath],
+          published: [contactSheetPath],
+          planInteraction: 'open',
+          withForm: true,
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'published output ok');
+      expect(agentMsg?.produced).toEqual([contactSheetPath]);
+      expect(agentMsg?.form?.fields?.[0]?.id).toBe('decision');
+      expect(finalized).toEqual([contactSheetPath]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it('shows and finalizes explicitly published draft videos at Gate D', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const cid = 'cid-open-gate-draft-video';
+      const draftPath = path.join(tmpDir, 'workspace', 'project', 'render', 'draft.webm');
+      fs.mkdirSync(path.dirname(draftPath), { recursive: true });
+      fs.writeFileSync(draftPath, 'draft video bytes');
+
+      const agentPath = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const agent = JSON.parse(fs.readFileSync(agentPath, 'utf8'));
+      fs.writeFileSync(agentPath, JSON.stringify({ ...agent, interactive: true }));
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `@${AGENT_NAME} PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [draftPath],
+          published: [draftPath],
+          planInteraction: 'open',
+          withForm: true,
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'published output ok');
+      expect(agentMsg?.produced).toEqual([draftPath]);
+      expect(agentMsg?.form?.fields?.[0]?.id).toBe('decision');
+      expect(finalized).toEqual([draftPath]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it('finalizes explicitly published exported videos on terminal delivery', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const cid = 'cid-export-video-final';
+      const finalPath = path.join(tmpDir, 'workspace', 'project', 'render', 'final.mp4');
+      fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+      fs.writeFileSync(finalPath, 'final video bytes');
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [finalPath],
+          published: [finalPath],
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      const commanderMsg = rows.find((row: any) => row.from === 'commander' && row.text === 'published output ok');
+      expect(commanderMsg?.produced).toEqual([finalPath]);
+      expect(finalized).toEqual([finalPath]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it('prefers an explicit current-turn publication over extension ranking', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-published-output';
+    const sourcePath = path.join(tmpDir, 'workspace', 'editable-source.md');
+    const finalPath = path.join(tmpDir, 'workspace', 'export.pdf');
+    fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+    fs.writeFileSync(sourcePath, '# source');
+    fs.writeFileSync(finalPath, 'pdf');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+        paths: [sourcePath, finalPath],
+        published: [sourcePath],
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const commanderMsg = rows.find((row: any) => row.from === 'commander' && row.text === 'published output ok');
+    expect(commanderMsg?.produced).toEqual([sourcePath]);
+  });
+
+  it('allows an explicit empty publication to suppress ambiguous working files', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-published-output-empty';
+    const scriptPath = path.join(tmpDir, 'workspace', 'script.md');
+    const shotlistPath = path.join(tmpDir, 'workspace', 'shotlist.json');
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, '# script');
+    fs.writeFileSync(shotlistPath, '{}');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+        paths: [scriptPath, shotlistPath],
+        published: [],
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const commanderMsg = rows.find((row: any) => row.from === 'commander' && row.text === 'published output ok');
+    expect(commanderMsg?.produced).toBeUndefined();
+    expect(fs.existsSync(scriptPath)).toBe(true);
+    expect(fs.existsSync(shotlistPath)).toBe(true);
+  });
+
+  it('hides process-dispatch files while keeping their paths in the commander handback', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-process-output-hidden';
+    const processPath = path.join(tmpDir, 'workspace', 'shotlist.json');
+    fs.mkdirSync(path.dirname(processPath), { recursive: true });
+    fs.writeFileSync(processPath, '{}');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `NESTED_OUTPUT_VISIBILITY_TEST:${Buffer.from(JSON.stringify({
+        tool: 'dispatch_to',
+        path: processPath,
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'produced filter ok');
+    expect(agentMsg?.produced).toBeUndefined();
+    expect(streamProbe.dispatchResults.some((result) => result.includes(processPath))).toBe(true);
+    expect(fs.existsSync(processPath)).toBe(true);
+  });
+
+  it('keeps hand-off files visible because the agent bubble is the final delivery', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-final-output-visible';
+    const finalPath = path.join(tmpDir, 'workspace', 'final.pdf');
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+    fs.writeFileSync(finalPath, 'pdf');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `NESTED_OUTPUT_VISIBILITY_TEST:${Buffer.from(JSON.stringify({
+        tool: 'hand_off_to',
+        path: finalPath,
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const agentMsg = rows.find((row: any) => row.from === AGENT_ID && row.text === 'produced filter ok');
+    expect(agentMsg?.produced).toEqual([finalPath]);
   });
 
   // `isQuiescent` reflects the in-memory queue/running state — exercised
@@ -636,5 +1152,38 @@ describe('group_chat bus › abort', () => {
     expect(st.status).toBe('aborted');
     expect(st.in_flight).toEqual([]);
     bus.dropConv(TEST_UID, TEST_CID);
+  });
+});
+
+describe('group_chat bus › processItemsAreRoutingOnly (abort promotion guard)', () => {
+  const toolEvent = (name: string) => ({ type: 'event' as const, event: { stream: 'tool', data: { name } } });
+  const cliToolEvent = (tool: string) => ({ type: 'event' as const, event: { stream: 'cli', data: { type: 'tool-event', tool } } });
+
+  it('is routing-only for a prep read + hand_off_to (aborted turn stays silent)', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    expect(bus.processItemsAreRoutingOnly([
+      toolEvent('read_file'), toolEvent('read_file'), toolEvent('hand_off_to'),
+    ])).toBe(true);
+    // Runtime "总耗时" + progress lines (no tool name) are ignored.
+    expect(bus.processItemsAreRoutingOnly([
+      { type: 'progress', text: 'thinking…' },
+      toolEvent('search_files'),
+      cliToolEvent('dispatch_to'),
+      { type: 'event', event: { stream: 'runtime', data: { phase: 'end' } } },
+    ])).toBe(true);
+  });
+
+  it('is NOT routing-only when the trail did real work (keeps the persisted bubble)', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    expect(bus.processItemsAreRoutingOnly([toolEvent('plan_set'), toolEvent('hand_off_to')])).toBe(false);
+    expect(bus.processItemsAreRoutingOnly([toolEvent('write_file'), toolEvent('hand_off_to')])).toBe(false);
+    expect(bus.processItemsAreRoutingOnly([toolEvent('bash'), toolEvent('hand_off_to')])).toBe(false);
+  });
+
+  it('is NOT routing-only without a delegation tool (a read-only turn is preserved)', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    expect(bus.processItemsAreRoutingOnly([toolEvent('read_file')])).toBe(false);
+    expect(bus.processItemsAreRoutingOnly([{ type: 'progress', text: 'x' }])).toBe(false);
+    expect(bus.processItemsAreRoutingOnly([])).toBe(false);
   });
 });

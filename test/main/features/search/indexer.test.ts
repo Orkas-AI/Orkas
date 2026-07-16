@@ -43,10 +43,26 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
   fs.writeFileSync(file, messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
 }
 
+async function waitForSearchDoc(
+  ix: Awaited<ReturnType<typeof loadIndexer>>,
+  docId: string,
+  token: string,
+  timeoutMs = 1000,
+): Promise<void> {
+  const paths = await import('../../../../src/main/paths');
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const entry = await ix.getEntry(paths.userChatsIndexPath(TEST_UID), 'chat');
+    if (entry.idx.docs[docId] && entry.idx.postings[token]) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${docId} in chat search index`);
+}
+
 describe('search/indexer › reconcileContextsIndex', () => {
   it('returns silently when CONTEXTS_DIR is missing', async () => {
     const ix = await loadIndexer();
-    await expect(ix.reconcileContextsIndex()).resolves.toBeUndefined();
+    await expect(ix.reconcileContextsIndex()).resolves.toEqual({ scanned: 0, updated: 0, deleted: 0 });
   });
 
   it('indexes files by relPath (directory + filename), not body content', async () => {
@@ -125,12 +141,28 @@ describe('search/indexer › reconcileContextsIndex', () => {
     const entry = await ix.getEntry(paths.userContextsIndexPath(TEST_UID), 'context');
     expect(Object.keys(entry.idx.files)).toEqual(['visible.md']);
   });
+
+  it('does not delete context docs from a cancelled partial scan', async () => {
+    writeContext('a.md', '# A');
+    writeContext('b.md', '# B');
+    const ix = await loadIndexer();
+    await ix.reconcileContextsIndex();
+    fs.rmSync(path.join(tmpDir, TEST_UID, 'cloud', 'contexts', 'b.md'));
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await ix.reconcileContextsIndex(TEST_UID, controller.signal);
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userContextsIndexPath(TEST_UID), 'context');
+    expect(result.cancelled).toBe(true);
+    expect(entry.idx.docs['b.md']).toBeDefined();
+  });
 });
 
 describe('search/indexer › reconcileChatsIndex', () => {
   it('returns silently when user has no chats dir', async () => {
     const ix = await loadIndexer();
-    await expect(ix.reconcileChatsIndex('u1')).resolves.toBeUndefined();
+    await expect(ix.reconcileChatsIndex('u1')).resolves.toEqual({ scanned: 0, updated: 0, deleted: 0 });
   });
 
   it('indexes each jsonl message as a separate doc', async () => {
@@ -147,6 +179,21 @@ describe('search/indexer › reconcileChatsIndex', () => {
     expect(entry.idx.postings['foobar'].length).toBe(2);  // two docs contain it
   });
 
+  it('uses the compact conversation catalog to validate a reconciled snapshot', async () => {
+    writeChat('u1', 'c1', [{ role: 'user', content: 'catalog marker', time: 't' }]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+
+    // Normal app writes and sync pulls update the aggregate index. That
+    // lightweight change must make the query path choose a full reconcile.
+    fs.writeFileSync(path.join(tmpDir, 'u1', 'cloud', 'chats', '_index.json'), JSON.stringify([
+      { conversation_id: 'c1', title: 'renamed by sync' },
+    ]));
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(false);
+  });
+
   it('skips messages with empty or non-string content', async () => {
     writeChat('u1', 'c1', [
       { role: 'user', content: '', time: 't1' },
@@ -159,6 +206,22 @@ describe('search/indexer › reconcileChatsIndex', () => {
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(Object.keys(entry.idx.docs)).toEqual(['chat:c1:2']);
   });
+
+  it('does not delete chat docs from a cancelled partial scan', async () => {
+    writeChat('u1', 'c1', [{ role: 'user', content: 'one', time: 't' }]);
+    writeChat('u1', 'c2', [{ role: 'user', content: 'two', time: 't' }]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    fs.rmSync(path.join(tmpDir, 'u1', 'cloud', 'chats', 'c2.jsonl'));
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await ix.reconcileChatsIndex('u1', controller.signal);
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    expect(result.cancelled).toBe(true);
+    expect(entry.idx.docs['chat:c2:0']).toBeDefined();
+  });
 });
 
 describe('search/indexer › indexChatMessage (hot path)', () => {
@@ -170,8 +233,8 @@ describe('search/indexer › indexChatMessage (hot path)', () => {
     // Append index 1 directly — simulates the chats.appendMessage hook
     ix.indexChatMessage('u1', 'c1', 1, { role: 'assistant', content: 'fresh keyword', time: 't2' });
 
-    // Work is scheduled asynchronously; give the promise chain a tick
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Work is scheduled asynchronously; wait for the actual index mutation.
+    await waitForSearchDoc(ix, 'chat:c1:1', 'fresh');
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.docs['chat:c1:1']).toBeDefined();
@@ -219,7 +282,7 @@ describe('search/indexer › chat message shapes (legacy + group-chat)', () => {
     ix.indexChatMessage('u1', 'c1', 0, {
       from: 'user', ts: 't', text: 'fresh group message',
     } as any);
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await waitForSearchDoc(ix, 'chat:c1:0', 'fresh');
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: 't' });

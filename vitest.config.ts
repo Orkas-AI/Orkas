@@ -26,5 +26,27 @@ export default defineConfig({
     maxWorkers: testWorkers,
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'json-summary'],
+      reportsDirectory: './coverage',
+      include: [
+        'src/main/**/*.{ts,js}',
+        'src/core-agent/src/**/*.ts',
+      ],
+      exclude: [
+        '**/*.d.ts',
+        'src/main/index.ts',
+        'src/main/smoke.ts',
+        'src/core-agent/src/demo.ts',
+        'src/core-agent/src/main.ts',
+      ],
+      thresholds: {
+        lines: 61,
+        functions: 62,
+        statements: 58,
+        branches: 52,
+      },
+    },
   },
 });

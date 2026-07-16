@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as vm from 'node:vm';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+const styleSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
 
 function extractFunction(name: string): string {
   const marker = `function ${name}`;
@@ -26,35 +27,6 @@ function extractFunction(name: string): string {
 function loadFailedClassifier(): (raw: string, message?: Record<string, unknown> | null) => boolean {
   const fnSource = extractFunction('_isFailedAssistantContent');
   return vm.runInNewContext(`(${fnSource})`, {});
-}
-
-function loadFeedbackBuilder(): (details: Record<string, unknown>, max?: number) => string {
-  const source = [
-    extractFunction('_normalizeFeedbackFieldText'),
-    extractFunction('_tailFeedbackText'),
-    extractFunction('_buildFailedAssistantFeedbackContent'),
-  ].join('\n');
-  return vm.runInNewContext(`${source}\n_buildFailedAssistantFeedbackContent;`, {});
-}
-
-function loadFeedbackSubmitDisplayMessage(): (raw: string) => string {
-  const source = [
-    extractFunction('_normalizeFeedbackFieldText'),
-    extractFunction('_isInternalFeedbackSubmitError'),
-    extractFunction('_feedbackSubmitDisplayMessage'),
-  ].join('\n');
-  return vm.runInNewContext(`
-    function t(key) {
-      const table = {
-        'chat.report_login_required': 'Please sign in before sending feedback.',
-        'chat.report_login_required': 'Please sign in before sending feedback.',
-        'chat.report_failed': 'Feedback failed.',
-      };
-      return table[key] || key;
-    }
-    ${source}
-    _feedbackSubmitDisplayMessage;
-  `, {});
 }
 
 function loadModelOutputTracker() {
@@ -84,6 +56,11 @@ describe('conversation failed assistant retry actions', () => {
     expect(isFailed('普通回复，没有失败状态')).toBe(false);
   });
 
+  it('uses the standard bubble action colors for retry', () => {
+    expect(styleSource).not.toMatch(/\.bubble-retry-btn\s*\{/);
+    expect(source).toContain("retryBtn.className = 'bubble-action-btn bubble-retry-btn';");
+  });
+
   it('routes live placeholder failures through retry actions instead of archive actions', () => {
     const finalizeBody = extractFunction('_finalizeActorPlaceholder');
 
@@ -95,37 +72,10 @@ describe('conversation failed assistant retry actions', () => {
     expect(failedActionsBody).toContain("msgDiv.dataset.failed = '1';");
     expect(failedActionsBody).toContain('archive: false');
     expect(failedActionsBody).toContain('retry: true');
-    expect(failedActionsBody).toContain('report: true');
-  });
-
-  it('uses only the last 300 characters of failed-reply feedback text', () => {
-    const build = loadFeedbackBuilder();
-    const replyText = 'All validation passed before the final confirmation step. '.repeat(20);
-    const errorText = 'Send failed: Run aborted while checking the generated file.';
-    const content = build({
-      cid: 'gconv-test',
-      actor: 'OfficeWriter',
-      msgId: 'm123',
-      errorText,
-      replyText,
-    }, 300);
-    const expected = `${replyText.trim()}\n${errorText}`.slice(-300);
-
-    expect(content).toHaveLength(300);
-    expect(content).toBe(expected);
-    expect(content).not.toContain('Conversation: gconv-test');
-    expect(content).toContain('Run aborted');
-  });
-
-  it('hides internal feedback submit transport errors from user-facing copy', () => {
-    const display = loadFeedbackSubmitDisplayMessage();
-
-    expect(display('account:/pms/feedback/submit timed out after 60s'))
-      .toBe('chat.unknown_error');
-    expect(display('HTTP 502')).toBe('chat.unknown_error');
-    expect(display('Please sign in before sending feedback.'))
-      .toBe('Please sign in before sending feedback.');
-    expect(display('Your feedback text is too long.')).toBe('Your feedback text is too long.');
+    expect(failedActionsBody).not.toContain('report: true');
+    expect(source).toContain("const mode = includeRetry ? 'failed'");
+    expect(source).toContain('class="chat-bubble-more-wrap"');
+    expect(source).toContain('_attachBubbleRetryBtn(directActions, msgDiv)');
   });
 
   it('does not send model output error telemetry in the open build', () => {

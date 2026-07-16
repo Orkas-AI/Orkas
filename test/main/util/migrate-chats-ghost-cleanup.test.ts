@@ -20,6 +20,13 @@ function migrationsFile(): string {
   return path.join(tmpDir, TEST_UID, 'local', '.migrations');
 }
 
+const GHOST_MIGRATION_TAG = 'chats-index-ghost-tombstones-v2';
+
+function migrationTags(): string[] {
+  if (!fs.existsSync(migrationsFile())) return [];
+  return fs.readFileSync(migrationsFile(), 'utf8').split('\n').filter(Boolean);
+}
+
 function writeIndex(rows: unknown[]): void {
   fs.mkdirSync(chatsDir(), { recursive: true });
   fs.writeFileSync(indexFile(), JSON.stringify(rows, null, 2));
@@ -43,7 +50,9 @@ describe('migrate-chats-ghost-cleanup', () => {
     const stats = migrateChatsGhostCleanup(TEST_UID, Date.parse('2026-05-29T00:00:00Z'));
 
     expect(stats.tombstoned).toBe(0);
-    expect(fs.existsSync(migrationsFile())).toBe(false);
+    // Project-root discovery may stamp its own layout migration. The ghost
+    // cleanup itself must remain unstamped so a later cloud index can run it.
+    expect(migrationTags()).not.toContain(GHOST_MIGRATION_TAG);
   });
 
   it('turns stale index rows with missing jsonl into sync tombstones', async () => {
@@ -73,7 +82,7 @@ describe('migrate-chats-ghost-cleanup', () => {
     expect(gone.deleted_at).toBeTruthy();
     expect(gone.updated_at).toBe(gone.deleted_at);
     expect(alive.deleted_at).toBeUndefined();
-    expect(fs.readFileSync(migrationsFile(), 'utf8')).toContain('chats-index-ghost-tombstones-v1');
+    expect(migrationTags()).toContain(GHOST_MIGRATION_TAG);
   });
 
   it('skips recent missing rows so a partial pull does not self-delete a fresh conversation', async () => {

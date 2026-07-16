@@ -5,6 +5,11 @@ const electronMock = vi.hoisted(() => ({
 }));
 
 vi.mock('electron', () => ({
+  app: {
+    isPackaged: false,
+    getVersion: () => '1.5.1',
+    getAppPath: () => process.cwd(),
+  },
   shell: { openExternal: electronMock.openExternal },
 }));
 
@@ -272,21 +277,6 @@ describe('features/connectors/oauth-dcr', () => {
           scope: 'data.records:read',
         });
       }
-      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-store') {
-        const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.provider).toBe('airtable');
-        expect(body.dcr_client.token_endpoint_auth_method).toBe('client_secret_basic');
-        return jsonResponse({
-          code: 0,
-          access_token: 'airtable-access-server',
-          refresh_token: null,
-          grant_id: 'airtable-grant-1',
-          server_managed: true,
-          expires_in: 3600,
-          token_type: 'Bearer',
-          scope: 'data.records:read',
-        });
-      }
       throw new Error(`unexpected fetch ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -300,7 +290,17 @@ describe('features/connectors/oauth-dcr', () => {
 
     await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1');
     const result = await pending;
-    expect(result.grant.server_grant_id).toBe('airtable-grant-1');
+    expect(result.grant).toMatchObject({
+      access_token: 'airtable-access-local',
+      refresh_token: 'airtable-refresh-local',
+      scopes: ['data.records:read'],
+    });
+    expect(result.client).toMatchObject({
+      client_id: 'airtable-client-1',
+      client_secret: 'airtable-secret-1',
+      token_endpoint_auth_method: 'client_secret_basic',
+    });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/dcr-store'))).toBe(false);
   });
 
   it('rejects a DCR callback with mismatched state before calling the provider token endpoint', async () => {
@@ -344,7 +344,7 @@ describe('features/connectors/oauth-dcr', () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://auth.notion.example/token')).toBe(false);
   });
 
-  it('stores a completed DCR grant on Server and returns only a server grant handle', async () => {
+  it('keeps a completed DCR grant and client credentials local', async () => {
     let openedState = '';
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (String(url).endsWith('/mcp/.well-known/oauth-protected-resource')) {
@@ -378,24 +378,6 @@ describe('features/connectors/oauth-dcr', () => {
           scope: 'read write',
         });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-store') {
-        const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.provider).toBe('notion');
-        expect(body.refresh_token).toBe('refresh-local');
-        expect(body.dcr_client.client_id).toBe('client-1');
-        expect(body.dcr_client.client_secret).toBe('secret-1');
-        expect((init?.headers as Record<string, string>).user_id).toBe('uid-1');
-        return jsonResponse({
-          code: 0,
-          access_token: 'access-server',
-          refresh_token: null,
-          grant_id: 'grant-1',
-          server_managed: true,
-          expires_in: 3600,
-          token_type: 'Bearer',
-          scope: 'read write',
-        });
-      }
       throw new Error(`unexpected fetch ${url}`);
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -411,12 +393,12 @@ describe('features/connectors/oauth-dcr', () => {
     const result = await pending;
 
     expect(result.grant).toMatchObject({
-      access_token: 'access-server',
-      refresh_token: null,
-      server_managed: true,
-      server_grant_id: 'grant-1',
+      access_token: 'access-local',
+      refresh_token: 'refresh-local',
       scopes: ['read', 'write'],
     });
+    expect(result.client).toMatchObject({ client_id: 'client-1', client_secret: 'secret-1' });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/dcr-store'))).toBe(false);
   });
 
   it('uses the first resource when protected-resource metadata returns a resource array', async () => {
@@ -510,22 +492,14 @@ describe('features/connectors/oauth-dcr', () => {
     expect(next.expires_at).toBeGreaterThan(Date.now());
   });
 
-  it('retries and refreshes server-managed DCR grants by grant_id', async () => {
+  it('force refreshes a still-unexpired local DCR grant directly at the provider', async () => {
     const fetchMock = vi.fn(async (url: string, init: RequestInit) => {
-      if (fetchMock.mock.calls.length === 1) {
-        throw new TypeError('fetch failed');
-      }
-      expect(String(url)).toBe('https://account.example/api/connectors/oauth/refresh');
-      const body = JSON.parse(String(init.body));
-      expect(body.provider).toBe('notion');
-      expect(body.grant_id).toBe('grant-1');
-      expect(body.refresh_token).toBeUndefined();
+      expect(String(url)).toBe('https://auth.notion.example/token');
+      const body = new URLSearchParams(String(init.body));
+      expect(body.get('refresh_token')).toBe('old-refresh');
       return jsonResponse({
-        code: 0,
         access_token: 'new-access',
-        refresh_token: null,
-        grant_id: 'grant-1',
-        server_managed: true,
+        refresh_token: 'new-refresh',
         expires_in: 3600,
         token_type: 'Bearer',
         scope: 'read write',
@@ -533,24 +507,25 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { refreshDcrServerManaged } = await import('../../../../src/main/features/connectors/oauth-dcr');
-    const next = await refreshDcrServerManaged('notion', {
+    const { refreshDcrIfStale } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const next = await refreshDcrIfStale({
+      client_id: 'client-1',
+      client_secret: 'secret-1',
+      authorization_endpoint: 'https://auth.notion.example/authorize',
+      token_endpoint: 'https://auth.notion.example/token',
+    }, {
       access_token: 'old-access',
-      refresh_token: null,
-      server_grant_id: 'grant-1',
-      server_managed: true,
-      expires_at: Date.now() - 1,
+      refresh_token: 'old-refresh',
+      expires_at: Date.now() + 60 * 60 * 1000,
       scopes: ['old'],
       token_type: 'Bearer',
-    });
+    }, { force: true });
 
     expect(next).toMatchObject({
       access_token: 'new-access',
-      refresh_token: null,
-      server_managed: true,
-      server_grant_id: 'grant-1',
+      refresh_token: 'new-refresh',
       scopes: ['read', 'write'],
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

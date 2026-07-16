@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 let tmpDir: string;
 const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
 
@@ -45,7 +47,7 @@ function writeAgentMarketplaceSkill(agentId: string, dirId: string, displayName:
 
 function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
   const pcRoot = process.cwd();
-  return spawnSync(process.execPath, [
+  return spawnSync(TEST_NODE, [
     path.join(pcRoot, 'bin', 'run-skill.cjs'),
     skillRef,
     scriptBase,

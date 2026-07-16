@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { trustedIpcSender } from '../../helpers/trusted-ipc-sender';
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
@@ -59,7 +60,7 @@ async function invoke(channel: string, payload: any): Promise<any> {
   const call = electron.ipcMain.handle.mock.calls.find(([name]: [string]) => name === 'orkas.invoke');
   expect(call).toBeTruthy();
   const handler = call[1];
-  return handler({ sender: {} }, { channel, payload });
+  return handler({ sender: trustedIpcSender() }, { channel, payload });
 }
 
 describe('contexts.pickAndUpload', () => {

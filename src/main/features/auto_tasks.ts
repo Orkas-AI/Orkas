@@ -1,14 +1,15 @@
 /**
  * Auto tasks — sidebar "Automation" tab feature.
  *
- * Each task is a self-contained directory at
- *   `<uid>/cloud/auto_tasks/<task_id>/`
+ * Each task is a self-contained directory at either
+ *   `<uid>/cloud/auto_tasks/<task_id>/` (global) or
+ *   `<uid>/cloud/projects/<pid>/auto_tasks/<task_id>/` (project-scoped),
  * holding `config.json` (spec) + `attachments/<filename>` (per-task files
  * pre-staged by the user). Deletion is `rm -rf <task_id>/`; cloud sync
  * ships only the bytes that changed (no global file bottleneck).
  *
  * Fire path: `chats.createConversation({projectId})` → copy attachments
- * into the new conv's `chat_attachments/<cid>/` → `groupChat.send({text,
+ * into the new conv's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
  * attachments})`. Same single-dispatch bus entry as a manual send (per
  * PC/CLAUDE.md §5).
  *
@@ -22,15 +23,13 @@
  * `startScheduler()` after `activateUser()`. Missed boundaries while the
  * app was closed do NOT back-fire.
  *
- * Fire-time seed text composition (mirrors the commander composer's
- * chip → text chain in `transformWithChatUse` + `applyRecipientPrefix`):
- *   content
- *     wrap with `skills.use_prefix` (if task.skill set)
- *       wrap with `connectors.use_prefix` (if task.connector set)
- *         prepend `@<agent.name> ` (if recipient.kind === 'agent')
+ * Fire-time seed text composition mirrors the commander composer:
+ *   - new UI tasks render ordered `message_parts` into localized inline text;
+ *   - legacy tasks wrap clean `content` with their single skill / connector;
+ *   - agent recipients still prepend `@<agent.name> ` after either path.
  *
- * Content is stored clean (no `@` tokens) — chip refs are the source of
- * truth for routing.
+ * Content is stored clean (no renderer token metadata). `message_parts` is
+ * plain JSON so multiple resource chips retain their original positions.
  */
 
 import * as crypto from 'node:crypto';
@@ -38,15 +37,18 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
-  userAutoTasksDir,
   userLocalRoot,
-  autoTaskDir,
-  autoTaskConfigFile,
-  autoTaskAttachmentsDir,
-  chatAttachmentDir,
   projectMetaFile,
   projectBindingsFile,
 } from '../paths';
+import {
+  autoTaskLocationForTask,
+  chatAttachmentDirForConversation,
+  cloudRelForAbs,
+  findAutoTaskLocation,
+  globalAutoTaskLocation,
+  listAutoTaskLocations,
+} from '../util/project-layout';
 import { readJson, writeJson, nowIso, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { t as translate } from '../i18n';
@@ -62,6 +64,7 @@ const log = createLogger('auto-tasks');
 
 const SCHEMA_VERSION = 2;
 const MAX_CONTENT_LEN = 8000;
+const MAX_MESSAGE_PARTS = 256;
 // Per-user task cap — every tick scans + reads each task's config.json, so a
 // runaway count can't be allowed to push a tick past TICK_MS.
 const MAX_TASKS_PER_USER = 200;
@@ -79,6 +82,9 @@ export type TaskRecipient =
 
 export type TaskSkillRef = { id: string; name: string };
 export type TaskConnectorRef = { id: string; name: string };
+export type TaskMessagePart =
+  | { type: 'text'; text: string }
+  | { type: 'use'; kind: 'skill' | 'connector'; id: string; name: string };
 
 export interface AutoTask {
   id: string;
@@ -86,6 +92,9 @@ export interface AutoTask {
   title?: string;
   content: string;                       // clean text, NO @ tokens
   recipient?: TaskRecipient;
+  /** Ordered composer content for tasks created by inline-chip aware clients.
+   *  Legacy `skill` / `connector` remain as first-ref fallbacks for old clients. */
+  message_parts?: TaskMessagePart[];
   skill?: TaskSkillRef;
   connector?: TaskConnectorRef;
   project_id?: string;
@@ -158,12 +167,47 @@ function _isValidRef(r: any): r is { id: string; name: string } {
     && typeof r.name === 'string' && r.name;
 }
 
+function _normaliseMessageParts(value: unknown): TaskMessagePart[] | null {
+  if (!Array.isArray(value) || !value.length || value.length > MAX_MESSAGE_PARTS) return null;
+  const out: TaskMessagePart[] = [];
+  let textLength = 0;
+  let hasUse = false;
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') return null;
+    if ((raw as any).type === 'text') {
+      const text = (raw as any).text;
+      if (typeof text !== 'string' || !text.length) return null;
+      textLength += text.length;
+      if (textLength > MAX_CONTENT_LEN) return null;
+      out.push({ type: 'text', text });
+      continue;
+    }
+    if ((raw as any).type !== 'use') return null;
+    const kind = (raw as any).kind;
+    if (kind !== 'skill' && kind !== 'connector') return null;
+    if (!_isValidRef(raw)) return null;
+    out.push({ type: 'use', kind, id: (raw as any).id, name: (raw as any).name });
+    hasUse = true;
+  }
+  return hasUse ? out : null;
+}
+
+function _contentFromMessageParts(parts: TaskMessagePart[]): string {
+  return parts
+    .filter((part): part is Extract<TaskMessagePart, { type: 'text' }> => part.type === 'text')
+    .map((part) => part.text)
+    .join('')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
 function _isValidTaskShape(t: any): t is AutoTask {
   if (!t || typeof t !== 'object') return false;
   if (!_isValidTaskId(t.id)) return false;
   if (typeof t.content !== 'string') return false;
   if (typeof t.enabled !== 'boolean') return false;
   if (!_isValidSchedule(t.schedule)) return false;
+  if (t.message_parts !== undefined && !_normaliseMessageParts(t.message_parts)) return false;
   if (t.attachments !== undefined) {
     if (!Array.isArray(t.attachments)) return false;
     if (t.attachments.some((n: any) => typeof n !== 'string' || !n)) return false;
@@ -176,9 +220,15 @@ function _isValidTaskShape(t: any): t is AutoTask {
 const _tails = new Map<string, Promise<unknown>>();
 type SyncDirtyNotifier = (domain: string, relPath: string) => void;
 let _syncDirtyNotifierForTest: SyncDirtyNotifier | null = null;
+type SyncDeletedNotifier = (relPath: string) => void;
+let _syncDeletedNotifierForTest: SyncDeletedNotifier | null = null;
 
 export function _setSyncDirtyNotifierForTest(fn: SyncDirtyNotifier | null): void {
   _syncDirtyNotifierForTest = fn;
+}
+
+export function _setSyncDeletedNotifierForTest(fn: SyncDeletedNotifier | null): void {
+  _syncDeletedNotifierForTest = fn;
 }
 
 function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
@@ -189,12 +239,14 @@ function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
 }
 
 async function _readOne(uid: string, taskId: string): Promise<AutoTask | null> {
-  const cfg = autoTaskConfigFile(uid, taskId);
+  const loc = findAutoTaskLocation(uid, taskId);
+  const cfg = loc?.configFile || globalAutoTaskLocation(uid, taskId).configFile;
   if (!fs.existsSync(cfg)) return null;
   try {
     const raw: any = await readJson(cfg);
     if (!raw || typeof raw !== 'object') return null;
     if (!_isValidTaskShape(raw)) return null;
+    if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
     return raw;
   } catch (err) {
     log.warn(`read failed uid=${uid} id=${taskId}: ${(err as Error).message}`);
@@ -203,10 +255,48 @@ async function _readOne(uid: string, taskId: string): Promise<AutoTask | null> {
 }
 
 async function _writeOne(uid: string, task: AutoTask): Promise<void> {
-  const dir = autoTaskDir(uid, task.id);
-  fs.mkdirSync(dir, { recursive: true });
-  await writeJson(autoTaskConfigFile(uid, task.id), task);
-  _notifyDirty(`cloud/auto_tasks/${task.id}/config.json`);
+  const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
+  const existing = findAutoTaskLocation(uid, task.id);
+  const globalDraft = globalAutoTaskLocation(uid, task.id);
+  // Attachments may be uploaded before config.json exists. Such drafts live
+  // in the global task directory because project membership is only known on
+  // submit; adopt that config-less directory when creating a project task.
+  const prev = existing || (
+    loc.projectId
+    && loc.dir !== globalDraft.dir
+    && fs.existsSync(globalDraft.dir)
+    ? globalDraft
+    : null
+  );
+  if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
+    const prevRelPaths = _relFilesUnder(uid, prev.dir, prev.configRelPath);
+    fs.mkdirSync(path.dirname(loc.dir), { recursive: true });
+    if (!fs.existsSync(loc.dir)) {
+      try { fs.renameSync(prev.dir, loc.dir); }
+      catch {
+        fs.cpSync(prev.dir, loc.dir, { recursive: true });
+        fs.rmSync(prev.dir, { recursive: true, force: true });
+      }
+    } else {
+      const srcAtt = prev.attachmentsDir;
+      const dstAtt = loc.attachmentsDir;
+      if (fs.existsSync(srcAtt)) {
+        fs.mkdirSync(dstAtt, { recursive: true });
+        for (const name of fs.readdirSync(srcAtt)) {
+          const src = path.join(srcAtt, name);
+          const dst = path.join(dstAtt, name);
+          if (fs.existsSync(dst)) continue;
+          try { fs.renameSync(src, dst); }
+          catch { try { fs.copyFileSync(src, dst); fs.unlinkSync(src); } catch { /* best effort */ } }
+        }
+      }
+      fs.rmSync(prev.dir, { recursive: true, force: true });
+    }
+    for (const relPath of prevRelPaths) _notifyDeleted(relPath);
+  }
+  fs.mkdirSync(loc.dir, { recursive: true });
+  await writeJson(loc.configFile, task);
+  _notifyDirty(loc.configRelPath);
 }
 
 // Sync engine dirty signal (lazy-require: `features/sync` is stripped from
@@ -224,23 +314,34 @@ function _notifyDirty(relPath: string): void {
   } catch { /* features/sync stripped */ }
 }
 
-async function _readAll(uid: string): Promise<AutoTask[]> {
-  const root = userAutoTasksDir(uid);
-  if (!fs.existsSync(root)) return [];
-  let entries: string[];
-  try { entries = fs.readdirSync(root); }
-  catch (err) {
-    log.warn(`readdir failed uid=${uid}: ${(err as Error).message}`);
-    return [];
+function _notifyDeleted(relPath: string): void {
+  if (_syncDeletedNotifierForTest) {
+    _syncDeletedNotifierForTest(relPath);
   }
+}
+
+function _relFilesUnder(uid: string, dir: string, fallback: string): string[] {
+  if (!fs.existsSync(dir)) return [fallback];
+  const out: string[] = [];
+  const walk = (absDir: string) => {
+    let entries: fs.Dirent[] = [];
+    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      const abs = path.join(absDir, entry.name);
+      if (entry.isDirectory()) walk(abs);
+      else if (entry.isFile()) out.push(cloudRelForAbs(uid, abs));
+    }
+  };
+  walk(dir);
+  return out.length ? out : [fallback];
+}
+
+async function _readAll(uid: string): Promise<AutoTask[]> {
   const out: AutoTask[] = [];
-  for (const name of entries) {
-    if (!_isValidTaskId(name)) continue;
-    const sub = autoTaskDir(uid, name);
-    let st: fs.Stats;
-    try { st = fs.statSync(sub); } catch { continue; }
-    if (!st.isDirectory()) continue;
-    const task = await _readOne(uid, name);
+  for (const loc of listAutoTaskLocations(uid)) {
+    if (!_isValidTaskId(loc.taskId)) continue;
+    const task = await _readOne(uid, loc.taskId);
     if (task) out.push(task);
   }
   // Newest-first by created_at — a brand-new task lands at the top so the
@@ -259,6 +360,7 @@ export type TaskDraft = {
   title?: string;
   enabled?: boolean;
   recipient?: TaskRecipient;
+  message_parts?: TaskMessagePart[] | null;
   skill?: TaskSkillRef;
   connector?: TaskConnectorRef;
   project_id?: string | null;
@@ -272,6 +374,7 @@ export type TaskError =
   | 'invalid_schedule'
   | 'invalid_content'
   | 'invalid_recipient'
+  | 'invalid_message_parts'
   | 'invalid_skill'
   | 'invalid_connector'
   | 'invalid_project'
@@ -283,7 +386,15 @@ type NormalisedFields = Omit<AutoTask, 'id' | 'created_at' | 'updated_at' | 'las
 
 function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } | { ok: false; error: TaskError } {
   if (!_isValidSchedule(d.schedule)) return { ok: false, error: 'invalid_schedule' };
-  let content = typeof d.content === 'string' ? d.content.trim() : '';
+  let messageParts: TaskMessagePart[] | undefined;
+  if (d.message_parts !== undefined && d.message_parts !== null) {
+    const normalised = _normaliseMessageParts(d.message_parts);
+    if (!normalised) return { ok: false, error: 'invalid_message_parts' };
+    messageParts = normalised;
+  }
+  let content = messageParts
+    ? _contentFromMessageParts(messageParts)
+    : (typeof d.content === 'string' ? d.content.trim() : '');
   if (!content) return { ok: false, error: 'invalid_content' };
   if (content.length > MAX_CONTENT_LEN) content = content.slice(0, MAX_CONTENT_LEN);
   let title = typeof d.title === 'string' ? d.title.trim() : '';
@@ -315,6 +426,7 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
       enabled,
       content,
       schedule: d.schedule,
+      ...(messageParts ? { message_parts: messageParts } : {}),
       ...(title ? { title } : {}),
       ...(recipient ? { recipient } : {}),
       ...(skill ? { skill } : {}),
@@ -401,12 +513,21 @@ export async function updateTask(
   return _runExclusive(uid, async () => {
     const cur = await _readOne(uid, taskId);
     if (!cur) return { ok: false as const, error: 'not_found' as const };
+    const legacyMessageChanged = patch.content !== undefined
+      || patch.skill !== undefined
+      || patch.connector !== undefined;
+    const messageParts = patch.message_parts === null
+      ? undefined
+      : (patch.message_parts !== undefined
+          ? patch.message_parts
+          : (legacyMessageChanged ? undefined : cur.message_parts));
     const merged: TaskDraft = {
       schedule: patch.schedule ? patch.schedule : cur.schedule,
       content: typeof patch.content === 'string' ? patch.content : cur.content,
       title: typeof patch.title === 'string' ? patch.title : cur.title,
       enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
       recipient: patch.recipient !== undefined ? patch.recipient : cur.recipient,
+      message_parts: messageParts,
       // Explicit `null` in the patch clears the field; `undefined` keeps
       // the current value. Mirrors the chip close-button on the renderer.
       skill: patch.skill === null ? undefined : (patch.skill !== undefined ? patch.skill : cur.skill),
@@ -429,6 +550,7 @@ export async function updateTask(
     // Strip optional fields when they normalised away.
     if (!norm.fields.title) delete next.title;
     if (!norm.fields.recipient) delete next.recipient;
+    if (!norm.fields.message_parts) delete next.message_parts;
     if (!norm.fields.skill) delete next.skill;
     if (!norm.fields.connector) delete next.connector;
     if (!norm.fields.project_id) delete next.project_id;
@@ -443,11 +565,12 @@ export async function updateTask(
 export async function deleteTask(uid: string, taskId: string): Promise<{ ok: boolean }> {
   if (!_isValidTaskId(taskId)) return { ok: false };
   return _runExclusive(uid, async () => {
-    const dir = autoTaskDir(uid, taskId);
-    if (!fs.existsSync(dir)) return { ok: false };
+    const loc = findAutoTaskLocation(uid, taskId);
+    if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
+    const relPaths = _relFilesUnder(uid, loc.dir, loc.configRelPath);
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
-      _notifyDirty(`cloud/auto_tasks/${taskId}/config.json`);
+      fs.rmSync(loc.dir, { recursive: true, force: true });
+      for (const relPath of relPaths) _notifyDeleted(relPath);
       log.info(`task deleted uid=${uid} id=${taskId}`);
       _cancelTimer(taskId);
       return { ok: true };
@@ -688,8 +811,9 @@ async function _stageContainerAttachments(
     ? container.updates.attachments.map((name) => _sanitiseFilename(name)).filter((name) => !!name)
     : [];
   if (!names.length || !opts.sourceAttachmentCid) return;
-  const srcDir = chatAttachmentDir(uid, opts.sourceAttachmentCid);
-  const destDir = autoTaskAttachmentsDir(uid, taskId);
+  const srcDir = chatAttachmentDirForConversation(uid, opts.sourceAttachmentCid);
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const destDir = loc.attachmentsDir;
   if (!fs.existsSync(srcDir)) return;
   try { fs.mkdirSync(destDir, { recursive: true }); } catch { return; }
   for (const name of names) {
@@ -697,7 +821,7 @@ async function _stageContainerAttachments(
     if (!fs.existsSync(src)) continue;
     try {
       fs.copyFileSync(src, path.join(destDir, name));
-      _notifyDirty(`cloud/auto_tasks/${taskId}/attachments/${name}`);
+      _notifyDirty(`${loc.attachmentsRelBase}/${name}`);
     } catch (err) {
       log.warn(`container attachment stage failed uid=${uid} id=${taskId} name=${name}: ${(err as Error).message}`);
     }
@@ -722,7 +846,7 @@ async function _markRan(uid: string, taskId: string, atIso: string, alsoDisable:
 
 export async function listAttachments(uid: string, taskId: string): Promise<string[]> {
   if (!_isValidTaskId(taskId)) return [];
-  const dir = autoTaskAttachmentsDir(uid, taskId);
+  const dir = (findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId)).attachmentsDir;
   if (!fs.existsSync(dir)) return [];
   try {
     return fs.readdirSync(dir).filter((n) => {
@@ -741,11 +865,12 @@ export async function uploadAttachment(
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_task_id' };
   const safe = _sanitiseFilename(name);
   if (!safe) return { ok: false, error: 'invalid_name' };
-  const dir = autoTaskAttachmentsDir(uid, taskId);
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const dir = loc.attachmentsDir;
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, safe), buf);
-    _notifyDirty(`cloud/auto_tasks/${taskId}/attachments/${safe}`);
+    _notifyDirty(`${loc.attachmentsRelBase}/${safe}`);
     log.info(`attachment uploaded uid=${uid} id=${taskId} name=${safe} bytes=${buf.length}`);
     return { ok: true, name: safe };
   } catch (err) {
@@ -758,10 +883,11 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
   if (!_isValidTaskId(taskId)) return { ok: false };
   const safe = _sanitiseFilename(name);
   if (!safe) return { ok: false };
-  const target = path.join(autoTaskAttachmentsDir(uid, taskId), safe);
+  const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  const target = path.join(loc.attachmentsDir, safe);
   try {
     if (fs.existsSync(target)) fs.unlinkSync(target);
-    _notifyDirty(`cloud/auto_tasks/${taskId}/attachments/${safe}`);
+    _notifyDeleted(`${loc.attachmentsRelBase}/${safe}`);
     return { ok: true };
   } catch (err) {
     log.warn(`attachment delete failed uid=${uid} id=${taskId} name=${safe}: ${(err as Error).message}`);
@@ -872,25 +998,50 @@ function _formatSeedPrefix(
   return translated === key ? fallback : translated;
 }
 
+function _messagePartsSeedText(parts: TaskMessagePart[]): string {
+  return parts.map((part) => {
+    if (part.type === 'text') return part.text;
+    if (part.kind === 'connector') {
+      return _formatSeedPrefix(
+        'connectors.inline_text',
+        { connector: part.name },
+        `${part.name} connector`,
+      );
+    }
+    return _formatSeedPrefix(
+      'skills.inline_text',
+      { skill: part.name },
+      `${part.name} skill`,
+    );
+  }).join('').trim();
+}
+
 /** Compose the seed message dispatched on fire. Mirrors the commander
  *  composer's chip → text chain (transformWithChatUse + applyRecipientPrefix). */
 function _buildSeedText(task: AutoTask): string {
-  let text = (task.content || '').trim();
-  if (task.skill && task.skill.name) {
-    const name = task.skill.name;
-    text = _formatSeedPrefix(
-      'skills.use_prefix',
-      { skill: name, content: text },
-      `Use ${name} skill: ${text}`,
-    );
-  }
-  if (task.connector && task.connector.name) {
-    const name = task.connector.name;
-    text = _formatSeedPrefix(
-      'connectors.use_prefix',
-      { connector: name, content: text },
-      `Use ${name} connector: ${text}`,
-    );
+  const messageParts = task.message_parts
+    ? _normaliseMessageParts(task.message_parts)
+    : null;
+  let text = messageParts
+    ? _messagePartsSeedText(messageParts)
+    : (task.content || '').trim();
+  if (!messageParts) {
+    if (task.skill && task.skill.name) {
+      const name = task.skill.name;
+      text = _formatSeedPrefix(
+        'skills.use_prefix',
+        { skill: name, content: text },
+        `Use ${name} skill: ${text}`,
+      );
+    }
+    if (task.connector && task.connector.name) {
+      const name = task.connector.name;
+      text = _formatSeedPrefix(
+        'connectors.use_prefix',
+        { connector: name, content: text },
+        `Use ${name} connector: ${text}`,
+      );
+    }
   }
   if (task.recipient && task.recipient.kind === 'agent' && task.recipient.name) {
     text = `@${task.recipient.name} ${text}`;
@@ -943,7 +1094,7 @@ async function _fireTask(uid: string, task: AutoTask): Promise<void> {
   const attachmentNames = await _copyAttachmentsForFire(uid, task, cid);
   const text = _buildSeedText(task);
   const rollbackEmptyConv = async (reason: string): Promise<void> => {
-    try { await chats.deleteConversation(uid, cid); }
+    try { await chats.deleteConversation(uid, cid, task.project_id || null); }
     catch (e) { log.warn(`fire rollback failed uid=${uid} id=${task.id} cid=${cid} reason=${reason}: ${(e as Error).message}`); }
   };
   try {
@@ -975,9 +1126,9 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
   const want = Array.isArray(task.attachments) ? task.attachments.filter((n) => typeof n === 'string' && n) : [];
   if (!want.length) return [];
   if (!_isValidTaskId(task.id)) return [];
-  const srcDir = autoTaskAttachmentsDir(uid, task.id);
+  const srcDir = autoTaskLocationForTask(uid, task.id, task.project_id).attachmentsDir;
   if (!fs.existsSync(srcDir)) return [];
-  const destDir = chatAttachmentDir(uid, cid);
+  const destDir = chatAttachmentDirForConversation(uid, cid, task.project_id);
   try { fs.mkdirSync(destDir, { recursive: true }); } catch (_) { /* ignore */ }
   const copied: string[] = [];
   for (const name of want) {

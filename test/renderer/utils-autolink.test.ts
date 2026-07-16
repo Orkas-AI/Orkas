@@ -27,6 +27,7 @@ const {
   _markdownVideoHtml,
   _markdownAudioHtml,
   _chatMediaLocalPathFromUrl,
+  _chatVideoNativeControlsHit,
 } = utils as {
   _BARE_URL_RE: RegExp;
   _linkifyBareUrls: (text: string) => string;
@@ -35,6 +36,7 @@ const {
   _markdownVideoHtml: (src: string, label: string, title?: string) => string;
   _markdownAudioHtml: (src: string, label: string, title?: string) => string;
   _chatMediaLocalPathFromUrl: (src: string) => string;
+  _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
 };
 
 const A = (url: string) =>
@@ -153,6 +155,7 @@ describe('set B — already-wrapped URLs must not be re-wrapped', () => {
 describe('markdown media links', () => {
   it('renders normal markdown images with the chat image class', () => {
     const out = inlineFormat('![car](chat-media://local/Users/test/car.png "preview")');
+    expect(out).toContain('<span class="chat-image-shell chat-md-img-shell is-loading">');
     expect(out).toContain('<img class="chat-md-img"');
     expect(out).toContain('src="chat-media://local/Users/test/car.png"');
     expect(out).toContain('alt="car"');
@@ -168,7 +171,7 @@ describe('markdown media links', () => {
 
   it('renders a normal markdown link to chat-media mp4 as an inline player', () => {
     const out = inlineFormat('[video](chat-media://local/Users/test/car_driving.mp4)');
-    expect(out).toContain('<span class="chat-md-video-shell">');
+    expect(out).toContain('<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble">');
     expect(out).toContain('<video class="chat-md-video"');
     expect(out).toContain('width="640"');
     expect(out).toContain('height="360"');
@@ -197,6 +200,14 @@ describe('markdown media links', () => {
     expect(_chatMediaLocalPathFromUrl('chat-media://local/Users/test/has%20space.mp4')).toBe('/Users/test/has space.mp4');
     expect(_chatMediaLocalPathFromUrl('chat-media://local/C:/Users/test/clip.mp4')).toBe('C:/Users/test/clip.mp4');
     expect(_chatMediaLocalPathFromUrl('https://x.test/a.mp4')).toBe('');
+  });
+
+  it('reserves native video controls while allowing the rest of the surface to toggle playback', () => {
+    expect(_chatVideoNativeControlsHit(351, 100, 360)).toBe(true);
+    expect(_chatVideoNativeControlsHit(312, 100, 360)).toBe(true);
+    expect(_chatVideoNativeControlsHit(311, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(200, 100, 360)).toBe(false);
+    expect(_chatVideoNativeControlsHit(361, 100, 360)).toBe(false);
   });
 
   it('renders a normal markdown link to chat-media mp3 as an inline audio player', () => {

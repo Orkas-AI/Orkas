@@ -112,11 +112,13 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).not.toContain('translate');
   });
 
-  it('does not render self-evolved skills under an empty allowlist', async () => {
+  it('does not render self-evolved skills — core-agent evolution injects those, not this block', async () => {
     writeSkill(builtinDir(), 'translate', 'Translate', 'T');
     writeSkill(agentEvolvedDir('agent-a'), 'evolved-helper', 'evolved-helper', 'evolved help');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock({ agentId: 'agent-a', allowlist: [] });
+    // Self-evolved skills (cloud/agents/<id>/skills) are surfaced by core-agent's
+    // evolution SkillStore.buildIndex(); rendering them here too would double-inject.
     expect(text).not.toContain('evolved-helper');
     expect(text).not.toContain('translate');
   });

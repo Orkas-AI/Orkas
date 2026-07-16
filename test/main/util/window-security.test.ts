@@ -27,7 +27,7 @@ describe('window security baseline', () => {
 
   it('accepts only credential-free HTTP(S) URLs', () => {
     expect(safeExternalHttpUrl('https://example.test/docs?q=1')).toBe('https://example.test/docs?q=1');
-    expect(safeExternalHttpUrl('http://localhost:9000/path')).toBe('http://localhost:9000/path');
+    expect(safeExternalHttpUrl('http://example.test:9000/path')).toBe('http://example.test:9000/path');
     for (const value of [
       'file:///etc/passwd',
       'javascript:alert(1)',

@@ -150,7 +150,7 @@ describe('skills renderer frontmatter parsing', () => {
       return {
         json: async () => ({
           ok: true,
-          skill: { id: 'url-skill' },
+          skill: { id: 'url-skill', name: 'URL Skill' },
         }),
       };
     };
@@ -172,6 +172,9 @@ describe('skills renderer frontmatter parsing', () => {
         result: 'success',
         duration_ms: 25,
         skill_id: 'url-skill',
+        resource_kind: 'skill',
+        resource_id: 'url-skill',
+        resource_name: 'URL Skill',
         skill_count: 1,
       }],
     ]);

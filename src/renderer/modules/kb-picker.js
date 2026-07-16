@@ -147,7 +147,7 @@ function _kbPickerRenderTree() {
 }
 
 function _kbPickerRenderNodes(nodes, depth) {
-  const indent = 18 + depth * 14;
+  const indent = 32 + depth * 18;
   return nodes
     .filter((n) => n.type === 'dir')    // files aren't selectable here
     .map((n) => {

@@ -7,7 +7,15 @@ import type {
   ToolUseContent,
 } from "../shared/types.js";
 import { createLogger } from "../shared/logger.js";
-import { Session, type HistoryResource, type SerializedSessionContextState } from "./session.js";
+import {
+  Session,
+  type CompletedWorkEntry,
+  type CompletedWorkInput,
+  type ExecutionPlanState,
+  type ExecutionPlanUpdate,
+  type HistoryResource,
+  type SerializedSessionContextState,
+} from "./session.js";
 
 const log = createLogger("persistent-session");
 
@@ -20,6 +28,24 @@ const log = createLogger("persistent-session");
  * instead of looping in "thinking…" forever. */
 const INTERRUPTED_TOOL_RESULT =
   "[interrupted: previous run aborted before this tool produced a result]";
+
+export type ToolProtocolRepairReport = {
+  changed: boolean;
+  synthesizedOrphanResults: number;
+  droppedUnmatchedResults: number;
+  mergedParallelResultMessages: number;
+  deduplicatedResults: number;
+};
+
+function emptyToolProtocolRepairReport(): ToolProtocolRepairReport {
+  return {
+    changed: false,
+    synthesizedOrphanResults: 0,
+    droppedUnmatchedResults: 0,
+    mergedParallelResultMessages: 0,
+    deduplicatedResults: 0,
+  };
+}
 
 /**
  * PersistentSession — a `Session` that mirrors every message to a JSONL file
@@ -39,6 +65,7 @@ const INTERRUPTED_TOOL_RESULT =
 export class PersistentSession extends Session {
   private readonly sessionFile: string;
   private readonly contextFile: string;
+  private lastToolProtocolRepairReport = emptyToolProtocolRepairReport();
 
   constructor(opts: {
     /** Absolute path to the jsonl file that backs this session. */
@@ -87,12 +114,18 @@ export class PersistentSession extends Session {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        const obj = JSON.parse(trimmed) as { role?: string; content?: unknown };
+        const obj = JSON.parse(trimmed) as { role?: string; content?: unknown; turnId?: unknown };
         if (
           (obj.role === "user" || obj.role === "assistant" || obj.role === "system") &&
           Array.isArray(obj.content)
         ) {
-          super.addMessage(obj.role as Message["role"], obj.content as MessageContent[]);
+          super.addMessage(
+            obj.role as Message["role"],
+            obj.content as MessageContent[],
+            Number.isInteger(obj.turnId) && (obj.turnId as number) > 0
+              ? obj.turnId as number
+              : undefined,
+          );
         }
       } catch {
         // Skip corrupt line — keep going rather than throwing away everything.
@@ -104,9 +137,13 @@ export class PersistentSession extends Session {
     // rather than one line at a time.
     if (this.healOrphanToolUses()) {
       this.flushToDisk();
-      console.warn(
-        `[persistent-session] healed orphan tool_use entries in ${this.sessionFile}`,
-      );
+      const report = this.lastToolProtocolRepairReport;
+      const detail = { sessionId: this.getSessionId(), ...report };
+      if (report.synthesizedOrphanResults || report.droppedUnmatchedResults) {
+        log.warn("repaired invalid tool protocol", detail);
+      } else {
+        log.info("normalized parallel tool results", detail);
+      }
     }
     this.loadContextFromDisk();
   }
@@ -130,6 +167,10 @@ export class PersistentSession extends Session {
     // the constructor's load-time heal re-applies the same (idempotent) fix on the
     // next reload, where memory holds the full history so a flush is lossless.
     return this.healOrphanToolUses();
+  }
+
+  getLastToolProtocolRepairReport(): ToolProtocolRepairReport {
+    return { ...this.lastToolProtocolRepairReport };
   }
 
   /**
@@ -156,6 +197,7 @@ export class PersistentSession extends Session {
   healOrphanToolUses(): boolean {
     const original = super.getMessages();
     let changed = false;
+    const report = emptyToolProtocolRepairReport();
 
     // Pre-pass — drop orphan tool_results whose toolUseId never appears as
     // a tool_use in any assistant message. Provider APIs reject these with
@@ -196,6 +238,7 @@ export class PersistentSession extends Session {
         messages.push(m);
       } else {
         changed = true;
+        report.droppedUnmatchedResults += m.content.length - kept.length;
         if (kept.length > 0) messages.push({ ...m, content: kept });
         // else: message had ONLY orphan tool_results — drop it entirely
       }
@@ -211,6 +254,7 @@ export class PersistentSession extends Session {
         if (m.role === "user" && m.content.some((c) => (c as { type?: string }).type === "tool_result")) {
           const kept = m.content.filter((c) => (c as { type?: string }).type !== "tool_result");
           changed = true;
+          report.droppedUnmatchedResults += m.content.length - kept.length;
           if (kept.length > 0) fixed.push({ ...m, content: kept });
         } else {
           fixed.push(m);
@@ -274,6 +318,7 @@ export class PersistentSession extends Session {
 
       const allCallIds = toolUses.map((t) => t.id);
       const orphanIds = allCallIds.filter((id) => !resultsByCallId.has(id));
+      report.synthesizedOrphanResults += orphanIds.length;
       for (const id of orphanIds) {
         resultsByCallId.set(id, {
           type: "tool_result",
@@ -297,6 +342,7 @@ export class PersistentSession extends Session {
       for (const id of resultsByCallId.keys()) {
         if (!allCallIds.includes(id)) droppedOrphanResults++;
       }
+      report.droppedUnmatchedResults += droppedOrphanResults;
 
       // Detect whether the rewrite changes anything observable: orphan
       // synthesis, dedup of duplicate tool_call_ids, or merging multiple
@@ -309,6 +355,18 @@ export class PersistentSession extends Session {
         (sum, mm) => sum + mm.content.length,
         0,
       );
+      const distinctOriginalResultIds = new Set(
+        originalToolResultMsgs.flatMap((message) =>
+          message.content.map((content) =>
+            (content as { toolUseId?: unknown }).toolUseId,
+          ),
+        ),
+      ).size;
+      report.mergedParallelResultMessages += Math.max(0, originalToolResultMsgs.length - 1);
+      report.deduplicatedResults += Math.max(
+        0,
+        originalToolResultCount - distinctOriginalResultIds,
+      );
       if (
         orphanIds.length > 0 ||
         droppedOrphanResults > 0 ||
@@ -320,13 +378,19 @@ export class PersistentSession extends Session {
 
       fixed.push(m);
       if (orderedResults.length > 0) {
-        fixed.push({ role: "user", content: orderedResults });
+        fixed.push({
+          role: "user",
+          content: orderedResults,
+          ...(m.turnId ? { turnId: m.turnId } : {}),
+        });
       }
       for (const im of trailingImageMsgs) fixed.push(im);
 
       i = j;
     }
 
+    report.changed = changed;
+    this.lastToolProtocolRepairReport = report;
     if (!changed) return false;
 
     // Preserve the rolling summary + resources across the merge — clearing and
@@ -337,16 +401,17 @@ export class PersistentSession extends Session {
   }
 
   /** Override: in-memory add + atomic append to disk. */
-  override addMessage(role: Message["role"], content: MessageContent[]): void {
-    super.addMessage(role, content);
-    this.appendToDisk({ role, content });
+  override addMessage(role: Message["role"], content: MessageContent[], turnId?: number): Message {
+    const message = super.addMessage(role, content, turnId);
+    this.appendToDisk(message);
     this.writeContextToDisk();
+    return message;
   }
 
   /** Override: start a tracked UI turn + atomic append to disk. */
   override beginUserTurn(content: MessageContent[]): number {
     const id = super.beginUserTurn(content);
-    this.appendToDisk({ role: "user", content });
+    this.appendToDisk({ role: "user", content, turnId: id });
     this.writeContextToDisk();
     return id;
   }
@@ -361,14 +426,38 @@ export class PersistentSession extends Session {
     this.writeContextToDisk();
   }
 
+  override recordCompletedWork(input: CompletedWorkInput): CompletedWorkEntry | undefined {
+    const entry = super.recordCompletedWork(input);
+    if (entry) this.writeContextToDisk();
+    return entry;
+  }
+
+  override updateExecutionPlan(update: ExecutionPlanUpdate): ExecutionPlanState {
+    const plan = super.updateExecutionPlan(update);
+    this.writeContextToDisk();
+    return plan;
+  }
+
+  override ensureExecutionPlanAnchor(): ExecutionPlanState {
+    const plan = super.ensureExecutionPlanAnchor();
+    this.writeContextToDisk();
+    return plan;
+  }
+
+  override clearExecutionPlan(): void {
+    super.clearExecutionPlan();
+    this.writeContextToDisk();
+  }
+
   override applyHistorySummary(summary: string, turnIds: readonly number[]): void {
     super.applyHistorySummary(summary, turnIds);
     this.writeContextToDisk();
   }
 
-  override applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): void {
-    super.applyActiveCheckpointSummary(summary, checkpointThroughMessageIndex);
+  override applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): string {
+    const appliedSummary = super.applyActiveCheckpointSummary(summary, checkpointThroughMessageIndex);
     this.writeContextToDisk();
+    return appliedSummary;
   }
 
   /**
@@ -400,7 +489,7 @@ export class PersistentSession extends Session {
    * larger payloads we fall back to a write+fsync on a tmp file + rename,
    * but in practice a single message is well under that limit.
    */
-  private appendToDisk(record: { role: Message["role"]; content: MessageContent[] }): void {
+  private appendToDisk(record: Message): void {
     this.ensureDir();
     const line = JSON.stringify({ ...record, ts: Date.now() }) + "\n";
     try {
@@ -419,7 +508,12 @@ export class PersistentSession extends Session {
     const tmp = `${this.sessionFile}.tmp`;
     try {
       const lines = this.getMessages()
-        .map((m) => JSON.stringify({ role: m.role, content: m.content, ts: Date.now() }))
+        .map((m) => JSON.stringify({
+          role: m.role,
+          content: m.content,
+          ...(m.turnId ? { turnId: m.turnId } : {}),
+          ts: Date.now(),
+        }))
         .join("\n");
       fs.writeFileSync(tmp, lines ? lines + "\n" : "", "utf-8");
       fs.renameSync(tmp, this.sessionFile);
@@ -438,10 +532,17 @@ export class PersistentSession extends Session {
       const raw = JSON.parse(fs.readFileSync(this.contextFile, "utf-8")) as SerializedSessionContextState;
       const repaired = this.restoreContextState(raw);
       if (repaired) {
-        log.warn("context sidecar repaired", {
-          sessionId: this.getSessionId(),
-          contextFile: this.contextFile,
-        });
+        const report = this.lastToolProtocolRepairReport;
+        const benignParallelNormalization = report.changed
+          && report.synthesizedOrphanResults === 0
+          && report.droppedUnmatchedResults === 0
+          && report.mergedParallelResultMessages > 0;
+        const detail = { sessionId: this.getSessionId() };
+        if (benignParallelNormalization) {
+          log.info("context sidecar normalized after parallel result merge", detail);
+        } else {
+          log.warn("context sidecar repaired", detail);
+        }
         this.writeContextToDisk();
       }
     } catch (err) {

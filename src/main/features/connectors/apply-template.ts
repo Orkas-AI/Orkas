@@ -98,6 +98,7 @@ export function applyTemplate(entry: CatalogEntry, grant: OAuthGrant): Transport
       command: _resolvePlaceholders(tpl.command),
       args: tpl.args.map((a) => _resolvePlaceholders(a)),
       env,
+      ...(tpl.proxy_target_url ? { proxyTargetUrl: tpl.proxy_target_url } : {}),
     };
   }
   // streamable-http

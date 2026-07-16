@@ -1,18 +1,20 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-html-renderer
-description_zh: "作为 UIDesigner 的默认交付格式守门员，用 HTML 呈现设计稿、改版稿、组件样例、设计系统、logo/字标、品牌视觉和 review，除非用户明确要求其他格式。"
-description_en: "Guard UIDesigner's default delivery format by rendering drafts, redesigns, component samples, design systems, logos/wordmarks, visual identity, and reviews as HTML unless the user explicitly requests another format."
+description_zh: "处理复杂状态型 HTML、运行时安全修复、严格 source-to-HTML 保真或详细交接；普通单页 HTML 由紧凑执行器直接完成。"
+description_en: "Handle complex stateful HTML, runtime-safety repair, strict source-to-HTML fidelity, or detailed implementation handoff; ordinary single-page HTML is completed directly by the compact executor."
 category: rnd
 ---
 
 # ui-html-renderer
 
-Use this skill for every UIDesigner design deliverable unless the user explicitly requests another final format. The output must be visible in HTML by default. Markdown is acceptable for rationale, but not as the final artifact unless the user asks for text only.
+Use this specialist for unusually complex stateful HTML, blank/runtime-risk repair, strict source-to-HTML fidelity, reusable component galleries, brand boards, or detailed implementation handoff. Ordinary single-page HTML uses `ui-design-executor`, which already preserves HTML-default delivery and baseline runtime/accessibility rules.
+
+Pair standalone output with `ui-artifact-workspace`. It owns the stable directory, `artifact.json`, revision continuity, relative assets, and packaging boundary. This skill owns what the HTML renders and whether it works.
 
 Skip this skill for meta work about the agent itself: analysis, options, debugging prior runs, prompt/skill review, or planning can be answered in prose unless the user asks for an HTML artifact.
 
-Before final delivery, pair with `ui-craft-checks` for any non-trivial HTML artifact, implemented screen, design-source handoff, live-ready view, form, dashboard, or interactive surface. Fix P0 craft failures before final response.
+Pair with `ui-craft-checks` only for formal review, QA, launch handoff, exact-fidelity inspection, or high-risk complex UI. Otherwise return to the executor's fast gate.
 
 ## Contract Input
 
@@ -61,12 +63,12 @@ Do not force HTML for non-deliverable discussion, such as "why did the agent do 
 
 ## HTML Artifact Requirements
 
-The HTML draft should be self-contained unless the repo already has an asset pipeline:
+The HTML draft should be self-contained unless the repo already has an asset pipeline or splitting files materially improves later edits:
 
 - Inline CSS for standalone drafts.
 - No remote runtime dependencies.
-- Realistic content and realistic data.
-- Representative empty, loading, error, selected, and disabled states where relevant.
+- Realistic domain content. Label sample or inferred data; never make invented metrics look observed or production-backed.
+- Reachable empty, loading, error, selected, and disabled implementations where relevant; prose state inventories do not count.
 - Desktop and mobile responsive behavior.
 - Stable dimensions for repeated items, toolbars, grids, cards, counters, boards, and fixed-format widgets.
 - Accessible labels for controls and icons.
@@ -75,6 +77,39 @@ The HTML draft should be self-contained unless the repo already has an asset pip
 - Parseable HTML structure and inline JavaScript that does not block first render.
 
 Use semantic HTML where practical. Add lightweight JavaScript only for preview interactions such as tabs, filters, menus, theme toggles, or sample state changes.
+
+## State Proof Protocol
+
+For non-trivial data surfaces, implement the relevant states in the artifact rather than describing them outside it:
+
+- Data workflows normally need populated, loading, empty, error, and partial/stale variants.
+- Forms normally need pristine, dirty/touched invalid, submitted-pending, recoverable server error, and success variants. Each explicitly requested outcome must be reachable; a helper whose failure branch is never invoked is not state proof. After validation or server/import failure, focus the first invalid field or an error summary when practical, and always announce the error through an appropriate live/alert role.
+- Tabs and other composite controls need semantic selected state plus their expected keyboard model; tabs include arrow-key navigation, not only click handlers.
+- Disabled, permission-gated, offline, and mobile-collapsed states are required when the brief can reach them.
+
+Keep these states inspectable without turning the product UI into a demo panel. Use the real workflow when practical; otherwise add a compact preview-only state switcher, a `data-ui-state` rendering branch, or a clearly separated state gallery. Every state must have actual DOM/component/rendering evidence and recovery behavior. A bullet list of intended states is not implementation.
+
+## Runtime-Safe Event Wiring
+
+- Prefer semantic static markup with `addEventListener`, event delegation, or `data-action` hooks.
+- Never put inline `onclick`/`onchange` handlers inside HTML strings assigned through `innerHTML`; nested quote/backslash layers are a common syntax and injection failure.
+- When markup must be generated, use template literals for markup only and attach behavior after insertion, or create elements/handlers through DOM APIs.
+- Keep cached DOM references immutable. Never temporarily assign a wrapper into a `refs`, `content`, `panels`, or similar element map to redirect a renderer.
+- Never clear a container and then query, append, or move a descendant that the clear just removed. Build the complete state in a local `DocumentFragment` or detached container, then commit it once with `replaceChildren(...)` or an equivalent safe operation.
+- Keep meaningful primary content in static HTML before the script runs. For an interactive standalone artifact, initialize through one guarded entry point so an initialization exception leaves the static shell visible and replaces a dedicated status/fallback region with an actionable error instead of blanking the page. When waiting for DOM readiness, register the guarded function itself: `function safeInit() { try { init(); } catch (error) { showFallback(error); } }` then use `addEventListener("DOMContentLoaded", safeInit, { once: true })`. A `try/catch` around `addEventListener(..., init)` does not catch errors thrown later by `init` and must be rejected.
+- Before delivery, inspect every `innerHTML` assignment for balanced delimiters, every selector for a matching element, every cached reference for later mutation, and every state renderer for clear-then-query hazards before claiming source-level runtime safety.
+
+## Raster Asset Handoff
+
+When a UI asks for an original raster illustration, photo, texture, or edited image and a dedicated raster image-generation capability is available:
+
+- Route only that asset by capability or role; never depend on a mutable display name.
+- Keep UIDesigner ownership of information architecture, layout, copy, tokens, responsive behavior, accessible fallback, integration slot, and final HTML.
+- Provide a concrete brief with subject/composition, aspect ratio, pixel dimensions that mathematically match that ratio, palette, background/alpha, exclusions, alt intent, relative save path, and crop-safe area.
+- Wire the future relative asset path in the HTML itself (normally `<img src="assets/...">` or `<picture>`) and include an honest placeholder/fallback until the raster exists. Put the ratio-consistent asset brief before long source listings so it remains actionable and auditable.
+- Do not silently replace the requested raster asset with an inline SVG. SVG is acceptable only as a labeled temporary fallback or when the user asked for vector output.
+
+Reject the handoff before delivery if, for example, the brief says `16:10` but asks for `1800x1200`.
 
 ## Stack And Dependency Boundaries
 
@@ -121,7 +156,8 @@ For live-ready artifacts:
 
 For dashboards:
 
-- Realistic metrics, tables, filters, charts, trends, alerts, and drilldown affordances.
+- Domain-appropriate metrics, tables, filters, charts, trends, alerts, and drilldown affordances only when the request or source actually calls for a dashboard.
+- Label invented preview data as sample data and keep it visibly distinct from inspected or connected data.
 - Charts can use SVG or CSS. Make them inspectable and labeled.
 
 For component systems:
@@ -174,14 +210,13 @@ For reviews:
 
 ## Visual Constraints
 
-- Do not use generic hero pages for apps, tools, or dashboards.
-- Do not create a split marketing hero unless the request is a landing page.
-- Do not put cards inside cards.
-- Do not use decorative orbs, blobs, or background bokeh.
-- Do not scale font size with viewport width.
-- Do not use negative letter spacing.
-- Keep card radius 8px or less unless the existing system requires otherwise.
-- Use icons for familiar actions rather than text-filled rounded rectangles.
+Treat these as contextual quality tests, not a house style that makes every artifact look the same:
+
+- Apps, tools, editors, and dashboards should open on the primary workflow, not a generic marketing hero.
+- Split heroes, bento grids, floating cards, nested cards, decorative blobs, blur, and bokeh need a brief-specific reason. Remove them when they only signal “designed by AI.”
+- Radius, shadow, letter spacing, font scaling, and surface depth must follow the chosen visual thesis and remain readable. Avoid applying one arbitrary value to every product category.
+- Familiar actions should use conventional controls and recognizable icons with accessible names; novelty must not hide function.
+- One justified aesthetic risk is welcome when it strengthens the subject or interaction. It cannot compromise hierarchy, accessibility, responsive behavior, or source fidelity.
 
 ## Verification
 
@@ -195,18 +230,30 @@ When possible:
 - Check desktop and mobile widths.
 - Inspect screenshots for blank areas, overlap, clipped text, broken assets, and unreadable contrast.
 - Interact with tabs, menus, toggles, filters, and primary actions if present.
+- Exercise every critical state branch. For forms, check pristine, dirty/touched invalid, pending, server-error recovery, and success; for data surfaces, check populated, loading, empty, error, and partial/stale.
 - Run the `ui-craft-checks` matrix for HTML default, source/design fidelity, state coverage, accessibility, forms, typography, motion, responsive behavior, live/security, and anti-template tells.
+- For standalone output, validate `artifact.json`, confirm its entry exists, check relative local references, and make sure the current file list is package-safe.
 - Run optional axe-core/pa11y, screenshot comparison, Storybook, or DOM/source checks only when already available or explicitly requested; do not install dependencies for verification by default.
 
-If verification cannot run, state that clearly and list the checks the artifact was designed to satisfy.
+If verification cannot run, state that clearly and separate `implemented from source inspection` from `not executed`. Never turn a planned check into a claimed result.
+
+When parser/browser tools are unavailable, source inspection is still a real, separately reportable check. Perform it before delivery and report its result without calling it browser validation:
+
+- Confirm the doctype/root/body, meaningful static first-render content, and balanced critical closing tags by inspecting the completed source.
+- Trace the single initialization entry point, all referenced selectors, delegated action names, tab targets, and requested success/failure transitions. Confirm that DOM-ready callbacks invoke a guarded initializer rather than merely registering an unguarded callback inside an outer `try/catch`.
+- Reject mutable cached-element maps, clear-then-query/move sequences, nested inline handlers inside generated markup, and state branches that overwrite their own recovery controls.
+- Mark HTML parser execution, JavaScript parser execution, console inspection, interaction playback, and viewport rendering `not run` when they did not run; give a concrete future command/action and pass criterion for each.
 
 ## Delivery
 
 Finish with:
 
-- HTML file or app screen path.
+- Canonical artifact directory and manifest revision, or the real app screen path for target-repo implementation.
+- HTML entry file.
+- Files changed when revising an existing artifact.
 - Viewports represented.
 - States represented.
+- State evidence and how each critical state is reached.
 - Interactions included.
 - Verification performed.
 - Known risks.

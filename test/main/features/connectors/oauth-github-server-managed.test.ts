@@ -55,12 +55,12 @@ function githubEntry() {
   } as any;
 }
 
-function bingEntry() {
+function gscEntry() {
   return {
-    id: 'bing-webmaster',
-    display_name: 'Bing Webmaster Tools',
+    id: 'gsearch-console',
+    display_name: 'Google Search Console',
     auth_mode: 'server_bridge',
-    oauth: { provider_id: 'bing' },
+    oauth: { provider_id: 'google' },
     transport_template: null,
   } as any;
 }
@@ -188,23 +188,43 @@ describe('connector OAuth GitHub server-managed grants', () => {
     expect(body.force_refresh).toBe(true);
   });
 
-  it('does not call the server when an existing server-managed Bing token is fresh', async () => {
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+  it('retries the generic (Google) refresh path on a transient 5xx and then succeeds', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 503,
+          text: async () => '{"code":1,"msg":"系统繁忙，请稍后重试"}',
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            code: 0,
+            access_token: 'gsc-new',
+            refresh_token: 'gsc-refresh',
+            expires_in: 3600,
+            token_type: 'Bearer',
+            scope: 'https://www.googleapis.com/auth/webmasters.readonly',
+          }),
+        });
+      vi.stubGlobal('fetch', fetchMock);
 
-    const grant = {
-      access_token: 'bing-fresh',
-      refresh_token: null,
-      server_managed: true,
-      server_grant_id: 'grant-bing',
-      expires_at: Date.now() + 60 * 60 * 1000,
-      scopes: ['webmaster.read'],
-      token_type: 'Bearer',
-    };
-    const { refreshIfStale } = await import('../../../../src/main/features/connectors/oauth');
-    const next = await refreshIfStale('uid-1', bingEntry(), grant);
+      const { refreshIfStale } = await import('../../../../src/main/features/connectors/oauth');
+      const pending = refreshIfStale('uid-1', gscEntry(), {
+        access_token: 'gsc-old',
+        refresh_token: 'gsc-refresh',
+        expires_at: Date.now() - 1000,
+        scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
+        token_type: 'Bearer',
+      });
+      await vi.runAllTimersAsync();
+      const next = await pending;
 
-    expect(next).toBe(grant);
-    expect(fetchMock).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(next.access_token).toBe('gsc-new');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

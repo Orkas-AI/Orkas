@@ -696,6 +696,25 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
 // `<uid>/local/marketplace/skills/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('skills › listSkills', () => {
+  it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {
+    writeCustomSkill('persisted-skill', 'name: "Old Skill"\ndescription: "cached"');
+    const first = await loadSkills();
+    expect((await first.listSkills())[0].name).toBe('Old Skill');
+
+    fs.writeFileSync(
+      path.join(customSkillsDir(), 'persisted-skill', 'SKILL.md'),
+      '---\nname: "New Skill"\ndescription: "fresh"\n---\n',
+    );
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const restarted = await loadSkills();
+    expect((await restarted.listSkills())[0].name).toBe('Old Skill');
+
+    restarted.clearSkillListCache();
+    expect((await restarted.listSkills())[0].name).toBe('New Skill');
+  });
+
   it('returns empty when both dirs are missing', async () => {
     const s = await loadSkills();
     const list = await s.listSkills();

@@ -24,7 +24,7 @@ import {
   sessionLock, globalSlots,
   type Releaser,
 } from '../../util/locks';
-import type { AgentTool } from '#core-agent';
+import type { AgentRunTimings, AgentTool } from '#core-agent';
 import { createLogger } from '../../logger';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
 
@@ -298,6 +298,8 @@ export interface ModelRunLogDiagnostics {
   errorEvents: number;
   retryCount: number;
   compactionCount: number;
+  compactionAttemptCount: number;
+  compactionFailureCount: number;
   toolDeltaCount: number;
   toolStarts: number;
   toolProgress: number;
@@ -376,6 +378,8 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     errorEvents: 0,
     retryCount: 0,
     compactionCount: 0,
+    compactionAttemptCount: 0,
+    compactionFailureCount: 0,
     toolDeltaCount: 0,
     toolStarts: 0,
     toolProgress: 0,
@@ -582,6 +586,20 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       );
       break;
     }
+    case 'context_status': {
+      const phase = typeof e.phase === 'string' ? e.phase : '';
+      if (phase.endsWith('_start')) stats.compactionAttemptCount += 1;
+      if (phase.endsWith('_failed')) stats.compactionFailureCount += 1;
+      noteRunTimelineForLog(
+        stats,
+        'context_status',
+        nowMs,
+        [phase, e.data && typeof e.data === 'object'
+          ? String((e.data as Record<string, unknown>).disabledReason || '')
+          : ''].filter(Boolean).join(' '),
+      );
+      break;
+    }
     case 'done': {
       noteElapsedOnce(stats, 'doneRawEventMs', nowMs);
       const result = e.result as { meta?: Record<string, unknown> } | undefined;
@@ -671,6 +689,8 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     errorEvents: stats.errorEvents,
     retryCount: stats.retryCount,
     compactionCount: stats.compactionCount,
+    compactionAttemptCount: stats.compactionAttemptCount,
+    compactionFailureCount: stats.compactionFailureCount,
     toolDeltaCount: stats.toolDeltaCount,
     toolStarts: stats.toolStarts,
     toolProgress: stats.toolProgress,
@@ -772,6 +792,10 @@ function agentRunResultEventForTelemetry(input: {
   modelId?: string;
   toolCount: number;
   nested: boolean;
+  idleWindowSec?: number;
+  idleTimeoutSec?: number;
+  streamIdleTimeoutSec?: number;
+  timings?: AgentRunTimings;
 }): StreamEvent {
   const result = input.status === 'completed'
     ? 'success'
@@ -788,6 +812,16 @@ function agentRunResultEventForTelemetry(input: {
     has_tools: input.toolCount > 0,
     tool_count_bucket: toolCountBucketForTelemetry(input.toolCount),
   };
+  if (Number.isFinite(input.idleTimeoutSec)) data.idle_timeout_sec = Math.max(0, Math.round(input.idleTimeoutSec || 0));
+  if (Number.isFinite(input.streamIdleTimeoutSec)) data.stream_idle_timeout_sec = Math.max(0, Math.round(input.streamIdleTimeoutSec || 0));
+  if (Number.isFinite(input.idleWindowSec)) data.idle_window_sec = Math.max(0, Math.round(input.idleWindowSec || 0));
+  if (input.timings) {
+    data.provider_ms = Math.max(0, Math.round(input.timings.providerMs));
+    data.tool_ms = Math.max(0, Math.round(input.timings.toolMs));
+    data.compaction_ms = Math.max(0, Math.round(input.timings.compactionMs));
+    data.retry_wait_ms = Math.max(0, Math.round(input.timings.retryWaitMs));
+    data.other_ms = Math.max(0, Math.round(input.timings.otherMs));
+  }
   if (errorCode) data.error_code = errorCode;
   return { type: 'event', event: { stream: 'agent_run_result', data } };
 }
@@ -908,6 +942,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     turnId,
     projectId,
     onFileWritten,
+    onOutputsPublished,
     hasProducedPath,
     onArtifactCreated,
     onSkillAdvertised,
@@ -1075,13 +1110,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   }
 
   const recorder: ReturnType<typeof startRecording> = startRecording(null);
+  let agentRunResult: import('#core-agent').AgentRunResult | null = null;
   let finalText = '';
   let errText: string | null = null;
   let abortedFlag = false;
   let activeProviderId = '';
   let activeModelId = '';
   let activeToolCount = 0;
-
   try {
 
     // Called back when pi-ai's onPayload hook injects the native web
@@ -1102,6 +1137,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(maxToolLoops ? { maxToolLoops } : {}),
       ...(cid ? { cid } : {}),
       ...(turnId ? { turnId } : {}),
+      ...(message ? { userMessage: message } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       ...(forceOpenSkillRefs && forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
@@ -1111,6 +1147,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(fileReadOnlyExtraRoots && fileReadOnlyExtraRoots.length ? { fileReadOnlyExtraRoots } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
+      ...(onOutputsPublished ? { onOutputsPublished } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
@@ -1132,7 +1169,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         recorder.setActiveCandidate(info);
       },
     });
-    const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
+    const { runner, providerId, modelId, resolvedSystemPrompt, turnEphemeral, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
     activeProviderId = providerId || '';
     activeModelId = modelId || '';
     activeToolCount = toolDefs.length;
@@ -1212,21 +1249,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const sandboxEnv = buildSkillSandboxEnv(userId, agentId);
 
     log.info('model turn run start', turnLogContext);
+    const requestMetadata = attachmentMetadata ? { attachmentMetadata } : {};
+
     const rawEvents = runner.runStream({
       message,
       signal: controller.signal,
       sandboxEnv,
       ...(workingDir ? { workingDir } : {}),
+      ...(turnEphemeral ? { turnEphemeral } : {}),
       ...(images && images.length ? { images } : {}),
       ...(historyResources && historyResources.length ? { historyResources } : {}),
-      ...(attachmentMetadata ? { requestMetadata: { attachmentMetadata } } : {}),
+      ...(Object.keys(requestMetadata).length ? { requestMetadata } : {}),
       ...(cacheRetention ? { cacheRetention } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
       ...(drainSteer ? { drainSteer } : {}),
     });
 
     // Wrap raw events to capture the AgentRunResult for post-run reflection.
-    let agentRunResult: import('#core-agent').AgentRunResult | null = null;
     async function* captureResult(events: AsyncIterable<import('#core-agent').AgentRunEvent>) {
       for await (const ev of events) {
         recordModelRawEventForLog(diagnostics, ev);
@@ -1289,7 +1328,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // runs from the background orchestrator on a 12h cycle. See
     // `features/reflection-orchestrator.ts`. Keeping `agentRunResult`
     // captured above for the recorder/archive payload.
-    void agentRunResult;
 
     if (externalAbort || directSessionAbort) {
       // mapCoreAgentEvents may have already yielded 'error: empty response'
@@ -1348,7 +1386,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       const cached = await _getCachedSession(sessionId);
       if (cached && typeof (cached as { healAndPersist?: () => boolean }).healAndPersist === 'function') {
         if (cached.healAndPersist()) {
-          log.warn('healed orphan tool_use after turn', { session_id: maskedSessionId });
+          const report = typeof (cached as { getLastToolProtocolRepairReport?: () => unknown }).getLastToolProtocolRepairReport === 'function'
+            ? (cached as { getLastToolProtocolRepairReport: () => Record<string, unknown> }).getLastToolProtocolRepairReport()
+            : {};
+          const invalid = Number(report.synthesizedOrphanResults || 0) > 0
+            || Number(report.droppedUnmatchedResults || 0) > 0;
+          if (invalid) {
+            log.warn('repaired invalid tool protocol after turn', { session_id: maskedSessionId, ...report });
+          } else {
+            log.info('normalized parallel tool results after turn', { session_id: maskedSessionId, ...report });
+          }
         }
       }
     } catch (err) {
@@ -1368,6 +1415,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       modelId: diagnostics.model || activeModelId,
       toolCount: activeToolCount,
       nested,
+      idleWindowSec: idleHit ? idleHitWindow : undefined,
+      idleTimeoutSec: idleTimeout,
+      streamIdleTimeoutSec: streamIdleTimeout,
+      timings: agentRunResult?.meta.timings,
     });
     log.info('model turn finish', {
       ...turnLogContext,
@@ -1381,7 +1432,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       diagnostics: summarizeModelRunForLog(diagnostics),
     });
     try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
-    catch (err) { log.warn('debug recorder finish failed', { error: logErrorRef(err) }); }
+    catch (err) { log.warn('archive finish failed', { error: logErrorRef(err) }); }
     yield doneEvent;
   }
 }

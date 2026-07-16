@@ -184,6 +184,19 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.ok).toBe(false);
   });
 
+  it('keeps local-display SVG out of conversation attachment uploads', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(
+      UID,
+      CID,
+      'contact-sheet.svg',
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"></svg>'),
+    );
+    expect(r.ok).toBe(false);
+    expect(m.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'contact-sheet.svg'))).toBe(false);
+  });
+
   it('renames on name collision rather than overwrite', async () => {
     const m = await loadMod();
     const r1 = await m.uploadAttachment(UID, CID, 'dup.txt', Buffer.from('v1'));
@@ -517,6 +530,13 @@ describe('chat_attachments › mediaMimeFor', () => {
     // is the end-of-line safety net, not the first check.
     expect(m.mediaMimeFor('weird.bin')).toBe('application/octet-stream');
   });
+
+  it('keeps SVG MIME support local-display-only', async () => {
+    const m = await loadMod();
+    expect(m.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    expect(m.mediaMimeFor('contact-sheet.svg')).toBe('application/octet-stream');
+    expect(m.localMediaMimeFor('contact-sheet.svg')).toBe('image/svg+xml');
+  });
 });
 
 describe('chat_attachments › resolveLocalMediaPath', () => {
@@ -540,6 +560,62 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     if (!r.ok) return;
     expect(r.kind).toBe('image');
     expect(r.absPath).toBe(path.resolve(p));
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts a passive local SVG for display without adding SVG to attachment uploads', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/><image href="01-frame.png"/></svg>');
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('image');
+    expect(r.absPath).toBe(path.resolve(p));
+    expect(mod.ALLOWED_EXTENSIONS.has('.svg')).toBe(false);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('inlines relative raster references when serving a legacy local SVG', async () => {
+    const { mod, sandbox } = await setup();
+    const frame = path.join(sandbox, '01-frame.png');
+    fs.writeFileSync(frame, await makePng());
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><image href="01-frame.png"/></svg>');
+    const r = mod.materializeLocalDisplaySvg(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.body).toContain('href="data:image/png;base64,');
+    expect(r.body).not.toContain('href="01-frame.png"');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('does not let legacy SVG image references escape their directory', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'contact-sheet.svg');
+    fs.writeFileSync(p, '<svg xmlns="http://www.w3.org/2000/svg"><image href="../outside.png"/></svg>');
+    const r = mod.materializeLocalDisplaySvg(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    expect(r.error).toBe('SVG image reference escapes its directory');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it.each([
+    '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject><div>unsafe</div></foreignObject></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"></svg>',
+    '<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.com/x.png"/></svg>',
+  ])('rejects active or remote local SVG content', async (svg) => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'unsafe.svg');
+    fs.writeFileSync(p, svg);
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    expect(r.error).toBe('unsafe SVG content');
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -819,28 +895,29 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.skipped[0].reason).toMatch(/unsupported|不支持|未対応/i);
   });
 
-  it('skips video attachments entirely — manifest empty, images empty, one skipped entry', async () => {
+  it('surfaces a video attachment in the manifest by path with model_readable="false" (usable by media tools, not skipped)', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'clip.mp4', Buffer.from('fake-bytes'));
     const r = await m.buildAttachmentManifest(UID, CID, ['clip.mp4']);
-    // Videos are display-only. If the model saw them in the manifest it
-    // would be tempted to `read_file` them — and get binary garbage back.
-    expect(r.manifest).toBe('');
+    // Not vision input, but the path IS surfaced so an agent can probe /
+    // transcribe / extract frames instead of giving up on the clip ([474]).
+    expect(r.manifest).toMatch(/<file[^>]*name="clip\.mp4"[^>]*kind="video"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
+    expect(r.manifest).toMatch(/media tools/i); // the how-to-read note is present
+    // Not inline vision bytes, and NOT dropped to skipped anymore.
     expect(r.images).toEqual([]);
-    expect(r.skipped.length).toBe(1);
-    expect(r.skipped[0].name).toBe('clip.mp4');
+    expect(r.skipped).toEqual([]);
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['video'] });
   });
 
-  it('skips audio attachments entirely — manifest empty, images empty, one skipped entry', async () => {
+  it('surfaces an audio attachment in the manifest by path with model_readable="false"', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'voice.mp3', Buffer.from('fake-bytes'));
     const r = await m.buildAttachmentManifest(UID, CID, ['voice.mp3']);
-    // Audio is display/playback-only. Do not surface binary bytes to the model.
-    expect(r.manifest).toBe('');
+    expect(r.manifest).toMatch(/<file[^>]*name="voice\.mp3"[^>]*kind="audio"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
     expect(r.images).toEqual([]);
-    expect(r.skipped.length).toBe(1);
-    expect(r.skipped[0].name).toBe('voice.mp3');
+    expect(r.skipped).toEqual([]);
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['audio'] });
   });
 
@@ -854,6 +931,9 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toMatch(/name="chart\.png"/);
     expect(r.manifest).toMatch(/kind="image"/);
     expect(r.manifest).toMatch(/attached="inline"/);
+    // Look-alike negative: an image is inline vision input and must NOT be
+    // marked model_readable="false" like a video/audio file.
+    expect(r.manifest).not.toContain('model_readable');
     // Bytes — fed to vision via ChatOptions.images on the same user turn.
     expect(r.images.length).toBe(1);
     expect(r.images[0].mediaType).toBe('image/jpeg');

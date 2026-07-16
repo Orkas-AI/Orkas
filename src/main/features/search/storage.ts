@@ -52,6 +52,10 @@ export type Postings = Record<string, Array<[string, number]>>;
 export interface Index {
   version: number;
   kind: IndexKind;
+  /** Lightweight source-tree fingerprint recorded after a successful
+   * reconciliation. It lets query-time callers avoid statting every source
+   * JSONL when the conversation catalog itself has not changed. */
+  sourceStamp?: string;
   files: Record<string, FileMeta>;
   docs: Record<string, Doc>;
   postings: Postings;

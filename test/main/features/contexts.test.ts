@@ -176,7 +176,12 @@ describe('contexts › content-level dedup', () => {
     // Now upload identical bytes at a different path → must reject.
     const up2 = c.uploadContextFile('archive/dup.pdf', buf);
     expect(up2.ok).toBe(false);
-    expect((up2 as { ok: false; error: string }).error).toMatch(/work\/a\.pdf/);
+    expect(up2).toMatchObject({
+      ok: false,
+      code: 'duplicate_content',
+      existingDir: 'work',
+    });
+    expect((up2 as { ok: false; error: string }).error).not.toMatch(/work|a\.pdf/);
     // Sanity: file should NOT be written to disk.
     expect(fs.existsSync(path.join(ctxRoot(), 'archive/dup.pdf'))).toBe(false);
   });
@@ -198,7 +203,11 @@ describe('contexts › content-level dedup', () => {
 
     const up2 = c.uploadContextFile('work/a.pdf', buf);
     expect(up2.ok).toBe(false);
-    expect((up2 as { ok: false; error: string }).error).toMatch(/work\/a\.pdf/);
+    expect(up2).toMatchObject({
+      ok: false,
+      code: 'duplicate_content',
+      existingDir: 'work',
+    });
   });
 
   it('rejects writeContextFile with sha1 matching a different existing path', async () => {
@@ -216,7 +225,11 @@ describe('contexts › content-level dedup', () => {
 
     const w2 = c.writeContextFile('archive/copy.md', content);
     expect(w2.ok).toBe(false);
-    expect((w2 as { ok: false; error: string }).error).toMatch(/notes\/a\.md/);
+    expect(w2).toMatchObject({
+      ok: false,
+      code: 'duplicate_content',
+      existingDir: 'notes',
+    });
   });
 
   it('allows empty content write/upload without dedup check', async () => {
@@ -376,6 +389,55 @@ describe('contexts › renameContextEntry', () => {
     const c = await loadContexts();
     const r = c.renameContextEntry('a.md', 'b.md');
     expect(r.ok).toBe(false);
+  });
+
+  it('moves a folder recursively and rejects moving it into itself', async () => {
+    fs.mkdirSync(path.join(ctxRoot(), 'inbox/nested'), { recursive: true });
+    fs.mkdirSync(path.join(ctxRoot(), 'archive'), { recursive: true });
+    writeFile('inbox/nested/note.md', '# body');
+    const c = await loadContexts();
+
+    expect(c.renameContextEntry('inbox', 'inbox/nested/inbox').ok).toBe(false);
+    expect(c.renameContextEntry('inbox', 'archive/inbox').ok).toBe(true);
+    expect(fs.existsSync(path.join(ctxRoot(), 'inbox'))).toBe(false);
+    expect(fs.readFileSync(path.join(ctxRoot(), 'archive/inbox/nested/note.md'), 'utf8')).toBe('# body');
+  });
+});
+
+describe('contexts › copyContextEntryFromPath', () => {
+  it('copies a folder recursively and re-enqueues the destination paths', async () => {
+    writeFile('source/nested/note.md', '# body');
+    fs.mkdirSync(path.join(ctxRoot(), 'archive'), { recursive: true });
+    const c = await loadContexts();
+    const source = c.resolveContextEntryAbsPath('source');
+    kbEnqueueCalls.length = 0;
+
+    const copied = c.copyContextEntryFromPath(source, 'archive/source');
+
+    expect(copied).toMatchObject({ ok: true, fileCount: 1 });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'archive/source/nested/note.md'), 'utf8')).toBe('# body');
+    expect(kbEnqueueCalls).toContainEqual(expect.objectContaining({ relPath: 'archive/source/nested/note.md', op: 'upsert' }));
+  });
+
+  it('does not overwrite an existing target', async () => {
+    writeFile('source.md', 'source');
+    writeFile('target.md', 'target');
+    const c = await loadContexts();
+
+    const copied = c.copyContextEntryFromPath(c.resolveContextEntryAbsPath('source.md'), 'target.md');
+
+    expect(copied).toMatchObject({ ok: false, error: 'target_exists' });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'target.md'), 'utf8')).toBe('target');
+  });
+
+  it('does not recreate a destination folder that no longer exists', async () => {
+    writeFile('source.md', 'source');
+    const c = await loadContexts();
+
+    const copied = c.copyContextEntryFromPath(c.resolveContextEntryAbsPath('source.md'), 'missing/source.md');
+
+    expect(copied).toMatchObject({ ok: false, error: 'not_found' });
+    expect(fs.existsSync(path.join(ctxRoot(), 'missing'))).toBe(false);
   });
 });
 

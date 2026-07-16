@@ -127,4 +127,26 @@ describe('connectors registry secret storage', () => {
     expect(second.connections.github.display_name).toBe('GitHub');
     expect(second.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
   });
+
+  it('reuses unchanged encrypted envelopes for metadata-only updates', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    await registry.upsert(TEST_UID, sampleInstance());
+    const before = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const encryptSpy = vi.spyOn(localSecrets, 'encryptLocalSecret');
+
+    await registry.update(TEST_UID, 'github', (cur) => ({
+      ...cur,
+      status: { kind: 'connected', since: 2 },
+      tools_cached_at: 2,
+      updated_at: '2026-06-01T12:01:00.000Z',
+    }));
+
+    const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(encryptSpy).not.toHaveBeenCalled();
+    expect(after.connections.github.secrets_enc).toBe(before.connections.github.secrets_enc);
+    expect(after.connections.github.tools_cached_at).toBe(2);
+  });
 });

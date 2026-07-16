@@ -5,10 +5,10 @@
  * files live under data/search/ and never participate in cloud sync —
  * each device rebuilds from source.
  *
- * Every query first calls the relevant `reconcileX(...)` so out-of-band
- * changes (sync drop-in, manual edit) are picked up automatically. Cost is
- * one stat per source file plus a re-tokenize for any whose mtime/size
- * moved.
+ * Queries use the persisted index when its lightweight source catalog is
+ * unchanged. A catalog mismatch triggers `reconcileX(...)`, which picks up
+ * out-of-band changes (sync drop-in, manual edit) with one stat per source
+ * file plus a re-tokenize for any whose mtime/size moved.
  *
  * Indexed kinds:
  *   - `context` — KB tree, by relPath only (directory + filename, not
@@ -25,15 +25,22 @@
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import * as readline from 'node:readline';
+import { Semaphore } from 'async-mutex';
 
 import {
-  WS_ROOT, userChatsDir,
+  WS_ROOT,
   userContextsIndexPath, userChatsIndexPath,
   userSearchDir,
 } from '../../paths';
+import { conversationMessageReadFile } from '../../util/project-layout';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
+import {
+  scheduleBootBackground,
+  type ScheduledBootBackgroundTask,
+} from '../../util/boot_init';
 
 const log = createLogger('search');
 
@@ -45,21 +52,75 @@ export {
   upsertContext, dropContext,
   indexChatMessage,
   dropChatConversation,
+  reconcileContextsIndex,
+  invalidateContextsIndex,
   flushAll,
 } from './indexer';
 
 const MAX_PER_KIND = 30;
 const SNIPPET_RADIUS = 60;
 
+interface ChatDisplayCatalog {
+  titles: Map<string, string>;
+  cidToPid: Map<string, string>;
+  pidToName: Map<string, string>;
+}
+
+const _chatDisplayCatalogCache = new Map<string, ChatDisplayCatalog>();
+const _chatDisplayCatalogInFlight = new Map<string, Promise<ChatDisplayCatalog>>();
+const _chatDisplayCatalogGeneration = new Map<string, number>();
+
+export function invalidateChatDisplayCatalog(userId: string): void {
+  _chatDisplayCatalogCache.delete(userId);
+  _chatDisplayCatalogInFlight.delete(userId);
+  _chatDisplayCatalogGeneration.set(
+    userId,
+    (_chatDisplayCatalogGeneration.get(userId) || 0) + 1,
+  );
+}
+
+async function _getChatDisplayCatalog(userId: string): Promise<ChatDisplayCatalog> {
+  const cached = _chatDisplayCatalogCache.get(userId);
+  if (cached) return cached;
+  const existing = _chatDisplayCatalogInFlight.get(userId);
+  if (existing) return existing;
+  const generation = _chatDisplayCatalogGeneration.get(userId) || 0;
+  const run = (async () => {
+    const [chats, projects] = await Promise.all([
+      import('../chats'),
+      import('../projects'),
+    ]);
+    const [conversationRows, projectRows] = await Promise.all([
+      chats.listConversationDisplayRows(userId),
+      projects.listProjectNameRows(userId),
+    ]);
+    const catalog: ChatDisplayCatalog = {
+      titles: new Map(),
+      cidToPid: new Map(),
+      pidToName: new Map(projectRows.map((row) => [row.project_id, row.name])),
+    };
+    for (const row of conversationRows) {
+      catalog.titles.set(row.conversation_id, row.title);
+      if (row.project_id) catalog.cidToPid.set(row.conversation_id, row.project_id);
+    }
+    if ((_chatDisplayCatalogGeneration.get(userId) || 0) === generation) {
+      _chatDisplayCatalogCache.set(userId, catalog);
+    }
+    return catalog;
+  })();
+  _chatDisplayCatalogInFlight.set(userId, run);
+  try { return await run; }
+  finally {
+    if (_chatDisplayCatalogInFlight.get(userId) === run) {
+      _chatDisplayCatalogInFlight.delete(userId);
+    }
+  }
+}
+
 interface RuntimeIndex extends Index {
   _avgdl?: number | null;
   _avgdlVersion?: number;
   _version?: number;
-}
-
-interface SourceCache {
-  jsonlMessage(file: string, msgIndex: number): { content?: unknown } | null;
-  body(file: string): string;
 }
 
 export interface SearchResult {
@@ -69,33 +130,80 @@ export interface SearchResult {
   [extra: string]: unknown;
 }
 
-// ── Source readers (per-query memoized to avoid re-reading large jsonls) ─
+// ── Source readers ──────────────────────────────────────────────────────
 
-function _makeSourceCache(): SourceCache {
-  const lines = new Map<string, string[]>();
-  const bodies = new Map<string, string>();
-  return {
-    jsonlMessage(file, msgIndex) {
-      let arr = lines.get(file);
-      if (!arr) {
-        try { arr = fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.trim()); }
-        catch { arr = []; }
-        lines.set(file, arr);
+interface ChatSourceMessage { content?: unknown; text?: unknown }
+
+// Search returns at most 30 chat hits. Read only their source records, group
+// hits by conversation, and cap the number of simultaneously-open JSONLs so a
+// broad query cannot turn into a disk burst. readline's async iterator yields
+// between chunks instead of synchronously reading/splitting an entire long
+// history on Electron's main event loop.
+const _chatSnippetIo = new Semaphore(4);
+
+async function _readJsonlMessagesAt(
+  file: string,
+  indexes: ReadonlySet<number>,
+): Promise<Map<number, ChatSourceMessage>> {
+  const found = new Map<number, ChatSourceMessage>();
+  if (!indexes.size) return found;
+  const maxIndex = Math.max(...indexes);
+  return _chatSnippetIo.runExclusive(async () => {
+    const input = fs.createReadStream(file, { encoding: 'utf8' });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    let parsedIndex = 0;
+    try {
+      for await (const line of lines) {
+        if (!line.trim()) continue;
+        let msg: ChatSourceMessage;
+        try { msg = JSON.parse(line) as ChatSourceMessage; }
+        catch { continue; }
+        if (indexes.has(parsedIndex)) found.set(parsedIndex, msg);
+        if (parsedIndex >= maxIndex || found.size >= indexes.size) break;
+        parsedIndex += 1;
       }
-      const line = arr[msgIndex];
-      if (!line) return null;
-      try { return JSON.parse(line); } catch { return null; }
-    },
-    body(file) {
-      let b = bodies.get(file);
-      if (b === undefined) {
-        try { b = fs.readFileSync(file, 'utf8'); } catch { b = ''; }
-        bodies.set(file, b);
-      }
-      return b;
-    },
-  };
+    } catch {
+      // Missing/replaced source files are repaired by the index reconciler.
+    } finally {
+      lines.close();
+      input.destroy();
+    }
+    return found;
+  });
 }
+
+const _chatRepairTasks = new Map<string, ScheduledBootBackgroundTask>();
+
+function _scheduleChatIndexRepair(userId: string): void {
+  if (_chatRepairTasks.has(userId)) return;
+  const task = scheduleBootBackground(
+    `search:chat-query-repair:${userId}`,
+    (signal) => indexer.reconcileChatsIndex(userId, signal),
+    250,
+    { resourceClass: 'disk', preferIdle: true, maxSliceMs: 15_000 },
+  );
+  _chatRepairTasks.set(userId, task);
+  void task.promise.finally(() => {
+    if (_chatRepairTasks.get(userId) === task) _chatRepairTasks.delete(userId);
+  });
+}
+
+export function invalidateChatsIndex(userId: string): void {
+  indexer.invalidateChatsIndex(userId);
+  const pending = _chatRepairTasks.get(userId);
+  if (pending) {
+    pending.cancel();
+    _chatRepairTasks.delete(userId);
+  }
+}
+
+export const __searchTestHooks = {
+  hasPendingChatRepair: (userId: string): boolean => _chatRepairTasks.has(userId),
+  cancelChatRepair: (userId: string): void => {
+    _chatRepairTasks.get(userId)?.cancel();
+    _chatRepairTasks.delete(userId);
+  },
+};
 
 function _makeSnippet(text: string, query: string): string {
   if (!text) return '';
@@ -205,8 +313,12 @@ export async function searchContexts(query: string, userId?: string): Promise<Se
   const q = (query || '').trim();
   if (!q) return [];
   const uid = userId || getActiveUserId();
-  // See `searchChats` for why we reconcile per-query.
-  await indexer.reconcileContextsIndex(uid);
+  // Startup/sync reconciliation establishes a complete in-process snapshot.
+  // Normal context mutations patch that snapshot directly, so repeated query
+  // keystrokes do not need to re-walk the entire library tree.
+  if (!indexer.isContextsIndexCurrent(uid)) {
+    await indexer.reconcileContextsIndex(uid);
+  }
   const entry = await indexer.getEntry(userContextsIndexPath(uid), 'context');
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
@@ -268,70 +380,88 @@ export async function searchProjectContexts(userId: string, projectId: string, q
   }
 }
 
-export async function searchChats(userId: string, query: string): Promise<SearchResult[]> {
+export interface SearchChatsOptions {
+  /** Restrict candidates to this project only. Ignored unless scope=project. */
+  projectId?: string;
+  /** Project scope is opt-in at this feature layer; model tools choose it by default in projects. */
+  scope?: 'project' | 'all';
+  /** Exclude a conversation whose history is already present in the caller's context. */
+  excludeCid?: string;
+}
+
+export async function searchChats(
+  userId: string,
+  query: string,
+  options: SearchChatsOptions = {},
+): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
-  // Per the file-header invariant ("every query first calls reconcileX"):
-  // reconcile picks up jsonl files that grew or were created since the last
-  // reconcile (boot or prior query). Bus does NOT live-index — without this
-  // call, conversations created after startup are unsearchable until the
-  // next boot. Cheap: one stat per chat jsonl + re-tokenize only for those
-  // whose mtime/size changed.
-  await indexer.reconcileChatsIndex(userId);
   const entry = await indexer.getEntry(userChatsIndexPath(userId), 'chat');
+  // A usable persisted snapshot is preferable to making the first query wait
+  // for a history-wide repair. Normal writes patch the index incrementally;
+  // this stale-snapshot path primarily covers sync/manual edits and repairs in
+  // the same idle, serialized disk queue used by startup maintenance. An empty
+  // or corrupt snapshot still reconciles synchronously because it cannot
+  // return any useful result.
+  if (!indexer.isChatsIndexTrusted(userId) && !await indexer.isChatsIndexCurrent(userId)) {
+    if (Object.keys(entry.idx.docs).length > 0) _scheduleChatIndexRepair(userId);
+    else await indexer.reconcileChatsIndex(userId);
+  }
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
 
-  // Conversation display data: title + project membership. Read from
-  // `_index.json` once per query so each result row gets cheap O(1) lookups.
-  const indexFile = path.join(userChatsDir(userId), '_index.json');
-  const titles: Record<string, string> = {};
-  const cidToPid: Record<string, string> = {};
-  try {
-    if (fs.existsSync(indexFile)) {
-      const items = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
-      const arr = Array.isArray(items) ? items : (items?.items || []);
-      for (const c of arr) {
-        titles[c.conversation_id] = c.title || '';
-        if (c.project_id) cidToPid[c.conversation_id] = c.project_id;
-      }
-    }
-  } catch { /* ignore */ }
+  const displayCatalog = await _getChatDisplayCatalog(userId);
 
-  // Project name lookup — cheap (a few file reads). Only build when at
-  // least one indexed conv has a project_id.
-  const pidToName: Record<string, string> = {};
-  if (Object.keys(cidToPid).length) {
-    try {
-      const projects = await import('../projects');
-      const list = await projects.listProjects(userId);
-      for (const p of list) pidToName[p.project_id] = p.name || '';
-    } catch { /* ignore — chip just won't show */ }
+  interface ChatCandidate extends SearchResult {
+    sourceFile: string;
+    sourceIndex: number;
   }
-
-  const cache = _makeSourceCache();
-  return _topN<SearchResult>(scores, MAX_PER_KIND, (docId, score) => {
+  const candidates = _topN<ChatCandidate>(scores, MAX_PER_KIND, (docId, score) => {
     const doc = entry.idx.docs[docId] as Doc & { cid?: string; msg_index?: number; role?: string; time?: string };
     if (!doc) return null;
-    const file = path.join(userChatsDir(userId), `${doc.cid}.jsonl`);
-    const msg = cache.jsonlMessage(file, Number(doc.msg_index));
     const cid = String(doc.cid);
-    const pid = cidToPid[cid] || '';
-    const result: SearchResult = {
+    const msgIndex = Number(doc.msg_index);
+    if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
+    const pid = displayCatalog.cidToPid.get(cid) || '';
+    if (options.excludeCid && cid === options.excludeCid) return null;
+    if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
+    // The catalog above already resolved project membership. Supplying it
+    // avoids `conversationMessageReadFile` re-scanning every project index
+    // once per search result.
+    const file = conversationMessageReadFile(userId, cid, pid || undefined);
+    const result: ChatCandidate = {
       kind: 'chat',
       cid: doc.cid,
       msg_index: doc.msg_index,
-      conv_title: titles[cid] || t('chat.default_title'),
+      conv_title: displayCatalog.titles.get(cid) || t('chat.default_title'),
       role: doc.role,
       time: doc.time,
-      snippet: _makeSnippet(indexer.readMsgText(msg as any), q),
+      snippet: '',
       score,
+      sourceFile: file,
+      sourceIndex: msgIndex,
     };
     if (pid) {
       (result as any).project_id = pid;
-      const name = pidToName[pid];
+      const name = displayCatalog.pidToName.get(pid);
       if (name) (result as any).project_name = name;
     }
+    return result;
+  });
+
+  const byFile = new Map<string, Set<number>>();
+  for (const candidate of candidates) {
+    const indexes = byFile.get(candidate.sourceFile) || new Set<number>();
+    indexes.add(candidate.sourceIndex);
+    byFile.set(candidate.sourceFile, indexes);
+  }
+  const sourceRows = new Map<string, Map<number, ChatSourceMessage>>();
+  await Promise.all(Array.from(byFile, async ([file, indexes]) => {
+    sourceRows.set(file, await _readJsonlMessagesAt(file, indexes));
+  }));
+  return candidates.map(({ sourceFile, sourceIndex, ...result }) => {
+    const msg = sourceRows.get(sourceFile)?.get(sourceIndex);
+    result.snippet = _makeSnippet(indexer.readMsgText(msg), q);
     return result;
   });
 }
@@ -374,8 +504,9 @@ function _descSnippet(description: string, qLower: string): string {
 
 async function _currentDescriptionLang(): Promise<'zh' | 'en'> {
   try {
-    const { descriptionLang, getCurrentLang } = await import('../../i18n');
-    return descriptionLang(getCurrentLang());
+    const { descriptionLang } = await import('../../i18n');
+    const { getLanguage } = await import('../config');
+    return descriptionLang(getLanguage());
   } catch { return 'en'; }
 }
 
@@ -392,8 +523,8 @@ export async function searchAgents(_userId: string, query: string): Promise<Sear
   if (!q) return [];
   const qLower = q.toLowerCase();
   const lang = await _currentDescriptionLang();
-  const { listAgents } = await import('../agents');
-  const list = await listAgents();
+  const { listAgentSearchListings } = await import('../agents');
+  const list = await listAgentSearchListings();
   const scored: SearchResult[] = [];
   for (const a of list) {
     const desc = _pickDesc(a, lang);
@@ -441,15 +572,63 @@ export async function searchSkills(_userId: string, query: string): Promise<Sear
   return scored.slice(0, MAX_PER_KIND);
 }
 
-/**
- * Run every kind's reconcile once — intended for startup or post-sync hooks.
- * Walks every user dir under WS_ROOT for per-user indexes. Runs in parallel
- * and logs progress so a long first-boot build shows up in the log.
- *
- * Also unlinks legacy `skill_chats.idx.json` / `agent_chats.idx.json` files
- * left behind by older builds — those scopes were dropped from search and
- * the files would otherwise sit forever as orphaned ~MBs in local/search/.
- */
+async function _hasPersistedIndex(file: string): Promise<boolean> {
+  try {
+    const st = await fsp.stat(file);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function _reconcileUser(
+  uid: string,
+  reusePersisted: boolean,
+  signal?: AbortSignal,
+): Promise<{ tasks: number; reused: number; cancelled: number }> {
+  const operations: Array<() => Promise<void>> = [];
+  let reused = 0;
+  let cancelled = 0;
+  const contextIndex = userContextsIndexPath(uid);
+  const chatIndex = userChatsIndexPath(uid);
+  // Context path indexes are comparatively small and used by interactive
+  // typeahead. Reconcile them in the idle startup cohort so the first query
+  // never inherits a full directory walk.
+  if (reusePersisted && await _hasPersistedIndex(contextIndex)) reused++;
+  operations.push(async () => {
+    const result = await indexer.reconcileContextsIndex(uid, signal);
+    if (result.cancelled) cancelled += 1;
+  });
+  if (reusePersisted && await _hasPersistedIndex(chatIndex)) reused++;
+  else operations.push(async () => {
+    const result = await indexer.reconcileChatsIndex(uid, signal);
+    if (result.cancelled) cancelled += 1;
+  });
+  operations.push(() => _unlinkLegacyIndexes(uid));
+  let failed = 0;
+  // Keep context and chat scans serial inside the shared disk resource slot.
+  // Missing both indexes must not create a second internal disk storm.
+  for (const operation of operations) {
+    try { await operation(); }
+    catch { failed += 1; }
+  }
+  if (failed) log.warn(`reconcile user=${uid} failed=${failed}/${operations.length}`);
+  return { tasks: operations.length, reused, cancelled };
+}
+
+/** Startup-only reconcile. It scopes work to the active uid, fully refreshes
+ * the smaller context path index, and treats an existing chat index as a
+ * usable snapshot without parsing multi-megabyte postings. Chat query-time
+ * validation uses the compact conversation catalog before any history scan. */
+export async function reconcileActive(signal?: AbortSignal): Promise<void> {
+  const t0 = Date.now();
+  const uid = getActiveUserId();
+  const result = await _reconcileUser(uid, true, signal);
+  log.info(`reconcileActive done in ${Date.now() - t0}ms (user=${uid}, tasks=${result.tasks}, reused=${result.reused}, cancelled=${result.cancelled})`);
+}
+
+/** Full all-user repair hook. Startup uses `reconcileActive`; this broader
+ * variant remains available for explicit maintenance and regression repair. */
 export async function reconcileAll(): Promise<void> {
   const t0 = Date.now();
   const tasks: Array<Promise<void>> = [];
@@ -457,16 +636,14 @@ export async function reconcileAll(): Promise<void> {
     for (const ent of fs.readdirSync(WS_ROOT, { withFileTypes: true })) {
       if (!ent.isDirectory()) continue;
       const uid = ent.name;
-      // Skip top-level non-user dirs (logs/, builtin/).
-      if (uid === 'logs' || uid === 'builtin') continue;
-      tasks.push(indexer.reconcileContextsIndex(uid));
-      tasks.push(indexer.reconcileChatsIndex(uid));
-      tasks.push(_unlinkLegacyIndexes(uid));
+      // Skip top-level non-user dirs.
+      if (uid === 'logs') continue;
+      tasks.push(_reconcileUser(uid, false).then(() => undefined));
     }
   }
   const results = await Promise.allSettled(tasks);
   const failed = results.filter((r) => r.status === 'rejected').length;
-  log.info(`reconcileAll done in ${Date.now() - t0}ms (${tasks.length} idx, ${failed} failed)`);
+  log.info(`reconcileAll done in ${Date.now() - t0}ms (${tasks.length} users, ${failed} failed)`);
 }
 
 async function _unlinkLegacyIndexes(uid: string): Promise<void> {

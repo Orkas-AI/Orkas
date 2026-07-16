@@ -342,6 +342,11 @@ type SkillSpec = ReturnType<SkillLoaderInstance['list']>[number];
 
 function agentPrivateSkillRoots(uid: string, agentId: string): string[] {
   if (!agentId) return [];
+  // NOTE: self-evolved skills (`agentEvolvedSkillsDir`, cloud/agents/<id>/skills)
+  // are deliberately NOT here. core-agent's evolution SkillStore.buildIndex()
+  // injects them into the system prompt itself, so rendering them here too would
+  // double-inject. This path is only the Orkas-side prompt block (marketplace
+  // agent skills + author-published private_skills).
   return [
     userMarketplaceAgentSkillsDir(uid, agentId),
     agentPrivateSkillsDir(uid, agentId),

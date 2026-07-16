@@ -53,6 +53,21 @@ function configurePackagedEsbuildBinary() {
   }
 }
 
+function configureWindowsVcRuntimePath() {
+  if (process.platform !== 'win32') return;
+  const platformKey = `${process.platform}-${process.arch}`;
+  const candidates = [
+    process.resourcesPath && path.join(process.resourcesPath, 'runtime', 'vc', platformKey),
+    path.join(__dirname, 'resources', 'runtime', 'vc', platformKey),
+  ].filter(Boolean);
+  const runtimeDir = candidates.find((dir) => fs.existsSync(path.join(dir, 'vcruntime140.dll')));
+  if (!runtimeDir) return;
+  const entries = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  process.env.PATH = [runtimeDir, ...entries.filter((entry) => path.resolve(entry) !== path.resolve(runtimeDir))]
+    .join(path.delimiter);
+}
+
+configureWindowsVcRuntimePath();
 configurePackagedEsbuildBinary();
 
 require('tsx/cjs');

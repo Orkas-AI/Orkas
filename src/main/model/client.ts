@@ -82,10 +82,10 @@ export interface ChatOptions {
    *  under `idleTimeout` + the per-tool watchdog). Default 180. */
   streamIdleTimeout?: number;
   /** Max tool-call rounds in a single turn before the run is force-ended with
-   *  "(Tool loop limit reached)". Undefined → core-agent default (100). Group
-   *  chat raises this for the commander, which legitimately runs long
-   *  multi-step builds (e.g. hyperframes video) that exceed normal tool rounds;
-   *  the identical-call loop_detection still guards true runaway loops. */
+   *  "(Tool loop limit reached)". Undefined → core-agent schema default (100).
+   *  Group chat pins this for the commander (120) and named agent workers (100),
+   *  which legitimately run long multi-step builds (e.g. VideoStudio draft/render,
+   *  DeepResearcher gathering); loop_detection still guards true runaway loops. */
   maxToolLoops?: number;
   abortSignal?: AbortSignal | null;
   /** Legacy openclaw CLI timeout — ignored, retained for signature parity. */
@@ -153,6 +153,10 @@ export interface ChatOptions {
    * `features/chats` uses this to attach a `produced[]` list to the
    * assistant message so the UI can offer a "reveal in Finder" chip. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
+  /** Accepts the model's complete final-deliverable declaration for this
+   * turn and returns the subset accepted by the conversation owner. Paths
+   * are absolute before this callback runs. */
+  onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
   /** Predicate: true when the given absolute path was already written by
    * this caller's session (typically: a `Set` populated by `onFileWritten`
    * earlier in the same turn). Used by the write-style tools' uniquify

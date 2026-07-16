@@ -154,6 +154,32 @@ async function loadConnectors() {
   }
 }
 
+/** Re-verify installed connectors on panel entry, then re-render with the real outcome.
+ *
+ *  Deliberately NOT awaited by `loadConnectors`: verification opens real connections and can take
+ *  seconds, and the panel must paint immediately from persisted state. Cards start on their last
+ *  known status and settle onto the verified one — a dead connector flips to the amber
+ *  "未验证 · <reason>" card instead of sitting there green forever.
+ *
+ *  Cost is bounded in the manager (`verifyUsableConnectors`), not here: rows with a live connection
+ *  or a recent successful connect are skipped, and concurrent runs coalesce. Fire-and-forget is
+ *  safe — a failure just leaves the persisted status on screen. */
+async function verifyConnectors() {
+  const seq = _connectorsLoadSeq;
+  try {
+    const res = await window.orkas.invoke('connectors.verify', {});
+    // A newer load superseded us — its own verify pass owns the screen now.
+    if (seq !== _connectorsLoadSeq) return;
+    if (res && res.ok && Array.isArray(res.instances)) {
+      _connectorsState.instances = res.instances;
+      _persistConnectorsRenderCache();
+      _renderConnectorsGrid();
+    }
+  } catch (err) {
+    _connectorsLog.warn('connector verification failed', { error: (err && err.message) || String(err) });
+  }
+}
+
 function _instanceById(id) {
   return _connectorsState.instances.find((i) => i.id === id) || null;
 }
@@ -168,6 +194,9 @@ function _deriveBundleInstance(entry) {
   const allConnected = members.length === entry.bundle_member_ids.length
     && members.every((m) => m.status && m.status.kind === 'connected');
   const anyErrored = members.find((m) => m.status && m.status.kind === 'error');
+  // One unverified member makes the whole bundle unverified — a bundle card that claims "已连接"
+  // while one of its five members can't reach its backend is the same lie at bundle scope.
+  const anyDegraded = members.find((m) => m.status && m.status.kind === 'degraded');
   const accountLabel = members.map((m) => m.oauth_grant && m.oauth_grant.account_label).find(Boolean) || '';
   // For enabled: bundle is "enabled" iff every member is enabled (any disabled → show Enable).
   const allEnabled = members.every((m) => m.enabled !== false);
@@ -176,7 +205,16 @@ function _deriveBundleInstance(entry) {
     display_name: entry.display_name,
     status: allConnected
       ? { kind: 'connected', since: 0 }
-      : (anyErrored ? { kind: 'error', message: anyErrored.status.message, at: 0 } : { kind: 'connecting' }),
+      : (anyErrored
+        ? { kind: 'error', message: anyErrored.status.message, at: 0 }
+        : (anyDegraded
+          ? {
+            kind: 'degraded',
+            message: anyDegraded.status.message,
+            at: 0,
+            last_verified_at: anyDegraded.status.last_verified_at,
+          }
+          : { kind: 'connecting' })),
     oauth_grant: accountLabel ? { account_label: accountLabel } : undefined,
     enabled: allEnabled,
     // Bundle marker so the click handlers fan out to all members.
@@ -184,10 +222,14 @@ function _deriveBundleInstance(entry) {
   };
 }
 
-// True iff this connector id is currently live for the LLM (connected + not user-disabled).
+// True iff this connector id is verified live (last attempt succeeded + not user-disabled).
 // Mirrors the main-side `resolveVisibleConnectors` filter so a queue-draft drained after the
 // user disconnects / disables the connector can detect the dangling reference and degrade the
 // message to plain text instead of injecting a `use <connector>` prefix the bus can't honor.
+//
+// `degraded` is deliberately NOT live here even though the main side still routes it: the LLM may
+// retry a degraded connector (that is what heals it), but we must not advertise one to the *user*
+// as ready, nor pin a composer draft to it.
 function isConnectorLive(id) {
   const inst = _instanceById(id);
   return !!(inst && inst.status && inst.status.kind === 'connected' && inst.enabled !== false);
@@ -239,6 +281,19 @@ function _formatConnectorStatusError(message) {
     return _connectorErrorFallback('reconnect');
   }
   return msg;
+}
+
+/** "上次验证 5 天前" for a degraded card. Returns '' when we never recorded a successful connect
+ *  (nothing truthful to say) so the caller falls back to the reason alone. */
+function _formatLastVerified(ts) {
+  const at = Number(ts) || 0;
+  if (!at) return '';
+  const mins = Math.floor((Date.now() - at) / 60000);
+  if (mins < 1) return t('connectors.status.verified_just_now');
+  if (mins < 60) return t('connectors.status.verified_minutes_ago', { n: mins });
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return t('connectors.status.verified_hours_ago', { n: hours });
+  return t('connectors.status.verified_days_ago', { n: Math.floor(hours / 24) });
 }
 
 function listUsableConnectorsForPicker() {
@@ -308,7 +363,12 @@ function _renderConnectorsGrid() {
     }
   }
 
-  // Partition catalog rows by whether there's a corresponding connected instance.
+  // Partition catalog rows by whether there's a corresponding installed instance.
+  //
+  // `degraded` rows group here alongside `connected` ones: they are installed and authorized, and
+  // a momentary backend 5xx must not yank every card down into "可用" and back. They are *not*
+  // presented as connected — `_renderCatalogCard` gives them the unverified treatment (reason +
+  // staleness + 重试). Grouping answers "is it installed"; the card answers "does it work".
   const connectedItems = [];
   const availableItems = [];
   for (const entry of _connectorsState.catalog) {
@@ -320,7 +380,7 @@ function _renderConnectorsGrid() {
     if (Array.isArray(entry.bundle_member_ids)) {
       inst = _deriveBundleInstance(entry);
     }
-    if (inst && inst.status && inst.status.kind === 'connected') {
+    if (inst && inst.status && (inst.status.kind === 'connected' || inst.status.kind === 'degraded')) {
       connectedItems.push({ entry, instance: inst });
     } else {
       availableItems.push({ entry, instance: inst });
@@ -332,7 +392,7 @@ function _renderConnectorsGrid() {
   for (const inst of _connectorsState.instances) {
     if (!inst || inst.origin !== 'custom') continue;
     const item = { entry: _entryFromInstance(inst), instance: inst };
-    if (inst.status && inst.status.kind === 'connected') connectedItems.push(item);
+    if (inst.status && (inst.status.kind === 'connected' || inst.status.kind === 'degraded')) connectedItems.push(item);
     else availableItems.push(item);
   }
   // A→Z within each group (CLAUDE.md §8 inventory ordering).
@@ -372,6 +432,10 @@ function _renderCatalogCard(entry, instance) {
   const isVisibleDisabled = _isConnectorVisibleDisabled(e);
   const connected = !!(instance && instance.status && instance.status.kind === 'connected');
   const errored = !!(instance && instance.status && instance.status.kind === 'error');
+  // Authorized + cached, but the last connect/refresh failed. Stays in this group (a 30s backend
+  // blip must not reshuffle every card out of the list) but must never render as connected: the
+  // card states the reason and how stale it is, and offers 重试 instead of 使用.
+  const degraded = !!(instance && instance.status && instance.status.kind === 'degraded');
   // `enabled` is per-user soft state attached by `connectors.list` IPC. Only meaningful for
   // connected cards (un-connected ones have nothing to disable). Default true when missing.
   const enabledFlag = instance && Object.prototype.hasOwnProperty.call(instance, 'enabled')
@@ -379,7 +443,7 @@ function _renderCatalogCard(entry, instance) {
     : true;
 
   const card = document.createElement('div');
-  card.className = `connector-card${connected && !enabledFlag ? ' is-disabled' : ''}`;
+  card.className = `connector-card${connected && !enabledFlag ? ' is-disabled' : ''}${degraded ? ' is-unverified' : ''}`;
   card.dataset.id = e.id;
 
   // Brand-color square per design (Surface E) — applied ONLY to the
@@ -389,8 +453,9 @@ function _renderCatalogCard(entry, instance) {
   // Notion `fill:#000` on `#000`, etc.) — the SVG sits on the card's own
   // surface instead.
   const brandTint = _CONNECTOR_BRAND_TINT[e.id] || '#16181d';
-  const iconHtml = e.icon_svg
-    ? `<div class="connector-card-icon is-svg">${e.icon_svg}</div>`
+  const safeIconSvg = typeof sanitizeSvgIconHtml === 'function' ? sanitizeSvgIconHtml(e.icon_svg) : '';
+  const iconHtml = safeIconSvg
+    ? `<div class="connector-card-icon is-svg">${safeIconSvg}</div>`
     : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((e.display_name || '?').slice(0, 1).toUpperCase())}</div>`;
   // Custom cards have no authored description — show the server summary
   // (url / command) so the user can tell their entries apart.
@@ -400,12 +465,17 @@ function _renderCatalogCard(entry, instance) {
 
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
   const errorMsg = errored && instance && instance.status && instance.status.message;
+  const degradedMsg = degraded && instance && instance.status && instance.status.message;
+  const degradedSince = degraded && instance && instance.status
+    ? instance.status.last_verified_at
+    : 0;
 
-  // The ⋯ menu lives on connected cards only — it hosts the destructive disconnect action so it stays
+  // The ⋯ menu lives on installed cards — it hosts the destructive disconnect action so it stays
   // one click away from accidental triggers. Un-connected / errored cards still surface the
   // disconnect action as a bottom-row button (they need it visible to recover; the disable toggle
-  // doesn't apply when there's nothing to disable).
-  const menuHtml = connected
+  // doesn't apply when there's nothing to disable). Degraded cards keep the menu because their
+  // bottom-row action is retry, while disconnect still needs to remain reachable.
+  const menuHtml = (connected || degraded)
     ? `<button class="connector-card-menu-btn" data-act="menu" aria-label="${escapeHtml(t('common.more'))}" aria-expanded="false">⋯</button>`
     : '';
 
@@ -423,7 +493,7 @@ function _renderCatalogCard(entry, instance) {
   let action = '';
   const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
   if (isConnecting) {
-    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect"><span class="btn-spinner"></span>${escapeHtml(t('connectors.action.connecting'))}</button>`;
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect">${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (isOAuthPending) {
     action = `<button class="btn btn-sm" disabled>${escapeHtml(t('connectors.action.unavailable'))}</button>`;
   } else if (isVisibleDisabled) {
@@ -431,6 +501,11 @@ function _renderCatalogCard(entry, instance) {
   } else if (connected) {
     const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: e.display_name || e.id }));
     action = `<button class="agent-card-use connector-card-use" data-act="use-connector" title="${useTitle}" aria-label="${useTitle}" ${enabledFlag ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('common.use'))}</button>`;
+  } else if (degraded) {
+    // Retry re-runs connect + token refresh (`connectors.refresh`) — NOT OAuth. The grant is fine;
+    // what failed was reaching the backend. Offering "连接" here would send the user through a
+    // pointless re-authorization for what is usually a server-side outage.
+    action = `<button class="btn btn-sm btn-primary" data-act="retry-degraded">${escapeHtml(t('connectors.action.retry'))}</button>`;
   } else if (e._custom) {
     // Custom server, not connected: retry probes the stored transport
     // (`connectors.refresh`), never OAuth. Disconnect stays available so a
@@ -449,6 +524,8 @@ function _renderCatalogCard(entry, instance) {
   let secondaryHtml = '';
   if (errorMsg) {
     secondaryHtml = '<div class="connector-card-error"></div>';
+  } else if (degradedMsg) {
+    secondaryHtml = '<div class="connector-card-unverified"></div>';
   } else if (accountLabel) {
     secondaryHtml = '<div class="connector-card-account muted"></div>';
   }
@@ -472,6 +549,14 @@ function _renderCatalogCard(entry, instance) {
     const text = `${t('connectors.status.error')}: ${_formatConnectorStatusError(errorMsg)}`;
     el.textContent = text;
     el.title = text;
+  } else if (degradedMsg) {
+    const el = card.querySelector('.connector-card-unverified');
+    const stale = _formatLastVerified(degradedSince);
+    const text = stale
+      ? `${t('connectors.status.unverified')} · ${stale}: ${_formatConnectorStatusError(degradedMsg)}`
+      : `${t('connectors.status.unverified')}: ${_formatConnectorStatusError(degradedMsg)}`;
+    el.textContent = text;
+    el.title = text;
   } else if (accountLabel) {
     const el = card.querySelector('.connector-card-account');
     el.textContent = accountLabel;
@@ -487,7 +572,8 @@ function _renderCatalogCard(entry, instance) {
       else if (act === 'disconnect') _quickDisconnect(e, instance);
       else if (act === 'menu') _openCardMenu(btn, e, instance);
       else if (act === 'use-connector' && enabledFlag) _useConnector(e, instance);
-      else if (act === 'retry-custom') _retryCustomConnect(e);
+      else if (act === 'retry-custom') _retryConnect(e, 'connector_custom_retry');
+      else if (act === 'retry-degraded') _retryConnect(e, 'connector_degraded_retry');
     });
   });
   return card;
@@ -759,35 +845,52 @@ async function _runConnect(entry) {
   }
 }
 
-async function _retryCustomConnect(entry) {
-  const payload = _connectorTrackPayload(entry, null);
+/** Re-run connect + token refresh for an installed instance (`connectors.refresh`), never OAuth.
+ *  Shared by the custom-server retry and the degraded-card retry. */
+async function _retryConnect(entry, event) {
+  // Bundle cards are synthetic; only their member instances exist in main. Retry every member and
+  // report success only when every latest status is actually connected.
+  const ids = Array.isArray(entry.bundle_member_ids) && entry.bundle_member_ids.length
+    ? entry.bundle_member_ids.slice()
+    : [entry.id];
+  const payload = { ..._connectorTrackPayload(entry, null), instance_count: ids.length };
   const startedAt = performance.now();
-  _connectorsTrackClick('connector_custom_retry', payload);
+  _connectorsTrackClick(event, payload);
   _connectorsState.connecting.add(entry.id);
   _renderConnectorsGrid();
   try {
-    const res = await window.orkas.invoke('connectors.refresh', { id: entry.id });
-    if (res && !res.ok) {
-      _connectorsTrackEvent('connector_custom_retry_result', {
+    const results = await Promise.all(ids.map(async (id) => {
+      try {
+        const res = await window.orkas.invoke('connectors.refresh', { id });
+        const status = res && res.instance && res.instance.status;
+        if (res && res.ok && status && status.kind === 'connected') return null;
+        return (res && (res.error || (status && status.message))) || t('connectors.errors.connect_failed');
+      } catch (err) {
+        return (err && err.message) || t('connectors.errors.connect_failed');
+      }
+    }));
+    const failures = results.filter(Boolean);
+    if (failures.length) {
+      _connectorsTrackEvent(`${event}_result`, {
         ...payload,
         result: 'failure',
         duration_ms: Math.round(performance.now() - startedAt),
       });
-      uiAlert(_formatConnectorStatusError(res.error || ''));
+      uiAlert(_formatConnectorStatusError(failures[0]));
     } else {
-      _connectorsTrackEvent('connector_custom_retry_result', {
+      _connectorsTrackEvent(`${event}_result`, {
         ...payload,
         result: 'success',
         duration_ms: Math.round(performance.now() - startedAt),
       });
     }
   } catch (err) {
-    _connectorsTrackEvent('connector_custom_retry_result', {
+    _connectorsTrackEvent(`${event}_result`, {
       ...payload,
       result: 'failure',
       duration_ms: Math.round(performance.now() - startedAt),
     });
-    _connectorsTrackError('connector_custom_retry', {
+    _connectorsTrackError(event, {
       ...payload,
       error_type: _connectorTrackErrorType(err),
     });
@@ -936,6 +1039,10 @@ function _openAddCustomDialog() {
           if (typeof uiToast === 'function') uiToast(t('connectors.custom.added'), { variant: 'success' });
         } else if (st.kind === 'error') {
           uiAlert(`${t('connectors.status.error')}: ${_formatConnectorStatusError(st.message)}`);
+        } else if (st.kind === 'degraded') {
+          // Added, but we could not verify it once — say so rather than falling through silently
+          // (the old if/else-if pair had no branch for this and showed nothing at all).
+          uiAlert(`${t('connectors.status.unverified')}: ${_formatConnectorStatusError(st.message)}`);
         }
         await loadConnectors();
       } else {

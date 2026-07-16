@@ -4,8 +4,9 @@
 // rootEl using MathJax v3 (configured in index.html before the script loads).
 //
 // Behaviour:
-//   • MathJax loads async via `<script defer>`. Before its startup promise
-//     resolves, calls are queued and flushed when it is ready.
+//   • The 1.16 MB runtime is injected only after content containing TeX is
+//     actually rendered. Plain chat sessions never fetch/parse MathJax.
+//   • Concurrent first-formula calls share one load promise.
 //   • Input sanity — our hand-rolled markdown renderer already protects
 //     math blocks (via utils.js::renderMarkdownFull phase 1) so delimiters
 //     survive markdown mangling; MathJax sees the original `$...$` etc.
@@ -16,30 +17,46 @@
 //     MathJax `clear`s its prior output via `typesetClear` first.
 
 const _mathLog = (typeof createLogger === 'function') ? createLogger('math') : console;
+let _mathJaxLoadPromise = null;
+
+function _containsMath(value) {
+  const text = String(value || '');
+  if (!text) return false;
+  return /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|(^|[^\\$])\$(?!\s|\d)[^$\n]+?\$(?!\d)/m.test(text);
+}
+
+function _rootContainsMath(rootEl) {
+  if (!rootEl) return false;
+  return _containsMath(rootEl.textContent || rootEl.innerHTML || '');
+}
+
+function _loadMathJaxRuntime() {
+  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') return Promise.resolve();
+  if (_mathJaxLoadPromise) return _mathJaxLoadPromise;
+  _mathJaxLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = './vendor/mathjax/tex-chtml.js';
+    script.async = true;
+    script.dataset.orkasMathjax = '1';
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('failed to load MathJax runtime'));
+    (document.head || document.documentElement).appendChild(script);
+  });
+  return _mathJaxLoadPromise;
+}
 
 async function _mjReady() {
-  // Before tex-chtml.js runs, `window.MathJax` is our config object (which
-  // intentionally has `startup: { typeset: false }` — so checking for
-  // `window.MathJax.startup` is NOT a reliable "is loaded" signal). The real
-  // signal is `window.MathJax.typesetPromise` becoming a function, which
-  // only happens after the runtime bundle replaces the config object with
-  // the full MathJax object. Poll for that, then await `startup.promise`.
-  if (typeof window.MathJax === 'undefined' || typeof window.MathJax.typesetPromise !== 'function') {
-    await new Promise((resolve) => {
-      const tick = () => {
-        if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') return resolve();
-        setTimeout(tick, 20);
-      };
-      tick();
-    });
-  }
+  await _loadMathJaxRuntime();
   if (window.MathJax.startup && window.MathJax.startup.promise) {
     await window.MathJax.startup.promise;
+  }
+  if (typeof window.MathJax.typesetPromise !== 'function') {
+    throw new Error('MathJax runtime did not initialize');
   }
 }
 
 async function typesetMath(rootEl) {
-  if (!rootEl) return;
+  if (!rootEl || !_rootContainsMath(rootEl)) return;
   try {
     await _mjReady();
     // Clear any prior typeset output inside rootEl, then retypset. Without
@@ -71,6 +88,7 @@ function _rememberMathHtml(key, value) {
 async function typesetMathHtml(html) {
   const key = String(html || '');
   if (!key) return '';
+  if (!_containsMath(key)) return key;
   const cached = _mathHtmlCache.get(key);
   if (cached) return cached;
   if (typeof document === 'undefined' || !document.createElement) return key;
@@ -100,17 +118,5 @@ async function typesetMathHtml(html) {
   }
 }
 
-function prewarmMathJax(retries = 240) {
-  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
-    _mjReady().catch((err) => {
-      (_mathLog.warn || console.warn).call(_mathLog, 'prewarm failed:', (err && err.message) || err);
-    });
-    return;
-  }
-  if (retries <= 0) return;
-  setTimeout(() => prewarmMathJax(retries - 1), 25);
-}
-
 window.typesetMath = typesetMath;
 window.typesetMathHtml = typesetMathHtml;
-setTimeout(() => prewarmMathJax(), 0);

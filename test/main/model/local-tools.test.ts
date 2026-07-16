@@ -3,6 +3,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 // ── Electron mock (for html_to_pdf / markdown_to_pdf paths) ─────────────
 
 const printToPDF = vi.fn(async () => Buffer.from('%PDF-1.4 test', 'utf8'));
@@ -96,6 +98,86 @@ describe('local-tools › identity', () => {
     const { lt } = await loadModules();
     const wf = lt.createLocalTools({}).find((t) => t.name === 'write_file')!;
     expect(wf.description.toLowerCase()).toContain('workspace');
+  });
+
+  it('blocks unmanaged QA runtimes only for VideoStudio', async () => {
+    const { lt } = await loadModules();
+    const videoBash = lt.createLocalTools({ agentId: '79df9cc89f5f' }).find((t) => t.name === 'bash')!;
+    const otherBash = lt.createLocalTools({ agentId: 'another-agent' }).find((t) => t.name === 'bash')!;
+
+    const blocked = await videoBash.execute({
+      command: 'python3 -m http.server 8765',
+      timeoutMs: 5000,
+    }, makeCtx());
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
+
+    const allowed = await otherBash.execute({ command: 'echo safe', timeoutMs: 5000 }, makeCtx());
+    expect(allowed.isError).toBeFalsy();
+  });
+
+  it('exposes publish_outputs only when the conversation supplies a validator', async () => {
+    const { lt } = await loadModules();
+    expect(lt.createLocalTools({}).some((t) => t.name === 'publish_outputs')).toBe(false);
+    expect(lt.createLocalTools({ onOutputsPublished: (paths) => paths })
+      .some((t) => t.name === 'publish_outputs')).toBe(true);
+  });
+});
+
+describe('local-tools › publish_outputs', () => {
+  it('accepts an explicit empty final-deliverable list', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: [] }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(onOutputsPublished).toHaveBeenCalledWith([]);
+    expect(JSON.parse(res.content)).toEqual({ published: 0, requested: 0 });
+  });
+
+  it('does not treat a malformed non-empty list as an empty declaration', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: ['  ', null] }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BAD_INPUT');
+    expect(onOutputsPublished).not.toHaveBeenCalled();
+  });
+
+  it('normalizes and deduplicates paths before publishing', async () => {
+    const { lt } = await loadModules();
+    const onOutputsPublished = vi.fn(async (paths: string[]) => paths);
+    const publish = lt.createLocalTools({ onOutputsPublished })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({
+      paths: ['out/report.pdf', 'out/report.pdf', path.join(tmpDir, 'deck.pptx')],
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(onOutputsPublished).toHaveBeenCalledWith([
+      path.join(tmpDir, 'out', 'report.pdf'),
+      path.join(tmpDir, 'deck.pptx'),
+    ]);
+    expect(JSON.parse(res.content)).toEqual({ published: 2, requested: 2 });
+  });
+
+  it('rejects a declaration when the turn accepts none of its paths', async () => {
+    const { lt } = await loadModules();
+    const publish = lt.createLocalTools({ onOutputsPublished: () => [] })
+      .find((t) => t.name === 'publish_outputs')!;
+
+    const res = await publish.execute({ paths: ['not-produced.pdf'] }, makeCtx());
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_OUTPUT_NOT_PRODUCED');
   });
 });
 
@@ -402,7 +484,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const script = `require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'blocked')`;
       const res = await bash.execute({
-        command: `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`,
+        command: `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`,
         timeoutMs: 5000,
       }, makeCtx());
       expect(res.isError).toBe(true);
@@ -434,7 +516,7 @@ describe('local-tools › interactive_cli tools', () => {
     const read = toolByName(tools, 'interactive_cli_read');
     const close = toolByName(tools, 'interactive_cli_close');
     const script = "process.stdout.write('Enter verification code: '); process.stdin.once('data', d => { process.stdout.write('got:' + d.toString().trim()); process.exit(0); });";
-    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
 
     const started = parseToolJson(await start.execute({
       command,
@@ -493,7 +575,7 @@ describe('local-tools › interactive_cli tools', () => {
     const start = toolByName(tools, 'interactive_cli_start');
     const read = toolByName(tools, 'interactive_cli_read');
     const script = "process.stderr.write('Missing provider auth configuration.'); process.exit(2);";
-    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
 
     const started = JSON.parse(String((await start.execute({
       command,
@@ -522,7 +604,7 @@ describe('local-tools › interactive_cli tools', () => {
     const close = toolByName(tools, 'interactive_cli_close');
     const authUrl = 'https://accounts.google.com/o/oauth2/auth?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2F&code_challenge=abc';
     const script = `process.stdout.write('Your browser has been opened to visit:\\n\\n ${authUrl}\\n'); setInterval(() => {}, 1000);`;
-    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
 
     const started = parseToolJson(await start.execute({
       command,
@@ -558,7 +640,7 @@ describe('local-tools › interactive_cli tools', () => {
   it('redacts sensitive UI-provided input if a CLI echoes it', async () => {
     const mgr = await import('../../../src/main/model/core-agent/interactive-cli-sessions');
     const script = "process.stdin.once('data', d => { process.stdout.write('echo:' + d.toString().trim()); process.exit(0); });";
-    const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
+    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
     const started = mgr.startInteractiveCliSession({
       uid: 'u1',
       command,
@@ -595,7 +677,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
       workingDir: tmpDir,
       state: {
         sandboxEnv: {
-          ORKAS_NODE: process.execPath,
+          ORKAS_NODE: TEST_NODE,
           ORKAS_PC_DIR: pcDir,
           ELECTRON_RUN_AS_NODE: '1',
         },
@@ -621,6 +703,30 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const parsed = JSON.parse(String(res.content));
     expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
     expect(parsed.out).toBe(tmpDir);
+  });
+
+  it('streams large direct Orkas CLI stdout to the Result Store handoff file', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const outputBytes = 1024 * 1024 + 257;
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      `process.stdout.write('x'.repeat(${outputBytes}));`,
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const context = makeOrkasCtx(pcDir);
+    context.state.toolResultSpoolDir = path.join(tmpDir, 'tool-results');
+
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval',
+      timeoutMs: 5000,
+    }, context);
+
+    expect(res.isError).toBeFalsy();
+    expect(res.content).toContain('full output streamed to Result Store');
+    expect(res.streamedOutput).toMatchObject({ size: outputBytes });
+    expect(fs.statSync(res.streamedOutput!.path).size).toBe(outputBytes);
+    expect(fs.readFileSync(res.streamedOutput!.path, 'utf8')).toBe('x'.repeat(outputBytes));
   });
 
   it('pipes heredoc stdin into the standard orkas-pkg.cjs command', async () => {
@@ -913,6 +1019,27 @@ describe('local-tools › bash produced files', () => {
     expect(produced).toContain(path.join(tmpDir, 'generated.md'));
     expect(produced).not.toContain(path.join(tmpDir, 'downloaded.txt'));
     expect(produced).not.toContain(path.join(tmpDir, 'fetched.json'));
+  });
+
+  it('tracks explicitly manifested outputs even inside a scan-skipped directory', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten })
+      .find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command:
+        'node -e "const fs=require(\'fs\');' +
+        'fs.mkdirSync(\'.cache\',{recursive:true});' +
+        'fs.writeFileSync(\'.cache/final.pdf\',\'pdf\');' +
+        'fs.appendFileSync(process.env.ORKAS_OUTPUT_MANIFEST,\'.cache/final.pdf\\n\')"',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(onFileWritten).toHaveBeenCalledWith(path.join(tmpDir, '.cache', 'final.pdf'));
+    expect(fs.existsSync(path.join(tmpDir, '.orkas-output-manifest'))).toBe(false);
   });
 });
 

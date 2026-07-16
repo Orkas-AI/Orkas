@@ -20,6 +20,7 @@
 import * as path from 'node:path';
 import type { Transport, ToolSchema } from './types';
 import { createLogger } from '../../logger';
+import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
 
 const log = createLogger('connectors:mcp');
 
@@ -70,7 +71,8 @@ export class McpConnection {
     const sdk = await _loadSdk();
     let transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
     if (this.transport.kind === 'stdio') {
-      const envFull: Record<string, string> = { ...this.transport.env };
+      const proxyEnv = await buildChildProxyEnvironment(this.transport.proxyTargetUrl);
+      const envFull: Record<string, string> = { ...this.transport.env, ...proxyEnv };
       // Custom connectors can legitimately carry secrets in argv (e.g.
       // `--api-key sk-…`); log only the command basename + arg count so a key
       // never lands in the persistent app log.
@@ -78,6 +80,7 @@ export class McpConnection {
         id: this.id,
         command: path.basename(this.transport.command),
         argCount: this.transport.args.length,
+        proxyMode: proxyEnv.ORKAS_PROXY_MODE || 'unmanaged',
       });
       transport = new sdk.StdioClientTransport({
         command: this.transport.command,

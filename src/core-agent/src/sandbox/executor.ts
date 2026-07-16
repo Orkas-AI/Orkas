@@ -9,6 +9,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 import { createLogger } from "../shared/logger.js";
+import {
+  ProcessOutputCapture,
+  type StreamedToolOutput,
+} from "./output-capture.js";
 
 const log = createLogger("sandbox");
 
@@ -20,6 +24,10 @@ export interface SandboxConfig {
   timeoutMs?: number;
   /** Maximum output buffer size in bytes (default: 1MB). */
   maxOutputBytes?: number;
+  /** Session-scoped directory for streaming output beyond maxOutputBytes. */
+  outputSpoolDir?: string;
+  /** Hard per-stream safety limit when outputSpoolDir is available (default: 64MB). */
+  maxSpoolBytes?: number;
   /** Allowed directories the sandbox can access (default: [workingDir]). */
   allowedDirs?: string[];
   /** Commands that are explicitly blocked. */
@@ -46,6 +54,12 @@ export interface SandboxResult {
   timedOut: boolean;
   /** Whether the command was killed due to output limit. */
   outputLimitExceeded: boolean;
+  /** Captured byte counts before UTF-8 normalization. */
+  stdoutBytes: number;
+  stderrBytes: number;
+  /** Host-only temp files for streams larger than the in-memory threshold. */
+  stdoutStreamedOutput?: StreamedToolOutput;
+  stderrStreamedOutput?: StreamedToolOutput;
   /** Execution duration in milliseconds. */
   durationMs: number;
 }
@@ -509,6 +523,8 @@ export class SandboxExecutor {
         exitCode: 1,
         timedOut: false,
         outputLimitExceeded: false,
+        stdoutBytes: 0,
+        stderrBytes: 0,
         durationMs: Date.now() - startTime,
       };
     }
@@ -531,6 +547,25 @@ export class SandboxExecutor {
       let abortListener: (() => void) | null = null;
 
       const env = buildSandboxEnv(this.config.env);
+      const outputSpoolDir = typeof this.config.outputSpoolDir === "string"
+        ? this.config.outputSpoolDir
+        : undefined;
+      const stdoutCapture = outputSpoolDir
+        ? new ProcessOutputCapture({
+          spoolDir: outputSpoolDir,
+          prefix: "bash-stdout",
+          memoryBytes: this.config.maxOutputBytes,
+          maxSpoolBytes: this.config.maxSpoolBytes,
+        })
+        : null;
+      const stderrCapture = outputSpoolDir
+        ? new ProcessOutputCapture({
+          spoolDir: outputSpoolDir,
+          prefix: "bash-stderr",
+          memoryBytes: this.config.maxOutputBytes,
+          maxSpoolBytes: this.config.maxSpoolBytes,
+        })
+        : null;
 
       // Restrict network if configured
       if (this.config.allowNetwork === false) {
@@ -564,6 +599,14 @@ export class SandboxExecutor {
       // Collect stdout with size limit
       child.stdout.on("data", (data: Buffer) => {
         if (outputLimitExceeded) return;
+        if (stdoutCapture) {
+          if (!stdoutCapture.append(data)) {
+            outputLimitExceeded = true;
+            stdoutTruncated = true;
+            killChild();
+          }
+          return;
+        }
         stdoutBytes += data.length;
         if (stdoutBytes > this.config.maxOutputBytes) {
           outputLimitExceeded = true;
@@ -579,6 +622,14 @@ export class SandboxExecutor {
       // Collect stderr with size limit
       child.stderr.on("data", (data: Buffer) => {
         if (outputLimitExceeded) return;
+        if (stderrCapture) {
+          if (!stderrCapture.append(data)) {
+            outputLimitExceeded = true;
+            stderrTruncated = true;
+            killChild();
+          }
+          return;
+        }
         stderrBytes += data.length;
         if (stderrBytes > this.config.maxOutputBytes) {
           outputLimitExceeded = true;
@@ -603,16 +654,42 @@ export class SandboxExecutor {
         clearTimeout(timeoutId);
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
         if (abortSignal && abortListener) abortSignal.removeEventListener("abort", abortListener);
-        let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
-        let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
-        if (stdoutTruncated) stdout += "\n... [output truncated by sandbox]";
-        if (stderrTruncated) stderr += "\n... [stderr truncated by sandbox]";
+        let stdout: string;
+        let stderr: string;
+        let stdoutStreamedOutput: StreamedToolOutput | undefined;
+        let stderrStreamedOutput: StreamedToolOutput | undefined;
+        if (stdoutCapture && stderrCapture) {
+          const decode = (bytes: Buffer) => decodeProcessOutput(bytes, process.platform, env);
+          const capturedStdout = stdoutCapture.finish({
+            decode,
+            normalizeSpoolToUtf8: process.platform === "win32",
+          });
+          const capturedStderr = stderrCapture.finish({
+            decode,
+            normalizeSpoolToUtf8: process.platform === "win32",
+          });
+          stdout = capturedStdout.text;
+          stderr = capturedStderr.text;
+          stdoutBytes = capturedStdout.bytes;
+          stderrBytes = capturedStderr.bytes;
+          stdoutStreamedOutput = capturedStdout.streamedOutput;
+          stderrStreamedOutput = capturedStderr.streamedOutput;
+        } else {
+          stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
+          stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
+          if (stdoutTruncated) stdout += "\n... [output truncated by sandbox]";
+          if (stderrTruncated) stderr += "\n... [stderr truncated by sandbox]";
+        }
         resolve({
           stdout,
           stderr,
           exitCode: code,
           timedOut,
           outputLimitExceeded,
+          stdoutBytes,
+          stderrBytes,
+          ...(stdoutStreamedOutput ? { stdoutStreamedOutput } : {}),
+          ...(stderrStreamedOutput ? { stderrStreamedOutput } : {}),
           durationMs: Date.now() - startTime,
         });
       };
@@ -634,19 +711,12 @@ export class SandboxExecutor {
 
       child.on("error", (err) => {
         if (settled) return;
-        clearTimeout(timeoutId);
-        if (forceSettleTimer) clearTimeout(forceSettleTimer);
-        if (abortSignal && abortListener) abortSignal.removeEventListener("abort", abortListener);
-        settled = true;
-        const stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
-        resolve({
-          stdout,
-          stderr: err.message,
-          exitCode: 1,
-          timedOut: false,
-          outputLimitExceeded: false,
-          durationMs: Date.now() - startTime,
-        });
+        if (stderrCapture) stderrCapture.append(Buffer.from(err.message));
+        else {
+          stderrChunks.push(Buffer.from(err.message));
+          stderrBytes += Buffer.byteLength(err.message);
+        }
+        finish(1);
       });
     });
   }

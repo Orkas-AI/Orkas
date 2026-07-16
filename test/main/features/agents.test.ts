@@ -1013,6 +1013,43 @@ describe('agents › listAgents', () => {
     expect(await a.listAgents()).toEqual([]);
   });
 
+  it('returns startup summaries without workflow, profile, memory or skill metadata', async () => {
+    writeCustomAgent('brief', {
+      name: 'Brief Agent',
+      category: 'data',
+      workflow: 'This must stay off the chat-first payload.',
+      runtime: { kind: 'cli', cli: 'codex' },
+      skill_list: ['skill-creator'],
+    });
+    const a = await loadAgents();
+    a.setAgentEnabledForActiveUser('brief', false);
+
+    const [summary] = await a.listAgentSummaries();
+
+    expect(summary).toMatchObject({
+      agent_id: 'brief',
+      name: 'Brief Agent',
+      source: 'custom',
+      category: 'data',
+      runtime: { kind: 'cli', cli: 'codex' },
+      enabled: false,
+    });
+    expect(summary).not.toHaveProperty('workflow');
+    expect(summary).not.toHaveProperty('profile');
+    expect(summary).not.toHaveProperty('skill_list');
+
+    const [searchListing] = await a.listAgentSearchListings();
+    expect(searchListing).toMatchObject({
+      agent_id: 'brief',
+      name: 'Brief Agent',
+      description_zh: '',
+      description_en: 'Test agent',
+      enabled: false,
+    });
+    expect(searchListing).not.toHaveProperty('workflow');
+    expect(searchListing).not.toHaveProperty('profile');
+  });
+
   it('lists custom and builtin with correct source', async () => {
     writeCustomAgent('c1', { name: 'Cust' });
     const builtinB1 = path.join(builtinAgentsDir(), 'b1');
@@ -1753,6 +1790,28 @@ describe('agents › buildAgentEditSystemPrompt', () => {
 });
 
 describe('agents › list cache invalidation', () => {
+  it('reuses the persisted catalog after a module restart and honors force invalidation', async () => {
+    writeCustomAgent('persisted-agent', { name: 'Persisted Agent' });
+    const first = await loadAgents();
+    expect((await first.listAgents())[0].name).toBe('Persisted Agent');
+
+    // Rewriting an existing spec does not change the catalog root mtime.
+    // The next process/module instance should therefore serve its versioned
+    // local snapshot without reopening every agent.json.
+    fs.writeFileSync(
+      path.join(customAgentsDir(), 'persisted-agent', 'agent.json'),
+      '{malformed while snapshot remains usable',
+    );
+    vi.resetModules();
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(TEST_UID);
+    const restarted = await loadAgents();
+    expect((await restarted.listAgents())[0].name).toBe('Persisted Agent');
+
+    restarted.clearAgentListCache();
+    expect(await restarted.listAgents()).toEqual([]);
+  });
+
   it('picks up newly created agents on next listAgents', async () => {
     const a = await loadAgents();
     expect(await a.listAgents()).toEqual([]);

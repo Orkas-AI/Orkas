@@ -458,8 +458,9 @@ export class MarketplaceInstallError extends Error {
   marketplaceId: string;
   marketplaceName: string;
   marketplaceReason: string;
-  /** Set when the install was blocked because the client app is older than
-   *  the item's min_app_version. The renderer can then show localized copy. */
+  /** Set when the install was blocked because the client app version is missing
+   *  or older than the item's min_app_version. Lets the renderer show a localized
+   *  "update Orkas" prompt with the versions instead of a raw English string. */
   appUpdateRequired = false;
   minAppVersion = '';
   currentAppVersion = '';

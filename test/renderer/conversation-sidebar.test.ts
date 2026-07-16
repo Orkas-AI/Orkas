@@ -54,6 +54,10 @@ function loadConversationRenderer() {
       'skills.use_label': `Skill: ${params?.skill || ''}`,
       'chat.stream.compaction_tokens': `Context compressed: ${params?.before} -> ${params?.after} tokens`,
       'chat.stream.runtime_total': `Total time ${params?.duration}`,
+      'chat.stream.runtime_model': `model ${params?.duration}`,
+      'chat.stream.runtime_tools': `tools ${params?.duration}`,
+      'chat.stream.runtime_context': `context ${params?.duration}`,
+      'chat.stream.runtime_retry': `retry wait ${params?.duration}`,
       'chat.stream.duration_s': `${params?.s}s`,
       'chat.stream.duration_ms': `${params?.m}m ${params?.s}s`,
       'chat.stream.duration_hms': `${params?.h}h ${params?.m}m ${params?.s}s`,
@@ -117,6 +121,17 @@ describe('conversation create-agent inline gate', () => {
     expect(context._shouldShowConvCreateAgentInline(true, false, false)).toBe(true);
     expect(context._shouldShowConvCreateAgentInline(true, false, true)).toBe(false);
     expect(context._shouldShowConvCreateAgentInline(false, false, false)).toBe(false);
+  });
+});
+
+describe('conversation history initial window', () => {
+  it('uses ten-message cursor pages for initial and older history requests', () => {
+    const context = loadConversationRenderer();
+    context.conversations.push({ conversation_id: 'c1', project_id: 'p1' });
+
+    expect(context._historyRequestUrl('c1')).toBe('/api/conversations/c1/history?limit=10&project_id=p1');
+    expect(context._historyRequestUrl('c1', 999)).toBe('/api/conversations/c1/history?limit=10&before=999&project_id=p1');
+    expect(context._historyRequestUrl('global')).toBe('/api/conversations/global/history?limit=10&project_id=');
   });
 });
 
@@ -263,6 +278,21 @@ describe('conversation sidebar task row actions', () => {
     expect(collapsedAgain).not.toContain('Old task');
   });
 
+  it('renders a collapsed old-bucket header from deferred counts without task rows', () => {
+    const context = loadConversationRenderer();
+    context.timeBucket = () => 'last30';
+
+    const html = context._renderConversationTimeBucketList([], {
+      bucketScope: 'sidebar',
+      deferredBucketCounts: { last30: 23 },
+    });
+
+    expect(html).toContain('Last 30 days');
+    expect(html).toContain('is-collapsed');
+    expect(html).toContain('conv-list-section-count">23');
+    expect(html).not.toContain('conv-item');
+  });
+
   it('builds pin or unpin menu items only where pinning is enabled', () => {
     const context = loadConversationRenderer();
     context.conversations = [
@@ -379,6 +409,49 @@ describe('conversation sticky scroll', () => {
     expect(el.scrollTop).toBe(500);
   });
 
+  it('releases the send-time scroll pin on a downward wheel gesture', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el.scrollTop = 800; // currently at the artificial spacer's bottom edge
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('wheel', { deltaY: 120 });
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+  });
+
+  it('releases the send-time scroll pin on a touch scroll gesture', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('touchmove');
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+  });
+
   it('resumes bottom-follow after the user returns to the bottom', () => {
     const context = loadConversationRenderer();
     const el = fakeScrollEl();
@@ -480,6 +553,7 @@ describe('conversation sticky scroll', () => {
 
   it('does not force bottom when a streaming reply finalizes', () => {
     const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
     const parent = fakeScrollEl();
     context.renderMarkdownFull = (text: string) => escapeHtml(text);
     context._stripSurvivingStructuralBlocks = (text: string) => text;
@@ -506,6 +580,7 @@ describe('conversation sticky scroll', () => {
 
   it('waits for offscreen math before painting a finalized streaming reply', async () => {
     const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
     context.renderMarkdownFull = (text: string) => escapeHtml(text);
     context._stripSurvivingStructuralBlocks = (text: string) => text;
     context.typesetMathHtml = async (html: string) => html.replace(
@@ -664,6 +739,77 @@ describe('conversation history reconcile', () => {
 });
 
 describe('conversation streaming math detection', () => {
+  it('reuses decoded inline image nodes across streaming markdown repaints', () => {
+    const context = loadConversationRenderer();
+    const src = 'chat-media://local/Users/test/preview.png';
+    const existingImage = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    const existingShell = {
+      className: 'chat-image-shell chat-md-img-shell is-loaded',
+      querySelector(selector: string) {
+        if (selector === 'img.chat-md-img[src]') return existingImage;
+        return null;
+      },
+    };
+    const freshImage = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    let replacement: unknown = null;
+    const freshShell = {
+      className: 'chat-image-shell chat-md-img-shell is-loading',
+      replaceWith(node: unknown) { replacement = node; },
+      querySelector(selector: string) {
+        if (selector === 'img.chat-md-img[src]') return freshImage;
+        return null;
+      },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-md-img-shell') return [freshShell];
+        if (selector === '.chat-md-video-shell' || selector === '.chat-md-audio-card') return [];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('image', src), [existingShell]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingShell);
+    expect(existingShell.className).toContain('is-loaded');
+    expect(existingShell.className).not.toContain('is-loading');
+  });
+
+  it('reuses standalone dashboard and raw HTML media nodes', () => {
+    const context = loadConversationRenderer();
+    const src = 'https://example.test/dashboard-preview.png';
+    const existingImage = {
+      tagName: 'IMG',
+      attributes: [],
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+      closest() { return null; },
+    };
+    let replacement: unknown = null;
+    const freshImage = {
+      tagName: 'IMG',
+      attributes: [],
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+      closest() { return null; },
+      replaceWith(node: unknown) { replacement = node; },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === 'img[src], video[src], audio[src]') return [freshImage];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('image-node', src), [existingImage]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingImage);
+  });
+
   it('reuses inline video nodes across streaming markdown repaints', () => {
     const context = loadConversationRenderer();
     const src = 'chat-media://local/Users/test/clip.mp4';
@@ -691,6 +837,7 @@ describe('conversation streaming math detection', () => {
     };
     const freshRoot = {
       querySelectorAll(selector: string) {
+        if (selector === '.chat-md-img-shell') return [];
         if (selector === '.chat-md-video-shell') return [freshShell];
         if (selector === '.chat-md-audio-card') return [];
         return [];
@@ -870,9 +1017,27 @@ describe('conversation process metadata formatting', () => {
       stream: 'runtime',
       data: { duration_ms: 65_000 },
     });
+    const runtimeWithBreakdown = context._formatEventLine({
+      stream: 'runtime',
+      data: {
+        duration_ms: 65_000,
+        provider_ms: 40_000,
+        tool_ms: 5_000,
+        compaction_ms: 15_000,
+        retry_wait_ms: 5_000,
+      },
+    });
+    const tool = context._formatEventLine({
+      stream: 'tool',
+      data: { phase: 'end', name: 'manage_execution_plan', duration_ms: 17 },
+    });
 
     expect(compaction).toBe('Context compressed: 20000 -> 3000 tokens');
     expect(runtime).toBe('Total time 1m 5s');
+    expect(runtimeWithBreakdown)
+      .toBe('Total time 1m 5s · model 40s · tools 5s · context 15s · retry wait 5s');
+    expect(tool).toContain('manage_execution_plan');
+    expect(tool).toContain('17ms');
     expect(context._processSummaryRuntimeFromItems([
       { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
       { type: 'progress', text: 'Total time 1m 5s', event: { stream: 'runtime', data: { duration_ms: 65_000 } } },
@@ -883,7 +1048,8 @@ describe('conversation process metadata formatting', () => {
     expect(context._processSummaryRuntimeFromItems([
       { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
     ])).toBe('');
-    expect(context._eventProcessKind({ stream: 'compaction', data: {} }, compaction)).toBe('info');
+    expect(context._eventProcessKind({ stream: 'context', data: {} }, 'Context prepared')).toBe('context');
+    expect(context._eventProcessKind({ stream: 'compaction', data: {} }, compaction)).toBe('context');
     expect(context._eventProcessKind({ stream: 'runtime', data: {} }, runtime)).toBe('bound');
   });
 });

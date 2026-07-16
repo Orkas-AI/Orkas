@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { defineTool, type AgentTool, type ToolContext } from "./base.js";
 import { SandboxExecutor } from "../sandbox/executor.js";
+import { discardStreamedToolOutput } from "../sandbox/output-capture.js";
 import { webFetchTool } from "./web-fetch.js";
 import { webSearchTool } from "./web-search.js";
 
@@ -111,6 +112,9 @@ export const bashTool: AgentTool = defineTool({
       env: ctx.state.sandboxEnv as Record<string, string> | undefined,
       allowedDirs: sandboxAllowedDirs,
       signal: ctx.signal,
+      ...(typeof ctx.state.toolResultSpoolDir === "string"
+        ? { outputSpoolDir: ctx.state.toolResultSpoolDir }
+        : {}),
     });
 
     if (input.run_in_background === true) {
@@ -139,15 +143,35 @@ export const bashTool: AgentTool = defineTool({
     }
 
     if (result.timedOut) {
+      discardStreamedToolOutput(result.stdoutStreamedOutput);
+      discardStreamedToolOutput(result.stderrStreamedOutput);
       return { content: `Command timed out after ${timeoutMs}ms`, isError: true };
     }
 
     if (result.exitCode !== 0) {
-      const output = result.stderr || result.stdout || `Exit code: ${result.exitCode}`;
-      return { content: output, isError: true };
+      const useStderr = result.stderrStreamedOutput?.sourceTruncated === true
+        || (result.stdoutStreamedOutput?.sourceTruncated !== true && result.stderrBytes > 0);
+      const output = useStderr ? result.stderr : result.stdout || `Exit code: ${result.exitCode}`;
+      const streamedOutput = useStderr
+        ? result.stderrStreamedOutput
+        : result.stdoutStreamedOutput;
+      discardStreamedToolOutput(useStderr
+        ? result.stdoutStreamedOutput
+        : result.stderrStreamedOutput);
+      return {
+        content: output,
+        ...(streamedOutput ? { streamedOutput } : {}),
+        isError: true,
+      };
     }
 
-    return { content: result.stdout };
+    discardStreamedToolOutput(result.stderrStreamedOutput);
+    return {
+      content: result.stdout,
+      ...(result.stdoutStreamedOutput
+        ? { streamedOutput: result.stdoutStreamedOutput }
+        : {}),
+    };
   },
 });
 

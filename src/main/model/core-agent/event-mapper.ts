@@ -16,6 +16,8 @@
  *                the raw reason (e.g. undici "terminated", "fetch failed",
  *                "ECONNRESET") is mapped to a user-facing string via
  *                `friendlyRetryReason`
+ *   provider_fallback → non-blocking credential warning; the run continues
+ *                       on the next configured candidate
  *   context_status → {type:'progress', text: '<message>'}
  *   compaction → {type:'progress', text: 'compacted <before>→<after> tokens'}
  *   done (ok)  → {type:'final', text} then {type:'done'}
@@ -30,6 +32,7 @@ import { t } from '../../i18n';
 import type { StreamEvent } from '../client';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { userAgentsDir, userMarketplaceAgentsDir } from '../../paths';
+import { providerLabel } from '../provider_catalog';
 import * as path from 'node:path';
 
 const log = createLogger('model');
@@ -93,11 +96,9 @@ function partialJsonStringField(source: string, field: string): string {
 /**
  * When `util/tool-result-cap.ts` spills an oversized in-process tool
  * result to disk, it rewrites `result.content` into a
- * `<persisted-output tool="..." size="..." path="...">...preview...</persisted-output>`
- * marker. This is what the model sees, and it's what we receive as
- * `ev.result` here in the event mapper. The renderer's click-to-expand
- * UI needs the absolute path to read back the full body via
- * `localAgents.readToolResult` — so we extract it from the marker.
+ * `<persisted-output ref="..." ...>` marker. New runners carry the backing
+ * path as model-hidden `tool_end.persistedOutput` metadata. This legacy parser
+ * remains for old persisted sessions/events whose marker embedded the path.
  *
  * Returns `{ path, size }` when the marker is present, `null` otherwise
  * (most tool calls don't spill — their result is just the raw output
@@ -370,22 +371,25 @@ export async function* mapCoreAgentEvents(
         const agentMeta = agentReadByToolId.get(ev.id) || null;
         agentReadByToolId.delete(ev.id);
         // Two click-to-expand storage paths, decided here:
-        //   - oversized → util/tool-result-cap.ts already spilled to
-        //     disk; rawResult is a `<persisted-output path=...>` marker.
-        //     Pass the absolute path so the renderer reads back via
+        //   - oversized → util/tool-result-cap.ts already spilled to disk and
+        //     tool_end carries model-hidden persistedOutput metadata. Pass its
+        //     absolute path so the renderer reads back via
         //     localAgents.readToolResult IPC.
-        //   - normal    → rawResult IS the full body (≤ 50 KB cap).
+        //   - normal    → rawResult IS the full body (within its token budget).
         //     Pass it inline so the renderer stashes on the row and
         //     renders directly without IO. The model already saw this
-        //     same body — sending it twice (event + persistent session)
-        //     adds ≤ 50 KB per call, well within memory budget.
-        const spill = extractPersistedOutputPath(rawResult);
+        //     same body — sending it twice (event + persistent session) stays
+        //     within the configured inline budget.
+        const spill = ev.persistedOutput
+          ? { path: ev.persistedOutput.path, size: ev.persistedOutput.size }
+          : extractPersistedOutputPath(rawResult);
         const data: Record<string, unknown> = {
           phase: 'end',
           id: ev.id,
           name: ev.name,
           isError: !!ev.isError,
           result_preview: preview,
+          ...(Number.isFinite(ev.durationMs) ? { duration_ms: Math.max(0, Math.round(ev.durationMs!)) } : {}),
           ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
           ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
           ...skillReadEventFields(skillMeta),
@@ -422,6 +426,18 @@ export async function* mapCoreAgentEvents(
         break;
       }
 
+      case 'provider_fallback': {
+        yield {
+          type: 'progress',
+          text: t('model.credential_fallback', { provider: providerLabel(ev.providerId) }),
+          event: {
+            stream: 'provider',
+            data: { phase: 'fallback', reason: ev.reason, provider_id: ev.providerId },
+          },
+        };
+        break;
+      }
+
       case 'context_status': {
         yield {
           type: 'progress',
@@ -442,6 +458,7 @@ export async function* mapCoreAgentEvents(
               tokensAfter: ev.tokensAfter,
               ...(ev.summary ? { summary: ev.summary } : {}),
               ...(ev.usage ? { usage: ev.usage as unknown as Record<string, unknown> } : {}),
+              ...(Number.isFinite(ev.durationMs) ? { duration_ms: Math.max(0, Math.round(ev.durationMs!)) } : {}),
             },
           },
         };

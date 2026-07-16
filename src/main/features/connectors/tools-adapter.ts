@@ -26,6 +26,7 @@ import * as manager from './manager';
 import * as agents from '../agents';
 import { isConnectorEnabled } from '../component_enabled';
 import { isConnectorRuntimeEnabled } from './availability';
+import { isConnectorUsable } from './types';
 import type { ConnectorInstance, ToolSchema } from './types';
 
 /** Convert MCP `callTool`'s raw result into a single string the LLM can read.
@@ -65,12 +66,18 @@ export async function resolveVisibleConnectors(
   if (!uid) return [];
   const all = manager.listInstances(uid);
   if (!all.length) return [];
-  // Live-state filter: only currently-connected instances surface to the LLM. A `connecting` /
-  // `disconnected` / `error` instance is unreachable in this turn — `manager.callTool` would
-  // throw anyway, and showing it (with a "— disconnected (ask user to refresh)" suffix) is
-  // noise that pollutes both the prompt block and the meta-tool routing matrix. The user can
-  // reconnect in the Connectors panel; the instance reappears on the next turn.
-  const connected = all.filter((i) => i.status.kind === 'connected' && isConnectorRuntimeEnabled(i.id));
+  // Usable-state filter: a persisted `connected` row with cached schemas may not yet have a live
+  // process/socket after restart; `manager.callTool` establishes that one connection on demand.
+  // A `connecting` / `disconnected` / `error` row still stays hidden because it needs discovery
+  // or repair before it can be routed safely.
+  //
+  // `degraded` stays visible on purpose — it means "authorized, cached tools, last attempt failed
+  // for a reason we expect to recover". Hiding it would remove the only thing that heals it (a tool
+  // call), stranding the connector until a manual reconnect. This is the retry question, which is
+  // deliberately separate from what the UI renders: `isConnectorVerifiedLive` gates the green card,
+  // `isConnectorUsable` gates routing. Conflating them is what let a six-day-dead connector show
+  // as connected while `callTool` failed every time.
+  const connected = all.filter((i) => isConnectorUsable(i.status) && isConnectorRuntimeEnabled(i.id));
   if (!connected.length) return [];
   // Per-user soft-disable filter (Connectors panel "停用" button). Separate from `agent.enabled_connectors`:
   // this filter applies to every actor including the commander; even a disconnected-by-user instance

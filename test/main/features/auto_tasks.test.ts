@@ -22,7 +22,10 @@ import {
   autoTaskDir,
   autoTaskConfigFile,
   chatAttachmentDir,
+  projectAutoTaskAttachmentsDir,
+  projectAutoTaskConfigFile,
   projectBindingsFile,
+  projectChatAttachmentDir,
   projectMetaFile,
   userLocalRoot,
   userRoot,
@@ -129,6 +132,29 @@ describe('seed text composition', () => {
     expect(text).not.toContain('connectors.use_prefix');
     expect(text).not.toContain('skills.use_prefix');
   });
+
+  it('preserves ordered text with multiple inline skills and connectors', () => {
+    setCurrentLang('zh');
+    const task = makeTask(
+      { type: 'daily', hour: 9, minute: 0 },
+      {
+        content: '鸟 水电费',
+        skill: { id: 'brand-research', name: 'brand-research' },
+        connector: { id: 'github', name: 'GitHub' },
+        message_parts: [
+          { type: 'use', kind: 'skill', id: 'brand-research', name: 'brand-research' },
+          { type: 'text', text: ' 鸟 ' },
+          { type: 'use', kind: 'skill', id: 'content-writer', name: 'content-writer' },
+          { type: 'text', text: ' 水电费 ' },
+          { type: 'use', kind: 'connector', id: 'github', name: 'GitHub' },
+        ],
+      },
+    );
+
+    expect(_buildSeedTextForTest(task)).toBe(
+      'brand-research 技能 鸟 content-writer 技能 水电费 GitHub 连接器',
+    );
+  });
 });
 
 describe('task CRUD normalization', () => {
@@ -170,6 +196,56 @@ describe('task CRUD normalization', () => {
     expect(updated.task.connector).toBeUndefined();
     expect(updated.task.schedule).toEqual({ type: 'monthly', day: 31, hour: 10, minute: 30 });
     expect(await listTasks(TEST_UID, { projectId: null })).toHaveLength(1);
+  });
+
+  it('persists ordered message parts and derives clean legacy content', async () => {
+    const messageParts = [
+      { type: 'use' as const, kind: 'skill' as const, id: 'brand-research', name: 'Brand Research' },
+      { type: 'text' as const, text: ' bird ' },
+      { type: 'use' as const, kind: 'skill' as const, id: 'content-writer', name: 'Content Writer' },
+      { type: 'text' as const, text: '  utility bill ' },
+      { type: 'use' as const, kind: 'connector' as const, id: 'github', name: 'GitHub' },
+    ];
+    const created = await createTask(TEST_UID, {
+      id: 'at_14141414',
+      content: 'stale fallback text',
+      message_parts: messageParts,
+      skill: { id: 'brand-research', name: 'Brand Research' },
+      connector: { id: 'github', name: 'GitHub' },
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.task.content).toBe('bird utility bill');
+    expect(created.task.message_parts).toEqual(messageParts);
+    expect((await getTask(TEST_UID, 'at_14141414'))?.message_parts).toEqual(messageParts);
+
+    const metadataOnly = await updateTask(TEST_UID, 'at_14141414', { title: 'Renamed' });
+    expect(metadataOnly.ok && metadataOnly.task.message_parts).toEqual(messageParts);
+
+    const legacyMessageEdit = await updateTask(TEST_UID, 'at_14141414', {
+      content: 'edited by a legacy client',
+    });
+    expect(legacyMessageEdit.ok && legacyMessageEdit.task.content).toBe('edited by a legacy client');
+    expect(legacyMessageEdit.ok && legacyMessageEdit.task.message_parts).toBeUndefined();
+  });
+
+  it('continues to read legacy configs without message parts', async () => {
+    const config = {
+      id: 'at_15151515',
+      enabled: true,
+      content: 'legacy task',
+      skill: { id: 'reader', name: 'Reader' },
+      connector: { id: 'github', name: 'GitHub' },
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+      created_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+    };
+    fs.mkdirSync(path.dirname(autoTaskConfigFile(TEST_UID, config.id)), { recursive: true });
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, config.id), JSON.stringify(config));
+
+    expect(await getTask(TEST_UID, config.id)).toEqual(config);
   });
 
   it('rejects project-scoped tasks whose recipient agent is not bound to the project', async () => {
@@ -216,6 +292,12 @@ describe('task CRUD normalization', () => {
       content: 'hello',
       schedule: { type: 'monthly', day: 0, hour: 9, minute: 0 },
     })).ok).toBe(false);
+    expect(await createTask(TEST_UID, {
+      id: 'at_34343434',
+      content: 'hello',
+      message_parts: [{ type: 'text', text: 'hello' }],
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    })).toEqual({ ok: false, error: 'invalid_message_parts' });
 
     fs.mkdirSync(path.dirname(autoTaskConfigFile(TEST_UID, 'at_44444444')), { recursive: true });
     fs.writeFileSync(autoTaskConfigFile(TEST_UID, 'at_44444444'), JSON.stringify({
@@ -338,6 +420,27 @@ describe('attachments', () => {
     expect(fs.existsSync(path.join(dir, 'escape.md'))).toBe(false);
     expect(await listAttachments(TEST_UID, 'bad-id')).toEqual([]);
   });
+
+  it('adopts config-less draft attachments when creating a project task', async () => {
+    const projectId = 'p_auto_draft';
+    const taskId = 'at_56565656';
+    writeProject(TEST_UID, projectId);
+
+    expect((await uploadAttachment(TEST_UID, taskId, 'brief.md', Buffer.from('draft brief'))).ok).toBe(true);
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'use the project brief',
+      project_id: projectId,
+      attachments: ['brief.md'],
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+
+    expect(created.ok).toBe(true);
+    expect(fs.existsSync(projectAutoTaskConfigFile(TEST_UID, projectId, taskId))).toBe(true);
+    expect(fs.readFileSync(path.join(projectAutoTaskAttachmentsDir(TEST_UID, projectId, taskId), 'brief.md'), 'utf8'))
+      .toBe('draft brief');
+    expect(fs.existsSync(autoTaskDir(TEST_UID, taskId))).toBe(false);
+  });
 });
 
 describe('scheduler dispatch', () => {
@@ -348,6 +451,7 @@ describe('scheduler dispatch', () => {
     const events: any[] = [];
     const unsubscribe = subscribeFires((ev) => events.push(ev));
     const taskId = 'at_66666666';
+    writeProject(TEST_UID, 'p_auto_project', ['agent_codex']);
     await uploadAttachment(TEST_UID, taskId, '../brief.md', Buffer.from('brief'));
 
     const created = await createTask(TEST_UID, {
@@ -380,7 +484,7 @@ describe('scheduler dispatch', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ type: 'conv_created', cid: 'cid_auto', task_id: taskId });
     expect(events[0].duration_ms).toEqual(expect.any(Number));
-    expect(fs.readFileSync(path.join(chatAttachmentDir(TEST_UID, 'cid_auto'), 'brief.md'), 'utf8')).toBe('brief');
+    expect(fs.readFileSync(path.join(projectChatAttachmentDir(TEST_UID, 'p_auto_project', 'cid_auto'), 'brief.md'), 'utf8')).toBe('brief');
 
     const task = await getTask(TEST_UID, taskId);
     expect(task?.enabled).toBe(false);
@@ -406,7 +510,7 @@ describe('scheduler dispatch', () => {
     unsubscribe();
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
-    expect(autoRuntime.deleteConversation).toHaveBeenCalledWith(TEST_UID, 'cid_auto');
+    expect(autoRuntime.deleteConversation).toHaveBeenCalledWith(TEST_UID, 'cid_auto', null);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'fire_failed',

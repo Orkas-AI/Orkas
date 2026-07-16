@@ -23,4 +23,9 @@ describe('app version compatibility', () => {
     expect(satisfiesMinAppVersion('1.5.1', '1.5.0')).toBe(true);
     expect(satisfiesMinAppVersion('1.4.9', '1.5.0')).toBe(false);
   });
+
+  it('rejects a declared minimum when the current app version is missing', () => {
+    expect(satisfiesMinAppVersion('', '1.5.0')).toBe(false);
+    expect(satisfiesMinAppVersion('   ', '1.5.0')).toBe(false);
+  });
 });

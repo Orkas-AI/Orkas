@@ -378,7 +378,7 @@ function _moveSearchSelection(delta) {
   });
 }
 
-function _gotoSearchResult(r) {
+async function _gotoSearchResult(r) {
   if (!r) return;
   closeGlobalSearch();
   if (r.kind === 'context') {
@@ -395,11 +395,10 @@ function _gotoSearchResult(r) {
       return;
     }
     setView('contexts');
-    // Defer the file open so the contexts view has mounted its tree first —
-    // openCtxFile renders into the viewer pane which only exists after setView.
-    setTimeout(() => {
-      if (typeof openCtxFile === 'function') openCtxFile(r.path);
-    }, 50);
+    const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+    if (typeof loader === 'function') await loader('contexts');
+    if (typeof loadContexts === 'function') await loadContexts();
+    if (typeof openCtxFile === 'function') openCtxFile(r.path);
   } else if (r.kind === 'chat') {
     setView('conversation', r.cid);
     // Scroll to the matched message after history loads.
@@ -415,18 +414,19 @@ function _gotoSearchResult(r) {
     }, 100);
   } else if (r.kind === 'skill') {
     setView('skills');
-    setTimeout(async () => {
-      const cached = (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache))
-        ? _skillsCache.find((s) => s.id === r.id)
-        : null;
-      if (cached && typeof _showSkillsDetailView === 'function') {
-        await _showSkillsDetailView(cached.source, cached.id);
-      } else if (typeof _showSkillsDetailView === 'function') {
-        // Cache may not be primed yet — fall back to the search result's
-        // own source field so we still land on the right card.
-        await _showSkillsDetailView(r.source, r.id);
-      }
-    }, 100);
+    const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+    if (typeof loader === 'function') await loader('skills');
+    if (typeof loadSkills === 'function') await loadSkills();
+    const cached = (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache))
+      ? _skillsCache.find((s) => s.id === r.id)
+      : null;
+    if (cached && typeof _showSkillsDetailView === 'function') {
+      await _showSkillsDetailView(cached.source, cached.id);
+    } else if (typeof _showSkillsDetailView === 'function') {
+      // Cache may not be primed yet — fall back to the search result's own
+      // source field so we still land on the right card.
+      await _showSkillsDetailView(r.source, r.id);
+    }
   }
 }
 

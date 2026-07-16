@@ -55,6 +55,7 @@ let _viewerKeyHandler = null;
 let _viewerCurrentPath = null;
 let _viewerCurrentCid = null;
 let _viewerCurrentProjectId = null;
+let _viewerLibraryProjectScoped = false;
 // Active view/edit controller — md (mountMdViewEdit) or text
 // (mountTextViewEdit). Both expose the same shape (`destroy / isDirty /
 // getMode / setMode`), so the close path can teardown without branching.
@@ -101,15 +102,6 @@ const _TEXT_EXTS = new Set([
   '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
 ]);
-const _LIBRARY_IMPORT_EXTS = new Set([
-  ..._IMAGE_EXTS,
-  ..._OFFICE_EXTS,
-  ..._MARKDOWN_EXTS,
-  ..._TEXT_EXTS,
-  '.pdf',
-  '.html', '.htm',
-]);
-
 function _extOf(name) {
   if (!name) return '';
   const i = name.lastIndexOf('.');
@@ -206,11 +198,24 @@ function _setSaveAppVisible(visible) {
   _viewerSaveAppBtn.disabled = !visible;
 }
 
-function _viewerCanAddToLibrary(nameOrKind) {
-  const raw = String(nameOrKind || '');
-  const ext = _extOf(raw);
-  if (ext) return _LIBRARY_IMPORT_EXTS.has(ext);
-  return ['image', 'pdf', 'office', 'markdown', 'text', 'html'].includes(raw);
+function _viewerFileOperationPolicy() {
+  if (typeof window !== 'undefined' && window.FileOperationPolicy) return window.FileOperationPolicy;
+  if (typeof module !== 'undefined' && module.exports && typeof require === 'function') {
+    // eslint-disable-next-line global-require
+    return require('./file-operation-policy.js');
+  }
+  return null;
+}
+
+function _viewerCanAddToLibrary(name, options = {}) {
+  const policy = _viewerFileOperationPolicy();
+  return !!(policy && policy.canAddToLibrary(name, options));
+}
+
+function _viewerConversationIsProjectScoped(cid) {
+  if (!cid || typeof conversations === 'undefined' || !Array.isArray(conversations)) return false;
+  const conversation = conversations.find((item) => item && item.conversation_id === cid);
+  return !!(conversation && conversation.project_id);
 }
 
 function _isViewerOpen() {
@@ -241,7 +246,7 @@ function _ensureViewer() {
             ${_viewerSaveAppButtonHtml(saveAppLabel)}
           </button>
           <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}" data-tooltip="${revealLabel}">${folderIcon}</button>
-          <button type="button" class="chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}" data-tooltip="${closeLabel}">×</button>
+          <button type="button" class="modal-close-btn chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}" data-tooltip="${closeLabel}">${_viewerUiIconHtml('x', 'modal-close-icon')}</button>
         </div>
       </div>
       <div class="chat-file-viewer-body"></div>
@@ -309,6 +314,7 @@ function _teardownViewerContent() {
   }
   _viewerEditController = null;
   _viewerDirty = false;
+  _viewerLibraryProjectScoped = false;
   if (_viewerBlobUrl) {
     try {
       if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
@@ -350,7 +356,7 @@ async function _onRevealClick() {
 async function _onAddLibraryClick() {
   const p = _viewerCurrentPath;
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
-  if (!_viewerCanAddToLibrary(p)) return;
+  if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
   _viewerTrack('file_preview_add_library', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
@@ -467,8 +473,13 @@ async function _openViewerShell(displayName, opts) {
   _viewerCurrentPath = absPath || null;
   _viewerCurrentCid = cid;
   _viewerCurrentProjectId = projectId;
+  _viewerLibraryProjectScoped = !!projectId || _viewerConversationIsProjectScoped(cid);
   if (_viewerRevealBtn) _viewerRevealBtn.hidden = !absPath;
-  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind);
+  if (_viewerAddLibraryBtn) {
+    _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind, {
+      projectScoped: _viewerLibraryProjectScoped,
+    });
+  }
   void _refreshSaveAppButton(_viewerCurrentPath);
   _viewerTitle.textContent = displayName || '';
   // `is-markdown` / `is-text` switch the body to a flex column so an editor
@@ -656,7 +667,7 @@ function _applyViewerVideoPlayback(video, opts) {
 async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOpts) {
   if (!(await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId }))) return;
   const url = _chatMediaLocalUrl(absPath);
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video></div>`;
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap" data-chat-video-playback-surface="floating_player"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video></div>`;
   _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), playbackOpts);
 }
 
@@ -668,7 +679,7 @@ async function openChatVideoUrlViewer(src, displayName, opts) {
   const projectId = (opts && opts.projectId) || null;
   if (!(await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId }))) return;
   _viewerTrack('file_preview_open', { kind: absPath ? 'video' : 'video_url', has_cid: !!cid, has_project: !!projectId });
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(url)}"></video></div>`;
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap" data-chat-video-playback-surface="floating_player"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(url)}"></video></div>`;
   _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), opts);
 }
 

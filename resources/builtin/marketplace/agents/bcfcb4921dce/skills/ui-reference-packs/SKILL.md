@@ -10,7 +10,7 @@ category: rnd
 
 Use this skill after `ui-design-contract` only when UIDesigner needs a visual-system reference, product pattern, or style benchmark. It adapts OpenDesign's design-system and template catalogue into a small routed reference layer for HTML-first UI work.
 
-This skill does not copy OpenDesign templates or brand systems. It helps choose a direction, then `ui-design-system` and `ui-html-renderer` turn that direction into original UI.
+This skill does not copy OpenDesign templates or brand systems. It helps choose a direction, then `ui-design-executor` turns that direction into original UI; load a design-system or deep renderer specialist only when separately triggered.
 
 If `ui-design-source` has produced a frame/component handoff, use that handoff as stronger evidence than any reference pack. If an existing app already has clear tokens and components, skip this skill unless the user asks for a new style direction. If `ui-live-artifact` has not classified the task as live-ready or connected-live, do not select the live-artifact pattern.
 

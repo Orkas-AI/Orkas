@@ -295,7 +295,10 @@ export function runPackageCommand(uid: string, command: string, name: string): P
       const { app } = require('electron') as typeof import('electron');
       if (app && app.isPackaged) pcDir = PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked');
     } catch { /* not in electron (tests) */ }
-    const node = process.execPath;
+    // Vitest itself runs under Electron-as-Node for native ABI parity, but
+    // standalone JS helpers should use the outer Node executable so tests do
+    // not create extra Orkas-named Electron processes.
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
     const script = path.join(pcDir, 'bin', 'orkas-pkg.cjs');
     const child = spawn(node, [script, command, name], {
       env: buildPackageCommandEnv(uid, pcDir),

@@ -13,12 +13,13 @@
  * Server serves `/api/connectors/oauth/dcr-callback` as a stable HTTPS redirect_uri (DCR
  * clients must declare one at registration), stashes the {code, state} pair under a one-time
  * exchange_code, and deep-links back to PC. PC then does the first token POST against the
- * provider's `token_endpoint` using the DCR-issued credentials, immediately hands the rotating
- * refresh grant + DCR client credentials to Server, and persists only a server grant id.
+ * provider's `token_endpoint` using the DCR-issued credentials. The public build then keeps the
+ * DCR client credentials and rotating refresh grant in its local encrypted connector registry.
+ * Server is only the short-lived HTTPS callback intermediary; it never receives those secrets.
  *
- * **Why not localhost listener (RFC 8252 native-app pattern)**: PC/CLAUDE.md §1 bans HTTP
- * server in main process. Server-bridge callback gets us a stable, registered HTTPS URI
- * (`orkas.ai/...`) at the cost of one additional KV roundtrip — fair trade.
+ * The public build never starts a loopback callback listener. Its bridge base is pinned to the
+ * global production HTTPS origin, and the landing page returns through the connector-only OS
+ * protocol receiver.
  */
 import * as crypto from 'node:crypto';
 import { URL, URLSearchParams } from 'node:url';
@@ -36,7 +37,6 @@ const log = createLogger('connectors:oauth-dcr');
 const FLOW_TIMEOUT_MS = 10 * 60 * 1000;
 const DCR_HTTP_TIMEOUT_MS = 60_000;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
-const SERVER_REFRESH_RETRY_DELAY_MS = 500;
 const CLIENT_NAME = 'Orkas';
 
 interface PendingDcrFlow {
@@ -75,12 +75,6 @@ interface AuthServerMetadata {
   token_endpoint_auth_methods_supported?: string[];
 }
 
-interface ConnectorRefreshErrorBody {
-  msg?: string;
-  error_code?: string;
-  retryable?: boolean;
-}
-
 /** Format `fetch` errors so the underlying cause (DNS / TLS / refused / …) surfaces in logs.
  *  Node undici flattens every transport-level failure to `TypeError: fetch failed` with the
  *  real reason hung off `err.cause`; logging just `err.message` loses the diagnostic. */
@@ -106,18 +100,6 @@ function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<
     undefined,
     `${label} timed out after ${Math.round(DCR_HTTP_TIMEOUT_MS / 1000)}s`,
   );
-}
-
-function _refreshErrorFromBody(body: ConnectorRefreshErrorBody, fallback: string): Error {
-  const errorCode = typeof body.error_code === 'string' ? body.error_code : '';
-  const message = body.msg || fallback;
-  const err = new Error(errorCode ? `${errorCode}: ${message}` : message) as Error & {
-    code?: string;
-    retryable?: boolean;
-  };
-  if (errorCode) err.code = errorCode;
-  if (typeof body.retryable === 'boolean') err.retryable = body.retryable;
-  return err;
 }
 
 /** Fetch `<base>/.well-known/<name>`, falling back to root-level discovery if path-suffixed
@@ -295,13 +277,9 @@ export async function startMcpDcrOAuth(
     token_auth: tokenEndpointAuthMethod,
   });
 
-  // Register client. The redirect_uri must point at our Server's `/connectors/oauth/dcr-callback`
-  // endpoint, which is environment-dependent (`accountApiBase()` resolves to the dev or prod
-  // Server URL per `OAUTH_REDIRECT_BASE` / debug-mode rules). DCR registers whichever URL we
-  // declare with the provider, so dev (localhost) and prod (orkas.ai) just work side-by-side
-  // — each ConnectorInstance carries its own dcr_client tied to whichever env it was installed
-  // under. (A dev-mode install does NOT migrate to prod automatically; the user would
-  // reconnect.)
+  // The public build has one Server environment. `accountApiBase()` is pinned to the global
+  // production HTTPS base by `_server_bridge.ts`, so source and packaged runs register the same
+  // stable callback URI.
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
   const registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });
@@ -444,172 +422,17 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
       scopes: tokens.scope ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [],
       token_type: tokens.token_type || 'Bearer',
     };
-    const grant = await storeDcrServerManaged(pending.catalogId, pending.client, localGrant);
     _pending = null;
     clearTimeout(pending.timer);
     log.info('DCR grant resolved', {
       catalog_id: pending.catalogId,
-      has_refresh: !!grant.refresh_token,
+      has_refresh: !!localGrant.refresh_token,
       expires_in: tokens.expires_in ?? null,
     });
-    pending.resolve({ grant, client: pending.client });
+    pending.resolve({ grant: localGrant, client: pending.client });
   } catch (err) {
     _cancelPending(`token exchange failed: ${_fmtFetchErr('', err).message}`);
   }
-}
-
-function _scopeString(grant: OAuthGrant): string {
-  return Array.isArray(grant.scopes) ? grant.scopes.filter(Boolean).join(' ') : '';
-}
-
-function _expiresInSeconds(grant: OAuthGrant): number {
-  if (!grant.expires_at) return 0;
-  return Math.max(0, Math.round((grant.expires_at - Date.now()) / 1000));
-}
-
-function _sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-  });
-}
-
-async function _fetchDcrServerRefresh(provider: string, body: Record<string, unknown>): Promise<Response> {
-  const url = `${accountApiBase()}/connectors/oauth/refresh`;
-  let lastErr: unknown = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      return await _fetchDcr('DCR server-managed refresh', url, {
-        method: 'POST',
-        headers: withCommonHeaders({
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          ...tokenStore.authHeaders(),
-        }),
-        body: JSON.stringify(body),
-      });
-    } catch (err) {
-      lastErr = err;
-      if (attempt === 0) {
-        log.warn('DCR server-managed refresh fetch failed; retrying once', {
-          provider,
-          error: (err as Error).message,
-        });
-        await _sleep(SERVER_REFRESH_RETRY_DELAY_MS);
-      }
-    }
-  }
-  throw lastErr;
-}
-
-function _grantFromServerPayload(
-  provider: string,
-  grant: OAuthGrant,
-  body: {
-    access_token?: string;
-    grant_id?: string;
-    server_managed?: boolean;
-    expires_in?: number;
-    token_type?: string;
-    scope?: string;
-    account_label?: string;
-  },
-): OAuthGrant {
-  if (!body.access_token || !body.grant_id) {
-    throw new Error(`invalid ${provider} server-managed DCR response`);
-  }
-  const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
-  return {
-    access_token: body.access_token,
-    refresh_token: null,
-    server_managed: true,
-    server_grant_id: body.grant_id,
-    expires_at,
-    scopes: body.scope ? body.scope.split(/[\s,]+/).filter(Boolean) : grant.scopes,
-    token_type: body.token_type || grant.token_type || 'Bearer',
-    ...(body.account_label || grant.account_label ? { account_label: body.account_label || grant.account_label } : {}),
-  };
-}
-
-export async function storeDcrServerManaged(
-  provider: string,
-  client: DcrClientCredentials,
-  grant: OAuthGrant,
-  opts: { force?: boolean } = {},
-): Promise<OAuthGrant> {
-  const res = await _fetchDcr('DCR server-managed store', `${accountApiBase()}/connectors/oauth/dcr-store`, {
-    method: 'POST',
-    headers: withCommonHeaders({
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      ...tokenStore.authHeaders(),
-    }),
-    body: JSON.stringify({
-      provider,
-      access_token: grant.access_token,
-      refresh_token: grant.refresh_token || '',
-      expires_in: _expiresInSeconds(grant),
-      token_type: grant.token_type || 'Bearer',
-      scope: _scopeString(grant),
-      account_label: grant.account_label || '',
-      dcr_client: client,
-      force_refresh: !!opts.force,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`DCR store HTTP ${res.status}: ${text}`);
-  }
-  const body = await res.json() as {
-    code: number;
-    msg?: string;
-    error_code?: string;
-    retryable?: boolean;
-    access_token?: string;
-    grant_id?: string;
-    server_managed?: boolean;
-    expires_in?: number;
-    token_type?: string;
-    scope?: string;
-    account_label?: string;
-  };
-  if (body.code !== 0) throw _refreshErrorFromBody(body, 'DCR server-managed store failed');
-  return _grantFromServerPayload(provider, grant, body);
-}
-
-export async function refreshDcrServerManaged(
-  provider: string,
-  grant: OAuthGrant,
-  opts: { force?: boolean } = {},
-): Promise<OAuthGrant> {
-  if (!grant.server_grant_id) throw new Error('DCR server grant missing grant_id');
-  const stale = !!(grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
-  if (!stale && !opts.force) return grant;
-  const res = await _fetchDcrServerRefresh(provider, {
-    provider,
-    grant_id: grant.server_grant_id,
-    device_id: tokenStore.getDeviceId(),
-    ...(opts.force ? { force_refresh: true } : {}),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`DCR refresh HTTP ${res.status}: ${text}`);
-  }
-  const body = await res.json() as {
-    code: number;
-    msg?: string;
-    error_code?: string;
-    retryable?: boolean;
-    access_token?: string;
-    grant_id?: string;
-    server_managed?: boolean;
-    expires_in?: number;
-    token_type?: string;
-    scope?: string;
-    account_label?: string;
-  };
-  if (body.code !== 0) throw _refreshErrorFromBody(body, 'DCR server-managed refresh failed');
-  return _grantFromServerPayload(provider, grant, body);
 }
 
 /** Refresh a DCR-issued access_token. Called by manager before reconnect when expires_at is
@@ -617,9 +440,10 @@ export async function refreshDcrServerManaged(
 export async function refreshDcrIfStale(
   client: DcrClientCredentials,
   grant: OAuthGrant,
+  opts: { force?: boolean } = {},
 ): Promise<OAuthGrant> {
-  if (!grant.expires_at) return grant;
-  if (grant.expires_at - Date.now() > REFRESH_BUFFER_MS) return grant;
+  if (!opts.force && !grant.expires_at) return grant;
+  if (!opts.force && grant.expires_at - Date.now() > REFRESH_BUFFER_MS) return grant;
   if (!grant.refresh_token) {
     throw new Error('access_token expired and no refresh_token available; reconnect required');
   }

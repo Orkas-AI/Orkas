@@ -283,14 +283,22 @@ describe('client_config', () => {
 
       const url = new URL(requestedUrl);
       expect(url.origin + url.pathname).toBe('https://orkas.ai/api/config/client');
-      expect(url.searchParams.get('platform')).toBe(clientConfigPlatform());
-      expect(url.searchParams.get('version')).toBe('9.8.7');
-      expect(url.searchParams.get('channel')).toBe('open');
       expect(url.searchParams.get('region')).toBe('global');
-      expect(url.searchParams.get('os')).toBe(process.platform);
-      expect(url.searchParams.get('arch')).toBe(process.arch);
+      expect(url.searchParams.has('platform')).toBe(false);
+      expect(url.searchParams.has('version')).toBe(false);
+      expect(url.searchParams.has('channel')).toBe(false);
+      expect(url.searchParams.has('os')).toBe(false);
+      expect(url.searchParams.has('arch')).toBe(false);
+      expect(url.searchParams.has('device_id')).toBe(false);
       expect(url.searchParams.has('build')).toBe(false);
-      expect((requestedInit?.headers as Record<string, string>)['If-None-Match']).toBe('"old-etag"');
+      expect(requestedInit?.headers).toMatchObject({
+        'If-None-Match': '"old-etag"',
+        'Orkas-App-Version': '9.8.7',
+        'Orkas-Platform': clientConfigPlatform(),
+        'Orkas-Arch': process.arch,
+        'Orkas-Channel': 'open',
+      });
+      expect(requestedInit?.headers).not.toHaveProperty('Orkas-Device-Id');
 
       const manager = new ClientConfigManager();
       expect(manager.get('feature.remote')).toBe('enabled');
@@ -316,8 +324,10 @@ describe('client_config', () => {
     (electronMock.app as any).getAppPath = vi.fn(() => appDir);
 
     let requestedUrl = '';
-    vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+    let requestedInit: RequestInit | undefined;
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
       requestedUrl = String(input);
+      requestedInit = init;
       return new Response(JSON.stringify({
         code: 0,
         immediate: {},
@@ -331,7 +341,8 @@ describe('client_config', () => {
 
     try {
       await refresh('manual', { force: true });
-      expect(new URL(requestedUrl).searchParams.get('channel')).toBe('open');
+      expect(new URL(requestedUrl).searchParams.has('channel')).toBe(false);
+      expect(requestedInit?.headers).toMatchObject({ 'Orkas-Channel': 'open' });
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }

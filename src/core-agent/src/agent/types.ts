@@ -16,6 +16,13 @@ export type AgentRunParams = {
    * the conversation and must not be exposed to generic providers unless an
    * adapter explicitly forwards selected fields. */
   requestMetadata?: Record<string, unknown>;
+  /** Per-turn ephemeral context (e.g. an orchestration ledger / datetime that
+   * changes EVERY turn). Injected into the model-facing view of THIS turn's
+   * user message only — the uncached tail, after all history — and NEVER
+   * persisted to the session JSONL or replayed into future turns. Host uses
+   * this to keep volatile blocks out of the (cached) system prompt so the
+   * system + history cache prefix stays byte-stable across turns. */
+  turnEphemeral?: string;
   /** Model override for this run. */
   model?: string;
   /** Provider override for this run. */
@@ -63,6 +70,19 @@ export type AgentRunResult = {
   meta: AgentRunMeta;
 };
 
+export type AgentRunTimings = {
+  /** Time awaiting primary/final-summary model calls. */
+  providerMs: number;
+  /** Wall time spent inside tool execution batches. */
+  toolMs: number;
+  /** Time spent producing/applying context summaries. */
+  compactionMs: number;
+  /** Explicit runner backoff sleep; provider-internal retries remain provider time. */
+  retryWaitMs: number;
+  /** Residual orchestration, serialization, rendering events, and bookkeeping. */
+  otherMs: number;
+};
+
 /** Metadata about an agent run. */
 export type AgentRunMeta = {
   /** Duration of the run in milliseconds. */
@@ -79,6 +99,8 @@ export type AgentRunMeta = {
   toolLoops: number;
   /** Number of compaction cycles. */
   compactionCount: number;
+  /** Non-overlapping wall-time buckets for diagnosis and UI attribution. */
+  timings?: AgentRunTimings;
   /** Whether the run was aborted. */
   aborted?: boolean;
   /** Error info if the run failed. */
@@ -107,20 +129,25 @@ export type AgentRunEvent =
       name: string;
       id: string;
       result: string;
+      persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;
       errorCode?: string;
       errorSeverity?: "recoverable" | "error";
+      durationMs?: number;
     }
-  | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage }
+  | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage; durationMs?: number }
   | {
       type: "context_status";
       phase:
         | "history_summary_start"
         | "history_summary_done"
+        | "history_summary_failed"
         | "active_process_compaction_start"
-        | "active_process_compaction_done";
+        | "active_process_compaction_done"
+        | "active_process_compaction_failed";
       message: string;
       data?: Record<string, unknown>;
     }
-  | { type: "retry"; attempt: number; reason: string }
+  | { type: "retry"; attempt: number; reason: string; waitMs?: number }
+  | { type: "provider_fallback"; reason: "auth"; providerId: string }
   | { type: "done"; result: AgentRunResult };

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Bing Webmaster Tools MCP server (stdio) — wraps the Bing Webmaster JSON REST API behind the MCP
 // tool-use protocol. Spawned as a child process by `features/connectors/mcp-client.ts`; the OAuth
 // access_token is injected through `BING_ACCESS_TOKEN` env (see `apply-template.ts`). Mirrors

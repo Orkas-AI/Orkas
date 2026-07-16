@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+require('./proxy-bootstrap.cjs');
 // Google Calendar MCP server (stdio). Same pattern as bin/gmail-mcp-server.cjs — wraps the public
 // Google Calendar REST API (`calendar.googleapis.com`, GA since 2014) to bypass the Workspace MCP
 // Developer Preview allowlist on `calendarmcp.googleapis.com`. OAuth scope `calendar` granted by

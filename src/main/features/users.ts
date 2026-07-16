@@ -43,6 +43,7 @@ import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateChatsGhostCleanup } from '../util/migrate-chats-ghost-cleanup';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
 import { migrateKbToLocalContexts } from '../util/migrate-kb-to-local';
+import { migrateProjectLayoutV4 } from '../util/migrate-project-layout-v4';
 import { rekeyUserLocalSecretsAfterLocalIdChange } from '../util/rekey-user-local-secrets';
 import { maskId } from '../util/log-redact';
 
@@ -292,38 +293,19 @@ export function activateUser(uid: string): void {
 
   ensureUserLayout(uid);
 
-  // Purge machine-local tool-results/ entries older than 7 days. Best-effort (nothrow);
-  // failure here should not block uid activation. See util/tool-result-cap.ts
-  // — these are oversized CLI/local-agent tool outputs persisted to disk with a
-  // <persisted-output> reference. Resumable core-agent session refs live next to
-  // cloud/sessions/<sid>.jsonl and are cleaned with the session lifecycle.
-  // We only clean on activate (not on session end) because the individual
-  // files are small and the 7-day window is comfortably above typical
-  // conversation lifetimes.
+  // Bound the machine-local Result Store on user activation: purge entries
+  // older than 7 days, then evict oldest remaining session entries above the
+  // default 1GB quota. Best-effort; failure must not block activation. These
+  // are CLI/local-agent outputs. Resumable core-agent refs live beside their
+  // cloud session and are deleted with that conversation's lifecycle.
   try { sweepToolResults(userToolResultsDir(uid), 7); }
   catch (err) { log.warn('sweepToolResults failed', { uid: maskId(uid), error: (err as Error).message }); }
-
-  // Sessions GC: clean cid-orphan / legacy-kind / leaked-ephemeral in
-  // cloud/sessions/, and mtime>7d in local/sessions/. Fire-and-forget — the
-  // file scan is bounded by the size of sessions/ and shouldn't gate startup.
-  // See features/sessions_sweep.ts for what it does and doesn't touch.
-  (async () => {
-    try {
-      const mod = await import('./sessions_sweep');
-      await mod.sweepSessions(uid);
-    } catch (err) { log.warn('sweepSessions failed', { uid: maskId(uid), error: (err as Error).message }); }
-  })();
 
   // Strip legacy session_id prefixes (aiteam- / orkas-) once.
   // Idempotent: after the stamp lands, subsequent startups are no-ops.
   // See util/migrate-session-ids.ts for details.
   try { migrateLegacySessionIds(uid); }
   catch (err) { log.warn('migrateLegacySessionIds failed', { uid: maskId(uid), error: (err as Error).message }); }
-
-  // Convert old sync ghosts (index row exists, jsonl already gone) into
-  // record-level tombstones so the new merge logic can propagate the delete.
-  try { migrateChatsGhostCleanup(uid); }
-  catch (err) { log.warn('migrateChatsGhostCleanup failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Agent layout migration: `agents/<aid>.json` →
   // `agents/<aid>/agent.json`, and `meta/<aid>/*` →
@@ -337,6 +319,19 @@ export function activateUser(uid: string): void {
   // devices). Idempotent + stamped. See util/migrate-kb-to-local.ts.
   try { migrateKbToLocalContexts(uid); }
   catch (err) { log.warn('migrateKbToLocalContexts failed', { uid: maskId(uid), error: (err as Error).message }); }
+
+  // v4 project-contained layout: move project-scoped conversations,
+  // automation tasks, sessions, attachments/artifacts, and project Library
+  // files under projects/<pid>/... before feature modules start using paths.
+  try { migrateProjectLayoutV4(uid); }
+  catch (err) { log.warn('migrateProjectLayoutV4 failed', { uid: maskId(uid), error: (err as Error).message }); }
+
+  // Convert old sync ghosts (index row exists, jsonl already gone) into
+  // record-level tombstones so the new merge logic can propagate the delete.
+  // Runs after project-layout migration so project-scoped rows are checked
+  // in their new `projects/<pid>/chats/` home.
+  try { migrateChatsGhostCleanup(uid); }
+  catch (err) { log.warn('migrateChatsGhostCleanup failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Pin core-agent's auth/state dir to this uid's local/config/.
   // `resolveAuthDir()` re-reads this env var on every call (see
@@ -432,6 +427,7 @@ export function switchToAccountLocalId(accountUserId: string): UserRecord {
 
 export function switchToAnonymousLocalId(): UserRecord {
   const current = ACTIVE_UID;
+  if (current === ANONYMOUS_LOCAL_ID) return recordForLocalId(ANONYMOUS_LOCAL_ID);
   if (current && current !== ANONYMOUS_LOCAL_ID) {
     const anonymousRoot = localRoot(ANONYMOUS_LOCAL_ID);
     try {

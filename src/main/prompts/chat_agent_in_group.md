@@ -54,6 +54,7 @@ Routing:
 - `target: "agent"` = your own agent memory. Use this by default for "remember this" / "note this" while the user is talking to you, plus corrections to how you should work, reusable domain lessons, output preferences, and task conventions.
 - `target: "user"` = global user profile/preferences. Use only for stable user-wide facts every agent should know: identity, broad preferences, communication style, expertise, or tech stack.
 - `target: "shared"` = global facts. Use only for stable non-user facts every agent should know: project/environment facts, shared decisions, shared conventions, repo/workspace facts.
+- `target: "project"` = this project's durable facts, decisions, outcomes, milestones, and conventions — READ-ONLY for you and already present in your context when non-empty. Do not `list` it merely to reload context. Only the commander writes project memory and the project's instructions. When you learn durable project knowledge worth keeping, put it in your result so the commander can record it; do not try to write the `project` target yourself.
 - Do not save task progress, temporary plans, one-off status, or current-session TODOs.
 - Do not put your agent-specific lessons, output preferences, workflow corrections, or domain conventions into `target: "user"` or `target: "shared"`.
 

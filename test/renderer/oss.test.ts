@@ -424,6 +424,22 @@ describe('oss.js', () => {
     const input = el('new-chat-input');
     const m = prompt.match(/\[[^\]]*\]/)!;
     expect(input.selection).toEqual([m.index, m.index! + m[0].length]);
+    expect(input.dataset.ossTemplatePlaceholder).toBe(m[0]);
+    expect(context.unresolvedOssTemplatePlaceholder(input)).toBe(m[0]);
+  });
+
+  it('validates only the exact renderer-owned OSS placeholder', () => {
+    const { context, el } = loadOss();
+    const input = el('new-chat-input');
+    input.value = 'ordinary [code] prompt';
+    expect(context.unresolvedOssTemplatePlaceholder(input)).toBe('');
+
+    const prompt = context.ossPromptFor({ name: 'X', repo: 'o/x' });
+    context.prefillCommander(prompt);
+    const marker = input.dataset.ossTemplatePlaceholder;
+    input.value = input.value.replace(marker, 'build a landing page');
+    expect(context.unresolvedOssTemplatePlaceholder(input)).toBe('');
+    expect(input.dataset.ossTemplatePlaceholder).toBeUndefined();
   });
 
   it('ossTaskFor / ossDescFor pick the active language', () => {

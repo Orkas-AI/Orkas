@@ -48,7 +48,18 @@ describe("Auth Store", () => {
   });
 
   it("resolves auth dir under home directory", () => {
-    expect(resolveAuthDir()).toBe(path.join(os.homedir(), ".core-agent"));
+    // The home-dir path is the *fallback*, so the override has to be gone for
+    // this to mean anything. It normally isn't: the vitest setup pins
+    // CORE_AGENT_AUTH_DIR to a tmp dir (and the app exports its own value to
+    // every child process), which is what the rest of this file writes to.
+    const prev = process.env.CORE_AGENT_AUTH_DIR;
+    delete process.env.CORE_AGENT_AUTH_DIR;
+    try {
+      expect(resolveAuthDir()).toBe(path.join(os.homedir(), ".core-agent"));
+    } finally {
+      if (prev === undefined) delete process.env.CORE_AGENT_AUTH_DIR;
+      else process.env.CORE_AGENT_AUTH_DIR = prev;
+    }
   });
 
   it("saves and loads auth store", () => {

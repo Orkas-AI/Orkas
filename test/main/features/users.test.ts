@@ -101,6 +101,24 @@ describe('features/users › activateUser', () => {
     expect(reg.users.map((u: { user_id: string }) => u.user_id).sort()).toEqual(['u1', 'u2']);
   });
 
+  it('does not reactivate an already-active anonymous uid', async () => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(users.ANONYMOUS_LOCAL_ID);
+    const marker = path.join(
+      tmpDir,
+      users.ANONYMOUS_LOCAL_ID,
+      'local',
+      'migrations',
+      'project-layout-v4.json',
+    );
+    fs.writeFileSync(marker, JSON.stringify({ version: 3, sentinel: 'unchanged' }), 'utf8');
+
+    const rec = users.switchToAnonymousLocalId();
+
+    expect(rec.user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+    expect(JSON.parse(fs.readFileSync(marker, 'utf8'))).toEqual({ version: 3, sentinel: 'unchanged' });
+  });
+
   it('rejects invalid uid (path-traversal / special chars)', async () => {
     const users = await import('../../../src/main/features/users');
     expect(() => users.activateUser('../evil')).toThrow(/invalid user id/);

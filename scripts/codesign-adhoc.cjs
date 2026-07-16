@@ -14,7 +14,18 @@
 const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { verifyRuntimeRoot } = require('../bin/runtime-gate.cjs');
+const { verifyNativePackagePayload } = require('../bin/native-package-gate.cjs');
+const {
+  verifyRuntimeRoot,
+  verifyWindowsVcAppLocalFiles,
+  verifyWindowsVcImportClosure,
+} = require('../bin/runtime-gate.cjs');
+const {
+  verifyEmbeddingModelRoot,
+  verifyMacLocalizedMetadataRoot,
+} = require('../bin/packaged-resource-gate.cjs');
+const { verifyPackagedEntrypointPayload } = require('../bin/packaged-entrypoint-gate.cjs');
+const { verifyBuiltinRoot } = require('../bin/builtin-resource-gate.cjs');
 
 const ARCH_NAMES = {
   0: 'ia32',
@@ -61,6 +72,12 @@ function pruneOnnxRuntimePackage(pkgDir, targetPlatform, targetArch) {
         removeIfExists(path.join(platformDir, archDirName));
       }
     }
+
+    // FastEmbed explicitly uses the CPU execution provider. DirectML is an
+    // unused 18 MB companion and must not silently become part of the payload.
+    if (targetPlatform === 'win32' && keepArch) {
+      removeIfExists(path.join(platformDir, keepArch, 'DirectML.dll'));
+    }
   }
 }
 
@@ -90,6 +107,14 @@ function pruneEsbuildPackage(nodeModules, targetPlatform, targetArch) {
   if (!fs.existsSync(bin)) {
     throw new Error(`[codesign-adhoc] missing ${targetPlatform} ${targetArch} esbuild runtime binary: ${bin}`);
   }
+
+  // esbuild/bin/esbuild is what direct esbuild imports launch. Cross-packaging
+  // otherwise leaves the host binary here even when @esbuild has been pruned
+  // to the correct target package.
+  const launcher = path.join(nodeModules, 'esbuild', 'bin', 'esbuild');
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.copyFileSync(bin, launcher);
+  if (targetPlatform !== 'win32') fs.chmodSync(launcher, 0o755);
 }
 
 function targetSqliteVecPackage(targetPlatform, targetArch) {
@@ -146,6 +171,19 @@ function pruneTokenizersPackages(nodeModules, targetPlatform, targetArch) {
       }
     }
   }
+}
+
+function pruneBetterSqlite3BuildArtifacts(nodeModules) {
+  // @electron/rebuild compiles better-sqlite3's optional test extension next
+  // to the production binding. It is not loaded by Orkas and must not become
+  // an undeclared native payload merely because npmRebuild ran during pack.
+  removeIfExists(path.join(
+    nodeModules,
+    'better-sqlite3',
+    'build',
+    'Release',
+    'test_extension.node',
+  ));
 }
 
 function packageDir(nodeModules, packageName) {
@@ -330,10 +368,14 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
 }
 
 function appNodeModules(context, appPath) {
+  return path.join(appUnpackedRoot(context, appPath), 'node_modules');
+}
+
+function appUnpackedRoot(context, appPath) {
   if (context.electronPlatformName === 'darwin') {
-    return path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked', 'node_modules');
+    return path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked');
   }
-  return path.join(context.appOutDir, 'resources', 'app.asar.unpacked', 'node_modules');
+  return path.join(context.appOutDir, 'resources', 'app.asar.unpacked');
 }
 
 function appResourcesDir(context, appPath) {
@@ -434,7 +476,40 @@ function verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch
   // npm/npx companion verification (my node-runtime hardening) is preserved by
   // verifyRuntimeRoot → verifyRuntimeDir → runtimeCompanionFiles (runtime-gate.cjs),
   // which the remote extracted; it also keeps marker/pip-shim/arch/dir-allowlist checks.
-  return verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch);
+  const options = {
+    ...(context.__orkasTestWhisperContract ? { whisperContract: context.__orkasTestWhisperContract } : {}),
+    ...(context.__orkasTestWindowsVcContract ? { windowsVcContract: context.__orkasTestWindowsVcContract } : {}),
+  };
+  const verified = verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch, options);
+  if (targetPlatform === 'win32') {
+    verified.push(verifyWindowsVcAppLocalFiles(context.appOutDir, targetArch, options));
+    verified.push(verifyWindowsVcImportClosure(context.appOutDir, targetArch, {
+      ...(context.__orkasTestWindowsVcContract ? { allowMinimalPe: true, allowNoVcImports: true } : {}),
+    }));
+  }
+  return verified;
+}
+
+function verifyPackedResourcePayload(context, appPath, targetPlatform) {
+  const resourcesDir = appResourcesDir(context, appPath);
+  const builtinRoot = context.__orkasTestBuiltinRoot || path.join(resourcesDir, 'builtin');
+  const verified = [
+    verifyEmbeddingModelRoot(path.join(resourcesDir, 'embedding-model')),
+    verifyBuiltinRoot(builtinRoot, context.__orkasTestBuiltinRoot ? { allowIgnoredJunk: true } : {}),
+  ];
+  if (targetPlatform === 'darwin') {
+    verified.push(verifyMacLocalizedMetadataRoot(resourcesDir, { allowElectronResources: true }));
+  }
+  return verified;
+}
+
+function verifyPackedEntrypointPayload(context, appPath) {
+  return verifyPackagedEntrypointPayload(
+    context.__orkasTestEntrypointRoot || appUnpackedRoot(context, appPath),
+    {
+      projectRoot: path.join(__dirname, '..'),
+    },
+  );
 }
 
 function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) {
@@ -449,6 +524,7 @@ function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) 
   pruneSqliteVecPackages(nodeModules, targetPlatform, targetArch);
   pruneCanvasPackages(nodeModules, targetPlatform, targetArch);
   pruneTokenizersPackages(nodeModules, targetPlatform, targetArch);
+  pruneBetterSqlite3BuildArtifacts(nodeModules);
   if (targetPlatform !== 'darwin') {
     removeIfExists(path.join(nodeModules, 'fsevents'));
   }
@@ -457,7 +533,9 @@ function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) 
     pruneOnnxRuntimePackage(pkgDir, targetPlatform, targetArch);
   }
 
-  return verifyPackedNativePayload(nodeModules, targetPlatform, targetArch);
+  const verified = verifyPackedNativePayload(nodeModules, targetPlatform, targetArch);
+  verified.push(...verifyNativePackagePayload(nodeModules, targetPlatform, targetArch));
+  return verified;
 }
 
 function writeNativeGateMarker(context, targetPlatform, targetArch, verified) {
@@ -535,7 +613,7 @@ function writeMacAppUpdateConfig(context, appPath) {
   console.log(`[app-update-config] wrote ${configFile}`);
 }
 
-module.exports = async function afterPack(context) {
+async function afterPack(context) {
   const targetPlatform = context.electronPlatformName;
   const targetArch = ARCH_NAMES[context.arch] || process.arch;
   const appName = context.packager.appInfo.productFilename;
@@ -549,6 +627,8 @@ module.exports = async function afterPack(context) {
   console.log(`[native-deps-gate] target=${targetPlatform}/${targetArch}`);
   const verified = prunePackedNativePayload(context, appPath, targetPlatform, targetArch);
   verified.push(...verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch));
+  verified.push(...verifyPackedResourcePayload(context, appPath, targetPlatform));
+  verified.push(...verifyPackedEntrypointPayload(context, appPath));
   writeNativeGateMarker(context, targetPlatform, targetArch, verified);
   console.log(`[native-deps-gate] verified: ${verified.join(', ')}`);
   console.log('[native-deps-gate] result=passed; signing may continue');
@@ -569,4 +649,11 @@ module.exports = async function afterPack(context) {
   execSync(`codesign --force --deep --sign - "${appPath}"`, { stdio: 'inherit' });
   // Fail the build if the fallback signature is invalid.
   execSync(`codesign --verify --deep "${appPath}"`, { stdio: 'inherit' });
+}
+
+module.exports = afterPack;
+module.exports.__test = {
+  pruneBetterSqlite3BuildArtifacts,
+  pruneEsbuildPackage,
+  pruneOnnxRuntimePackage,
 };

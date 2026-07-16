@@ -230,16 +230,70 @@ export const commanderRuntimeStatsFile = (uid: string) => path.join(commanderDir
 // transactional update and would conflict on multi-device sync. See
 // `features/projects.ts` and `PC/CLAUDE.md` §4 / §5 / §9.
 //
-// Project membership of a conversation stays as a `project_id` field on the
-// conv index entry, NOT as a path component (cid stays globally unique;
-// session_id schema is untouched — see CLAUDE.md §5).
+// Project-scoped runtime data mirrors the top-level user layout inside the
+// project directory. Legacy builds stored project conversations/tasks at the
+// top level with only `project_id` on the records; v4 migrates those bytes into
+// `projects/<pid>/{chats,sessions,chat_attachments,chat_artifacts,auto_tasks}`
+// while keeping cid/session/task ids unchanged.
 export const userProjectsDir       = (uid: string) => path.join(userCloudRoot(uid), 'projects');
 export const projectDir            = (uid: string, pid: string) => path.join(userProjectsDir(uid), pid);
 export const projectMetaFile       = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'project.json');
 export const projectBindingsFile   = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'bindings.json');
-export const projectFilesDir        = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'files');
+/** Guard a project id used as a single path segment for project-scoped
+ *  instructions/memory. The pid comes from the conv index / IPC (never
+ *  model-supplied), but these paths are written to, so reject traversal /
+ *  separators defensively — same posture as `assertAgentSegment` below. */
+function assertProjectSegment(pid: string): string {
+  if (!pid || pid.includes('/') || pid.includes('\\') || pid.includes('..') || pid.includes('\0')) {
+    throw new Error(`invalid project id for project path: ${JSON.stringify(pid)}`);
+  }
+  return pid;
+}
+// User-authored per-project instructions (agent-readonly; edited in the
+// project settings UI, injected into every session of the project).
+// Read/write goes through features/projects.ts.
+export const projectInstructionsFile = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'ORKAS.md');
+// Project-scoped cross-session memory (`project` tier of cross_session_memory).
+// Inside the project dir so it lives/dies/syncs with the project.
+export const projectMemoryFile       = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'MEMORY.md');
+export const projectChatsDir           = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chats');
+export const projectChatIndexFile      = (uid: string, pid: string) => path.join(projectChatsDir(uid, pid), '_index.json');
+export const projectChatJsonlFile      = (uid: string, pid: string, cid: string) => path.join(projectChatsDir(uid, pid), `${cid}.jsonl`);
+export const projectGroupChatDir       = (uid: string, pid: string, cid: string) => path.join(projectChatsDir(uid, pid), cid);
+export const projectGroupChatMembersFile = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'members.json');
+export const projectGroupChatStateFile = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'state.json');
+export const projectGroupChatPlanFile  = (uid: string, pid: string, cid: string) => path.join(projectGroupChatDir(uid, pid, cid), 'plan.json');
+export const projectGroupChatVisibilityDir = (uid: string, pid: string, cid: string) =>
+  path.join(projectGroupChatDir(uid, pid, cid), 'visibility');
+export const projectGroupChatVisibilityFile = (uid: string, pid: string, cid: string, actorId: string) =>
+  path.join(projectGroupChatVisibilityDir(uid, pid, cid), `${actorId}.jsonl`);
+
+export const projectSessionsDir        = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'sessions');
+export const projectSessionFile        = (uid: string, pid: string, sessionId: string) => path.join(projectSessionsDir(uid, pid), `${sessionId}.jsonl`);
+export const projectSessionCloudToolResultsDir = (uid: string, pid: string, sessionId: string) =>
+  path.join(projectSessionsDir(uid, pid), `${sessionId}.tool-results`);
+
+export const projectChatAttachmentsDir = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chat_attachments');
+export const projectChatAttachmentDir  = (uid: string, pid: string, cid: string) => path.join(projectChatAttachmentsDir(uid, pid), cid);
+export const projectChatArtifactsDir   = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'chat_artifacts');
+export const projectChatArtifactCidDir = (uid: string, pid: string, cid: string) => path.join(projectChatArtifactsDir(uid, pid), cid);
+export const projectArtifactDir        = (uid: string, pid: string, cid: string, artifactId: string) =>
+  path.join(projectChatArtifactCidDir(uid, pid, cid), artifactId);
+
+export const projectContextsDir        = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'contexts');
+// Compatibility name for project Library callers. Physical v4 layout uses
+// `contexts/`, matching the top-level Library domain.
+export const projectFilesDir           = (uid: string, pid: string) => projectContextsDir(uid, pid);
+// Legacy project Library source from v3 and earlier. Only migration/fallback
+// paths should read this; new writes use projectFilesDir()/contexts/.
+export const projectLegacyFilesDir     = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'files');
+// Structured task backlog (the project work-state's task layer). One file per
+// task, cloud-synced with the project (directory-is-truth, no aggregate index —
+// mirrors the project listing). See Common/docs/plans/project-work-state.md.
+export const projectTasksDir        = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'tasks');
+export const projectTaskFile        = (uid: string, pid: string, tid: string) => path.join(projectTasksDir(uid, pid), `${assertProjectSegment(tid)}.json`);
 export const projectLocalDir        = (uid: string, pid: string) => path.join(userLocalRoot(uid), 'projects', pid);
-export const projectLibraryVectorDbPath = (uid: string, pid: string) => path.join(projectLocalDir(uid, pid), 'files', '.kb', 'vector.db');
+export const projectLibraryVectorDbPath = (uid: string, pid: string) => path.join(projectLocalDir(uid, pid), 'contexts', '.kb', 'vector.db');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
 export const userAgentMemoryDir  = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'memory');
@@ -292,8 +346,9 @@ export const userSystemSkillsDir = (uid: string) => path.join(userSystemDir(uid)
 export const userSystemSkillDir = (uid: string, id: string) => path.join(userSystemSkillsDir(uid), id);
 export const userSystemSkillsManifestFile = (uid: string) => path.join(userSystemSkillsDir(uid), '_system.json');
 
-// Per-user auto tasks (sidebar "Automation" tab). Each task is a
-// self-contained directory at `<uid>/cloud/auto_tasks/<task_id>/`:
+// Per-user auto tasks (sidebar "Automation" tab). Global tasks live at
+// `<uid>/cloud/auto_tasks/<task_id>/`; project tasks mirror that layout at
+// `<uid>/cloud/projects/<pid>/auto_tasks/<task_id>/`:
 //
 //   <task_id>/
 //     config.json    spec (schedule / recipient / skill / connector / ...)
@@ -308,6 +363,11 @@ export const userAutoTasksDir = (uid: string) => path.join(userCloudRoot(uid), '
 export const autoTaskDir = (uid: string, taskId: string) => path.join(userAutoTasksDir(uid), taskId);
 export const autoTaskConfigFile = (uid: string, taskId: string) => path.join(autoTaskDir(uid, taskId), 'config.json');
 export const autoTaskAttachmentsDir = (uid: string, taskId: string) => path.join(autoTaskDir(uid, taskId), 'attachments');
+export const projectAutoTasksDir = (uid: string, pid: string) => path.join(projectDir(uid, assertProjectSegment(pid)), 'auto_tasks');
+export const projectAutoTaskDir = (uid: string, pid: string, taskId: string) => path.join(projectAutoTasksDir(uid, pid), taskId);
+export const projectAutoTaskConfigFile = (uid: string, pid: string, taskId: string) => path.join(projectAutoTaskDir(uid, pid, taskId), 'config.json');
+export const projectAutoTaskAttachmentsDir = (uid: string, pid: string, taskId: string) =>
+  path.join(projectAutoTaskDir(uid, pid, taskId), 'attachments');
 // Connector registry: installed MCP server instances + cached tool schemas + OAuth grants
 // (local-secret encrypted with the active Orkas account's OAuth user_id as owner — see
 // `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
@@ -327,6 +387,10 @@ export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDi
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
 export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
+// Compact crash-recovery journal. Keeping this local avoids syncing transient
+// process state and lets startup inspect only conversations that were running.
+export const userRunningConversationsFile = (uid: string) =>
+  path.join(userLocalConfigDir(uid), 'running-conversations.json');
 // Last-known-good product control-plane config fetched from the Server.
 // Local cache only; Server JSON is the authority.
 export const userRemoteConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'remote-config.json');
@@ -370,6 +434,10 @@ export const userFileCacheDir = (uid: string) => path.join(userLocalRoot(uid), '
 export const userLocalCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'cache');
 export const localCacheBucketDir = (uid: string, bucket: string) =>
   path.join(userLocalCacheDir(uid), bucket);
+export const userAgentCatalogCacheFile = (uid: string) =>
+  path.join(localCacheBucketDir(uid, 'catalogs'), 'agents.json');
+export const userSkillCatalogCacheFile = (uid: string) =>
+  path.join(localCacheBucketDir(uid, 'catalogs'), 'skills.json');
 
 // ── Business data ──────────────────────────────────────────────────────
 // `<uid>/local/biz/` holds server-sourced reference data the client mirrors
@@ -574,6 +642,12 @@ export const userSyncRecycleDir   = (uid: string) => path.join(userSyncDir(uid),
 // successful sync pass.
 export const userSyncManifestCacheFile = (uid: string) =>
   path.join(userSyncDir(uid), 'manifest_cached.json');
+// One-shot structural move map written by v4 project-layout migration. The
+// sync engine uses it to force-push new project-contained paths and tombstone
+// old top-level paths without treating the migration as an accidental mass
+// delete.
+export const userSyncProjectLayoutMovesFile = (uid: string) =>
+  path.join(userSyncDir(uid), 'project-layout-v4-moves.json');
 
 // ── Build-time resources (shipped with installer, read-only) ────────────
 // The 95MB ONNX embedding model ships via electron-builder's `extraResources`

@@ -220,12 +220,12 @@ function _mpCompareVersions(a, b) {
   }
   return 0;
 }
-
+/** True when the item has no minimum or this client is known to meet it. */
 function _mpItemAppCompatible(item) {
   const min = _mpMinAppVersion(item);
   if (!min) return true;
   const current = _mpState && _mpState.appVersion;
-  if (!current) return true;
+  if (!current) return false;
   return _mpCompareVersions(current, min) >= 0;
 }
 

@@ -5,6 +5,8 @@ import { spawnSync } from 'node:child_process';
 
 import { describe, expect, it } from 'vitest';
 
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+
 function pcDir() {
   return fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
     ? process.cwd()
@@ -33,7 +35,7 @@ function runSkill(
   const dir = pcDir();
   const workspaceRoot = path.join(os.tmpdir(), 'orkas-video-skill-workspace');
   return spawnSync(
-    process.execPath,
+    TEST_NODE,
     [path.join(dir, 'bin', 'run-skill.cjs'), skillId, script, '--', ...args],
     {
       cwd: path.dirname(dir),

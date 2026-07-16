@@ -40,16 +40,39 @@ export { ProviderRegistry } from "./providers/index.js";
 export { AgentRunner } from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
-export type { HistoryResource, HistoryResourceKind } from "./agent/index.js";
-export type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./agent/index.js";
+export type { ToolProtocolRepairReport } from "./agent/index.js";
+export type {
+  CompletedWorkEntry,
+  CompletedWorkInput,
+  CompletedWorkStatus,
+  ExecutionPlanAuditRecord,
+  ExecutionPlanState,
+  ExecutionPlanStep,
+  ExecutionPlanStepStatus,
+  ExecutionPlanUpdate,
+  HistoryResource,
+  HistoryResourceKind,
+} from "./agent/index.js";
+export type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunTimings, AgentRunEvent } from "./agent/index.js";
 
 // Tools
 export type { AgentTool, ToolContext, ToolResult, ToolResultImage } from "./tools/index.js";
-export { defineTool, toToolDefinition, getBuiltinTools, runBuiltinWebSearch, WEB_SEARCH_DEFAULT_COUNT, WEB_SEARCH_MAX_COUNT } from "./tools/index.js";
+export { defineTool, toToolDefinition, getBuiltinTools, createExecutionPlanTool, runBuiltinWebSearch, WEB_SEARCH_DEFAULT_COUNT, WEB_SEARCH_MAX_COUNT } from "./tools/index.js";
 
 // Sandbox
 export { SandboxExecutor } from "./sandbox/index.js";
-export type { SandboxConfig, SandboxResult } from "./sandbox/index.js";
+export {
+  ProcessOutputCapture,
+  discardStreamedToolOutput,
+  DEFAULT_PROCESS_OUTPUT_MEMORY_BYTES,
+  DEFAULT_PROCESS_OUTPUT_SPOOL_BYTES,
+} from "./sandbox/index.js";
+export type {
+  SandboxConfig,
+  SandboxResult,
+  CapturedProcessOutput,
+  StreamedToolOutput,
+} from "./sandbox/index.js";
 
 // Skills (SKILL.md directory scanner + system-prompt injection helper)
 export { SkillLoader, parseFrontmatter, pickDescription } from "./skills/index.js";

@@ -96,7 +96,6 @@ function _autoAttachDisplayName(item) {
 
 let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
-let _autoEventsHandle = null;
 let _autoFormMounted = false;  // _aiSelectMount only once
 let _autoEditingTaskId = null; // null = create mode, taskId = edit mode
 // Current device fingerprint — fetched lazily on first row render. Used to
@@ -149,6 +148,12 @@ let _autoCurrentRecipient = { kind: 'commander' };
 // Allocated lazily on first attach + on edit-mode entry (= task.id).
 let _autoCurrentTaskId = '';
 let _autoCurrentAttachments = []; // [{ name, displayName?, kind?, bytes?, status? }]
+
+// Execution-history data is paged independently from the sidebar's bounded
+// startup conversation cache. Counts are loaded in one batch for every
+// visible auto task; pages are fetched only when a task card is expanded.
+const _autoTaskConversationCounts = new Map(); // taskId -> total
+const _autoTaskConversationPages = new Map();  // taskId -> page state
 
 // Cached `_aiSelectMount` handles for the inline form. Set on first mount.
 let _autoFreqSel = null;
@@ -236,6 +241,59 @@ function _buildProjectNameLookup() {
   };
 }
 
+function _autoStructuredMessagePreview(task, maxLength) {
+  if (!task || !Array.isArray(task.message_parts)
+      || typeof chatUseTextFromMessageParts !== 'function') return null;
+  const limit = Math.max(1, Number(maxLength) || 160);
+  const totalTextLength = task.message_parts.reduce((sum, part) => (
+    sum + (part && part.type === 'text' && typeof part.text === 'string' ? part.text.length : 0)
+  ), 0);
+  const previewParts = [];
+  let remaining = limit;
+  for (const part of task.message_parts) {
+    if (totalTextLength > limit && remaining <= 0) break;
+    if (part && part.type === 'text' && typeof part.text === 'string') {
+      const text = totalTextLength > limit ? part.text.slice(0, remaining) : part.text;
+      if (text) previewParts.push({ type: 'text', text });
+      remaining -= text.length;
+      if (text.length < part.text.length) break;
+    } else {
+      previewParts.push(part);
+    }
+  }
+  const value = chatUseTextFromMessageParts(previewParts);
+  return value ? { value, truncated: totalTextLength > limit } : null;
+}
+
+function _autoTaskMessagePreviewHtml(task, maxLength = 160) {
+  const content = String((task && task.content) || '');
+  const limit = Math.max(1, Number(maxLength) || 160);
+  const structured = _autoStructuredMessagePreview(task, limit);
+  const previewContent = structured ? '' : content.slice(0, limit);
+  const previewTask = { ...(task || {}), content: previewContent };
+  const previewValue = structured ? structured.value : _autoComposerValueForTask(previewTask);
+  let html;
+  if (typeof _renderChatUseMirrorHtml === 'function') {
+    html = _renderChatUseMirrorHtml(previewValue, (value) => escapeHtml(value));
+  } else if (typeof formatChatUseTextForDisplay === 'function') {
+    html = escapeHtml(formatChatUseTextForDisplay(previewValue));
+  } else {
+    // `chat-use.js` loads before this lazy module in the app. Keep a readable
+    // fallback for focused tests or partial renderer shells without exposing
+    // the invisible token metadata as text.
+    const labels = [];
+    if (task && task.skill && task.skill.name) {
+      labels.push(t('skills.use_label', { skill: task.skill.name }));
+    }
+    if (task && task.connector && task.connector.name) {
+      labels.push(t('connectors.use_label', { connector: task.connector.name }));
+    }
+    html = escapeHtml(labels.concat(previewContent ? [previewContent] : []).join(' '));
+  }
+  const truncated = structured ? structured.truncated : content.length > limit;
+  return `${html}${truncated ? '…' : ''}`;
+}
+
 // ─── Row rendering (shared between global tab and project-detail card) ──
 
 function _autoRenderRow(task, opts) {
@@ -245,28 +303,23 @@ function _autoRenderRow(task, opts) {
   row.dataset.taskId = task.id;
 
   // ── Main column (left) ────────────────────────────────────────────────
-  // Layout: content preview (primary) → chip row (recipient / skill /
-  // connector / attachment count). Title is folded into the content area
-  // as a secondary line below the message preview, since the schedule
-  // summary moved to the right column.
-  const contentPreview = (task.content || '').slice(0, 160);
-  const contentHtml = contentPreview
-    ? `<div class="auto-row-content">${escapeHtml(contentPreview)}${task.content.length > 160 ? '…' : ''}</div>`
+  // Layout: message preview (with inline skill / connector chips) → metadata
+  // chips (recipient / attachment / project / device). Title is folded into
+  // the content area as a secondary line below the message preview, since the
+  // schedule summary moved to the right column.
+  const contentText = String(task.content || '');
+  const contentHtml = contentText
+    ? `<div class="auto-row-content">${_autoTaskMessagePreviewHtml(task)}</div>`
     : `<div class="auto-row-content auto-row-content-empty muted">${escapeHtml(t('auto.invalid_content'))}</div>`;
   const titleHtml = task.title
     ? `<div class="auto-row-title muted">${escapeHtml(task.title)}</div>`
     : '';
 
-  // Chip row — only emitted for fields actually set on this task.
+  // Metadata chip row — skill and connector belong to the message preview
+  // above, matching the current chat composer instead of forming a second row.
   const chips = [];
   if (task.recipient && task.recipient.kind === 'agent' && task.recipient.name) {
     chips.push(`<span class="auto-row-chip is-agent">${escapeHtml('@' + task.recipient.name)}</span>`);
-  }
-  if (task.skill && task.skill.name) {
-    chips.push(`<span class="auto-row-chip is-skill">${escapeHtml(t('skills.use_label', { skill: task.skill.name }))}</span>`);
-  }
-  if (task.connector && task.connector.name) {
-    chips.push(`<span class="auto-row-chip is-connector">${escapeHtml(t('connectors.use_label', { connector: task.connector.name }))}</span>`);
   }
   const attachCount = Array.isArray(task.attachments) ? task.attachments.length : 0;
   if (attachCount > 0) {
@@ -368,12 +421,112 @@ function _autoRenderRow(task, opts) {
   return row;
 }
 
-// Conversation count for a given task id — reads the shared `conversations`
-// global populated by conversation.js. Auto-fired convs carry
-// `origin_auto_task_id` (set by features/auto_tasks.ts on fire).
+function _autoCachedTaskConversations(taskId) {
+  if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return [];
+  return conversations.filter((c) => c && c.origin_auto_task_id === taskId);
+}
+
+// Prefer the authoritative batch/page total. The shared `conversations`
+// array remains a fallback for the brief interval before counts arrive.
 function _autoCountConvsForTask(taskId) {
-  if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return 0;
-  return conversations.filter((c) => c && c.origin_auto_task_id === taskId).length;
+  const page = _autoTaskConversationPages.get(taskId);
+  if (page && page.initialized) return Math.max(0, Number(page.total) || 0);
+  if (_autoTaskConversationCounts.has(taskId)) {
+    return Math.max(0, Number(_autoTaskConversationCounts.get(taskId)) || 0);
+  }
+  return _autoCachedTaskConversations(taskId).length;
+}
+
+async function _autoLoadTaskConversationCounts(taskIds) {
+  const ids = Array.from(new Set((Array.isArray(taskIds) ? taskIds : [])
+    .map((id) => String(id || ''))
+    .filter(Boolean)));
+  if (!ids.length) return;
+  try {
+    const res = await window.orkas.invoke('conversations.autoTaskCounts', { task_ids: ids });
+    if (!res || res.ok === false) throw new Error(res?.error || 'auto task conversation count failed');
+    const counts = (res.counts && typeof res.counts === 'object') ? res.counts : {};
+    for (const taskId of ids) {
+      const total = Math.max(0, Number(counts[taskId]) || 0);
+      const page = _autoTaskConversationPages.get(taskId);
+      // A changed total means the existing offset belongs to an older index
+      // snapshot. Drop it so the next expansion starts from the correct head.
+      if (page && page.initialized && page.total !== total) {
+        _autoTaskConversationPages.delete(taskId);
+      }
+      _autoTaskConversationCounts.set(taskId, total);
+    }
+  } catch (err) {
+    _autoLog.warn('load task conversation counts failed', err);
+  }
+}
+
+function _autoTaskConversationPage(taskId) {
+  let page = _autoTaskConversationPages.get(taskId);
+  if (!page) {
+    page = {
+      items: [],
+      total: _autoCountConvsForTask(taskId),
+      nextOffset: 0,
+      initialized: false,
+      loading: null,
+    };
+    _autoTaskConversationPages.set(taskId, page);
+  }
+  return page;
+}
+
+function _autoMergeConversationRows(existing, incoming) {
+  const byCid = new Map();
+  for (const row of Array.isArray(existing) ? existing : []) {
+    if (row && row.conversation_id) byCid.set(row.conversation_id, row);
+  }
+  for (const row of Array.isArray(incoming) ? incoming : []) {
+    if (row && row.conversation_id) byCid.set(row.conversation_id, row);
+  }
+  return Array.from(byCid.values());
+}
+
+function _autoMergeIntoConversationCache(rows) {
+  if (!Array.isArray(rows) || !rows.length || typeof conversations === 'undefined') return;
+  if (typeof _appendConversationSlice === 'function') {
+    _appendConversationSlice(rows);
+    return;
+  }
+  conversations = _autoMergeConversationRows(
+    Array.isArray(conversations) ? conversations : [],
+    rows,
+  );
+}
+
+async function _autoLoadTaskConversationPage(taskId, append = false) {
+  const page = _autoTaskConversationPage(taskId);
+  if (page.loading) return page.loading;
+  if (append && (!page.initialized || page.nextOffset === null)) return page;
+  const offset = append ? page.nextOffset : 0;
+  const run = (async () => {
+    const res = await window.orkas.invoke('conversations.list', {
+      mode: 'auto_task',
+      task_id: taskId,
+      offset,
+    });
+    if (!res || res.ok === false) throw new Error(res?.error || 'auto task conversation page failed');
+    const rows = Array.isArray(res.conversations) ? res.conversations : [];
+    page.items = append ? _autoMergeConversationRows(page.items, rows) : rows;
+    page.total = Math.max(0, Number(res.total) || 0);
+    const next = res.next_offset === null ? null : Number(res.next_offset);
+    page.nextOffset = Number.isSafeInteger(next) && next >= 0 ? next : null;
+    page.initialized = true;
+    _autoTaskConversationCounts.set(taskId, page.total);
+    _autoMergeIntoConversationCache(rows);
+    return page;
+  })();
+  page.loading = run;
+  try {
+    return await run;
+  } finally {
+    if (page.loading === run) page.loading = null;
+  }
 }
 
 function _autoRefreshTaskConvsChrome(taskId, container) {
@@ -395,14 +548,25 @@ function _autoRefreshTaskConvsChrome(taskId, container) {
 function _autoRenderTaskConvs(taskId, container) {
   if (!container) return;
   _autoRefreshTaskConvsChrome(taskId, container);
-  const matches = (typeof conversations !== 'undefined' && Array.isArray(conversations))
-    ? conversations.filter((c) => c && c.origin_auto_task_id === taskId)
-    : [];
+  const page = _autoTaskConversationPages.get(taskId);
+  if (!page || !page.initialized) {
+    container.innerHTML = `<div class="muted auto-row-convs-empty">${escapeHtml(t('chat.loading'))}</div>`;
+    _autoLoadTaskConversationPage(taskId).then(() => {
+      if (container.isConnected) _autoRenderTaskConvs(taskId, container);
+    }).catch((err) => {
+      _autoLog.warn('load task conversations failed', err);
+      if (container.isConnected) {
+        container.innerHTML = `<div class="muted auto-row-convs-empty">${escapeHtml(t('auto.load_failed', { reason: err?.message || err }))}</div>`;
+      }
+    });
+    return;
+  }
+  const matches = page.items;
   if (!matches.length) {
     container.innerHTML = `<div class="muted auto-row-convs-empty">${escapeHtml(t('auto.no_convs'))}</div>`;
     return;
   }
-  container.innerHTML = (typeof _renderConversationTimeBucketList === 'function')
+  let html = (typeof _renderConversationTimeBucketList === 'function')
     ? _renderConversationTimeBucketList(matches, { nested: true, hidePin: true, bucketScope: `auto:${taskId}` })
     : matches
         .slice()
@@ -413,13 +577,51 @@ function _autoRenderTaskConvs(taskId, container) {
         })
         .map((c) => _renderConversationSidebarItem(c, { nested: true, hidePin: true }))
         .join('');
+  if (page.nextOffset !== null) {
+    html += `<button type="button" class="conversation-list-load-more" data-auto-task-convs-more="1">${escapeHtml(t('sidebar.load_more_conversations'))}</button>`;
+  }
+  container.innerHTML = html;
   if (typeof _bindConversationSidebarItems === 'function') {
     _bindConversationSidebarItems(container, {
       selector: '.conv-item',
       onBucketToggle: () => _autoRenderTaskConvs(taskId, container),
-      async afterDelete() {
+      async afterSave(updated) {
+        if (!updated || !updated.conversation_id) return;
+        page.items = page.items.map((item) => (
+          item && item.conversation_id === updated.conversation_id
+            ? { ...item, ...updated }
+            : item
+        ));
         _autoRenderTaskConvs(taskId, container);
       },
+      async afterDelete(cid) {
+        const previousLength = page.items.length;
+        page.items = page.items.filter((item) => item && item.conversation_id !== cid);
+        if (page.items.length !== previousLength) {
+          page.total = Math.max(0, page.total - 1);
+          if (page.nextOffset !== null) {
+            page.nextOffset = Math.max(page.items.length, page.nextOffset - 1);
+          }
+          _autoTaskConversationCounts.set(taskId, page.total);
+        }
+        _autoRenderTaskConvs(taskId, container);
+      },
+    });
+  }
+  const more = container.querySelector('[data-auto-task-convs-more="1"]');
+  if (more) {
+    more.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (more.disabled) return;
+      more.disabled = true;
+      try {
+        await _autoLoadTaskConversationPage(taskId, true);
+        if (container.isConnected) _autoRenderTaskConvs(taskId, container);
+      } catch (err) {
+        _autoLog.warn('load more task conversations failed', err);
+        if (more.isConnected) more.disabled = false;
+      }
     });
   }
   if (typeof _refreshAllConvBadges === 'function') _refreshAllConvBadges();
@@ -539,6 +741,7 @@ async function loadAutoList(force) {
   try {
     const res = await window.orkas.invoke('autoTasks.list', {});
     _autoTasks = (res && Array.isArray(res.tasks)) ? res.tasks : [];
+    await _autoLoadTaskConversationCounts(_autoTasks.map((task) => task && task.id));
   } catch (err) {
     _autoTasks = [];
     _autoLog.warn('list failed', err);
@@ -577,18 +780,19 @@ async function loadProjectAutoList(projectId) {
   if (!projectId) {
     listEl.innerHTML = '';
     if (emptyEl) emptyEl.style.display = '';
-    if (countEl) countEl.textContent = '';
+    if (countEl) countEl.textContent = '0';
     return;
   }
   let tasks = [];
   try {
     const res = await window.orkas.invoke('autoTasks.list', { projectId });
     tasks = (res && Array.isArray(res.tasks)) ? res.tasks : [];
+    await _autoLoadTaskConversationCounts(tasks.map((task) => task && task.id));
   } catch (err) {
     _autoLog.warn('project list failed', err);
   }
   listEl.innerHTML = '';
-  if (countEl) countEl.textContent = tasks.length > 0 ? String(tasks.length) : '';
+  if (countEl) countEl.textContent = String(tasks.length);
   if (!tasks.length) {
     if (emptyEl) emptyEl.style.display = '';
     return;
@@ -757,6 +961,11 @@ function _autoUseToken(ref, kind) {
 }
 
 function _autoComposerValueForTask(task) {
+  if (task && Array.isArray(task.message_parts)
+      && typeof chatUseTextFromMessageParts === 'function') {
+    const structured = chatUseTextFromMessageParts(task.message_parts);
+    if (structured) return structured;
+  }
   const tokens = [];
   const skill = task && task.skill && (task.skill.id || task.skill.name) ? task.skill : null;
   const connector = task && task.connector && (task.connector.id || task.connector.name) ? task.connector : null;
@@ -1541,6 +1750,9 @@ async function _autoSubmitForm() {
   const rawContent = (ta.value || '').trim();
   const content = _autoStripComposerUseTokens(rawContent).trim();
   if (!content) { await uiAlert(t('auto.invalid_content')); return; }
+  const messageParts = (typeof chatUseMessagePartsFromText === 'function')
+    ? chatUseMessagePartsFromText(rawContent)
+    : null;
   const useState = _autoReadComposerUseState();
   const skillField = useState.skill;
   const connectorField = useState.connector;
@@ -1614,6 +1826,9 @@ async function _autoSubmitForm() {
       : { kind: 'commander' };
     const payload = {
       content,
+      ...(messageParts
+        ? { message_parts: messageParts }
+        : (_autoEditingTaskId ? { message_parts: null } : {})),
       schedule,
       title: titleInput ? _autoNormaliseTitle(titleInput.value) : '',
       enabled: enabledInput ? !!enabledInput.checked : true,
@@ -1699,13 +1914,15 @@ if (typeof window !== 'undefined') {
   window.refreshAutoProjectOptions = _autoRefreshProjectOptions;
   window._autoUploadFilesFromComposer = _autoUploadFiles;
   window._autoAttachLibraryFile = _autoAttachLibraryFile;
-  document.addEventListener('DOMContentLoaded', () => {
+  const bindAutoAddButton = () => {
     const addBtn = document.getElementById('auto-add-btn');
     if (addBtn && addBtn.dataset.bound !== '1') {
       addBtn.dataset.bound = '1';
       addBtn.addEventListener('click', () => openAutoTaskDialog({}));
     }
-  });
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindAutoAddButton, { once: true });
+  else bindAutoAddButton();
 }
 
 // ─── Boot-time fire subscription ─────────────────────────────────────────
@@ -1766,5 +1983,9 @@ if (typeof window !== 'undefined') {
 }
 
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _autoDisplayDeviceName };
+  module.exports = {
+    _autoDisplayDeviceName,
+    _autoTaskMessagePreviewHtml,
+    _autoComposerValueForTask,
+  };
 }

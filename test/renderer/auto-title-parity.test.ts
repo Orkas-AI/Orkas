@@ -36,6 +36,7 @@ const renderer: {
   _AUTO_TITLE_ZH_FILLER: RegExp;
   _AUTO_TITLE_EN_FILLER: RegExp;
   _AUTO_TITLE_CLAUSE: RegExp;
+  _AUTO_TITLE_URL_TOKEN: RegExp;
   _AUTO_TITLE_MAX: number;
 } = rendererAutoTitle;
 
@@ -60,6 +61,11 @@ describe('auto-title parity › regex source / flags match across main + rendere
     expect(renderer._AUTO_TITLE_CLAUSE.source).toBe(mainAutoTitle.CLAUSE_RE.source);
   });
 
+  it('URL_TOKEN_RE source and flags match', () => {
+    expect(renderer._AUTO_TITLE_URL_TOKEN.source).toBe(mainAutoTitle.URL_TOKEN_RE.source);
+    expect(renderer._AUTO_TITLE_URL_TOKEN.flags).toBe(mainAutoTitle.URL_TOKEN_RE.flags);
+  });
+
   it('TITLE_MAX matches', () => {
     expect(renderer._AUTO_TITLE_MAX).toBe(mainAutoTitle.TITLE_MAX);
   });
@@ -77,6 +83,12 @@ describe('auto-title parity › functional equivalence on representative inputs'
     'Please review this PR',
     'I want to refactor the auth flow',
     '帮我写一段 TypeScript 来解析 csv，谢谢',
+    '你根据 https://orkas.ai',
+    '分析 https://x.co/a?q=one,two',
+    '查看 www.orkas.ai 的内容',
+    '根据 https://orkas.ai，分析首页内容',
+    'Review https://orkas.ai, then summarize',
+    '检查 httpsx://orkas.ai 的内容',
     '这是一个很长的对话标题，应该会被三十字符的上限截断到刚好显示',
     'AI，怎么样', // < 4-char clause floor; first clause not used
   ];

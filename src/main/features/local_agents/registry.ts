@@ -48,13 +48,27 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   hermes: 'ORKAS_HERMES_PATH',
 };
 
-function defaultSearchDirs(type: LocalCliType): string[] {
-  const home = os.homedir();
+export function localCliSearchDirs(
+  type: LocalCliType,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+  home = os.homedir(),
+): string[] {
   const dirs: string[] = [];
-  if (process.platform === 'win32') {
-    const localAppData = process.env.LOCALAPPDATA || (home ? path.join(home, 'AppData', 'Local') : '');
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || (home ? path.win32.join(home, 'AppData', 'Local') : '');
+    const appData = env.APPDATA || (home ? path.win32.join(home, 'AppData', 'Roaming') : '');
+    if (appData) dirs.push(path.win32.join(appData, 'npm'));
+    if (localAppData) {
+      dirs.push(path.win32.join(localAppData, 'Microsoft', 'WindowsApps'));
+      dirs.push(path.win32.join(localAppData, 'pnpm'));
+    }
+    if (home) dirs.push(path.win32.join(home, '.local', 'bin'));
+    if (env.VOLTA_HOME) dirs.push(path.win32.join(env.VOLTA_HOME, 'bin'));
+    if (env.PNPM_HOME) dirs.push(env.PNPM_HOME);
+    if (env.NVM_SYMLINK) dirs.push(env.NVM_SYMLINK);
     if (type === 'codex' && localAppData) {
-      dirs.push(path.join(localAppData, 'Programs', 'OpenAI', 'Codex', 'bin'));
+      dirs.push(path.win32.join(localAppData, 'Programs', 'OpenAI', 'Codex', 'bin'));
     }
     return dirs;
   }
@@ -65,7 +79,7 @@ function defaultSearchDirs(type: LocalCliType): string[] {
     dirs.push(path.join(home, 'bin'));
   }
   dirs.push('/opt/homebrew/bin', '/usr/local/bin');
-  if (type === 'codex' && process.platform === 'darwin') {
+  if (type === 'codex' && platform === 'darwin') {
     dirs.push('/Applications/Codex.app/Contents/Resources');
   }
   return dirs;
@@ -141,7 +155,7 @@ export async function detectOne(type: LocalCliType): Promise<LocalCliEntry> {
   const envPath = process.env[ENV_KEYS[type]]?.trim();
   const candidate = envPath && envPath.length > 0 ? envPath : BIN_NAMES[type];
   const resolved = await whichBin(candidate, {
-    extraDirs: envPath ? [] : defaultSearchDirs(type),
+    extraDirs: envPath ? [] : localCliSearchDirs(type),
   });
   if (!resolved) {
     return {

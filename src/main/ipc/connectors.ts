@@ -7,12 +7,13 @@
  *   connectors.start_oauth   → { instance }  (Server-bridge OAuth; blocks until deep-link returns)
  *   connectors.add_custom    → { instance }  (user-supplied MCP server; validated form input)
  *   connectors.remove        → { removed }
- *   connectors.refresh       → { tools }
+ *   connectors.refresh       → { tools, instance }
  *   connectors.set_subtools  → { instance }
  *
- * Catalog installs are OAuth-only — no API-key fallback, no BYO client credentials; Server
- * holds every provider's `client_id` / `client_secret`. Custom MCP servers are the separate,
- * explicitly user-authored path: `connectors.add_custom` is the single validated route
+ * Catalog installs are OAuth-only — no API-key fallback. Server-bridge providers use an
+ * Orkas-registered OAuth app; MCP DCR providers issue a per-device client whose credentials stay
+ * in the encrypted local registry. Custom MCP servers are the separate, explicitly user-authored
+ * path: `connectors.add_custom` is the single validated route
  * (features/connectors/custom-transport.ts), the renderer form is the consent surface, and the
  * stored transport lives inside `secrets_enc`. See docs/plans/open-ecosystem-architecture.md §C.
  */
@@ -37,7 +38,7 @@ interface ClientConnectorInstance {
   id: string;
   display_name: string;
   origin?: 'catalog' | 'custom';
-  transport:
+  transport?:
     | { kind: 'stdio'; summary: string }
     | { kind: 'streamable-http'; summary: string };
   enabled_subtools: string[] | null;
@@ -50,15 +51,17 @@ interface ClientConnectorInstance {
   enabled?: boolean;
 }
 
-function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] {
-  if (inst.transport.kind === 'stdio') {
-    const command = path.basename(inst.transport.command || '');
-    const argCount = inst.transport.args?.length ?? 0;
+function _safeTransportSummary(inst: ConnectorInstance): ClientConnectorInstance['transport'] | undefined {
+  const transport = inst.transport;
+  if (!transport) return undefined;
+  if (transport.kind === 'stdio') {
+    const command = path.basename(transport.command || '');
+    const argCount = transport.args?.length ?? 0;
     const suffix = argCount === 1 ? '1 arg' : `${argCount} args`;
     return { kind: 'stdio', summary: argCount > 0 ? `${command} (${suffix})` : command };
   }
   try {
-    const url = new URL(inst.transport.url);
+    const url = new URL(transport.url);
     url.username = '';
     url.password = '';
     url.search = '';
@@ -76,7 +79,7 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean): ClientCon
     id: inst.id,
     display_name: inst.display_name,
     ...(inst.origin ? { origin: inst.origin } : {}),
-    transport,
+    ...(transport ? { transport } : {}),
     enabled_subtools: inst.enabled_subtools,
     tools_cache: inst.tools_cache,
     tools_cached_at: inst.tools_cached_at,
@@ -103,6 +106,18 @@ export const invokeHandlers = {
     const raw = connectors.listInstances(ctx.userId).filter((inst) => isConnectorRuntimeEnabled(inst.id));
     const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id)));
     return { instances };
+  },
+
+  /** Re-verify installed connectors whose last successful connect is older than the verify TTL,
+   *  then hand back the fresh rows. Called on Connectors-panel entry: `connectors.list` alone only
+   *  re-reads persisted status, so a connector whose backend died stays green until something
+   *  happens to call one of its tools. TTL + live-connection checks live in the manager, so repeat
+   *  panel opens cost nothing — see `verifyUsableConnectors` for the full cost rationale. */
+  'connectors.verify': async (_payload: unknown, ctx: { userId: string }) => {
+    const verified = await connectors.verifyUsableConnectors(ctx.userId, 'connectors_panel');
+    const raw = connectors.listInstances(ctx.userId).filter((inst) => isConnectorRuntimeEnabled(inst.id));
+    const instances = raw.map((inst) => toClientInstance(inst, isConnectorEnabled(ctx.userId, inst.id)));
+    return { verified, instances };
   },
 
   'connectors.set_enabled': async (
@@ -141,7 +156,7 @@ export const invokeHandlers = {
     payload: { display_name?: unknown; transport?: unknown },
     ctx: { userId: string },
   ) => {
-    // Validation (shape, https/localhost rule, header/env hygiene) lives in
+    // Validation (shape, HTTPS/explicit-loopback rule, header/env hygiene) lives in
     // custom-transport.ts — this handler stays logic-free per CLAUDE.md §2.
     const instance = await connectors.addCustomInstance(ctx.userId, {
       display_name: payload?.display_name as string,
@@ -159,7 +174,12 @@ export const invokeHandlers = {
   'connectors.refresh': async (payload: { id?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.id !== 'string' || !connectors.isValidInstanceId(payload.id)) throw new Error('invalid id');
     const tools = await connectors.refreshTools(ctx.userId, payload.id);
-    return { tools };
+    const instance = connectors.getInstance(ctx.userId, payload.id);
+    if (!instance) throw new Error('instance not found after refresh');
+    return {
+      tools,
+      instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id)),
+    };
   },
 
   'connectors.set_subtools': async (

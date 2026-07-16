@@ -6,7 +6,7 @@ import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync,
   writeTextAtomicSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl, __storageTestHooks,
+  invalidateLineCount, readJsonl, readJsonlPage, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -181,6 +181,34 @@ describe('storage › JSONL append/read', () => {
     for (let i = 0; i < 10; i++) await appendJsonl(p, { i });
     const last3 = await readJsonl(p, 3);
     expect(last3.map((r: any) => r.i)).toEqual([7, 8, 9]);
+  });
+
+  it('reads a bounded tail across disk chunks without parsing an old malformed row', async () => {
+    const p = path.join(tmpDir, 'large-log.jsonl');
+    const pad = '中'.repeat(12_000);
+    const lines = Array.from({ length: 12 }, (_, i) => JSON.stringify({ i, pad }));
+    lines.splice(1, 0, '{not json');
+    fs.writeFileSync(p, lines.join('\n') + '\n', 'utf8');
+
+    const last3 = await readJsonl<{ i: number }>(p, 3);
+
+    expect(last3.map((r) => r.i)).toEqual([9, 10, 11]);
+  });
+
+  it('pages backward by byte cursor without rereading or duplicating newer records', async () => {
+    const p = path.join(tmpDir, 'paged-log.jsonl');
+    const rows = Array.from({ length: 25 }, (_, i) => JSON.stringify({ i, text: `第 ${i} 条` }));
+    rows.splice(13, 0, '{malformed');
+    fs.writeFileSync(p, rows.join('\n') + '\n', 'utf8');
+
+    const newest = await readJsonlPage<{ i: number }>(p, 10);
+    const middle = await readJsonlPage<{ i: number }>(p, 10, newest.nextCursor);
+    const oldest = await readJsonlPage<{ i: number }>(p, 10, middle.nextCursor);
+
+    expect(newest.records.map((r) => r.i)).toEqual([15, 16, 17, 18, 19, 20, 21, 22, 23, 24]);
+    expect(middle.records.map((r) => r.i)).toEqual([5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    expect(oldest.records.map((r) => r.i)).toEqual([0, 1, 2, 3, 4]);
+    expect(oldest.nextCursor).toBeNull();
   });
 
   it('readJsonl skips malformed lines silently', async () => {

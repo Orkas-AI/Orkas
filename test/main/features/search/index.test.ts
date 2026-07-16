@@ -118,6 +118,18 @@ describe('search › searchContexts', () => {
     const results = await s.searchContexts('notes');
     expect(results[0].path).toBe('notes/2024/meeting.md');
   });
+
+  it('reuses the reconciled context snapshot across query keystrokes', async () => {
+    writeContext('stable-name.md', 'body');
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileContextsIndex();
+    fs.rmSync(path.join(tmpDir, TEST_UID, 'cloud', 'contexts', 'stable-name.md'));
+
+    expect((await s.searchContexts('stable')).length).toBe(1);
+    ix.invalidateContextsIndex(TEST_UID);
+    expect(await s.searchContexts('stable')).toEqual([]);
+  });
 });
 
 describe('search › searchChats — group-chat shape end-to-end', () => {
@@ -164,6 +176,75 @@ describe('search › searchChats', () => {
     await ix.reconcileChatsIndex('u1');
     const results = await s.searchChats('u1', 'thingamajig');
     expect(results[0].conv_title).toBe('New conversation');
+  });
+
+  it('serves a usable invalidated snapshot and schedules one idle repair', async () => {
+    writeChat(TEST_UID, 'c1', [{ role: 'user', content: 'stale snapshot token', time: 't' }]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+    const compactIndex = path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json');
+    fs.writeFileSync(compactIndex, JSON.stringify([
+      { conversation_id: 'c1', title: 'Synced title' },
+    ]));
+    ix.invalidateChatsIndex(TEST_UID);
+
+    const results = await s.searchChats(TEST_UID, 'snapshot token');
+    expect(results.some((result) => result.cid === 'c1')).toBe(true);
+    expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
+
+    await s.searchChats(TEST_UID, 'snapshot token');
+    expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
+    s.__searchTestHooks.cancelChatRepair(TEST_UID);
+  });
+
+  it('caches display metadata and invalidates it on conversation/project rename', async () => {
+    const projects = await import('../../../../src/main/features/projects');
+    const chats = await import('../../../../src/main/features/chats');
+    const createdProject = await projects.createProject(TEST_UID, 'Original project');
+    expect(createdProject.ok).toBe(true);
+    if (!createdProject.ok) return;
+    const projectId = createdProject.project.project_id;
+    const conversation = await chats.createConversation(TEST_UID, {
+      title: 'Original conversation',
+      projectId,
+    });
+    const jsonl = path.join(
+      tmpDir, TEST_UID, 'cloud', 'projects', projectId, 'chats',
+      `${conversation.conversation_id}.jsonl`,
+    );
+    fs.writeFileSync(jsonl, `${JSON.stringify({
+      role: 'user', content: 'display catalog keyword', time: 't',
+    })}\n`);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex(TEST_UID);
+
+    let results = await s.searchChats(TEST_UID, 'catalog keyword');
+    expect(results[0]).toMatchObject({
+      conv_title: 'Original conversation',
+      project_name: 'Original project',
+    });
+
+    await chats.renameConversation(
+      TEST_UID, conversation.conversation_id, 'Renamed conversation', projectId);
+    await projects.renameProject(TEST_UID, projectId, 'Renamed project');
+    results = await s.searchChats(TEST_UID, 'catalog keyword');
+    expect(results[0]).toMatchObject({
+      conv_title: 'Renamed conversation',
+      project_name: 'Renamed project',
+    });
+
+    const readSpy = vi.spyOn(fs.promises, 'readFile');
+    try {
+      await s.searchChats(TEST_UID, 'catalog keyword');
+      const metadataReads = readSpy.mock.calls.filter(([file]) => (
+        String(file).endsWith('_index.json') || String(file).endsWith('project.json')
+      ));
+      expect(metadataReads).toEqual([]);
+    } finally {
+      readSpy.mockRestore();
+    }
   });
 });
 
@@ -254,6 +335,52 @@ describe('search › reconcileAll', () => {
     const ix = await import('../../../../src/main/features/search/indexer');
     const entry = await ix.getEntry(paths.userChatsIndexPath('real_user'), 'chat');
     expect(Object.keys(entry.idx.files)).toContain('c1');
+  });
+});
+
+describe('search › startup reconcile', () => {
+  it('reuses an existing active-user snapshot and defers validation until the first query', async () => {
+    writeChat(TEST_UID, 'active-chat', [
+      { role: 'user', content: 'startup fallback token', time: 't' },
+    ]);
+    writeChat('inactive-user', 'inactive-chat', [
+      { role: 'user', content: 'should not be scanned at startup', time: 't' },
+    ]);
+    const paths = await import('../../../../src/main/paths');
+    const activeIndex = paths.userChatsIndexPath(TEST_UID);
+    const inactiveIndex = paths.userChatsIndexPath('inactive-user');
+    fs.mkdirSync(path.dirname(activeIndex), { recursive: true });
+    // Deliberately invalid but non-empty: startup must not parse a large
+    // persisted snapshot. Query-time reconcile remains the repair boundary.
+    fs.writeFileSync(activeIndex, 'persisted-snapshot');
+
+    const s = await loadSearch();
+    await s.reconcileActive();
+
+    expect(fs.readFileSync(activeIndex, 'utf-8')).toBe('persisted-snapshot');
+    expect(fs.existsSync(inactiveIndex)).toBe(false);
+    const results = await s.searchChats(TEST_UID, 'fallback token');
+    expect(results.some((result) => result.cid === 'active-chat')).toBe(true);
+  });
+
+  it('bounds chat source stats instead of awaiting every JSONL serially', async () => {
+    for (let i = 0; i < 96; i++) {
+      writeChat(TEST_UID, `chat-${i}`, [{ role: 'user', content: `message ${i}`, time: 't' }]);
+    }
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    let active = 0;
+    let maxActive = 0;
+    const files = await indexer.__searchIndexerTestHooks.listUserChats(TEST_UID, async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active--;
+      return { mtimeMs: 1, size: 1 };
+    });
+
+    expect(files).toHaveLength(96);
+    expect(maxActive).toBeGreaterThan(1);
+    expect(maxActive).toBeLessThanOrEqual(indexer.__searchIndexerTestHooks.chatStatConcurrency);
   });
 });
 

@@ -83,6 +83,197 @@ describe("PersistentSession", () => {
     expect(model).not.toContain("call-1");
   });
 
+  it("keeps one stable turn across parallel-result healing, same-turn steer, and restart", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    const turnId = s1.beginUserTurn([{ type: "text", text: "Original long-running task" }]);
+    s1.addAssistantMessage([
+      { type: "tool_use", id: "call-a", name: "search", input: { q: "a" } },
+      { type: "tool_use", id: "call-b", name: "search", input: { q: "b" } },
+    ]);
+    s1.addToolResult("call-a", "hidden result a", undefined, false);
+    s1.addToolResult("call-b", "hidden result b", undefined, false);
+    s1.addMessage("user", [{ type: "text", text: "Also include the same-turn user steer" }]);
+    s1.addAssistantMessage([{ type: "text", text: "Final answer for the original task" }]);
+    s1.completeActiveTurn();
+
+    expect(turnId).toBe(1);
+    expect(s1.getMessages().every((message) => message.turnId === turnId)).toBe(true);
+    expect(s1.healAndPersist()).toBe(true);
+    expect(s1.getSerializedContextState()?.completedTurns).toHaveLength(1);
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    const restored = s2.getSerializedContextState();
+    expect(restored?.completedTurns).toHaveLength(1);
+    expect(restored?.completedTurns[0]).toMatchObject({
+      id: turnId,
+      userMessageIndex: 0,
+      finalAssistantMessageIndex: 4,
+      startIndex: 0,
+      endIndex: 4,
+    });
+
+    s2.beginUserTurn([{ type: "text", text: "Follow-up task" }]);
+    const model = JSON.stringify(s2.getMessagesForModel());
+    expect(model).toContain("Original long-running task");
+    expect(model).toContain("Also include the same-turn user steer");
+    expect(model).toContain("Final answer for the original task");
+    expect(model).not.toContain("hidden result a");
+    expect(model).not.toContain("hidden result b");
+    expect(s2.getMessagesForModel().some((message) => "turnId" in message)).toBe(false);
+  });
+
+  it("repairs a legacy internal convergence nudge that was persisted as a false user turn", () => {
+    const legacyNudge = [
+      "You are approaching the tool loop round limit (8/18; 10 round(s) left).",
+      "Stop exploratory/retry tool calls now unless one final tool call is strictly necessary.",
+    ].join("\n\n");
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ role: "user", content: [{ type: "text", text: "Original research task" }] }),
+        JSON.stringify({ role: "assistant", content: [{ type: "tool_use", id: "legacy-call", name: "search", input: {} }] }),
+        JSON.stringify({ role: "user", content: [{ type: "tool_result", toolUseId: "legacy-call", content: "legacy hidden output" }] }),
+        JSON.stringify({ role: "user", content: [{ type: "text", text: legacyNudge }] }),
+        JSON.stringify({ role: "assistant", content: [{ type: "text", text: "Legacy final answer" }] }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+    fs.writeFileSync(
+      `${file}.context.json`,
+      JSON.stringify({
+        version: 1,
+        nextTurnId: 3,
+        completedTurns: [
+          { id: 1, userMessageIndex: 0, finalAssistantMessageIndex: 1, startIndex: 0, endIndex: 2 },
+          { id: 2, userMessageIndex: 3, finalAssistantMessageIndex: 4, startIndex: 3, endIndex: 4 },
+        ],
+        resources: [],
+      }),
+      "utf-8",
+    );
+
+    const session = new PersistentSession({ sessionFile: file });
+    const repaired = session.getSerializedContextState();
+    expect(repaired?.completedTurns).toHaveLength(1);
+    expect(repaired?.completedTurns[0]).toMatchObject({
+      id: 1,
+      userMessageIndex: 0,
+      finalAssistantMessageIndex: 4,
+      startIndex: 0,
+      endIndex: 4,
+    });
+
+    session.beginUserTurn([{ type: "text", text: "Next real user task" }]);
+    const model = JSON.stringify(session.getMessagesForModel());
+    expect(model).toContain("Original research task");
+    expect(model).toContain("Legacy final answer");
+    expect(model).not.toContain("approaching the tool loop round limit");
+    expect(model).not.toContain("legacy hidden output");
+    // Raw audit history remains intact; compatibility changes only the model
+    // projection and repaired context sidecar.
+    const rawMessages = fs.readFileSync(file, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(rawMessages.some((message) => message.content?.some(
+      (content: { type?: string; text?: string }) => content.type === "text" && content.text === legacyNudge,
+    ))).toBe(true);
+  });
+
+  it("persists the execution plan in the sidecar and restores its tail anchor", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Finish the multi-hour migration" }]);
+    s1.updateExecutionPlan({
+      steps: [
+        { step: "Inventory callers", status: "completed" },
+        { step: "Migrate storage", status: "in_progress" },
+        { step: "Verify restart behavior", status: "pending" },
+      ],
+    });
+    s1.addAssistantMessage([{ type: "tool_use", id: "call-plan", name: "bash", input: { command: "inspect" } }]);
+    s1.addToolResult("call-plan", "inspection complete", undefined, false);
+
+    const rawHistory = fs.readFileSync(file, "utf-8");
+    const sidecar = fs.readFileSync(`${file}.context.json`, "utf-8");
+    expect(rawHistory).not.toContain("executionPlan");
+    expect(sidecar).toContain("executionPlan");
+    expect(sidecar).toContain("Finish the multi-hour migration");
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    const view = JSON.stringify(s2.getMessagesForModel());
+    expect(view).toContain("Execution plan anchor");
+    expect(view).toContain("Finish the multi-hour migration");
+    expect(view).toContain("Migrate storage");
+    expect(s2.getExecutionPlan()?.revision).toBe(1);
+    expect(s2.getExecutionPlan()?.steps.map((step) => step.id)).toEqual([1, 2, 3]);
+    expect(s2.getExecutionPlan()?.nextStepId).toBe(4);
+  });
+
+  it("migrates persisted plans without step ids and keeps assigned ids stable", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Complete the durable migration" }]);
+    s1.updateExecutionPlan({
+      steps: [
+        { step: "Inspect existing state", status: "in_progress" },
+        { step: "Migrate durable state", status: "pending" },
+      ],
+    });
+
+    const legacySidecar = JSON.parse(fs.readFileSync(`${file}.context.json`, "utf-8"));
+    for (const step of legacySidecar.executionPlan.steps) delete step.id;
+    delete legacySidecar.executionPlan.nextStepId;
+    fs.writeFileSync(`${file}.context.json`, JSON.stringify(legacySidecar), "utf-8");
+
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getExecutionPlan()?.steps.map((step) => step.id)).toEqual([1, 2]);
+    const updated = restored.updateExecutionPlan({
+      steps: [
+        { step: "Inspect existing state", status: "completed" },
+        { step: "Migrate durable state", status: "in_progress" },
+        { step: "Verify restored state", status: "pending" },
+      ],
+    });
+    expect(updated.steps.map((step) => step.id)).toEqual([1, 2, 3]);
+    expect(updated.nextStepId).toBe(4);
+  });
+
+  it("persists completed-work evidence and plan audit tombstones across restart", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Complete the evidenced migration" }]);
+    s1.updateExecutionPlan({
+      steps: [{ step: "Run migration verification", status: "in_progress" }],
+    });
+    s1.recordCompletedWork({
+      toolCallId: "verify-1",
+      tool: "bash",
+      inputDigest: "18:verify",
+      inputSummary: '{"command":"npm test"}',
+      status: "succeeded",
+      resultSummary: "121 tests passed",
+      checkpointEpoch: 1,
+    });
+    s1.updateExecutionPlan({
+      steps: [{ step: "Run migration verification", status: "completed" }],
+    });
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.getCompletedWorkLedger()).toEqual([expect.objectContaining({
+      id: 1,
+      tool: "bash",
+      status: "succeeded",
+    })]);
+    expect(s2.getExecutionPlan()?.steps[0].completionEvidence).toEqual({
+      verification: "observed",
+      workEntryIds: [1],
+    });
+    expect(s2.getExecutionPlanAudit()).toHaveLength(2);
+    expect(JSON.stringify(s2.getMessagesForModel())).toContain("Completed work ledger");
+
+    s2.addMessage("user", [{ type: "text", text: "Verification accepted; clear the plan" }]);
+    s2.clearExecutionPlan();
+    const s3 = new PersistentSession({ sessionFile: file });
+    expect(s3.getExecutionPlan()).toBeUndefined();
+    expect(s3.getExecutionPlanAudit().at(-1)?.action).toBe("clear");
+    expect(s3.getCompletedWorkLedger()).toHaveLength(1);
+  });
+
   it("repairs restored turn context when indexes point at tool process rows", () => {
     fs.writeFileSync(
       file,
@@ -284,6 +475,12 @@ describe("PersistentSession", () => {
       expect((last.content[0] as { toolUseId: string }).toolUseId).toBe("call-A");
       expect((last.content[0] as { isError: boolean }).isError).toBe(true);
       expect((last.content[0] as { content: string }).content).toMatch(/interrupted/i);
+      expect(s.getLastToolProtocolRepairReport()).toMatchObject({
+        changed: true,
+        synthesizedOrphanResults: 1,
+        droppedUnmatchedResults: 0,
+        mergedParallelResultMessages: 0,
+      });
 
       // Disk was rewritten — a fresh load produces the same state without
       // re-healing (idempotent).
@@ -563,6 +760,13 @@ describe("PersistentSession", () => {
       expect(ids).toEqual(["p-0", "p-1", "p-2"]); // order matches assistant's tool_uses
       // None of the results are interrupted — all are the real ones.
       expect(msgs[2].content.every((c) => (c as { content: string }).content !== INTERRUPTED_TOOL_RESULT)).toBe(true);
+      expect(s.getLastToolProtocolRepairReport()).toMatchObject({
+        changed: true,
+        synthesizedOrphanResults: 0,
+        droppedUnmatchedResults: 0,
+        mergedParallelResultMessages: 2,
+        deduplicatedResults: 0,
+      });
     });
 
     it("dedupes a tool_call_id that appears as both interrupted and real", () => {
@@ -611,6 +815,7 @@ describe("PersistentSession", () => {
       expect(byId.get("c-1")!.content).toBe("r1");
       expect(byId.get("c-2")!.content).toBe("r2");
       expect(results.every((r) => !r.content.includes("interrupted"))).toBe(true);
+      expect(s.getLastToolProtocolRepairReport().deduplicatedResults).toBe(2);
     });
 
     it("leaves a well-formed history untouched", () => {

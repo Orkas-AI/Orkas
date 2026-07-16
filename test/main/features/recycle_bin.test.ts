@@ -108,6 +108,88 @@ describe('global recycle bin', () => {
     expect(JSON.parse(await fsp.readFile(projectFile, 'utf-8')).name).toBe('Project One');
   });
 
+  it('archives and restores project-contained conversations with attachments and sessions', async () => {
+    const paths = await import('../../../src/main/paths');
+    const {
+      createAppRecycleBatchForConversation,
+      restoreRecycleBatch,
+    } = await import('../../../src/main/features/recycle_bin');
+
+    const cid = 'task-project-a';
+    const pid = 'p_project2';
+    const relChat = `cloud/projects/${pid}/chats/${cid}.jsonl`;
+    const relAttachment = `cloud/projects/${pid}/chat_attachments/${cid}/brief.md`;
+    const relSession = `cloud/projects/${pid}/sessions/gconv-${cid}.jsonl`;
+    const abs = (relPath: string) => path.join(paths.userCloudRoot(UID), ...relPath.slice('cloud/'.length).split('/'));
+    const indexFile = paths.projectChatIndexFile(UID, pid);
+    const projectFile = paths.projectMetaFile(UID, pid);
+
+    for (const relPath of [relChat, relAttachment, relSession]) {
+      await fsp.mkdir(path.dirname(abs(relPath)), { recursive: true });
+    }
+    await fsp.mkdir(path.dirname(indexFile), { recursive: true });
+    await fsp.mkdir(path.dirname(projectFile), { recursive: true });
+    await fsp.writeFile(abs(relChat), 'project task body\n');
+    await fsp.writeFile(abs(relAttachment), '# project brief\n');
+    await fsp.writeFile(abs(relSession), '{"role":"user","content":"hi"}\n');
+    await fsp.writeFile(projectFile, JSON.stringify({
+      project_id: pid,
+      name: 'Project Two',
+      owner_uid: UID,
+      created_at: '2026-07-09T09:00:00.000Z',
+      updated_at: '2026-07-09T09:00:00.000Z',
+    }, null, 2));
+    await fsp.writeFile(indexFile, JSON.stringify([
+      {
+        conversation_id: cid,
+        title: 'Project Task A',
+        kind: 'normal',
+        project_id: pid,
+        session_id: `gconv-${cid}`,
+        created_at: '2026-07-09T10:00:00.000Z',
+        updated_at: '2026-07-09T10:00:00.000Z',
+      },
+    ], null, 2));
+
+    const batch = await createAppRecycleBatchForConversation(UID, cid);
+    expect(batch?.display_items).toEqual([
+      expect.objectContaining({
+        category: 'conversation',
+        title: 'Project Task A',
+        id: cid,
+      }),
+    ]);
+    expect(batch?.items.map((it) => it.path).sort()).toEqual(expect.arrayContaining([
+      relChat,
+      relAttachment,
+      relSession,
+    ].sort()));
+    expect(batch?.metadata?.chat_index_rows?.[0]).toEqual(expect.objectContaining({
+      conversation_id: cid,
+      project_id: pid,
+      session_id: `gconv-${cid}`,
+    }));
+
+    await fsp.rm(abs(relChat));
+    await fsp.rm(path.dirname(abs(relAttachment)), { recursive: true, force: true });
+    await fsp.rm(abs(relSession));
+    await fsp.rm(projectFile);
+    await fsp.writeFile(indexFile, '[]');
+
+    const restored = await restoreRecycleBatch(UID, batch!.id);
+
+    expect(restored.restored_paths).toEqual(expect.arrayContaining([relChat, relAttachment, relSession]));
+    expect(restored.reactivated_paths).toContain(`cloud/projects/${pid}/project.json`);
+    expect(restored.reactivated_paths).toContain(relChat);
+    expect(await fsp.readFile(abs(relAttachment), 'utf-8')).toBe('# project brief\n');
+    const indexRows = JSON.parse(await fsp.readFile(indexFile, 'utf-8'));
+    expect(indexRows[0]).toEqual(expect.objectContaining({
+      conversation_id: cid,
+      project_id: pid,
+      session_id: `gconv-${cid}`,
+    }));
+  });
+
   it('archives app-deleted auto tasks with project metadata and task attachments', async () => {
     const paths = await import('../../../src/main/paths');
     const {
@@ -435,9 +517,9 @@ describe('global recycle bin', () => {
     expect(restored.failed_paths).toEqual([]);
     expect(restored.restored_paths).toEqual(expect.arrayContaining([
       `cloud/projects/${pid}/project.json`,
-      `cloud/chats/${conv.conversation_id}.jsonl`,
-      'cloud/auto_tasks/at_c0ffee12/config.json',
-      'cloud/auto_tasks/at_c0ffee12/attachments/brief.txt',
+      `cloud/projects/${pid}/chats/${conv.conversation_id}.jsonl`,
+      `cloud/projects/${pid}/auto_tasks/at_c0ffee12/config.json`,
+      `cloud/projects/${pid}/auto_tasks/at_c0ffee12/attachments/brief.txt`,
     ]));
     expect(fs.existsSync(path.join(paths.userRecycleDir(UID), batch!.id))).toBe(true);
     const [batchAfterRestore] = await listRecycleBatches(UID);
@@ -461,6 +543,8 @@ describe('global recycle bin', () => {
     ]);
     const attachmentPath = path.join(
       paths.userCloudRoot(UID),
+      'projects',
+      pid,
       'auto_tasks',
       'at_c0ffee12',
       'attachments',

@@ -8,9 +8,14 @@ describe('local_agents/models', () => {
     const codex = listModels('codex');
 
     expect(claude.map(model => model.id)).toEqual(['claude-opus-4-8', 'claude-opus-4-7']);
-    expect(codex.map(model => model.id)).toContain('gpt-5.5');
+    expect(codex.map(model => model.id)).toEqual([
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+    ]);
     expect(defaultModel('claude')).toBe('claude-opus-4-8');
-    expect(defaultModel('codex')).toBe('gpt-5.5');
+    expect(defaultModel('codex')).toBe('gpt-5.6-sol');
   });
 
   it('keeps dynamic or account-routed CLIs in free-text mode', () => {

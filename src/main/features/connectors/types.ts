@@ -18,6 +18,9 @@ export interface StdioTransport {
   args: string[];
   env?: Record<string, string>;
   cwd?: string;
+  /** Representative external URL marks an app-owned child whose fetch calls
+   * may use the parent Electron system network stack per request. */
+  proxyTargetUrl?: string;
 }
 
 export interface StreamableHttpTransport {
@@ -33,11 +36,54 @@ export interface ToolSchema {
   input_schema: Record<string, unknown>;
 }
 
+/** Connector status. Every value records an outcome that actually happened — no state here is
+ *  ever synthesized from a cache to keep a card green (that is what made a dead connector render
+ *  as "connected" for six days while every tool call failed).
+ *
+ *  Two orthogonal questions must not be conflated, because they have different answers:
+ *    - "should we keep routing/retrying this connector?" → `connected` OR `degraded` (see
+ *      `isConnectorUsable`). A transient backend hiccup must not hide the connector from the LLM,
+ *      or it never gets a tool call and can never auto-heal.
+ *    - "is it verified working right now?" → `connected` only (see `isConnectorVerifiedLive`).
+ *      This is what the UI pill must render.
+ *  Collapsing both onto one `connected` boolean is what forced the old code to lie. */
 export type ConnectorStatus =
   | { kind: 'connected'; since: number }
   | { kind: 'connecting' }
   | { kind: 'disconnected' }
+  /** Grant + cached tools are established, but the last connect/refresh attempt failed for a
+   *  reason we expect to recover (backend 5xx, network blip). Still routed and retried on the next
+   *  use; rendered as "未验证/异常" — never as connected. `last_verified_at` is the `since` of the
+   *  last real successful connect, so the UI can say how stale the connector is.
+   *
+   *  `failures` / `retry_after` are the circuit breaker (see `manager.ts::_retryAfterFor`). Each
+   *  connect attempt is individually bounded (3 tries inside `postConnectorBridgeJson`), but
+   *  nothing used to bound attempts *across* calls: every tool call re-ran the whole refresh, so an
+   *  agent turn against a dead backend fired 3 requests per call, indefinitely, and an app restart
+   *  began again from zero. These two fields are persisted precisely so a cooldown survives restart. */
+  | {
+    kind: 'degraded';
+    message: string;
+    at: number;
+    last_verified_at?: number;
+    /** Consecutive transient failures. Reset by any success (the status becomes `connected`). */
+    failures?: number;
+    /** Epoch ms before which automatic reconnects must fail fast without touching the network.
+     *  User-initiated retries deliberately ignore this. */
+    retry_after?: number;
+  }
   | { kind: 'error'; message: string; at: number };
+
+/** Should this connector still be routed to the LLM and retried on use?
+ *  `degraded` stays usable on purpose: the next tool call is what heals it. */
+export function isConnectorUsable(status: ConnectorStatus | undefined): boolean {
+  return status?.kind === 'connected' || status?.kind === 'degraded';
+}
+
+/** Did the last attempt actually succeed? This — and only this — may render as "已连接". */
+export function isConnectorVerifiedLive(status: ConnectorStatus | undefined): boolean {
+  return status?.kind === 'connected';
+}
 
 export interface ConnectorAuthError {
   code: string;
@@ -72,9 +118,9 @@ export interface ConnectorInstance {
    *  The manager rewrites the transport env at spawn time using `oauth_grant.access_token`;
    *  refresh logic in `oauth.ts::refreshIfStale` runs before connect / after a 401. */
   oauth_grant?: OAuthGrant;
-  /** DCR-issued client identity for legacy local MCP-spec auth (`auth_mode === 'mcp_dcr'`).
-   *  New rotating DCR grants are server-managed; this field remains only so older local grants
-   *  can be adopted on the next refresh. */
+  /** DCR-issued client identity for MCP-spec auth (`auth_mode === 'mcp_dcr'`). The public build
+   *  stores this with the grant inside the encrypted local registry and never uploads it to the
+   *  Orkas account service. */
   dcr_client?: DcrClientCredentials;
   created_at: string;
   updated_at: string;
@@ -112,6 +158,9 @@ export type TransportTemplate =
        *  isn't a flat one-key map (Notion's `OPENAPI_MCP_HEADERS` packs a token into a JSON
        *  blob). The synthesizer receives the resolved `access_token`. */
       env_synthesizer?: string;
+      /** Representative API URL opting an app-owned stdio adapter into the
+       * parent's per-request system-network fetch bridge. */
+      proxy_target_url?: string;
     }
   | {
       kind: 'streamable-http';
@@ -133,9 +182,8 @@ export type TransportTemplate =
 //    self-registers via Dynamic Client Registration (RFC 7591) at runtime, runs the OAuth
 //    handshake from PC, uses the `/api/connectors/oauth/dcr-callback` Server endpoint **only**
 //    as an HTTPS callback intermediate (Server stashes code+state in a 5-min KV, deep-links
-//    PC). After the first exchange, rotating DCR refresh grants are moved to Server and PC keeps
-//    only a server grant handle. Used for Notion, Atlassian, Cloudflare suite, … — the modern
-//    path.
+//    PC). The DCR client and rotating refresh grant remain encrypted on this device; Server is
+//    never a credential store for this mode. Used for Notion, Atlassian, Cloudflare suite, … .
 
 export interface OAuthConfig {
   /** Server-bridge only: matches the Server's `biz/connectors/oauth/<provider>.py` module name
@@ -143,10 +191,9 @@ export interface OAuthConfig {
   provider_id: string;
 }
 
-/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Legacy local
- *  instances may still store this on the ConnectorInstance until the grant is adopted by Server.
- *  All endpoints captured at first connect — re-discovery on every refresh would add latency
- *  and assumes provider doesn't rotate URLs (which they shouldn't). */
+/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Stored locally
+ *  with the connector's encrypted secrets. All endpoints are captured at first connect —
+ *  re-discovery on every refresh would add latency and assumes stable provider endpoints. */
 export interface DcrClientCredentials {
   client_id: string;
   /** Most providers issue one; some omit (public clients). */

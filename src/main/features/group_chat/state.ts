@@ -23,8 +23,9 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import {
-  groupChatDir, groupChatMembersFile, groupChatStateFile, userChatsDir,
+  userChatsDir, projectChatIndexFile, userRunningConversationsFile,
 } from '../../paths';
+import { conversationLayout, listProjectIds } from '../../util/project-layout';
 import {
   genId12, nowIso, readJson, writeJson, safeId,
 } from '../../storage';
@@ -51,6 +52,16 @@ export interface MembersFile {
 }
 
 export type GroupStatus = 'idle' | 'running' | 'aborted';
+
+export interface RunningConversationEntry {
+  conversation_id: string;
+  project_id?: string;
+}
+
+export interface RunningConversationRegistry {
+  version: 1;
+  items: RunningConversationEntry[];
+}
 
 export interface OrchestrationLedger {
   version: 1;
@@ -226,14 +237,18 @@ export function actorSessionId(cid: string, actor: Actor): string {
 
 // ── Members IO ───────────────────────────────────────────────────────────
 
-function ensureGroupDir(uid: string, cid: string): string {
-  const d = groupChatDir(uid, cid);
+function ensureGroupDir(uid: string, cid: string, projectIdHint?: string | null): string {
+  const d = conversationLayout(uid, cid, projectIdHint).groupDir;
   fs.mkdirSync(d, { recursive: true });
   return d;
 }
 
-export async function readMembers(uid: string, cid: string): Promise<MembersFile> {
-  const file = groupChatMembersFile(uid, cid);
+export async function readMembers(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<MembersFile> {
+  const file = conversationLayout(uid, cid, projectIdHint).membersFile;
   if (!fs.existsSync(file)) return { version: 1, actors: [] };
   try {
     const data: any = await readJson(file);
@@ -246,9 +261,14 @@ export async function readMembers(uid: string, cid: string): Promise<MembersFile
   return { version: 1, actors: [] };
 }
 
-async function writeMembers(uid: string, cid: string, m: MembersFile): Promise<void> {
-  ensureGroupDir(uid, cid);
-  await writeJson(groupChatMembersFile(uid, cid), m);
+async function writeMembers(
+  uid: string,
+  cid: string,
+  m: MembersFile,
+  projectIdHint?: string | null,
+): Promise<void> {
+  ensureGroupDir(uid, cid, projectIdHint);
+  await writeJson(conversationLayout(uid, cid, projectIdHint).membersFile, m);
 }
 
 /** Idempotent. Returns true if the actor was newly added.
@@ -261,22 +281,31 @@ async function writeMembers(uid: string, cid: string, m: MembersFile): Promise<v
  *  `ENOENT: ... members.json.tmp -> members.json` and killing the stream.
  *  Reuses `_stateLock` because it's already per-`(uid,cid)` and members
  *  shares the cid scope. */
-export async function addMember(uid: string, cid: string, actor: Omit<Actor, 'joined_at'>): Promise<boolean> {
+export async function addMember(
+  uid: string,
+  cid: string,
+  actor: Omit<Actor, 'joined_at'>,
+  projectIdHint?: string | null,
+): Promise<boolean> {
   return _stateLock(uid, cid).runExclusive(async () => {
-    const members = await readMembers(uid, cid);
+    const members = await readMembers(uid, cid, projectIdHint);
     if (members.actors.find((a) => a.id === actor.id)) return false;
     const next: Actor = { ...actor, joined_at: nowIso() };
     members.actors.push(next);
-    await writeMembers(uid, cid, members);
+    await writeMembers(uid, cid, members, projectIdHint);
     log.info(`member-joined user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind}${actor.name ? ` name=${actor.name}` : ''}`);
     return true;
   });
 }
 
 /** Seed commander + user at conv creation / first activity. Idempotent. */
-export async function seedReservedActors(uid: string, cid: string): Promise<void> {
-  await addMember(uid, cid, { kind: 'commander', id: COMMANDER_ID, name: 'Commander' });
-  await addMember(uid, cid, { kind: 'user', id: USER_ID, name: 'User' });
+export async function seedReservedActors(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<void> {
+  await addMember(uid, cid, { kind: 'commander', id: COMMANDER_ID, name: 'Commander' }, projectIdHint);
+  await addMember(uid, cid, { kind: 'user', id: USER_ID, name: 'User' }, projectIdHint);
 }
 
 export async function findActor(uid: string, cid: string, actorId: string): Promise<Actor | null> {
@@ -306,23 +335,29 @@ export async function renameAgentInMembers(
   uid: string, agentId: string, newName: string,
 ): Promise<number> {
   if (!uid || !safeId(agentId) || RESERVED_IDS.has(agentId) || !newName) return 0;
-  const indexFile = path.join(userChatsDir(uid), '_index.json');
-  if (!fs.existsSync(indexFile)) return 0;
-  let cids: string[] = [];
+  const indexFiles = [
+    path.join(userChatsDir(uid), '_index.json'),
+    ...listProjectIds(uid).map((pid) => projectChatIndexFile(uid, pid)),
+  ];
+  const cids = new Set<string>();
   try {
-    const data: any = await readJson(indexFile);
-    const items: any[] = Array.isArray(data) ? data
-      : (data && Array.isArray(data.items) ? data.items : []);
-    cids = items
-      .map((c) => c && typeof c.conversation_id === 'string' ? c.conversation_id : '')
-      .filter((s) => s && safeId(s));
+    for (const indexFile of indexFiles) {
+      if (!fs.existsSync(indexFile)) continue;
+      const data: any = await readJson(indexFile);
+      const items: any[] = Array.isArray(data) ? data
+        : (data && Array.isArray(data.items) ? data.items : []);
+      for (const item of items) {
+        const cid = item && typeof item.conversation_id === 'string' ? item.conversation_id : '';
+        if (cid && safeId(cid)) cids.add(cid);
+      }
+    }
   } catch (err) {
     log.warn(`read conv index failed user=${uid}: ${(err as Error).message}`);
     return 0;
   }
   let touched = 0;
   for (const cid of cids) {
-    const file = groupChatMembersFile(uid, cid);
+    const file = conversationLayout(uid, cid).membersFile;
     if (!fs.existsSync(file)) continue;
     let m: MembersFile;
     try { m = await readMembers(uid, cid); }
@@ -343,8 +378,12 @@ export async function renameAgentInMembers(
 
 // ── State IO ─────────────────────────────────────────────────────────────
 
-export async function readState(uid: string, cid: string): Promise<StateFile> {
-  const file = groupChatStateFile(uid, cid);
+export async function readState(
+  uid: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<StateFile> {
+  const file = conversationLayout(uid, cid, projectIdHint).stateFile;
   if (!fs.existsSync(file)) {
     return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [] };
   }
@@ -407,7 +446,109 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
 
 async function writeStateRaw(uid: string, cid: string, s: StateFile): Promise<void> {
   ensureGroupDir(uid, cid);
-  await writeJson(groupChatStateFile(uid, cid), s);
+  await writeJson(conversationLayout(uid, cid).stateFile, s);
+}
+
+// A compact local journal makes boot crash recovery proportional to the
+// number of turns that were running at shutdown instead of total history.
+// Per-user serialisation prevents two conversations starting/stopping at the
+// same time from losing each other's registry update.
+const _runningRegistryMutex = new Map<string, Mutex>();
+function _runningRegistryLock(uid: string): Mutex {
+  let m = _runningRegistryMutex.get(uid);
+  if (!m) { m = new Mutex(); _runningRegistryMutex.set(uid, m); }
+  return m;
+}
+
+function _sanitizeRunningRegistry(data: unknown): RunningConversationRegistry | null {
+  const row = data as Record<string, unknown> | null;
+  if (!row || row.version !== 1 || !Array.isArray(row.items)) return null;
+  const seen = new Set<string>();
+  const items: RunningConversationEntry[] = [];
+  for (const raw of row.items) {
+    const item = raw as Record<string, unknown> | null;
+    const cid = typeof item?.conversation_id === 'string' ? item.conversation_id : '';
+    if (!safeId(cid)) return null;
+    if (seen.has(cid)) continue;
+    seen.add(cid);
+    if (item?.project_id !== undefined
+      && (typeof item.project_id !== 'string' || !safeId(item.project_id))) return null;
+    const pid = typeof item?.project_id === 'string' ? item.project_id : '';
+    items.push({ conversation_id: cid, ...(pid ? { project_id: pid } : {}) });
+  }
+  return { version: 1, items };
+}
+
+async function _readRunningRegistry(uid: string): Promise<RunningConversationRegistry | null> {
+  try {
+    return _sanitizeRunningRegistry(await readJson(userRunningConversationsFile(uid)));
+  } catch {
+    return null;
+  }
+}
+
+/** Read the compact boot journal. `valid=false` requests a one-time indexed
+ * migration scan for installs upgrading from before the journal existed. */
+export async function readRunningConversationRegistry(
+  uid: string,
+): Promise<{ valid: boolean; items: RunningConversationEntry[] }> {
+  return _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid);
+    return registry
+      ? { valid: true, items: registry.items }
+      : { valid: false, items: [] };
+  });
+}
+
+/** Establish an empty valid journal without overwriting a concurrently
+ * created entry. Used after the one-time migration fallback is selected. */
+export async function ensureRunningConversationRegistry(uid: string): Promise<void> {
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    if (await _readRunningRegistry(uid)) return;
+    await writeJson(userRunningConversationsFile(uid), { version: 1, items: [] });
+  });
+}
+
+async function _trackRunningConversation(uid: string, cid: string): Promise<void> {
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid) || { version: 1 as const, items: [] };
+    const layout = conversationLayout(uid, cid);
+    const next: RunningConversationEntry = {
+      conversation_id: cid,
+      ...(layout.projectId ? { project_id: layout.projectId } : {}),
+    };
+    const index = registry.items.findIndex((item) => item.conversation_id === cid);
+    if (index >= 0
+      && registry.items[index].project_id === next.project_id) return;
+    if (index >= 0) registry.items[index] = next;
+    else registry.items.push(next);
+    await writeJson(userRunningConversationsFile(uid), registry);
+  });
+}
+
+export async function untrackRunningConversation(uid: string, cid: string): Promise<void> {
+  await _runningRegistryLock(uid).runExclusive(async () => {
+    const registry = await _readRunningRegistry(uid);
+    if (!registry) return;
+    const items = registry.items.filter((item) => item.conversation_id !== cid);
+    if (items.length === registry.items.length) return;
+    await writeJson(userRunningConversationsFile(uid), { version: 1, items });
+  });
+}
+
+async function _writeStatusTransition(
+  uid: string, cid: string, current: GroupStatus, next: GroupStatus, state: StateFile,
+): Promise<void> {
+  // Register before persisting `running`: a crash can leave an extra journal
+  // row (self-healing), but must never leave an untracked running state.
+  if (current !== 'running' && next === 'running') {
+    await _trackRunningConversation(uid, cid);
+  }
+  await writeStateRaw(uid, cid, state);
+  // Persist non-running state before removing the row for the same reason.
+  if (current === 'running' && next !== 'running') {
+    await untrackRunningConversation(uid, cid);
+  }
 }
 
 // Per-cid serialisation lock for state.json read-modify-write. Without
@@ -428,10 +569,11 @@ function _stateLock(uid: string, cid: string): Mutex {
 export async function setStatus(uid: string, cid: string, status: GroupStatus): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
+    const current = s.status;
     s.status = status;
     s.last_active_at = nowIso();
     if (status !== 'running') s.in_flight = [];
-    await writeStateRaw(uid, cid, s);
+    await _writeStatusTransition(uid, cid, current, status, s);
     return s;
   });
 }
@@ -454,7 +596,7 @@ export async function transitionStatus(
     s.status = next;
     s.last_active_at = nowIso();
     if (next !== 'running') s.in_flight = [];
-    await writeStateRaw(uid, cid, s);
+    await _writeStatusTransition(uid, cid, cur, next, s);
     return { changed: true, state: s };
   });
 }
@@ -732,13 +874,14 @@ export async function setSyncConflictResolution(
 
 /** Drop the whole group dir (called from chats.deleteConversation). */
 export async function purgeGroupDir(uid: string, cid: string): Promise<void> {
-  const dir = groupChatDir(uid, cid);
+  const dir = conversationLayout(uid, cid).groupDir;
   try { await fsp.rm(dir, { recursive: true, force: true }); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
       log.warn(`purge group dir failed user=${uid} cid=${cid}: ${(err as Error).message}`);
     }
   }
+  await untrackRunningConversation(uid, cid);
   // Suppress unused import lint when the function body is the only path consumer.
   void path;
 }

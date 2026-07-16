@@ -1,14 +1,18 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-controls-accessibility
-description_zh: "选择正确控件并检查可访问性，覆盖控件分类、状态覆盖、响应式、文本适配、键盘操作和 A11y 规则。"
-description_en: "Choose the right controls and check accessibility across control taxonomy, states, responsive behavior, text fit, keyboard use, and A11y rules."
+description_zh: "处理复杂表单、复合控件或专项可访问性审查，覆盖控件分类、状态、响应式、文本适配、键盘操作和 A11y；普通界面使用紧凑执行器的基础规则。"
+description_en: "Handle complex forms, composite widgets, or focused accessibility reviews across control taxonomy, states, responsive behavior, text fit, keyboard use, and A11y; ordinary UI uses the compact executor's baseline rules."
 category: rnd
 ---
 
 # ui-controls-accessibility
 
-Use this skill when choosing controls, defining states, checking responsive behavior, or reviewing accessibility. It adapts UI Skills-style practical UI rules into implementation-ready design work.
+## Requested Outcome Gate
+
+Before rendering, turn every explicitly requested workflow outcome into a compact ledger: `user outcome -> triggering control/event -> rendered state branch -> recovery/next action`. Success and failure are separate outcomes. If a backend is unavailable, give each outcome a distinct, clearly labeled preview control with an explicit action name such as `data-action="import-success"` and `data-action="import-failure"`; wire each action to its own feedback branch and recovery. Do not deliver while any requested outcome exists only in prose, an unreachable conditional, an ambiguous shared trigger, or a generic error state from a different step.
+
+Use this specialist for complex forms, non-trivial composite widgets, accessibility audits, or control/state failures that need deeper guidance. Ordinary controls, focus, labels, and responsive behavior are covered by `ui-design-executor` and do not require loading this skill.
 
 ## Control Taxonomy
 
@@ -44,12 +48,15 @@ Represent states that a real product would need:
 
 Do not add every state to every component. Add the states the workflow can actually reach.
 
+State coverage is an implementation requirement, not a prose checklist. For a standalone prototype, put each critical state in real DOM or rendering logic and make it inspectable through the real workflow, a small preview-only state switcher, or a clearly labeled state gallery. Listing state names while shipping only the happy path does not count.
+
 ## Accessibility Checks
 
 Minimum checks:
 
 - Contrast: body text, muted text, controls, borders, focus rings, and semantic status.
 - Keyboard: tab order, visible focus, Escape for popovers/modals, Enter/Space activation where expected.
+- Composite widgets: tabs use `tablist`/`tab` semantics with `aria-selected`, roving focus, and Left/Right or Up/Down arrow-key movement as appropriate; menus, listboxes, and grids follow their expected keyboard model.
 - Labels: every input and icon-only action needs a visible label, aria-label, or clear surrounding context.
 - Target size: small controls need enough clickable area.
 - Text scaling: labels and buttons must fit with realistic localized text.
@@ -69,6 +76,8 @@ Define stable responsive behavior:
 
 Do not scale font size with viewport width. Use explicit type roles and breakpoints.
 
+If the brief explicitly forbids horizontal scrolling or names a narrow target such as 320px, do not choose horizontal table/nav scrolling. Use column priority, stacked labeled rows/cards, wrapped navigation, and full-width actions so the primary workflow fits the viewport.
+
 ## Form And Data Rules
 
 Forms:
@@ -77,6 +86,8 @@ Forms:
 - Put helper/error text near the field.
 - Show required/optional intent clearly.
 - Use inline validation for recoverable errors.
+- Implement the reachable lifecycle: pristine, dirty/touched invalid, submitted-pending with duplicate submission blocked, recoverable server/error feedback, and success. Do not show dirty validation on first render. Every outcome the user explicitly requests (for example import success and import failure) needs its own reachable real-workflow or preview trigger. With no backend, prefer two explicit named preview actions over a hidden flag or an overloaded generic error button; a conditional branch that is never called with one outcome is dead code and does not count.
+- Wire field errors with `aria-invalid` and `aria-describedby` where applicable; move or announce focus to the error summary after a failed submit when the form is long.
 
 Data:
 
@@ -91,6 +102,7 @@ For every UI brief or implementation, include:
 
 - Control choices and why.
 - Key states represented.
+- Where each critical state is implemented and how to reach it.
 - Keyboard/focus expectations.
 - Mobile behavior.
 - Text-fit and localization risk.

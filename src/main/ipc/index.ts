@@ -20,6 +20,7 @@ import * as users from '../features/users';
 import * as chats from '../features/chats';
 import * as projects from '../features/projects';
 import * as projectFiles from '../features/project_files';
+import * as projectTasks from '../features/project_tasks';
 import * as projectLibraryIndexer from '../features/project_library_indexer';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
@@ -33,6 +34,7 @@ import * as marketplaceCache from '../features/marketplace_cache';
 import * as marketplaceReconcile from '../features/marketplace_reconcile';
 import * as cacheClearable from '../features/cache_clearable';
 import * as contexts from '../features/contexts';
+import * as libraryTransfer from '../features/library_transfer';
 import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
 import * as chatAttachments from '../features/chat_attachments';
@@ -67,14 +69,35 @@ import {
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
-import { DEFAULT_USER_WORKSPACE, WS_ROOT, chatAttachmentDir, projectFilesDir } from '../paths';
+import { DEFAULT_USER_WORKSPACE, WS_ROOT, projectFilesDir } from '../paths';
+import {
+  chatAttachmentDirForConversation,
+  chatAttachmentRelPath,
+  findAutoTaskLocation,
+  globalAutoTaskLocation,
+} from '../util/project-layout';
 import { readState as readGroupChatState } from '../features/group_chat/state';
 import { logErrorRef } from '../util/log-redact';
 import { macosTccSensitivePath } from '../util/macos-tcc';
+import { normalizeAppError } from '../util/app-error';
+import {
+  isTrustedIpcSender,
+  parseInvokeEnvelope,
+  parseStreamEnvelope,
+  parseStreamRequestId,
+} from './security';
 
 const log = createLogger('ipc');
 
 function markPreferencesDirty(): void {}
+
+function conversationProjectHint(args: Record<string, any>): string | null | undefined {
+  if (!Object.prototype.hasOwnProperty.call(args, 'project_id')) return undefined;
+  const raw = args.project_id;
+  if (raw === '') return null;
+  if (!safeId(raw)) throw new Error('invalid project id');
+  return raw;
+}
 
 interface IpcContext {
   userId: string;
@@ -115,12 +138,9 @@ function _safeDialogDefaultPath(preferred?: string): string | undefined {
   return undefined;
 }
 
-const CHAT_PICK_EXTENSIONS = [
-  'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
-  'pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm',
-  'png', 'jpg', 'jpeg', 'webp', 'gif',
-  'mp4', 'webm', 'mov', 'm4v', 'ogv',
-];
+const CHAT_PICK_EXTENSIONS = [...chatAttachments.ALLOWED_EXTENSIONS]
+  .map((ext) => ext.replace(/^\./, ''))
+  .sort();
 const CONTEXT_PICK_EXTENSIONS = [
   'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
   'html', 'htm', 'xml', 'toml', 'ini', 'conf',
@@ -192,7 +212,7 @@ async function _resolveWorkspaceScope(
 function _attachmentScopeForPayload(userId: string, payload: any): string | null {
   if (!payload || typeof payload.cid !== 'string' || !payload.cid) return null;
   if (!safeId(payload.cid)) return null;
-  return path.resolve(chatAttachmentDir(userId, payload.cid));
+  return path.resolve(chatAttachmentDirForConversation(userId, payload.cid));
 }
 
 // Project-file scope for sandbox checks. Takes the already-resolved projectId
@@ -545,7 +565,17 @@ function _recycleDataChangeForPaths(paths: string[]): { domains: string[]; cids:
     if (first === 'chats' || first === 'chat_attachments' || first === 'chat_artifacts' || first === 'sessions') {
       domains.add('chats');
     } else if (first === 'contexts') domains.add('contexts');
-    else if (first === 'projects') domains.add('projects');
+    else if (first === 'projects') {
+      const parts = rel.split('/');
+      const projectChild = parts[3] || '';
+      if (projectChild === 'chats' || projectChild === 'chat_attachments' || projectChild === 'chat_artifacts' || projectChild === 'sessions') {
+        domains.add('chats');
+      } else if (projectChild === 'auto_tasks') {
+        domains.add('auto_tasks');
+      } else {
+        domains.add('projects');
+      }
+    }
     else if (first === 'auto_tasks') domains.add('auto_tasks');
     else if (first === 'saved_apps') domains.add('saved_apps');
     else if (first === 'agents') domains.add('agents');
@@ -556,7 +586,11 @@ function _recycleDataChangeForPaths(paths: string[]): { domains: string[]; cids:
     const chatFile = /^cloud\/chats\/([^/]+)\.jsonl$/.exec(rel);
     const chatDir = /^cloud\/chats\/([^/]+)\//.exec(rel);
     const chatPool = /^cloud\/chat_(?:attachments|artifacts)\/([^/]+)\//.exec(rel);
-    const cid = chatFile?.[1] || chatDir?.[1] || chatPool?.[1] || '';
+    const projectChatFile = /^cloud\/projects\/[^/]+\/chats\/([^/]+)\.jsonl$/.exec(rel);
+    const projectChatDir = /^cloud\/projects\/[^/]+\/chats\/([^/]+)\//.exec(rel);
+    const projectChatPool = /^cloud\/projects\/[^/]+\/chat_(?:attachments|artifacts)\/([^/]+)\//.exec(rel);
+    const cid = chatFile?.[1] || chatDir?.[1] || chatPool?.[1]
+      || projectChatFile?.[1] || projectChatDir?.[1] || projectChatPool?.[1] || '';
     if (cid && safeId(cid) && cid !== 'agent' && cid !== 'skill') cids.add(cid);
   }
   return { domains: Array.from(domains), cids: Array.from(cids), recycle: true };
@@ -579,7 +613,7 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
         kbIndexer.enqueue(ctx.userId, ctxRel, 'upsert');
       }
     }
-    const projectFile = /^cloud\/projects\/([^/]+)\/files\/(.+)$/.exec(rel);
+    const projectFile = /^cloud\/projects\/([^/]+)\/(?:contexts|files)\/(.+)$/.exec(rel);
     if (projectFile && safeId(projectFile[1]) && projectFile[2]) {
       projectLibraryIndexer.enqueue(ctx.userId, projectFile[1], projectFile[2], 'upsert');
     }
@@ -608,29 +642,70 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return user;
   },
 
-  'conversations.list': async (_payload, ctx) => {
+  'conversations.list': async ({ mode, active_cid, expanded_projects, project_id, task_id, bucket, offset }, ctx) => {
+    if (mode === 'startup') {
+      const expandedProjectIds = String(expanded_projects || '')
+        .split(',')
+        .filter((id) => safeId(id));
+      const result = await chats.listStartupConversations(ctx.userId, {
+        activeConversationId: safeId(active_cid) ? active_cid : undefined,
+        expandedProjectIds,
+      });
+      return result;
+    }
+    if (mode === 'project') {
+      if (!safeId(project_id)) throw new Error('invalid project id');
+      return chats.listProjectConversationPage(ctx.userId, project_id, offset);
+    }
+    if (mode === 'auto_task') {
+      if (!safeId(task_id)) throw new Error('invalid auto task id');
+      return chats.listAutoTaskConversationPage(ctx.userId, task_id, offset);
+    }
+    if (mode === 'old_unprojected') {
+      if (bucket !== 'last30' && bucket !== 'older') throw new Error('invalid conversation bucket');
+      return chats.listOldUnprojectedConversationPage(ctx.userId, bucket, offset);
+    }
     return { conversations: await chats.listConversations(ctx.userId) };
   },
 
-  'conversations.get': async ({ cid }, ctx) => {
+  'conversations.autoTaskCounts': async ({ task_ids } = {}, ctx) => {
+    const ids = Array.isArray(task_ids) ? task_ids : [];
+    return { counts: await chats.countAutoTaskConversations(ctx.userId, ids) };
+  },
+
+  'conversations.get': async (args, ctx) => {
+    const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    const conv = await chats.getConversation(ctx.userId, cid);
+    const conv = await chats.getConversation(ctx.userId, cid, conversationProjectHint(args));
     if (!conv) throw new Error('conversation not found');
     return { conversation: conv };
   },
 
-  'conversations.history': async ({ cid, limit = 500 }, ctx) => {
+  'conversations.history': async (args, ctx) => {
+    const { cid, limit = 10, before } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    const conv = await chats.getConversation(ctx.userId, cid);
+    const projectIdHint = conversationProjectHint(args);
+    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
     if (!conv) throw new Error('conversation not found');
+    const resolvedProjectId = conv.project_id ?? null;
     // Stamp the conv-bound agent's current enabled state so the renderer can
     // grey out the input + show a banner without making a second IPC round trip.
     // True for unbound (no agent_id) — input always allowed there.
     const agent_enabled = conv.agent_id ? isAgentEnabled(ctx.userId, conv.agent_id) : true;
-    const runtime = await groupChat.runtimeStatus(ctx.userId, cid);
+    const runtime = await groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId);
+    const requestedLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 10)));
+    const requestedBefore = Number(before);
+    const page = await chats.getMessagesPage(
+      ctx.userId,
+      cid,
+      requestedLimit,
+      Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
+      resolvedProjectId,
+    );
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
-      history: await chats.getMessages(ctx.userId, cid, limit),
+      history: page.history,
+      next_cursor: page.nextCursor,
     };
   },
 
@@ -664,23 +739,28 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { conversation: conv };
   },
 
-  'conversations.delete': async ({ cid }, ctx) => {
+  'conversations.delete': async (args, ctx) => {
+    const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     await recycleBin.createAppRecycleBatchForConversation(ctx.userId, cid);
-    const ok = await chats.deleteConversation(ctx.userId, cid);
+    const ok = await chats.deleteConversation(ctx.userId, cid, conversationProjectHint(args));
     return { deleted: ok };
   },
 
-  'conversations.pin': async ({ cid, pinned }, ctx) => {
+  'conversations.pin': async (args, ctx) => {
+    const { cid, pinned } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    const conv = await chats.setConversationPinned(ctx.userId, cid, !!pinned);
+    const conv = await chats.setConversationPinned(
+      ctx.userId, cid, !!pinned, conversationProjectHint(args));
     if (!conv) throw new Error('conversation not found');
     return { conversation: conv };
   },
 
-  'conversations.rename': async ({ cid, title }, ctx) => {
+  'conversations.rename': async (args, ctx) => {
+    const { cid, title } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    const conv = await chats.renameConversation(ctx.userId, cid, title);
+    const conv = await chats.renameConversation(
+      ctx.userId, cid, title, conversationProjectHint(args));
     if (!conv) throw new Error('conversation not found');
     return { conversation: conv };
   },
@@ -730,6 +810,64 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const project = await projects.getProject(ctx.userId, projectId);
     if (!project) throw new Error('not_found');
     return { project };
+  },
+
+  // User-authored per-project instructions (ORKAS.md). User-owned: edited only
+  // here via the project settings UI; agents read it from the system prompt.
+  'projects.instructions.get': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const result = await projects.readProjectInstructions(ctx.userId, projectId);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { content: result.content, limit: result.limit };
+  },
+
+  'projects.instructions.set': async ({ projectId, content }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof content !== 'string') throw new Error('invalid content');
+    const result = await projects.writeProjectInstructions(ctx.userId, projectId, content);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { ok: true };
+  },
+
+  // ── Project tasks (structured work backlog — user + agent shared) ─────────
+  'projects.tasks.list': async ({ projectId } = {}, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const tasks = await projectTasks.listTasks(ctx.userId, projectId);
+    return { tasks, progress: projectTasks.computeProgress(tasks) };
+  },
+
+  'projects.tasks.create': async ({ projectId, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof title !== 'string') throw new Error('invalid title');
+    const r = await projectTasks.createTask(ctx.userId, projectId, {
+      title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
+    });
+    if (!r.ok) throw new Error((r as { error: string }).error);
+    return { task: r.task };
+  },
+
+  'projects.tasks.update': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const r = await projectTasks.updateTask(ctx.userId, projectId, taskId, { title, detail, status, owner_agent, owner_agent_id, result_ref });
+    if (!r.ok) throw new Error((r as { error: string }).error);
+    return { task: r.task };
+  },
+
+  'projects.tasks.complete': async ({ projectId, taskId, resultRef } = {}, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const r = await projectTasks.completeTask(ctx.userId, projectId, taskId, resultRef);
+    if (!r.ok) throw new Error((r as { error: string }).error);
+    return { task: r.task };
+  },
+
+  'projects.tasks.delete': async ({ projectId, taskId } = {}, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const r = await projectTasks.deleteTask(ctx.userId, projectId, taskId);
+    if (!r.ok) throw new Error((r as { error: string }).error);
+    return { ok: true };
   },
 
   'projects.files.list': async ({ projectId }, ctx) => {
@@ -807,10 +945,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof name !== 'string' || !name) throw new Error('invalid name');
     await recycleBin.createAppRecycleBatchForCloudEntry(
       ctx.userId,
-      `cloud/projects/${projectId}/files/${name}`,
+      `cloud/projects/${projectId}/contexts/${name}`,
       'project_file',
     );
     return projectFiles.deleteProjectEntry(ctx.userId, projectId, name);
+  },
+
+  'library.transfer': async (payload, ctx) => {
+    return libraryTransfer.transferLibraryEntries(ctx.userId, payload);
   },
 
   'projects.files.absPath': async ({ projectId, name }, ctx) => {
@@ -876,7 +1018,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
     const [agentList, skillList] = await Promise.all([
-      agents.listAgents(),
+      agents.listAgentSummaries(),
       skills.listSkills(),
     ]);
     const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
@@ -941,7 +1083,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const boundAgents = new Set(bindings.agents);
     const boundSkills = new Set(bindings.skills);
     const [agentList, skillList] = await Promise.all([
-      agents.listAgents(),
+      agents.listAgentSearchListings(),
       skills.listSkills(),
     ]);
     return {
@@ -959,10 +1101,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { tasks };
   },
 
-  'autoTasks.create': async ({ id, content, schedule, title, enabled, recipient, skill, connector, project_id, attachments }, ctx) => {
+  'autoTasks.create': async ({ id, content, message_parts, schedule, title, enabled, recipient, skill, connector, project_id, attachments }, ctx) => {
     const result = await autoTasks.createTask(ctx.userId, {
       ...(typeof id === 'string' && id ? { id } : {}),
       content: typeof content === 'string' ? content : '',
+      message_parts: Array.isArray(message_parts) ? message_parts : undefined,
       schedule,
       title: typeof title === 'string' ? title : undefined,
       enabled: enabled !== false,
@@ -1094,7 +1237,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof name !== 'string' || !name) throw new Error('invalid name');
     await recycleBin.createAppRecycleBatchForCloudEntry(
       ctx.userId,
-      `cloud/auto_tasks/${taskId}/attachments/${name}`,
+      `${(findAutoTaskLocation(ctx.userId, taskId) || globalAutoTaskLocation(ctx.userId, taskId)).attachmentsRelBase}/${name}`,
       'attachment',
     );
     const res = await autoTasks.deleteAttachment(ctx.userId, taskId, name);
@@ -1124,16 +1267,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
-  'groupChat.send': async ({ cid, content, attachments, use_selections }, ctx) => {
+  'groupChat.send': async ({ cid, content, attachments, use_selections, references }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
+    const refs = Array.isArray(references) ? references : [];
     return groupChat.send({
       userId: ctx.userId, cid, text,
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
+      ...(refs.length ? { references: refs } : {}),
     });
   },
 
@@ -1142,17 +1287,29 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.abort(ctx.userId, cid);
   },
 
-  'groupChat.listMembers': async ({ cid }, ctx) => {
+  'groupChat.deleteMessages': async ({ cid, message_ids }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    if (!await chats.getConversation(ctx.userId, cid)) {
-      return { ok: false, error: 'conversation not found', actors: [] };
-    }
-    return groupChat.listMembers(ctx.userId, cid);
+    const ids = Array.isArray(message_ids) ? message_ids.filter((id: unknown) => typeof id === 'string') : [];
+    return groupChat.deleteMessages(ctx.userId, cid, ids);
   },
 
-  'groupChat.runtimeStatus': async ({ cid }, ctx) => {
+  'groupChat.listMembers': async (args, ctx) => {
+    const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.runtimeStatus(ctx.userId, cid);
+    const projectIdHint = conversationProjectHint(args);
+    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    if (!conv) {
+      return { ok: false, error: 'conversation not found', actors: [] };
+    }
+    return groupChat.listMembers(ctx.userId, cid, conv.project_id ?? null);
+  },
+
+  'groupChat.runtimeStatus': async (args, ctx) => {
+    const { cid } = args;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const projectIdHint = conversationProjectHint(args);
+    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    return groupChat.runtimeStatus(ctx.userId, cid, conv?.project_id ?? projectIdHint);
   },
 
   'groupChat.markFormSubmitted': async ({ cid, msgId, formId, values }, ctx) => {
@@ -1271,7 +1428,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!chatAttachments.isDraftAttachmentCid(cid)) {
       await recycleBin.createAppRecycleBatchForCloudEntry(
         ctx.userId,
-        `cloud/chat_attachments/${cid}/${name || ''}`,
+        chatAttachmentRelPath(ctx.userId, cid, name || ''),
         'attachment',
       );
     }
@@ -1392,9 +1549,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Agents ──
-  'agents.list': async ({ force } = {}) => {
-    if (force === true || force === '1') agents.clearAgentListCache();
-    return { agents: await agents.listAgents() };
+  'agents.list': async ({ summary } = {}) => {
+    // `force` is a renderer-cache concern: callers may need a fresh payload,
+    // but ordinary navigation must not delete the validated on-disk Agent
+    // catalog and reopen every agent.json. Actual definition mutations,
+    // marketplace reconcile and sync already invalidate the main cache at
+    // their write boundary.
+    return {
+      agents: summary === true || summary === '1'
+        ? await agents.listAgentSummaries()
+        : await agents.listAgents(),
+    };
   },
 
   'agents.get': async ({ agent_id }) => {
@@ -2493,7 +2658,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections }, ctx, signal) {
+  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections, references }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
@@ -2505,6 +2670,7 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
+    const refs = Array.isArray(references) ? references : [];
     // Legacy `conversations.stream` is now a thin wrapper around the
     // group_chat bus. Subscribe to the bus directly BEFORE calling
     // `groupChat.send` — `send` internally wakes the recipient worker
@@ -2545,6 +2711,7 @@ const streamHandlers: Record<string, StreamHandler> = {
           userId: ctx.userId, cid, text,
           ...(atts.length ? { attachments: atts } : {}),
           ...(useSelections.length ? { use_selections: useSelections } : {}),
+          ...(refs.length ? { references: refs } : {}),
         });
       } catch (err) {
         sendErr = err;
@@ -2790,7 +2957,7 @@ const streamHandlers: Record<string, StreamHandler> = {
 
 // ── Runtime ──────────────────────────────────────────────────────────────
 
-interface StreamState { cancelled: boolean; controller: AbortController }
+interface StreamState { cancelled: boolean; controller: AbortController; sender: WebContents }
 const activeStreams = new Map<string, StreamState>();
 
 /**
@@ -2813,7 +2980,14 @@ export function broadcastToRenderer(channel: string, payload: unknown): void {
 }
 
 export function register(): void {
-  ipcMain.handle('orkas.invoke', async (event, { channel, payload }) => {
+  ipcMain.handle('orkas.invoke', async (event, request: unknown) => {
+    if (!isTrustedIpcSender(event.sender)) {
+      log.warn('rejected invoke from untrusted renderer');
+      return { ok: false, error: 'untrusted ipc sender', code: 'E_IPC_SENDER' };
+    }
+    const envelope = parseInvokeEnvelope(request);
+    if (!envelope) return { ok: false, error: 'invalid ipc request', code: 'E_IPC_REQUEST' };
+    const { channel, payload } = envelope;
     const handler = invokeHandlers[channel];
     if (!handler) return { ok: false, error: `unknown channel: ${channel}` };
     try {
@@ -2821,11 +2995,18 @@ export function register(): void {
       const result = await handler(payload || {}, ctx);
       return { ok: true, ...(result || {}) };
     } catch (err) {
-      log.error(`invoke ${channel} failed`, { error: (err as Error)?.message || String(err) });
+      const normalized = normalizeAppError(err);
+      const rawCode = (err as { code?: unknown }).code;
+      const code = typeof rawCode === 'number'
+        ? rawCode
+        : (typeof rawCode === 'string' && /^\d+$/.test(rawCode.trim())
+          ? Number(rawCode.trim())
+          : (typeof rawCode === 'string' && rawCode ? rawCode : normalized.code));
+      log.error(`invoke ${channel} failed`, { error: normalized.error, code });
       const out: {
         ok: false;
         error: string;
-        code?: string | number;
+        code: string | number;
         marketplaceKind?: string;
         marketplaceId?: string;
         marketplaceName?: string;
@@ -2836,10 +3017,9 @@ export function register(): void {
         qualityReport?: unknown;
       } = {
         ok: false,
-        error: (err as Error).message || String(err),
+        error: normalized.error,
+        code,
       };
-      const code = (err as { code?: unknown }).code;
-      if (typeof code === 'string' || typeof code === 'number') out.code = code;
       const qualityReport = (err as { qualityReport?: unknown }).qualityReport;
       if (qualityReport) out.qualityReport = qualityReport;
       const installInfo = marketplace.getMarketplaceInstallErrorInfo(err);
@@ -2858,7 +3038,11 @@ export function register(): void {
     }
   });
 
-  ipcMain.on('orkas.streamStart', async (event, { requestId, channel, payload }) => {
+  ipcMain.on('orkas.streamStart', async (event, request: unknown) => {
+    if (!isTrustedIpcSender(event.sender)) return;
+    const envelope = parseStreamEnvelope(request);
+    if (!envelope) return;
+    const { requestId, channel, payload } = envelope;
     const out = (ev: unknown) => {
       if (event.sender.isDestroyed()) return;
       event.sender.send(`stream:${requestId}`, ev);
@@ -2871,8 +3055,13 @@ export function register(): void {
       return;
     }
 
+    if (activeStreams.has(requestId)) {
+      out({ type: 'error', text: 'duplicate stream request id' });
+      out({ type: 'done' });
+      return;
+    }
     const controller = new AbortController();
-    const state: StreamState = { cancelled: false, controller };
+    const state: StreamState = { cancelled: false, controller, sender: event.sender };
     activeStreams.set(requestId, state);
     log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
     try {
@@ -2892,10 +3081,17 @@ export function register(): void {
     }
   });
 
-  ipcMain.on('orkas.streamCancel', (_event, requestId: string) => {
+  ipcMain.on('orkas.streamCancel', (event, rawRequestId: unknown) => {
+    if (!isTrustedIpcSender(event.sender)) return;
+    const requestId = parseStreamRequestId(rawRequestId);
+    if (!requestId) return;
     const state = activeStreams.get(requestId);
     if (!state) {
       log.warn(`streamCancel: unknown requestId=${requestId}`);
+      return;
+    }
+    if (state.sender !== event.sender) {
+      log.warn(`streamCancel: sender mismatch requestId=${requestId}`);
       return;
     }
     log.info(`streamCancel requestId=${requestId}`);

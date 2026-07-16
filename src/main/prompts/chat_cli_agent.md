@@ -4,6 +4,8 @@ $agent_description
 
 $output_protocol_block
 
+$project_block
+
 ## Runtime injection
 
 $language_block

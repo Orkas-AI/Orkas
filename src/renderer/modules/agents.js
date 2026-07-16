@@ -6,6 +6,9 @@ function _agentsTrackClick(action, data) {
 }
 
 let _agentsCache = null;
+// Startup holds a deliberately small identity cache for chat mentions and
+// avatars. The Agents tab upgrades it to the complete listing on first entry.
+let _agentsCacheIsSummary = false;
 let _agentsLoadInFlight = null;
 let _selectedAgent = null; // { id, name, source }
 let _agentEditing = false;
@@ -486,19 +489,24 @@ function _isValidAgentNameCharset(name) {
   return _NAME_TOKEN_RE.test(trimmed);
 }
 
-async function loadAgents(forceRefresh) {
+async function loadAgents(forceRefresh, opts = {}) {
+  const summary = opts.summary === true;
   if (_agentsLoadInFlight) {
-    if (!forceRefresh) return _agentsLoadInFlight;
     await _agentsLoadInFlight.catch(() => {});
   }
-  if (_agentsCache && !forceRefresh) {
-    await _refreshCommanderAgentState();
-    renderAgentsList(_agentsCache);
+  if (_agentsCache && !forceRefresh && (summary || !_agentsCacheIsSummary)) {
+    if (!summary) {
+      await _refreshCommanderAgentState();
+      renderAgentsList(_agentsCache);
+    }
     return;
   }
   _agentsLoadInFlight = (async () => {
     try {
-      const res = await apiFetch(forceRefresh ? '/api/agents/list?force=1' : '/api/agents/list');
+      const query = new URLSearchParams();
+      if (forceRefresh) query.set('force', '1');
+      if (summary) query.set('summary', '1');
+      const res = await apiFetch(`/api/agents/list${query.size ? `?${query}` : ''}`);
       const data = await res.json();
       if (data.ok) {
         // Sort once on cache fill so picker + grid share the order.
@@ -524,9 +532,8 @@ async function loadAgents(forceRefresh) {
           const kb = pinyinSortKey(b.name || b.agent_id || '');
           return ka < kb ? -1 : ka > kb ? 1 : 0;
         });
-        await _refreshCommanderAgentState();
         _agentsCache = sortedAgents;
-        renderAgentsList(_agentsCache);
+        _agentsCacheIsSummary = summary;
         // Sidebar conv-row badges read agent icon+color from `_agentsCache`
         // (via `_renderConvAgentStackHtml`). Boot order is loadConversations
         // → loadAgents, so the first sidebar render lands before the cache
@@ -535,6 +542,9 @@ async function loadAgents(forceRefresh) {
         // icon. Projects section subscribes to the same render call.
         if (typeof renderConversationList === 'function') renderConversationList();
         if (typeof renderProjectsSection === 'function') renderProjectsSection();
+        if (summary) return;
+        await _refreshCommanderAgentState();
+        renderAgentsList(_agentsCache);
         // Backfill avatars to disk when older specs lack them — derive
         // from the seed for cross-device consistency (the same agent_id
         // produces the same icon/color combination on every machine, so
@@ -825,7 +835,8 @@ async function _showAgentsDetailView(agentId) {
   const detail = document.getElementById('agents-detail-view');
   if (grid) grid.style.display = 'none';
   if (detail) detail.style.display = 'flex';
-  await loadAgents(true);
+  // Detail has a target-scoped API below. Do not refresh/enrich the complete
+  // Agent catalog merely to open one agent.json.
   await selectAgent(agentId);
 }
 
@@ -917,7 +928,7 @@ function _toggleAgentRowMenu(anchorBtn, agentId, source = '') {
 // through `selectAgent` so it re-fetches the full agent (the cached
 // `_selectedAgent` only holds id/name/source).
 window.addEventListener('i18n-change', () => {
-  if (_agentsCache) renderAgentsList(_agentsCache);
+  if (_agentsCache && !_agentsCacheIsSummary) renderAgentsList(_agentsCache);
   if (_selectedAgent?.id) {
     selectAgent(_selectedAgent.id).catch(() => { /* ignore */ });
   }
@@ -2853,7 +2864,9 @@ async function useAgent(agentId) {
   if (_isAgentProfileMock(agentId)) return;
   if (_isCommanderAgent(agentId)) {
     _agentsLog.info('use commander');
-    _agentsTrackClick('agent_use', { agent_id: _COMMANDER_AGENT_ID });
+    _agentsTrackClick('agent_use', {
+      agent_id: _COMMANDER_AGENT_ID,
+    });
     setView('new-chat');
     if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
     if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
@@ -2871,7 +2884,9 @@ async function useAgent(agentId) {
     if (agent.enabled === false) return;
 
     _agentsLog.info('use agent', { agent_id: agentId });
-    _agentsTrackClick('agent_use', { agent_id: agentId });
+    _agentsTrackClick('agent_use', {
+      agent_id: agentId,
+    });
 
     setView('new-chat');
     setChatRecipient('new-chat', {
@@ -2889,7 +2904,8 @@ async function useAgent(agentId) {
 }
 
 async function useSkill(skillId, skillName) {
-  if (_skillsCache?.some((s) => s.id === skillId && s.enabled === false)) return;
+  if (typeof _skillsCache !== 'undefined'
+      && _skillsCache?.some((s) => s.id === skillId && s.enabled === false)) return;
   // Open-tier skills (external packages / global folders) live in their own
   // cache; a disabled one must not run from its card's play button either.
   if (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache)
@@ -2897,7 +2913,9 @@ async function useSkill(skillId, skillName) {
   // Skill "use" flow: navigate to the new-chat page with the skill
   // pre-selected and wait for user input.
   _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
-  _agentsTrackClick('skill_use', { skill_id: skillId });
+  _agentsTrackClick('skill_use', {
+    skill_id: skillId,
+  });
   setView('new-chat');
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
@@ -2989,6 +3007,11 @@ let _pickerLibraryRows = null;
 let _pickerLibraryLoading = null;
 let _pickerLibraryRenderSeq = 0;
 let _agentPickerTab = 'agents';
+let _agentPickerOpenSeq = 0;
+let _agentPickerLoadedTabs = new Set();
+const _agentPickerTabLoads = new Map();
+let _pickerProjectContextLoading = false;
+let _pickerProjectContextSeq = 0;
 const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors', 'library'];
 const _AGENT_PICKER_TABS = new Set(_AGENT_PICKER_TAB_ORDER);
 
@@ -3043,7 +3066,64 @@ function _setAgentPickerTab(tab, opts = {}) {
   if (search && !opts.keepSearch) search.value = '';
   _updateAgentPickerChrome();
   _renderAgentPickerList(search ? search.value : '');
+  _ensureAgentPickerTabData(_agentPickerTab, _agentPickerOpenSeq);
   if (opts.focusSearch !== false) setTimeout(() => search?.focus(), 0);
+}
+
+function _ensureAgentPickerTabData(tab, openSeq) {
+  const normalized = _normalizeAgentPickerTab(tab);
+  if (normalized === 'library' || _agentPickerLoadedTabs.has(normalized)) {
+    return Promise.resolve();
+  }
+  const existing = _agentPickerTabLoads.get(normalized);
+  if (existing) {
+    const joined = existing.then(() => {
+      if (openSeq !== _agentPickerOpenSeq) return;
+      _agentPickerLoadedTabs.add(normalized);
+      const picker = document.getElementById('agent-picker');
+      if (!picker || picker.style.display === 'none' || _agentPickerTab !== normalized) return;
+      const search = document.getElementById('agent-picker-search');
+      _renderAgentPickerList(search ? search.value : '');
+    });
+    joined.catch(() => {});
+    return joined;
+  }
+  const run = (async () => {
+    if (normalized === 'skills') {
+      const loader = typeof loadRendererFeature === 'function'
+        ? loadRendererFeature
+        : window.loadRendererFeature;
+      if (typeof loadSkills !== 'function' && typeof loader === 'function') {
+        await loader('skills');
+      }
+      if (typeof loadSkills === 'function') await loadSkills(false);
+    } else if (normalized === 'connectors') {
+      if (typeof loadConnectors === 'function') await loadConnectors();
+    } else {
+      // A summary catalog is enough for the first frame. `loadAgents(false)`
+      // upgrades it once and then reuses the validated full cache.
+      await loadAgents(false);
+    }
+    if (openSeq === _agentPickerOpenSeq) _agentPickerLoadedTabs.add(normalized);
+  })().catch((err) => {
+    _agentsLog.warn('picker tab load failed', {
+      tab: normalized,
+      error: err?.message || String(err),
+    });
+    throw err;
+  }).finally(() => {
+    if (_agentPickerTabLoads.get(normalized) === run) _agentPickerTabLoads.delete(normalized);
+    const picker = document.getElementById('agent-picker');
+    if (openSeq !== _agentPickerOpenSeq || !picker || picker.style.display === 'none') return;
+    if (_agentPickerTab !== normalized) return;
+    const search = document.getElementById('agent-picker-search');
+    _renderAgentPickerList(search ? search.value : '');
+  });
+  _agentPickerTabLoads.set(normalized, run);
+  // Tab clicks are UI events; contain failures here so they never create an
+  // unhandled rejection. Re-selecting the tab retries because the map clears.
+  run.catch(() => {});
+  return run;
 }
 
 function _moveAgentPickerTab(delta) {
@@ -3100,18 +3180,23 @@ function _resolveActiveProjectId(anchorId) {
 }
 
 async function _refreshAgentPickerProjectContext(anchorId) {
+  const refreshSeq = ++_pickerProjectContextSeq;
   _pickerBoundAgentIds = null;
   _pickerProjectId = _resolveActiveProjectId(anchorId) || '';
+  _pickerProjectContextLoading = !!_pickerProjectId;
   _pickerLibraryRows = null;
   _pickerLibraryLoading = null;
   _pickerLibraryRenderSeq += 1;
   if (_pickerProjectId) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: _pickerProjectId });
-      if (res?.ok) {
+      if (refreshSeq === _pickerProjectContextSeq && res?.ok) {
         _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
       }
     } catch (_) { /* keep Library project scope; backend/file-tree handles stale ids */ }
+    finally {
+      if (refreshSeq === _pickerProjectContextSeq) _pickerProjectContextLoading = false;
+    }
   }
 }
 
@@ -3129,31 +3214,26 @@ async function _openAgentPicker(anchorBtn) {
   const picker = document.getElementById('agent-picker');
   if (!anchorBtn || !picker) return;
   picker.dataset.anchorId = anchorBtn.id;
-  // Force-refresh `_agentsCache` on every open. The cache's only background
-  // refresh source is `_mountCreatedAgentChip` / fallback in conversation.js,
-  // which fires when the user is sitting on the conversation view at the
-  // moment a `<agent>` container result message arrives. If the user creates
-  // an agent in conversation A then immediately opens the picker in
-  // conversation B (or just after a renderer reload that refilled cache from
-  // an older state), the picker filter still uses fresh project bindings
-  // (refreshed below) but reads against a stale `_agentsCache` and the new
-  // agent silently disappears from the list. Mirror the `setView('agents')`
-  // force-refresh in `boot.js` here so the picker is also a ground-truth
-  // surface; cost is one IPC + dir scan per picker open (sub-ms in practice).
-  await Promise.all([
-    loadAgents(true),
-    (typeof loadSkills === 'function' ? loadSkills(true) : Promise.resolve()),
-    (typeof loadConnectors === 'function' ? loadConnectors() : Promise.resolve()),
-  ]);
-  // Refresh project-scoped agent bindings and Library rows on every open so
-  // the picker reflects the auto form's currently selected/locked project.
-  // A deleted project drops back to global scope instead of showing stale rows.
-  await _refreshAgentPickerProjectContext(anchorBtn.id);
-  // Render first so measurement in _positionPopoverAboveOrBelow reflects
-  // the real list height (not stale content from a previous open).
+  const openSeq = ++_agentPickerOpenSeq;
+  _agentPickerLoadedTabs = new Set();
+  // Reset project scope synchronously before painting. For project-bound
+  // composers this flips the list to a loading shell immediately, so stale
+  // unrestricted rows from the previous picker session are never clickable
+  // while the fresh binding request is in flight.
+  const projectContextPromise = _refreshAgentPickerProjectContext(anchorBtn.id);
+  // Paint the cached Agent shell in the same interaction frame. Other tabs
+  // own their script/data loads and cannot delay this first frame.
   _setAgentPickerTab('agents', { focusSearch: false });
   _positionPopoverAboveOrBelow(picker, anchorBtn);
   setTimeout(() => document.getElementById('agent-picker-search')?.focus(), 30);
+  // Project bindings affect Agent visibility, so refresh them independently
+  // and repaint only if this picker session is still current.
+  projectContextPromise.then(() => {
+    if (openSeq !== _agentPickerOpenSeq || picker.style.display === 'none') return;
+    if (_agentPickerTab !== 'agents') return;
+    const search = document.getElementById('agent-picker-search');
+    _renderAgentPickerList(search ? search.value : '');
+  }).catch(() => {});
 }
 
 function _closeAgentPicker() {
@@ -3175,6 +3255,10 @@ function _renderAgentPickerList(filterText) {
   }
   _updateAgentPickerChrome();
   if (_agentPickerTab === 'skills') {
+    if (typeof loadSkills !== 'function') {
+      listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+      return;
+    }
     _renderSkillPickerList(listEl, filterText, anchorId);
     return;
   }
@@ -3188,6 +3272,10 @@ function _renderAgentPickerList(filterText) {
   }
   // Disabled agents are filtered out — picker is a "what can I dispatch right
   // now" UI, and re-enabling lives in the management page (Agents view + ⋯ menu).
+  if (_pickerProjectContextLoading) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+    return;
+  }
   let agents = (_agentsCache || []).filter((a) => a.enabled !== false);
   // Project scope: only show agents bound to the active context's project.
   // Applied AFTER the enabled filter (per CLAUDE.md §6 outer-intersection
@@ -3556,7 +3644,11 @@ function _targetFromPickerAnchor(anchorId) {
 async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset) {
   const target = _targetFromPickerAnchor(anchorId);
   if (kind === 'skill') {
-    _agentsTrackClick(target === 'auto' ? 'auto_skill_select' : 'chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
+    const skillId = String(itemId || itemName || '');
+    _agentsTrackClick(target === 'auto' ? 'auto_skill_select' : 'chat_skill_select', {
+      target,
+      skill_id: skillId,
+    });
     _consumeAtKeyChar();
     setChatSkill(target, itemId, itemName || itemId);
     const inputId = target === 'new-chat'
@@ -3667,6 +3759,7 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     const rec = (agentId === '__commander__')
       ? { kind: 'commander' }
       : { kind: 'agent', id: agentId, name: agentName || agentId };
+    const resourceAgentId = rec.kind === 'commander' ? _COMMANDER_AGENT_ID : String(agentId || '');
     _agentsTrackClick('auto_agent_select', {
       target: 'auto',
       recipient_type: rec.kind,
@@ -3684,6 +3777,7 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     || anchorId === 'project-chat-recipient-chip';
   if (isRecipientAnchor) {
     const target = _targetFromPickerAnchor(anchorId);
+    const resourceAgentId = agentId === '__commander__' ? _COMMANDER_AGENT_ID : String(agentId || '');
     _agentsTrackClick('chat_agent_select', {
       target,
       recipient_type: agentId === '__commander__' ? 'commander' : 'agent',
@@ -3814,7 +3908,6 @@ function bindRecipientAnchor(chipId, inputId) {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       _atKeyMark = null; // chip click is not a `@`-keystroke trigger
-      if (!_agentsCache) await loadAgents();
       const picker = document.getElementById('agent-picker');
       if (picker && picker.style.display !== 'none' && picker.dataset.anchorId === chipId) {
         _closeAgentPicker();

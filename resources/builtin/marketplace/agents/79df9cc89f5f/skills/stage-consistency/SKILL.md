@@ -30,7 +30,7 @@ From the script/idea, extract every recurring character into `project/characters
 
 ## 2. Portrait anchor (generate once, then LOCK)
 
-For each character, generate ONE **front portrait** (full-body, front view, plain background) from its static+dynamic features with `generate_image`. **This is the anchor — never regenerate it.** Derive side/back views by reference-image editing the front portrait (so all three views are the same person). Save paths into the bible.
+For each character, plan ONE **front portrait** as its own signed `media_kind:"image"` EDL segment, then generate it with `generate_image` using that segment id. **This is the anchor — never regenerate it.** Any separately generated side/back view is another explicit Gate C segment; otherwise derive views without a new hosted generation. Save paths into the bible.
 
 - **Cameo** (the user uploads a photo to BE a character): use that photo AS the front portrait — skip generation for that character. Everything downstream references it.
 
@@ -56,7 +56,7 @@ For each shot, before generating it, assemble the reference images and bind them
 For a character-critical shot, generate the **first-frame image** first (cheap), check it, and only then drive the video from that locked frame — catching drift at the still is far cheaper than discovering it after paying to animate.
 
 - **Check the keyframe against the bible** on the identity axes, in priority order: 1) character — gender, age, ethnicity, facial features, body shape, hairstyle; 2) spatial — relative positions/perspective match the reference (left stays left); 3) accuracy — matches the shot's description. Read it yourself if multimodal; if you cannot see images, mark it unverified and lean harder on a strong locked reference.
-- **Re-roll the cheap image**, not the expensive video — at most 3 re-rolls per keyframe (each is billable), then keep the most consistent candidate. Never hard-fail — pick the best and note its shortcoming.
+- **No implicit re-rolls.** If multiple image candidates are desired, put each candidate in the EDL before Gate C so the displayed count is exact. After a failed/interrupted provider attempt, do not retry the same segment automatically; the durable transaction fails closed until the user explicitly authorizes another paid attempt.
 
 ## 5. Carry-forward (continuity between shots)
 
@@ -80,5 +80,5 @@ A story multiplies billable calls (portraits per character + clips per shot + ca
 ## Rules & boundary
 
 - **The anchor is sacred**: a character's front portrait is generated once and reused; never silently regenerate it (that's how looks drift).
-- **Cost discipline**: portraits + per-shot generation are billable; state the exact character/shot counts in the approval-gate proposal and never start generating before the user approves.
+- **Cost discipline**: portraits + per-shot generation are billable; represent every provider call as one signed generate segment, state the exact count at Gate C, call `production.approve_generation`, and pass the owning plan/segment metadata to every generate tool call.
 - This skill is the consistency METHOD; it does not itself author HTML (composition skill) or cut user footage (editing skill). It sits on top of the generation line.

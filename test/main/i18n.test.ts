@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   t, setCurrentLang, getCurrentLang,
-  acceptLanguageHeader, detectSystemLang, descriptionLang, isLang, _resetCacheForTests,
+  acceptLanguageHeader, detectSystemLang, descriptionLang, getRendererBootTables,
+  isLang, _resetCacheForTests,
 } from '../../src/main/i18n';
 
 beforeEach(() => {
@@ -108,6 +109,18 @@ describe('i18n › descriptionLang', () => {
     expect(descriptionLang('en')).toBe('en');
     expect(descriptionLang('ja')).toBe('en');
     expect(descriptionLang('pt')).toBe('en');
+  });
+});
+
+describe('i18n › renderer boot bundle', () => {
+  it('loads only English when English is active', () => {
+    expect(Object.keys(getRendererBootTables('en'))).toEqual(['en']);
+  });
+
+  it('loads the active non-English table plus English fallback', () => {
+    expect(Object.keys(getRendererBootTables('zh')).sort()).toEqual(['en', 'zh']);
+    expect(Object.keys(getRendererBootTables('ja')).sort()).toEqual(['en', 'ja']);
+    expect(Object.keys(getRendererBootTables('pt')).sort()).toEqual(['en', 'pt']);
   });
 });
 

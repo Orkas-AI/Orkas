@@ -234,6 +234,7 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/bing-webmaster-mcp-server.cjs'],
       oauth_env_key: 'BING_ACCESS_TOKEN',
+      proxy_target_url: 'https://www.bing.com/webmaster/api.svc/json',
     },
   },
 ];

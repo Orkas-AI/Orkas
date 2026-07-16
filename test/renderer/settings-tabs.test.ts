@@ -82,16 +82,17 @@ function loadSettingsTabsModule() {
 }
 
 describe('settings tabs module', () => {
-  it('is loaded before settings.js from index.html', () => {
+  it('loads tabs eagerly and the settings page on demand', () => {
     const indexHtml = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
+    const lazyFeatures = fs.readFileSync(path.join(root, 'src/renderer/modules/lazy-features.js'), 'utf8');
     const modulePath = path.join(root, 'src/renderer/modules/settings_tabs.js');
     const tabsScript = '<script src="./modules/settings_tabs.js"></script>';
     const settingsScript = '<script src="./modules/settings.js"></script>';
 
     expect(fs.existsSync(modulePath)).toBe(true);
     expect(indexHtml.indexOf(tabsScript)).toBeGreaterThanOrEqual(0);
-    expect(indexHtml.indexOf(settingsScript)).toBeGreaterThanOrEqual(0);
-    expect(indexHtml.indexOf(tabsScript)).toBeLessThan(indexHtml.indexOf(settingsScript));
+    expect(indexHtml.indexOf(settingsScript)).toBe(-1);
+    expect(lazyFeatures).toContain("{ src: './modules/settings.js' }");
   });
 
   it('binds clicks and toggles the matching settings pane', () => {

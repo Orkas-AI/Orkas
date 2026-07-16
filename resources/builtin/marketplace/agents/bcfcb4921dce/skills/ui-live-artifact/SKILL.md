@@ -10,7 +10,7 @@ category: rnd
 
 Use this skill when the user asks for a live dashboard, refreshable report, synced view, recurring data artifact, connector-backed UI, auditable status page, or data-backed HTML that should remain useful after the first render.
 
-Do not use this for ordinary one-off mockups, static redesigns, image-to-HTML conversion, or visual polish. In those cases `ui-html-renderer` is enough.
+Do not use this for ordinary one-off mockups, static redesigns, image-to-HTML conversion, or visual polish. In those cases `ui-design-executor` is enough.
 
 ## Intent Gate
 
@@ -63,8 +63,8 @@ The preview must still be a good UIDesigner artifact:
 - Show refresh status, last updated time, data freshness, and empty/error states.
 - Include source/provenance cues only where they help trust; do not clutter the main workflow.
 - Separate UI actions from data refresh actions.
-- Make stale, partial, loading, and failed-refresh states visible.
-- Use `ui-design-contract`, `ui-reference-packs`, `ui-design-system`, and `ui-html-renderer` for visual quality.
+- Implement visible, reachable stale, partial, loading, failed-refresh, empty, and last-updated states in DOM/rendering logic; a prose inventory is not sufficient.
+- Use `ui-design-executor` for baseline visual quality. Add a contract, reference, system, or deep renderer skill only when its specialist trigger is present.
 
 ## Connector Boundaries
 

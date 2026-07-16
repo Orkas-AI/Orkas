@@ -44,7 +44,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
-import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir, userChatsDir } from '../paths';
+import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir } from '../paths';
+import {
+  chatAttachmentDirForConversation,
+  chatAttachmentRelPath,
+  conversationMessageReadFile,
+} from '../util/project-layout';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { toCompressedGrayJpeg } from '../util/image-transform';
@@ -64,6 +69,10 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.json', '.yaml', '.yml', '.log',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+// SVG is intentionally display-only. Keep it out of IMAGE_EXTS so attachment
+// upload, model vision input, image transforms, and per-cid attachment serving
+// retain their existing raster-only contract.
+const LOCAL_DISPLAY_IMAGE_EXTS: ReadonlySet<string> = new Set([...IMAGE_EXTS, '.svg']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
 const PDF_EXT = '.pdf';
@@ -210,7 +219,7 @@ function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
     return;
   }
 
-  for (const name of names) notifyAttachmentDeleted(cid, name);
+  for (const name of names) notifyAttachmentDeleted(userId, cid, name);
 }
 
 function attachmentDirForCid(userId: string, cid: string): string {
@@ -218,7 +227,7 @@ function attachmentDirForCid(userId: string, cid: string): string {
     migrateLegacyDraftCloudDir(userId, cid);
     return chatAttachmentDraftDir(userId, cid);
   }
-  return chatAttachmentDir(userId, cid);
+  return chatAttachmentDirForConversation(userId, cid);
 }
 
 function ensureDir(userId: string, cid: string): string {
@@ -227,32 +236,24 @@ function ensureDir(userId: string, cid: string): string {
   return dir;
 }
 
-function attachmentRelPath(cid: string, name: string): string {
-  return `cloud/chat_attachments/${cid}/${name}`;
+function notifyAttachmentDirty(userId: string, cid: string, name: string): void {
+  void userId;
+  void cid;
+  void name;
 }
 
-function notifyAttachmentDirty(cid: string, name: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('chat_attachments', attachmentRelPath(cid, name));
-  } catch { /* features/sync stripped */ }
+function notifyAttachmentDeleted(userId: string, cid: string, name: string): void {
+  void userId;
+  void cid;
+  void name;
 }
 
-function notifyAttachmentDeleted(cid: string, name: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
-    void sync?.markDeleted?.(attachmentRelPath(cid, name));
-  } catch { /* features/sync stripped */ }
+function notifyAttachmentDirtyIfSyncable(userId: string, cid: string, name: string): void {
+  if (!isDraftAttachmentCid(cid)) notifyAttachmentDirty(userId, cid, name);
 }
 
-function notifyAttachmentDirtyIfSyncable(cid: string, name: string): void {
-  if (!isDraftAttachmentCid(cid)) notifyAttachmentDirty(cid, name);
-}
-
-function notifyAttachmentDeletedIfSyncable(cid: string, name: string): void {
-  if (!isDraftAttachmentCid(cid)) notifyAttachmentDeleted(cid, name);
+function notifyAttachmentDeletedIfSyncable(userId: string, cid: string, name: string): void {
+  if (!isDraftAttachmentCid(cid)) notifyAttachmentDeleted(userId, cid, name);
 }
 
 function uniqueTarget(dir: string, name: string): string {
@@ -403,7 +404,7 @@ export async function uploadAttachment(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
-    notifyAttachmentDirtyIfSyncable(safeConvId, finalName);
+    notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -475,7 +476,7 @@ export async function importAttachmentFromPath(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`import user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
-    notifyAttachmentDirtyIfSyncable(safeConvId, finalName);
+    notifyAttachmentDirtyIfSyncable(userId, safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -532,7 +533,7 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
   catch { return all; }
 
   const committed = new Set<string>();
-  const jsonlPath = path.join(userChatsDir(userId), `${safeConvId}.jsonl`);
+  const jsonlPath = conversationMessageReadFile(userId, safeConvId);
   let raw: string;
   try { raw = fs.readFileSync(jsonlPath, 'utf8'); }
   catch { return all; }  // new conv, no messages yet → everything is pending
@@ -574,7 +575,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   try {
     if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
-  notifyAttachmentDeletedIfSyncable(safeConvId, safeName);
+  notifyAttachmentDeletedIfSyncable(userId, safeConvId, safeName);
   return { ok: true };
 }
 
@@ -645,20 +646,121 @@ export function resolveLocalMediaPath(
   }
   const normalized = path.resolve(absPath);
   const ext = path.extname(normalized).toLowerCase();
-  if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
+  if (!LOCAL_DISPLAY_IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
     return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
   }
   let stat: fs.Stats;
   try { stat = fs.statSync(normalized); }
   catch { return { ok: false, code: 'not_found', error: 'not found' }; }
   if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
-  const cap = maxBytesFor(ext);
+  const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : maxBytesFor(ext);
   if (stat.size > cap) {
     const mb = Math.round(cap / 1024 / 1024);
     return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
   }
+  if (ext === '.svg') {
+    let body: string;
+    try { body = fs.readFileSync(normalized, 'utf8'); }
+    catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+    // Do not run markup-pattern checks across opaque raster base64 payloads;
+    // arbitrary encoded bytes can coincidentally end with text like `onfoo=`.
+    const bodyForSafety = body.replace(
+      /data:image\/(?:png|jpe?g|webp|gif);base64,[a-z0-9+/=\r\n]+/gi,
+      'data:image/png;base64,',
+    );
+    // Local SVGs render inside an <img>, but still reject active/remote content.
+    // VideoStudio contact sheets use only relative PNG hrefs plus rect/text/image.
+    if (
+      /<!DOCTYPE\b|<!ENTITY\b|<script\b|<foreignObject\b|<(?:iframe|object|embed)\b/i.test(bodyForSafety)
+      || /\bon[a-z]+\s*=/i.test(bodyForSafety)
+      || /javascript\s*:|data\s*:\s*text\/html/i.test(bodyForSafety)
+      || /(?:href|xlink:href|src)\s*=\s*["']\s*(?:https?:|\/\/)/i.test(bodyForSafety)
+      || /(?:@import|url\s*\()\s*["']?\s*(?:https?:|\/\/)/i.test(bodyForSafety)
+    ) {
+      return { ok: false, code: 'bad_input', error: 'unsafe SVG content' };
+    }
+  }
   const kind = VIDEO_EXTS.has(ext) ? 'video' : (AUDIO_EXTS.has(ext) ? 'audio' : 'image');
   return { ok: true, absPath: normalized, kind };
+}
+
+/**
+ * Make a passive local SVG self-contained before returning it to an <img>.
+ * Chromium intentionally blocks external subresources for SVG-as-image, so
+ * legacy VideoStudio contact sheets with relative PNG hrefs otherwise render
+ * only their labels. New contact sheets are already self-contained; this is
+ * the read-only compatibility path for existing conversation history.
+ */
+export function materializeLocalDisplaySvg(
+  absPath: string,
+): { ok: true; body: string } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string } {
+  const resolved = resolveLocalMediaPath(absPath);
+  if (!resolved.ok) {
+    const err = resolved as { code: 'bad_input' | 'not_found' | 'too_large'; error: string };
+    return { ok: false, code: err.code, error: err.error };
+  }
+  if (path.extname(resolved.absPath).toLowerCase() !== '.svg') {
+    return { ok: false, code: 'bad_input', error: 'path is not an SVG' };
+  }
+
+  let body: string;
+  try { body = fs.readFileSync(resolved.absPath, 'utf8'); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+
+  const root = path.dirname(resolved.absPath);
+  let inlineError: { code: 'bad_input' | 'not_found' | 'too_large'; error: string } | null = null;
+  let refCount = 0;
+  body = body.replace(
+    /(<image\b[^>]*?\b(?:href|xlink:href)\s*=\s*)(["'])([^"']*)\2/gi,
+    (full, prefix: string, quote: string, rawRef: string) => {
+      if (inlineError) return full;
+      const ref = String(rawRef || '').trim();
+      if (/^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(ref)) return full;
+      refCount += 1;
+      if (refCount > 20) {
+        inlineError = { code: 'too_large', error: 'SVG contains too many image references' };
+        return full;
+      }
+      if (!ref || ref.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(ref) || ref.startsWith('//')) {
+        inlineError = { code: 'bad_input', error: 'unsupported SVG image reference' };
+        return full;
+      }
+      const decodedRef = ref.replace(/&amp;/g, '&');
+      const imageAbs = path.resolve(root, decodedRef);
+      const rel = path.relative(root, imageAbs);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+        inlineError = { code: 'bad_input', error: 'SVG image reference escapes its directory' };
+        return full;
+      }
+      const imageExt = path.extname(imageAbs).toLowerCase();
+      if (!IMAGE_EXTS.has(imageExt)) {
+        inlineError = { code: 'bad_input', error: `unsupported SVG image extension: ${imageExt || '(none)'}` };
+        return full;
+      }
+      let stat: fs.Stats;
+      try { stat = fs.statSync(imageAbs); }
+      catch {
+        inlineError = { code: 'not_found', error: 'SVG image reference not found' };
+        return full;
+      }
+      if (!stat.isFile()) {
+        inlineError = { code: 'not_found', error: 'SVG image reference is not a file' };
+        return full;
+      }
+      if (stat.size > MAX_BYTES_IMAGE) {
+        inlineError = { code: 'too_large', error: 'SVG image reference exceeds image size cap' };
+        return full;
+      }
+      const data = fs.readFileSync(imageAbs).toString('base64');
+      return `${prefix}${quote}data:${mediaMimeFor(imageAbs)};base64,${data}${quote}`;
+    },
+  );
+
+  if (inlineError) return { ok: false, ...inlineError };
+  if (Buffer.byteLength(body, 'utf8') > MAX_BYTES_IMAGE) {
+    return { ok: false, code: 'too_large', error: 'materialized SVG exceeds image size cap' };
+  }
+  return { ok: true, body };
 }
 
 /**
@@ -720,6 +822,13 @@ export function mediaMimeFor(name: string): string {
   return 'application/octet-stream';
 }
 
+/** MIME lookup for `chat-media://local`. SVG support is deliberately kept
+ * separate from `mediaMimeFor`, which is also used by per-cid attachments. */
+export function localMediaMimeFor(name: string): string {
+  if (path.extname(name).toLowerCase() === '.svg') return 'image/svg+xml';
+  return mediaMimeFor(name);
+}
+
 function imageMimeFromExt(ext: string): ImageMimeType {
   const e = ext.toLowerCase();
   if (e === '.png') return 'image/png';
@@ -750,7 +859,7 @@ export function adoptDraftAttachments(
 
   const src = attachmentDirForCid(userId, srcSafe);
   if (!fs.existsSync(src)) return { ok: true, count: 0 };
-  const dst = chatAttachmentDir(userId, dstSafe);
+  const dst = chatAttachmentDirForConversation(userId, dstSafe);
   let movedNames: string[] = [];
   try { movedNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
   catch { /* ignore */ }
@@ -780,8 +889,8 @@ export function adoptDraftAttachments(
   try { count = fs.readdirSync(dst).filter((n) => !n.startsWith('.')).length; }
   catch { /* ignore */ }
   for (const name of movedNames) {
-    notifyAttachmentDeletedIfSyncable(srcSafe, name);
-    notifyAttachmentDirty(dstSafe, name);
+    notifyAttachmentDeletedIfSyncable(userId, srcSafe, name);
+    notifyAttachmentDirty(userId, dstSafe, name);
   }
   log.info(`adopt user=${userId} ${srcSafe} → ${dstSafe} count=${count}`);
   return { ok: true, count };
@@ -808,7 +917,7 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
   try { await purgeFileCacheByCid(userId, safeConvId); }
   catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
-  for (const name of names) notifyAttachmentDeletedIfSyncable(safeConvId, name);
+  for (const name of names) notifyAttachmentDeletedIfSyncable(userId, safeConvId, name);
   return count;
 }
 
@@ -892,7 +1001,7 @@ export async function buildAttachmentManifest(
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch (err) { return { manifest: '', images: [], skipped: [{ name: '', reason: (err as Error).message }], metadata: metadata() }; }
-  const dir = chatAttachmentDir(userId, safeConvId);
+  const dir = attachmentDirForCid(userId, safeConvId);
 
   for (const rawName of names) {
     let nm: string;
@@ -923,10 +1032,12 @@ export async function buildAttachmentManifest(
     }
 
     if (kind === 'video' || kind === 'audio') {
-      // Video/audio files are display-only: no vision support + no text extraction. The
-      // renderer streams bytes through the `chat-media://` protocol directly;
-      // nothing to surface to the model.
-      skipped.push({ name: nm, reason: t('attachments.skipped.video_for_display') });
+      // Not vision/inline-text input, but the FILE is available at its path.
+      // Surface it in the manifest (do NOT skip it) with model_readable="false"
+      // so an agent can probe / transcribe / extract frames with media tools.
+      // The earlier "display only, not read by the model" skip made agents give
+      // up on a clip the user explicitly handed them (VideoStudio [474]).
+      entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="${kind}" model_readable="false"/>`);
       continue;
     }
 
@@ -957,8 +1068,12 @@ export async function buildAttachmentManifest(
     entries.push(`<file ${attrs.join(' ')}/>`);
   }
 
+  const hasMedia = entries.some((e) => e.includes('model_readable="false"'));
+  const mediaNote = hasMedia
+    ? '\n<!-- video/audio are not vision input; read their content with media tools (probe / transcribe / extract frames) via the path — do not treat them as unreadable -->'
+    : '';
   const manifest = entries.length
-    ? `<attachments>\n${entries.join('\n')}\n</attachments>`
+    ? `<attachments>${mediaNote}\n${entries.join('\n')}\n</attachments>`
     : '';
   return { manifest, images, skipped, metadata: metadata() };
 }
@@ -978,7 +1093,7 @@ export async function buildConversationAttachmentIndex(
   try { safeConvId = safeCid(cid); }
   catch { return ''; }
 
-  const dir = chatAttachmentDir(userId, safeConvId);
+  const dir = attachmentDirForCid(userId, safeConvId);
   let dirents: fs.Dirent[];
   try { dirents = fs.readdirSync(dir, { withFileTypes: true }); }
   catch { return ''; }

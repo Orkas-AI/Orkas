@@ -11,6 +11,7 @@ export {
 } from "./base.js";
 export { getBuiltinTools, readFileTool, writeFileTool, bashTool, listFilesTool } from "./builtin.js";
 export { webFetchTool } from "./web-fetch.js";
+export { createExecutionPlanTool, type ExecutionPlanController } from "./execution-plan.js";
 export {
   webSearchTool,
   runBuiltinWebSearch,

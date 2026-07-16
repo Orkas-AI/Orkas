@@ -563,6 +563,9 @@ export interface RunCliAgentResult {
   status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'missing_cli';
   output?: string;
   error?: string;
+  cliError?: LocalCliEntry['error'];
+  cliPath?: string;
+  cliVersion?: string;
 }
 
 export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
@@ -645,9 +648,9 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     // pulsing during a real stall.
     if (e.type !== 'idle') lastEventAt = Date.now();
     // Tool-event result phase: spill oversized output to disk before
-    // it lands in events.jsonl / the renderer stream. Above 50 KB the
-    // raw bash output bloats the persistence log and the renderer
-    // memory; the spill keeps a head+tail preview inline (matching
+    // it lands in events.jsonl / the renderer stream. Above the estimated
+    // inline-token budget the raw output bloats the persistence log and the
+    // renderer memory; the spill keeps a bounded preview inline (matching
     // the in-process tool-result spill format) and exposes the full
     // path via `outputPath` for click-to-expand. Backends don't know
     // about this — they always emit the full output.
@@ -819,6 +822,20 @@ async function _missing(opts: RunCliAgentOpts, entry: LocalCliEntry): Promise<Ru
     }),
     error: logErrorRef(new Error(err)),
   });
-  opts.onEvent({ type: 'done', status: 'missing_cli', error: err });
-  return { runId: '', status: 'missing_cli', error: err };
+  opts.onEvent({
+    type: 'done',
+    status: 'missing_cli',
+    error: err,
+    cliError: entry.error || 'not_found',
+    ...(entry.path ? { cliPath: entry.path } : {}),
+    ...(entry.version ? { cliVersion: entry.version } : {}),
+  });
+  return {
+    runId: '',
+    status: 'missing_cli',
+    error: err,
+    cliError: entry.error || 'not_found',
+    ...(entry.path ? { cliPath: entry.path } : {}),
+    ...(entry.version ? { cliVersion: entry.version } : {}),
+  };
 }

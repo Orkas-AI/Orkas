@@ -9,26 +9,28 @@ category: creation
 
 # composition-design-review
 
-Use this after `video_studio` `op: "composition.draft"` returns a draft/report, but only when the compose task is design-sensitive. It is a design QA layer, not a renderer, line router, or generic video craft checklist.
+Use this after `video_studio` `op: "composition.draft"` returns `design_review_required: true`. It is a design QA layer, not a renderer, line router, or generic video craft checklist. Submit its verdict through `composition.submit_design_review`; prose alone does not satisfy the host gate.
 
-Do not open a new user Gate. Read `steps.inspect.draft_disposition` when present. Draft visual/readability inspect findings are review evidence, not automatic blockers. If findings are blockers, make at most one localized repair to the contract/scene-map/HTML and re-run the draft command before Gate D. If findings are `fix` or `polish`, include them in the Gate D note unless they are trivial to repair in the same pass.
+Do not open a new user Gate. Read `steps.inspect.draft_disposition` when present. Host-classified semantic readability blockers must already be repaired before draft succeeds. For the remaining design judgment, make at most one localized repair to `manifest.art_direction` or the affected HTML and re-run the draft command before Gate D. Submit `repair`/`blocked` with concrete evidence when needed, or `passed` before Gate D.
 
 ## Activation
 
-Run this review only when one of these is true:
+The host requires this review for long/scene-dense drafts and may also require it for design-sensitive work. Review when any of these is true:
+
+- The draft result contains `design_review_required: true` (authoritative).
 
 - The approved brief is brand, product, promo, launch, version-update, portfolio, or other design-led COMPOSE work.
-- `project/composition/design-contract.json` contains a `style_source`.
+- `project/composition/composition-manifest.json::art_direction.style_source` is present.
 - The draft report or sampled frames show a visible design risk that deterministic QA cannot judge, such as a weak first frame, flat hierarchy, repeated scene grammar, or motion that hides the message.
 
-Do not run this review for ordinary edit/TTS/clip-selection work, simple caption cards, or generic "make it polished" wording without a visible design risk.
+Do not run this review for non-COMPOSE edit/TTS/clip-selection work. For COMPOSE, always follow the draft result even when the visual concept is otherwise simple.
 
 ## Review Inputs
 
 Read only the relevant artifacts:
 
-- `project/composition/design-contract.json`
-- `project/composition/scene-map.json` when narration/timing alignment matters
+- `project/composition/composition-manifest.json`, especially `art_direction` and the affected canonical scene
+- `project/composition/narration-map.json` as read-only evidence when detailed narration-line alignment matters
 - `project/composition/qa/inspect.json` or `project/render/draft-report.json`
 - Sampled evidence frames from the draft report when available: `video_qa.contact_sheet`, `video_qa.frame_paths`, first frame, one mid-frame per scene, and payoff/closing frame
 - The approved script/shotlist only when a finding depends on message intent
@@ -56,6 +58,7 @@ Fix:
 - Repeated layout, transition, or card pattern three or more times in a row.
 - Palette uses extra chromatic colors beyond the contract.
 - Type hierarchy is flat or labels feel like UI residue instead of video graphics.
+- English titles, body copy, captions, subtitles, or CTAs are forced to all caps, or two or more English text roles in one scene use all caps without an explicit user, brand, or art-direction reason. Restore the approved natural casing and use scale, weight, width, color, or spacing for hierarchy; keep all caps only for one short metadata label, acronym, or code.
 - Scene density is too high for phone viewing.
 - Style-source adaptation is vague: it borrows mood words but no concrete tokens.
 
@@ -67,17 +70,19 @@ Polish:
 
 ## Repair Preference
 
-Fix the highest-level artifact that caused the issue:
+Fix the highest-level canonical artifact that caused the issue:
 
-1. `design-contract.json` when the thesis, tokens, or layout budget are wrong.
-2. `scene-map.json` when timing, narration mapping, or source-shot mapping is wrong.
+1. `composition-manifest.json::art_direction` when the thesis, style source, tokens, layout budget, or per-scene visual plan is wrong.
+2. `composition-manifest.json` when canonical scene timing or source-shot mapping is wrong; use the normal `stage-compose` reconciliation path after changing protected fields.
 3. `index.html` for visual hierarchy, typography, layout, motion, asset, or scene variation fixes.
+
+Use `narration-map.json` only to diagnose detailed narration-line alignment. Do not edit it from design review; hand alignment findings back to `stage-compose`, which owns narration materialization and reconciliation.
 
 Do not solve design problems by only nudging pixels. If the issue is "too generic", change the signature device or scene grammar. If the issue is "too dense", remove or split content.
 
 ## Output Format
 
-Return a compact review object or bullets:
+Return a compact review object or bullets, then call the tool with the same evidence:
 
 - `verdict`: pass | repair | block
 - `review_scope`: why this review was triggered
@@ -86,3 +91,7 @@ Return a compact review object or bullets:
 - `fixes`: concrete location + repair
 - `polish`: optional
 - `next_action`: rerun draft, open Gate D, or surface blocker
+
+```json
+{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"contact sheet + per-scene midpoint/payoff frames","review_findings":[]}
+```

@@ -335,8 +335,10 @@ function prefillCommander(text) {
   const input = document.getElementById('new-chat-input');
   if (!input) return;
   input.value = value;
-  input.focus();
   const m = value.match(/\[[^\]]*\]/);
+  if (m) input.dataset.ossTemplatePlaceholder = m[0];
+  else delete input.dataset.ossTemplatePlaceholder;
+  input.focus();
   try {
     if (m && typeof m.index === 'number') input.setSelectionRange(m.index, m.index + m[0].length);
     else input.setSelectionRange(value.length, value.length);
@@ -344,6 +346,26 @@ function prefillCommander(text) {
   input.dispatchEvent(new Event('input', { bubbles: true })); // triggers autoGrow + chip state
   input.classList.add('is-prefilled');
   setTimeout(() => input.classList.remove('is-prefilled'), 1200);
+}
+
+/**
+ * Return the exact placeholder inserted by prefillCommander when the user has
+ * not replaced it yet. Ordinary bracketed text is never inspected unless this
+ * renderer-owned marker exists, so code/prompts containing `[value]` are safe.
+ */
+function unresolvedOssTemplatePlaceholder(input) {
+  if (!input || !input.dataset) return '';
+  const marker = String(input.dataset.ossTemplatePlaceholder || '');
+  if (!marker) return '';
+  const value = String(input.value || '');
+  if (!value.includes(marker)) {
+    delete input.dataset.ossTemplatePlaceholder;
+    return '';
+  }
+  const start = value.indexOf(marker);
+  input.focus();
+  try { input.setSelectionRange(start, start + marker.length); } catch (_) { /* unsupported */ }
+  return marker;
 }
 
 // ① entry — render the task cards into #oss-entry-grid + bind clicks. Called on
@@ -356,7 +378,11 @@ async function initOssEntry(opts = {}) {
   // Bind the "更多能力 →" header link once.
   const more = document.getElementById('oss-entry-more');
   if (more && !more.dataset.bound) {
-    more.addEventListener('click', () => { if (typeof openMarketplace === 'function') openMarketplace('oss'); });
+    more.addEventListener('click', () => {
+      const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+      if (typeof load !== 'function') return;
+      load('marketplace').then(() => openMarketplace('oss')).catch(() => {});
+    });
     more.dataset.bound = '1';
   }
 
@@ -421,4 +447,5 @@ window.ossPromptFor = ossPromptFor;
 window.ossInstallPromptFor = ossInstallPromptFor;
 window.ossOpenRepo = ossOpenRepo;
 window.prefillCommander = prefillCommander;
+window.unresolvedOssTemplatePlaceholder = unresolvedOssTemplatePlaceholder;
 window.initOssEntry = initOssEntry;
