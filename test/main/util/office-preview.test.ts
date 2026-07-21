@@ -31,4 +31,13 @@ describe('office-preview', () => {
     expect(preview.html).toContain('office-preview office-presentation');
     expect(preview.html).not.toContain('(no text)');
   });
+
+  it('renders a presentation with no slides as a blank page', async () => {
+    const pptx = makeMinimalPptx({ slides: [] });
+    const preview = await officeBufferToPreviewHtml('presentation', 'empty.pptx', pptx);
+
+    expect(preview.kind).toBe('presentation');
+    expect(preview.html).toContain('class="office-slide office-slide-blank"');
+    expect(preview.html).not.toContain('(no previewable content)');
+  });
 });
