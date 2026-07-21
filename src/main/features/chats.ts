@@ -2022,21 +2022,38 @@ export async function getMessagesPage(
   return { history, nextCursor };
 }
 
-/** Load the fixed-size history page containing one search-result record. */
+/** Load from the fixed-size page containing a search hit through the newest
+ * record. The search index gives us the absolute record index, so this is one
+ * direct forward read rather than a renderer-driven chain of older-page IPC
+ * requests. `nextCursor` still points immediately before the target page so
+ * normal upward pagination remains available. */
 export async function getMessagesPageAtIndex(
   userId: string,
   cid: string,
   messageIndex: number,
   limit = 10,
   projectIdHint?: string | null,
-): Promise<{ history: MessageRecord[]; nextCursor: number | null; pageStart: number }> {
+): Promise<{
+  history: MessageRecord[];
+  historyIndexes: number[];
+  nextCursor: number | null;
+  pageStart: number;
+}> {
   const file = conversationMessageReadFile(userId, cid, projectIdHint);
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   const index = Math.max(0, Math.floor(Number(messageIndex) || 0));
   const pageStart = Math.floor(index / wanted) * wanted;
-  const page = await readJsonlWindow<MessageRecord>(file, pageStart, wanted);
+  const page = await readJsonlWindow<MessageRecord>(file, pageStart, Number.MAX_SAFE_INTEGER);
+  const visible = page.records
+    .map((message, offset) => ({ message, index: pageStart + offset }))
+    .filter(({ message }) => !message.deleted_at);
   return {
-    history: page.records.filter((message) => !message.deleted_at),
+    history: visible.map(({ message }) => message),
+    // Keep the source JSONL indexes aligned with `history`. The renderer uses
+    // this as the final navigation identity for old records that predate
+    // stable message ids/timestamps; filtering a tombstone must not shift the
+    // remaining page-relative offsets.
+    historyIndexes: visible.map(({ index: recordIndex }) => recordIndex),
     nextCursor: page.previousCursor,
     pageStart,
   };

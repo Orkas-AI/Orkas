@@ -806,7 +806,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
       next_cursor: page.nextCursor,
-      ...(hasAroundIndex && 'pageStart' in page ? { page_start: page.pageStart } : {}),
+      ...(hasAroundIndex && 'pageStart' in page && 'historyIndexes' in page ? {
+        page_start: page.pageStart,
+        history_indexes: page.historyIndexes,
+      } : {}),
     };
   },
 

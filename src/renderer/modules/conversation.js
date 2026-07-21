@@ -2454,6 +2454,7 @@ function _groupMsgToLegacy(gm) {
     ...(gm.failure_kind ? { failure_kind: gm.failure_kind } : {}),
     ...(gm.failure_code ? { failure_code: gm.failure_code } : {}),
     ...(_groupMessageSystemKind(gm) ? { _system_kind: _groupMessageSystemKind(gm) } : {}),
+    ...(Number.isSafeInteger(gm._history_index) ? { _history_index: gm._history_index } : {}),
   };
   return out;
 }
@@ -4742,6 +4743,11 @@ function _findConversationHistorySearchTarget(container, target = {}) {
     const byId = messages.find((message) => String(message.dataset?.msgId || '') === msgId);
     if (byId) return byId;
   }
+  const msgIndex = Number(target.msgIndex);
+  if (Number.isSafeInteger(msgIndex) && msgIndex >= 0) {
+    const byIndex = messages.find((message) => Number(message.dataset?.msgIndex) === msgIndex);
+    if (byIndex) return byIndex;
+  }
   const targetTs = _msTs(target.time);
   if (!targetTs) return null;
   const role = target.role === 'user' || target.role === 'assistant' ? target.role : '';
@@ -4753,7 +4759,28 @@ function _findConversationHistorySearchTarget(container, target = {}) {
 
 function _flashConversationHistorySearchTarget(target) {
   if (!target) return;
-  target.scrollIntoView({ block: 'center' });
+  const container = target.closest?.('.chat-history') || target.parentElement;
+  if (container) {
+    // `.chat-history` has CSS smooth scrolling for ordinary navigation. A
+    // search hit is an exact address, so assign scrollTop directly and mark
+    // the resulting event as programmatic. Besides making the jump instant,
+    // this prevents the top-of-page auto-loader from interpreting the jump as
+    // user intent and walking through earlier pages one by one.
+    const previousBehavior = container.style?.scrollBehavior || '';
+    if (container.style) container.style.scrollBehavior = 'auto';
+    _markProgrammaticStickyScroll(container);
+    const containerRect = container.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const centeredTop = Number(container.scrollTop || 0)
+      + targetRect.top - containerRect.top
+      - (Number(container.clientHeight || 0) - targetRect.height) / 2;
+    container.scrollTop = Math.max(0, centeredTop);
+    container._stickyEnabled = false;
+    container._stickyUserPaused = true;
+    requestAnimationFrame(() => {
+      if (container.style) container.style.scrollBehavior = previousBehavior;
+    });
+  }
   target.classList.add('search-flash');
   setTimeout(() => target.classList.remove('search-flash'), 1600);
 }
@@ -4857,8 +4884,24 @@ async function loadConversationHistory(cid, opts = {}) {
     // agent's visibility slice still carries dispatches so the agent has the
     // dispatch text in its own context.
     const renderStartedAt = performance.now();
+    const rawHistory = Array.isArray(data.history) ? data.history : [];
+    const responseIndexes = Array.isArray(data.history_indexes) ? data.history_indexes : [];
+    const responsePageStart = Number(data.page_start);
+    const indexedHistory = rawHistory.map((gm, offset) => {
+      if (!gm || typeof gm !== 'object') return gm;
+      const explicitIndex = Number(responseIndexes[offset]);
+      const fallbackIndex = Number.isSafeInteger(responsePageStart) && responsePageStart >= 0
+        ? responsePageStart + offset
+        : Number.NaN;
+      const sourceIndex = Number.isSafeInteger(explicitIndex) && explicitIndex >= 0
+        ? explicitIndex
+        : fallbackIndex;
+      return Number.isSafeInteger(sourceIndex) && sourceIndex >= 0
+        ? { ...gm, _history_index: sourceIndex }
+        : gm;
+    });
     const visibleGroupHistory = _collapseSupersededInterruptionRecords(
-      (data.history || []).filter(_isVisibleGroupHistoryRecord),
+      indexedHistory.filter(_isVisibleGroupHistoryRecord),
     );
     const history = visibleGroupHistory
       .map(_groupMsgToLegacy)
@@ -4876,9 +4919,12 @@ async function loadConversationHistory(cid, opts = {}) {
       // tree scans. Live messages and recovery paths still use the guarded
       // incremental insertion path below.
       const historyFragment = document.createDocumentFragment();
-      history.forEach((msg, idx) => appendChatMessage(msg, false, {
+      history.forEach((msg) => appendChatMessage(msg, false, {
         cid,
-        msgIndex: idx,
+        // Only stamp authoritative source indexes returned by an anchored
+        // history read. A normal latest-page row has no global index; using
+        // its local 0..9 offset would let a later search falsely match it.
+        msgIndex: Number.isSafeInteger(msg?._history_index) ? msg._history_index : undefined,
         container: historyFragment,
         historyHydration: true,
       }));

@@ -131,7 +131,7 @@ describe('chats › message history tombstones', () => {
     expect(earlier.nextCursor).toBeNull();
   });
 
-  it('loads the fixed history page containing a search message index', async () => {
+  it('loads from the search target page through the newest message', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'search target' });
     const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
@@ -149,8 +149,34 @@ describe('chats › message history tombstones', () => {
     expect(page.pageStart).toBe(20);
     expect(page.history.map((row) => row.id)).toEqual([
       'm20', 'm21', 'm22', 'm23', 'm24', 'm25', 'm26', 'm27', 'm28', 'm29',
+      'm30', 'm31', 'm32', 'm33', 'm34',
+    ]);
+    expect(page.historyIndexes).toEqual([
+      20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
     ]);
     expect(page.nextCursor).not.toBeNull();
+  });
+
+  it('keeps source indexes aligned when an anchored page contains tombstones or legacy rows', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'legacy search target' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const rows = Array.from({ length: 35 }, (_, i) => {
+      if (i === 21) {
+        return { id: 'm21', from: 'user', text: 'deleted', deleted_at: '2026-07-10T11:00:00' };
+      }
+      if (i === 23) return { from: 'commander', text: 'legacy target without identity' };
+      return { id: `m${i}`, from: i % 2 ? 'commander' : 'user', text: `message ${i}` };
+    });
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const page = await chats.getMessagesPageAtIndex(TEST_UID, conv.conversation_id, 23, 10);
+
+    expect(page.pageStart).toBe(20);
+    expect(page.history.map((row) => row.text)).toContain('legacy target without identity');
+    expect(page.historyIndexes).toEqual([
+      20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+    ]);
   });
 
   it('keeps an explicit global history read out of a duplicate project root', async () => {
