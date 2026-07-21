@@ -152,6 +152,14 @@ run.cmd            # Windows
 
 ---
 
+## 贡献者
+
+感谢帮助改进 Orkas 的贡献者：
+
+- [BlueSkyID666](https://github.com/BlueSkyID666)
+
+---
+
 ## 致谢
 
 本项目部分核心模块参考了以下开源项目，特此致谢：
