@@ -13056,13 +13056,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   margin-right: 4px;
 }
 
-/* Settings page commander avatar slot */
-.settings-commander-avatar-slot {
-  display: inline-flex;
-  align-items: center;
-  flex-shrink: 0;
-}
-
 /* ─── Avatar picker popover ───────────────────────────────────────────── */
 .avatar-picker {
   position: fixed;

@@ -12,4 +12,5 @@
 /resources/runtime/ffmpeg
 /resources/runtime/whisper
 /resources/runtime/vc
+/src/main/native/build/
 /userWorkSpace

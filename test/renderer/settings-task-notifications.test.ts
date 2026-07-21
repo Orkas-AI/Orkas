@@ -209,4 +209,17 @@ describe('Settings → General task notification toggle', () => {
 
     expect(warning.hidden).toBe(true);
   });
+
+  it('does not claim system settings disabled Orkas when no per-app settings destination is available', async () => {
+    const { sandbox, warning, openButton } = loadHarness(
+      { ok: true },
+      { state: 'denied', can_open_settings: false },
+      true,
+    );
+    await sandbox._settingsRefreshTaskNotifications();
+    sandbox._settingsRenderTaskNotifications();
+
+    expect(warning.hidden).toBe(true);
+    expect(openButton.hidden).toBe(true);
+  });
 });

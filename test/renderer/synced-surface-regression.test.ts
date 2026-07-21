@@ -172,9 +172,10 @@ describe('synced PC surface regressions', () => {
     expect(ttsAuth).not.toContain('Orkas · Voice');
   });
 
-  it('keeps Settings local execution modes and Open commander avatar copy usable', () => {
+  it('keeps Settings local execution modes and edits the commander avatar from AI Team', () => {
     const html = read('src/renderer/index.html');
     const settings = read('src/renderer/modules/settings.js');
+    const agents = read('src/renderer/modules/agents.js');
     const locales = ['en', 'zh', 'ja', 'pt'].map((lang) => readJson(`src/renderer/locales/${lang}.json`));
 
     for (const marker of [
@@ -202,12 +203,15 @@ describe('synced PC surface regressions', () => {
     expect(settings).toContain("const _LOCALEXEC_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];");
     expect(settings).toContain("'all_files_approval'");
     expect(settings).not.toContain("const _LOCALEXEC_MODES = ['off', 'risk_prompt', 'allow_all'];");
+    expect(html).not.toContain('settings-commander-avatar');
+    expect(settings).not.toContain('_settingsRenderCommanderAvatar');
+    expect(settings).not.toContain('_settingsRefreshCommanderAvatar');
+    expect(agents).toContain("window.orkas.invoke('prefs.setCommanderAvatar'");
+    expect(agents).toContain('allowCommanderCombo: true');
+    expect(agents).toContain('hideIcons: true');
 
     for (const locale of locales) {
       for (const key of [
-        'settings.commander_avatar.title',
-        'settings.commander_avatar.sub',
-        'settings.commander_avatar.hint',
         'settings.localexec.mode.workspace_approval',
         'settings.localexec.mode.all_files_approval',
         'settings.localexec.mode.all_files_auto',

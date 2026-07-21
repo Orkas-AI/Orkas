@@ -71,7 +71,6 @@ async function loadSettings() {
     _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
     _settingsSafeCall('settings tts refresh', _settingsRefreshTtsProfiles),
     _settingsSafeCall('settings task notifications refresh', _settingsRefreshTaskNotifications),
-    _settingsSafeCall('settings commander avatar refresh', _settingsRefreshCommanderAvatar),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
   ]);
@@ -83,7 +82,6 @@ async function loadSettings() {
   await _settingsSafeCall('settings video render', _settingsRenderVideoSection);
   await _settingsSafeCall('settings tts render', _settingsRenderTtsEntries);
   await _settingsSafeCall('settings task notifications render', _settingsRenderTaskNotifications);
-  await _settingsSafeCall('settings commander avatar render', _settingsRenderCommanderAvatar);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
   // Account card + subscription card (views/login/account_settings.js — absent in
@@ -152,7 +150,14 @@ function _settingsRenderTaskNotifications() {
 
   const warning = document.getElementById('settings-task-notification-permission');
   const openBtn = document.getElementById('settings-task-notification-open-settings');
-  const permissionDenied = state.enabled && state.permission && state.permission.state === 'denied';
+  // Only make the definitive "system notifications are off" claim when the
+  // platform also exposes an actionable per-app settings destination. A
+  // delivery failure on an unsupported/unprobeable desktop can surface as
+  // `denied` without proving that the user disabled Orkas in system settings.
+  const permissionDenied = state.enabled
+    && state.permission
+    && state.permission.state === 'denied'
+    && state.permission.can_open_settings;
   if (warning) warning.hidden = !permissionDenied;
   if (openBtn) {
     openBtn.hidden = !(state.permission && state.permission.can_open_settings);
@@ -219,70 +224,6 @@ function _settingsRenderTaskNotifications() {
 }
 
 function _settingsBindClientConfigOnce() {}
-
-// ── Commander avatar ──
-// Commander avatar goes through the prefs IPC and lands in
-// preferences.json. After a change we immediately push it back to the
-// cache (conversation.js's _commanderAvatarCache) so chat rows pick up
-// the new avatar without waiting for the next view switch.
-
-function _settingsCommanderDefaultAvatar() {
-  if (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT) {
-    return { ...COMMANDER_DEFAULT };
-  }
-  return { icon: 'crown', color: 'gold' };
-}
-
-async function _settingsRefreshCommanderAvatar() {
-  try {
-    const res = await window.orkas.invoke('prefs.getCommanderAvatar');
-    _settingsState.commanderAvatar = (res && res.avatar)
-      ? { icon: res.avatar.icon, color: res.avatar.color }
-      : _settingsCommanderDefaultAvatar();
-  } catch (_) {
-    _settingsState.commanderAvatar = _settingsCommanderDefaultAvatar();
-  }
-}
-
-function _settingsRenderCommanderAvatar() {
-  const slot = document.getElementById('settings-commander-avatar');
-  if (!slot) return;
-  const cur = _settingsState.commanderAvatar || _settingsCommanderDefaultAvatar();
-  if (typeof renderAvatarHtml !== 'function') return;
-  slot.innerHTML = renderAvatarHtml(cur.icon, cur.color, {
-    size: 44, seed: 'commander', clickable: true,
-  });
-  const trigger = slot.querySelector('.avatar-circle');
-  if (!trigger) return;
-  trigger.title = t('avatar.change');
-  trigger.addEventListener('click', (e) => {
-    e.stopPropagation();
-    if (typeof openAvatarPicker !== 'function') return;
-    if (typeof isAvatarPickerOpenFor === 'function' && isAvatarPickerOpenFor(trigger)) {
-      if (typeof closeAvatarPicker === 'function') closeAvatarPicker();
-      return;
-    }
-    // The commander avatar's icon is fixed at crown, so the picker
-    // only shows the color row. Backend validation still requires both
-    // tokens, so we force-write crown on save.
-    openAvatarPicker(trigger, cur, { allowCommanderCombo: true, hideIcons: true }, async (next) => {
-      const icon = _settingsCommanderDefaultAvatar().icon;
-      _settingsState.commanderAvatar = { icon, color: next.color };
-      cur.icon = icon; cur.color = next.color;
-      // Update in place — the trigger's click listener is preserved so
-      // the user can click a few times in a row until satisfied.
-      if (typeof applyAvatarToElement === 'function') applyAvatarToElement(trigger, icon, next.color, 'commander');
-      try {
-        const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon, color: next.color });
-        if (res?.ok && res.avatar) {
-          if (typeof setCommanderAvatarCache === 'function') setCommanderAvatarCache(res.avatar);
-        }
-      } catch (err) {
-        _settingsLog.warn('save commander avatar failed', err);
-      }
-    });
-  });
-}
 
 // ── Tool execution access permission ──
 
