@@ -519,7 +519,7 @@ describe('conversation activity elapsed clock', () => {
     expect(replacement.dataset.activityStart).toBe('10000');
   });
 
-  it('keeps advancing monotonically when the wall clock moves backwards', () => {
+  it('keeps a concise elapsed-only label advancing when the wall clock moves backwards', () => {
     const { paint, setTimes } = loadActivityHelpers();
     const meta = { textContent: '' };
     const msg: Record<string, any> = {
@@ -528,10 +528,11 @@ describe('conversation activity elapsed clock', () => {
     };
 
     paint(msg);
-    expect(meta.textContent).toBe('2 tools · 1:40');
+    expect(meta.textContent).toBe('1:40');
 
     setTimes(30_000, 2_000);
     paint(msg);
-    expect(meta.textContent).toBe('2 tools · 1:41');
+    expect(meta.textContent).toBe('1:41');
+    expect(meta.textContent).not.toContain('tools');
   });
 });

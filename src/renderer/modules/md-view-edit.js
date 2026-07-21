@@ -369,9 +369,9 @@ function _mveRenderView(state) {
   if (state.caps.delete) actions.push(_mveActionButton(state, 'delete', 'contexts.viewer.delete', 'trash', 'btn-danger'));
   actionsEl.innerHTML = actions.join('');
 
-  actionsEl.querySelector('[data-mve-action="edit"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_edit', state); _mveEnterEdit(state); });
-  actionsEl.querySelector('[data-mve-action="reveal"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_reveal', state); state.callbacks.onReveal?.(); });
-  actionsEl.querySelector('[data-mve-action="delete"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_delete', state); state.callbacks.onDelete?.(); });
+  actionsEl.querySelector('[data-mve-action="edit"]')?.addEventListener('click', () => _mveEnterEdit(state));
+  actionsEl.querySelector('[data-mve-action="reveal"]')?.addEventListener('click', () => state.callbacks.onReveal?.());
+  actionsEl.querySelector('[data-mve-action="delete"]')?.addEventListener('click', () => state.callbacks.onDelete?.());
 
   _mveEmitDirty(state);
 }
@@ -425,17 +425,16 @@ function _mveRenderEditor(state) {
   }
   actionsEl.innerHTML = actions.join('');
 
-  actionsEl.querySelector('[data-mve-action="save"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_save', state, { chars: (state.draft || '').length }); _mveSave(state); });
-  actionsEl.querySelector('[data-mve-action="cancel"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_cancel', state, { dirty: state.draft !== state.content }); _mveCancelEdit(state); });
-  actionsEl.querySelector('[data-mve-action="copy-draft"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_copy_draft', state, { chars: (state.draft || '').length }); _mveCopyDraft(state); });
-  actionsEl.querySelector('[data-mve-action="send-to-chat"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_send_to_chat', state, { chars: (state.draft || '').length }); _mveSendDraftToChat(state); });
+  actionsEl.querySelector('[data-mve-action="save"]')?.addEventListener('click', () => _mveSave(state));
+  actionsEl.querySelector('[data-mve-action="cancel"]')?.addEventListener('click', () => _mveCancelEdit(state));
+  actionsEl.querySelector('[data-mve-action="copy-draft"]')?.addEventListener('click', () => _mveCopyDraft(state));
+  actionsEl.querySelector('[data-mve-action="send-to-chat"]')?.addEventListener('click', () => _mveSendDraftToChat(state));
 
-  bodyEl.querySelector('[data-mve-toggle]')?.addEventListener('click', () => { _mveTrack('markdown_editor_preview_toggle', state, { preview: !state.preview }); _mveTogglePreview(state); });
+  bodyEl.querySelector('[data-mve-toggle]')?.addEventListener('click', () => _mveTogglePreview(state));
   bodyEl.querySelectorAll('.ctx-editor-tb-btn').forEach(btn => {
     btn.addEventListener('mousedown', (e) => e.preventDefault());
     btn.addEventListener('click', () => {
       if (state.preview) return;
-      _mveTrack('markdown_editor_toolbar', state, { tool: btn.dataset.kind || '' });
       const ta = bodyEl.querySelector('[data-mve-textarea]');
       if (!ta) return;
       _mveApplyMd(state, ta, btn.dataset.kind);

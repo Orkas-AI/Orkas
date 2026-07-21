@@ -48,6 +48,17 @@ export interface ChatMessageReference {
   produced?: string[];
 }
 
+/** Stable source taxonomy for a user-visible failed assistant bubble. UI
+ * styling and retry affordances are deliberately independent of this value;
+ * analytics uses it to distinguish actual model-output failures. */
+export type GroupMessageFailureKind =
+  | 'model'
+  | 'config'
+  | 'dependency'
+  | 'validation'
+  | 'operation'
+  | 'runtime';
+
 export interface GroupMessage {
   /** Stable per-message id (not jsonl line index). Used by visibility +
    * dedupe. */
@@ -72,6 +83,11 @@ export interface GroupMessage {
   system_kind?: 'reply_interrupted';
   /** Markdown text body. */
   text: string;
+  /** Structured failure origin. Older records omit this field and must not be
+   * retroactively classified by inspecting localized HTML/text. */
+  failure_kind?: GroupMessageFailureKind;
+  /** Stable low-cardinality reason paired with `failure_kind`. */
+  failure_code?: string;
   /** Internal model-facing text. UI renders `text`; workers use this when
    * present so system-created messages can stay terse for humans while
    * preserving full instructions for the model. */

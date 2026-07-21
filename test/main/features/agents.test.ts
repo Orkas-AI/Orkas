@@ -3,6 +3,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+// vi.resetModules() creates a fresh agents module per case. A real electron-log
+// transport would leave every prior temp workspace file open until the worker
+// exits, which is both unrepresentative and invalidates Windows IO handles when
+// afterEach removes that workspace.
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 // Swap the LLM stream impl per test — mirrors chats.test.ts pattern so
 // streamSendToAgentEditChat tests can feed synthetic final events.
 const streamImpl: { current: null | ((opts: any) => AsyncGenerator<any, void, unknown>) } = { current: null };
@@ -30,10 +38,15 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  streamImpl.current = null;
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+afterEach(async () => {
+  try {
+    const reports = await import('../../../src/main/quality/report');
+    await reports.drainReportWrites();
+  } finally {
+    process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+    streamImpl.current = null;
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
 });
 
 async function loadAgents() {
@@ -488,6 +501,16 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.cleanText).toContain('tail');
   });
 
+  it('accepts only selectable avatar catalog ids from <icon>', async () => {
+    const a = await loadAgents();
+    expect(a.extractAgentFieldBlocks('<agent><icon>spreadsheet</icon></agent>')
+      .blocks[0].icon).toBe('spreadsheet');
+    expect('icon' in a.extractAgentFieldBlocks('<agent><icon>not-a-real-icon</icon></agent>')
+      .blocks[0]).toBe(false);
+    expect('icon' in a.extractAgentFieldBlocks('<agent><icon>crown</icon></agent>')
+      .blocks[0]).toBe(false);
+  });
+
   it('parses each block independently — a malformed sub-tag in one does not affect the other', async () => {
     const a = await loadAgents();
     const text = [
@@ -738,6 +761,28 @@ describe('agents › validateAgentInputs', () => {
     expect(a.validateAgentInputs([{ id: 'p', type: 'select', default: 'b', options: opts }])[0].default).toBe('b');
   });
 
+  it('keeps valid UI-language select defaults and drops unknown or invalid mappings', async () => {
+    const a = await loadAgents();
+    const options = [
+      { value: 'en', label: 'English' },
+      { value: 'zh-CN', label: '简体中文' },
+    ];
+    const [input] = a.validateAgentInputs([{
+      id: 'language',
+      type: 'select',
+      default: 'en',
+      options,
+      default_by_ui_language: {
+        en: 'en',
+        zh: 'zh-CN',
+        ja: 'missing-option',
+        unknown: 'zh-CN',
+      },
+    }]);
+
+    expect(input.default_by_ui_language).toEqual({ en: 'en', zh: 'zh-CN' });
+  });
+
   it('requires select/multiselect to have non-empty options', async () => {
     const a = await loadAgents();
     expect(a.validateAgentInputs([{ id: 'x', type: 'select', default: 'a', options: [] }])).toEqual([]);
@@ -902,6 +947,17 @@ describe('agents › createCustomAgent', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).workflow).toBe('`agent-creator` skill');
   });
 
+  it('rejects direct bundled-script commands while creating the agent', async () => {
+    const a = await loadAgents();
+    await expect(a.createCustomAgent({
+      name: 'UnsafeBuilder',
+      description: 'desc',
+      category: 'rnd',
+      workflow: 'Run node scripts/build.js before returning.',
+    })).rejects.toThrow(/skill_script_requires_runner/);
+    expect(fs.readdirSync(customAgentsDir())).toEqual([]);
+  });
+
   it('enforces the unified display-width name limit', async () => {
     const a = await loadAgents();
 
@@ -970,6 +1026,7 @@ describe('agents › createAgentFromBlocks', () => {
       description_en: 'desc',
       workflow: 'Ask for a topic, then use the selected skill.',
       category: 'writing',
+      icon: 'spreadsheet',
       interactive: true,
       skill_list: ['known-skill', 'missing-skill'],
       inputs: [
@@ -979,6 +1036,7 @@ describe('agents › createAgentFromBlocks', () => {
     });
 
     expect(created?.category).toBe('creation');
+    expect(created?.icon).toBe('spreadsheet');
     expect(created?.interactive).toBe(true);
     expect(created?.skill_list).toEqual(['known-skill']);
     expect(created?.inputs).toEqual([
@@ -1763,6 +1821,7 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     const sys = await a.buildAgentEditSystemPrompt({
       name: 'Researcher',
       description: '一句话简介',
+      icon: 'search',
       category: 'rnd',
       workflow: '1. step one\n2. step two',
       knowhow: ['Evidence synthesis'],
@@ -1770,6 +1829,10 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     });
     expect(sys).toContain('Researcher');
     expect(sys).toContain('一句话简介');
+    expect(sys).toContain('**Current icon**: search');
+    expect(sys).not.toContain('Avatar icon candidates');
+    expect(sys).not.toContain('$avatar_icon_catalog');
+    expect(sys).not.toContain('sparkle, rocket, brain');
     expect(sys).toContain('step one');
     expect(sys).toContain('Evidence synthesis');
     expect(sys).toContain('Every claim cites its source');
@@ -1786,6 +1849,7 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     const a = await loadAgents();
     const sys = await a.buildAgentEditSystemPrompt({});
     expect(sys).toContain('(not provided)');
+    expect(sys).toMatch(/Current icon\*\*: \(not provided\)/);
   });
 });
 

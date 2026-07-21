@@ -23,6 +23,8 @@ import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './avai
 import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
+import { broadcastOAuthConnectOutcome } from './oauth-events';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import { isConnectorUsable } from './types';
 import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
@@ -46,6 +48,10 @@ let _bootedFor: string | null = null;
  *  identically. Lock entries auto-clear in the `finally` block so a failed refresh doesn't
  *  jam the slot. */
 const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
+
+export interface OAuthConnectStart {
+  attempt_id: string;
+}
 
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const CONNECT_RETRY_DELAY_MS = 500;
@@ -907,6 +913,57 @@ export async function connectViaOAuth(uid: string, catalogId: string): Promise<C
   return _provisionMemberInstance(uid, entry, grant, dcrClient);
 }
 
+function _oauthConnectErrorCode(err: unknown): string {
+  const explicit = (err as { code?: unknown } | null)?.code;
+  if (typeof explicit === 'string' && explicit) return explicit;
+  const message = String((err as Error | null)?.message || err || '').toLowerCase();
+  if (message.includes('superseded')) return 'superseded';
+  if (/cancelled|canceled/.test(message)) return 'user_cancelled';
+  if (message.includes('flow timed out')) return 'flow_timeout';
+  if (message.includes('failed to open browser')) return 'browser_open_failed';
+  if (message.includes('exchange')) return 'exchange_failed';
+  return 'oauth_failed';
+}
+
+/** Start OAuth without holding renderer IPC open while the user is in the browser. */
+export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectStart {
+  if (!uid) throw new Error('uid required');
+  const entry = findCatalogEntry(catalogId);
+  if (!entry) throw new Error('unknown catalog id');
+  assertConnectorRuntimeEnabled(catalogId);
+
+  const attemptId = crypto.randomUUID();
+  const startedAt = Date.now();
+  void connectViaOAuth(uid, catalogId).then((instance) => {
+    const failureMessage = instance.status.kind === 'error'
+      ? (instance.status.message || 'connector transport error')
+      : '';
+    broadcastOAuthConnectOutcome({
+      attempt_id: attemptId,
+      catalog_id: catalogId,
+      result: failureMessage ? 'failure' : 'success',
+      duration_ms: Math.max(0, Date.now() - startedAt),
+      ...(failureMessage ? { code: 'mcp_connect_failed', error: failureMessage } : {}),
+    });
+  }).catch((err) => {
+    const code = _oauthConnectErrorCode(err);
+    if (code === 'flow_timeout') {
+      log.info('connector authorization expired without callback', { catalog_id: catalogId });
+      return;
+    }
+    const cancelled = code === 'user_cancelled' || code === 'superseded';
+    broadcastOAuthConnectOutcome({
+      attempt_id: attemptId,
+      catalog_id: catalogId,
+      result: cancelled ? 'cancelled' : 'failure',
+      duration_ms: Math.max(0, Date.now() - startedAt),
+      code,
+      error: String((err as Error | null)?.message || err || 'connector authorization failed'),
+    });
+  });
+  return { attempt_id: attemptId };
+}
+
 /** Provision (or replace) a single instance for a non-bundle catalog entry. Pulled out of
  *  `connectViaOAuth` so the bundle branch can loop over members. Caller has already obtained
  *  the OAuth grant. */
@@ -1067,8 +1124,10 @@ export async function callTool(
   id: string,
   name: string,
   args: Record<string, unknown>,
+  opts: { signal?: AbortSignal } = {},
 ): Promise<unknown> {
   if (!uid) throw new Error('uid required');
+  if (opts.signal?.aborted) throw _connectorCancelledError(opts.signal.reason);
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
@@ -1079,6 +1138,7 @@ export async function callTool(
   if ((!liveConn?.isConnected || grantStaleForCooldown) && _isInRetryCooldown(inst)) {
     throw new Error(_cooldownMessage(id, inst));
   }
+  if (opts.signal?.aborted) throw _connectorCancelledError(opts.signal.reason);
   // Stale-token guard: the transport snapshots the bearer at connect time (for streamable-http)
   // or injects it into env at spawn time (for stdio). A long-lived connection past the
   // `expires_at` deadline will keep using the dead token on every request — fine for short-lived
@@ -1090,7 +1150,10 @@ export async function callTool(
   const stale = !!(grant && grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
   let conn = _conns.get(id);
   if (stale && conn) {
-    log.info('grant stale → tearing down to refresh on reconnect', { id });
+    log.info('connector state stale; tearing down only this instance before reconnect', {
+      id,
+      stale_grant: stale,
+    });
     try { await conn.close(); } catch { /* swallow */ }
     _conns.delete(id);
     conn = undefined;
@@ -1118,9 +1181,77 @@ export async function callTool(
         if (_onDemandConnectLocks.get(id) === pending) _onDemandConnectLocks.delete(id);
       }).catch(() => {});
     }
-    conn = await pending;
+    conn = await _waitForConnectorOrAbort(pending, opts.signal);
   }
-  return conn.callTool(name, args);
+  const startedAt = Date.now();
+  try {
+    const result = opts.signal
+      ? await conn.callTool(name, args, { signal: opts.signal })
+      : await conn.callTool(name, args);
+    log.info('connector tool call completed', {
+      id,
+      tool: name,
+      duration_ms: Date.now() - startedAt,
+    });
+    return result;
+  } catch (err) {
+    const cancelled = opts.signal?.aborted || (err as Error)?.name === 'AbortError';
+    const transient = !cancelled && _isTransientConnectorFailure(err);
+    const entry = findCatalogEntry(id);
+    const hardAuth = !cancelled && !!entry
+      && (_isGoogleAuthFailure(entry, err) || _isDcrAuthFailure(entry, err));
+    if (cancelled || transient || hardAuth) {
+      const current = _conns.get(id);
+      if (current === conn) {
+        _conns.delete(id);
+        try { await current.close(); } catch { /* close already logs */ }
+      }
+    }
+    if (transient) {
+      try {
+        const current = registry.load(uid).connections[id] || inst;
+        await _markDegradedOnTransientFailure(uid, current, err, 'tool_call');
+      } catch (statusErr) {
+        log.warn('failed to persist connector tool-call degradation', {
+          id,
+          error: (statusErr as Error).message,
+        });
+      }
+    } else if (hardAuth) {
+      try { await _markAuthorizationError(uid, id, (err as Error).message, 'tool_call_auth_failed'); }
+      catch { /* primary tool error still wins */ }
+    }
+    log.warn('connector tool call failed', {
+      id,
+      tool: name,
+      duration_ms: Date.now() - startedAt,
+      cancelled,
+      transient,
+      hard_auth: hardAuth,
+      error: logErrorSummary(err),
+    });
+    if (cancelled) throw _connectorCancelledError(opts.signal?.reason || err);
+    throw err;
+  }
+}
+
+function _connectorCancelledError(_reason: unknown): Error & { code: string } {
+  const error = new Error('connector tool call cancelled') as Error & { code: string };
+  error.name = 'AbortError';
+  error.code = 'E_TOOL_CALL_CANCELLED';
+  return error;
+}
+
+async function _waitForConnectorOrAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw _connectorCancelledError(signal.reason);
+  let listener: (() => void) | null = null;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    listener = () => reject(_connectorCancelledError(signal.reason));
+    signal.addEventListener('abort', listener, { once: true });
+  });
+  try { return await Promise.race([promise, cancelled]); }
+  finally { if (listener) signal.removeEventListener('abort', listener); }
 }
 
 function _connectFailureMessage(id: string, updated: ConnectorInstance): string {

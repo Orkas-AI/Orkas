@@ -24,24 +24,25 @@ let _settingsState = {
   ttsProfiles: [],
   ttsProviderSel: null,
   dragState: null,
+  taskNotifications: {
+    enabled: true,
+    permission: { state: 'unknown', can_open_settings: false },
+  },
+  taskNotificationsBound: false,
+  taskNotificationPermissionRefreshTimer: null,
   clientConfigBound: false,
 };
 
 function _settingsTrackClick() {}
 
-function _settingsTrackModelProviderSelect(surface, provider) {
-  const value = String(provider || '').trim();
-  if (!value) return;
-  _settingsTrackClick('model_provider_select', { surface, provider: value });
+function _settingsTrackEvent(action, payload) {
+  void action;
+  void payload;
 }
 
-function _settingsTrackModelSelect(surface, provider, model) {
-  const modelValue = String(model || '').trim();
-  if (!modelValue) return;
-  const payload = { surface, model: modelValue };
-  const providerValue = String(provider || '').trim();
-  if (providerValue) payload.provider = providerValue;
-  _settingsTrackClick('model_model_select', payload);
+function _settingsTrackError(action, payload) {
+  void action;
+  void payload;
 }
 
 async function _settingsSafeCall(label, fn) {
@@ -58,6 +59,7 @@ async function loadSettings() {
   // (通用 by default — matches the is-active class on the markup).
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
+  _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
   _settingsSyncLanguageRadio();
   await Promise.all([
@@ -68,6 +70,7 @@ async function loadSettings() {
     _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
     _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
     _settingsSafeCall('settings tts refresh', _settingsRefreshTtsProfiles),
+    _settingsSafeCall('settings task notifications refresh', _settingsRefreshTaskNotifications),
     _settingsSafeCall('settings commander avatar refresh', _settingsRefreshCommanderAvatar),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -79,6 +82,7 @@ async function loadSettings() {
   await _settingsSafeCall('settings image render', _settingsRenderImageSection);
   await _settingsSafeCall('settings video render', _settingsRenderVideoSection);
   await _settingsSafeCall('settings tts render', _settingsRenderTtsEntries);
+  await _settingsSafeCall('settings task notifications render', _settingsRenderTaskNotifications);
   await _settingsSafeCall('settings commander avatar render', _settingsRenderCommanderAvatar);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
@@ -90,6 +94,128 @@ async function loadSettings() {
   // which only fires on state changes — for a Free user with no transitions the
   // listener never fires after boot, leaving the button bound to whatever its
   // first render captured).
+}
+
+// ── Native task notifications ──
+
+function _settingsTaskNotificationPermissionState(state) {
+  return String(state?.permission?.state || 'unknown');
+}
+
+async function _settingsRefreshTaskNotifications() {
+  try {
+    const res = await window.orkas.invoke('prefs.getTaskNotifications');
+    _settingsState.taskNotifications = (res && res.ok)
+      ? {
+          enabled: !!res.enabled,
+          permission: {
+            state: String(res.permission && res.permission.state || 'unknown'),
+            can_open_settings: !!(res.permission && res.permission.can_open_settings),
+          },
+        }
+      : {
+          enabled: true,
+          permission: { state: 'unknown', can_open_settings: false },
+        };
+  } catch (_) {
+    _settingsState.taskNotifications = {
+      enabled: true,
+      permission: { state: 'unknown', can_open_settings: false },
+    };
+  }
+}
+
+function _settingsBindTaskNotificationsOnce() {
+  if (_settingsState.taskNotificationsBound) return;
+  _settingsState.taskNotificationsBound = true;
+  window.addEventListener('focus', () => {
+    if (typeof currentView !== 'undefined' && currentView !== 'settings') return;
+    if (_settingsState.taskNotificationPermissionRefreshTimer) {
+      clearTimeout(_settingsState.taskNotificationPermissionRefreshTimer);
+    }
+    _settingsState.taskNotificationPermissionRefreshTimer = setTimeout(async () => {
+      _settingsState.taskNotificationPermissionRefreshTimer = null;
+      await _settingsRefreshTaskNotifications();
+      _settingsRenderTaskNotifications();
+    }, 350);
+  });
+}
+
+function _settingsRenderTaskNotifications() {
+  const cb = document.getElementById('settings-task-notifications-toggle');
+  if (!cb) return;
+  const state = _settingsState.taskNotifications || {
+    enabled: true,
+    permission: { state: 'unknown', can_open_settings: false },
+  };
+  cb.checked = !!state.enabled;
+
+  const warning = document.getElementById('settings-task-notification-permission');
+  const openBtn = document.getElementById('settings-task-notification-open-settings');
+  const permissionDenied = state.enabled && state.permission && state.permission.state === 'denied';
+  if (warning) warning.hidden = !permissionDenied;
+  if (openBtn) {
+    openBtn.hidden = !(state.permission && state.permission.can_open_settings);
+    if (!openBtn.dataset.bound) {
+      openBtn.addEventListener('click', async () => {
+        openBtn.disabled = true;
+        try {
+          await window.orkas.invoke('prefs.openTaskNotificationSettings');
+        } catch (err) {
+          _settingsLog.warn('open task notification settings failed', err);
+        } finally {
+          openBtn.disabled = false;
+        }
+      });
+      openBtn.dataset.bound = '1';
+    }
+  }
+
+  if (!cb.dataset.bound) {
+    cb.addEventListener('change', async () => {
+      const next = !!cb.checked;
+      const currentState = _settingsState.taskNotifications || {
+        enabled: true,
+        permission: { state: 'unknown', can_open_settings: false },
+      };
+      const previous = !!currentState.enabled;
+      const permissionState = _settingsTaskNotificationPermissionState(currentState);
+      cb.disabled = true;
+      try {
+        const res = await window.orkas.invoke('prefs.setTaskNotifications', { enabled: next });
+        if (res && res.ok) {
+          _settingsState.taskNotifications = {
+            ...currentState,
+            enabled: !!res.enabled,
+            permission: res.permission
+              ? {
+                  state: String(res.permission.state || 'unknown'),
+                  can_open_settings: !!res.permission.can_open_settings,
+                }
+              : currentState.permission,
+          };
+          _settingsLog.info('task notification toggle saved', {
+            previous_enabled: previous,
+            enabled: !!res.enabled,
+            permission_state: _settingsTaskNotificationPermissionState(_settingsState.taskNotifications),
+          });
+        } else {
+          _settingsState.taskNotifications = { ...currentState, enabled: previous };
+          _settingsLog.warn('set task notifications rejected', {
+            target_enabled: next,
+            error: String(res?.error || 'preference update rejected'),
+          });
+        }
+      } catch (err) {
+        _settingsState.taskNotifications = { ...currentState, enabled: previous };
+        _settingsLog.warn('set task notifications failed', err);
+      } finally {
+        cb.disabled = false;
+        _settingsRenderTaskNotifications();
+      }
+    });
+    cb.dataset.bound = '1';
+  }
 }
 
 function _settingsBindClientConfigOnce() {}
@@ -239,10 +365,20 @@ function _settingsRenderMetacognition() {
           // Roll back the UI on write failure.
           cb.checked = !next;
           _settingsLog.warn('setMetacognition rejected', res);
+          _settingsTrackEvent('metacognition_toggle_result', { result: 'failure', enabled: !next });
+          _settingsTrackError('metacognition_toggle', {
+            error_type: 'operation',
+            error_message: 'metacognition_toggle_rejected',
+          });
         }
       } catch (err) {
         cb.checked = !next;
         _settingsLog.warn('setMetacognition failed', err);
+        _settingsTrackEvent('metacognition_toggle_result', { result: 'failure', enabled: !next });
+        _settingsTrackError('metacognition_toggle', {
+          error_type: 'operation',
+          error_message: 'metacognition_toggle_failed',
+        });
       }
     });
     cb.dataset.bound = '1';
@@ -273,6 +409,11 @@ function _settingsRenderDataRoot() {
         await window.orkas.invoke('app.openDataRoot');
       } catch (err) {
         _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
+        _settingsTrackEvent('settings_open_data_root_result', { result: 'failure' });
+        _settingsTrackError('settings_open_data_root', {
+          error_type: 'operation',
+          error_message: 'open_data_root_failed',
+        });
       }
     });
     btn.dataset.bound = '1';
@@ -390,7 +531,6 @@ async function _settingsRenderPicker() {
       placeholder: t('settings.picker.select_provider'),
     });
     _settingsState.pickerProviderSel.onChange(async (val) => {
-      _settingsTrackModelProviderSelect('model_auth_picker', val);
       await _settingsPopulatePickerModel(val, '');
       _settingsSetStatus('settings-picker-status', '', '');
     });
@@ -409,7 +549,6 @@ async function _settingsRenderPicker() {
       placeholder: t('settings.picker.pick_provider_first'),
     });
     _settingsState.pickerModelSel.onChange((val) => {
-      _settingsTrackModelSelect('model_auth_picker', _settingsState.pickerProviderSel?.getValue(), val);
       _settingsSetStatus('settings-picker-status', '', '');
     });
   }
@@ -876,7 +1015,6 @@ function _settingsRenderEntryRow(entry, idx) {
     });
     modelSel.onChange(async (val) => {
       if (!val || val === entry.model) return;
-      _settingsTrackModelSelect('configured_model_entry', entry.provider, val);
       const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
       if (!up || !up.ok) {
         await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));

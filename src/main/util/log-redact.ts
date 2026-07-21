@@ -24,9 +24,14 @@ export function logCorrelationId(nowMs = Date.now(), seq = 0): string {
 }
 
 export function logPathRef(relPath: unknown): Record<string, unknown> {
-  const rel = normalizePathForLog(relPath);
+  const raw = String(relPath || '');
+  const rel = normalizePathForLog(raw);
   const parts = rel.split('/').filter(Boolean);
-  const root = parts[0] === 'cloud' ? parts[1] || 'unknown' : parts[0] || 'unknown';
+  const root = parts[0] === 'cloud' || parts[0] === 'local'
+    ? parts[1] || parts[0]
+    : path.isAbsolute(raw)
+      ? 'absolute'
+      : 'relative';
   const base = parts[parts.length - 1] || '';
   const ext = path.extname(base).toLowerCase();
   return {

@@ -273,7 +273,7 @@ export async function readVideoProductionPlanIdentity(planPath: string): Promise
     if (segment.source === 'compose') {
       const binding = isRecord(spec.composition_plan) ? spec.composition_plan : null;
       if (!binding || !Array.isArray(binding.scenes) || binding.scenes.length === 0) {
-        throw new Error(`E_VIDEO_PRODUCTION_COMPOSITION_BINDING_REQUIRED: segment ${segment.id} needs spec.composition_plan.scenes before Gate B approval`);
+        throw new Error(`E_VIDEO_PRODUCTION_COMPOSITION_BINDING_REQUIRED: segment ${segment.id} needs spec.composition_plan.scenes before production plan confirmation`);
       }
     }
     if (segment.source === 'provided' && (spec.kind !== 'image' && spec.kind !== 'video')) {
@@ -406,7 +406,7 @@ export async function validateVideoProductionPlanApproval(input: {
       delete next.plan_approval;
       delete next.generation_approval;
     });
-    throw new Error('E_VIDEO_PRODUCTION_GATE_B_STALE: plan.json changed after Gate B approval');
+    throw new Error('E_VIDEO_PRODUCTION_GATE_B_STALE: plan.json changed after production plan confirmation');
   }
   return { identity, state };
 }
@@ -453,7 +453,7 @@ function assertGenerationRequestMatchesIntent(
 ): void {
   const actualPrompt = typeof request.prompt === 'string' ? request.prompt.trim() : '';
   if (actualPrompt !== intent.prompt) {
-    throw new Error('E_VIDEO_PRODUCTION_GENERATION_PROMPT_MISMATCH: the provider prompt differs from the Gate B plan');
+    throw new Error('E_VIDEO_PRODUCTION_GENERATION_PROMPT_MISMATCH: the provider prompt differs from the confirmed production plan');
   }
   const stringList = (value: unknown): string[] => Array.isArray(value)
     ? value.map(String).map((item) => item.trim()).filter(Boolean)
@@ -533,13 +533,13 @@ export async function beginVideoProductionGeneration(input: {
       state.revision += 1;
       state.updated_at = new Date().toISOString();
       await writeState(input.statePath, state);
-      throw new Error('E_VIDEO_PRODUCTION_GATE_B_STALE: plan.json changed after Gate B approval');
+      throw new Error('E_VIDEO_PRODUCTION_GATE_B_STALE: plan.json changed after production plan confirmation');
     }
     const approval = state.generation_approval;
     if (!approval
       || approval.plan_signature !== identity.signature
       || approval.intent_signature !== identity.intent_signature) {
-      throw new Error('E_VIDEO_PRODUCTION_GATE_C_REQUIRED: obtain explicit Gate C approval for the current generation intents');
+      throw new Error('E_VIDEO_PRODUCTION_GATE_C_REQUIRED: obtain explicit paid generation confirmation for the current generation intents');
     }
     const intent = identity.generation_intents.find((candidate) => candidate.segment_id === input.segmentId);
     if (!intent) throw new Error(`E_VIDEO_PRODUCTION_SEGMENT_NOT_APPROVED: no approved generate segment ${input.segmentId}`);
@@ -565,10 +565,10 @@ export async function beginVideoProductionGeneration(input: {
       return { status: 'reused' as const, transaction: existing, intent };
     }
     if (existing?.status === 'pending' && existing.approval_id === approval.approval_id) {
-      throw new Error('E_VIDEO_PRODUCTION_GENERATION_UNCERTAIN: the prior billable request may still have completed; do not retry without a new explicit Gate C approval');
+      throw new Error('E_VIDEO_PRODUCTION_GENERATION_UNCERTAIN: the prior billable request may still have completed; do not retry without a new explicit paid generation confirmation');
     }
     if (existing?.status === 'failed' && existing.approval_id === approval.approval_id) {
-      throw new Error('E_VIDEO_PRODUCTION_GENERATION_REAPPROVAL_REQUIRED: the prior attempt failed after dispatch; obtain a new explicit Gate C approval before retrying');
+      throw new Error('E_VIDEO_PRODUCTION_GENERATION_REAPPROVAL_REQUIRED: the prior attempt failed after dispatch; obtain a new explicit paid generation confirmation before retrying');
     }
     const reservedOutputPaths = [...new Set([
       input.outputPath,
@@ -579,7 +579,7 @@ export async function beginVideoProductionGeneration(input: {
         ? existing.reserved_output_paths
         : [existing.output_path];
       if (uncertainPaths.some((candidate) => reservedOutputPaths.includes(path.resolve(candidate)))) {
-        throw new Error('E_VIDEO_PRODUCTION_OUTPUT_RESERVED_BY_UNCERTAIN_ATTEMPT: the previous provider request may still write this path; after explicit Gate C reapproval choose a new output path');
+        throw new Error('E_VIDEO_PRODUCTION_OUTPUT_RESERVED_BY_UNCERTAIN_ATTEMPT: the previous provider request may still write this path; after renewed paid generation confirmation choose a new output path');
       }
     }
     for (const transaction of Object.values(state.transactions)) {

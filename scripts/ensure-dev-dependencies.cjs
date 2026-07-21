@@ -18,6 +18,10 @@ function run(label, script, args = []) {
 
 function main() {
   console.log(`[dev-deps] preparing built-in dependencies for ${process.platform}-${process.arch}`);
+  run('notification permission addon', 'scripts/build-notification-permission-addon.cjs', [
+    '--platform', process.platform,
+    '--arch', process.arch,
+  ]);
   run('SQLite Electron ABI', 'scripts/ensure-sqlite-electron-abi.mjs');
   run('runtime ensure', 'bin/ensure-runtime.cjs', [
     '--root', path.join(pcRoot, 'resources', 'runtime'),

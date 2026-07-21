@@ -195,6 +195,21 @@ describe("Errors", () => {
       expect(getRetryErrorPolicy().permanent_statuses).toEqual([]);
     });
 
+    it("never retries a provider set already exhausted by the rotating provider", () => {
+      for (const code of [
+        "PROVIDER_NO_FIRST_EVENT_TIMEOUT",
+        "PROVIDER_NETWORK_EXHAUSTED",
+        "PROVIDER_RATE_LIMIT_EXHAUSTED",
+      ]) {
+        const err = Object.assign(new Error("provider candidates exhausted"), { code });
+        expect(classifyRetryableErrorWithPolicy(err, {
+          permanent_statuses: [],
+          permanent_message_patterns: [],
+          permanent_code_patterns: [],
+        })).toBeNull();
+      }
+    });
+
     it("allows runtime retry policy to add permanent message patterns", () => {
       configureRetryErrorPolicy({
         permanent_message_patterns: ["custom_hard_stop"],

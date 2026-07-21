@@ -129,6 +129,9 @@ async function bootApp() {
   // chat render finds the commander avatar warm; one cheap IPC, worth
   // it to avoid a default-avatar flash on the first frame.
   _restoreLastView();
+  if (typeof _consumePendingTaskNotificationConversation === 'function') {
+    _consumePendingTaskNotificationConversation();
+  }
   if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
   // Inline `delete_file` confirm-card subscription is attached here (NOT in
   // Stage C) so a tool call fired within the first 2.5 s of boot still has
@@ -412,7 +415,9 @@ function setView(view, cid, opts = {}) {
       container.innerHTML = '';
       if (typeof _replayBufferedGroupEvents === 'function') _replayBufferedGroupEvents(cid);
     } else if (!streamBubbleAlive) {
-      loadConversationHistory(cid);
+      loadConversationHistory(cid, opts.historyTarget ? { searchTarget: opts.historyTarget } : undefined);
+    } else if (opts.historyTarget && typeof _revealConversationHistorySearchTarget === 'function') {
+      _revealConversationHistorySearchTarget(cid, opts.historyTarget);
     }
     // If this conversation is still pending a response, re-attach loading indicator
     if (isConvPending(cid) && !opts.skipLoad && !streamBubbleAlive) {

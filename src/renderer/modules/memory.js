@@ -43,10 +43,10 @@ async function _memInvoke(channel, payload) {
 
   try {
     const res = await window.orkas.invoke(channel, payload || {});
-    if (res && res.ok === false) _memTrackError('memory_ipc_result', { channel, msg: res.error || 'failed' });
+    if (res && res.ok === false) _memTrackError('memory_ipc_result', { channel, error_message: res.error || 'failed' });
     return res || { ok: false, error: 'no response' };
   } catch (err) {
-    _memTrackError('memory_ipc', { channel, msg: (err && err.message) || String(err) });
+    _memTrackError('memory_ipc', { channel, error_message: (err && err.message) || String(err) });
     return { ok: false, error: (err && err.message) || String(err) };
   }
 }
@@ -258,43 +258,35 @@ async function _memOnPageAction(e) {
 
   switch (action) {
     case 'back':
-      _memTrack('memory_back_settings');
       if (typeof setView === 'function') setView('settings');
       return;
     case 'open-import':
-      _memTrack('memory_import_open', { mode: 'paste' });
       _memOpenImport('paste');
       return;
     case 'open-export':
-      _memTrack('memory_export_open');
       _memOpenExport();
       return;
     case 'add':
-      _memTrack('memory_entry_add_start', { target });
       _memEditor = { target, mode: 'add' };
       _memRerender();
       return;
     case 'edit': {
       const text = ((_memData[target] && _memData[target].entries) || [])[Number(idx)];
       if (text === undefined) return;
-      _memTrack('memory_entry_edit_start', { target, idx: Number(idx) });
       _memEditor = { target, mode: 'edit', oldText: text };
       _memRerender();
       return;
     }
     case 'cancel-edit':
-      _memTrack('memory_entry_edit_cancel', { target: _memEditor && _memEditor.target, mode: _memEditor && _memEditor.mode });
       _memEditor = null;
       _memRerender();
       return;
     case 'save-edit':
-      _memTrack('memory_entry_save_click', { target, mode: _memEditor && _memEditor.mode });
       await _memSaveEditor(target);
       return;
     case 'delete': {
       const text = ((_memData[target] && _memData[target].entries) || [])[Number(idx)];
       if (text === undefined) return;
-      _memTrack('memory_entry_delete_click', { target, idx: Number(idx) });
       await _memDelete(target, text);
       return;
     }
@@ -326,11 +318,12 @@ async function _memSaveEditor(target) {
     ? await _memInvoke('memory.replace', _memScopePayload(target, { oldText: _memEditor.oldText, content }))
     : await _memInvoke('memory.add', _memScopePayload(target, { content }));
   if (!res.ok) {
-    _memTrackError('memory_entry_save', { target, mode: isEdit ? 'edit' : 'add', msg: res.error || 'failed' });
+    _memTrackEvent('memory_entry_save_result', { result: 'failure', target, mode: isEdit ? 'edit' : 'add' });
+    _memTrackError('memory_entry_save', { target, mode: isEdit ? 'edit' : 'add', error_message: res.error || 'failed' });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrack('memory_entry_save_ok', { target, mode: isEdit ? 'edit' : 'add', chars: content.length });
+  _memTrackEvent('memory_entry_save_result', { result: 'success', target, mode: isEdit ? 'edit' : 'add', chars: content.length });
   _memEditor = null;
   // Refresh just this scope from the op result (it already carries entries+usage).
   const prev = _memData[target] || {};
@@ -345,11 +338,12 @@ async function _memDelete(target, text) {
   if (!ok) return;
   const res = await _memInvoke('memory.remove', _memScopePayload(target, { oldText: text }));
   if (!res.ok) {
-    _memTrackError('memory_entry_delete', { target, msg: res.error || 'failed' });
+    _memTrackEvent('memory_entry_delete_result', { result: 'failure', target });
+    _memTrackError('memory_entry_delete', { target, error_message: res.error || 'failed' });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrack('memory_entry_delete_ok', { target });
+  _memTrackEvent('memory_entry_delete_result', { result: 'success', target });
   const prev = _memData[target] || {};
   _memData[target] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
@@ -438,7 +432,6 @@ function _memOpenImport(mode) {
   host.querySelectorAll('[data-mem-import-tab]').forEach((tab) => {
     tab.addEventListener('click', () => {
       const which = tab.getAttribute('data-mem-import-tab');
-      _memTrack('memory_import_mode', { mode: which });
       host.querySelectorAll('[data-mem-import-tab]').forEach((tt) => tt.classList.toggle('is-active', tt === tab));
       if (which === 'file') _memPickImportFile(ta, updateStat);
       else ta.focus();
@@ -477,9 +470,8 @@ function _memDecodeBase64Text(b64) {
 
 async function _memDoParse(text) {
   if (!text.trim()) { _memToast(t('memory.import_empty'), 'warning'); return; }
-  _memTrack('memory_import_parse', { chars: text.length });
   const res = await _memInvoke('memory.importParse', { text });
-  if (!res.ok || !Array.isArray(res.items)) { _memTrackError('memory_import_parse', { msg: res.error || 'failed' }); _memToast(t('memory.error_generic'), 'error'); return; }
+  if (!res.ok || !Array.isArray(res.items)) { _memTrackError('memory_import_parse', { error_message: res.error || 'failed' }); _memToast(t('memory.error_generic'), 'error'); return; }
   if (!res.items.length) { _memToast(t('memory.import_empty'), 'warning'); return; }
   // Flagged items default to unchecked; clean ones checked. The backend
   // classifier emits 'memory'|'user' — normalize 'memory' → 'shared'.
@@ -543,7 +535,6 @@ function _memBindImportReview(host) {
   host.querySelectorAll('[data-mem-action="toggle-keep"]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const i = Number(btn.getAttribute('data-mem-row'));
-      _memTrack('memory_import_toggle_keep', { row: i, keep: !_memImportItems[i].keep });
       _memImportItems[i].keep = !_memImportItems[i].keep;
       _memOpenImportReview(); // re-render keeps state simple
     });
@@ -551,18 +542,15 @@ function _memBindImportReview(host) {
   host.querySelectorAll('[data-mem-action="set-target"]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const i = Number(btn.getAttribute('data-mem-row'));
-      _memTrack('memory_import_set_target', { row: i, target: btn.getAttribute('data-mem-target') });
       _memImportItems[i].target = btn.getAttribute('data-mem-target');
       _memOpenImportReview();
     });
   });
   host.querySelectorAll('[data-mem-action="modal-close"]').forEach((b) => b.addEventListener('click', _memCloseModal));
   host.querySelector('#memory-review-back').addEventListener('click', () => {
-    _memTrack('memory_import_back');
     _memOpenImport('paste');
   });
   host.querySelector('#memory-review-merge').addEventListener('click', () => {
-    _memTrack('memory_import_merge_click', { kept: _memImportItems.filter((it) => it.keep).length });
     _memDoMerge();
   });
 }
@@ -593,7 +581,11 @@ async function _memDoMerge() {
   _memCloseModal();
   if (added) _memToast(t('memory.merge_done', { n: added }), 'success');
   if (failed) _memToast(t('memory.merge_partial', { n: failed }), 'warning');
-  _memTrack('memory_import_merge_done', { added, failed });
+  _memTrackEvent('memory_import_result', {
+    result: failed ? (added ? 'partial_failure' : 'failure') : 'success',
+    added_count: added,
+    failed_count: failed,
+  });
   await renderMemoryPage();
 }
 

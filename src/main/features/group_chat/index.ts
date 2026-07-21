@@ -270,6 +270,174 @@ export async function send(
   }
 }
 
+export type FailedTurnRetryMode = 'resume' | 'restart';
+
+export interface RetryFailedTurnInput {
+  userId: string;
+  cid: string;
+  failedMessageId: string;
+  /** Short localized text rendered in the user's bubble (for example,
+   * "Continue"). The model receives host-owned text below. */
+  visibleText: string;
+}
+
+export interface ResolvedFailedTurnRetry {
+  mode: FailedTurnRetryMode;
+  enqueue: Parameters<typeof enqueue>[0];
+}
+
+const RETRY_RESUME_MODEL_TEXT = [
+  '<task-retry mode="resume">',
+  'Continue the unfinished task from the durable state in this same session.',
+  'Read the authoritative execution plan, completed-work ledger, prior tool results, and history resources before acting.',
+  'Do not repeat work already verified as successful. If an external, paid, destructive, or otherwise non-idempotent operation was interrupted with an uncertain outcome, verify its current state before deciding whether to run it again.',
+  'Respect every existing confirmation and permission gate. Complete the remaining work or report the smallest blocker that still requires the user.',
+  '</task-retry>',
+].join('\n');
+
+function _processHasCompletedOrStartedTool(msg: GroupMessage): boolean {
+  return (msg.process || []).some((item) => {
+    const event = item && typeof item === 'object' && 'event' in item ? item.event : undefined;
+    if (!event || event.stream !== 'tool') return false;
+    const data = event.data && typeof event.data === 'object'
+      ? event.data as Record<string, unknown>
+      : {};
+    return /^(?:start|running|request|call|begin|end|result)$/.test(String(data.phase || data.status || '').toLowerCase());
+  });
+}
+
+/** Resolve one failed-bubble retry without mutating conversation state. The
+ * main process owns this decision so the renderer cannot guess from localized
+ * text or stale DOM. */
+export async function resolveFailedTurnRetry(
+  input: RetryFailedTurnInput,
+): Promise<{ ok: true; value: ResolvedFailedTurnRetry } | { ok: false; error: string }> {
+  const { userId, cid, failedMessageId } = input;
+  const visibleText = String(input.visibleText || '').trim();
+  if (!safeId(cid) || !safeId(failedMessageId)) return { ok: false, error: 'invalid retry target' };
+  if (!visibleText) return { ok: false, error: 'empty retry message' };
+
+  const rows = await readJsonl<GroupMessage>(mainJsonlFile(userId, cid), 100_000);
+  const failedIndex = rows.findIndex((row) => row.id === failedMessageId && !row.deleted_at);
+  if (failedIndex < 0) return { ok: false, error: 'failed message not found' };
+  const failed = rows[failedIndex];
+  if (!failed.from || failed.from === USER_ID || failed.dispatch) {
+    return { ok: false, error: 'retry target is not an assistant reply' };
+  }
+  if (!failed.failure_kind && !failed.failure_code) {
+    return { ok: false, error: 'retry target is not a failed assistant reply' };
+  }
+
+  let sourceIndex = failedIndex - 1;
+  while (sourceIndex >= 0) {
+    const row = rows[sourceIndex];
+    if (!row.deleted_at && !row.dispatch && row.from === USER_ID && String(row.text || '').trim()) break;
+    sourceIndex -= 1;
+  }
+  if (sourceIndex < 0) return { ok: false, error: 'retry source message not found' };
+  const source = rows[sourceIndex];
+
+  await seedReservedActors(userId, cid);
+  const members = await readMembers(userId, cid);
+  const actor = members.actors.find((item) => item.id === failed.from);
+  if (!actor || actor.kind === 'user' || actor.kind === 'worker') {
+    return { ok: false, error: 'retry actor is unavailable' };
+  }
+
+  let context: {
+    activeTurn?: { id: number };
+    completedTurns?: Array<{ id: number }>;
+    executionPlan?: { updatedTurnId: number; objectiveTurnId: number };
+    completedWork?: Array<{ turnId: number }>;
+    resources?: Array<{ sourceTurnId?: number }>;
+  } | null = null;
+  try {
+    const { getSession } = await import('../../model/core-agent/session-store');
+    context = (await getSession(actorSessionId(cid, actor))).getSerializedContextState();
+  } catch (err) {
+    log.warn('retry context inspection failed', { error: logErrorRef(err) });
+  }
+
+  const activeTurnId = context?.activeTurn?.id;
+  const latestCompletedTurnId = context?.completedTurns?.length
+    ? context.completedTurns[context.completedTurns.length - 1]?.id
+    : undefined;
+  const attemptTurnId = activeTurnId || latestCompletedTurnId;
+  const planBelongsToAttempt = !!context?.executionPlan && !!attemptTurnId
+    && (
+      context.executionPlan.updatedTurnId === attemptTurnId
+      || context.executionPlan.objectiveTurnId === attemptTurnId
+      || !!activeTurnId
+    );
+  const completedWorkBelongsToAttempt = !!attemptTurnId
+    && (context?.completedWork || []).some((entry) => entry.turnId === attemptTurnId);
+  const resourceBelongsToAttempt = !!attemptTurnId
+    && (context?.resources || []).some((resource) => resource.sourceTurnId === attemptTurnId);
+  const attemptRows = rows.slice(sourceIndex + 1, failedIndex + 1);
+  // Actor sessions only expose their latest active/completed turn. If the
+  // user or this actor has produced a newer visible turn after the selected
+  // failure, that latest session state cannot be proven to belong to the old
+  // bubble. Restart the old authoritative request instead of attaching it to
+  // unrelated newer work.
+  const newerAttemptExists = rows.slice(failedIndex + 1).some((row) =>
+    !row.deleted_at
+    && !row.dispatch
+    && (row.from === USER_ID || row.from === failed.from),
+  );
+  const hasProduced = attemptRows.some((row) => Array.isArray(row.produced) && row.produced.length > 0);
+  const hasToolState = attemptRows.some(_processHasCompletedOrStartedTool);
+  const hasDurableState = !!activeTurnId
+    || planBelongsToAttempt
+    || completedWorkBelongsToAttempt
+    || resourceBelongsToAttempt
+    || hasProduced
+    || hasToolState;
+  // Configuration/dependency failures normally happen before the runner
+  // starts. A stale plan from an older turn must not turn those into a false
+  // resume; concrete state from this attempt still wins if it exists.
+  const failedBeforeExecution = /^(?:config|dependency)$/.test(String(failed.failure_kind || ''))
+    && !activeTurnId && !hasProduced && !hasToolState;
+  const mode: FailedTurnRetryMode = hasDurableState && !failedBeforeExecution && !newerAttemptExists
+    ? 'resume'
+    : 'restart';
+  const originalModelText = String(source.model_text || source.text || '');
+
+  return {
+    ok: true,
+    value: {
+      mode,
+      enqueue: {
+        uid: userId,
+        cid,
+        fromActorId: USER_ID,
+        text: visibleText,
+        model_text: mode === 'resume'
+          ? `${RETRY_RESUME_MODEL_TEXT}\n\nOriginal user request (quoted for objective continuity):\n${JSON.stringify(originalModelText)}`
+          : originalModelText,
+        forceTo: [actor.id],
+        ...(mode === 'resume' ? { resumeActiveTurn: true } : {}),
+        ...(source.use_selections?.length ? { use_selections: source.use_selections.slice() } : {}),
+        ...(mode === 'restart' && source.attachments?.length ? { attachments: source.attachments.slice() } : {}),
+        ...(mode === 'restart' && source.references?.length ? { references: source.references.slice() } : {}),
+      },
+    },
+  };
+}
+
+export async function retryFailedTurn(
+  input: RetryFailedTurnInput,
+): Promise<{ ok: boolean; mode?: FailedTurnRetryMode; msg?: GroupMessage; error?: string }> {
+  try {
+    const resolved = await resolveFailedTurnRetry(input);
+    if (!resolved.ok) return resolved;
+    const msg = await enqueue(resolved.value.enqueue);
+    return { ok: true, mode: resolved.value.mode, msg };
+  } catch (err) {
+    log.error('failed-turn retry failed', { error: logErrorRef(err) });
+    return { ok: false, error: (err as Error).message || String(err) };
+  }
+}
+
 // ── Abort + drop ─────────────────────────────────────────────────────────
 
 export async function abort(userId: string, cid: string): Promise<{ ok: boolean }> {
@@ -278,7 +446,7 @@ export async function abort(userId: string, cid: string): Promise<{ ok: boolean 
 }
 
 export async function dropConv(userId: string, cid: string): Promise<void> {
-  busDropConv(userId, cid);
+  await busDropConv(userId, cid);
   await purgeGroupDir(userId, cid);
 }
 

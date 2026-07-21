@@ -44,6 +44,7 @@ import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
   type ChatUseSelection,
   type ChatMessageReference,
+  type GroupMessageFailureKind,
   type MarketplaceInstallRequest,
 } from './visibility';
 import {
@@ -67,7 +68,7 @@ import type { AgentRunStatus } from '../agent_runtime_stats';
 import { isAgentEnabled, readDisabledSets } from '../component_enabled';
 import { finalizeProducedFile } from '../produced_output_hooks';
 import { selectVisibleProducedFiles } from '../produced_files';
-import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
+import { buildLanguageDirective, descriptionLang, normalizeLang, t } from '../../i18n';
 import { getLanguage } from '../config';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
@@ -417,6 +418,10 @@ function runtimeProcessItem(
     const value = Number(breakdown?.[key]);
     return Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
   };
+  const failurePhase = String(breakdown?.failure_phase || '');
+  const safeFailurePhase = /^(preflight|provider_wait|model_text|tool_input|tool|compaction)$/.test(failurePhase)
+    ? failurePhase
+    : '';
   return {
     type: 'event',
     event: {
@@ -427,6 +432,7 @@ function runtimeProcessItem(
         status,
         aborted,
         errored,
+        ...(safeFailurePhase ? { failure_phase: safeFailurePhase } : {}),
         ...(timing('provider_ms') !== undefined ? { provider_ms: timing('provider_ms') } : {}),
         ...(timing('tool_ms') !== undefined ? { tool_ms: timing('tool_ms') } : {}),
         ...(timing('compaction_ms') !== undefined ? { compaction_ms: timing('compaction_ms') } : {}),
@@ -513,6 +519,8 @@ interface QueueItem {
    * Used to grant read-only access to source attachment directories. */
   references?: ChatMessageReference[];
   useSelections?: ChatUseSelection[];
+  /** Preserve the target persistent session's active durable turn. */
+  resumeActiveTurn?: boolean;
   /** Shadow-tap marker: this turn was triggered NOT because the actor was
    * a declared recipient (`to` includes them), but because the bus woke
    * them as an observer (e.g. commander wakes on every agent → user reply
@@ -555,6 +563,10 @@ interface WorkerState {
   /** Set by `dropConv` so the worker loop can exit cleanly instead of
    * blocking forever on `wake` after the cid state is gone. */
   terminated: boolean;
+  /** Resolves after the background loop has fully unwound. Deletion paths
+   * await this before removing conversation files so Windows never observes
+   * an in-flight writer under the directory being deleted. */
+  loopDone: Promise<void> | null;
   /** Marketplace install confirmations requested during a commander turn.
    * The model can stage these via `marketplace_request_install`; the user
    * decides in the renderer before any install side effect happens. */
@@ -579,6 +591,14 @@ interface CidState {
    * upstream waiters (IPC stream / waitForQuiescent in tests) don't
    * declare the bus done in the gap. */
   pendingEnqueues: number;
+  /** Set before deletion starts. New enqueue calls fail fast while existing
+   * calls drain, preventing a late admission from recreating an orphan worker
+   * or conversation file after dropConv returns. */
+  terminating: boolean;
+  pendingEnqueueWaiters: Set<() => void>;
+  /** File-persistence work intentionally kept off the worker's hot path.
+   * Conversation deletion drains this set before removing the directory. */
+  backgroundWrites: Set<Promise<void>>;
   nextTurnOrder: number;
   /** Visible nested dispatches (dispatch_to / hand_off_to / named run_worker)
    *  currently running in-process, keyed by their turnId. The nested worker is
@@ -597,7 +617,29 @@ interface CidState {
    *  fresh process can't tell its own prior writes from the user's
    *  anyway). */
   producedPaths: Set<string>;
+  /** One user-triggered run spans every top-level turn until the whole
+   * conversation bus becomes quiescent. It is intentionally content-free:
+   * terminal listeners may feed OS notifications and must never receive
+   * prompts, titles, or model output. */
+  taskRun?: {
+    runId: string;
+    startedAtMs: number;
+    status: TaskTerminalStatus | null;
+  };
 }
+
+export type TaskTerminalStatus = 'completed' | 'failed' | 'cancelled' | 'waiting_input';
+
+export interface TaskTerminalEvent {
+  run_id: string;
+  user_id: string;
+  conversation_id: string;
+  status: TaskTerminalStatus;
+  started_at_ms: number;
+  finished_at_ms: number;
+}
+
+export type TaskTerminalListener = (event: TaskTerminalEvent) => void;
 
 /**
  * Per-cid in-memory state (workers, listeners, producedPaths, …).
@@ -624,8 +666,16 @@ interface CidState {
 const _BUS_CIDS_KEY = Symbol.for('orkas.group_chat.bus._cids');
 const _cids: Map<string, CidState> =
   ((globalThis as any)[_BUS_CIDS_KEY] ??= new Map<string, CidState>());
+const _TASK_TERMINAL_LISTENERS_KEY = Symbol.for('orkas.group_chat.bus.task_terminal_listeners');
+const _taskTerminalListeners: Set<TaskTerminalListener> =
+  ((globalThis as any)[_TASK_TERMINAL_LISTENERS_KEY] ??= new Set<TaskTerminalListener>());
 
 function cidKey(uid: string, cid: string): string { return `${uid}:${cid}`; }
+let _enqueueAdmissionGateForTest: (() => Promise<void>) | null = null;
+
+export function _setEnqueueAdmissionGateForTest(gate: (() => Promise<void>) | null): void {
+  _enqueueAdmissionGateForTest = gate;
+}
 
 function getOrInitCid(uid: string, cid: string): CidState {
   const k = cidKey(uid, cid);
@@ -636,6 +686,9 @@ function getOrInitCid(uid: string, cid: string): CidState {
       workers: new Map(),
       listeners: new Set(),
       pendingEnqueues: 0,
+      terminating: false,
+      pendingEnqueueWaiters: new Set(),
+      backgroundWrites: new Set(),
       nextTurnOrder: 0,
       nestedTurns: new Map(),
       producedPaths: new Set(),
@@ -645,10 +698,68 @@ function getOrInitCid(uid: string, cid: string): CidState {
   return s;
 }
 
+function trackBackgroundWrite(state: CidState, work: Promise<void>, label: string): void {
+  let tracked!: Promise<void>;
+  tracked = work
+    .catch((err) => {
+      log.warn(`${label} failed cid=${state.cid}: ${(err as Error).message}`);
+    })
+    .finally(() => state.backgroundWrites.delete(tracked));
+  state.backgroundWrites.add(tracked);
+}
+
 export function subscribe(uid: string, cid: string, listener: GroupListener): () => void {
   const s = getOrInitCid(uid, cid);
   s.listeners.add(listener);
   return () => { s.listeners.delete(listener); };
+}
+
+/** Subscribe to privacy-safe conversation-run terminal events. The registry is
+ * global-symbol backed for the same dual-loader reason as `_cids` above. */
+export function subscribeTaskTerminals(listener: TaskTerminalListener): () => void {
+  _taskTerminalListeners.add(listener);
+  return () => { _taskTerminalListeners.delete(listener); };
+}
+
+function _recordTaskRunOutcome(state: CidState, status: TaskTerminalStatus): void {
+  const run = state.taskRun;
+  if (!run) return;
+  // Preserve the most actionable outcome when multiple top-level recipients
+  // finish in the same user-triggered run. An explicit stop always wins.
+  const rank: Record<TaskTerminalStatus, number> = {
+    completed: 1,
+    failed: 2,
+    waiting_input: 3,
+    cancelled: 4,
+  };
+  if (!run.status || rank[status] >= rank[run.status]) run.status = status;
+}
+
+function _emitTaskRunTerminalIfQuiescent(state: CidState, stateFile?: StateFile): void {
+  const run = state.taskRun;
+  if (!run || !isQuiescent(state.uid, state.cid)) return;
+  // Clear synchronously before notifying. Concurrent status reconciliations
+  // can now observe the run as finished and cannot emit it twice.
+  state.taskRun = undefined;
+  const waitingForUser = stateFile?.orchestration_ledger?.status === 'waiting_for_form'
+    || stateFile?.orchestration_ledger?.status === 'waiting_for_agent';
+  const status: TaskTerminalStatus = stateFile?.status === 'aborted'
+    ? 'cancelled'
+    : waitingForUser
+      ? 'waiting_input'
+      : run.status || 'failed';
+  const event: TaskTerminalEvent = {
+    run_id: run.runId,
+    user_id: state.uid,
+    conversation_id: state.cid,
+    status,
+    started_at_ms: run.startedAtMs,
+    finished_at_ms: Date.now(),
+  };
+  for (const listener of _taskTerminalListeners) {
+    try { listener(event); }
+    catch (err) { log.warn(`task terminal listener threw: ${(err as Error).message}`); }
+  }
 }
 
 function emit(state: CidState, ev: GroupEvent): void {
@@ -774,6 +885,7 @@ async function _syncStateStatus(state: CidState, forceRunning = false): Promise<
       active_turns: activeTurnsForState(state),
     });
   }
+  if (want === 'idle') _emitTaskRunTerminalIfQuiescent(state, result.state);
 }
 
 // ── Main jsonl helpers ───────────────────────────────────────────────────
@@ -807,7 +919,14 @@ export interface EnqueueParams {
   cid: string;
   fromActorId: string;
   text: string;
+  /** Structured source for a user-visible failure. This controls analytics
+   * taxonomy only; the rendered text still controls failure actions/UI. */
+  failure_kind?: GroupMessageFailureKind;
+  failure_code?: string;
   model_text?: string;
+  /** Host-verified failed-turn continuation. Kept off the persisted message
+   * schema; it only controls how the recipient worker opens its session. */
+  resumeActiveTurn?: boolean;
   attachments?: string[];
   use_selections?: ChatUseSelection[];
   references?: ChatMessageReference[];
@@ -873,15 +992,32 @@ export interface EnqueueParams {
 export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
   const { uid, cid, fromActorId, text } = params;
   const state = getOrInitCid(uid, cid);
+  if (state.terminating) {
+    throw Object.assign(new Error('conversation runtime is terminating'), {
+      code: 'E_CONVERSATION_TERMINATING',
+    });
+  }
+  if (fromActorId === USER_ID && !state.taskRun) {
+    state.taskRun = { runId: genId12(), startedAtMs: Date.now(), status: null };
+  }
   // Mark in-flight enqueue. `isQuiescent` returns false while >0 so
   // callers waiting for "everything done" don't hit the gap between
   // a sender's running=false and the recipient.queue.push that lives
   // late in this body. Reset in `finally` to cover throws.
   state.pendingEnqueues += 1;
   try {
+    if (_enqueueAdmissionGateForTest) await _enqueueAdmissionGateForTest();
     return await _enqueueBody(params, state);
   } finally {
     state.pendingEnqueues -= 1;
+    if (state.pendingEnqueues === 0 && state.pendingEnqueueWaiters.size > 0) {
+      const waiters = [...state.pendingEnqueueWaiters];
+      state.pendingEnqueueWaiters.clear();
+      for (const resolve of waiters) resolve();
+    }
+    if (state.taskRun) {
+      trackBackgroundWrite(state, _syncStateStatus(state), 'post-enqueue syncStateStatus');
+    }
   }
 }
 
@@ -1151,6 +1287,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(unknown.length ? { unknown_mentions: unknown } : {}),
     ...(mentions.length ? { mentions } : {}),
     text: rewrittenText,
+    ...(params.failure_kind ? { failure_kind: params.failure_kind } : {}),
+    ...(params.failure_code ? { failure_code: params.failure_code } : {}),
     ...(params.model_text && params.model_text.trim() ? { model_text: params.model_text } : {}),
     ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     ...(useSelections.length ? { use_selections: useSelections } : {}),
@@ -1222,6 +1360,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
       ...(msg.references && msg.references.length ? { references: msg.references.slice() } : {}),
       ...(msg.use_selections && msg.use_selections.length ? { useSelections: msg.use_selections.slice() } : {}),
+      ...(params.resumeActiveTurn ? { resumeActiveTurn: true } : {}),
     });
     const wake = w.wake; w.wake = null;
     wake?.();
@@ -1515,11 +1654,13 @@ function ensureRuntime(state: CidState): WorkerState {
     queue: [], running: false, wake: null,
     abortController: null, currentTurnId: null, currentMsgId: null,
     currentTurnOrder: null, currentTurnStartedAtMs: null, turnsThisActivation: 0,
-    terminated: false,
+    terminated: false, loopDone: null,
   };
   state.workers.set(RUNTIME_KEY, w);
   // Spawn loop. No await — runs in background; failures log + retry on next msg.
-  void runWorkerLoop(state, w);
+  w.loopDone = runWorkerLoop(state, w).catch((err) => {
+    log.error(`worker loop failed cid=${w.cid}: ${(err as Error).message}`);
+  });
   return w;
 }
 
@@ -1543,6 +1684,7 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
       const dropped = w.queue.slice();
       w.queue.length = 0;
       w.turnsThisActivation = 0;
+      _recordTaskRunOutcome(state, 'failed');
       // Surface the halt instead of silently dropping queued work: clear every
       // dropped item's streaming placeholder, persist one visible notice, then
       // reconcile status. Without this the renderer keeps a permanent
@@ -1584,6 +1726,7 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
     try {
       await runTurn(state, w, item);
     } catch (err) {
+      _recordTaskRunOutcome(state, 'failed');
       log.error(`worker turn failed cid=${w.cid} actor=${w.actor.id}: ${(err as Error).message}`);
       // Deterministic termination: an unexpected throw means runTurn skipped its
       // normal terminal emit (the persist `turn_end` message / `turn_silent`).
@@ -1620,9 +1763,7 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
     // is still pending, and by the time we set `w.wake=resolve` the wake
     // is gone. Fire-and-forget keeps the loop moving so the next iteration
     // either picks up real work or arms the wake correctly.
-    void _syncStateStatus(state).catch((err) => {
-      log.warn(`post-turn syncStateStatus failed cid=${w.cid} actor=${w.actor.id}: ${(err as Error).message}`);
-    });
+    trackBackgroundWrite(state, _syncStateStatus(state), `post-turn syncStateStatus actor=${w.actor.id}`);
   }
 }
 
@@ -1662,9 +1803,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   const turnStartedAt = Date.now();
 
   // Loop bookkeeping (running flag, in-flight marker, turn-start log) is the
-  // scheduler's; the reusable turn body lives in `runActorTurn`. The current
-  // loop ignores the returned result — it's there for G8d's nested dispatch
-  // path, which runs an actor turn in-process and reads back text/produced.
+  // scheduler's; the reusable turn body lives in `runActorTurn`. The top-level
+  // loop reads only its privacy-safe terminal classification; G8d's nested
+  // dispatch path additionally reads back text/produced for its caller.
   w.running = true;
   w.abortController = new AbortController();
   await _syncStateStatus(state, /*forceRunning*/ true);
@@ -1672,14 +1813,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   await emitStateChanged(state);
   log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} turn=${item.turnId} fromMsg=${item.msgId} from=${item.fromActorId}`);
 
-  await runActorTurn(state, w, item, turnStartedAt);
+  const result = await runActorTurn(state, w, item, turnStartedAt);
+  _recordTaskRunOutcome(
+    state,
+    result.kind === 'completed' ? result.terminalStatus : 'failed',
+  );
 }
 
 /** Result of one actor turn. `early` = a pre-stream guard already handled the
  *  turn (emitted its own bubble + cleared in-flight) and the caller must do
  *  nothing more. `completed` carries the turn's synthesized output: G8d's
  *  dispatch tool runs an actor turn as a nested sub-run and reads `text` /
- *  `produced` to hand back to its caller; the top-level loop ignores it. */
+ *  `produced` to hand back to its caller; the top-level loop uses only its
+ *  terminal status. */
 type ActorTurnResult =
   | { kind: 'early' }
   | {
@@ -1690,6 +1836,7 @@ type ActorTurnResult =
       persistedMsg: GroupMessage | null;
       errText?: string;
       aborted?: boolean;
+      terminalStatus: TaskTerminalStatus;
     };
 
 // One actor turn: per-role prompt/tools, model (or CLI agent) stream,
@@ -1857,6 +2004,8 @@ async function runActorTurn(
         uid, cid,
         fromActorId: actor.id,
         text: reply,
+        failure_kind: 'dependency',
+        failure_code: 'skill_disabled',
         forceTo: [USER_ID],
         turn_end: true,
         turn_id: item.turnId,      });
@@ -1933,6 +2082,8 @@ async function runActorTurn(
         uid, cid,
         fromActorId: actor.id,
         text: errBubble,
+        failure_kind: 'dependency',
+        failure_code: 'agent_unavailable',
         forceTo: [USER_ID],
         turn_end: true,
         turn_id: item.turnId,      });
@@ -2057,6 +2208,15 @@ async function runActorTurn(
   let streamingText = '';
   let errText: string | null = null;
   let aborted = false;
+  let turnFailureKind: GroupMessageFailureKind | undefined;
+  let turnFailureCode = '';
+  const markTurnFailure = (kind: GroupMessageFailureKind, code: string) => {
+    // Preserve the first causal failure. Later host-side validation warnings
+    // must not overwrite an already-recorded provider/config/CLI failure.
+    if (turnFailureKind) return;
+    turnFailureKind = kind;
+    turnFailureCode = code;
+  };
   let agentRunTimingData: Record<string, unknown> | undefined;
   // Wire the commander segment flush now that `streamingText` exists. Called
   // from a visible-dispatch tool BEFORE the dispatched agent runs, so the
@@ -2225,10 +2385,15 @@ async function runActorTurn(
       for (const p of cliOut.produced || []) await onFileWritten(p);
       finalText = cliOut.text;
       streamingText = cliOut.text;
-      if (cliOut.error) errText = cliOut.error;
+      if (cliOut.error) {
+        errText = cliOut.error;
+        markTurnFailure(cliOut.failureKind || 'runtime', cliOut.failureCode || 'cli_failed');
+      }
       if (cliOut.aborted) aborted = true;
     } catch (err) {
       errText = (err as Error).message || String(err);
+      aborted = !!w.abortController?.signal.aborted;
+      if (!aborted) markTurnFailure('runtime', 'cli_exception');
       log.warn(`cli stream threw cid=${cid} actor=${actor.id}: ${errText}`);
     } finally {
       w.abortController = null;
@@ -2248,6 +2413,7 @@ async function runActorTurn(
         ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
         cid,
         turnId: item.turnId,
+        ...(item.resumeActiveTurn ? { resumeActiveTurn: true } : {}),
         ...(turnProjectId ? { projectId: turnProjectId } : {}),
         onFileWritten,
         onOutputsPublished,
@@ -2308,6 +2474,9 @@ async function runActorTurn(
         // failure bubble vs treating 'empty response' as a tool-only turn.
         errText = ev.text || 'unknown error';
         aborted = !!(ev as { aborted?: boolean }).aborted;
+        if (!aborted) {
+          markTurnFailure(ev.failureKind || 'model', ev.failureCode || 'model_stream_error');
+        }
         log.warn(`stream error cid=${cid} actor=${actor.id}: ${errText}${aborted ? ' (aborted)' : ''}`);
       } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_result') {
         const inner = (ev.event as { data?: unknown } | undefined)?.data;
@@ -2360,6 +2529,8 @@ async function runActorTurn(
     }
   } catch (err) {
     errText = (err as Error).message || String(err);
+    aborted = !!w.abortController?.signal.aborted;
+    if (!aborted) markTurnFailure('model', 'model_stream_exception');
     log.warn(`stream threw cid=${cid} actor=${actor.id}: ${errText}`);
   } finally {
     // Salvage partial reply on abort — the event-mapper emits `error` (no
@@ -2502,10 +2673,12 @@ async function runActorTurn(
           if (editId) {
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
+              markTurnFailure('validation', 'agent_mutation_rejected');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
             } else if (target.source !== 'custom') {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
+              markTurnFailure('validation', 'agent_mutation_rejected');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
               // The open-source build only permits main-chat edits for
@@ -2515,6 +2688,7 @@ async function runActorTurn(
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
               } else {
+                markTurnFailure('validation', 'agent_mutation_rejected');
                 workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
               }
             }
@@ -2539,12 +2713,14 @@ async function runActorTurn(
                 }
               }
             } else {
+              markTurnFailure('validation', 'agent_mutation_rejected');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
             }
           }
         } catch (err) {
           const verb = editId ? 'edit' : 'create';
           log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
+          markTurnFailure('validation', 'agent_mutation_rejected');
           workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
         }
       }
@@ -2571,6 +2747,7 @@ async function runActorTurn(
             createdSkills.push({ skill_id: result.skillId, name: result.name, kind: result.kind });
             if (result.rejected && result.rejected.length) {
               const list = result.rejected.map((p) => `\`${p}\``).join(', ');
+              markTurnFailure('validation', 'skill_mutation_rejected');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
             }
             // Quality validator rejections: surface friendly warning to the
@@ -2579,6 +2756,7 @@ async function runActorTurn(
             // can rewrite. The fenced block is opaque to bus — it's just
             // text that survives into history.
             if (result.validation_failed && result.validation_failed.length) {
+              markTurnFailure('validation', 'skill_mutation_rejected');
               workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
             }
             if (result.validation_warnings && result.validation_warnings.length) {
@@ -2605,14 +2783,17 @@ async function runActorTurn(
             // Plain error (missing-name / collision / etc) shows the
             // localized message only.
             if (result.validation_failed && result.validation_failed.length) {
+              markTurnFailure('validation', 'skill_mutation_rejected');
               workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
             } else {
+              markTurnFailure('validation', 'skill_mutation_rejected');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
             }
           }
         } catch (err) {
           const verb = container.skillId ? 'edit' : 'create';
           log.error(`${verb}-skill failed cid=${cid}: ${(err as Error).message}`);
+          markTurnFailure('validation', 'skill_mutation_rejected');
           workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Skill ${verb} failed: ${(err as Error).message}</span>`;
         }
       }
@@ -2639,10 +2820,12 @@ async function runActorTurn(
                     : 'disabled';
             workingText = `${workingText}\n\n<span>Automation ${label}: ${name}</span>`;
           } else {
+            markTurnFailure('operation', 'auto_task_operation_failed');
             workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble(result.error || 'unknown error')}</span>`;
           }
         } catch (err) {
           log.error(`auto-task container failed cid=${cid}: ${(err as Error).message}`);
+          markTurnFailure('operation', 'auto_task_operation_failed');
           workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble((err as Error).message)}</span>`;
         }
       }
@@ -2674,6 +2857,8 @@ async function runActorTurn(
       finalText: workingText,
       errText,
       aborted,
+      ...(turnFailureKind ? { failureKind: turnFailureKind } : {}),
+      ...(turnFailureCode ? { failureCode: turnFailureCode } : {}),
       ...(form ? { form } : {}),
       ...(planInteraction ? { planInteraction } : {}),
       produced: visibleProduced,
@@ -2703,6 +2888,8 @@ async function runActorTurn(
           ...(visibleProduced.length ? { produced: visibleProduced } : {}),
           ...(createdAgents.length ? { createdAgents } : {}),
           ...(createdSkills.length ? { createdSkills } : {}),
+          ...(turnFailureKind ? { failureKind: turnFailureKind } : {}),
+          ...(turnFailureCode ? { failureCode: turnFailureCode } : {}),
         };
   }
   // Marketplace install requests are visible side effects of a commander
@@ -2832,6 +3019,8 @@ async function runActorTurn(
       uid, cid,
       fromActorId: actor.id,
       text: outcome.text,
+      ...(outcome.failureKind ? { failure_kind: outcome.failureKind } : {}),
+      ...(outcome.failureCode ? { failure_code: outcome.failureCode } : {}),
       ...(outcome.form ? { form: outcome.form } : {}),
       ...(outcome.produced && outcome.produced.length ? { produced: outcome.produced } : {}),
       ...(outcome.createdAgents && outcome.createdAgents.length ? { created_agents: outcome.createdAgents } : {}),
@@ -2979,7 +3168,28 @@ async function runActorTurn(
     + (aborted ? ' aborted=1' : ''),
   );
 
-  return { kind: 'completed', text: workingText, produced, outcome, persistedMsg, errText: errText || undefined, aborted };
+  const terminalStatus: TaskTerminalStatus = aborted
+    ? 'cancelled'
+    : (form || planInteraction === 'open')
+      ? 'waiting_input'
+      : (
+          errText
+          || actorRunStatus === 'failure'
+          || actorRunStatus === 'error'
+          || (outcome.kind === 'persist' && !!outcome.failureKind)
+        )
+        ? 'failed'
+        : 'completed';
+  return {
+    kind: 'completed',
+    text: workingText,
+    produced,
+    outcome,
+    persistedMsg,
+    errText: errText || undefined,
+    aborted,
+    terminalStatus,
+  };
 }
 
 // ── System prompts ───────────────────────────────────────────────────────
@@ -3023,7 +3233,7 @@ async function buildCommanderSystemPrompt(
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     shell_hint: process.platform === 'win32'
-      ? 'On native Windows, command execution runs in PowerShell by default; write ad-hoc commands for PowerShell, not POSIX shell syntax.'
+      ? 'On native Windows, command execution runs in PowerShell by default. Use `$env:NAME`, `;`, and PowerShell-native pipelines; do not use POSIX `&&`, heredocs, `head`, `mktemp`, or `/dev/null`. Invoke quoted executables with `&`, for example `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ...`.'
       : '',
     local_exec_state: permState,
     env_summary: envSummary,
@@ -3145,9 +3355,9 @@ async function buildAgentInGroupSystemPrompt(
   // / required / default / label / options to extract values, not the
   // multi-line user-facing copy. Empty / absent schema → empty placeholder
   // so the prompt branch "if you have inputs_schema" simply doesn't trigger.
-  const rawInputs = Array.isArray(agent.inputs) ? agent.inputs : [];
+  const rawInputs = resolveAgentInputsForRuntime(agent.inputs, getLanguage());
   const slimmed = rawInputs.map((f: any) => {
-    const { description: _d, placeholder: _p, ...rest } = f;
+    const { description: _d, placeholder: _p, default_by_ui_language: _dui, ...rest } = f;
     return rest;
   });
   const inputsSchemaJson = slimmed.length ? JSON.stringify(slimmed) : '';
@@ -3168,6 +3378,28 @@ async function buildAgentInGroupSystemPrompt(
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
+}
+
+function resolveAgentInputsForRuntime(inputs: unknown, uiLanguage: unknown): any[] {
+  const rawInputs = Array.isArray(inputs) ? inputs : [];
+  const normalizedUiLanguage = normalizeLang(uiLanguage) ?? 'en';
+  return rawInputs.map((field: any) => {
+    if (!field || typeof field !== 'object') return field;
+    const defaults = field.default_by_ui_language;
+    if (!defaults || typeof defaults !== 'object' || Array.isArray(defaults)) return field;
+    const resolvedDefault = defaults[normalizedUiLanguage] ?? defaults.en ?? field.default;
+    return {
+      ...field,
+      default: resolvedDefault,
+    };
+  });
+}
+
+export function _resolveAgentInputsForRuntimeForTest(
+  inputs: unknown,
+  uiLanguage: unknown,
+): any[] {
+  return resolveAgentInputsForRuntime(inputs, uiLanguage);
 }
 
 function pickAgentRuntimeDescription(agent: { description?: string; description_zh?: string; description_en?: string }): string {
@@ -3435,7 +3667,7 @@ async function runNestedDispatch(
     uid: state.uid, cid: state.cid, actor,
     queue: [], running: true, wake: null, abortController: ac,
     currentTurnId: null, currentMsgId: null, currentTurnOrder: null,
-    currentTurnStartedAtMs: null, turnsThisActivation: 0, terminated: false,
+    currentTurnStartedAtMs: null, turnsThisActivation: 0, terminated: false, loopDone: null,
   };
   const payload = composeLlmTurnPayload(state.uid, COMMANDER_ID, {
     id: genId12(), ts: nowIso(), from: COMMANDER_ID, to: [actor.id], text: task,
@@ -3524,10 +3756,11 @@ async function runNestedDispatch(
  * worker has no user to ask and its reply goes back to the commander, not the
  * chat. */
 const WORKER_WORKFLOW = [
-  'You are an ephemeral worker spun up by the commander to complete ONE bounded sub-task — you are the commander\'s hands, not an independent specialist.',
-  'The task is in the incoming message. Do it end to end using your available tools (files, shell, web, library, etc.).',
+  'You are an ephemeral worker spun up by the commander to complete ONE isolated auxiliary sub-task. You are a separate helper, not the commander itself.',
+  'Complete only the boundary stated in the incoming message using your available tools (files, shell, web, library, etc.); do not infer or continue the surrounding user goal or later milestones.',
+  'If the message assigns a coupled milestone chain or work that needs the commander\'s ongoing shared context, stop without changing files and return a concise scope-mismatch result so the commander can retain ownership.',
   'There is no user in this turn: never ask a question, request input, or emit a form — if something is ambiguous, make the most reasonable assumption and state it in your result.',
-  'Your reply is handed back to the commander verbatim (not shown to anyone else), so return the COMPLETE result it needs to act on. Put large artifacts in files and reference their paths; keep the reply itself focused on the result and any pointers.',
+  'Your reply is handed back to the commander verbatim (not shown to anyone else), so return the complete result for this delegated sub-task. Put large artifacts in files and reference their paths; keep the reply itself focused on the result and any pointers.',
 ].join(' ');
 
 function _toolError(error: string): { content: string; isError: true } {
@@ -4213,9 +4446,9 @@ async function buildCommanderExtraTools(
     // bounded by dispatchSlots. See dispatch_to above.
     executionMode: 'parallel',
     description: [
-      'Run a bounded sub-task and get its FULL result handed back to YOU (the commander) within this same call, so you can read it, synthesise, and decide the next step — the in-loop coordinator pattern.',
-      'Use this for a sub-task you own: a bounded job whose output you will build on, or heavy scanning whose bulk you do not want to keep in your own context.',
-      'Omit `to` to spin up a fresh anonymous worker (your own hands); set `to` to a named agent when that specialist\'s output is what you need back. To bring a domain agent into the conversation as its own visible participant, prefer `dispatch_to`.',
+      'Run ONE isolated auxiliary sub-task and get its full sub-task result handed back to YOU (the commander) within this same call, so you can read it, synthesise, and decide the next step — the in-loop coordinator pattern.',
+      'Use this only when the result can be consumed without sharing your evolving context. Never delegate a coupled milestone chain or work that needs your ongoing shared context.',
+      'Omit `to` to spin up a fresh anonymous helper and follow the batching boundary in your system instructions. Calling an anonymous worker is delegation, not self-execution, and it does not inherit your skills or evolving context. If the user explicitly requires you to do the work yourself, retain it; never use an anonymous worker as fallback for an unavailable agent. Set `to` to a named agent only when an actually available specialist\'s private output is what you need back. To bring a domain agent into the conversation as its own visible participant, prefer `dispatch_to`.',
       'For a named agent, if the agent may ask the user for missing information with a form and this is part of a broader commander-owned task, include `resume` so the system can resume you after the form is submitted and the agent completes.',
       'The worker runs and returns its result here (with any file pointers) — there is no separate later turn. `task` is the instruction, sent verbatim.',
     ].join(' '),
@@ -4224,11 +4457,11 @@ async function buildCommanderExtraTools(
       properties: {
         to: {
           type: 'string',
-          description: 'Optional. A worker agent — name (matching the "Agents list") or agent_id — when you specifically need that specialist\'s output back. Omit to spin up an anonymous worker for a generic bounded sub-task.',
+          description: 'Optional. An actually available worker agent — name (matching the "Agents list") or agent_id — when you specifically need that specialist\'s output back. Omit to spin up an anonymous worker for a generic bounded sub-task.',
         },
         task: {
           type: 'string',
-          description: 'Sub-task instruction, sent verbatim to the worker.',
+          description: 'One isolated sub-task with an explicit boundary and expected result, sent verbatim to the worker. Do not assign a coupled milestone chain or work that needs shared evolving context.',
         },
         resume: {
           type: 'string',
@@ -4244,7 +4477,7 @@ async function buildCommanderExtraTools(
       const resume = String(input?.resume || '').trim();
       if (!task) return _toolError('`task` is required');
       if (!toRaw) {
-        // Anonymous ephemeral worker — the commander's own hands. G8d step 3:
+        // Anonymous ephemeral worker — the commander's private isolated helper. G8d step 3:
         // run it in-process, synchronously, and hand its FULL result straight
         // back as this tool's result (single-layer dispatch — no staging, no
         // turn-end flush, no re-wake; the handback IS the tool result).
@@ -4298,6 +4531,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   let aborted = 0;
   let abortedModelSessions = 0;
   if (state) {
+    _recordTaskRunOutcome(state, 'cancelled');
     for (const [, w] of state.workers) {
       cleared += w.queue.length;
       if (w.abortController) aborted += 1;
@@ -4356,16 +4590,24 @@ export async function abort(uid: string, cid: string): Promise<void> {
     while (!isQuiescent(uid, cid) && Date.now() < deadline) {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
+    await _syncStateStatus(state).catch((err) => {
+      log.warn(`post-abort syncStateStatus failed cid=${cid}: ${(err as Error).message}`);
+    });
   }
   log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted} abortedModelSessions=${abortedModelSessions}`);
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────────
 
-export function dropConv(uid: string, cid: string): void {
+export async function dropConv(uid: string, cid: string): Promise<void> {
   const k = cidKey(uid, cid);
   const state = _cids.get(k);
   if (!state) return;
+  state.terminating = true;
+  if (state.pendingEnqueues > 0) {
+    await new Promise<void>((resolve) => state.pendingEnqueueWaiters.add(resolve));
+  }
+  const loopPromises: Promise<void>[] = [];
   for (const [, w] of state.workers) {
     // Mark terminated so the runWorkerLoop exits its outer while at the
     // next wake, instead of looping forever on a stale `state` reference
@@ -4375,10 +4617,18 @@ export function dropConv(uid: string, cid: string): void {
     w.queue.length = 0;
     const wake = w.wake; w.wake = null;
     wake?.();
+    if (w.loopDone) loopPromises.push(w.loopDone);
+  }
+  await Promise.allSettled(loopPromises);
+  while (state.backgroundWrites.size > 0) {
+    await Promise.allSettled([...state.backgroundWrites]);
   }
   state.workers.clear();
   state.listeners.clear();
-  _cids.delete(k);
+  // A late post-turn enqueue must not recreate a fresh runtime while the old
+  // worker is unwinding. Keeping the terminating state registered until here
+  // makes that enqueue land in the doomed queue, which is discarded now.
+  if (_cids.get(k) === state) _cids.delete(k);
 }
 
 export function _cidStateForTest(uid: string, cid: string): CidState | null {
@@ -4471,7 +4721,14 @@ async function _runCliAgentTurn(opts: {
   workingDir: string;
   signal: AbortSignal;
   onProcess: (data: Record<string, unknown>) => void;
-}): Promise<{ text: string; error?: string; aborted?: boolean; produced?: string[] }> {
+}): Promise<{
+  text: string;
+  error?: string;
+  aborted?: boolean;
+  produced?: string[];
+  failureKind?: GroupMessageFailureKind;
+  failureCode?: string;
+}> {
   const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
 
   // Required-input gate: a CLI agent never runs an LLM, so the form-emit
@@ -4650,17 +4907,35 @@ async function _runCliAgentTurn(opts: {
       : result.cliError === 'version_too_old'
         ? t('cli_agent.version_too_old', vars)
         : t('cli_agent.not_found', vars);
-    return { text: '', error: msg, aborted: false, produced: Array.from(produced) };
+    return {
+      text: '',
+      error: msg,
+      aborted: false,
+      produced: Array.from(produced),
+      failureKind: 'dependency',
+      failureCode: result.cliError || 'missing_cli',
+    };
   }
   if (result.status === 'cancelled') {
     return { text: resultText || accText, aborted: true, produced: Array.from(produced) };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
-    const detail = result.error || (result.status === 'timeout' ? 'timeout' : 'failed');
-    // When the failure was a stale resume id, hint the user that a
-    // simple resend will recover (the binding has been cleared above).
-    const hint = resumeRejected ? ' — session expired; retry will start fresh.' : '';
-    return { text: resultText || accText, error: detail + hint, produced: Array.from(produced) };
+    const vars = { name: opts.agent.name || runtime.cli, cli: runtime.cli };
+    // Backend errors remain available to runner diagnostics, but they are
+    // internal implementation details and may contain paths, stderr, or
+    // protocol prose. User copy is derived from structured terminal state.
+    const detail = resumeRejected
+      ? t('cli_agent.session_expired_detail', vars)
+      : result.status === 'timeout'
+        ? t('cli_agent.timeout_detail', vars)
+        : t('cli_agent.run_failed_detail', vars);
+    return {
+      text: resultText || accText,
+      error: detail,
+      produced: Array.from(produced),
+      failureKind: 'runtime',
+      failureCode: result.status === 'timeout' ? 'cli_timeout' : 'cli_failed',
+    };
   }
   const finalText = resultText || accText;
   if (slashCommandName && _looksLikeNoOutput(finalText)) {

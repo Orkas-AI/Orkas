@@ -6,7 +6,7 @@ import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync,
   writeTextAtomicSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl, readJsonlPage, __storageTestHooks,
+  invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -209,6 +209,20 @@ describe('storage › JSONL append/read', () => {
     expect(middle.records.map((r) => r.i)).toEqual([5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     expect(oldest.records.map((r) => r.i)).toEqual([0, 1, 2, 3, 4]);
     expect(oldest.nextCursor).toBeNull();
+  });
+
+  it('reads the page containing a parsed-record index in one bounded window', async () => {
+    const p = path.join(tmpDir, 'indexed-log.jsonl');
+    const pad = '中'.repeat(4_000);
+    const rows = Array.from({ length: 30 }, (_, i) => JSON.stringify({ i, text: `${i}:${pad}` }));
+    rows.splice(7, 0, '{malformed');
+    fs.writeFileSync(p, rows.join('\n') + '\n', 'utf8');
+
+    const targetPage = await readJsonlWindow<{ i: number }>(p, 20, 10);
+    const previousPage = await readJsonlPage<{ i: number }>(p, 10, targetPage.previousCursor);
+
+    expect(targetPage.records.map((row) => row.i)).toEqual([20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
+    expect(previousPage.records.map((row) => row.i)).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
   });
 
   it('readJsonl skips malformed lines silently', async () => {

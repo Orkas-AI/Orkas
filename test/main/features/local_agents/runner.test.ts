@@ -389,13 +389,17 @@ describe('local_agents/runner', () => {
     const prevIdleMin = process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;
     process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS = '50';
     process.env.ORKAS_LOCAL_AGENT_IDLE_MS = '120';   // threshold 120ms
+    vi.useFakeTimers();
     try {
       mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
       let onEventCb: ((e: any) => void) | null = null;
       let resolveBackend!: () => void;
+      let markBackendReady!: () => void;
+      const backendReady = new Promise<void>((resolve) => { markBackendReady = resolve; });
       mockBackendImpl = async ({ onEvent }) => {
         onEventCb = onEvent;
         onEvent({ type: 'process-info', pid: 42, cwd: '/x', cmd: 'claude', args: [] });
+        markBackendReady();
         await new Promise<void>(resolve => { resolveBackend = resolve; });
         onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
       };
@@ -409,14 +413,17 @@ describe('local_agents/runner', () => {
         onEvent: e => events.push(e),
       });
 
+      await backendReady;
+      expect(onEventCb).not.toBeNull();
+
       // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Wait ~250ms:
       // at least 2 idle pulses should fire after the 120ms quiet period.
-      await new Promise(r => setTimeout(r, 250));
+      await vi.advanceTimersByTimeAsync(250);
       const idleCount1 = events.filter(e => e.type === 'idle').length;
       expect(idleCount1).toBeGreaterThanOrEqual(1);
 
       // Continue waiting → steady drumbeat (more idle events).
-      await new Promise(r => setTimeout(r, 150));
+      await vi.advanceTimersByTimeAsync(150);
       const idleCount2 = events.filter(e => e.type === 'idle').length;
       expect(idleCount2).toBeGreaterThan(idleCount1);
 
@@ -424,13 +431,15 @@ describe('local_agents/runner', () => {
       // idle pulse during the next sub-threshold window.
       onEventCb!({ type: 'text-delta', text: 'still here' });
       const beforeReset = events.filter(e => e.type === 'idle').length;
-      await new Promise(r => setTimeout(r, 80));  // less than 120ms threshold
+      await vi.advanceTimersByTimeAsync(80);  // less than 120ms threshold
       const afterReset = events.filter(e => e.type === 'idle').length;
       expect(afterReset).toBe(beforeReset);  // no new idle fired
 
       resolveBackend();
+      await vi.advanceTimersByTimeAsync(0);
       await promise;
     } finally {
+      vi.useRealTimers();
       if (prevIdleMs === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MS;
       else process.env.ORKAS_LOCAL_AGENT_IDLE_MS = prevIdleMs;
       if (prevIdleMin === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;

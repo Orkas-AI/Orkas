@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const SHELL_SUCCESS_TIMEOUT_MS = process.platform === 'win32' ? 15_000 : 5_000;
 
 // ── Electron mock (for html_to_pdf / markdown_to_pdf paths) ─────────────
 
@@ -26,6 +27,10 @@ vi.mock('electron', () => ({
   BrowserWindow: FakeBrowserWindow,
 }));
 
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 
@@ -44,9 +49,23 @@ beforeEach(async () => {
   users.activateUser('u1');
 });
 
-afterEach(() => {
+afterEach(async () => {
+  try {
+    const sessions = await import('../../../src/main/model/core-agent/interactive-cli-sessions');
+    sessions._resetInteractiveCliSessionsForTest();
+    // Windows taskkill is asynchronous; let the shell/tree release its cwd
+    // before removing the case workspace.
+    if (process.platform === 'win32') await new Promise(resolve => setTimeout(resolve, 150));
+  } catch { /* no interactive module in this case */ }
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch (err) {
+    // Electron's Windows worker can retain the root-directory handle after a
+    // shell-backed interactive child exits. Accept only an otherwise empty
+    // tree; files, databases, or process artifacts must still fail cleanup.
+    if (process.platform !== 'win32' || !fs.existsSync(tmpDir) || fs.readdirSync(tmpDir).length > 0) throw err;
+  }
 });
 
 async function loadModules() {
@@ -61,8 +80,35 @@ async function setTmpWorkspace() {
   if (!res.ok) throw new Error(`setWorkspacePath failed: ${res.error}`);
 }
 
-function makeCtx(): any {
-  return { workingDir: tmpDir, state: {} };
+function makeCtx(sandboxEnv: Record<string, string> = {}): any {
+  // Production turns always receive buildSkillSandboxEnv(), whose bundled
+  // runtime directory makes bare `node` commands resolvable. The native-host
+  // test runner itself is launched by absolute path, so mirror that contract
+  // explicitly instead of depending on the developer's Windows PATH.
+  return {
+    workingDir: tmpDir,
+    state: {
+      sandboxEnv: {
+        ORKAS_NODE: TEST_NODE,
+        ORKAS_PATH_PREPEND: path.dirname(TEST_NODE),
+        ...sandboxEnv,
+      },
+    },
+  };
+}
+
+function writeFakeCommand(dir: string, name: string, source: string): void {
+  fs.mkdirSync(dir, { recursive: true });
+  const scriptName = `${name}.js`;
+  fs.writeFileSync(path.join(dir, scriptName), source);
+  if (process.platform === 'win32') {
+    fs.writeFileSync(path.join(dir, `${name}.cmd`), `@echo off\r\n"${TEST_NODE}" "%~dp0${scriptName}" %*\r\n`);
+    return;
+  }
+  const safeNode = TEST_NODE.replace(/'/g, `'\\''`);
+  const launcher = path.join(dir, name);
+  fs.writeFileSync(launcher, `#!/bin/sh\nexec '${safeNode}' "$(dirname "$0")/${scriptName}" "$@"\n`);
+  fs.chmodSync(launcher, 0o755);
 }
 
 // ── Tool identity ─────────────────────────────────────────────────────────
@@ -94,6 +140,31 @@ describe('local-tools › identity', () => {
     expect(bash.description).toMatch(/local machine|host/i);
   });
 
+  it('resolves documented POSIX, PowerShell, and cmd environment path forms', async () => {
+    const { lt } = await loadModules();
+    const env = { ORKAS_OUTPUT_DIR: path.join(tmpDir, 'outputs') };
+    const expected = path.join(tmpDir, 'outputs', 'report.json');
+
+    expect(lt.expandKnownShellPathVars('$ORKAS_OUTPUT_DIR/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('$env:orkas_output_dir/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('${env:ORKAS_OUTPUT_DIR}/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('%ORKAS_OUTPUT_DIR%/report.json', env)).toEqual({
+      value: expected,
+      dynamic: false,
+    });
+    expect(lt.expandKnownShellPathVars('$env:UNKNOWN/report.json', env).dynamic).toBe(true);
+    expect(lt.expandKnownShellPathVars('%UNKNOWN%/report.json', env).dynamic).toBe(true);
+  });
+
   it('write_file tool description mentions the workspace directory', async () => {
     const { lt } = await loadModules();
     const wf = lt.createLocalTools({}).find((t) => t.name === 'write_file')!;
@@ -112,7 +183,10 @@ describe('local-tools › identity', () => {
     expect(blocked.isError).toBe(true);
     expect(blocked.content).toContain('E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
 
-    const allowed = await otherBash.execute({ command: 'echo safe', timeoutMs: 5000 }, makeCtx());
+    const allowed = await otherBash.execute({
+      command: 'echo safe',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
     expect(allowed.isError).toBeFalsy();
   });
 
@@ -189,7 +263,7 @@ describe('local-tools › bash permission gate', () => {
     perm.revokeLocalExec();
     const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
     const res = await bash.execute(
-      { command: 'echo orkas-test-sentinel-42', timeoutMs: 5000 },
+      { command: 'echo orkas-test-sentinel-42', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS },
       makeCtx(),
     );
     expect(res.isError).toBeFalsy();
@@ -203,7 +277,7 @@ describe('local-tools › bash permission gate', () => {
     i18n.setCurrentLang('zh');
     try {
       const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
-      const res = await bash.execute({ command: 'exit 7', timeoutMs: 5000 }, makeCtx());
+      const res = await bash.execute({ command: 'exit 7', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
       expect(res.isError).toBe(true);
       expect(res.content).toBe('退出码：7');
     } finally {
@@ -261,10 +335,16 @@ describe('local-tools › bash permission gate', () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
     const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
-    const ok = await bash.execute({ command: 'echo first', timeoutMs: 5000 }, makeCtx());
+    const ok = await bash.execute({
+      command: 'echo first',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
     expect(ok.isError).toBeFalsy();
     perm.revokeLocalExec();
-    const stillAllowed = await bash.execute({ command: 'echo second', timeoutMs: 5000 }, makeCtx());
+    const stillAllowed = await bash.execute({
+      command: 'echo second',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
     expect(stillAllowed.isError).toBeFalsy();
     expect(stillAllowed.content).toContain('second');
   });
@@ -278,8 +358,8 @@ describe('local-tools › bash filesystem mutation scope', () => {
     const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
     const target = path.join(tmpDir, 'bash-ok.txt');
     const res = await bash.execute({
-      command: `printf ok > ${JSON.stringify(target)}`,
-      timeoutMs: 5000,
+      command: `node -e "require('fs').writeFileSync(process.argv[1], 'ok')" ${JSON.stringify(target)}`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
     expect(res.isError, `content=${res.content}`).toBeFalsy();
     expect(fs.readFileSync(target, 'utf8')).toBe('ok');
@@ -315,8 +395,8 @@ describe('local-tools › bash filesystem mutation scope', () => {
     try {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const res = await bash.execute({
-        command: `printf ok > ${JSON.stringify(outside)}`,
-        timeoutMs: 5000,
+        command: `node -e "require('fs').writeFileSync(process.argv[1], 'ok')" ${JSON.stringify(outside)}`,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
       }, makeCtx());
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(fs.readFileSync(outside, 'utf8')).toBe('ok');
@@ -358,7 +438,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const res = await bash.execute({
         command: `cat ${JSON.stringify(outside)}`,
-        timeoutMs: 5000,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
       }, makeCtx());
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(res.content).toContain('outside read ok');
@@ -417,7 +497,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const res = await bash.execute({
         command: `cat ${JSON.stringify(outside)}`,
-        timeoutMs: 5000,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
       }, makeCtx());
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(res.content).toContain('SENSITIVE-BASH-ALLOW');
@@ -696,13 +776,31 @@ describe('local-tools › Orkas CLI direct execution', () => {
 
     const res = await bash.execute({
       command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeOrkasCtx(pcDir));
 
     expect(res.isError).toBeFalsy();
     const parsed = JSON.parse(String(res.content));
     expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
     expect(parsed.out).toBe(tmpDir);
+  });
+
+  it('runs the PowerShell form of a standard Orkas CLI command directly', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: '& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(String(res.content)).argv).toEqual(['calculator', 'eval', '--', '1+1']);
   });
 
   it('streams large direct Orkas CLI stdout to the Result Store handoff file', async () => {
@@ -719,7 +817,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
 
     const res = await bash.execute({
       command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval',
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, context);
 
     expect(res.isError).toBeFalsy();
@@ -741,7 +839,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
 
     const res = await bash.execute({
       command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeOrkasCtx(pcDir));
 
     expect(res.isError).toBeFalsy();
@@ -762,13 +860,17 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const errPath = path.join(tmpDir, 'run-skill-stderr.txt');
 
     const res = await bash.execute({
-      command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`,
-      timeoutMs: 5000,
+      command: process.platform === 'win32'
+        ? `& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`
+        : `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeOrkasCtx(pcDir));
 
     expect(res.isError).toBeFalsy();
     expect(String(res.content)).toBe('');
-    const parsed = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+    const redirected = fs.readFileSync(outPath, process.platform === 'win32' ? 'utf16le' : 'utf8')
+      .replace(/^\uFEFF/, '');
+    const parsed = JSON.parse(redirected);
     expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
     expect(fs.readFileSync(errPath, 'utf8')).toBe('');
   });
@@ -816,7 +918,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     bashPerms._setBroadcastForTest(() => { prompted = true; });
     try {
       const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
-      const res = await bash.execute({ command: 'echo safe-run-ok', timeoutMs: 5000 }, makeCtx());
+      const res = await bash.execute({ command: 'echo safe-run-ok', timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
       expect(prompted).toBe(false);
       expect(res.isError).toBeFalsy();
       expect(res.content).toContain('safe-run-ok');
@@ -882,7 +984,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     bashPerms._setBroadcastForTest((_ch: string, info: any) => { prompts++; bashPerms.respond(info.request_id, 'allow_once'); });
     try {
       const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
-      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(res.content).toContain(SECRET); // cat ran
       expect(prompts).toBe(1);
@@ -897,7 +999,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     const key = makeKeyFile();
     try {
       const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
-      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
       expect(prompted).toBe(false);
       expect(res.isError, `content=${res.content}`).toBeFalsy();
       expect(res.content).toContain(SECRET);
@@ -918,7 +1020,7 @@ describe('local-tools › bash produced files', () => {
         'fs.mkdirSync(process.env.ORKAS_OUTPUT_DIR, { recursive: true });' +
         'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/report.docx\', \'doc\');' +
         'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/notes.md\', \'notes\');"',
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
 
     expect(res.isError).toBeFalsy();
@@ -938,7 +1040,7 @@ describe('local-tools › bash produced files', () => {
 
     const res = await bash.execute({
       command: 'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/draft.txt\', \'v2\')"',
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
 
     expect(res.isError).toBeFalsy();
@@ -960,7 +1062,7 @@ describe('local-tools › bash produced files', () => {
           'node -e "const fs=require(\'fs\');' +
           `fs.writeFileSync('${outsideForSingleQuotedJs}', '{}');` +
           'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/visible.json\', \'{}\');"',
-        timeoutMs: 5000,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
       }, makeCtx());
 
       expect(res.isError).toBeFalsy();
@@ -977,14 +1079,20 @@ describe('local-tools › bash produced files', () => {
     perm.grantLocalExec();
     const onFileWritten = vi.fn();
     const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+    const fakeBin = path.join(tmpDir, 'fake-git-bin');
+    writeFakeCommand(fakeBin, 'git', `
+const fs = require('node:fs');
+fs.mkdirSync('vendor/src', { recursive: true });
+fs.writeFileSync('vendor/package.json', '{}');
+fs.writeFileSync('vendor/src/index.ts', 'x');
+`);
 
     const res = await bash.execute({
       command:
-        'git() { mkdir -p vendor/src; printf "{}" > vendor/package.json; printf "x" > vendor/src/index.ts; }\n' +
         'git clone https://example.com/vendor.git\n' +
         'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/summary.csv\', \'ok\')"',
-      timeoutMs: 5000,
-    }, makeCtx());
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}` }));
 
     expect(res.isError, `content=${res.content}`).toBeFalsy();
     const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
@@ -999,20 +1107,23 @@ describe('local-tools › bash produced files', () => {
     const onFileWritten = vi.fn();
     const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
     const fakeBin = path.join(tmpDir, 'fake-bin');
-    fs.mkdirSync(fakeBin);
-    fs.writeFileSync(path.join(fakeBin, 'curl'), '#!/bin/sh\nprintf downloaded > "$2"\n');
-    fs.writeFileSync(path.join(fakeBin, 'wget'), '#!/bin/sh\nprintf downloaded > "$2"\n');
-    fs.chmodSync(path.join(fakeBin, 'curl'), 0o755);
-    fs.chmodSync(path.join(fakeBin, 'wget'), 0o755);
+    const downloadScript = `
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const at = Math.max(args.indexOf('-o'), args.indexOf('-O'));
+if (at < 0 || !args[at + 1]) process.exit(2);
+fs.writeFileSync(args[at + 1], 'downloaded');
+`;
+    writeFakeCommand(fakeBin, 'curl', downloadScript);
+    writeFakeCommand(fakeBin, 'wget', downloadScript);
 
     const res = await bash.execute({
       command:
-        `export PATH=${JSON.stringify(fakeBin)}:$PATH\n` +
         'curl -o downloaded.txt https://example.com/downloaded.txt\n' +
         'wget -O fetched.json https://example.com/fetched.json\n' +
         'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/generated.md\', \'# ok\')"',
-      timeoutMs: 5000,
-    }, makeCtx());
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}` }));
 
     expect(res.isError, `content=${res.content}`).toBeFalsy();
     const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
@@ -1034,7 +1145,7 @@ describe('local-tools › bash produced files', () => {
         'fs.mkdirSync(\'.cache\',{recursive:true});' +
         'fs.writeFileSync(\'.cache/final.pdf\',\'pdf\');' +
         'fs.appendFileSync(process.env.ORKAS_OUTPUT_MANIFEST,\'.cache/final.pdf\\n\')"',
-      timeoutMs: 5000,
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeCtx());
 
     expect(res.isError, `content=${res.content}`).toBeFalsy();

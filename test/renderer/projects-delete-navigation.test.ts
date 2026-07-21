@@ -6,6 +6,7 @@ import * as vm from 'node:vm';
 function loadProjectsRenderer(options: {
   afterProjects: any[];
   afterConversations: any[];
+  createdProject?: any;
 }) {
   const setViewCalls: any[] = [];
   const refreshAutoProjectCalls: string[] = [];
@@ -50,6 +51,7 @@ function loadProjectsRenderer(options: {
         invoke: async (channel: string) => {
           if (channel === 'autoTasks.list') return { tasks: [] };
           if (channel === 'projects.delete') return { ok: true };
+          if (channel === 'projects.create') return { ok: true, project: options.createdProject };
           if (channel === 'projects.list') return { ok: true, projects: options.afterProjects };
           throw new Error(`unexpected invoke: ${channel}`);
         },
@@ -128,5 +130,39 @@ describe('project delete navigation', () => {
       },
     ]);
     expect(context.__refreshAutoProjectCalls).toEqual(['p1']);
+  });
+});
+
+describe('project create navigation', () => {
+  it('selects the new project and opens its detail page after creation', async () => {
+    const createdProject = { project_id: 'p-new', name: 'Alpha', conv_count: 0 };
+    const context = loadProjectsRenderer({
+      afterProjects: [createdProject],
+      afterConversations: [],
+      createdProject,
+    });
+    context.currentView = 'new-chat';
+    context._projectDetailPid = '';
+
+    const listeners = new Map<string, (...args: any[]) => any>();
+    const input = {
+      value: 'Alpha',
+      addEventListener(type: string, listener: (...args: any[]) => any) {
+        listeners.set(type, listener);
+      },
+    };
+    context._bindInlineCreateInput(input);
+
+    await listeners.get('blur')?.();
+
+    expect(context.__setViewCalls).toEqual([
+      {
+        view: 'project',
+        id: 'p-new',
+        opts: { entryPoint: 'project_create' },
+      },
+    ]);
+    expect(context.currentView).toBe('project');
+    expect(context._projectDetailPid).toBe('p-new');
   });
 });

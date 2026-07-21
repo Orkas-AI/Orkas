@@ -5,6 +5,10 @@ import type { HistoryResource } from "./session.js";
 export type AgentRunParams = {
   /** User message to send to the agent. */
   message: string;
+  /** Continue the currently active durable UI turn instead of closing it and
+   * starting a new one. The host sets this only after verifying that a failed
+   * run still owns recoverable state in this same persistent session. */
+  resumeActiveTurn?: boolean;
   /** Optional image attachments (base64). */
   images?: Array<{
     data: string;
@@ -107,6 +111,9 @@ export type AgentRunMeta = {
   error?: {
     kind: "auth" | "rate_limit" | "context_overflow" | "timeout" | "provider_error";
     message: string;
+    /** Machine-readable provider/runtime code. Host adapters must map this to
+     * a bounded telemetry taxonomy before reporting it externally. */
+    code?: string;
   };
   /** Names of tools actually called during this run. */
   toolNames?: string[];
@@ -149,5 +156,5 @@ export type AgentRunEvent =
       data?: Record<string, unknown>;
     }
   | { type: "retry"; attempt: number; reason: string; waitMs?: number }
-  | { type: "provider_fallback"; reason: "auth"; providerId: string }
+  | { type: "provider_fallback"; reason: "auth" | "no_first_event_timeout"; providerId: string }
   | { type: "done"; result: AgentRunResult };

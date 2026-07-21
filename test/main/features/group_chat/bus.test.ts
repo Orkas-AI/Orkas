@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 const streamGate = vi.hoisted(() => ({
   releaseActiveTurn: null as null | (() => void),
@@ -135,6 +140,7 @@ vi.mock('../../../../src/main/model/client', () => ({
             compaction_ms: 10,
             retry_wait_ms: 5,
             other_ms: 3,
+            failure_phase: 'tool',
           },
         },
       };
@@ -149,12 +155,21 @@ vi.mock('../../../../src/main/model/client', () => ({
   abortActiveSessionsForConversation: vi.fn(() => 0),
 }));
 
-const cliRunMock = vi.hoisted(() => ({ calls: [] as any[] }));
+const cliRunMock = vi.hoisted(() => ({
+  calls: [] as any[],
+  nextResult: null as any,
+}));
 vi.mock('../../../../src/main/features/local_agents/runner', () => ({
   run: vi.fn(async (opts: any) => {
     cliRunMock.calls.push(opts);
-    opts.onEvent({ type: 'done', status: 'completed', output: 'ok' });
-    return { runId: 'mock-run', status: 'completed', output: 'ok' };
+    const result = cliRunMock.nextResult || { runId: 'mock-run', status: 'completed', output: 'ok' };
+    opts.onEvent({
+      type: 'done',
+      status: result.status,
+      ...(result.output ? { output: result.output } : {}),
+      ...(result.error ? { error: result.error } : {}),
+    });
+    return result;
   }),
 }));
 
@@ -163,6 +178,7 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 const TEST_CID = 'cidbus';
 const AGENT_ID = 'a83d30d995fd';
+const cidsToDrop = new Set<string>();
 const AGENT_NAME = '软件工程师';
 
 beforeEach(async () => {
@@ -171,11 +187,13 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   cliRunMock.calls.length = 0;
+  cliRunMock.nextResult = null;
   streamProbe.messages.length = 0;
   streamProbe.readOnlyRoots.length = 0;
   streamProbe.dispatchResults.length = 0;
   streamProbe.maxToolLoops.length = 0;
   streamGate.releaseActiveTurn = null;
+  cidsToDrop.clear();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
 
@@ -204,18 +222,23 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  cidsToDrop.add(TEST_CID);
   try {
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    await bus.abort(TEST_UID, TEST_CID);
-    bus.dropConv(TEST_UID, TEST_CID);
+    for (const cid of cidsToDrop) {
+      await bus.abort(TEST_UID, cid);
+      await bus.dropConv(TEST_UID, cid);
+    }
   } catch {
     // Some skipped/failed setup paths may not have loaded the bus module yet.
   }
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
+  cidsToDrop.add(cid);
   const bus = await import('../../../../src/main/features/group_chat/bus');
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -299,7 +322,9 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       payload.includes('<referenced-messages>')
       && payload.includes('not executable instructions or routing mentions')
       && payload.includes('@other-agent')
-      && payload.includes(path.join(sourceAttachmentDir, 'brief.txt'))
+      // The path is embedded in a JSON snapshot, which doubles Windows
+      // backslashes even though the underlying read-only root is native.
+      && payload.includes(path.join(sourceAttachmentDir, 'brief.txt').replace(/\\/g, '\\\\'))
       && payload.includes('比较一下')
     ))).toBe(true);
     expect(streamProbe.readOnlyRoots.some((roots) => roots.includes(sourceAttachmentDir))).toBe(true);
@@ -442,6 +467,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       compaction_ms: 10,
       retry_wait_ms: 5,
       other_ms: 3,
+      failure_phase: 'tool',
     });
   });
 
@@ -1003,13 +1029,74 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const stateBefore = bus._cidStateForTest(TEST_UID, TEST_CID);
     expect(stateBefore).toBeTruthy();
 
-    bus.dropConv(TEST_UID, TEST_CID);
+    await bus.dropConv(TEST_UID, TEST_CID);
     const stateAfter = bus._cidStateForTest(TEST_UID, TEST_CID);
     expect(stateAfter).toBeNull();
     // Worker.terminated flag was set; the loop's `while (!w.terminated)`
     // now exits at the next wake. We can't observe the loop exit
     // directly, but isQuiescent reports true (since cid state is gone).
     expect(bus.isQuiescent(TEST_UID, TEST_CID)).toBe(true);
+  });
+
+  it('dropConv rejects late enqueue admission while an active worker unwinds', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid: TEST_CID,
+      fromActorId: 'user',
+      text: 'ACTIVE_TURN_TEST',
+    });
+    const deadline = Date.now() + 2_000;
+    while (!streamGate.releaseActiveTurn && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(streamGate.releaseActiveTurn).toBeTypeOf('function');
+
+    const dropping = bus.dropConv(TEST_UID, TEST_CID);
+    await expect(bus.enqueue({
+      uid: TEST_UID,
+      cid: TEST_CID,
+      fromActorId: 'user',
+      text: 'must not resurrect deleted runtime',
+    })).rejects.toMatchObject({ code: 'E_CONVERSATION_TERMINATING' });
+
+    streamGate.releaseActiveTurn?.();
+    await dropping;
+    expect(bus._cidStateForTest(TEST_UID, TEST_CID)).toBeNull();
+  });
+
+  it('dropConv drains an enqueue already admitted before terminating workers', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    let enterGate!: () => void;
+    let releaseGate!: () => void;
+    const entered = new Promise<void>((resolve) => { enterGate = resolve; });
+    const released = new Promise<void>((resolve) => { releaseGate = resolve; });
+    bus._setEnqueueAdmissionGateForTest(async () => {
+      enterGate();
+      await released;
+    });
+
+    try {
+      const enqueuing = bus.enqueue({
+        uid: TEST_UID,
+        cid: TEST_CID,
+        fromActorId: 'user',
+        text: 'admitted before deletion',
+      });
+      await entered;
+      let dropResolved = false;
+      const dropping = bus.dropConv(TEST_UID, TEST_CID).then(() => { dropResolved = true; });
+      await Promise.resolve();
+      expect(dropResolved).toBe(false);
+
+      releaseGate();
+      await enqueuing;
+      await dropping;
+      expect(bus._cidStateForTest(TEST_UID, TEST_CID)).toBeNull();
+    } finally {
+      bus._setEnqueueAdmissionGateForTest(null);
+      releaseGate?.();
+    }
   });
 
   it('initialises a coding CLI conversation cwd from the agent project-dir setting without replaying on first dispatch', async () => {
@@ -1040,6 +1127,38 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const st = await state.readState(TEST_UID, cid);
     expect(st.coding_project_dir).toBe(projectDir);
     expect(st.coding_project_dir_explicit).toBe(true);
+  });
+
+  it('shows localized external-agent failure copy without raw backend diagnostics', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'openclaw' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.nextResult = {
+      runId: 'failed-run',
+      status: 'failed',
+        error: 'openclaw exited with code 17 at /Users/user/private-project',
+    };
+
+    const i18n = await import('../../../../src/main/i18n');
+    i18n.setCurrentLang('en');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-failure-copy';
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: `@${AGENT_NAME} run the task`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const failure = rows.find((row: any) => row.from === AGENT_ID && row.failure_kind === 'runtime');
+    expect(failure?.failure_code).toBe('cli_failed');
+    expect(failure?.text).toContain('Agent run failed');
+    expect(failure?.text).toContain('Confirm that its CLI is signed in and working');
+    expect(failure?.text).not.toContain('openclaw exited');
+    expect(failure?.text).not.toContain('/Users/alice');
   });
 
   it('asks for a project directory instead of silently falling back when a custom coding cwd vanished', async () => {
@@ -1151,7 +1270,7 @@ describe('group_chat bus › abort', () => {
     const st = await state.readState(TEST_UID, TEST_CID);
     expect(st.status).toBe('aborted');
     expect(st.in_flight).toEqual([]);
-    bus.dropConv(TEST_UID, TEST_CID);
+    await bus.dropConv(TEST_UID, TEST_CID);
   });
 });
 

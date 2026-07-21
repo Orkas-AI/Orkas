@@ -9,7 +9,7 @@ category: creation
 
 # stage-edit
 
-For the VideoStudio EDIT line, the edit decision list lives in `project/plan.json` and Gate B is host-recorded with `video_studio production.approve_plan`. Start/resume execution with `production.status`; do not run trims, assembly, or localization against a changed or unsigned EDL. Runtime `status`/`produced_path` updates do not invalidate the signed creative plan, but changing cuts, copy, source allocation, or delivery settings does.
+For the VideoStudio EDIT line, the edit decision list lives in `project/plan.json` and `gate-control` owns its Gate B authorization transition. Start/resume execution with `production.status`; do not run trims, assembly, or localization against a changed or unsigned EDL. Runtime `status`/`produced_path` updates do not invalidate the signed creative plan, but changing cuts, copy, source allocation, or delivery settings does.
 
 How to edit **real user-supplied footage** deterministically (cut / join / burn subtitles / overlay), as opposed to composing designed HTML (that is the composition skill). In Orkas, media inspection and editing run through skill scripts, not direct tool calls.
 

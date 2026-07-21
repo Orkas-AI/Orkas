@@ -30,7 +30,7 @@ afterEach(async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     for (const cid of ['target-cid']) {
       await bus.abort(UID, cid);
-      bus.dropConv(UID, cid);
+      await bus.dropConv(UID, cid);
     }
   } catch (_) {}
   process.env.ORKAS_WORKSPACE_ROOT = previousWorkspace;

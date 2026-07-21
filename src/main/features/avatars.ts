@@ -2,7 +2,7 @@
  * Avatar catalog — PC runtime source for icon / color tokens.
  *
  * Data lives at `src/main/data/avatars.json`:
- *   - icons[]:  { id, label, svg }
+ *   - icons[]:  { id, label, description, svg }
  *   - colors[]: { id, label, bg, fg }
  *   - commander_default: { icon, color }   (commander's fixed icon + default color)
  *
@@ -34,7 +34,10 @@ import * as path from 'node:path';
 export interface AvatarIcon {
   id: string;
   label: string;
+  /** Stable semantic metadata kept beside the visual asset. */
+  description: string;
   svg: string;
+  auto_seed?: boolean;
 }
 export interface AvatarColor {
   id: string;

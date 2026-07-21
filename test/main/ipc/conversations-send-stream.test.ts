@@ -24,6 +24,8 @@ const groupChatMock = vi.hoisted(() => ({
   resolveSendFinished: null as null | (() => void),
   sendStarted: Promise.resolve(),
   sendFinished: Promise.resolve(),
+  sendCalls: [] as unknown[],
+  retryCalls: [] as unknown[],
 }));
 
 vi.mock('electron', () => ({
@@ -44,11 +46,19 @@ vi.mock('../../../src/main/features/group_chat', () => ({
     groupChatMock.subscribers.add(cb);
     return () => groupChatMock.subscribers.delete(cb);
   }),
-  send: vi.fn(async () => {
+  send: vi.fn(async (input: unknown) => {
+    groupChatMock.sendCalls.push(input);
     groupChatMock.resolveSendStarted?.();
     await new Promise<void>((resolve) => { groupChatMock.releaseSend = resolve; });
     groupChatMock.resolveSendFinished?.();
     return { ok: true };
+  }),
+  retryFailedTurn: vi.fn(async (input: unknown) => {
+    groupChatMock.retryCalls.push(input);
+    groupChatMock.resolveSendStarted?.();
+    await new Promise<void>((resolve) => { groupChatMock.releaseSend = resolve; });
+    groupChatMock.resolveSendFinished?.();
+    return { ok: true, mode: 'resume' };
   }),
   busIsQuiescent: vi.fn(() => groupChatMock.quiescent),
   streamEvents: vi.fn(async function* () {}),
@@ -67,6 +77,8 @@ beforeEach(async () => {
   groupChatMock.subscribers.clear();
   groupChatMock.quiescent = false;
   groupChatMock.releaseSend = null;
+  groupChatMock.sendCalls.length = 0;
+  groupChatMock.retryCalls.length = 0;
   groupChatMock.sendStarted = new Promise<void>((resolve) => { groupChatMock.resolveSendStarted = resolve; });
   groupChatMock.sendFinished = new Promise<void>((resolve) => { groupChatMock.resolveSendFinished = resolve; });
   vi.resetModules();
@@ -92,6 +104,36 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 }
 
 describe('ipc › conversations.sendStream', () => {
+  it('routes a failed-message retry to the smart retry path instead of a normal send', async () => {
+    if (!streamStartHandler) throw new Error('stream handler not registered');
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const run = streamStartHandler(
+      { sender },
+      {
+        requestId: 'retry-request',
+        channel: 'conversations.sendStream',
+        payload: {
+          cid: 'c123abc',
+          content: 'Continue',
+          retry_message_id: 'failed-message-1',
+        },
+      },
+    );
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.retryCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      failedMessageId: 'failed-message-1',
+      visibleText: 'Continue',
+    }]);
+    expect(groupChatMock.sendCalls).toEqual([]);
+
+    groupChatMock.quiescent = true;
+    groupChatMock.releaseSend?.();
+    await run;
+  });
+
   it('ignores stream starts from an untrusted sender', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sent = vi.fn();

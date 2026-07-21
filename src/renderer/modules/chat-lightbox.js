@@ -180,7 +180,7 @@ function _ensureLightbox() {
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
-      <img class="chat-lightbox-img" alt="" draggable="false" />
+      <img class="chat-lightbox-img" alt="" draggable="false" data-monitor-resource="chat-image-lightbox" />
       <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
         ${libraryIcon}
       </button>

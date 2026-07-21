@@ -1,29 +1,30 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: composition-design-review
-min_app_version: "1.5.1"
-description_zh: VideoStudio 的 COMPOSE 设计审查层 - 在 stage-compose draft/inspect 后,检查 HTML/动态图形视频的模板感、首帧、视觉层级、可读性、风格一致、动效目的和 DESIGN.md/品牌 token 执行情况,只输出可执行修复。
-description_en: Design review layer for VideoStudio COMPOSE drafts. Use after stage-compose draft/inspect to assess template feel, first frame, hierarchy, readability, style consistency, purposeful motion, and adherence to DESIGN.md/brand tokens, returning only actionable fixes.
+min_app_version: "1.6.0"
+description_zh: VideoStudio 的 COMPOSE 设计审查层 - 优先在 HTML 预览展示前完整检查首帧、每镜中点与收束帧；无预览时才在 draft 后兜底，只输出一次汇总的可执行修复。
+description_en: Design review layer for VideoStudio COMPOSE. Prefer a complete first-frame, per-scene midpoint, and payoff review before exposing HTML preview; fall back to post-draft review only when preview was skipped, returning one batched set of actionable fixes.
 category: creation
 ---
 
 # composition-design-review
 
-Use this after `video_studio` `op: "composition.draft"` returns `design_review_required: true`. It is a design QA layer, not a renderer, line router, or generic video craft checklist. Submit its verdict through `composition.submit_design_review`; prose alone does not satisfy the host gate.
+Use this first when `video_studio` `op:"composition.snapshot"` returns `preview_design_review_required:true`, before the preview is shown. Use it after `composition.draft` only when that draft still returns `design_review_required:true`, which is the no-preview fallback. It is a design QA layer, not a renderer, line router, or generic video craft checklist. Submit its verdict through `composition.submit_design_review`; prose alone does not satisfy the host state.
 
-Do not open a new user Gate. Read `steps.inspect.draft_disposition` when present. Host-classified semantic readability blockers must already be repaired before draft succeeds. For the remaining design judgment, make at most one localized repair to `manifest.art_direction` or the affected HTML and re-run the draft command before Gate D. Submit `repair`/`blocked` with concrete evidence when needed, or `passed` before Gate D.
+Do not open a new user Gate. For preview review, inspect every returned frame path at usable scale before choosing a verdict; the contact sheet is only an index. Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, submit one `repair` verdict, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot. Submit `passed` only for the complete current snapshot signature. For the no-preview draft fallback, read `steps.inspect.draft_disposition` when present and re-run draft after a repair.
 
 ## Activation
 
-The host requires this review for long/scene-dense drafts and may also require it for design-sensitive work. Review when any of these is true:
+The host requires this review before showing a captured preview and may require a post-draft fallback for short work that skipped preview. Review when either authoritative result requests it:
 
-- The draft result contains `design_review_required: true` (authoritative).
+- The snapshot result contains `preview_design_review_required:true` (authoritative and preferred).
+- A draft produced without a reviewed preview contains `design_review_required:true` (authoritative fallback).
 
 - The approved brief is brand, product, promo, launch, version-update, portfolio, or other design-led COMPOSE work.
 - `project/composition/composition-manifest.json::art_direction.style_source` is present.
 - The draft report or sampled frames show a visible design risk that deterministic QA cannot judge, such as a weak first frame, flat hierarchy, repeated scene grammar, or motion that hides the message.
 
-Do not run this review for non-COMPOSE edit/TTS/clip-selection work. For COMPOSE, always follow the draft result even when the visual concept is otherwise simple.
+Do not run this review for non-COMPOSE edit/TTS/clip-selection work. For COMPOSE, always follow the current snapshot/draft result even when the visual concept is otherwise simple. When draft says `design_review_inherited_from_preview:true`, do not repeat the static design review.
 
 ## Review Inputs
 
@@ -31,8 +32,9 @@ Read only the relevant artifacts:
 
 - `project/composition/composition-manifest.json`, especially `art_direction` and the affected canonical scene
 - `project/composition/narration-map.json` as read-only evidence when detailed narration-line alignment matters
-- `project/composition/qa/inspect.json` or `project/render/draft-report.json`
-- Sampled evidence frames from the draft report when available: `video_qa.contact_sheet`, `video_qa.frame_paths`, first frame, one mid-frame per scene, and payoff/closing frame
+- `project/composition/qa/inspect.json`, or `project/render/draft-report.json` only for fallback review
+- For preview review, the snapshot result's `contact_sheet` and every `frame_paths` item: first frame, every scene midpoint, and payoff/closing frame. Open every path individually; do not infer full coverage from a thumbnail sheet.
+- For fallback review, sampled evidence frames from the draft report: `contact_sheet`, `frame_paths`, first frame, one mid-frame per scene, and payoff/closing frame
 - The approved script/shotlist only when a finding depends on message intent
 
 ## Findings Rubric
@@ -58,7 +60,7 @@ Fix:
 - Repeated layout, transition, or card pattern three or more times in a row.
 - Palette uses extra chromatic colors beyond the contract.
 - Type hierarchy is flat or labels feel like UI residue instead of video graphics.
-- English titles, body copy, captions, subtitles, or CTAs are forced to all caps, or two or more English text roles in one scene use all caps without an explicit user, brand, or art-direction reason. Restore the approved natural casing and use scale, weight, width, color, or spacing for hierarchy; keep all caps only for one short metadata label, acronym, or code.
+- English titles, body copy, captions, subtitles, or CTAs are forced to all caps, or two or more English text roles in one scene use all caps. Restore the approved natural casing and use scale, weight, width, color, or spacing for hierarchy. Existing all caps may remain only when the exact casing appears in approved user copy or an external brand/source and is limited to one short metadata label, acronym, or code; a model-authored art direction or style rationale is not an exception.
 - Scene density is too high for phone viewing.
 - Style-source adaptation is vague: it borrows mood words but no concrete tokens.
 
@@ -82,16 +84,17 @@ Do not solve design problems by only nudging pixels. If the issue is "too generi
 
 ## Output Format
 
-Return a compact review object or bullets, then call the tool with the same evidence:
+Return one compact review object or bullets after the entire evidence set has been inspected, then call the tool with the same evidence:
 
-- `verdict`: pass | repair | block
+- `verdict`: passed | repair | blocked
 - `review_scope`: why this review was triggered
+- `reviewed_frame_paths`: every current snapshot frame path inspected; required for preview review
 - `design_direction`: one line
-- `blockers`: concrete location + evidence + repair
+- `blockers`: all concrete locations + evidence + repair, not only the first finding
 - `fixes`: concrete location + repair
 - `polish`: optional
-- `next_action`: rerun draft, open Gate D, or surface blocker
+- `next_action`: rerun inspect + snapshot, open the existing Preview Gate, rerun draft for fallback review, open Gate D, or surface blocker
 
 ```json
-{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"contact sheet + per-scene midpoint/payoff frames","review_findings":[]}
+{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"first frame + every returned scene midpoint/payoff frame","review_findings":[],"reviewed_frame_paths":["/absolute/path/01-first-frame.png","/absolute/path/02-scene-mid.png","/absolute/path/03-payoff.png"]}
 ```

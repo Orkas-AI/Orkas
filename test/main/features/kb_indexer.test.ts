@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 /**
  * Tests kb_indexer's queue + reconcile logic. kb_embed is mocked to avoid
@@ -18,6 +19,9 @@ vi.mock('../../../src/main/features/kb_embed', () => ({
     // Sentinel makes extraction fail — simpler than re-mocking per-test.
     if (texts.some((t) => t.includes('__FAIL_EMBED__'))) {
       throw new Error('mocked embed failure');
+    }
+    if (texts.some((t) => t.includes('__HANG_EMBED__'))) {
+      await new Promise(() => {});
     }
     // Deterministic 512-dim vectors keyed by text hash — enough for
     // "same input → same vector" without actually running ONNX.
@@ -179,6 +183,27 @@ describe('kb_indexer › enqueue + processJob', () => {
     const row = kb.getFileByPath(TEST_UID, 'a.md');
     expect(row?.status).toBe('failed');
     expect(row?.error).toMatch(/mocked embed failure/);
+  });
+
+  it('times out one stuck embedding and still processes the next queued file', async () => {
+    process.env.ORKAS_LIBRARY_EMBED_TIMEOUT_MS = '1000';
+    try {
+      writeCtx('stuck.md', '__HANG_EMBED__');
+      writeCtx('after.md', 'this file must still become searchable');
+      const idx = await import('../../../src/main/features/kb_indexer');
+      const kb = await import('../../../src/main/features/kb_vector');
+      idx.enqueue(TEST_UID, 'stuck.md');
+      idx.enqueue(TEST_UID, 'after.md');
+      await idx.drain(TEST_UID);
+
+      expect(kb.getFileByPath(TEST_UID, 'stuck.md')?.status).toBe('failed');
+      expect(kb.getFileByPath(TEST_UID, 'stuck.md')?.error).toMatch(/timed out/i);
+      expect(kb.getFileByPath(TEST_UID, 'after.md')?.status).toBe('ready');
+      const reconcile = await idx.reconcile(TEST_UID);
+      expect(reconcile.enqueuedUpsert).toBe(0);
+    } finally {
+      delete process.env.ORKAS_LIBRARY_EMBED_TIMEOUT_MS;
+    }
   });
 
   it('splits long text into multiple small chunks (paragraph-aware, ≤ EMBED_MAX_CHARS)', async () => {
@@ -364,6 +389,28 @@ describe('kb_indexer › reconcile', () => {
     });
     const r = await idx.reconcile(TEST_UID);
     expect(r.enqueuedUpsert).toBe(1);
+  });
+
+  it('recovers an orphaned processing row left by a crashed prior process', async () => {
+    const body = 'recover me after crash';
+    writeCtx('orphan.md', body);
+    const full = path.join(contextsRoot(), 'orphan.md');
+    const stat = fs.statSync(full);
+    const sha1 = crypto.createHash('sha1').update(body).digest('hex');
+    const kb = await import('../../../src/main/features/kb_vector');
+    const idx = await import('../../../src/main/features/kb_indexer');
+    await kb.setFileStatus(TEST_UID, 'orphan.md', 'processing', {
+      kind: 'text',
+      bytes: stat.size,
+      mtime: stat.mtimeMs / 1000,
+      sha1,
+    });
+
+    const result = await idx.reconcile(TEST_UID);
+    expect(result.enqueuedUpsert).toBe(1);
+    expect(result.recoveredProcessing).toBe(1);
+    await idx.drain(TEST_UID);
+    expect(kb.getFileByPath(TEST_UID, 'orphan.md')?.status).toBe('ready');
   });
 
   it('does not enqueue deletes from a cancelled partial filesystem snapshot', async () => {

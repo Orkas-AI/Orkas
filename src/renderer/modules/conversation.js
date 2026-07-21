@@ -180,10 +180,10 @@ function _skillsForDisplayNameRewrite() {
 function _skillIdFromKnownSkillMdPath(p) {
   const s = String(p || '').replace(/\\/g, '/');
   if (!s.endsWith('/SKILL.md')) return '';
-  const direct = /\/(?:cloud\/skills|local\/marketplace\/skills)\/([^/]+)\/SKILL\.md$/.exec(s);
+  const direct = /\/(?:cloud\/skills|local\/marketplace\/skills|local\/system\/skills)\/([^/]+)\/SKILL\.md$/.exec(s);
   if (direct) return direct[1] || '';
-  const evolved = /\/cloud\/agents\/[^/]+\/skills\/([^/]+)\/SKILL\.md$/.exec(s);
-  return evolved ? (evolved[1] || '') : '';
+  const agentOwned = /\/(?:cloud\/agents|local\/marketplace\/agents)\/[^/]+\/(?:skills|private_skills)\/([^/]+)\/SKILL\.md$/.exec(s);
+  return agentOwned ? (agentOwned[1] || '') : '';
 }
 
 function _skillDisplayNameFromReadFilePath(p) {
@@ -195,7 +195,7 @@ function _skillDisplayNameFromReadFilePath(p) {
 }
 
 function _agentIdFromKnownAgentJsonPath(p) {
-  const s = String(p || '');
+  const s = String(p || '').replace(/\\/g, '/');
   const direct = /\/(?:cloud\/agents|local\/marketplace\/agents)\/([^/]+)\/agent\.json$/.exec(s);
   return direct ? (direct[1] || '') : '';
 }
@@ -528,10 +528,27 @@ function _chatRichCreateUseChip(selection, rawToken) {
 // Browsers solve this with a filler <br>; we mirror that with a marked "bogus"
 // <br> that serialization drops (see _chatRichSerializeNode). Keep exactly one,
 // always at the very end, and only when the content actually ends in a newline.
+function _chatRichHasAuthoredContent(node) {
+  if (!node) return false;
+  if (node.nodeType === Node.TEXT_NODE) return !!(node.nodeValue || '');
+  if (node.nodeType === Node.ELEMENT_NODE && node.dataset?.chatUseChip === '1') return true;
+  return Array.from(node.childNodes || []).some((child) => _chatRichHasAuthoredContent(child));
+}
+
 function _chatRichEnsureTrailingBreak(editor) {
   if (!editor) return;
   const stale = editor.querySelector ? editor.querySelector('br[data-chat-bogus="1"]') : null;
   if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+  // Chromium represents an emptied contenteditable as <br> (and sometimes
+  // <div><br></div>) so the caret still has a line box. That node is browser
+  // chrome, not user input: serializing it as "\n" makes an emptied composer
+  // one line taller and persists a phantom newline in the hidden textarea.
+  // Real newlines in this editor are text nodes created by render/keydown/paste,
+  // so they count as authored content and remain intact.
+  if (!_chatRichHasAuthoredContent(editor)) {
+    if (editor.childNodes?.length) editor.textContent = '';
+    return;
+  }
   if (_chatRichSerializeNode(editor).endsWith('\n')) {
     const br = document.createElement('br');
     br.dataset.chatBogus = '1';
@@ -1263,7 +1280,7 @@ function _refreshEmptyStateAll() {
 }
 
 // ── Conversation header (Surface C top) ─────────────────────────────────
-// Title + 执行中 pill + project swatch + project name + stacked agent avatars
+// Title + project swatch + project name + stacked agent avatars
 // + message count + 详情 toggle. Driven by the same data sources the sidebar
 // already consumes (conversations[] cache, _groupMembersCache, pendingConvs)
 // so the header stays consistent across refreshes without new IPC.
@@ -1275,7 +1292,6 @@ function _refreshChatHeader() {
     : null;
   const titleEl = document.getElementById('chat-header-title');
   const titleInput = document.getElementById('chat-header-title-input');
-  const pillEl = document.getElementById('chat-header-running-pill');
   const metaEl = document.getElementById('chat-header-meta');
   const actionsEl = document.querySelector('.chat-header-actions');
   const menuBtn = document.getElementById('chat-header-menu-btn');
@@ -1295,11 +1311,6 @@ function _refreshChatHeader() {
     const label = t('project.menu.more_actions');
     menuBtn.title = label;
     menuBtn.setAttribute('aria-label', label);
-  }
-  if (pillEl) {
-    const state = pendingConvs.get(cid);
-    const running = isConvPending(cid) && !(state && state.aborted);
-    pillEl.hidden = !running;
   }
   if (metaEl) {
     const parts = [];
@@ -1585,7 +1596,7 @@ function _groupEventDedupeKey(evData) {
         return `process:event:${actor}:${turnId}:context:${phase}:${payload.tokensBefore || ''}:${payload.tokensAfter || ''}`;
       }
       if (evt.stream === 'runtime') {
-        return `process:event:${actor}:${turnId}:runtime:${payload.duration_ms || payload.durationMs || payload.elapsedMs || ''}:${payload.status || ''}`;
+        return `process:event:${actor}:${turnId}:runtime:${payload.duration_ms || payload.durationMs || payload.elapsedMs || ''}:${payload.phase || payload.status || ''}:${payload.attempt || ''}`;
       }
       if (evt.stream === 'tool' && String(phase) === 'progress') {
         const progressPhase = String(payload.progress_phase || '');
@@ -2440,6 +2451,8 @@ function _groupMsgToLegacy(gm) {
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
     ...(gm.turn_id ? { _turn_id: gm.turn_id } : {}),
+    ...(gm.failure_kind ? { failure_kind: gm.failure_kind } : {}),
+    ...(gm.failure_code ? { failure_code: gm.failure_code } : {}),
     ...(_groupMessageSystemKind(gm) ? { _system_kind: _groupMessageSystemKind(gm) } : {}),
   };
   return out;
@@ -2481,6 +2494,10 @@ function _syncRenderedGroupMessageIdentity(el, message) {
   if (turnId && !el.dataset.turnId) el.dataset.turnId = String(turnId);
   const systemKind = message.system_kind || message._system_kind;
   if (systemKind && !el.dataset.systemKind) el.dataset.systemKind = String(systemKind);
+  const failureKind = message.failure_kind || message._failure_kind;
+  if (failureKind) el.dataset.failureKind = String(failureKind);
+  const failureCode = message.failure_code || message._failure_code;
+  if (failureCode) el.dataset.failureCode = String(failureCode);
   const tsInput = message.ts || message.time;
   if (tsInput) {
     el.dataset.ts = String(_msTs(tsInput));
@@ -3121,7 +3138,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
     if (kind === 'image' && cid) {
       const url = _chatMediaUrl(cid, n);
       return `<span class="chat-msg-attach is-image" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <span class="chat-image-shell chat-msg-attach-thumb-shell is-loading"><img class="chat-msg-attach-thumb" src="${url}" alt="${label}" /></span>
+        <span class="chat-image-shell chat-msg-attach-thumb-shell is-loading"><img class="chat-msg-attach-thumb" src="${url}" alt="${label}" data-monitor-resource="chat-attachment-image" /></span>
         <span class="chat-msg-attach-label">${label}</span>
       </span>`;
     }
@@ -3130,7 +3147,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
       const floatingTitle = escapeHtml(_chatVideoFloatingTitle());
       return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
         <span class="chat-msg-attach-video-shell" data-chat-video-playback-surface="attachment_bubble">
-          <video class="chat-msg-attach-video" width="320" height="180" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
+          <video class="chat-msg-attach-video" width="320" height="180" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}" data-monitor-resource="chat-attachment-video"></video>
           <button type="button" class="chat-msg-attach-video-float" data-attach-video-open="1" aria-label="${floatingTitle}" title="${floatingTitle}">${_uiIconHtml('maximize', 'ui-icon chat-msg-attach-video-float-svg')}</button>
         </span>
         <span class="chat-msg-attach-label">${label}</span>
@@ -4515,10 +4532,36 @@ let _createAgentInlineObserver = null;
 // request carries the previous page's opaque byte cursor, so both disk reads
 // and first paint stay bounded even for very long JSONL transcripts.
 const HISTORY_PAGE_SIZE = 10;
+const HISTORY_AUTO_LOAD_THRESHOLD = 48;
 
-function _historyRequestUrl(cid, before = null) {
-  let url = `/api/conversations/${encodeURIComponent(cid)}/history?limit=${HISTORY_PAGE_SIZE}`;
+function _isConversationMissingResponse(data) {
+  if (!data || data.ok !== false) return false;
+  const code = String(data.code || '').toUpperCase();
+  const message = String(data.error || '').trim().toLowerCase();
+  return code === 'E_CONVERSATION_NOT_FOUND'
+    || code === 'E_NOT_FOUND'
+    || message === 'conversation not found';
+}
+
+async function _recoverMissingConversation(cid, source = 'history') {
+  if (!cid) return;
+  try { abortConvStream(cid); } catch (_) {}
+  try { _forgetConvLocal(cid); } catch (_) {}
+  conversations = (Array.isArray(conversations) ? conversations : [])
+    .filter((item) => item && item.conversation_id !== cid);
+  try { renderConversationList(); } catch (_) {}
+  if (currentCid === cid) {
+    try { setView('new-chat'); } catch (_) {}
+  }
+  try { await loadConversations(); } catch (_) {}
+  void source;
+}
+
+function _historyRequestUrl(cid, before = null, limit = HISTORY_PAGE_SIZE, aroundIndex = null) {
+  const pageSize = Math.max(1, Math.min(500, Math.floor(Number(limit) || HISTORY_PAGE_SIZE)));
+  let url = `/api/conversations/${encodeURIComponent(cid)}/history?limit=${pageSize}`;
   if (Number.isSafeInteger(before) && before >= 0) url += `&before=${before}`;
+  if (Number.isSafeInteger(aroundIndex) && aroundIndex >= 0) url += `&around_index=${aroundIndex}`;
   // The sidebar already knows the physical owner. Main treats this only as a
   // validated lookup hint and falls back safely if sync moved the conversation.
   url += `&project_id=${encodeURIComponent(_projectIdForConversation(cid))}`;
@@ -4534,6 +4577,53 @@ function _historyNextCursor(value) {
   return Number.isSafeInteger(cursor) && cursor > 0 ? cursor : null;
 }
 
+function _setEarlierHistoryLoaderState(row, state, error = '') {
+  if (!row) return;
+  row.classList.toggle('is-loading', state === 'loading');
+  row.classList.toggle('is-error', state === 'error');
+  row.dataset.state = state;
+  if (state === 'loading') {
+    row.removeAttribute('aria-hidden');
+    row.innerHTML = `<span class="chat-history-inline-spinner" aria-hidden="true"></span><span>${escapeHtml(t('chat.loading'))}</span>`;
+    return;
+  }
+  if (state === 'error') {
+    row.removeAttribute('aria-hidden');
+    row.textContent = t('chat.load_failed', { msg: error });
+    return;
+  }
+  row.setAttribute('aria-hidden', 'true');
+  row.textContent = '';
+}
+
+function _maybeAutoLoadEarlierHistory(container) {
+  if (!container || Number(container.scrollTop || 0) > HISTORY_AUTO_LOAD_THRESHOLD) {
+    const row = container?.querySelector?.('.chat-history-load-earlier');
+    if (row?.dataset.state === 'error') _setEarlierHistoryLoaderState(row, 'idle');
+    return;
+  }
+  if (_isProgrammaticStickyScroll(container)) return;
+  const row = container.querySelector('.chat-history-load-earlier');
+  if (!row || row.dataset.state === 'loading' || row.dataset.state === 'error') return;
+  const cursor = _historyNextCursor(row.dataset.cursor);
+  const cid = String(row.dataset.cid || '');
+  if (cursor === null || !cid || cid !== currentCid) return;
+  void _loadOlderConversationHistory(cid, cursor);
+}
+
+function _bindAutoLoadEarlierHistory(container) {
+  if (!container || container._historyAutoLoadBound) return;
+  container._historyAutoLoadBound = true;
+  container.addEventListener('scroll', () => _maybeAutoLoadEarlierHistory(container), { passive: true });
+  // A wheel/touch gesture at scrollTop=0 does not always emit another scroll
+  // event. Listen for the user's continued upward intent so short pages can
+  // still advance without a button.
+  container.addEventListener('wheel', (event) => {
+    if (Number(event?.deltaY || 0) < 0) _maybeAutoLoadEarlierHistory(container);
+  }, { passive: true });
+  container.addEventListener('touchmove', () => _maybeAutoLoadEarlierHistory(container), { passive: true });
+}
+
 function _setLoadEarlierHistory(container, cid, nextCursor) {
   if (!container) return;
   const existing = container.querySelector('.chat-history-load-earlier');
@@ -4544,58 +4634,138 @@ function _setLoadEarlierHistory(container, cid, nextCursor) {
   }
   const row = existing || document.createElement('div');
   row.className = 'chat-history-load-earlier';
-  let button = row.querySelector('button');
-  if (!button) {
-    button = document.createElement('button');
-    button.type = 'button';
-    row.appendChild(button);
-  }
-  button.disabled = false;
-  button.textContent = t('chat.history_load_earlier');
-  button.onclick = () => _loadOlderConversationHistory(cid, cursor);
+  row.setAttribute('role', 'status');
+  row.setAttribute('aria-live', 'polite');
+  row.dataset.cid = String(cid || '');
+  row.dataset.cursor = String(cursor);
+  _setEarlierHistoryLoaderState(row, 'idle');
   if (!existing) container.insertBefore(row, container.firstChild);
+  _bindAutoLoadEarlierHistory(container);
 }
 
 async function _loadOlderConversationHistory(cid, before) {
   if (!cid || cid !== currentCid) return;
   const container = document.getElementById('chat-history');
   if (!container) return;
+  if (container._historyOlderLoading) return container._historyOlderLoading;
   const row = container.querySelector('.chat-history-load-earlier');
-  const button = row?.querySelector('button');
-  if (button?.disabled) return;
-  if (button) button.disabled = true;
-  try {
-    const res = await apiFetch(_historyRequestUrl(cid, before));
-    const data = await res.json();
-    if (!data?.ok) throw new Error(data?.error || 'load failed');
-    if (cid !== currentCid) return;
+  const initialCursor = _historyNextCursor(before);
+  if (!row || initialCursor === null) return;
 
-    const knownIds = new Set(Array.from(container.querySelectorAll('.chat-message[data-msg-id]'))
-      .map((el) => el.dataset.msgId)
-      .filter(Boolean));
-    const page = _collapseSupersededInterruptionRecords(
-      (Array.isArray(data.history) ? data.history : [])
-        .filter((gm) => gm && !gm.dispatch && (!gm.id || !knownIds.has(String(gm.id)))),
-    )
-      .map(_groupMsgToLegacy)
-      .sort((a, b) => _msTs(a && a.time) - _msTs(b && b.time));
-    const fragment = document.createDocumentFragment();
-    page.forEach((msg) => appendChatMessage(msg, false, {
-      cid,
-      container: fragment,
-      historyHydration: true,
-    }));
-    if (row) container.insertBefore(fragment, row);
-    else container.insertBefore(fragment, container.firstChild);
-    _removeSupersededInterruptionBubbles(container);
-    _setLoadEarlierHistory(container, cid, data.next_cursor);
-    // The user deliberately requested older history, so reveal the new page
-    // rather than preserving the previous top loader as the viewport anchor.
-    container.scrollTop = 0;
-  } catch (err) {
-    _convLog.warn('load older conversation history failed', err);
-    if (button) button.disabled = false;
+  const run = (async () => {
+    _setEarlierHistoryLoaderState(row, 'loading');
+    const previousScrollHeight = Number(container.scrollHeight || 0);
+    const previousScrollTop = Number(container.scrollTop || 0);
+    try {
+      const knownIds = new Set(Array.from(container.querySelectorAll('.chat-message[data-msg-id]'))
+        .map((el) => el.dataset.msgId)
+        .filter(Boolean));
+      const visitedCursors = new Set();
+      let cursor = initialCursor;
+      let nextCursor = initialCursor;
+      let page = [];
+      let rawRows = 0;
+
+      // Task transcripts can contain full raw pages made only of internal
+      // dispatch/routing records. Advance across those pages in the same load
+      // so reaching the top never appears to do nothing.
+      while (cursor !== null && page.length === 0) {
+        if (visitedCursors.has(cursor)) throw new Error('history cursor did not advance');
+        visitedCursors.add(cursor);
+        const res = await apiFetch(_historyRequestUrl(cid, cursor));
+        const data = await res.json();
+        if (_isConversationMissingResponse(data)) {
+          await _recoverMissingConversation(cid, 'older_history');
+          return;
+        }
+        if (!data?.ok) throw new Error(data?.error || 'load failed');
+        if (cid !== currentCid || row.parentElement !== container) return;
+
+        const rawHistory = Array.isArray(data.history) ? data.history : [];
+        rawRows += rawHistory.length;
+        page = _collapseSupersededInterruptionRecords(
+          rawHistory.filter((gm) => (
+            _isVisibleGroupHistoryRecord(gm)
+            && (!gm.id || !knownIds.has(String(gm.id)))
+          )),
+        );
+        nextCursor = _historyNextCursor(data.next_cursor);
+        if (nextCursor !== null && nextCursor === cursor) {
+          throw new Error('history cursor did not advance');
+        }
+        cursor = nextCursor;
+      }
+
+      const messages = page
+        .map(_groupMsgToLegacy)
+        .sort((a, b) => _msTs(a && a.time) - _msTs(b && b.time));
+      const fragment = document.createDocumentFragment();
+      messages.forEach((msg) => appendChatMessage(msg, false, {
+        cid,
+        container: fragment,
+        historyHydration: true,
+      }));
+      // Keep the auto-load sentinel as the first child. Every successively
+      // older page lands immediately after it and before the already-mounted
+      // transcript, preserving chronological order across repeated loads.
+      container.insertBefore(fragment, row.nextSibling);
+      _removeSupersededInterruptionBubbles(container);
+      _setLoadEarlierHistory(container, cid, nextCursor);
+      _restoreOlderHistoryPrependScroll(container, previousScrollHeight, previousScrollTop);
+      _convLog.info('older conversation history loaded', {
+        cid,
+        before: initialCursor,
+        next_cursor: nextCursor,
+        raw_rows: rawRows,
+        visible_rows: messages.length,
+      });
+    } catch (err) {
+      _convLog.warn('load older conversation history failed', err);
+      if (row.parentElement === container) {
+        _setEarlierHistoryLoaderState(row, 'error', err?.message || String(err));
+      }
+    }
+  })();
+  container._historyOlderLoading = run;
+  try {
+    await run;
+  } finally {
+    if (container._historyOlderLoading === run) container._historyOlderLoading = null;
   }
+}
+
+function _findConversationHistorySearchTarget(container, target = {}) {
+  if (!container) return null;
+  const messages = Array.from(container.querySelectorAll('.chat-message'));
+  const msgId = String(target.msgId || '').trim();
+  if (msgId) {
+    const byId = messages.find((message) => String(message.dataset?.msgId || '') === msgId);
+    if (byId) return byId;
+  }
+  const targetTs = _msTs(target.time);
+  if (!targetTs) return null;
+  const role = target.role === 'user' || target.role === 'assistant' ? target.role : '';
+  return messages.find((message) => (
+    Number(message.dataset?.ts || 0) === targetTs
+    && (!role || message.classList?.contains(role))
+  )) || null;
+}
+
+function _flashConversationHistorySearchTarget(target) {
+  if (!target) return;
+  target.scrollIntoView({ block: 'center' });
+  target.classList.add('search-flash');
+  setTimeout(() => target.classList.remove('search-flash'), 1600);
+}
+
+function _revealConversationHistorySearchTarget(cid, target = {}) {
+  if (!cid || cid !== currentCid) return false;
+  const container = document.getElementById('chat-history');
+  if (!container) return false;
+  const message = _findConversationHistorySearchTarget(container, target);
+  if (!message) return false;
+  _flashConversationHistorySearchTarget(message);
+  return true;
 }
 
 function _ensureCreateAgentInlineObserver() {
@@ -4622,7 +4792,12 @@ async function loadConversationHistory(cid, opts = {}) {
     // before transcript rendering, but a cold summary-cache fill no longer
     // serializes ahead of the history round trip.
     const historyStartedAt = performance.now();
-    const historyPromise = apiFetch(_historyRequestUrl(cid));
+    const historyPromise = apiFetch(_historyRequestUrl(
+      cid,
+      null,
+      HISTORY_PAGE_SIZE,
+      Number(opts.searchTarget?.msgIndex),
+    ));
     const membersStartedAt = performance.now();
     const membersPromise = _refreshGroupMembers(cid).then((actors) => {
       _convLog.info('conversation detail members ready', {
@@ -4654,7 +4829,12 @@ async function loadConversationHistory(cid, opts = {}) {
     const parseStartedAt = performance.now();
     const data = await res.json();
     const jsonParseMs = Math.round(performance.now() - parseStartedAt);
+    if (_isConversationMissingResponse(data)) {
+      await _recoverMissingConversation(cid, 'history');
+      return;
+    }
     if (!data.ok) throw new Error(data.error || 'load failed');
+    if (cid !== currentCid) return;
     const convMeta = data.conversation || {};
     _serverFloorByCid.set(cid, typeof convMeta.active_recipient === 'string' ? convMeta.active_recipient : '');
     // History reload: drop ALL per-actor placeholder map entries — the
@@ -4705,6 +4885,9 @@ async function loadConversationHistory(cid, opts = {}) {
       container.appendChild(historyFragment);
     }
     _setLoadEarlierHistory(container, cid, data.next_cursor);
+    const searchTargetRevealed = opts.searchTarget
+      ? _revealConversationHistorySearchTarget(cid, opts.searchTarget)
+      : false;
     const renderMs = Math.round(performance.now() - renderStartedAt);
     _convLog.info('conversation detail first paint', {
       cid,
@@ -4750,7 +4933,11 @@ async function loadConversationHistory(cid, opts = {}) {
     if (shouldRecoverRunningUi) {
       pollMsgCounts.set(cid, String(lastMsg?._msg_id || ''));
       const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
-      pendingConvs.set(cid, { loadingEl, needsIndicator: false });
+      pendingConvs.set(cid, {
+        loadingEl,
+        needsIndicator: false,
+        startedAtMs: Math.max(0, new Date(convMeta.processing_since).getTime() || 0),
+      });
       if (hasActiveTurnsField) {
         for (const turn of activeTurns) {
           _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id, turn.started_at_ms);
@@ -4814,8 +5001,9 @@ async function loadConversationHistory(cid, opts = {}) {
     // scrollHeight when we jump to the bottom — otherwise the MutationObserver
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
+    if (cid !== currentCid) return;
     if (preserveScroll) _restoreHistoryReloadScroll(container, scrollSnapshot);
-    else _scrollToBottomNoAnim(container);
+    else if (!searchTargetRevealed) _scrollToBottomNoAnim(container);
     if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid);
     if (cid === currentCid && !isConvPending(cid) && (messageQueues.get(cid) || []).length) {
       _dispatchNextQueued(cid);
@@ -4993,6 +5181,30 @@ function _scrollToBottomNoAnim(container) {
   container._stickyUserPaused = false;
   container._stickyEnabled = true;
   _bindStickToBottom(container);
+  requestAnimationFrame(() => {
+    container.style.scrollBehavior = prev || '';
+  });
+}
+
+function _olderHistoryPrependTop(previousScrollTop, previousScrollHeight, nextScrollHeight) {
+  const addedHeight = Math.max(0, Number(nextScrollHeight || 0) - Number(previousScrollHeight || 0));
+  return Math.max(0, Number(previousScrollTop || 0) + addedHeight);
+}
+
+function _restoreOlderHistoryPrependScroll(container, previousScrollHeight, previousScrollTop) {
+  if (!container) return;
+  const prev = container.style.scrollBehavior;
+  container.style.scrollBehavior = 'auto';
+  _markProgrammaticStickyScroll(container);
+  container.scrollTop = _olderHistoryPrependTop(
+    previousScrollTop,
+    previousScrollHeight,
+    container.scrollHeight,
+  );
+  // Loading older history is explicit upward-reading intent. Do not let the
+  // sticky-bottom stream path pull the viewport back to the newest message.
+  container._stickyEnabled = false;
+  container._stickyUserPaused = true;
   requestAnimationFrame(() => {
     container.style.scrollBehavior = prev || '';
   });
@@ -5545,6 +5757,8 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
   if (message._turn_id) msgDiv.dataset.turnId = String(message._turn_id);
   if (message._system_kind) msgDiv.dataset.systemKind = String(message._system_kind);
+  if (message.failure_kind) msgDiv.dataset.failureKind = String(message.failure_kind);
+  if (message.failure_code) msgDiv.dataset.failureCode = String(message.failure_code);
   msgDiv.dataset.ts = String(_msTs(message.time));
   if (role === 'user') {
     msgDiv.dataset.retryContent = String(rawContent || '');
@@ -6473,12 +6687,12 @@ async function _openReferenceTargetPicker(payloads) {
   const overlay = document.createElement('div');
   overlay.id = 'chat-reference-target-overlay';
   overlay.className = 'modal-overlay open chat-reference-target-overlay';
-  overlay.innerHTML = `<div class="chat-reference-target-modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(t('chat.reference_target_title', { count: payloads.length }))}">
-    <div class="chat-reference-target-header">
-      <h2>${escapeHtml(t('chat.reference_target_title', { count: payloads.length }))}</h2>
+  overlay.innerHTML = `<div class="modal-standard chat-reference-target-modal" role="dialog" aria-modal="true" aria-labelledby="chat-reference-target-title">
+    <div class="modal-header chat-reference-target-header">
+      <h2 class="modal-title" id="chat-reference-target-title">${escapeHtml(t('chat.reference_target_title', { count: payloads.length }))}</h2>
       <button type="button" class="modal-close-btn chat-reference-target-close" title="${escapeHtml(t('common.close'))}" aria-label="${escapeHtml(t('common.close'))}">${_uiIconHtml('x', 'modal-close-icon') || '×'}</button>
     </div>
-    <div class="chat-reference-target-body">
+    <div class="modal-body chat-reference-target-body">
       <button type="button" class="chat-reference-new-task" data-new-task="1">
         <span class="chat-reference-leading-plus" aria-hidden="true">+</span>
         <span class="chat-reference-new-task-label">${escapeHtml(t('chat.reference_new_task'))}</span>
@@ -6529,7 +6743,6 @@ async function _openReferenceTargetPicker(payloads) {
     _stageReferencesForNewTask(payloads, sourceProjectId);
   });
   overlay.querySelector('.chat-reference-target-close')?.addEventListener('click', _closeReferenceTargetPicker);
-  overlay.addEventListener('mousedown', (event) => { if (event.target === overlay) _closeReferenceTargetPicker(); });
   overlay.addEventListener('keydown', (event) => { if (event.key === 'Escape') _closeReferenceTargetPicker(); });
   search.addEventListener('input', render);
   render();
@@ -6788,6 +7001,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
       });
       if (data.ok) {
         btn.textContent = t('chat.archive_done');
+        if (typeof uiToast === 'function') uiToast(t('chat.archive_done'), { variant: 'success' });
         if (data.scope === 'global' && currentView === 'contexts' && typeof loadContexts === 'function') {
           loadContexts();
         }
@@ -6796,11 +7010,15 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
         }
       } else {
         btn.textContent = t('chat.archive_failed');
-        await uiAlert(t('chat.archive_failed_with_reason', { reason: data.error || t('chat.unknown_error') }));
+        const message = t('chat.archive_failed_with_reason', { reason: data.error || t('chat.unknown_error') });
+        if (typeof uiToast === 'function') uiToast(message, { variant: 'error' });
+        else await uiAlert(message);
       }
     } catch (err) {
       btn.textContent = t('chat.archive_failed');
-      await uiAlert(t('chat.archive_failed_with_reason', { reason: err.message || err }));
+      const message = t('chat.archive_failed_with_reason', { reason: err.message || err });
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'error' });
+      else await uiAlert(message);
     }
     setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000);
   });
@@ -6846,11 +7064,23 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
   if (btn) btn.disabled = true;
   const orig = btn ? btn.innerHTML : '';
   try {
-    const userMsgEl = _findUserMessageForRetry(msgDiv);
-    const payload = _retryPayloadFromUserMessage(userMsgEl);
-    if (!payload) {
-      await uiAlert(t('chat.retry_no_source'));
-      return;
+    const failedMessageId = String(msgDiv.dataset.msgId || '').trim();
+    let payload;
+    if (failedMessageId) {
+      payload = {
+        content: t('chat.retry_user_message'),
+        extra: { retry_message_id: failedMessageId },
+      };
+    } else {
+      // Compatibility for an unpersisted/legacy live failure with no stable
+      // message id. There is no authoritative recovery target, so retain the
+      // old restart behavior using the preceding rendered user message.
+      const userMsgEl = _findUserMessageForRetry(msgDiv);
+      payload = _retryPayloadFromUserMessage(userMsgEl);
+      if (!payload) {
+        await uiAlert(t('chat.retry_no_source'));
+        return;
+      }
     }
     if (btn) btn.innerHTML = `<span class="bubble-action-spinner" aria-hidden="true"></span><span>${escapeHtml(t('chat.retry_running'))}</span>`;
     await sendInConversation(currentCid, payload.content, payload.extra);
@@ -6863,6 +7093,11 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
 }
 
 // ─── Send flows ───
+
+function _trackChatSendResult(result, data = {}) {
+  void result;
+  void data;
+}
 
 async function handleNewChatSubmit() {
   const input = document.getElementById('new-chat-input');
@@ -6893,6 +7128,7 @@ async function handleNewChatSubmit() {
     return;
   }
   const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
+  const sendAttemptStartedAt = performance.now();
   _convLog.info('new chat submit', {
     content_length: content.length,
     use: useSelections.map((sel) => sel.kind),
@@ -6933,6 +7169,14 @@ async function handleNewChatSubmit() {
     conversations.unshift(conv);
     renderConversationList();
   } catch (e) {
+    _trackChatSendResult('failure', {
+      conversation_id: '',
+      source_view: 'new_chat',
+      content_length: content.length,
+      attachment_count: draftNames.length,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'conversation_create',
+    });
     await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
     if (newBtn) newBtn.disabled = false;
     return;
@@ -7404,9 +7648,16 @@ function _makeConvChatController(cid, options = {}) {
         pendingConvs.set(id, {
           loadingEl: msgEl,
           needsIndicator: false,
-          controller: { abort: () => _convChatCtrls.get(id)?.abort() },
+          startedAtMs: Date.now(),
+          // Keep the controller that owns this exact send. Looking it up by
+          // cid at abort time can target a newer queued send after the map is
+          // replaced by its controller.
+          controller: self,
           aborted: false,
         });
+        if (typeof options.onStarted === 'function') {
+          try { options.onStarted(); } catch (_) {}
+        }
         if (activePairId) msgEl.dataset.convPair = activePairId;
         _lastGroupWorkEventAt.set(id, Date.now());
         _groupEventDedupe.delete(id);
@@ -7418,8 +7669,10 @@ function _makeConvChatController(cid, options = {}) {
       onAbort(msgEl, id) {
         const state = pendingConvs.get(id);
         if (state) state.aborted = true;
-        _taskTurnFinish(id, { msgEl, aborted: true });
-        _finishStreamingMsg(id);
+        // `onDone` is the single owner of task settlement and queue drain.
+        // Finishing here used to start the next queued send before the old
+        // controller's finally/onDone ran, allowing that stale callback to
+        // clear and settle the new send.
       },
       onStreamEvent(ev, _msgEl, id) {
         _taskTurnRecordStreamEvent(id, ev);
@@ -7433,7 +7686,8 @@ function _makeConvChatController(cid, options = {}) {
         }
       },
       onDone(msgEl, id, result = {}) {
-        // Unconditional cleanup — safe even if polling already resolved.
+        // Final cleanup is owned by the controller that still represents this
+        // conversation's active send.
         // `_finishStreamingMsg` synchronously drains the next queued
         // message (via `_dispatchNextQueued` → new `ctrl.send`), which
         // appends the user bubble + RE-ARMS the scroll-pin spacer for the
@@ -7442,14 +7696,17 @@ function _makeConvChatController(cid, options = {}) {
         // before invoking us, so a second removal would strip the spacer
         // the new turn just added and the queued user message would render
         // off-screen until later layout shifts pushed it into view.
-        _taskTurnFinish(id, { msgEl, aborted: !!result.aborted, errored: !!result.errored });
-        _finishStreamingMsg(id);
-        _scheduleHistoryReconcileAfterStream(id);
-        // Only drop the map entry if it still refers to *this* controller.
-        // On abort we dispatch the next queued message synchronously from
-        // `onAbort`, which assigns a new controller into `_convChatCtrls`
-        // before this finally block runs — we must not stomp on it.
-        if (_convChatCtrls.get(id) === self) _convChatCtrls.delete(id);
+        // A stale controller must never settle or clear a newer send for the
+        // same conversation. Reuse the existing controller identity instead
+        // of introducing another run token.
+        if (_convChatCtrls.get(id) === self) {
+          _taskTurnFinish(id, { msgEl, aborted: !!result.aborted, errored: !!result.errored });
+          _finishStreamingMsg(id);
+          _scheduleHistoryReconcileAfterStream(id);
+          // `_finishStreamingMsg` can synchronously start the next queued
+          // controller. Delete only if the map still belongs to this send.
+          if (_convChatCtrls.get(id) === self) _convChatCtrls.delete(id);
+        }
         if (typeof options.onDone === 'function') {
           try { options.onDone(result); } catch (_) {}
         }
@@ -7461,24 +7718,18 @@ function _makeConvChatController(cid, options = {}) {
 }
 
 async function sendInConversation(cid, content, extra, options = {}) {
-  if (!cid) return;
+  if (!cid) return { started: false, aborted: false, errored: false, result: 'failure' };
   const startedAt = performance.now();
   const sendOptions = options && typeof options === 'object' ? options : {};
   const statAgentId = String(sendOptions.agent_id || '');
   let doneResult = null;
+  let taskStarted = false;
   const attachmentCount = Array.isArray(extra && extra.attachments) ? extra.attachments.length : 0;
   if (isConvPending(cid)) {
     // Queued input starts a new execution stream after the current one ends,
     // so it must not be merged into the active task-turn sample.
     enqueueMessage(cid, content, '', { direct: true, extra });
-    if (window.Monitor) (() => {})('chat_send_result', {
-      result: 'queued',
-      conversation_id: cid,
-      content_length: String(content || '').length,
-      attachment_count: attachmentCount,
-      duration_ms: 0,
-    });
-    return;
+    return { started: false, queued: true, aborted: false, errored: false };
   }
 
   // Scroll-pin spacer is owned by the controller (features.scrollPin) —
@@ -7486,6 +7737,13 @@ async function sendInConversation(cid, content, extra, options = {}) {
   // padding the top instead of the bottom and defeating the pin.
 
   const ctrl = _makeConvChatController(cid, {
+    onStarted() {
+      taskStarted = true;
+      _taskTurnStart(cid, content, extra, Date.now());
+      if (typeof sendOptions.onStarted === 'function') {
+        try { sendOptions.onStarted(); } catch (_) {}
+      }
+    },
     onDone(result = {}) {
       doneResult = result || {};
       if (typeof sendOptions.onDone === 'function') {
@@ -7494,13 +7752,20 @@ async function sendInConversation(cid, content, extra, options = {}) {
     },
   });
   _convChatCtrls.set(cid, ctrl);
-  _taskTurnStart(cid, content, extra, Date.now());
   try {
-    await ctrl.send(content, extra);
+    const controllerResult = await ctrl.send(content, extra);
+    const terminal = doneResult || controllerResult || {
+      started: false,
+      aborted: false,
+      errored: true,
+      reason: 'unknown',
+    };
     const durationMs = Math.round(performance.now() - startedAt);
-    if (statAgentId && doneResult) {
-      const aborted = !!doneResult.aborted;
-      const errored = !!doneResult.errored;
+    const started = terminal.started !== false && taskStarted;
+    const aborted = !!terminal.aborted;
+    const errored = !!terminal.errored || !started;
+    const result = aborted ? 'cancelled' : (errored ? 'failure' : 'success');
+    if (statAgentId) {
       _notifyAgentRunFinished(statAgentId, {
         duration_ms: durationMs,
         aborted,
@@ -7508,13 +7773,8 @@ async function sendInConversation(cid, content, extra, options = {}) {
         success: !aborted && !errored,
       });
     }
-    if (window.Monitor) (() => {})('chat_send_result', {
-      result: 'success',
-      conversation_id: cid,
-      content_length: String(content || '').length,
-      attachment_count: attachmentCount,
-      duration_ms: durationMs,
-    });
+    if (!started && _convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
+    return { ...terminal, started, aborted, errored, result };
   } catch (err) {
     const durationMs = Math.round(performance.now() - startedAt);
     if (statAgentId) {
@@ -7528,9 +7788,11 @@ async function sendInConversation(cid, content, extra, options = {}) {
       (() => {})('chat_send_result', {
         result: 'failure',
         conversation_id: cid,
+        source_view: sendOptions.source_view || 'conversation',
         content_length: String(content || '').length,
         attachment_count: attachmentCount,
         duration_ms: durationMs,
+        failure_stage: taskStarted ? 'stream' : 'preflight',
       });
       (() => {})('chat_send', {
         conversation_id: cid,
@@ -7538,10 +7800,14 @@ async function sendInConversation(cid, content, extra, options = {}) {
         error_message: err && err.message ? err.message : String(err),
       });
     }
-    _taskTurnFinish(cid, {
-      errored: true,
-      error: err && err.message ? err.message : String(err),
-    });
+    if (taskStarted && _convChatCtrls.get(cid) === ctrl) {
+      _taskTurnFinish(cid, {
+        errored: true,
+        error: err && err.message ? err.message : String(err),
+      });
+      _finishStreamingMsg(cid);
+    }
+    if (_convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
     throw err;
   }
 }
@@ -7715,6 +7981,7 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
       ...existing,
       loadingEl: msgEl,
       needsIndicator: false,
+      startedAtMs: Number(existing.startedAtMs || Date.now()),
       controller: allowWithController ? (existing.controller || ctrl) : ctrl,
       aborted: false,
     });
@@ -8506,23 +8773,15 @@ function _streamingAppendProgress(msg, text, kindHint, eventName) {
 }
 
 // ── Always-visible liveness strip ──────────────────────────────────────
-// Long CLI-agent turns emit mostly tool-events, which land in the
-// collapsible / scrollable process rail — the bubble body itself can sit
-// unchanged for minutes and reads as "stuck" (real case: a 20-minute
-// claude-code turn produced 6 text deltas vs 80 tool events, and its last
-// ~10 minutes were one long Bash call with zero events). The activity
-// strip is one always-visible row on the streaming placeholder: latest
-// action summary + tool-call counter + a live elapsed clock. It does not
-// depend on the rail being open or scrolled, and its 1 s ticker keeps the
-// clock moving even while the backend is silent between events.
-function _streamingUpdateActivity(msg, text, opts = {}) {
+// Long turns emit most detail into the collapsible process rail, so the
+// bubble keeps one concise always-visible status + elapsed clock. Specific
+// tool names/counts, inferred steps and ETA stay out of this strip because
+// reconnects and suppressed worker events can make those incomplete.
+function _streamingUpdateActivity(msg, text) {
   if (!msg || msg.dataset.activityDone === '1') return;
   const row = msg.querySelector('[data-role="activity"]');
   if (!row) return;
   if (!msg.dataset.activityStart) msg.dataset.activityStart = String(Date.now());
-  if (opts.countTool) {
-    msg.dataset.activityTools = String((Number(msg.dataset.activityTools) || 0) + 1);
-  }
   const textEl = row.querySelector('[data-role="activity-text"]');
   const label = String(text || '').replace(/\s+/g, ' ').trim();
   if (textEl) {
@@ -8576,11 +8835,7 @@ function _streamingPaintActivityMeta(msg) {
   const secs = Math.max(0, Math.floor(clock.elapsedMs / 1000));
   const mm = Math.floor(secs / 60);
   const ss = String(secs % 60).padStart(2, '0');
-  const tools = Number(msg.dataset.activityTools) || 0;
-  const parts = [];
-  if (tools > 0) parts.push(t('chat.activity_tools', { n: tools }));
-  parts.push(`${mm}:${ss}`);
-  meta.textContent = parts.join(' · ');
+  meta.textContent = `${mm}:${ss}`;
 }
 
 function _streamingStopActivity(msg) {
@@ -8594,34 +8849,26 @@ function _streamingStopActivity(msg) {
   if (row) row.style.display = 'none';
 }
 
-// Map one live process event onto the activity strip. Usage pulses prove
-// liveness but carry no displayable action — refresh the clock without
-// touching the label. Idle heartbeats get a localized "still running"
-// message (the rail's own idle row is en-only and easy to miss).
+// Map one structured live event onto the concise activity strip. Retry is a
+// reliable explicit phase; every other process event stays at generic working
+// so incomplete event streams cannot overstate the exact current action.
 function _streamingUpdateActivityFromEvent(msg, evt) {
   const data = (evt && evt.data) || {};
   const stream = (evt && evt.stream) || '';
   const cliType = stream === 'cli' ? String(data.type || '').toLowerCase() : '';
-  if (cliType === 'status' && String(data.status || '').toLowerCase() === 'usage') {
-    _streamingUpdateActivity(msg, '');
+  const phase = String(data.phase || data.status || '').toLowerCase();
+  if (stream === 'runtime' && phase === 'retrying') {
+    const attempt = Math.max(1, Math.round(Number(data.attempt) || 1));
+    _streamingUpdateActivity(msg, attempt > 1
+      ? t('model.retrying_n', { attempt })
+      : t('model.retrying'));
     return;
   }
-  if (cliType === 'idle') {
-    const secs = Math.max(1, Math.round(Number(data.stalledMs || 0) / 1000));
-    _streamingUpdateActivity(msg, t('chat.activity_waiting', { secs }));
+  if (cliType === 'status' && phase === 'usage') {
+    _streamingUpdateActivity(msg, t('chat.activity_working'));
     return;
   }
-  const phase = String(data.phase || data.status || '');
-  const contextDone = stream === 'context' && (phase.endsWith('_done') || phase.endsWith('_failed'));
-  if ((stream === 'tool' && phase === 'end') || stream === 'compaction' || contextDone) {
-    _streamingUpdateActivity(msg, t('chat.activity_thinking'));
-    return;
-  }
-  const isToolUse = (cliType === 'tool-event' && data.phase !== 'result')
-    || (stream === 'tool' && (data.phase === 'start' || data.status === 'start'));
-  let line = null;
-  try { line = _formatEventLine(evt); } catch (_) { line = null; }
-  _streamingUpdateActivity(msg, line || '', { countTool: isToolUse });
+  _streamingUpdateActivity(msg, t('chat.activity_working'));
 }
 
 // Cancel any rAF queued by `_streamingAppendFinalDelta`. Callers that are
@@ -8998,6 +9245,9 @@ function createChatController(config) {
     if (pending) return;
     const q = _qGet(id);
     if (!q.length) return;
+    // Preserve edit-chat queue entries when credentials/configuration become
+    // unavailable while another response is running.
+    if (!ensureModelConfigured()) return;
     const next = q.shift();
     _qSave(id, q);
     renderQueue();
@@ -9180,18 +9430,22 @@ function createChatController(config) {
   }
 
   async function send(rawContent, extraBody) {
-    if (pending) return;   // single-threaded send per controller
+    if (pending) return { started: false, aborted: false, errored: false, reason: 'busy' };
     const id = config.getCurrentId();
-    if (!id) return;
+    if (!id) return { started: false, aborted: false, errored: false, reason: 'missing_id' };
     let content = (rawContent || '').trim();
-    if (!content) return;
+    if (!content) return { started: false, aborted: false, errored: false, reason: 'empty' };
     // Gate every chat-controller send on model config — covers the normal
     // conversation flow plus skill/agent edit chats, and also catches queue
     // drains and auto-seed sends (e.g. skills.js 'autoSeed').
-    if (!ensureModelConfigured()) return;
+    if (!ensureModelConfigured()) {
+      return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
+    }
     if (hooks.beforeSend) {
       const transformed = await hooks.beforeSend(content, id);
-      if (transformed === null || transformed === undefined) return;
+      if (transformed === null || transformed === undefined) {
+        return { started: false, aborted: false, errored: false, reason: 'cancelled_by_hook' };
+      }
       content = transformed;
     }
 
@@ -9243,9 +9497,16 @@ function createChatController(config) {
     }
 
     const controller = new AbortController();
-    pending = { controller, msgEl, userMsgEl, aborted: false, errored: false };
+    pending = {
+      controller,
+      msgEl,
+      userMsgEl,
+      aborted: false,
+      errored: false,
+    };
     _updateSendUI();
 
+    let terminalResult = { started: true, aborted: false, errored: false };
     try {
       const res = await apiFetch(config.streamEndpoint(id), {
         method: 'POST',
@@ -9289,13 +9550,14 @@ function createChatController(config) {
             if (hooks.onStreamEvent) hooks.onStreamEvent(ev, msgEl, id);
             if (ev.type === 'final' && hooks.onFinal) hooks.onFinal(ev, msgEl, id);
             if (ev.type === 'error') {
-              pending.errored = true;
-              _handleModelOutputErrorForUi(id, msgEl, ev.text, {
-                stage: 'stream_event',
-                error_type: ev.aborted ? 'abort' : 'model_output',
-                aborted: !!ev.aborted,
-              });
-              if (hooks.onError) hooks.onError(ev.text, msgEl, id);
+              if (ev.aborted) {
+                pending.aborted = true;
+                pending.errored = false;
+                if (hooks.onAbort) hooks.onAbort(msgEl, id);
+              } else {
+                pending.errored = true;
+                if (hooks.onError) hooks.onError(ev.text, msgEl, id);
+              }
             }
             const paintWait = maybeYieldToPaint();
             if (paintWait) await paintWait;
@@ -9323,15 +9585,17 @@ function createChatController(config) {
     } finally {
       const wasAborted = pending?.aborted;
       const wasErrored = pending?.errored;
+      terminalResult = { started: true, aborted: !!wasAborted, errored: !!wasErrored };
       pending = null;
       _updateSendUI();
       if (features.scrollPin) _setChatScrollOffset(false, historyEl);
-      if (hooks.onDone) hooks.onDone(msgEl, id, { aborted: wasAborted, errored: wasErrored });
+      if (hooks.onDone) hooks.onDone(msgEl, id, terminalResult);
       // No re-pin at stream end — respect the user's scroll position
       // if they scrolled up mid-stream.
       // Drain one queued message if any, matching main-chat behaviour.
       if (features.queue) _qDispatchNext();
     }
+    return terminalResult;
   }
 
   function abort() {
@@ -9397,7 +9661,7 @@ function createChatController(config) {
     if (sendBtnEl && !sendBtnEl.dataset.ctrlBound) {
       sendBtnEl.dataset.ctrlBound = '1';
       sendBtnEl.addEventListener('click', () => {
-        if (pending) abort();
+        if (pending) abort({ userInitiated: true });
         else _submitFromInput();
       });
     }
@@ -9466,12 +9730,8 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
       for (const payload of finalCreated) _mountCreatedAgentChip(msg, payload);
     }
   } else if (ev.type === 'error') {
-    _streamingSetError(msg, ev.text);
-    _handleModelOutputErrorForUi(cid, msg, ev.text, {
-      stage: 'stream_event',
-      error_type: ev.aborted ? 'abort' : 'model_output',
-      aborted: !!ev.aborted,
-    });
+    if (ev.aborted) _streamingMarkAborted(msg);
+    else _streamingSetError(msg, ev.text);
   }
 }
 
@@ -9762,6 +10022,8 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   }
   ph.dataset.fromActor = String(gm.from || '');
   ph.dataset.msgId = String(gm.id || '');
+  if (gm.failure_kind) ph.dataset.failureKind = String(gm.failure_kind);
+  if (gm.failure_code) ph.dataset.failureCode = String(gm.failure_code);
   _stampRenderedGroupMessage(ph, gm);
 
   // Update the header timestamp to the message's actual ts (placeholder
@@ -9798,6 +10060,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     _handleModelOutputErrorForUi(cid, ph, _failedAssistantErrorText(ph) || text, {
       stage: 'actor_final',
       error_type: 'model_output',
+      failure_kind: String(gm.failure_kind || ''),
     });
   }
 
@@ -9872,7 +10135,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
   if (evData.type === 'agent_run_result') {
-    _trackAgentRunResultTelemetry(cid, evData);
     return;
   }
   if (
@@ -10064,7 +10326,8 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const line = evt ? (_formatEventLine(evt) || String(data.text)) : String(data.text);
         if (evt) _setProcessSummaryRuntimeFromEvent(target, evt);
         _streamingAppendProgress(target, line, evt ? _eventProcessKind(evt, line) : undefined);
-        _streamingUpdateActivity(target, t('chat.activity_thinking'));
+        if (evt) _streamingUpdateActivityFromEvent(target, evt);
+        else _streamingUpdateActivity(target, t('chat.activity_working'));
       } else if (data.type === 'event') {
         const before = _processLineCount(target);
         _renderAgentEvent(target, data.event);
@@ -11110,7 +11373,7 @@ function abortConvStream(cid) {
 // pendingConvs / messageQueues directly so callers don't have to stay in sync.
 function _updateConvSidebarBadge(cid, _unused) {
   _refreshCommanderRunningChip();
-  // Chat header's 执行中 pill follows the same per-conv signal.
+  // Chat header's status pill follows the same per-conversation signal.
   if (cid === currentCid) {
     try { _refreshChatHeader(); } catch (_) { /* not yet bound */ }
   }
@@ -11135,7 +11398,6 @@ function _updateConvSidebarBadge(cid, _unused) {
   let html = '';
   if (pending) {
     html += '<span class="conv-status-dot"></span>';
-    // html += '<span class="conv-status-text">replying</span>';
     if (queued > 0) html += `<span class="conv-status-count">+${queued}</span>`;
   } else {
     html += `<span class="conv-status-text">${escapeHtml(t('chat.status.pending_short'))}</span>`;

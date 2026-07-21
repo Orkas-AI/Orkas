@@ -260,6 +260,72 @@ type SafeUsage = {
   totalTokens?: number;
 };
 
+export type LiveRunTimingPhase = 'provider' | 'tool' | 'compaction' | 'retry_wait' | 'other';
+
+export type LiveRunTimingState = {
+  phase: LiveRunTimingPhase;
+  phaseStartedAtMs: number;
+  providerMs: number;
+  toolMs: number;
+  compactionMs: number;
+  retryWaitMs: number;
+  otherMs: number;
+};
+
+function liveTimingKey(phase: LiveRunTimingPhase): keyof AgentRunTimings {
+  if (phase === 'provider') return 'providerMs';
+  if (phase === 'tool') return 'toolMs';
+  if (phase === 'compaction') return 'compactionMs';
+  if (phase === 'retry_wait') return 'retryWaitMs';
+  return 'otherMs';
+}
+
+export function createLiveRunTimings(startedAtMs = Date.now()): LiveRunTimingState {
+  return {
+    phase: 'other',
+    phaseStartedAtMs: startedAtMs,
+    providerMs: 0,
+    toolMs: 0,
+    compactionMs: 0,
+    retryWaitMs: 0,
+    otherMs: 0,
+  };
+}
+
+export function transitionLiveRunTimings(
+  state: LiveRunTimingState,
+  phase: LiveRunTimingPhase,
+  nowMs = Date.now(),
+): void {
+  const elapsed = Math.max(0, nowMs - state.phaseStartedAtMs);
+  const key = liveTimingKey(state.phase);
+  state[key] += elapsed;
+  state.phase = phase;
+  state.phaseStartedAtMs = nowMs;
+}
+
+export function snapshotLiveRunTimings(
+  state: LiveRunTimingState,
+  nowMs = Date.now(),
+): AgentRunTimings {
+  const snapshot: AgentRunTimings = {
+    providerMs: state.providerMs,
+    toolMs: state.toolMs,
+    compactionMs: state.compactionMs,
+    retryWaitMs: state.retryWaitMs,
+    otherMs: state.otherMs,
+  };
+  snapshot[liveTimingKey(state.phase)] += Math.max(0, nowMs - state.phaseStartedAtMs);
+  return snapshot;
+}
+
+function liveRunFailurePhase(phase: LiveRunTimingPhase): StreamEvent['failurePhase'] {
+  if (phase === 'tool') return 'tool';
+  if (phase === 'compaction') return 'compaction';
+  if (phase === 'other') return 'preflight';
+  return 'provider_wait';
+}
+
 type ToolRunLogCounter = {
   starts: number;
   progress: number;
@@ -796,13 +862,15 @@ function agentRunResultEventForTelemetry(input: {
   idleTimeoutSec?: number;
   streamIdleTimeoutSec?: number;
   timings?: AgentRunTimings;
+  failureCode?: string;
+  failurePhase?: StreamEvent['failurePhase'];
 }): StreamEvent {
   const result = input.status === 'completed'
     ? 'success'
     : (input.status === 'aborted' ? 'aborted' : 'failure');
   const errorCode = input.status === 'completed'
     ? ''
-    : (input.status === 'empty' ? 'empty_response' : input.status);
+    : (input.failureCode || (input.status === 'empty' ? 'empty_response' : input.status));
   const data: Record<string, unknown> = {
     result,
     provider: providerCategoryForTelemetry(input.providerId),
@@ -815,6 +883,7 @@ function agentRunResultEventForTelemetry(input: {
   if (Number.isFinite(input.idleTimeoutSec)) data.idle_timeout_sec = Math.max(0, Math.round(input.idleTimeoutSec || 0));
   if (Number.isFinite(input.streamIdleTimeoutSec)) data.stream_idle_timeout_sec = Math.max(0, Math.round(input.streamIdleTimeoutSec || 0));
   if (Number.isFinite(input.idleWindowSec)) data.idle_window_sec = Math.max(0, Math.round(input.idleWindowSec || 0));
+  if (input.failurePhase) data.failure_phase = input.failurePhase;
   if (input.timings) {
     data.provider_ms = Math.max(0, Math.round(input.timings.providerMs));
     data.tool_ms = Math.max(0, Math.round(input.timings.toolMs));
@@ -917,9 +986,11 @@ export function modelTurnContextForLog(input: {
  */
 export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<StreamEvent, void, unknown> {
   const runStartedAt = Date.now();
+  const liveRunTimings = createLiveRunTimings(runStartedAt);
   const {
     userId, message,
     sessionId = `anon-${genConversationId().slice(0, 8)}`,
+    resumeActiveTurn = false,
     systemPrompt,
     agentName,
     workingDir,
@@ -1065,6 +1136,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   const assemblingToolCallIds = new Set<string>();
   let modelTextStreamActive = false;
   let idleHitWindow = idleTimeout;
+  let idleHitPhase: NonNullable<StreamEvent['failurePhase']> = 'provider_wait';
   const activeAbortEntry: ActiveSessionAbort = {
     abort: () => {
       directSessionAbort = true;
@@ -1082,13 +1154,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const assemblingToolCall = assemblingToolCallIds.size > 0;
     const inToolPhase = toolDepth > 0 || assemblingToolCall;
     const window = !inToolPhase && modelTextStreamActive ? streamIdleTimeout : idleTimeout;
+    const phase: NonNullable<StreamEvent['failurePhase']> = toolDepth > 0
+      ? 'tool'
+      : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'provider_wait'));
     idleTimer = setTimeout(() => {
       idleHit = true;
       idleHitWindow = window;
+      idleHitPhase = phase;
       log.warn('idle-watchdog fired; aborting and releasing locks', {
         session_id: maskedSessionId,
         idle_seconds: window,
-        phase: toolDepth > 0 ? 'tool' : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'model_wait')),
+        phase,
       });
       controller.abort();
       releaseSlotOnce('idle-watchdog');
@@ -1114,6 +1190,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let finalText = '';
   let errText: string | null = null;
   let abortedFlag = false;
+  let terminalFailureCode = '';
+  let terminalFailurePhase: StreamEvent['failurePhase'];
+  // Set only after runner construction and all host-side preflight gates pass.
+  // This is the taxonomy boundary between setup/config failures and failures
+  // produced by an attempted model run; do not replace it with text matching.
+  let modelRunStarted = false;
   let activeProviderId = '';
   let activeModelId = '';
   let activeToolCount = 0;
@@ -1135,6 +1217,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       agentId,
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
+      providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
       ...(turnId ? { turnId } : {}),
       ...(message ? { userMessage: message } : {}),
@@ -1251,8 +1334,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     log.info('model turn run start', turnLogContext);
     const requestMetadata = attachmentMetadata ? { attachmentMetadata } : {};
 
+    modelRunStarted = true;
+    transitionLiveRunTimings(liveRunTimings, 'provider');
     const rawEvents = runner.runStream({
       message,
+      ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       signal: controller.signal,
       sandboxEnv,
       ...(workingDir ? { workingDir } : {}),
@@ -1268,6 +1354,21 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // Wrap raw events to capture the AgentRunResult for post-run reflection.
     async function* captureResult(events: AsyncIterable<import('#core-agent').AgentRunEvent>) {
       for await (const ev of events) {
+        const liveNow = Date.now();
+        if (liveRunTimings.phase === 'retry_wait' && ev.type !== 'retry') {
+          transitionLiveRunTimings(liveRunTimings, 'provider', liveNow);
+        }
+        if (ev.type === 'context_status') {
+          if (ev.phase.endsWith('_start')) {
+            transitionLiveRunTimings(liveRunTimings, 'compaction', liveNow);
+          } else if (liveRunTimings.phase === 'compaction') {
+            transitionLiveRunTimings(liveRunTimings, 'provider', liveNow);
+          }
+        } else if (ev.type === 'retry') {
+          transitionLiveRunTimings(liveRunTimings, 'retry_wait', liveNow);
+        } else if (ev.type === 'tool_start' && toolDepth === 0) {
+          transitionLiveRunTimings(liveRunTimings, 'tool', liveNow);
+        }
         recordModelRawEventForLog(diagnostics, ev);
         if (ev.type === 'done') agentRunResult = ev.result;
         // Track tool-execution phase from the RAW events (stable discriminants)
@@ -1287,6 +1388,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
           modelTextStreamActive = false;
           assemblingToolCallIds.delete(ev.id || 'stream_tool');
           toolDepth = Math.max(0, toolDepth - 1);
+          if (toolDepth === 0 && liveRunTimings.phase === 'tool') {
+            transitionLiveRunTimings(liveRunTimings, 'provider', liveNow);
+          }
         }
         // Some raw events intentionally do not map to visible UI events
         // (e.g. an empty tool-input delta before a large write_file argument).
@@ -1306,15 +1410,29 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // mapped UI events can be synthesized from accumulated raw state.
       resetIdle();
       eventCount += 1;
-      recordModelStreamEventForLog(diagnostics, ev);
-      recorder.record(ev as any);
-      if (ev.type === 'final') finalText = (ev as any).text || finalText;
-      if (ev.type === 'error') { errText = (ev as any).text || errText; if ((ev as any).aborted) abortedFlag = true; }
+      let outgoing: StreamEvent = ev;
+      if (ev.type === 'error' && !(ev as StreamEvent).aborted) {
+        terminalFailureCode = (ev as StreamEvent).failureCode || 'model_stream_error';
+        terminalFailurePhase = (ev as StreamEvent).failurePhase || (finalText ? 'model_text' : 'provider_wait');
+        outgoing = {
+          ...ev,
+          failureKind: (ev as StreamEvent).failureKind || 'model',
+          failureCode: terminalFailureCode,
+          failurePhase: terminalFailurePhase,
+        };
+      }
+      recordModelStreamEventForLog(diagnostics, outgoing);
+      recorder.record(outgoing as any);
+      if (outgoing.type === 'final') finalText = outgoing.text || finalText;
+      if (outgoing.type === 'error') {
+        errText = outgoing.text || errText;
+        if (outgoing.aborted) abortedFlag = true;
+      }
       // NOTE: compaction summaries are deliberately NOT mined into cross-session
       // memory. That hook persisted transient task progress (the summary is
       // work-in-progress, not durable user facts) into MEMORY.md. Memory is now
       // written only by the explicit `cross_session_memory` tool.
-      yield ev;
+      yield outgoing;
     }
     log.info('model turn stream drained', {
       ...turnLogContext,
@@ -1339,7 +1457,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield abortEvent;
     } else if (idleHit) {
       errText = errText || `Model exceeded ${idleHitWindow}s with no response (aborted)`;
-      const idleEvent: StreamEvent = { type: 'error', text: errText };
+      terminalFailureCode = 'idle_timeout';
+      terminalFailurePhase = idleHitPhase;
+      const idleEvent: StreamEvent = {
+        type: 'error',
+        text: errText,
+        failureKind: 'model',
+        failureCode: 'idle_timeout',
+        failurePhase: idleHitPhase,
+      };
       recordModelStreamEventForLog(diagnostics, idleEvent);
       recorder.record(idleEvent as any);
       yield idleEvent;
@@ -1347,8 +1473,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   } catch (err) {
     if (idleHit) {
       errText = `Model exceeded ${idleHitWindow}s with no response (aborted)`;
+      terminalFailureCode = 'idle_timeout';
+      terminalFailurePhase = idleHitPhase;
       log.warn('model turn idle timeout surfaced after stream error', { ...turnLogContext, error: logErrorSummary(err) });
-      const idleEvent: StreamEvent = { type: 'error', text: errText };
+      const idleEvent: StreamEvent = {
+        type: 'error',
+        text: errText,
+        failureKind: 'model',
+        failureCode: 'idle_timeout',
+        failurePhase: idleHitPhase,
+      };
       recordModelStreamEventForLog(diagnostics, idleEvent);
       recorder.record(idleEvent as any);
       yield idleEvent;
@@ -1362,8 +1496,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield abortEvent;
     } else {
       errText = (err as Error).message || String(err);
+      terminalFailureCode = modelRunStarted ? 'model_stream_error' : 'model_preflight';
+      terminalFailurePhase = modelRunStarted ? 'provider_wait' : 'preflight';
       log.error('model turn stream error', { ...turnLogContext, error: logErrorSummary(err) });
-      const errorEvent: StreamEvent = { type: 'error', text: errText };
+      const errorEvent: StreamEvent = {
+        type: 'error',
+        text: errText,
+        failureKind: modelRunStarted ? 'model' : 'config',
+        failureCode: terminalFailureCode,
+        failurePhase: terminalFailurePhase,
+      };
       recordModelStreamEventForLog(diagnostics, errorEvent);
       recorder.record(errorEvent as any);
       yield errorEvent;
@@ -1418,7 +1560,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       idleWindowSec: idleHit ? idleHitWindow : undefined,
       idleTimeoutSec: idleTimeout,
       streamIdleTimeoutSec: streamIdleTimeout,
-      timings: agentRunResult?.meta.timings,
+      timings: agentRunResult?.meta.timings || snapshotLiveRunTimings(liveRunTimings),
+      failureCode: terminalFailureCode || undefined,
+      failurePhase: terminalFailurePhase
+        || (terminalStatus === 'aborted' ? liveRunFailurePhase(liveRunTimings.phase) : undefined),
     });
     log.info('model turn finish', {
       ...turnLogContext,

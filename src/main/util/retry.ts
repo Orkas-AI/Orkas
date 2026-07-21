@@ -12,10 +12,11 @@ interface RetryOptions {
   delaysMs?: number[];
 }
 
-interface FetchRetryOptions extends RetryOptions {
+export interface FetchRetryOptions extends RetryOptions {
   /** Per-attempt wall-clock timeout. Omitted by default so large downloads can opt in deliberately. */
   timeoutMs?: number;
   timeoutMessage?: string;
+  isRetriable?: (err: unknown) => boolean;
 }
 
 let fetchImplementation: FetchImplementation | null = null;
@@ -111,6 +112,24 @@ export async function fetchWithRetry(
   init?: RequestInit,
   opts: FetchRetryOptions = {},
 ): Promise<Response> {
+  const { response } = await fetchAndReadWithRetry(
+    label,
+    input,
+    init,
+    async () => undefined,
+    opts,
+  );
+  return response;
+}
+
+/** Keep the request timeout active until the caller has consumed the response body. */
+export async function fetchAndReadWithRetry<T>(
+  label: string,
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  readBody: (response: Response, signal?: AbortSignal) => Promise<T>,
+  opts: FetchRetryOptions = {},
+): Promise<{ response: Response; body: T }> {
   return retryAsync(label, async () => {
     const timeoutMessage = opts.timeoutMessage || `${label} timed out after ${opts.timeoutMs}ms`;
     const composed = composeTimeoutSignal(init?.signal ?? undefined, opts.timeoutMs, timeoutMessage);
@@ -119,12 +138,16 @@ export async function fetchWithRetry(
       if (isRetriableHttpStatus(res.status)) {
         throw new RetriableHttpStatusError(res.status, label);
       }
-      return res;
+      return { response: res, body: await readBody(res, composed.signal) };
     } catch (err) {
       if (composed.timedOut()) throw new Error(timeoutMessage);
       throw err;
     } finally {
       composed.cleanup();
     }
-  }, opts);
+  }, {
+    retries: opts.retries,
+    delaysMs: opts.delaysMs,
+    isRetriable: opts.isRetriable,
+  });
 }

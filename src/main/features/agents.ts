@@ -10,8 +10,9 @@
  *
  * The inline "edit" chat lets the LLM refine an agent by emitting one
  * `<agent>...</agent>` container per turn, whose children are the fields
- * to update: `<name>` / `<description>` / `<workflow>` / `<skills>` /
- * `<inputs>`. Each child is a full-replacement update for that field.
+ * to update: `<name>` / `<description>` / `<icon>` / `<workflow>` /
+ * `<skills>` / `<inputs>`. Each child is a full-replacement update for that
+ * field.
  */
 
 import * as crypto from 'node:crypto';
@@ -86,6 +87,8 @@ export interface AgentInputOption {
   label: string;
 }
 
+export type AgentInputUiLanguage = 'zh' | 'en' | 'ja' | 'pt';
+
 /** Declarative schema for an agent's user-facing input parameters.
  * Populated by the agent-edit LLM (or commander quick-create) via the
  * `<inputs>` child of the `<agent>` update container; consumed at run
@@ -105,6 +108,10 @@ export interface AgentInput {
    * file → string (single) or string[] (when `multiple`). For `file` the
    * default is always `""` / `[]` — model authors can't pre-pick a file. */
   default: string | number | boolean | string[];
+  /** Optional select defaults resolved from the current User UI language.
+   * Values must reference declared option values; `default` remains the
+   * unavailable/unsupported-language fallback. */
+  default_by_ui_language?: Partial<Record<AgentInputUiLanguage, string>>;
   /** Required for select/multiselect; ignored otherwise. */
   options?: AgentInputOption[];
   placeholder?: string;
@@ -605,6 +612,22 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
     if (typeof e.description === 'string' && e.description) input.description = e.description;
     if (e.required === true) input.required = true;
     if (options) input.options = options;
+    if (
+      type === 'select'
+      && e.default_by_ui_language
+      && typeof e.default_by_ui_language === 'object'
+      && !Array.isArray(e.default_by_ui_language)
+    ) {
+      const rawDefaults = e.default_by_ui_language as Record<string, unknown>;
+      const uiDefaults: Partial<Record<AgentInputUiLanguage, string>> = {};
+      for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
+        const value = rawDefaults[lang];
+        if (typeof value === 'string' && options!.some((option) => option.value === value)) {
+          uiDefaults[lang] = value;
+        }
+      }
+      if (Object.keys(uiDefaults).length > 0) input.default_by_ui_language = uiDefaults;
+    }
     if (typeof e.placeholder === 'string' && e.placeholder) input.placeholder = e.placeholder;
     if (typeof e.min === 'number' && Number.isFinite(e.min)) input.min = e.min;
     if (typeof e.max === 'number' && Number.isFinite(e.max)) input.max = e.max;
@@ -2152,9 +2175,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // ─────────────────────────────────────────────────────────────────────────
 
 // Single outer container: `<agent>...</agent>`. Inside: child tags `<name>`,
-// `<description>`, `<workflow>`, `<skills>`, `<inputs>`. One container per
-// turn gives us atomic extraction (all fields in or none) and a single
-// placeholder to stream-hide. Shared between agent-edit chat and main-chat
+// `<description>`, `<icon>`, `<workflow>`, `<skills>`, `<inputs>`. One
+// container per turn gives us atomic extraction (all fields in or none) and
+// a single placeholder to stream-hide. Shared between agent-edit chat and main-chat
 // quick-create; see the "Create agent" section of
 // `chat_agent_setup.md` / `chat_commander.md`.
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
@@ -2173,6 +2196,8 @@ export interface ExtractedFields {
   description?: string;
   description_zh?: string;
   description_en?: string;
+  /** Parsed only when the model emits a token from the avatar catalog. */
+  icon?: string;
   workflow?: string;
   /** Parsed from independent `<knowhow>` / `<standards>` line lists.
    *  JSON arrays and legacy `<profile>` remain accepted for compatibility. */
@@ -2219,6 +2244,13 @@ function _parseAgentBlock(inner: string): ExtractedFields {
   if (descEnM) {
     const v = descEnM[1].trim();
     if (v) fields.description_en = v;
+  }
+  const iconM = inner.match(AGENT_CHILD_RE('icon'));
+  if (iconM) {
+    const v = iconM[1].trim();
+    if (avatars.isKnownIcon(v) && v !== avatars.getCatalog().commander_default.icon) {
+      fields.icon = v;
+    }
   }
   const wfM = inner.match(AGENT_CHILD_RE('workflow'));
   if (wfM) {
@@ -2427,6 +2459,7 @@ export function buildAgentEditSystemPrompt(agent: {
   description?: string;
   description_zh?: string;
   description_en?: string;
+  icon?: string;
   workflow?: string;
   skill_list?: string[];
   inputs?: AgentInput[];
@@ -2480,6 +2513,7 @@ export function buildAgentEditSystemPrompt(agent: {
         description: display || '(not provided)',
         description_zh: zh || '(not provided)',
         description_en: en || '(not provided)',
+        icon: avatars.isKnownIcon(agent.icon) ? agent.icon : '(not provided)',
         workflow: (agent.workflow || '').trim() || '(not provided)',
         skills: skillsText || '(not provided)',
         inputs_json: inputsJson,
@@ -2872,6 +2906,7 @@ export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Ag
 
   const created = await createCustomAgent({
     name, description, description_zh, description_en, workflow, category,
+    ...(fields.icon ? { icon: fields.icon } : {}),
     ...(fields.knowhow ? { knowhow: fields.knowhow } : {}),
     ...(fields.standards ? { standards: fields.standards } : {}),
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),

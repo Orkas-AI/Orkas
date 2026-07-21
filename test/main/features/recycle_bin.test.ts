@@ -1,13 +1,68 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 
 const UID = 'global-recycle-user';
+
+async function acquireExclusiveWindowsLock(filePath: string): Promise<ChildProcessWithoutNullStreams> {
+  const escapedPath = filePath.replace(/'/g, "''");
+  const script = [
+    `$stream = [System.IO.File]::Open('${escapedPath}', [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)`,
+    `[Console]::Out.WriteLine('locked')`,
+    `[Console]::Out.Flush()`,
+    `[Console]::In.ReadLine() | Out-Null`,
+    `$stream.Dispose()`,
+  ].join('; ');
+  const child = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`timed out acquiring Windows file lock: ${stderr}`));
+    }, 10_000);
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+      if (!stdout.includes('locked')) return;
+      clearTimeout(timer);
+      resolve();
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once('exit', (code) => {
+      if (stdout.includes('locked')) return;
+      clearTimeout(timer);
+      reject(new Error(`Windows file-lock helper exited with ${code}: ${stderr}`));
+    });
+  });
+  return child;
+}
+
+async function releaseExclusiveWindowsLock(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null) return;
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+  child.stdin.end();
+  const timer = setTimeout(() => child.kill(), 5_000);
+  await closed;
+  clearTimeout(timer);
+}
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-global-recycle-'));
@@ -567,7 +622,10 @@ describe('global recycle bin', () => {
     const protectedFile = path.join(paths.projectFilesDir(UID, pid), 'locked.txt');
     await fsp.mkdir(path.dirname(protectedFile), { recursive: true });
     await fsp.writeFile(protectedFile, 'must stay recoverable');
-    await fsp.chmod(protectedFile, 0o000);
+    const lockChild = process.platform === 'win32'
+      ? await acquireExclusiveWindowsLock(protectedFile)
+      : null;
+    if (!lockChild) await fsp.chmod(protectedFile, 0o000);
 
     try {
       await expect(createAppRecycleBatchForProject(UID, pid)).rejects.toMatchObject({
@@ -579,7 +637,8 @@ describe('global recycle bin', () => {
         name: 'Do Not Lose Files',
       }));
     } finally {
-      await fsp.chmod(protectedFile, 0o600).catch(() => {});
+      if (lockChild) await releaseExclusiveWindowsLock(lockChild);
+      else await fsp.chmod(protectedFile, 0o600).catch(() => {});
     }
   });
 });

@@ -14,7 +14,8 @@ const ipcSource = fs.readFileSync(
 describe('conversation detail first-paint boundary', () => {
   it('keeps the first history page at 10 rows', () => {
     expect(rendererSource).toContain('const HISTORY_PAGE_SIZE = 10;');
-    expect(rendererSource).toContain('limit=${HISTORY_PAGE_SIZE}');
+    expect(rendererSource).toContain('limit = HISTORY_PAGE_SIZE');
+    expect(rendererSource).toContain('limit=${pageSize}');
   });
 
   it('does not make secondary member enrichment a transcript paint prerequisite', () => {
@@ -23,7 +24,8 @@ describe('conversation detail first-paint boundary', () => {
     const body = rendererSource.slice(start, end);
 
     expect(body).toContain('const membersPromise = _refreshGroupMembers(cid)');
-    expect(body).toContain('const historyPromise = apiFetch(_historyRequestUrl(cid))');
+    expect(body).toContain('const historyPromise = apiFetch(_historyRequestUrl(');
+    expect(body).toContain('Number(opts.searchTarget?.msgIndex)');
     expect(body).toContain('const res = await historyPromise');
     expect(body.indexOf('const historyPromise = apiFetch')).toBeLessThan(
       body.indexOf('await loadAgents(false, { summary: true })'),
@@ -50,7 +52,9 @@ describe('conversation detail first-paint boundary', () => {
 
     expect(handler).toContain('const resolvedProjectId = conv.project_id ?? null');
     expect(handler).toContain('groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId)');
-    expect(handler).toContain('resolvedProjectId,\n    );');
+    expect(handler).toContain('chats.getMessagesPageAtIndex(');
+    expect(handler).toContain('requestedAroundIndex, requestedLimit, resolvedProjectId');
+    expect(handler).toContain('resolvedProjectId,\n      );');
   });
 
   it('keeps attachment refresh independent and timed', () => {

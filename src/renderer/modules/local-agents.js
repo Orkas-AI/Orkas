@@ -71,6 +71,19 @@ function cliIsCodingAgent(cliType) {
   return !!(d && d.isCoding);
 }
 
+/** Localized recovery hint for an unavailable registry entry. Keep the
+ * registry error code intact instead of collapsing every unavailable CLI
+ * into "not installed". */
+function getLocalCliUnavailableHint(entry) {
+  if (entry?.error === 'version_unknown') {
+    return t('agent.cli_version_unknown');
+  }
+  if (entry?.error === 'version_too_old') {
+    return t('agent.cli_version_too_old', { version: entry.version || '?' });
+  }
+  return t('agent.cli_not_found');
+}
+
 let _localCliEntries = null;
 
 async function loadLocalCliEntries({ force = false } = {}) {
@@ -106,7 +119,10 @@ let _extCliSelectApi = null;
 async function mountExternalCliSelect(onChange) {
   const mount = document.getElementById('agent-modal-ext-cli-select');
   if (!mount) return null;
-  const entries = await loadLocalCliEntries();
+  // The modal may have been opened before the user installed a CLI. Re-probe
+  // on every open so the renderer's longer-lived cache cannot preserve a
+  // stale "not installed" result for the rest of the app session.
+  const entries = await loadLocalCliEntries({ force: true });
   const available = entries.filter(e => e.available);
   const noneLabel = t('agent_modal.ext_cli_none');
   const options = [
@@ -151,6 +167,7 @@ function setExternalCliValue(cliType) {
 window.loadLocalCliEntries = loadLocalCliEntries;
 window.getCliDefaults = getCliDefaults;
 window.cliIsCodingAgent = cliIsCodingAgent;
+window.getLocalCliUnavailableHint = getLocalCliUnavailableHint;
 window.mountExternalCliSelect = mountExternalCliSelect;
 window.getExternalCliValue = getExternalCliValue;
 window.setExternalCliValue = setExternalCliValue;

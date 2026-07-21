@@ -5,7 +5,7 @@
  *   1. ORKAS_<TYPE>_PATH env var, if set → use as-is (still validated).
  *   2. Else `whichBin(defaultBin)` scans PATH plus standard GUI-app
  *      fallback dirs (`~/.local/bin`, Homebrew locations, etc.).
- *   3. If found, run `<path> --version` and `checkMinVersion`.
+ *   3. If found, run the CLI's documented version probe and `checkMinVersion`.
  *
  * Results are cached for 60s to keep the create/edit panel snappy
  * across re-renders. Pass `{ force: true }` to bypass the cache (used
@@ -48,6 +48,17 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   hermes: 'ORKAS_HERMES_PATH',
 };
 
+/** Documented version probes for each CLI, in compatibility order. */
+const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
+  claude: [['--version']],
+  codex: [['--version']],
+  openclaw: [['--version']],
+  opencode: [['--version']],
+  // Hermes documents both forms across releases. Prefer the stable
+  // subcommand, then tolerate installations that expose only the flag.
+  hermes: [['version'], ['--version']],
+};
+
 export function localCliSearchDirs(
   type: LocalCliType,
   platform: NodeJS.Platform = process.platform,
@@ -55,6 +66,7 @@ export function localCliSearchDirs(
   home = os.homedir(),
 ): string[] {
   const dirs: string[] = [];
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
   if (platform === 'win32') {
     const localAppData = env.LOCALAPPDATA || (home ? path.win32.join(home, 'AppData', 'Local') : '');
     const appData = env.APPDATA || (home ? path.win32.join(home, 'AppData', 'Roaming') : '');
@@ -74,13 +86,19 @@ export function localCliSearchDirs(
   }
   if (home) {
     // macOS GUI apps do not source ~/.zprofile, but Codex standalone
-    // installs its visible command here by default.
-    dirs.push(path.join(home, '.local', 'bin'));
-    dirs.push(path.join(home, 'bin'));
+    // installs its visible command here by default. npm's commonly
+    // recommended user prefix is also absent from Finder-launched apps.
+    dirs.push(pathApi.join(home, '.local', 'bin'));
+    dirs.push(pathApi.join(home, '.npm-global', 'bin'));
+    dirs.push(pathApi.join(home, 'bin'));
   }
+  if (env.NPM_CONFIG_PREFIX) dirs.push(pathApi.join(env.NPM_CONFIG_PREFIX, 'bin'));
+  if (env.VOLTA_HOME) dirs.push(pathApi.join(env.VOLTA_HOME, 'bin'));
+  if (env.PNPM_HOME) dirs.push(env.PNPM_HOME);
   dirs.push('/opt/homebrew/bin', '/usr/local/bin');
   if (type === 'codex' && platform === 'darwin') {
     dirs.push('/Applications/Codex.app/Contents/Resources');
+    dirs.push('/Applications/ChatGPT.app/Contents/Resources');
   }
   return dirs;
 }
@@ -113,14 +131,14 @@ export type LocalCliEntry = {
   type: LocalCliType;
   /** Absolute path to the binary, or null when unavailable. */
   path: string | null;
-  /** Parsed `MAJOR.MINOR.PATCH` from `--version`, or null. */
+  /** Parsed `MAJOR.MINOR.PATCH` from the CLI's version probe, or null. */
   version: string | null;
   /** True only when path resolved AND version check passed. */
   available: boolean;
   /**
    * Populated when `available === false` to explain why:
    * "not_found" (no PATH match), "version_too_old" (below MIN_VERSIONS),
-   * or "version_unknown" (binary exists but `--version` returned nothing).
+   * or "version_unknown" (binary exists but its version probe returned nothing).
    */
   error?: 'not_found' | 'version_too_old' | 'version_unknown';
   /** Human-readable detail when error is set; safe to show in UI. */
@@ -169,14 +187,20 @@ export async function detectOne(type: LocalCliType): Promise<LocalCliEntry> {
   // The npm @openai/codex wrapper can hang on `--version` in GUI-launched
   // environments. Prefer its package.json version when available; fall back to
   // the normal subprocess probe for standalone/non-npm installs.
-  const version = type === 'codex'
-    ? (await detectCodexPackageVersion(resolved)) || await detectVersion(resolved)
-    : await detectVersion(resolved);
+  const versionProbes = VERSION_PROBES[type];
+  let version = type === 'codex' ? await detectCodexPackageVersion(resolved) : null;
+  for (const versionArgs of versionProbes) {
+    if (version) break;
+    version = await detectVersion(resolved, 5000, versionArgs);
+  }
   if (!version) {
+    const attempted = versionProbes
+      .map(args => `\`${resolved} ${args.join(' ')}\``)
+      .join(', ');
     return {
       type, path: resolved, version: null, available: false,
       error: 'version_unknown',
-      errorDetail: `\`${resolved} --version\` produced no parsable output`,
+      errorDetail: `${attempted} produced no parsable output`,
     };
   }
   const minErr = checkMinVersion(type, version);

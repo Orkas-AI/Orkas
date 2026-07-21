@@ -122,10 +122,10 @@ function _dispatchNextQueued(cid) {
   // messages go out in order. Queues on other cids stay parked until the user
   // switches back (then on render we'll also kick the next item).
   if (cid !== currentCid) return;
-  const next = q.shift();
-  _saveQueueToStorage(cid);
-  _updateConvSidebarBadge(cid);
-  renderMessageQueue(cid);
+  // Keep the item durable until the chat controller has actually entered its
+  // started state. A model-config/preflight rejection must not silently drop
+  // the queued user message.
+  const next = q[0];
   // Inline skill / connector tokens are expanded at dispatch time. Agent runs
   // are just "run <name>" text — no flag. Legacy queued rows may still carry a
   // separate `use` field; keep honoring it until old localStorage drains.
@@ -167,9 +167,24 @@ function _dispatchNextQueued(cid) {
     ]);
     if (selections.length) extra.use_selections = selections;
   }
-  // Fire-and-forget: sendInCurrentConversation handles its own errors via
-  // _streamingSetError + _finishStreamingMsg (which will re-enter this fn).
-  sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
+  const removeStartedItem = () => {
+    const liveQueue = _getQueue(cid);
+    const idx = liveQueue.findIndex((item) => item && item.id === next.id);
+    if (idx < 0) return;
+    liveQueue.splice(idx, 1);
+    _saveQueueToStorage(cid);
+    _updateConvSidebarBadge(cid);
+    if (cid === currentCid) renderMessageQueue(cid);
+  };
+  // Fire-and-forget: the send path owns stream failures and final cleanup.
+  // `onStarted` runs synchronously before the request begins, so a second
+  // drain cannot overtake this item; if preflight refuses the send, it stays
+  // at the head of the persisted queue.
+  Promise.resolve(sendInCurrentConversation(
+    content,
+    Object.keys(extra).length ? extra : undefined,
+    { from_queue: true, source_view: 'conversation', onStarted: removeStartedItem },
+  )).catch(() => {});
 }
 
 function renderMessageQueue(cid) {

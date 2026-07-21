@@ -14,12 +14,32 @@ const afterPack = require('../../../scripts/codesign-adhoc.cjs') as ((context: a
 
 let tmpDir: string;
 
+async function removeFixtureTree(root: string): Promise<void> {
+  const deadline = Date.now() + (process.platform === 'win32' ? 15_000 : 2_000);
+  let lastError: unknown;
+  do {
+    try {
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (process.platform !== 'win32' || !['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(String(code))) throw err;
+      lastError = err;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  } while (Date.now() < deadline);
+  throw lastError;
+}
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-afterpack-'));
 });
 
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  // A full Windows run can leave Defender scanning the synthetic PE/runtime
+  // fixture briefly after validation. Retry this suite-owned temp tree instead
+  // of turning delayed handle release into a packaging-gate failure.
+  await removeFixtureTree(tmpDir);
 });
 
 const RUNTIME_SIZES: Record<'python' | 'uv' | 'node', number> = { python: 101, uv: 202, node: 303 };

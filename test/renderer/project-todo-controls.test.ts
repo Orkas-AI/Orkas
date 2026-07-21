@@ -97,4 +97,49 @@ describe('project to-do controls', () => {
     expect(invocations.filter((call) => call.channel === 'projects.tasks.delete')).toHaveLength(1);
     expect(invocations.filter((call) => call.channel === 'projects.tasks.update')).toHaveLength(2);
   });
+
+  it('restores the send control when project conversation creation fails', async () => {
+    const events: any[] = [];
+    const input = { value: 'project question' };
+    const button = { disabled: false };
+    const Monitor = {
+      click() {},
+      event(name: string, payload: any) { events.push({ name, payload }); },
+    };
+    const context = vm.createContext({
+      console,
+      performance,
+      createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById(id: string) {
+          if (id === 'project-chat-input') return input;
+          if (id === 'project-chat-send-btn') return button;
+          return null;
+        },
+      },
+      window: { addEventListener() {}, Monitor: true },
+      Monitor,
+      t: (key: string) => key,
+      ensureModelConfigured: () => true,
+      _getQuotes: () => [],
+      _referenceSnapshotsForQuotes: () => [],
+      consumeChatUseSelections: () => [],
+      getChatRecipient: () => ({ kind: 'commander' }),
+      transformWithChatUse: (value: string) => value,
+      applyRecipientPrefix: (value: string) => value,
+      apiFetch: async () => ({ json: async () => ({ ok: false, error: 'create failed' }) }),
+      uiAlert: async () => {},
+      setTimeout,
+      clearTimeout,
+    });
+    vm.runInContext(source, context, { filename: 'project-detail.js' });
+    vm.runInContext("_projectDetailPid = 'p_test'", context);
+
+    await context._submitProjectChat();
+
+    expect(events).toEqual([]);
+    expect(button.disabled).toBe(false);
+  });
 });

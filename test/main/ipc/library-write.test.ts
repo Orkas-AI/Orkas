@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 vi.mock('electron', () => ({
   app: { isPackaged: false },
@@ -48,6 +49,61 @@ function ctx(userId = TEST_UID): any {
 }
 
 describe('library.writeText', () => {
+  it('recovers an orphaned project processing row and completes it', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const projectLibrary = await import('../../../src/main/features/project_library_indexer');
+    const vec = await import('../../../src/main/features/vec_store');
+    const { projectFilesDir, projectLibraryVectorDbPath } = await import('../../../src/main/paths');
+    const project = await projects.createProject(TEST_UID, 'Recovery Project');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const name = 'orphan.md';
+    const body = 'project crash recovery';
+    const source = path.join(projectFilesDir(TEST_UID, projectId), name);
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, body, 'utf8');
+    const stat = fs.statSync(source);
+    const store = vec.openVecStore(path.dirname(projectLibraryVectorDbPath(TEST_UID, projectId)));
+    await store.setFileStatus(name, 'processing', {
+      kind: 'text',
+      bytes: stat.size,
+      mtime: stat.mtimeMs / 1000,
+      sha1: crypto.createHash('sha1').update(body).digest('hex'),
+    });
+
+    const result = await projectLibrary.reconcile(TEST_UID, projectId);
+    expect(result.recoveredProcessing).toBe(1);
+    await projectLibrary.drain(TEST_UID);
+    expect(projectLibrary.getFileByPath(TEST_UID, projectId, name)?.status).toBe('ready');
+  });
+
+  it('keeps project vectors when a reconcile snapshot is temporarily unreadable', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const projectLibrary = await import('../../../src/main/features/project_library_indexer');
+    const { projectFilesDir } = await import('../../../src/main/paths');
+    const project = await projects.createProject(TEST_UID, 'Incomplete Snapshot');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const root = projectFilesDir(TEST_UID, projectId);
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'keep.md'), 'keep indexed data', 'utf8');
+    await projectLibrary.reconcile(TEST_UID, projectId);
+    await projectLibrary.drain(TEST_UID);
+    expect(projectLibrary.getFileByPath(TEST_UID, projectId, 'keep.md')?.status).toBe('ready');
+
+    const backup = `${root}.backup`;
+    fs.renameSync(root, backup);
+    fs.writeFileSync(root, 'not a directory', 'utf8');
+    try {
+      const result = await projectLibrary.reconcile(TEST_UID, projectId);
+      expect(result).toMatchObject({ incomplete: true, enqueuedDelete: 0 });
+      expect(projectLibrary.getFileByPath(TEST_UID, projectId, 'keep.md')?.status).toBe('ready');
+    } finally {
+      fs.rmSync(root, { force: true });
+      fs.renameSync(backup, root);
+    }
+  });
+
   it('writes archived chat text into the owning project Library when cid is project-scoped', async () => {
     const projects = await import('../../../src/main/features/projects');
     const chats = await import('../../../src/main/features/chats');

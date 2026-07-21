@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 /**
  * End-to-end integration tests for the group_chat bus. We mock
@@ -90,9 +95,12 @@ let prevWs: string | undefined;
 const TEST_UID = 'u1';
 const AGENT_ID = 'b8c7d6a5e4f3';
 const AGENT_NAME = 'Writer';
+const cidsToDrop = new Set<string>();
 
 function newCid(): string {
-  return 'c' + Math.random().toString(16).slice(2, 13);
+  const cid = 'c' + Math.random().toString(16).slice(2, 13);
+  cidsToDrop.add(cid);
+  return cid;
 }
 
 beforeEach(async () => {
@@ -104,6 +112,7 @@ beforeEach(async () => {
   _recordedToolResults.length = 0;
   modelAbortMock.mockClear();
   modelAbortMock.mockReturnValue(0);
+  cidsToDrop.clear();
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -133,16 +142,18 @@ afterEach(async () => {
     if (fs.existsSync(dir)) {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       for (const e of entries) {
-        if (e.isDirectory() && /^c[0-9a-f]{12}$/.test(e.name)) bus.dropConv(TEST_UID, e.name);
+        if (e.isDirectory()) cidsToDrop.add(e.name);
       }
     }
+    for (const cid of cidsToDrop) await bus.dropConv(TEST_UID, cid);
   } catch { /* ignore */ }
-  await new Promise((r) => setTimeout(r, 30));
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
+  cidsToDrop.add(cid);
   const bus = await import('../../../../src/main/features/group_chat/bus');
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -183,7 +194,7 @@ describe('group_chat bus integration › disabled skills', () => {
     ].join('\n'));
     enabled.setSkillEnabled(TEST_UID, 'arxiv-reader', false);
 
-    _setScript(state.buildGconvSessionId(TEST_UID, cid), [
+    _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: 'WRONG: substituted skill ran' },
     ]);
     await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '使用 arxiv-reader 技能：最新论文' });
@@ -194,6 +205,40 @@ describe('group_chat bus integration › disabled skills', () => {
     expect(messages.some((m: any) => String(m.text || '').includes('component.skill_disabled_request'))).toBe(false);
     expect(messages.some((m: any) => String(m.text || '').includes('arxiv-reader'))).toBe(true);
     expect(messages.some((m: any) => /停用|disabled/i.test(String(m.text || '')))).toBe(true);
+    const failure = messages.find((m: any) => m.from === 'commander' && m.failure_kind);
+    expect(failure).toMatchObject({
+      failure_kind: 'dependency',
+      failure_code: 'skill_disabled',
+    });
+  });
+});
+
+describe('group_chat bus integration › failure taxonomy', () => {
+  it('persists model preflight failures as config rather than model output', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+
+    _setScript(state.buildGconvSessionId(cid), [
+      {
+        type: 'error',
+        text: 'No model configured',
+        failureKind: 'config',
+        failureCode: 'model_preflight',
+      },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'hello' });
+    await waitForQuiescent(TEST_UID, cid, 2000);
+
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    const failure = messages.find((m: any) => m.from === 'commander' && m.failure_kind);
+    expect(failure).toMatchObject({
+      failure_kind: 'config',
+      failure_code: 'model_preflight',
+    });
+    expect(String(failure?.text || '')).toContain('No model configured');
   });
 });
 
@@ -1249,6 +1294,100 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       && String(m.text || '').includes('RESUMED-FORM-COMMANDER'))).toBe(true);
   }, 15_000);
 
+});
+
+describe('group_chat bus integration › task terminal boundary', () => {
+  it('emits one completed event only after the whole user-triggered run is quiescent', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => terminals.push(event));
+
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: 'done' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'finish this task' });
+    await waitForQuiescent(TEST_UID, cid, 3000);
+    expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      user_id: TEST_UID,
+      conversation_id: cid,
+      status: 'completed',
+    });
+    expect(terminals[0].finished_at_ms).toBeGreaterThanOrEqual(terminals[0].started_at_ms);
+    unsubscribe();
+  }, 10_000);
+
+  it('classifies model errors as failed', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => terminals.push(event));
+
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'error', text: 'provider unavailable', failureKind: 'provider', failureCode: 'upstream' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'finish this task' });
+    await waitForQuiescent(TEST_UID, cid, 3000);
+    expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+
+    expect(terminals[0].status).toBe('failed');
+    unsubscribe();
+  }, 10_000);
+
+  it('classifies a persisted input form as waiting_input', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => terminals.push(event));
+    const formPayload = { fields: [{ id: 'topic', label: 'Topic', type: 'text', required: true }] };
+
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: `Need one detail.\n<agent-input-form>\n${JSON.stringify(formPayload)}\n</agent-input-form>` },
+    ]);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} start`,
+    });
+    await waitForQuiescent(TEST_UID, cid, 3000);
+    expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+
+    expect(terminals[0].status).toBe('waiting_input');
+    unsubscribe();
+  }, 10_000);
+
+  it('emits cancelled after a live run is stopped', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => terminals.push(event));
+
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: '__wait_for_abort__' },
+    ]);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} long task`,
+    });
+    expect(await waitUntil(() => !bus.isQuiescent(TEST_UID, cid))).toBe(true);
+    await bus.abort(TEST_UID, cid);
+    await waitForQuiescent(TEST_UID, cid, 3000);
+    expect(await waitUntil(() => terminals.length === 1)).toBe(true);
+
+    expect(terminals[0].status).toBe('cancelled');
+    unsubscribe();
+  }, 10_000);
 });
 
 describe('group_chat bus integration › direct agent reply routing', () => {

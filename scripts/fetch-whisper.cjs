@@ -19,16 +19,29 @@ const { WHISPER_RUNTIME_CONTRACT } = require('../bin/runtime-gate.cjs');
 const { installWindowsVcRuntime } = require('./fetch-win-vc-runtime.cjs');
 
 const pcRoot = path.resolve(__dirname, '..');
-const vendorRoot = path.join(pcRoot, 'vendor', 'whisper', `v${WHISPER_RUNTIME_CONTRACT.version}`);
+const vendorWhisperRoot = path.join(pcRoot, 'vendor', 'whisper');
+const vendorRoot = path.join(vendorWhisperRoot, `v${WHISPER_RUNTIME_CONTRACT.version}`);
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
-const NOTICE = `Bundled whisper.cpp runtime
+
+function runtimeVersion(target) {
+  return target.version || WHISPER_RUNTIME_CONTRACT.version;
+}
+
+function noticeForTarget(target) {
+  const version = runtimeVersion(target);
+  const openBlasNotice = target.openBlasVersion ? `
+Windows OpenBLAS acceleration:
+  https://github.com/OpenMathLib/OpenBLAS/tree/v${target.openBlasVersion}
+  BSD-3-Clause; see LICENSE.openblas.
+` : '';
+  return `Bundled whisper.cpp runtime
 ===========================
 
 Orkas invokes whisper.cpp as a separate process for local VideoStudio speech
-transcription. The runtime version is ${WHISPER_RUNTIME_CONTRACT.version}.
+transcription. The runtime version is ${version}.
 
 whisper.cpp source and license:
-  https://github.com/ggml-org/whisper.cpp/tree/v${WHISPER_RUNTIME_CONTRACT.version}
+  https://github.com/ggml-org/whisper.cpp/tree/v${version}
   MIT; see LICENSE.whisper.cpp.
 
 Multilingual Whisper base-q5_1 model:
@@ -41,9 +54,15 @@ Orkas does not install or modify the machine-wide Visual C++ Redistributable.
 Microsoft redistributable terms apply:
   https://visualstudio.microsoft.com/license-terms/
 
+${openBlasNotice}
 The macOS CLIs are static target-native builds whose pinned source, toolchain,
 flags, sizes, and hashes are documented in vendor/whisper/v${WHISPER_RUNTIME_CONTRACT.version}/BUILD.md.
 `;
+}
+
+const hostTarget = WHISPER_RUNTIME_CONTRACT.targets[`${process.platform}-${process.arch}`]
+  || { version: WHISPER_RUNTIME_CONTRACT.version };
+const NOTICE = noticeForTarget(hostTarget);
 
 function argValue(flag, argv = process.argv) {
   const i = argv.indexOf(flag);
@@ -79,6 +98,88 @@ function matchesFile(file, expected) {
   }
 }
 
+const RETRYABLE_WINDOWS_FS_ERRORS = new Set(['EACCES', 'EBUSY', 'ENOTEMPTY', 'EPERM']);
+
+function waitSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function retryFsMutation(operation, options = {}) {
+  const retries = options.retries ?? (process.platform === 'win32' ? 6 : 0);
+  const retryDelayMs = options.retryDelayMs ?? 50;
+  const wait = options.wait || waitSync;
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return operation();
+    } catch (err) {
+      lastError = err;
+      if (attempt === retries || !RETRYABLE_WINDOWS_FS_ERRORS.has(err && err.code)) throw err;
+      wait(retryDelayMs * (2 ** attempt));
+    }
+  }
+  throw lastError;
+}
+
+function replaceDirectoryTransactional(tempDir, destDir, options = {}) {
+  const io = options.fs || fs;
+  const backupDir = options.backupDir || `${destDir}.replace-backup`;
+  const retryOptions = {
+    retries: options.retries,
+    retryDelayMs: options.retryDelayMs,
+    wait: options.wait,
+  };
+  const mutate = operation => retryFsMutation(operation, retryOptions);
+  const remove = dir => io.rmSync(dir, {
+    recursive: true,
+    force: true,
+    maxRetries: options.retries ?? (process.platform === 'win32' ? 6 : 0),
+    retryDelay: options.retryDelayMs ?? 50,
+  });
+
+  // Recover a previous interrupted swap before starting a new one. The
+  // backup name is stable across PIDs so a killed provisioner cannot strand
+  // the only good runtime under an undiscoverable process-specific path.
+  if (io.existsSync(backupDir)) {
+    if (io.existsSync(destDir)) remove(backupDir);
+    else mutate(() => io.renameSync(backupDir, destDir));
+  }
+  const hadExisting = io.existsSync(destDir);
+  if (hadExisting) mutate(() => io.renameSync(destDir, backupDir));
+  try {
+    mutate(() => io.renameSync(tempDir, destDir));
+  } catch (installError) {
+    if (hadExisting) {
+      try {
+        mutate(() => io.renameSync(backupDir, destDir));
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [installError, rollbackError],
+          `failed to replace ${destDir} and restore the previous runtime`,
+        );
+      }
+    }
+    throw installError;
+  }
+  try {
+    remove(backupDir);
+  } catch (cleanupError) {
+    // Do not report a successful install while a stale runtime directory is
+    // still present (the packaging gate intentionally rejects extras).
+    // Restore the previously valid runtime so a later retry starts cleanly.
+    try {
+      mutate(() => io.renameSync(destDir, tempDir));
+      mutate(() => io.renameSync(backupDir, destDir));
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [cleanupError, rollbackError],
+        `installed ${destDir}, but failed to remove or restore its previous runtime`,
+      );
+    }
+    throw cleanupError;
+  }
+}
+
 function rel(root, relativePath) {
   return path.join(root, ...String(relativePath).split('/'));
 }
@@ -89,15 +190,17 @@ function expectedFiles(target) {
     ...(target.appLocalFiles || {}),
     [WHISPER_RUNTIME_CONTRACT.model.relativePath]: WHISPER_RUNTIME_CONTRACT.model,
     ...WHISPER_RUNTIME_CONTRACT.licenses,
+    ...(target.licenses || {}),
   };
 }
 
 function ready(destDir, platformKey, target) {
+  const version = runtimeVersion(target);
   try {
     const marker = JSON.parse(fs.readFileSync(path.join(destDir, '.orkas-whisper-ready.json'), 'utf8'));
     if (marker.schema !== WHISPER_RUNTIME_CONTRACT.schema
       || marker.platformKey !== platformKey
-      || marker.version !== WHISPER_RUNTIME_CONTRACT.version
+      || marker.version !== version
       || marker.model !== WHISPER_RUNTIME_CONTRACT.model.name) return false;
     for (const [relativePath, expected] of Object.entries(expectedFiles(target))) {
       const file = rel(destDir, relativePath);
@@ -105,7 +208,7 @@ function ready(destDir, platformKey, target) {
       if (!matchesFile(file, expected) || !recorded
         || recorded.bytes !== expected.bytes || recorded.sha256 !== expected.sha256) return false;
     }
-    return fs.readFileSync(path.join(destDir, 'NOTICE.txt'), 'utf8') === NOTICE;
+    return fs.readFileSync(path.join(destDir, 'NOTICE.txt'), 'utf8') === noticeForTarget(target);
   } catch {
     return false;
   }
@@ -194,11 +297,14 @@ function writeMacFiles(tempDir, platformKey, target) {
   }
 }
 
-function writeLicenses(tempDir) {
+function writeLicenses(tempDir, target) {
   for (const [relativePath, expected] of Object.entries(WHISPER_RUNTIME_CONTRACT.licenses)) {
     copyPinned(path.join(vendorRoot, relativePath), rel(tempDir, relativePath), expected);
   }
-  fs.writeFileSync(path.join(tempDir, 'NOTICE.txt'), NOTICE);
+  for (const [relativePath, expected] of Object.entries(target.licenses || {})) {
+    copyPinned(rel(vendorWhisperRoot, expected.vendorPath), rel(tempDir, relativePath), expected);
+  }
+  fs.writeFileSync(path.join(tempDir, 'NOTICE.txt'), noticeForTarget(target));
 }
 
 function writeMarker(tempDir, platformKey, target) {
@@ -209,7 +315,7 @@ function writeMarker(tempDir, platformKey, target) {
   fs.writeFileSync(path.join(tempDir, '.orkas-whisper-ready.json'), `${JSON.stringify({
     schema: WHISPER_RUNTIME_CONTRACT.schema,
     platformKey,
-    version: WHISPER_RUNTIME_CONTRACT.version,
+    version: runtimeVersion(target),
     model: WHISPER_RUNTIME_CONTRACT.model.name,
     source: target.source,
     capability: { status: 'ready' },
@@ -248,6 +354,7 @@ async function installWhisper(options = targetOptions()) {
   if (!target) {
     throw new Error(`Whisper runtime is not configured for ${platformKey}; supported targets: ${Object.keys(WHISPER_RUNTIME_CONTRACT.targets).join(', ')}`);
   }
+  const version = runtimeVersion(target);
   const vcRuntimeDir = options.platform === 'win32'
     ? await installWindowsVcRuntime({ platform: options.platform, arch: options.arch, force: options.force })
     : undefined;
@@ -266,22 +373,21 @@ async function installWhisper(options = targetOptions()) {
     if (options.platform === 'darwin') {
       writeMacFiles(tempDir, platformKey, target);
     } else if (options.platform === 'win32') {
-      const archive = await cachedDownload(`whisper-bin-x64-v${WHISPER_RUNTIME_CONTRACT.version}.zip`, target.archive);
+      const archive = await cachedDownload(target.archive.cacheName || `whisper-bin-x64-v${version}.zip`, target.archive);
       writeWindowsFiles(archive, tempDir, target);
       writeWindowsAppLocalFiles(vcRuntimeDir, tempDir, target);
     }
 
     const model = await cachedDownload('ggml-base-q5_1.bin', WHISPER_RUNTIME_CONTRACT.model);
     copyPinned(model, rel(tempDir, WHISPER_RUNTIME_CONTRACT.model.relativePath), WHISPER_RUNTIME_CONTRACT.model);
-    writeLicenses(tempDir);
+    writeLicenses(tempDir, target);
     writeMarker(tempDir, platformKey, target);
 
-    fs.rmSync(destDir, { recursive: true, force: true });
-    fs.renameSync(tempDir, destDir);
+    replaceDirectoryTransactional(tempDir, destDir);
     if (options.platform === process.platform && options.arch === process.arch) {
       writeCapabilityState(destDir, smokeCli(destDir, options.platform));
     }
-    console.log(`[fetch-whisper] installed whisper.cpp ${WHISPER_RUNTIME_CONTRACT.version} + ${WHISPER_RUNTIME_CONTRACT.model.name} for ${platformKey}`);
+    console.log(`[fetch-whisper] installed whisper.cpp ${version} + ${WHISPER_RUNTIME_CONTRACT.model.name} for ${platformKey}`);
     return destDir;
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -301,6 +407,10 @@ module.exports = {
   installWhisper,
   isWindowsIllegalInstruction,
   matchesFile,
+  noticeForTarget,
+  replaceDirectoryTransactional,
+  retryFsMutation,
+  runtimeVersion,
   targetOptions,
   writeCapabilityState,
   writeWindowsAppLocalFiles,

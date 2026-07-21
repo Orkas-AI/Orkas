@@ -76,6 +76,23 @@ describe('features/config › readConfig / writeConfig', () => {
   });
 });
 
+describe('features/config › task notifications', () => {
+  it('defaults to enabled when the preference has never been written', async () => {
+    const { appConfig } = await load();
+    expect(appConfig.getTaskNotificationsEnabled()).toBe(true);
+  });
+
+  it('persists explicit disable and re-enable decisions', async () => {
+    const { appConfig } = await load();
+    expect(appConfig.setTaskNotificationsEnabled(false)).toBe(false);
+    expect(appConfig.getTaskNotificationsEnabled()).toBe(false);
+    expect(appConfig.readPreferences().task_notifications_enabled).toBe(false);
+
+    expect(appConfig.setTaskNotificationsEnabled(true)).toBe(true);
+    expect(appConfig.getTaskNotificationsEnabled()).toBe(true);
+  });
+});
+
 describe('features/config › initLanguage', () => {
   it('uses persisted language when present (ignores system locale)', async () => {
     const { appConfig, i18n } = await load();

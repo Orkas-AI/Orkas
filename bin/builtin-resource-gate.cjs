@@ -295,11 +295,9 @@ function marketplaceAgentInventory(root, standaloneSkills) {
     }
     const embeddedSkills = embeddedSkillNames(id, dir);
     const embeddedSet = new Set(embeddedSkills);
-    for (const skill of embeddedSkills) {
-      if (!skillList.includes(skill)) {
-        throw new Error(`[builtin-resource-gate] builtin marketplace agent ${id} omits embedded skill ${skill}`);
-      }
-    }
+    // Agent-private skills are owner-scoped runtime content and are discovered from the
+    // embedded skills directory. They do not need to be duplicated in skill_list, which is
+    // still validated below when an agent explicitly declares private or public references.
     for (const skill of skillList) {
       if (!embeddedSet.has(skill) && !standaloneRefs.has(skill)) {
         throw new Error(`[builtin-resource-gate] builtin marketplace agent ${id} references missing skill ${skill}`);

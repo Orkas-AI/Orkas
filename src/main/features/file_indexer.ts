@@ -118,6 +118,10 @@ export interface FileMeta {
 export interface TextReadResult {
   content: string;
   meta: FileMeta;
+  /** Hash of the complete source bytes for editable plain-text files. This is
+   *  intentionally absent for extracted rich-document text, which cannot be
+   *  edited in place. */
+  sourceHash?: string;
   /** Echo of the applied range (what was actually returned, clamped to
    *  `[0, totalChars)`). */
   range: { charStart: number; charEnd: number };
@@ -455,6 +459,9 @@ export async function readRange(
   return {
     content: body.slice(start, end),
     meta: metaToPublic(meta),
+    ...(kind === 'text'
+      ? { sourceHash: `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}` }
+      : {}),
     range: { charStart: start, charEnd: end },
     startLine,
   };

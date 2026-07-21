@@ -19,10 +19,11 @@ let _ctxPendingRename = null;       // {path} — flagged for inline-rename on t
                                     // immediately, and by the ⋯ menu's
                                     // "rename" item).
 let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}}
+let _kbUnavailableCode = '';
+let _kbUnavailableReportedCode = '';
 let _kbEventsAbort = null;
 let _kbStatusRefreshTimer = null;
 let _kbReconcileInFlight = false;
-const _kbVectorizeStartedAtByPath = new Map();
 const CTX_INTERNAL_DRAG_TYPE = 'application/x-context-path';
 
 function _ctxUiIconHtml(name, className) {
@@ -41,7 +42,7 @@ async function loadContexts() {
     const treeData = await treeRes.json();
     const kbData = await kbRes.json().catch(() => ({ ok: false }));
     if (treeData.ok !== false) _ctxTree = treeData.tree || [];
-    if (kbData.ok) _kbStatusByPath = _buildKbStatusMap(_ctxTree, kbData.files || []);
+    if (_applyKbStatusResult(kbData)) _kbStatusByPath = _buildKbStatusMap(_ctxTree, kbData.files || []);
     renderCtxTree();
     _ensureKbEventSubscription();
     _kickKbReconcileIfNeeded();
@@ -69,6 +70,20 @@ function _buildKbStatusMap(tree, statusRows) {
   return next;
 }
 
+function _applyKbStatusResult(data) {
+  if (data && data.ok) {
+    _kbUnavailableCode = '';
+    _kbUnavailableReportedCode = '';
+    return true;
+  }
+  const code = String((data && data.code) || 'E_LIBRARY_STATUS_UNAVAILABLE').slice(0, 80);
+  _kbUnavailableCode = code;
+  if (_kbUnavailableReportedCode !== code) {
+    _kbUnavailableReportedCode = code;
+  }
+  return false;
+}
+
 function _hasActiveKbStatuses() {
   return Object.values(_kbStatusByPath || {}).some((st) =>
     st && (st.status === 'pending' || st.status === 'processing'));
@@ -89,7 +104,10 @@ function _kickKbReconcileIfNeeded() {
 async function _refreshKbStatusSnapshot() {
   const res = await apiFetch('/api/kb/status');
   const data = await res.json().catch(() => ({ ok: false }));
-  if (!data.ok) return;
+  if (!_applyKbStatusResult(data)) {
+    renderCtxTree();
+    return;
+  }
   _kbStatusByPath = _buildKbStatusMap(_ctxTree, data.files || []);
   renderCtxTree();
 }
@@ -164,7 +182,6 @@ function _ensureKbEventSubscription() {
 function _applyKbEvent(ev) {
   const p = ev.relPath;
   if (!p) return;
-  _trackKbVectorizeEvent(p, ev);
   if (ev.status === 'deleted') {
     delete _kbStatusByPath[p];
   } else {
@@ -314,6 +331,28 @@ function _refreshCtxCounts() {
   if (treeEl) treeEl.textContent = n > 0 ? String(n) : '';
 }
 
+function _kbUnavailableHtml() {
+  if (!_kbUnavailableCode) return '';
+  const key = _kbUnavailableCode === 'E_STORAGE_FULL'
+    ? 'contexts.kb.storage_full'
+    : 'contexts.kb.unavailable';
+  return `<div class="lazy-feature-error ctx-kb-unavailable">
+    <span>${escapeHtml(t(key))}</span>
+    <button type="button" class="btn btn-sm" data-kb-status-retry>${escapeHtml(t('chat.retry_btn'))}</button>
+  </div>`;
+}
+
+function _bindKbUnavailableRetry(container) {
+  if (!container || typeof container.querySelector !== 'function') return;
+  const button = container.querySelector('[data-kb-status-retry]');
+  if (!button) return;
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try { await _refreshKbStatusSnapshot(); }
+    finally { if (button.isConnected) button.disabled = false; }
+  });
+}
+
 function renderCtxTree() {
   const container = document.getElementById('contexts-tree');
   if (!container) {
@@ -323,11 +362,12 @@ function renderCtxTree() {
   if (!_ctxTree.length) {
     _ctxSelected.clear();
     _ctxSelectionAnchor = null;
-    container.innerHTML = `<div class="empty">${escapeHtml(t('contexts.empty'))}</div>`;
+    container.innerHTML = `${_kbUnavailableHtml()}<div class="empty">${escapeHtml(t('contexts.empty'))}</div>`;
     // The root remains a valid destination even before the first file exists.
     // Binding here lets users populate an empty Library by dragging files in
     // from Finder / Explorer instead of having to use the upload menu first.
     _bindCtxTreeHandlers(container);
+    _bindKbUnavailableRetry(container);
     _refreshCtxCounts();
     _renderCtxBatchBar();
     return;
@@ -337,8 +377,9 @@ function renderCtxTree() {
     if (!existing.has(rel)) _ctxSelected.delete(rel);
   }
   if (_ctxSelectionAnchor && !existing.has(_ctxSelectionAnchor)) _ctxSelectionAnchor = null;
-  container.innerHTML = _renderCtxNodes(_ctxTree);
+  container.innerHTML = `${_kbUnavailableHtml()}${_renderCtxNodes(_ctxTree)}`;
   _bindCtxTreeHandlers(container);
+  _bindKbUnavailableRetry(container);
   _refreshCtxCounts();
   _renderCtxBatchBar();
 }
@@ -1333,24 +1374,41 @@ async function handleCtxUpload(fileList, targetDir = '') {
   // funnels them all into the same single-worker queue on the back end (so
   // actual vectorization stays serial and predictable). Failures are
   // collected and surfaced once at the end, not per-file.
-  const jobs = files.map(async (file) => {
+  const jobs = _ctxUploadMap(files, async (file) => {
     if (_ctxHasHiddenPathSegment(file.name)) return { ok: false, name: file.name, reason: 'hidden' };
     const ext = _ctxExtOf(file.name);
     if (!CTX_ALLOWED_EXTS.includes(ext)) return { ok: false, name: file.name, reason: 'ext' };
     try {
-      const buf = await file.arrayBuffer();
       const target = targetDir ? `${targetDir}/${file.name}` : file.name;
       _kbStatusByPath[target] = { status: 'pending' };
-      _kbVectorizeStartedAtByPath.set(target, performance.now());
-      const res = await apiFetch('/api/contexts/upload', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'X-Filename': encodeURIComponent(target),
-        },
-        body: buf,
-      });
-      const data = await res.json();
+      let data = null;
+      if (window.orkas && typeof window.orkas.importLocalFiles === 'function') {
+        const imported = await window.orkas.importLocalFiles('contexts', [file], { targetDir });
+        if (imported && imported.ok === false) {
+          data = imported;
+        } else if (Array.isArray(imported && imported.files) && imported.files.length) {
+          data = imported.files[0];
+        }
+      }
+      // Synthetic File objects used by browser tests have no OS path. Keep a
+      // small compatibility fallback, but never allow a large payload back
+      // onto the base64 bridge.
+      if (!data) {
+        if (Number(file.size || 0) > 8 * 1024 * 1024) {
+          data = { ok: false, code: 'E_IMPORT_PATH', error: 'local file path unavailable' };
+        } else {
+          const buf = await file.arrayBuffer();
+          const res = await apiFetch('/api/contexts/upload', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'X-Filename': encodeURIComponent(target),
+            },
+            body: buf,
+          });
+          data = await res.json();
+        }
+      }
       if (!data.ok) {
         delete _kbStatusByPath[target];
         return {
@@ -1361,15 +1419,14 @@ async function handleCtxUpload(fileList, targetDir = '') {
           existingDir: typeof data.existingDir === 'string' ? data.existingDir : '',
         };
       }
-      if (window.Monitor) (() => {})('library_file_upload', { file_size_bytes: file.size || 0, file_ext: ext });
       return { ok: true, name: file.name };
     } catch (e) {
       return { ok: false, name: file.name, reason: e.message || String(e) };
     }
-  });
+  }, 2);
   let results;
   try {
-    results = await Promise.all(jobs);
+    results = await jobs;
     // Single post-upload refresh picks up all new rows at once.
     await loadContexts();
   } finally {
@@ -1397,6 +1454,20 @@ async function handleCtxUpload(fileList, targetDir = '') {
   }
   await _ctxAlertDuplicateUploads(duplicateRejected);
   await _ctxAlertUploadFailures(failed);
+}
+
+async function _ctxUploadMap(items, worker, concurrency) {
+  const results = new Array(items.length);
+  let next = 0;
+  const count = Math.min(Math.max(1, concurrency || 1), items.length);
+  await Promise.all(Array.from({ length: count }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await worker(items[index]);
+    }
+  }));
+  return results;
 }
 
 async function handleCtxNativeUpload(targetDir = '') {

@@ -186,6 +186,9 @@ export interface BuildRunnerParams {
   /** Max tool-call rounds per turn before force-end. Undefined → core-agent
    *  default (50). Group chat raises it for the commander's long builds. */
   maxToolLoops?: number;
+  /** Provider stream deadline before its first usable text/tool event. This
+   * boundary is safe for fallback because no visible output has committed. */
+  providerFirstEventTimeoutMs?: number;
 
   /** Optional subset of skill ids; undefined = full global listing. See
    * `skill-registry.getSystemPromptBlock` for the exact semantics. */
@@ -994,7 +997,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // Build a rotating provider covering the whole primary group. Even
     // when there's only one candidate, the wrapper is cheap (just one
     // pass-through) and keeps the code path uniform.
-    const rotating = await buildRotatingProvider(mod, providerId, group, params.onNativeSearchInjected, params.onCandidateChosen);
+    const rotating = await buildRotatingProvider(
+      mod,
+      providerId,
+      group,
+      params.onNativeSearchInjected,
+      params.onCandidateChosen,
+      params.providerFirstEventTimeoutMs,
+    );
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
     // the instance cache without consulting the factory, so injecting
@@ -1148,6 +1158,7 @@ async function buildRotatingProvider(
   group: ChatEntryChoice[],
   onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
+  firstEventTimeoutMs?: number,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
@@ -1189,6 +1200,7 @@ async function buildRotatingProvider(
       clearCooldown(profileId);
     },
     ...(onCandidateChosen ? { onCandidateChosen } : {}),
+    ...(Number.isFinite(firstEventTimeoutMs) ? { firstEventTimeoutMs } : {}),
   });
 }
 

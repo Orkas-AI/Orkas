@@ -31,7 +31,7 @@ import { createLogger } from '../../logger';
 import { t } from '../../i18n';
 import type { StreamEvent } from '../client';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
-import { userAgentsDir, userMarketplaceAgentsDir } from '../../paths';
+import { userAgentsDir, userMarketplaceAgentsDir, userSystemSkillsDir } from '../../paths';
 import { providerLabel } from '../provider_catalog';
 import * as path from 'node:path';
 
@@ -53,13 +53,42 @@ export interface MapCoreAgentEventsOptions {
 export interface SkillReadEventMetadata {
   skill_id: string;
   skill_name: string;
-  skill_system: 'A.custom' | 'A.platform' | 'B';
+  skill_system: 'A.custom' | 'A.platform' | 'B' | 'system';
 }
 
 export interface AgentReadEventMetadata {
   agent_id: string;
   agent_name: string;
   agent_system: 'custom' | 'marketplace';
+}
+
+type AgentErrorMeta = {
+  kind: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
+  code?: string;
+};
+
+function modelFailureDetails(
+  error: AgentErrorMeta,
+  hasVisibleText: boolean,
+): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> {
+  const code = String(error.code || '').trim().toUpperCase();
+  let failureCode = 'provider_error';
+  let failurePhase: NonNullable<StreamEvent['failurePhase']> = hasVisibleText ? 'model_text' : 'provider_wait';
+
+  if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
+  else if (code === 'PROVIDER_NETWORK_EXHAUSTED' || /^(ECONN|ENET|EAI_|ETIMEDOUT|UND_ERR_)/.test(code)) failureCode = 'provider_network';
+  else if (code === 'NO_PROVIDER') failureCode = 'provider_not_configured';
+  else if (error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED') failureCode = 'provider_auth';
+  else if (error.kind === 'rate_limit' || code === 'PROVIDER_RATE_LIMIT_EXHAUSTED') failureCode = 'provider_rate_limit';
+  else if (error.kind === 'context_overflow') {
+    failureCode = 'context_overflow';
+    failurePhase = 'compaction';
+  } else if (error.kind === 'timeout') failureCode = 'provider_timeout';
+  else if (/BALANCE|QUOTA|CREDIT|FUNDS|PAYMENT/.test(code)) failureCode = 'provider_balance';
+  else if (/PERMISSION|FORBIDDEN|PLAN_REQUIRED|SUBSCRIPTION/.test(code)) failureCode = 'provider_permission';
+  else if (/INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL/.test(code)) failureCode = 'provider_request';
+
+  return { failureKind: 'model', failureCode, failurePhase };
 }
 
 /**
@@ -172,6 +201,21 @@ export function skillReadMetadataForToolStart(
   if (toolName !== 'read_file' || !opts.userId) return null;
   const p = toolInputPath(input);
   if (!p) return null;
+
+  // Product-protocol and owner-private skills are intentionally absent from
+  // the public skill registry, so parse their runtime roots before falling
+  // back to the expert-signal parser. The metadata here is UI-only: carrying
+  // it from tool_start to tool_end prevents the process pane from exposing a
+  // full internal path or a persisted-output marker for these reads.
+  const hidden = parseHiddenSkillReadPath(p, opts.userId);
+  if (hidden) {
+    return {
+      skill_id: hidden.skill_id,
+      skill_name: hidden.skill_id,
+      skill_system: hidden.system,
+    };
+  }
+
   const parsed = parseSkillPath(p, opts.userId);
   if (!parsed) return null;
   const display = opts.skillDisplayNameById?.get(parsed.skill_id) || parsed.skill_id;
@@ -180,6 +224,43 @@ export function skillReadMetadataForToolStart(
     skill_name: display,
     skill_system: parsed.system,
   };
+}
+
+function parseHiddenSkillReadPath(
+  absPath: string,
+  uid: string,
+): { system: 'system' | 'B'; skill_id: string } | null {
+  const abs = path.resolve(absPath);
+  if (path.basename(abs) !== 'SKILL.md') return null;
+
+  const system = _skillSegmentsUnderRoot(abs, userSystemSkillsDir(uid), 1);
+  if (system) return { system: 'system', skill_id: system[0] };
+
+  // Platform/builtin agent-private skills:
+  // <uid>/local/marketplace/agents/<aid>/skills/<sid>/SKILL.md
+  const platformPrivate = _skillSegmentsUnderRoot(abs, userMarketplaceAgentsDir(uid), 3);
+  if (platformPrivate?.[1] === 'skills') {
+    return { system: 'B', skill_id: platformPrivate[2] };
+  }
+
+  // Custom owner-private skills use `private_skills`; self-evolved `skills`
+  // under the same agent root are already handled by parseSkillPath().
+  const customPrivate = _skillSegmentsUnderRoot(abs, userAgentsDir(uid), 3);
+  if (customPrivate?.[1] === 'private_skills') {
+    return { system: 'B', skill_id: customPrivate[2] };
+  }
+
+  return null;
+}
+
+function _skillSegmentsUnderRoot(abs: string, root: string, expectedDirSegments: number): string[] | null {
+  const rel = path.relative(path.resolve(root), abs);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const segments = rel.split(path.sep);
+  if (segments.length !== expectedDirSegments + 1 || segments[segments.length - 1] !== 'SKILL.md') {
+    return null;
+  }
+  return segments.slice(0, expectedDirSegments);
 }
 
 export function agentReadMetadataForToolStart(
@@ -253,6 +334,7 @@ export async function* mapCoreAgentEvents(
 ): AsyncGenerator<StreamEvent, { finalText: string; error: string | null }, unknown> {
   let finalText = '';
   let error: string | null = null;
+  let failureDetails: Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> | null = null;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
   const earlyToolStarts = new Set<string>();
@@ -422,14 +504,28 @@ export async function* mapCoreAgentEvents(
       case 'retry': {
         const friendly = friendlyRetryReason(ev.reason);
         const prefix = ev.attempt <= 1 ? t('model.retrying') : t('model.retrying_n', { attempt: ev.attempt });
-        yield { type: 'progress', text: `${prefix}·${friendly}` };
+        yield {
+          type: 'progress',
+          text: `${prefix}·${friendly}`,
+          event: {
+            stream: 'runtime',
+            data: {
+              phase: 'retrying',
+              attempt: Math.max(1, Math.round(Number(ev.attempt) || 1)),
+              ...(Number.isFinite(Number(ev.waitMs)) ? { wait_ms: Math.max(0, Math.round(Number(ev.waitMs))) } : {}),
+            },
+          },
+        };
         break;
       }
 
       case 'provider_fallback': {
         yield {
           type: 'progress',
-          text: t('model.credential_fallback', { provider: providerLabel(ev.providerId) }),
+          text: t(
+            ev.reason === 'no_first_event_timeout' ? 'model.timeout_fallback' : 'model.credential_fallback',
+            { provider: providerLabel(ev.providerId) },
+          ),
           event: {
             stream: 'provider',
             data: { phase: 'fallback', reason: ev.reason, provider_id: ev.providerId },
@@ -481,6 +577,7 @@ export async function* mapCoreAgentEvents(
         }
         if (result.meta.error) {
           error = localizeKnownRunnerText(result.meta.error.message || 'unknown error');
+          failureDetails = modelFailureDetails(result.meta.error, finalText.length > 0);
           // meta.error is `{kind, message}` — cause/stack live on the
           // ProviderError that runner.ts already logged via `log.warn(...)`
           // on the retry path. Keep this line focused on what survives.
@@ -507,11 +604,17 @@ export async function* mapCoreAgentEvents(
   }
 
   if (error) {
-    yield { type: 'error', text: error };
+    yield { type: 'error', text: error, ...failureDetails };
   } else if (finalText) {
     yield { type: 'final', text: finalText };
   } else {
-    yield { type: 'error', text: localizeKnownRunnerText('empty response') };
+    yield {
+      type: 'error',
+      text: localizeKnownRunnerText('empty response'),
+      failureKind: 'model',
+      failureCode: 'empty_response',
+      failurePhase: 'provider_wait',
+    };
   }
 
   return { finalText, error };

@@ -44,6 +44,28 @@ function baseInstance(transport: any): any {
 }
 
 describe('ipc/connectors renderer DTO', () => {
+  it('accepts OAuth start without waiting for the browser callback', async () => {
+    const beginOAuthConnect = vi.fn(() => ({ attempt_id: 'attempt-1' }));
+    vi.doMock('../../../src/main/features/connectors', () => ({ beginOAuthConnect }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    const out = await invokeHandlers['connectors.start_oauth'](
+      { catalog_id: 'github' },
+      { userId: 'u-ipc' },
+    );
+
+    expect(beginOAuthConnect).toHaveBeenCalledWith('u-ipc', 'github');
+    expect(out).toEqual({ started: true, attempt_id: 'attempt-1' });
+  });
+
   it('lists local connector state without triggering Composio restore', async () => {
     const restoreComposioConnectionsFromServer = vi.fn(async () => 0);
     vi.doMock('../../../src/main/features/connectors', () => ({

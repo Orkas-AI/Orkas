@@ -26,6 +26,7 @@ You **must** consult before emitting any `<agent>` container. The protocol below
 - **Output language follows the user's UI language** — `<name>`, `<description>`, `<workflow>` step titles + body, `<inputs>` `label` values, `<knowhow>` / `<standards>` string values, and the prose around the container all go in the user's current UI language (per the "User language" directive in the system prompt; that directive's coverage applies even though this file reaches you as a `read_file` result). Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions. XML tag names, backticked tool / skill names, JSON keys, file paths, and `select` `value` strings stay as-is / English.
 - **Do not hard-code other agent display names inside agent content.** Agent names are user-editable and may change after creation. In `<workflow>`, meta notes, handoff text, and routing rules, refer to downstream agents by capability or role boundary (for example, "route to the dedicated math learning agent" or "route to the appropriate planning agent"), not by a concrete display name. The only required concrete name is the current agent's own `<name>` field.
 - **Keep `<skills>` aligned with workflow skill use.** `<skills>` is authored by the model as dependency metadata, so it MUST use the model-visible skill name exactly as shown in Available skills, not hidden/internal ids. If `<workflow>` invokes, follows, or depends on any available skill, `<skills>` MUST list every required skill name. Use an empty `<skills></skills>` only when the workflow uses built-in tools/connectors alone and no skills. Runtime agents still receive the enabled skill surface, but this dependency list keeps the agent spec understandable and backward-compatible.
+- **Agents invoke skills, never skill files.** In `<workflow>`, reference an available skill by its model-visible name and list it in `<skills>`. Do not embed a bundled script command, a `scripts/` path, or any Marketplace/system skill installation path in agent fields. Script resolution belongs inside that skill's SKILL.md and must use the standard Skill Runner.
 
 ## Quality bar — designing the agent
 
@@ -46,6 +47,7 @@ Quality validation treats these as severe red flags. They are authoring constrai
 
 - **Credentials and private context**: do not reference direct reads of `.env`, `~/.ssh`, `~/.aws/credentials`, shell history, keychains, browser cookies, other agents' private data, or other skills' `SKILL.md`. Ask the user to provide the needed secret or path as an input.
 - **Dynamic or disguised execution**: do not design steps around `eval`, `exec`, `new Function`, decoded executable payloads, obfuscated code, or `base64` decode-then-run flows.
+- **Skill execution boundary**: do not resolve or invoke bundled skill files from an agent workflow. Invoke the skill by its available name; the skill owns its standard Skill Runner entrypoint.
 - **Download-and-execute**: do not use `curl | sh`, `wget | sh`, unknown raw IP downloads, or equivalent "fetch remote code then run it" behavior.
 - **Persistence and shell startup mutation**: do not modify shell init files, login hooks, launch agents, startup services, cron/systemd/plist persistence, or similar auto-run mechanisms.
 - **Spec self-modification**: do not instruct runtime code to write, copy, move, or patch `SKILL.md`, `agent.json`, `_install.json`, or other agent/skill specs. Spec changes go through this editor flow.
@@ -53,7 +55,8 @@ Quality validation treats these as severe red flags. They are authoring constrai
 
 ## Create vs edit decision
 
-- **No `<agent_id>` sub-tag** → create a brand-new agent. Triggered by "crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly". If the user supplied source agent material, use that source as the primary reference and make only minimal Orkas adaptations.
+- **Bound edit session** (the system prompt says the target is supplied by Runtime injection) → omit `<agent_id>` and patch that bound agent; never create another agent from this surface.
+- **No `<agent_id>` sub-tag in an unbound session** → create a brand-new agent. Triggered by "crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly". If the user supplied source agent material, use that source as the primary reference and make only minimal Orkas adaptations.
 - **With `<agent_id>X</agent_id>`** → patch the existing custom agent X. Sub-tags you emit replace the field; sub-tags you omit are preserved. Triggered by "改 X 的 workflow / 给 X 加输入 / X 的 description ..." etc.
 
 ## Pre-create similarity check (new agents only)
@@ -72,7 +75,7 @@ Use this whenever the user provides source content to base the agent on: a paste
 1. **Read the source first.** Inspect the prompt/spec and any companion files that explain behavior before emitting the container. Do not ask the user to restate content that is already present on disk or in the message.
 2. **Preserve the core prompt.** Keep the source role/persona, objective, task boundaries, step order, tool-use rules, examples, output format, evaluation/self-check rules, and safety/confirmation requirements. Prefer retaining the original wording in `<workflow>` bullets when it is compatible with Orkas.
 3. **Adapt the format, not the substance.** Convert source content into Orkas fields: display name, current-language dispatch description by default, workflow, knowhow, standards, skill list, inputs, interactive behavior, and category.
-4. **Apply the Orkas field allowlist.** The final container may only carry `<name>`, `<description>`, optional `<description_zh>`, optional `<description_en>`, `<workflow>`, `<knowhow>`, `<standards>`, `<skills>`, `<inputs>`, `<interactive>`, and `<category>` (plus `<agent_id>` on edits). Map source keys outside this allowlist into an allowed field only when needed; otherwise drop them. Do not emit `<profile>`.
+4. **Apply the Orkas field allowlist.** The final container may only carry `<name>`, `<description>`, optional `<description_zh>`, optional `<description_en>`, `<icon>`, `<workflow>`, `<knowhow>`, `<standards>`, `<skills>`, `<inputs>`, `<interactive>`, and `<category>` (plus `<agent_id>` on edits). Map source keys outside this allowlist into an allowed field only when needed; otherwise drop them. Do not emit `<profile>`.
 5. **Verify category.** `<category>` must be one of the current Orkas category codes listed below. If the source uses another value, choose the closest Orkas category by content.
 6. **Map tools minimally.** Replace source tool names only when an Orkas built-in tool or available skill is the clear equivalent. If no equivalent exists, mention the missing capability in user-perspective prose; do not invent skill names or fake a tool.
 7. **Preserve examples and output contracts.** If the source includes example dialogues, JSON output shapes, report templates, or acceptance criteria, keep them in the workflow as reference bullets instead of compressing them into a vague summary.
@@ -81,7 +84,7 @@ Use this whenever the user provides source content to base the agent on: a paste
 
 ## Editing protocol — required loop
 
-When `<agent_id>` is the right move (the user is changing an existing agent), follow this loop **before** emitting the container — skipping any step risks silent data loss:
+When editing from an unbound commander session with `<agent_id>`, follow this loop **before** emitting the container — skipping any step risks silent data loss. A bound edit session already receives the current spec through Runtime injection and skips this file-read loop.
 
 1. **Read the current spec.** Take the `id` field from the matching `agents_index` entry and `read_file` per the path pattern in that block's header. Never rewrite from memory — `agents_index` carries a slim view (description / inputs only); skipping this step ⇒ silently wiping fields you didn't intend to touch.
 2. **Confirm the agent is editable here.**
@@ -94,9 +97,10 @@ When `<agent_id>` is the right move (the user is changing an existing agent), fo
 
 ```
 <agent>
-<agent_id>(omit when creating; required when editing)</agent_id>
+<agent_id>(omit when creating or in a bound edit session; otherwise required when editing)</agent_id>
 <name>A short unquoted name</name>
 <description>① 一句功能：动词+对象+交付 ;② 适合"用户原话1""用户原话2"…;③ 触发词：词1、词2、…</description>
+<icon>one exact id from the icon candidate list below</icon>
 <workflow>
 Stepwise markdown. Step format = `### N. <title>` + bulleted actions. Tool / skill names in backticks where invoked.
 </workflow>
@@ -122,8 +126,8 @@ skill-name-b
 </agent>
 ```
 
-- **Creating** (no `<agent_id>`): missing `<name>` / `<workflow>` causes the server to treat it as a failure; missing / unknown `<category>` is a defect because the server silently repairs it to `general`. Always emit a valid category on create. For LLM-managed agents, emit `<knowhow>` and `<standards>` unless the source gives no basis.
-- **Editing** (with `<agent_id>`): every sub-tag except `<agent_id>` is optional; emit only the ones you're changing.
+- **Creating** (no `<agent_id>` in an unbound session): missing `<name>` / `<workflow>` causes the server to treat it as a failure; missing / unknown `<category>` is a defect because the server silently repairs it to `general`. Always emit a valid category on create. For LLM-managed agents, emit `<knowhow>` and `<standards>` unless the source gives no basis.
+- **Editing** (with `<agent_id>`, or through a bound edit session): emit only the fields you're changing.
 - The container is auto-hidden from the user-visible message; the prose accompanying it is what the user sees.
 - Use `<description_zh>` and `<description_en>` instead of `<description>` only when the user explicitly asks for multilingual/bilingual dispatch descriptions. Keep the same three-part format in each language.
 
@@ -134,6 +138,12 @@ skill-name-b
 - Written in the user's current UI language. Chinese UI → Chinese name (e.g. `需求挖掘者`); English UI → English name (e.g. `requirements-miner`). Don't auto-romanize Chinese into pinyin or auto-translate to English — match the user's actual locale.
 - Charset is strictly limited: ASCII letters / digits / `_` / `-` / CJK U+4E00–U+9FFF / single internal spaces between tokens. **Forbidden**: `/` `\` `.` `,` `(` `)` `:` `;` `!` `?`, full-width punctuation (`·` `（` `）` `：` etc.), Japanese kana, Korean Hangul, extended-CJK, emoji.
 - **Why**: the `@`-mention router uses regex token class `[A-Za-z0-9_一-鿿-]`; a name with any other character truncates at the illegal char and mis-routes the dispatch. The validator rejects offending names with `E_AGENT_NAME_INVALID` and the create / edit fails.
+
+### `<icon>` — semantic avatar
+
+Avatar icon candidates (exact IDs): `sparkle`, `rocket`, `brain`, `bulb`, `bot`, `atom`, `compass`, `search`, `flame`, `film`, `star`, `bolt`, `target`, `music`, `code`, `palette`, `document`, `spreadsheet`, `presentation`, `image`, `chart`, `graduation-cap`, `book-open`, `calculator`, `users`, `megaphone`, `shopping-bag`, `archive`, `activity`, `git-pull-request`, `briefcase`, `clipboard`.
+
+- On create or when the current icon is missing, choose the closest candidate; otherwise preserve it unless the user requests a change or the agent's role changes.
 
 ### `<description>` — the dispatch signal
 
@@ -201,7 +211,7 @@ Edit rule: omit `<knowhow>` / `<standards>` unless that specific field is changi
 
 Manual-edit surface for LLM-managed agents:
 
-- Users can directly edit definition/display fields: name, icon/color, category, localized description, output format, inputs, skills, workflow, knowhow, and standards.
+- Users can directly edit definition/display fields: name, icon, category, localized description, output format, inputs, skills, workflow, knowhow, and standards.
 - Users can add, edit, or remove runtime-learned memory from the detail page; that goes to the per-agent memory store, not to any creator-authored tag.
 - Runtime counters (`delivery`, `success rate`, `duration`, `memory count`) are system-maintained and must never be emitted in any authoring tag.
 

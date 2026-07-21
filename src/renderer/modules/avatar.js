@@ -1,14 +1,12 @@
 // ─── Avatar (icon + color) for AI actors ─────────────────────────────────
 //
-// The avatar catalog (15 icons + 16 colors + commander default) is a
+// The avatar catalog (agent icons + colors + commander default) is a
 // per-platform runtime resource fetched through `avatars.getCatalog` at
 // startup and cached locally. Every render helper reads the cache —
 // **no SVG or hex is hardcoded in the renderer**.
 //
-// Default fallback: when an agent has no stored avatar yet, derive a
-// deterministic combination by hashing `agent_id`. The same agent_id
-// derives the same combination on every device, so cloud sync does not
-// see two ends pick differently and collide.
+// Default fallback: when an agent has no usable icon, use `bot`; derive only
+// its color from `agent_id`. The same agent_id gets the same color everywhere.
 //
 // Rendering goes through renderAvatarHtml(...). The DOM and
 // .avatar-circle CSS are shared, so cards, detail pages, chat rows,
@@ -17,13 +15,14 @@
 let AVATAR_ICONS = [];
 let AVATAR_COLORS = [];
 let COMMANDER_DEFAULT = { icon: 'crown', color: 'gold' }; // fallback, overwritten once the IPC fetch lands
+const LEGACY_AVATAR_COLOR_STRIDE = 15;
 
 let _avatarCatalogReady = false;
 let _avatarCatalogPromise = null;
 
 /** Call once at startup — fetch the catalog and cache it locally.
  *  boot.js awaits this before rendering any avatar so the sync helpers
- *  (renderAvatarHtml / randomAgentAvatar / …) are ready by the time
+ *  synchronous render helpers are ready by the time
  *  they're called. Safe to call multiple times — subsequent calls
  *  resolve immediately. */
 async function initAvatarCatalog() {
@@ -55,17 +54,6 @@ function _isCommanderCombo(icon, color) {
   return icon === COMMANDER_DEFAULT.icon || color === COMMANDER_DEFAULT.color;
 }
 
-/** Random agent avatar: pick a (icon, color) pair from the
- *  non-commander pool. */
-function randomAgentAvatar() {
-  const icons = AVATAR_ICONS.filter((i) => i.id !== COMMANDER_DEFAULT.icon);
-  const colors = AVATAR_COLORS.filter((c) => c.id !== COMMANDER_DEFAULT.color);
-  if (!icons.length || !colors.length) return { icon: '', color: '' };
-  const i = icons[Math.floor(Math.random() * icons.length)];
-  const c = colors[Math.floor(Math.random() * colors.length)];
-  return { icon: i.id, color: c.id };
-}
-
 // Simple djb2 hash — sufficient to spread agent_id across the
 // non-commander icon / color pools.
 function _hash(str) {
@@ -75,26 +63,24 @@ function _hash(str) {
   return h >>> 0;
 }
 
-/** Derive a stable (icon, color) from a seed. The same seed produces
- *  the same combination on every machine, which is good for both
- *  "backfill when an old spec lacks the fields" and as a render
- *  fallback. */
+/** Resolve the unified generic icon plus a stable color from a seed.
+ *  Missing/unknown agent icons must not turn into a random role icon; `bot`
+ *  is the single fallback. Keep the historical icon-count stride for colors so
+ *  existing seed-derived colors do not change after catalog additions. */
 function avatarFromSeed(seed) {
-  const icons = AVATAR_ICONS.filter((i) => i.id !== COMMANDER_DEFAULT.icon);
   const colors = AVATAR_COLORS.filter((c) => c.id !== COMMANDER_DEFAULT.color);
-  if (!icons.length || !colors.length) return { icon: '', color: '' };
+  const fallbackIcon = AVATAR_ICONS.find((i) => i.id === 'bot');
+  if (!fallbackIcon || !colors.length) return { icon: '', color: '' };
   const h = _hash(seed);
   return {
-    icon: icons[h % icons.length].id,
-    color: colors[Math.floor(h / icons.length) % colors.length].id,
+    icon: fallbackIcon.id,
+    color: colors[Math.floor(h / LEGACY_AVATAR_COLOR_STRIDE) % colors.length].id,
   };
 }
 
-/** Resolve any (iconId, colorId) to renderable visual data. Fields
- *  that aren't in the catalog (dirty data / future-renamed tokens)
- *  derive from fallbackSeed; if neither side is given, fall back to
- *  the commander default (an edge case — never triggered on the
- *  normal path). */
+/** Resolve any (iconId, colorId) to renderable visual data. Unknown or missing
+ *  icons use the generic `bot`; unknown or missing colors remain stable by
+ *  fallbackSeed. */
 function resolveAvatar(iconId, colorId, fallbackSeed) {
   let resolvedIcon = AVATAR_ICONS.find((i) => i.id === iconId);
   let resolvedColor = AVATAR_COLORS.find((c) => c.id === colorId);

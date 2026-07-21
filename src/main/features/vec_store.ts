@@ -163,8 +163,17 @@ function handleFor(dbDir: string): Handle {
     throw new Error(`sqlite-vec load failed: ${(err as Error).message}`);
   }
 
-  ensureSchema(db, dbPath);
-  ensureConfig(dbDir);
+  try {
+    ensureSchema(db, dbPath);
+    ensureConfig(dbDir);
+  } catch (err) {
+    // A mismatched/corrupt config or schema fails before the handle reaches
+    // _cache, so closeAllVecStores() cannot discover it later. This matters
+    // especially on Windows, where the leaked SQLite handle permanently
+    // locks vector.db and prevents repair or temp-workspace cleanup.
+    try { db.close(); } catch { /* preserve the validation error */ }
+    throw err;
+  }
 
   const h: Handle = { db, dbDir, dbPath, writeLock: new Mutex() };
   _cache.set(dbDir, h);

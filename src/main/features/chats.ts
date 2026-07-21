@@ -34,7 +34,7 @@ import {
 import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
 import {
   nowIso, genConversationId, genId12, safeId,
-  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, appendJsonlAtomic,
+  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, appendJsonlAtomic,
 } from '../storage';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
@@ -1901,7 +1901,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
   // wrong _cids.
   try {
     const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
-    bus.dropConv(userId, cid);
+    await bus.dropConv(userId, cid);
     await purgeGroupDir(userId, cid);
   }
   catch (err) { log.warn(`group_chat dropConv failed user=${userId} cid=${cid}: ${(err as Error).message}`); }
@@ -2020,6 +2020,26 @@ export async function getMessagesPage(
     cursor = page.nextCursor;
   }
   return { history, nextCursor };
+}
+
+/** Load the fixed-size history page containing one search-result record. */
+export async function getMessagesPageAtIndex(
+  userId: string,
+  cid: string,
+  messageIndex: number,
+  limit = 10,
+  projectIdHint?: string | null,
+): Promise<{ history: MessageRecord[]; nextCursor: number | null; pageStart: number }> {
+  const file = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const index = Math.max(0, Math.floor(Number(messageIndex) || 0));
+  const pageStart = Math.floor(index / wanted) * wanted;
+  const page = await readJsonlWindow<MessageRecord>(file, pageStart, wanted);
+  return {
+    history: page.records.filter((message) => !message.deleted_at),
+    nextCursor: page.previousCursor,
+    pageStart,
+  };
 }
 
 /** Drop every conversation belonging to `userId`. Loops `deleteConversation`

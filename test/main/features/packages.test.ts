@@ -36,7 +36,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 async function loadPackages() {
@@ -191,6 +191,45 @@ describe('packages › runPackageCommand guards', () => {
     expect(enabled.ok).toBe(true);
     expect(JSON.parse(enabled.stdout)).toMatchObject({ ok: true, action: 'enable', name: 'toggle' });
     expect(readPackagesRegistry(TEST_UID).packages[0]!.enabled).toBe(true);
+  });
+
+  it('bounds helper output and settles a timeout without waiting for process close', async () => {
+    const { runPackageProcessForTest } = await loadPackages();
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const noisy = await runPackageProcessForTest(node, [
+      '-e',
+      "process.stdout.write('x'.repeat(256)); setInterval(() => {}, 1000)",
+    ], { timeoutMs: 10_000, maxOutputBytes: 32 });
+    expect(noisy).toMatchObject({ code: -1, error: 'package command output exceeded 32 bytes' });
+
+    const startedAt = Date.now();
+    const timedOut = await runPackageProcessForTest(node, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ], { timeoutMs: 50 });
+    expect(timedOut).toMatchObject({ code: -1, error: 'package command timed out after 1s' });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it.runIf(process.platform === 'win32')('terminates a package command and its Windows descendants', async () => {
+    const { runPackageProcessForTest } = await loadPackages();
+    const sentinel = path.join(tmpDir, 'orphan-package-wrote.txt');
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const grandchildScript = [
+      "const fs = require('node:fs');",
+      `setTimeout(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'orphaned'), 700);`,
+      'setInterval(() => {}, 1000);',
+    ].join('');
+    const parentScript = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });`,
+      'setInterval(() => {}, 1000);',
+    ].join('');
+
+    await expect(runPackageProcessForTest(node, ['-e', parentScript], { timeoutMs: 75 }))
+      .resolves.toMatchObject({ code: -1, error: 'package command timed out after 1s' });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(fs.existsSync(sentinel)).toBe(false);
   });
 });
 

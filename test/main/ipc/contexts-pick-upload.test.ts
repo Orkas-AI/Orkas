@@ -99,7 +99,7 @@ describe('contexts.pickAndUpload', () => {
     expect(fs.readFileSync(path.join(contextsRoot(), 'note.md'), 'utf8')).toBe('# note');
   });
 
-  it('does not seed the native picker with a macOS media-library workspace', async () => {
+  it.runIf(process.platform === 'darwin')('does not seed the native picker with a macOS media-library workspace', async () => {
     const prevHome = process.env.HOME;
     const prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
     try {

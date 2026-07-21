@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 // index.ts wraps indexer + BM25 scoring + snippet extraction. Each test sets
 // ORKAS_WORKSPACE_ROOT then resetModules so the module graph (paths +
@@ -20,7 +25,8 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -147,6 +153,7 @@ describe('search › searchChats — group-chat shape end-to-end', () => {
     const results = await s.searchChats('u1', 'pangolin');
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].cid).toBe('cgroup');
+    expect(results[0].msg_id).toBe('m0');
     expect(results[0].role).toBe('user');
     // Snippet must include the matched token (proves `text` field is being
     // read, not the absent `content`).

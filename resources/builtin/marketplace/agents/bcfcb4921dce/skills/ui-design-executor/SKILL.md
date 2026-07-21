@@ -94,7 +94,9 @@ For interactive standalone HTML:
 For a standalone HTML artifact, run the bundled validator when Node and shell execution are available:
 
 ```text
-node <this-skill-directory>/scripts/validate-html-artifact.mjs <artifact-directory>
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" \
+  ui-design-executor validate-html-artifact -- \
+  <artifact-directory>
 ```
 
 It checks strict `artifact.json`, entry/file inventory, safe relative paths, critical HTML structure, meaningful static content, inline JavaScript syntax, fragile generated inline handlers, and local references in one call. Fix every reported error. Treat warnings as review prompts, not automatic failures.

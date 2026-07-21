@@ -2,7 +2,8 @@
  * Version probe + minimum-version gate for local CLI agents.
  *
  * Two pure functions (parseSemver / checkMinVersion) for unit-testing,
- * and one subprocess call (detectVersion) that runs `<bin> --version`
+ * and one subprocess call (detectVersion) that runs the caller-provided
+ * version command (defaulting to `<bin> --version`)
  * and extracts the first `[v]MAJOR.MINOR.PATCH` token from stdout/stderr.
  *
  * MIN_VERSIONS is intentionally narrow: only CLIs whose stream-json /
@@ -12,7 +13,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { resolveCliCommand } from './spawn-command.js';
+import { killProcessTree } from './backends/base.js';
+import { buildCliSpawnEnv, resolveCliCommand } from './spawn-command.js';
 
 /** Minimum CLI versions; absent entry = no minimum. */
 export const MIN_VERSIONS: Record<string, string> = {
@@ -66,45 +68,78 @@ export function checkMinVersion(cli: string, detected: string | null): string | 
 }
 
 /**
- * Run `<binPath> --version`, return the parsed version string (the raw
- * line we matched, not just the semver), or null on any failure.
+ * Run the configured version probe, return the parsed version string (the
+ * raw line we matched, not just the semver), or null on any failure.
  *
- * Timeout is 5s — `--version` should be sub-100ms; anything longer is
+ * Timeout is 5s — a version probe should be sub-100ms; anything longer is
  * a hung/wrong binary.
  */
-export async function detectVersion(binPath: string, timeoutMs = 5000): Promise<string | null> {
+export async function detectVersion(
+  binPath: string,
+  timeoutMs = 5000,
+  versionArgs: readonly string[] = ['--version'],
+): Promise<string | null> {
   return new Promise(resolve => {
     let settled = false;
+    let outputBytes = 0;
+    let timer: NodeJS.Timeout | null = null;
+    const maxOutputBytes = 64 * 1024;
     const finish = (v: string | null) => {
       if (settled) return;
       settled = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
       resolve(v);
     };
 
     let stdout = '';
     let stderr = '';
-    const launch = resolveCliCommand(binPath, ['--version']);
-    const child = spawn(launch.command, launch.args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      windowsVerbatimArguments: launch.windowsVerbatimArguments,
-    });
+    const launch = resolveCliCommand(binPath, [...versionArgs]);
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(launch.command, launch.args, {
+        env: buildCliSpawnEnv(binPath),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+        detached: process.platform !== 'win32',
+      });
+    } catch {
+      finish(null);
+      return;
+    }
 
-    child.stdout?.on('data', (c: Buffer) => { stdout += c.toString('utf8'); });
-    child.stderr?.on('data', (c: Buffer) => { stderr += c.toString('utf8'); });
+    const capture = (target: 'stdout' | 'stderr', chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += data.length;
+      if (outputBytes > maxOutputBytes) {
+        killProcessTree(child, 'SIGKILL');
+        finish(null);
+        return;
+      }
+      if (target === 'stdout') stdout += data.toString('utf8');
+      else stderr += data.toString('utf8');
+    };
+    child.stdout?.on('data', (c: Buffer | string) => capture('stdout', c));
+    child.stderr?.on('data', (c: Buffer | string) => capture('stderr', c));
 
-    const timer = setTimeout(() => {
-      try { child.kill('SIGTERM'); } catch { /* noop */ }
+    timer = setTimeout(() => {
+      // Windows npm CLIs are .cmd -> node process trees. Killing only the
+      // command-shell parent leaves the real CLI (and any probe descendants)
+      // running after discovery has already returned.
+      killProcessTree(child, 'SIGTERM');
       finish(null);
     }, timeoutMs);
+    timer.unref?.();
 
-    child.on('error', () => {
-      clearTimeout(timer);
-      finish(null);
-    });
-    child.on('close', () => {
-      clearTimeout(timer);
-      const text = (stdout || stderr || '').trim();
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(null);
+      // Some wrappers print a banner to stdout and the actual version to
+      // stderr. Inspect both streams instead of letting non-empty stdout
+      // hide a valid stderr version.
+      const text = `${stdout}\n${stderr}`.trim();
       if (!text) return finish(null);
       const sv = parseSemver(text);
       if (!sv) return finish(null);

@@ -53,4 +53,4 @@ export interface RuleDef {
 
 /** Bumped on every rule list change so persisted reports record the schema
  *  they were produced under. Loosely follows the validator module version. */
-export const VALIDATOR_VERSION = '0.2.0';
+export const VALIDATOR_VERSION = '0.3.0';

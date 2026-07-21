@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -13,12 +14,17 @@ import {
   draftComposition,
   inspectComposition,
   isCompositionRequestUrlAllowed,
+  isWindowsNativeRuntimeIncompatible,
   lintComposition,
   preflightComposition,
   prepareComposition,
+  previewArtifactPaths,
+  previewEvidenceRunDir,
   normalizeWhisperTranscript,
   normalizeCapturedFrame,
   renderComposition,
+  resolveSpeechTranscribeBackend,
+  runVideoProcessForTest,
   selectSafeFinalRenderFps,
   shouldNormalizeLoudness,
   transcribeSpeech,
@@ -46,6 +52,7 @@ import {
   compareVisualBaseline,
   dedupeInspectIssues,
   isEnvironmentalDraftFailure,
+  isSuspiciousCrossSceneDuplicate,
   loadDesignContract,
   loadNarrationMap,
   loadSceneMap,
@@ -255,6 +262,49 @@ describe('native VideoStudio draft QA parity', () => {
     expect(JSON.parse(fs.readFileSync(statePath, 'utf8'))).toMatchObject({ schema_version: 1, revision: 1 });
   });
 
+  it('admits orthogonal visual work from current facts without consulting the compatibility stage', async () => {
+    const p = tmpProject('narration-policy');
+    const statePath = path.join(p.root, 'production-state.json');
+    const state = await updateVideoProductionState(statePath, p.compositionDir, (next) => {
+      next.plan_approval = {
+        gate: 'B',
+        signature: 'approved-plan',
+        turn_id: 'turn-plan',
+        approved_at: new Date().toISOString(),
+        artifact_paths: [],
+        validation_version: 1,
+      };
+      next.stage = 'scaffold_ready';
+    });
+
+    const pendingOps = nextVideoProductionOps(state, {
+      narrationRequired: true,
+      narrationMaterialized: false,
+    });
+    expect(pendingOps).toContain('composition.materialize_narration');
+    expect(pendingOps).toContain('composition.lint');
+    expect(pendingOps).toContain('composition.inspect');
+    expect(pendingOps).not.toContain('composition.snapshot');
+    expect(pendingOps).not.toContain('composition.draft');
+    expect(pendingOps).not.toContain('composition.begin_visual_revision');
+    expect(nextVideoProductionOps(state)).toContain('composition.materialize_narration');
+    state.stage = 'draft_approved';
+    expect(isVideoProductionOpAllowed(state, 'composition.inspect', {
+      narrationRequired: true,
+      narrationMaterialized: false,
+    })).toBe(true);
+    expect(isVideoProductionOpAllowed(state, 'composition.draft', {
+      narrationRequired: true,
+      narrationMaterialized: false,
+    })).toBe(false);
+
+    const silentOps = nextVideoProductionOps(state, {
+      narrationRequired: false,
+      narrationMaterialized: true,
+    });
+    expect(silentOps).toEqual(expect.arrayContaining(['composition.lint', 'composition.inspect']));
+  });
+
   it('retimes the canonical manifest once from measured narration before visual authoring', () => {
     const planned = CompositionManifestSchema.parse({
       schema_version: 1,
@@ -446,7 +496,7 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
-  it('migrates a v2 approval when only a runtime QA report changed', async () => {
+  it('fails closed when a v2 approval cannot prove the current v3 inputs', async () => {
     const p = tmpProject('gate-v3-runtime-report-migration');
     writeHtml(p.compositionDir, 'Approved source', { duration: 60 });
     const gatePath = path.join(p.root, 'private-gate.json');
@@ -467,16 +517,16 @@ describe('native VideoStudio draft QA parity', () => {
     fs.writeFileSync(path.join(p.compositionDir, 'draft-qa.json'), JSON.stringify({ attempt: 2, error: 'runtime-only' }), 'utf8');
 
     await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
-      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 3 } });
+      .resolves.toMatchObject({ ok: false, errorCode: 'E_HTML_PREVIEW_STALE' });
     const migrated = await readVideoProductionState(gatePath, p.compositionDir);
     expect(migrated.preview).toMatchObject({
-      signature: await videoStudioCompositionSignature(p.compositionDir),
+      signature: approvedV2Signature,
       status: 'approved',
-      validation_version: 3,
+      validation_version: 2,
     });
   });
 
-  it('does not migrate a v2 approval after an authored input changes', async () => {
+  it('does not trust a backdated mtime when a v2-approved input changes', async () => {
     const p = tmpProject('gate-v3-authored-change');
     writeHtml(p.compositionDir, 'Approved source', { duration: 60 });
     fs.writeFileSync(path.join(p.compositionDir, 'draft-qa.json'), JSON.stringify({ attempt: 1 }), 'utf8');
@@ -496,12 +546,38 @@ describe('native VideoStudio draft QA parity', () => {
       };
     });
     writeHtml(p.compositionDir, 'Changed after approval', { duration: 60 });
-    const future = new Date(approvedAt.getTime() + 2_000);
-    fs.utimesSync(path.join(p.compositionDir, 'index.html'), future, future);
+    const backdated = new Date(approvedAt.getTime() - 2_000);
+    fs.utimesSync(path.join(p.compositionDir, 'index.html'), backdated, backdated);
 
     await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
       .resolves.toMatchObject({ ok: false, errorCode: 'E_HTML_PREVIEW_STALE' });
     expect((await readVideoProductionState(gatePath, p.compositionDir)).preview?.validation_version).toBe(2);
+  });
+
+  it('migrates a legacy-tagged approval whose signature exactly matches current v3 inputs', async () => {
+    const p = tmpProject('gate-v3-exact-signature-migration');
+    writeHtml(p.compositionDir, 'Approved source', { duration: 60 });
+    const gatePath = path.join(p.root, 'private-gate.json');
+    const signature = await videoStudioCompositionSignature(p.compositionDir, 3);
+    await updateVideoProductionState(gatePath, p.compositionDir, (state) => {
+      state.stage = 'preview_approved';
+      state.preview = {
+        signature,
+        turn_id: 'turn-preview',
+        created_at: new Date().toISOString(),
+        status: 'approved',
+        approved_turn_id: 'turn-approve',
+        approved_at: new Date().toISOString(),
+        validation_version: 2,
+      };
+    });
+
+    await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
+      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 3 } });
+    expect((await readVideoProductionState(gatePath, p.compositionDir)).preview).toMatchObject({
+      signature,
+      validation_version: 3,
+    });
   });
 
   it('normalizes legacy start_s/duration_s once into the canonical manifest', async () => {
@@ -640,7 +716,7 @@ describe('native VideoStudio draft QA parity', () => {
       issues: expect.arrayContaining([
         expect.objectContaining({ code: 'IMPERATIVE_MEDIA_CONTROL', severity: 'error' }),
         expect.objectContaining({ code: 'GSAP_CALLBACK_NOT_SEEKABLE', severity: 'error' }),
-        expect.objectContaining({ code: 'NARRATION_DECLARED_BUT_SILENT', severity: 'error' }),
+        expect.objectContaining({ code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED', severity: 'error' }),
       ]),
     });
     expect(fs.existsSync(p.outputPath)).toBe(false);
@@ -1589,6 +1665,45 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
+  it('P1 bounds native-process output and settles timeout without waiting for close', async () => {
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const noisy = await runVideoProcessForTest(node, [
+      '-e',
+      "process.stdout.write('x'.repeat(256)); setInterval(() => {}, 1000)",
+    ], { timeoutMs: 10_000, maxOutputBytes: 32 });
+    expect(noisy).toMatchObject({ code: -1, timedOut: false, aborted: false });
+    expect(noisy.stderr).toContain('process output exceeded 32 bytes');
+
+    const startedAt = Date.now();
+    const timedOut = await runVideoProcessForTest(node, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ], { timeoutMs: 50 });
+    expect(timedOut).toMatchObject({ code: -1, timedOut: true, aborted: false });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it.runIf(process.platform === 'win32')('P1 terminates a real Windows video subprocess tree', async () => {
+    const p = tmpProject('video-process-tree');
+    const sentinel = path.join(p.root, 'orphan-wrote.txt');
+    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    const grandchildScript = [
+      "const fs = require('node:fs');",
+      `setTimeout(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'orphaned'), 700);`,
+      'setInterval(() => {}, 1000);',
+    ].join('');
+    const parentScript = [
+      "const { spawn } = require('node:child_process');",
+      `spawn(process.execPath, ['-e', ${JSON.stringify(grandchildScript)}], { stdio: 'ignore' });`,
+      'setInterval(() => {}, 1000);',
+    ].join('');
+
+    await expect(runVideoProcessForTest(node, ['-e', parentScript], { timeoutMs: 75 }))
+      .resolves.toMatchObject({ code: -1, timedOut: true });
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(fs.existsSync(sentinel)).toBe(false);
+  });
+
   it('P1 streams raw BGRA frames into ffmpeg instead of compressing PNGs on the main thread', () => {
     const args = buildFrameEncoderArgs({
       outputAbsPath: '/tmp/out.mp4',
@@ -1674,10 +1789,61 @@ describe('native VideoStudio draft QA parity', () => {
       ok: false,
       errorCode: 'E_PREFLIGHT_BLOCKED',
       preflight: expect.objectContaining({
-        issues: expect.arrayContaining([expect.objectContaining({ code: 'NARRATION_DECLARED_BUT_SILENT' })]),
+          issues: expect.arrayContaining([expect.objectContaining({ code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED' })]),
       }),
     });
     expect(fs.existsSync(p.outputPath)).toBe(false);
+  });
+
+  it('blocks pre-production narration intent before rendering instead of treating owner none as silence', async () => {
+    const p = tmpProject('pending-narration');
+    writeHtml(p.compositionDir, 'Launch');
+    writeManifest(p.compositionDir, {
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: ['Launch'],
+        narration_refs: ['n1'],
+        narration_text: 'Launch narration.',
+        source_shots: [],
+        roles: ['title', 'visual'],
+      }],
+      audio: { owner: 'none', tracks: [] },
+    });
+
+    const res = await draftComposition({
+      compositionDirAbs: p.compositionDir,
+      outputAbsPath: p.outputPath,
+      reportAbsPath: p.reportPath,
+    });
+
+    expect(res).toMatchObject({
+      ok: false,
+      errorCode: 'E_PREFLIGHT_BLOCKED',
+      preflight: expect.objectContaining({
+        issues: expect.arrayContaining([expect.objectContaining({
+          code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED',
+          severity: 'error',
+        })]),
+      }),
+    });
+    expect(fs.existsSync(p.outputPath)).toBe(false);
+  });
+
+  it('keeps explicitly silent compositions eligible for visual QA', async () => {
+    const p = tmpProject('intentional-silence');
+    writeHtml(p.compositionDir, 'Launch');
+    writeManifest(p.compositionDir);
+
+    const preflight = await preflightComposition({ compositionDirAbs: p.compositionDir });
+
+    expect(preflight.ok).toBe(true);
+    expect(preflight.steps.audio_timing).toMatchObject({
+      ok: true,
+      skipped: true,
+      narration_required: false,
+    });
   });
 
   it('S2 blocks narration-map timing drift before rendering', async () => {
@@ -1834,49 +2000,70 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
-  it('S2 discovers bundled whisper runtime for speech.transcribe without env-only setup', async () => {
-    const p = tmpProject('bundled-whisper');
-    const input = path.join(p.root, 'raw.mp4');
-    const transcript = path.join(p.root, 'project', 'transcript.json');
-    fs.writeFileSync(input, 'fake media');
-
-    const fakeFfmpeg = path.join(p.root, 'ffmpeg');
-    writeExecutable(fakeFfmpeg, [
-      '#!/usr/bin/env node',
-      "const fs = require('node:fs');",
-      "fs.writeFileSync(process.argv[process.argv.length - 1], 'wav');",
-      '',
-    ].join('\n'));
-
+  it('S2 resolves the bundled whisper runtime without env-only setup', () => {
+    const p = tmpProject('bundled-whisper-resolution');
     const runtimeRoot = path.join(p.root, 'runtime');
-    const fakeWhisper = path.join(runtimeRoot, 'whisper', 'current', 'bin', 'whisper-cli');
-    writeExecutable(fakeWhisper, [
-      '#!/usr/bin/env node',
-      "const fs = require('node:fs');",
-      "const outIndex = process.argv.indexOf('-of');",
-      "const outBase = outIndex >= 0 ? process.argv[outIndex + 1] : 'transcript';",
-      "fs.writeFileSync(`${outBase}.json`, JSON.stringify({ text: 'hello world', segments: [] }));",
-      '',
-    ].join('\n'));
-    const model = path.join(runtimeRoot, 'whisper', 'current', 'models', 'ggml-base.bin');
+    const targetDir = path.join(runtimeRoot, 'whisper', `${process.platform}-${process.arch}`);
+    const cli = path.join(targetDir, 'bin', process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli');
+    const model = path.join(targetDir, 'models', 'ggml-base-q5_1.bin');
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
     fs.mkdirSync(path.dirname(model), { recursive: true });
-    fs.writeFileSync(model, 'model');
+    fs.writeFileSync(cli, 'test runtime');
+    fs.writeFileSync(model, 'test model');
 
-    process.env.ORKAS_BUNDLED_FFMPEG = fakeFfmpeg;
     process.env.ORKAS_RUNTIME_DIR = runtimeRoot;
     delete process.env.ORKAS_WHISPER_CPP;
     delete process.env.ORKAS_WHISPER_CLI;
     delete process.env.ORKAS_WHISPER_MODEL;
 
-    const res = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+    expect(resolveSpeechTranscribeBackend()).toEqual({ cli, model, source: 'bundled' });
+  });
 
-    expect(res).toMatchObject({
-      ok: true,
-      op: 'speech.transcribe',
-      backend: 'orkas-native:whisper.cpp',
-      backend_source: 'bundled',
-    });
-    expect(fs.existsSync(transcript)).toBe(true);
+  it.runIf(process.platform === 'win32' && process.env.ORKAS_REAL_WHISPER_TEST === '1')(
+    'Windows real bundled whisper transcribes within the performance budget', async () => {
+      const p = tmpProject('bundled-whisper');
+      const input = path.join(p.root, 'raw.mp4');
+      const transcript = path.join(p.root, 'project', 'transcript.json');
+      const runtimeRoot = path.resolve(process.cwd(), 'resources', 'runtime');
+      const ffmpeg = path.join(runtimeRoot, 'ffmpeg', 'win32-x64', 'ffmpeg.exe');
+      const generated = spawnSync(ffmpeg, [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono:d=0.2', input,
+      ], { encoding: 'utf8' });
+      expect(generated.status, generated.stderr).toBe(0);
+
+      process.env.ORKAS_BUNDLED_FFMPEG = ffmpeg;
+      process.env.ORKAS_RUNTIME_DIR = runtimeRoot;
+      delete process.env.ORKAS_WHISPER_CPP;
+      delete process.env.ORKAS_WHISPER_CLI;
+      delete process.env.ORKAS_WHISPER_MODEL;
+
+      const startedAt = Date.now();
+      const res = await transcribeSpeech({ inputAbsPath: input, transcriptAbsPath: transcript });
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(res, JSON.stringify(res)).toMatchObject({
+        ok: true,
+        op: 'speech.transcribe',
+        backend: 'orkas-native:whisper.cpp',
+        backend_source: 'bundled',
+      });
+      expect(fs.existsSync(transcript)).toBe(true);
+      expect(elapsedMs).toBeLessThan(60_000);
+    }, 90_000,
+  );
+
+  it('classifies signed and unsigned Windows native-runtime failures without masking normal exits', () => {
+    if (process.platform === 'win32') {
+      expect(isWindowsNativeRuntimeIncompatible(-1073741795)).toBe(true);
+      expect(isWindowsNativeRuntimeIncompatible(0xC000001D)).toBe(true);
+      expect(isWindowsNativeRuntimeIncompatible(-1073741515)).toBe(true);
+      expect(isWindowsNativeRuntimeIncompatible(0xC0000135)).toBe(true);
+      expect(isWindowsNativeRuntimeIncompatible(-1073741701)).toBe(true);
+      expect(isWindowsNativeRuntimeIncompatible(0xC000007B)).toBe(true);
+    }
+    expect(isWindowsNativeRuntimeIncompatible(1)).toBe(false);
+    expect(isWindowsNativeRuntimeIncompatible(null)).toBe(false);
   });
 
   it('uses multilingual auto-detection and DTW word timestamps for the q5 model', () => {
@@ -1956,7 +2143,7 @@ describe('native VideoStudio draft QA parity', () => {
       errorCode: 'E_TRANSCRIBE_AUDIO_EXTRACT_FAILED',
     });
     expect(String(res.message)).toContain('<path>');
-    expect(String(res.message)).not.toContain('/Users/alice');
+    expect(String(res.message)).not.toContain(process.platform === 'win32' ? p.root : '/Users/test');
   });
 
   it('S2 blocks incompatible local GSAP vendor files before rendering', async () => {

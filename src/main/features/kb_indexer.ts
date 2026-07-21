@@ -25,7 +25,13 @@ import { EventEmitter } from 'node:events';
 import { userContextsDir } from '../paths';
 import { createLogger } from '../logger';
 import { fileToChunks } from '../util/file_to_chunks';
-import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
+import {
+  envTimeoutMs,
+  OperationTimeoutError,
+  operationErrorCode,
+  withOperationTimeout,
+} from '../util/operation-timeout';
 import { describeLibraryImage } from './library_image_describer';
 
 import * as kb from './kb_vector';
@@ -46,6 +52,34 @@ export const EMBED_MAX_CHARS = 400;
  *  at sentence boundaries — preserves local context across the cut. Cross-
  *  paragraph chunks don't overlap (different topics shouldn't bleed). */
 export const EMBED_OVERLAP = 50;
+const EXTRACT_TIMEOUT_MS = envTimeoutMs('ORKAS_LIBRARY_EXTRACT_TIMEOUT_MS', 5 * 60 * 1000);
+const EMBED_TIMEOUT_MS = envTimeoutMs('ORKAS_LIBRARY_EMBED_TIMEOUT_MS', 5 * 60 * 1000);
+
+type LibraryVectorizeBatch = Record<string, never>;
+interface LibraryVectorizeSummary {
+  result: string;
+  file_count: number;
+  succeeded_count: number;
+  failed_count: number;
+  timeout_count: number;
+  recovered_count: number;
+  retry_count: number;
+  duration_ms: number;
+  max_queue_wait_ms: number;
+}
+
+function createLibraryVectorizeBatch(_scope: 'global'): LibraryVectorizeBatch {
+  return {};
+}
+
+function flushLibraryVectorizeBatch(_batch: LibraryVectorizeBatch): LibraryVectorizeSummary | null {
+  return null;
+}
+
+function recordLibraryVectorizeOutcome(
+  _batch: LibraryVectorizeBatch,
+  _outcome: Record<string, string | number>,
+): void {}
 
 /** Files this indexer knows how to vectorize. Filenames not in this list are
  *  silently skipped by reconcile (e.g. `_INDEX.md` stays outside KB). */
@@ -84,6 +118,9 @@ export interface KbStatusEvent {
   error?: string;
   /** Echoed on every event once detected — UI uses it for icon routing. */
   kind?: kb.KbKind;
+  stage?: 'queue' | 'extract' | 'embed' | 'persist' | 'reconcile';
+  errorCode?: string;
+  recovered?: boolean;
 }
 
 /** Listeners subscribe via `kbEvents.on('status', fn)`. IPC layer bridges to
@@ -102,12 +139,16 @@ function emit(ev: KbStatusEvent): void {
 interface Job {
   relPath: string;
   op: 'upsert' | 'delete';
+  enqueuedAt: number;
+  reason: 'mutation' | 'reconcile' | 'crash_recovery' | 'late_recovery' | 'manual';
+  attempt: number;
 }
 
 interface Queue {
   jobs: Job[];
   running: boolean;
   scheduled: boolean;
+  activePaths: Map<string, number>;
 }
 
 const _queues = new Map<string, Queue>();
@@ -115,22 +156,43 @@ const _queues = new Map<string, Queue>();
 function getQueue(uid: string): Queue {
   let q = _queues.get(uid);
   if (!q) {
-    q = { jobs: [], running: false, scheduled: false };
+    q = { jobs: [], running: false, scheduled: false, activePaths: new Map() };
     _queues.set(uid, q);
   }
   return q;
 }
 
+function retainActivePath(q: Queue, relPath: string): void {
+  q.activePaths.set(relPath, (q.activePaths.get(relPath) || 0) + 1);
+}
+
+function releaseActivePath(q: Queue, relPath: string): void {
+  const count = q.activePaths.get(relPath) || 0;
+  if (count <= 1) q.activePaths.delete(relPath);
+  else q.activePaths.set(relPath, count - 1);
+}
+
 /** Enqueue a single file for processing. `op='delete'` drops the row from
  *  `kb_files` + cascades its chunks/vectors; `op='upsert'` reads from disk
  *  and (re-)vectorizes. Safe to call multiple times — dedup is by (path, op). */
-export function enqueue(uid: string, relPath: string, op: 'upsert' | 'delete' = 'upsert'): void {
+export function enqueue(
+  uid: string,
+  relPath: string,
+  op: 'upsert' | 'delete' = 'upsert',
+  opts: { reason?: Job['reason']; attempt?: number } = {},
+): void {
   const q = getQueue(uid);
   // Dedup: if same (path, op) already pending, skip. If a deletion is queued
   // and an upsert arrives (or vice-versa), keep both in order — the later op
   // wins naturally.
   if (q.jobs.some((j) => j.relPath === relPath && j.op === op)) return;
-  q.jobs.push({ relPath, op });
+  q.jobs.push({
+    relPath,
+    op,
+    enqueuedAt: Date.now(),
+    reason: opts.reason || 'mutation',
+    attempt: Math.max(1, Math.round(opts.attempt || 1)),
+  });
   if (op === 'upsert') emit({ userId: uid, relPath, status: 'pending' });
   scheduleRunQueue(uid);
 }
@@ -156,6 +218,7 @@ async function runQueue(uid: string): Promise<void> {
   const q = getQueue(uid);
   if (q.running) return;
   q.running = true;
+  const batch = createLibraryVectorizeBatch('global');
   let chain: Promise<void> = Promise.resolve();
   try {
     while (true) {
@@ -167,28 +230,35 @@ async function runQueue(uid: string): Promise<void> {
             .catch((err) => log.warn('delete failed', {
               user_id: maskId(uid),
               path: logPathRef(job.relPath),
-              error: logErrorRef(err),
+              error: logErrorSummary(err),
             }));
           continue;
         }
+        retainActivePath(q, job.relPath);
         let extract: ExtractResult | null = null;
-        try { extract = await prepareAndExtract(uid, job.relPath); }
+        try { extract = await prepareAndExtract(uid, job, batch); }
         catch (err) {
           log.warn('extract failed', {
             user_id: maskId(uid),
             path: logPathRef(job.relPath),
-            error: logErrorRef(err),
+            error: logErrorSummary(err),
           });
+          await failUnexpectedJob(uid, job, err, batch);
+          releaseActivePath(q, job.relPath);
           continue;
         }
-        if (!extract) continue;
+        if (!extract) {
+          releaseActivePath(q, job.relPath);
+          continue;
+        }
         const ex = extract;
-        chain = chain.then(() => embedAndUpsert(uid, ex))
+        chain = chain.then(() => embedAndUpsert(uid, ex, batch))
           .catch((err) => log.warn('embed failed', {
             user_id: maskId(uid),
             path: logPathRef(ex.relPath),
-            error: logErrorRef(err),
-          }));
+            error: logErrorSummary(err),
+          }))
+          .finally(() => { releaseActivePath(q, ex.relPath); });
       }
       // Drain the in-flight chain; new jobs may land during the drain (user
       // upload, reconcile enqueue), so re-check q.jobs after and loop back.
@@ -198,6 +268,21 @@ async function runQueue(uid: string): Promise<void> {
     }
   } finally {
     q.running = false;
+    const summary = flushLibraryVectorizeBatch(batch);
+    if (summary) {
+      log.info('library vectorization batch complete', {
+        user_id: maskId(uid),
+        result: summary.result,
+        files: summary.file_count,
+        succeeded: summary.succeeded_count,
+        failed: summary.failed_count,
+        timeouts: summary.timeout_count,
+        recovered: summary.recovered_count,
+        retries: summary.retry_count,
+        duration_ms: summary.duration_ms,
+        max_queue_wait_ms: summary.max_queue_wait_ms,
+      });
+    }
   }
 }
 
@@ -210,12 +295,20 @@ interface ExtractResult {
   mtime: number;
   sha1: string;
   chunks: PreChunk[];
+  job: Job;
+  startedAt: number;
 }
 
 /** Foreground stage: stat + hash + cache check + extract chunks. Returns null
  *  when embedding should be skipped (delete-on-gone, cache hit, unsupported,
  *  or extract failure — each handled with appropriate emit + status write). */
-async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractResult | null> {
+async function prepareAndExtract(
+  uid: string,
+  job: Job,
+  batch: LibraryVectorizeBatch,
+): Promise<ExtractResult | null> {
+  const { relPath } = job;
+  const startedAt = Date.now();
   const root = userContextsDir(uid);
   const abs = path.join(root, relPath);
 
@@ -226,7 +319,7 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
   }
 
   let stat: fs.Stats;
-  try { stat = fs.statSync(abs); }
+  try { stat = await fsp.stat(abs); }
   catch {
     // Disk deleted it between enqueue and processing — treat as delete.
     await kb.deleteFile(uid, relPath);
@@ -234,7 +327,7 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
     return null;
   }
 
-  const buf = fs.readFileSync(abs);
+  const buf = await fsp.readFile(abs);
   const sha1 = crypto.createHash('sha1').update(buf).digest('hex');
 
   // Cache-hit: identical content, already marked ready → skip re-embed.
@@ -256,34 +349,70 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
       sha1,
       chunks: [],
     });
-    emit({ userId: uid, relPath, status: 'ready', kind, chunks: 0 });
-    log.info('skipped empty library file', { user_id: maskId(uid), path: logPathRef(relPath), kind });
+    emit({ userId: uid, relPath, status: 'ready', kind, chunks: 0, stage: 'persist' });
+    recordVectorizeResult(batch, job, startedAt, {
+      result: 'success', stage: 'persist', chunks: 0,
+    });
+    log.debug('skipped empty library file', { user_id: maskId(uid), path: logPathRef(relPath), kind });
     return null;
   }
 
   await kb.setFileStatus(uid, relPath, 'processing', {
     kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1,
   });
-  emit({ userId: uid, relPath, status: 'processing', kind });
+  emit({ userId: uid, relPath, status: 'processing', kind, stage: 'extract' });
 
   try {
-    const chunks = await extractChunks(uid, relPath, buf, kind);
+    const operation = extractChunks(uid, relPath, buf, kind);
+    const chunks = await withOperationTimeout(operation, {
+      timeoutMs: EXTRACT_TIMEOUT_MS,
+      code: 'E_LIBRARY_EXTRACT_TIMEOUT',
+      stage: 'extract',
+      onLateSettlement: (late) => scheduleLateRecovery(uid, job, sha1, late, 'extract'),
+    });
     if (!chunks.length) throw new Error('extraction returned zero chunks');
-    return { relPath, kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1, chunks };
+    return { relPath, kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1, chunks, job, startedAt };
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    log.warn('extract failed', { user_id: maskId(uid), path: logPathRef(relPath), kind, error: logErrorRef(err) });
+    const errorCode = operationErrorCode(err, 'E_LIBRARY_EXTRACT_FAILED');
+    log.warn('library extraction failed', {
+      user_id: maskId(uid),
+      path: logPathRef(relPath),
+      kind,
+      stage: 'extract',
+      error_code: errorCode,
+      duration_ms: Date.now() - startedAt,
+      queue_wait_ms: startedAt - job.enqueuedAt,
+      attempt: job.attempt,
+      error: logErrorSummary(err),
+    });
     await kb.setFileStatus(uid, relPath, 'failed', { error: msg });
-    emit({ userId: uid, relPath, status: 'failed', error: msg, kind });
+    emit({ userId: uid, relPath, status: 'failed', error: msg, kind, stage: 'extract', errorCode });
+    recordVectorizeResult(batch, job, startedAt, {
+      result: 'failure', stage: 'extract', errorCode,
+    });
     return null;
   }
 }
 
 /** Background stage: embed chunks + atomic upsert. Runs on the chain so only
  *  one embed is in flight at a time (ONNX session is single-threaded). */
-async function embedAndUpsert(uid: string, ex: ExtractResult): Promise<void> {
+async function embedAndUpsert(
+  uid: string,
+  ex: ExtractResult,
+  batch: LibraryVectorizeBatch,
+): Promise<void> {
+  let currentStage: 'embed' | 'persist' = 'embed';
   try {
-    const vectors = await kbEmbed.embedTexts(ex.chunks.map((c) => c.content));
+    emit({ userId: uid, relPath: ex.relPath, status: 'processing', kind: ex.kind, stage: 'embed' });
+    const operation = kbEmbed.embedTexts(ex.chunks.map((c) => c.content));
+    const vectors = await withOperationTimeout(operation, {
+      timeoutMs: EMBED_TIMEOUT_MS,
+      code: 'E_LIBRARY_EMBED_TIMEOUT',
+      stage: 'embed',
+      onLateSettlement: (late) => scheduleLateRecovery(uid, ex.job, ex.sha1, late, 'embed'),
+    });
+    currentStage = 'persist';
     await kb.upsertFile(uid, {
       relPath: ex.relPath,
       kind: ex.kind,
@@ -294,18 +423,117 @@ async function embedAndUpsert(uid: string, ex: ExtractResult): Promise<void> {
         title: c.title, content: c.content, embedding: vectors[i],
       })),
     });
-    emit({ userId: uid, relPath: ex.relPath, status: 'ready', kind: ex.kind, chunks: ex.chunks.length });
-    log.info('vectorized library file', {
-      user_id: maskId(uid),
-      path: logPathRef(ex.relPath),
-      kind: ex.kind,
-      chunks: ex.chunks.length,
+    emit({ userId: uid, relPath: ex.relPath, status: 'ready', kind: ex.kind, chunks: ex.chunks.length, stage: 'persist' });
+    recordVectorizeResult(batch, ex.job, ex.startedAt, {
+      result: 'success', stage: 'persist', chunks: ex.chunks.length,
     });
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    log.warn('embed failed', { user_id: maskId(uid), path: logPathRef(ex.relPath), kind: ex.kind, error: logErrorRef(err) });
+    const stage = err instanceof OperationTimeoutError && err.stage === 'embed' ? 'embed' : currentStage;
+    const errorCode = operationErrorCode(err, stage === 'embed' ? 'E_LIBRARY_EMBED_FAILED' : 'E_LIBRARY_PERSIST_FAILED');
+    log.warn('library vectorization failed', {
+      user_id: maskId(uid),
+      path: logPathRef(ex.relPath),
+      kind: ex.kind,
+      stage,
+      error_code: errorCode,
+      duration_ms: Date.now() - ex.startedAt,
+      queue_wait_ms: ex.startedAt - ex.job.enqueuedAt,
+      attempt: ex.job.attempt,
+      error: logErrorSummary(err),
+    });
     await kb.setFileStatus(uid, ex.relPath, 'failed', { error: msg });
-    emit({ userId: uid, relPath: ex.relPath, status: 'failed', error: msg, kind: ex.kind });
+    emit({ userId: uid, relPath: ex.relPath, status: 'failed', error: msg, kind: ex.kind, stage, errorCode });
+    recordVectorizeResult(batch, ex.job, ex.startedAt, {
+      result: 'failure', stage, errorCode,
+    });
+  }
+}
+
+function recordVectorizeResult(
+  batch: LibraryVectorizeBatch,
+  job: Job,
+  startedAt: number,
+  terminal: {
+    result: 'success' | 'failure';
+    stage: 'extract' | 'embed' | 'persist';
+    chunks?: number;
+    errorCode?: string;
+  },
+): void {
+  recordLibraryVectorizeOutcome(batch, {
+    result: terminal.result,
+    stage: terminal.stage,
+    reason: job.reason,
+    chunks: terminal.chunks || 0,
+    durationMs: Math.max(0, Date.now() - startedAt),
+    queueWaitMs: Math.max(0, startedAt - job.enqueuedAt),
+    errorCode: terminal.errorCode || '',
+    attempt: job.attempt,
+  });
+}
+
+function scheduleLateRecovery<T>(
+  uid: string,
+  job: Job,
+  expectedSha1: string,
+  late: Promise<T>,
+  stage: 'extract' | 'embed',
+): void {
+  // The timeout only releases the queue; it cannot stop PDF/model/native work.
+  // Keep a second ownership reference until that work really settles so a
+  // reconcile cannot start the same path concurrently in the meantime.
+  const queue = getQueue(uid);
+  retainActivePath(queue, job.relPath);
+  void late.then(() => {
+    if (job.attempt >= 2) return;
+    const row = kb.getFileByPath(uid, job.relPath);
+    if (!row || row.status !== 'failed' || row.sha1 !== expectedSha1) return;
+    log.info('timed-out library operation settled; scheduling one recovery attempt', {
+      user_id: maskId(uid),
+      path: logPathRef(job.relPath),
+      stage,
+      attempt: job.attempt + 1,
+    });
+    enqueue(uid, job.relPath, 'upsert', { reason: 'late_recovery', attempt: job.attempt + 1 });
+  }).catch((err) => {
+    log.info('timed-out library operation eventually failed', {
+      user_id: maskId(uid),
+      path: logPathRef(job.relPath),
+      stage,
+      error: logErrorSummary(err),
+    });
+  }).finally(() => {
+    releaseActivePath(queue, job.relPath);
+  });
+}
+
+async function failUnexpectedJob(
+  uid: string,
+  job: Job,
+  err: unknown,
+  batch: LibraryVectorizeBatch,
+): Promise<void> {
+  if (job.op !== 'upsert') return;
+  const row = kb.getFileByPath(uid, job.relPath);
+  const kind = kindFor(job.relPath) || row?.kind;
+  const msg = (err as Error)?.message || String(err);
+  const errorCode = operationErrorCode(err, 'E_LIBRARY_JOB_FAILED');
+  try { await kb.setFileStatus(uid, job.relPath, 'failed', { error: msg }); }
+  catch { /* storage failure is already present in the primary log */ }
+  emit({
+    userId: uid,
+    relPath: job.relPath,
+    status: 'failed',
+    error: msg,
+    ...(kind ? { kind } : {}),
+    stage: 'queue',
+    errorCode,
+  });
+  if (kind) {
+    recordVectorizeResult(batch, job, Date.now(), {
+      result: 'failure', stage: 'persist', errorCode,
+    });
   }
 }
 
@@ -343,9 +571,13 @@ export interface ReconcileResult {
   unchanged: number;
   /** Files whose persisted sha1 was reusable from matching size + mtime. */
   reusedHashes?: number;
+  /** Persisted `processing` rows with no corresponding in-memory job. */
+  recoveredProcessing?: number;
   /** True when admission cancellation stopped the scan before a complete
    * filesystem snapshot was available. No queue mutations are made then. */
   cancelled?: boolean;
+  /** Snapshot was incomplete because of a transient filesystem/I/O failure. */
+  incomplete?: boolean;
 }
 
 interface ReconcileFileMeta {
@@ -374,27 +606,51 @@ export async function reconcile(uid: string, signal?: AbortSignal): Promise<Reco
   const indexedByPath = new Map(indexedRows.map((row) => [row.rel_path, row]));
   const scan = await walk(root, '', indexedByPath, signal);
   if (!scan.complete) {
-    log.info('library reconcile cancelled before snapshot completed', {
+    const cancelled = !!signal?.aborted;
+    log.warn('library reconcile snapshot incomplete; leaving persisted rows untouched', {
       user_id: maskId(uid),
       discovered: scan.files.size,
+      cancelled,
       ms: Date.now() - startedAt,
     });
-    return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0, cancelled: true };
+    return {
+      enqueuedUpsert: 0,
+      enqueuedDelete: 0,
+      unchanged: 0,
+      ...(cancelled ? { cancelled: true } : { incomplete: true }),
+    };
   }
   const onDisk = scan.files;
   let enqueuedUpsert = 0;
   let enqueuedDelete = 0;
   let unchanged = 0;
+  let recoveredProcessing = 0;
+  const queue = getQueue(uid);
 
   for (const [relPath, meta] of onDisk) {
     const existing = indexedByPath.get(relPath);
+    const ownedByQueue = queue.activePaths.has(relPath)
+      || queue.jobs.some((job) => job.relPath === relPath);
+    const orphanedProcessing = existing?.status === 'processing'
+      && !ownedByQueue;
     const needsWork =
       !existing ||
       existing.sha1 !== meta.sha1 ||
-      existing.status === 'failed' ||
-      existing.status === 'pending';
+      (!ownedByQueue && (existing.status === 'failed' || existing.status === 'pending')) ||
+      orphanedProcessing;
     if (needsWork) {
-      enqueue(uid, relPath, 'upsert');
+      if (orphanedProcessing && existing) {
+        recoveredProcessing += 1;
+        await kb.setFileStatus(uid, relPath, 'pending', { error: null });
+        log.warn('recovered orphaned processing library row', {
+          user_id: maskId(uid),
+          path: logPathRef(relPath),
+          stale_ms: Math.max(0, Date.now() - existing.updated_at * 1000),
+        });
+      }
+      enqueue(uid, relPath, 'upsert', {
+        reason: orphanedProcessing ? 'crash_recovery' : 'reconcile',
+      });
       enqueuedUpsert += 1;
     } else {
       unchanged += 1;
@@ -414,6 +670,7 @@ export async function reconcile(uid: string, signal?: AbortSignal): Promise<Reco
       upsert: enqueuedUpsert,
       delete: enqueuedDelete,
       unchanged,
+      recovered_processing: recoveredProcessing,
     });
   }
   log.info('library reconcile scan complete', {
@@ -422,8 +679,15 @@ export async function reconcile(uid: string, signal?: AbortSignal): Promise<Reco
     reused_hashes: scan.reusedHashes,
     hashed_files: onDisk.size - scan.reusedHashes,
     ms: Date.now() - startedAt,
+    recovered_processing: recoveredProcessing,
   });
-  return { enqueuedUpsert, enqueuedDelete, unchanged, reusedHashes: scan.reusedHashes };
+  return {
+    enqueuedUpsert,
+    enqueuedDelete,
+    unchanged,
+    reusedHashes: scan.reusedHashes,
+    recoveredProcessing,
+  };
 }
 
 async function hashReconcileFile(

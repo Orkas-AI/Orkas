@@ -8,7 +8,7 @@ For the whole piece, decide five things before coding:
 
 1. **Material world** — list the real artifacts, surfaces, marks, diagrams, interfaces, documents, objects, or physical behaviors that belong to the topic. Prefer those over generic circles and lines.
 2. **Recurring carrier** — choose one visual object that can move through the story: signal, rule, token stream, document strip, route, waveform, product surface, cursor, scale, or data mark.
-3. **Type behavior** — choose how display, supporting copy, labels, and data differ through family/width/weight/case/tracking, not size alone.
+3. **Type behavior** — choose how display, supporting copy, labels, and data differ through family, width, weight, scale, color, spacing, or tracking while preserving approved casing.
 4. **Spatial rhythm** — alternate where the dominant mass lives. A sequence can move left-heavy → full-field → right-heavy → centered payoff; it should not reset to the same top-left title layout each time.
 5. **Motion logic** — decide what information is established, explained, and resolved. Motion must change meaning or state, not merely prove that animation exists.
 

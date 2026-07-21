@@ -67,6 +67,7 @@ describe('conversation failed assistant retry actions', () => {
     expect(finalizeBody).toContain('const failedAssistant = _isFailedAssistantContent(text, gm);');
     expect(finalizeBody).toContain('_streamingSetFinal(ph, text, { archive: archive && !failedAssistant });');
     expect(finalizeBody).toContain('_attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));');
+    expect(finalizeBody).toContain("failure_kind: String(gm.failure_kind || '')");
 
     const failedActionsBody = extractFunction('_attachFailedAssistantActions');
     expect(failedActionsBody).toContain("msgDiv.dataset.failed = '1';");
@@ -95,4 +96,5 @@ describe('conversation failed assistant retry actions', () => {
 
     expect(calls).toHaveLength(0);
   });
+
 });

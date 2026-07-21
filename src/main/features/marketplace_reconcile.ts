@@ -12,7 +12,6 @@
  * reinstall (or the next boot retries automatically).
  */
 
-import AdmZip from 'adm-zip';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
@@ -40,6 +39,8 @@ import {
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import { extractBundleSafely, postJson } from './marketplace';
 import { withMarketplaceInstallLock } from './marketplace_locks';
+import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
+import { downloadMarketplaceBundle, parseMarketplaceBundle } from './marketplace_bundle';
 import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
 import {
@@ -50,7 +51,6 @@ import {
 
 const log = createLogger('marketplace_reconcile');
 const MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS = 60_000;
-const MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 function _currentAppVersion(): string {
   try { return app.getVersion(); } catch { return ''; }
@@ -844,9 +844,11 @@ async function _ensureAgentSkillDependencies(
   uid: string,
   agentId: string,
   agentJson: Record<string, unknown>,
+  privateSkillIds: ReadonlySet<string> = new Set(),
   opts: MarketplaceReconcileOptions = {},
 ): Promise<void> {
-  const skillList = _skillListFromAgentJson(agentJson);
+  const skillList = _skillListFromAgentJson(agentJson)
+    .filter((skillId) => !privateSkillIds.has(skillId));
   if (skillList.length === 0) return;
   const manifest = await readInstalls(uid);
   const manifestSkills = new Map(manifest.skills.map((s) => [s.id, s]));
@@ -1151,8 +1153,14 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   if (!_isAppCompatible(minAppVersion)) {
     throw new Error(`agent ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
   }
-  await _ensureAgentSkillDependencies(uid, row.id, parsed, opts);
   const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(row.id, current.agent_skills_bundle_url || '', opts);
+  await _ensureAgentSkillDependencies(
+    uid,
+    row.id,
+    parsed,
+    agentPrivateSkillIdsFromBundle(privateSkillsZip),
+    opts,
+  );
 
   const dir = userMarketplaceAgentDir(uid, row.id);
   _assertContinue(opts);
@@ -1166,7 +1174,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
     _assertContinue(opts);
     const privateSkillsDir = userMarketplaceAgentSkillsDir(uid, row.id);
     await fsp.mkdir(privateSkillsDir, { recursive: true });
-    extractBundleSafely(new AdmZip(privateSkillsZip), privateSkillsDir);
+    extractBundleSafely(privateSkillsZip, privateSkillsDir);
   }
   _assertContinue(opts);
   await _writeInstallMeta(dir, {
@@ -1200,9 +1208,10 @@ async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceRecon
 async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
   _assertContinue(opts);
-  let res = await fetchWithRetry(`marketplace:pull-skill:${row.id}`, current.bundle_url, undefined, {
-    timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+  let downloaded = await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}`, current.bundle_url, {
+    assertContinue: () => _assertContinue(opts),
   });
+  let res = downloaded.response;
   if (!res.ok && res.status === 404) {
     _assertContinue(opts);
     const fresh = await postJson<{
@@ -1231,14 +1240,15 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     };
     _assertContinue(opts);
     await addSkillInstall(uid, current);
-    res = await fetchWithRetry(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url, undefined, {
-      timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+    downloaded = await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url, {
+      assertContinue: () => _assertContinue(opts),
     });
+    res = downloaded.response;
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const ab = await res.arrayBuffer();
+  if (!downloaded.buffer) throw new Error('skill bundle response body missing');
   _assertContinue(opts);
-  const zip = new AdmZip(Buffer.from(ab));
+  const zip = parseMarketplaceBundle(downloaded.buffer);
   const minAppVersion = _normalizeMinAppVersion(current);
   if (!_isAppCompatible(minAppVersion)) {
     throw new Error(`skill ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
@@ -1280,13 +1290,15 @@ async function _fetchAgentPrivateSkillsBundle(
   agentId: string,
   bundleUrl: string,
   opts: MarketplaceReconcileOptions = {},
-): Promise<Buffer | null> {
+): Promise<ReturnType<typeof parseMarketplaceBundle> | null> {
   if (!bundleUrl) return null;
   _assertContinue(opts);
-  const res = await fetchWithRetry(`marketplace:pull-agent-private-skills:${agentId}`, bundleUrl, undefined, {
-    timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+  const downloaded = await downloadMarketplaceBundle(`marketplace:pull-agent-private-skills:${agentId}`, bundleUrl, {
+    assertContinue: () => _assertContinue(opts),
   });
+  const res = downloaded.response;
   if (!res.ok) throw new Error(`agent private skills HTTP ${res.status}`);
   _assertContinue(opts);
-  return Buffer.from(await res.arrayBuffer());
+  if (!downloaded.buffer) throw new Error('agent private skills response body missing');
+  return parseMarketplaceBundle(downloaded.buffer);
 }

@@ -359,8 +359,9 @@ function _bindInlineCreateInput(input) {
         _showProjectInlineError(input, res && res.error);
         return;
       }
-      // Auto-expand the freshly created project so users see it's empty &
-      // ready for new convs.
+      // Auto-expand the freshly created project, then select it below so the
+      // successful create lands on the project detail instead of leaving the
+      // user on the previous page with only an empty sidebar row.
       const pid = res.project && res.project.project_id;
       _projectsTrackEvent('project_create_result', {
         result: 'success',
@@ -373,6 +374,9 @@ function _bindInlineCreateInput(input) {
       }
       _projectsInlineCreate = false;
       await loadProjects(true);
+      if (pid && typeof setView === 'function') {
+        setView('project', pid, { entryPoint: 'project_create' });
+      }
     } catch (err) {
       _projectsTrackEvent('project_create_result', {
         result: 'failure',

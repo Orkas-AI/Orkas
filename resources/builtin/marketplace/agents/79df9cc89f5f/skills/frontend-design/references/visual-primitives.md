@@ -54,7 +54,7 @@ body {
 ```
 
 Derive tokens from the design contract. Do not paste this palette into unrelated work.
-Preserve the authored case by default. All caps is an optional accent for one short metadata label, acronym, or code—not the default treatment for labels and never a broad selector for titles, body copy, captions, or CTAs.
+Preserve the authored case. Existing all caps may remain only when the exact casing appears in approved user copy or an external brand/source and is limited to one short metadata label, acronym, or code. A model-authored art direction or generic tech/editorial mood is not permission to introduce it, and it is never a broad-selector treatment for titles, body copy, captions, or CTAs.
 
 ## 2. Topic-derived background field
 

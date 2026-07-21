@@ -8,10 +8,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNativeImage } from 'electron';
 
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../util/bundled-runtime';
+import { versionedChatMediaLocalUrl } from '../util/chat-media-url';
 import { redactPaths } from '../util/redact';
 import { createLogger } from '../logger';
 import { writeJson } from '../storage';
 import {
+  compositionNarrationText,
   ensureCompositionManifest,
   manifestAsDesignContract,
   manifestAsSceneMap,
@@ -27,6 +29,7 @@ import {
   buildPreviewFrameSamplePlan,
   compareVisualBaseline,
   initDraftRepairBudget,
+  isSuspiciousCrossSceneDuplicate,
   dedupeInspectIssues,
   normalizeDraftInspectIssueSeverities,
   loadDesignContract,
@@ -55,6 +58,7 @@ import {
 } from './video_studio_qa';
 import { extractCssImports, extractCssUrls, extractHtmlResourceRefs, parseHtmlStructure, type HtmlResourceRef } from './video_studio_html_check';
 import { hardenedWebPreferences } from '../util/window-security';
+import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 
 const log = createLogger('video-studio');
 
@@ -953,7 +957,12 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
     scaffold_created: prepared.scaffold_created,
     blocking_error_count: 0,
     issues,
-    next_allowed_ops: ['composition.lint', 'composition.inspect', 'composition.snapshot'],
+    next_allowed_ops: prepared.manifest
+      && prepared.manifest.audio.owner !== 'assembler'
+      && !!compositionNarrationText(prepared.manifest)
+      && !prepared.manifest.audio.tracks.some((track) => track.kind === 'narration')
+      ? ['composition.materialize_narration']
+      : ['composition.lint', 'composition.inspect', 'composition.snapshot'],
   };
 }
 
@@ -966,6 +975,7 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
     preflight: preflight.report,
   });
   if (!preflight.ok) {
+    const narrationPending = preflight.issues.some((issue) => issue.code === 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED');
     return {
       ok: false,
       op: 'composition.lint',
@@ -976,7 +986,7 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
       blocking_error_count: preflight.issues.filter((issue) => issue.severity === 'error').length,
       preflight: preflight.report,
       findings,
-      next_allowed_ops: ['composition.prepare'],
+      next_allowed_ops: narrationPending ? ['composition.materialize_narration'] : ['composition.prepare'],
     };
   }
   return {
@@ -1341,6 +1351,17 @@ async function seek(win: ElectronBrowserWindow, tSec: number): Promise<void> {
   });
 }
 
+async function settleCompositionPaint(win: ElectronBrowserWindow): Promise<void> {
+  win.webContents.invalidate();
+  await withVideoStudioTimeout(win.webContents.executeJavaScript(`
+new Promise((resolve) => requestAnimationFrame(() => {
+  setTimeout(() => requestAnimationFrame(resolve), 0);
+}))
+`, true), COMPOSITION_SCRIPT_TIMEOUT_MS, 'E_COMPOSITION_PAINT_TIMEOUT', 'composition paint did not settle before capture.', () => {
+    try { win.destroy(); } catch { /* best effort */ }
+  });
+}
+
 async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
   visible_scene_ids: string[];
   visible_roles: string[];
@@ -1390,6 +1411,29 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
 function sampleTimes(durationSec: number): number[] {
   const dur = Math.max(0.1, durationSec);
   return [...new Set([0, dur * 0.25, dur * 0.5, dur * 0.75, Math.max(0, dur - 0.05)].map((n) => round2(n)))];
+}
+
+export function previewEvidenceRunDir(snapshotAbsPath: string, sourceHtml: string): string {
+  const snapshotStem = path.basename(snapshotAbsPath, path.extname(snapshotAbsPath));
+  const sourceHash = crypto.createHash('sha256').update(sourceHtml).digest('hex').slice(0, 12);
+  const runId = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  return path.join(path.dirname(snapshotAbsPath), `${snapshotStem}-frames`, `${sourceHash}-${runId}`);
+}
+
+export function previewArtifactPaths(
+  snapshotAbsPath: string,
+  contactSheetPath: string,
+  samples: FrameSampleEvidence[],
+): Record<string, string> {
+  const firstFramePath = samples[0]?.path || snapshotAbsPath;
+  return {
+    path: contactSheetPath,
+    contact_sheet: contactSheetPath,
+    contact_sheet_path: contactSheetPath,
+    first_frame: firstFramePath,
+    first_frame_path: firstFramePath,
+    artifact_type: 'contact_sheet',
+  };
 }
 
 export async function inspectComposition(p: CompositionOptions): Promise<VideoStudioResult> {
@@ -1756,40 +1800,49 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         ...(item.sceneId ? { sceneId: item.sceneId } : {}),
       }))
       : buildPreviewFrameSamplePlan(meta, preflight.sceneMapLoad.value, 30);
-    const snapshotStem = path.basename(p.snapshotAbsPath, path.extname(p.snapshotAbsPath));
     const evidenceDirAbs = p.frameEvidenceDirAbs
-      || path.join(path.dirname(p.snapshotAbsPath), `${snapshotStem}-frames`);
+      || previewEvidenceRunDir(p.snapshotAbsPath, meta.html);
     await fs.mkdir(evidenceDirAbs, { recursive: true });
     const capturedSamples: FrameSampleEvidence[] = [];
+    const captureSample = async (
+      win: ElectronBrowserWindow,
+      index: number,
+      retryCount = 0,
+    ): Promise<FrameSampleEvidence> => {
+      const plan = plans[index];
+      await seek(win, plan.timeSec);
+      await settleCompositionPaint(win);
+      const semanticEvidence = await readFrameSemanticEvidence(win);
+      const capturedImage = await withVideoStudioTimeout(
+        win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+        COMPOSITION_CAPTURE_TIMEOUT_MS,
+        'E_SNAPSHOT_TIMEOUT',
+        `composition snapshot timed out while capturing preview frame ${index + 1}/${plans.length}.`,
+        () => { try { win.destroy(); } catch { /* best effort */ } },
+      );
+      const normalizedCapture = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+      const image = normalizedCapture.image;
+      const png = image.toPNG();
+      if (index === 0) await fs.writeFile(p.snapshotAbsPath!, png);
+      const samplePath = path.join(evidenceDirAbs, `${String(index + 1).padStart(2, '0')}-${plan.label}.png`);
+      await fs.writeFile(samplePath, png);
+      return {
+        label: plan.label,
+        time_seconds: round2(plan.timeSec),
+        frame_index: plan.frameIndex,
+        path: samplePath,
+        ...(plan.sceneId ? { expected_scene_id: plan.sceneId } : {}),
+        capture_source_width: normalizedCapture.sourceWidth,
+        capture_source_height: normalizedCapture.sourceHeight,
+        capture_scale_factor: normalizedCapture.scaleFactor,
+        ...(retryCount > 0 ? { capture_retry_count: retryCount } : {}),
+        ...semanticEvidence,
+        ...analyzeNativeImage(image),
+      };
+    };
     await withCompositionWindow(meta, p, async (win) => {
       for (const [index, plan] of plans.entries()) {
-        await seek(win, plan.timeSec);
-        const semanticEvidence = await readFrameSemanticEvidence(win);
-        const capturedImage = await withVideoStudioTimeout(
-          win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
-          COMPOSITION_CAPTURE_TIMEOUT_MS,
-          'E_SNAPSHOT_TIMEOUT',
-          `composition snapshot timed out while capturing preview frame ${index + 1}/${plans.length}.`,
-          () => { try { win.destroy(); } catch { /* best effort */ } },
-        );
-        const normalizedCapture = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
-        const image = normalizedCapture.image;
-        const png = image.toPNG();
-        if (index === 0) await fs.writeFile(p.snapshotAbsPath!, png);
-        const samplePath = path.join(evidenceDirAbs, `${String(index + 1).padStart(2, '0')}-${plan.label}.png`);
-        await fs.writeFile(samplePath, png);
-        capturedSamples.push({
-          label: plan.label,
-          time_seconds: round2(plan.timeSec),
-          frame_index: plan.frameIndex,
-          path: samplePath,
-          ...(plan.sceneId ? { expected_scene_id: plan.sceneId } : {}),
-          capture_source_width: normalizedCapture.sourceWidth,
-          capture_source_height: normalizedCapture.sourceHeight,
-          capture_scale_factor: normalizedCapture.scaleFactor,
-          ...semanticEvidence,
-          ...analyzeNativeImage(image),
-        });
+        capturedSamples.push(await captureSample(win, index));
         p.onProgress?.({
           phase: 'composition.snapshot.capture',
           message: `Captured preview frame ${index + 1}/${plans.length}.`,
@@ -1797,7 +1850,24 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         });
       }
     });
+    const suspiciousIndexes = capturedSamples
+      .map((sample, index) => index > 0 && isSuspiciousCrossSceneDuplicate(capturedSamples[index - 1], sample) ? index : -1)
+      .filter((index) => index >= 0);
+    if (suspiciousIndexes.length) {
+      await withCompositionWindow(meta, p, async (win) => {
+        for (const index of suspiciousIndexes) {
+          capturedSamples[index] = await captureSample(win, index, 1);
+          p.onProgress?.({
+            phase: 'composition.snapshot.recapture',
+            message: `Recaptured semantically inconsistent preview frame ${index + 1}/${plans.length} in a fresh renderer.`,
+            data: { frame: index + 1, totalFrames: plans.length, timeSec: plans[index].timeSec },
+          });
+        }
+      });
+    }
+    const previewRevision = path.basename(evidenceDirAbs);
     const contactSheet = await writeFrameContactSheet(evidenceDirAbs, capturedSamples);
+    const publicArtifacts = previewArtifactPaths(p.snapshotAbsPath, contactSheet, capturedSamples);
     const frameEvidence: FrameEvidence = {
       evidence_dir: evidenceDirAbs,
       contact_sheet: contactSheet,
@@ -1827,7 +1897,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       expectedSceneIds: manifest.scenes.map((scene) => scene.id),
       requireSemanticCoverage: true,
     });
-    const st = await fs.stat(p.snapshotAbsPath);
+    const st = await fs.stat(contactSheet);
     if (previewQa.ok === false) {
       const result = {
         ok: false,
@@ -1837,11 +1907,9 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         status: 'failed',
         stage: 'preview',
         blocking_error_count: Number(previewQa.error_count || 0),
-        path: p.snapshotAbsPath,
-        first_frame: p.snapshotAbsPath,
-        artifact_type: 'first_frame',
+        ...publicArtifacts,
         bytes: st.size,
-        contact_sheet: contactSheet,
+        preview_revision: previewRevision,
         frame_paths: frameEvidence.frame_paths,
         frame_evidence: frameEvidence,
         preview_qa: previewQa,
@@ -1872,11 +1940,9 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         stage: 'preview',
         blocking_error_count: visualBlockingCount,
         fatal_error_count: 0,
-        path: p.snapshotAbsPath,
-        first_frame: p.snapshotAbsPath,
-        artifact_type: 'first_frame',
+        ...publicArtifacts,
         bytes: st.size,
-        contact_sheet: contactSheet,
+        preview_revision: previewRevision,
         frame_paths: frameEvidence.frame_paths,
         frame_evidence: frameEvidence,
         preview_qa: reviewQa,
@@ -1897,11 +1963,9 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       status: 'passed',
       stage: 'preview',
       blocking_error_count: 0,
-      path: p.snapshotAbsPath,
-      first_frame: p.snapshotAbsPath,
-      artifact_type: 'first_frame',
+      ...publicArtifacts,
       bytes: st.size,
-      contact_sheet: contactSheet,
+      preview_revision: previewRevision,
       frame_paths: frameEvidence.frame_paths,
       frame_evidence: frameEvidence,
       preview_qa: previewQa,
@@ -2122,7 +2186,7 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
       op: 'composition.render',
       path: p.outputAbsPath,
       bytes: st.size,
-      media: `chat-media://local/${p.outputAbsPath}`,
+      media: versionedChatMediaLocalUrl(p.outputAbsPath),
       probe,
       engine: 'orkas-native',
       fps,
@@ -2152,6 +2216,18 @@ type ProcessResult = {
   timedOut: boolean;
   aborted: boolean;
 };
+
+const WINDOWS_NATIVE_RUNTIME_INCOMPATIBLE_EXITS = new Set([
+  -1073741795, // 0xC000001D: illegal instruction (CPU feature mismatch)
+  -1073741515, // 0xC0000135: dependent DLL not found
+  -1073741701, // 0xC000007B: invalid image / architecture mismatch
+]);
+
+export function isWindowsNativeRuntimeIncompatible(code: number | null): boolean {
+  return process.platform === 'win32'
+    && typeof code === 'number'
+    && WINDOWS_NATIVE_RUNTIME_INCOMPATIBLE_EXITS.has(code | 0);
+}
 
 type FrameEncoderOptions = {
   ffmpeg: string;
@@ -2212,7 +2288,11 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
   cancel: () => void;
   bytesWritten: () => number;
 } {
-  const child = spawn(opts.ffmpeg, buildFrameEncoderArgs(opts), { ...(opts.signal ? { signal: opts.signal } : {}) });
+  const child = spawn(opts.ffmpeg, buildFrameEncoderArgs(opts), {
+    detached: process.platform !== 'win32',
+    windowsHide: true,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
   let settled = false;
   let timedOut = false;
   let bytesWritten = 0;
@@ -2220,6 +2300,7 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
   const stderr: string[] = [];
   let resolveDone: (result: ProcessResult) => void = () => {};
   const done = new Promise<ProcessResult>((resolve) => { resolveDone = resolve; });
+  let timer: NodeJS.Timeout | null = null;
   const appendBounded = (target: string[], chunk: Buffer) => {
     target.push(chunk.toString('utf8'));
     while (target.length > 128) target.shift();
@@ -2227,7 +2308,9 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
   const settle = (code: number | null, errorMessage = '') => {
     if (settled) return;
     settled = true;
-    clearTimeout(timer);
+    if (timer) clearTimeout(timer);
+    timer = null;
+    opts.signal?.removeEventListener('abort', onAbort);
     if (errorMessage) stderr.push(errorMessage);
     resolveDone({
       code,
@@ -2237,10 +2320,22 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
       aborted: !!opts.signal?.aborted,
     });
   };
-  const timer = setTimeout(() => {
+  const terminate = () => {
+    try { killProcessTree(child, 'SIGKILL'); } catch { /* best effort */ }
+  };
+  const onAbort = () => {
+    if (!child.stdin.destroyed) child.stdin.destroy();
+    terminate();
+    settle(-1);
+  };
+  timer = setTimeout(() => {
     timedOut = true;
-    child.kill('SIGKILL');
+    terminate();
+    settle(-1);
   }, RENDER_TIMEOUT_MS);
+  timer.unref?.();
+  opts.signal?.addEventListener('abort', onAbort, { once: true });
+  if (opts.signal?.aborted) onAbort();
   child.stdout?.on('data', (chunk: Buffer) => appendBounded(stdout, chunk));
   child.stderr?.on('data', (chunk: Buffer) => appendBounded(stderr, chunk));
   child.stdin?.on('error', () => { /* write callbacks surface EPIPE to the render loop */ });
@@ -2266,21 +2361,33 @@ function startRawFrameEncoder(opts: FrameEncoderOptions): {
     wait: () => done,
     cancel: () => {
       if (!child.stdin.destroyed) child.stdin.destroy();
-      if (!settled) child.kill('SIGKILL');
+      if (!settled) {
+        terminate();
+        settle(-1);
+      }
     },
     bytesWritten: () => bytesWritten,
   };
 }
 
-async function runProcess(
+const PROCESS_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
+
+export async function runVideoProcessForTest(
   bin: string,
   args: string[],
-  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  opts: { signal?: AbortSignal; timeoutMs?: number; maxOutputBytes?: number } = {},
 ): Promise<ProcessResult> {
+  if (opts.signal?.aborted) {
+    return { code: -1, stdout: '', stderr: '', timedOut: false, aborted: true };
+  }
   return new Promise((resolve) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(bin, args, { ...(opts.signal ? { signal: opts.signal } : {}) });
+      child = spawn(bin, args, {
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
     } catch (err) {
       resolve({ code: -1, stdout: '', stderr: (err as Error).message, timedOut: false, aborted: false });
       return;
@@ -2288,22 +2395,64 @@ async function runProcess(
     const out: string[] = [];
     const err: string[] = [];
     let timedOut = false;
-    const timer = opts.timeoutMs
-      ? setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, opts.timeoutMs)
-      : null;
-    child.stdout?.on('data', (c: Buffer) => out.push(c.toString('utf8')));
-    child.stderr?.on('data', (c: Buffer) => err.push(c.toString('utf8')));
+    let settled = false;
+    let outputBytes = 0;
+    const maxOutputBytes = Math.max(1, opts.maxOutputBytes ?? PROCESS_OUTPUT_MAX_BYTES);
+    let timer: NodeJS.Timeout | null = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      opts.signal?.removeEventListener('abort', onAbort);
+    };
+    const finish = (code: number | null, errorMessage = '') => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (errorMessage) err.push(errorMessage);
+      resolve({ code, stdout: out.join(''), stderr: err.join(''), timedOut, aborted: !!opts.signal?.aborted });
+    };
+    const terminate = () => {
+      try { killProcessTree(child, 'SIGKILL'); } catch { /* best effort */ }
+    };
+    const onAbort = () => {
+      terminate();
+      finish(-1);
+    };
+    const capture = (target: string[], chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += data.length;
+      if (outputBytes > maxOutputBytes) {
+        terminate();
+        finish(-1, `process output exceeded ${maxOutputBytes} bytes`);
+        return;
+      }
+      target.push(data.toString('utf8'));
+    };
+    if (opts.timeoutMs) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        terminate();
+        finish(-1);
+      }, opts.timeoutMs);
+      timer.unref?.();
+    }
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) onAbort();
+    child.stdout?.on('data', (c: Buffer | string) => capture(out, c));
+    child.stderr?.on('data', (c: Buffer | string) => capture(err, c));
+    child.stdin?.on('error', () => { /* spawn/termination races can close stdin before EOF */ });
     child.stdin?.end();
     child.on('error', (e: Error) => {
-      if (timer) clearTimeout(timer);
-      resolve({ code: -1, stdout: out.join(''), stderr: e.message, timedOut, aborted: !!opts.signal?.aborted });
+      finish(-1, e.message);
     });
     child.on('close', (code) => {
-      if (timer) clearTimeout(timer);
-      resolve({ code, stdout: out.join(''), stderr: err.join(''), timedOut, aborted: !!opts.signal?.aborted });
+      finish(code);
     });
   });
 }
+
+const runProcess = runVideoProcessForTest;
 
 function parseLastJsonObject(text: string): Record<string, unknown> | null {
   const raw = String(text || '');
@@ -2754,7 +2903,7 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     bytes: finalBytes,
     report_path: p.reportAbsPath || '',
     findings_path: p.findingsAbsPath || '',
-    media: `chat-media://local/${renderPath}`,
+    media: versionedChatMediaLocalUrl(renderPath),
     probe: mediaProbe,
     render_profile: (steps.render_profile as Record<string, unknown>) || null,
     visual_regression: visualRegression,
@@ -2798,7 +2947,7 @@ function resolveWhisperBackend(modelHint?: string): { cli: string; model: string
   return { cli, model, source: 'env' };
 }
 
-function resolveSpeechTranscribeBackend(modelHint?: string): { cli: string; model: string; source: 'env' | 'bundled' } | null {
+export function resolveSpeechTranscribeBackend(modelHint?: string): { cli: string; model: string; source: 'env' | 'bundled' } | null {
   const envBackend = resolveWhisperBackend(modelHint);
   if (envBackend) return envBackend;
   const bundled = bundledWhisperPaths(modelHint);
@@ -2969,6 +3118,15 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     });
     const tr = await runProcess(backend.cli, args, { signal: p.signal, timeoutMs: 45 * 60 * 1000 });
     if (tr.code !== 0) {
+      if (isWindowsNativeRuntimeIncompatible(tr.code)) {
+        return {
+          ok: false,
+          op: 'speech.transcribe',
+          errorCode: 'E_TRANSCRIBE_RUNTIME_INCOMPATIBLE',
+          message: 'The whisper.cpp runtime cannot run on this Windows machine. Reinstall the native runtime or use a CPU-compatible build.',
+          backend_source: backend.source,
+        };
+      }
       return { ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_FAILED', message: redactPaths(tr.stderr.slice(-1200)) || 'transcriber failed' };
     }
     const jsonPath = `${outBase}.json`;

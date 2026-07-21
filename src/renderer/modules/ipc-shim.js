@@ -244,7 +244,6 @@ async function _uploadBinary(channel, options, extraParams) {
   const data = btoa(binary);
   try {
     const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
-    if (result && result.ok === false) _monitorIpcError('ipc_upload_result', channel, { msg: result.error || result.reason || 'failed' });
     return _mockJsonResponse(result);
   } catch (err) {
     _monitorIpcError('ipc_upload', channel, { msg: err && err.message ? err.message : String(err) });
@@ -323,7 +322,6 @@ function apiFetch(url, options) {
 
   return window.orkas.invoke(channel, payload)
     .then((result) => {
-      if (result && result.ok === false) _monitorIpcError('ipc_result', channel, { msg: result.error || result.reason || 'failed' });
       return _mockJsonResponse(result);
     })
     .catch((err) => {

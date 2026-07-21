@@ -153,7 +153,7 @@ const DEFAULT_PERMANENT_MESSAGE_PATTERNS = [
 ];
 
 const DEFAULT_PERMANENT_CODE_PATTERNS = [
-  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|CONTENT_POLICY|CONTENT_FILTER|SAFETY|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
+  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|CONTENT_POLICY|CONTENT_FILTER|SAFETY|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
 ];
 
 export const DEFAULT_RETRY_ERROR_POLICY: RetryErrorPolicyConfig = Object.freeze({
@@ -314,6 +314,10 @@ function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknow
     if (msg && policy.permanentMessagePatterns.some((pattern) => pattern.test(msg))) return true;
 
     const code = errorCodeOf(cur);
+    // The rotating provider already exhausted its safe candidates/retries.
+    // Retrying at AgentRunner level would repeat the whole set and multiply
+    // the wait, regardless of server-supplied policy overrides.
+    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
     if (code && policy.permanentCodePatterns.some((pattern) => pattern.test(code))) return true;
 
     cur = errorCauseOf(cur);

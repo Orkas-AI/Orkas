@@ -47,6 +47,7 @@ import {
 } from '../paths';
 import { nowIso, readJson, safeId, writeJson, writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
+import { getCurrentLang, getLocaleMeta } from '../i18n';
 import { logErrorRef } from '../util/log-redact';
 import * as chats from './chats';
 import * as autoTasks from './auto_tasks';
@@ -282,8 +283,16 @@ export async function listProjects(uid: string): Promise<ProjectWithStats[]> {
     convCount: conversationCounts.get(project.project_id) || 0,
   } : null);
   const projects = entries.filter((entry): entry is { project: Project; convCount: number } => entry !== null);
-  // Newest first — matches the prior `items.unshift(project)` ordering.
-  projects.sort((a, b) => (b.project.created_at || '').localeCompare(a.project.created_at || ''));
+  // Display-name order is shared by the sidebar and every picker backed by
+  // `projects.list`. Numeric comparison keeps names such as Project 2 before
+  // Project 10; project_id is a deterministic fallback for malformed legacy
+  // data that collates to the same display name.
+  const locale = getLocaleMeta(getCurrentLang()).intlLocale;
+  const collator = new Intl.Collator(locale, { sensitivity: 'base', numeric: true });
+  projects.sort((a, b) => (
+    collator.compare(a.project.name || '', b.project.name || '')
+    || a.project.project_id.localeCompare(b.project.project_id)
+  ));
   return projects.map(({ project, convCount }) => ({ ...project, conv_count: convCount }));
 }
 

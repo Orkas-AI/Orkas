@@ -149,6 +149,7 @@ describe('prompts ↔ code contract', () => {
   it('cross-session memory scopes are routed explicitly and written in the UI language', () => {
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const sharedPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
     const memoryTool = readFile('src/core-agent/src/tools/memory-tool.ts');
 
     // Tool description ships in two shapes: the legacy three-tier one and the
@@ -169,11 +170,14 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toContain('`target: "agent"` = your own agent memory');
     expect(agentPrompt).toContain('`target: "user"` = global user profile/preferences');
     expect(agentPrompt).toContain('`target: "shared"` = global facts');
-    expect(agentPrompt).toContain('current response/UI language');
+    expect(agentPrompt).not.toContain('current response/UI language');
 
     expect(commanderPrompt).toContain('`target: "agent"` = commander\'s own orchestration memory');
     expect(commanderPrompt).toContain('commander-specific routing lessons');
-    expect(commanderPrompt).toContain('current response/UI language');
+    expect(commanderPrompt).not.toContain('current response/UI language');
+    expect(sharedPrompt).toContain('current response/UI language');
+    expect(sharedPrompt).toContain('Preserve proper nouns, commands, file paths, code identifiers, URLs');
+    expect(readFile('src/main/features/group_chat/bus.ts')).toContain("prompts.load('chat_shared_rules'");
   });
 
   it('group-chat system prompts inject the current User UI language directive', () => {
@@ -299,6 +303,24 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).not.toContain('parallel_group');
   });
 
+  it('anonymous workers remain isolated helpers rather than commander or unavailable-agent substitutes', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+
+    expect(commanderPrompt).toMatch(/Calling an anonymous worker is delegation, not self-execution/i);
+    expect(commanderPrompt).toMatch(/does not inherit your skills or evolving context/i);
+    expect(commanderPrompt).toMatch(/user explicitly requires you to do the work yourself/i);
+    expect(commanderPrompt).toMatch(/fallback for an unavailable agent/i);
+    expect(commanderPrompt).toMatch(/coupled milestone chain/i);
+
+    expect(bus).toMatch(/ONE isolated auxiliary sub-task/);
+    expect(bus).toMatch(/separate helper, not the commander itself/i);
+    expect(bus).toMatch(/stop without changing files and return a concise scope-mismatch result/i);
+    expect(bus).toMatch(/complete result for this delegated sub-task/i);
+    expect(bus).toMatch(/explicit boundary and expected result/i);
+    expect(bus).not.toMatch(/your own hands|commander(?:\\'|')s hands/i);
+  });
+
   it('commander prompt makes hand_off_to the default for a single deliverable, dispatch_to the next-action exception', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
@@ -388,13 +410,45 @@ describe('prompts ↔ code contract', () => {
   it('agent authoring prompts keep created agent inputs sparse', () => {
     const setupPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_setup.md'), 'utf-8');
     const cliSetupPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_setup_cli.md'), 'utf-8');
+    const creatorSkill = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
 
-    expect(setupPrompt).toMatch(/Keep inputs sparse/i);
-    expect(setupPrompt).toMatch(/prefer zero inputs/i);
-    expect(setupPrompt).toMatch(/one required task\/material field plus one optional context field/i);
-    expect(setupPrompt).toMatch(/instead of front-loading mode, role, depth, style, or stage choices/i);
+    expect(setupPrompt).not.toMatch(/Keep inputs sparse/i);
+    expect(creatorSkill).toMatch(/Keep inputs sparse/i);
+    expect(creatorSkill).toMatch(/Prefer zero inputs/i);
+    expect(creatorSkill).toMatch(/one required task \/ material field/i);
     expect(cliSetupPrompt).toMatch(/zero\/few inputs/i);
     expect(cliSetupPrompt).toMatch(/one task field plus one optional context field/i);
+  });
+
+  it('keeps the bound agent editor prompt as a thin adapter over agent-creator', () => {
+    const setupPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_setup.md'), 'utf-8');
+    const creatorSkill = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
+
+    expect(setupPrompt).toContain('agent-creator/SKILL.md');
+    expect(setupPrompt).toContain('Runtime injection contains the current spec');
+    expect(setupPrompt).toMatch(/omit `<agent_id>`/i);
+    expect(setupPrompt).not.toContain('Emit `<name>`');
+    expect(setupPrompt).not.toContain('Keep inputs sparse');
+    expect(creatorSkill).toContain('Bound edit session');
+  });
+
+  it('keeps agent icon selection inside agent-creator instead of global prompts', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const setupPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_setup.md'), 'utf-8');
+    const creatorSkill = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const agents = readFile('src/main/features/agents.ts');
+
+    expect(commanderPrompt).not.toContain('Avatar icon candidates');
+    expect(commanderPrompt).not.toContain('$avatar_icon_catalog');
+    expect(setupPrompt).not.toContain('Avatar icon candidates');
+    expect(setupPrompt).not.toContain('$avatar_icon_catalog');
+    expect(creatorSkill).toContain('Avatar icon candidates (exact IDs)');
+    expect(creatorSkill).toMatch(/On create or when the current icon is missing, choose the closest candidate/i);
+    expect(creatorSkill).not.toContain('<color>');
+    expect(bus).not.toContain('getAgentIconPromptCatalog');
+    expect(agents).toContain("AGENT_CHILD_RE('icon')");
+    expect(agents).toContain('avatars.isKnownIcon(v)');
   });
 
   it('commander treats project chat history as conditional continuity context', () => {

@@ -75,6 +75,26 @@ describe('core-agent client skill sandbox env', () => {
     await expect(pending).resolves.toEqual({ value: undefined, done: true });
   });
 
+  it('keeps a non-overlapping live timing snapshot when a run aborts before done metadata', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const timings = client.createLiveRunTimings(1_000);
+
+    client.transitionLiveRunTimings(timings, 'provider', 1_100);
+    client.transitionLiveRunTimings(timings, 'tool', 1_500);
+    client.transitionLiveRunTimings(timings, 'provider', 1_700);
+    client.transitionLiveRunTimings(timings, 'compaction', 1_900);
+    client.transitionLiveRunTimings(timings, 'provider', 2_200);
+    client.transitionLiveRunTimings(timings, 'retry_wait', 2_300);
+
+    expect(client.snapshotLiveRunTimings(timings, 2_500)).toEqual({
+      providerMs: 700,
+      toolMs: 200,
+      compactionMs: 300,
+      retryWaitMs: 200,
+      otherMs: 100,
+    });
+  });
+
   it('builds model turn log context without raw prompts, ids, or paths', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
 
@@ -146,6 +166,8 @@ describe('core-agent client skill sandbox env', () => {
       name: 'bash',
       isError: true,
       result: 'private command output',
+      errorCode: 'tool_execution_exception',
+      errorSeverity: 'error',
     }, 1200);
     client.recordModelRawEventForLog(stats, {
       type: 'tool_start',
@@ -215,7 +237,7 @@ describe('core-agent client skill sandbox env', () => {
       '#2 +75ms tool_input_delta tool=bash call=call...3456 input_bytes=24',
       '#3 +100ms tool_start tool=bash call=call...3456',
       '#4 +150ms tool_progress tool=bash call=call...3456',
-      '#5 +200ms tool_end tool=bash call=call...3456 error=true',
+      '#5 +200ms tool_end tool=bash call=call...3456 error=true severity=error',
       '#6 +225ms tool_start tool=read_file call=call...cdef',
       '#7 +240ms tool_end tool=read_file call=call...cdef error=false',
       '#8 +250ms retry kind=network attempt=1',
@@ -239,6 +261,7 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('private-skill-id');
     expect(serialized).not.toContain('call-secret-123456');
     expect(serialized).not.toContain('private progress');
+
   });
 
   it('reports compaction attempts and failures separately from successful compactions', async () => {

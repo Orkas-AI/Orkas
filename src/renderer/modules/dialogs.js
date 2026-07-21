@@ -21,8 +21,8 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const okText = escapeHtml(okLabel || _dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog" role="dialog" aria-modal="true">
-        <div class="ui-dialog-message">${msgHtml}</div>
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
+        <div class="modal-body ui-dialog-message">${msgHtml}</div>
         <div class="modal-actions">
           ${showCancel ? `<button class="btn" data-act="cancel">${cancelText}</button>` : ''}
           <button class="btn btn-primary" data-act="ok">${okText}</button>
@@ -133,14 +133,14 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
-    const titleHtml = title ? `<div class="ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const dangerText = escapeHtml(dangerLabel || _dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog ui-dialog-danger" role="dialog" aria-modal="true">
+      <div class="modal ui-dialog ui-dialog-danger modal-standard" role="dialog" aria-modal="true">
         ${titleHtml}
-        <div class="ui-dialog-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message">${msgHtml}</div>
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${cancelText}</button>
           <button class="btn btn-danger" data-act="ok">${dangerText}</button>
@@ -183,7 +183,7 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
-    const titleHtml = title ? `<div class="ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const renderChoice = (c, extraClass = '') => {
@@ -196,9 +196,9 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
     const choiceHtml = choices.map((c) => renderChoice(c)).join('');
     overlay.innerHTML = `
-      <div class="modal ui-dialog" role="dialog" aria-modal="true">
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
         ${titleHtml}
-        <div class="ui-dialog-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message">${msgHtml}</div>
         <div class="modal-actions">
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -236,8 +236,8 @@ function uiPrompt(message, defaultValue = '', options = {}) {
     const cancelText = escapeHtml(_dialogLabel('common.cancel', 'Cancel'));
     const okText = escapeHtml(_dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog" role="dialog" aria-modal="true">
-        <div class="ui-dialog-message">${msgHtml}</div>
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
+        <div class="modal-body ui-dialog-message">${msgHtml}</div>
         <div class="form-row" style="margin-top:12px;margin-bottom:0">
           <input type="text" class="ui-dialog-input" />
         </div>

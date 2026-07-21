@@ -37,6 +37,9 @@ const mocks = vi.hoisted(() => ({
     startMcpDcrOAuth: undefined as any,
     refreshDcrIfStale: undefined as any,
   },
+  events: {
+    broadcastOAuthConnectOutcome: undefined as any,
+  },
 }));
 
 vi.mock('../../../../src/main/features/connectors/mcp-client', () => ({
@@ -63,6 +66,10 @@ vi.mock('../../../../src/main/features/connectors/oauth', () => ({
 vi.mock('../../../../src/main/features/connectors/oauth-dcr', () => ({
   startMcpDcrOAuth: (...args: any[]) => mocks.dcr.startMcpDcrOAuth(...args),
   refreshDcrIfStale: (...args: any[]) => mocks.dcr.refreshDcrIfStale(...args),
+}));
+
+vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
+  broadcastOAuthConnectOutcome: (...args: any[]) => mocks.events.broadcastOAuthConnectOutcome(...args),
 }));
 
 /** Restore default (passthrough) behavior for every mock slot. Fresh spies each
@@ -384,6 +391,54 @@ describe('features/connectors/manager authorization recovery', () => {
       'github_search_repositories',
       { query: 'orkas' },
     );
+  });
+
+  it('invalidates and degrades a live connection after a tool-call timeout', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    await manager.bootstrap(TEST_UID);
+    mocks.mcp.callTool = vi.fn(async () => { throw new Error('Request timed out'); });
+
+    await expect(
+      manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'slow' }),
+    ).rejects.toThrow(/timed out/i);
+
+    expect(mocks.mcp.close).toHaveBeenCalledTimes(1);
+    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({
+      kind: 'degraded',
+      failures: 1,
+    });
+    await expect(
+      manager.callTool(TEST_UID, 'github', 'github_search_repositories', { query: 'again' }),
+    ).rejects.toThrow(/not retrying/i);
+    expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes an in-flight connector on task cancellation without opening the failure circuit', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    await registry.upsert(TEST_UID, githubInstance());
+    await manager.bootstrap(TEST_UID);
+    mocks.mcp.callTool = vi.fn((_name: string, _args: unknown, opts: { signal?: AbortSignal }) => (
+      new Promise((_resolve, reject) => {
+        opts.signal?.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+      })
+    ));
+    const controller = new AbortController();
+    const pending = manager.callTool(
+      TEST_UID,
+      'github',
+      'github_search_repositories',
+      { query: 'cancel' },
+      { signal: controller.signal },
+    );
+    await vi.waitFor(() => expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1));
+    controller.abort('user stopped task');
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError', code: 'E_TOOL_CALL_CANCELLED' });
+    expect(mocks.mcp.close).toHaveBeenCalledTimes(1);
+    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
   });
 
   it('reports the real reason when an on-demand connect fails transiently, not "connector unavailable"', async () => {

@@ -360,6 +360,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           `total_chars="${total}"`,
           `covered="${cs}-${ce}"`,
           `lines="${result.startLine}-${lastLine}"`,
+          ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
           ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
@@ -387,7 +388,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         // Stamp the read-state baseline so a later edit_file accepts an edit
         // built on these bytes (read-before-edit) and rejects it if the file
         // changed since (OCC). See read-tracker.ts.
-        recordRead(ctx, abs);
+        recordRead(ctx, abs, undefined, result.sourceHash);
         return { content: `${header}\n${numberedContent}\n</file>` };
       } catch (err) {
         if (err instanceof NeedStatError) {

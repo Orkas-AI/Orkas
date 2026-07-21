@@ -5,6 +5,16 @@ function _agentsTrackClick(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
+function _agentsTrackEvent(action, data) {
+  void action;
+  void data;
+}
+
+function _agentsTrackError(action, data) {
+  void action;
+  void data;
+}
+
 let _agentsCache = null;
 // Startup holds a deliberately small identity cache for chat mentions and
 // avatars. The Agents tab upgrades it to the complete listing on first entry.
@@ -1819,10 +1829,16 @@ async function _renderAgentDetailRuntime(agent) {
     return;
   }
 
-  const entries = (typeof loadLocalCliEntries === 'function') ? await loadLocalCliEntries() : [];
+  // Re-probe when the detail selector is rendered. A CLI can be installed
+  // while Orkas is already open, and the renderer cache otherwise keeps the
+  // old missing result indefinitely.
+  const entries = (typeof loadLocalCliEntries === 'function')
+    ? await loadLocalCliEntries({ force: true })
+    : [];
   const available = entries.filter(e => e.available);
   const seen = new Set(available.map(e => e.type));
   const currentType = agent.runtime.cli;
+  const currentEntry = entries.find(e => e.type === currentType);
 
   // Build CLI-only options: every detected CLI + the bound one if it's
   // missing (with a warning suffix so the user can flip away in one
@@ -1841,7 +1857,9 @@ async function _renderAgentDetailRuntime(agent) {
     options.push({
       value: `cli:${currentType}`,
       label: labelText,
-      hint: t('agent.cli_missing'),
+      hint: (typeof window.getLocalCliUnavailableHint === 'function')
+        ? window.getLocalCliUnavailableHint(currentEntry)
+        : t('agent.cli_not_found'),
       iconName: 'warning',
     });
   }
@@ -2486,8 +2504,10 @@ async function _saveCreateAgent({ msgEl }) {
   const startedAt = performance.now();
   if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'default', output_format: outputFormat });
   try {
-    const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general' };
+    // Leave the icon unset so the immediately-started agent authoring model
+    // can choose semantically from the controlled catalog. The renderer's
+    // legacy seed fallback covers the brief pre-authoring state.
+    const body = { name, description, category: 'general' };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2590,11 +2610,12 @@ async function _saveExternalAgent({ msgEl }) {
   const startedAt = performance.now();
   if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'cli', cli });
   try {
-    const avatar = randomAgentAvatar();
     const body = {
       name,
       description: desc,
-      icon: avatar.icon, color: avatar.color,
+      // CLI-backed agents do not run the LLM authoring pass, so use the
+      // stable role-specific coding avatar instead of a random pair.
+      icon: 'code', color: 'sage',
       runtime: { kind: 'cli', cli },
       category: 'general',
     };
@@ -3658,7 +3679,6 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset) {
     return;
   }
   if (kind === 'connector') {
-    _agentsTrackClick(target === 'auto' ? 'auto_connector_select' : 'chat_connector_select', { target, connector_id: String(itemId || '') });
     _consumeAtKeyChar();
     setChatConnector(target, itemId, itemName || itemId);
     const inputId = target === 'new-chat'
@@ -3700,11 +3720,6 @@ async function _triggerLibraryFile(dataset, anchorId) {
   const projectId = dataset.projectId || _resolveActiveProjectId(anchorId);
   if (!rel) return;
   if (target === 'auto') {
-    _agentsTrackClick('chat_library_select', {
-      target,
-      scope,
-      project_id: scope === 'project' ? String(projectId || '') : '',
-    });
     try {
       if (typeof window._autoAttachLibraryFile !== 'function') throw new Error('auto_attach_unavailable');
       await window._autoAttachLibraryFile({ scope, rel, projectId });
@@ -3724,11 +3739,11 @@ async function _triggerLibraryFile(dataset, anchorId) {
     ? { projectId, name: rel }
     : { relPath: rel };
   const inputId = _libraryPickerInputIdForTarget(target);
-  _agentsTrackClick('chat_library_select', {
+  const telemetry = {
     target,
     scope,
-    project_id: scope === 'project' ? String(projectId || '') : '',
-  });
+    has_project: scope === 'project' && !!projectId,
+  };
   try {
     await window.attachKbFileToDraft(
       channel,
@@ -3739,10 +3754,17 @@ async function _triggerLibraryFile(dataset, anchorId) {
         else if (target === 'project' && projectId && typeof setView === 'function') setView('project', projectId);
       },
     );
+    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, result: 'success' });
     _consumeAtKeyChar();
     _focusInput(document.getElementById(inputId));
   } catch (err) {
     const reason = String((err && err.message) || err || 'failed');
+    _agentsTrackEvent('chat_library_attach_result', { ...telemetry, result: 'failure' });
+    _agentsTrackError('chat_library_attach', {
+      ...telemetry,
+      error_type: 'operation',
+      error_message: 'library_attach_failed',
+    });
     if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
   }
 }

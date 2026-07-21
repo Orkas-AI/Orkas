@@ -306,6 +306,7 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
   it('renders system skills in a separate block with SYSTEM_SKILLS_ROOT', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
     writeSkill(systemDir(), 'autotask-creator', 'autotask-creator', 'Create automations');
+    writeSkill(systemDir(), 'coding', 'coding', 'Change project code');
     writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
     writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
     const { getSystemSkillsPromptBlock, getSystemPromptBlock } = await loadRegistry();
@@ -314,14 +315,18 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('## System skills');
     expect(systemText).toContain('SYSTEM_SKILLS_ROOT');
     expect(systemText).toContain(path.resolve(systemDir()));
+    expect(systemText).toContain('When the task or the work you decide to perform clearly matches a description below');
+    expect(systemText).toContain('Do not load system skills that do not match.');
     expect(systemText).toContain('**agent-creator**');
     expect(systemText).toContain('**autotask-creator**');
+    expect(systemText).toContain('**coding**');
     expect(systemText).toContain('**package-installer**');
     expect(systemText).toContain('**skill-creator**');
 
     const regularText = await getSystemPromptBlock();
     expect(regularText).not.toContain('agent-creator');
     expect(regularText).not.toContain('autotask-creator');
+    expect(regularText).not.toContain('**coding**');
     expect(regularText).not.toContain('package-installer');
     expect(regularText).not.toContain('skill-creator');
   });

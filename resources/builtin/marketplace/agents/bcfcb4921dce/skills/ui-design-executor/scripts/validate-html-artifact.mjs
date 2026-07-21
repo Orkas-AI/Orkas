@@ -2,12 +2,12 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import vm from 'node:vm';
 
-const rootArg = process.argv[2];
+export function validateHtmlArtifact(rootArg) {
 if (!rootArg) {
-  console.error('Usage: validate-html-artifact.mjs <artifact-directory>');
-  process.exit(2);
+  throw new Error('Usage: validate-html-artifact.mjs <artifact-directory>');
 }
 
 const root = path.resolve(rootArg);
@@ -183,5 +183,21 @@ const result = {
   errors,
   warnings,
 };
-console.log(JSON.stringify(result, null, 2));
-process.exitCode = result.ok ? 0 : 1;
+return result;
+}
+
+export default async function runSkill({ args = [] } = {}) {
+  if (!Array.isArray(args)) throw new Error('args must be an array');
+  return validateHtmlArtifact(args[0]);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  try {
+    const result = validateHtmlArtifact(process.argv[2]);
+    console.log(JSON.stringify(result, null, 2));
+    process.exitCode = result.ok ? 0 : 1;
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+  }
+}

@@ -31,6 +31,7 @@ A skill is **an independent tool capability**, not a tutorial. When the LLM sees
 ## Hard rules (non-negotiable)
 
 - **Mutation only via lightweight metadata tags or `<<<skill-file>>>` blocks.** Use metadata tags for metadata-only changes (`name`, `description`, optional `description_zh`, optional `description_en`, `category`, and routing hints). Use `<<<skill-file>>>` for file content changes. Do NOT use `edit_file` / `write_file` / `bash` (with redirects) to mutate any file under the skill directory. Read for inspection is allowed; every write goes through the parsed protocol so skill rename / registry invalidation / progress events run correctly.
+- **Bundled scripts use the standard Skill Runner only.** Every command in SKILL.md that executes a bundled script must call `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs"` with the skill name/id and script basename. Never construct, expose, or invoke a path under the skill installation directory; never rely on the caller's current working directory. Imported skills are adapted to this entrypoint before they are considered usable.
 - **Do NOT dump the container or any inner block as a workspace file.** The server parses them inline and persists to `<skill_dir>/<path>`.
 - **Explicit creation intent required.** Do not create a custom skill merely because the user provided a URL, file, repo, README, or tool docs. Create/import only when the user's wording names skill creation/import, asks to convert material into a skill, or is already inside a per-skill creation/edit flow. If intent is ambiguous, ask one short clarification or use the package installer for a plain install.
 - **Cross-skill writes are no longer supported.** Inside an inline edit chat, only the current skill's directory is writable. Do not try `<<<skill-file skill=...>>>` (deprecated).
@@ -253,10 +254,10 @@ Add implementation-specific subsections only when they are needed:
 Single entry point template (write this in the body's "How to call" section):
 
 ```
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" <skill-id> <script-basename> [-- args...]
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" <skill-id-or-name> <script-basename> -- [args...]
 ```
 
-**Do NOT prefix the command with `bash`** — the command execution tool runs `command` itself; a `bash` prefix tells the shell to execute the Electron binary as a script and produces "cannot execute binary file". The command starts with `"$ORKAS_NODE"`; keep both runner path parts quoted because app paths can contain spaces. The `<script-basename>` does NOT include the extension — only one file per basename per directory.
+**Do NOT prefix the command with `bash`** — the command execution tool runs `command` itself; a `bash` prefix tells the shell to execute the Electron binary as a script and produces "cannot execute binary file". The command starts with `"$ORKAS_NODE"`; keep both runner path parts quoted because app paths can contain spaces. The `<script-basename>` does NOT include the extension — only one file per basename per directory. Keep the standalone `--` before script arguments so runner options and script options cannot be confused.
 
 Use this exact Orkas runner shape for cross-platform skill execution. It is handled by Orkas's direct CLI path; generic Unix shell pipelines remain OS/shell-specific and should not be the primary implementation of a new skill.
 
@@ -367,7 +368,7 @@ Final audit before claiming success: reread `SKILL.md` and verify the first YAML
 The body outside the frontmatter is **kept verbatim** — don't rearrange or restate the author's sections. Even if the original is tutorial-style or a long README, do NOT compress it into the new-skill body structure — that's the template for writing from scratch in Mode A; it does NOT apply to imports. Only change command examples or tool names when the source platform's invocation literally cannot work in Orkas; keep the surrounding wording and examples intact.
 
 **Scripts, references, assets, configs, directory structure = preserved**:
-- Scripts keep their original language, original filename, original path. Don't move them, don't rewrite cross-platform branches, don't wrap them into `bin/run-skill.cjs`-compatible shape, don't change languages.
+- Scripts keep their original language, original filename, and original path. Don't move them, rewrite unrelated cross-platform branches, or change languages. Make only the compatibility changes required by the standard Skill Runner: JS/MJS/TS entry scripts expose the runner default function while retaining direct-CLI behavior behind an explicit main-module guard when useful; subprocess languages keep their argv/stdout/exit-code contract. Rewrite every bundled-script command in SKILL.md to the standard runner form and remove all installation-path or current-working-directory assumptions.
 - `references/`, `assets/`, `examples/`, `prompts/`, `templates/`, `tests/`, and `test/` keep their original files and relative paths unless the user explicitly asks for a subset.
 - Config files (`config.json` / `.env.example` / any toml/yaml/ini) are kept only when SKILL.md / scripts read them, when they are user-editable runtime templates, or when they document required environment. Source-market / installer metadata is not a runtime config.
 - Directory structure (`src/` / `lib/` / `assets/` / sub-dir organization) kept as-is — do NOT consolidate everything into `scripts/`.

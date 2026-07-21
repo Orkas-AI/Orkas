@@ -21,6 +21,7 @@ import * as path from 'node:path';
 import type { Transport, ToolSchema } from './types';
 import { createLogger } from '../../logger';
 import { buildChildProxyEnvironment } from '../../util/proxy-dispatcher';
+import { logErrorSummary } from '../../util/log-redact';
 
 const log = createLogger('connectors:mcp');
 
@@ -48,14 +49,29 @@ async function _loadSdk(): Promise<SdkBundle> {
 }
 
 const CLIENT_INFO = { name: 'orkas-pc', version: '0.1.0' };
-const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 3 * 60 * 1000;
+const DEFAULT_STDIO_CONNECT_TIMEOUT_MS = 3 * 60 * 1000;
+const DEFAULT_HTTP_CONNECT_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_LIST_TOOLS_TIMEOUT_MS = 30 * 1000;
+const DEFAULT_CALL_TOOL_TIMEOUT_MS = 60 * 1000;
 
-function resolveMcpConnectTimeoutMs(): number {
-  const raw = process.env.ORKAS_MCP_CONNECT_TIMEOUT_MS;
-  if (!raw) return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+function resolveBoundedTimeout(raw: string | undefined, fallback: number): number {
+  if (!raw) return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 30_000) return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+  if (!Number.isFinite(n) || n < 5_000) return fallback;
   return Math.min(Math.trunc(n), 10 * 60 * 1000);
+}
+
+function resolveMcpConnectTimeoutMs(kind: Transport['kind']): number {
+  const specific = kind === 'stdio'
+    ? process.env.ORKAS_MCP_STDIO_CONNECT_TIMEOUT_MS
+    : process.env.ORKAS_MCP_HTTP_CONNECT_TIMEOUT_MS;
+  const fallback = kind === 'stdio' ? DEFAULT_STDIO_CONNECT_TIMEOUT_MS : DEFAULT_HTTP_CONNECT_TIMEOUT_MS;
+  return resolveBoundedTimeout(specific || process.env.ORKAS_MCP_CONNECT_TIMEOUT_MS, fallback);
+}
+
+export interface McpRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 export class McpConnection {
@@ -68,6 +84,7 @@ export class McpConnection {
 
   async connect(): Promise<void> {
     if (this._connected) return;
+    const startedAt = Date.now();
     const sdk = await _loadSdk();
     let transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
     if (this.transport.kind === 'stdio') {
@@ -104,7 +121,7 @@ export class McpConnection {
       // First-run `npx -y @modelcontextprotocol/server-github` can download ~10-30 MB. Bound
       // the wait so a stuck spawn surfaces as a clear error, but keep the default above weak-link
       // cold-install time so a working connector is not reported as failed too early.
-      const connectTimeoutMs = resolveMcpConnectTimeoutMs();
+      const connectTimeoutMs = resolveMcpConnectTimeoutMs(this.transport.kind);
       let to: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_resolve, reject) => {
         const seconds = Math.round(connectTimeoutMs / 1000);
@@ -117,17 +134,30 @@ export class McpConnection {
       }
       this._client = client;
       this._connected = true;
-      log.info('MCP connect ok', { id: this.id });
+      log.info('MCP connect ok', {
+        id: this.id,
+        transport: this.transport.kind,
+        duration_ms: Date.now() - startedAt,
+        timeout_ms: connectTimeoutMs,
+      });
     } catch (err) {
-      log.warn('connect failed', { id: this.id, error: (err as Error).message });
+      log.warn('connect failed', {
+        id: this.id,
+        transport: this.transport.kind,
+        duration_ms: Date.now() - startedAt,
+        error: logErrorSummary(err),
+      });
       try { await transport.close?.(); } catch { /* swallow */ }
       throw err;
     }
   }
 
-  async listTools(): Promise<ToolSchema[]> {
+  async listTools(opts: McpRequestOptions = {}): Promise<ToolSchema[]> {
     if (!this._client || !this._connected) throw new Error('not connected');
-    const res = await this._client.listTools();
+    const res = await this._client.listTools(undefined, {
+      timeout: opts.timeoutMs || DEFAULT_LIST_TOOLS_TIMEOUT_MS,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
     return (res.tools || []).map((t) => ({
       name: t.name,
       description: typeof t.description === 'string' ? t.description : '',
@@ -137,9 +167,16 @@ export class McpConnection {
     }));
   }
 
-  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  async callTool(name: string, args: Record<string, unknown>, opts: McpRequestOptions = {}): Promise<unknown> {
     if (!this._client || !this._connected) throw new Error('not connected');
-    const res = await this._client.callTool({ name, arguments: args });
+    const res = await this._client.callTool(
+      { name, arguments: args },
+      undefined,
+      {
+        timeout: opts.timeoutMs || DEFAULT_CALL_TOOL_TIMEOUT_MS,
+        ...(opts.signal ? { signal: opts.signal } : {}),
+      },
+    );
     return res;
   }
 

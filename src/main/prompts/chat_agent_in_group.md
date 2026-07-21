@@ -58,10 +58,6 @@ Routing:
 - Do not save task progress, temporary plans, one-off status, or current-session TODOs.
 - Do not put your agent-specific lessons, output preferences, workflow corrections, or domain conventions into `target: "user"` or `target: "shared"`.
 
-Language:
-- Before `add` / `replace`, write the memory entry in the current response/UI language. If the user said it in another language, translate or summarize it first.
-- Preserve proper nouns, commands, file paths, code identifiers, URLs, and exact quoted wording when exact text matters.
-
 ---
 
 ## Interacting with the user

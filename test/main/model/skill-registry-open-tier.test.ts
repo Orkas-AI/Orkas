@@ -3,6 +3,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 // OPEN-tier rendering (external packages + global roots) in
 // `getSystemPromptBlock`. Companion to skill-registry.test.ts (trusted
 // tier). Plan: docs/plans/open-ecosystem-architecture.md §A3/§B1; callers
@@ -11,6 +15,7 @@ import * as path from 'node:path';
 let tmpDir: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
+let prevUserProfile: string | undefined;
 const TEST_UID = 'u1';
 
 function customDir(): string {
@@ -48,10 +53,12 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skillreg-open-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   prevHome = process.env.HOME;
+  prevUserProfile = process.env.USERPROFILE;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   // Redirect homedir so global roots (~/.claude/skills, ~/.codex/skills)
   // resolve inside the sandbox, never the developer machine.
   process.env.HOME = homeDir();
+  process.env.USERPROFILE = homeDir();
   fs.mkdirSync(homeDir(), { recursive: true });
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
@@ -62,6 +69,8 @@ afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
+  if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = prevUserProfile;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

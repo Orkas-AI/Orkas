@@ -1951,10 +1951,12 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   justify-content: space-between;
   padding: 12px 14px 10px;
   border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
 }
 .project-binding-picker-title {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 600;
+  line-height: 1.4;
   color: var(--text);
 }
 .project-binding-picker-search {
@@ -2215,10 +2217,11 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 
 /* Danger-styled confirm modal ornaments. */
 .ui-dialog-title {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 8px;
+  margin: 0;
+  line-height: 1.4;
 }
 .ui-dialog-danger .ui-dialog-message {
   white-space: pre-wrap;
@@ -2505,7 +2508,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 .conv-status-badge.is-streaming {
-  /* Streaming state is now dot-only (no label); drop the pill background /
+  /* Streaming state is dot-only (no label); drop the pill background /
      border / inner padding so the dot floats by itself. +N queued count
      still renders inside, gap handles the spacing. Color shifted to green
      per PC/docs/design/PATTERNS.md P6 (live/online dot). */
@@ -2553,7 +2556,7 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 }
 
 /* When the conv item is active, use a slightly brighter backdrop so the
-   badge stays legible against the active background. Streaming badge no
+   badge stays legible against the active background. Running badge no
    longer has a pill background, so only the queued variant adjusts. */
 .conv-item.active .conv-status-badge.is-queued {
   background: rgba(234, 179, 8, 0.28);
@@ -4449,17 +4452,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 0 0 2px rgba(91, 87, 214, 0.10);
 }
 .chat-header-title-input[hidden] { display: none !important; }
-.chat-header-running-pill {
-  flex: 0 0 auto;
-  padding: 1px 7px;
-  border-radius: 4px;
-  background: var(--primary-soft);
-  color: var(--primary-text);
-  font-size: 10.5px;
-  font-weight: 600;
-  white-space: nowrap;
-}
-.chat-header-running-pill[hidden] { display: none; }
 .chat-header-meta {
   display: flex;
   align-items: center;
@@ -5042,27 +5034,31 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 
 .chat-history-load-earlier {
-  display: flex;
+  display: none;
+  align-items: center;
   justify-content: center;
+  gap: 8px;
   flex: 0 0 auto;
-}
-.chat-history-load-earlier button {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 5px 12px;
-  background: var(--card, #fff);
+  min-height: 28px;
+  padding: 2px 0;
   color: var(--muted);
-  font: inherit;
   font-size: 12px;
-  cursor: pointer;
 }
-.chat-history-load-earlier button:hover:not(:disabled) {
-  color: var(--primary);
-  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
+.chat-history-load-earlier.is-loading,
+.chat-history-load-earlier.is-error {
+  display: flex;
 }
-.chat-history-load-earlier button:disabled {
-  cursor: wait;
-  opacity: 0.65;
+.chat-history-load-earlier.is-error {
+  color: var(--danger);
+}
+.chat-history-inline-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 2px solid color-mix(in srgb, var(--muted) 28%, transparent);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
 }
 
 /* While a new exchange is in flight, a DOM spacer (`.chat-scroll-spacer`)
@@ -6078,6 +6074,29 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 100%;
   border: none;
   display: block;
+}
+.chat-file-viewer.is-video-composition .chat-file-viewer-body {
+  overflow: hidden;
+  background: #020617;
+}
+.chat-file-viewer-composition-wrap {
+  --composition-width: 1920px;
+  --composition-height: 1080px;
+  --composition-scale: 1;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #020617;
+}
+.chat-file-viewer-composition-frame {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--composition-width);
+  height: var(--composition-height);
+  transform: translate(-50%, -50%) scale(var(--composition-scale));
+  transform-origin: center center;
 }
 .chat-file-viewer-video-wrap {
   width: 100%;
@@ -7658,14 +7677,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex: 0 0 auto;
   padding: 18px 20px 15px;
   border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
 }
 .chat-reference-target-header h2 {
   flex: 1;
   margin: 0;
   color: var(--text);
   font-size: 16px;
-  font-weight: 650;
-  line-height: 1.35;
+  font-weight: 600;
+  line-height: 1.4;
   letter-spacing: -0.01em;
 }
 .chat-reference-target-body {
@@ -9030,8 +9050,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   gap: 12px;
   padding: 16px 18px 12px;
   border-bottom: 1px solid var(--border);
+  margin-bottom: 0;
 }
-.library-transfer-title { color: var(--text); font-size: 15px; font-weight: 600; }
+.library-transfer-title { color: var(--text); font-size: 16px; font-weight: 600; line-height: 1.4; }
 .library-transfer-summary { margin-top: 3px; color: var(--muted); font-size: 12px; }
 .library-transfer-body {
   min-height: 0;
@@ -9540,7 +9561,41 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 20px 40px rgba(0,0,0,0.12);
 }
 
-.modal h3 { margin-bottom: 20px; font-size: 17px; }
+.modal h3 { margin: 0; font-size: 16px; line-height: 1.4; font-weight: 600; }
+
+/* Shared dialog chrome. Workflow dialogs may choose a wider body, but title,
+   body copy, dismiss controls, and footer actions use one visual contract. */
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-height: 32px;
+  margin-bottom: 16px;
+}
+.modal-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+}
+.modal > .modal-title,
+.modal > .ui-dialog-title {
+  margin-bottom: 16px;
+}
+.modal-standard {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.modal-body {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
 
 /* Shared close control for modal dialogs. Keep position/layout on the
    individual dialog; dimensions, icon, hover, and focus stay global. */
@@ -9655,6 +9710,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   gap: 10px;
   justify-content: flex-end;
   margin-top: 20px;
+}
+.modal-actions .btn,
+.memory-modal-foot .btn {
+  min-width: 76px;
+  min-height: 36px;
+  padding: 0 16px;
+  font-size: 13px;
+  line-height: 34px;
 }
 
 /* ── Skill-modal import-method tabs ───────────────────────────────────── */
@@ -12007,6 +12070,24 @@ body.model-not-configured .main-content { flex-direction: column; }
  *  "启用云端同步" + the enabled/disabled hint read as one line. */
 .settings-row > label.settings-toggle.settings-toggle-tight { flex: 0 0 auto; }
 
+.settings-task-notification-permission {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(220, 38, 38, 0.24);
+  border-radius: var(--radius-sm);
+  background: rgba(220, 38, 38, 0.07);
+}
+.settings-task-notification-permission-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--danger-hover);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.settings-task-notification-permission .btn { flex: 0 0 auto; }
+
 /* Shared input style — used inside modals too. */
 .form-input {
   width: 100%;
@@ -13678,7 +13759,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   max-height: calc(100vh - 48px);
   overflow: auto;
 }
-.auto-task-dialog-title { margin-bottom: 14px; font-weight: 600; font-size: 15px; }
+.auto-task-dialog-title { margin-bottom: 16px; font-weight: 600; font-size: 16px; line-height: 1.4; }
 .auto-task-dialog-title + .auto-task-dialog-sync-note { margin-top: -6px; margin-bottom: 12px; }
 .auto-task-dialog-body { display: flex; flex-direction: column; gap: 14px; }
 .auto-composer-wrapper .chat-rich-editor {
@@ -14749,10 +14830,10 @@ body.model-not-configured .main-content { flex-direction: column; }
 .memory-modal-head { padding: 16px 20px 14px; border-bottom: 1px solid var(--border); display: flex; align-items: flex-start; gap: 12px; }
 .memory-modal-head-main { flex: 1; min-width: 0; }
 .memory-modal-head-titlerow { display: flex; align-items: baseline; gap: 8px; }
-.memory-modal-title { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; color: var(--text); }
+.memory-modal-title { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.4; letter-spacing: -0.01em; color: var(--text); }
 .memory-modal-step { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); }
 .memory-modal-sub { margin: 4px 0 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
-.memory-modal-body { padding: 20px; flex: 1; overflow-y: auto; }
+.memory-modal-body { padding: 20px; flex: 1; overflow-y: auto; font-size: 14px; line-height: 1.6; }
 .memory-modal-foot { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
 .memory-export-foot-icon { color: var(--muted); display: inline-flex; align-items: center; }
 

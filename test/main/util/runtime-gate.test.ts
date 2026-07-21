@@ -307,7 +307,7 @@ function writeWhisperRuntime(root: string, key: string, contract: any): void {
   fs.writeFileSync(path.join(dir, '.orkas-whisper-ready.json'), JSON.stringify({
     schema: contract.schema,
     platformKey: key,
-    version: contract.version,
+    version: target.version || contract.version,
     model: contract.model.name,
     source: 'test',
     files,
@@ -342,6 +342,28 @@ function writeAllRuntimes(root: string, key: string, contract: any, withNodeComp
 }
 
 describe('runtime-gate', () => {
+  it('verifies a target-specific Whisper version independently of the shared contract version', () => {
+    const root = path.join(tmpDir, 'runtime');
+    const key = 'win32-x64';
+    const contract = whisperContract([key]);
+    contract.targets[key].version = 'test-whisper-windows';
+    writeWhisperRuntime(root, key, contract);
+
+    expect(verifyWhisperRuntimeDir(root, 'win32', 'x64', {
+      checkArch: false,
+      whisperContract: contract,
+    })).toBe(path.join(root, 'whisper', key, 'bin', 'whisper-cli.exe'));
+
+    const markerFile = path.join(root, 'whisper', key, '.orkas-whisper-ready.json');
+    const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+    marker.version = contract.version;
+    fs.writeFileSync(markerFile, JSON.stringify(marker));
+    expect(() => verifyWhisperRuntimeDir(root, 'win32', 'x64', {
+      checkArch: false,
+      whisperContract: contract,
+    })).toThrow(/whisper runtime marker mismatch/);
+  });
+
   it('verifies all bundled runtimes and their companion commands before signing', () => {
     const root = path.join(tmpDir, 'runtime');
     const key = 'win32-x64';

@@ -93,9 +93,9 @@ function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
     const force = forceLabel ? escapeHtml(forceLabel) : '';
 
     overlay.innerHTML = `
-      <div class="modal ui-dialog quality-report-dialog" role="dialog" aria-modal="true" style="max-width:640px;width:90vw;">
-        <div class="ui-dialog-title">${titleText}</div>
-        <div class="quality-report-body" style="max-height:60vh;overflow-y:auto;margin:12px 0;">
+      <div class="modal modal-standard ui-dialog quality-report-dialog" role="dialog" aria-modal="true" aria-labelledby="quality-report-title" style="max-width:640px;width:90vw;">
+        <div class="modal-title ui-dialog-title" id="quality-report-title">${titleText}</div>
+        <div class="modal-body quality-report-body" style="max-height:60vh;overflow-y:auto;">
           ${bodyHtml}
         </div>
         <div class="modal-actions">

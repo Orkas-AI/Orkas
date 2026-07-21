@@ -6,7 +6,12 @@ import {
   skillReadMetadataForToolStart,
   agentReadMetadataForToolStart,
 } from '../../../src/main/model/core-agent/event-mapper';
-import { userMarketplaceAgentsDir, userMarketplaceSkillsDir } from '../../../src/main/paths';
+import {
+  userMarketplaceAgentSkillsDir,
+  userMarketplaceAgentsDir,
+  userMarketplaceSkillsDir,
+  userSystemSkillsDir,
+} from '../../../src/main/paths';
 import { setCurrentLang } from '../../../src/main/i18n';
 
 type AgentRunEvent =
@@ -199,6 +204,50 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(endEvent.event.data.skill_file).toBe('SKILL.md');
   });
 
+  it('read_file of a hidden system SKILL.md carries a friendly label through tool_end', async () => {
+    const uid = 'u-system-skill-event';
+    const skillPath = `${userSystemSkillsDir(uid)}/agent-creator/SKILL.md`;
+    const meta = skillReadMetadataForToolStart(
+      'read_file',
+      { path: skillPath },
+      { userId: uid },
+    );
+    expect(meta).toEqual({
+      skill_id: 'agent-creator',
+      skill_name: 'agent-creator',
+      skill_system: 'system',
+    });
+
+    const out = await collect([
+      { type: 'tool_start', name: 'read_file', id: 'c-system-skill', input: { path: skillPath } },
+      {
+        type: 'tool_end',
+        name: 'read_file',
+        id: 'c-system-skill',
+        result: '<persisted-output ref="read_file.deadbeef" tool="read_file" size="41420">preview</persisted-output>',
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { userId: uid });
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.skill_name).toBe('agent-creator');
+    expect(endEvent.event.data.skill_system).toBe('system');
+    expect(endEvent.event.data.skill_file).toBe('SKILL.md');
+  });
+
+  it('read_file of a platform agent-private SKILL.md carries its resource label', () => {
+    const uid = 'u-private-skill-event';
+    const skillPath = `${userMarketplaceAgentSkillsDir(uid, '79df9cc89f5f')}/stage-plan/SKILL.md`;
+    expect(skillReadMetadataForToolStart(
+      'read_file',
+      { path: skillPath },
+      { userId: uid },
+    )).toEqual({
+      skill_id: 'stage-plan',
+      skill_name: 'stage-plan',
+      skill_system: 'B',
+    });
+  });
+
   it('read_file of marketplace agent.json carries the agent display name', async () => {
     const uid = 'u-agent-event';
     const agentId = '4430ca181349';
@@ -238,6 +287,10 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     );
     expect(retryProgress).toBeDefined();
     expect(retryProgress.text).toBe('Retrying·Connection dropped');
+    expect(retryProgress.event).toEqual({
+      stream: 'runtime',
+      data: { phase: 'retrying', attempt: 1 },
+    });
     // Raw English error sentinel must not survive into user-visible text.
     expect(retryProgress.text).not.toContain('terminated');
     expect(retryProgress.text).not.toContain('retry #');

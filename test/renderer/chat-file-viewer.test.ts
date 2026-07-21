@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
-const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget } = viewer as {
+const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _videoCompositionDimensions } = viewer as {
   _kindOf: (name: string) => string;
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
@@ -15,6 +15,7 @@ const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl
   _viewerCanAddToLibrary: (name: string, options?: { projectScoped?: boolean }) => boolean;
   _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number; duration?: number; ended?: boolean }) => { autoplay: boolean; startTime: number };
   _viewerVideoSeekTarget: (startTime: number, duration?: number) => number;
+  _videoCompositionDimensions: (html: string) => { width: number; height: number } | null;
 };
 
 describe('chat-file-viewer › _kindOf', () => {
@@ -27,6 +28,7 @@ describe('chat-file-viewer › _kindOf', () => {
     ['art.jpeg', 'image'],
     ['art.webp', 'image'],
     ['art.gif', 'image'],
+    ['contact-sheet.svg', 'image'],
     ['report.pdf', 'pdf'],
     ['doc.docx', 'office'],
     ['macro.docm', 'office'],
@@ -75,6 +77,7 @@ describe('chat-file-viewer › _kindOf', () => {
     expect(_kindOf('Note.MD')).toBe('markdown');
     expect(_kindOf('Page.Html')).toBe('html');
     expect(_kindOf('Voice.MP3')).toBe('audio');
+    expect(_kindOf('CONTACT-SHEET.SVG')).toBe('image');
   });
 
   it('handles paths with directories — only the basename ext matters', () => {
@@ -98,13 +101,17 @@ describe('chat-file-viewer › _extOf', () => {
 
 describe('chat-file-viewer › _chatMediaLocalUrl', () => {
   // The URL has to round-trip cleanly through new URL() + the main-side
-  // `_pathnameToAbsPath`, so it must encode spaces / non-ASCII but
-  // preserve `/` separators. encodeURI does both.
+  // `_pathnameToAbsPath`, so it must encode reserved filename characters and
+  // non-ASCII text while preserving `/` separators.
   it('builds chat-media://local/ + path for a unix abs path', () => {
     expect(_chatMediaLocalUrl('/Users/test/file.pdf')).toBe('chat-media://local/Users/test/file.pdf');
   });
   it('URL-encodes spaces in the path', () => {
     expect(_chatMediaLocalUrl('/Users/test/has space.pdf')).toBe('chat-media://local/Users/test/has%20space.pdf');
+  });
+  it('URL-encodes fragment/query delimiters and literal percent signs in filenames', () => {
+    expect(_chatMediaLocalUrl('/Users/user/hero #1?.png')).toBe('chat-media://local/Users/user/hero%20%231%3F.png');
+    expect(_chatMediaLocalUrl('/Users/user/100%/图.png')).toBe('chat-media://local/Users/user/100%25/%E5%9B%BE.png');
   });
   it('preserves "/" separators (doesn\'t use encodeURIComponent)', () => {
     const url = _chatMediaLocalUrl('/a/b/c/d.pdf');
@@ -174,5 +181,17 @@ describe('chat-file-viewer › _viewerVideoSeekTarget', () => {
 
   it('keeps a safe in-range mid-video seek target', () => {
     expect(_viewerVideoSeekTarget(4.25, 10)).toBe(4.25);
+  });
+});
+
+describe('chat-file-viewer › VideoStudio composition dimensions', () => {
+  it('reads the authored canvas size regardless of attribute order', () => {
+    expect(_videoCompositionDimensions('<main data-height="1080" data-composition-id="main" data-width="1920"></main>'))
+      .toEqual({ width: 1920, height: 1080 });
+  });
+
+  it('leaves ordinary HTML and invalid canvas sizes on the generic viewer path', () => {
+    expect(_videoCompositionDimensions('<main data-width="1920" data-height="1080"></main>')).toBeNull();
+    expect(_videoCompositionDimensions('<main data-composition-id="main" data-width="99999" data-height="1080"></main>')).toBeNull();
   });
 });

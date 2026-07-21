@@ -10,7 +10,7 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
     files: unknown[];
     inventory: {
       system_skills: unknown[];
-      marketplace_agents: Array<{ id: string; skill_list: string[] }>;
+      marketplace_agents: Array<{ id: string; skill_list: string[]; embedded_skills: string[] }>;
       marketplace_skills: Array<{ id: string }>;
     };
   };
@@ -51,6 +51,40 @@ describe('builtin-resource-gate', () => {
       .toContainEqual(expect.objectContaining({
         id: '78900d8758bc',
         skill_list: expect.arrayContaining(['e7f5c0e6f1be']),
+      }));
+    expect(manifest.inventory.marketplace_agents)
+      .toContainEqual(expect.objectContaining({
+        id: '79df9cc89f5f',
+        skill_list: [
+          'composition-design-review',
+          'design-system-importer',
+          'frontend-design',
+          'gate-control',
+          'stage-assemble',
+          'stage-compose',
+          'stage-consistency',
+          'stage-decide',
+          'stage-edit',
+          'stage-generate',
+          'stage-plan',
+          'video-craft',
+          'video-router',
+        ],
+        embedded_skills: expect.arrayContaining([
+          'video-router',
+          'gate-control',
+          'frontend-design',
+          'design-system-importer',
+          'composition-design-review',
+          'video-craft',
+          'stage-compose',
+          'stage-edit',
+          'stage-decide',
+          'stage-generate',
+          'stage-consistency',
+          'stage-plan',
+          'stage-assemble',
+        ]),
       }));
   });
 

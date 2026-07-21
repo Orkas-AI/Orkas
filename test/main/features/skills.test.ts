@@ -34,12 +34,17 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  streamImpl.current = null;
-  chatImpl.current = null;
-  vi.unstubAllGlobals();
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  try {
+    const reports = await import('../../../src/main/quality/report');
+    await reports.drainReportWrites();
+  } finally {
+    process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+    streamImpl.current = null;
+    chatImpl.current = null;
+    vi.unstubAllGlobals();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 async function loadSkills() {
@@ -941,6 +946,32 @@ describe('skills › createCustomSkill', () => {
 });
 
 describe('skills › createFromDir', () => {
+  it('enforces Windows import blacklists case-insensitively on the actual system drive', async () => {
+    const s = await loadSkills();
+    const options = {
+      platform: 'win32' as const,
+      env: {
+        SystemRoot: 'D:\\Windows',
+        ProgramFiles: 'D:\\Program Files',
+        'ProgramFiles(x86)': 'D:\\Program Files (x86)',
+        ProgramW6432: 'D:\\Program Files',
+      },
+      sourceRoot: 'D:\\Code\\Orkas\\PC',
+      workspaceRoot: 'D:\\.orkas\\data',
+      homeDir: 'D:\\Users\\Alice',
+    };
+
+    expect(s._isBlacklistedImportSourceForTest('d:\\WINDOWS\\System32', options).blocked).toBe(true);
+    expect(s._isBlacklistedImportSourceForTest('d:\\program files\\Vendor', options).blocked).toBe(true);
+    expect(s._isBlacklistedImportSourceForTest('d:\\CODE\\ORKAS\\pc\\src', options).blocked).toBe(true);
+    expect(s._isBlacklistedImportSourceForTest('d:\\users\\alice\\.SSH', options).blocked).toBe(true);
+    expect(s._isBlacklistedImportSourceForTest('D:\\Users\\Alice', options).blocked).toBe(true);
+
+    expect(s._isBlacklistedImportSourceForTest('D:\\Windows.old\\Skill', options).blocked).toBe(false);
+    expect(s._isBlacklistedImportSourceForTest('D:\\Program Files-old\\Skill', options).blocked).toBe(false);
+    expect(s._isBlacklistedImportSourceForTest('E:\\portable-skills\\safe', options).blocked).toBe(false);
+  });
+
   it('reports the actual filtered file count when the import exceeds the limit', async () => {
     const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-import-'));
     try {
@@ -1252,6 +1283,31 @@ describe('skills › createFromDir', () => {
       const forced = await s.createFromDir(null, null, src, { force: true });
       expect(forced.ok).toBe(true);
       expect(fs.existsSync(path.join(customSkillsDir(), 'unsafe-import', 'scripts', 'run.py'))).toBe(true);
+    } finally {
+      fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('never imports a skill that bypasses the standard runner, even with force', async () => {
+    const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-runner-import-'));
+    try {
+      const src = path.join(srcParent, 'direct-script-import');
+      fs.mkdirSync(path.join(src, 'scripts'), { recursive: true });
+      fs.writeFileSync(path.join(src, 'SKILL.md'), [
+        '---',
+        'name: "direct-script-import"',
+        'description: "Direct script import"',
+        '---',
+        'node scripts/run.js',
+      ].join('\n'));
+      fs.writeFileSync(path.join(src, 'scripts', 'run.js'), 'module.exports = async () => ({ ok: true });\n');
+
+      const s = await loadSkills();
+      const result = await s.createFromDir(null, null, src, { force: true });
+
+      expect(result.ok).toBe(false);
+      expect(result.report?.violations.map((v: any) => v.rule)).toContain('skill_script_requires_runner');
+      expect(fs.existsSync(path.join(customSkillsDir(), 'direct-script-import'))).toBe(false);
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }

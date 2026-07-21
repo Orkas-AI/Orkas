@@ -57,10 +57,12 @@ function loadConnectorsRenderer(
   const storage = new Map<string, string>();
   const alerts: string[] = [];
   const events: Array<[string, Record<string, unknown>]> = [];
+  const errors: Array<[string, Record<string, unknown>]> = [];
+  const pushHandlers = new Map<string, (payload: any) => void>();
   const monitor = {
     click: () => {},
     event: (name: string, data: Record<string, unknown>) => { events.push([name, data]); },
-    error: () => {},
+    error: (name: string, data: Record<string, unknown>) => { errors.push([name, data]); },
   };
   const context: any = {
     console,
@@ -90,7 +92,10 @@ function loadConnectorsRenderer(
       innerWidth: 1200,
       innerHeight: 800,
       Monitor: monitor,
-      orkas: { invoke, onPushEvent: () => {} },
+      orkas: {
+        invoke,
+        onPushEvent: (channel: string, handler: (payload: any) => void) => { pushHandlers.set(channel, handler); },
+      },
     },
     Monitor: monitor,
     uiAlert: (message: string) => { alerts.push(message); },
@@ -115,6 +120,8 @@ function loadConnectorsRenderer(
   };
   context.__alerts = alerts;
   context.__events = events;
+  context.__errors = errors;
+  context.__emitPush = (channel: string, payload: any) => pushHandlers.get(channel)?.(payload);
   return context;
 }
 
@@ -251,6 +258,117 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
 
     await ctx._retryConnect({ id: 'gsearch-console', display_name: 'GSC' }, 'connector_degraded_retry');
 
+    expect(ctx.__alerts).toHaveLength(1);
+  });
+
+  it('handles an asynchronous OAuth transport failure without a duplicate alert', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: true, started: true, attempt_id: 'attempt-notion' };
+      }
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [] };
+      if (channel === 'connectors.list') return { ok: true, instances: [] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'notion', display_name: 'Notion' });
+    expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-notion',
+      catalog_id: 'notion',
+      result: 'failure',
+      code: 'mcp_connect_failed',
+      error: 'fetch failed',
+      duration_ms: 12,
+    });
+
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    expect(ctx.__alerts).toEqual([]);
+  });
+
+  it('reports success only after the asynchronous callback provisions the connector', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: true, started: true, attempt_id: 'attempt-success' };
+      }
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [] };
+      if (channel === 'connectors.list') return { ok: true, instances: [] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+    expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
+
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-success',
+      catalog_id: 'github',
+      result: 'success',
+      duration_ms: 18,
+    });
+
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    expect(ctx.__alerts).toEqual([]);
+  });
+
+  it('reports an asynchronous user cancellation without an error or alert', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: true, started: true, attempt_id: 'attempt-github' };
+      }
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [] };
+      if (channel === 'connectors.list') return { ok: true, instances: [] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-github',
+      catalog_id: 'github',
+      result: 'cancelled',
+      code: 'user_cancelled',
+      error: 'provider canceled authorization',
+      duration_ms: 12,
+    });
+
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    expect(ctx.__alerts).toEqual([]);
+  });
+
+  it('accepts the browser launch without fabricating a timeout result when no callback arrives', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: true, started: true, attempt_id: 'attempt-abandoned' };
+      }
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+
+    expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    expect(ctx.__alerts).toEqual([]);
+  });
+
+  it('surfaces an empty OAuth response as a launch failure', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') return undefined;
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [] };
+      if (channel === 'connectors.list') return { ok: true, instances: [] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
     expect(ctx.__alerts).toHaveLength(1);
   });
 });

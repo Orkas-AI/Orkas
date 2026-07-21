@@ -3,6 +3,18 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+// Module isolation reloads kb_vector for every temp workspace. Keep the test
+// focused on SQLite/vector behavior without creating one electron-log file
+// transport per case (those file handles outlive a case on Windows).
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
+}));
+
 // kb_vector opens a per-uid sqlite database under <uid>/cloud/contexts/.kb/.
 // Each test resets ORKAS_WORKSPACE_ROOT + the module graph so the per-uid
 // cache map doesn't leak handles across runs.

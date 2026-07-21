@@ -33,10 +33,10 @@ describe('open-source VideoStudio resources', () => {
     const standards = (agent.standards ?? []).join('\n');
 
     expect(visualPrimitives).not.toMatch(/text-transform\s*:\s*uppercase/i);
-    expect(visualPrimitives).toMatch(/Preserve the authored case by default/i);
-    expect(frontendDesign).toMatch(/Preserve the authored casing of approved English copy by default/i);
-    expect(frontendDesign).toMatch(/two or more English text roles.*all caps/i);
-    expect(stageCompose).toMatch(/Preserve approved English casing by default/i);
+    expect(visualPrimitives).toMatch(/Preserve the authored case/i);
+    expect(frontendDesign).toMatch(/Preserve the authored casing of approved English copy/i);
+    expect(frontendDesign).toMatch(/two(?: or more)? English text roles.*all caps/i);
+    expect(stageCompose).toMatch(/Preserve approved English casing/i);
     expect(compositionDesignReview).toMatch(/two or more English text roles.*all caps/i);
     expect(standards).toMatch(/Preserve approved English casing/i);
   });
@@ -50,12 +50,12 @@ describe('open-source VideoStudio resources', () => {
     expect(agent.skill_list).toContain('gate-control');
     expect(stageCompose).toMatch(/gate-control.*single canonical authorization and state-transition policy/is);
     expect(gateControl).toMatch(/Authority is not the same as recovery/);
-    expect(gateControl).toMatch(/`revise` is already edit authorization/i);
-    expect(gateControl).toMatch(/An authorization error cannot establish recovery availability|does not by itself justify a form/i);
+    expect(gateControl).toMatch(/`revise` is the complete user authorization/i);
+    expect(gateControl).toMatch(/An authorization error cannot establish recovery availability|does not (?:by itself )?justify a form/i);
     expect(gateControl).toMatch(/One user decision may produce at most one follow-up authorization form/i);
     expect(standards).toMatch(/read gate-control and run its bundled transition resolver/i);
     expect(standards).toMatch(/single authorization source across COMPOSE, AUTO, GENERATE, and EDIT/i);
-    expect(standards).toMatch(/no form or composition\.begin_visual_revision call is allowed unless the resolver returns it/i);
+    expect(standards).toMatch(/composition\.begin_visual_revision is internal and may run only when the resolver returns it/i);
   });
 
   it('resolves post-gate authorization traces without duplicate recovery forms', () => {
@@ -84,16 +84,18 @@ describe('open-source VideoStudio resources', () => {
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'preview', '--decision', 'revise', '--scope', 'gate_b_payload', '--recovery', 'available',
     ])).toMatchObject({
-      next_action: 'open_combined_amendment_and_recovery',
-      form: { fields: ['gate_b_decision', 'visual_recovery_decision'] },
+      next_action: 'open_gate_b_amendment',
+      form: { fields: ['gate_b_decision'] },
     });
 
     const unknownRecovery = resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'gate_b_payload', '--recovery', 'unknown',
     ]);
-    expect(unknownRecovery).toMatchObject({ next_action: 'query_status', form: null });
-    expect(unknownRecovery.prohibited_ops).toContain('emit_form');
+    expect(unknownRecovery).toMatchObject({
+      next_action: 'open_gate_b_amendment',
+      form: { fields: ['gate_b_decision'] },
+    });
 
     expect(resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',

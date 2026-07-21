@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 import { makeMinimalPdf } from '../../../fixtures/make-minimal-pdf';
 
@@ -10,6 +15,93 @@ const CID = 'conv-edit';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+
+describe('local-tools › Windows PowerShell compatibility preflight', () => {
+  it('rejects high-confidence POSIX syntax before execution and leaves PowerShell syntax alone', async () => {
+    const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
+    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
+    expect(windowsPowerShellCompatibilityError('$env:TOKEN = "x"; Get-Content a.txt | Select-Object -First 3', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('npm install && npm test', 'darwin')).toBeNull();
+  });
+
+  it('blocks incompatible commands through bash and interactive_cli_start before spawning them', async () => {
+    await grant();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const tools = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' });
+    const bash = tools.find((tool) => tool.name === 'bash')!;
+    const interactive = tools.find((tool) => tool.name === 'interactive_cli_start')!;
+    const marker = path.join(tmpDir, 'must-not-run.txt');
+    const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && echo done`;
+    const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
+
+    const bashResult = await bash.execute({ command }, ctx);
+    const interactiveResult = await interactive.execute({ command }, ctx);
+
+    expect(bashResult).toMatchObject({ isError: true });
+    expect(interactiveResult).toMatchObject({ isError: true });
+    expect(bashResult.content).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(interactiveResult.content).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it.runIf(process.platform === 'win32')('executes a real PowerShell command with inherited UTF-8 environment and a spaced cwd', async () => {
+    await grant();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
+    const cwd = path.join(tmpDir, 'native cwd with spaces');
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const result = await bash.execute({
+      command: 'Write-Output $env:ORKAS_NATIVE_SMOKE',
+      timeoutMs: 10_000,
+    }, {
+      workingDir: cwd,
+      state: { sandboxEnv: { ORKAS_NATIVE_SMOKE: 'Windows-你好' } },
+    } as any);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content.trim()).toBe('Windows-你好');
+  });
+
+  it.runIf(process.platform === 'win32')('executes an explicit cmd /c command without sending cmd syntax through PowerShell', async () => {
+    await grant();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
+    const cwd = path.join(tmpDir, 'cmd cwd with spaces');
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const result = await bash.execute({
+      command: 'cmd /c echo %ORKAS_NATIVE_SMOKE%',
+      timeoutMs: 10_000,
+    }, {
+      workingDir: cwd,
+      state: { sandboxEnv: { ORKAS_NATIVE_SMOKE: 'cmd-ok' } },
+    } as any);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content.trim()).toBe('cmd-ok');
+  });
+
+  it.runIf(process.platform === 'darwin')('executes a real POSIX command with inherited UTF-8 environment and a spaced cwd', async () => {
+    await grant();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
+    const cwd = path.join(tmpDir, 'native cwd with spaces');
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const result = await bash.execute({
+      command: 'printf \'%s\' "$ORKAS_NATIVE_SMOKE"',
+      timeoutMs: 10_000,
+    }, {
+      workingDir: cwd,
+      state: { sandboxEnv: { ORKAS_NATIVE_SMOKE: 'macOS-你好' } },
+    } as any);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toBe('macOS-你好');
+  });
+});
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-localtools-'));
@@ -138,7 +230,7 @@ describe('local-tools › bash › disabled skills', () => {
     const bash = await buildBashTool();
     const skillDir = path.join(paths.userSkillsDir(UID), 'disabled-skill');
     const r = await run(bash, {
-      command: `cd "${skillDir}" && python3 scripts/search.py`,
+      command: `cd "${skillDir}"${process.platform === 'win32' ? ';' : ' &&'} python3 scripts/search.py`,
     });
 
     expect(r.isError).toBe(true);
@@ -252,10 +344,59 @@ describe('local-tools › edit_file › sandbox', () => {
     expect(deleteRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
     expect(fs.existsSync(skillFile)).toBe(true);
 
-    const bashRes = await run(bash, { command: `printf hacked > "${skillFile}"` });
+    const bashRes = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Set-Content -LiteralPath "${skillFile}" -Value hacked`
+        : `printf hacked > "${skillFile}"`,
+    });
     expect(bashRes.isError).toBe(true);
     expect(bashRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
     expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
+  });
+
+  it('allows provably read-only bash access to protected roots without weakening mutation guards', async () => {
+    await allFilesApproval();
+    const paths = await import('../../../../src/main/paths');
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const skillDir = paths.userMarketplaceSkillDir(UID, 'platform-read-only');
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillFile = path.join(skillDir, 'SKILL.md');
+    fs.writeFileSync(skillFile, 'protected skill bytes');
+
+    const bash = localTools.createLocalTools({ userId: UID, cid: CID })
+      .find((tool) => tool.name === 'bash');
+    if (!bash) throw new Error('bash tool missing');
+
+    const catRes = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Get-Content -LiteralPath "${skillFile}"`
+        : `cat "${skillFile}"`,
+    });
+    expect(catRes.isError).toBeFalsy();
+    expect(catRes.content).toContain('protected skill bytes');
+
+    const findRes = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Get-ChildItem -LiteralPath "${skillDir}" -File -Name`
+        : `find "${skillDir}" -maxdepth 1 -type f -print`,
+    });
+    expect(findRes.isError).toBeFalsy();
+    expect(findRes.content).toContain('SKILL.md');
+
+    const deleteRes = await run(bash, {
+      command: process.platform === 'win32'
+        ? `Remove-Item -LiteralPath "${skillFile}"`
+        : `find "${skillDir}" -type f -delete`,
+    });
+    expect(deleteRes.isError).toBe(true);
+    expect(deleteRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.readFileSync(skillFile, 'utf8')).toBe('protected skill bytes');
+
+    const scriptRes = await run(bash, {
+      command: `python3 -c 'print("${skillFile}")'`,
+    });
+    expect(scriptRes.isError).toBe(true);
+    expect(scriptRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
   });
 });
 
@@ -466,6 +607,7 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, runCtx());
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_NOT_READ');
+    expect(r.content).toContain('<edit-recovery file_hash="sha256:');
     expect(fs.readFileSync(p, 'utf8')).toBe('hello world'); // untouched
   });
 
@@ -478,7 +620,9 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const ctx = runCtx();
     const rr = await read.execute({ path: p }, ctx);
     expect(rr.isError).toBeFalsy();
-    const r = await edit.execute({ path: p, old_string: 'hello world', new_string: 'goodbye' }, ctx);
+    const hash = /file_hash="([^"]+)"/.exec(rr.content)?.[1];
+    expect(hash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    const r = await edit.execute({ path: p, old_string: 'hello world', new_string: 'goodbye', expected_hash: hash }, ctx);
     expect(r.isError).toBeFalsy();
     expect(fs.readFileSync(p, 'utf8')).toContain('goodbye');
   });
@@ -495,6 +639,54 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, ctx);
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_STALE');
+    expect(r.content).toContain('Retry with expected_hash=');
+  });
+
+  it('returns a current hash/context after stale expected_hash and accepts the corrected retry', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, 'alpha beta gamma');
+    const ctx = runCtx();
+    const rr = await read.execute({ path: p }, ctx);
+    const oldHash = /file_hash="([^"]+)"/.exec(rr.content)?.[1];
+    fs.writeFileSync(p, 'alpha BETA gamma');
+
+    const stale = await edit.execute({
+      path: p,
+      old_string: 'beta',
+      new_string: 'B',
+      expected_hash: oldHash,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('alpha BETA gamma');
+    const currentHash = /file_hash="([^"]+)"/.exec(stale.content)?.[1];
+    expect(currentHash).not.toBe(oldHash);
+
+    const retry = await edit.execute({
+      path: p,
+      old_string: 'BETA',
+      new_string: 'B',
+      expected_hash: currentHash,
+    }, ctx);
+    expect(retry.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe('alpha B gamma');
+  });
+
+  it('returns bounded current context and hash on E_NO_MATCH', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, 'current line\n' + 'x'.repeat(2_000));
+    const ctx = runCtx();
+    await read.execute({ path: p }, ctx);
+    const result = await edit.execute({ path: p, old_string: 'missing line', new_string: 'new' }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_NO_MATCH');
+    expect(result.content).toContain('current line');
+    expect(result.content.length).toBeLessThan(1_800);
   });
 
   it('allows a second consecutive edit without re-reading (post-edit stamp refresh)', async () => {
@@ -540,7 +732,8 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
     const seed = () => {
       const ctx = runCtx();
       const st = fs.statSync(p);
-      (ctx.state[READ_KEY] as Map<string, any>).set(p, { mtimeMs: st.mtimeMs, size: st.size });
+      const hash = `sha256:${createHash('sha256').update(original).digest('hex')}`;
+      (ctx.state[READ_KEY] as Map<string, any>).set(p, { mtimeMs: st.mtimeMs, size: st.size, hash });
       return ctx;
     };
     const [r1, r2] = await Promise.all([

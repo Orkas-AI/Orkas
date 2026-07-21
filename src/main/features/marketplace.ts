@@ -25,14 +25,15 @@
  * dep needed); switched to adm-zip to avoid base64 expansion on binary files + get deflate
  * compression on text. PC/CLAUDE.md §1 allow-list updated accordingly.
  *
- * **Agent install installs skill_list dependencies FIRST, then the agent body.** When agent.json
- * declares `skill_list: [sid1, sid2, ...]` (three-state: undefined = no filter, [] = zero,
- * non-empty = strict subset), the install runs every missing sid in parallel BEFORE writing the
- * agent's own files / manifest entry. If ANY skill install throws, the whole agent install fails;
- * the agent never gets recorded. **Why:** prevents "agent installed but its skills are missing"
- * inconsistency that would survive across devices via the cloud manifest. Previously-installed
- * skills from a partial retry are no-ops (`_skillAlreadyOnDisk` check), so retry-on-failure is
- * cheap. The user just re-clicks Install.
+ * **Agent install resolves skill_list dependencies before writing the agent body.** `skill_list`
+ * is the runtime allowlist and may contain skills shipped by `agent_skills_bundle_url` as well as
+ * standalone marketplace skills. The installer inspects the private bundle first, then installs
+ * every missing standalone sid in parallel BEFORE writing the agent's own files / manifest entry.
+ * If ANY dependency install throws, the whole agent install fails; the agent never gets recorded.
+ * **Why:** prevents "agent installed but its skills are missing" inconsistency that would survive
+ * across devices via the cloud manifest. Previously-installed skills from a partial retry are
+ * no-ops (`_skillAlreadyOnDisk` check), so retry-on-failure is cheap. The user just re-clicks
+ * Install.
  *
  * Upload + delete (publishing custom items to the Server) are dev-only and live in
  * `marketplace_dev.ts` — excluded from packaged builds via `package.json::build.files`.
@@ -75,6 +76,13 @@ import {
   addAgentInstall, addSkillInstall, readInstalls, removeAgentInstall, removeSkillInstall,
 } from './marketplace_installs';
 import { withMarketplaceCacheLock, withMarketplaceInstallLock } from './marketplace_locks';
+import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
+import {
+  downloadMarketplaceBundle,
+  extractBundleSafely,
+  parseMarketplaceBundle,
+  safeRelPath,
+} from './marketplace_bundle';
 import { createLogger } from '../logger';
 import {
   validateAgentSpec, validateSkillDir,
@@ -84,7 +92,8 @@ import { persistReport as persistQualityReport } from '../quality/report';
 
 const log = createLogger('marketplace');
 const MARKETPLACE_JSON_TIMEOUT_MS = 60_000;
-const MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
+export { extractBundleSafely, safeRelPath };
 
 // ── server URL ────────────────────────────────────────────────────────────
 // The open-source build has exactly one server environment: global prod. Use the apex host
@@ -661,35 +670,36 @@ async function _fetchAndCacheSkill(
   skillId: string, meta: { bundle_url: string; version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
   let res: Response;
+  let zipBuf: Buffer | null;
   try {
-    res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url, undefined, {
-      timeoutMs: MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS,
-      timeoutMessage: `marketplace:skill-bundle:${skillId} timed out after ${Math.round(MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS / 1000)}s`,
-    });
+    const downloaded = await downloadMarketplaceBundle(`marketplace:skill-bundle:${skillId}`, meta.bundle_url);
+    res = downloaded.response;
+    zipBuf = downloaded.buffer;
   } catch (err) {
     throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)}: ${(err as Error)?.message || String(err)}`);
   }
   if (!res.ok) throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)} (${res.status})`);
-  const ab = await res.arrayBuffer();
-  const zipBuf = Buffer.from(ab);
+  if (!zipBuf) throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)} (empty response)`);
+  const zip = parseMarketplaceBundle(zipBuf);
   await writeSkillCache(skillId, async (dir) => {
-    extractBundleSafely(new AdmZip(zipBuf), dir);
+    extractBundleSafely(zip, dir);
   }, { version: meta.version, published_at: meta.published_at, updated_at: meta.updated_at });
 }
 
-async function _fetchAgentPrivateSkillsBundle(agentId: string, bundleUrl: string): Promise<Buffer | null> {
+async function _fetchAgentPrivateSkillsBundle(agentId: string, bundleUrl: string): Promise<ReturnType<typeof parseMarketplaceBundle> | null> {
   if (!bundleUrl) return null;
   let res: Response;
+  let bundle: Buffer | null;
   try {
-    res = await fetchWithRetry(`marketplace:agent-private-skills:${agentId}`, bundleUrl, undefined, {
-      timeoutMs: MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS,
-      timeoutMessage: `marketplace:agent-private-skills:${agentId} timed out after ${Math.round(MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS / 1000)}s`,
-    });
+    const downloaded = await downloadMarketplaceBundle(`marketplace:agent-private-skills:${agentId}`, bundleUrl);
+    res = downloaded.response;
+    bundle = downloaded.buffer;
   } catch (err) {
     throw new Error(`download agent private skills failed from ${_bundleHost(bundleUrl)}: ${(err as Error)?.message || String(err)}`);
   }
   if (!res.ok) throw new Error(`download agent private skills failed from ${_bundleHost(bundleUrl)} (${res.status})`);
-  return Buffer.from(await res.arrayBuffer());
+  if (!bundle) throw new Error(`download agent private skills failed from ${_bundleHost(bundleUrl)} (empty response)`);
+  return parseMarketplaceBundle(bundle);
 }
 
 function _bundleHost(bundleUrl: string): string {
@@ -697,37 +707,6 @@ function _bundleHost(bundleUrl: string): string {
     return new URL(bundleUrl).host || 'bundle host';
   } catch {
     return 'bundle host';
-  }
-}
-
-// zip-bomb defense, mirrored at server (see `api/marketplace.py::_validate_skill_bundle`).
-// Server already enforces these caps on upload, but a corrupted COS blob or downgrade attack
-// could deliver a different payload to the client — re-check on the unpack side too.
-const MAX_BUNDLE_ENTRIES = 500;
-const MAX_BUNDLE_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;  // 64 MB
-
-/** Walk a zip, validate every entry's path + per-entry / total uncompressed size, then write
- *  out. Throws on any limit breach (caller wraps the write in a fresh dir so a thrown error
- *  doesn't leave a half-extracted state). Exported so `marketplace_reconcile.ts` reuses
- *  exactly the same caps. */
-export function extractBundleSafely(zip: AdmZip, dst: string): void {
-  const entries = zip.getEntries();
-  if (entries.length > MAX_BUNDLE_ENTRIES) {
-    throw new Error(`zip entry count ${entries.length} exceeds limit ${MAX_BUNDLE_ENTRIES}`);
-  }
-  let total = 0;
-  for (const entry of entries) {
-    if (entry.isDirectory) continue;
-    const safe = safeRelPath(entry.entryName);
-    if (!safe) { log.warn(`skip unsafe zip entry: ${entry.entryName}`); continue; }
-    // entry.header.size = uncompressed bytes (adm-zip per-entry field).
-    total += entry.header.size;
-    if (total > MAX_BUNDLE_UNCOMPRESSED_BYTES) {
-      throw new Error(`zip uncompressed total exceeds ${MAX_BUNDLE_UNCOMPRESSED_BYTES} bytes`);
-    }
-    const out = path.join(dst, safe);
-    fs.mkdirSync(path.dirname(out), { recursive: true });
-    fs.writeFileSync(out, entry.getData());
   }
 }
 
@@ -775,7 +754,13 @@ async function _installMarketplaceAgentLocked(
     }
     _assertMarketplaceAppCompatible('agent', agentId, agentName, detail.min_app_version || '');
 
-    // 1. Install dependent skills FIRST, in parallel. Any failure throws — the agent body
+    // 1. Download the private bundle first so ids materialized by that bundle are not
+    //    misclassified as standalone marketplace dependencies. `skill_list` doubles as the
+    //    runtime allowlist and may contain both private and public skill ids.
+    const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(agentId, detail.agent_skills_bundle_url || '');
+    const privateSkillIds = agentPrivateSkillIdsFromBundle(privateSkillsZip);
+
+    // 2. Install dependent standalone skills FIRST, in parallel. Any failure throws — the agent body
     //    and manifest entry are never touched, so retry is a clean re-run (previously-installed
     //    skills short-circuit via `_skillAlreadyOnDisk`). This is the atomicity guarantee called
     //    out in the file header.
@@ -785,7 +770,9 @@ async function _installMarketplaceAgentLocked(
         .filter((x): x is string => x.length > 0)
       : [];
     const depSkillNames = _agentSkillDependencyDisplayNames(detail.agent_json, skillList);
-    const missingSkillIds = skillList.filter((sid) => !_skillAlreadyOnDisk(sid));
+    const missingSkillIds = skillList.filter(
+      (sid) => !privateSkillIds.has(sid) && !_skillAlreadyOnDisk(sid),
+    );
     if (missingSkillIds.length > 0) {
       await Promise.all(missingSkillIds.map(async (sid) => {
         let depSkillName = depSkillNames.get(sid) || '';
@@ -810,21 +797,24 @@ async function _installMarketplaceAgentLocked(
       }));
     }
 
-    // 2. Quality gate. Reject the install if `detail.agent_json` itself trips
+    // 3. Quality gate. Reject the install if `detail.agent_json` itself trips
     //    a red flag — content already on the catalog can still be malicious
     //    on a fresh user account, and the validator is the choke point that
     //    catches it before write. EXTREME → abort + persist report; MEDIUM
     //    only persists the report and lets the install proceed.
-    const preReport = validateAgentSpec({ agentJson: detail.agent_json });
+    const preReport = validateAgentSpec({
+      agentJson: detail.agent_json,
+      // Installation restores published bytes verbatim. Runner compatibility
+      // is enforced while authoring/publishing, not retroactively on install.
+      enforceSkillRunner: false,
+    });
     await persistQualityReport({
       uid: getActiveUserId(), kind: 'agent', id: agentId, report: preReport,
     });
     if (!preReport.ok && opts.force !== true) {
       throw _qualityInstallError('agent', agentId, preReport);
     }
-    const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(agentId, detail.agent_skills_bundle_url || '');
-
-    // 3. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
+    // 4. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
     //    `_install.json` is a version pin read by `marketplace_reconcile.ts::_agentNeedsPull`
     //    on other devices to skip a re-pull when their local copy already matches the manifest's
     //    (version, freshness timestamp).
@@ -836,7 +826,7 @@ async function _installMarketplaceAgentLocked(
     if (privateSkillsZip) {
       const privateSkillsDir = userMarketplaceAgentSkillsDir(getActiveUserId(), agentId);
       await fsp.mkdir(privateSkillsDir, { recursive: true });
-      extractBundleSafely(new AdmZip(privateSkillsZip), privateSkillsDir);
+      extractBundleSafely(privateSkillsZip, privateSkillsDir);
     }
     // `_install.json` stores everything the in-app UI needs without re-hitting the network:
     // version/freshness timestamp for reconcile; create_uid for the author badge on the
@@ -937,7 +927,11 @@ async function _installMarketplaceSkillLocked(
     // scripts/*). EXTREME violations → roll back the install dir + persist
     // the failed report + throw. MEDIUM passes through but the report is
     // persisted so the UI advisory chip shows.
-    const skillReport = validateSkillDir(target);
+    const skillReport = validateSkillDir(target, {
+      // Installation restores published bytes verbatim. Runner compatibility
+      // is enforced while authoring/publishing, not retroactively on install.
+      enforceSkillRunner: false,
+    });
     await persistQualityReport({
       uid: getActiveUserId(), kind: 'skill', id: skillId, report: skillReport,
     });
@@ -1040,14 +1034,23 @@ async function _seedAgentSkillDependencies(
   shouldContinue: () => boolean = () => true,
 ): Promise<{ seeded: number; blocked: boolean }> {
   if (!shouldContinue()) return { seeded: 0, blocked: true };
-  const detail = await postJson<{ agent_json: Record<string, unknown> }>(
+  const detail = await postJson<{
+    agent_json: Record<string, unknown>;
+    agent_skills_bundle_url?: string;
+  }>(
     '/marketplace/agents/detail', { id: agentId },
   );
   if (!shouldContinue()) return { seeded: 0, blocked: true };
+  const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(
+    agentId,
+    detail.agent_skills_bundle_url || '',
+  );
+  if (!shouldContinue()) return { seeded: 0, blocked: true };
+  const privateSkillIds = agentPrivateSkillIdsFromBundle(privateSkillsZip);
   const skillList = Array.isArray(detail.agent_json?.skill_list)
     ? (detail.agent_json.skill_list as unknown[])
       .map((x) => (typeof x === 'string' ? x.trim() : ''))
-      .filter((x): x is string => x.length > 0)
+      .filter((x): x is string => x.length > 0 && !privateSkillIds.has(x))
     : [];
   let seeded = 0;
   for (const sid of skillList) {
@@ -1093,8 +1096,9 @@ async function _seedAgentSkillDependencies(
 // The server `POST /marketplace/defaults` returns the current recommended set (rows with
 // `default_install=1`); we add a manifest row per missing item and let the standard
 // `marketplace_reconcile` pass fetch the actual content at boot. Default agents mirror the
-// manual install path's dependency rule: read `agent_json.skill_list` and seed missing skills
-// first, so the reconciled agent never lands without its required skills.
+// manual install path's dependency rule: read `agent_json.skill_list`, exclude skills supplied by
+// the agent-private bundle, and seed the remaining missing skills first, so the reconciled agent
+// never lands without its required skills.
 //
 // This is intentionally incremental, not one-shot: if the team marks a new marketplace item
 // as default later, existing users who have never installed/uninstalled that id should get it
@@ -1347,22 +1351,4 @@ export async function uninstallMarketplaceSkill(skillId: string): Promise<{ ok: 
     log.info(`uninstalled marketplace skill ${skillId} (local + cache + manifest)`);
     return { ok: true, id: skillId };
   });
-}
-
-// ── helpers (exported for marketplace_dev.ts) ─────────────────────────────
-
-/** A path is safe if it's a relative POSIX-style path inside the target dir — no absolute,
- *  no `..` segments, no empty / dot paths. Used both when materializing a marketplace skill
- *  bundle and when packing one (defense in depth — bundles travel through COS, which is
- *  outside our trust boundary). */
-export function safeRelPath(rel: string): string | null {
-  if (!rel || typeof rel !== 'string') return null;
-  if (path.isAbsolute(rel)) return null;
-  // `path.posix.normalize` collapses any internal `a/../b` to `b`, so `/../` literally cannot
-  // survive normalization — only a leading `..` (escape attempt) or pure-dot / empty paths
-  // remain to be rejected.
-  const norm = path.posix.normalize(rel.replace(/\\/g, '/'));
-  if (norm.startsWith('..') || norm === '.' || norm === '') return null;
-  if (norm.startsWith('/')) return null;
-  return norm;
 }

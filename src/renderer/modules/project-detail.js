@@ -461,13 +461,26 @@ function _bindProjectInstructions() {
   saveBtn?.addEventListener('click', async () => {
     if (!_projectDetailPid || input.disabled) return;
     const content = input.value;
+    const startedAt = performance.now();
     saveBtn.disabled = true;
     try {
       const res = await window.orkas.invoke('projects.instructions.set', { projectId: _projectDetailPid, content });
       if (!res?.ok) throw new Error(res?.error || 'save_failed');
       input.dataset.savedValue = content;
       if (_projectDetailMeta?.instructions) _projectDetailMeta.instructions.content = content;
+      _projectTrackEvent('project_instructions_update_result', {
+        project_id: _projectDetailPid,
+        result: 'success',
+        source: 'detail',
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
     } catch (err) {
+      _projectTrackEvent('project_instructions_update_result', {
+        project_id: _projectDetailPid,
+        result: 'failure',
+        source: 'detail',
+        duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
       _projectDetailLog.warn('save project instructions failed', err);
       if (typeof uiAlert === 'function') uiAlert(t('project.instructions.save_failed'));
     }
@@ -1074,10 +1087,6 @@ async function _selectProjectAgentRecipient(agentId, agentName = '') {
     if (typeof setChatRecipient === 'function') {
       setChatRecipient('project', { kind: 'agent', id: agentId, name: agentName || agentId });
     }
-    _projectTrackClick('project_agent_select_recipient', {
-      project_id: _projectDetailPid,
-      agent_id: agentId,
-    });
     setTimeout(() => {
       try { document.getElementById('project-chat-input')?.focus(); } catch (_) {}
     }, 0);
@@ -2788,13 +2797,30 @@ async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   try {
     await _runProjectUploadPool(uploadable, async (file) => {
       try {
-        const buf = await file.arrayBuffer();
         const targetName = _projectJoinPath(targetDir, file.name || 'file');
-        const res = await window.orkas.invoke('projects.files.upload', {
-          projectId: uploadProjectId,
-          name: targetName,
-          data: _arrayBufferToBase64(buf),
-        });
+        let res = null;
+        if (window.orkas && typeof window.orkas.importLocalFiles === 'function') {
+          const imported = await window.orkas.importLocalFiles('project', [file], {
+            projectId: uploadProjectId,
+            targetDir,
+          });
+          if (imported && imported.ok === false) res = imported;
+          else if (Array.isArray(imported && imported.files) && imported.files.length) res = imported.files[0];
+        }
+        // Browser-test/synthetic File fallback only. Real desktop files use
+        // path-based async copy and never cross IPC as base64.
+        if (!res) {
+          if (Number(file.size || 0) > 8 * 1024 * 1024) {
+            res = { ok: false, error: 'local file path unavailable' };
+          } else {
+            const buf = await file.arrayBuffer();
+            res = await window.orkas.invoke('projects.files.upload', {
+              projectId: uploadProjectId,
+              name: targetName,
+              data: _arrayBufferToBase64(buf),
+            });
+          }
+        }
         if (!res?.ok) failed.push({ name: file.name || '' });
       } catch (_) {
         failed.push({ name: file.name || '' });
@@ -2936,6 +2962,7 @@ async function _submitProjectChat() {
     attachment_count: 0,
     has_project: true,
   };
+  const sendAttemptStartedAt = performance.now();
   _projectTrackClick('project_chat_send', sendPayload);
   _projectTrackClick('chat_send', sendPayload);
   if (btn) btn.disabled = true;
@@ -2956,6 +2983,20 @@ async function _submitProjectChat() {
     renderConversationList();
     if (typeof loadProjects === 'function') loadProjects(true);
   } catch (err) {
+    const resultPayload = {
+      result: 'failure',
+      conversation_id: '',
+      source_view: 'project',
+      content_length: content.length,
+      attachment_count: 0,
+      duration_ms: Math.max(0, Math.round(performance.now() - sendAttemptStartedAt)),
+      failure_stage: 'conversation_create',
+    };
+    if (typeof _trackChatSendResult === 'function') {
+      _trackChatSendResult('failure', resultPayload);
+    } else {
+      _projectTrackEvent('chat_send_result', resultPayload);
+    }
     if (typeof uiAlert === 'function') {
       await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
     }
@@ -3120,9 +3161,9 @@ async function _openAddPicker(kind) {
   overlay.id = 'project-binding-picker-overlay';
   overlay.className = 'modal-overlay open';
   overlay.innerHTML = `
-    <div class="modal project-binding-picker-modal" role="dialog" aria-modal="true">
-      <div class="project-binding-picker-header">
-        <span class="project-binding-picker-title" data-i18n="${titleKey}">${escapeHtml(t(titleKey))}</span>
+    <div class="modal modal-standard project-binding-picker-modal" role="dialog" aria-modal="true" aria-labelledby="project-binding-picker-title">
+      <div class="modal-header project-binding-picker-header">
+        <span class="modal-title project-binding-picker-title" id="project-binding-picker-title" data-i18n="${titleKey}">${escapeHtml(t(titleKey))}</span>
         <button type="button" class="modal-close-btn project-binding-picker-close" data-action="close" title="${closeText}" aria-label="${closeText}">${_projectUiIconHtml('x', 'modal-close-icon') || '×'}</button>
       </div>
       <div class="project-binding-picker-search">
