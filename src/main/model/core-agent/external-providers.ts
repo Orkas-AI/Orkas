@@ -50,18 +50,26 @@ function ca(): Promise<CA> {
   return _caPromise;
 }
 
+function configuredPositiveInteger(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+    ? value
+    : fallback;
+}
+
 // ── Moonshot open-platform (https://api.moonshot.cn/v1) ─────────────────
 
 const MOONSHOT_BASE_URL = 'https://api.moonshot.cn/v1';
 
 /**
  * Context windows by Moonshot model id. Numbers come from
- * platform.kimi.com/docs/models (checked 2026-04). Fallback 131072 for
+ * platform.kimi.com/docs/models (checked 2026-06). Fallback 131072 for
  * ids we haven't catalogued — safe lower bound given every current kimi
- * model is at least 128k. Catalog only ships K2.5 / K2.6; legacy K2 preview
- * ids still resolve via fallback if a stale credential references them.
+ * model is at least 128k. Legacy ids still resolve via fallback if a stale
+ * credential references them.
  */
 const MOONSHOT_CONTEXT_WINDOW: Record<string, number> = {
+  'kimi-k3': 1048576,
+  'kimi-k2.7-code': 262144,
   'kimi-k2.6': 262144,
   'kimi-k2.5': 262144,
 };
@@ -76,9 +84,11 @@ function moonshotContextWindow(modelId: string): number {
 // value caps every model at the lowest common denominator and complex
 // structured replies get cut mid-stream with `stopReason: "length"` while
 // the renderer just shows whatever streamed before the cap. Numbers from
-// platform.kimi.com/docs/models (2026-04). Unknown ids fall back to 8192
+// platform.kimi.com/docs/models (2026-06). Unknown ids fall back to 8192
 // to stay safe against providers that 400 on over-cap requests.
 const MOONSHOT_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'kimi-k3': 131072,
+  'kimi-k2.7-code': 32768,
   'kimi-k2.6': 16384,
   'kimi-k2.5': 16384,
 };
@@ -87,14 +97,39 @@ function moonshotMaxOutputTokens(modelId: string): number {
   return MOONSHOT_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
 }
 
+const MOONSHOT_K3_PROTOCOL_FALLBACK: Pick<
+  Model<'openai-completions'>,
+  'reasoning' | 'thinkingLevelMap' | 'input' | 'compat'
+> = {
+  reasoning: true,
+  thinkingLevelMap: {
+    off: null,
+    minimal: null,
+    low: null,
+    medium: null,
+    high: null,
+    xhigh: null,
+  },
+  input: ['text', 'image'],
+  compat: {
+    supportsStore: false,
+    supportsDeveloperRole: false,
+    supportsReasoningEffort: false,
+    maxTokensField: 'max_tokens',
+    supportsStrictMode: false,
+    thinkingFormat: 'deepseek',
+    requiresReasoningContentOnAssistantMessages: true,
+  },
+};
+
 /**
  * Build a `Model<"openai-completions">` object for a Moonshot model.
  * Exported for tests — production code usually goes through
  * `createMoonshotProvider()`.
  */
 export function buildMoonshotModel(modelId: string): Model<'openai-completions'> {
-  // `name` defaults to the curated label if we have one; otherwise the id.
   const curated = curatedModelsFor('moonshot').find((m) => m.id === modelId);
+  const protocol = modelId === 'kimi-k3' ? MOONSHOT_K3_PROTOCOL_FALLBACK : null;
   return {
     id: modelId,
     name: curated?.name || modelId,
@@ -103,15 +138,17 @@ export function buildMoonshotModel(modelId: string): Model<'openai-completions'>
     // so using a custom id here is supported.
     provider: 'moonshot' as any,
     baseUrl: MOONSHOT_BASE_URL,
-    reasoning: false,
-    input: ['text', 'image'],
+    reasoning: protocol?.reasoning ?? false,
+    ...(protocol?.thinkingLevelMap ? { thinkingLevelMap: { ...protocol.thinkingLevelMap } } : {}),
+    input: protocol ? [...protocol.input] : ['text', 'image'],
     // The Moonshot open platform bills per token, but pi-ai's `cost`
     // field is only used for local cost-statistics display and does not
     // affect the actual request. Filling 0 means "not accounted for here";
     // users check the actual price on their Moonshot bill.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: moonshotContextWindow(modelId),
-    maxTokens: moonshotMaxOutputTokens(modelId),
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, moonshotContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, moonshotMaxOutputTokens(modelId)),
+    ...(protocol?.compat ? { compat: { ...protocol.compat } } : {}),
   };
 }
 
@@ -268,6 +305,7 @@ const DOUBAO_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 const DOUBAO_CONTEXT_WINDOW: Record<string, number> = {
   'doubao-seed-2-0-pro-260215':  262144,
   'doubao-seed-2-0-lite-260215': 262144,
+  'doubao-seed-2-0-lite-260428': 262144,
 };
 
 function doubaoContextWindow(modelId: string): number {
@@ -280,6 +318,7 @@ function doubaoContextWindow(modelId: string): number {
 const DOUBAO_MAX_OUTPUT_TOKENS: Record<string, number> = {
   'doubao-seed-2-0-pro-260215':  16384,
   'doubao-seed-2-0-lite-260215': 16384,
+  'doubao-seed-2-0-lite-260428': 32768,
 };
 
 function doubaoMaxOutputTokens(modelId: string): number {
@@ -306,8 +345,8 @@ export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
     compat: { supportsDeveloperRole: false },
     input: ['text', 'image'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: doubaoContextWindow(modelId),
-    maxTokens: doubaoMaxOutputTokens(modelId),
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, doubaoContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, doubaoMaxOutputTokens(modelId)),
   };
 }
 

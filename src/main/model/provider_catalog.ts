@@ -35,6 +35,7 @@ import {
   DEFAULT_IMAGE_GEN_BY_PROVIDER,
   DEFAULT_PROVIDER_MODELS,
   type ImageGenCapability as ConfigImageGenCapability,
+  type ProviderModelEntry,
   getConfiguredImageGenCapability,
   getConfiguredProviderModels,
 } from '../features/client_config';
@@ -120,11 +121,11 @@ export const CATALOG: readonly CatalogEntry[] = [
 
 export const CURATED_MODELS = DEFAULT_PROVIDER_MODELS;
 
-export function curatedModelsFor(providerId: string): { id: string; name: string }[] {
+export function curatedModelsFor(providerId: string): ProviderModelEntry[] {
   const configured = getConfiguredProviderModels(providerId);
   if (configured) return configured.models;
   const list = CURATED_MODELS[providerId];
-  return list ? list.map((m) => ({ id: m.id, name: m.name })) : [];
+  return list ? list.map((m) => ({ ...m })) : [];
 }
 
 /**
@@ -163,8 +164,13 @@ function safeGetPiModel(
   }
 }
 
-function cloneModelWithId(template: Model<Api>, id: string, name: string): Model<Api> {
-  return {
+function cloneModelWithId(
+  template: Model<Api>,
+  id: string,
+  name: string,
+  overrides?: Pick<ProviderModelEntry, 'contextWindow' | 'maxTokens'>,
+): Model<Api> {
+  const cloned = {
     ...template,
     id,
     name,
@@ -172,6 +178,28 @@ function cloneModelWithId(template: Model<Api>, id: string, name: string): Model
     cost: { ...template.cost },
     ...(template.headers ? { headers: { ...template.headers } } : {}),
     ...(template.thinkingLevelMap ? { thinkingLevelMap: { ...template.thinkingLevelMap } } : {}),
+  };
+  return applyConfiguredModelOverrides(cloned, overrides);
+}
+
+function hasConfiguredModelOverrides(configured: ProviderModelEntry | undefined): boolean {
+  return !!configured
+    && (typeof configured.contextWindow === 'number' || typeof configured.maxTokens === 'number');
+}
+
+function applyConfiguredModelOverrides(
+  model: Model<Api>,
+  overrides?: Pick<ProviderModelEntry, 'contextWindow' | 'maxTokens'>,
+): Model<Api> {
+  if (!overrides) return model;
+  return {
+    ...model,
+    ...(typeof overrides.contextWindow === 'number' && overrides.contextWindow > 0
+      ? { contextWindow: overrides.contextWindow }
+      : {}),
+    ...(typeof overrides.maxTokens === 'number' && overrides.maxTokens > 0
+      ? { maxTokens: overrides.maxTokens }
+      : {}),
   };
 }
 
@@ -205,22 +233,37 @@ export function resolveConfiguredPiModel(
   if (!requestedProviderId || !requestedModelId) return null;
 
   const catalogProviderId = PI_MODEL_PROVIDER_ALIAS[requestedProviderId] || requestedProviderId;
+  const configuredModels = curatedModelsFor(requestedProviderId);
+  const configured = configuredModels.find((m) => m.id === requestedModelId);
   const exact = safeGetPiModel(catalog, catalogProviderId, requestedModelId);
   if (exact) {
     return {
-      model: exact,
+      model: applyConfiguredModelOverrides(exact, configured),
       requestedProviderId,
       requestedModelId,
       catalogProviderId,
       templateModelId: requestedModelId,
       isConfiguredFallback: false,
-      needsCustomModel: catalogProviderId !== requestedProviderId,
+      needsCustomModel: catalogProviderId !== requestedProviderId || hasConfiguredModelOverrides(configured),
     };
   }
 
-  const configuredModels = curatedModelsFor(requestedProviderId);
-  const configured = configuredModels.find((m) => m.id === requestedModelId);
   if (!configured) return null;
+
+  if (configured.template) {
+    const template = safeGetPiModel(catalog, catalogProviderId, configured.template);
+    if (template) {
+      return {
+        model: cloneModelWithId(template, requestedModelId, configured.name || requestedModelId, configured),
+        requestedProviderId,
+        requestedModelId,
+        catalogProviderId,
+        templateModelId: configured.template,
+        isConfiguredFallback: true,
+        needsCustomModel: true,
+      };
+    }
+  }
 
   const requestedFamily = modelFamilyKey(requestedModelId);
   const candidates = configuredModels
@@ -231,7 +274,7 @@ export function resolveConfiguredPiModel(
     const template = safeGetPiModel(catalog, catalogProviderId, candidate.id);
     if (!template) continue;
     return {
-      model: cloneModelWithId(template, requestedModelId, configured.name || requestedModelId),
+      model: cloneModelWithId(template, requestedModelId, configured.name || requestedModelId, configured),
       requestedProviderId,
       requestedModelId,
       catalogProviderId,

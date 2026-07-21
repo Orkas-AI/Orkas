@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildDoubaoModel,
   buildMoonshotModel,
   createMoonshotProvider,
 } from '../../../../src/main/model/core-agent/external-providers';
@@ -15,6 +16,9 @@ describe('external-providers › buildMoonshotModel', () => {
   });
 
   it('uses known context windows and falls back to 131072 for unknown ids', () => {
+    expect(buildMoonshotModel('kimi-k3').contextWindow).toBe(1048576);
+    expect(buildMoonshotModel('kimi-k3').maxTokens).toBe(131072);
+    expect(buildMoonshotModel('kimi-k2.7-code').contextWindow).toBe(262144);
     expect(buildMoonshotModel('kimi-k2.6').contextWindow).toBe(262144);
     expect(buildMoonshotModel('kimi-k2.5').contextWindow).toBe(262144);
     // Future Moonshot models fall back to the conservative 128k lower bound.
@@ -24,10 +28,29 @@ describe('external-providers › buildMoonshotModel', () => {
   });
 
   it('prefers curated labels and falls back to the id', () => {
-    expect(buildMoonshotModel('kimi-k2.6').name).toBe('Kimi K2.6');
-    expect(buildMoonshotModel('kimi-k2.5').name).toBe('Kimi K2.5');
+    expect(buildMoonshotModel('kimi-k3').name).toBe('Kimi K3');
+    expect(buildMoonshotModel('kimi-k2.7-code').name).toBe('Kimi K2.7 Code');
     // Uncurated ids fall back directly without throwing.
     expect(buildMoonshotModel('random-id').name).toBe('random-id');
+  });
+
+  it('uses K3 reasoning compatibility when the bundled runtime lacks native metadata', () => {
+    const model = buildMoonshotModel('kimi-k3');
+    expect(model.reasoning).toBe(true);
+    expect(model.compat).toMatchObject({
+      supportsDeveloperRole: false,
+      thinkingFormat: 'deepseek',
+      requiresReasoningContentOnAssistantMessages: true,
+    });
+  });
+});
+
+describe('external-providers › buildDoubaoModel', () => {
+  it('uses the current Seed 2.0 Lite limits', () => {
+    expect(buildDoubaoModel('doubao-seed-2-0-lite-260428')).toMatchObject({
+      contextWindow: 262144,
+      maxTokens: 32768,
+    });
   });
 });
 

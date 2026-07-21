@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
+import { getModel } from '@earendil-works/pi-ai';
 import {
   CATALOG,
   CURATED_MODELS,
@@ -101,10 +102,13 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(CURATED_MODELS['moonshot']?.length).toBeGreaterThan(0);
   });
 
-  it('moonshot catalog 只列当代主力 K2.6 / K2.5(legacy preview 已下架)', () => {
+  it('moonshot catalog exposes only K3 and K2.7', () => {
     const ids = (CURATED_MODELS['moonshot'] || []).map((m) => m.id);
-    // 顺序锁:UI 下拉默认选首项,必须是当前推荐的 K2.6
-    expect(ids).toEqual(['kimi-k2.6', 'kimi-k2.5']);
+    expect(ids).toEqual(['kimi-k3', 'kimi-k2.7-code']);
+  });
+
+  it('kimi-coding catalog exposes only K3 and K2.7', () => {
+    expect((CURATED_MODELS['kimi-coding'] || []).map((m) => m.id)).toEqual(['k3', 'k2p7']);
   });
 
   it('minimax catalog exposes M3 before the M2.7 generation', () => {
@@ -112,7 +116,6 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(directIds).toEqual([
       'MiniMax-M3',
       'MiniMax-M2.7',
-      'MiniMax-M2.7-highspeed',
     ]);
 
     const globalPortalIds = (CURATED_MODELS['minimax-portal'] || []).map((m) => m.id);
@@ -120,6 +123,37 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
     const portalIds = (CURATED_MODELS['minimax-portal-cn'] || []).map((m) => m.id);
     expect(portalIds).toEqual(directIds);
+  });
+
+  it('exposes the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
+    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'];
+    expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
+    expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
+  });
+
+  it('resolves GPT-5.6 entries through declared compatibility templates', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'modelcfggpt56';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    const catalog = { getPiModel: (provider: string, modelId: string) => getModel(provider, modelId) };
+    try {
+      for (const provider of ['openai', 'openai-codex'] as const) {
+        for (const modelId of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
+          const resolved = resolveConfiguredPiModel(catalog, provider, modelId);
+          expect(resolved).toMatchObject({
+            requestedModelId: modelId,
+            templateModelId: 'gpt-5.5',
+            isConfiguredFallback: true,
+            needsCustomModel: true,
+            model: { id: modelId, maxTokens: 128000 },
+          });
+        }
+      }
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 
   it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
@@ -140,6 +174,18 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(claudeIds).toEqual([
       'anthropic/claude-opus-4.8',
       'anthropic/claude-opus-4.7',
+    ]);
+  });
+
+  it('openrouter GPT catalog keeps GPT-5.6 tiers and GPT-5.5 only', () => {
+    const ids = (CURATED_MODELS.openrouter || [])
+      .map((m) => m.id)
+      .filter((id) => id.startsWith('openai/gpt-'));
+    expect(ids).toEqual([
+      'openai/gpt-5.6-sol',
+      'openai/gpt-5.6-terra',
+      'openai/gpt-5.6-luna',
+      'openai/gpt-5.5',
     ]);
   });
 
