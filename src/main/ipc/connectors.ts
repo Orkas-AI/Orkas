@@ -4,7 +4,7 @@
  *
  *   connectors.catalog       → { catalog }
  *   connectors.list          → { instances }
- *   connectors.start_oauth   → { instance }  (Server-bridge OAuth; blocks until deep-link returns)
+ *   connectors.start_oauth   → { started, attempt_id }  (returns after accepting the browser flow)
  *   connectors.add_custom    → { instance }  (user-supplied MCP server; validated form input)
  *   connectors.remove        → { removed }
  *   connectors.refresh       → { tools, instance }
@@ -132,8 +132,8 @@ export const invokeHandlers = {
 
   'connectors.start_oauth': async (payload: { catalog_id?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');
-    const instance = await connectors.connectViaOAuth(ctx.userId, payload.catalog_id);
-    return { instance: toClientInstance(instance, isConnectorEnabled(ctx.userId, instance.id)) };
+    const started = connectors.beginOAuthConnect(ctx.userId, payload.catalog_id);
+    return { started: true, attempt_id: started.attempt_id };
   },
 
   'connectors.cancel_oauth': async () => {

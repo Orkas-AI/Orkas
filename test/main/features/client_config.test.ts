@@ -22,6 +22,7 @@ vi.mock('electron', () => ({
 
 import {
   ClientConfigManager,
+  DEFAULT_PROVIDER_MODELS,
   clientConfigPlatform,
   refresh,
   start,
@@ -68,6 +69,15 @@ describe('client_config', () => {
     const manager = new ClientConfigManager();
     manager.registerDefault('feature.local-default', true);
     expect(manager.get('feature.local-default')).toBe(true);
+  });
+
+  it('ships the synchronized public model catalog with compatibility metadata', () => {
+    expect(DEFAULT_PROVIDER_MODELS['openai-codex']).toEqual([
+      { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000 },
+      { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000 },
+      { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000 },
+      { id: 'gpt-5.5', name: 'GPT-5.5' },
+    ]);
   });
 
   it('maps desktop OS names to client config platform buckets', () => {

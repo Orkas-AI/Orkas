@@ -20,7 +20,7 @@
  */
 'use strict';
 
-const { contextBridge, ipcRenderer } = require('electron');
+const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 // Synchronous i18n boot — handed to the renderer via contextBridge before any
 // renderer-side script runs. The renderer's i18n module reads window.__orkasI18nBoot
@@ -45,6 +45,35 @@ function nextRequestId() {
 
 function invoke(channel, payload) {
   return ipcRenderer.invoke('orkas.invoke', { channel, payload: payload || {} });
+}
+
+/**
+ * Resolve genuine DOM File objects to OS paths inside preload and immediately
+ * hand them to main. Raw paths are never exposed to renderer JavaScript, and
+ * file bytes never cross contextBridge/base64 IPC.
+ */
+function importLocalFiles(scope, files, opts) {
+  const list = Array.isArray(files) ? files : Array.from(files || []);
+  const entries = [];
+  for (const file of list.slice(0, 200)) {
+    try {
+      const localPath = webUtils && typeof webUtils.getPathForFile === 'function'
+        ? webUtils.getPathForFile(file)
+        : '';
+      if (!localPath) continue;
+      entries.push({
+        path: localPath,
+        name: String((file && file.name) || ''),
+        size: Math.max(0, Number((file && file.size) || 0)),
+      });
+    } catch (_) { /* synthetic/non-local File; caller can use the small-file fallback */ }
+  }
+  return ipcRenderer.invoke('orkas.importLocalFiles', {
+    scope: scope === 'project' ? 'project' : 'contexts',
+    projectId: opts && opts.projectId ? String(opts.projectId) : '',
+    targetDir: opts && opts.targetDir ? String(opts.targetDir) : '',
+    entries,
+  });
 }
 
 /**
@@ -148,6 +177,7 @@ contextBridge.exposeInMainWorld('__orkasI18nBoot', _i18nBoot);
 contextBridge.exposeInMainWorld('orkas', {
   ping: () => ipcRenderer.invoke('orkas.ping'),
   diagnostics: () => ipcRenderer.invoke('orkas.diagnostics'),
+  importLocalFiles,
   env: () => ipcRenderer.invoke('orkas.env'),
   relaunch: () => ipcRenderer.invoke('orkas.relaunch'),
   reportUserActivity: () => ipcRenderer.send('orkas.userActivity'),

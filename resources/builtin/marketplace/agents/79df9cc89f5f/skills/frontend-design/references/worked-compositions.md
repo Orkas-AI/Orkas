@@ -8,7 +8,7 @@ Use these as reasoning examples, not layouts to copy. Preserve the method—extr
 
 **Subject materials:** paper typography, token rows, attention matrices, parameter scales, chat turns, image crops, waveforms, syntax bands.
 
-**Visual system:** near-black research desk; warm paper-white type; amber signal as the historical carrier; mint/red only for meaningful comparison. Display type is dense and editorial, labels are measured and technical.
+**Visual system:** near-black research desk; warm paper-white type; amber signal as the historical carrier; mint/red only for meaningful comparison. Display type is dense and editorial; labels feel measured and technical through weight, spacing, and alignment while preserving approved casing.
 
 **Sequence:**
 

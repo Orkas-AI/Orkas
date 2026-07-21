@@ -78,6 +78,7 @@ import {
 } from '../util/project-layout';
 import { readState as readGroupChatState } from '../features/group_chat/state';
 import { logErrorRef } from '../util/log-redact';
+import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { normalizeAppError } from '../util/app-error';
 import {
@@ -185,6 +186,67 @@ async function _pickLocalFiles(
 function _targetInDir(targetDir: unknown, baseName: string): string {
   const dir = typeof targetDir === 'string' ? targetDir.trim().replace(/^\/+|\/+$/g, '') : '';
   return dir ? `${dir}/${baseName}` : baseName;
+}
+
+interface LocalFileImportEntry {
+  path: string;
+  name: string;
+  size?: number;
+}
+
+async function _importLocalFileEntries(payload: any, ctx: IpcContext): Promise<{ files: any[] }> {
+  const scope = payload?.scope;
+  const entries = Array.isArray(payload?.entries)
+    ? payload.entries.slice(0, 200).filter((entry: unknown): entry is LocalFileImportEntry => {
+      if (!entry || typeof entry !== 'object') return false;
+      const item = entry as Partial<LocalFileImportEntry>;
+      return typeof item.path === 'string'
+        && path.isAbsolute(item.path)
+        && typeof item.name === 'string'
+        && !!item.name.trim();
+    })
+    : [];
+  if (!entries.length) return { files: [] };
+
+  const results = [];
+  if (scope === 'contexts') {
+    for (const entry of entries) {
+      const name = path.basename(entry.name);
+      const target = _targetInDir(payload?.targetDir, name);
+      const ext = path.extname(name).toLowerCase();
+      if (contexts.hasHiddenContextPathSegment(target)) {
+        results.push({ ok: false, name, target, bytes: entry.size || 0, ext, reason: 'hidden' });
+        continue;
+      }
+      if (!contexts.isSupportedContextFileName(target)) {
+        results.push({ ok: false, name, target, bytes: entry.size || 0, ext, reason: 'ext' });
+        continue;
+      }
+      const result = await contexts.importContextFileFromPath(target, entry.path);
+      results.push({ name, target, bytes: entry.size || 0, ext, ...result });
+    }
+    return { files: results };
+  }
+
+  if (scope === 'project') {
+    const projectId = payload?.projectId;
+    if (!safeId(projectId) || !await projects.projectExists(ctx.userId, projectId)) {
+      throw new Error('invalid projectId');
+    }
+    for (const entry of entries) {
+      const name = path.basename(entry.name);
+      const targetName = _targetInDir(payload?.targetDir, name);
+      const result = await projectFiles.importProjectFileFromPath(
+        ctx.userId,
+        projectId,
+        targetName,
+        entry.path,
+      );
+      results.push({ name, targetName, ...result });
+    }
+    return { files: results };
+  }
+  throw new Error('invalid import scope');
 }
 
 // Resolve the workspace scope hint a renderer payload carries. cid is
@@ -460,6 +522,39 @@ async function _isAllowedFileActionPath(userId: string, payload: any, absPath: s
   return typeof cid === 'string' && !!cid && await _isConversationRecordedFile(userId, cid, absPath);
 }
 
+// Scan an HTML file with constant memory and return only the authored
+// composition root tag. The file may be any size; only this small tag crosses
+// IPC, while the complete HTML continues to stream through chat-media://.
+async function _readHtmlCompositionRootTag(absPath: string): Promise<string> {
+  const stream = fs.createReadStream(absPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
+  const rootPattern = /<[^>]*\bdata-composition-id\s*=\s*["'][^"']+["'][^>]*>/i;
+  const MAX_TAG_CARRY_CHARS = 64 * 1024;
+  let carry = '';
+  try {
+    for await (const chunk of stream) {
+      const combined = carry + String(chunk);
+      const match = combined.match(rootPattern);
+      if (match) return match[0];
+      const lastOpen = combined.lastIndexOf('<');
+      carry = lastOpen >= 0 ? combined.slice(lastOpen) : '';
+      // A normal HTML opening tag is tiny. Drop pathological unterminated
+      // markup instead of letting a malformed file grow the scan buffer.
+      if (carry.length > MAX_TAG_CARRY_CHARS) carry = '';
+    }
+    return '';
+  } finally {
+    // `destroy()` schedules the underlying file-handle close. Await the close
+    // edge before returning so callers can immediately move/delete the file
+    // or its workspace on Windows.
+    if (!stream.closed) {
+      await new Promise<void>((resolve) => {
+        stream.once('close', resolve);
+        stream.destroy();
+      });
+    }
+  }
+}
+
 function _contextTreeHasPath(nodes: contexts.ContextNode[], relPath: string): boolean {
   for (const node of nodes || []) {
     if (node.path === relPath) return true;
@@ -682,7 +777,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.history': async (args, ctx) => {
-    const { cid, limit = 10, before } = args;
+    const { cid, limit = 10, before, around_index } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
     const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
@@ -695,17 +790,26 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const runtime = await groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId);
     const requestedLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 10)));
     const requestedBefore = Number(before);
-    const page = await chats.getMessagesPage(
-      ctx.userId,
-      cid,
-      requestedLimit,
-      Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
-      resolvedProjectId,
-    );
+    const requestedAroundIndex = Number(around_index);
+    const hasAroundIndex = Number.isSafeInteger(requestedAroundIndex) && requestedAroundIndex >= 0;
+    const page = hasAroundIndex
+      ? await chats.getMessagesPageAtIndex(
+        ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
+      : await chats.getMessagesPage(
+        ctx.userId,
+        cid,
+        requestedLimit,
+        Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
+        resolvedProjectId,
+      );
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
       next_cursor: page.nextCursor,
+      ...(hasAroundIndex && 'pageStart' in page && 'historyIndexes' in page ? {
+        page_start: page.pageStart,
+        history_indexes: page.historyIndexes,
+      } : {}),
     };
   },
 
@@ -891,6 +995,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.files.upload': async ({ projectId, name, data }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (typeof data !== 'string') throw new Error('missing data');
+    if (data.length > 12 * 1024 * 1024) {
+      return { ok: false, error: 'large uploads require path-based import', code: 'E_IMPORT_PATH_REQUIRED' };
+    }
     const buf = Buffer.from(data, 'base64');
     return projectFiles.uploadProjectFile(ctx.userId, projectId, name || '', buf);
   },
@@ -903,9 +1010,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     for (const filePath of picked) {
       const name = path.basename(filePath);
       try {
-        const buf = fs.readFileSync(filePath);
         const targetName = _targetInDir(targetDir, name);
-        const res = await projectFiles.uploadProjectFile(ctx.userId, projectId, targetName, buf);
+        const res = await projectFiles.importProjectFileFromPath(ctx.userId, projectId, targetName, filePath);
         results.push({ name, targetName, ...res });
       } catch (err) {
         results.push({ ok: false, name, error: (err as Error)?.message || String(err) });
@@ -1979,6 +2085,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'contexts.upload': async (payload) => {
     const target = payload?.path || payload?.name || '';
     const data = payload?.data;
+    if (typeof data === 'string' && data.length > 12 * 1024 * 1024) {
+      return { ok: false, error: 'large uploads require path-based import', code: 'E_IMPORT_PATH_REQUIRED' };
+    }
     const buf = typeof data === 'string' ? Buffer.from(data, 'base64') : Buffer.from(data || []);
     return contexts.uploadContextFile(target, buf);
   },
@@ -2001,9 +2110,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
           results.push({ ok: false, name, target, bytes, ext, reason: 'ext' });
           continue;
         }
-        const buf = fs.readFileSync(filePath);
-        const res = contexts.uploadContextFile(target, buf);
-        results.push({ name, target, bytes: buf.length, ext, ...res });
+        const res = await contexts.importContextFileFromPath(target, filePath);
+        results.push({ name, target, bytes, ext, ...res });
       } catch (err) {
         results.push({ ok: false, name, bytes, ext, error: (err as Error)?.message || String(err) });
       }
@@ -2498,13 +2606,52 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, path: r.absPath, kind: r.kind };
   },
 
+  // Diagnose a failed <img>/<video> request without returning or reporting a
+  // local path. Monitor uses the stable reason to distinguish missing/moved
+  // files from unsupported/oversized media and browser decode/stream errors.
+  'media.diagnose': async ({ url }, ctx) => {
+    let parsed: URL;
+    try { parsed = new URL(String(url || '')); }
+    catch { return { diagnosis: 'invalid_url' }; }
+    if (parsed.protocol !== 'chat-media:') return { diagnosis: 'unsupported_scheme' };
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'local') {
+      const absPath = chatMediaLocalPathFromUrl(parsed.toString());
+      if (!absPath) return { diagnosis: 'invalid_url' };
+      const resolved = chatAttachments.resolveLocalMediaPath(absPath);
+      if (!resolved.ok) {
+        return { diagnosis: (resolved as { code?: string }).code || 'unavailable' };
+      }
+      if (path.extname(resolved.absPath).toLowerCase() === '.svg') {
+        const svg = chatAttachments.materializeLocalDisplaySvg(resolved.absPath);
+        if (!svg.ok) return { diagnosis: (svg as { code?: string }).code || 'unavailable', media_kind: resolved.kind };
+      }
+      return { diagnosis: 'available', media_kind: resolved.kind };
+    }
+    if (host === 'cid') {
+      let decoded = '';
+      try { decoded = decodeURIComponent(parsed.pathname || '').replace(/^\/+/, ''); }
+      catch { return { diagnosis: 'invalid_url' }; }
+      const segments = decoded.split('/');
+      const cid = segments.shift() || '';
+      const name = segments.join('/');
+      if (!cid || !name) return { diagnosis: 'invalid_url' };
+      const resolved = chatAttachments.resolveAttachmentAbsPath(ctx.userId, cid, name);
+      if (!resolved.ok) {
+        return { diagnosis: (resolved as { code?: string }).code || 'unavailable' };
+      }
+      return { diagnosis: 'available', media_kind: resolved.kind };
+    }
+    return { diagnosis: 'unknown_route' };
+  },
+
   // Read a file's text content for the in-app preview overlay
   // (markdown / plain text — pdf and html are streamed via `chat-media://`
   // instead). Same scope as the file actions above: active workspace ∪ the
-  // attachment dir of the current cid ∪ exact recorded produced files. 2 MB cap is
-  // intentional — the whole file is slurped into the JS heap and crosses
-  // IPC, so larger files would balloon the renderer; the caller falls
-  // through to the "too large → open folder" dialog on `error: 'too_large'`.
+  // attachment dir of the current cid ∪ exact recorded produced files. Full
+  // reads keep the 2 MB cap because their contents cross IPC. The HTML viewer
+  // uses `compositionRootOnly` to scan files of any size while returning only
+  // the small composition tag; the HTML body itself never crosses this IPC.
   'produced.readText': async (payload, ctx) => {
     const target = payload?.path;
     if (typeof target !== 'string' || !target) {
@@ -2519,11 +2666,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     catch { return { ok: false, error: 'not_found' }; }
     if (!st.isFile()) return { ok: false, error: 'not_found' };
     const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-    if (st.size > MAX_TEXT_BYTES) {
+    const compositionRootOnly = payload?.compositionRootOnly === true;
+    if (!compositionRootOnly && st.size > MAX_TEXT_BYTES) {
       return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
     }
     let text: string;
-    try { text = fs.readFileSync(norm, 'utf8'); }
+    try {
+      text = compositionRootOnly
+        ? await _readHtmlCompositionRootTag(norm)
+        : fs.readFileSync(norm, 'utf8');
+    }
     catch (err) { return { ok: false, error: String((err as Error).message || 'read failed') }; }
     // Strip UTF-8 BOM so markdown / json don't render a leading invisible char.
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
@@ -2658,7 +2810,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections, references }, ctx, signal) {
+  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections, references, retry_message_id }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
@@ -2703,16 +2855,26 @@ const streamHandlers: Record<string, StreamHandler> = {
     let processCount = 0;
     let firstProcessLogged = false;
     let sendDone = false;
-    let sendRes: Awaited<ReturnType<typeof groupChat.send>> | null = null;
+    let sendRes: Awaited<ReturnType<typeof groupChat.send>>
+      | Awaited<ReturnType<typeof groupChat.retryFailedTurn>>
+      | null = null;
     let sendErr: unknown = null;
     const sendPromise = (async () => {
       try {
-        sendRes = await groupChat.send({
-          userId: ctx.userId, cid, text,
-          ...(atts.length ? { attachments: atts } : {}),
-          ...(useSelections.length ? { use_selections: useSelections } : {}),
-          ...(refs.length ? { references: refs } : {}),
-        });
+        const retryMessageId = typeof retry_message_id === 'string' ? retry_message_id.trim() : '';
+        sendRes = retryMessageId
+          ? await groupChat.retryFailedTurn({
+              userId: ctx.userId,
+              cid,
+              failedMessageId: retryMessageId,
+              visibleText: text,
+            })
+          : await groupChat.send({
+              userId: ctx.userId, cid, text,
+              ...(atts.length ? { attachments: atts } : {}),
+              ...(useSelections.length ? { use_selections: useSelections } : {}),
+              ...(refs.length ? { references: refs } : {}),
+            });
       } catch (err) {
         sendErr = err;
       } finally {
@@ -3035,6 +3197,32 @@ export function register(): void {
         out.marketplaceCurrentAppVersion = installInfo.currentAppVersion || '';
       }
       return out;
+    }
+  });
+
+  // File objects cannot cross the regular JSON invoke envelope without being
+  // copied into base64. Preload resolves only genuine user-selected DOM File
+  // objects through Electron `webUtils.getPathForFile` and sends their paths
+  // on this private channel; the renderer never receives a raw local path.
+  ipcMain.handle('orkas.importLocalFiles', async (event, request: unknown) => {
+    if (!isTrustedIpcSender(event.sender)) {
+      log.warn('rejected local file import from untrusted renderer');
+      return { ok: false, error: 'untrusted ipc sender', code: 'E_IPC_SENDER' };
+    }
+    if (!request || typeof request !== 'object') {
+      return { ok: false, error: 'invalid import request', code: 'E_IPC_REQUEST' };
+    }
+    try {
+      const ctx = await resolveContext(event.sender);
+      const result = await _importLocalFileEntries(request, ctx);
+      return { ok: true, ...result };
+    } catch (err) {
+      const normalized = normalizeAppError(err);
+      log.warn('local file import request failed', {
+        code: normalized.code,
+        error: normalized.error,
+      });
+      return { ok: false, error: normalized.error, code: normalized.code };
     }
   });
 

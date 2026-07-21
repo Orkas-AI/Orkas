@@ -49,6 +49,7 @@ import {
 import { createLogger } from '../logger';
 import { companionSkillFileExists } from './package_skills';
 import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../util/bundled-runtime';
+import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 
 const log = createLogger('packages');
 
@@ -221,6 +222,91 @@ export interface PackageActionResult {
   error?: string;
 }
 
+interface PackageProcessResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  error?: string;
+}
+
+const PACKAGE_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+const PACKAGE_COMMAND_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+export function runPackageProcessForTest(
+  bin: string,
+  args: string[],
+  options: {
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    maxOutputBytes?: number;
+  } = {},
+): Promise<PackageProcessResult> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(bin, args, {
+        env: options.env,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      resolve({ code: -1, stdout: '', stderr: '', error: (err as Error).message });
+      return;
+    }
+
+    const timeoutMs = Math.max(1, options.timeoutMs ?? PACKAGE_COMMAND_TIMEOUT_MS);
+    const maxOutputBytes = Math.max(1, options.maxOutputBytes ?? PACKAGE_COMMAND_MAX_OUTPUT_BYTES);
+    let stdout = '';
+    let stderr = '';
+    let outputBytes = 0;
+    let settled = false;
+    let timer: NodeJS.Timeout | null = null;
+    const finish = (result: PackageProcessResult) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      resolve(result);
+    };
+    const terminate = () => {
+      try { killProcessTree(child, 'SIGKILL'); } catch { /* already gone */ }
+    };
+    const capture = (target: 'stdout' | 'stderr', chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += data.length;
+      if (outputBytes > maxOutputBytes) {
+        terminate();
+        finish({
+          code: -1,
+          stdout,
+          stderr,
+          error: `package command output exceeded ${maxOutputBytes} bytes`,
+        });
+        return;
+      }
+      if (target === 'stdout') stdout += data.toString('utf8');
+      else stderr += data.toString('utf8');
+    };
+
+    timer = setTimeout(() => {
+      terminate();
+      finish({
+        code: -1,
+        stdout,
+        stderr,
+        error: `package command timed out after ${Math.max(1, Math.ceil(timeoutMs / 1000))}s`,
+      });
+    }, timeoutMs);
+    timer.unref?.();
+    child.stdout?.on('data', (chunk: Buffer | string) => capture('stdout', chunk));
+    child.stderr?.on('data', (chunk: Buffer | string) => capture('stderr', chunk));
+    child.on('error', (err) => finish({ code: -1, stdout, stderr, error: err.message }));
+    child.on('close', (code) => finish({ code, stdout, stderr }));
+  });
+}
+
 function buildPackageCommandEnv(uid: string, pcDir: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -300,23 +386,17 @@ export function runPackageCommand(uid: string, command: string, name: string): P
     // not create extra Orkas-named Electron processes.
     const node = process.env.ORKAS_TEST_NODE || process.execPath;
     const script = path.join(pcDir, 'bin', 'orkas-pkg.cjs');
-    const child = spawn(node, [script, command, name], {
+    void runPackageProcessForTest(node, [script, command, name], {
       env: buildPackageCommandEnv(uid, pcDir),
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (c) => { stdout += c; });
-    child.stderr.on('data', (c) => { stderr += c; });
-    child.on('error', (err) => finish({ ok: false, stdout, error: err.message }));
-    child.on('close', (code) => {
-      if (code === 0) { finish({ ok: true, stdout }); return; }
-      let error = stderr.trim();
+    }).then((result) => {
+      if (result.error) {
+        finish({ ok: false, stdout: result.stdout, error: result.error });
+        return;
+      }
+      if (result.code === 0) { finish({ ok: true, stdout: result.stdout }); return; }
+      let error = result.stderr.trim();
       try { const j = JSON.parse(error.slice(error.indexOf('{'))); if (j && j.error) error = j.error; } catch { /* keep raw */ }
-      finish({ ok: false, stdout, error: error || `orkas-pkg exited ${code}` });
+      finish({ ok: false, stdout: result.stdout, error: error || `orkas-pkg exited ${result.code}` });
     });
   });
 }

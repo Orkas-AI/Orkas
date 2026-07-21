@@ -22,6 +22,10 @@
     "test:resources": "node scripts/run-python-tests.mjs resources/builtin resources/test -q",
     "test:coverage": "node scripts/run-tests.mjs run --coverage",
     "test:watch": "node scripts/run-tests.mjs",
+    "test:local-agents:live": "tsx scripts/test-local-agents-live.ts",
+    "test:local-agents:prepare": "tsx scripts/test-local-agents-live.ts --install-only",
+    "test:platform-native": "node scripts/run-platform-native-tests.mjs",
+    "test:windows-native": "node scripts/run-windows-native-tests.mjs",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:fetch": "node scripts/fetch-officecli.cjs",
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.cjs",
@@ -49,7 +53,7 @@
   "dependencies": {
     "@earendil-works/pi-ai": "^0.79.9",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.6.0",
     "async-mutex": "^0.5.0",
     "better-sqlite3": "^12.10.0",
     "electron-log": "^5.4.3",
@@ -64,7 +68,7 @@
     "zod": "^3.24.0"
   },
   "overrides": {
-    "tar": "7.5.15"
+    "tar": "7.5.20"
   },
   "build": {
     "appId": "com.orkas.desktop",
@@ -91,6 +95,7 @@
       "!bin/packaged-resource-gate.cjs",
       "!bin/runtime-gate.cjs",
       "src/main/**/*.{js,ts,mjs,md,json}",
+      "src/main/native/build/*.node",
       "src/renderer/**/*",
       "src/resources/icons/**/*",
       "tsconfig.json",
@@ -111,6 +116,7 @@
     "asar": true,
     "asarUnpack": [
       "bin/**/*",
+      "src/main/native/build/*.node",
       "node_modules/tsx/**/*",
       "node_modules/get-tsconfig/**/*",
       "node_modules/resolve-pkg-maps/**/*",

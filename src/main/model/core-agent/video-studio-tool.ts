@@ -35,17 +35,17 @@ import {
   type CompositionManifest,
 } from '../../features/video_studio_contract';
 import {
-  advanceVideoProductionStage,
-  isVideoProductionOpAllowed,
+  evaluateVideoProductionOperation,
   readVideoProductionState,
   recordVideoProductionTransition,
   summarizeVideoProductionState,
   updateVideoProductionState,
-  videoProductionStageAtLeast,
   type VideoProductionArtifactState,
   type VideoProductionGateEntry,
   type VideoProductionNarrationFit,
   type VideoProductionNarrationRepairAuthorization,
+  type VideoProductionPlanApproval,
+  type VideoProductionPolicyFacts,
   type VideoProductionStateV1,
   type VideoProductionVisualQaCycle,
   type VideoProductionVisualQaState,
@@ -107,6 +107,10 @@ const REJECTION_VALUES = new Set([
   'revise', 'revision', 'change', 'change_direction', 'reject', 'rejected', 'deny', 'denied',
   'no', 'cancel', 'back', 'modify', 'edit', 'stop', 'pause',
   '修改', '调整', '重做', '拒绝', '取消', '返回', '停止', '暂停',
+]);
+const REVISION_VALUES = new Set([
+  'revise', 'revision', 'change', 'change_direction', 'modify', 'edit',
+  '修改', '调整', '重做',
 ]);
 
 function currentUserTurnPayload(message: string | undefined): string {
@@ -207,6 +211,42 @@ export function explicitVideoStudioVisualRecoveryDecision(
   if (!submission || submission.agent_id !== expectedAgentId) return 'unknown';
   return submission.values.visual_recovery_decision === 'new_visual_revision'
     ? 'new_visual_revision'
+    : 'unknown';
+}
+
+/**
+ * A Preview/Gate D revise submission is the user authorization for the
+ * requested bounded visual edit. Restarting an exhausted, non-billable QA
+ * cycle is an internal consequence of that decision and must not create a
+ * second recovery-confirmation form.
+ */
+export function explicitVideoStudioVisualRevisionDecision(
+  message: string | undefined,
+  expectedAgentId = VIDEO_STUDIO_AGENT_ID,
+): 'revise' | 'unknown' {
+  const payload = currentUserTurnPayload(message);
+  if (!payload) return 'unknown';
+  if (/<agent-input-submission\b/i.test(payload)) {
+    const submission = decodeSubmission(payload);
+    if (!submission || submission.agent_id !== expectedAgentId) return 'unknown';
+    for (const [key, value] of Object.entries(submission.values)) {
+      if (!APPROVAL_FIELD_RE.test(key) || typeof value !== 'string') continue;
+      const hints = approvalKeyGateHints(key);
+      if (hints.size !== 1 || (!hints.has('preview') && !hints.has('draft'))) continue;
+      const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
+      if (REVISION_VALUES.has(normalized)) return 'revise';
+    }
+    return 'unknown';
+  }
+  const text = payload
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/@\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text || text.length > 2_000) return 'unknown';
+  if (/^(?:取消|暂停|停止|算了|cancel|pause|stop)[。！!\s]*$/i.test(text)) return 'unknown';
+  return /(?:修改|调整|改成|换成|替换|删除|移除|去掉|增加|添加|重做|重新做|继续修改|\b(?:revise|change|modify|remove|delete|add|replace|redo|update)\b)/i.test(text)
+    ? 'revise'
     : 'unknown';
 }
 
@@ -541,16 +581,6 @@ async function checkVideoStudioGateSignature(
   };
 }
 
-async function compositionInputsUnchangedSince(
-  compositionDirAbs: string,
-  isoTime: string | undefined,
-): Promise<boolean> {
-  const cutoff = Date.parse(isoTime || '');
-  if (!Number.isFinite(cutoff)) return false;
-  const stats = await Promise.all((await compositionFiles(compositionDirAbs, 3)).map((abs) => fs.stat(abs)));
-  return stats.every((stat) => stat.mtimeMs <= cutoff);
-}
-
 async function migrateVideoStudioGateSignatureV3(
   statePath: string,
   kind: 'preview' | 'draft',
@@ -560,13 +590,10 @@ async function migrateVideoStudioGateSignatureV3(
   const entry = state[kind];
   if (!entry || entry.validation_version !== 2) return state;
   const check = await checkVideoStudioGateSignature(compositionDirAbs, entry);
-  const unchangedApprovedInputs = entry.status === 'approved'
-    && await compositionInputsUnchangedSince(compositionDirAbs, entry.approved_at);
-  // Some v2 gates included an earlier copy of draft-qa.json. Once that report
-  // was rewritten, its old bytes were unavailable, so equality cannot prove
-  // migration. File mtimes provide the second safe path: every v3 input must
-  // still predate the recorded approval; runtime reports are excluded.
-  if ((!check.matches || !check.upgradeToV3) && !unchangedApprovedInputs) return state;
+  // Migrate only when the stored signature already proves an exact match with
+  // the current v3 inputs. Filesystem mtimes are not authorization evidence:
+  // they can be preserved, rounded, or deliberately backdated.
+  if (!check.matches || !check.upgradeToV3) return state;
   const artifacts = await videoProductionArtifacts(compositionDirAbs);
   try {
     return await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
@@ -607,6 +634,101 @@ function sameVideoProductionArtifacts(
     && a.composition_signature === b.composition_signature
     && a.manifest_sha256 === b.manifest_sha256
     && a.html_sha256 === b.html_sha256;
+}
+
+const MAX_PRESERVED_PLAN_APPROVALS = 10;
+
+function preservePlanApproval(
+  state: VideoProductionStateV1,
+  approval: VideoProductionPlanApproval | undefined = state.plan_approval,
+): void {
+  if (!approval) return;
+  const prior = Array.isArray(state.plan_approval_history) ? state.plan_approval_history : [];
+  state.plan_approval_history = [
+    ...prior.filter((entry) => entry.signature !== approval.signature),
+    approval,
+  ].slice(-MAX_PRESERVED_PLAN_APPROVALS);
+}
+
+function setCurrentPlanApproval(
+  state: VideoProductionStateV1,
+  approval: VideoProductionPlanApproval,
+): void {
+  if (state.plan_approval && state.plan_approval.signature !== approval.signature) {
+    preservePlanApproval(state, state.plan_approval);
+  }
+  state.plan_approval = approval;
+  state.plan_approval_history = (state.plan_approval_history || [])
+    .filter((entry) => entry.signature !== approval.signature)
+    .slice(-MAX_PRESERVED_PLAN_APPROVALS);
+}
+
+function reconcileCurrentPlanApproval(state: VideoProductionStateV1, signature: string): boolean {
+  if (state.plan_approval?.signature === signature) return true;
+  if (state.plan_approval) {
+    preservePlanApproval(state, state.plan_approval);
+    delete state.plan_approval;
+  }
+  const restored = [...(state.plan_approval_history || [])]
+    .reverse()
+    .find((entry) => entry.signature === signature);
+  if (!restored) return false;
+  setCurrentPlanApproval(state, restored);
+  return true;
+}
+
+async function enforceNarrationProductionInvariant(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  state: VideoProductionStateV1;
+  identity: CompositionNarrationIdentity;
+  turnId?: string;
+}): Promise<VideoProductionStateV1> {
+  const facts = narrationPolicyFacts(input.state, input.identity);
+  if (!facts.narrationRequired
+    || facts.narrationMaterialized) {
+    return input.state;
+  }
+  const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
+  const alreadyRecorded = input.state.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED'
+    && sameVideoProductionArtifacts(input.state.blocked_operation.artifacts, artifacts)
+    && !input.state.preview
+    && !input.state.draft;
+  if (alreadyRecorded) return input.state;
+  const hasScaffold = !!(await fs.stat(path.join(input.compositionDirAbs, 'index.html')).catch(() => null));
+  try {
+    return await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      delete next.preview;
+      delete next.draft;
+      // `stage` is retained only as a compatibility projection for older
+      // clients. Runtime admission below is based on canonical facts.
+      if (next.plan_approval) next.stage = hasScaffold ? 'scaffold_ready' : 'manifest_ready';
+      next.blocked_operation = {
+        op: 'composition.materialize_narration',
+        error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED',
+        message: 'Required standalone narration is missing. Existing preview and draft evidence was invalidated without requesting production plan confirmation again; authored visuals and their QA history were preserved.',
+        artifacts,
+        created_at: new Date().toISOString(),
+      };
+      recordVideoProductionTransition(next, {
+        op: 'composition.recover_narration_invariant',
+        status: 'passed',
+        turnId: input.turnId,
+        stage: next.stage,
+      });
+    }, { expectedRevision: input.state.revision });
+  } catch (err) {
+    if (!String((err as Error).message || err).includes('E_VIDEO_PRODUCTION_STATE_CONFLICT')) throw err;
+    return readVideoProductionState(input.statePath, input.compositionDirAbs);
+  }
+}
+
+async function summarizeCompositionProductionState(
+  state: VideoProductionStateV1,
+  compositionDirAbs: string,
+): Promise<Record<string, unknown>> {
+  const identity = await currentNarrationIdentity(compositionDirAbs);
+  return summarizeVideoProductionState(state, narrationPolicyFacts(state, identity));
 }
 
 type VisualQaOp = 'composition.inspect' | 'composition.snapshot';
@@ -728,7 +850,9 @@ async function guardVisualQaAttempt(input: {
   const cycle = currentVisualQaCycle(state.visual_qa);
   if (!signature || !cycle) return null;
   const key = visualQaStateKey(input.op);
-  if (cycle.passed_signatures[key] === signature) {
+  const legacyPreviewNeedsRevision = input.op === 'composition.snapshot'
+    && (!state.preview?.revision_id || !state.preview.path);
+  if (cycle.passed_signatures[key] === signature && !legacyPreviewNeedsRevision) {
     const previewStatus = state.preview?.status;
     return {
       content: resultContent({
@@ -740,7 +864,11 @@ async function guardVisualQaAttempt(input: {
         ...(input.op === 'composition.snapshot' ? {
           preview_ready: true,
           preview_status: previewStatus || 'ready',
-          ...(state.preview?.path ? { contact_sheet: state.preview.path } : {}),
+          ...(state.preview?.path ? {
+            contact_sheet: state.preview.path,
+            contact_sheet_path: state.preview.path,
+          } : {}),
+          ...(state.preview?.revision_id ? { preview_revision: state.preview.revision_id } : {}),
         } : {}),
         next_action: input.op === 'composition.inspect'
           ? 'composition.snapshot'
@@ -776,11 +904,8 @@ async function guardVisualQaAttempt(input: {
         message: `Automatic visual repair reached the limit for this QA cycle after the initial attempt plus ${VISUAL_QA_MAX_REPAIR_PASSES} distinct repair passes. Preserve the approved plan and narration; do not edit again until the user starts a new visual revision.`,
         visual_revision_recovery_available: true,
         recovery_action: 'composition.begin_visual_revision',
-        recovery_requires_explicit_user_confirmation: true,
-        recovery_form: {
-          field_id: 'visual_recovery_decision',
-          approve_value: 'new_visual_revision',
-        },
+        recovery_requires_new_user_revision: true,
+        next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
         preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
         visual_repair_cycle: visualQaRepairSummary(cycle),
       }),
@@ -905,6 +1030,11 @@ async function videoProductionPlanIdentity(compositionDirAbs: string): Promise<{
   try {
     const manifest = CompositionManifestSchema.parse(JSON.parse(manifestRaw));
     manifestValid = true;
+    requirementIssues.push(...videoProductionNarrationAlignmentIssues({
+      script: script?.toString('utf8') || '',
+      shotlist,
+      manifest,
+    }));
     planPayload = JSON.stringify(canonicalPlanPayload(
       manifest,
       Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : undefined,
@@ -960,7 +1090,7 @@ async function validateParentCompositionBinding(input: {
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_BINDING_REQUIRED',
-      message: 'AUTO compose inheritance requires spec.composition_plan.scenes in the Gate B EDL. Do not open a child Gate B automatically; revise and re-approve the parent EDL once.',
+      message: 'AUTO compose inheritance requires spec.composition_plan.scenes in the confirmed parent EDL. Do not request a separate child production plan confirmation; revise and confirm the parent EDL once.',
     };
   }
   let manifest: CompositionManifest;
@@ -1015,7 +1145,7 @@ async function validateParentCompositionBinding(input: {
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_CONTENT_MISMATCH',
-      message: 'The child composition copy, narration, scene ids, or semantic roles differ from the Gate B parent EDL binding.',
+      message: 'The child composition copy, narration, scene ids, or semantic roles differ from the confirmed parent EDL binding.',
     };
   }
   return { ok: true, parentSignature: input.parentIdentity.signature };
@@ -1039,6 +1169,67 @@ function stableJson(value: unknown): string {
 
 function normalizedRepairText(value: string): string {
   return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+}
+
+type ShotNarrationProjection = {
+  keys: Array<'narration' | 'narration_text'>;
+  text: string;
+  issue?: 'invalid' | 'conflict';
+};
+
+/** The manifest is the canonical narration source. Shotlist narration fields
+ * are optional legacy/review projections; when present they must agree with
+ * each other and with the manifest. */
+function shotNarrationProjection(shot: Record<string, unknown>): ShotNarrationProjection {
+  const keys = (['narration', 'narration_text'] as const)
+    .filter((key) => Object.prototype.hasOwnProperty.call(shot, key));
+  if (keys.length === 0) return { keys: [], text: '' };
+  const values: string[] = [];
+  for (const key of keys) {
+    const value = shot[key];
+    if (typeof value !== 'string' || !value.trim()) return { keys, text: '', issue: 'invalid' };
+    values.push(value.trim());
+  }
+  if (values.some((value) => normalizedRepairText(value) !== normalizedRepairText(values[0]))) {
+    return { keys, text: '', issue: 'conflict' };
+  }
+  return { keys, text: values[0] };
+}
+
+function videoProductionNarrationAlignmentIssues(input: {
+  script: string;
+  shotlist: Record<string, unknown>;
+  manifest: CompositionManifest;
+}): string[] {
+  const narratedScenes = input.manifest.scenes.filter((scene) => !!scene.narration_text?.trim());
+  if (narratedScenes.length === 0) return [];
+  const shots = Array.isArray(input.shotlist.shots)
+    ? input.shotlist.shots.filter((value): value is Record<string, unknown> => (
+      !!value && typeof value === 'object' && !Array.isArray(value)
+    ))
+    : [];
+  const shotsById = new Map(shots.map((shot) => [typeof shot.id === 'string' ? shot.id : '', shot]));
+  const issues: string[] = [];
+  let scriptCursor = 0;
+  for (const scene of narratedScenes) {
+    const narration = scene.narration_text!.trim();
+    const scriptIndex = input.script.indexOf(narration, scriptCursor);
+    if (scriptIndex < 0) issues.push(`script.narration_missing(${scene.id})`);
+    else scriptCursor = scriptIndex + narration.length;
+    const shot = shotsById.get(scene.id);
+    if (!shot) {
+      issues.push(`shotlist.shots.missing(${scene.id})`);
+      continue;
+    }
+    const projection = shotNarrationProjection(shot);
+    if (projection.issue) {
+      issues.push(`shotlist.shots.${scene.id}.narration_${projection.issue}`);
+    } else if (projection.text
+      && normalizedRepairText(projection.text) !== normalizedRepairText(narration)) {
+      issues.push(`shotlist.shots.${scene.id}.narration_conflicts_with_manifest`);
+    }
+  }
+  return issues;
 }
 
 function narrationRepairTokens(text: string): string[] {
@@ -1069,9 +1260,10 @@ function narrationTokenEditRatio(before: string[], after: string[]): number {
 
 /**
  * Build a signature for every approved plan field except the narration copy
- * that may be shortened/expanded by the measured-duration repair. The three
- * narration copies must still agree scene-by-scene, and approved on-screen
- * copy is redacted only when it exactly duplicates that scene's narration.
+ * that may be shortened/expanded by the measured-duration repair. The
+ * manifest is canonical. Optional shotlist narration/narration_text
+ * projections must agree scene-by-scene, and approved on-screen copy is
+ * redacted only when it exactly duplicates that scene's narration.
  */
 async function videoProductionNarrationRepairIdentity(
   compositionDirAbs: string,
@@ -1094,7 +1286,7 @@ async function videoProductionNarrationRepairIdentity(
   } catch {
     return undefined;
   }
-  if (!Array.isArray(shotlist.shots) || shotlist.shots.length !== manifest.scenes.length) return undefined;
+  if (!Array.isArray(shotlist.shots)) return undefined;
 
   const shotsById = new Map<string, Record<string, unknown>>();
   for (const value of shotlist.shots) {
@@ -1111,15 +1303,20 @@ async function videoProductionNarrationRepairIdentity(
   for (const scene of manifest.scenes) {
     const narration = scene.narration_text?.trim() || '';
     const shot = shotsById.get(scene.id);
-    const shotNarration = typeof shot?.narration === 'string' ? shot.narration.trim() : '';
-    if (!narration || !shot || normalizedRepairText(shotNarration) !== normalizedRepairText(narration)) {
+    if (!narration || !shot) {
       return undefined;
     }
+    const projection = shotNarrationProjection(shot);
+    if (projection.issue || (projection.text
+      && normalizedRepairText(projection.text) !== normalizedRepairText(narration))) return undefined;
     const scriptIndex = scriptStructure.indexOf(narration);
     if (scriptIndex < 0) return undefined;
     const marker = `{{ORKAS_NARRATION:${scene.id}}}`;
     scriptStructure = `${scriptStructure.slice(0, scriptIndex)}${marker}${scriptStructure.slice(scriptIndex + narration.length)}`;
-    sanitizedShots.push({ ...shot, narration: marker });
+    const sanitizedShot = { ...shot };
+    delete sanitizedShot.narration;
+    delete sanitizedShot.narration_text;
+    sanitizedShots.push(sanitizedShot);
     sanitizedScenes.push({
       ...scene,
       narration_text: marker,
@@ -1232,7 +1429,7 @@ async function resolveCompositionNarrationSelection(input: {
       return {
         ok: false,
         errorCode: 'E_TTS_NARRATION_INTENT_REQUIRED',
-        message: 'A narrated schema_version 2 manifest must contain audio.narration_intent selected from speech.capabilities before Gate B.',
+        message: 'A narrated schema_version 2 manifest must contain audio.narration_intent selected from speech.capabilities before production plan confirmation.',
       };
     }
     if (input.legacyVoice
@@ -1240,7 +1437,7 @@ async function resolveCompositionNarrationSelection(input: {
       return {
         ok: false,
         errorCode: 'E_TTS_SELECTION_OVERRIDE_FORBIDDEN',
-        message: 'Execution cannot override the Gate B-signed narration route, voice, language, or speed. Revise audio.narration_intent and reopen Gate B.',
+        message: 'Execution cannot override the confirmed narration route, voice, language, or speed. Revise audio.narration_intent and request production plan confirmation again.',
       };
     }
     const resolved = await resolveTtsSelection({
@@ -1254,7 +1451,7 @@ async function resolveCompositionNarrationSelection(input: {
       return {
         ok: false,
         errorCode: 'E_TTS_INTENT_LABEL_MISMATCH',
-        message: 'The signed narration display name no longer matches the active capability catalog. Refresh speech.capabilities and reopen Gate B.',
+        message: 'The confirmed narration display name no longer matches the active capability catalog. Refresh speech.capabilities and request production plan confirmation again.',
       };
     }
     return { ok: true, selection: resolved.selection, speed: intent.speed, legacy: false };
@@ -1346,7 +1543,7 @@ function narrationFitMessage(fit: VideoProductionNarrationFit): string {
   if (fit.status === 'under') {
     return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}. Expand it to about ${fit.suggested_units} ${fit.narration_unit}; no speech request was sent.`;
   }
-  return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source} and is ready for Gate B.`;
+  return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source} and is ready for production plan confirmation.`;
 }
 
 async function currentPlanNarrationTextSha(compositionDirAbs: string): Promise<string> {
@@ -1401,7 +1598,7 @@ async function validateEdlNarrationSelection(planPath: string, signal?: AbortSig
       return {
         ok: false,
         errorCode: 'E_TTS_INTENT_LABEL_MISMATCH',
-        message: 'tracks.narration.synthesis.display_name no longer matches speech.capabilities. Refresh the plan before Gate B.',
+        message: 'tracks.narration.synthesis.display_name no longer matches speech.capabilities. Refresh the plan before production plan confirmation.',
       };
     }
     return { ok: true, selection: resolved.selection, speed, legacy: false };
@@ -1459,10 +1656,20 @@ async function validatePlanApproval(
     return {
       ok: false,
       errorCode: 'E_GATE_B_ARTIFACTS_INCOMPLETE',
-      message: 'Gate B requires project/script.md, project/shotlist.json, and a valid composition manifest before prepare.',
+      message: 'Production plan confirmation requires project/script.md, project/shotlist.json, and a valid composition manifest before prepare.',
     };
   }
   const state = await readVideoProductionState(statePath, compositionDirAbs);
+  if (state.plan_approval?.signature === identity.signature) return { ok: true };
+  const restorable = [...(state.plan_approval_history || [])]
+    .reverse()
+    .find((entry) => entry.signature === identity.signature);
+  if (restorable) {
+    await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
+      setCurrentPlanApproval(next, restorable);
+    });
+    return { ok: true };
+  }
   if (!state.plan_approval) {
     return {
       ok: false,
@@ -1470,26 +1677,24 @@ async function validatePlanApproval(
       message: 'Record the explicit script/shotlist approval with composition.approve_plan before prepare.',
     };
   }
-  if (state.plan_approval.signature !== identity.signature) {
-    await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
-      delete next.plan_approval;
-      delete next.preview;
-      delete next.draft;
-      next.stage = 'manifest_ready';
-      recordVideoProductionTransition(next, {
-        op: 'composition.approve_plan',
-        status: 'failed',
-        errorCode: 'E_GATE_B_ARTIFACT_CHANGED',
-        stage: 'manifest_ready',
-      });
-    });
-    return {
-      ok: false,
+  await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
+    preservePlanApproval(next);
+    delete next.plan_approval;
+    delete next.preview;
+    delete next.draft;
+    next.stage = 'manifest_ready';
+    recordVideoProductionTransition(next, {
+      op: 'composition.approve_plan',
+      status: 'failed',
       errorCode: 'E_GATE_B_ARTIFACT_CHANGED',
-      message: 'The approved script, shotlist, or narration payload changed. Re-open Gate B and approve the new plan.',
-    };
-  }
-  return { ok: true };
+      stage: 'manifest_ready',
+    });
+  });
+  return {
+    ok: false,
+    errorCode: 'E_GATE_B_ARTIFACT_CHANGED',
+    message: 'The confirmed script, shotlist, or narration payload changed. Request production plan confirmation again for the new plan.',
+  };
 }
 
 async function writeJsonAtomic(absPath: string, value: unknown): Promise<void> {
@@ -1507,33 +1712,88 @@ async function writeTextAtomic(absPath: string, value: string): Promise<void> {
 }
 
 async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
+  required: boolean;
   textSha?: string;
   audioSha?: string;
   duration?: number;
+  narrationMapMatches: boolean;
+  htmlTrackMatches: boolean;
   materialized: boolean;
 }> {
   try {
     const parsed = CompositionManifestSchema.safeParse(JSON.parse(
       await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
     ));
-    if (!parsed.success) return { materialized: false };
+    if (!parsed.success) {
+      return { required: false, narrationMapMatches: false, htmlTrackMatches: false, materialized: false };
+    }
     const text = compositionNarrationText(parsed.data);
+    const required = !!text && parsed.data.audio.owner !== 'assembler';
     const track = parsed.data.audio.tracks.find((item) => item.kind === 'narration');
     const audioAbsPath = track?.src === 'assets/narration.mp3'
       ? path.join(compositionDirAbs, track.src)
       : '';
     const audioSha = audioAbsPath ? await sha256File(audioAbsPath) : undefined;
+    const textSha = text ? crypto.createHash('sha256').update(text).digest('hex') : undefined;
+    const narrationMap = await fs.readFile(path.join(compositionDirAbs, 'narration-map.json'), 'utf8')
+      .then((raw) => JSON.parse(raw) as Record<string, unknown>)
+      .catch(() => null);
+    const narrationMapMatches = !!narrationMap
+      && narrationMap.narration_text_sha256 === textSha
+      && narrationMap.narration_audio_sha256 === audioSha;
+    const html = await fs.readFile(path.join(compositionDirAbs, 'index.html'), 'utf8').catch(() => '');
+    const htmlTrackMatches = (html.match(/<audio\b[^>]*>/gi) || []).some((tag) => {
+      const srcMatch = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
+      const src = (srcMatch?.[1] || srcMatch?.[2] || '').replace(/\\/g, '/').replace(/^\.\//, '');
+      return src === 'assets/narration.mp3';
+    });
     return {
-      ...(text ? { textSha: crypto.createHash('sha256').update(text).digest('hex') } : {}),
+      required,
+      ...(textSha ? { textSha } : {}),
       ...(audioSha ? { audioSha } : {}),
       ...(track ? { duration: track.duration } : {}),
+      narrationMapMatches,
+      htmlTrackMatches,
       materialized: parsed.data.audio.owner === 'composition'
         && track?.src === 'assets/narration.mp3'
         && !!audioSha,
     };
   } catch {
-    return { materialized: false };
+    return { required: false, narrationMapMatches: false, htmlTrackMatches: false, materialized: false };
   }
+}
+
+type CompositionNarrationIdentity = Awaited<ReturnType<typeof currentNarrationIdentity>>;
+
+function narrationAudioMatchesState(
+  state: VideoProductionStateV1,
+  identity: CompositionNarrationIdentity,
+): boolean {
+  return !!state.narration
+    && identity.materialized
+    && identity.narrationMapMatches
+    && identity.textSha === state.narration.text_sha256
+    && identity.audioSha === state.narration.audio_sha256
+    && Math.abs((identity.duration || 0) - state.narration.measured_duration_sec) <= 0.01;
+}
+
+function narrationIdentityMatchesState(
+  state: VideoProductionStateV1,
+  identity: CompositionNarrationIdentity,
+): boolean {
+  return narrationAudioMatchesState(state, identity)
+    && identity.narrationMapMatches
+    && identity.htmlTrackMatches;
+}
+
+function narrationPolicyFacts(
+  state: VideoProductionStateV1,
+  identity: CompositionNarrationIdentity,
+): VideoProductionPolicyFacts {
+  return {
+    narrationRequired: identity.required,
+    narrationMaterialized: !identity.required || narrationIdentityMatchesState(state, identity),
+  };
 }
 
 async function recordVideoStudioOperationState(input: {
@@ -1550,11 +1810,7 @@ async function recordVideoStudioOperationState(input: {
     ? await currentNarrationIdentity(input.compositionDirAbs)
     : null;
   return updateVideoProductionState(input.statePath, input.compositionDirAbs, (state) => {
-    const narrationIsCurrent = !!state.narration
-      && narration?.materialized === true
-      && narration.textSha === state.narration.text_sha256
-      && narration.audioSha === state.narration.audio_sha256
-      && Math.abs((narration.duration || 0) - state.narration.measured_duration_sec) <= 0.01;
+    const narrationIsCurrent = !!narration && narrationIdentityMatchesState(state, narration);
     if (input.stage) {
       const authoredVisuals = input.stage === 'visuals_ready'
         && !!state.artifacts.scaffold_html_sha256
@@ -1647,9 +1903,17 @@ export async function recordVideoStudioGate(
     videoStudioCompositionSignature(compositionDirAbs),
     videoProductionArtifacts(compositionDirAbs),
   ]);
+  const framePaths = Array.isArray(result.frame_paths)
+    ? result.frame_paths
+      .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      .map((value) => path.resolve(value))
+    : [];
   await updateVideoProductionState(statePath, compositionDirAbs, (state) => {
     state[kind] = {
       signature,
+      ...(kind === 'preview' && typeof result.preview_revision === 'string' && result.preview_revision
+        ? { revision_id: result.preview_revision }
+        : {}),
       turn_id: turnId,
       created_at: new Date().toISOString(),
       status: 'ready',
@@ -1657,14 +1921,23 @@ export async function recordVideoStudioGate(
       ...(kind === 'preview' && typeof result.contact_sheet === 'string' && result.contact_sheet
         ? { path: result.contact_sheet }
         : typeof result.path === 'string' && result.path ? { path: result.path } : {}),
+      ...(framePaths.length ? { frame_paths: framePaths } : {}),
       ...(typeof result.report_path === 'string' && result.report_path ? { report_path: result.report_path } : {}),
+      ...(kind === 'preview' && result.design_review_required === true ? {
+        design_review: {
+          required: true,
+          status: 'pending',
+        },
+      } : {}),
       ...(kind === 'draft' ? {
         design_review: {
           required: result.design_review_required === true,
           status: result.design_review_required === true ? 'pending' : 'passed',
           ...(result.design_review_required === true ? {} : {
             reviewed_at: new Date().toISOString(),
-            verdict: 'not_required',
+            verdict: result.design_review_inherited_from_preview === true
+              ? 'preview_review_inherited'
+              : 'not_required',
           }),
         },
       } : {}),
@@ -1711,7 +1984,7 @@ export async function approveVideoStudioGate(
   if (!entry) {
     return kind === 'preview'
       ? { ok: false, errorCode: 'E_HTML_PREVIEW_REQUIRED', message: 'Generate a passing composition.snapshot before approving the HTML preview.' }
-      : { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'Generate a passing composition.draft before approving Gate D.' };
+      : { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'Generate a passing composition.draft before final video confirmation.' };
   }
   const signature = await videoStudioGateSignature(compositionDirAbs, entry);
   if (entry.signature !== signature) {
@@ -1722,13 +1995,20 @@ export async function approveVideoStudioGate(
   if (!currentTurnId || entry.turn_id === currentTurnId) {
     return kind === 'preview'
       ? { ok: false, errorCode: 'E_HTML_PREVIEW_APPROVAL_REQUIRED', message: 'Preview approval must come from a later explicit user turn.' }
-      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'Gate D approval must come from a later explicit user turn.' };
+      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'Final video confirmation must come from a later explicit user turn.' };
+  }
+  if (kind === 'preview' && entry.design_review?.required && entry.design_review.status !== 'passed') {
+    return {
+      ok: false,
+      errorCode: 'E_PREVIEW_DESIGN_REVIEW_REQUIRED',
+      message: 'Preview approval is unavailable until composition.submit_design_review records a passed review covering every frame from this exact snapshot.',
+    };
   }
   if (kind === 'draft' && entry.design_review?.required && entry.design_review.status !== 'passed') {
     return {
       ok: false,
       errorCode: 'E_DESIGN_REVIEW_REQUIRED',
-      message: 'Gate D cannot be approved until composition.submit_design_review records a passed review for this exact draft signature.',
+      message: 'Final video confirmation is unavailable until composition.submit_design_review records a passed review for this exact draft signature.',
     };
   }
   if (!explicitlyApproved) {
@@ -1741,7 +2021,7 @@ export async function approveVideoStudioGate(
       : {
         ok: false,
         errorCode: 'E_GATE_D_EXPLICIT_APPROVAL_REQUIRED',
-        message: 'The current real user message must explicitly approve the displayed draft before composition.approve_draft can record Gate D approval.',
+        message: 'The current real user message must explicitly confirm the displayed draft before composition.approve_draft can record final video approval.',
       };
   }
   const artifacts = await videoProductionArtifacts(compositionDirAbs);
@@ -1783,12 +2063,19 @@ export async function validateVideoStudioGate(
   if (entry.signature !== signature) {
     return kind === 'preview'
       ? { ok: false, errorCode: 'E_HTML_PREVIEW_STALE', message: 'Composition inputs changed after the preview. Capture and show a new snapshot before rendering.' }
-      : { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the approved draft. Run composition.draft again and reopen Gate D.' };
+      : { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the approved draft. Run composition.draft again and request final video confirmation.' };
+  }
+  if (kind === 'preview' && entry.design_review?.required && entry.design_review.status !== 'passed') {
+    return {
+      ok: false,
+      errorCode: 'E_PREVIEW_DESIGN_REVIEW_REQUIRED',
+      message: 'The snapshot exists but has not passed a complete preview-frame design review.',
+    };
   }
   if (entry.status !== 'approved' || !entry.approved_turn_id || !entry.approved_at) {
     return kind === 'preview'
       ? { ok: false, errorCode: 'E_HTML_PREVIEW_APPROVAL_REQUIRED', message: 'The preview exists but has not been explicitly approved. Call composition.approve_preview only after the user approves it.' }
-      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'The draft exists but Gate D has not been explicitly approved. Call composition.approve_draft only after the user approves it.' };
+      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'The draft exists but the final video has not been explicitly confirmed. Call composition.approve_draft only after the user confirms it.' };
   }
   return { ok: true, entry };
 }
@@ -2076,9 +2363,9 @@ async function reconcileVideoProduction(input: {
     currentNarrationIdentity(input.compositionDirAbs),
     videoProductionPlanIdentity(input.compositionDirAbs),
   ]);
-  const visualAuthored = videoProductionStageAtLeast(currentState.stage, 'visuals_ready')
-    || (!!currentState.artifacts.scaffold_html_sha256
-      && originalHtmlSha !== currentState.artifacts.scaffold_html_sha256);
+  const visualAuthored = (!!currentState.artifacts.scaffold_html_sha256
+      && originalHtmlSha !== currentState.artifacts.scaffold_html_sha256)
+    || !originalHtml.includes('ORKAS-GENERATED-SCAFFOLD');
   const narrationProvenanceMatches = (!!currentState.narration
     && currentState.narration.text_sha256 === narrationIdentity.textSha
     && currentState.narration.audio_sha256 === narrationIdentity.audioSha)
@@ -2088,6 +2375,8 @@ async function reconcileVideoProduction(input: {
         || currentState.narration_transaction.audio_sha256 === narrationIdentity.audioSha));
   const narrationRecovered = narrationProvenanceMatches
     && narrationIdentity.materialized
+    && narrationIdentity.narrationMapMatches
+    && narrationIdentity.htmlTrackMatches
     && !!narrationIdentity.textSha
     && !!narrationIdentity.audioSha
     && typeof narrationIdentity.duration === 'number';
@@ -2100,12 +2389,22 @@ async function reconcileVideoProduction(input: {
         stage: next.stage,
       });
     }
-    const planChanged = !!next.plan_approval
-      && planIdentity.applicable
-      && next.plan_approval.signature !== planIdentity.signature;
-    if (planChanged) delete next.plan_approval;
-    const previewValid = !!next.preview && previewGateCheck?.matches === true;
-    const draftValid = !!next.draft && draftGateCheck?.matches === true;
+    if (planIdentity.applicable) reconcileCurrentPlanApproval(next, planIdentity.signature);
+    const narrationPending = narrationIdentity.required && !narrationRecovered;
+    const previewValid = !narrationPending && !!next.preview && previewGateCheck?.matches === true;
+    const draftValid = !narrationPending && !!next.draft && draftGateCheck?.matches === true;
+    if (narrationPending) {
+      delete next.preview;
+      delete next.draft;
+      delete next.visual_qa;
+      next.blocked_operation = {
+        op: 'composition.materialize_narration',
+        error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED',
+        message: 'Required standalone narration is missing. Downstream gates remain invalid until composition.materialize_narration succeeds.',
+        artifacts,
+        created_at: new Date().toISOString(),
+      };
+    }
     if (!previewValid) delete next.preview;
     else if (next.preview && previewGateCheck?.upgradeToV3) {
       next.preview.validation_version = 3;
@@ -2130,12 +2429,14 @@ async function reconcileVideoProduction(input: {
         materialized_at: previous?.materialized_at || new Date().toISOString(),
       };
       delete next.narration_transaction;
-    } else if (next.narration) {
+    } else if (next.narration && !narrationAudioMatchesState(next, narrationIdentity)) {
       delete next.narration;
     }
-    let stage: VideoProductionStateV1['stage'] = visualAuthored
-      ? 'visuals_ready'
-      : narrationRecovered ? 'narration_ready' : 'scaffold_ready';
+    let stage: VideoProductionStateV1['stage'] = narrationPending
+      ? 'scaffold_ready'
+      : visualAuthored
+        ? 'visuals_ready'
+        : narrationRecovered ? 'narration_ready' : 'scaffold_ready';
     if (draftValid && next.draft?.status === 'approved') stage = 'draft_approved';
     else if (draftValid) stage = 'draft_ready';
     else if (previewValid && next.preview?.status === 'approved') stage = 'preview_approved';
@@ -2247,6 +2548,7 @@ async function materializeCompositionNarration(input: {
   }
 
   const state = await readVideoProductionState(input.statePath, input.compositionDirAbs);
+  const narrationInvariantRecovery = state.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED';
   const textSha = crypto.createHash('sha256').update(text).digest('hex');
   const requestSignature = crypto.createHash('sha256').update(JSON.stringify({
     text_sha256: textSha,
@@ -2272,27 +2574,67 @@ async function materializeCompositionNarration(input: {
     && narrationTrack?.src === 'assets/narration.mp3'
     && Math.abs((narrationTrack?.duration || 0) - state.narration.measured_duration_sec) <= 0.01;
   if (trackedNarrationIsCurrent) {
-    const reusedState = videoProductionStageAtLeast(state.stage, 'narration_ready')
-      ? state
-      : await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
-        next.stage = 'narration_ready';
-        recordVideoProductionTransition(next, {
+    const existingIdentity = await currentNarrationIdentity(input.compositionDirAbs);
+    const narrationMapPath = path.join(input.compositionDirAbs, 'narration-map.json');
+    if (!existingIdentity.narrationMapMatches) {
+      await writeJsonAtomic(narrationMapPath, buildCompositionNarrationMap(manifest, {
+        textSha256: textSha,
+        audioSha256: existingAudioSha!,
+        method: 'scene_estimate_scaled',
+      }));
+    }
+    const htmlPath = path.join(input.compositionDirAbs, 'index.html');
+    const existingHtml = await fs.readFile(htmlPath, 'utf8').catch(() => '');
+    if (!existingIdentity.htmlTrackMatches) {
+      const reconciledHtml = reconcileCompositionHtml(existingHtml, manifest);
+      if (!reconciledHtml.ok) {
+        return {
+          ok: false,
           op: 'composition.materialize_narration',
-          status: 'passed',
-          turnId: input.opts.turnId,
-          stage: 'narration_ready',
-          artifacts: next.artifacts,
-        });
+          errorCode: 'E_NARRATION_VISUAL_RECOVERY_BLOCKED',
+          message: reconciledHtml.issues[0]?.message || 'Narration audio exists, but its render binding could not be repaired without replacing authored visuals.',
+          issues: reconciledHtml.issues,
+          path: outputAbsPath,
+          billable_request_sent: false,
+        };
+      }
+      if (reconciledHtml.changed) await writeTextAtomic(htmlPath, reconciledHtml.html);
+    }
+    const metadataRecovered = !existingIdentity.narrationMapMatches || !existingIdentity.htmlTrackMatches;
+    const authoredVisualsRecovered = narrationInvariantRecovery
+      && ((!existingHtml.includes('ORKAS-GENERATED-SCAFFOLD'))
+        || (!!state.artifacts.scaffold_html_sha256
+          && state.artifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
+    const finalArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
+    const reusedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      next.stage = authoredVisualsRecovered ? 'visuals_ready' : 'narration_ready';
+      delete next.blocked_operation;
+      next.artifacts = {
+        ...finalArtifacts,
+        scaffold_html_sha256: authoredVisualsRecovered
+          ? state.artifacts.scaffold_html_sha256
+          : finalArtifacts.html_sha256,
+      };
+      recordVideoProductionTransition(next, {
+        op: 'composition.materialize_narration',
+        status: 'passed',
+        turnId: input.opts.turnId,
+        stage: next.stage,
+        artifacts: next.artifacts,
       });
+    });
     return {
       ok: true,
       op: 'composition.materialize_narration',
-      status: 'reused',
+      status: metadataRecovered ? 'recovered' : 'reused',
       path: outputAbsPath,
       measured_duration_sec: state.narration.measured_duration_sec,
       narration_text_sha256: textSha,
+      narration_map_path: narrationMapPath,
+      html_path: htmlPath,
+      visuals_preserved: authoredVisualsRecovered,
       billable_request_sent: false,
-      production_state: summarizeVideoProductionState(reusedState),
+      production_state: await summarizeCompositionProductionState(reusedState, input.compositionDirAbs),
     };
   }
   const transactionMatches = !!state.narration_transaction
@@ -2310,7 +2652,7 @@ async function materializeCompositionNarration(input: {
       op: 'composition.materialize_narration',
       errorCode: safeAfterPlanFix ? 'E_TTS_PLAN_REVISION_REQUIRED' : 'E_TTS_RETRY_REQUIRES_USER_ACTION',
       message: safeAfterPlanFix
-        ? 'The matching narration request was rejected without a charge. Refresh speech.capabilities, revise the signed narration intent, and reopen Gate B before retrying.'
+        ? 'The matching narration request was rejected without a charge. Refresh speech.capabilities, revise the confirmed narration intent, and request production plan confirmation again before retrying.'
         : 'The matching narration request may have reached the provider and its charge state is not safely retryable. Do not resend automatically; require explicit user direction and a new signed request.',
       billable_request_sent: transaction.request_disposition === 'sent',
       request_disposition: transaction.request_disposition || 'sent',
@@ -2326,30 +2668,25 @@ async function materializeCompositionNarration(input: {
       message: 'assets/narration.mp3 exists but its text/audio hashes or transaction do not match production state. Preserve it and run composition.reconcile instead of overwriting a potentially billable artifact.',
     };
   }
-  if (state.stage !== 'scaffold_ready' && !transactionMatches) {
-    return {
-      ok: false,
-      op: 'composition.materialize_narration',
-      errorCode: 'E_NARRATION_STAGE_INVALID',
-      message: `Narration may be generated only at scaffold_ready, after composition.prepare and before visual authoring. Current stage: ${state.stage}.`,
-      production_state: summarizeVideoProductionState(state),
-    };
-  }
   const currentArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
+  const htmlPath = path.join(input.compositionDirAbs, 'index.html');
+  const html = await fs.readFile(htmlPath, 'utf8').catch(() => '');
+  const authoredVisualsPresent = narrationInvariantRecovery
+    && ((!html.includes('ORKAS-GENERATED-SCAFFOLD'))
+      || (!!state.artifacts.scaffold_html_sha256
+        && currentArtifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
   if (!transactionMatches && (!state.artifacts.manifest_sha256
     || !state.artifacts.html_sha256
     || state.artifacts.manifest_sha256 !== currentArtifacts.manifest_sha256
-    || state.artifacts.html_sha256 !== currentArtifacts.html_sha256)) {
+    || (state.artifacts.html_sha256 !== currentArtifacts.html_sha256 && !authoredVisualsPresent))) {
     return {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_NARRATION_PREPARE_STALE',
-      message: 'Manifest or scaffold changed after composition.prepare. Run prepare again so narration is generated only from validated, untouched production inputs.',
+      message: 'The manifest changed after composition.prepare, or the HTML cannot be proven to be a prepared scaffold or an authored-visual recovery. Reconcile the current files before narration materialization.',
     };
   }
-  const htmlPath = path.join(input.compositionDirAbs, 'index.html');
-  const html = await fs.readFile(htmlPath, 'utf8').catch(() => '');
-  if (!html.includes('ORKAS-GENERATED-SCAFFOLD') && !transactionMatches) {
+  if (!html.includes('ORKAS-GENERATED-SCAFFOLD') && !transactionMatches && !narrationInvariantRecovery) {
     return {
       ok: false,
       op: 'composition.materialize_narration',
@@ -2362,7 +2699,7 @@ async function materializeCompositionNarration(input: {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_TTS_NO_PROVIDER',
-      message: 'No TTS provider is configured. Configure Orkas Voice or a speech provider, then retry from scaffold_ready.',
+      message: 'No TTS provider is configured. Configure Orkas Voice or a speech provider, then retry narration materialization.',
     };
   }
 
@@ -2393,7 +2730,7 @@ async function materializeCompositionNarration(input: {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: fit.status === 'over' ? 'E_TTS_TEXT_TOO_LONG' : 'E_TTS_TEXT_TOO_SHORT',
-      message: `${narrationFitMessage(fit)} Revise the candidate manifest, run composition.check_narration_fit until gate_b_ready=true, then open Gate B once for the fitting script.`,
+      message: `${narrationFitMessage(fit)} Revise the candidate manifest, run composition.check_narration_fit until gate_b_ready=true, then request production plan confirmation once for the fitting script.`,
       billable_request_sent: false,
       narration_fit: fit,
     };
@@ -2440,7 +2777,7 @@ async function materializeCompositionNarration(input: {
         op: 'composition.materialize_narration',
         status: 'started',
         turnId: input.opts.turnId,
-        stage: 'scaffold_ready',
+        stage: next.stage,
       });
     });
     const speech = await generateSpeech({
@@ -2510,7 +2847,7 @@ async function materializeCompositionNarration(input: {
   const repairIdentity = measuredDurationMismatch
     ? await videoProductionNarrationRepairIdentity(input.compositionDirAbs)
     : undefined;
-  await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+  const updatedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     const transaction = next.narration_transaction;
     if (!transaction || transaction.transaction_id !== transactionId) return;
     transaction.status = 'synthesized';
@@ -2594,11 +2931,25 @@ async function materializeCompositionNarration(input: {
   });
 
   if (measuredDurationMismatch) {
+    const repairAuthorizationPreserved = !!updatedState.narration_repair
+      && updatedState.narration_repair.approval_signature === planIdentity.signature;
+    if (!repairAuthorizationPreserved) {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED',
+        message: 'Measured narration does not fit, but the timing-repair authorization could not be persisted. Preserve the synthesized audio and transaction, do not send another speech request, and do not reopen production plan confirmation. Repair the narration plan-alignment invariant, then resume the bounded timing repair.',
+        path: outputAbsPath,
+        measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+        target_duration_sec: targetDurationSec,
+        billable_request_sent: billableRequestSent,
+      };
+    }
     return {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_TTS_MEASURED_DURATION_MISMATCH',
-      message: `Measured narration is ${Math.round(measuredDurationSec * 1000) / 1000}s and cannot fit the approved ${targetDurationSec}s target (it may be at most 10% shorter, but cannot run longer). The synthesized audio, transaction, measured voice calibration, and bounded timing-repair authorization were preserved. Revise the script, shotlist narration, and manifest narration together to narration_fit.suggested_units, then run composition.check_narration_fit. When it returns approval_inherited=true, continue with composition.prepare without opening Gate B again.`,
+      message: `Measured narration is ${Math.round(measuredDurationSec * 1000) / 1000}s and cannot fit the approved ${targetDurationSec}s target (it may be at most 10% shorter, but cannot run longer). The synthesized audio, transaction, measured voice calibration, and bounded timing-repair authorization were preserved. Revise the script, shotlist narration, and manifest narration together to narration_fit.suggested_units, then run composition.check_narration_fit. When it returns approval_inherited=true, continue with composition.prepare without requesting production plan confirmation again.`,
       path: outputAbsPath,
       measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
       target_duration_sec: targetDurationSec,
@@ -2641,7 +2992,27 @@ async function materializeCompositionNarration(input: {
     audioSha256: audioSha,
     method: 'scene_estimate_scaled',
   }));
-  await writeTextAtomic(htmlPath, buildCompositionScaffold(retimedValidation.data));
+  const authoredVisualsRecovered = narrationInvariantRecovery
+    && ((!html.includes('ORKAS-GENERATED-SCAFFOLD'))
+      || (!!state.artifacts.scaffold_html_sha256
+        && state.artifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
+  if (authoredVisualsRecovered) {
+    const reconciledHtml = reconcileCompositionHtml(html, retimedValidation.data);
+    if (!reconciledHtml.ok) {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_VISUAL_RECOVERY_BLOCKED',
+        message: reconciledHtml.issues[0]?.message || 'Narration was generated, but protected timing/audio markup could not be reconciled without replacing authored visuals.',
+        issues: reconciledHtml.issues,
+        path: outputAbsPath,
+        billable_request_sent: billableRequestSent,
+      };
+    }
+    await writeTextAtomic(htmlPath, reconciledHtml.html);
+  } else {
+    await writeTextAtomic(htmlPath, buildCompositionScaffold(retimedValidation.data));
+  }
   const finalArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const updated = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     next.narration = {
@@ -2663,10 +3034,16 @@ async function materializeCompositionNarration(input: {
     };
     delete next.narration_transaction;
     delete next.narration_repair;
-    next.stage = advanceVideoProductionStage(next.stage, 'narration_ready');
+    next.stage = authoredVisualsRecovered ? 'visuals_ready' : 'narration_ready';
     delete next.preview;
     delete next.draft;
-    next.artifacts = { ...finalArtifacts, scaffold_html_sha256: finalArtifacts.html_sha256 };
+    delete next.blocked_operation;
+    next.artifacts = {
+      ...finalArtifacts,
+      scaffold_html_sha256: authoredVisualsRecovered
+        ? state.artifacts.scaffold_html_sha256
+        : finalArtifacts.html_sha256,
+    };
     recordVideoProductionTransition(next, {
       op: 'composition.materialize_narration',
       status: 'passed',
@@ -2691,6 +3068,7 @@ async function materializeCompositionNarration(input: {
     narration_map_path: narrationMapPath,
     alignment_method: 'scene_estimate_scaled',
     scaffold_retimed: true,
+    visuals_preserved: authoredVisualsRecovered,
     billable_request_sent: billableRequestSent,
     narration_selection: {
       route_ref: routeRef,
@@ -2700,7 +3078,7 @@ async function materializeCompositionNarration(input: {
       speed: effectiveSpeed,
       legacy: narrationSelection.legacy,
     },
-    production_state: summarizeVideoProductionState(updated),
+    production_state: await summarizeCompositionProductionState(updated, input.compositionDirAbs),
   };
 }
 
@@ -2715,11 +3093,12 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         op: {
           type: 'string',
           enum: [...OPS],
-          description: 'Operation: production.status, production.approve_plan, production.approve_generation, composition.status, composition.doctor, composition.reconcile, composition.check_narration_fit, composition.approve_plan, composition.prepare, composition.materialize_narration, composition.lint, composition.inspect, composition.begin_visual_revision, composition.snapshot, composition.approve_preview, composition.draft, composition.submit_design_review, composition.approve_draft, composition.export, speech.capabilities, or speech.transcribe.',
+          description: 'Operation: production.status, production.approve_plan, production.approve_generation, composition.status, composition.doctor, composition.reconcile, composition.check_narration_fit, composition.approve_plan, composition.prepare, composition.materialize_narration, composition.lint, composition.inspect, composition.begin_visual_revision, composition.snapshot, composition.approve_preview, composition.draft, composition.submit_design_review, composition.approve_draft, composition.export, speech.capabilities, or speech.transcribe. composition.begin_visual_revision is an internal recovery operation for an exhausted visual-QA cycle. A current visual-preview or final-video revision submission authorizes the bounded edit and restart without a second user form; a newly confirmed production-plan signature starts fresh QA without this operation.',
         },
-        plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition Gate B inheritance.' },
-        segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition Gate B inheritance.' },
+        plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition production-plan inheritance.' },
+        segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition production-plan inheritance.' },
         composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
+        expected_plan_change: { type: 'boolean', description: 'Set true only when composition.approve_plan consumes an approved production-plan amendment. The operation then fails closed unless the signed script, shotlist, or manifest signature actually changed; it never converts that mismatch into a recovery form.' },
         output_path: { type: 'string', description: 'Output video path for composition.draft/export, or snapshot path for composition.snapshot.' },
         report_path: { type: 'string', description: 'Optional JSON QA report path for composition.draft/export.' },
         findings_path: { type: 'string', description: 'Optional findings JSON path for composition.inspect/snapshot/draft.' },
@@ -2730,11 +3109,12 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         variables: { type: 'object', description: 'Optional composition variables exposed as window.__ORKAS_VIDEO_VARIABLES__.' },
         visual_baseline_path: { type: 'string', description: 'Optional visual baseline JSON path for advisory preview/draft regression checks.' },
         update_visual_baseline: { type: 'boolean', description: 'Explicitly promote current sampled preview/draft frames to the visual baseline. Never enabled automatically.' },
-        voice: { type: 'string', description: 'Legacy schema_version 1 compatibility only. New manifests must use the Gate B-signed audio.narration_intent from speech.capabilities.' },
-        speed: { type: 'number', description: 'Legacy schema_version 1 compatibility only. New manifests read speed from the Gate B-signed audio.narration_intent.' },
+        voice: { type: 'string', description: 'Legacy schema_version 1 compatibility only. New manifests must use the production-plan-confirmed audio.narration_intent from speech.capabilities.' },
+        speed: { type: 'number', description: 'Legacy schema_version 1 compatibility only. New manifests read speed from the production-plan-confirmed audio.narration_intent.' },
         review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Structured design-review verdict for composition.submit_design_review.' },
         review_scope: { type: 'string', description: 'What the design review inspected (contact sheet, sampled frames, hierarchy, typography, rhythm).' },
         review_findings: { type: 'array', items: { type: 'string' }, description: 'Concise visual findings or required repairs.' },
+        reviewed_frame_paths: { type: 'array', items: { type: 'string' }, description: 'Every returned snapshot frame path actually inspected during a preview design review. Required to cover the complete current preview frame set before the preview can be shown.' },
         input_path: { type: 'string', description: 'Input audio/video path for speech.transcribe.' },
         transcript_path: { type: 'string', description: 'Optional transcript JSON output path for speech.transcribe.' },
         model: { type: 'string', description: 'ASR model id/path. Backend-specific.' },
@@ -2790,7 +3170,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               })),
               supports: route.supports,
             })),
-            invariant: 'Choose only a returned route_ref + voice_ref pair whose native_locale or verified supported_locales matches the deliverable language, and sign route_ref, voice_ref, language, display_name, and speed at Gate B. language_confidence=candidate is unavailable for non-native production until verified; mixed_language_support permits inline foreign tokens, not an unsupported narration language. Never invent or pass an ad hoc provider voice id.',
+            invariant: 'Choose only a returned route_ref + voice_ref pair whose native_locale or verified supported_locales matches the deliverable language, and sign route_ref, voice_ref, language, display_name, and speed during production plan confirmation. language_confidence=candidate is unavailable for non-native production until verified; mixed_language_support permits inline foreign tokens, not an unsupported narration language. Never invent or pass an ad hoc provider voice id.',
           }),
           isError: routes.length === 0,
         } as ToolResult;
@@ -2940,8 +3320,20 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
 
         await migrateConversationScopedVideoStudioState(opts, compositionDirAbs);
         const gateStatePath = videoStudioGateStatePath(opts, compositionDirAbs);
-        const stateBefore = await readVideoProductionState(gateStatePath, compositionDirAbs);
-        if (PLAN_APPROVAL_REQUIRED_OPS.has(op)) {
+        let stateBefore = await readVideoProductionState(gateStatePath, compositionDirAbs);
+        const narrationIdentityBefore = await currentNarrationIdentity(compositionDirAbs);
+        stateBefore = await enforceNarrationProductionInvariant({
+          statePath: gateStatePath,
+          compositionDirAbs,
+          state: stateBefore,
+          identity: narrationIdentityBefore,
+          turnId: opts.turnId,
+        });
+        const policyFactsBefore = narrationPolicyFacts(stateBefore, narrationIdentityBefore);
+        const misroutedGateBApproval = op === 'composition.begin_visual_revision'
+          && /<agent-input-submission\b/i.test(currentUserTurnPayload(opts.userMessage))
+          && explicitVideoStudioGateDecision(opts.userMessage, 'plan') === 'approve';
+        if (PLAN_APPROVAL_REQUIRED_OPS.has(op) && !misroutedGateBApproval) {
           const planApproval = await validatePlanApproval(
             gateStatePath,
             compositionDirAbs,
@@ -2950,14 +3342,17 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             return { content: `${planApproval.errorCode}: ${planApproval.message}`, isError: true } as ToolResult;
           }
         }
-        if (!isVideoProductionOpAllowed(stateBefore, op)) {
+        const admission = evaluateVideoProductionOperation(stateBefore, op, policyFactsBefore);
+        if (!misroutedGateBApproval && admission.ok === false) {
           return {
             content: resultContent({
               ok: false,
               op,
-              errorCode: 'E_VIDEO_PRODUCTION_STAGE_INVALID',
-              message: `Operation ${op} is not allowed at production stage ${stateBefore.stage}.`,
-              production_state: summarizeVideoProductionState(stateBefore),
+              errorCode: admission.errorCode,
+              message: admission.message,
+              gate_b_required: admission.errorCode === 'E_GATE_B_APPROVAL_REQUIRED',
+              ...(admission.nextAction ? { next_action: admission.nextAction } : {}),
+              production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
             }),
             isError: true,
           } as ToolResult;
@@ -2988,29 +3383,33 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               visual_qa_cycle_stale: !!legacyVisualQaCycle(stateBefore.visual_qa)
                 && !currentVisualQaCycle(stateBefore.visual_qa),
               repair_state: repairState,
-              production_state: summarizeVideoProductionState(stateBefore),
+              production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
             }),
             isError: false,
           } as ToolResult;
         }
         if (op === 'composition.begin_visual_revision') {
-          if (!opts.turnId || explicitVideoStudioVisualRecoveryDecision(opts.userMessage) !== 'new_visual_revision') {
+          if (misroutedGateBApproval) {
             return {
               content: resultContent({
                 ok: false,
                 op,
-                errorCode: 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED',
-                message: 'A new visual revision can start only in the real user turn that submitted visual_recovery_decision=new_visual_revision.',
-                recovery_form: {
-                  field_id: 'visual_recovery_decision',
-                  approve_value: 'new_visual_revision',
-                },
+                errorCode: 'E_GATE_B_APPROVE_PLAN_REQUIRED',
+                message: 'The current user already approved the displayed production-plan amendment. Apply that exact patch to the canonical plan artifacts, then call composition.approve_plan with expected_plan_change=true in this turn. Do not request visual recovery or another production plan confirmation.',
+                expected_plan_change: true,
+                visual_revision_recovery_available: false,
+                next_action: 'apply_approved_amendment_then_composition.approve_plan',
               }),
               isError: true,
             } as ToolResult;
           }
+          const revisionAuthorized = explicitVideoStudioVisualRevisionDecision(opts.userMessage) === 'revise';
+          const legacyRecoveryAuthorized = explicitVideoStudioVisualRecoveryDecision(opts.userMessage) === 'new_visual_revision';
+          const explicitlyAuthorized = !!opts.turnId
+            && (revisionAuthorized || legacyRecoveryAuthorized);
           const existingCycle = currentVisualQaCycle(stateBefore.visual_qa);
-          if (existingCycle?.started_by_turn_id === opts.turnId
+          if (explicitlyAuthorized
+            && existingCycle?.started_by_turn_id === opts.turnId
             && existingCycle.failed_signatures.length === 0) {
             return {
               content: resultContent({
@@ -3032,18 +3431,34 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 op,
                 errorCode: 'E_VISUAL_REVISION_NOT_REQUIRED',
                 message: 'The current visual QA cycle is not exhausted. Continue the existing cycle instead of resetting it.',
+                visual_revision_recovery_available: false,
+                next_action: 'continue_current_cycle_without_recovery',
                 visual_repair_cycle: visualQaRepairSummary(legacyVisualQaCycle(stateBefore.visual_qa)),
               }),
               isError: true,
             } as ToolResult;
           }
-          if (stateBefore.stage === 'draft_approved' || stateBefore.stage === 'exported') {
+          if (!explicitlyAuthorized) {
             return {
               content: resultContent({
                 ok: false,
                 op,
-                errorCode: 'E_VISUAL_REVISION_STAGE_INVALID',
-                message: `A visual QA recovery revision cannot start from ${stateBefore.stage}; use the signed follow-up edit workflow.`,
+                errorCode: 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED',
+                message: 'The exhausted visual QA cycle can restart only in a real user turn that submits a visual-preview or final-video revision decision. That revision decision is sufficient; do not ask for a separate recovery confirmation.',
+                visual_revision_recovery_available: true,
+                recovery_requires_new_user_revision: true,
+                next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
+              }),
+              isError: true,
+            } as ToolResult;
+          }
+          if (stateBefore.draft?.status === 'approved') {
+            return {
+              content: resultContent({
+                ok: false,
+                op,
+                errorCode: 'E_VISUAL_REVISION_APPROVED_DRAFT_INVALID',
+                message: 'A visual QA recovery revision cannot start after the current draft was approved; use the signed follow-up edit workflow.',
               }),
               isError: true,
             } as ToolResult;
@@ -3093,7 +3508,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             result,
             opts.turnId,
           );
-          result.production_state = summarizeVideoProductionState(checkedState);
+          result.production_state = await summarizeCompositionProductionState(checkedState, compositionDirAbs);
           return { content: resultContent(result), isError: result.ok !== true } as ToolResult;
         }
         if (op === 'composition.reconcile') {
@@ -3103,6 +3518,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             turnId: opts.turnId,
           });
           if (result.ok) await notifyWritten(opts, [result.html_path]);
+          const reconciledState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+          result.production_state = await summarizeCompositionProductionState(reconciledState, compositionDirAbs);
           return { content: resultContent(result), isError: result.ok !== true } as ToolResult;
         }
         if (op === 'composition.check_narration_fit') {
@@ -3122,7 +3539,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           }
           if (identity.requirementIssues.length > 0) {
             return {
-              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: Gate B shotlist must declare target duration, language, audio, captions, and music. Missing: ${identity.requirementIssues.join(', ')}.`,
+              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
               isError: true,
             } as ToolResult;
           }
@@ -3140,7 +3557,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const text = compositionNarrationText(manifest);
           if (!text) {
             return {
-              content: 'E_NARRATION_TEXT_MISSING: add the complete candidate narration_text to manifest scenes before checking Gate B fit.',
+              content: 'E_NARRATION_TEXT_MISSING: add the complete candidate narration_text to manifest scenes before checking production-plan narration fit.',
               isError: true,
             } as ToolResult;
           }
@@ -3181,8 +3598,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           });
           const approvalInherited = repairAssessment.status === 'inheritable';
           const repairBudgetExhausted = repairAssessment.reason === 'repair_check_budget_exhausted';
-          const gateBRequired = repairAssessment.status === 'none'
-            || (repairAssessment.status === 'rejected' && !repairBudgetExhausted);
+          const planApprovalCurrent = stateBefore.plan_approval?.signature === identity.signature;
+          const gateBRequired = !planApprovalCurrent && (repairAssessment.status === 'none'
+            || (repairAssessment.status === 'rejected' && !repairBudgetExhausted));
           const archivedNarrationPath = approvalInherited
             ? await archiveStaleNarrationAudio({
               state: stateBefore,
@@ -3195,7 +3613,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             next.narration_fit = fit;
             if (approvalInherited && next.narration_repair) {
               const authorization = next.narration_repair;
-              next.plan_approval = {
+              setCurrentPlanApproval(next, {
                 gate: 'B',
                 signature: identity.signature,
                 turn_id: authorization.approval_turn_id,
@@ -3205,7 +3623,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 inherited_at: new Date().toISOString(),
                 inheritance_reason: 'measured_narration_fit_repair',
                 validation_version: 1,
-              };
+              });
               delete next.narration;
               delete next.narration_transaction;
               delete next.narration_repair;
@@ -3225,14 +3643,17 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             });
           });
           if (archivedNarrationPath) await notifyWritten(opts, [archivedNarrationPath]);
+          const preparedHtmlPresent = !!(await fs.stat(path.join(compositionDirAbs, 'index.html')).catch(() => null));
           const message = approvalInherited
-            ? `${narrationFitMessage(fit)} The existing Gate B approval was inherited for this bounded measured-duration repair. Do not open Gate B again; run composition.prepare next.`
+            ? `${narrationFitMessage(fit)} The existing production plan confirmation was inherited for this bounded measured-duration repair. Do not request it again; run composition.prepare next.`
+            : planApprovalCurrent && fit.status === 'fits'
+              ? `${narrationFitMessage(fit)} The current production plan confirmation already covers this unchanged narration plan. Do not request it again; follow the current native narration operation.`
             : repairAssessment.status === 'pending'
-              ? `${narrationFitMessage(fit)} This remains an authorized internal timing repair. Revise once more and recheck without opening Gate B.`
+              ? `${narrationFitMessage(fit)} This remains an authorized internal timing repair. Revise once more and recheck without requesting production plan confirmation.`
               : repairBudgetExhausted
-                ? `${narrationFitMessage(fit)} The bounded timing-repair check budget is exhausted. Report this deterministic blocker instead of reopening Gate B or sending another speech request.`
+                ? `${narrationFitMessage(fit)} The bounded timing-repair check budget is exhausted. Report this deterministic blocker instead of requesting production plan confirmation again or sending another speech request.`
                 : repairAssessment.status === 'rejected'
-                  ? `${narrationFitMessage(fit)} The change is outside the timing-only repair authorization (${repairAssessment.reason}); a new Gate B approval is required for the changed plan.`
+                  ? `${narrationFitMessage(fit)} The change is outside the timing-only repair authorization (${repairAssessment.reason}); a new production plan confirmation is required for the changed plan.`
                   : narrationFitMessage(fit);
           return {
             content: resultContent({
@@ -3249,6 +3670,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 : {}),
               next_action: approvalInherited
                 ? 'composition.prepare'
+                : planApprovalCurrent && fit.status === 'fits'
+                  ? preparedHtmlPresent ? 'composition.materialize_narration' : 'composition.prepare'
                 : repairAssessment.status === 'pending'
                   ? 'revise_narration_then_composition.check_narration_fit'
                   : repairBudgetExhausted
@@ -3268,22 +3691,23 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               },
               ...(archivedNarrationPath ? { archived_narration_path: archivedNarrationPath } : {}),
               narration_fit: fit,
-              production_state: summarizeVideoProductionState(checked),
+              production_state: await summarizeCompositionProductionState(checked, compositionDirAbs),
             }),
             isError: false,
           } as ToolResult;
         }
         if (op === 'composition.approve_plan') {
           const identity = await videoProductionPlanIdentity(compositionDirAbs);
+          const planChanged = stateBefore.plan_approval?.signature !== identity.signature;
           if (!identity.complete) {
             return {
-              content: 'E_GATE_B_ARTIFACTS_INCOMPLETE: Gate B approval requires project/script.md, project/shotlist.json, and composition/composition-manifest.json.',
+              content: 'E_GATE_B_ARTIFACTS_INCOMPLETE: production plan confirmation requires project/script.md, project/shotlist.json, and composition/composition-manifest.json.',
               isError: true,
             } as ToolResult;
           }
           if (identity.requirementIssues.length > 0) {
             return {
-              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: Gate B shotlist must declare target duration, language, audio, captions, and music. Missing: ${identity.requirementIssues.join(', ')}.`,
+              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
               isError: true,
             } as ToolResult;
           }
@@ -3298,7 +3722,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } | undefined;
           if (parentPlanRaw || parentSegmentId) {
             if (!parentPlanRaw || !parentSegmentId) {
-              return { content: 'E_PARENT_COMPOSITION_BINDING_INCOMPLETE: plan_path and segment_id are both required for AUTO Gate B inheritance.', isError: true } as ToolResult;
+              return { content: 'E_PARENT_COMPOSITION_BINDING_INCOMPLETE: plan_path and segment_id are both required for AUTO production-plan inheritance.', isError: true } as ToolResult;
             }
             const parentPlanAbs = resolvePath(ctx, opts, parentPlanRaw, roots);
             if (!isPathAllowed(parentPlanAbs, roots)) {
@@ -3348,6 +3772,21 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 isError: true,
               } as ToolResult;
             }
+          }
+          if (input.expected_plan_change === true && !planChanged) {
+            return {
+              content: resultContent({
+                ok: false,
+                op,
+                errorCode: 'E_GATE_B_AMENDMENT_NOT_APPLIED',
+                message: 'The approved production-plan amendment did not change the signed script, shotlist, or composition manifest. Apply the exact displayed patch to the canonical plan artifacts, then retry composition.approve_plan in this same approval turn. Do not request visual recovery or another production plan confirmation.',
+                expected_plan_change: true,
+                plan_changed: false,
+                visual_revision_recovery_available: false,
+                next_action: 'apply_approved_amendment_then_composition.approve_plan',
+              }),
+              isError: true,
+            } as ToolResult;
           }
           const manifest = CompositionManifestSchema.parse(JSON.parse(
             await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
@@ -3407,7 +3846,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 ok: false,
                 op,
                 errorCode: 'E_GATE_B_NARRATION_FIT_REQUIRED',
-                message: `${narrationFitMessage(approvedNarrationFit)} Revise the candidate files and run composition.check_narration_fit before reopening Gate B; do not ask the user to approve another known-unfit script.`,
+                message: `${narrationFitMessage(approvedNarrationFit)} Revise the candidate files and run composition.check_narration_fit before requesting production plan confirmation again; do not ask the user to approve another known-unfit script.`,
                 gate_b_ready: false,
                 billable_request_sent: false,
                 narration_fit: approvedNarrationFit,
@@ -3433,9 +3872,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             compositionDirAbs,
             roots,
           });
+          const visualQaReset = planChanged && !!stateBefore.visual_qa;
           const approved = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
-            const changed = next.plan_approval?.signature !== identity.signature;
-            next.plan_approval = {
+            setCurrentPlanApproval(next, {
               gate: 'B',
               signature: identity.signature,
               turn_id: inheritedParent?.turnId || opts.turnId!,
@@ -3449,11 +3888,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 parent_segment_id: inheritedParent.segmentId,
               } : {}),
               validation_version: 1,
-            };
+            });
             if (approvedNarrationFit) next.narration_fit = approvedNarrationFit;
             else delete next.narration_fit;
             delete next.narration_repair;
-            if (changed) {
+            if (planChanged) {
               delete next.preview;
               delete next.draft;
               delete next.visual_qa;
@@ -3481,6 +3920,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               status: 'approved',
               gate: 'B',
               plan_signature: identity.signature,
+              plan_changed: planChanged,
+              visual_qa_reset: visualQaReset,
               approval_inherited: !!inheritedParent,
               ...(approvedNarrationSelection?.ok === true ? {
                 narration_selection: {
@@ -3495,9 +3936,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ...(inheritedParent ? {
                 inherited_from_parent_plan_signature: inheritedParent.signature,
                 parent_segment_id: inheritedParent.segmentId,
-                next_action: 'composition.doctor',
               } : {}),
-              production_state: summarizeVideoProductionState(approved),
+              next_action: planChanged
+                ? 'composition.doctor'
+                : 'follow_current_native_state_without_visual_reset',
+              production_state: await summarizeCompositionProductionState(approved, compositionDirAbs),
             }),
             isError: false,
           } as ToolResult;
@@ -3518,7 +3961,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   ...doctorResult,
                   errorCode: 'E_VIDEO_PRODUCTION_CAPABILITY_MISSING',
                   auto_checked: true,
-                  production_state: summarizeVideoProductionState(checkedState),
+                  production_state: await summarizeCompositionProductionState(checkedState, compositionDirAbs),
                 }),
                 isError: true,
               } as ToolResult;
@@ -3543,52 +3986,114 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (!scope || (verdict !== 'passed' && findings.length === 0)) {
             return { content: 'E_DESIGN_REVIEW_EVIDENCE_REQUIRED: provide review_scope and concrete findings for any non-passing verdict.', isError: true } as ToolResult;
           }
-          if ((stateBefore.draft?.design_review?.status === 'repair' || stateBefore.draft?.design_review?.status === 'blocked')
+          const reviewKind = stateBefore.draft?.design_review?.required
+            ? 'draft'
+            : stateBefore.preview?.design_review?.required
+              ? 'preview'
+              : stateBefore.draft ? 'draft' : 'preview';
+          const reviewEntry = stateBefore[reviewKind];
+          if ((reviewEntry?.design_review?.status === 'repair' || reviewEntry?.design_review?.status === 'blocked')
             && verdict === 'passed') {
             return {
-              content: 'E_DESIGN_REVIEW_REPAIR_REQUIRED: a repair/blocked verdict is signature-bound. Change the composition, run composition.reconcile, and render a new draft before submitting a passed review.',
+              content: `E_DESIGN_REVIEW_REPAIR_REQUIRED: a repair/blocked verdict is signature-bound. Change the composition, run composition.reconcile, and generate a new ${reviewKind === 'preview' ? 'snapshot' : 'draft'} before submitting a passed review.`,
               isError: true,
             } as ToolResult;
           }
-          const draftEntry = stateBefore.draft;
-          const draftSignatureCheck = draftEntry
-            ? await checkVideoStudioGateSignature(compositionDirAbs, draftEntry)
+          const signatureCheck = reviewEntry
+            ? await checkVideoStudioGateSignature(compositionDirAbs, reviewEntry)
             : undefined;
-          if (!draftEntry || draftSignatureCheck?.matches !== true) {
-            return { content: 'E_DESIGN_REVIEW_DRAFT_STALE: render a new draft before reviewing changed composition inputs.', isError: true } as ToolResult;
+          if (!reviewEntry || signatureCheck?.matches !== true) {
+            return {
+              content: reviewKind === 'preview'
+                ? 'E_DESIGN_REVIEW_PREVIEW_STALE: capture a new snapshot before reviewing changed composition inputs.'
+                : 'E_DESIGN_REVIEW_DRAFT_STALE: render a new draft before reviewing changed composition inputs.',
+              isError: true,
+            } as ToolResult;
           }
-          const signature = draftEntry.signature;
+          const submittedFramePaths = Array.isArray(input.reviewed_frame_paths)
+            ? input.reviewed_frame_paths
+              .map(String)
+              .map((value) => value.trim())
+              .filter(Boolean)
+            : [];
+          const expectedFramePaths = (reviewEntry.frame_paths || []).map((value) => path.resolve(value));
+          const submittedPathCandidates = new Set(submittedFramePaths.flatMap((value) => path.isAbsolute(value)
+            ? [path.resolve(value)]
+            : [path.resolve(compositionDirAbs, value), path.resolve(ctx.workingDir, value)]));
+          const reviewedFramePaths = expectedFramePaths.filter((value) => submittedPathCandidates.has(value));
+          if (reviewKind === 'preview') {
+            if (expectedFramePaths.length === 0) {
+              return {
+                content: 'E_PREVIEW_DESIGN_REVIEW_EVIDENCE_MISSING: the current snapshot has no recorded frame paths. Capture a new snapshot before design review.',
+                isError: true,
+              } as ToolResult;
+            }
+            const missingFramePaths = expectedFramePaths.filter((value) => !submittedPathCandidates.has(value));
+            if (missingFramePaths.length > 0) {
+              return {
+                content: resultContent({
+                  ok: false,
+                  op,
+                  errorCode: 'E_PREVIEW_DESIGN_REVIEW_COVERAGE_REQUIRED',
+                  message: 'Inspect every frame returned by the current snapshot in one review pass before submitting a verdict.',
+                  reviewed_frame_count: reviewedFramePaths.length,
+                  expected_frame_count: expectedFramePaths.length,
+                  missing_frame_paths: missingFramePaths,
+                }),
+                isError: true,
+              } as ToolResult;
+            }
+          }
+          const signature = reviewEntry.signature;
           let reviewed: VideoProductionStateV1;
           try {
             reviewed = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
-              if (!next.draft || next.draft.signature !== signature) {
-                throw new Error('E_DESIGN_REVIEW_DRAFT_STALE: render a new draft before reviewing changed composition inputs.');
+              const nextEntry = next[reviewKind];
+              if (!nextEntry || nextEntry.signature !== signature) {
+                throw new Error(reviewKind === 'preview'
+                  ? 'E_DESIGN_REVIEW_PREVIEW_STALE: capture a new snapshot before reviewing changed composition inputs.'
+                  : 'E_DESIGN_REVIEW_DRAFT_STALE: render a new draft before reviewing changed composition inputs.');
               }
-              next.draft.design_review = {
+              nextEntry.design_review = {
                 required: true,
                 status: verdict,
                 reviewed_at: new Date().toISOString(),
                 verdict,
                 scope,
                 findings,
+                ...(reviewedFramePaths.length ? { reviewed_frame_paths: reviewedFramePaths } : {}),
               };
               recordVideoProductionTransition(next, {
                 op,
                 status: 'passed',
                 turnId: opts.turnId,
-                stage: 'draft_ready',
+                stage: reviewKind === 'preview' ? 'preview_ready' : 'draft_ready',
               });
             });
           } catch (err) {
             return { content: (err as Error).message, isError: true } as ToolResult;
+          }
+          if (reviewKind === 'preview' && verdict === 'passed') {
+            await publishVisibleOutputs(opts, [reviewEntry.path]);
           }
           return {
             content: resultContent({
               ok: true,
               op,
               status: verdict,
-              gate_d_ready: verdict === 'passed',
-              next_action: verdict === 'passed' ? 'composition.approve_draft' : 'repair_visuals_then_composition.reconcile',
+              review_target: reviewKind,
+              reviewed_frame_count: reviewedFramePaths.length,
+              expected_frame_count: expectedFramePaths.length,
+              ...(reviewKind === 'preview' ? {
+                preview_gate_ready: verdict === 'passed',
+                contact_sheet: reviewEntry.path || '',
+                frame_paths: expectedFramePaths,
+              } : {
+                gate_d_ready: verdict === 'passed',
+              }),
+              next_action: verdict === 'passed'
+                ? reviewKind === 'preview' ? 'show_preview_then_wait_for_user_approval' : 'composition.approve_draft'
+                : 'repair_visuals_then_composition.reconcile',
               production_state: summarizeVideoProductionState(reviewed),
             }),
             isError: false,
@@ -3644,7 +4149,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ok: false,
               errorCode: typeof narrationResult.errorCode === 'string' ? narrationResult.errorCode : undefined,
             });
-            narrationResult.production_state = summarizeVideoProductionState(failedState);
+            narrationResult.production_state = await summarizeCompositionProductionState(failedState, compositionDirAbs);
           } else {
             await notifyWritten(opts, [
               narrationResult.path,
@@ -3751,20 +4256,39 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               op,
               errorCode,
               message: interrupted
-                ? 'The operation was interrupted. Its durable state was preserved; resume with composition.status and composition.reconcile instead of reopening Gate B or blindly rerunning.'
+                ? 'The operation was interrupted. Its durable state was preserved; resume with composition.status and composition.reconcile instead of requesting production plan confirmation again or blindly rerunning.'
                 : `The operation failed before a normal tool result: ${(err as Error).message || String(err)}`,
               recovery: ['composition.status', 'composition.reconcile'],
-              production_state: summarizeVideoProductionState(failedState),
+              production_state: await summarizeCompositionProductionState(failedState, compositionDirAbs),
             }),
             isError: true,
           } as ToolResult;
         }
 
+        if (result.ok && op === 'composition.snapshot') {
+          result = {
+            ...result,
+            design_review_required: true,
+            preview_design_review_required: true,
+            preview_gate_ready: false,
+            next_action: 'composition.submit_design_review',
+            next_allowed_ops: ['composition.submit_design_review'],
+          } as typeof result;
+        }
+
         if (result.ok && op === 'composition.draft') {
-          const designReviewRequired = await videoStudioDesignReviewRequired(compositionDirAbs, result);
+          const previewEntry = stateBefore.preview;
+          const previewReviewInherited = !!previewEntry
+            && previewEntry.status === 'approved'
+            && previewEntry.design_review?.status === 'passed'
+            && (await checkVideoStudioGateSignature(compositionDirAbs, previewEntry)).matches;
+          const designReviewRequired = previewReviewInherited
+            ? false
+            : await videoStudioDesignReviewRequired(compositionDirAbs, result);
           result = {
             ...result,
             design_review_required: designReviewRequired,
+            design_review_inherited_from_preview: previewReviewInherited,
             gate_d_ready: !designReviewRequired,
             next_action: designReviewRequired ? 'composition.submit_design_review' : 'open_gate_d',
           } as typeof result;
@@ -3851,9 +4375,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             ...(result.ok === false && typeof result.errorCode === 'string' ? { errorCode: result.errorCode } : {}),
           });
         }
+        const productionStateSummary = await summarizeCompositionProductionState(productionState, compositionDirAbs);
         result = {
           ...result,
-          production_state: summarizeVideoProductionState(productionState),
+          production_state: productionStateSummary,
+          next_allowed_ops: Array.isArray(productionStateSummary.next_allowed_ops)
+            ? productionStateSummary.next_allowed_ops
+            : [],
         } as typeof result;
 
         if (result.ok) {
@@ -3868,11 +4396,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             result.frame_paths,
             (result.visual_regression as { baseline_path?: unknown } | undefined)?.baseline_path,
           ]);
-          if (op === 'composition.snapshot') {
-            await publishVisibleOutputs(opts, [
-              result.contact_sheet,
-            ]);
-          } else if (op === 'composition.draft' || op === 'composition.export') {
+          if (op === 'composition.draft' || op === 'composition.export') {
             await publishVisibleOutputs(opts, [
               result.path,
             ]);

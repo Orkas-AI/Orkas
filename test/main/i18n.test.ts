@@ -90,6 +90,16 @@ describe('i18n › t() lookup', () => {
       .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
   });
 
+  it('localizes actionable external-agent terminal states', () => {
+    setCurrentLang('zh');
+    expect(t('cli_agent.run_failed_detail', { name: 'Codex' }))
+      .toContain('请确认对应 CLI 已登录且可正常运行');
+    expect(t('cli_agent.timeout_detail', { name: 'OpenClaw' }))
+      .toContain('长时间没有响应');
+    expect(t('cli_agent.session_expired_detail', { name: 'Claude Code' }))
+      .toContain('外接会话已失效');
+  });
+
   it('leaves unknown placeholders untouched', () => {
     expect(t('Ping {unknown} pong', { other: 'x' })).toBe('Ping {unknown} pong');
   });

@@ -1029,7 +1029,7 @@ function _dbImage(props) {
   const alt = escapeHtml(props.alt || '');
   const caption = props.caption
     ? `<figcaption class="db-image-caption">${escapeHtml(props.caption)}</figcaption>` : '';
-  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}">${caption}</figure>`;
+  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}" data-monitor-resource="dashboard-image">${caption}</figure>`;
 }
 
 // ── Chart (minimal inline SVG; line/bar/area/pie) ─────────────────────
@@ -1174,7 +1174,7 @@ function _markdownVideoHtml(src, label, title) {
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1199,13 +1199,13 @@ function _markdownAudioHtml(src, label, title) {
   return `<span class="chat-md-audio-card"${t} role="group" aria-label="${escapeHtml(name)}">
     <span class="chat-md-audio-icon">${_markdownAudioIconHtml(name)}</span>
     <span class="chat-md-audio-name">${escapeHtml(name)}</span>
-    <audio class="chat-md-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}"></audio>
+    <audio class="chat-md-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}" data-monitor-resource="chat-markdown-audio"></audio>
   </span>`;
 }
 
 function _markdownImageHtml(src, alt, title) {
   const t = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}></span>`;
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t} data-monitor-resource="chat-markdown-image"></span>`;
 }
 
 function _notifyChatImageSettled(node) {

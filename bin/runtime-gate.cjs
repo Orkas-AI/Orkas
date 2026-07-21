@@ -77,18 +77,42 @@ const WHISPER_RUNTIME_CONTRACT = Object.freeze({
       }),
     }),
     'win32-x64': Object.freeze({
-      source: 'official-release-archive',
+      // v1.9.1's Windows build ships runtime-selected CPU backends from the
+      // x64 baseline through AVX-era microarchitectures. Keeping every CPU
+      // DLL lets old SSE4.2-only PCs run while modern machines retain the
+      // fastest compatible implementation.
+      version: '1.9.1',
+      openBlasVersion: '0.3.29',
+      source: 'official-release-openblas-cpu-dispatch',
       archive: Object.freeze({
-        url: 'https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6/whisper-bin-x64.zip',
-        bytes: 4_093_849,
-        sha256: 'b07ea0b1b4115a38e1a7b07debf581f0b77d999925f8acb8f39d322b0ba0a822',
+        cacheName: 'whisper-blas-bin-x64-v1.9.1.zip',
+        url: 'https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.1/whisper-blas-bin-x64.zip',
+        bytes: 20_769_031,
+        sha256: '3c319eab3e87f85883e1ff3d14426c0a1986c661c5eb5985e8af431ed9c4f71f',
       }),
       files: Object.freeze({
-        'bin/whisper-cli.exe': Object.freeze({ archivePath: 'Release/whisper-cli.exe', bytes: 489_472, sha256: '111bd344b7bf0356818f2795a525cb5240ed0a99028fa9f3f1c68b4ff5b17b91', executable: true }),
-        'bin/whisper.dll': Object.freeze({ archivePath: 'Release/whisper.dll', bytes: 484_864, sha256: 'aecc185550327461d74a7c89436e13a62e12cc408c05719e7a677e1586a9cda3', executable: true }),
-        'bin/ggml.dll': Object.freeze({ archivePath: 'Release/ggml.dll', bytes: 67_072, sha256: '722ff1350efe25a1bffa048bef2a8aa7fe7552fce3c38d2c1505f99beb0fb1f7', executable: true }),
-        'bin/ggml-base.dll': Object.freeze({ archivePath: 'Release/ggml-base.dll', bytes: 636_416, sha256: '017cd9c859d0da3c6d0e8da120ec5641db7c8d1f266df7ce1f9eca42029186ba', executable: true }),
-        'bin/ggml-cpu.dll': Object.freeze({ archivePath: 'Release/ggml-cpu.dll', bytes: 782_848, sha256: 'cb5bfd79c0255e282982527fee42d8aa8407b63ae46ef1acd395c3e21d1f52f9', executable: true }),
+        'bin/whisper-cli.exe': Object.freeze({ archivePath: 'Release/whisper-cli.exe', bytes: 479_232, sha256: '254ee898dd8c3b16fa87583113320dad3f8e3787e15d8f14e245fcb3b487fc39', executable: true }),
+        'bin/whisper.dll': Object.freeze({ archivePath: 'Release/whisper.dll', bytes: 1_366_016, sha256: 'b5e511b1a633a253cc7b243cd25f6ffd2f711627bf9fa933410e343d1c27b746', executable: true }),
+        'bin/ggml.dll': Object.freeze({ archivePath: 'Release/ggml.dll', bytes: 67_584, sha256: '29eeeea33caa3b1ded75a0e5dbeccb26bb61f4abbc07332713bba6e9418fe2de', executable: true }),
+        'bin/ggml-base.dll': Object.freeze({ archivePath: 'Release/ggml-base.dll', bytes: 656_384, sha256: '0a83d59e460327075e4241f830f2c60d6709f3e9ad2f342784a3701540139bf1', executable: true }),
+        'bin/ggml-blas.dll': Object.freeze({ archivePath: 'Release/ggml-blas.dll', bytes: 55_296, sha256: 'd3424b2358cc58a071dd9989df5b4fbfe06ed24553838d7edf1f8ef5a257c635', executable: true }),
+        'bin/libopenblas.dll': Object.freeze({ archivePath: 'Release/libopenblas.dll', bytes: 51_126_150, sha256: '4c7fb23e900bd637cf771ad4ae3d1b51112a897385906433f2f1e58fe053ff70', executable: true }),
+        'bin/ggml-cpu-x64.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-x64.dll', bytes: 776_704, sha256: '5213a16d1f75f67feb764279c1fc3b70f1dc9b129a3874864d72ca9eb977fcb9', executable: true }),
+        'bin/ggml-cpu-sse42.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-sse42.dll', bytes: 772_096, sha256: '0ff12d0aae20e08e20f3d621d066cb3e3d803fd3409aedd50f7e5cfcf26f4cf2', executable: true }),
+        'bin/ggml-cpu-sandybridge.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-sandybridge.dll', bytes: 783_360, sha256: '5040ec013478a4c2a35b7ae8d0f09ad237d9ce6bb74e62a9904d57ebae3fabd4', executable: true }),
+        'bin/ggml-cpu-haswell.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-haswell.dll', bytes: 791_552, sha256: '0f1a4980687f4cd80e95d915630ca1162b674d2df52611b9947cc16a0c44152b', executable: true }),
+        'bin/ggml-cpu-alderlake.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-alderlake.dll', bytes: 790_528, sha256: 'db5a6a3bc11591fe3723592efcaabe00c2474a673d10c0b5a5ad62f8ef25b301', executable: true }),
+        'bin/ggml-cpu-cannonlake.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-cannonlake.dll', bytes: 833_536, sha256: 'a906f51530a5f308a5fc68533185f50edc8f42570fb7a7929e95ff75620f8f68', executable: true }),
+        'bin/ggml-cpu-cascadelake.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-cascadelake.dll', bytes: 830_976, sha256: '0702e65259ee8368033254a379869c9433e8dc25f242f19288270ea9542467cb', executable: true }),
+        'bin/ggml-cpu-icelake.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-icelake.dll', bytes: 830_976, sha256: '89d7ce412fab8680c62defb3f172339750300b3b64b31e47652cd0044fcae559', executable: true }),
+        'bin/ggml-cpu-skylakex.dll': Object.freeze({ archivePath: 'Release/ggml-cpu-skylakex.dll', bytes: 833_536, sha256: 'c7c69ee619c5f4128b01a7d4583c4a0a8df7823ad6e805310e3eecaa5454da57', executable: true }),
+      }),
+      licenses: Object.freeze({
+        'LICENSE.openblas': Object.freeze({
+          vendorPath: 'openblas/v0.3.29/LICENSE',
+          bytes: 1_545,
+          sha256: 'fc239da73616d04dce1663d9f789bc822221d7df6a25e4139082d1802af8b1e9',
+        }),
       }),
       appLocalFiles: appLocalVcFiles('bin'),
     }),
@@ -372,12 +396,13 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
   if (!target) {
     throw new Error(`[native-deps-gate] whisper runtime is not configured for ${key}`);
   }
+  const runtimeVersion = target.version || contract.version;
   const dir = path.join(runtimeRoot, 'whisper', key);
   const markerFile = path.join(dir, '.orkas-whisper-ready.json');
   const marker = readJsonFile('whisper runtime marker', markerFile);
   if (marker.schema !== contract.schema
     || marker.platformKey !== key
-    || marker.version !== contract.version
+    || marker.version !== runtimeVersion
     || marker.model !== contract.model.name) {
     throw new Error(`[native-deps-gate] whisper runtime marker mismatch for ${key}: ${markerFile}`);
   }
@@ -387,6 +412,7 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
     ...(target.appLocalFiles || {}),
     [contract.model.relativePath]: contract.model,
     ...contract.licenses,
+    ...(target.licenses || {}),
   };
   for (const [relativePath, expected] of Object.entries(expectedFiles)) {
     const file = relPath(dir, relativePath);

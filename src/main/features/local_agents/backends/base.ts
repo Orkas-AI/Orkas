@@ -16,7 +16,11 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { resolveCliCommand } from '../spawn-command.js';
+import * as path from 'node:path';
+import { buildCliSpawnEnv, resolveCliCommand } from '../spawn-command.js';
+
+type KillableChild = Pick<ChildProcessWithoutNullStreams, 'kill' | 'pid'>;
+type SpawnFn = typeof spawn;
 
 /** All event types a backend can emit. The runner persists these to
  *  `events.jsonl` verbatim and forwards them to the renderer through
@@ -144,17 +148,18 @@ export class StderrTail {
  *  — so the run's `close` event never fires until those descendants exit
  *  on their own, making abort/timeout appear to hang. We do NOT `unref`:
  *  the run still awaits the child's lifetime. Windows has no POSIX process
- *  groups, so it stays on the direct-child kill path. */
+ *  groups, so termination uses `taskkill /t /f` to include descendants. */
 export function spawnCli(
   binPath: string,
   args: string[],
   cwd: string,
   env?: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
-  const launch = resolveCliCommand(binPath, args);
+  const childEnv = buildCliSpawnEnv(binPath, env ?? process.env);
+  const launch = resolveCliCommand(binPath, args, process.platform, childEnv);
   const child = spawn(launch.command, launch.args, {
     cwd,
-    env: env ?? process.env,
+    env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
     windowsVerbatimArguments: launch.windowsVerbatimArguments,
@@ -166,18 +171,46 @@ export function spawnCli(
   return child;
 }
 
+function windowsSystem32Tool(name: string): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+  return path.win32.join(root, 'System32', name);
+}
+
 /** Send `signal` to the child's whole process group on POSIX (the child
  *  is spawned detached, so its pgid == pid and `-pid` addresses the
  *  group). This reaps grandchildren that inherited the stdio pipes;
  *  signaling only the direct child leaves them orphaned and the run's
- *  `close` hangs for their full lifetime (see `spawnCli`). Falls back to
- *  a direct child kill on Windows or when the group is already gone. */
+ *  `close` hangs for their full lifetime (see `spawnCli`). Windows uses
+ *  taskkill's tree mode for the same reason. Both paths fall back to a
+ *  direct child kill when the platform mechanism cannot start or fails. */
 export function killProcessTree(
-  child: ChildProcessWithoutNullStreams,
+  child: KillableChild,
   signal: NodeJS.Signals,
+  opts: { platform?: NodeJS.Platform; spawnFn?: SpawnFn } = {},
 ): void {
   const pid = child.pid;
-  if (pid && process.platform !== 'win32') {
+  const platform = opts.platform ?? process.platform;
+  if (pid && platform === 'win32') {
+    try {
+      const killer = (opts.spawnFn ?? spawn)(
+        windowsSystem32Tool('taskkill.exe'),
+        ['/pid', String(pid), '/t', '/f'],
+        { stdio: 'ignore', windowsHide: true },
+      );
+      const fallback = () => {
+        try { child.kill(signal); } catch { /* already gone */ }
+      };
+      killer.once('error', fallback);
+      killer.once('exit', (code) => {
+        if (code !== 0) fallback();
+      });
+      if (typeof killer.unref === 'function') killer.unref();
+      return;
+    } catch {
+      // Fall through to a best-effort direct child kill.
+    }
+  }
+  if (pid && platform !== 'win32') {
     try {
       process.kill(-pid, signal);
       return;

@@ -4,6 +4,7 @@ import {
   _buildOutputFormatHintForTest,
   _buildPlanInteractionHintForTest,
   _redactDispatchToolResult,
+  _resolveAgentInputsForRuntimeForTest,
 } from '../../../../src/main/features/group_chat/bus';
 import { prompts } from '../../../../src/main/prompts/loader';
 
@@ -102,6 +103,48 @@ describe('group_chat output_format prompt hints', () => {
     }
   });
 
+});
+
+describe('VideoStudio runtime language input', () => {
+  const inputs = [{
+    id: 'language',
+    type: 'select',
+    default: 'en',
+    default_by_ui_language: {
+      zh: 'zh-CN',
+      en: 'en',
+      ja: 'ja',
+      pt: 'pt-BR',
+    },
+    options: [
+      { value: 'en', label: 'English' },
+      { value: 'zh-CN', label: '简体中文' },
+      { value: 'ja', label: '日本語' },
+      { value: 'pt-BR', label: 'Português (Brasil)' },
+    ],
+  }];
+
+  it.each([
+    ['zh-CN', 'zh-CN'],
+    ['en-US', 'en'],
+    ['ja-JP', 'ja'],
+    ['pt-BR', 'pt-BR'],
+    ['unsupported', 'en'],
+    [undefined, 'en'],
+  ])('maps user UI language %s to video default %s', (uiLanguage, expected) => {
+    const [language] = _resolveAgentInputsForRuntimeForTest(inputs, uiLanguage);
+    expect(language.default).toBe(expected);
+    expect(language.options.map((option: { value: string }) => option.value)).toEqual(
+      expect.arrayContaining(['en', 'zh-CN', 'ja', 'pt-BR']),
+    );
+  });
+
+  it('does not rewrite inputs without a UI-language mapping or mutate the persisted schema', () => {
+    const plainInputs = [{ id: 'tone', type: 'select', default: 'formal' }];
+    const resolved = _resolveAgentInputsForRuntimeForTest(plainInputs, 'zh');
+    expect(resolved[0]).toBe(plainInputs[0]);
+    expect(inputs[0].default).toBe('en');
+  });
 });
 
 describe('group_chat CLI output_format prompt hints', () => {

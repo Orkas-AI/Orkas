@@ -21,9 +21,19 @@ const LOCK_FILE = path.join(PC_DIR, 'package-lock.json');
 const CACHE_HELPER = path.join(__dirname, 'native-prepare-cache.cjs');
 const TARGET_PLATFORM = 'win32';
 const TARGET_ARCH = 'x64';
+const WINDOWS_RM_OPTIONS = Object.freeze({
+  recursive: true,
+  force: true,
+  maxRetries: 6,
+  retryDelay: 100,
+});
 
-function npmCmd() {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+function npmCmd(platform = process.platform) {
+  return platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+function removeTree(target, fsImpl = fs) {
+  fsImpl.rmSync(target, WINDOWS_RM_OPTIONS);
 }
 
 function run(cwd, command, args) {
@@ -31,6 +41,7 @@ function run(cwd, command, args) {
     cwd,
     stdio: 'inherit',
     shell: false,
+    windowsHide: true,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -43,7 +54,8 @@ function npmPack(cwd, spec) {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'inherit'],
-    shell: false,
+    shell: process.platform === 'win32',
+    windowsHide: true,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
@@ -74,11 +86,11 @@ function ensurePackageFromRegistry(packageName, requiredFiles = []) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-win-native-deps-'));
   try {
     const tarball = npmPack(tmpDir, `${packageName}@${version}`);
-    fs.rmSync(targetDir, { recursive: true, force: true });
+    removeTree(targetDir);
     fs.mkdirSync(targetDir, { recursive: true });
     run(targetDir, 'tar', ['-xzf', tarball, '--strip-components=1']);
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    removeTree(tmpDir);
   }
 }
 
@@ -103,16 +115,16 @@ function expectedState(electronVersion) {
 }
 
 function removeLegacyMarker() {
-  fs.rmSync(path.join(PC_DIR, 'node_modules', '.orkas-native-prepared'), { recursive: true, force: true });
+  removeTree(path.join(PC_DIR, 'node_modules', '.orkas-native-prepared'));
 }
 
-function removeDirectories(parentDir, shouldRemove) {
-  if (!fs.existsSync(parentDir) || !fs.statSync(parentDir).isDirectory()) {
+function removeDirectories(parentDir, shouldRemove, fsImpl = fs) {
+  if (!fsImpl.existsSync(parentDir) || !fsImpl.statSync(parentDir).isDirectory()) {
     return;
   }
-  for (const entry of fs.readdirSync(parentDir, { withFileTypes: true })) {
+  for (const entry of fsImpl.readdirSync(parentDir, { withFileTypes: true })) {
     if (entry.isDirectory() && shouldRemove(entry.name)) {
-      fs.rmSync(path.join(parentDir, entry.name), { recursive: true, force: true });
+      removeTree(path.join(parentDir, entry.name), fsImpl);
     }
   }
 }
@@ -174,7 +186,7 @@ function main() {
   removeDirectories(path.join(PC_DIR, 'node_modules'), (name) => /^sqlite-vec-(darwin|linux)-/i.test(name));
   removeDirectories(path.join(PC_DIR, 'node_modules', '@napi-rs'), (name) => /^canvas-/i.test(name) && name !== 'canvas-win32-x64-msvc');
   removeDirectories(path.join(PC_DIR, 'node_modules', '@anush008'), (name) => /^tokenizers-/i.test(name) && name !== 'tokenizers-win32-x64-msvc');
-  fs.rmSync(path.join(PC_DIR, 'node_modules', 'fsevents'), { recursive: true, force: true });
+  removeTree(path.join(PC_DIR, 'node_modules', 'fsevents'));
 
   ensureFile(
     'Windows esbuild runtime binary',
@@ -202,4 +214,12 @@ function main() {
   writeMarker(PC_DIR, state);
 }
 
-main();
+module.exports = {
+  WINDOWS_RM_OPTIONS,
+  allFilesExist,
+  npmCmd,
+  removeDirectories,
+  removeTree,
+};
+
+if (require.main === module) main();

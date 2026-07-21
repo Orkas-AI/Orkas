@@ -323,6 +323,12 @@ export interface JsonlPage<T> {
   nextCursor: number | null;
 }
 
+export interface JsonlWindow<T> {
+  records: T[];
+  /** Byte offset immediately before this window; compatible with readJsonlPage. */
+  previousCursor: number | null;
+}
+
 /**
  * Return one newest-first-selected JSONL page in chronological order.
  *
@@ -386,6 +392,78 @@ export async function readJsonlPage<T = Record<string, any>>(
     return {
       records: newestFirst.reverse(),
       nextCursor: oldestRecordStart > 0 ? oldestRecordStart : null,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Read a bounded chronological window by parsed-record index.
+ *
+ * This is the direct-window companion to tail pagination: search already owns a
+ * stable JSONL record index, so opening a hit can stream forward once to that
+ * window instead of fetching every intervening tail page through IPC. The
+ * returned byte cursor lets the existing older-page reader continue upward.
+ */
+export async function readJsonlWindow<T = Record<string, any>>(
+  filePath: string,
+  startIndex: number,
+  limit = 10,
+): Promise<JsonlWindow<T>> {
+  const first = Math.max(0, Math.floor(Number(startIndex) || 0));
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fsp.open(filePath, 'r');
+  } catch {
+    return { records: [], previousCursor: null };
+  }
+
+  try {
+    const size = (await handle.stat()).size;
+    const records: T[] = [];
+    let recordIndex = 0;
+    let position = 0;
+    let carry = Buffer.alloc(0);
+    let firstRecordStart = -1;
+    let done = false;
+
+    const consumeLine = (line: Buffer, recordStart: number): boolean => {
+      const record = _parseJsonlRecord<T>(line.toString('utf8'));
+      if (record === undefined) return false;
+      if (recordIndex >= first && records.length < wanted) {
+        if (firstRecordStart < 0) firstRecordStart = recordStart;
+        records.push(record);
+      }
+      recordIndex += 1;
+      return records.length >= wanted;
+    };
+
+    while (position < size && !done) {
+      const bytes = Math.min(JSONL_TAIL_CHUNK_BYTES, size - position);
+      const block = Buffer.allocUnsafe(bytes);
+      const { bytesRead } = await handle.read(block, 0, bytes, position);
+      if (bytesRead <= 0) break;
+      const joined = carry.length
+        ? Buffer.concat([carry, block.subarray(0, bytesRead)])
+        : block.subarray(0, bytesRead);
+      const joinedStart = position - carry.length;
+      let lineStart = 0;
+      for (let i = 0; i < joined.length; i += 1) {
+        if (joined[i] !== 0x0a) continue;
+        done = consumeLine(joined.subarray(lineStart, i), joinedStart + lineStart);
+        lineStart = i + 1;
+        if (done) break;
+      }
+      position += bytesRead;
+      if (!done) carry = joined.subarray(lineStart);
+    }
+    if (!done && carry.length) consumeLine(carry, position - carry.length);
+
+    return {
+      records,
+      previousCursor: firstRecordStart > 0 ? firstRecordStart : null,
     };
   } finally {
     await handle.close();

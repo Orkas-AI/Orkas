@@ -51,5 +51,9 @@ describe('project memory controls', () => {
     expect(source).toContain("input.value !== (input.dataset.savedValue || '')");
     expect(source).toContain('saveBtn.disabled = !dirty || over');
     expect(source).toContain("uiAlert(t('project.instructions.save_failed'))");
+    expect(source).toContain("_projectTrackEvent('project_instructions_update_result'");
+    expect(source).toContain("result: 'success'");
+    expect(source).toContain("result: 'failure'");
+    expect(source).toContain('duration_ms: Math.max(0, Math.round(performance.now() - startedAt))');
   });
 });

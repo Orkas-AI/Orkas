@@ -100,12 +100,12 @@ export interface AutoTask {
   project_id?: string;
   schedule: Schedule;
   attachments?: string[];                // file names under <task_dir>/attachments/
-  /** Device the task was CREATED on — only this machine fires the schedule.
+  /** Device the task is bound to — only this machine fires the schedule.
    *  Every device can still read / edit the config (the file cloud-syncs).
-   *  `device_id` is the MAC address of the creator's first non-internal NIC;
-   *  `device_name` is the hostname at creation time (display only). Both
-   *  immutable after creation — `updateTask` does not accept patches for
-   *  these fields. */
+   *  `device_id` is the MAC address of the bound device's first non-internal
+   *  NIC; `device_name` is its hostname at bind time (display only). New
+   *  tasks bind to their creator, and an explicit edit can rebind them to
+   *  the device performing the update. */
   device_id?: string;
   device_name?: string;
   created_at: string;
@@ -222,6 +222,7 @@ type SyncDirtyNotifier = (domain: string, relPath: string) => void;
 let _syncDirtyNotifierForTest: SyncDirtyNotifier | null = null;
 type SyncDeletedNotifier = (relPath: string) => void;
 let _syncDeletedNotifierForTest: SyncDeletedNotifier | null = null;
+let _markRanFailureForTest: Error | null = null;
 
 export function _setSyncDirtyNotifierForTest(fn: SyncDirtyNotifier | null): void {
   _syncDirtyNotifierForTest = fn;
@@ -229,6 +230,10 @@ export function _setSyncDirtyNotifierForTest(fn: SyncDirtyNotifier | null): void
 
 export function _setSyncDeletedNotifierForTest(fn: SyncDeletedNotifier | null): void {
   _syncDeletedNotifierForTest = fn;
+}
+
+export function _setMarkRanFailureForTest(error: Error | null): void {
+  _markRanFailureForTest = error;
 }
 
 function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
@@ -370,6 +375,12 @@ export type TaskDraft = {
   id?: string;
 };
 
+export type TaskUpdatePatch = Partial<TaskDraft> & {
+  /** Semantic update-only flag. Device identifiers always come from main so
+   *  renderer callers cannot bind a task to an arbitrary machine. */
+  run_on_current_device?: boolean;
+};
+
 export type TaskError =
   | 'invalid_schedule'
   | 'invalid_content'
@@ -507,7 +518,7 @@ export async function createTask(
 }
 
 export async function updateTask(
-  uid: string, taskId: string, patch: Partial<TaskDraft>,
+  uid: string, taskId: string, patch: TaskUpdatePatch,
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
   return _runExclusive(uid, async () => {
@@ -547,6 +558,15 @@ export async function updateTask(
       ...norm.fields,
       updated_at: nowIso(),
     };
+    if (patch.run_on_current_device === true) {
+      const device = getCurrentDevice();
+      if (device.id) {
+        next.device_id = device.id;
+        next.device_name = device.name;
+      } else {
+        log.warn(`task device rebind skipped uid=${uid} id=${taskId} reason=missing_device_id`);
+      }
+    }
     // Strip optional fields when they normalised away.
     if (!norm.fields.title) delete next.title;
     if (!norm.fields.recipient) delete next.recipient;
@@ -830,6 +850,7 @@ async function _stageContainerAttachments(
 
 async function _markRan(uid: string, taskId: string, atIso: string, alsoDisable: boolean): Promise<void> {
   if (!_isValidTaskId(taskId)) return;
+  if (_markRanFailureForTest) throw _markRanFailureForTest;
   await _runExclusive(uid, async () => {
     const cur = await _readOne(uid, taskId);
     if (!cur) return;
@@ -897,7 +918,11 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
 
 function _sanitiseFilename(name: string): string {
   if (typeof name !== 'string') return '';
-  const base = path.basename(name).replace(/[\\/]+/g, '_').trim();
+  // Attachment names can cross OS boundaries through IPC and cloud-synced
+  // task configs. Treat both separator styles as directory boundaries before
+  // taking the basename so the persisted name is host-independent.
+  const normalized = name.replace(/\\/g, '/');
+  const base = path.posix.basename(normalized).trim();
   if (!base || base === '.' || base === '..') return '';
   if (base.startsWith('.')) return '';
   return base.length > 200 ? base.slice(0, 200) : base;

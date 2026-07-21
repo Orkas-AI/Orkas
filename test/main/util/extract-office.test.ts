@@ -1,3 +1,4 @@
+import AdmZip from 'adm-zip';
 import { describe, it, expect } from 'vitest';
 
 import {
@@ -136,5 +137,19 @@ describe('extract-office › pptxBufferToHtml', () => {
     expect(html).toContain('aria-label="Slide 1"');
     expect(html).toContain('<p>Roadmap</p>');
     expect(html).toContain('Launch &lt;June&gt;');
+  });
+
+  it('renders a valid zero-slide presentation as a blank page', () => {
+    const html = pptxBufferToHtml(makeMinimalPptx({ slides: [] }));
+
+    expect(html).toContain('class="office-slide office-slide-blank"');
+    expect(html).toContain('aria-label="Blank presentation"');
+  });
+
+  it('rejects a presentation that declares a slide but has no slide data', () => {
+    const zip = new AdmZip(makeMinimalPptx({ slides: [['Missing']] }));
+    zip.deleteFile('ppt/slides/slide1.xml');
+
+    expect(() => pptxBufferToHtml(zip.toBuffer())).toThrow(/slide data is missing/i);
   });
 });

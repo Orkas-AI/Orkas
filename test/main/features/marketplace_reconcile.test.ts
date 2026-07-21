@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import AdmZip from 'adm-zip';
+import { MAX_MARKETPLACE_BUNDLE_BYTES } from '../../../src/main/features/marketplace_bundle';
 
 const postJsonMock = vi.hoisted(() => vi.fn());
 const extractBundleSafelyMock = vi.hoisted(() => vi.fn());
@@ -504,7 +505,11 @@ describe('marketplace reconcile', () => {
     const base = await listen((req, res) => {
       if (req.url === '/agent.json') {
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ agent_id: 'agent-private', name: 'Private Agent' }));
+        res.end(JSON.stringify({
+          agent_id: 'agent-private',
+          name: 'Private Agent',
+          skill_list: ['private-helper'],
+        }));
         return;
       }
       if (req.url === '/agent-skills.zip') {
@@ -538,6 +543,63 @@ describe('marketplace reconcile', () => {
       expect.anything(),
       paths.userMarketplaceAgentSkillsDir('u1', 'agent-private'),
     );
+  });
+
+  it('rejects an oversized skill bundle before reconcile parses or extracts it', async () => {
+    const base = await listen((_req, res) => {
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Length', String(MAX_MARKETPLACE_BUNDLE_BYTES + 1));
+      res.end('oversized');
+    });
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'oversized-skill',
+        version: '1.0.0',
+        published_at: 100,
+        bundle_url: `${base}/skill.zip`,
+        installed_at: 200,
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1');
+
+    expect(result).toMatchObject({ pulled_skills: 0, failed: ['skill:oversized-skill'] });
+    expect(extractBundleSafelyMock).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'oversized-skill'))).toBe(false);
+  });
+
+  it('cancels a streaming skill bundle when reconcile admission is revoked', async () => {
+    const skillZip = new AdmZip();
+    skillZip.addFile('SKILL.md', Buffer.from('---\nname: cancelled-skill\n---\n'));
+    const body = skillZip.toBuffer();
+    let shouldContinue = true;
+    const base = await listen((_req, res) => {
+      res.setHeader('Content-Type', 'application/zip');
+      res.write(body.subarray(0, Math.max(1, Math.floor(body.length / 2))));
+      shouldContinue = false;
+      setTimeout(() => res.end(body.subarray(Math.max(1, Math.floor(body.length / 2)))), 10);
+    });
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'cancelled-skill',
+        version: '1.0.0',
+        published_at: 100,
+        bundle_url: `${base}/skill.zip`,
+        installed_at: 200,
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1', { shouldContinue: () => shouldContinue });
+
+    expect(result).toMatchObject({ pulled_skills: 0, failed: [] });
+    expect(extractBundleSafelyMock).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'cancelled-skill'))).toBe(false);
   });
 
   it('pulls new skill_list dependencies while reconciling an updated agent', async () => {

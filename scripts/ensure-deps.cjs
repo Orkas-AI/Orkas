@@ -14,6 +14,41 @@ const LOCK = path.join(PC_DIR, 'package-lock.json');
 const NODE_MODULES = path.join(PC_DIR, 'node_modules');
 const STAMP = path.join(NODE_MODULES, '.orkas-deps-hash');
 
+function missingDeclaredDependencyPackages(options = {}) {
+  const packageFile = options.packageFile || PKG;
+  const nodeModulesDir = options.nodeModulesDir || NODE_MODULES;
+  const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+  const names = new Set([
+    ...Object.keys(packageJson.dependencies || {}),
+    ...Object.keys(packageJson.devDependencies || {}),
+  ]);
+  const missing = [];
+  for (const name of [...names].sort()) {
+    const manifest = path.join(nodeModulesDir, ...name.split('/'), 'package.json');
+    try {
+      const installed = JSON.parse(fs.readFileSync(manifest, 'utf8'));
+      if (!installed || typeof installed.version !== 'string' || !installed.version.trim()) {
+        missing.push(name);
+      }
+    } catch {
+      missing.push(name);
+    }
+  }
+  return missing;
+}
+
+function summarizePackages(packages) {
+  const visible = packages.slice(0, 5).join(', ');
+  return packages.length > 5 ? `${visible}, +${packages.length - 5} more` : visible;
+}
+
+function dependencyInstallReason({ nodeModulesExists, stored, current, missingPackages }) {
+  if (!nodeModulesExists) return 'node_modules_missing';
+  if (stored !== current) return 'fingerprint_changed';
+  if (missingPackages.length > 0) return 'packages_incomplete';
+  return '';
+}
+
 // 指纹只覆盖真正影响 npm install 结果的字段，避免改 scripts.stop / build /
 // name 这类无关字段也触发重装。
 function depFingerprint() {
@@ -425,8 +460,15 @@ function main() {
   const current = depFingerprint();
   const stored = readStamp();
   const nodeModulesExists = fs.existsSync(NODE_MODULES);
+  const missingPackages = nodeModulesExists ? missingDeclaredDependencyPackages() : [];
+  const installReason = dependencyInstallReason({
+    nodeModulesExists,
+    stored,
+    current,
+    missingPackages,
+  });
 
-  if (nodeModulesExists && stored === current) {
+  if (!installReason) {
     // 依赖已同步；但模型文件可能被误删，单独校验一次。
     if (!modelReady()) {
       console.log('[Orkas] 知识库 embedding 模型缺失，补下载（约 90MB）...');
@@ -438,13 +480,20 @@ function main() {
     return;
   }
 
-  if (!nodeModulesExists) {
+  if (installReason === 'node_modules_missing') {
     console.log('[Orkas] 首次运行：安装依赖 + 下载嵌入模型（约 5～10 分钟）...');
+  } else if (installReason === 'packages_incomplete') {
+    console.log(`[Orkas] Installed npm packages are incomplete (${summarizePackages(missingPackages)}); repairing...`);
   } else {
     console.log('[Orkas] 依赖与 package.json / lockfile 不一致，执行 npm install...');
   }
 
   runNpmInstall();
+  const missingAfterInstall = missingDeclaredDependencyPackages();
+  if (missingAfterInstall.length > 0) {
+    console.error(`[Orkas] npm install completed but required packages are still incomplete: ${summarizePackages(missingAfterInstall)}`);
+    process.exit(1);
+  }
   ensureElectronReady('npm install finished without a complete Electron binary');
 
   // 双保险：npm install 的 postinstall 已跑 fetch-embedding-model，若因 npm
@@ -468,4 +517,9 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) main();
+
+module.exports = {
+  dependencyInstallReason,
+  missingDeclaredDependencyPackages,
+};

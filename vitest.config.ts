@@ -1,7 +1,13 @@
 import { defineConfig } from 'vitest/config';
 import { cpus } from 'node:os';
 
-const testWorkers = Math.max(1, Math.min(4, cpus().length || 1));
+const logicalCpus = cpus().length || 1;
+// Windows files exercise real Electron workers, PowerShell/cmd shims, Git,
+// SQLite, FFmpeg, and whisper.cpp. Even two concurrent forks can exhaust the
+// desktop process/commit budget late in the full suite (`spawn UNKNOWN` /
+// `ENOMEM`) and push real-shell cases past their native startup budget. Keep
+// Windows serialized; other hosts retain bounded parallelism.
+const testWorkers = Math.max(1, Math.min(process.platform === 'win32' ? 1 : 4, logicalCpus));
 
 export default defineConfig({
   test: {

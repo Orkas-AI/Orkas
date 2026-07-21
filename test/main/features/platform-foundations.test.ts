@@ -35,7 +35,7 @@ describe('platform foundations', () => {
     expect(order).toEqual(['first:start', 'cache', 'first:end', 'second']);
   });
 
-  it('blocks protected macOS roots and recursive ancestors without prefix false positives', () => {
+  it.runIf(process.platform === 'darwin')('blocks protected macOS roots and recursive ancestors without prefix false positives', () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = process.env.HOME || '';
     expect(macosTccSensitivePath(`${home}/Documents/project`)?.reason).toBe('documents');

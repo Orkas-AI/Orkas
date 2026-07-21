@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -14,6 +14,7 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const TEST_UID = 'u1';
 let tmpDir: string;
 let wsRoot: string;
+const tmpDirs: string[] = [];
 
 const gitAvailable = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0;
 const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
@@ -103,12 +104,25 @@ function readRegistry(): any {
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-pkg-'));
+  tmpDirs.push(tmpDir);
   wsRoot = path.join(tmpDir, 'data');
   fs.mkdirSync(wsRoot, { recursive: true });
 });
 
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterAll(() => {
+  if (process.platform === 'win32') {
+    // Git for Windows marks clone metadata hidden. Clean from the stock Node
+    // helper rather than Electron's still-live worker process, which can keep
+    // freshly cloned trees undeletable until the worker exits.
+    const cleanup = spawnSync(TEST_NODE, [
+      '-e',
+      'const fs=require("node:fs");for(const p of process.argv.slice(1))fs.rmSync(p,{recursive:true,force:true,maxRetries:20,retryDelay:100});',
+      ...tmpDirs,
+    ], { encoding: 'utf8', windowsHide: true });
+    if (cleanup.status !== 0) throw new Error(`Windows temp cleanup failed: ${cleanup.stderr}`);
+  } else {
+    for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 describe('orkas-pkg.cjs source invariants', () => {
@@ -181,7 +195,8 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(content).not.toContain('ORKAS_NODE');
   });
 
-  itOnNonWindows('records package-local native executables and creates shims', () => {
+  it('records package-local native executables and creates shims', () => {
+    const nativeFile = process.platform === 'win32' ? 'native-tool.exe' : 'native-tool';
     const repo = makeRepo('nativepkg', {
       'package.json': JSON.stringify({
         name: '@vendor/nativepkg',
@@ -189,12 +204,14 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
         private: true,
       }),
       'skills/native/SKILL.md': '---\nname: native\ndescription: native\n---\n',
-      'npm/bin/native-tool': '#!/bin/sh\nprintf "native tool\\n"\n',
+      [`npm/bin/${nativeFile}`]: process.platform === 'win32' ? 'MZ-test-fixture' : '#!/bin/sh\nprintf "native tool\\n"\n',
       'npm/bin/README.md': 'not executable',
     });
-    fs.chmodSync(path.join(repo, 'npm', 'bin', 'native-tool'), 0o755);
-    git(repo, 'add', '--chmod=+x', 'npm/bin/native-tool');
-    git(repo, 'commit', '-qm', 'mark native executable');
+    if (process.platform !== 'win32') {
+      fs.chmodSync(path.join(repo, 'npm', 'bin', nativeFile), 0o755);
+      git(repo, 'add', '--chmod=+x', `npm/bin/${nativeFile}`);
+      git(repo, 'commit', '-qm', 'mark native executable');
+    }
 
     const r = runPkg('install', repo);
     expect(r.status).toBe(0);
@@ -202,13 +219,13 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(r.json.bin_entries).toEqual(['native-tool']);
     expect(r.json.shims).toEqual(['native-tool']);
     const regEntry = readRegistry().packages[0];
-    expect(regEntry.bin_entries).toEqual([{ name: 'native-tool', target: 'npm/bin/native-tool', runtime: 'native' }]);
+    expect(regEntry.bin_entries).toEqual([{ name: 'native-tool', target: `npm/bin/${nativeFile}`, runtime: 'native' }]);
 
     const shim = fs.readFileSync(path.join(pkgsDir(), '.bin', 'native-tool'), 'utf8');
     expect(shim).toContain(path.join(pkgsDir(), 'nativepkg', 'npm/bin/native-tool'));
   });
 
-  itOnNonWindows('installs Node deps under the user package tree with Orkas npm cache/prefix', () => {
+  it('installs Node deps under the user package tree with Orkas npm cache/prefix', () => {
     const repo = makeRepo('npmpkg', {
       'package.json': JSON.stringify({
         name: 'npmpkg',
@@ -220,20 +237,31 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
       'bin/cli.js': '#!/usr/bin/env node\nconsole.log("hi")\n',
     });
     const fakeBin = path.join(tmpDir, 'fake-bin');
-    const fakeNpm = path.join(fakeBin, 'npm');
+    const fakeNpm = path.join(fakeBin, process.platform === 'win32' ? 'npm.cmd' : 'npm');
     const argsLog = path.join(tmpDir, 'npm-args.log');
     const cacheLog = path.join(tmpDir, 'npm-cache.log');
     const prefixLog = path.join(tmpDir, 'npm-prefix.log');
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(fakeNpm, [
-      '#!/bin/sh',
-      'printf "%s\\n" "$*" > "$NPM_ARGS_LOG"',
-      'printf "%s\\n" "$NPM_CONFIG_CACHE" > "$NPM_CACHE_LOG"',
-      'printf "%s\\n" "$NPM_CONFIG_PREFIX" > "$NPM_PREFIX_LOG"',
-      'mkdir -p node_modules/fake-dep',
-      '',
-    ].join('\n'));
-    fs.chmodSync(fakeNpm, 0o755);
+    if (process.platform === 'win32') {
+      fs.writeFileSync(fakeNpm, [
+        '@echo off',
+        'echo %*> "%NPM_ARGS_LOG%"',
+        'echo %NPM_CONFIG_CACHE%> "%NPM_CACHE_LOG%"',
+        'echo %NPM_CONFIG_PREFIX%> "%NPM_PREFIX_LOG%"',
+        'mkdir node_modules\\fake-dep',
+        '',
+      ].join('\r\n'));
+    } else {
+      fs.writeFileSync(fakeNpm, [
+        '#!/bin/sh',
+        'printf "%s\\n" "$*" > "$NPM_ARGS_LOG"',
+        'printf "%s\\n" "$NPM_CONFIG_CACHE" > "$NPM_CACHE_LOG"',
+        'printf "%s\\n" "$NPM_CONFIG_PREFIX" > "$NPM_PREFIX_LOG"',
+        'mkdir -p node_modules/fake-dep',
+        '',
+      ].join('\n'));
+      fs.chmodSync(fakeNpm, 0o755);
+    }
 
     const install = runPkg('install', repo);
     expect(install.status).toBe(0);
@@ -245,6 +273,8 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
       NPM_ARGS_LOG: argsLog,
       NPM_CACHE_LOG: cacheLog,
       NPM_PREFIX_LOG: prefixLog,
+      NPM_CONFIG_CACHE: path.join(tmpDir, 'inherited-global-npm-cache'),
+      NPM_CONFIG_PREFIX: path.join(tmpDir, 'inherited-global-npm-prefix'),
     }, 'consent-deps', 'npmpkg');
 
     expect(consent.status).toBe(0);
@@ -286,7 +316,7 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(false);
   });
 
-  itOnNonWindows('uses ORKAS_UV and ORKAS_PYTHON for Python package dependency consent', () => {
+  it('uses ORKAS_UV and ORKAS_PYTHON for Python package dependency consent', () => {
     const repo = makeRepo('pyuv', {
       'pyproject.toml': [
         '[build-system]',
@@ -296,30 +326,53 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
         'real-entry = "pkg.cli:main"',
       ].join('\n'),
       'pkg/__init__.py': '',
+      ...(process.platform === 'win32' ? {
+        venv: [
+          'const fs = require("node:fs");',
+          'const path = require("node:path");',
+          'const root = process.argv.at(-1);',
+          'fs.mkdirSync(path.join(root, "Scripts"), { recursive: true });',
+          'fs.writeFileSync(path.join(root, "Scripts", "python.exe"), "");',
+        ].join('\n'),
+        pip: [
+          'const fs = require("node:fs");',
+          'const path = require("node:path");',
+          'const python = process.argv[4];',
+          'fs.mkdirSync(path.dirname(python), { recursive: true });',
+          'fs.writeFileSync(path.join(path.dirname(python), "real-entry.exe"), "MZ-test-fixture");',
+        ].join('\n'),
+      } : {}),
     });
-    const fakePython = path.join(tmpDir, 'fake-python');
-    fs.writeFileSync(fakePython, '#!/bin/sh\nexit 0\n');
-    fs.chmodSync(fakePython, 0o755);
-    const fakeUv = path.join(tmpDir, 'fake-uv');
-    fs.writeFileSync(fakeUv, [
-      '#!/bin/sh',
-      'set -eu',
-      'if [ "$1" = "venv" ]; then',
-      '  if [ "$2" = "--python" ]; then venv="$4"; else venv="$2"; fi',
-      '  mkdir -p "$venv/bin"',
-      '  printf "#!/bin/sh\\nexit 0\\n" > "$venv/bin/python"',
-      '  chmod +x "$venv/bin/python"',
-      'elif [ "$1" = "pip" ]; then',
-      '  venv="$(dirname "$(dirname "$4")")"',
-      '  mkdir -p "$venv/bin"',
-      '  printf "#!/bin/sh\\necho real-entry\\n" > "$venv/bin/real-entry"',
-      '  chmod +x "$venv/bin/real-entry"',
-      'else',
-      '  exit 2',
-      'fi',
-      '',
-    ].join('\n'));
-    fs.chmodSync(fakeUv, 0o755);
+    let fakePython: string;
+    let fakeUv: string;
+    if (process.platform === 'win32') {
+      fakePython = TEST_NODE;
+      fakeUv = TEST_NODE;
+    } else {
+      fakePython = path.join(tmpDir, 'fake-python');
+      fs.writeFileSync(fakePython, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(fakePython, 0o755);
+      fakeUv = path.join(tmpDir, 'fake-uv');
+      fs.writeFileSync(fakeUv, [
+        '#!/bin/sh',
+        'set -eu',
+        'if [ "$1" = "venv" ]; then',
+        '  if [ "$2" = "--python" ]; then venv="$4"; else venv="$2"; fi',
+        '  mkdir -p "$venv/bin"',
+        '  printf "#!/bin/sh\\nexit 0\\n" > "$venv/bin/python"',
+        '  chmod +x "$venv/bin/python"',
+        'elif [ "$1" = "pip" ]; then',
+        '  venv="$(dirname "$(dirname "$4")")"',
+        '  mkdir -p "$venv/bin"',
+        '  printf "#!/bin/sh\\necho real-entry\\n" > "$venv/bin/real-entry"',
+        '  chmod +x "$venv/bin/real-entry"',
+        'else',
+        '  exit 2',
+        'fi',
+        '',
+      ].join('\n'));
+      fs.chmodSync(fakeUv, 0o755);
+    }
     const env = { ORKAS_UV: fakeUv, ORKAS_PYTHON: fakePython };
 
     const install = runPkgWithEnv(env, 'install', repo);
@@ -334,7 +387,12 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(consent.status).toBe(0);
     expect(consent.json.deps_installed).toEqual(['uv pip install .']);
     expect(consent.json.shims).toEqual(['real-entry']);
-    expect(fs.existsSync(path.join(pkgsDir(), 'pyuv', '.venv', 'bin', 'real-entry'))).toBe(false);
+    expect(fs.existsSync(path.join(
+      pkgsDir(),
+      'pyuv',
+      '.venv',
+      ...(process.platform === 'win32' ? ['Scripts', 'real-entry.exe'] : ['bin', 'real-entry']),
+    ))).toBe(false);
     const shim = fs.readFileSync(path.join(pkgsDir(), '.bin', 'real-entry'), 'utf8');
     expect(shim).toContain(path.join(wsRoot, 'venv', 'python', 'packages'));
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(true);

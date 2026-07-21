@@ -187,7 +187,6 @@
         const id = _rowMenuAppId;
         _closeRowMenu();
         if (!id) return;
-        _track('saved_app_menu_action', { action, app_id: String(id || '') });
         if (action === 'edit') _editApp(id);
         else if (action === 'rename') _renameApp(id);
         else if (action === 'delete') _deleteApp(id);
@@ -210,13 +209,15 @@
 
   // ── actions ─────────────────────────────────────────────────────────────
   async function _openApp(appId) {
-    _track('saved_app_open', { app_id: String(appId || '') });
     try {
       const r = await window.orkas.invoke('savedApps.openInApp', { appId: String(appId) });
       if (!r || r.ok === false || !r.url) throw new Error((r && r.error) || 'open failed');
       const app = (_appsCache || []).find((a) => a && a.id === appId);
       _openAppViewer(r.url, (app && app.title) || _t('artifact.title', 'Interactive app'));
-    } catch (err) { _trackError('saved_app_open', { app_id: String(appId || ''), error_message: String(err && err.message || err) }); _fail(_t('apps.open_failed', 'Could not open the app'), err); }
+    } catch (err) {
+      _trackError('saved_app_open', { error_message: 'saved_app_open_failed' });
+      _fail(_t('apps.open_failed', 'Could not open the app'), err);
+    }
   }
 
   // "Edit" — backend creates a fresh conversation with the app's source bundled
@@ -411,7 +412,6 @@
       card.addEventListener('click', (e) => {
         if (e.target && e.target.closest && e.target.closest('[data-app-more]')) {
           e.stopPropagation();
-          _track('saved_app_menu_open', { app_id: String(a.id || '') });
           _toggleRowMenu(more, a.id);
           return;
         }

@@ -61,6 +61,19 @@ describe('read-tracker › checkEditFreshness', () => {
     expect(checkEditFreshness(ctx, file, fs.statSync(file))).toBeNull();
   });
 
+  it('accepts an explicit matching hash and rejects a stale hash', () => {
+    const ctx = ctxWithMap();
+    const st = fs.statSync(file);
+    expect(checkEditFreshness(ctx, file, st, {
+      expectedHash: 'sha256:current',
+      currentHash: 'sha256:current',
+    })).toBeNull();
+    expect(checkEditFreshness(ctx, file, st, {
+      expectedHash: 'sha256:old',
+      currentHash: 'sha256:current',
+    })?.code).toBe('E_STALE');
+  });
+
   it('blocks with E_STALE when the file changed (size differs) since the read', () => {
     const ctx = ctxWithMap();
     recordRead(ctx, file);
@@ -79,6 +92,14 @@ describe('read-tracker › checkEditFreshness', () => {
     const block = checkEditFreshness(ctx, file, fs.statSync(file));
     expect(block?.code).toBe('E_STALE');
   });
+
+  it('blocks when content hash changed even if filesystem metadata is unchanged', () => {
+    const ctx = ctxWithMap();
+    const st = fs.statSync(file);
+    recordRead(ctx, file, st, 'sha256:old');
+    const block = checkEditFreshness(ctx, file, st, { currentHash: 'sha256:new' });
+    expect(block?.code).toBe('E_STALE');
+  });
 });
 
 describe('read-tracker › recordRead', () => {
@@ -94,6 +115,13 @@ describe('read-tracker › recordRead', () => {
     const st = fs.statSync(file);
     recordRead(ctx, file, st);
     expect(getReadState(ctx)!.get(file)).toEqual({ mtimeMs: st.mtimeMs, size: st.size });
+  });
+
+  it('stores an optional content hash with the filesystem stamp', () => {
+    const ctx = ctxWithMap();
+    const st = fs.statSync(file);
+    recordRead(ctx, file, st, 'sha256:abc');
+    expect(getReadState(ctx)!.get(file)).toEqual({ mtimeMs: st.mtimeMs, size: st.size, hash: 'sha256:abc' });
   });
 
   it('is a no-op when no map is injected (never throws)', () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
@@ -13,7 +13,7 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 const TEST_UID = 'u1';
 let tmpDir: string;
-const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
+const tmpDirs: string[] = [];
 
 function pkgsDir(): string {
   return path.join(tmpDir, TEST_UID, 'local', 'packages');
@@ -60,7 +60,12 @@ function writePackagePythonSkill(pkgName: string, skillId: string): void {
     path.join(skillDir, 'SKILL.md'),
     `---\nname: ${skillId}\ndescription: pkg py skill\n---\nbody\n`,
   );
-  fs.writeFileSync(path.join(scriptsDir, 'run.py'), 'print("package-local python should not run")\n');
+  fs.writeFileSync(
+    path.join(scriptsDir, 'run.py'),
+    process.platform === 'win32'
+      ? 'process.stdout.write(JSON.stringify({ python: "shared", script: process.argv[1], arg: process.argv[2] }));\n'
+      : 'print("package-local python should not run")\n',
+  );
 }
 
 function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
@@ -90,11 +95,14 @@ function runSkill(skillRef: string, scriptBase: string, args: string[] = [], ext
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-run-skill-pkg-'));
+  tmpDirs.push(tmpDir);
   fs.mkdirSync(path.join(tmpDir, 'home'), { recursive: true });
 });
 
-afterEach(() => {
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterAll(() => {
+  for (const dir of tmpDirs) {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+  }
 });
 
 describe('run-skill.cjs › external packages root', () => {
@@ -141,7 +149,7 @@ describe('run-skill.cjs › external packages root', () => {
     expect(r.status).toBe(66);
   });
 
-  itOnNonWindows('uses shared data/venv Python for package skill scripts', () => {
+  it('uses shared data/venv Python for package skill scripts', () => {
     const repoUrl = 'https://example.test/mypack.git';
     const commit = 'abc123';
     writePackagePythonSkill('mypack', 'pkg-py');
@@ -164,16 +172,22 @@ describe('run-skill.cjs › external packages root', () => {
       'packages',
       packageVenvKey('mypack', repoUrl, commit),
       '.venv',
-      'bin',
-      'python',
+      ...(process.platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python']),
     );
     fs.mkdirSync(path.dirname(python), { recursive: true });
-    fs.writeFileSync(python, [
-      '#!/bin/sh',
-      'printf \'{"python":"shared","script":"%s","arg":"%s"}\\n\' "$1" "$2"',
-      '',
-    ].join('\n'));
-    fs.chmodSync(python, 0o755);
+    if (process.platform === 'win32') {
+      // Do not hard-link the currently running test Node executable: Windows
+      // locks the shared file record until the outer test process exits, which
+      // makes deterministic temp cleanup impossible.
+      fs.copyFileSync(TEST_NODE, python);
+    } else {
+      fs.writeFileSync(python, [
+        '#!/bin/sh',
+        'printf \'{"python":"shared","script":"%s","arg":"%s"}\\n\' "$1" "$2"',
+        '',
+      ].join('\n'));
+      fs.chmodSync(python, 0o755);
+    }
 
     const r = runSkill('pkg-py', 'run', ['x']);
 
@@ -190,7 +204,7 @@ describe('run-skill.cjs › external packages root', () => {
     const allowedScripts = path.join(allowed, 'scripts');
     fs.mkdirSync(allowedScripts, { recursive: true });
     fs.writeFileSync(path.join(allowed, 'SKILL.md'), '---\nname: allowed\ndescription: d\n---\n');
-    fs.writeFileSync(path.join(allowedScripts, 'ok.sh'), 'printf \'{"ok":true,"where":"allowed"}\\n\'\n');
+    fs.writeFileSync(path.join(allowedScripts, 'ok.js'), 'module.exports = async () => ({ ok: true, where: "allowed" });\n');
 
     const blockedScripts = path.join(tmpDir, 'home', '.codex', 'skills', 'blocked', 'scripts');
     fs.mkdirSync(blockedScripts, { recursive: true });
@@ -214,7 +228,7 @@ describe('run-skill.cjs › external packages root', () => {
       path.join(path.dirname(skillDir), 'SKILL.md'),
       '---\nname: global-hello\ndescription: g\n---\nbody\n',
     );
-    fs.writeFileSync(path.join(skillDir, 'hello.sh'), 'printf \'{"ok":true,"where":"global"}\\n\'\n');
+    fs.writeFileSync(path.join(skillDir, 'hello.js'), 'module.exports = async () => ({ ok: true, where: "global" });\n');
 
     const r = runSkill('global-hello', 'hello');
     expect(r.status).toBe(0);
@@ -228,7 +242,7 @@ describe('run-skill.cjs › external packages root', () => {
       path.join(path.dirname(skillDir), 'SKILL.md'),
       '---\nname: codex-hello\ndescription: g\n---\nbody\n',
     );
-    fs.writeFileSync(path.join(skillDir, 'hello.sh'), 'printf \'{"ok":true,"where":"codex"}\\n\'\n');
+    fs.writeFileSync(path.join(skillDir, 'hello.js'), 'module.exports = async () => ({ ok: true, where: "codex" });\n');
 
     const r = runSkill('codex-hello', 'hello');
     expect(r.status).toBe(0);

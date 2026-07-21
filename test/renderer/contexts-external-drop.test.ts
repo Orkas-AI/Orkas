@@ -98,6 +98,16 @@ function dropEvent(dataTransfer: any, closestEntry: any = null) {
 }
 
 describe('Library external file drag-and-drop', () => {
+  it('keeps files usable and exposes storage-full recovery guidance when KB startup fails', () => {
+    const context = loadContextsScript();
+
+    expect(context._applyKbStatusResult({ ok: false, code: 'E_STORAGE_FULL' })).toBe(false);
+    expect(context._kbUnavailableHtml()).toContain('contexts.kb.storage_full');
+    expect(context._kbUnavailableHtml()).toContain('data-kb-status-retry');
+    expect(context._applyKbStatusResult({ ok: true, files: [] })).toBe(true);
+    expect(context._kbUnavailableHtml()).toBe('');
+  });
+
   it('uploads operating-system files into the hovered folder with copy semantics', async () => {
     const context = loadContextsScript();
     const tree = makeTree({ folderPath: 'Research/Notes' });
@@ -253,6 +263,23 @@ describe('Library external file drag-and-drop', () => {
     expect(context.uiAlert.mock.calls[0][0]).toContain('archive.zip');
     expect(context.uiAlert.mock.calls[0][0]).not.toContain('.markdown');
     expect(zh['contexts.upload_rejected']).toBe('这些文件暂不支持，未添加到资料库：\n{list}');
+  });
+
+  it('bounds and completes a large multi-file upload action', async () => {
+    const context = loadContextsScript();
+    context.uiAlert = vi.fn(async () => undefined);
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+    context.loadContexts = vi.fn(async () => undefined);
+    const files = Array.from({ length: 200 }, (_, index) => ({
+      name: `doc-${index}.md`,
+      size: 10,
+      arrayBuffer: vi.fn(async () => new ArrayBuffer(10)),
+    }));
+
+    await context.handleCtxUpload(files, 'Bulk');
+
+    expect(context.apiFetch).toHaveBeenCalledTimes(200);
+    expect(context.uiAlert).not.toHaveBeenCalled();
   });
 
   it('shows only the existing directory for a duplicate upload', async () => {

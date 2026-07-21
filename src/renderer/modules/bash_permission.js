@@ -104,7 +104,7 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
-    const titleHtml = title ? `<div class="ui-dialog-title">${_bashEscapeHtml(title)}</div>` : '';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title">${_bashEscapeHtml(title)}</div>` : '';
     const msgHtml = _bashEscapeHtml(message).replace(/\n/g, '<br />');
     let selectedModeValue = safeCurrentMode;
     const selectedItem = () => modes.find((item) => item.mode === selectedModeValue) || modes.find((item) => item.mode === safeCurrentMode) || modes[0];
@@ -123,9 +123,9 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
       : '<span class="bash-permission-mode-trigger-caret" aria-hidden="true">⌄</span>';
 
     overlay.innerHTML = `
-      <div class="modal ui-dialog bash-permission-dialog" role="dialog" aria-modal="true">
+      <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true">
         ${titleHtml}
-        <div class="ui-dialog-message bash-permission-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}</div>
         <div class="bash-permission-footer">
           <div class="modal-actions bash-permission-actions">
             <div class="bash-permission-mode-control">

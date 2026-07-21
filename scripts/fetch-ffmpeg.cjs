@@ -68,7 +68,8 @@ const platformKey = `${TARGET_PLATFORM}-${TARGET_ARCH}`;
 const destDir = path.join(pcRoot, 'resources', 'runtime', 'ffmpeg', platformKey);
 const exe = TARGET_PLATFORM === 'win32' ? '.exe' : '';
 const READY_FILE = path.join(destDir, '.orkas-ffmpeg-ready.json');
-const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+const PACKAGE_REPAIR_TIMEOUT_MS = 10 * 60 * 1000;
 const REQUIRED_CAPABILITIES = FFMPEG_CAPABILITIES;
 
 // sha256 of the cross-downloaded binaries per target. Update deliberately when
@@ -94,19 +95,157 @@ const CROSS_PINS = {
 };
 
 // ---------------------------------------------------------------------------
-// Host-platform sources (unchanged behavior)
+// Host-platform sources
 // ---------------------------------------------------------------------------
-function resolveSources() {
+function ensureFfmpegStaticBinary(binaryPath, options = {}) {
+  const existsSync = options.existsSync || fs.existsSync;
+  if (!binaryPath) {
+    throw new Error(`ffmpeg-static does not provide a binary for ${process.platform}-${process.arch}`);
+  }
+  if (existsSync(binaryPath)) return false;
+
+  const packageJsonPath = options.packageJsonPath || require.resolve('ffmpeg-static/package.json');
+  const packageDir = path.dirname(packageJsonPath);
+  const installScript = options.installScript || path.join(packageDir, 'install.js');
+  if (!existsSync(installScript)) {
+    throw new Error('ffmpeg-static is incomplete: install.js is missing; run npm install in PC/');
+  }
+
+  const run = options.spawnSync || spawnSync;
+  const logger = options.logger || console;
+  logger.warn('[fetch-ffmpeg] ffmpeg-static binary is missing; repairing its downloaded artifact...');
+  const result = run(process.execPath, [installScript], {
+    cwd: packageDir,
+    env: options.env || process.env,
+    stdio: 'inherit',
+    timeout: options.timeoutMs || PACKAGE_REPAIR_TIMEOUT_MS,
+  });
+  if (result.error) {
+    throw new Error(`ffmpeg-static repair failed to run: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`ffmpeg-static repair failed with status ${result.status ?? 'unknown'}`);
+  }
+  if (!existsSync(binaryPath)) {
+    throw new Error('ffmpeg-static repair completed but the binary is still missing');
+  }
+  logger.log('[fetch-ffmpeg] ffmpeg-static binary repaired');
+  return true;
+}
+
+function verifyPackageIntegrity(buffer, integrity, label) {
+  const candidates = String(integrity || '')
+    .trim()
+    .split(/\s+/)
+    .map((entry) => {
+      const separator = entry.indexOf('-');
+      return separator > 0
+        ? { algorithm: entry.slice(0, separator), digest: entry.slice(separator + 1) }
+        : null;
+    })
+    .filter((entry) => entry && ['sha512', 'sha384', 'sha256'].includes(entry.algorithm));
+  if (!candidates.length) {
+    throw new Error(`${label} has no supported lockfile integrity`);
+  }
+
+  for (const candidate of candidates) {
+    const actual = crypto.createHash(candidate.algorithm).update(buffer).digest();
+    const expected = Buffer.from(candidate.digest, 'base64');
+    if (actual.length === expected.length && crypto.timingSafeEqual(actual, expected)) return;
+  }
+  throw new Error(`${label} integrity mismatch against package-lock.json`);
+}
+
+function installLockedPackageTarball(tgz, packageDir, options = {}) {
+  const run = options.spawnSync || spawnSync;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-npm-package-repair-'));
+  const stagedDir = `${packageDir}.orkas-repair-${process.pid}-${Date.now()}`;
+  try {
+    const tgzPath = path.join(tmp, 'package.tgz');
+    fs.writeFileSync(tgzPath, tgz);
+    const result = run('tar', ['-xzf', tgzPath, '-C', tmp], {
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    if (result.error) throw new Error(`tar extract failed: ${result.error.message}`);
+    if (result.status !== 0) {
+      throw new Error(`tar extract exited ${result.status}: ${(result.stderr || '').slice(-500)}`);
+    }
+
+    const extractedDir = path.join(tmp, 'package');
+    if (!fs.existsSync(path.join(extractedDir, 'package.json'))) {
+      throw new Error('locked npm package archive has no package/package.json');
+    }
+    fs.mkdirSync(path.dirname(packageDir), { recursive: true });
+    fs.rmSync(stagedDir, { recursive: true, force: true });
+    fs.renameSync(extractedDir, stagedDir);
+    fs.rmSync(packageDir, { recursive: true, force: true });
+    fs.renameSync(stagedDir, packageDir);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.rmSync(stagedDir, { recursive: true, force: true });
+  }
+}
+
+async function ensureFfprobeInstallerBinary(options = {}) {
+  const targetKey = options.platformKey || platformKey;
+  const wrapperPackage = options.wrapperPackage || require('@ffprobe-installer/ffprobe/package.json');
+  const packageName = `@ffprobe-installer/${targetKey}`;
+  const expectedVersion = wrapperPackage.optionalDependencies?.[packageName];
+  if (!expectedVersion) {
+    throw new Error(`@ffprobe-installer has no package for ${targetKey}`);
+  }
+
+  let packageDir = options.packageDir;
+  if (!packageDir) {
+    try {
+      packageDir = path.dirname(require.resolve(`${packageName}/package.json`));
+    } catch {
+      packageDir = path.join(pcRoot, 'node_modules', ...packageName.split('/'));
+    }
+  }
+  const binaryPath = options.binaryPath
+    || path.join(packageDir, targetKey.startsWith('win32-') ? 'ffprobe.exe' : 'ffprobe');
+  const existsSync = options.existsSync || fs.existsSync;
+  if (existsSync(binaryPath)) return binaryPath;
+
+  const packageLock = options.packageLock
+    || JSON.parse(fs.readFileSync(path.join(pcRoot, 'package-lock.json'), 'utf8'));
+  const lockKey = `node_modules/${packageName}`;
+  const locked = packageLock.packages?.[lockKey];
+  if (!locked || locked.version !== expectedVersion || !locked.resolved || !locked.integrity) {
+    throw new Error(`${packageName}@${expectedVersion} is not fully pinned in package-lock.json`);
+  }
+  let resolved;
+  try {
+    resolved = new URL(locked.resolved);
+  } catch {
+    throw new Error(`${packageName} has an invalid package-lock.json URL`);
+  }
+  if (resolved.protocol !== 'https:') {
+    throw new Error(`${packageName} package-lock.json URL must use HTTPS`);
+  }
+
+  const logger = options.logger || console;
+  logger.warn(`[fetch-ffmpeg] ${packageName} binary is missing; restoring the lockfile-pinned package...`);
+  const downloadBuffer = options.downloadBuffer || httpGetBuffer;
+  const tgz = await downloadBuffer(resolved.href);
+  verifyPackageIntegrity(tgz, locked.integrity, `${packageName}@${expectedVersion}`);
+  const installPackage = options.installPackage || installLockedPackageTarball;
+  await installPackage(tgz, packageDir);
+  if (!existsSync(binaryPath)) {
+    throw new Error(`${packageName} repair completed but ffprobe is still missing`);
+  }
+  fs.chmodSync(binaryPath, 0o755);
+  logger.log(`[fetch-ffmpeg] ${packageName} binary repaired`);
+  return binaryPath;
+}
+
+async function resolveSources() {
   // ffmpeg-static default export = absolute path to the ffmpeg binary.
-  // @ffprobe-installer/ffprobe `.path` = current platform/arch ffprobe.
   const ffmpegSrc = require('ffmpeg-static');
-  const ffprobeSrc = require('@ffprobe-installer/ffprobe').path;
-  if (!ffmpegSrc || !fs.existsSync(ffmpegSrc)) {
-    throw new Error(`ffmpeg-static binary missing (${ffmpegSrc}); run npm install`);
-  }
-  if (!ffprobeSrc || !fs.existsSync(ffprobeSrc)) {
-    throw new Error(`@ffprobe-installer/ffprobe binary missing (${ffprobeSrc}); run npm install`);
-  }
+  ensureFfmpegStaticBinary(ffmpegSrc);
+  const ffprobeSrc = await ensureFfprobeInstallerBinary();
   return { ffmpegSrc, ffprobeSrc };
 }
 
@@ -322,7 +461,7 @@ function readyCross(pin) {
 
 // ---------------------------------------------------------------------------
 async function mainHost() {
-  const { ffmpegSrc, ffprobeSrc } = resolveSources();
+  const { ffmpegSrc, ffprobeSrc } = await resolveSources();
   fs.mkdirSync(destDir, { recursive: true });
   const ffmpegChanged = copyBinary(ffmpegSrc, `ffmpeg${exe}`, FORCE);
   const ffprobeChanged = copyBinary(ffprobeSrc, `ffprobe${exe}`, FORCE);
@@ -367,7 +506,16 @@ async function main() {
   else await mainCross();
 }
 
-main().catch((err) => {
-  console.error(`[fetch-ffmpeg] failed: ${err.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`[fetch-ffmpeg] failed: ${err.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  ensureFfmpegStaticBinary,
+  ensureFfprobeInstallerBinary,
+  installLockedPackageTarball,
+  verifyPackageIntegrity,
+};

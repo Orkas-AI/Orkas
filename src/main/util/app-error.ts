@@ -5,6 +5,7 @@ export const AppErrorCode = {
   NETWORK_UNAVAILABLE: 'E_NETWORK_UNAVAILABLE',
   SERVER_UNAVAILABLE: 'E_SERVER_UNAVAILABLE',
   BAD_RESPONSE: 'E_BAD_RESPONSE',
+  STORAGE_FULL: 'E_STORAGE_FULL',
 } as const;
 
 export type AppErrorCodeValue = typeof AppErrorCode[keyof typeof AppErrorCode];
@@ -27,6 +28,14 @@ export function normalizeAppError(err: unknown): NormalizedAppError {
   const raw = errorMessage(err);
   const rawCode = errorCode(err);
   const text = `${String(rawCode || '')} ${raw}`.toLowerCase();
+
+  if (
+    rawCode === 'ENOSPC'
+    || rawCode === 'SQLITE_FULL'
+    || /\benospc\b|\bsqlite_full\b|no space left on device|database or disk is full|disk (?:is )?full/.test(text)
+  ) {
+    return { code: AppErrorCode.STORAGE_FULL, error: raw };
+  }
 
   if (
     rawCode === 'E_NOT_LOGGED_IN'

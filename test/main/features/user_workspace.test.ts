@@ -3,6 +3,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
@@ -115,7 +119,7 @@ describe('user_workspace › setWorkspacePath', () => {
     if (result.ok) expect(result.path).toBe(dir);
   });
 
-  it('rejects macOS privacy-protected workspace roots selected by the user', async () => {
+  it.runIf(process.platform === 'darwin')('rejects macOS privacy-protected workspace roots selected by the user', async () => {
     await _pinZh();
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
@@ -325,7 +329,7 @@ describe('user_workspace › scoped (projects)', () => {
     expect(info.recentPaths).toContain(protectedRecent);
   });
 
-  it('falls back from a legacy protected selectedPath without statting it', async () => {
+  it.runIf(process.platform === 'darwin')('falls back from a legacy protected selectedPath without statting it', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const desktop = path.join(home, 'Desktop');

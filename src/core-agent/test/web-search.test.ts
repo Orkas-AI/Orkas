@@ -1,10 +1,30 @@
-import { describe, it, expect } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   parseBraveHtml,
   parseBingHtml,
   chooseProvider,
+  webSearchTool,
   type SearchProvider,
 } from "../src/tools/web-search.js";
+
+let stateDir = "";
+let previousStateDir: string | undefined;
+
+beforeEach(() => {
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "core-web-search-test-"));
+  previousStateDir = process.env.CORE_AGENT_STATE_DIR;
+  process.env.CORE_AGENT_STATE_DIR = stateDir;
+});
+
+afterEach(() => {
+  if (previousStateDir === undefined) delete process.env.CORE_AGENT_STATE_DIR;
+  else process.env.CORE_AGENT_STATE_DIR = previousStateDir;
+  vi.unstubAllGlobals();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
 
 // ─── parseBraveHtml ───────────────────────────────────────────────────────
 
@@ -135,5 +155,60 @@ describe("web-search › chooseProvider", () => {
   it("returns null when neither is reachable (caller surfaces network error)", () => {
     expect(chooseProvider(probe(false, false))).toBeNull();
     expect(chooseProvider(probe(false, false), "brave")).toBeNull();
+  });
+});
+
+describe("web-search tool execution", () => {
+  it("rejects an empty query without touching the network", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await webSearchTool.execute({ query: "   " }, { state: {} });
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain("query is required");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("probes providers, executes the preferred search, clamps count, and persists the choice", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "HEAD") return new Response("", { status: 200 });
+      return new Response(BRAVE_FIXTURE, { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await webSearchTool.execute({ query: "cross platform", count: 1 }, { state: {} });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toContain("Search results for: \"cross platform\" (via Brave)");
+    expect(result.content).toContain("Example A");
+    expect(result.content).not.toContain("Example B");
+    const cache = JSON.parse(fs.readFileSync(path.join(stateDir, "web-search-cache.json"), "utf8"));
+    expect(cache.preferred).toBe("brave");
+  });
+
+  it("switches from an unreachable cached provider and retries the reachable provider", async () => {
+    fs.writeFileSync(path.join(stateDir, "web-search-cache.json"), JSON.stringify({
+      preferred: "brave",
+      probedAt: new Date().toISOString(),
+    }));
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const href = String(url);
+      if (init?.method === "HEAD") {
+        if (href.includes("brave.com")) throw new Error("blocked");
+        return new Response("", { status: 200 });
+      }
+      if (href.includes("brave.com")) throw new Error("blocked");
+      return new Response(BING_FIXTURE, { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await webSearchTool.execute({ query: "fallback" }, { state: {} });
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toContain("via Bing");
+    expect(result.content).toContain("Docs & page");
+    const cache = JSON.parse(fs.readFileSync(path.join(stateDir, "web-search-cache.json"), "utf8"));
+    expect(cache.preferred).toBe("bing");
   });
 });

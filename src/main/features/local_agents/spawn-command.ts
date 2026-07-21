@@ -1,4 +1,5 @@
 import * as path from 'node:path';
+import * as os from 'node:os';
 
 export type ResolvedCliCommand = {
   command: string;
@@ -8,6 +9,63 @@ export type ResolvedCliCommand = {
 
 const WINDOWS_COMMAND_SCRIPT_RE = /\.(?:cmd|bat)$/i;
 const CMD_META_RE = /([()\][%!^"`<>&|;, *?])/g;
+
+/**
+ * Build the environment used for CLI version probes and real runs.
+ * Finder-launched macOS apps inherit a minimal PATH, so an npm-installed
+ * CLI may be discoverable by absolute path while its `#!/usr/bin/env node`
+ * launcher still cannot find Node. Keep the user's existing order, then add
+ * the same conventional install roots used by CLI discovery.
+ */
+export function buildCliSpawnEnv(
+  binPath: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  home = os.homedir(),
+): NodeJS.ProcessEnv {
+  const out = { ...env };
+  const delimiter = platform === 'win32' ? ';' : ':';
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const rawPath = env.PATH || env.Path || '';
+  const candidates = rawPath.split(delimiter).filter(Boolean);
+  candidates.push(pathApi.dirname(binPath));
+
+  if (platform === 'win32') {
+    const localAppData = env.LOCALAPPDATA || (home ? path.win32.join(home, 'AppData', 'Local') : '');
+    const appData = env.APPDATA || (home ? path.win32.join(home, 'AppData', 'Roaming') : '');
+    if (appData) candidates.push(path.win32.join(appData, 'npm'));
+    if (localAppData) candidates.push(path.win32.join(localAppData, 'Programs', 'nodejs'));
+    if (env.VOLTA_HOME) candidates.push(path.win32.join(env.VOLTA_HOME, 'bin'));
+    if (env.PNPM_HOME) candidates.push(env.PNPM_HOME);
+  } else {
+    if (home) {
+      candidates.push(pathApi.join(home, '.local', 'bin'));
+      candidates.push(pathApi.join(home, '.npm-global', 'bin'));
+      candidates.push(pathApi.join(home, 'bin'));
+    }
+    if (env.NPM_CONFIG_PREFIX) candidates.push(pathApi.join(env.NPM_CONFIG_PREFIX, 'bin'));
+    if (env.VOLTA_HOME) candidates.push(pathApi.join(env.VOLTA_HOME, 'bin'));
+    if (env.PNPM_HOME) candidates.push(env.PNPM_HOME);
+    candidates.push(
+      '/opt/homebrew/bin', '/opt/homebrew/sbin',
+      '/usr/local/bin', '/usr/local/sbin',
+      '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+    );
+  }
+
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const candidate of candidates) {
+    const value = String(candidate || '').trim();
+    if (!value) continue;
+    const key = platform === 'win32' ? value.toLowerCase() : value;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(value);
+  }
+  out.PATH = merged.join(delimiter);
+  return out;
+}
 
 function escapeCmdCommand(value: string): string {
   return String(value).replace(CMD_META_RE, '^$1');

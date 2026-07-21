@@ -7,6 +7,11 @@ const read = (relativePath: string) => fs.readFileSync(path.join(root, relativeP
 
 const indexSource = read('src/renderer/index.html');
 const styleSource = read('src/renderer/style.css');
+const backdropDismissSources = [
+  read('src/renderer/modules/library-transfer.js'),
+  read('src/renderer/modules/conversation.js'),
+  read('src/renderer/modules/search.js'),
+];
 const dialogSources = [
   read('src/renderer/modules/library-transfer.js'),
   read('src/renderer/modules/memory.js'),
@@ -19,6 +24,12 @@ const dialogSources = [
 ];
 
 describe('modal close control consistency', () => {
+  it('does not dismiss the audited dialogs from a backdrop click', () => {
+    for (const source of backdropDismissSources) {
+      expect(source).not.toMatch(/event\.target\s*===\s*overlay|e\.target\s*===\s*overlay/);
+    }
+  });
+
   it('defines one shared close-button and icon treatment', () => {
     expect(styleSource).toContain('.modal-close-btn {');
     expect(styleSource).toContain('.modal-close-btn:hover:not(:disabled)');
@@ -38,5 +49,11 @@ describe('modal close control consistency', () => {
     expect(styleSource).toMatch(/\.chat-lightbox-add-library,\s*\.chat-lightbox-reveal\s*\{[\s\S]*?border-radius: 8px;/);
     expect(styleSource).toMatch(/\.chat-file-viewer-md-actions \.ctx-viewer-action-icon-btn\s*\{[\s\S]*?border-radius: 8px;/);
     expect(styleSource).toMatch(/\.chat-file-viewer-add-library,\s*\.chat-file-viewer-save-app,\s*\.chat-file-viewer-reveal\s*\{[\s\S]*?border-radius: 8px;/);
+  });
+
+  it('uses one title, body, and action-button sizing contract', () => {
+    expect(styleSource).toMatch(/\.modal-title\s*\{[\s\S]*?font-size:\s*16px;[\s\S]*?font-weight:\s*600;[\s\S]*?line-height:\s*1\.4;/);
+    expect(styleSource).toMatch(/\.modal-body\s*\{[\s\S]*?font-size:\s*14px;[\s\S]*?line-height:\s*1\.6;/);
+    expect(styleSource).toMatch(/\.modal-actions \.btn,[\s\S]*?min-width:\s*76px;[\s\S]*?min-height:\s*36px;[\s\S]*?padding:\s*0 16px;[\s\S]*?font-size:\s*13px;/);
   });
 });

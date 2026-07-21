@@ -31,6 +31,7 @@
  */
 
 import * as fs from 'node:fs';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -41,6 +42,78 @@ import * as path from 'node:path';
 // require with `Cannot find module './group_chat/bus'` and chats.deleteConversation
 // silently skips purgeGroupDir, breaking the delete-cascade tests.
 import 'tsx/cjs';
+
+// Windows can keep just-closed SQLite databases, command shims, and watched
+// files non-deletable for a short interval. Most tests remove an OS-temp tree
+// in afterEach with recursive rmSync; Node only retries those transient
+// EPERM/EBUSY/ENOTEMPTY errors when maxRetries is non-zero. Apply that policy
+// centrally to recursive removals inside the OS temp directory so every case
+// gets the same semantics without weakening deletion assertions elsewhere.
+if (process.platform === 'win32') {
+  const require = createRequire(import.meta.url);
+  // Main-process feature modules create scoped electron-log instances at
+  // import time. Unit tests repeatedly reset that module graph against a new
+  // temp workspace; a real file transport would retain every old Windows file
+  // handle until the worker exits. Logging behavior has its own focused tests,
+  // so keep the API/console transport but disable process-wide test file IO.
+  const electronLog = require('electron-log/main') as {
+    transports: { file: { level: string | false } };
+  };
+  electronLog.transports.file.level = false;
+  const mutableFs = require('node:fs') as typeof fs & Record<PropertyKey, unknown>;
+  const retryMarker = Symbol.for('orkas.test.windows-temp-rm-retry');
+  if (!mutableFs[retryMarker]) {
+    const originalRmSync = mutableFs.rmSync.bind(mutableFs);
+    const containsDirectoriesOnly = (root: string): boolean => {
+      const pending = [root];
+      try {
+        while (pending.length) {
+          const dir = pending.pop()!;
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) return false;
+            pending.push(path.join(dir, entry.name));
+          }
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    mutableFs.rmSync = ((target: fs.PathLike, options?: fs.RmDirOptions) => {
+      const rawTarget = String(target);
+      // fs.realpathSync.native() returns Win32 extended-length paths. Normalize
+      // both local and UNC forms before checking whether cleanup is safely
+      // contained by the OS temp directory.
+      const ordinaryTarget = rawTarget.startsWith('\\\\?\\UNC\\')
+        ? `\\\\${rawTarget.slice(8)}`
+        : rawTarget.startsWith('\\\\?\\')
+          ? rawTarget.slice(4)
+          : rawTarget;
+      const resolved = path.resolve(ordinaryTarget);
+      const tempRoot = path.resolve(os.tmpdir());
+      const isTempTree = resolved === tempRoot || resolved.startsWith(`${tempRoot}${path.sep}`);
+      if (isTempTree && options?.recursive && options.maxRetries === undefined) {
+        try {
+          return originalRmSync(target, { ...options, maxRetries: 10, retryDelay: 50 });
+        } catch (err) {
+          // Some Windows libraries keep a directory handle until the test
+          // worker exits. If recursive rm already removed every file and
+          // only empty directories remain, retaining that empty shell is
+          // harmless and lets the worker release the handle normally. Never
+          // tolerate a leftover file or symlink: those remain real cleanup
+          // failures.
+          const code = (err as NodeJS.ErrnoException).code;
+          if (options.force && ['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(String(code))
+            && fs.existsSync(resolved) && containsDirectoriesOnly(resolved)) return;
+          throw err;
+        }
+      }
+      return originalRmSync(target, options);
+    }) as typeof fs.rmSync;
+    mutableFs[retryMarker] = true;
+    syncBuiltinESMExports();
+  }
+}
 
 // Unconditional. An inherited value is exactly the case that must not win:
 // `index.ts` exports `ORKAS_WORKSPACE_ROOT` into the app's own environment, so

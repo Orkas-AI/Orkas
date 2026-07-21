@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 // Mock electron — the IPC router imports `shell` / `dialog` / `ipcMain` at
 // module load, none of which are exercised by the readText handler.
@@ -22,7 +27,8 @@ beforeEach(() => {
   vi.resetModules();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -34,7 +40,7 @@ afterEach(() => {
 // covers this kind of multi-branch decision function (CLAUDE.md §9).
 async function callReadText(
   userId: string,
-  input: { path?: unknown; cid?: unknown },
+  input: { path?: unknown; cid?: unknown; compositionRootOnly?: unknown },
 ): Promise<{ ok: boolean; error?: string; size?: number; cap?: number; text?: string }> {
   const userWorkspace = await import('../../../src/main/features/user_workspace');
   const { chatAttachmentDir } = await import('../../../src/main/paths');
@@ -62,10 +68,39 @@ async function callReadText(
   catch { return { ok: false, error: 'not_found' }; }
   if (!st.isFile()) return { ok: false, error: 'not_found' };
   const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-  if (st.size > MAX_TEXT_BYTES) {
+  const compositionRootOnly = input?.compositionRootOnly === true;
+  if (!compositionRootOnly && st.size > MAX_TEXT_BYTES) {
     return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
   }
-  let text = fs.readFileSync(norm, 'utf8');
+  let text: string;
+  if (compositionRootOnly) {
+    const stream = fs.createReadStream(norm, { encoding: 'utf8', highWaterMark: 64 * 1024 });
+    const rootPattern = /<[^>]*\bdata-composition-id\s*=\s*["'][^"']+["'][^>]*>/i;
+    let carry = '';
+    text = '';
+    try {
+      for await (const chunk of stream) {
+        const combined = carry + String(chunk);
+        const match = combined.match(rootPattern);
+        if (match) {
+          text = match[0];
+          break;
+        }
+        const lastOpen = combined.lastIndexOf('<');
+        carry = lastOpen >= 0 ? combined.slice(lastOpen) : '';
+        if (carry.length > 64 * 1024) carry = '';
+      }
+    } finally {
+      if (!stream.closed) {
+        await new Promise<void>((resolve) => {
+          stream.once('close', resolve);
+          stream.destroy();
+        });
+      }
+    }
+  } else {
+    text = fs.readFileSync(norm, 'utf8');
+  }
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   return { ok: true, text, size: st.size };
 }
@@ -167,6 +202,21 @@ describe('produced.readText › size cap', () => {
 
     const res = await callReadText('u7', { path: file });
     expect(res.ok).toBe(true);
+  });
+
+  it('finds composition metadata anywhere in an HTML file over the full-read cap', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(dir, { recursive: true });
+    ws.setWorkspacePath('u10', dir);
+    const file = path.join(dir, 'large.html');
+    const root = '<main data-composition-id="main" data-width="1920" data-height="1080">';
+    fs.writeFileSync(file, 'x'.repeat(2 * 1024 * 1024 + 1) + root);
+
+    const res = await callReadText('u10', { path: file, compositionRootOnly: true });
+    expect(res.ok).toBe(true);
+    expect(res.text).toBe(root);
+    expect(res.size).toBeGreaterThan(2 * 1024 * 1024);
   });
 });
 

@@ -115,6 +115,21 @@ describe('projects › createProject', () => {
 });
 
 describe('projects › listProjects', () => {
+  it('sorts project display names alphabetically with natural number order', async () => {
+    const projects = await loadProjects();
+    for (const name of ['Zulu', 'Beta 10', 'alpha', 'Beta 2']) {
+      const created = await projects.createProject(TEST_UID, name);
+      expect(created.ok).toBe(true);
+    }
+
+    expect((await projects.listProjects(TEST_UID)).map((project) => project.name)).toEqual([
+      'alpha',
+      'Beta 2',
+      'Beta 10',
+      'Zulu',
+    ]);
+  });
+
   it('returns conv_count derived from chats index', async () => {
     const projects = await loadProjects();
     const chats = await loadChats();

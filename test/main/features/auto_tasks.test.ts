@@ -35,6 +35,7 @@ import {
   deleteAttachment,
   applyAutoTaskContainerFromCommander,
   extractAutoTaskContainers,
+  getCurrentDevice,
   getTask,
   isDue,
   listAttachments,
@@ -46,10 +47,12 @@ import {
   uploadAttachment,
   _buildSeedTextForTest,
   _onTimerFireForTest,
+  _setMarkRanFailureForTest,
   type AutoTask,
   type Schedule,
 } from '../../../src/main/features/auto_tasks';
 import { setCurrentLang } from '../../../src/main/i18n';
+import { _setDeviceFingerprintForTests } from '../../../src/main/util/device';
 
 const autoRuntime = vi.hoisted(() => ({
   createConversation: vi.fn(),
@@ -98,6 +101,7 @@ function writeProject(uid: string, projectId: string, agentIds: string[] = []) {
 
 beforeEach(() => {
   stopScheduler();
+  _setMarkRanFailureForTest(null);
   vi.useRealTimers();
   fs.rmSync(userRoot(TEST_UID), { recursive: true, force: true });
   autoRuntime.createConversation.mockReset();
@@ -110,6 +114,7 @@ beforeEach(() => {
 
 afterEach(() => {
   stopScheduler();
+  _setMarkRanFailureForTest(null);
   vi.useRealTimers();
   setCurrentLang('en');
   fs.rmSync(userRoot(TEST_UID), { recursive: true, force: true });
@@ -229,6 +234,66 @@ describe('task CRUD normalization', () => {
     });
     expect(legacyMessageEdit.ok && legacyMessageEdit.task.content).toBe('edited by a legacy client');
     expect(legacyMessageEdit.ok && legacyMessageEdit.task.message_parts).toBeUndefined();
+  });
+
+  it('preserves the assigned device on ordinary edits and explicitly rebinds to the current device', async () => {
+    const created = await createTask(TEST_UID, {
+      id: 'at_16161616',
+      content: 'run on the assigned device',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const remoteTask = {
+      ...created.task,
+      device_id: '11:22:33:44:55:66',
+      device_name: 'Remote workstation',
+    };
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, remoteTask.id), JSON.stringify(remoteTask));
+
+    const ordinaryEdit = await updateTask(TEST_UID, remoteTask.id, { title: 'Still remote' });
+    expect(ordinaryEdit.ok).toBe(true);
+    if (!ordinaryEdit.ok) return;
+    expect(ordinaryEdit.task.device_id).toBe(remoteTask.device_id);
+    expect(ordinaryEdit.task.device_name).toBe(remoteTask.device_name);
+
+    const rebound = await updateTask(TEST_UID, remoteTask.id, { run_on_current_device: true });
+    expect(rebound.ok).toBe(true);
+    if (!rebound.ok) return;
+    const current = getCurrentDevice();
+    expect(rebound.task.device_id).toBe(current.id || undefined);
+    expect(rebound.task.device_name).toBe(current.name);
+    expect((await getTask(TEST_UID, remoteTask.id))?.device_id).toBe(current.id || undefined);
+    expect((await getTask(TEST_UID, remoteTask.id))?.device_name).toBe(current.name);
+  });
+
+  it('does not clear an existing device binding when the current device has no stable id', async () => {
+    _setDeviceFingerprintForTests({ id: '', name: 'No stable NIC' });
+    try {
+      const created = await createTask(TEST_UID, {
+        id: 'at_17171717',
+        content: 'run on the assigned device',
+        schedule: { type: 'daily', hour: 9, minute: 0 },
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+
+      const remoteTask = {
+        ...created.task,
+        device_id: '11:22:33:44:55:66',
+        device_name: 'Remote workstation',
+      };
+      fs.writeFileSync(autoTaskConfigFile(TEST_UID, remoteTask.id), JSON.stringify(remoteTask));
+
+      const rebound = await updateTask(TEST_UID, remoteTask.id, { run_on_current_device: true });
+      expect(rebound.ok).toBe(true);
+      if (!rebound.ok) return;
+      expect(rebound.task.device_id).toBe(remoteTask.device_id);
+      expect(rebound.task.device_name).toBe(remoteTask.device_name);
+    } finally {
+      _setDeviceFingerprintForTests(null);
+    }
   });
 
   it('continues to read legacy configs without message parts', async () => {
@@ -407,17 +472,31 @@ describe('attachments', () => {
     expect((await uploadAttachment(TEST_UID, 'bad-id', 'brief.md', Buffer.from('brief'))).ok).toBe(false);
 
     const nested = await uploadAttachment(TEST_UID, taskId, 'nested\\brief.md', Buffer.from('nested'));
-    expect(nested).toEqual({ ok: true, name: 'nested_brief.md' });
+    // Directory components are discarded with the same semantics on every host.
+    expect(nested).toEqual({ ok: true, name: 'brief.md' });
+    const browserFakePath = await uploadAttachment(
+      TEST_UID,
+      taskId,
+      'C:\\fakepath\\windows-brief.md',
+      Buffer.from('windows'),
+    );
+    expect(browserFakePath).toEqual({ ok: true, name: 'windows-brief.md' });
     const escaped = await uploadAttachment(TEST_UID, taskId, '../escape.md', Buffer.from('escape'));
     expect(escaped).toEqual({ ok: true, name: 'escape.md' });
 
     const dir = autoTaskAttachmentsDir(TEST_UID, taskId);
     fs.writeFileSync(path.join(dir, '.DS_Store'), 'metadata');
     fs.mkdirSync(path.join(dir, 'not-a-file'));
-    expect((await listAttachments(TEST_UID, taskId)).sort()).toEqual(['escape.md', 'nested_brief.md']);
+    expect((await listAttachments(TEST_UID, taskId)).sort()).toEqual([
+      'brief.md',
+      'escape.md',
+      'windows-brief.md',
+    ]);
 
     expect((await deleteAttachment(TEST_UID, taskId, '../escape.md')).ok).toBe(true);
     expect(fs.existsSync(path.join(dir, 'escape.md'))).toBe(false);
+    expect((await deleteAttachment(TEST_UID, taskId, 'nested\\brief.md')).ok).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'brief.md'))).toBe(false);
     expect(await listAttachments(TEST_UID, 'bad-id')).toEqual([]);
   });
 
@@ -575,14 +654,10 @@ describe('scheduler dispatch', () => {
     vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
     const boundary = new Date(2026, 4, 22, 9, 0, 0);
     const claimFile = path.join(userLocalRoot(TEST_UID), 'auto_task_claims', taskId, `${boundary.getTime()}.json`);
-    const taskDir = autoTaskDir(TEST_UID, taskId);
 
-    fs.chmodSync(taskDir, 0o500);
-    try {
-      await _onTimerFireForTest(TEST_UID, taskId);
-    } finally {
-      fs.chmodSync(taskDir, 0o700);
-    }
+    _setMarkRanFailureForTest(new Error('injected persistence failure'));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    _setMarkRanFailureForTest(null);
 
     expect(autoRuntime.createConversation).not.toHaveBeenCalled();
     expect(autoRuntime.send).not.toHaveBeenCalled();

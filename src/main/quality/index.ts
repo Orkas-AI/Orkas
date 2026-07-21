@@ -34,6 +34,10 @@ import {
   parseFailureViolation,
   skillMetaParseViolation,
 } from './rules/schema';
+import {
+  scanAgentRunnerContract,
+  scanSkillRunnerContract,
+} from './rules/skill-runner';
 
 // Re-export the types so callers only need one import path.
 export type { Violation, ValidationReport, Level } from './types';
@@ -76,7 +80,10 @@ export function validateSkillFile(args: {
  *
  * EXTREME if SKILL.md is missing or unparseable.
  */
-export function validateSkillDir(skillDir: string): ValidationReport {
+export function validateSkillDir(
+  skillDir: string,
+  options: { enforceSkillRunner?: boolean } = {},
+): ValidationReport {
   const violations: Violation[] = [];
   const skillMdPath = path.join(skillDir, 'SKILL.md');
 
@@ -95,7 +102,12 @@ export function validateSkillDir(skillDir: string): ValidationReport {
     const content = fs.readFileSync(skillMdPath, 'utf8');
     const { meta, metaViolations } = _readSkillMeta(skillDir);
     violations.push(...metaViolations);
-    violations.push(..._scanSkillMd(content, 'SKILL.md', meta));
+    violations.push(..._scanSkillMd(
+      content,
+      'SKILL.md',
+      meta,
+      options.enforceSkillRunner !== false,
+    ));
     violations.push(...validateSkillMeta(meta));
   } catch (err) {
     violations.push(parseFailureViolation({
@@ -130,6 +142,7 @@ export function validateSkillDir(skillDir: string): ValidationReport {
  */
 export function validateAgentSpec(args: {
   agentJson: unknown;
+  enforceSkillRunner?: boolean;
 }): ValidationReport {
   const violations: Violation[] = [];
   if (!args.agentJson || typeof args.agentJson !== 'object') {
@@ -141,6 +154,9 @@ export function validateAgentSpec(args: {
   }
   const obj = args.agentJson as Record<string, unknown>;
   violations.push(...validateAgentJsonShape(obj));
+  if (args.enforceSkillRunner !== false) {
+    violations.push(...scanAgentRunnerContract(obj));
+  }
 
   // Scan string fields for red flags (path-style strings in workflow /
   // description fields). Cheap pass over the serialized form keeps the rule
@@ -163,7 +179,10 @@ export function validateAgentSpec(args: {
 /**
  * Validate an on-disk agent directory (reads `agent.json` from `<dir>/agent.json`).
  */
-export function validateAgentDir(agentDir: string): ValidationReport {
+export function validateAgentDir(
+  agentDir: string,
+  options: { enforceSkillRunner?: boolean } = {},
+): ValidationReport {
   const file = path.join(agentDir, 'agent.json');
   if (!fs.existsSync(file)) {
     return _finalize([{
@@ -183,7 +202,10 @@ export function validateAgentDir(agentDir: string): ValidationReport {
       message: (err as Error).message,
     })]);
   }
-  return validateAgentSpec({ agentJson: parsed });
+  return validateAgentSpec({
+    agentJson: parsed,
+    enforceSkillRunner: options.enforceSkillRunner,
+  });
 }
 
 // ── Internals ───────────────────────────────────────────────────────────
@@ -200,7 +222,12 @@ function detectSkillFileKind(relpath: string): ScanKind {
   return 'other';
 }
 
-function _scanSkillMd(content: string, field: string, skillMeta: Record<string, unknown> = {}): Violation[] {
+function _scanSkillMd(
+  content: string,
+  field: string,
+  skillMeta: Record<string, unknown> = {},
+  enforceSkillRunner = true,
+): Violation[] {
   const violations: Violation[] = [];
 
   // Frontmatter: parse with a minimal YAML-subset (same shape as
@@ -215,6 +242,9 @@ function _scanSkillMd(content: string, field: string, skillMeta: Record<string, 
     return violations;
   }
   violations.push(...validateSkillFrontmatter(meta, skillMeta));
+  if (enforceSkillRunner) {
+    violations.push(...scanSkillRunnerContract({ content, field }));
+  }
 
   // Embedded executable code blocks: scan each for red flags.
   for (const block of extractExecutableBlocks(body)) {

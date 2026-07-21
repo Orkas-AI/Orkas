@@ -68,9 +68,19 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function drain(opts: Record<string, unknown>): Promise<{ events: Array<{ type: string; text?: string }>; ms: number }> {
+type DrainedEvent = {
+  type: string;
+  text?: string;
+  failureKind?: 'model' | 'config';
+  failureCode?: string;
+  failurePhase?: string;
+  telemetry?: Record<string, unknown>;
+  event?: { stream?: string; data?: Record<string, unknown> };
+};
+
+async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEvent[]; ms: number }> {
   const client = await import('../../../../src/main/model/core-agent/client');
-  const events: Array<{ type: string; text?: string }> = [];
+  const events: DrainedEvent[] = [];
   const start = Date.now();
   for await (const ev of client.streamChatWithModel({
     userId: 'u1',
@@ -78,7 +88,7 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: Array<{ t
     sessionId: 'gconv-stalltest',
     ...opts,
   } as Parameters<typeof client.streamChatWithModel>[0])) {
-    events.push(ev as { type: string; text?: string });
+    events.push(ev as DrainedEvent);
   }
   return { events, ms: Date.now() - start };
 }
@@ -98,7 +108,12 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(types).toContain('delta');
     expect(types).toContain('error');
     expect(types[types.length - 1]).toBe('done');
-    expect(events.find((e) => e.type === 'error')?.text || '').toMatch(/no response|exceeded/i);
+    const failure = events.find((e) => e.type === 'error');
+    expect(failure?.text || '').toMatch(/no response|exceeded/i);
+    expect(failure).toMatchObject({
+      failureKind: 'model',
+      failureCode: 'idle_timeout',
+    });
     // Fired on the 0.3s short window, not the 10s long one.
     expect(ms).toBeLessThan(3000);
   }, 8000);

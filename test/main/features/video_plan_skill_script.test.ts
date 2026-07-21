@@ -7,6 +7,12 @@ import { describe, expect, it } from 'vitest';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
+function pcDir() {
+  return path.basename(process.cwd()) === 'PC'
+    ? process.cwd()
+    : path.resolve(process.cwd(), 'PC');
+}
+
 function validPlan() {
   return {
     aspect: '9:16',
@@ -35,6 +41,25 @@ function makeProject(plan: unknown) {
 }
 
 function makeFakeProbeEnv(cwd: string, durations: Record<string, number>) {
+  if (process.platform === 'win32') {
+    const runtimeDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+    const ffmpegPath = path.join(runtimeDir, 'ffmpeg.exe');
+    const ffprobePath = path.join(runtimeDir, 'ffprobe.exe');
+    for (const [name, duration] of Object.entries(durations)) {
+      const output = path.join(cwd, 'project', 'cuts', name);
+      const generated = spawnSync(ffmpegPath, [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', `color=c=black:s=16x16:r=1:d=${duration}`,
+        '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', output,
+      ], { encoding: 'utf8' });
+      if (generated.status !== 0) throw new Error(generated.stderr || `failed to generate ${name}`);
+    }
+    return {
+      ORKAS_BUNDLED_FFMPEG: ffmpegPath,
+      ORKAS_BUNDLED_FFPROBE: ffprobePath,
+    };
+  }
+
   const binDir = path.join(cwd, 'fake-bin');
   fs.mkdirSync(binDir, { recursive: true });
   const durationsPath = path.join(binDir, 'durations.json');
@@ -66,19 +91,19 @@ function makeFakeProbeEnv(cwd: string, durations: Record<string, number>) {
 }
 
 function runVideoPlan(cwd: string, args: string[], extraEnv: Record<string, string> = {}) {
-  const pcDir = fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
+  const appDir = fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
     ? process.cwd()
     : path.resolve(process.cwd(), 'PC');
-  const skillDir = path.join(pcDir, 'resources', 'builtin', 'marketplace', 'agents', '79df9cc89f5f', 'skills', 'stage-plan');
+  const skillDir = path.join(appDir, 'resources', 'builtin', 'marketplace', 'agents', '79df9cc89f5f', 'skills', 'stage-plan');
   return spawnSync(
     TEST_NODE,
-    [path.join(pcDir, 'bin', 'run-skill.cjs'), 'stage-plan', 'video_plan', '--', ...args],
+    [path.join(appDir, 'bin', 'run-skill.cjs'), 'stage-plan', 'video_plan', '--', ...args],
     {
       cwd,
       encoding: 'utf8',
       env: {
         ...process.env,
-        ORKAS_PC_DIR: pcDir,
+        ORKAS_PC_DIR: appDir,
         ORKAS_RUN_SKILL_DIR: skillDir,
         ORKAS_WORKSPACE_ROOT: cwd,
         ...extraEnv,

@@ -15,6 +15,7 @@ quality/
 ├── types.ts              Violation / ValidationReport / Level
 ├── rules/
 │   ├── red-flags.ts      9 EXTREME patterns (credential reads, eval, …)
+│   ├── skill-runner.ts   standard Skill Runner invocation contract
 │   └── schema.ts         frontmatter + agent.json shape checks
 └── report.ts             persist / read / delete the per-spec report
                           under <uid>/local/quality_reports/
@@ -35,6 +36,8 @@ quality/
 | `EXTREME` | Blocks the write. Authoring path retries up to 2 times with structured feedback; install / hand-edit path rejects outright. |
 | `MEDIUM` | Writes succeed. UI shows an advisory chip / suggestion. |
 | `LOW` | Silent — recorded only in the persisted report. |
+
+The `skill_script_requires_runner` rule is an authoring/publishing contract, not an install migration. Creation, editing, import, and Marketplace upload enforce it. Marketplace installation validates the existing security/schema rules while explicitly omitting this one rule, so historical bundles are restored verbatim rather than rejected or rewritten.
 
 There is intentionally NO override for EXTREME. If a real use case triggers a red flag, restructure the spec to remove the pattern (typically: accept the path as a user-provided argument rather than hard-coding a sensitive location).
 

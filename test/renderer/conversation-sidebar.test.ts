@@ -133,6 +133,31 @@ describe('conversation history initial window', () => {
     expect(context._historyRequestUrl('c1', 999)).toBe('/api/conversations/c1/history?limit=10&before=999&project_id=p1');
     expect(context._historyRequestUrl('global')).toBe('/api/conversations/global/history?limit=10&project_id=');
   });
+
+  it('recognizes a stale deleted-conversation result as recoverable', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._isConversationMissingResponse({ ok: false, error: 'conversation not found' })).toBe(true);
+    expect(context._isConversationMissingResponse({ ok: false, code: 'E_CONVERSATION_NOT_FOUND' })).toBe(true);
+    expect(context._isConversationMissingResponse({ ok: false, error: 'database unavailable' })).toBe(false);
+  });
+
+  it('drops a missing current conversation and returns to the new-task view', async () => {
+    const context = loadConversationRenderer();
+    const views: string[] = [];
+    context.currentCid = 'gone';
+    context.conversations.push({ conversation_id: 'gone' }, { conversation_id: 'keep' });
+    context.abortConvStream = () => {};
+    context._forgetConvLocal = () => {};
+    context.renderConversationList = () => {};
+    context.setView = (view: string) => { views.push(view); context.currentCid = null; };
+    context.loadConversations = async () => {};
+
+    await context._recoverMissingConversation('gone');
+
+    expect(context.conversations.map((item: any) => item.conversation_id)).toEqual(['keep']);
+    expect(views).toEqual(['new-chat']);
+  });
 });
 
 describe('conversation run observer cleanup', () => {
@@ -1003,6 +1028,59 @@ describe('conversation process read_file resource labels', () => {
 
     expect(line).toContain('Agent: 学习路径设计师 · agent.json');
   });
+
+  it('simplifies hidden system skill paths in legacy start events', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: {
+          path: '/Users/user/.orkas/data/u1/local/system/skills/agent-creator/SKILL.md',
+        },
+      },
+    });
+
+    expect(line).toContain('Skill: agent-creator · SKILL.md');
+    expect(line).not.toContain('/Users/user/.orkas');
+  });
+
+  it('uses system skill metadata instead of a persisted-output marker on completion', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        name: 'read_file',
+        skill_id: 'agent-creator',
+        skill_name: 'agent-creator',
+        skill_system: 'system',
+        skill_file: 'SKILL.md',
+        result_preview: '<persisted-output ref="read_file.deadbeef" tool="read_file" size="41420">',
+      },
+    });
+
+    expect(line).toContain('Skill: agent-creator · SKILL.md');
+    expect(line).not.toContain('persisted-output');
+  });
+
+  it('simplifies platform agent-private skill paths in legacy events', () => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        name: 'read_file',
+        arguments: {
+          path: '/Users/user/.orkas/data/u1/local/marketplace/agents/79df9cc89f5f/skills/stage-plan/SKILL.md',
+        },
+      },
+    });
+
+    expect(line).toContain('Skill: stage-plan · SKILL.md');
+    expect(line).not.toContain('79df9cc89f5f/skills');
+  });
 });
 
 describe('conversation process metadata formatting', () => {
@@ -1187,6 +1265,175 @@ describe('conversation auto recipient', () => {
     `, context);
 
     expect(context.__sent).toEqual(['@FamilyTutor 还有吗？']);
+  });
+
+  it('keeps a queued message until its controller reports that sending started', async () => {
+    const context = loadConversationRenderer();
+    context.messageQueues = new Map();
+    context._QUEUE_KEY = (cid: string) => `queue_${cid}`;
+    context._DRAFT_KEY = (cid: string) => `draft_${cid}`;
+    const queueSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8');
+    vm.runInContext(queueSource, context);
+    vm.runInContext(`
+      currentCid = "c1";
+      enqueueMessage("c1", "稍后执行", null);
+      sendInCurrentConversation = async () => ({ started: false, reason: "model_not_configured" });
+      _dispatchNextQueued("c1");
+    `, context);
+    await Promise.resolve();
+
+    expect(context.messageQueues.get('c1')).toHaveLength(1);
+
+    vm.runInContext(`
+      sendInCurrentConversation = async (_content, _extra, options) => {
+        options.onStarted();
+        return { started: true, aborted: false, errored: false };
+      };
+      _dispatchNextQueued("c1");
+    `, context);
+    await Promise.resolve();
+
+    expect(context.messageQueues.get('c1')).toHaveLength(0);
+  });
+});
+
+describe('conversation controller settlement', () => {
+  it('settles an aborted send only from onDone and reuses the owning controller', () => {
+    const context = loadConversationRenderer();
+    const finishes: any[] = [];
+    const cleanups: string[] = [];
+    let hooks: any = null;
+    context.createChatController = (config: any) => {
+      hooks = config.hooks;
+      return { abort() {} };
+    };
+    context._taskTurnFinish = (...args: any[]) => finishes.push(args);
+    context._finishStreamingMsg = (cid: string) => cleanups.push(cid);
+    context._scheduleHistoryReconcileAfterStream = () => {};
+    context._updateConvSendUI = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context.startPolling = () => {};
+    context._startRuntimeActorRecovery = () => {};
+
+    const ctrl = context._makeConvChatController('c1');
+    context.__ctrl = ctrl;
+    vm.runInContext('_convChatCtrls.set("c1", __ctrl)', context);
+    const msg = { dataset: {} };
+    hooks.onAssistantStart(msg, 'c1');
+
+    expect(context.pendingConvs.get('c1').controller).toBe(ctrl);
+    hooks.onAbort(msg, 'c1');
+    expect(finishes).toHaveLength(0);
+    expect(cleanups).toHaveLength(0);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(finishes).toHaveLength(1);
+    expect(finishes[0][1]).toMatchObject({ aborted: true, errored: false });
+    expect(cleanups).toEqual(['c1']);
+
+    hooks.onDone(msg, 'c1', { started: true, aborted: true, errored: false });
+    expect(finishes).toHaveLength(1);
+    expect(cleanups).toEqual(['c1']);
+  });
+
+  it('classifies a server abort as aborted instead of model output failure', async () => {
+    const context = loadConversationRenderer();
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-07-17T00:00:00';
+    context._createStreamingAssistantMessage = () => ({ dataset: {} });
+    context._handleStreamEvent = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    const encoded = new TextEncoder().encode(`data: ${JSON.stringify({
+      type: 'error',
+      aborted: true,
+      text: 'stopped',
+    })}\n\n`);
+    let readCount = 0;
+    context.apiFetch = async () => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: async () => (readCount++ === 0
+            ? { done: false, value: encoded }
+            : { done: true, value: undefined }),
+        }),
+      },
+    });
+    let aborts = 0;
+    let errors = 0;
+    let doneResult: any = null;
+    const controller = context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'c1',
+      streamEndpoint: () => '/stream',
+      features: { bindInput: false, scrollPin: false },
+      hooks: {
+        appendHistoryMessage: () => ({ dataset: {} }),
+        onAbort: () => { aborts += 1; },
+        onError: () => { errors += 1; },
+        onDone: (_msg: any, _cid: string, result: any) => { doneResult = result; },
+      },
+    });
+
+    const result = await controller.send('hello');
+
+    expect(aborts).toBe(1);
+    expect(errors).toBe(0);
+    expect(result).toMatchObject({ started: true, aborted: true, errored: false });
+    expect(doneResult).toMatchObject({ started: true, aborted: true, errored: false });
+  });
+
+  it('renders a server abort as stopped instead of a model error', () => {
+    const context = loadConversationRenderer();
+    let stopped = 0;
+    let errors = 0;
+    context._streamingMarkAborted = () => { stopped += 1; };
+    context._streamingSetError = () => { errors += 1; };
+
+    context._handleStreamEvent('c1', {}, { type: 'error', aborted: true, text: 'stopped' });
+
+    expect(stopped).toBe(1);
+    expect(errors).toBe(0);
+  });
+
+  it.each([
+    [{ started: true, aborted: false, errored: false }, 'success'],
+    [{ started: true, aborted: false, errored: true }, 'failure'],
+    [{ started: true, aborted: true, errored: false }, 'cancelled'],
+  ])('returns the terminal chat result from controller state %#', async (terminal, expected) => {
+    const context = loadConversationRenderer();
+    context.performance = performance;
+    context._taskTurnStart = () => {};
+    context._makeConvChatController = (_cid: string, options: any) => ({
+      abort() {},
+      async send() {
+        options.onStarted();
+        options.onDone(terminal);
+        return terminal;
+      },
+    });
+
+    const result = await context.sendInConversation('c1', 'hello');
+
+    expect(result.result).toBe(expected);
+  });
+
+  it('returns failure for a controller preflight rejection', async () => {
+    const context = loadConversationRenderer();
+    context.performance = performance;
+    context._makeConvChatController = () => ({
+      abort() {},
+      async send() {
+        return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
+      },
+    });
+
+    const result = await context.sendInConversation('c1', 'hello');
+
+    expect(result.result).toBe('failure');
   });
 });
 

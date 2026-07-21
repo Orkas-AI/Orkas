@@ -25,11 +25,10 @@ const pkg = require(PKG_PATH) as {
 
 const tarAvailable = spawnSync('tar', ['--version'], { encoding: 'utf8' }).status === 0;
 const itWithTar = tarAvailable ? it : it.skip;
-const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
 
 let tmpDir: string;
 beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-pkg-tb-')); });
-afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
 
 describe('classifySource', () => {
   it('recognizes GitHub https URLs (with and without .git / scheme / www)', () => {
@@ -105,7 +104,7 @@ describe('extractGithubTarball', () => {
 });
 
 describe('install routing without git', () => {
-  itOnNonWindows('errors clearly when git is absent and the source is not a public GitHub repo', () => {
+  it('errors clearly when git is absent and the source is not a public GitHub repo', () => {
     const wsRoot = path.join(tmpDir, 'data');
     fs.mkdirSync(wsRoot, { recursive: true });
     const emptyBin = path.join(tmpDir, 'empty-bin');
@@ -127,9 +126,9 @@ describe('install routing without git', () => {
   });
 });
 
-// Real end-to-end install over the network. Opt-in only (ORKAS_PKG_NET_TEST),
-// non-Windows (uses a unix symlink + PATH to hide git while keeping tar).
-describe.skipIf(!process.env.ORKAS_PKG_NET_TEST || process.platform === 'win32')('install over the network without git', () => {
+// Real end-to-end install over the network. Opt-in only (ORKAS_PKG_NET_TEST).
+// Its isolated PATH hides git while retaining a target-native tar executable.
+describe.skipIf(!process.env.ORKAS_PKG_NET_TEST)('install over the network without git', () => {
   it('downloads a public GitHub repo as a tarball when git is unavailable', () => {
     const wsRoot = path.join(tmpDir, 'data');
     fs.mkdirSync(wsRoot, { recursive: true });
@@ -138,8 +137,14 @@ describe.skipIf(!process.env.ORKAS_PKG_NET_TEST || process.platform === 'win32')
     // is found via the absolute test Node path regardless of PATH.
     const onlyTarBin = path.join(tmpDir, 'only-tar-bin');
     fs.mkdirSync(onlyTarBin, { recursive: true });
-    const tarPath = spawnSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).stdout.trim();
-    fs.symlinkSync(tarPath, path.join(onlyTarBin, 'tar'));
+    if (process.platform === 'win32') {
+      const tarPath = path.join(process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows', 'System32', 'tar.exe');
+      if (!fs.existsSync(tarPath)) throw new Error(`Windows tar executable not found: ${tarPath}`);
+      fs.copyFileSync(tarPath, path.join(onlyTarBin, 'tar.exe'));
+    } else {
+      const tarPath = spawnSync('sh', ['-c', 'command -v tar'], { encoding: 'utf8' }).stdout.trim();
+      fs.symlinkSync(tarPath, path.join(onlyTarBin, 'tar'));
+    }
 
     // octocat/Hello-World is tiny and stable but has no SKILL.md / CLI entry,
     // so a successful download+extract reaches the scan stage and exits 65.
@@ -179,21 +184,26 @@ describe('orkas-pkg source hardening (security fixes)', () => {
       expect(pkg.isGithubHost(bad)).toBe(false);
   });
 
-  itOnNonWindows('findSymlink reports the first repo-content symlink, skips top-level .git, null for a clean tree', () => {
+  it('findSymlink reports the first repo-content symlink, skips top-level .git, null for a clean tree', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-sl-'));
+    const outside = `${root}-outside-target`;
     try {
       fs.mkdirSync(path.join(root, 'sub'), { recursive: true });
       fs.writeFileSync(path.join(root, 'sub', 'a.txt'), 'x');
       expect(pkg.findSymlink(root)).toBeNull();
+      fs.mkdirSync(outside);
       // a symlink inside .git (git metadata) is ignored
       fs.mkdirSync(path.join(root, '.git'), { recursive: true });
-      fs.symlinkSync('/etc/hosts', path.join(root, '.git', 'link'));
+      fs.symlinkSync(process.platform === 'win32' ? outside : '/etc/hosts', path.join(root, '.git', 'link'), process.platform === 'win32' ? 'junction' : 'file');
       expect(pkg.findSymlink(root)).toBeNull();
-      // a symlink in repo content is reported (the escape vector)
-      fs.symlinkSync('/etc/hosts', path.join(root, 'sub', 'SKILL.md'));
-      expect(pkg.findSymlink(root)).toBe(path.join('sub', 'SKILL.md'));
+      // A Windows junction is a reparse-point escape with the same security
+      // contract as a POSIX file symlink and does not require elevated rights.
+      const linkName = process.platform === 'win32' ? 'linked-dir' : 'SKILL.md';
+      fs.symlinkSync(process.platform === 'win32' ? outside : '/etc/hosts', path.join(root, 'sub', linkName), process.platform === 'win32' ? 'junction' : 'file');
+      expect(pkg.findSymlink(root)).toBe(path.join('sub', linkName));
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
     }
   });
 });

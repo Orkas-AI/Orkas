@@ -63,6 +63,11 @@
     try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
   }
 
+  function _trackEvent(action, data) {
+    void action;
+    void data;
+  }
+
   function _trackError(action, data) {
     try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
   }
@@ -267,7 +272,6 @@
         const ctx = _menuCtx;
         _closeMenu();
         if (!ctx) return;
-        _track('artifact_menu_action', { action, cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
         if (action === 'reload') _doReload(ctx);
         else if (action === 'open') _doOpen(ctx);
         else if (action === 'save') _doSave(ctx);
@@ -360,7 +364,6 @@
   function _doReload(ctx) {
     const f = ctx && ctx.frame;
     if (!f || !f.isConnected) return;
-    _track('artifact_reload', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
     // Reset height to default; the artifact re-reports on load. Reassigning
     // `src` forces a fresh load (the protocol handler sends `Cache-Control:
     // private` and dev reload ignores cache; this just re-runs the app).
@@ -371,19 +374,18 @@
   }
 
   function _doOpen(ctx) {
-    _track('artifact_open_viewer', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
     try { _openViewer(ctx); }
     catch (err) { _trackError('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
-    _track('artifact_save', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
+    _track('artifact_save', { surface: 'conversation' });
     try {
       const r = await window.orkas.invoke('conversations.artifacts.save', {
         cid: String(ctx.cid), artifactId: String(ctx.artifactId),
       });
       if (!r || r.ok === false) throw new Error((r && r.error) || 'save failed');
-      _track('artifact_save_ok', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
+      _trackEvent('artifact_save_result', { result: 'success', surface: 'conversation' });
       try {
         const message = _t('apps.saved_toast', 'Saved to My Apps');
         if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
@@ -391,7 +393,11 @@
       } catch (_) {}
       // Refresh the "My Apps" tab if its module is loaded.
       try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-    } catch (err) { _trackError('artifact_save', { error_message: String(err && err.message || err) }); _notifyFail(_t('apps.save_failed', 'Could not save the app'), err); }
+    } catch (err) {
+      _trackEvent('artifact_save_result', { result: 'failure', surface: 'conversation' });
+      _trackError('artifact_save', { error_message: String(err && err.message || err) });
+      _notifyFail(_t('apps.save_failed', 'Could not save the app'), err);
+    }
   }
 
   // ── render ──────────────────────────────────────────────────────────────
@@ -439,7 +445,6 @@
 
     moreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      _track('artifact_menu_open', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
       _openMenu(moreBtn, { frame, cid: ctx.cid, artifactId: ctx.artifactId, title, agentId: ctx.agentId || '' });
     });
 

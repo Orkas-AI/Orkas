@@ -2,6 +2,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 // Mock the model client so the autoTitle integration test below can
 // exercise `groupChat.send` (which spawns a commander worker that
@@ -33,7 +38,8 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -123,6 +129,54 @@ describe('chats › message history tombstones', () => {
     const earlier = await chats.getMessagesPage(TEST_UID, conv.conversation_id, 2, latest.nextCursor);
     expect(earlier.history.map((row) => row.id)).toEqual(['m1']);
     expect(earlier.nextCursor).toBeNull();
+  });
+
+  it('loads from the search target page through the newest message', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'search target' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const rows = Array.from({ length: 35 }, (_, i) => ({
+      id: `m${i}`,
+      ts: `2026-07-10T10:${String(i).padStart(2, '0')}:00`,
+      from: i % 2 ? 'commander' : 'user',
+      to: i % 2 ? ['user'] : ['commander'],
+      text: `message ${i}`,
+    }));
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const page = await chats.getMessagesPageAtIndex(TEST_UID, conv.conversation_id, 23, 10);
+
+    expect(page.pageStart).toBe(20);
+    expect(page.history.map((row) => row.id)).toEqual([
+      'm20', 'm21', 'm22', 'm23', 'm24', 'm25', 'm26', 'm27', 'm28', 'm29',
+      'm30', 'm31', 'm32', 'm33', 'm34',
+    ]);
+    expect(page.historyIndexes).toEqual([
+      20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+    ]);
+    expect(page.nextCursor).not.toBeNull();
+  });
+
+  it('keeps source indexes aligned when an anchored page contains tombstones or legacy rows', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'legacy search target' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const rows = Array.from({ length: 35 }, (_, i) => {
+      if (i === 21) {
+        return { id: 'm21', from: 'user', text: 'deleted', deleted_at: '2026-07-10T11:00:00' };
+      }
+      if (i === 23) return { from: 'commander', text: 'legacy target without identity' };
+      return { id: `m${i}`, from: i % 2 ? 'commander' : 'user', text: `message ${i}` };
+    });
+    fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const page = await chats.getMessagesPageAtIndex(TEST_UID, conv.conversation_id, 23, 10);
+
+    expect(page.pageStart).toBe(20);
+    expect(page.history.map((row) => row.text)).toContain('legacy target without identity');
+    expect(page.historyIndexes).toEqual([
+      20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+    ]);
   });
 
   it('keeps an explicit global history read out of a duplicate project root', async () => {
@@ -1156,7 +1210,7 @@ describe('chats › autoTitle on first send', () => {
     // worker that tries to do an LLM call (no model configured here →
     // turn errors immediately, but the worker is still spawned).
     const { dropConv } = await import('../../../src/main/features/group_chat/bus');
-    dropConv(TEST_UID, conv.conversation_id);
+    await dropConv(TEST_UID, conv.conversation_id);
   });
 
   it('does NOT overwrite an existing user-set title', async () => {
@@ -1172,7 +1226,7 @@ describe('chats › autoTitle on first send', () => {
     expect(after?.title).toBe('我的项目'); // unchanged
 
     const { dropConv } = await import('../../../src/main/features/group_chat/bus');
-    dropConv(TEST_UID, conv.conversation_id);
+    await dropConv(TEST_UID, conv.conversation_id);
   });
 
   it('does NOT overwrite a manually renamed placeholder title', async () => {
@@ -1191,7 +1245,7 @@ describe('chats › autoTitle on first send', () => {
     expect(after?.title_manually_set).toBe(true);
 
     const { dropConv } = await import('../../../src/main/features/group_chat/bus');
-    dropConv(TEST_UID, conv.conversation_id);
+    await dropConv(TEST_UID, conv.conversation_id);
   });
 });
 

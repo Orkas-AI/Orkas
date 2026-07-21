@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
+  RUN_CONVERGENCE_ELAPSED_MS,
+  RUN_CONVERGENCE_MIN_TOOL_LOOPS,
+  SLOW_COMPACTION_CONVERGENCE_MS,
+  shouldNudgeElapsedConvergence,
   shouldNudgeSpinConvergence,
   SPIN_CONVERGENCE_MIN_COMPACTIONS,
   SPIN_CONVERGENCE_TOOL_LOOP_RATIO,
@@ -24,9 +28,15 @@ describe("shouldNudgeSpinConvergence", () => {
     expect(shouldNudgeSpinConvergence(0, 80, 80)).toBe(false);
   });
 
-  it("does not fire on compaction alone (tool loops below the ratio)", () => {
+  it("does not fire on fast compaction alone (tool loops below the ratio)", () => {
     expect(shouldNudgeSpinConvergence(2, 59, 80)).toBe(false); // one round short of 60
     expect(shouldNudgeSpinConvergence(5, 10, 80)).toBe(false);
+  });
+
+  it("fires earlier when repeated compaction itself has already consumed two minutes", () => {
+    expect(shouldNudgeSpinConvergence(2, 8, 80, SLOW_COMPACTION_CONVERGENCE_MS)).toBe(true);
+    expect(shouldNudgeSpinConvergence(2, 7, 80, SLOW_COMPACTION_CONVERGENCE_MS)).toBe(false);
+    expect(shouldNudgeSpinConvergence(1, 20, 80, SLOW_COMPACTION_CONVERGENCE_MS)).toBe(false);
   });
 
   it("stops firing at/after the hard round limit (cap + near-limit nudge own that zone)", () => {
@@ -37,5 +47,13 @@ describe("shouldNudgeSpinConvergence", () => {
   it("scales the ratio with the actual budget (max=18 → 0.75 ratio = 13 rounds)", () => {
     expect(shouldNudgeSpinConvergence(2, 13, 18)).toBe(true);
     expect(shouldNudgeSpinConvergence(2, 12, 18)).toBe(false);
+  });
+});
+
+describe("shouldNudgeElapsedConvergence", () => {
+  it("requires both prolonged execution and meaningful tool work", () => {
+    expect(shouldNudgeElapsedConvergence(RUN_CONVERGENCE_ELAPSED_MS, RUN_CONVERGENCE_MIN_TOOL_LOOPS)).toBe(true);
+    expect(shouldNudgeElapsedConvergence(RUN_CONVERGENCE_ELAPSED_MS - 1, RUN_CONVERGENCE_MIN_TOOL_LOOPS)).toBe(false);
+    expect(shouldNudgeElapsedConvergence(RUN_CONVERGENCE_ELAPSED_MS, RUN_CONVERGENCE_MIN_TOOL_LOOPS - 1)).toBe(false);
   });
 });

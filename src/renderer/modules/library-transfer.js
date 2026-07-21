@@ -95,17 +95,17 @@
     overlay.className = 'modal-overlay library-transfer-overlay open';
     overlay.setAttribute('aria-hidden', 'false');
     overlay.innerHTML = `
-      <div class="modal library-transfer-dialog" role="dialog" aria-modal="true" aria-labelledby="library-transfer-title">
-        <div class="library-transfer-header">
+      <div class="modal modal-standard library-transfer-dialog" role="dialog" aria-modal="true" aria-labelledby="library-transfer-title">
+        <div class="modal-header library-transfer-header">
           <div>
-            <div class="library-transfer-title" id="library-transfer-title">${escapeHtml(t('contexts.transfer.title'))}</div>
+            <div class="modal-title library-transfer-title" id="library-transfer-title">${escapeHtml(t('contexts.transfer.title'))}</div>
             <div class="library-transfer-summary">${escapeHtml(t('contexts.transfer.selected_count', { count: paths.length }))}</div>
           </div>
           <button type="button" class="modal-close-btn project-library-modal-close" data-transfer-close title="${escapeHtml(t('common.close'))}" aria-label="${escapeHtml(t('common.close'))}">
             ${_icon('x', 'modal-close-icon')}
           </button>
         </div>
-        <div class="library-transfer-body">
+        <div class="modal-body library-transfer-body">
           <div class="library-transfer-label" id="library-transfer-mode-label">${escapeHtml(t('contexts.transfer.action'))}</div>
           <div class="library-transfer-mode" role="radiogroup" aria-labelledby="library-transfer-mode-label">
             <label class="library-transfer-mode-option">
@@ -123,9 +123,9 @@
           <div class="library-transfer-folders" data-transfer-folders></div>
           <div class="library-transfer-error" data-transfer-error hidden></div>
         </div>
-        <div class="library-transfer-footer">
-          <button type="button" class="btn btn-sm" data-transfer-cancel>${escapeHtml(t('common.cancel'))}</button>
-          <button type="button" class="btn btn-sm btn-primary" data-transfer-confirm>${escapeHtml(t('contexts.transfer.move'))}</button>
+        <div class="modal-actions library-transfer-footer">
+          <button type="button" class="btn" data-transfer-cancel>${escapeHtml(t('common.cancel'))}</button>
+          <button type="button" class="btn btn-primary" data-transfer-confirm>${escapeHtml(t('contexts.transfer.move'))}</button>
         </div>
       </div>
     `;
@@ -211,7 +211,6 @@
     document.addEventListener('keydown', onKey, true);
     overlay.querySelector('[data-transfer-close]')?.addEventListener('click', close);
     overlay.querySelector('[data-transfer-cancel]')?.addEventListener('click', close);
-    overlay.addEventListener('mousedown', (event) => { if (event.target === overlay) close(); });
     confirmBtn.addEventListener('click', async () => {
       if (loadingFolders || confirmBtn.disabled) return;
       const startedAt = performance.now();

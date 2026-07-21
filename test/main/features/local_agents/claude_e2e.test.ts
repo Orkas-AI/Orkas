@@ -1,36 +1,60 @@
 /**
  * End-to-end-ish smoke test for the claude backend without requiring
- * the real `claude` CLI installed. We synthesize a tiny shell script
+ * the real `claude` CLI installed. We synthesize a tiny Node-backed CLI
  * that emits valid stream-json on stdout and then exits, then exercise
- * `claudeBackend.run` against it. Skipped on Windows where /bin/sh
- * isn't there — manual verification on Windows uses a real CLI.
+ * `claudeBackend.run` against it. On Windows the fixture is launched via
+ * a .cmd shim, matching the npm-global CLI mechanism used in production.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { claudeBackend } from '../../../../src/main/features/local_agents/backends/claude';
 
 const isWindows = process.platform === 'win32';
+const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
-function writeShellExecutable(dir: string, name: string, body: string): string {
-  const p = path.join(dir, name);
-  fs.writeFileSync(p, body);
-  fs.chmodSync(p, 0o755);
-  return p;
+function writeNodeExecutable(dir: string, name: string, source: string): string {
+  const scriptName = `${name}.js`;
+  fs.writeFileSync(path.join(dir, scriptName), source);
+  if (isWindows) {
+    const launcher = path.join(dir, `${name}.cmd`);
+    fs.writeFileSync(launcher, `@echo off\r\n"${TEST_NODE}" "%~dp0${scriptName}" %*\r\n`);
+    return launcher;
+  }
+  const launcher = path.join(dir, name);
+  const safeNode = TEST_NODE.replace(/'/g, `'\\''`);
+  fs.writeFileSync(launcher, `#!/bin/sh\nexec '${safeNode}' "$(dirname "$0")/${scriptName}" "$@"\n`);
+  fs.chmodSync(launcher, 0o755);
+  return launcher;
+}
+
+function emitAfterPrompt(lines: string[]): string {
+  return `process.stdin.once('data', () => {\n  process.stdout.write(${JSON.stringify(`${lines.join('\n')}\n`)});\n});\n`;
 }
 
 describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
-  if (isWindows) {
-    it.skip('(skipped on Windows)', () => { /* */ });
-    return;
-  }
-
   let tmpDir: string;
+  const tmpDirs: string[] = [];
 
-  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-claude-e2e-')); });
-  afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-claude-e2e-'));
+    tmpDirs.push(tmpDir);
+  });
+  afterAll(() => {
+    if (isWindows) {
+      const cleanup = spawnSync(TEST_NODE, [
+        '-e',
+        'const fs=require("node:fs");for(const p of process.argv.slice(1))fs.rmSync(p,{recursive:true,force:true,maxRetries:20,retryDelay:100});',
+        ...tmpDirs,
+      ], { encoding: 'utf8', windowsHide: true });
+      if (cleanup.status !== 0) throw new Error(`Windows temp cleanup failed: ${cleanup.stderr}`);
+      return;
+    }
+    for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+  });
 
   it('parses a minimal completed conversation', async () => {
     // fake CLI reads one stdin line (the user message JSON) and then
@@ -38,15 +62,12 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     // pipeline would (`cat > /dev/null`) because the backend now keeps
     // stdin open for the whole turn to handle control_request — same
     // contract real claude code has.
-    const fake = writeShellExecutable(tmpDir, 'claude', `#!/bin/sh
-read prompt
-cat <<'EOF'
-{"type":"system","subtype":"init","session_id":"sess-fake","cwd":"/x"}
-{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]}}
-{"type":"assistant","message":{"content":[{"type":"text","text":"world."}]}}
-{"type":"result","subtype":"success","result":"Hello world.","total_cost_usd":0,"duration_ms":1}
-EOF
-`);
+    const fake = writeNodeExecutable(tmpDir, 'claude', emitAfterPrompt([
+      '{"type":"system","subtype":"init","session_id":"sess-fake","cwd":"/x"}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"Hello "}]}}',
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"world."}]}}',
+      '{"type":"result","subtype":"success","result":"Hello world.","total_cost_usd":0,"duration_ms":1}',
+    ]));
     const events: any[] = [];
     const ac = new AbortController();
     await claudeBackend.run({
@@ -68,9 +89,9 @@ EOF
   });
 
   it('reports failed status when the CLI exits non-zero', async () => {
-    const fake = writeShellExecutable(tmpDir, 'claude', `#!/bin/sh
-echo "boom: model unavailable" 1>&2
-exit 7
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+process.stderr.write('boom: model unavailable\\n');
+process.exit(7);
 `);
     const events: any[] = [];
     await claudeBackend.run({
@@ -86,12 +107,7 @@ exit 7
   });
 
   it('cancels mid-run via AbortSignal (SIGTERM)', async () => {
-    const fake = writeShellExecutable(tmpDir, 'claude', `#!/bin/sh
-# Stay alive long enough to be killed. We don't bother reading stdin
-# here — the backend will write the prompt + later call stdin.end(),
-# both no-ops once SIGTERM lands.
-sleep 10
-`);
+    const fake = writeNodeExecutable(tmpDir, 'claude', `setInterval(() => {}, 1_000);\n`);
     const events: any[] = [];
     const ac = new AbortController();
     const promise = claudeBackend.run({
@@ -112,15 +128,12 @@ sleep 10
     // snapshot. We expect TWO status:usage events with cumulative
     // running totals (mirrors multica's per-model usage map but
     // collapsed to a single flat record).
-    const fake = writeShellExecutable(tmpDir, 'claude', `#!/bin/sh
-read prompt
-cat <<'EOF'
-{"type":"system","subtype":"init","session_id":"s-acc","cwd":"/x"}
-{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 1"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000,"cache_creation_input_tokens":20}}}
-{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 2"}],"usage":{"input_tokens":10,"output_tokens":40,"cache_read_input_tokens":1100,"cache_creation_input_tokens":0}}}
-{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":110,"output_tokens":90,"cache_read_input_tokens":2100,"cache_creation_input_tokens":20},"total_cost_usd":0.0234,"message":{"model":"claude-opus-4-7"}}
-EOF
-`);
+    const fake = writeNodeExecutable(tmpDir, 'claude', emitAfterPrompt([
+      '{"type":"system","subtype":"init","session_id":"s-acc","cwd":"/x"}',
+      '{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 1"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000,"cache_creation_input_tokens":20}}}',
+      '{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 2"}],"usage":{"input_tokens":10,"output_tokens":40,"cache_read_input_tokens":1100,"cache_creation_input_tokens":0}}}',
+      '{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":110,"output_tokens":90,"cache_read_input_tokens":2100,"cache_creation_input_tokens":20},"total_cost_usd":0.0234,"message":{"model":"claude-opus-4-7"}}',
+    ]));
     const events: any[] = [];
     await claudeBackend.run({
       binPath: fake,
@@ -159,17 +172,21 @@ EOF
     //
     // We tee the response we received to stderr so the test can assert
     // exactly what got written back to the CLI.
-    const fake = writeShellExecutable(tmpDir, 'claude', `#!/bin/sh
-read prompt
-cat <<'EOF'
-{"type":"system","subtype":"init","session_id":"sess-perm","cwd":"/x"}
-{"type":"control_request","request_id":"req-42","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}
-EOF
-read response
-echo "GOT_RESPONSE: $response" 1>&2
-cat <<'EOF'
-{"type":"result","subtype":"success","result":"ok"}
-EOF
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+const readline = require('node:readline');
+const input = readline.createInterface({ input: process.stdin });
+let lineCount = 0;
+input.on('line', (line) => {
+  lineCount += 1;
+  if (lineCount === 1) {
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-perm","cwd":"/x"}\\n');
+    process.stdout.write('{"type":"control_request","request_id":"req-42","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}\\n');
+  } else if (lineCount === 2) {
+    process.stderr.write('GOT_RESPONSE: ' + line + '\\n');
+    process.stdout.write('{"type":"result","subtype":"success","result":"ok"}\\n');
+    input.close();
+  }
+});
 `);
     const events: any[] = [];
     await claudeBackend.run({

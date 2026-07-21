@@ -1,9 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   AgentRunner,
   CONTEXT_COMPACTION_SYSTEM_PROMPT,
   LOOP_HARD,
   NEAR_DUP_LOOP_WARN,
+  NEAR_DUP_LOOP_HARD,
   MAX_INLINE_TOOL_RESULT_TOKENS_PER_ROUND,
   MIN_COMPACTION_EPOCHS_PER_RUN,
   calculateToolResultInlineBudget,
@@ -17,6 +21,8 @@ import type { AgentRunEvent } from "../src/agent/types.js";
 import type { LLMProvider, CompletionParams, CompletionResult } from "../src/providers/base.js";
 import type { Message } from "../src/shared/types.js";
 import { ContextOverflowError } from "../src/shared/errors.js";
+import { Session } from "../src/agent/session.js";
+import { PersistentSession } from "../src/agent/persistent-session.js";
 
 /** Create a mock LLM provider that returns predefined responses. */
 function createMockProvider(responses: CompletionResult[], onStream?: (params: CompletionParams) => void): LLMProvider {
@@ -80,6 +86,214 @@ describe("tool-result inline budget", () => {
 });
 
 describe("AgentRunner", () => {
+  it("resumes a verified active turn without projecting away its tool state", async () => {
+    let modelMessages: Message[] = [];
+    const mockProvider = createMockProvider([{
+      content: [{ type: "text", text: "finished remaining work" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+      model: "mock-model",
+    }], (params) => { modelMessages = params.messages; });
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    const originalTurnId = session.beginUserTurn([{ type: "text", text: "Build the complete report" }]);
+    session.ensureExecutionPlanAnchor();
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-1",
+      name: "research",
+      input: { topic: "durable state" },
+    }]);
+    session.addToolResult("call-1", "verified research result", undefined, false);
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    const result = await runner.run({
+      message: "Continue from durable state",
+      resumeActiveTurn: true,
+    });
+
+    expect(result.text).toBe("finished remaining work");
+    expect(JSON.stringify(modelMessages)).toContain("Build the complete report");
+    expect(JSON.stringify(modelMessages)).toContain("verified research result");
+    expect(JSON.stringify(modelMessages)).toContain("Continue from durable state");
+    expect(session.getMessages().every((message) => message.turnId === originalTurnId)).toBe(true);
+    expect(session.getSerializedContextState()?.completedTurns.map((turn) => turn.id)).toEqual([originalTurnId]);
+  });
+
+  it("restores a failed tool turn from disk and executes only its remaining work", async () => {
+    const file = path.join(
+      os.tmpdir(),
+      `core-agent-retry-resume-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`,
+    );
+    let phaseACalls = 0;
+    let phaseBCalls = 0;
+    try {
+      let firstRunProviderCalls = 0;
+      const failingProvider: LLMProvider = {
+        id: "mock",
+        name: "Mock Provider",
+        async complete(): Promise<CompletionResult> {
+          throw new Error("unexpected complete call");
+        },
+        async *stream() {
+          if (firstRunProviderCalls++ > 0) {
+            throw new Error("provider disconnected after phase A");
+          }
+          const content: CompletionResult["content"] = [{
+            type: "tool_use",
+            id: "phase-a-call",
+            name: "phase_a",
+            input: { target: "report" },
+          }];
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id: "phase-a-call", name: "phase_a" };
+          yield { type: "tool_use_delta" as const, id: "phase-a-call", input: JSON.stringify({ target: "report" }) };
+          yield { type: "tool_use_end" as const, id: "phase-a-call" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 10, outputTokens: 3, totalTokens: 13 },
+            content,
+            model: "mock-model",
+          };
+        },
+        async validateAuth() { return true; },
+      };
+      const phaseA = defineTool({
+        name: "phase_a",
+        description: "Complete phase A",
+        inputSchema: { type: "object", properties: { target: { type: "string" } } },
+        async execute() {
+          phaseACalls += 1;
+          return { content: "phase A complete; artifact=report-outline.md" };
+        },
+      });
+      const phaseB = defineTool({
+        name: "phase_b",
+        description: "Complete phase B",
+        inputSchema: { type: "object", properties: { target: { type: "string" } } },
+        async execute() {
+          phaseBCalls += 1;
+          return { content: "phase B complete" };
+        },
+      });
+      const firstRegistry = new ProviderRegistry();
+      firstRegistry.registerFactory("mock", () => failingProvider);
+      const config = createConfig({
+        agent: { defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 0 },
+      });
+      const firstSession = new PersistentSession({ sessionFile: file });
+      const firstRunner = new AgentRunner({
+        config,
+        providers: firstRegistry,
+        tools: [phaseA, phaseB],
+        session: firstSession,
+      });
+
+      const failed = await firstRunner.run({ message: "Complete phases A and B" });
+      const originalTurnId = firstSession.getSerializedContextState()?.activeTurn?.id;
+
+      expect(failed.meta.error?.kind).toBe("provider_error");
+      expect(phaseACalls).toBe(1);
+      expect(phaseBCalls).toBe(0);
+      expect(originalTurnId).toBeTypeOf("number");
+      expect(firstSession.getCompletedWorkLedger()).toEqual([
+        expect.objectContaining({ tool: "phase_a", status: "succeeded" }),
+      ]);
+
+      // A new PersistentSession instance is the process-restart boundary: it
+      // must rebuild the active turn, raw tool result, plan, and work ledger
+      // from the JSONL + context sidecar rather than an in-memory runner.
+      const restoredSession = new PersistentSession({ sessionFile: file });
+      const resumedRequests: CompletionParams[] = [];
+      let resumedProviderCalls = 0;
+      const resumedProvider: LLMProvider = {
+        id: "mock",
+        name: "Mock Provider",
+        async complete(): Promise<CompletionResult> {
+          throw new Error("unexpected complete call");
+        },
+        async *stream(params: CompletionParams) {
+          resumedRequests.push(params);
+          const context = JSON.stringify(params.messages);
+          const hasDurablePhaseA = context.includes("phase A complete; artifact=report-outline.md")
+            && context.includes("Completed work ledger")
+            && context.includes("[succeeded] phase_a");
+          const response: CompletionResult = resumedProviderCalls++ === 0
+            ? {
+                // Make the next action depend on recovered state. Without both
+                // the raw result and ledger, this fixture deliberately repeats
+                // phase A and the assertions below fail.
+                content: [{
+                  type: "tool_use",
+                  id: hasDurablePhaseA ? "phase-b-call" : "phase-a-repeat-call",
+                  name: hasDurablePhaseA ? "phase_b" : "phase_a",
+                  input: { target: "report" },
+                }],
+                stopReason: "tool_use",
+                usage: { inputTokens: 20, outputTokens: 4, totalTokens: 24 },
+                model: "mock-model",
+              }
+            : {
+                content: [{ type: "text", text: "Both phases are complete." }],
+                stopReason: "end_turn",
+                usage: { inputTokens: 25, outputTokens: 5, totalTokens: 30 },
+                model: "mock-model",
+              };
+          yield { type: "message_start" as const };
+          for (const content of response.content) {
+            if (content.type === "text") {
+              yield { type: "text_delta" as const, text: content.text };
+            } else if (content.type === "tool_use") {
+              yield { type: "tool_use_start" as const, id: content.id, name: content.name };
+              yield { type: "tool_use_delta" as const, id: content.id, input: JSON.stringify(content.input) };
+              yield { type: "tool_use_end" as const, id: content.id };
+            }
+          }
+          yield {
+            type: "message_end" as const,
+            stopReason: response.stopReason,
+            usage: response.usage,
+            content: response.content,
+            model: response.model,
+          };
+        },
+        async validateAuth() { return true; },
+      };
+      const resumedRegistry = new ProviderRegistry();
+      resumedRegistry.registerFactory("mock", () => resumedProvider);
+      const resumedRunner = new AgentRunner({
+        config,
+        providers: resumedRegistry,
+        tools: [phaseA, phaseB],
+        session: restoredSession,
+      });
+
+      const resumed = await resumedRunner.run({
+        message: "Continue from the durable failed-turn state",
+        resumeActiveTurn: true,
+      });
+
+      const firstResumedContext = JSON.stringify(resumedRequests[0].messages);
+      expect(firstResumedContext).toContain("Complete phases A and B");
+      expect(firstResumedContext).toContain("phase A complete; artifact=report-outline.md");
+      expect(firstResumedContext).toContain("Completed work ledger");
+      expect(firstResumedContext).toContain("Continue from the durable failed-turn state");
+      expect(resumed.text).toBe("Both phases are complete.");
+      expect(phaseACalls).toBe(1);
+      expect(phaseBCalls).toBe(1);
+      expect(restoredSession.getMessages().every((message) => message.turnId === originalTurnId)).toBe(true);
+      expect(restoredSession.getSerializedContextState()?.activeTurn).toBeUndefined();
+      expect(restoredSession.getSerializedContextState()?.completedTurns.map((turn) => turn.id)).toEqual([originalTurnId]);
+    } finally {
+      for (const target of [file, `${file}.tmp`, `${file}.context.json`, `${file}.context.json.tmp`]) {
+        try { fs.unlinkSync(target); } catch { /* ignore */ }
+      }
+    }
+  });
+
   it("can disable every tool for text-only utility calls", async () => {
     let sentTools: CompletionParams["tools"] = [];
     const mockProvider = createMockProvider([{
@@ -310,6 +524,7 @@ describe("AgentRunner", () => {
     expect(secondContext).toContain("Complete the exact long-running migration goal");
     expect(secondContext).toContain("Implement change");
     expect(requests[0].requestMetadata).toMatchObject({
+      outputLimitSource: "model_default",
       routeContext: {
         sessionKind: "gmember",
         toolLoops: 0,
@@ -320,6 +535,7 @@ describe("AgentRunner", () => {
       },
     });
     expect(requests[1].requestMetadata).toMatchObject({
+      outputLimitSource: "model_default",
       routeContext: {
         sessionKind: "gmember",
         toolLoops: 1,
@@ -727,9 +943,19 @@ describe("AgentRunner", () => {
     });
 
     const runner = new AgentRunner({ config, providers: registry, tools: [failingTool] });
-    const result = await runner.run({ message: "Run the failing tool" });
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "Run the failing tool" })) events.push(event);
+    const toolEnd = events.find((event) => event.type === "tool_end");
+    const done = events.findLast((event) => event.type === "done");
 
-    expect(result.text).toBe("The tool failed, but I handled it.");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      name: "failing_tool",
+      isError: true,
+      errorCode: "tool_execution_exception",
+      errorSeverity: "error",
+    });
+    expect(done && done.type === "done" ? done.result.text : "").toBe("The tool failed, but I handled it.");
   });
 
   it("returns error when no provider is found", async () => {
@@ -1723,6 +1949,8 @@ describe("AgentRunner", () => {
       name: "wedged_tool",
       isError: true,
       result: "Tool execution stalled after 30ms without substantive progress",
+      errorCode: "tool_execution_stalled",
+      errorSeverity: "error",
     });
     const done = collected[collected.length - 1] as { type: string; result?: { text?: string; meta?: { aborted?: boolean; permanentToolErrors?: number } } };
     expect(done.type).toBe("done");
@@ -2160,9 +2388,42 @@ describe("AgentRunner", () => {
     expect(JSON.stringify(runner.getSession().getMessages())).not.toContain("effectively the same arguments");
   });
 
-  it("loop_detection: legitimate pagination does not trigger the near-duplicate nudge", async () => {
+  it("loop_detection: hard-stops an ignored near-duplicate warning", async () => {
+    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
+      content: [{
+        type: "tool_use" as const,
+        id: `near-dup-hard-${index}`,
+        name: "web_fetch",
+        input: { url: "https://example.test/report", request_id: `request-${index}` },
+      }],
+      stopReason: "tool_use" as const,
+      usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+      model: "mock-model",
+    }));
+    const provider = createMockProvider(toolRounds);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    let executions = 0;
+    const webFetch = defineTool({
+      name: "web_fetch",
+      description: "synthetic fetch",
+      inputSchema: { type: "object", properties: { url: { type: "string" }, request_id: { type: "string" } } },
+      async execute() { executions++; return { content: "same source result" }; },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 30 },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [webFetch] });
+
+    const result = await runner.run({ message: "fetch the report without spinning" });
+
+    expect(result.text).toContain("Stopped");
+    expect(executions).toBe(NEAR_DUP_LOOP_HARD - 1);
+  });
+
+  it("loop_detection: legitimate pagination can cross the hard threshold without a false stop", async () => {
     const requests: CompletionParams[] = [];
-    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_WARN }, (_, index) => ({
+    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
         id: `page-${index}`,
@@ -2198,7 +2459,7 @@ describe("AgentRunner", () => {
     const result = await runner.run({ message: "read every page" });
 
     expect(result.text).toBe("All distinct pages were read.");
-    expect(result.meta.toolLoops).toBe(NEAR_DUP_LOOP_WARN);
+    expect(result.meta.toolLoops).toBe(NEAR_DUP_LOOP_HARD);
     expect(JSON.stringify(requests)).not.toContain("effectively the same arguments");
   });
 

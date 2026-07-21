@@ -157,7 +157,7 @@ function _tveRenderView(state) {
   const actions = [];
   if (state.caps.edit) actions.push(_tveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
   state.actionsEl.innerHTML = actions.join('');
-  state.actionsEl.querySelector('[data-tve-action="edit"]')?.addEventListener('click', () => { _tveTrack('text_editor_edit', state); _tveEnterEdit(state); });
+  state.actionsEl.querySelector('[data-tve-action="edit"]')?.addEventListener('click', () => _tveEnterEdit(state));
   _tveEmitDirty(state);
 }
 
@@ -180,8 +180,8 @@ function _tveRenderEditor(state) {
     actions.push(_tveActionButton(state, 'cancel', 'contexts.viewer.cancel', 'x'));
   }
   state.actionsEl.innerHTML = actions.join('');
-  state.actionsEl.querySelector('[data-tve-action="save"]')?.addEventListener('click', () => { _tveTrack('text_editor_save', state, { chars: (state.draft || '').length }); _tveSave(state); });
-  state.actionsEl.querySelector('[data-tve-action="cancel"]')?.addEventListener('click', () => { _tveTrack('text_editor_cancel', state, { dirty: state.draft !== state.content }); _tveCancelEdit(state); });
+  state.actionsEl.querySelector('[data-tve-action="save"]')?.addEventListener('click', () => _tveSave(state));
+  state.actionsEl.querySelector('[data-tve-action="cancel"]')?.addEventListener('click', () => _tveCancelEdit(state));
 
   const ta = state.bodyEl.querySelector('[data-tve-textarea]');
   if (ta) {

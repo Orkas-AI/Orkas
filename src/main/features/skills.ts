@@ -1231,50 +1231,90 @@ const IMPORT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 /** Paths that must never be selected as the source of a folder import.
  *  Check the *realpath* of the chosen dir against this list so symlinks
  *  can't dodge the guard. */
-function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: string } | { blocked: false } {
-  const dir = realDir;
+interface ImportPathPolicyOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  sourceRoot?: string;
+  workspaceRoot?: string;
+  homeDir?: string;
+}
+
+function _pathPolicyContains(candidate: string, root: string, platform: NodeJS.Platform): boolean {
+  if (!candidate || !root) return false;
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const normalize = (value: string) => {
+    const normalized = pathApi.resolve(value);
+    return platform === 'win32' ? normalized.toLowerCase() : normalized;
+  };
+  const dir = normalize(candidate);
+  const base = normalize(root);
+  const relative = pathApi.relative(base, dir);
+  return relative === ''
+    || (relative !== '..' && !relative.startsWith(`..${pathApi.sep}`) && !pathApi.isAbsolute(relative));
+}
+
+export function _isBlacklistedImportSourceForTest(
+  realDir: string,
+  options: ImportPathPolicyOptions = {},
+): { blocked: true; reason: string } | { blocked: false } {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const sourceRoot = options.sourceRoot ?? SRC_ROOT;
+  const workspaceRoot = options.workspaceRoot ?? WS_ROOT;
+  const home = options.homeDir ?? os.homedir();
+  const contains = (root: string): boolean => _pathPolicyContains(realDir, root, platform);
 
   // Orkas's own trees — pulling these in would recursion-bomb and/or leak
   // the source/data.
-  for (const root of [SRC_ROOT, WS_ROOT]) {
-    if (root && (dir === root || dir.startsWith(root + path.sep))) {
+  for (const root of [sourceRoot, workspaceRoot]) {
+    if (root && contains(root)) {
       return { blocked: true, reason: t('skills.import_block.self_dir') };
     }
   }
 
   // Home-dir root exactly — would trigger the import byte cap only after
   // hoovering plenty of sensitive files.
-  const home = os.homedir();
-  if (home && dir === home) return { blocked: true, reason: t('skills.import_block.home_root') };
+  if (home && contains(home) && _pathPolicyContains(home, realDir, platform)) {
+    return { blocked: true, reason: t('skills.import_block.home_root') };
+  }
 
   // Platform blacklists (absolute or prefix match).
   const mac = ['/System', '/private', '/etc', '/var', '/usr'];
   const macExcept = ['/usr/local', '/private/tmp'];
-  const win = ['C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)'];
+  const systemRoot = env.SystemRoot || env.WINDIR || 'C:\\Windows';
+  const systemDriveRoot = path.win32.parse(systemRoot).root || 'C:\\';
+  const win = [
+    systemRoot,
+    env.ProgramFiles || path.win32.join(systemDriveRoot, 'Program Files'),
+    env['ProgramFiles(x86)'] || path.win32.join(systemDriveRoot, 'Program Files (x86)'),
+    env.ProgramW6432 || '',
+  ].filter((value, index, all): value is string => !!value && all.indexOf(value) === index);
 
-  const hitsPrefix = (roots: string[]): boolean =>
-    roots.some((r) => dir === r || dir.startsWith(r + path.sep));
-  const hitsException = (roots: string[]): boolean =>
-    roots.some((r) => dir === r || dir.startsWith(r + path.sep));
+  const hitsPrefix = (roots: string[]): boolean => roots.some(contains);
 
-  if (process.platform === 'darwin' || process.platform === 'linux') {
-    if (hitsPrefix(mac) && !hitsException(macExcept)) {
+  if (platform === 'darwin' || platform === 'linux') {
+    if (hitsPrefix(mac) && !hitsPrefix(macExcept)) {
       return { blocked: true, reason: t('skills.import_block.system_dir') };
     }
   }
-  if (process.platform === 'win32') {
+  if (platform === 'win32') {
     if (hitsPrefix(win)) return { blocked: true, reason: t('skills.import_block.system_dir') };
   }
 
   // User-sensitive subdirs (SSH / GPG / AWS creds).
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
   const sensitive = [
-    path.join(home, '.ssh'),
-    path.join(home, '.gnupg'),
-    path.join(home, '.aws'),
+    pathApi.join(home, '.ssh'),
+    pathApi.join(home, '.gnupg'),
+    pathApi.join(home, '.aws'),
   ];
   if (hitsPrefix(sensitive)) return { blocked: true, reason: t('skills.import_block.credentials_dir') };
 
   return { blocked: false };
+}
+
+function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: string } | { blocked: false } {
+  return _isBlacklistedImportSourceForTest(realDir);
 }
 
 function _walkImportSource(root: string): {
@@ -1522,6 +1562,10 @@ async function _markSourceSkillMetadataSession(firstSkillId: string, targetSkill
   });
 }
 
+function _hasNonOverrideableAuthoringViolation(report: QualityReport): boolean {
+  return report.violations.some((violation) => violation.rule === 'skill_script_requires_runner');
+}
+
 async function _installSourceSkillRoots(
   name: string | null,
   description: string | null,
@@ -1586,7 +1630,7 @@ async function _installSourceSkillRoots(
       firstReportSkillId = skill.id;
     }
   }
-  if (firstReport && opts.force !== true) {
+  if (firstReport && (opts.force !== true || _hasNonOverrideableAuthoringViolation(firstReport))) {
     for (const id of createdIds) {
       try { await deleteCustomSkill(id); } catch { /* best-effort rollback */ }
     }
@@ -1645,7 +1689,7 @@ async function _createEditableDraftFromImportDir(
   void persistQualityReport({
     uid: getActiveUserId(), kind: 'skill', id: created.id, report,
   });
-  if (!report.ok && opts.force !== true) {
+  if (!report.ok && (opts.force !== true || _hasNonOverrideableAuthoringViolation(report))) {
     try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
     return {
       ok: false,

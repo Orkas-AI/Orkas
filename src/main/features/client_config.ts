@@ -13,6 +13,9 @@ import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
 import { desktopPlatform } from '../system_info';
 import { withCommonHeaders } from './api_common';
+import { PUBLIC_PROVIDER_MODELS, type ProviderModelEntry } from '../model/public_model_catalog';
+
+export type { ProviderModelEntry } from '../model/public_model_catalog';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
 
@@ -495,11 +498,6 @@ export function stop(): void {
   runtimePowerMonitor = null;
 }
 
-export interface ProviderModelEntry {
-  id: string;
-  name: string;
-}
-
 export interface ImageGenCapability {
   model: string;
   api: 'openai' | 'gemini' | 'doubao';
@@ -530,88 +528,7 @@ interface ModelCatalogConfig {
 
 const VALID_IMAGE_APIS = new Set(['openai', 'gemini', 'doubao']);
 
-export const DEFAULT_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderModelEntry[]>> = {
-  anthropic: [
-    { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-    { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-  ],
-  'openai-codex': [
-    { id: 'gpt-5.5', name: 'GPT-5.5' },
-    { id: 'gpt-5.4', name: 'GPT-5.4' },
-  ],
-  openai: [
-    { id: 'gpt-5.5', name: 'GPT-5.5' },
-    { id: 'gpt-5.5-pro', name: 'GPT-5.5 Pro' },
-    { id: 'gpt-5.4', name: 'GPT-5.4' },
-    { id: 'gpt-5.4-pro', name: 'GPT-5.4 Pro' },
-    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-  ],
-  google: [
-    { id: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)' },
-    { id: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite (preview)' },
-    { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro (preview)' },
-    { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash (preview)' },
-  ],
-  zai: [
-    { id: 'glm-5.1', name: 'GLM-5.1' },
-    { id: 'glm-5', name: 'GLM-5' },
-    { id: 'glm-5-turbo', name: 'GLM-5 Turbo' },
-    { id: 'glm-5v-turbo', name: 'GLM-5V Turbo' },
-  ],
-  moonshot: [
-    { id: 'kimi-k2.6', name: 'Kimi K2.6' },
-    { id: 'kimi-k2.5', name: 'Kimi K2.5' },
-  ],
-  'kimi-coding': [
-    { id: 'k2p6', name: 'Kimi K2.6' },
-    { id: 'kimi-for-coding', name: 'Kimi For Coding' },
-  ],
-  'minimax-cn': [
-    { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax 2.7 Highspeed' },
-  ],
-  'minimax-portal': [
-    { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax 2.7 Highspeed' },
-  ],
-  'minimax-portal-cn': [
-    { id: 'MiniMax-M3', name: 'MiniMax 3' },
-    { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax 2.7 Highspeed' },
-  ],
-  deepseek: [
-    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  ],
-  doubao: [
-    { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },
-    { id: 'doubao-seed-2-0-lite-260215', name: 'Doubao Seed 2.0 Lite' },
-  ],
-  openrouter: [
-    { id: 'anthropic/claude-opus-4.8', name: 'Claude Opus 4.8' },
-    { id: 'anthropic/claude-opus-4.7', name: 'Claude Opus 4.7' },
-    { id: 'openai/gpt-5.5', name: 'GPT-5.5' },
-    { id: 'openai/gpt-5.5-pro', name: 'GPT-5.5 Pro' },
-    { id: 'openai/gpt-5.4', name: 'GPT-5.4' },
-    { id: 'openai/gpt-5.4-pro', name: 'GPT-5.4 Pro' },
-    { id: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (preview)' },
-    { id: 'google/gemini-3-pro-preview', name: 'Gemini 3 Pro (preview)' },
-    { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-    { id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6' },
-    { id: 'moonshotai/kimi-k2.5', name: 'Kimi K2.5' },
-    { id: 'qwen/qwen3-max', name: 'Qwen3 Max' },
-    { id: 'qwen/qwen3-coder', name: 'Qwen3 Coder' },
-    { id: 'z-ai/glm-5.1', name: 'GLM-5.1' },
-    { id: 'z-ai/glm-5', name: 'GLM-5' },
-    { id: 'minimax/minimax-m3', name: 'MiniMax 3' },
-    { id: 'minimax/minimax-m2.7', name: 'MiniMax 2.7' },
-    { id: 'xiaomi/mimo-v2.5-pro', name: 'Xiaomi MiMo V2.5 Pro' },
-    { id: 'xiaomi/mimo-v2.5', name: 'Xiaomi MiMo V2.5' },
-  ],
-};
+export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
@@ -632,9 +549,24 @@ function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
     const id = typeof r.id === 'string' ? r.id.trim() : '';
     if (!id) continue;
     const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : id;
-    out.push({ id, name });
+    const template = typeof r.template === 'string' && r.template.trim() ? r.template.trim() : undefined;
+    const contextWindow = normalizePositiveInteger(r.contextWindow);
+    const maxTokens = normalizePositiveInteger(r.maxTokens);
+    out.push({
+      id,
+      name,
+      ...(template ? { template } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
+      ...(maxTokens ? { maxTokens } : {}),
+    });
   }
   return out;
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const n = Math.floor(value);
+  return n > 0 ? n : undefined;
 }
 
 function normalizeImageGenCapability(value: unknown): ImageGenCapability | null {
@@ -787,7 +719,7 @@ export function getConfiguredProviderModels(providerId: string): { models: Provi
   if (!id) return null;
   const cfg = loadModelCatalog();
   if (!Object.prototype.hasOwnProperty.call(cfg.providers, id)) return null;
-  return { models: cfg.providers[id].map((m) => ({ id: m.id, name: m.name })) };
+  return { models: cfg.providers[id].map((m) => ({ ...m })) };
 }
 
 export function getConfiguredImageGenCapability(providerId: string): ImageGenCapabilityOverride | null {

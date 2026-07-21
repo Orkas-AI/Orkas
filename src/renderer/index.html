@@ -176,7 +176,7 @@
         <div class="chat-container">
           <div class="chat-main-pane">
             <!-- Conversation header — Surface C top per PC/docs/design/PATTERNS.md.
-                 Title + 执行中 pill + project swatch + name + stacked agent
+                 Title + project swatch + name + stacked agent
                  avatars + counts + 详情 toggle. Filled in by JS lifecycle hook
                  `_refreshChatHeader()` in conversation.js. -->
             <div class="chat-header" id="chat-header">
@@ -185,8 +185,6 @@
                   <h1 class="chat-header-title" id="chat-header-title"></h1>
                   <input type="text" class="chat-header-title-input" id="chat-header-title-input"
                          autocomplete="off" spellcheck="false" hidden />
-                  <span class="chat-header-running-pill" id="chat-header-running-pill" hidden
-                        data-i18n="chat.header.running_pill">Running</span>
                 </div>
                 <div class="chat-header-meta" id="chat-header-meta"></div>
               </div>
@@ -1012,12 +1010,18 @@
 
               <div class="settings-group">
                 <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
-                  <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new color.</div>
+                  <div class="settings-group-title" data-i18n="settings.task_notifications.title">任务通知</div>
+                  <div class="settings-group-sub" data-i18n="settings.task_notifications.sub">当 Orkas 不在前台时，在任务完成、失败或需要输入时发送系统通知。</div>
                 </div>
                 <div class="settings-row">
-                  <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
-                  <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
+                  <label class="settings-toggle">
+                    <input type="checkbox" id="settings-task-notifications-toggle" checked />
+                    <span data-i18n="settings.task_notifications.toggle">启用</span>
+                  </label>
+                </div>
+                <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
+                  <span class="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
+                  <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
                 </div>
               </div>
 
@@ -1220,8 +1224,8 @@
 
   <!-- Create Agent Modal -->
   <div class="modal-overlay" id="agent-modal">
-    <div class="modal">
-      <h3 data-i18n="agent_modal.title">New agent</h3>
+    <div class="modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="agent-modal-title">
+      <h3 class="modal-title" id="agent-modal-title" data-i18n="agent_modal.title">New agent</h3>
 
       <!-- Mode tabs: Create (in-process) / External (cli runtime). Mirrors the
            skill-modal tab pattern; reuses the same .skill-modal-tab styles
@@ -1277,8 +1281,8 @@
 
   <!-- Create/Edit Skill Modal -->
   <div class="modal-overlay" id="skill-modal">
-    <div class="modal">
-      <h3 id="skill-modal-title" data-i18n="skill_modal.title_create">New skill</h3>
+    <div class="modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title">
+      <h3 class="modal-title" id="skill-modal-title" data-i18n="skill_modal.title_create">New skill</h3>
       <input type="hidden" id="skill-edit-id" value="" />
 
       <!-- Import-method tabs. Only shown in create mode (hidden when editing). -->
@@ -1348,10 +1352,27 @@
 
   <!-- Add-account modal (settings page) -->
   <div class="modal-overlay" id="add-account-modal">
-    <div class="modal add-account-modal">
-      <h3 id="add-account-title" data-i18n="add_account.title">Add account</h3>
-      <div class="add-account-body" id="add-account-body"></div>
+    <div class="modal add-account-modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="add-account-title">
+      <h3 class="modal-title" id="add-account-title" data-i18n="add_account.title">Add account</h3>
+      <div class="modal-body add-account-body" id="add-account-body"></div>
       <div class="modal-actions" id="add-account-actions"></div>
+    </div>
+  </div>
+
+  <!-- OAuth login flow modal -->
+  <div class="modal-overlay" id="oauth-flow-modal">
+    <div class="modal oauth-flow-modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="oauth-flow-title">
+      <div class="modal-header">
+        <h3 class="modal-title" id="oauth-flow-title" data-i18n="oauth_flow.title">OAuth sign-in</h3>
+        <button type="button" class="modal-close-btn oauth-flow-close-btn" id="oauth-flow-close-btn"
+                data-i18n-title="common.close" title="Close"
+                data-i18n-aria-label="common.close" aria-label="Close">
+          <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
+        </button>
+      </div>
+      <div class="modal-body oauth-flow-body" id="oauth-flow-body">
+        <div class="oauth-flow-stage" data-i18n="oauth_flow.preparing">Preparing authorization…</div>
+      </div>
     </div>
   </div>
 
@@ -1359,10 +1380,9 @@
        Automation tab AND the project-detail page's "自动化" tab. Opens via
        `window.openAutoTaskDialog({ task?, projectId?, onSaved? })`. -->
   <div class="modal-overlay ui-dialog-overlay" id="auto-task-dialog-overlay" style="display:none">
-    <div class="modal ui-dialog auto-task-dialog" role="dialog" aria-modal="true">
-      <div class="ui-dialog-title auto-task-dialog-title" id="auto-task-dialog-title" data-i18n="auto.create_section_title">New auto task</div>
-      <div class="auto-sync-note auto-task-dialog-sync-note" id="auto-task-dialog-sync-note" hidden></div>
-      <div class="auto-task-dialog-body">
+    <div class="modal ui-dialog auto-task-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="auto-task-dialog-title">
+      <div class="modal-title ui-dialog-title auto-task-dialog-title" id="auto-task-dialog-title" data-i18n="auto.create_section_title">New auto task</div>
+      <div class="modal-body auto-task-dialog-body">
         <!-- Composer chrome cloned 1:1 from #new-chat-input-area. -->
         <div class="new-chat-input-wrapper auto-composer-wrapper">
           <div class="new-chat-input-area">
@@ -1421,6 +1441,11 @@
           <div id="auto-project-select"></div>
         </div>
 
+        <div class="form-row" id="auto-row-run-device" hidden>
+          <label data-i18n="auto.run_label">Run</label>
+          <div id="auto-run-device-select"></div>
+        </div>
+
         <div class="form-row">
           <label data-i18n="auto.title_label">Title (optional)</label>
           <input type="text" id="auto-title-input"
@@ -1433,6 +1458,7 @@
             <span data-i18n="auto.enabled_label">Enabled</span>
           </label>
         </div>
+
       </div>
 
       <div class="modal-actions">
@@ -1446,8 +1472,8 @@
        goes through this modal — + Text creates an "Untitled.md" inline and
        drops the tree into rename mode + the viewer into edit mode. -->
   <div class="modal-overlay" id="ctx-new-modal">
-    <div class="modal">
-      <h3 data-i18n="contexts.new.modal_title_dir">New Folder</h3>
+    <div class="modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="ctx-new-modal-title">
+      <h3 class="modal-title" id="ctx-new-modal-title" data-i18n="contexts.new.modal_title_dir">New Folder</h3>
       <div class="form-row ctx-new-target" id="ctx-new-target"></div>
       <div class="form-row">
         <label data-i18n="contexts.new.dir_name">Folder name</label>
@@ -1474,8 +1500,8 @@
 
   <!-- Library location picker (chat archive + produced-file imports) -->
   <div class="modal-overlay" id="kb-picker-modal">
-    <div class="modal kb-picker">
-      <h3 id="kb-picker-title" data-i18n="kb_picker.title">Save to Library</h3>
+    <div class="modal kb-picker modal-standard" role="dialog" aria-modal="true" aria-labelledby="kb-picker-title">
+      <h3 class="modal-title" id="kb-picker-title" data-i18n="kb_picker.title">Save to Library</h3>
       <div class="form-row">
         <label><span data-i18n="kb_picker.name">Filename</span> <span class="form-hint" data-i18n="kb_picker.name_hint">Missing extension will be auto-filled as .md</span></label>
         <input type="text" id="kb-picker-name" autocomplete="off" />

@@ -60,6 +60,24 @@ module.exports = async function ensureRuntimeBeforePack(context) {
   const arch = normalizeArch(context && context.arch);
   const arches = arch === 'universal' ? ['x64', 'arm64'] : [arch];
 
+  for (const targetArch of arches) {
+    const addon = spawnSync(process.execPath, [
+      path.join(pcRoot, 'scripts', 'build-notification-permission-addon.cjs'),
+      '--platform', platform,
+      '--arch', targetArch,
+      ...(arches.length > 1 ? ['--keep-other-arches'] : []),
+    ], {
+      cwd: pcRoot,
+      encoding: 'utf8',
+      stdio: 'inherit',
+      env: process.env,
+    });
+    if (addon.error) throw addon.error;
+    if (addon.status !== 0) {
+      throw new Error(`notification permission addon failed for ${platform}-${targetArch} with status ${addon.status}`);
+    }
+  }
+
   // Fail the actual packaging run, even when tests were skipped, if a new
   // extraResources destination has no declared verification owner.
   const packageJson = JSON.parse(fs.readFileSync(path.join(pcRoot, 'package.json'), 'utf8'));

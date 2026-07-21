@@ -24,5 +24,13 @@ describe('util/app-error', () => {
     expect(normalizeAppError(new Error('bad response (502): <html>'))).toMatchObject({
       code: AppErrorCode.BAD_RESPONSE,
     });
+
+    expect(normalizeAppError(Object.assign(new Error('database or disk is full'), { code: 'SQLITE_FULL' }))).toMatchObject({
+      code: AppErrorCode.STORAGE_FULL,
+    });
+
+    expect(normalizeAppError(Object.assign(new Error('no space left on device'), { code: 'ENOSPC' }))).toMatchObject({
+      code: AppErrorCode.STORAGE_FULL,
+    });
   });
 });

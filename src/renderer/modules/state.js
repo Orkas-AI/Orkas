@@ -7,6 +7,7 @@ let accessPassword = '';
 let currentView = 'new-chat';
 let currentCid = null;
 let conversations = [];
+let _pendingTaskNotificationNavigation = null;
 
 // Per-conversation pending state
 // key: cid, value: { loadingEl: HTMLElement | null, needsIndicator: bool,
@@ -51,6 +52,38 @@ function _handleModifiedComposerEnter(e) {
   e.preventDefault();
   _insertComposerNewline(e.currentTarget);
   return true;
+}
+
+function _normalizeTaskNotificationNavigation(payload) {
+  const conversationId = typeof payload?.conversation_id === 'string'
+    ? payload.conversation_id.trim()
+    : '';
+  const terminalStatus = typeof payload?.terminal_status === 'string'
+    ? payload.terminal_status
+    : '';
+  if (!conversationId || !/^[A-Za-z0-9_-]+$/.test(conversationId)) return null;
+  if (!['completed', 'failed', 'waiting_input'].includes(terminalStatus)) return null;
+  return { conversationId, terminalStatus };
+}
+
+function _openTaskNotificationConversation(payload) {
+  const target = _normalizeTaskNotificationNavigation(payload);
+  if (!target) return false;
+  if (!currentUserId) {
+    _pendingTaskNotificationNavigation = {
+      conversation_id: target.conversationId,
+      terminal_status: target.terminalStatus,
+    };
+    return false;
+  }
+  _pendingTaskNotificationNavigation = null;
+  setView('conversation', target.conversationId, { entryPoint: 'task_notification' });
+  return true;
+}
+
+function _consumePendingTaskNotificationConversation() {
+  if (!_pendingTaskNotificationNavigation) return false;
+  return _openTaskNotificationConversation(_pendingTaskNotificationNavigation);
 }
 
 // Keep sidebar navigation independent from private analytics. The commercial
@@ -272,6 +305,10 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function bindStaticHandlers() {
+  window.orkas.onPushEvent('conversations:open-from-notification', (payload) => {
+    _openTaskNotificationConversation(payload);
+  });
+
   // Sidebar nav
   document.getElementById('new-chat-btn').addEventListener('click', () => _setViewFromSidebar('new-chat'));
   document.getElementById('auto-btn')?.addEventListener('click', () => _setViewFromSidebar('auto'));
@@ -312,7 +349,7 @@ function bindStaticHandlers() {
     // the in-flight reply. Queued messages (if any) stay put and will drain
     // one-by-one after the abort completes. To add to the queue, use Enter.
     if (currentCid && isConvPending(currentCid)) {
-      abortConvStream(currentCid);
+      abortConvStream(currentCid, { userInitiated: true });
     } else {
       handleChatSubmit();
     }

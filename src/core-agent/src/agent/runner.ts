@@ -42,6 +42,9 @@ export const COMPACTED_HISTORY_PLACEHOLDER_ERROR_CODE = "E_COMPACTED_HISTORY_PLA
 const LEGACY_COMPACTED_TOOL_USE_INPUT_KEY = "__orkas_compacted_tool_use";
 const TOOL_LOOP_LIMIT_SUMMARY_MAX_TOKENS = 1_200;
 export const RUN_CONVERGENCE_SOFT_RATIO = 0.8;
+export const RUN_CONVERGENCE_ELAPSED_MS = 8 * 60 * 1000;
+export const RUN_CONVERGENCE_MIN_TOOL_LOOPS = 8;
+export const SLOW_COMPACTION_CONVERGENCE_MS = 2 * 60 * 1000;
 // Per-run compaction backstops. These are the FLOOR: a short run still gets at
 // least this many. The effective cap scales with the tool-round budget (see
 // compactionRunCaps) because a long run legitimately reaches many distinct
@@ -179,6 +182,20 @@ function retryDelayMs(err: unknown, attempt: number): number {
   return base + jitter;
 }
 
+function errorCodeForMeta(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    if (typeof current === "object") {
+      const record = current as { code?: unknown; cause?: unknown; error?: unknown };
+      if (typeof record.code === "string" && record.code.trim()) return record.code.trim();
+      current = record.cause ?? (typeof record.error === "object" ? record.error : undefined);
+      continue;
+    }
+    break;
+  }
+  return undefined;
+}
+
 /** Concurrency cap for a parallel (read-only) tool batch (G4). Env-overridable;
  *  conservative default. This is the READ-TOOL cap only — the group-chat layer
  *  applies a separate, lower cap to agent/worker dispatch tools. */
@@ -211,12 +228,14 @@ export function partitionToolBatches<T>(
 export const LOOP_WARN = 3;
 export const LOOP_HARD = 5;
 
-/** Near-duplicate loop_detection: nudge (WARN-only, never a hard stop) after this
- *  many CONSECUTIVE calls that are identical except for volatile id/timestamp
+/** Near-duplicate loop_detection: nudge after this many CONSECUTIVE calls that
+ *  are identical except for volatile id/timestamp
  *  fields. Strictly above LOOP_HARD so the exact detector always acts first on
- *  byte-identical repeats; this tier only catches the "same call, fresh
- *  request-id/uuid each time" spin that exact matching misses. */
+ *  byte-identical repeats; this tier catches the "same call, fresh
+ *  request-id/uuid each time" spin that exact matching misses. A deliberately
+ *  higher hard threshold bounds the run if the warning is ignored. */
 export const NEAR_DUP_LOOP_WARN = 6;
+export const NEAR_DUP_LOOP_HARD = 12;
 
 /** Compaction skips a pass that would free less than this fraction of the context
  *  window — when the verbatim-kept tail dominates the window, summarising the
@@ -375,10 +394,22 @@ export function shouldNudgeSpinConvergence(
   compactionCount: number,
   toolLoops: number,
   maxToolLoops: number,
+  compactionMs = 0,
 ): boolean {
   return compactionCount >= SPIN_CONVERGENCE_MIN_COMPACTIONS
-    && toolLoops >= Math.floor(maxToolLoops * SPIN_CONVERGENCE_TOOL_LOOP_RATIO)
+    && (
+      toolLoops >= Math.floor(maxToolLoops * SPIN_CONVERGENCE_TOOL_LOOP_RATIO)
+      || (
+        toolLoops >= RUN_CONVERGENCE_MIN_TOOL_LOOPS
+        && compactionMs >= SLOW_COMPACTION_CONVERGENCE_MS
+      )
+    )
     && toolLoops < maxToolLoops;
+}
+
+export function shouldNudgeElapsedConvergence(elapsedMs: number, toolLoops: number): boolean {
+  return elapsedMs >= RUN_CONVERGENCE_ELAPSED_MS
+    && toolLoops >= RUN_CONVERGENCE_MIN_TOOL_LOOPS;
 }
 
 function requestMetadataForModelCall(
@@ -391,13 +422,21 @@ function requestMetadataForModelCall(
     planStepCount: number;
   },
 ): Record<string, unknown> | undefined {
-  if (!base) return undefined;
-  const rawRouteContext = base.routeContext;
+  const metadata: Record<string, unknown> = {
+    ...(base || {}),
+    // The main agent turn gets its output limit from the model catalog (or the
+    // provider model when the catalog has no override). Managed adapters may
+    // omit that generated wire default so their server can choose a route-
+    // specific cap. Auxiliary completions never receive this marker because
+    // they pass their explicit maxTokens directly to provider.complete().
+    outputLimitSource: "model_default",
+  };
+  const rawRouteContext = metadata.routeContext;
   if (!rawRouteContext || typeof rawRouteContext !== "object" || Array.isArray(rawRouteContext)) {
-    return base;
+    return metadata;
   }
   return {
-    ...base,
+    ...metadata,
     routeContext: {
       ...(rawRouteContext as Record<string, unknown>),
       toolLoops: Math.max(0, Math.trunc(runtime.toolLoops)),
@@ -447,6 +486,20 @@ function buildSpinConvergenceNudge(input: {
     "2. State concisely what is DONE and what REMAINS.",
     "3. Then complete the remaining work directly; or, if you cannot make progress, stop and deliver the best partial result with an honest note of what is incomplete.",
     "Do not re-derive the plan or redo work already recorded as done.",
+  ].join("\n\n");
+}
+
+function buildElapsedConvergenceNudge(input: {
+  elapsedMs: number;
+  toolLoops: number;
+  maxToolLoops: number;
+}): string {
+  const elapsedMinutes = Math.max(1, Math.round(input.elapsedMs / 60_000));
+  return [
+    `This turn has run for about ${elapsedMinutes} minutes and used ${input.toolLoops} of ${input.maxToolLoops} tool rounds.`,
+    "Pause broad exploration and audit the authoritative execution plan and completed-work ledger now.",
+    "Finish the smallest valid remaining deliverable directly. Do not repeat completed reads, searches, generation, or verification.",
+    "If a concrete blocker prevents completion, stop with the best usable partial result, the blocker, and one precise next step instead of continuing open-ended tool use.",
   ].join("\n\n");
 }
 
@@ -654,6 +707,7 @@ export class AgentRunner {
       : [
           ...getBuiltinTools(),
           createExecutionPlanTool({
+            get: () => this.session.getExecutionPlan(),
             update: (update) => this.session.updateExecutionPlan(update),
             clear: () => this.session.clearExecutionPlan(),
           }),
@@ -719,6 +773,7 @@ export class AgentRunner {
       const err = this.errorResult(startTime, model, providerId, {
         kind: "auth",
         message: `No provider found for model: ${model}`,
+        code: "NO_PROVIDER",
       });
       yield { type: "done", result: err };
       return;
@@ -787,7 +842,17 @@ export class AgentRunner {
       }
     }
 
-    const turnId = this.session.beginUserTurn(userContent);
+    const activeTurnId = params.resumeActiveTurn
+      ? this.session.getSerializedContextState()?.activeTurn?.id
+      : undefined;
+    const turnId = activeTurnId || this.session.beginUserTurn(userContent);
+    if (activeTurnId) {
+      // A failed run deliberately leaves its active turn open. Keep the retry
+      // instruction inside that same turn so raw tool results, checkpoints,
+      // the plan anchor, and completed-work ledger remain current instead of
+      // being projected as ordinary completed history before continuation.
+      this.session.addMessage("user", userContent, activeTurnId);
+    }
     for (const resource of params.historyResources ?? []) {
       this.session.addHistoryResource({
         ...resource,
@@ -824,6 +889,7 @@ export class AgentRunner {
     let toolLoopLimitNudgeSent = false;
     const pendingRequestControls: string[] = [];
     let spinConvergenceNudgeSent = false;
+    let elapsedConvergenceNudgeSent = false;
     let terminalCompletionNudgeSent = false;
 
     // loop_detection state (run-scoped): a runaway agent emits the SAME tool
@@ -1190,12 +1256,13 @@ export class AgentRunner {
               + `or stop and report what you have so far. Repeating the identical call again will end the run.`;
           }
 
-          // Near-duplicate loop_detection (WS-3, WARN-only): a call that repeats
+          // Near-duplicate loop_detection (WS-3): a call that repeats
           // modulo volatile id/timestamp fields. The exact streak above resets on
           // any real arg change, so this is the only tier that catches a "same
           // call, fresh request-id/uuid each time" spin. Threshold is above
           // LOOP_HARD, so exact repeats are already stopped before this fires;
-          // it never hard-stops (false positives here stay a benign nudge).
+          // the high hard threshold stops an ignored warning before this can
+          // consume the full 100+ round actor budget.
           const nsig = normalizedToolCallSignature(call);
           if (nsig === normSig) {
             normRepeat += 1;
@@ -1211,11 +1278,20 @@ export class AgentRunner {
               + `(only volatile fields such as ids or timestamps differ). This is likely not making progress. `
               + `Change the target or your approach, or stop and report what you have so far.`;
           }
+          if (normRepeat >= NEAR_DUP_LOOP_HARD) {
+            loopHardTripped = true;
+            break;
+          }
         }
         if (loopHardTripped) {
-          log.warn(`loop_detection: identical tool call repeated ${LOOP_HARD}x — stopping run`);
+          const nearDuplicateHardStop = normRepeat >= NEAR_DUP_LOOP_HARD && loopRepeat < LOOP_HARD;
+          log.warn(nearDuplicateHardStop
+            ? `loop_detection: effectively identical tool call repeated ${NEAR_DUP_LOOP_HARD}x — stopping run`
+            : `loop_detection: identical tool call repeated ${LOOP_HARD}x — stopping run`);
           const final: AgentRunResult = {
-            text: turnText || "(Stopped: the same tool call was repeated too many times without progress.)",
+            text: turnText || (nearDuplicateHardStop
+              ? "(Stopped: effectively the same tool call was repeated too many times without progress.)"
+              : "(Stopped: the same tool call was repeated too many times without progress.)"),
             content: result.content,
             meta: {
               durationMs: Date.now() - startTime,
@@ -1661,6 +1737,19 @@ export class AgentRunner {
           });
         }
 
+        const runElapsedMs = Math.max(0, Date.now() - startTime);
+        if (!elapsedConvergenceNudgeSent
+            && !toolLoopLimitNudgeSent
+            && shouldNudgeElapsedConvergence(runElapsedMs, toolLoops)) {
+          pendingRequestControls.push(buildElapsedConvergenceNudge({ elapsedMs: runElapsedMs, toolLoops, maxToolLoops }));
+          elapsedConvergenceNudgeSent = true;
+          log.warn("run_convergence: nudged model after prolonged tool execution", {
+            elapsedMs: runElapsedMs,
+            toolLoops,
+            maxToolLoops,
+          });
+        }
+
         // Compound spin signal: repeated compaction + heavy tool use → nudge the
         // model once to re-anchor on durable state instead of re-deriving work
         // lost to summarization (the "context fills → compaction → loop" failure).
@@ -1669,7 +1758,12 @@ export class AgentRunner {
         // real "latest user text" and reconciliation treats it as a new user
         // instruction — flipping the plan anchor and unlocking scope revision
         // (the exact contamination the internal-control invariant above forbids).
-        if (!spinConvergenceNudgeSent && shouldNudgeSpinConvergence(compactionCount, toolLoops, maxToolLoops)) {
+        if (!spinConvergenceNudgeSent && shouldNudgeSpinConvergence(
+          compactionCount,
+          toolLoops,
+          maxToolLoops,
+          timings.compactionMs,
+        )) {
           pendingRequestControls.push(buildSpinConvergenceNudge({ compactionCount, toolLoops, maxToolLoops }));
           spinConvergenceNudgeSent = true;
           log.warn("run_convergence: nudged model to re-anchor after repeated compaction + heavy tool use", {
@@ -1692,6 +1786,7 @@ export class AgentRunner {
           const e = this.errorResult(startTime, modelId, provider.id, {
             kind: "timeout",
             message: "Run aborted",
+            code: "ABORT_ERR",
           }, lastUsage, toolLoops, compactionCount, true, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings));
           yield { type: "done", result: e };
           return;
@@ -1701,6 +1796,7 @@ export class AgentRunner {
           const e = this.errorResult(startTime, modelId, provider.id, {
             kind: "auth",
             message: err.message,
+            code: errorCodeForMeta(err) || "AUTH_ERROR",
           }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings));
           yield { type: "done", result: e };
           return;
@@ -1724,6 +1820,7 @@ export class AgentRunner {
             const e = this.errorResult(startTime, modelId, provider.id, {
               kind: "context_overflow",
               message: err.message,
+              code: errorCodeForMeta(err) || "CONTEXT_OVERFLOW",
             }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings));
             yield { type: "done", result: e };
             return;
@@ -1794,6 +1891,7 @@ export class AgentRunner {
             const e = this.errorResult(startTime, modelId, provider.id, {
               kind: "context_overflow",
               message: err.message,
+              code: errorCodeForMeta(err) || "CONTEXT_OVERFLOW",
             }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings));
             yield { type: "done", result: e };
             return;
@@ -1813,8 +1911,9 @@ export class AgentRunner {
         }
 
         const e = this.errorResult(startTime, modelId, provider.id, {
-          kind: "provider_error",
+          kind: retryKind === "rate_limit" ? "rate_limit" : (retryKind === "timeout" ? "timeout" : "provider_error"),
           message: formatError(err),
+          code: errorCodeForMeta(err),
         }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings));
         yield { type: "done", result: e };
         return;
@@ -2521,7 +2620,10 @@ async function runToolWithWatchdog(opts: {
   const abortedToolMessage = "Tool execution aborted: Run aborted";
   const stalledToolMessage =
     `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
-  const emitToolEnd = (result: ToolResult) => {
+  const emitToolEnd = (
+    result: ToolResult,
+    diagnostic?: { errorCode: string; errorSeverity: "error" },
+  ) => {
     emitEvent({
       type: "tool_end",
       id: call.id,
@@ -2529,6 +2631,7 @@ async function runToolWithWatchdog(opts: {
       result: result.content,
       persistedOutput: result.persistedOutput,
       isError: result.isError,
+      ...(diagnostic || {}),
       durationMs: Math.max(0, Date.now() - startedAt),
     });
   };
@@ -2608,7 +2711,10 @@ async function runToolWithWatchdog(opts: {
     if (raced === "tool_idle") {
       toolAbort.abort();
       const result = { content: stalledToolMessage, isError: true };
-      emitToolEnd(result);
+      emitToolEnd(result, {
+        errorCode: "tool_execution_stalled",
+        errorSeverity: "error",
+      });
       return { result, stalled: true };
     }
     if (raced === "abort") {
@@ -2621,7 +2727,10 @@ async function runToolWithWatchdog(opts: {
         return abortResult();
       }
       const result = { content: `Tool execution error: ${formatError(raced.err)}`, isError: true };
-      emitToolEnd(result);
+      emitToolEnd(result, {
+        errorCode: "tool_execution_exception",
+        errorSeverity: "error",
+      });
       return { result, err: raced.err };
     }
     let finalResult = raced.result;
@@ -2633,7 +2742,10 @@ async function runToolWithWatchdog(opts: {
           `Tool result processing failed for ${call.name}: ${formatError(err)}`,
         );
         const result = { content: transformError.message, isError: true };
-        emitToolEnd(result);
+        emitToolEnd(result, {
+          errorCode: "tool_result_processing_exception",
+          errorSeverity: "error",
+        });
         return { result, err: transformError };
       }
     }

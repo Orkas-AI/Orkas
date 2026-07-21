@@ -63,7 +63,11 @@ for (const userDir of iterUserDirs()) {
     ...iterSpecDirs(path.join(userDir, 'local', 'marketplace', 'skills'), 'marketplace-skill'),
   ]) {
     totalSkills++;
-    const r = validateSkillDir(dir);
+    const r = validateSkillDir(dir, {
+      // Marketplace installs are historical published bytes. The Runner
+      // contract is enforced on custom authoring and republish, not install.
+      enforceSkillRunner: source !== 'marketplace-skill',
+    });
     const extreme = r.violations.filter((v) => v.level === 'EXTREME');
     const medium = r.violations.filter((v) => v.level === 'MEDIUM');
     if (extreme.length) {
@@ -84,7 +88,9 @@ for (const userDir of iterUserDirs()) {
     ...iterSpecDirs(path.join(userDir, 'local', 'marketplace', 'agents'), 'marketplace-agent'),
   ]) {
     totalAgents++;
-    const r = validateAgentDir(dir);
+    const r = validateAgentDir(dir, {
+      enforceSkillRunner: source !== 'marketplace-agent',
+    });
     const extreme = r.violations.filter((v) => v.level === 'EXTREME');
     const medium = r.violations.filter((v) => v.level === 'MEDIUM');
     if (extreme.length) {

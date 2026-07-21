@@ -2,6 +2,7 @@ export { bootstrap } from './bootstrap';
 export {
   listInstances,
   getInstance,
+  beginOAuthConnect,
   connectViaOAuth,
   addCustomInstance,
   removeInstance,

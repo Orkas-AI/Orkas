@@ -38,6 +38,7 @@ function loadComposer() {
   const fns = [
     '_chatRichSerializeNode',
     '_chatRichTextLength',
+    '_chatRichHasAuthoredContent',
     '_chatRichEnsureTrailingBreak',
     '_chatRichHandleEditorInput',
     '_chatRichRenderValue',
@@ -106,6 +107,7 @@ function loadComposer() {
       ensure: (e) => _chatRichEnsureTrailingBreak(e),
       reconcileInput: (api) => _chatRichHandleEditorInput(api),
       makeEditor,
+      makeElement: (tag) => document.createElement(tag),
       makeText: (value) => document.createTextNode(value),
       makeBr: (bogus) => { const b = document.createElement('br'); if (bogus) b.dataset.chatBogus = '1'; return b; },
     });
@@ -165,6 +167,31 @@ describe('chat rich composer newline handling', () => {
 
     expect(synced).toBe('abc');
     expect(editor.countBogus()).toBe(0);
+  });
+
+  it('normalizes Chromium empty-editor filler DOM back to a true empty value', () => {
+    const c = loadComposer();
+    for (const nested of [false, true]) {
+      const editor = c.makeEditor();
+      if (nested) {
+        const block = c.makeElement('div');
+        block.appendChild(c.makeBr(false));
+        editor.appendChild(block);
+      } else {
+        editor.appendChild(c.makeBr(false));
+      }
+      let synced = 'not-empty';
+
+      c.reconcileInput({
+        composing: false,
+        ensureTrailingBreak: () => c.ensure(editor),
+        syncFromEditor: () => { synced = c.serialize(editor); },
+      });
+
+      expect(synced).toBe('');
+      expect(editor.childNodes).toHaveLength(0);
+      expect(editor.countBogus()).toBe(0);
+    }
   });
 
   it('removes a stale filler when text is typed after a trailing newline', () => {

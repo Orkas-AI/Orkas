@@ -227,7 +227,18 @@ function parsePresentationSlides(buf: Buffer): PresentationSlide[] {
   const zip = new AdmZip(buf);
   const slideEntries = parsePresentationSlideRefs(zip);
 
-  if (!slideEntries.length) throw new Error('presentation contains no slides');
+  if (!slideEntries.length) {
+    const presentation = readZipText(zip, 'ppt/presentation.xml');
+    if (!presentation) throw new Error('empty or invalid presentation');
+
+    // A newly-created PowerPoint file may be a valid package whose slide list
+    // is empty. Treat that as an empty document, while still rejecting a deck
+    // that declares slides whose relationship or XML payload is missing.
+    if (tagOpenRe('sldId').test(presentation)) {
+      throw new Error('presentation slide data is missing');
+    }
+    return [];
+  }
 
   return slideEntries.map((slide) => ({
     number: slide.number,
@@ -317,6 +328,13 @@ export function pptxBufferToMarkdown(buf: Buffer): string {
 
 export function pptxBufferToHtml(buf: Buffer): string {
   const slides = parsePresentationSlides(buf);
+  if (!slides.length) {
+    return [
+      '<section class="office-slide office-slide-blank" aria-label="Blank presentation">',
+      '<div class="office-slide-body"></div>',
+      '</section>',
+    ].join('');
+  }
   return slides.map((slide) => {
     const lines = slide.texts.map((line) => `<p>${escapeHtml(line)}</p>`).join('');
     return [

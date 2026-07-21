@@ -21,6 +21,7 @@ import * as path from 'node:path';
 
 import { officeCliBinaryPath } from '../../paths';
 import { createLogger } from '../../logger';
+import { killProcessTree } from '../../../core-agent/src/sandbox/executor';
 
 const log = createLogger('office-engine');
 
@@ -44,9 +45,17 @@ export interface RunOfficeCliOpts {
   timeoutMs?: number;
   /** UTF-8 text piped to stdin (used by `batch` when no --input is given). */
   stdin?: string;
+  /** Combined stdout/stderr capture ceiling (default 16 MiB). */
+  maxOutputBytes?: number;
 }
 
+const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
+
 let availableCache: boolean | null = null;
+
+export function _resetOfficeCliAvailableForTest(): void {
+  availableCache = null;
+}
 
 /** True when a usable OfficeCLI binary is present for this platform/arch.
  *  Only the POSITIVE result is cached — in dev the binary is fetched on demand
@@ -73,11 +82,26 @@ export function runOfficeCli(args: string[], opts: RunOfficeCliOpts): Promise<Of
     );
   }
   const timeoutMs = opts.timeoutMs ?? 60_000;
+  const maxOutputBytes = Math.max(1, opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES);
+  if (opts.signal?.aborted) {
+    return Promise.reject(new OfficeCliError('E_OFFICE_ABORTED', `OfficeCLI aborted before start: ${args[0]}`));
+  }
 
   return new Promise<OfficeCliResult>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(bin, args, { cwd: opts.cwd, ...(opts.signal ? { signal: opts.signal } : {}) });
+      child = spawn(bin, args, {
+        cwd: opts.cwd,
+        detached: process.platform !== 'win32',
+        // OfficeCLI enables background self-updates by default. Orkas vendors
+        // a hash-pinned binary, so letting it replace itself at runtime defeats
+        // that pin and can swap versions in the middle of a create/batch flow.
+        // Always prefer the version shipped with Orkas; upgrades belong to the
+        // dependency/release pipeline, never an end-user document operation.
+        env: { ...process.env, OFFICECLI_SKIP_UPDATE: '1' },
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
     } catch (err) {
       reject(new OfficeCliError('E_OFFICE_SPAWN', (err as Error).message));
       return;
@@ -85,37 +109,74 @@ export function runOfficeCli(args: string[], opts: RunOfficeCliOpts): Promise<Of
 
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
-    let timedOut = false;
     let settled = false;
+    let outputBytes = 0;
+    let timer: NodeJS.Timeout | null = null;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill('SIGKILL');
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      opts.signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (code: string, message: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new OfficeCliError(code, message));
+    };
+    const terminate = () => {
+      try { killProcessTree(child, 'SIGKILL'); } catch { /* best effort */ }
+    };
+    const onAbort = () => {
+      terminate();
+      fail('E_OFFICE_ABORTED', `OfficeCLI aborted: ${args[0]}`);
+    };
+    const capture = (chunks: Buffer[], chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      outputBytes += data.length;
+      if (outputBytes > maxOutputBytes) {
+        terminate();
+        fail('E_OFFICE_OUTPUT_LIMIT', `OfficeCLI output exceeded ${maxOutputBytes} bytes: ${args[0]}`);
+        return;
+      }
+      chunks.push(data);
+    };
+
+    timer = setTimeout(() => {
+      terminate();
+      fail('E_OFFICE_TIMEOUT', `OfficeCLI timed out after ${timeoutMs}ms: ${args[0]}`);
     }, timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
 
-    child.stdout?.on('data', (c: Buffer) => outChunks.push(c));
-    child.stderr?.on('data', (c: Buffer) => errChunks.push(c));
+    child.stdout?.on('data', (c: Buffer | string) => capture(outChunks, c));
+    child.stderr?.on('data', (c: Buffer | string) => capture(errChunks, c));
+    child.stdin?.on('error', (err: Error) => fail('E_OFFICE_STDIN', `OfficeCLI stdin failed: ${err.message}`));
+
+    if (opts.signal) {
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+      if (opts.signal.aborted) onAbort();
+    }
 
     // Always close stdin: `batch` reads JSON from it; commands that ignore
     // stdin are unaffected by an immediate EOF.
-    if (opts.stdin !== undefined) child.stdin?.write(opts.stdin);
-    child.stdin?.end();
+    if (!settled) {
+      try {
+        if (opts.stdin !== undefined) child.stdin?.write(opts.stdin);
+        child.stdin?.end();
+      } catch (err) {
+        fail('E_OFFICE_STDIN', `OfficeCLI stdin failed: ${(err as Error).message}`);
+      }
+    }
 
     child.on('error', (err: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(new OfficeCliError('E_OFFICE_SPAWN', err.message));
+      fail('E_OFFICE_SPAWN', err.message);
     });
 
     child.on('close', (code: number | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(new OfficeCliError('E_OFFICE_TIMEOUT', `OfficeCLI timed out after ${timeoutMs}ms: ${args[0]}`));
-        return;
-      }
+      cleanup();
       resolve({
         code: code ?? -1,
         stdout: Buffer.concat(outChunks).toString('utf8'),
@@ -147,7 +208,17 @@ export function closeAllOfficeResidents(): void {
     if (process.platform === 'win32') {
       // Match-by-cmdline is unreliable on Windows; at startup/quit killing every
       // process of our bundled exe by image name is safe (no concurrent instance).
-      spawnSync('taskkill', ['/F', '/IM', path.basename(bin)], { timeout: 5_000, stdio: 'ignore' });
+      const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+      const taskkill = path.win32.join(systemRoot, 'System32', 'taskkill.exe');
+      // Use Windows path semantics explicitly. Besides making this branch
+      // deterministic in cross-host tests, it avoids ever passing a full
+      // `C:\\...` path to taskkill when the value originated outside the host
+      // path module (for example packaged metadata or a cross-build step).
+      spawnSync(taskkill, ['/F', '/T', '/IM', path.win32.basename(bin)], {
+        timeout: 5_000,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
     } else {
       // Scope strictly to OUR binary's resident daemons, not any other officecli.
       // `pkill -f` treats the pattern as an extended regex, so escape the binary

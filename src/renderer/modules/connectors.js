@@ -9,12 +9,11 @@
 // click handler was firing OAuth flows by accident. Buttons stop propagation as a defence in
 // depth.
 //
-// OAuth flow UX: clicking Connect just opens the system browser and returns control to the
-// renderer's _runConnect Promise (which the main process resolves once the deep-link callback
-// completes). **The card itself does NOT change state during the flow** — no authorizing badge, no
-// disabled button. The user can click Connect again at any time; server-side startOAuth
-// supersedes any prior pending flow, and the renderer surfaces only real errors (the
-// "superseded" message is swallowed since it's caused by the user's own re-click).
+// OAuth flow UX: clicking Connect asks main to open the system browser, then the IPC returns
+// immediately. The custom-scheme callback finishes exchange + provisioning independently and
+// pushes `connectors:oauth-result` back here. **The card itself does NOT stay busy while the user
+// is in the browser** — no authorizing badge, no disabled button. Closing/ignoring the browser is
+// abandonment, not a connector failure; a second click simply supersedes the earlier flow.
 
 const _connectorsLog = createLogger('connectors');
 const _CONNECTORS_RENDER_CACHE_VERSION = 2;
@@ -49,17 +48,39 @@ function _connectorTrackErrorType(err) {
   return 'exception';
 }
 
+const CONNECT_CANCEL_CODES = new Set(['user_cancelled', 'superseded']);
+
+function _isConnectCancel(errLike) {
+  const code = errLike && typeof errLike.code === 'string' ? errLike.code : '';
+  if (code && CONNECT_CANCEL_CODES.has(code)) return true;
+  const msg = String((errLike && (errLike.error || errLike.message)) || '').toLowerCase();
+  return msg.includes('superseded') || msg.includes('cancelled') || msg.includes('canceled');
+}
+
+// The commercial build records the terminal outcome at this boundary. The
+// open build keeps only the behavior needed to distinguish an intentional
+// cancellation from a failure that should be surfaced to the user.
+function _reportConnectOutcome(_payload, _startedAt, errLike, _durationMs) {
+  return _isConnectCancel(errLike);
+}
+
+function _handleConnectFailure(payload, startedAt, errLike) {
+  if (_reportConnectOutcome(payload, startedAt, errLike)) return;
+  uiAlert(_formatConnectError(errLike));
+}
+
 let _connectorsState = {
   catalog: [],
   instances: [],
   loading: false,
-  /** Per-card connecting flag. Set when `_runConnect` is in flight (browser-open → deep-link
-   *  return → /oauth/exchange → MCP connect → list_tools). Visible only post-return when the
-   *  user comes back to PC and the IPC is still running through exchange + MCP setup — without
-   *  this they'd see a static Connect button with no indication anything is happening. Button
-   *  stays clickable; re-click supersedes the prior flow (see comment in `_runConnect`). */
+  /** Per-card launch flag. It lasts only until main accepts the OAuth request; browser consent,
+   *  callback exchange, and MCP startup continue asynchronously. */
   connecting: new Set(),
 };
+// Correlates the accepted start with a later push so the terminal metric retains click metadata
+// and wall duration. Entries intentionally remain when no callback arrives: that is an abandoned
+// browser flow, so there is no fabricated terminal result to report.
+const _pendingConnectAttempts = new Map();
 let _connectorsLoadSeq = 0;
 
 function _connectorsRenderCacheKey() {
@@ -786,63 +807,51 @@ async function _runConnect(entry) {
   const payload = _connectorTrackPayload(entry, null);
   const startedAt = performance.now();
   _connectorsTrackClick('connector_connect', payload);
-  // Mark "connecting" so the card's foot button shows a spinner. The button stays clickable —
-  // re-clicks supersede the prior pending flow on the main side (oauth.ts::startOAuth calls
-  // _cancelPending before installing a new listener), and the prior _runConnect's await
-  // rejects with "superseded ..." which we silently drop. The spinner is mainly for the
-  // post-deep-link-return phase (exchange / MCP connect / list_tools — multiple network
-  // roundtrips that look frozen if we render nothing). During the browser-open phase the user
-  // isn't looking at the PC anyway.
+  // Show a spinner only while main validates and accepts the launch. The renderer must not hold
+  // the card in a ten-minute "connecting" state while the user is in an external browser.
   _connectorsState.connecting.add(entry.id);
   _renderConnectorsGrid();
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
-    if (res && res.ok && res.instance) {
-      _connectorsTrackEvent('connector_connect_result', {
-        ...payload,
-        result: 'success',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
-      // Refresh state + re-render the grid. The new instance shows up in the connected group.
-      await loadConnectors();
+    if (res && res.ok && res.started && typeof res.attempt_id === 'string' && res.attempt_id) {
+      _pendingConnectAttempts.set(res.attempt_id, { payload, startedAt });
     } else if (res && !res.ok) {
-      const msg = (res.error || '').toLowerCase();
-      const softCancel = msg.includes('superseded') || msg.includes('cancelled');
-      _connectorsTrackEvent('connector_connect_result', {
-        ...payload,
-        result: softCancel ? 'cancelled' : 'failure',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
-      if (!msg.includes('superseded') && !msg.includes('cancelled')) {
-        uiAlert(_formatConnectError(res));
-      }
-      await loadConnectors();
+      _handleConnectFailure(payload, startedAt, res);
+    } else {
+      _handleConnectFailure(payload, startedAt, { code: 'empty_response' });
     }
   } catch (err) {
-    const msg = ((err && err.message) || '').toLowerCase();
-    const softCancel = msg.includes('superseded') || msg.includes('cancelled');
-    _connectorsTrackEvent('connector_connect_result', {
-      ...payload,
-      result: softCancel ? 'cancelled' : 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
-    if (!softCancel) {
-      _connectorsTrackError('connector_connect', {
-        ...payload,
-        error_type: _connectorTrackErrorType(err),
-      });
-    }
-    if (!msg.includes('superseded') && !msg.includes('cancelled')) {
-      uiAlert(_formatConnectError(err));
-    }
-    await loadConnectors();
+    _handleConnectFailure(payload, startedAt, err);
   } finally {
     _connectorsState.connecting.delete(entry.id);
-    // `loadConnectors` already re-renders, but it's inside the try/catch and may have skipped
-    // (e.g. on `superseded` we don't always reload). Belt-and-suspenders: ensure the spinner
-    // clears even when the connect flow exits without a reload.
     _renderConnectorsGrid();
   }
+}
+
+function _handleOAuthConnectResult(info) {
+  if (!info || typeof info.attempt_id !== 'string' || typeof info.catalog_id !== 'string') return;
+  const pending = _pendingConnectAttempts.get(info.attempt_id) || null;
+  if (pending) _pendingConnectAttempts.delete(info.attempt_id);
+  const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
+  const payload = pending ? pending.payload : _connectorTrackPayload(entry, null);
+  const durationMs = pending
+    ? Math.round(performance.now() - pending.startedAt)
+    : (Number.isFinite(info.duration_ms) ? info.duration_ms : 0);
+
+  if (info.result === 'success') {
+    _connectorsTrackEvent('connector_connect_result', {
+      ...payload,
+      result: 'success',
+      duration_ms: Math.max(0, durationMs),
+    });
+  } else {
+    const errLike = { code: info.code || 'oauth_failed', error: info.error || 'connector authorization failed' };
+    const cancelled = _reportConnectOutcome(payload, pending ? pending.startedAt : performance.now(), errLike, durationMs);
+    // A transport failure is rendered on the resulting connector card. Other asynchronous
+    // failures need an explicit alert now that the initiating IPC has already returned.
+    if (!cancelled && errLike.code !== 'mcp_connect_failed') uiAlert(_formatConnectError(errLike));
+  }
+  if (currentView === 'connectors') loadConnectors();
 }
 
 /** Re-run connect + token refresh for an installed instance (`connectors.refresh`), never OAuth.
@@ -936,8 +945,9 @@ function _openAddCustomDialog() {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay ui-dialog-overlay open';
   overlay.innerHTML = `
-    <div class="modal ui-dialog connector-custom-dialog" role="dialog" aria-modal="true">
-      <div class="ui-dialog-title">${escapeHtml(t('connectors.custom.title'))}</div>
+    <div class="modal modal-standard ui-dialog connector-custom-dialog" role="dialog" aria-modal="true" aria-labelledby="connector-custom-title">
+      <div class="modal-title ui-dialog-title" id="connector-custom-title">${escapeHtml(t('connectors.custom.title'))}</div>
+      <div class="modal-body">
       <div class="form-row">
         <label>${escapeHtml(t('connectors.custom.name_label'))}</label>
         <input type="text" data-f="name" maxlength="64" />
@@ -973,6 +983,7 @@ function _openAddCustomDialog() {
           <textarea data-f="env" rows="2" placeholder="API_KEY=..."></textarea>
         </div>
         <div class="muted connector-custom-warning">${escapeHtml(t('connectors.custom.stdio_warning'))}</div>
+      </div>
       </div>
       <div class="modal-actions">
         <button class="btn" data-act="cancel">${escapeHtml(t('common.cancel'))}</button>
@@ -1105,6 +1116,7 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('connectors:changed', () => {
       if (currentView === 'connectors') loadConnectors();
     });
+    window.orkas.onPushEvent('connectors:oauth-result', _handleOAuthConnectResult);
     window.orkas.onPushEvent('client-config:changed', () => {
       if (currentView === 'connectors') loadConnectors();
     });

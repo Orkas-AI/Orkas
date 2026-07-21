@@ -3,6 +3,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 // indexer.ts pulls path constants from paths.ts at module load. Each test sets
 // ORKAS_WORKSPACE_ROOT before resetting the module graph so a fresh tmp WS
 // is in effect. Module-level `_cache` / `_locks` / `_flushTimers` are also

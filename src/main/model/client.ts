@@ -28,6 +28,12 @@ export interface StreamEvent {
   text?: string;
   event?: Record<string, unknown>;
   aborted?: boolean;
+  /** Structured source for terminal failures. */
+  failureKind?: 'model' | 'config';
+  /** Stable low-cardinality reason paired with `failureKind`. */
+  failureCode?: string;
+  /** Runtime phase where the terminal failure occurred. */
+  failurePhase?: 'preflight' | 'provider_wait' | 'model_text' | 'tool_input' | 'tool' | 'compaction';
   /** Only present on the main-chat `final` event when the assistant text
    * contained a fenced `agent-input-form` block. Carries the parsed form
    * payload + the msgIndex at which the assistant message will land, so
@@ -52,6 +58,9 @@ export interface ChatOptions {
   userId: string;
   message: string;
   sessionId?: string;
+  /** Continue a verified failed active turn in the same persistent session.
+   * Falls back to a normal new turn if no active turn remains. */
+  resumeActiveTurn?: boolean;
   /** Extra system prompt prepended to core-agent's auto-generated skills block.
    * Use this for conversation-level rules that must stay in context for every
    * turn (kept on the system channel, not duplicated into each user message). */

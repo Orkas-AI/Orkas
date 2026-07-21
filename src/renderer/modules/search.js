@@ -32,10 +32,6 @@ function _bindGlobalSearch() {
     btn.dataset.bound = '1';
     btn.addEventListener('click', () => _setSearchTab(btn.dataset.tab));
   });
-  const overlay = document.getElementById('search-overlay');
-  overlay?.addEventListener('click', (e) => {
-    if (e.target === overlay) closeGlobalSearch();
-  });
   // Global Cmd/Ctrl+K shortcut. Toggle behaviour: if the overlay is already
   // open, a second Cmd+K closes it (parity with Cmd+K-style command palettes
   // in VS Code / Notion / etc.) — without this, the keystroke would re-call
@@ -400,9 +396,14 @@ async function _gotoSearchResult(r) {
     if (typeof loadContexts === 'function') await loadContexts();
     if (typeof openCtxFile === 'function') openCtxFile(r.path);
   } else if (r.kind === 'chat') {
-    setView('conversation', r.cid);
-    // Scroll to the matched message after history loads.
-    setTimeout(() => _scrollToMsgIndex('chat-history', r.msg_index), 300);
+    setView('conversation', r.cid, {
+      historyTarget: {
+        msgId: r.msg_id || '',
+        msgIndex: r.msg_index,
+        time: r.time || '',
+        role: r.role || '',
+      },
+    });
   } else if (r.kind === 'agent') {
     // Open the agent detail view in read mode. Edit mode is intentionally
     // NOT auto-toggled — the user is looking up "this agent", not editing.
@@ -428,17 +429,6 @@ async function _gotoSearchResult(r) {
       await _showSkillsDetailView(r.source, r.id);
     }
   }
-}
-
-function _scrollToMsgIndex(containerId, idx) {
-  const container = document.getElementById(containerId);
-  if (!container) return;
-  const items = container.querySelectorAll('.chat-message');
-  const target = items[idx];
-  if (!target) return;
-  target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  target.classList.add('search-flash');
-  setTimeout(() => target.classList.remove('search-flash'), 1600);
 }
 
 function _loadSearchHistory() {

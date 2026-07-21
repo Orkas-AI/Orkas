@@ -968,6 +968,8 @@ export async function getSystemSkillsPromptBlock(uid?: string): Promise<string> 
     '',
     'System skills are product protocols. They are not marketplace or custom skills.',
     '',
+    'When the task or the work you decide to perform clearly matches a description below, use that system skill by reading its SKILL.md. Do not load system skills that do not match.',
+    '',
     'Read with:',
     '`read_file(<SYSTEM_SKILLS_ROOT>/<id>/SKILL.md)`',
     '',

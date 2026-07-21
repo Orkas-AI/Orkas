@@ -208,6 +208,19 @@ describe('system skills reconciliation', () => {
 });
 
 describe('system creator skill contracts', () => {
+  it('describes coding by its semantic use boundary rather than trigger keywords', () => {
+    const fm = frontmatterOf(packagedSystemSkill('coding'));
+    expect(fm).toContain('Use for implementing or changing code in an existing project');
+    expect(fm).toContain('Do not use for explanation-only requests or disposable one-line scripts.');
+    expect(fm).not.toContain('Triggers:');
+  });
+
+  it('keeps coding plans on the durable execution-plan tool', () => {
+    const md = packagedSystemSkill('coding');
+    expect(md).toContain('durable plan/TODO tool (`manage_execution_plan`)');
+    expect(md).not.toContain('plan/TODO tool (`plan_set`)');
+  });
+
   it('keeps creator SKILL.md frontmatter portable', () => {
     for (const id of ['agent-creator', 'skill-creator']) {
       const fm = frontmatterOf(packagedSystemSkill(id));
@@ -238,5 +251,27 @@ describe('system creator skill contracts', () => {
     expect(md).toContain('Default: one current-language description only');
     expect(md).toContain('Do **not** show source provenance by default');
     expect(md).not.toContain('Both are required');
+  });
+
+  it('keeps intentional creator-skill category and provenance rules in parity', () => {
+    const agentCreator = packagedSystemSkill('agent-creator');
+    const skillCreator = packagedSystemSkill('skill-creator');
+    const categoryCodes = (md: string): string[] => {
+      const section = md.match(/Pick one code from this fixed marketplace category list:[\s\S]*?\n\nMatch the primary domain/);
+      expect(section).not.toBeNull();
+      return Array.from(section![0].matchAll(/^\| `([^`]+)` \|/gm), (match) => match[1]);
+    };
+    const expectedCategories = ['education', 'ecommerce', 'rnd', 'creation', 'data', 'office', 'general'];
+    const sharedClauses = [
+      'Category sanity pass before final reply: if the chosen code is `general`',
+      'Do **not** show source provenance by default.',
+    ];
+
+    expect(categoryCodes(agentCreator)).toEqual(expectedCategories);
+    expect(categoryCodes(skillCreator)).toEqual(expectedCategories);
+    for (const clause of sharedClauses) {
+      expect(agentCreator).toContain(clause);
+      expect(skillCreator).toContain(clause);
+    }
   });
 });

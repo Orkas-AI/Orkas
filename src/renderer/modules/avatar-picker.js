@@ -10,9 +10,9 @@
 //   anchorEl:  the anchor element used for positioning.
 //   current:   { icon, color }, used to highlight the current pick.
 //   opts:
-//     allowCommanderCombo: false — when true, crown / gold are not
-//                                  filtered out (used by the
-//                                  commander avatar settings).
+//     allowCommanderCombo: false — when true, the commander-only crown icon
+//                                  is not filtered out. Colors are shared by
+//                                  commander and regular agents.
 //     hideIcons: false           — when true, only the color row is
 //                                  rendered (legacy / constrained callers).
 //     colorLabelKey: ''          — optional i18n key for the color row label.
@@ -80,7 +80,7 @@ function _renderAvatarPicker() {
   if (iconSection) iconSection.style.display = hideIcons ? 'none' : '';
 
   const icons = AVATAR_ICONS.filter((i) => allowCommander || i.id !== COMMANDER_DEFAULT.icon);
-  const colors = AVATAR_COLORS.filter((c) => allowCommander || c.id !== COMMANDER_DEFAULT.color);
+  const colors = AVATAR_COLORS;
 
   // i18n.t returns the raw key if no entry exists in either locale, so fall
   // back to the JSON-side English `label` for forward compatibility when a
@@ -137,7 +137,13 @@ function openAvatarPicker(anchorEl, current, opts, onChange) {
   } else {
     const rect = anchorEl.getBoundingClientRect();
     el.style.display = 'flex';
-    el.style.left = rect.left + 'px';
+    const margin = 12;
+    const width = el.getBoundingClientRect().width;
+    const left = Math.min(
+      Math.max(rect.left, margin),
+      Math.max(margin, window.innerWidth - width - margin),
+    );
+    el.style.left = left + 'px';
     el.style.top = (rect.bottom + 8) + 'px';
   }
 }

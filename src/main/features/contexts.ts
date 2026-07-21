@@ -35,6 +35,13 @@ import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { getActiveUserId } from './users';
 import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
+import {
+  assertLocalImportTarget,
+  copyLocalFileAtomic,
+  inspectLocalImportSource,
+  withLocalImportLock,
+} from '../util/file-import';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('contexts');
 
@@ -351,10 +358,9 @@ const IMAGE_MEDIA_TYPE: Record<string, string> = {
  * identical content is treated as a duplicate too so the user gets explicit
  * feedback rather than a silent no-op.
  *
- * Race note: `kb_files` rows are created when the indexer picks up a job
- * (not at enqueue time), so there's a ~ms window where two parallel uploads
- * with identical content could both slip through. Desktop single-user flow
- * makes that window irrelevant in practice.
+ * Path-based imports serialize their duplicate-check/copy critical section so
+ * renderer windows and native pickers cannot exploit the indexer's short row-
+ * creation delay. In-memory upload callers remain synchronous after hashing.
  */
 function checkDuplicateContent(sha1: string): Result<null> | null {
   let existing: kbVector.KbFileRow | null;
@@ -372,6 +378,16 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
     code: 'duplicate_content',
     existingDir: existingDir === '.' ? '' : existingDir,
   };
+}
+
+function kbKindForContextName(name: string): kbVector.KbKind {
+  const ext = extOf(name);
+  if (ext === '.pdf') return 'pdf';
+  if (ext === '.docx' || ext === '.docm') return 'docx';
+  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.pptx' || ext === '.pptm') return 'presentation';
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image';
+  return 'text';
 }
 
 function notifyDeletedContext(relPath: string): void {
@@ -499,6 +515,87 @@ export function uploadContextFile(relpath: string, raw: Buffer | Uint8Array | nu
   kbIndexer.enqueue(uid, relpath, 'upsert');
   notifyDirtyContext(relpath);
   return { ok: true, path: relpath, bytes: buf.length };
+}
+
+/**
+ * Import a user-selected local file without materialising it as ArrayBuffer →
+ * binary string → base64 → Buffer across the renderer/main IPC boundary.
+ * Hashing and copying are streamed/asynchronous, so a large PDF does not block
+ * Electron's main event loop or multiply its bytes in the JS heap.
+ */
+export async function importContextFileFromPath(
+  relpath: string,
+  sourceAbs: string,
+): Promise<Result<{ path: string; bytes: number }>> {
+  const startedAt = Date.now();
+  const uid = getActiveUserId();
+  let target: string;
+  try { target = resolvePath(relpath); }
+  catch (err) { return { ok: false, error: (err as Error).message, code: 'E_IMPORT_TARGET' }; }
+  if (!isAllowedName(path.basename(target))) {
+    return { ok: false, error: t('errors.contexts.formats_only', { allowed: [...ALLOWED_EXTS].sort().join(', ') }), code: 'E_IMPORT_EXT' };
+  }
+  if (path.basename(target) === CONTEXTS_INDEX_FILENAME) {
+    return { ok: false, error: t('errors.cant_edit_index'), code: 'E_IMPORT_TARGET' };
+  }
+  if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+    return { ok: false, error: 'path is a directory', code: 'E_IMPORT_TARGET' };
+  }
+  try {
+    const source = await inspectLocalImportSource(sourceAbs, MAX_FILE_BYTES);
+    const result = await withLocalImportLock(`contexts:${uid}`, async () => {
+      const dup = source.bytes > 0 ? checkDuplicateContent(source.sha1) : null;
+      if (dup) return dup;
+      await assertLocalImportTarget(contextsRoot(), target);
+      await copyLocalFileAtomic(source.absPath, target, source);
+      try {
+        // Publish a pending row before releasing the import lock. Without this,
+        // a second same-content import can arrive before the async index worker
+        // creates its row and both copies slip past content deduplication.
+        await kbVector.setFileStatus(uid, relpath, 'pending', {
+          kind: kbKindForContextName(relpath),
+          bytes: source.bytes,
+          mtime: source.mtimeMs / 1000,
+          sha1: source.sha1,
+        });
+      } catch (err) {
+        // The vector DB is derived state: keep the successfully copied source
+        // file and let enqueue/reconcile rebuild it rather than failing import.
+        log.warn('failed to publish pending library row after import', {
+          user_id: maskId(uid),
+          path: logPathRef(relpath),
+          error: logErrorSummary(err),
+        });
+      }
+      invalidateIndex();
+      search.upsertContext(uid, relpath);
+      kbIndexer.enqueue(uid, relpath, 'upsert');
+      notifyDirtyContext(relpath);
+      return { ok: true as const, path: relpath, bytes: source.bytes };
+    });
+    if (!result.ok) return result;
+    log.info('imported local library file', {
+      user_id: maskId(uid),
+      path: logPathRef(relpath),
+      ext: extOf(relpath),
+      bytes: source.bytes,
+      duration_ms: Date.now() - startedAt,
+    });
+    return result;
+  } catch (err) {
+    log.warn('local library file import failed', {
+      user_id: maskId(uid),
+      path: logPathRef(relpath),
+      ext: extOf(relpath),
+      duration_ms: Date.now() - startedAt,
+      error: logErrorSummary(err),
+    });
+    return {
+      ok: false,
+      error: (err as Error).message || String(err),
+      code: typeof (err as { code?: unknown }).code === 'string' ? (err as { code: string }).code : 'E_IMPORT_FAILED',
+    };
+  }
 }
 
 /** User-facing delete — files or dirs (recursive), refuses to touch the root index. */

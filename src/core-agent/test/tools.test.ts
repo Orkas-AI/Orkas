@@ -10,6 +10,17 @@ import type { ToolContext } from "../src/tools/index.js";
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
+function shellQuote(value: string): string {
+  return process.platform === "win32"
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function shellInvoke(executable: string, args: string[]): string {
+  const command = [shellQuote(executable), ...args.map(shellQuote)].join(" ");
+  return process.platform === "win32" ? `& ${command}` : command;
+}
+
 describe("Tools", () => {
   describe("defineTool", () => {
     it("creates a tool with all required fields", () => {
@@ -45,6 +56,48 @@ describe("Tools", () => {
   });
 
   describe("manage_execution_plan tool", () => {
+    it("repairs a missing update action when a complete plan is present", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete the task" }]);
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+      const context: ToolContext = { state: {} };
+
+      const inferred = await tool.execute({
+        plan: [{ step: "Complete the work", status: "working" }],
+      }, context);
+
+      expect(inferred.isError).toBeUndefined();
+      expect(JSON.parse(inferred.content)).toMatchObject({
+        action: "update",
+        action_inferred: true,
+      });
+      expect(session.getExecutionPlan()?.steps[0].status).toBe("in_progress");
+    });
+
+    it("accepts replace as a legacy alias without bypassing plan guards", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete the task" }]);
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+      const context: ToolContext = { state: {} };
+
+      const result = await tool.execute({
+        action: "replace",
+        plan: [{ step: "Complete the work", status: "in_progress" }],
+      }, context);
+
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content)).toMatchObject({ action: "update", action_inferred: false });
+      expect(session.getExecutionPlan()?.steps[0].step).toBe("Complete the work");
+    });
+
     it("downgrades a redundant replace_objective replay to a guarded status update", async () => {
       const session = new Session();
       session.beginUserTurn([{ type: "text", text: "Complete the original task" }]);
@@ -53,6 +106,7 @@ describe("Tools", () => {
       });
       session.addMessage("user", [{ type: "text", text: "Also include the revised requirement" }]);
       const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
         update: (update) => session.updateExecutionPlan(update),
         clear: () => session.clearExecutionPlan(),
       });
@@ -86,6 +140,51 @@ describe("Tools", () => {
       }, context);
       expect(unsafeReplay.isError).toBe(true);
       expect(unsafeReplay.content).toContain("cannot remove or rename existing milestones");
+    });
+
+    it("updates and appends by stable step id without replaying unchanged steps", async () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
+      const tool = createExecutionPlanTool({
+        get: () => session.getExecutionPlan(),
+        update: (update) => session.updateExecutionPlan(update),
+        clear: () => session.clearExecutionPlan(),
+      });
+      const context: ToolContext = { state: {} };
+
+      const initial = await tool.execute({
+        action: "update",
+        plan: [
+          { step: "Inspect the inputs", status: "in_progress" },
+          { step: "Verify the result", status: "pending" },
+        ],
+      }, context);
+      expect(JSON.parse(initial.content).steps).toEqual([
+        { id: 1, step: "Inspect the inputs", status: "in_progress" },
+        { id: 2, step: "Verify the result", status: "pending" },
+      ]);
+
+      const status = await tool.execute({ action: "set_status", step_id: 1, status: "completed" }, context);
+      expect(status.isError).toBeUndefined();
+      expect(JSON.parse(status.content).steps[0]).toEqual({
+        id: 1,
+        step: "Inspect the inputs",
+        status: "completed",
+      });
+
+      const appended = await tool.execute({
+        action: "append_step",
+        step: "Publish the result",
+        status: "in_progress",
+      }, context);
+      expect(appended.isError).toBeUndefined();
+      expect(JSON.parse(appended.content)).toMatchObject({ appended_step_id: 3, step_count: 3 });
+      expect(session.getExecutionPlan()?.steps.map((item) => item.id)).toEqual([1, 2, 3]);
+      expect(session.getExecutionPlan()?.steps.map((item) => item.step)).toEqual([
+        "Inspect the inputs",
+        "Verify the result",
+        "Publish the result",
+      ]);
     });
   });
 
@@ -185,6 +284,72 @@ describe("Tools", () => {
       expect(names).toContain("write_file");
       expect(names).toContain("bash");
       expect(names).toContain("list_files");
+    });
+  });
+
+  describe("write_file tool", () => {
+    it("creates parent directories and writes UTF-8 content", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-write-file-test-"));
+      try {
+        const writeFile = getBuiltinTools().find((tool) => tool.name === "write_file")!;
+        const result = await writeFile.execute(
+          { path: "nested/output.txt", content: "Windows + macOS: 你好" },
+          { workingDir: tmpDir, state: {} },
+        );
+
+        const output = path.join(tmpDir, "nested", "output.txt");
+        expect(result.isError).toBeUndefined();
+        expect(result.content).toContain(path.resolve(output));
+        await expect(fs.readFile(output, "utf8")).resolves.toBe("Windows + macOS: 你好");
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns a tool error when the target cannot be written", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-write-file-error-test-"));
+      try {
+        const parentFile = path.join(tmpDir, "not-a-directory");
+        await fs.writeFile(parentFile, "occupied");
+        const writeFile = getBuiltinTools().find((tool) => tool.name === "write_file")!;
+        const result = await writeFile.execute(
+          { path: path.join(parentFile, "output.txt"), content: "nope" },
+          { workingDir: tmpDir, state: {} },
+        );
+
+        expect(result.isError).toBe(true);
+        expect(result.content).toContain("Error writing file:");
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("list_files tool", () => {
+    it("lists files and directories using a platform-neutral result format", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-list-files-test-"));
+      try {
+        await fs.mkdir(path.join(tmpDir, "folder"));
+        await fs.writeFile(path.join(tmpDir, "file.txt"), "content");
+        const listFiles = getBuiltinTools().find((tool) => tool.name === "list_files")!;
+        const result = await listFiles.execute({}, { workingDir: tmpDir, state: {} });
+
+        expect(result.isError).toBeUndefined();
+        expect(result.content.split("\n").sort()).toEqual(["d folder", "f file.txt"]);
+      } finally {
+        await fs.rm(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("returns a tool error for a missing directory", async () => {
+      const listFiles = getBuiltinTools().find((tool) => tool.name === "list_files")!;
+      const result = await listFiles.execute(
+        { path: path.join(os.tmpdir(), `missing-list-dir-${Date.now()}`) },
+        { state: {} },
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain("Error listing files:");
     });
   });
 
@@ -367,7 +532,12 @@ describe("Tools", () => {
         state: { sandboxEnv: { ORKAS_TEST_TOKEN: "propagated-abc123" } },
       };
       const result = await bash.execute(
-        { command: "echo $ORKAS_TEST_TOKEN" },
+        {
+          command: shellInvoke(TEST_NODE, [
+            "-e",
+            "process.stdout.write(process.env.ORKAS_TEST_TOKEN || '')",
+          ]),
+        },
         ctx,
       );
       expect(result.content.trim()).toBe("propagated-abc123");
@@ -377,11 +547,13 @@ describe("Tools", () => {
     it("hands large stdout to the host through a complete spool file", async () => {
       const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-bash-spool-test-"));
       const outputBytes = 1024 * 1024 + 257;
-      const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
       try {
         const bash = getBuiltinTools().find((tool) => tool.name === "bash")!;
         const result = await bash.execute({
-          command: `${quote(TEST_NODE)} -e ${quote(`process.stdout.write('x'.repeat(${outputBytes}))`)}`,
+          command: shellInvoke(TEST_NODE, [
+            "-e",
+            `process.stdout.write('x'.repeat(${outputBytes}))`,
+          ]),
         }, {
           workingDir: tmpDir,
           state: { toolResultSpoolDir: path.join(tmpDir, "results") },

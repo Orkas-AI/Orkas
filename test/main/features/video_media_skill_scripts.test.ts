@@ -56,6 +56,23 @@ function parseJson(text: string) {
 }
 
 function makeFakeFfmpegEnv(tmp: string) {
+  if (process.platform === 'win32') {
+    const runtimeDir = path.join(pcDir(), 'resources', 'runtime', 'ffmpeg', `${process.platform}-${process.arch}`);
+    const ffmpegPath = path.join(runtimeDir, 'ffmpeg.exe');
+    const ffprobePath = path.join(runtimeDir, 'ffprobe.exe');
+    const input = path.join(tmp, 'input.mp4');
+    const generated = spawnSync(ffmpegPath, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'color=c=black:s=64x64:r=5:d=3',
+      '-an', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', input,
+    ], { encoding: 'utf8' });
+    if (generated.status !== 0) throw new Error(generated.stderr || 'failed to generate Windows media fixture');
+    return {
+      ORKAS_BUNDLED_FFMPEG: ffmpegPath,
+      ORKAS_BUNDLED_FFPROBE: ffprobePath,
+    };
+  }
+
   const binDir = path.join(tmp, 'fake-bin');
   fs.mkdirSync(binDir, { recursive: true });
 

@@ -30,7 +30,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
-import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
@@ -44,6 +44,7 @@ import { hardenedWebPreferences, installExternalNavigationGuard } from './util/w
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
+const WINDOWS_TASK_BADGE_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPklEQVR4nGNgoAX4jwNQpJkoQ2CK3ru4YMV4DSGkGa8hxGrGacioAVQwgOJopEpCQjcEF8CrmZAhRGkmFQAAcdLnkJb3ml4AAAAASUVORK5CYII=';
 const PACKAGED_LAUNCH_SMOKE_FILE = app.isPackaged
   ? String(process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE || '').trim()
   : '';
@@ -176,6 +177,8 @@ import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
+import * as taskNotifications from './features/task_notifications';
+import * as notificationPermissions from './features/notification_permissions';
 import {
   consumeColdLaunchConnectorCallback,
   registerConnectorProtocol,
@@ -184,6 +187,24 @@ import * as windowState from './features/window_state';
 // Server-backed account, multi-device sync, remote-control relay, and
 // auto-update features are stripped in the open-source build. Connectors remain available
 // through the open server bridge.
+
+let windowsTaskBadgeIcon: ReturnType<typeof nativeImage.createFromDataURL> | null = null;
+
+function setTaskNotificationBadgeCount(count: number): void {
+  const normalized = Math.max(0, Math.trunc(count));
+  if (process.platform === 'win32') {
+    if (normalized > 0 && !windowsTaskBadgeIcon) {
+      windowsTaskBadgeIcon = nativeImage.createFromDataURL(WINDOWS_TASK_BADGE_DATA_URL);
+    }
+    const overlay = normalized > 0 ? windowsTaskBadgeIcon : null;
+    const description = normalized > 0 ? `${normalized} unread task notification${normalized === 1 ? '' : 's'}` : '';
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.setOverlayIcon(overlay, description);
+    }
+    return;
+  }
+  app.setBadgeCount(normalized);
+}
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
@@ -251,6 +272,31 @@ function createWindow(): BrowserWindow {
   });
 
   return win;
+}
+
+function openConversationFromTaskNotification(
+  conversationId: string,
+  status: import('./features/group_chat/bus').TaskTerminalStatus,
+): void {
+  if (!storage.safeId(conversationId)) {
+    log.warn('task notification carried invalid conversation id');
+    return;
+  }
+
+  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed()) || createWindow();
+  if (win.isMinimized()) win.restore();
+  if (!win.isVisible()) win.show();
+  win.focus();
+
+  const send = () => {
+    if (win.isDestroyed() || win.webContents.isDestroyed()) return;
+    win.webContents.send('conversations:open-from-notification', {
+      conversation_id: conversationId,
+      terminal_status: status,
+    });
+  };
+  if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
+  else send();
 }
 
 function registerIpc(): void {
@@ -1035,6 +1081,34 @@ if (!gotLock) {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
     registerIpc();
+    const stopTaskNotifications = taskNotifications.startTaskNotifications({
+      getActiveUserId: () => users.getActiveUserId(),
+      isEnabled: () => appConfig.getTaskNotificationsEnabled(),
+      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
+        !win.isDestroyed() && win.isFocused()
+      )),
+      isSupported: () => Notification.isSupported(),
+      setBadgeCount: setTaskNotificationBadgeCount,
+      onDidFocus: (listener) => {
+        const onFocus = () => listener();
+        app.on('browser-window-focus', onFocus);
+        return () => { app.off('browser-window-focus', onFocus); };
+      },
+      createNotification: (options) => {
+        const notification = new Notification(options);
+        notification.on('show', () => notificationPermissions.markSystemNotificationDelivered());
+        notification.on('failed', (_event, error) => {
+          notificationPermissions.markSystemNotificationFailed();
+          log.warn('native task notification rejected by OS', { error: error || 'unknown' });
+        });
+        return {
+          onClick: (listener) => { notification.on('click', listener); },
+          show: () => { notification.show(); },
+        };
+      },
+      openConversation: openConversationFromTaskNotification,
+    });
+    app.once('before-quit', stopTaskNotifications);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
     });

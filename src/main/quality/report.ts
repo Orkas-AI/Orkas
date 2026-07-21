@@ -20,6 +20,8 @@ import { createLogger } from '../logger';
 import { ValidationReport } from './types';
 
 const log = createLogger('quality');
+const reportWriteTails = new Map<string, Promise<void>>();
+const pendingReportWrites = new Set<Promise<void>>();
 
 export type SpecKind = 'skill' | 'agent';
 
@@ -33,18 +35,42 @@ function _reportFile(uid: string, kind: SpecKind, id: string): string {
  * Write the latest report for a spec. Best-effort: a write failure is logged
  * but does not throw — persistence is informational, not load-bearing.
  */
-export async function persistReport(args: {
+function enqueueReportMutation(file: string, mutation: () => Promise<void>): Promise<void> {
+  const previous = reportWriteTails.get(file) || Promise.resolve();
+  const run = previous.catch(() => undefined).then(mutation);
+  let tracked!: Promise<void>;
+  tracked = run.finally(() => {
+    pendingReportWrites.delete(tracked);
+    if (reportWriteTails.get(file) === tracked) reportWriteTails.delete(file);
+  });
+  reportWriteTails.set(file, tracked);
+  pendingReportWrites.add(tracked);
+  return tracked;
+}
+
+export function persistReport(args: {
   uid: string;
   kind: SpecKind;
   id: string;
   report: ValidationReport;
 }): Promise<void> {
   const file = _reportFile(args.uid, args.kind, args.id);
-  try {
-    await fsp.mkdir(path.dirname(file), { recursive: true });
-    await writeJson(file, args.report);
-  } catch (err) {
-    log.warn(`persist ${args.kind} report id=${args.id} failed: ${(err as Error).message}`);
+  return enqueueReportMutation(file, async () => {
+    try {
+      await fsp.mkdir(path.dirname(file), { recursive: true });
+      await writeJson(file, args.report);
+    } catch (err) {
+      log.warn(`persist ${args.kind} report id=${args.id} failed: ${(err as Error).message}`);
+    }
+  });
+}
+
+/** Wait for fire-and-forget report writes to settle. Tests call this before
+ * deleting a temporary workspace; shutdown paths may also use it when they
+ * need report durability. */
+export async function drainReportWrites(): Promise<void> {
+  while (pendingReportWrites.size) {
+    await Promise.all(Array.from(pendingReportWrites));
   }
 }
 
@@ -57,6 +83,7 @@ export async function readReport(args: {
   id: string;
 }): Promise<ValidationReport | null> {
   const file = _reportFile(args.uid, args.kind, args.id);
+  await reportWriteTails.get(file)?.catch(() => undefined);
   if (!fs.existsSync(file)) return null;
   try {
     return await readJson<ValidationReport>(file);
@@ -75,8 +102,10 @@ export async function deleteReport(args: {
   id: string;
 }): Promise<void> {
   const file = _reportFile(args.uid, args.kind, args.id);
-  try { await fsp.rm(file, { force: true }); }
-  catch (err) {
-    log.warn(`delete ${args.kind} report id=${args.id} failed: ${(err as Error).message}`);
-  }
+  await enqueueReportMutation(file, async () => {
+    try { await fsp.rm(file, { force: true }); }
+    catch (err) {
+      log.warn(`delete ${args.kind} report id=${args.id} failed: ${(err as Error).message}`);
+    }
+  });
 }

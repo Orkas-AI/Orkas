@@ -43,6 +43,7 @@
  * workspace, exposed to scripts as `ORKAS_OUTPUT_DIR`.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -111,6 +112,9 @@ import {
 const log = createLogger('local-tools');
 
 export interface LocalToolsOpts {
+  /** Host shell platform override for deterministic wrapper integration tests.
+   *  Production callers omit this and use `process.platform`. */
+  hostPlatform?: NodeJS.Platform;
   /** Active uid. Used by `edit_file` to resolve workspace + attachment
    *  sandbox roots; also reserved for future tools that need user-scoped
    *  resolution. Optional so the catalog drift test can call
@@ -707,12 +711,42 @@ function shellWords(input: string): string[] | null {
   return words;
 }
 
+function shellEnvValue(env: Record<string, string>, name: string): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(env, name)) return env[name];
+  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  return key === undefined ? undefined : env[key];
+}
+
+function replaceKnownShellEnvTokens(
+  raw: string,
+  env: Record<string, string>,
+  onUnknown?: (token: string) => void,
+): string {
+  const replace = (token: string, name: string): string => {
+    const value = shellEnvValue(env, name);
+    if (value !== undefined) return value;
+    onUnknown?.(token);
+    return token;
+  };
+  return raw
+    // PowerShell environment-variable forms must run before the generic
+    // `$NAME` replacement, otherwise `$env:NAME` is misread as an unknown
+    // variable named `env` and the path guard rejects a documented command.
+    .replace(/\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/gi, (token, name) => replace(token, name))
+    .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)/gi, (token, name) => replace(token, name))
+    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (token, name) => replace(token, name))
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (token, name) => replace(token, name))
+    // Explicit `cmd /c` commands use `%NAME%` even though PowerShell is the
+    // default Windows host shell.
+    .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (token, name) => replace(token, name));
+}
+
 function expandOrkasEnvToken(token: string, env: Record<string, string>): string {
-  return token
-    .replace(/\$\{ORKAS_NODE\}/g, env.ORKAS_NODE || '')
-    .replace(/\$ORKAS_NODE/g, env.ORKAS_NODE || '')
-    .replace(/\$\{ORKAS_PC_DIR\}/g, env.ORKAS_PC_DIR || '')
-    .replace(/\$ORKAS_PC_DIR/g, env.ORKAS_PC_DIR || '');
+  const known = {
+    ORKAS_NODE: shellEnvValue(env, 'ORKAS_NODE') || '',
+    ORKAS_PC_DIR: shellEnvValue(env, 'ORKAS_PC_DIR') || '',
+  };
+  return replaceKnownShellEnvTokens(token, known);
 }
 
 function sameResolvedPath(a: string, b: string): boolean {
@@ -730,7 +764,10 @@ function parseOrkasCliInvocation(
   if (input.run_in_background === true) return null;
   const rawCommand = String(input.command ?? '');
   const heredoc = splitTrailingHeredoc(rawCommand);
-  const command = heredoc?.command ?? rawCommand;
+  // A PowerShell executable path needs the call operator (`&`). Standard
+  // Orkas CLI invocations are executed directly by the host, so accept that
+  // prefix and keep the same cross-platform fast/safe path.
+  const command = (heredoc?.command ?? rawCommand).replace(/^\s*&\s+/, '');
   if (hasUnquotedShellControlSyntax(command)) return null;
   const words = shellWords(command);
   if (!words || words.length < 2) return null;
@@ -1200,11 +1237,21 @@ const BASH_DEST_LAST_OPERAND = new Set(['cp', 'install', 'rsync']);
 const BASH_READ_ALL_OPERANDS = new Set([
   'cat', 'less', 'more', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls', 'find',
   'sort', 'uniq', 'cut', 'strings', 'realpath', 'readlink', 'open',
+  'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
 ]);
 const BASH_READ_PATTERN_FIRST_CMDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack']);
 const BASH_READ_SCRIPT_CMDS = new Set([
   'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
   'python', 'python3', 'node', 'ruby', 'perl', 'php',
+]);
+const BASH_PROTECTED_READ_ONLY_CMDS = new Set([
+  'cat', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls',
+  'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'find',
+  'echo', 'printf', 'pwd', 'dirname', 'basename', 'true', 'false', 'test', '[',
+  'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path', 'write-output',
+]);
+const BASH_FIND_MUTATING_ACTIONS = new Set([
+  '-delete', '-exec', '-execdir', '-ok', '-okdir', '-fls', '-fprint', '-fprint0', '-fprintf',
 ]);
 const BASH_ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const BASH_GENERIC_FLAGS_WITH_VALUE = new Set([
@@ -1236,7 +1283,14 @@ function tokenizeBashPathGuard(input: string): BashPathToken[] {
       continue;
     }
     if (ch === '\\') {
-      escaped = true;
+      const next = input[i + 1] || '';
+      const escapable = quote === "'"
+        ? false
+        : quote === '"'
+          ? ['"', '\\', '$', '`'].includes(next)
+          : /[\s'"\\;&|<>$`]/.test(next);
+      if (escapable) escaped = true;
+      else { cur += ch; hasCur = true; }
       continue;
     }
     if (quote) {
@@ -1349,6 +1403,30 @@ function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } 
   return { cmd, args: w.slice(1) };
 }
 
+/**
+ * The protected-root mention guard is intentionally conservative because an
+ * interpreter can mutate a literal protected path without using a shell
+ * redirection that the path guard can inspect. Let only a small, auditable
+ * read-only command subset continue to the normal read/write path checks.
+ */
+function bashProtectedRootMentionIsProvablyReadOnly(command: string): boolean {
+  if (!command.trim() || /\$\(|`|[<>]\(/.test(command)) return false;
+  const segments = bashPathSegments(command);
+  if (!segments.length) return false;
+  for (const segment of segments) {
+    const effective = bashEffectiveCommand(segment.words);
+    if (!effective || !BASH_PROTECTED_READ_ONLY_CMDS.has(effective.cmd)) return false;
+    if (effective.cmd === 'find' && effective.args.some((arg) => BASH_FIND_MUTATING_ACTIONS.has(arg))) {
+      return false;
+    }
+    if ((effective.cmd === 'rg' || effective.cmd === 'ag' || effective.cmd === 'ack')
+      && effective.args.some((arg) => arg === '--pre' || arg.startsWith('--pre='))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function bashNonFlagOperands(args: string[], flagsWithValue: Set<string> = BASH_GENERIC_FLAGS_WITH_VALUE): string[] {
   const out: string[] = [];
   let endOfOptions = false;
@@ -1377,26 +1455,19 @@ function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<
   };
 }
 
-function expandKnownBashPathVars(raw: string, env: Record<string, string>): { value: string; dynamic: boolean } {
+export function expandKnownShellPathVars(raw: string, env: Record<string, string>): { value: string; dynamic: boolean } {
   let dynamic = false;
-  const value = raw
-    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => {
-      if (Object.prototype.hasOwnProperty.call(env, name)) return env[name] ?? '';
-      dynamic = true;
-      return _m;
-    })
-    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name) => {
-      if (Object.prototype.hasOwnProperty.call(env, name)) return env[name] ?? '';
-      dynamic = true;
-      return _m;
-    });
-  return { value, dynamic: dynamic || value.includes('$') || value.includes('`') || value.includes('$(') };
+  const value = path.normalize(replaceKnownShellEnvTokens(raw, env, () => { dynamic = true; }));
+  return {
+    value,
+    dynamic: dynamic || value.includes('$') || value.includes('`') || /%[A-Za-z_][A-Za-z0-9_]*%/.test(value),
+  };
 }
 
 function resolveBashCandidate(raw: string, workingDir: string, env: Record<string, string>): { abs?: string; dynamic?: boolean } | null {
   const trimmed = String(raw || '').trim();
   if (!trimmed || trimmed === '-' || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return null;
-  const expanded = expandKnownBashPathVars(trimmed, env);
+  const expanded = expandKnownShellPathVars(trimmed, env);
   if (expanded.dynamic) return { dynamic: true };
   let value = expanded.value;
   if (value === '~' || value.startsWith('~/')) {
@@ -1742,6 +1813,40 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+function editableFileHash(body: string): string {
+  return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
+}
+
+function editRecoveryContext(body: string, needle: string, fileHash: string): string {
+  const maxChars = 1_200;
+  let matchAt = body.indexOf(needle);
+  if (matchAt < 0) {
+    const candidates = needle
+      .split(/\r?\n/)
+      .map((part) => part.trim())
+      .filter((part) => part.length >= 8)
+      .sort((a, b) => b.length - a.length);
+    for (const candidate of candidates) {
+      matchAt = body.indexOf(candidate.slice(0, 160));
+      if (matchAt >= 0) break;
+    }
+  }
+  let start = 0;
+  let end = Math.min(body.length, maxChars);
+  if (body.length > maxChars && matchAt >= 0) {
+    start = Math.max(0, Math.min(body.length - maxChars, matchAt - Math.floor(maxChars / 3)));
+    end = Math.min(body.length, start + maxChars);
+  }
+  const content = body.slice(start, end);
+  const omittedTail = end < body.length ? `\n...[${body.length - end} chars omitted]` : '';
+  return [
+    `<edit-recovery file_hash="${fileHash}" char_start="${start}" char_end="${end}" total_chars="${body.length}">`,
+    content + omittedTail,
+    '</edit-recovery>',
+    `Retry with expected_hash="${fileHash}" and an old_string copied from this current raw context.`,
+  ].join('\n');
+}
+
 function extractRunSkillRefs(command: string): string[] {
   const out: string[] = [];
   const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))/g;
@@ -1945,14 +2050,79 @@ function guardVideoStudioUnmanagedRuntime(opts: LocalToolsOpts, command: string,
     : null;
 }
 
+function unquotedShellSurface(command: string): string {
+  let quote = '';
+  let escaped = false;
+  let out = '';
+  for (const ch of command) {
+    if (escaped) {
+      out += quote ? ' ' : ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' || (quote === '"' && ch === '`')) {
+      escaped = true;
+      out += quote ? ' ' : ch;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = '';
+      out += ch === '\n' ? '\n' : ' ';
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ' ';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/** Detect commands that are valid POSIX shell but invalid in Windows
+ * PowerShell 5.1, the host shell used by the compatibility-named `bash` tool.
+ * Keep this conservative: reject only high-confidence syntax mismatches and
+ * return rewrite guidance before paying for a real failed process. */
+export function windowsPowerShellCompatibilityError(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if (platform !== 'win32') return null;
+  const surface = unquotedShellSurface(String(command || ''));
+  const findings: string[] = [];
+  if (/&&|\|\|/.test(surface)) findings.push('POSIX &&/|| chaining');
+  if (/<<-?\s*[A-Za-z_][A-Za-z0-9_]*/.test(surface)) findings.push('POSIX heredoc');
+  if (/(?:^|[;\r\n]\s*)(?:source|export)\b/m.test(surface)) findings.push('source/export');
+  if (/(?:^|[;|\r\n]\s*)head(?:\s|$)/m.test(surface)) findings.push('head');
+  if (/(?:^|[;|\r\n]\s*)mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
+  if (/\/dev\/null\b/.test(surface)) findings.push('/dev/null');
+  if (/^\s*[A-Za-z_][A-Za-z0-9_]*=[^\s;]+\s+\S/m.test(surface)) findings.push('POSIX inline environment assignment');
+  if (!findings.length) return null;
+  return errText(
+    'E_SHELL_SYNTAX_MISMATCH',
+    `host shell is Windows PowerShell, but the command contains ${findings.join(', ')}. `
+    + 'Rewrite it as PowerShell before retrying: use `;` for sequencing, `$env:NAME = value` for environment variables, '
+    + '`$null` for discarded output, `Select-Object -First N` for head, and a `[System.IO.Path]::GetTempFileName()` or '
+    + '`New-Item` temporary path. For a multi-line script, write a `.ps1` file and invoke it with PowerShell.',
+  );
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
   const wafBlockedCommands = new Set<string>();
   const windowsShellDescription = process.platform === 'win32'
-    ? 'On Windows, commands run through PowerShell by default: use `$env:NAME` for ' +
-      'environment variables and avoid POSIX-only syntax such as `&&`, heredocs, ' +
-      '`source`/`export`, and `/dev/null` unless Git Bash is explicitly available. '
+    ? 'This tool is the host shell (PowerShell on Windows), despite its compatibility name `bash`. ' +
+      'Use `$env:NAME` for environment variables, `;` for sequencing, and PowerShell-native ' +
+      'pipelines. Do not use POSIX-only `&&`, heredocs, `source`/`export`, `/dev/null`, `head`, ' +
+      'or `mktemp`. Invoke a quoted executable with `&`, for example ' +
+      '`& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ...`. '
     : '';
+  const outputDirDescription = process.platform === 'win32'
+    ? 'Use the absolute `$env:ORKAS_OUTPUT_DIR` path for final generated outputs. ' +
+      'Complex scripts may append one final output path per line to `$env:ORKAS_OUTPUT_MANIFEST`. '
+    : 'Use the absolute `$ORKAS_OUTPUT_DIR` path for final generated outputs. ' +
+      'Complex scripts may append one final output path per line to `$ORKAS_OUTPUT_MANIFEST`. ';
 
   return {
     name: 'bash',
@@ -1963,8 +2133,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'the user\'s current workspace directory. Files generated under the conversation ' +
       'workspace are surfaced as produced-file chips, except for files clearly created ' +
       'by external download/clone commands such as git clone, gh repo clone, curl, or wget. ' +
-      'Use the absolute $ORKAS_OUTPUT_DIR path for final generated outputs. ' +
-      'Complex scripts may append one final output path per line to $ORKAS_OUTPUT_MANIFEST so outputs in skipped/cache directories are still tracked. ' +
+      outputDirDescription +
       windowsShellDescription +
       'Scratch/cache files should stay in temporary or cache directories. ' +
       'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
@@ -1984,6 +2153,15 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       const mode = getLocalExecMode();
       const command = String(input.command ?? '');
       const commandKey = command.trim();
+      const shellMismatch = windowsPowerShellCompatibilityError(command, opts.hostPlatform ?? process.platform);
+      if (shellMismatch) {
+        log.warn('bash host shell syntax reject', {
+          user_id: maskId(opts.userId),
+          cid: maskId(opts.cid),
+          command_chars: command.length,
+        });
+        return { content: shellMismatch, isError: true } as ToolResult;
+      }
       if (wafBlockedCommands.has(commandKey)) {
         return {
           content: errText(
@@ -2024,7 +2202,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         return { content: unmanagedRuntimeErr, isError: true };
       }
       const protectedMention = protectedRootMentionedByCommand(opts, command);
-      if (protectedMention) {
+      if (protectedMention && !bashProtectedRootMentionIsProvablyReadOnly(command)) {
         log.warn('bash protected root reject', {
           user_id: maskId(opts.userId),
           command_chars: command.length,
@@ -2151,6 +2329,8 @@ async function gateInteractiveCliStart(
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
   const mode = getLocalExecMode();
+  const shellMismatch = windowsPowerShellCompatibilityError(command, opts.hostPlatform ?? process.platform);
+  if (shellMismatch) return { content: shellMismatch, isError: true };
   const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, settings?.workingDir);
   if (unmanagedRuntimeErr) return { content: unmanagedRuntimeErr, isError: true };
   const protectedMention = protectedRootMentionedByCommand(opts, command);
@@ -2526,7 +2706,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. On E_STALE, reread then retry. Cannot edit PDF/Office/image sources in place.',
+      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. Pass read_file\'s file_hash as expected_hash for explicit optimistic concurrency. E_NOT_READ/E_STALE/E_NO_MATCH return bounded current context and a fresh hash for one safe retry. Cannot edit PDF/Office/image sources in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2534,6 +2714,11 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         old_string: { type: 'string', description: 'Exact text to find. Must be unique unless replace_all=true.' },
         new_string: { type: 'string', description: 'Replacement text. May be empty.' },
         replace_all: { type: 'boolean', description: 'Default false. When true, every occurrence of old_string is replaced.' },
+        expected_hash: {
+          type: 'string',
+          description: 'Optional sha256 file_hash returned by read_file or a prior edit recovery response.',
+          pattern: '^sha256:[a-f0-9]{64}$',
+        },
       },
       required: ['path', 'old_string', 'new_string'],
     },
@@ -2554,6 +2739,10 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         return { content: errText('E_BAD_INPUT', '`old_string` and `new_string` are identical — no-op rejected'), isError: true };
       }
       const replaceAll = input.replace_all === true;
+      const expectedHash = typeof input.expected_hash === 'string' ? input.expected_hash.trim() : '';
+      if (expectedHash && !/^sha256:[a-f0-9]{64}$/.test(expectedHash)) {
+        return { content: errText('E_BAD_INPUT', '`expected_hash` must be a lowercase sha256:<64 hex> file hash'), isError: true };
+      }
 
       const abs = resolveAbs(ctx, rawPath);
       const scopeErr = await gateEditPath(opts, abs, ctx);
@@ -2591,16 +2780,6 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        // Read-before-edit + OCC: the model must have read this file this run,
-        // and it must not have changed on disk since (parallel worker, a bash
-        // command, an external edit). See read-tracker.ts. No-op when the host
-        // didn't inject the read-state map.
-        const block = checkEditFreshness(ctx, abs, st);
-        if (block) {
-          log.warn('edit_file freshness reject', { user_id: maskId(opts.userId), path: logPathRef(abs), code: block.code });
-          return { content: errText(block.code, block.msg), isError: true };
-        }
-
         let body: string;
         try { body = fs.readFileSync(abs, 'utf8'); }
         catch (err) {
@@ -2608,10 +2787,32 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           log.warn('edit_file read failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
         }
+        const currentHash = editableFileHash(body);
+
+        // Read-before-edit + OCC: a run-scoped baseline or an explicit hash
+        // must identify the exact bytes being edited. A rejected attempt
+        // refreshes the baseline and returns bounded current context, so the
+        // next attempt can recover without another tool round.
+        const block = checkEditFreshness(ctx, abs, st, {
+          ...(expectedHash ? { expectedHash } : {}),
+          currentHash,
+        });
+        if (block) {
+          recordRead(ctx, abs, st, currentHash);
+          log.warn('edit_file freshness reject', { user_id: maskId(opts.userId), path: logPathRef(abs), code: block.code });
+          return {
+            content: `${errText(block.code, block.msg)}\n${editRecoveryContext(body, oldStr, currentHash)}`,
+            isError: true,
+          };
+        }
 
         const count = countOccurrences(body, oldStr);
         if (count === 0) {
-          return { content: errText('E_NO_MATCH', `${abs}: \`old_string\` not found in file`), isError: true };
+          recordRead(ctx, abs, st, currentHash);
+          return {
+            content: `${errText('E_NO_MATCH', `${abs}: \`old_string\` not found in the current file`)}\n${editRecoveryContext(body, oldStr, currentHash)}`,
+            isError: true,
+          };
         }
         if (count > 1 && !replaceAll) {
           return {
@@ -2640,7 +2841,8 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
 
         // Refresh the baseline to the post-edit bytes so a follow-up edit in a
         // later round doesn't trip OCC on this same intended change.
-        recordRead(ctx, abs);
+        const nextHash = editableFileHash(next);
+        recordRead(ctx, abs, undefined, nextHash);
 
         const replaced = replaceAll ? count : 1;
         log.info('edit_file applied', { user_id: maskId(opts.userId), path: logPathRef(abs), replaced });
@@ -2651,7 +2853,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
 
         return {
-          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"/>`,
+          content: `<file path="${abs}" edited="${replaced}" kind="${kind}" file_hash="${nextHash}"/>`,
         };
       } finally {
         release();

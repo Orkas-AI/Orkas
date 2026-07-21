@@ -104,11 +104,14 @@ function pythonVenvCacheEnv() {
 function nodePackageEnv() {
   return {
     ORKAS_VENV_ROOT: sharedVenvRoot(),
-    NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE || path.join(nodeVenvRoot(), 'cache', 'npm'),
-    NPM_CONFIG_PREFIX: process.env.NPM_CONFIG_PREFIX || path.join(nodeVenvRoot(), 'prefix'),
-    NPM_CONFIG_FUND: process.env.NPM_CONFIG_FUND || 'false',
-    NPM_CONFIG_AUDIT: process.env.NPM_CONFIG_AUDIT || 'false',
-    NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || 'false',
+    // Package installs must remain inside the Orkas-managed data root. Desktop
+    // launches can inherit machine/user npm settings (especially on Windows),
+    // which otherwise redirect cache/prefix writes into global shared state.
+    NPM_CONFIG_CACHE: path.join(nodeVenvRoot(), 'cache', 'npm'),
+    NPM_CONFIG_PREFIX: path.join(nodeVenvRoot(), 'prefix'),
+    NPM_CONFIG_FUND: 'false',
+    NPM_CONFIG_AUDIT: 'false',
+    NPM_CONFIG_UPDATE_NOTIFIER: 'false',
   };
 }
 
@@ -221,6 +224,17 @@ function runOrDie(cmd, args, opts, what) {
     die(1, `${what} failed (${cmd} exited ${res.status})`, { cmd, args, stdout: (res.stdout || '').slice(-2000) });
   }
   return res;
+}
+
+function npmInvocation(args) {
+  if (process.platform !== 'win32') return { cmd: 'npm', args };
+  // npm is a command shim on Windows, not a native executable. Launch it
+  // through ComSpec with fixed, app-owned arguments; spawnSync('npm') cannot
+  // execute npm.cmd directly and fails before dependency consent can run.
+  return {
+    cmd: process.env.ComSpec || process.env.COMSPEC || 'cmd.exe',
+    args: ['/d', '/s', '/c', 'npm.cmd', ...args],
+  };
 }
 
 // ── Capability scan ──────────────────────────────────────────────────────
@@ -412,8 +426,13 @@ function scanNativeBinEntries(pkgDir) {
     try { dirents = fs.readdirSync(absDir, { withFileTypes: true }); } catch { continue; }
     for (const dirent of dirents) {
       if (!dirent.isFile()) continue;
+      // Windows has no executable mode bit. Only extensions that CreateProcess
+      // or cmd.exe can actually launch count as native entries; treating every
+      // file under a generic `bin/` directory as executable registered README,
+      // source, and package.json files as bogus CLIs.
+      if (process.platform === 'win32' && !/\.(?:exe|com|cmd|bat)$/i.test(dirent.name)) continue;
       let name = dirent.name;
-      if (process.platform === 'win32') name = name.replace(/\.(?:exe|cmd|bat)$/i, '');
+      if (process.platform === 'win32') name = name.replace(/\.(?:exe|com|cmd|bat)$/i, '');
       if (!PKG_NAME_RE.test(name) || seen.has(name)) continue;
       const abs = path.join(absDir, dirent.name);
       if (!isExecutableFile(abs)) continue;
@@ -480,7 +499,8 @@ function installDeps(pkgDir, pkgMeta) {
     const useCi = isFile(path.join(pkgDir, 'package-lock.json'));
     const args = [useCi ? 'ci' : 'install', '--omit=dev', '--no-fund', '--no-audit'];
     const label = useCi ? 'npm ci' : 'npm install';
-    runOrDie('npm', args, { cwd: pkgDir, env: nodePackageEnv() }, label);
+    const npm = npmInvocation(args);
+    runOrDie(npm.cmd, npm.args, { cwd: pkgDir, env: nodePackageEnv() }, label);
     performed.push(`${label} --omit=dev`);
   }
   if (hasPythonProject(pkgDir)) {
@@ -811,6 +831,7 @@ function cmdInstall(args) {
         const clone = run('git', [
           '-c', 'protocol.ext.allow=never',
           '-c', 'protocol.file.allow=user',
+          '-c', 'core.autocrlf=false',
           'clone', '--depth', '1', '--no-recurse-submodules', source, staging,
         ], { env: { GIT_TERMINAL_PROMPT: '0' } });
         if (clone.status === 0) {
@@ -937,12 +958,12 @@ function cmdUpdate(args) {
     let tarballCommit = '';
     if (hasDotGit) {
       const before = headCommit(pkgDir);
-      runOrDie('git', ['pull', '--ff-only'], { cwd: pkgDir }, 'git pull');
+      runOrDie('git', ['-c', 'core.autocrlf=false', 'pull', '--ff-only'], { cwd: pkgDir }, 'git pull');
       // Upstream could have introduced a symlink since install; reject + revert
       // so the in-place tree never gains a file that reads outside the package.
       const sl = findSymlink(pkgDir);
       if (sl) {
-        if (before) run('git', ['reset', '--hard', before], { cwd: pkgDir });
+        if (before) run('git', ['-c', 'core.autocrlf=false', 'reset', '--hard', before], { cwd: pkgDir });
         die(1, 'refusing to update: upstream now contains a symbolic link (reverted to the prior revision)', { path: sl });
       }
     } else {

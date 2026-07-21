@@ -1,7 +1,7 @@
 /**
  * Read-before-edit + optimistic concurrency control (OCC) for the file tools.
  *
- * `read_file` / `write_file` stamp the file's `{ mtimeMs, size }` into a
+ * `read_file` / `write_file` stamp the file's `{ mtimeMs, size, hash? }` into a
  * run-scoped map; `edit_file` checks that stamp before it writes:
  *   - read-before-edit — refuse to edit a file the model has not read this run
  *     (its `old_string` would be a guess), and
@@ -33,7 +33,7 @@ import type { ToolContext } from '#core-agent';
 export const READ_FILE_STATE_KEY = 'readFileState';
 
 /** Baseline captured when a file is read; compared on edit. */
-export type ReadStamp = { mtimeMs: number; size: number };
+export type ReadStamp = { mtimeMs: number; size: number; hash?: string };
 
 /** Return the run-scoped read-state map, or null when the host didn't inject
  *  one (→ callers skip read-before-edit/OCC enforcement). */
@@ -45,20 +45,20 @@ export function getReadState(ctx: ToolContext): Map<string, ReadStamp> | null {
   return m instanceof Map ? (m as Map<string, ReadStamp>) : null;
 }
 
-function stampFromStats(st: fs.Stats): ReadStamp {
-  return { mtimeMs: st.mtimeMs, size: st.size };
+function stampFromStats(st: fs.Stats, hash?: string): ReadStamp {
+  return { mtimeMs: st.mtimeMs, size: st.size, ...(hash ? { hash } : {}) };
 }
 
 /** Record that `abs` was read (or written) at its current on-disk state, so a
  *  later `edit_file` accepts an edit built on these bytes. Best-effort: a stat
  *  failure is swallowed (the edit path re-stats and will reject if needed).
  *  Pass `st` to reuse a stat the caller already took. No-op when no map. */
-export function recordRead(ctx: ToolContext, abs: string, st?: fs.Stats): void {
+export function recordRead(ctx: ToolContext, abs: string, st?: fs.Stats, hash?: string): void {
   const rs = getReadState(ctx);
   if (!rs) return;
   try {
     const stat = st ?? fs.statSync(abs);
-    rs.set(abs, stampFromStats(stat));
+    rs.set(abs, stampFromStats(stat, hash));
   } catch {
     // File vanished between read and stamp — leave it unstamped; the edit
     // path will surface E_NOT_FOUND on its own.
@@ -75,8 +75,22 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  *   - never read this run            → E_NOT_READ (read it first)
  *   - read, but mtime/size changed   → E_STALE   (re-read; it moved under you)
  */
-export function checkEditFreshness(ctx: ToolContext, abs: string, st: fs.Stats): EditBlock | null {
+export function checkEditFreshness(
+  ctx: ToolContext,
+  abs: string,
+  st: fs.Stats,
+  opts: { expectedHash?: string; currentHash?: string } = {},
+): EditBlock | null {
   const rs = getReadState(ctx);
+  if (opts.expectedHash) {
+    if (opts.expectedHash !== opts.currentHash) {
+      return {
+        code: 'E_STALE',
+        msg: `${abs}: expected_hash no longer matches the current file. Retry only against the returned current file_hash and context.`,
+      };
+    }
+    return null;
+  }
   if (!rs) return null; // host opted out of enforcement
   const seen = rs.get(abs);
   if (!seen) {
@@ -85,7 +99,11 @@ export function checkEditFreshness(ctx: ToolContext, abs: string, st: fs.Stats):
       msg: `${abs}: read the file with read_file before editing it, so old_string matches the real current contents.`,
     };
   }
-  if (seen.mtimeMs !== st.mtimeMs || seen.size !== st.size) {
+  if (
+    seen.mtimeMs !== st.mtimeMs
+    || seen.size !== st.size
+    || (!!seen.hash && !!opts.currentHash && seen.hash !== opts.currentHash)
+  ) {
     return {
       code: 'E_STALE',
       msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Call read_file again, then redo the edit against the current contents.`,

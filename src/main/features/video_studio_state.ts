@@ -18,12 +18,14 @@ export type VideoProductionStage =
 
 export type VideoProductionGateEntry = {
   signature: string;
+  revision_id?: string;
   turn_id: string;
   created_at: string;
   status: 'ready' | 'approved';
   approved_turn_id?: string;
   approved_at?: string;
   path?: string;
+  frame_paths?: string[];
   report_path?: string;
   /** v1 signatures included runtime outputs; v2 excludes the original
    * runtime-output set; v3 also excludes runtime QA reports whose names are
@@ -36,6 +38,7 @@ export type VideoProductionGateEntry = {
     verdict?: string;
     scope?: string;
     findings?: string[];
+    reviewed_frame_paths?: string[];
   };
 };
 
@@ -255,6 +258,10 @@ export type VideoProductionStateV1 = {
   stage: VideoProductionStage;
   artifacts: VideoProductionArtifactState;
   plan_approval?: VideoProductionPlanApproval;
+  /** Previously valid Gate B approvals are retained so a transient artifact
+   * drift can recover automatically when the canonical plan returns to an
+   * already-approved signature. */
+  plan_approval_history?: VideoProductionPlanApproval[];
   capability_check?: VideoProductionCapabilityCheck;
   narration?: VideoProductionNarration;
   narration_transaction?: VideoProductionNarrationTransaction;
@@ -277,23 +284,41 @@ export type VideoProductionStateV1 = {
   updated_at: string;
 };
 
+/** Canonical filesystem facts are intentionally not persisted in production
+ * state. Callers recompute them from the current manifest/audio artifacts and
+ * pass them into the policy so a stale compatibility phase cannot authorize a
+ * narrated composition without its audio. */
+export type VideoProductionPolicyFacts = {
+  narrationRequired: boolean;
+  narrationMaterialized: boolean;
+};
+
+export type VideoProductionOperationAdmission =
+  | { ok: true }
+  | {
+    ok: false;
+    errorCode: string;
+    message: string;
+    nextAction?: string;
+  };
+
 type LegacyGateState = {
   preview?: VideoProductionGateEntry;
   draft?: VideoProductionGateEntry;
 };
 
-const STAGE_RANK: Record<VideoProductionStage, number> = {
-  initialized: 0,
-  manifest_ready: 1,
-  scaffold_ready: 2,
-  narration_ready: 3,
-  visuals_ready: 4,
-  preview_ready: 5,
-  preview_approved: 6,
-  draft_ready: 7,
-  draft_approved: 8,
-  exported: 9,
-};
+const LEGACY_STAGE_VALUES = new Set<VideoProductionStage>([
+  'initialized',
+  'manifest_ready',
+  'scaffold_ready',
+  'narration_ready',
+  'visuals_ready',
+  'preview_ready',
+  'preview_approved',
+  'draft_ready',
+  'draft_approved',
+  'exported',
+]);
 
 const stateMutexes = new Map<string, Mutex>();
 
@@ -307,7 +332,7 @@ function stateMutex(statePath: string): Mutex {
 }
 
 function isVideoProductionStage(value: unknown): value is VideoProductionStage {
-  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(STAGE_RANK, value);
+  return typeof value === 'string' && LEGACY_STAGE_VALUES.has(value as VideoProductionStage);
 }
 
 function initialState(compositionDir: string): VideoProductionStateV1 {
@@ -332,21 +357,68 @@ function stageFromLegacy(value: LegacyGateState): VideoProductionStage {
   return 'initialized';
 }
 
-export function videoProductionStageAtLeast(
-  stage: VideoProductionStage,
-  expected: VideoProductionStage,
-): boolean {
-  return STAGE_RANK[stage] >= STAGE_RANK[expected];
+const PLAN_APPROVAL_REQUIRED_OPS = new Set([
+  'composition.prepare',
+  'composition.materialize_narration',
+  'composition.lint',
+  'composition.inspect',
+  'composition.begin_visual_revision',
+  'composition.snapshot',
+  'composition.approve_preview',
+  'composition.submit_design_review',
+  'composition.draft',
+  'composition.approve_draft',
+  'composition.export',
+]);
+
+/** Operations whose result would be presented, approved, rendered, or
+ * delivered as a complete composition. Visual authoring and diagnostics stay
+ * available while narration is missing so an orthogonal task cannot strand
+ * another one. */
+const NARRATION_COMPLETE_REQUIRED_OPS = new Set([
+  'composition.snapshot',
+  'composition.approve_preview',
+  'composition.submit_design_review',
+  'composition.draft',
+  'composition.approve_draft',
+  'composition.export',
+]);
+
+/**
+ * Fact-based operation admission. The persisted `stage` is deliberately not
+ * consulted: it remains a compatibility/display field for existing clients,
+ * not an authority over the production workflow.
+ */
+export function evaluateVideoProductionOperation(
+  state: VideoProductionStateV1,
+  op: string,
+  facts?: VideoProductionPolicyFacts,
+): VideoProductionOperationAdmission {
+  if (PLAN_APPROVAL_REQUIRED_OPS.has(op) && !state.plan_approval) {
+    return {
+      ok: false,
+      errorCode: 'E_GATE_B_APPROVAL_REQUIRED',
+      message: 'Approve the current composition plan before production.',
+      nextAction: 'composition.approve_plan',
+    };
+  }
+  if (facts?.narrationRequired
+    && !facts.narrationMaterialized
+    && NARRATION_COMPLETE_REQUIRED_OPS.has(op)) {
+    return {
+      ok: false,
+      errorCode: 'E_NARRATION_MATERIALIZATION_REQUIRED',
+      message: 'This composition requires standalone narration, but its audio or render binding is incomplete. Materialize or recover narration before creating or approving a deliverable artifact.',
+      nextAction: 'composition.materialize_narration',
+    };
+  }
+  return { ok: true };
 }
 
-export function advanceVideoProductionStage(
-  current: VideoProductionStage,
-  candidate: VideoProductionStage,
-): VideoProductionStage {
-  return videoProductionStageAtLeast(current, candidate) ? current : candidate;
-}
-
-export function nextVideoProductionOps(state: VideoProductionStateV1): string[] {
+export function nextVideoProductionOps(
+  state: VideoProductionStateV1,
+  facts?: VideoProductionPolicyFacts,
+): string[] {
   const recoveryOps = [
     'composition.status',
     'composition.doctor',
@@ -356,45 +428,39 @@ export function nextVideoProductionOps(state: VideoProductionStateV1): string[] 
   if (!state.plan_approval) {
     return ['composition.approve_plan', ...recoveryOps];
   }
-  const visualRecoveryOps = ['composition.begin_visual_revision'];
-  let stageOps: string[];
-  switch (state.stage) {
-    case 'initialized':
-    case 'manifest_ready':
-      stageOps = ['composition.approve_plan', 'composition.prepare'];
-      break;
-    case 'scaffold_ready':
-      stageOps = ['composition.approve_plan', 'composition.prepare', 'composition.materialize_narration', 'composition.lint', 'composition.inspect'];
-      break;
-    case 'narration_ready':
-      stageOps = ['composition.approve_plan', 'composition.prepare', 'composition.lint', 'composition.inspect'];
-      break;
-    case 'visuals_ready':
-      stageOps = ['composition.approve_plan', 'composition.prepare', 'composition.lint', 'composition.inspect', 'composition.snapshot', 'composition.draft'];
-      break;
-    case 'preview_ready':
-      stageOps = ['composition.approve_plan', 'composition.prepare', 'composition.inspect', 'composition.snapshot', 'composition.approve_preview'];
-      break;
-    case 'preview_approved':
-      stageOps = ['composition.approve_plan', 'composition.prepare', 'composition.inspect', 'composition.snapshot', 'composition.draft'];
-      break;
-    case 'draft_ready':
-      stageOps = state.draft?.design_review?.required && state.draft.design_review.status !== 'passed'
-        ? ['composition.submit_design_review']
-        : ['composition.approve_draft'];
-      break;
-    case 'draft_approved':
-      stageOps = ['composition.export'];
-      break;
-    case 'exported':
-      stageOps = [];
-      break;
-  }
-  return [...new Set([...stageOps, ...visualRecoveryOps, ...recoveryOps])];
+  const narrationPending = facts?.narrationRequired && !facts.narrationMaterialized;
+  const evidenceOps = narrationPending ? [] : [
+    'composition.snapshot',
+    'composition.draft',
+    ...(state.preview?.design_review?.required && state.preview.design_review.status !== 'passed'
+      ? ['composition.submit_design_review']
+      : state.preview?.status === 'ready' ? ['composition.approve_preview'] : []),
+    ...(state.draft?.design_review?.required && state.draft.design_review.status !== 'passed'
+      ? ['composition.submit_design_review']
+      : state.draft?.status === 'ready' ? ['composition.approve_draft'] : []),
+    ...(state.draft?.status === 'approved' ? ['composition.export'] : []),
+  ];
+  const candidates = [...new Set([
+    'composition.approve_plan',
+    'composition.prepare',
+    ...(!facts || narrationPending ? ['composition.materialize_narration'] : []),
+    'composition.lint',
+    'composition.inspect',
+    ...(state.visual_qa?.cycle?.status === 'exhausted' ? ['composition.begin_visual_revision'] : []),
+    ...evidenceOps,
+    ...recoveryOps,
+  ])];
+  return candidates.filter((op) => evaluateVideoProductionOperation(state, op, facts).ok);
 }
 
-export function isVideoProductionOpAllowed(state: VideoProductionStateV1, op: string): boolean {
-  return nextVideoProductionOps(state).includes(op);
+/** @deprecated Compatibility helper. Runtime enforcement uses
+ * evaluateVideoProductionOperation directly and never interprets `stage`. */
+export function isVideoProductionOpAllowed(
+  state: VideoProductionStateV1,
+  op: string,
+  facts?: VideoProductionPolicyFacts,
+): boolean {
+  return evaluateVideoProductionOperation(state, op, facts).ok;
 }
 
 export async function readVideoProductionState(
@@ -413,6 +479,9 @@ export async function readVideoProductionState(
       ...loaded,
       composition_dir: compositionDir,
       artifacts: loaded.artifacts && typeof loaded.artifacts === 'object' ? loaded.artifacts : {},
+      plan_approval_history: Array.isArray(loaded.plan_approval_history)
+        ? loaded.plan_approval_history.slice(-10)
+        : [],
       history: Array.isArray(loaded.history) ? loaded.history.slice(-50) : [],
     };
   }
@@ -486,13 +555,17 @@ export function recordVideoProductionTransition(
   state.history = [...state.history, transition].slice(-50);
 }
 
-export function summarizeVideoProductionState(state: VideoProductionStateV1): Record<string, unknown> {
+export function summarizeVideoProductionState(
+  state: VideoProductionStateV1,
+  facts?: VideoProductionPolicyFacts,
+): Record<string, unknown> {
   return {
     schema_version: state.schema_version,
     revision: state.revision,
     stage: state.stage,
     artifacts: state.artifacts,
     plan_approval: state.plan_approval || null,
+    preserved_plan_approval_count: state.plan_approval_history?.length || 0,
     capability_check: state.capability_check || null,
     ...(state.narration ? { narration: state.narration } : {}),
     ...(state.narration_transaction ? { narration_transaction: state.narration_transaction } : {}),
@@ -504,9 +577,10 @@ export function summarizeVideoProductionState(state: VideoProductionStateV1): Re
     ...(state.visual_qa ? { visual_qa: state.visual_qa } : {}),
     ...(state.last_operation ? { last_operation: state.last_operation } : {}),
     preview_status: state.preview?.status || 'missing',
+    preview_design_review: state.preview?.design_review || null,
     draft_status: state.draft?.status || 'missing',
     draft_design_review: state.draft?.design_review || null,
-    next_allowed_ops: nextVideoProductionOps(state),
+    next_allowed_ops: nextVideoProductionOps(state, facts),
     updated_at: state.updated_at,
   };
 }

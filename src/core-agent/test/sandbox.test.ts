@@ -14,10 +14,36 @@ import {
 } from "../src/sandbox/executor.js";
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const IS_WINDOWS = process.platform === "win32";
+const NATIVE_SHELL_STARTUP_BUDGET_MS = IS_WINDOWS ? 15_000 : 5_000;
+const NATIVE_SHELL_TEST_TIMEOUT_MS = IS_WINDOWS ? 25_000 : 10_000;
+
+function shellQuote(value: string): string {
+  return IS_WINDOWS
+    ? `'${value.replace(/'/g, "''")}'`
+    : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function nodeEvalCommand(script: string): string {
+  const invocation = `${shellQuote(TEST_NODE)} -e ${shellQuote(script)}`;
+  return IS_WINDOWS ? `& ${invocation}` : invocation;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); }
+    catch { return; }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`process ${pid} did not exit within ${timeoutMs}ms`);
+}
+
+async function removeTree(dir: string): Promise<void> {
+  await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+}
 
 describe("SandboxExecutor", () => {
-  const shQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-
   it("defaults command execution to the long bash timeout", () => {
     expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(60 * 60_000);
   });
@@ -32,7 +58,7 @@ describe("SandboxExecutor", () => {
 
   it("captures stderr", async () => {
     const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
-    const result = await sandbox.execute("echo error >&2");
+    const result = await sandbox.execute(nodeEvalCommand("process.stderr.write('error')"));
     expect(result.stderr.trim()).toBe("error");
   });
 
@@ -47,13 +73,11 @@ describe("SandboxExecutor", () => {
       workingDir: os.tmpdir(),
       timeoutMs: 500,
     });
-    const result = await sandbox.execute("sleep 10");
+    const result = await sandbox.execute(nodeEvalCommand("setTimeout(() => {}, 10_000)"));
     expect(result.timedOut).toBe(true);
   }, 10000);
 
   it("times out commands whose background child keeps stdout open", async () => {
-    if (process.platform === "win32") return;
-    const quote = (s: string) => `"${s.replace(/(["\\$`])/g, "\\$1")}"`;
     const script = [
       "const { spawn } = require('node:child_process');",
       "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
@@ -64,7 +88,7 @@ describe("SandboxExecutor", () => {
       timeoutMs: 500,
     });
     const started = Date.now();
-    const result = await sandbox.execute(`${quote(TEST_NODE)} -e ${quote(script)}`);
+    const result = await sandbox.execute(nodeEvalCommand(script));
     expect(result.timedOut).toBe(true);
     expect(Date.now() - started).toBeLessThan(5000);
   }, 10000);
@@ -92,7 +116,7 @@ describe("SandboxExecutor", () => {
       maxOutputBytes: 100,
     });
     // Generate more than 100 bytes of output
-    const result = await sandbox.execute("seq 1 1000");
+    const result = await sandbox.execute(nodeEvalCommand("process.stdout.write('x'.repeat(1_000))"));
     expect(result.outputLimitExceeded).toBe(true);
     expect(result.stdout).toContain("[output truncated by sandbox]");
   });
@@ -107,9 +131,11 @@ describe("SandboxExecutor", () => {
         outputSpoolDir: path.join(tmpDir, "results"),
         maxSpoolBytes: 5_000,
       });
-      const script = `process.stdout.write(${JSON.stringify(output)})`;
-      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
+      const script = `process.stdout.write('x'.repeat(${output.length}))`;
+      const result = await sandbox.execute(nodeEvalCommand(script));
 
+      expect(result.stderr).toBe("");
+      expect(result.exitCode).toBe(0);
       expect(result.outputLimitExceeded).toBe(false);
       expect(result.stdoutBytes).toBe(Buffer.byteLength(output));
       expect(result.stdout).toContain("full output streamed to Result Store");
@@ -119,7 +145,7 @@ describe("SandboxExecutor", () => {
       expect(result.stdoutStreamedOutput?.sourceTruncated).toBeUndefined();
       await expect(fs.readFile(result.stdoutStreamedOutput!.path, "utf8")).resolves.toBe(output);
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      await removeTree(tmpDir);
     }
   });
 
@@ -132,9 +158,10 @@ describe("SandboxExecutor", () => {
         outputSpoolDir: path.join(tmpDir, "results"),
         maxSpoolBytes: 500,
       });
-      const script = `process.stdout.write(${JSON.stringify("x".repeat(1_000))})`;
-      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
+      const script = "process.stdout.write('x'.repeat(1_000))";
+      const result = await sandbox.execute(nodeEvalCommand(script));
 
+      expect(result.stderr).toBe("");
       expect(result.outputLimitExceeded).toBe(true);
       expect(result.stdoutBytes).toBe(500);
       expect(result.stdout).toContain("stored prefix is incomplete");
@@ -144,7 +171,7 @@ describe("SandboxExecutor", () => {
       });
       await expect(fs.stat(result.stdoutStreamedOutput!.path)).resolves.toMatchObject({ size: 500 });
     } finally {
-      await fs.rm(tmpDir, { recursive: true, force: true });
+      await removeTree(tmpDir);
     }
   });
 
@@ -153,10 +180,10 @@ describe("SandboxExecutor", () => {
     await fs.writeFile(path.join(tmpDir, "marker.txt"), "found");
 
     const sandbox = new SandboxExecutor({ workingDir: tmpDir });
-    const result = await sandbox.execute("cat marker.txt");
+    const result = await sandbox.execute(nodeEvalCommand("process.stdout.write(require('node:fs').readFileSync('marker.txt', 'utf8'))"));
     expect(result.stdout.trim()).toBe("found");
 
-    await fs.rm(tmpDir, { recursive: true });
+    await removeTree(tmpDir);
   });
 
   it("uses allowedDirs as a macOS write sandbox when sandbox-exec is available", async () => {
@@ -178,13 +205,13 @@ describe("SandboxExecutor", () => {
         workingDir: allowedDir,
         allowedDirs: [allowedDir],
       });
-      const result = await sandbox.execute(`${shQuote(TEST_NODE)} -e ${shQuote(script)}`);
+      const result = await sandbox.execute(nodeEvalCommand(script));
       expect(result.exitCode).not.toBe(0);
       await expect(fs.readFile(allowedFile, "utf8")).resolves.toBe("ok");
       await expect(fs.access(deniedFile)).rejects.toThrow();
     } finally {
-      await fs.rm(allowedDir, { recursive: true, force: true });
-      await fs.rm(deniedDir, { recursive: true, force: true });
+      await removeTree(allowedDir);
+      await removeTree(deniedDir);
     }
   });
 
@@ -193,7 +220,7 @@ describe("SandboxExecutor", () => {
       workingDir: os.tmpdir(),
       env: { MY_VAR: "test_value" },
     });
-    const result = await sandbox.execute("echo $MY_VAR");
+    const result = await sandbox.execute(nodeEvalCommand("process.stdout.write(process.env.MY_VAR || '')"));
     expect(result.stdout.trim()).toBe("test_value");
   });
 
@@ -201,8 +228,8 @@ describe("SandboxExecutor", () => {
     const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("echo fast");
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
-    expect(result.durationMs).toBeLessThan(5000);
-  });
+    expect(result.durationMs).toBeLessThan(NATIVE_SHELL_STARTUP_BUDGET_MS);
+  }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 });
 
 describe("killProcessTree", () => {
@@ -251,27 +278,27 @@ describe("killProcessTree", () => {
 
 describe("augmentPath", () => {
   it("prepends /opt/homebrew/bin when it's missing (Apple Silicon case)", () => {
-    const out = augmentPath("/usr/bin:/bin");
+    const out = augmentPath("/usr/bin:/bin", "darwin", {});
     expect(out.split(":")).toContain("/opt/homebrew/bin");
     expect(out.indexOf("/opt/homebrew/bin")).toBeLessThan(out.indexOf("/usr/bin"));
   });
 
   it("does not duplicate entries that are already present", () => {
     const input = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-    const out = augmentPath(input);
+    const out = augmentPath(input, "darwin", {});
     const homebrewCount = out.split(":").filter((p) => p === "/opt/homebrew/bin").length;
     expect(homebrewCount).toBe(1);
   });
 
   it("preserves user-supplied entries verbatim", () => {
     const input = "/Users/me/bin:/usr/bin";
-    const out = augmentPath(input);
+    const out = augmentPath(input, "darwin", {});
     expect(out.split(":")).toContain("/Users/me/bin");
     expect(out.split(":")).toContain("/usr/bin");
   });
 
   it("falls back to canonical list when input is empty/undefined", () => {
-    const out = augmentPath(undefined);
+    const out = augmentPath(undefined, "darwin", {});
     expect(out.split(":")).toContain("/opt/homebrew/bin");
     expect(out.split(":")).toContain("/usr/local/bin");
     expect(out.split(":")).toContain("/usr/bin");
@@ -335,7 +362,25 @@ describe("augmentPath", () => {
 
   describe("Windows shell selection", () => {
     it("defaults Windows to PowerShell instead of a POSIX-incompatible cmd -c path", () => {
-      expect(defaultShellForPlatform("win32")).toBe("powershell.exe");
+      const previous = process.env.ORKAS_WINDOWS_SHELL;
+      delete process.env.ORKAS_WINDOWS_SHELL;
+      try {
+        expect(defaultShellForPlatform("win32")).toBe("powershell.exe");
+      } finally {
+        if (previous === undefined) delete process.env.ORKAS_WINDOWS_SHELL;
+        else process.env.ORKAS_WINDOWS_SHELL = previous;
+      }
+    });
+
+    it("honors an explicit Windows shell override", () => {
+      const previous = process.env.ORKAS_WINDOWS_SHELL;
+      process.env.ORKAS_WINDOWS_SHELL = "pwsh.exe";
+      try {
+        expect(defaultShellForPlatform("win32")).toBe("pwsh.exe");
+      } finally {
+        if (previous === undefined) delete process.env.ORKAS_WINDOWS_SHELL;
+        else process.env.ORKAS_WINDOWS_SHELL = previous;
+      }
     });
 
     it("uses cmd.exe /d /s /c when cmd is explicitly selected", () => {
@@ -380,20 +425,27 @@ describe("augmentPath", () => {
       try {
         const logPath = path.join(dir, "run.log");
         const sandbox = new SandboxExecutor({ workingDir: dir });
-        const { pid, error } = sandbox.executeBackground("printf done; echo", logPath);
+        const { pid, error } = sandbox.executeBackground(
+          nodeEvalCommand("process.stdout.write('done\\n')"),
+          logPath,
+        );
         expect(error).toBeUndefined();
         expect(typeof pid).toBe("number");
-        // The detached child writes asynchronously — poll the log briefly.
+        // PowerShell cold-start plus native scanner latency can exceed two
+        // seconds on loaded Windows hosts. Background launch is deliberately
+        // asynchronous, so allow a bounded platform-specific startup window.
         let body = "";
-        for (let i = 0; i < 40 && !body.includes("done"); i++) {
+        const deadline = Date.now() + NATIVE_SHELL_STARTUP_BUDGET_MS;
+        while (Date.now() < deadline && !body.includes("done")) {
           await new Promise((r) => setTimeout(r, 50));
           try { body = await fs.readFile(logPath, "utf8"); } catch { /* not yet */ }
         }
         expect(body).toContain("done");
+        await waitForProcessExit(pid!);
       } finally {
-        await fs.rm(dir, { recursive: true, force: true });
+        await removeTree(dir);
       }
-    }, 10000);
+    }, NATIVE_SHELL_TEST_TIMEOUT_MS);
 
     it("refuses blocked commands without spawning", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
@@ -403,7 +455,7 @@ describe("augmentPath", () => {
         expect(pid).toBeNull();
         expect(error).toMatch(/blocked/i);
       } finally {
-        await fs.rm(dir, { recursive: true, force: true });
+        await removeTree(dir);
       }
     });
   });

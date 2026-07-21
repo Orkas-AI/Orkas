@@ -125,11 +125,9 @@ async function _refreshAutoSyncNotice() {
 }
 function _paintAutoSyncNotice() {
   const listText = t('auto.sync_note_list');
-  const createText = t('auto.sync_note_create');
   const targets = [
     { id: 'auto-sync-note', text: listText },
     { id: 'project-auto-sync-note', text: listText },
-    { id: 'auto-task-dialog-sync-note', text: createText },
   ];
   for (const item of targets) {
     const el = document.getElementById(item.id);
@@ -162,12 +160,14 @@ let _autoMonthlyDaySel = null;
 let _autoHourSel = null;
 let _autoMinuteSel = null;
 let _autoProjectSel = null;
+let _autoRunDeviceSel = null;
 // Set by `openAutoTaskDialog({projectId})` from the project-detail entry —
 // the task gets bound to this project on save. Global-tab opens omit it,
 // producing a project-less task. (No project picker inside the modal; the
 // project a task lives under is determined by where it was created from.)
 let _autoLockedProjectId = '';
 let _autoEditingProjectId = '';
+let _autoEditingDeviceTask = null;
 // Optional callback the dialog opener can pass to be notified after a
 // successful save. Used by project-detail's auto tab to refresh its list.
 let _autoOnSaved = null;
@@ -227,6 +227,26 @@ function _autoDisplayDeviceName(name) {
   if (!raw) return '';
   const display = raw.replace(/\.local\.?$/i, '');
   return display || raw;
+}
+
+function _autoIsTaskOnCurrentDevice(task, device = _autoCurrentDevice) {
+  if (!task || !task.device_id) return true;
+  return !!device && task.device_id === device.id;
+}
+
+function _autoCanTransferTaskToCurrentDevice(task, device = _autoCurrentDevice) {
+  return !!task && !!device && !!device.id && !_autoIsTaskOnCurrentDevice(task, device);
+}
+
+function _autoRunDeviceOptions(task, device = _autoCurrentDevice, translate = t) {
+  if (!_autoCanTransferTaskToCurrentDevice(task, device)) return [];
+  return [
+    {
+      value: 'assigned',
+      label: _autoDisplayDeviceName(task.device_name || task.device_id),
+    },
+    { value: 'current', label: translate('auto.device_current') },
+  ];
 }
 
 function _buildProjectNameLookup() {
@@ -330,13 +350,13 @@ function _autoRenderRow(task, opts) {
     chips.push(`<span class="auto-row-chip is-project">${escapeHtml(t('auto.project_scope', { name: pname }))}</span>`);
   }
   // Device chip — always shown so the user can tell at a glance which
-  // machine each task is bound to. "本机" when the task was created here
+  // machine each task is bound to. "本机" when the task is assigned here
   // (or for legacy tasks created before device-stamping shipped — treated
   // as current-device since they live in this uid's local cloud tree).
-  // Otherwise the creator's hostname; hover tooltip spells out that
+  // Otherwise the assigned device's hostname; hover tooltip spells out that
   // remote-device tasks don't fire locally.
   if (_autoCurrentDevice) {
-    const isHere = !task.device_id || task.device_id === _autoCurrentDevice.id;
+    const isHere = _autoIsTaskOnCurrentDevice(task);
     if (isHere) {
       chips.push(`<span class="auto-row-chip is-device is-device-here">${escapeHtml(t('auto.device_current'))}</span>`);
     } else {
@@ -1039,8 +1059,8 @@ function _mountAutoForm() {
   // (project detail) or selected in the form's project row.
   window._autoGetProjectId = () => _autoSelectedProjectId();
 
-  // _aiSelectMount the five dropdowns once. Frequency drives the
-  // conditional sub-rows below it.
+  // Mount the shared dropdown controls once. Frequency drives the
+  // conditional schedule sub-rows below it.
   const freqMount = document.getElementById('auto-freq-select');
   const weekdayMount = document.getElementById('auto-weekday-select');
   const monthlyDayMount = document.getElementById('auto-monthly-day-select');
@@ -1077,10 +1097,14 @@ function _mountAutoForm() {
       options: _autoProjectOptions(),
       value: '',
       onChange: () => {
-        _autoTrackClick('auto_project_select', { has_project: !!(_autoProjectSel && _autoProjectSel.getValue()) });
         _autoRefreshProjectScopedPicker();
         _autoClearRecipientIfOutsideProject().catch(() => {});
       },
+    });
+    const runDeviceMount = document.getElementById('auto-run-device-select');
+    _autoRunDeviceSel = _aiSelectMount(runDeviceMount, {
+      options: [],
+      value: '',
     });
   }
 
@@ -1422,11 +1446,11 @@ async function _autoAttachLibraryFile(ref) {
   const channel = scope === 'project'
     ? 'autoTasks.attachments.attachProjectFile'
     : 'autoTasks.attachments.attachContext';
-  _autoTrackClick('auto_library_attach', {
+  const telemetry = {
     scope,
     mode: _autoEditingTaskId ? 'edit' : 'create',
     has_project: !!projectId,
-  });
+  };
   const displayName = _autoAttachBaseName(rel);
   const tempId = _autoAttachTempId();
   _autoSetAttachmentItems([
@@ -1451,9 +1475,16 @@ async function _autoAttachLibraryFile(ref) {
       bytes: 0,
       status: 'ready',
     });
+    _autoTrackEvent('auto_library_attach_result', { ...telemetry, result: 'success' });
   } catch (err) {
     _autoReplaceAttachmentByTempId(tempId, null);
     _autoLog.warn('library attach failed', err);
+    _autoTrackEvent('auto_library_attach_result', { ...telemetry, result: 'failure' });
+    _autoTrackError('auto_library_attach', {
+      ...telemetry,
+      error_type: 'operation',
+      error_message: 'library_attach_failed',
+    });
     throw err;
   }
 }
@@ -1589,6 +1620,19 @@ function _repaintAutoRecipientChip() {
   }
 }
 
+function _autoRefreshRunDevicePicker(resetValue = false) {
+  const row = document.getElementById('auto-row-run-device');
+  const options = _autoRunDeviceOptions(_autoEditingDeviceTask);
+  const visible = options.length > 0;
+  if (row) row.hidden = !visible;
+  if (!_autoRunDeviceSel) return;
+  const previous = _autoRunDeviceSel.getValue();
+  const value = !resetValue && options.some((option) => option.value === previous)
+    ? previous
+    : (visible ? 'assigned' : '');
+  _autoRunDeviceSel.setOptions(options, { value });
+}
+
 function _autoRepaintLabels() {
   const titleEl = document.getElementById('auto-task-dialog-title');
   if (titleEl) {
@@ -1602,12 +1646,14 @@ function _autoRepaintLabels() {
   }
   const cancelBtn = document.getElementById('auto-dialog-cancel-btn');
   if (cancelBtn) cancelBtn.textContent = t('auto.cancel_btn');
+  _autoRefreshRunDevicePicker();
   _paintAutoSyncNotice();
 }
 
 function _autoResetForm() {
   _autoEditingTaskId = null;
   _autoEditingProjectId = '';
+  _autoEditingDeviceTask = null;
   _autoCurrentRecipient = { kind: 'commander' };
   _autoCurrentTaskId = '';
   _autoCurrentAttachments = [];
@@ -1619,6 +1665,7 @@ function _autoResetForm() {
   }
   const enabledInput = document.getElementById('auto-enabled-input');
   if (enabledInput) enabledInput.checked = true;
+  _autoRefreshRunDevicePicker(true);
   const dateInput = document.getElementById('auto-date-input');
   if (dateInput) dateInput.value = _autoLocalDateInputValue(new Date().toISOString());
   if (_autoFreqSel) _autoFreqSel.setValue('daily');
@@ -1692,6 +1739,7 @@ function _hideAutoDialog() {
 function _autoFillForm(task) {
   _autoEditingTaskId = task.id;
   _autoEditingProjectId = task.project_id || '';
+  _autoEditingDeviceTask = task;
   _autoCurrentTaskId = task.id;
   _autoCurrentAttachments = (Array.isArray(task.attachments) ? task.attachments : [])
     .map((name) => ({
@@ -1712,6 +1760,7 @@ function _autoFillForm(task) {
   }
   const enabledInput = document.getElementById('auto-enabled-input');
   if (enabledInput) enabledInput.checked = task.enabled !== false;
+  _autoRefreshRunDevicePicker(true);
 
   const sched = task.schedule || { type: 'daily', hour: 9, minute: 0 };
   if (_autoFreqSel) _autoFreqSel.setValue(sched.type || 'daily');
@@ -1832,6 +1881,9 @@ async function _autoSubmitForm() {
       schedule,
       title: titleInput ? _autoNormaliseTitle(titleInput.value) : '',
       enabled: enabledInput ? !!enabledInput.checked : true,
+      ...(isUpdate && _autoRunDeviceSel && _autoRunDeviceSel.getValue() === 'current'
+        ? { run_on_current_device: true }
+        : {}),
       recipient: recipientField,
       // Send `null` to clear an existing chip on update; omit on create.
       ...(skillField ? { skill: skillField } : (_autoEditingTaskId ? { skill: null } : {})),
@@ -1985,6 +2037,9 @@ if (typeof window !== 'undefined') {
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
     _autoDisplayDeviceName,
+    _autoIsTaskOnCurrentDevice,
+    _autoCanTransferTaskToCurrentDevice,
+    _autoRunDeviceOptions,
     _autoTaskMessagePreviewHtml,
     _autoComposerValueForTask,
   };

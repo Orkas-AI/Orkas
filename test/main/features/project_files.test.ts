@@ -34,6 +34,39 @@ afterEach(() => {
 });
 
 describe('project_files › modern Office support', () => {
+  it('imports a local file by path and enqueues the copied target', async () => {
+    const source = path.join(tmpDir, 'picked.md');
+    fs.writeFileSync(source, '# picked project file', 'utf8');
+    const projectFiles = await import('../../../src/main/features/project_files');
+
+    const result = await projectFiles.importProjectFileFromPath('u1', 'p1', 'imports/picked.md', source);
+
+    expect(result.ok).toBe(true);
+    expect(fs.readFileSync(path.join(tmpDir, 'u1', 'cloud', 'projects', 'p1', 'contexts', 'imports', 'picked.md'), 'utf8'))
+      .toBe('# picked project file');
+    expect(enqueueCalls).toContainEqual({ userId: 'u1', projectId: 'p1', name: 'imports/picked.md', op: 'upsert' });
+  });
+
+  it('allocates distinct names for concurrent path imports into one project', async () => {
+    const first = path.join(tmpDir, 'first.md');
+    const second = path.join(tmpDir, 'second.md');
+    fs.writeFileSync(first, 'first', 'utf8');
+    fs.writeFileSync(second, 'second', 'utf8');
+    const projectFiles = await import('../../../src/main/features/project_files');
+
+    const [a, b] = await Promise.all([
+      projectFiles.importProjectFileFromPath('u1', 'p1', 'same.md', first),
+      projectFiles.importProjectFileFromPath('u1', 'p1', 'same.md', second),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    const names = [(a as any).info.relPath, (b as any).info.relPath];
+    expect(new Set(names).size).toBe(2);
+    expect(names).toContain('same.md');
+    expect(names.some((name) => /^same-\d{8}-\d{6}(?:-\d+)?\.md$/.test(name))).toBe(true);
+  });
+
   it('accepts spreadsheets and presentations into project files', async () => {
     const projectFiles = await import('../../../src/main/features/project_files');
     const sheet = await projectFiles.uploadProjectFile('u1', 'p1', 'sources/scores.xlsx', makeMinimalXlsx());

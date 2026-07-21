@@ -19,6 +19,7 @@
 
 import { t } from '../../i18n';
 import type { ChatFormPayload } from './router';
+import type { GroupMessageFailureKind } from './visibility';
 
 // ── Public API ───────────────────────────────────────────────────────────
 
@@ -30,6 +31,9 @@ export interface TurnFinishedEvent {
   finalText: string;
   errText: string | null;
   aborted: boolean;
+  /** Structured source supplied by the model/CLI/host mutation path. */
+  failureKind?: GroupMessageFailureKind;
+  failureCode?: string;
   /** Form extracted by the bus's post-stream parser (agents only). */
   form?: ChatFormPayload;
   /** Lightweight multi-turn marker extracted from agent final text. */
@@ -67,6 +71,8 @@ export type TurnOutcome = (
       produced?: string[];
       createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
       createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
+      failureKind?: GroupMessageFailureKind;
+      failureCode?: string;
     }
   | { kind: 'silent' }
 );
@@ -111,11 +117,12 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
     // already landed, append the error pill instead of dropping the partial.
     const partial = evt.finalText || '';
     const body = evt.errText
-      ? (partial ? `${partial}\n\n${errorBubble(evt.errText)}` : errorBubble(evt.errText))
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText, evt.failureKind)}` : errorBubble(evt.errText, evt.failureKind))
       : partial;
     return {
       kind: 'persist',
       text: body,
+      ...failureFields(evt, !!evt.errText),
       ...(evt.form ? { form: evt.form } : {}),
       ...(evt.produced.length ? { produced: evt.produced } : {}),
       ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
@@ -125,16 +132,16 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   // Empty final, no side effects.
   if (evt.actor.kind === 'commander') {
     if (evt.terminalDelivery) return { kind: 'silent' };
-    if (!evt.errText) return { kind: 'persist', text: '' };
+    if (!evt.errText) return { kind: 'persist', text: '', ...failureFields(evt) };
     if (evt.errText === 'empty response' && evt.activityEvents > 0) {
-      return { kind: 'persist', text: '' };
+      return { kind: 'persist', text: '', ...failureFields(evt) };
     }
     // Real failure (zero-activity empty, or other err).
-    return { kind: 'persist', text: errorBubble(evt.errText) };
+    return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind), ...failureFields(evt, true) };
   }
   // agent empty + no side effects.
-  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };
-  return { kind: 'persist', text: '(no reply)' };
+  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind), ...failureFields(evt, true) };
+  return { kind: 'persist', text: '(no reply)', ...failureFields(evt) };
 }
 
 /** Aborted-turn outcome: salvage partial reply + side effects, NO "(stopped)"
@@ -154,8 +161,31 @@ function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
   };
 }
 
-function errorBubble(msg: string): string {
-  return `<span style="color:var(--danger)">${escapeHtmlForBubble(t('model.call_failed', { message: msg }))}</span>`;
+function failureFields(
+  evt: TurnFinishedEvent,
+  defaultModelFailure = false,
+): Pick<Extract<TurnOutcome, { kind: 'persist' }>, 'failureKind' | 'failureCode'> {
+  const failureKind = evt.failureKind || (defaultModelFailure ? 'model' : undefined);
+  if (!failureKind) return {};
+  const failureCode = evt.failureCode
+    || (failureKind === 'config' ? 'model_preflight' : failureKind === 'model' ? 'model_stream_error' : undefined);
+  return { failureKind, ...(failureCode ? { failureCode } : {}) };
+}
+
+function errorBubble(msg: string, failureKind?: GroupMessageFailureKind): string {
+  let visible: string;
+  if (failureKind === 'dependency') {
+    visible = normalizeRunError(msg);
+  } else if (failureKind && failureKind !== 'model' && failureKind !== 'config') {
+    visible = t('agent.run_failed', { message: normalizeRunError(msg) });
+  } else {
+    visible = t('model.call_failed', { message: normalizeRunError(msg) });
+  }
+  return `<span style="color:var(--danger)">${escapeHtmlForBubble(visible)}</span>`;
+}
+
+function normalizeRunError(msg: string): string {
+  return String(msg || '').replace(/^Error:\s*/i, '').replace(/\s+/g, ' ').trim() || 'unknown error';
 }
 
 function escapeHtmlForBubble(s: string): string {

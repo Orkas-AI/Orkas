@@ -87,7 +87,10 @@ function _listHashFiles(root: string): string[] {
       return;
     }
     for (const entry of entries) {
-      const childRel = rel ? path.join(rel, entry.name) : entry.name;
+      // Relative paths are persisted in manifests and hashed against the
+      // Python implementation, so they must be platform-neutral even when
+      // this walk runs on Windows.
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) walk(childRel);
       else if (entry.isFile()) out.push(childRel);
     }

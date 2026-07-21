@@ -8,6 +8,7 @@ import { prepareFeedbackUploadImage } from '../util/image-transform';
 import { fetchWithTimeout, throwIfAborted } from '../util/abort';
 import { logPathRef } from '../util/log-redact';
 import { createLogger } from '../logger';
+import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 
 const log = createLogger('generation-reference-assets');
 
@@ -295,33 +296,34 @@ async function prepareVideo(
   return { buf: raw, mimeType, fileName: ensureExt(path.basename(localPath), extForVideoMime(mimeType)) };
 }
 
-function runFfmpeg(
+const MAX_FFMPEG_STDERR_BYTES = 64 * 1024;
+
+export function runReferenceFfmpegForTest(
   cmd: string,
   args: string[],
   opts: {
     signal?: AbortSignal;
     timeoutMs: number;
     onProgress?: (elapsedMs: number) => void;
+    maxStderrBytes?: number;
   },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     try { throwIfAborted(opts.signal); } catch (err) { reject(err); return; }
-    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
+    const child = spawn(cmd, args, {
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true,
+    });
     let stderr = '';
+    let stderrBytes = 0;
     let settled = false;
     const started = Date.now();
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    const maxStderrBytes = Math.max(1, opts.maxStderrBytes ?? MAX_FFMPEG_STDERR_BYTES);
     const heartbeat = setInterval(() => {
       opts.onProgress?.(Date.now() - started);
     }, PROGRESS_HEARTBEAT_MS);
-    const terminateChild = () => {
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, 10_000).unref?.();
-    };
-    const onAbort = () => {
-      finish(new Error('operation aborted'));
-      terminateChild();
-    };
     const finish = (err?: Error) => {
       if (settled) return;
       settled = true;
@@ -331,12 +333,31 @@ function runFfmpeg(
       if (err) reject(err);
       else resolve();
     };
-    timeout = setTimeout(() => {
-      finish(new Error(`ffmpeg timed out after ${Math.round(opts.timeoutMs / 1000)}s`));
+    const terminateChild = () => {
+      try { killProcessTree(child, 'SIGKILL'); } catch { /* already gone */ }
+    };
+    const onAbort = () => {
       terminateChild();
+      finish(new Error('operation aborted'));
+    };
+    timeout = setTimeout(() => {
+      terminateChild();
+      finish(new Error(`ffmpeg timed out after ${Math.round(opts.timeoutMs / 1000)}s`));
     }, opts.timeoutMs);
+    timeout.unref?.();
     if (opts.signal) opts.signal.addEventListener('abort', onAbort, { once: true });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk || ''); });
+    if (opts.signal?.aborted) onAbort();
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
+      const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      stderrBytes += data.length;
+      if (stderrBytes > maxStderrBytes) {
+        terminateChild();
+        finish(new Error(`ffmpeg stderr exceeded ${maxStderrBytes} bytes`));
+        return;
+      }
+      stderr += data.toString('utf8');
+    });
     child.on('error', (err) => finish(new Error(`ffmpeg failed${errorCodeSuffix(err)}`)));
     child.on('close', (code) => {
       if (code === 0) finish();
@@ -344,6 +365,8 @@ function runFfmpeg(
     });
   });
 }
+
+const runFfmpeg = runReferenceFfmpegForTest;
 
 function referenceLabel(
   kind: GenerationReferenceKind,

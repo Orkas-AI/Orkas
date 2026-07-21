@@ -10,8 +10,16 @@ const ttsMock = vi.hoisted(() => ({
   generateSpeech: vi.fn(),
 }));
 
+const mediaProbeMock = vi.hoisted(() => ({
+  duration: vi.fn(),
+}));
+
 vi.mock('../../../../src/main/features/permissions', () => ({
   getLocalExecGranted: () => true,
+}));
+
+vi.mock('../../../../src/main/util/media_probe', () => ({
+  probeMediaDurationSec: mediaProbeMock.duration,
 }));
 
 vi.mock('../../../../src/main/features/tts', () => ({
@@ -157,6 +165,80 @@ function writePlan(): void {
   ].join('\n'), 'utf8');
 }
 
+function makePlanVisualOnly(): void {
+  const projectDir = path.join(workspace, 'project');
+  fs.writeFileSync(path.join(projectDir, 'script.md'), '# Approved script\n\nVisual only.', 'utf8');
+
+  const shotlistPath = path.join(projectDir, 'shotlist.json');
+  const shotlist = JSON.parse(fs.readFileSync(shotlistPath, 'utf8'));
+  shotlist.audio_mode = 'visual-only';
+  shotlist.shots = shotlist.shots.map(({ narration: _narration, ...shot }: Record<string, unknown>) => shot);
+  fs.writeFileSync(shotlistPath, JSON.stringify(shotlist), 'utf8');
+
+  const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  manifest.scenes = manifest.scenes.map((scene: Record<string, unknown>) => {
+    const { narration_text: _narrationText, ...visualScene } = scene;
+    return visualScene;
+  });
+  manifest.audio = { owner: 'none', tracks: [] };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+}
+
+function materializeNarrationFixture(): { textSha256: string; audioSha256: string; durationSec: number } {
+  const durationSec = 4.8;
+  const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const narrationText = manifest.scenes
+    .map((scene: Record<string, unknown>) => String(scene.narration_text || '').trim())
+    .filter(Boolean)
+    .join('\n\n');
+  const textSha256 = crypto.createHash('sha256').update(narrationText).digest('hex');
+  const audio = Buffer.from('materialized narration fixture');
+  const audioSha256 = crypto.createHash('sha256').update(audio).digest('hex');
+  const assetsDir = path.join(compositionDir, 'assets');
+  fs.mkdirSync(assetsDir, { recursive: true });
+  fs.writeFileSync(path.join(assetsDir, 'narration.mp3'), audio);
+
+  manifest.audio = {
+    owner: 'composition',
+    tracks: [{
+      id: 'narration',
+      kind: 'narration',
+      src: 'assets/narration.mp3',
+      start: 0,
+      duration: durationSec,
+      volume: 1,
+    }],
+  };
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+  fs.writeFileSync(path.join(compositionDir, 'narration-map.json'), JSON.stringify({
+    schema_version: 1,
+    source: 'test-fixture',
+    alignment_method: 'scene_estimate_scaled',
+    narration_text_sha256: textSha256,
+    narration_audio_sha256: audioSha256,
+    total_duration: manifest.composition.duration,
+    lines: manifest.scenes.flatMap((scene: Record<string, any>) => scene.narration_text
+      ? [{
+        id: `narration-${scene.id}`,
+        scene_id: scene.id,
+        start: scene.start,
+        duration: scene.duration,
+        text: scene.narration_text,
+      }]
+      : []),
+  }, null, 2), 'utf8');
+
+  const htmlPath = path.join(compositionDir, 'index.html');
+  const html = fs.readFileSync(htmlPath, 'utf8').replace(
+    '</main>',
+    `  <audio id="audio-narration" src="./assets/narration.mp3" data-start="0" data-duration="${durationSec}" data-track-index="10" data-volume="1"></audio>\n</main>`,
+  );
+  fs.writeFileSync(htmlPath, html, 'utf8');
+  return { textSha256, audioSha256, durationSec };
+}
+
 function writeAutoParentPlan(): string {
   const planPath = path.join(workspace, 'project', 'plan.json');
   fs.writeFileSync(planPath, JSON.stringify({
@@ -255,6 +337,8 @@ beforeEach(async () => {
     unitsPerSec: 1,
   }));
   ttsMock.generateSpeech.mockReset();
+  mediaProbeMock.duration.mockReset();
+  mediaProbeMock.duration.mockResolvedValue(4.8);
   const users = await import('../../../../src/main/features/users');
   users.activateUser(UID);
   const userWorkspace = await import('../../../../src/main/features/user_workspace');
@@ -352,6 +436,24 @@ describe('VideoStudio production-state tool protocol', () => {
     )).toBe('unknown');
     expect(mod.explicitVideoStudioVisualRecoveryDecision(
       '<msg from="user">新建视觉修订</msg>',
+    )).toBe('unknown');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      approvalSubmission('preview_decision', 'revise'),
+    )).toBe('revise');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      approvalSubmission('gate_d_decision', 'change'),
+    )).toBe('revise');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      approvalSubmission('gate_b_decision', 'revise'),
+    )).toBe('unknown');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      approvalSubmission('preview_decision', 'revise', 'another-agent'),
+    )).toBe('unknown');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      '<msg from="user">把封面的线删掉，增加三个英文关键词。</msg>',
+    )).toBe('revise');
+    expect(mod.explicitVideoStudioVisualRevisionDecision(
+      '<msg from="user">先暂停。</msg>',
     )).toBe('unknown');
   });
 
@@ -456,6 +558,7 @@ describe('VideoStudio production-state tool protocol', () => {
   });
 
   it('requires gate-specific approval content, not merely a later turn', async () => {
+    makePlanVisualOnly();
     const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const ctx = { workingDir: workspace, state: {} } as any;
     const planTool = mod.createVideoStudioTool({
@@ -550,6 +653,201 @@ describe('VideoStudio production-state tool protocol', () => {
       op: 'composition.approve_draft',
       composition_dir: 'project/composition',
     }, ctx)).isError).toBe(false);
+  });
+
+  it('reviews every current preview frame before publishing or enabling preview approval', async () => {
+    makePlanVisualOnly();
+    const videoStudio = await import('../../../../src/main/features/video_studio');
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const published: string[][] = [];
+    const opts = {
+      userId: UID,
+      cid: 'cid-preview-design-review',
+      turnId: 'turn-preview-review',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认',
+      onOutputsPublished: async (paths: string[]) => { published.push(paths); },
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    expect((await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const contactSheet = path.join(compositionDir, 'preview-contact-sheet.png');
+    const framePaths = [
+      path.join(compositionDir, 'preview-contact-sheet-frames', '01-first-frame.png'),
+      path.join(compositionDir, 'preview-contact-sheet-frames', '02-scene-mid.png'),
+    ];
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      state.stage = 'visuals_ready';
+    });
+    vi.spyOn(videoStudio, 'snapshotComposition').mockResolvedValue({
+      ok: true,
+      op: 'composition.snapshot',
+      preview_ready: true,
+      preview_qa: { ok: true, error_count: 0 },
+      preflight: { status: 'passed', blocking_error_count: 0 },
+      contact_sheet: contactSheet,
+      frame_paths: framePaths,
+    } as any);
+    const snapshot = await tool.execute({
+      op: 'composition.snapshot',
+      composition_dir: 'project/composition',
+      output_path: 'project/composition/preview-contact-sheet.png',
+    }, ctx);
+    expect(snapshot.isError).toBe(false);
+    expect(parseResult(snapshot.content)).toMatchObject({
+      preview_design_review_required: true,
+      preview_gate_ready: false,
+      next_action: 'composition.submit_design_review',
+    });
+    expect(published).toEqual([]);
+
+    const pending = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(stateMod.nextVideoProductionOps(pending)).toContain('composition.submit_design_review');
+    expect(stateMod.nextVideoProductionOps(pending)).not.toContain('composition.approve_preview');
+    expect((await toolMod.approveVideoStudioGate(
+      statePath,
+      'preview',
+      compositionDir,
+      'turn-user-approval',
+      true,
+    ))).toMatchObject({ ok: false, errorCode: 'E_PREVIEW_DESIGN_REVIEW_REQUIRED' });
+
+    const incomplete = await tool.execute({
+      op: 'composition.submit_design_review',
+      composition_dir: 'project/composition',
+      review_verdict: 'passed',
+      review_scope: 'all preview frames',
+      review_findings: [],
+      reviewed_frame_paths: [framePaths[0]],
+    }, ctx);
+    expect(incomplete.isError).toBe(true);
+    expect(parseResult(incomplete.content)).toMatchObject({
+      errorCode: 'E_PREVIEW_DESIGN_REVIEW_COVERAGE_REQUIRED',
+      reviewed_frame_count: 1,
+      expected_frame_count: 2,
+    });
+    expect(published).toEqual([]);
+
+    const passed = await tool.execute({
+      op: 'composition.submit_design_review',
+      composition_dir: 'project/composition',
+      review_verdict: 'passed',
+      review_scope: 'first frame and every returned scene sample; typography, hierarchy, safe area, and overlap',
+      review_findings: [],
+      reviewed_frame_paths: framePaths,
+    }, ctx);
+    expect(passed.isError).toBe(false);
+    expect(parseResult(passed.content)).toMatchObject({
+      review_target: 'preview',
+      preview_gate_ready: true,
+      reviewed_frame_count: 2,
+      expected_frame_count: 2,
+      next_action: 'show_preview_then_wait_for_user_approval',
+    });
+    expect(published).toEqual([[path.resolve(contactSheet)]]);
+
+    const reviewed = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(stateMod.nextVideoProductionOps(reviewed)).toContain('composition.approve_preview');
+    expect(reviewed.preview?.design_review).toMatchObject({
+      status: 'passed',
+      reviewed_frame_paths: framePaths.map((value) => path.resolve(value)),
+    });
+    expect((await toolMod.approveVideoStudioGate(
+      statePath,
+      'preview',
+      compositionDir,
+      'turn-user-approval',
+      true,
+    )).ok).toBe(true);
+  });
+
+  it('inherits a passed approved-preview review instead of repeating static design review after draft render', async () => {
+    makePlanVisualOnly();
+    const videoStudio = await import('../../../../src/main/features/video_studio');
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const opts = {
+      userId: UID,
+      cid: 'cid-preview-review-inheritance',
+      turnId: 'turn-draft',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认',
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    expect((await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const framePath = path.join(compositionDir, 'preview-contact-sheet-frames', '01-first-frame.png');
+    expect(await toolMod.recordVideoStudioGate(statePath, 'preview', compositionDir, 'turn-snapshot', {
+      preview_ready: true,
+      preview_qa: { ok: true, error_count: 0 },
+      preflight: { status: 'passed', blocking_error_count: 0 },
+      contact_sheet: path.join(compositionDir, 'preview-contact-sheet.png'),
+      frame_paths: [framePath],
+      design_review_required: true,
+    })).toBe(true);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      if (!state.preview) throw new Error('preview missing');
+      state.preview.design_review = {
+        required: true,
+        status: 'passed',
+        reviewed_at: new Date().toISOString(),
+        verdict: 'passed',
+        scope: 'all preview frames',
+        findings: [],
+        reviewed_frame_paths: [framePath],
+      };
+    });
+    expect((await toolMod.approveVideoStudioGate(
+      statePath,
+      'preview',
+      compositionDir,
+      'turn-preview-approval',
+      true,
+    )).ok).toBe(true);
+
+    const draftPath = path.join(workspace, 'project', 'render', 'draft.mp4');
+    vi.spyOn(videoStudio, 'draftComposition').mockResolvedValue({
+      ok: true,
+      op: 'composition.draft',
+      path: draftPath,
+      draft_ready: true,
+      report: { steps: { render: { status: 'passed' } } },
+    } as any);
+    const draft = await tool.execute({
+      op: 'composition.draft',
+      composition_dir: 'project/composition',
+      output_path: 'project/render/draft.mp4',
+    }, ctx);
+    expect(draft.isError).toBe(false);
+    expect(parseResult(draft.content)).toMatchObject({
+      design_review_required: false,
+      design_review_inherited_from_preview: true,
+      gate_d_ready: true,
+      next_action: 'open_gate_d',
+      production_state: {
+        stage: 'draft_ready',
+        draft_design_review: {
+          required: false,
+          status: 'passed',
+          verdict: 'preview_review_inherited',
+        },
+      },
+    });
+    expect(parseResult(draft.content).next_allowed_ops).toContain('composition.approve_draft');
+    expect(parseResult(draft.content).next_allowed_ops).not.toContain('composition.submit_design_review');
   });
 
   it('records one parent EDL Gate B and lets a matching AUTO child inherit it without another user gate', async () => {
@@ -761,6 +1059,37 @@ describe('VideoStudio production-state tool protocol', () => {
     });
   });
 
+  it('uses manifest narration as canonical and rejects conflicting shotlist projections before Gate B', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const shotlistPath = path.join(workspace, 'project', 'shotlist.json');
+    const shotlist = JSON.parse(fs.readFileSync(shotlistPath, 'utf8'));
+    delete shotlist.shots[0].narration;
+    shotlist.shots[0].narration_text = 'This conflicts with the manifest.';
+    fs.writeFileSync(shotlistPath, JSON.stringify(shotlist), 'utf8');
+
+    const tool = mod.createVideoStudioTool({
+      userId: UID,
+      turnId: 'turn-plan-alignment',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    });
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const conflict = await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(conflict.isError).toBe(true);
+    expect(conflict.content).toContain('E_GATE_B_REQUIREMENTS_INCOMPLETE');
+    expect(conflict.content).toContain('narration_conflicts_with_manifest');
+
+    delete shotlist.shots[0].narration_text;
+    fs.writeFileSync(shotlistPath, JSON.stringify(shotlist), 'utf8');
+    const canonicalOnly = await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(canonicalOnly.isError).toBe(false);
+  });
+
   it('turns an unexpected native-operation rejection into a durable recovery result', async () => {
     const native = await import('../../../../src/main/features/video_studio');
     vi.spyOn(native, 'prepareComposition').mockRejectedValueOnce(new Error('native window closed'));
@@ -804,6 +1133,7 @@ describe('VideoStudio production-state tool protocol', () => {
   });
 
   it('blocks repeated snapshot retries until the composition artifact changes', async () => {
+    makePlanVisualOnly();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -862,10 +1192,75 @@ describe('VideoStudio production-state tool protocol', () => {
     const exhausted = await tool.execute(input, ctx);
     expect(exhausted.isError).toBe(true);
     expect(exhausted.content).toContain('E_VISUAL_REPAIR_BUDGET_EXCEEDED');
+    expect(parseResult(exhausted.content)).toMatchObject({
+      recovery_requires_new_user_revision: true,
+      next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
+    });
+    expect(parseResult(exhausted.content)).not.toHaveProperty('recovery_form');
     expect(snapshot).toHaveBeenCalledTimes(3);
   });
 
+  it('recaptures a legacy passed preview once when it has no revision id', async () => {
+    makePlanVisualOnly();
+    const videoStudio = await import('../../../../src/main/features/video_studio');
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      cid: 'cid-legacy-preview-revision',
+      turnId: 'turn-preview-revision',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '确认',
+    };
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {}, emitProgress: vi.fn() } as any;
+    expect((await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      state.stage = 'visuals_ready';
+    });
+    const legacyContactSheet = path.join(compositionDir, 'preview-contact-sheet-frames', 'contact-sheet.svg');
+    const revisedContactSheet = path.join(compositionDir, 'preview-contact-sheet-frames', 'revision-2', 'contact-sheet.svg');
+    const passingPreview = (contactSheet: string, revision?: string) => ({
+      ok: true,
+      op: 'composition.snapshot',
+      path: contactSheet,
+      contact_sheet: contactSheet,
+      preview_ready: true,
+      preview_qa: { ok: true, error_count: 0 },
+      preflight: { status: 'passed', blocking_error_count: 0 },
+      ...(revision ? { preview_revision: revision } : {}),
+    });
+    const snapshot = vi.spyOn(videoStudio, 'snapshotComposition')
+      .mockResolvedValueOnce(passingPreview(legacyContactSheet) as any)
+      .mockResolvedValueOnce(passingPreview(revisedContactSheet, 'revision-2') as any);
+    const input = {
+      op: 'composition.snapshot',
+      composition_dir: 'project/composition',
+      output_path: 'project/composition/preview-contact-sheet.png',
+    };
+
+    expect((await tool.execute(input, ctx)).isError).toBe(false);
+    const legacyState = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(legacyState.preview?.revision_id).toBeUndefined();
+
+    const migrated = await tool.execute(input, ctx);
+    expect(migrated.isError).toBe(false);
+    expect(parseResult(migrated.content)).not.toMatchObject({ reused_result: true });
+    expect(snapshot).toHaveBeenCalledTimes(2);
+    const migratedState = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(migratedState.preview).toMatchObject({
+      revision_id: 'revision-2',
+      path: revisedContactSheet,
+    });
+  });
+
   it('blocks repeated inspect retries until visual inputs change', async () => {
+    makePlanVisualOnly();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -929,6 +1324,7 @@ describe('VideoStudio production-state tool protocol', () => {
   });
 
   it('shares one repair cycle across inspect and snapshot', async () => {
+    makePlanVisualOnly();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -973,7 +1369,10 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(parseResult(exhausted.content)).toMatchObject({
       visual_revision_recovery_available: true,
       recovery_action: 'composition.begin_visual_revision',
+      recovery_requires_new_user_revision: true,
+      next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
     });
+    expect(parseResult(exhausted.content)).not.toHaveProperty('recovery_form');
     expect(inspect).toHaveBeenCalledTimes(2);
     expect(snapshot).toHaveBeenCalledTimes(1);
     const state = await stateMod.readVideoProductionState(statePath, compositionDir);
@@ -986,6 +1385,7 @@ describe('VideoStudio production-state tool protocol', () => {
   });
 
   it('invalidates an exhausted legacy cycle when the inspector version changes', async () => {
+    makePlanVisualOnly();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -1023,7 +1423,122 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(migrated.visual_qa?.history?.[0]).toMatchObject({ inspector_version: 1, status: 'exhausted' });
   });
 
+  it('starts fresh QA from an approved Gate B amendment without visual recovery', async () => {
+    makePlanVisualOnly();
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const initialOpts = {
+      userId: UID,
+      cid: 'cid-gate-b-amendment-fresh-qa',
+      turnId: 'turn-initial-plan',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    };
+    const statePath = toolMod.videoStudioProductionStatePath(initialOpts, compositionDir);
+    const ctx = { workingDir: workspace, state: {}, emitProgress: vi.fn() } as any;
+    expect((await toolMod.createVideoStudioTool(initialOpts).execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      state.stage = 'preview_ready';
+      state.visual_qa = {
+        cycle: {
+          inspector_version: 2,
+          cycle_id: 'old-passed-cycle',
+          visual_revision: 1,
+          status: 'passed',
+          max_repair_passes: 2,
+          failed_signatures: ['old-failed-signature'],
+          passed_signatures: { inspect: 'old-signature', snapshot: 'old-signature' },
+          last_signature: 'old-signature',
+          started_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      };
+    });
+
+    const amendmentOpts = {
+      ...initialOpts,
+      turnId: 'turn-amendment-approval',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    };
+    const amendmentTool = toolMod.createVideoStudioTool(amendmentOpts);
+    const unapplied = await amendmentTool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+      expected_plan_change: true,
+    }, ctx);
+    expect(unapplied.isError).toBe(true);
+    const unappliedResult = parseResult(unapplied.content);
+    expect(unappliedResult).toMatchObject({
+      errorCode: 'E_GATE_B_AMENDMENT_NOT_APPLIED',
+      expected_plan_change: true,
+      plan_changed: false,
+      visual_revision_recovery_available: false,
+      next_action: 'apply_approved_amendment_then_composition.approve_plan',
+    });
+    expect(unappliedResult).not.toHaveProperty('recovery_form');
+
+    const manifestPath = path.join(compositionDir, 'composition-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.scenes[0].approved_copy = ['Approved amended cover'];
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf8');
+    fs.writeFileSync(path.join(workspace, 'project', 'script.md'), '# Approved amended script\n\nSpeak once.', 'utf8');
+
+    const approved = await amendmentTool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+      expected_plan_change: true,
+    }, ctx);
+    expect(approved.isError).toBe(false);
+    expect(parseResult(approved.content)).toMatchObject({
+      status: 'approved',
+      plan_changed: true,
+      visual_qa_reset: true,
+      next_action: 'composition.doctor',
+    });
+
+    const amendedState = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(amendedState.stage).toBe('manifest_ready');
+    expect(amendedState.visual_qa).toBeUndefined();
+
+    // Reproduce the erroneous final call from the real six-minute trace. A
+    // non-exhausted/new plan must correct control flow, never mint a form.
+    const unnecessaryReset = await toolMod.createVideoStudioTool({
+      ...amendmentOpts,
+      turnId: 'turn-preview-revise-after-amendment',
+      userMessage: approvalSubmission('preview_decision', 'revise'),
+    }).execute({
+      op: 'composition.begin_visual_revision',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(unnecessaryReset.isError).toBe(true);
+    const unnecessaryResetResult = parseResult(unnecessaryReset.content);
+    expect(unnecessaryResetResult).toMatchObject({
+      errorCode: 'E_VISUAL_REVISION_NOT_REQUIRED',
+      visual_revision_recovery_available: false,
+      next_action: 'continue_current_cycle_without_recovery',
+    });
+    expect(unnecessaryResetResult).not.toHaveProperty('recovery_form');
+
+    const misroutedGateBReset = await amendmentTool.execute({
+      op: 'composition.begin_visual_revision',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(misroutedGateBReset.isError).toBe(true);
+    expect(parseResult(misroutedGateBReset.content)).toMatchObject({
+      errorCode: 'E_GATE_B_APPROVE_PLAN_REQUIRED',
+      expected_plan_change: true,
+      visual_revision_recovery_available: false,
+      next_action: 'apply_approved_amendment_then_composition.approve_plan',
+    });
+    expect(parseResult(misroutedGateBReset.content)).not.toHaveProperty('recovery_form');
+  });
+
   it('starts an authorized visual revision atomically while preserving plan and narration', async () => {
+    const narration = materializeNarrationFixture();
     const videoStudio = await import('../../../../src/main/features/video_studio');
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
@@ -1045,10 +1560,10 @@ describe('VideoStudio production-state tool protocol', () => {
       state.stage = 'visuals_ready';
       state.narration = {
         status: 'materialized',
-        text_sha256: 'text-hash',
-        audio_sha256: 'audio-hash',
+        text_sha256: narration.textSha256,
+        audio_sha256: narration.audioSha256,
         path: path.join(compositionDir, 'assets', 'narration.mp3'),
-        measured_duration_sec: 4.8,
+        measured_duration_sec: narration.durationSec,
         backend: 'mock-voice',
         speed: 1,
         materialized_at: new Date().toISOString(),
@@ -1077,11 +1592,16 @@ describe('VideoStudio production-state tool protocol', () => {
     }, ctx);
     expect(unauthorized.isError).toBe(true);
     expect(unauthorized.content).toContain('E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED');
+    expect(parseResult(unauthorized.content)).toMatchObject({
+      recovery_requires_new_user_revision: true,
+      next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
+    });
+    expect(parseResult(unauthorized.content)).not.toHaveProperty('recovery_form');
 
     const recoveryOpts = {
       ...baseOpts,
       turnId: 'turn-visual-revision',
-      userMessage: approvalSubmission('visual_recovery_decision', 'new_visual_revision'),
+      userMessage: approvalSubmission('preview_decision', 'revise'),
     };
     const recoveryTool = toolMod.createVideoStudioTool(recoveryOpts);
     const started = await recoveryTool.execute({
@@ -1100,7 +1620,10 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(revised.revision).toBeGreaterThan(before.revision);
     expect(revised.stage).toBe('visuals_ready');
     expect(revised.plan_approval?.signature).toBe(approvalSignature);
-    expect(revised.narration).toMatchObject({ text_sha256: 'text-hash', audio_sha256: 'audio-hash' });
+    expect(revised.narration).toMatchObject({
+      text_sha256: narration.textSha256,
+      audio_sha256: narration.audioSha256,
+    });
     expect(revised.visual_qa?.cycle).toMatchObject({
       inspector_version: 2,
       visual_revision: 1,
@@ -1138,6 +1661,7 @@ describe('VideoStudio production-state tool protocol', () => {
 
   it('registers and publishes an approved export after rendering', async () => {
     const videoStudio = await import('../../../../src/main/features/video_studio');
+    makePlanVisualOnly();
     const events: string[] = [];
     const finalPath = path.join(workspace, 'project', 'render', 'final.mp4');
     const draftPath = path.join(workspace, 'project', 'render', 'draft.mp4');
@@ -1211,7 +1735,7 @@ describe('VideoStudio production-state tool protocol', () => {
       review_scope: 'draft contact sheet plus scene midpoint and payoff frames',
       review_findings: [],
     }, { workingDir: workspace, state: {} } as any);
-    expect(review.isError).toBe(false);
+    expect(review.isError, JSON.stringify(parseResult(review.content))).toBe(false);
     expect(parseResult(review.content)).toMatchObject({ gate_d_ready: true });
     fs.writeFileSync(path.join(compositionDir, 'draft.mp4'), 'runtime draft');
     fs.writeFileSync(path.join(compositionDir, 'draft-qa-report.json'), '{}');
@@ -1260,7 +1784,7 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(events).toEqual(['render', 'written', 'published']);
   });
 
-  it('enforces Gate B, auto-checks capabilities, then reconciles authored visual state', async () => {
+  it('enforces Gate B and prevents authored visuals from bypassing pending narration', async () => {
     const mod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const tool = mod.createVideoStudioTool({
       userId: UID,
@@ -1306,10 +1830,18 @@ describe('VideoStudio production-state tool protocol', () => {
       composition_dir: 'project/composition',
     }, ctx);
     expect(prepared.isError).toBe(false);
-    expect(parseResult(prepared.content).production_state).toMatchObject({
+    const preparedResult = parseResult(prepared.content);
+    expect(preparedResult.production_state).toMatchObject({
       stage: 'scaffold_ready',
       capability_check: { status: 'ready' },
+      next_allowed_ops: expect.arrayContaining(['composition.materialize_narration']),
     });
+    expect(preparedResult.next_allowed_ops).toEqual(preparedResult.production_state.next_allowed_ops);
+    expect(preparedResult.next_allowed_ops).toEqual(expect.arrayContaining([
+      'composition.materialize_narration',
+      'composition.lint',
+      'composition.inspect',
+    ]));
 
     const blockedDraft = await tool.execute({
       op: 'composition.draft',
@@ -1317,7 +1849,7 @@ describe('VideoStudio production-state tool protocol', () => {
       output_path: 'project/render/draft.mp4',
     }, ctx);
     expect(blockedDraft.isError).toBe(true);
-    expect(blockedDraft.content).toContain('E_VIDEO_PRODUCTION_STAGE_INVALID');
+    expect(blockedDraft.content).toContain('E_NARRATION_MATERIALIZATION_REQUIRED');
 
     const htmlPath = path.join(compositionDir, 'index.html');
     fs.appendFileSync(htmlPath, '\n<!-- authored visual change -->\n', 'utf8');
@@ -1333,8 +1865,233 @@ describe('VideoStudio production-state tool protocol', () => {
     }, ctx);
     expect(reconciled.isError).toBe(false);
     expect(parseResult(reconciled.content).production_state).toMatchObject({
-      stage: 'visuals_ready',
-      next_allowed_ops: expect.arrayContaining(['composition.draft', 'composition.snapshot']),
+      stage: 'scaffold_ready',
+      next_allowed_ops: expect.arrayContaining(['composition.materialize_narration']),
+    });
+    expect(parseResult(reconciled.content).production_state.next_allowed_ops).not.toContain('composition.draft');
+    expect(parseResult(reconciled.content).production_state.next_allowed_ops).not.toContain('composition.snapshot');
+
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const statePath = mod.videoStudioProductionStatePath({ userId: UID }, compositionDir);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      // Reproduce the late stage recorded in the production trace. The
+      // current-fact admission must ignore this compatibility value.
+      state.stage = 'draft_ready';
+    });
+    ttsMock.generateSpeech.mockImplementation(async ({ outputAbsPath }: { outputAbsPath: string }) => {
+      fs.mkdirSync(path.dirname(outputAbsPath), { recursive: true });
+      const audio = Buffer.from('late materialized narration');
+      fs.writeFileSync(outputAbsPath, audio);
+      return { ok: true, bytes: audio.byteLength };
+    });
+    const materialized = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(materialized.isError).toBe(false);
+    expect(parseResult(materialized.content)).toMatchObject({
+      status: 'passed',
+      visuals_preserved: true,
+      billable_request_sent: true,
+    });
+    expect(ttsMock.generateSpeech).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(htmlPath, 'utf8')).toContain('authored visual change');
+    expect(fs.existsSync(path.join(compositionDir, 'assets', 'narration.mp3'))).toBe(true);
+    expect(fs.existsSync(path.join(compositionDir, 'narration-map.json'))).toBe(true);
+  });
+
+  it('restores the matching Gate B approval after transient plan drift is reverted', async () => {
+    makePlanVisualOnly();
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      cid: 'cid-transient-plan-drift',
+      turnId: 'turn-plan-approved',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const approved = await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(approved.isError).toBe(false);
+    const approvedSignature = parseResult(approved.content).production_state.plan_approval.signature;
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    const scriptPath = path.join(workspace, 'project', 'script.md');
+    const canonicalScript = fs.readFileSync(scriptPath, 'utf8');
+
+    fs.writeFileSync(scriptPath, `${canonicalScript}\nTransient edit.`, 'utf8');
+    expect((await tool.execute({
+      op: 'composition.reconcile',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+    const drifted = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(drifted.plan_approval).toBeUndefined();
+    expect(drifted.plan_approval_history).toEqual(expect.arrayContaining([
+      expect.objectContaining({ signature: approvedSignature, turn_id: 'turn-plan-approved' }),
+    ]));
+
+    fs.writeFileSync(scriptPath, canonicalScript, 'utf8');
+    expect((await tool.execute({
+      op: 'composition.reconcile',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+    const restored = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(restored.plan_approval).toMatchObject({
+      signature: approvedSignature,
+      turn_id: 'turn-plan-approved',
+    });
+    expect(restored.plan_approval_history).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ signature: approvedSignature }),
+    ]));
+  });
+
+  it('recovers legacy late-stage silent narration without reopening Gate B', async () => {
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      turnId: 'turn-recover-silent',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {} } as any;
+    expect((await tool.execute({ op: 'composition.approve_plan', composition_dir: 'project/composition' }, ctx)).isError).toBe(false);
+    expect((await tool.execute({ op: 'composition.prepare', composition_dir: 'project/composition' }, ctx)).isError).toBe(false);
+
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      const gate = {
+        signature: 'legacy-silent-signature',
+        turn_id: 'turn-draft',
+        created_at: new Date().toISOString(),
+        status: 'approved' as const,
+        approved_turn_id: 'turn-approve-draft',
+        approved_at: new Date().toISOString(),
+        validation_version: 3 as const,
+      };
+      state.preview = { ...gate };
+      state.draft = { ...gate };
+      state.stage = 'draft_approved';
+    });
+
+    const status = parseResult((await tool.execute({
+      op: 'composition.status',
+      composition_dir: 'project/composition',
+    }, ctx)).content);
+    expect(status).toMatchObject({
+      plan_approval_current: true,
+      production_state: {
+        stage: 'scaffold_ready',
+        preview_status: 'missing',
+        draft_status: 'missing',
+        blocked_operation: { error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED' },
+        next_allowed_ops: expect.arrayContaining(['composition.materialize_narration']),
+      },
+    });
+    expect(status.production_state.next_allowed_ops).not.toContain('composition.export');
+
+    const fit = parseResult((await tool.execute({
+      op: 'composition.check_narration_fit',
+      composition_dir: 'project/composition',
+    }, ctx)).content);
+    expect(fit).toMatchObject({
+      gate_b_ready: true,
+      gate_b_required: false,
+      next_action: 'composition.materialize_narration',
+      production_state: {
+        next_allowed_ops: expect.arrayContaining(['composition.materialize_narration']),
+      },
+    });
+    expect(fit.production_state.next_allowed_ops).toContain('composition.lint');
+  });
+
+  it('repairs missing narration map and HTML binding without another speech request or Gate B', async () => {
+    const narration = materializeNarrationFixture();
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const stateMod = await import('../../../../src/main/features/video_studio_state');
+    const opts = {
+      userId: UID,
+      turnId: 'turn-repair-narration-metadata',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    };
+    const tool = toolMod.createVideoStudioTool(opts);
+    const ctx = { workingDir: workspace, state: {} } as any;
+    expect((await tool.execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/composition',
+    }, ctx)).isError).toBe(false);
+
+    const htmlPath = path.join(compositionDir, 'index.html');
+    const scaffoldSha = crypto.createHash('sha256').update(fs.readFileSync(htmlPath)).digest('hex');
+    const statePath = toolMod.videoStudioProductionStatePath(opts, compositionDir);
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      state.stage = 'draft_approved';
+      state.narration = {
+        status: 'materialized',
+        text_sha256: narration.textSha256,
+        audio_sha256: narration.audioSha256,
+        path: path.join(compositionDir, 'assets', 'narration.mp3'),
+        measured_duration_sec: narration.durationSec,
+        backend: 'mock-voice',
+        speed: 1,
+        materialized_at: new Date().toISOString(),
+      };
+      state.artifacts.html_sha256 = scaffoldSha;
+      state.artifacts.scaffold_html_sha256 = scaffoldSha;
+    });
+
+    fs.rmSync(path.join(compositionDir, 'narration-map.json'));
+    fs.writeFileSync(
+      htmlPath,
+      fs.readFileSync(htmlPath, 'utf8')
+        .replace(/\s*<audio\b[^>]*>\s*<\/audio>/i, '')
+        .replace('</section>', '<div data-role="visual">authored visual survives</div>\n</section>'),
+      'utf8',
+    );
+
+    const status = parseResult((await tool.execute({
+      op: 'composition.status',
+      composition_dir: 'project/composition',
+    }, ctx)).content);
+    expect(status).toMatchObject({
+      plan_approval_current: true,
+      production_state: {
+        stage: 'scaffold_ready',
+        blocked_operation: { error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED' },
+        next_allowed_ops: expect.arrayContaining(['composition.materialize_narration']),
+      },
+    });
+    expect((await stateMod.readVideoProductionState(statePath, compositionDir)).narration).toBeDefined();
+
+    const recovered = await tool.execute({
+      op: 'composition.materialize_narration',
+      composition_dir: 'project/composition',
+    }, ctx);
+    expect(recovered.isError).toBe(false);
+    expect(parseResult(recovered.content)).toMatchObject({
+      status: 'recovered',
+      billable_request_sent: false,
+      visuals_preserved: true,
+      production_state: { stage: 'visuals_ready' },
+    });
+    expect(ttsMock.generateSpeech).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(compositionDir, 'narration-map.json'))).toBe(true);
+    expect(fs.readFileSync(htmlPath, 'utf8')).toContain('src="./assets/narration.mp3"');
+    expect(fs.readFileSync(htmlPath, 'utf8')).toContain('authored visual survives');
+    const recoveredState = await stateMod.readVideoProductionState(statePath, compositionDir);
+    expect(recoveredState.blocked_operation).toBeUndefined();
+    expect(recoveredState.narration).toMatchObject({
+      text_sha256: narration.textSha256,
+      audio_sha256: narration.audioSha256,
     });
   });
 
@@ -1378,6 +2135,10 @@ describe('VideoStudio production-state tool protocol', () => {
         updated_at: now,
       };
     });
+    fs.appendFileSync(htmlPath, '\n<!-- authored visual must survive late narration recovery -->\n', 'utf8');
+    await stateMod.updateVideoProductionState(statePath, compositionDir, (state) => {
+      state.stage = 'visuals_ready';
+    });
     // A paid matching artifact must still be measured/recovered if a later
     // estimator version would call the text too long.
     ttsMock.estimateNarrationDuration.mockImplementation((text: string) => ({
@@ -1397,25 +2158,28 @@ describe('VideoStudio production-state tool protocol', () => {
       billable_request_sent: false,
       measured_duration_sec: 4.6,
       alignment_method: 'scene_estimate_scaled',
-      production_state: { stage: 'narration_ready' },
+      visuals_preserved: true,
+      production_state: { stage: 'visuals_ready' },
     });
     expect(ttsMock.generateSpeech).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(compositionDir, 'narration-map.json'))).toBe(true);
+    expect(fs.readFileSync(htmlPath, 'utf8')).toContain('authored visual must survive late narration recovery');
     const finalState = await stateMod.readVideoProductionState(statePath, compositionDir);
     expect(finalState.narration_transaction).toBeUndefined();
     expect(finalState.narration).toMatchObject({ status: 'materialized', backend: 'mock-previous' });
   });
 
-  it('inherits Gate B for a bounded measured-duration repair without another approval or paid check', async () => {
+  it('inherits Gate B for a production-shaped narration_text timing repair without another approval or paid check', async () => {
     const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
     const stateMod = await import('../../../../src/main/features/video_studio_state');
-    const originalNarration = 'How did next-word prediction become systems that reason, see, and use tools? In 2017, the Transformer made attention-based language training parallel and scalable. In 2018, BERT learned from both sides of context, adapted across language tasks. By 2020, GPT-3 showed scale unlocked few-shot learning from instructions and examples. In 2022, ChatGPT brought prompting to a global audience. In 2024, multimodal models connected text, images, and audio, while reasoning models computed longer before answering. In 2025, DeepSeek-R1 opened reasoning further, while tool use pushed models toward agents. The pattern: attention enabled scale; scale enabled generality; reasoning and tools turn prediction into problem-solving.';
-    const revisedNarration = 'How did next-word prediction become systems reasoning, seeing, and using tools? In 2017, the Transformer made attention-based training parallel and scalable. In 2018, BERT learned from both sides of context, adapted across language tasks. By 2020, GPT-3 showed scale unlocked few-shot learning from instructions and examples. In 2022, ChatGPT brought prompting to a global audience. In 2024, multimodal models connected text, images, and audio, while reasoning models computed before answering. In 2025, DeepSeek-R1 opened reasoning further, while tool use pushed models toward agents. The pattern: attention enabled scale; scale enabled generality; reasoning and tools turn prediction into problem-solving.';
+    const originalNarration = 'How did next-word prediction become systems reasoning, seeing, and using tools? In 2017, the Transformer made attention-based training parallel and scalable. In 2018, BERT learned from both sides of context, adapted across language tasks. By 2020, GPT-3 showed scale unlocked few-shot learning from instructions and examples. In 2022, ChatGPT brought prompting to a global audience. In 2024, multimodal models connected text, images, and audio, while reasoning models computed before answering. In 2025, DeepSeek-R1 opened reasoning further, while tool use pushed models toward agents. The pattern: attention enabled scale; scale enabled generality; reasoning and tools turn prediction into problem-solving.';
+    const revisedNarration = 'How did next-word prediction become systems that reason, see, and use tools? In 2017, the Transformer made attention-based language training parallel and scalable. In 2018, BERT learned from both sides of context, adapted across language tasks. By 2020, GPT-3 showed scale unlocked few-shot learning from instructions and examples. In 2022, ChatGPT brought prompting to a global audience. In 2024, multimodal models connected text, images, and audio, while reasoning models computed longer before answering. In 2025, DeepSeek-R1 opened reasoning further, while tool use pushed models toward agents. The pattern: attention enabled scale; scale enabled generality; reasoning and tools turn prediction into problem-solving.';
     fs.writeFileSync(path.join(workspace, 'project', 'script.md'), `# Approved script\n\n${originalNarration}`, 'utf8');
     const initialShotlistPath = path.join(workspace, 'project', 'shotlist.json');
     const initialShotlist = JSON.parse(fs.readFileSync(initialShotlistPath, 'utf8'));
     initialShotlist.target_duration_seconds = 60;
-    initialShotlist.shots[0].narration = originalNarration;
+    delete initialShotlist.shots[0].narration;
+    initialShotlist.shots[0].narration_text = originalNarration;
     fs.writeFileSync(initialShotlistPath, JSON.stringify(initialShotlist), 'utf8');
     const initialManifestPath = path.join(compositionDir, 'composition-manifest.json');
     const initialManifest = JSON.parse(fs.readFileSync(initialManifestPath, 'utf8'));
@@ -1435,7 +2199,7 @@ describe('VideoStudio production-state tool protocol', () => {
     const tool = toolMod.createVideoStudioTool(opts);
     const ctx = { workingDir: workspace, state: {} } as any;
     ttsMock.estimateNarrationDuration.mockImplementation((text: string) => ({
-      estimatedSec: text.includes('longer') ? 56 : 48.42,
+      estimatedSec: text.includes('longer') ? 63.01 : 56,
       unit: 'words',
       units: text.includes('longer') ? 101 : 98,
       unitsPerSec: 1,
@@ -1463,11 +2227,11 @@ describe('VideoStudio production-state tool protocol', () => {
         manifest_sha256: sha(manifestPath),
         scaffold_html_sha256: sha(htmlPath),
         backend: 'mock-voice',
-        generic_estimated_duration_sec: 49.62,
+        generic_estimated_duration_sec: 56,
         narration_unit: 'words',
-        narration_units: 101,
+        narration_units: 98,
         audio_sha256: sha(audioPath),
-        measured_duration_sec: 61.584,
+        measured_duration_sec: 53.304,
         started_at: now,
         updated_at: now,
       };
@@ -1481,19 +2245,24 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(parseResult(mismatch.content)).toMatchObject({
       errorCode: 'E_TTS_MEASURED_DURATION_MISMATCH',
       billable_request_sent: false,
-      narration_fit: { status: 'over', source: 'measured_calibration' },
+      narration_fit: { status: 'under', source: 'measured_calibration' },
     });
     const calibrated = await stateMod.readVideoProductionState(statePath, compositionDir);
     expect(calibrated.narration_calibration).toMatchObject({
       backend: 'mock-voice',
-      duration_scale: 1.2411,
-      narration_units: 101,
+      duration_scale: 0.9519,
+      narration_units: 98,
+    });
+    expect(calibrated.narration_repair).toMatchObject({
+      source: 'measured_duration_mismatch',
+      approval_turn_id: 'turn-initial',
+      checks_used: 0,
     });
 
     fs.writeFileSync(path.join(workspace, 'project', 'script.md'), `# Approved script\n\n${revisedNarration}`, 'utf8');
     const shotlistPath = path.join(workspace, 'project', 'shotlist.json');
     const shotlist = JSON.parse(fs.readFileSync(shotlistPath, 'utf8'));
-    shotlist.shots[0].narration = revisedNarration;
+    shotlist.shots[0].narration_text = revisedNarration;
     fs.writeFileSync(shotlistPath, JSON.stringify(shotlist), 'utf8');
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
     manifest.scenes[0].narration_text = revisedNarration;
@@ -1514,8 +2283,8 @@ describe('VideoStudio production-state tool protocol', () => {
       narration_fit: {
         status: 'fits',
         source: 'measured_calibration',
-        generic_estimated_duration_sec: 48.42,
-        estimated_duration_sec: 60.09,
+        generic_estimated_duration_sec: 63.01,
+        estimated_duration_sec: 59.98,
       },
       production_state: {
         stage: 'manifest_ready',
@@ -1526,7 +2295,7 @@ describe('VideoStudio production-state tool protocol', () => {
     const afterApproval = await stateMod.readVideoProductionState(statePath, compositionDir);
     expect(afterApproval.narration_transaction).toBeUndefined();
     expect(afterApproval.narration_repair).toBeUndefined();
-    expect(afterApproval.narration_calibration?.duration_scale).toBe(1.2411);
+    expect(afterApproval.narration_calibration?.duration_scale).toBe(0.9519);
     expect(afterApproval.narration_fit).toMatchObject({ status: 'fits', source: 'measured_calibration' });
     expect(afterApproval.plan_approval).toMatchObject({
       turn_id: 'turn-initial',

@@ -601,6 +601,16 @@ describe('auth › listModels', () => {
     const { models } = await a.listModels('no-such-provider');
     expect(models).toEqual([]);
   });
+
+  it('returns the synchronized GPT-5.6 catalog for OpenAI Codex', async () => {
+    const a = await import('../../../src/main/features/auth');
+    expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-5.5',
+    ]);
+  });
 });
 
 describe('auth › DeepSeek policy gate', () => {

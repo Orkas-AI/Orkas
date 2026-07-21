@@ -107,6 +107,7 @@ export type FrameSampleEvidence = {
   capture_source_width?: number;
   capture_source_height?: number;
   capture_scale_factor?: number;
+  capture_retry_count?: number;
 };
 
 export type FrameEvidence = {
@@ -115,6 +116,26 @@ export type FrameEvidence = {
   frame_paths: string[];
   samples: FrameSampleEvidence[];
 };
+
+/**
+ * Exact pixels are only suspicious when the composition's own semantic
+ * evidence says that a different visible scene was committed. Shared
+ * backgrounds and unchanged scenes are valid, so a matching image hash by
+ * itself must never become a gate.
+ */
+export function isSuspiciousCrossSceneDuplicate(
+  previous: FrameSampleEvidence | undefined,
+  current: FrameSampleEvidence | undefined,
+): boolean {
+  if (!previous || !current || !previous.hash || previous.hash !== current.hash) return false;
+  if (!previous.expected_scene_id || !current.expected_scene_id
+    || previous.expected_scene_id === current.expected_scene_id) return false;
+  const previousScenes = [...(previous.visible_scene_ids || [])].sort().join('\u0000');
+  const currentScenes = [...(current.visible_scene_ids || [])].sort().join('\u0000');
+  const previousText = String(previous.visible_text || '').replace(/\s+/g, ' ').trim();
+  const currentText = String(current.visible_text || '').replace(/\s+/g, ' ').trim();
+  return previousScenes !== currentScenes && previousText !== currentText;
+}
 
 export type DesignReviewInputOptions = {
   contractLoad: JsonLoad;
@@ -836,6 +857,13 @@ function compositionOwnsNarration(contract: unknown, sceneMap: unknown): boolean
   return audioOwnsNarration(audio) || audioOwnsNarration(timelineAudio);
 }
 
+function compositionUsesExternalNarration(contract: unknown, sceneMap: unknown): boolean {
+  const owners = [contractAudio(contract), sceneMapAudio(sceneMap)]
+    .map((audio) => String(audio?.owner || audio?.mode || '').trim().toLowerCase())
+    .filter(Boolean);
+  return owners.some((owner) => owner === 'assemble' || owner === 'assembler' || owner === 'external');
+}
+
 function narrationPathFromAudio(audio: Record<string, unknown> | null): string {
   if (!audio) return '';
   return String(audio.narration || audio.narration_path || audio.path || audio.src || '').trim();
@@ -1469,6 +1497,8 @@ export async function runAudioTimingQa(
   const timelineSelector = path.basename(sceneMapLoad.path) || contractSelector;
   const ownsNarration = compositionOwnsNarration(contract, sceneMap);
   const scenes = extractScenes(sceneMapLoad.value);
+  const narrationRequired = scenes.some((scene) => !!sceneNarrationText(scene))
+    && !compositionUsesExternalNarration(contract, sceneMap);
   const narrationPath = narrationPathFromSources(contract, sceneMap);
   const narrationAbsPath = narrationPath ? resolveCompositionLocalPath(compositionDirAbs, narrationPath) : null;
   const narrationFileExists = narrationAbsPath ? !!(await fs.stat(narrationAbsPath).catch(() => null)) : false;
@@ -1482,12 +1512,21 @@ export async function runAudioTimingQa(
       source: 'orkas-native-audio-timing',
     });
   }
-  if (ownsNarration && (!meta.audioTracks.length || !narrationFileExists)) {
+  if (!narrationRequired && ownsNarration && (!meta.audioTracks.length || !narrationFileExists)) {
     issues.push({
       code: 'NARRATION_DECLARED_BUT_SILENT',
       severity: 'error',
       selector: meta.audioTracks.length ? narrationPath || contractSelector : 'index.html',
       message: 'The canonical manifest declares composition-owned narration, but the composition has no usable narration audio track.',
+      source: 'orkas-native-audio-timing',
+    });
+  }
+  if (narrationRequired && (!ownsNarration || !meta.audioTracks.length || !narrationFileExists)) {
+    issues.push({
+      code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED',
+      severity: 'error',
+      selector: ownsNarration ? narrationPath || contractSelector : contractSelector,
+      message: 'The canonical manifest contains standalone narration text, but its narration audio has not been materialized. Run composition.materialize_narration before preview, draft, or export.',
       source: 'orkas-native-audio-timing',
     });
   }
@@ -1625,7 +1664,8 @@ export async function runAudioTimingQa(
   const errorCount = issues.filter((issue) => issue.severity === 'error').length;
   return {
     ok: errorCount === 0,
-    skipped: !ownsNarration && meta.audioTracks.length === 0,
+    skipped: !narrationRequired && !ownsNarration && meta.audioTracks.length === 0,
+    narration_required: narrationRequired,
     narration_path: narrationPath,
     narration_file_exists: narrationFileExists,
     narration_map_path: narrationMapLoad.path,
@@ -2257,6 +2297,17 @@ export function summarizeVideoFrameQa(
       }
     }
   }
+  for (let i = 1; i < samples.length; i += 1) {
+    if (!isSuspiciousCrossSceneDuplicate(samples[i - 1], samples[i])
+      || Number(samples[i].capture_retry_count || 0) < 1) continue;
+    issues.push({
+      code: 'SCENE_CAPTURE_SEMANTIC_PIXEL_MISMATCH',
+      severity: 'error',
+      sceneId: samples[i].expected_scene_id,
+      message: `Sample "${samples[i].label}" reports a different visible scene from "${samples[i - 1].label}" but captured identical pixels after retry.`,
+      source: 'orkas-native-video-qa',
+    });
+  }
   let runStart = 0;
   for (let i = 1; i <= samples.length; i += 1) {
     const sameAsRun = i < samples.length && samples[i].hash === samples[runStart].hash;
@@ -2266,8 +2317,8 @@ export function summarizeVideoFrameQa(
     if (runLen >= 3 && span >= Math.min(6, Math.max(2, durationSec * 0.35))) {
       issues.push({
         code: 'FROZEN_FRAME_RUN',
-        severity: 'error',
-        message: `${runLen} sampled frames are identical across ${round2(span)}s, indicating a frozen or static draft.`,
+        severity: 'warning',
+        message: `${runLen} sampled frames are identical across ${round2(span)}s. Review the contact sheet for intentionally static or unsampled local motion.`,
         source: 'orkas-native-video-qa',
       });
     }

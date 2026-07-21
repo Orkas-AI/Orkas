@@ -62,13 +62,16 @@ function enumerateAllInjectedTools(): AgentTool[] {
   // core-agent builtins (always merged into AgentRunner's tool map)
   tools.push(...getBuiltinTools());
   tools.push(createExecutionPlanTool({
+    get: () => undefined,
     update: () => ({
       version: 1,
       objective: 'task',
       objectiveTurnId: 1,
       updatedTurnId: 1,
       revision: 1,
-      steps: [{ step: 'work', status: 'in_progress' }],
+      steps: [{ id: 1, step: 'work', status: 'in_progress' }],
+      nextStepId: 2,
+      lastWorkLedgerId: 0,
       updatedAt: 1,
     }),
     clear: () => {},

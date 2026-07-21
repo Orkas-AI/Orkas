@@ -138,7 +138,7 @@ describe('prompts › default singleton', () => {
   });
 
   it('default root points at main/prompts directory', () => {
-    expect(prompts.root).toMatch(/main\/prompts$/);
+    expect(prompts.root).toMatch(/main[\\/]prompts$/);
   });
 });
 

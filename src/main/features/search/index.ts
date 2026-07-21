@@ -132,7 +132,7 @@ export interface SearchResult {
 
 // ── Source readers ──────────────────────────────────────────────────────
 
-interface ChatSourceMessage { content?: unknown; text?: unknown }
+interface ChatSourceMessage { id?: unknown; content?: unknown; text?: unknown }
 
 // Search returns at most 30 chat hits. Read only their source records, group
 // hits by conversation, and cap the number of simultaneously-open JSONLs so a
@@ -462,6 +462,7 @@ export async function searchChats(
   return candidates.map(({ sourceFile, sourceIndex, ...result }) => {
     const msg = sourceRows.get(sourceFile)?.get(sourceIndex);
     result.snippet = _makeSnippet(indexer.readMsgText(msg), q);
+    if (typeof msg?.id === 'string' && msg.id) result.msg_id = msg.id;
     return result;
   });
 }

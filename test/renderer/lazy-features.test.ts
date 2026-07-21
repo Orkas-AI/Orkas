@@ -216,7 +216,20 @@ describe('renderer lazy feature loader', () => {
 
     expect(source).not.toContain('setTimeout(() => { loadLocalCliEntries');
     expect(source).toContain('async function mountExternalCliSelect');
-    expect(source).toContain('const entries = await loadLocalCliEntries()');
+    expect(source).toContain('const entries = await loadLocalCliEntries({ force: true })');
+  });
+
+  it('re-probes local CLI runtimes when an Agent detail selector is rendered', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
+    const start = source.indexOf('async function _renderAgentDetailRuntime');
+    const end = source.indexOf('async function _renderAgentDetailProjectDir', start);
+    const runtimeSelector = source.slice(start, end);
+
+    expect(runtimeSelector).toContain('loadLocalCliEntries({ force: true })');
+    expect(runtimeSelector).toContain('const currentEntry = entries.find');
+    expect(runtimeSelector).toContain('window.getLocalCliUnavailableHint(currentEntry)');
+    expect(runtimeSelector).not.toContain("hint: t('agent.cli_missing')");
   });
 
 });

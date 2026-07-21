@@ -1,6 +1,6 @@
 ---
 name: coding
-description: "Engineering discipline for non-trivial code changes in a real project: ground in the repo's conventions, plan, edit minimally, then verify — cheap checks always, run-it-or-say-you-couldn't, and an adversarial pass for high-stakes work; For: 'implement X', 'fix this bug', 'refactor this module', 'add a feature', 'write tests', 'edit this project's source'; Triggers: implement, fix bug, refactor, add feature, edit code, write tests, change an interface."
+description: "Use for implementing or changing code in an existing project, including features, bug fixes, refactors, interfaces, engineering configuration, build files, and tests. Ground the work in repository guidance and surrounding code, make focused changes, verify proportionately, and review the final diff. Do not use for explanation-only requests or disposable one-line scripts."
 ---
 
 # coding
@@ -27,7 +27,7 @@ Before editing, read the conventions that govern the files you will touch and ob
 
 ## 2. Plan with the structured tool, not prose
 
-For multi-step or multi-file work, use the plan/TODO tool (`plan_set`). Skip planning for the easiest ~25%; never write a single-step plan. Keep exactly one step in progress, mark steps done as you finish them, and do not re-paste the plan after updating it.
+For multi-step or multi-file work, use the durable plan/TODO tool (`manage_execution_plan`). Skip planning for the easiest ~25%; never write a single-step plan. Keep exactly one step in progress, mark steps done as you finish them, and do not re-paste the plan after updating it.
 
 ## 3. Edit minimally
 

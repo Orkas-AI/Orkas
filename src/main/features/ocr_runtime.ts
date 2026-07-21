@@ -85,14 +85,29 @@ type RuntimeVerification =
   | { ok: true }
   | { ok: false; message: string };
 
+let runtimeReadyCache: RuntimeReady | null = null;
+let runtimeEnsureInFlight: Promise<RuntimeResult> | null = null;
+
 function venvDir(): string {
   return pythonPackageVenvDir(OCR_RUNTIME_KEY);
 }
 
-function venvPython(venv = venvDir()): string {
-  return process.platform === 'win32'
+export function _ocrVenvPythonForTest(
+  venv = venvDir(),
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === 'win32'
     ? path.join(venv, 'Scripts', 'python.exe')
     : path.join(venv, 'bin', 'python');
+}
+
+function venvPython(venv = venvDir()): string {
+  return _ocrVenvPythonForTest(venv);
+}
+
+export function _resetOcrRuntimeForTest(): void {
+  runtimeReadyCache = null;
+  runtimeEnsureInFlight = null;
 }
 
 function isFile(p: string): boolean {
@@ -165,7 +180,7 @@ async function verifyRuntime(python: string, onProgress?: ProgressFn): Promise<R
   }
 }
 
-async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
+async function ensureRuntimeUncached(onProgress?: ProgressFn): Promise<RuntimeResult> {
   const venv = venvDir();
   const python = venvPython(venv);
   onProgress?.({ phase: 'ocr_runtime_check', message: 'Checking local OCR runtime' });
@@ -264,6 +279,44 @@ async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
     errorCode: 'E_OCR_INSTALL_FAILED',
     message: `Local OCR runtime installed, but verification failed: ${installedVerification.message}`,
   };
+}
+
+/** Coalesce first-use provisioning and retain a verified positive result.
+ * RapidOCR verification initializes the model, so repeating it before every
+ * OCR call adds substantial latency. The executable existence check keeps the
+ * cache from masking an externally removed venv. */
+export async function _ensureOcrRuntimeForTest(onProgress?: ProgressFn): Promise<RuntimeResult> {
+  if (runtimeReadyCache) {
+    if (isFile(runtimeReadyCache.python)) {
+      onProgress?.({ phase: 'ocr_runtime_ready', message: 'Local OCR runtime is ready' });
+      return { ...runtimeReadyCache, installed: false };
+    }
+    runtimeReadyCache = null;
+  }
+
+  if (runtimeEnsureInFlight) {
+    onProgress?.({ phase: 'ocr_runtime_wait', message: 'Waiting for local OCR runtime preparation' });
+    return runtimeEnsureInFlight;
+  }
+
+  const task = ensureRuntimeUncached(onProgress).then((result) => {
+    if (result.ok) runtimeReadyCache = { ...result, installed: false };
+    return result;
+  });
+  runtimeEnsureInFlight = task;
+  try {
+    return await task;
+  } finally {
+    if (runtimeEnsureInFlight === task) runtimeEnsureInFlight = null;
+  }
+}
+
+async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
+  return _ensureOcrRuntimeForTest(onProgress);
+}
+
+function invalidateRuntimeCache(python: string): void {
+  if (runtimeReadyCache?.python === python) runtimeReadyCache = null;
 }
 
 async function runOcrProcess(
@@ -419,6 +472,7 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
   try {
     stdout = await runOcrProcess(runtime.python, payload, emitProgress, input.signal);
   } catch (err) {
+    if (!input.signal?.aborted) invalidateRuntimeCache(runtime.python);
     log.warn(`ocr failed path=${input.absPath}: ${(err as Error).message}`);
     processLog.push('Local OCR process failed');
     return {
@@ -454,6 +508,7 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
       processLog,
     };
   } catch (err) {
+    invalidateRuntimeCache(runtime.python);
     processLog.push('Local OCR returned invalid output');
     return {
       ok: false,
@@ -499,6 +554,7 @@ export async function ocrImageText(input: {
   try {
     stdout = await runOcrProcess(runtime.python, payload, input.onProgress, input.signal);
   } catch (err) {
+    if (!input.signal?.aborted) invalidateRuntimeCache(runtime.python);
     return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR failed: ${(err as Error).message}` };
   }
   try {
@@ -513,6 +569,7 @@ export async function ocrImageText(input: {
     const page = (parsed.pages && parsed.pages[0]) || {};
     return { ok: true, text: String(page.text || '').trim(), items: Array.isArray(page.items) ? page.items : [] };
   } catch (err) {
+    invalidateRuntimeCache(runtime.python);
     return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR returned invalid output: ${(err as Error).message}` };
   }
 }

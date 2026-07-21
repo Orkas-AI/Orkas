@@ -60,7 +60,7 @@ describe('conversation workspace file listing', () => {
     }
   });
 
-  it('reports a skipped scan for macOS privacy-protected workspace roots', () => {
+  it.runIf(process.platform === 'darwin')('reports a skipped scan for macOS privacy-protected workspace roots', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-conv-files-'));
     try {
       const home = path.join(dir, 'home');

@@ -7,6 +7,10 @@ import { makeMinimalPdf } from '../../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../../fixtures/make-minimal-docx';
 import { makeMinimalXlsx, makeMinimalPptx } from '../../../fixtures/make-minimal-office';
 
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
 const UID = 'u-ftools-001';
 const CID = 'conv-x';
 const PROJECT_ID = 'projfiletools';
@@ -630,7 +634,7 @@ describe('file-tools › search_files', () => {
     expect(r.content).toContain('MOCK_SYNC_CONFLICT.md');
   });
 
-  it('does not recursively scan a legacy privacy-protected workspace root', async () => {
+  it.runIf(process.platform === 'darwin')('does not recursively scan a legacy privacy-protected workspace root', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'home');
     const downloads = path.join(home, 'Downloads');

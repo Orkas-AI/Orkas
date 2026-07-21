@@ -1,8 +1,8 @@
 /**
  * User preferences bag — `<uid>/cloud/config/preferences.json`.
  *
- * Cross-device user preferences (cloud-synced). Currently stores the
- * UI language only (`language` from i18n.SUPPORTED_LANGS).
+ * Cross-device user preferences (cloud-synced), including language,
+ * appearance, feature toggles, and notification preferences.
  *
  * History: the old `data/config/config.json` also held legacy
  * `provider` / `model` fields (the default model pair written by
@@ -201,6 +201,19 @@ export function setGlobalSkillRootsEnabled(enabled: boolean): boolean {
   return !!enabled;
 }
 
+
+// ── Native task notifications ───────────────────────────────────────────
+// Defaults to ON. Notification permission/support remain OS-owned; this is
+// the user's Orkas-level preference and gates the single notification outlet.
+
+export function getTaskNotificationsEnabled(): boolean {
+  return readPreferences().task_notifications_enabled !== false;
+}
+
+export function setTaskNotificationsEnabled(enabled: boolean): boolean {
+  writePreferences({ task_notifications_enabled: !!enabled });
+  return !!enabled;
+}
 
 /** Production wrapper: reads the system locale from Electron's `app`. */
 export function initLanguageFromApp(): Lang {

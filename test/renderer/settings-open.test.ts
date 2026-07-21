@@ -85,7 +85,7 @@ function loadRendererNavigation() {
   const noop = () => undefined;
   const window = {
     addEventListener: noop,
-    orkas: {},
+    orkas: { onPushEvent: noop },
     loadRendererFeature,
   } as any;
   window.window = window;

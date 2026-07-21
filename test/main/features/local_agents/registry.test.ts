@@ -13,10 +13,65 @@ import {
 
 const isWindows = process.platform === 'win32';
 
+function writeMockCli(basePath: string, output: string): string {
+  const binPath = isWindows ? `${basePath}.cmd` : basePath;
+  fs.mkdirSync(path.dirname(binPath), { recursive: true });
+  if (isWindows) {
+    fs.writeFileSync(binPath, `@echo off\r\necho ${output}\r\n`);
+  } else {
+    fs.writeFileSync(binPath, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(output)}\n`);
+    fs.chmodSync(binPath, 0o755);
+  }
+  return binPath;
+}
+
+function writeArgAwareMockCli(
+  basePath: string,
+  outputs: Partial<Record<'version' | '--version', string>>,
+): string {
+  const binPath = isWindows ? `${basePath}.cmd` : basePath;
+  fs.mkdirSync(path.dirname(binPath), { recursive: true });
+  if (isWindows) {
+    const lines = ['@echo off'];
+    for (const [arg, output] of Object.entries(outputs)) {
+      lines.push(
+        `if "%~1"=="${arg}" (`,
+        `  echo ${output}`,
+        '  exit /b 0',
+        ')',
+      );
+    }
+    lines.push('echo unsupported version probe', 'exit /b 2', '');
+    fs.writeFileSync(binPath, lines.join('\r\n'));
+  } else {
+    const lines = ['#!/bin/sh', 'case "$1" in'];
+    for (const [arg, output] of Object.entries(outputs)) {
+      lines.push(
+        `  ${arg})`,
+        `    printf '%s\\n' ${JSON.stringify(output)}`,
+        '    ;;',
+      );
+    }
+    lines.push(
+      '  *)',
+      "    printf '%s\\n' 'unsupported version probe'",
+      '    exit 2',
+      '    ;;',
+      'esac',
+      '',
+    );
+    fs.writeFileSync(binPath, lines.join('\n'));
+    fs.chmodSync(binPath, 0o755);
+  }
+  return binPath;
+}
+
 describe('local_agents/registry', () => {
   let tmpDir: string;
   let savedPath: string | undefined;
   let savedHome: string | undefined;
+  let savedUserProfile: string | undefined;
+  let savedPathExt: string | undefined;
   let savedFileLevel: unknown;
   let savedEnvOverrides: Record<string, string | undefined> = {};
 
@@ -26,13 +81,22 @@ describe('local_agents/registry', () => {
     'ORKAS_OPENCLAW_PATH',
     'ORKAS_OPENCODE_PATH',
     'ORKAS_HERMES_PATH',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'VOLTA_HOME',
+    'PNPM_HOME',
+    'NVM_SYMLINK',
   ];
 
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-registry-'));
     savedPath = process.env.PATH;
     savedHome = process.env.HOME;
+    savedUserProfile = process.env.USERPROFILE;
+    savedPathExt = process.env.PATHEXT;
     process.env.HOME = path.join(tmpDir, 'home');
+    process.env.USERPROFILE = process.env.HOME;
+    if (isWindows) process.env.PATHEXT = '.CMD;.EXE;.BAT';
     fs.mkdirSync(process.env.HOME, { recursive: true });
     fs.mkdirSync(path.join(process.env.HOME, 'Library', 'Logs', 'orkas'), { recursive: true });
     savedFileLevel = log.transports.file.level;
@@ -42,6 +106,8 @@ describe('local_agents/registry', () => {
       savedEnvOverrides[k] = process.env[k];
       delete process.env[k];
     }
+    process.env.APPDATA = path.join(process.env.HOME, 'AppData', 'Roaming');
+    process.env.LOCALAPPDATA = path.join(process.env.HOME, 'AppData', 'Local');
     invalidateCache();
   });
 
@@ -49,13 +115,17 @@ describe('local_agents/registry', () => {
     process.env.PATH = savedPath;
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
+    if (savedUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = savedUserProfile;
+    if (savedPathExt === undefined) delete process.env.PATHEXT;
+    else process.env.PATHEXT = savedPathExt;
     log.transports.file.level = savedFileLevel as any;
     for (const k of ENV_KEYS) {
       const v = savedEnvOverrides[k];
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     invalidateCache();
   });
 
@@ -75,32 +145,25 @@ describe('local_agents/registry', () => {
   });
 
   it('honors ORKAS_<TYPE>_PATH override', async () => {
-    if (isWindows) return; // covered by which.test.ts on Windows
-    const fake = path.join(tmpDir, 'my-claude');
+    const fake = writeMockCli(path.join(tmpDir, 'my-claude'), '2.0.0');
     // Print a version that satisfies the claude minimum so it ends up "available".
-    fs.writeFileSync(fake, '#!/bin/sh\necho "2.0.0"\n');
-    fs.chmodSync(fake, 0o755);
     process.env.PATH = '';
     process.env.ORKAS_CLAUDE_PATH = fake;
 
     const r = await detectOne('claude');
-    expect(r.path).toBe(fake);
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? fake.toLowerCase() : fake);
     expect(r.version).toBe('2.0.0');
     expect(r.available).toBe(true);
     expect(r.error).toBeUndefined();
   });
 
   it('finds Codex in the standalone default ~/.local/bin even when PATH omits it', async () => {
-    if (isWindows) return;
     const binDir = path.join(process.env.HOME!, '.local', 'bin');
-    fs.mkdirSync(binDir, { recursive: true });
-    const fake = path.join(binDir, 'codex');
-    fs.writeFileSync(fake, '#!/bin/sh\necho "codex-cli 0.139.0"\n');
-    fs.chmodSync(fake, 0o755);
-    process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+    const fake = writeMockCli(path.join(binDir, 'codex'), 'codex-cli 0.139.0');
+    process.env.PATH = '';
 
     const r = await detectOne('codex');
-    expect(r.path).toBe(fake);
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? fake.toLowerCase() : fake);
     expect(r.version).toBe('0.139.0');
     expect(r.available).toBe(true);
   });
@@ -127,10 +190,7 @@ describe('local_agents/registry', () => {
   });
 
   it('marks version_too_old when below minimum', async () => {
-    if (isWindows) return;
-    const fake = path.join(tmpDir, 'old-claude');
-    fs.writeFileSync(fake, '#!/bin/sh\necho "1.5.0"\n');
-    fs.chmodSync(fake, 0o755);
+    const fake = writeMockCli(path.join(tmpDir, 'old-claude'), '1.5.0');
     process.env.PATH = '';
     process.env.ORKAS_CLAUDE_PATH = fake;
 
@@ -141,10 +201,7 @@ describe('local_agents/registry', () => {
   });
 
   it('marks version_unknown when --version output has no semver', async () => {
-    if (isWindows) return;
-    const fake = path.join(tmpDir, 'mute-cli');
-    fs.writeFileSync(fake, '#!/bin/sh\necho "no version"\n');
-    fs.chmodSync(fake, 0o755);
+    const fake = writeMockCli(path.join(tmpDir, 'mute-cli'), 'no version');
     process.env.PATH = '';
     process.env.ORKAS_OPENCODE_PATH = fake;
 
@@ -154,11 +211,37 @@ describe('local_agents/registry', () => {
     expect(r.path).toBe(fake);
   });
 
+  it('uses the documented version subcommand for Hermes', async () => {
+    const fake = writeArgAwareMockCli(path.join(tmpDir, 'hermes'), {
+      version: 'Hermes Agent v0.18.2',
+      '--version': 'Hermes Agent v9.9.9',
+    });
+    process.env.PATH = '';
+    process.env.ORKAS_HERMES_PATH = fake;
+
+    const r = await detectOne('hermes');
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? fake.toLowerCase() : fake);
+    expect(r.version).toBe('0.18.2');
+    expect(r.available).toBe(true);
+    expect(r.error).toBeUndefined();
+  });
+
+  it('falls back to --version for Hermes installations without the version subcommand', async () => {
+    const fake = writeArgAwareMockCli(path.join(tmpDir, 'legacy-hermes'), {
+      '--version': 'Hermes Agent v0.17.0',
+    });
+    process.env.PATH = '';
+    process.env.ORKAS_HERMES_PATH = fake;
+
+    const r = await detectOne('hermes');
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? fake.toLowerCase() : fake);
+    expect(r.version).toBe('0.17.0');
+    expect(r.available).toBe(true);
+    expect(r.error).toBeUndefined();
+  });
+
   it('detectAll caches results within the TTL window', async () => {
-    if (isWindows) return;
-    const fake = path.join(tmpDir, 'ok-opencode');
-    fs.writeFileSync(fake, '#!/bin/sh\necho "0.10.0"\n');
-    fs.chmodSync(fake, 0o755);
+    const fake = writeMockCli(path.join(tmpDir, 'ok-opencode'), '0.10.0');
     process.env.PATH = '';
     process.env.ORKAS_OPENCODE_PATH = fake;
 
@@ -196,6 +279,26 @@ describe('local_agents/registry › Windows GUI search paths', () => {
       'D:\\pnpm',
       'C:\\Program Files\\nodejs',
       'C:\\Users\\alice\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin',
+    ]));
+  });
+});
+
+describe('local_agents/registry › macOS GUI search paths', () => {
+  it('covers user npm installs and bundled Codex app locations', () => {
+    const dirs = localCliSearchDirs('codex', 'darwin', {
+      NPM_CONFIG_PREFIX: '/Users/user/custom-npm',
+      VOLTA_HOME: '/Users/user/.volta',
+      PNPM_HOME: '/Users/user/Library/pnpm',
+    }, '/Users/user');
+
+    expect(dirs).toEqual(expect.arrayContaining([
+      '/Users/user/.local/bin',
+      '/Users/user/.npm-global/bin',
+      '/Users/user/custom-npm/bin',
+      '/Users/user/.volta/bin',
+      '/Users/user/Library/pnpm',
+      '/Applications/Codex.app/Contents/Resources',
+      '/Applications/ChatGPT.app/Contents/Resources',
     ]));
   });
 });

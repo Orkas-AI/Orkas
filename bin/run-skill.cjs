@@ -585,7 +585,10 @@ function trySpawn(cmd, argv, skillDir, skillId, fatalOnEnoent = false) {
     if (e && e.code === 'ENOENT' && !fatalOnEnoent) return; // caller will retry
     die(76, `failed to spawn ${cmd}: ${e && e.message}`, { cmd, argv });
   });
-  child.on('exit', (code, signal) => {
+  // `close` follows `exit` after inherited stdio and OS process handles are
+  // released. Exiting the runner on `exit` left freshly executed .exe files
+  // and temporary skill directories briefly locked on Windows.
+  child.on('close', (code, signal) => {
     if (signal) process.kill(process.pid, signal);
     process.exit(code == null ? 1 : code);
   });

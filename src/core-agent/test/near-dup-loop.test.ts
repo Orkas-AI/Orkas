@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   normalizedToolCallSignature,
   NEAR_DUP_LOOP_WARN,
+  NEAR_DUP_LOOP_HARD,
   LOOP_HARD,
 } from "../src/agent/runner.js";
 
@@ -10,6 +11,7 @@ const sig = (name: string, input: unknown) => normalizedToolCallSignature({ name
 describe("normalizedToolCallSignature (near-duplicate loop detection)", () => {
   it("fires only after the exact detector could (threshold above LOOP_HARD)", () => {
     expect(NEAR_DUP_LOOP_WARN).toBeGreaterThan(LOOP_HARD);
+    expect(NEAR_DUP_LOOP_HARD).toBeGreaterThan(NEAR_DUP_LOOP_WARN);
   });
 
   describe("MATCH — collapses calls that differ only in volatile id/timestamp fields", () => {

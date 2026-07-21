@@ -3,6 +3,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { makeMinimalPptx, makeMinimalXlsx } from '../../fixtures/make-minimal-office';
+import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
 
 /**
  * contexts.ts tests for the single-region user-owned model. Mocks
@@ -46,7 +51,8 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await drainMainRuntimeForTest();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -264,6 +270,51 @@ describe('contexts › content-level dedup', () => {
 });
 
 describe('contexts › uploadContextFile', () => {
+  it('imports a local file by path without a base64/Buffer IPC copy', async () => {
+    const source = path.join(tmpDir, 'picked.md');
+    fs.writeFileSync(source, '# imported by path', 'utf8');
+    const c = await loadContexts();
+
+    const result = await c.importContextFileFromPath('imports/picked.md', source);
+
+    expect(result).toMatchObject({ ok: true, path: 'imports/picked.md' });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'imports', 'picked.md'), 'utf8')).toBe('# imported by path');
+    expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'imports/picked.md', op: 'upsert' });
+  });
+
+  it('serializes path imports so concurrent identical content is rejected once', async () => {
+    const first = path.join(tmpDir, 'first.md');
+    const second = path.join(tmpDir, 'second.md');
+    fs.writeFileSync(first, 'same imported content', 'utf8');
+    fs.writeFileSync(second, 'same imported content', 'utf8');
+    const c = await loadContexts();
+
+    const [a, b] = await Promise.all([
+      c.importContextFileFromPath('a.md', first),
+      c.importContextFileFromPath('b.md', second),
+    ]);
+
+    expect([a.ok, b.ok].sort()).toEqual([false, true]);
+    expect([a, b].find((result) => !result.ok)).toMatchObject({ code: 'duplicate_content' });
+  });
+
+  it('rejects a symlinked target directory', async () => {
+    const source = path.join(tmpDir, 'source.md');
+    const outside = path.join(tmpDir, 'outside');
+    fs.writeFileSync(source, 'must stay inside Library', 'utf8');
+    fs.mkdirSync(ctxRoot(), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    // A directory junction exercises the Windows reparse-point path without
+    // requiring Developer Mode or elevated symbolic-link privileges.
+    fs.symlinkSync(outside, path.join(ctxRoot(), 'linked'), process.platform === 'win32' ? 'junction' : 'dir');
+    const c = await loadContexts();
+
+    const result = await c.importContextFileFromPath('linked/escape.md', source);
+
+    expect(result).toMatchObject({ ok: false, code: 'E_IMPORT_TARGET_SYMLINK' });
+    expect(fs.existsSync(path.join(outside, 'escape.md'))).toBe(false);
+  });
+
   it('accepts pdf bytes', async () => {
     const c = await loadContexts();
     const r = c.uploadContextFile('doc.pdf', Buffer.from('%PDF-1.4\n'));

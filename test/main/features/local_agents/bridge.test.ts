@@ -18,6 +18,19 @@ vi.mock('../../../../src/main/features/kb_embed', () => ({
   closeEmbedder: () => {},
 }));
 
+// Re-importing the production logger for every isolated workspace leaves an
+// electron-log file transport alive until the worker exits. On Windows that
+// permanently locks the previous case's temp tree, so bridge behavior tests
+// use a handle-free logger double.
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  }),
+}));
+
 // orkas-bridge host: socket auth + skills surface + KB scope + permission gate.
 // Connector methods are covered by their own feature tests; here we pin the
 // bridge-specific contracts (token, path discipline, scope plumbing, gating).
@@ -79,11 +92,13 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const kb = await import('../../../../src/main/features/kb_vector');
+  kb.closeAllKb();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 async function startTestBridge(opts: { projectId?: string } = {}) {

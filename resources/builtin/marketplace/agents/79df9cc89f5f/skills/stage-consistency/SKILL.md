@@ -80,5 +80,5 @@ A story multiplies billable calls (portraits per character + clips per shot + ca
 ## Rules & boundary
 
 - **The anchor is sacred**: a character's front portrait is generated once and reused; never silently regenerate it (that's how looks drift).
-- **Cost discipline**: portraits + per-shot generation are billable; represent every provider call as one signed generate segment, state the exact count at Gate C, call `production.approve_generation`, and pass the owning plan/segment metadata to every generate tool call.
+- **Cost discipline**: portraits + per-shot generation are billable; represent every provider call as one signed generate segment, state the exact count in the Gate C evidence supplied to `gate-control`, and pass the owning approved plan/segment metadata to every generate tool call.
 - This skill is the consistency METHOD; it does not itself author HTML (composition skill) or cut user footage (editing skill). It sits on top of the generation line.

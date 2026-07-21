@@ -19,6 +19,13 @@ import { invalidateFileCache } from './file_indexer';
 import { projectExists } from './projects';
 import * as projectLibraryIndexer from './project_library_indexer';
 import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
+import {
+  assertLocalImportTarget,
+  copyLocalFileAtomic,
+  inspectLocalImportSource,
+  withLocalImportLock,
+} from '../util/file-import';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('project_files');
 
@@ -406,6 +413,67 @@ export async function uploadProjectFile(
   _notifyDirty(userId, pid);
   log.info(`upload user=${userId} pid=${pid} name=${info.relPath} kind=${info.kind} bytes=${info.bytes}`);
   return { ok: true, info };
+}
+
+/** Import a user-selected local file via async filesystem copy, not base64 IPC. */
+export async function importProjectFileFromPath(
+  userId: string,
+  projectId: string,
+  name: string,
+  sourceAbs: string,
+): Promise<Result<{ info: ProjectFileInfo }>> {
+  const startedAt = Date.now();
+  let safeName: string;
+  let pid: string;
+  let dir: string;
+  try {
+    safeName = safeFileName(name);
+    pid = safeProjectId(projectId);
+    dir = await ensureProjectFilesDir(userId, pid);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  try {
+    const source = await inspectLocalImportSource(sourceAbs, maxBytesFor(safeName));
+    if (TEXT_EXTS.has(path.extname(safeName).toLowerCase())) {
+      // Text caps are small; validate UTF-8 without bringing large Office/PDF
+      // payloads back into the main-process heap.
+      const text = await fsp.readFile(sourceAbs, 'utf8');
+      if (Buffer.byteLength(text, 'utf8') !== source.bytes) {
+        return { ok: false, error: t('errors.not_utf8') };
+      }
+    }
+    const info = await withLocalImportLock(`project:${userId}:${pid}`, async () => {
+      const parent = path.dirname(safeName);
+      const targetDir = parent === '.' ? dir : resolveUnder(dir, parent);
+      const target = uniqueTarget(targetDir, path.basename(safeName));
+      await assertLocalImportTarget(dir, target);
+      await fsp.mkdir(targetDir, { recursive: true });
+      await copyLocalFileAtomic(source.absPath, target, source);
+      const imported = infoFor(target, dir);
+      if (!imported) throw Object.assign(new Error('write failed'), { code: 'E_IMPORT_PUBLISH' });
+      projectLibraryIndexer.enqueue(userId, pid, imported.relPath, 'upsert');
+      _notifyDirty(userId, pid);
+      return imported;
+    });
+    log.info('imported local project library file', {
+      user_id: maskId(userId),
+      project_id: maskId(pid),
+      path: logPathRef(info.relPath),
+      kind: info.kind,
+      bytes: info.bytes,
+      duration_ms: Date.now() - startedAt,
+    });
+    return { ok: true, info };
+  } catch (err) {
+    log.warn('local project library file import failed', {
+      user_id: maskId(userId),
+      project_id: maskId(pid),
+      path: logPathRef(safeName),
+      duration_ms: Date.now() - startedAt,
+      error: logErrorSummary(err),
+    });
+    return { ok: false, error: (err as Error).message || String(err) };
+  }
 }
 
 export async function createProjectDir(
