@@ -11993,6 +11993,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   gap: 12px;
   margin-bottom: 10px;
 }
+.settings-row[hidden] { display: none !important; }
 .settings-row:last-child { margin-bottom: 0; }
 .settings-row > label {
   flex: 0 0 80px;

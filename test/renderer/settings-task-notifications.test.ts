@@ -8,6 +8,7 @@ const settingsSource = readFileSync(
   'utf8',
 );
 const htmlSource = readFileSync(resolve(__dirname, '../../src/renderer/index.html'), 'utf8');
+const styleSource = readFileSync(resolve(__dirname, '../../src/renderer/style.css'), 'utf8');
 
 function loadHarness(
   setResult: { ok: boolean; enabled?: boolean; error?: string; code?: string },
@@ -97,6 +98,12 @@ function loadHarness(
 describe('Settings → General task notification toggle', () => {
   it('renders checked by default in markup', () => {
     expect(htmlSource).toMatch(/id="settings-task-notifications-toggle" checked/);
+  });
+
+  it('keeps a non-actionable permission row actually hidden', () => {
+    expect(styleSource).toMatch(
+      /\.settings-row\[hidden\]\s*{[^}]*display:\s*none\s*!important\s*;/s,
+    );
   });
 
   it('loads the persisted value and saves a user change', async () => {
@@ -203,6 +210,18 @@ describe('Settings → General task notification toggle', () => {
     const { sandbox, warning } = loadHarness(
       { ok: true },
       { state: 'denied', can_open_settings: true },
+    );
+    await sandbox._settingsRefreshTaskNotifications();
+    sandbox._settingsRenderTaskNotifications();
+
+    expect(warning.hidden).toBe(true);
+  });
+
+  it('does not present a permission that has never been requested as disabled', async () => {
+    const { sandbox, warning } = loadHarness(
+      { ok: true },
+      { state: 'not_determined', can_open_settings: true },
+      true,
     );
     await sandbox._settingsRefreshTaskNotifications();
     sandbox._settingsRenderTaskNotifications();
