@@ -1352,10 +1352,27 @@
 
   <!-- Add-account modal (settings page) -->
   <div class="modal-overlay" id="add-account-modal">
-    <div class="modal add-account-modal">
-      <h3 id="add-account-title" data-i18n="add_account.title">Add account</h3>
-      <div class="add-account-body" id="add-account-body"></div>
+    <div class="modal add-account-modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="add-account-title">
+      <h3 class="modal-title" id="add-account-title" data-i18n="add_account.title">Add account</h3>
+      <div class="modal-body add-account-body" id="add-account-body"></div>
       <div class="modal-actions" id="add-account-actions"></div>
+    </div>
+  </div>
+
+  <!-- OAuth login flow modal -->
+  <div class="modal-overlay" id="oauth-flow-modal">
+    <div class="modal oauth-flow-modal modal-standard" role="dialog" aria-modal="true" aria-labelledby="oauth-flow-title">
+      <div class="modal-header">
+        <h3 class="modal-title" id="oauth-flow-title" data-i18n="oauth_flow.title">OAuth sign-in</h3>
+        <button type="button" class="modal-close-btn oauth-flow-close-btn" id="oauth-flow-close-btn"
+                data-i18n-title="common.close" title="Close"
+                data-i18n-aria-label="common.close" aria-label="Close">
+          <span data-ui-icon="x" data-ui-icon-class="modal-close-icon"></span>
+        </button>
+      </div>
+      <div class="modal-body oauth-flow-body" id="oauth-flow-body">
+        <div class="oauth-flow-stage" data-i18n="oauth_flow.preparing">Preparing authorization…</div>
+      </div>
     </div>
   </div>
 
