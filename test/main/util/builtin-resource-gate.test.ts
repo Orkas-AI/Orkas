@@ -10,7 +10,14 @@ const gate = require('../../../bin/builtin-resource-gate.cjs') as {
     files: unknown[];
     inventory: {
       system_skills: unknown[];
-      marketplace_agents: Array<{ id: string; skill_list: string[]; embedded_skills: string[] }>;
+      marketplace_agents: Array<{
+        id: string;
+        icon: string;
+        color: string;
+        updated_at: string;
+        skill_list: string[];
+        embedded_skills: string[];
+      }>;
       marketplace_skills: Array<{ id: string }>;
     };
   };
@@ -50,6 +57,9 @@ describe('builtin-resource-gate', () => {
     expect(manifest.inventory.marketplace_agents)
       .toContainEqual(expect.objectContaining({
         id: '78900d8758bc',
+        icon: 'search',
+        color: 'sky',
+        updated_at: '2026-07-14T15:17:44',
         skill_list: expect.arrayContaining(['e7f5c0e6f1be']),
       }));
     expect(manifest.inventory.marketplace_agents)
@@ -121,6 +131,18 @@ describe('builtin-resource-gate', () => {
     fs.writeFileSync(file, `${JSON.stringify(agent, null, 2)}\n`);
 
     expect(() => gate.createBuiltinManifest(root)).toThrow(/references missing skill missing-skill/);
+  });
+
+  it('rejects an agent whose avatar or freshness metadata cannot drive an upgrade', () => {
+    const root = copyBuiltin();
+    const file = path.join(root, 'marketplace', 'agents', '78900d8758bc', 'agent.json');
+    const agent = JSON.parse(fs.readFileSync(file, 'utf8'));
+    delete agent.icon;
+    agent.updated_at = 'not-a-date';
+    fs.writeFileSync(file, `${JSON.stringify(agent, null, 2)}\n`);
+
+    expect(() => gate.createBuiltinManifest(root))
+      .toThrow(/invalid id\/name\/version\/icon\/color\/update metadata/);
   });
 
   it('allows ignored source caches but rejects them from a copied application', () => {

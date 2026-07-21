@@ -676,6 +676,9 @@
         "id": "78900d8758bc",
         "name": "DeepResearcher",
         "version": "1.0.6",
+        "icon": "search",
+        "color": "sky",
+        "updated_at": "2026-07-14T15:17:44",
         "skill_list": [
           "6743aa0797a2",
           "9be6fda271a5",
@@ -688,6 +691,9 @@
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
         "version": "1.1.15",
+        "icon": "film",
+        "color": "violet",
+        "updated_at": "2026-07-20T15:23:23.000Z",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
@@ -723,6 +729,9 @@
         "id": "bcfcb4921dce",
         "name": "UIDesigner",
         "version": "1.3.1",
+        "icon": "palette",
+        "color": "violet",
+        "updated_at": "2026-07-17T06:59:13.000Z",
         "skill_list": [
           "ui-artifact-workspace",
           "ui-color",
@@ -758,6 +767,9 @@
         "id": "e064dca9e1bd",
         "name": "SeoGeoAgent",
         "version": "1.0.2",
+        "icon": "target",
+        "color": "gold",
+        "updated_at": "2026-07-04T00:00:00",
         "skill_list": [
           "geo-probe",
           "geo-score",

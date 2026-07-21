@@ -283,8 +283,11 @@ function marketplaceAgentInventory(root, standaloneSkills) {
     const agent = readJson(`builtin marketplace agent ${id}`, path.join(dir, 'agent.json'));
     const name = typeof agent.name === 'string' ? agent.name.trim() : '';
     const version = typeof agent.version === 'string' ? agent.version.trim() : '';
-    if (agent.agent_id !== id || !name || !version) {
-      throw new Error(`[builtin-resource-gate] invalid id/name/version for builtin marketplace agent ${id}`);
+    const icon = typeof agent.icon === 'string' ? agent.icon.trim() : '';
+    const color = typeof agent.color === 'string' ? agent.color.trim() : '';
+    const updatedAt = typeof agent.updated_at === 'string' ? agent.updated_at.trim() : '';
+    if (agent.agent_id !== id || !name || !version || !icon || !color || !updatedAt || !Number.isFinite(Date.parse(updatedAt))) {
+      throw new Error(`[builtin-resource-gate] invalid id/name/version/icon/color/update metadata for builtin marketplace agent ${id}`);
     }
     if (!Array.isArray(agent.skill_list) || agent.skill_list.some((item) => typeof item !== 'string' || !item.trim())) {
       throw new Error(`[builtin-resource-gate] builtin marketplace agent ${id} skill_list must be a string array`);
@@ -303,7 +306,16 @@ function marketplaceAgentInventory(root, standaloneSkills) {
         throw new Error(`[builtin-resource-gate] builtin marketplace agent ${id} references missing skill ${skill}`);
       }
     }
-    rows.push({ id, name, version, skill_list: [...skillList].sort(), embedded_skills: embeddedSkills });
+    rows.push({
+      id,
+      name,
+      version,
+      icon,
+      color,
+      updated_at: updatedAt,
+      skill_list: [...skillList].sort(),
+      embedded_skills: embeddedSkills,
+    });
   }
   exactNames(
     'required builtin marketplace agent inventory',
