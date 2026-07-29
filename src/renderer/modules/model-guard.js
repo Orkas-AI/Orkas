@@ -7,8 +7,8 @@
 //      call before firing an LLM-backed request — it short-circuits with
 //      an alert + settings redirect when the user hasn't configured a
 //      model yet, so every action path fails the same way.
-// Refreshed at boot and after each successful `auth.addEntry` in the
-// settings page.
+// Refreshed at boot and after Settings reloads following a successful
+// credential/entry transaction, OAuth entry creation, repair, or deletion.
 
 const _guardLog = createLogger('model-guard');
 
@@ -37,7 +37,7 @@ function _ensureGuardBanner() {
     if (typeof setView === 'function') setView('settings');
     // Drop the user straight on the 配置 (Credentials) tab — that's where
     // the model-auth UI lives now (Phase 4 4-tab restructure).
-    if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+    _activateModelCredentialsTab();
   });
   // Keep this one in sync when user toggles language.
   window.addEventListener('i18n-change', () => {
@@ -157,7 +157,27 @@ function ensureModelConfigured(opts = {}) {
       else window.alert(msg);
     } catch (_) { /* swallow — alert is best-effort */ }
     if (typeof setView === 'function') setView('settings');
-    if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
+    _activateModelCredentialsTab();
   }
   return false;
+}
+
+function _activateModelCredentialsTab() {
+  const activate = () => {
+    if (typeof window.activateSettingsTab !== 'function') return false;
+    window.activateSettingsTab('credentials');
+    return true;
+  };
+  // Settings can be initialized lazily by setView(). Its first render uses
+  // the default Account tab. Wait for the owning feature when necessary,
+  // then repeat on the next turn to win its initial-render race.
+  if (!activate()) {
+    const load = (typeof loadRendererFeature === 'function')
+      ? loadRendererFeature
+      : window.loadRendererFeature;
+    if (typeof load === 'function') {
+      Promise.resolve(load('settings')).then(activate).catch(() => {});
+    }
+  }
+  setTimeout(activate, 0);
 }

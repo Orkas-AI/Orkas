@@ -2,6 +2,17 @@
 
 Use APA 7 unless the user requests another citation style.
 
+Citation presence is not claim support. Before delivery, require:
+
+1. The cited source was actually fetched.
+2. The quoted text appears in that source.
+3. The quote is materially about the claim rather than merely sharing a source.
+4. The quote does not contradict or narrow the drafted wording.
+
+The deterministic citation script checks 1–2 and a conservative lexical
+alignment gate for 3. It cannot prove semantic entailment, so the agent must
+review 3–4 and weaken or remove any claim whose support remains uncertain.
+
 ## In-text citations
 
 Use author-date citations:

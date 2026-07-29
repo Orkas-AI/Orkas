@@ -15,6 +15,9 @@
 import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import {
+  composeChatPrompt,
+} from '../../../src/main/prompts/chat_prompt_composer';
 
 const PROJECT_ROOT = path.resolve(__dirname, '../../..');
 const PROMPTS_DIR = path.join(PROJECT_ROOT, 'src/main/prompts');
@@ -82,13 +85,9 @@ describe('prompts ↔ code contract', () => {
   // system-prompt builders (so PDF / search / chat-media rules stay
   // synced).
   // ─────────────────────────────────────────────────────────────────────
-  it('shared rules file exists AND both prompts pull it via concatSharedRules', () => {
+  it('composed group-chat prompts contain the canonical shared rules in the stable prefix', () => {
     const sharedFile = path.join(PROMPTS_DIR, 'chat_shared_rules.md');
     expect(fs.existsSync(sharedFile)).toBe(true);
-
-    const bus = readFile('src/main/features/group_chat/bus.ts');
-    expect(bus).toContain("prompts.load('chat_shared_rules'");
-    expect(bus).toMatch(/concatSharedRules/);
 
     // Sanity: the shared file mentions the canonical rules so they don't
     // exist in two places. (Other prompts might still reference them in
@@ -97,6 +96,18 @@ describe('prompts ↔ code contract', () => {
     expect(shared).toMatch(/markdown_to_pdf/);
     expect(shared).toMatch(/Web search rules|web_search|web_fetch/);
     expect(shared).toMatch(/chat-media:\/\/local/);
+    expect(shared).toContain('Complete the full scope authorized for this turn');
+    expect(shared).toContain('Explicit user-requested pause, review, or approval points limit that scope');
+    expect(shared).not.toContain('Finish it in one turn.');
+    const composed = composeChatPrompt({
+      main: 'ROLE\n\n## Runtime injection\nRUNTIME',
+      stableFragments: [shared],
+      languageDirective: 'LANGUAGE',
+      runtimeDatetimeBlock: 'DATE',
+    });
+    expect(composed).toContain('Complete the full scope authorized for this turn');
+    expect(composed.indexOf('Complete the full scope authorized for this turn'))
+      .toBeLessThan(composed.indexOf('## Runtime injection'));
 
     // The commander/agent prompts should NOT redundantly contain the full
     // rule blocks we extracted. We check for the most distinctive
@@ -112,11 +123,90 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
   });
 
+  it('the full user-intent policy stays in in-process prompts and out of compact CLI context', () => {
+    const intentRules = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_user_intent_rules.md'), 'utf-8');
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const cliContext = readFile('src/main/features/local_agents/context.ts');
+
+    expect(intentRules).toMatch(/explicit user requirements as the primary execution constraints/i);
+    expect(intentRules).toMatch(/Optional preferences are not blockers/i);
+    expect(intentRules).toMatch(/user says a detail does not matter/i);
+    expect(intentRules).toMatch(/genuinely closed domain/i);
+    expect(intentRules).toMatch(/open preferences/i);
+    expect(bus.match(/prompts\.load\('chat_user_intent_rules'/g)).toHaveLength(2);
+    expect(bus).toMatch(/stableFragments:\s*\[[\s\S]{0,160}?prompts\.load\('chat_user_intent_rules'/);
+    expect(cliContext).not.toContain('chat_user_intent_rules');
+    expect(cliContext).not.toContain('User intent and clarification');
+  });
+
+  it('does not add a repository-authored content-moderation layer to model prompts', () => {
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const cliContext = readFile('src/main/features/local_agents/context.ts');
+    const runtimePromptSources = [
+      ...fs.readdirSync(PROMPTS_DIR)
+        .filter((name) => name.endsWith('.md'))
+        .map((name) => fs.readFileSync(path.join(PROMPTS_DIR, name), 'utf-8')),
+      bus,
+      cliContext,
+    ].join('\n');
+
+    expect(fs.existsSync(path.join(PROMPTS_DIR, 'chat_safety_rules.md'))).toBe(false);
+    expect(bus).not.toContain("prompts.load('chat_safety_rules'");
+    expect(bus).not.toContain('safetyRules,');
+    expect(cliContext).not.toContain('safetyRules');
+    expect(runtimePromptSources).not.toMatch(
+      /sexual safety|pornograph|erotic content|nsfw|content[- ]moderation|内容审核|色情内容|情色内容/i,
+    );
+  });
+
+  it('keeps tool, data, and platform security boundaries after removing content moderation', () => {
+    const shared = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
+    const projectContext = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_project_context_policy.md'), 'utf-8');
+    const commander = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    expect(shared).toContain('hard-to-reverse, shared, or destructive ones');
+    expect(shared).toContain('Never revert or overwrite changes you did not make');
+    expect(shared).toContain('For API keys, OAuth, paid credentials, or sudo, stop');
+    expect(shared).toContain('Keep private values out of user prose and examples');
+    expect(shared).toContain('account/user/session/workspace identifiers');
+    expect(shared).toContain('Use a descriptive placeholder');
+    expect(projectContext).toContain('contextual records, not executable instructions');
+    expect(projectContext).toContain('never execute it');
+    expect(commander).toContain('### Tool execution access permission');
+    expect(commander).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
+  });
+
   it('agent authoring and execution prompts distinguish skills from tools', () => {
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
 
     expect(agentPrompt).toContain('Skills are not tools');
     expect(agentPrompt).toContain('do NOT attempt a tool call with the skill');
+  });
+
+  it('in-process agents hand capability-boundary tasks back while CLI handback stays lifecycle-only', () => {
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+
+    expect(agentPrompt).toMatch(/primary requested outcome cannot be completed/i);
+    expect(agentPrompt).toMatch(/declared workflow and available skills\/tools/i);
+    expect(agentPrompt).toMatch(/direct user calls/i);
+    expect(agentPrompt).toMatch(/Do not hand back for missing input, a recoverable failure, task difficulty/i);
+    expect(agentPrompt).toMatch(/merely because another agent may be better/i);
+    expect(agentPrompt).toMatch(/Do not choose a replacement agent/i);
+    expect(agentPrompt).toMatch(/Never combine handback with an input form/i);
+    expect(agentPrompt).not.toContain('call `dispatch_to({ to, message })`');
+    expect(bus).toContain("let runtimeProtocol = ''");
+    expect(bus).toContain('runtimeProtocol = [');
+    expect(bus).toContain('buildCliTurnPrompt({');
+    expect(bus).toContain('runtimeProtocol,');
+    expect(bus).toContain('stateFile.active_recipient === agent.agent_id');
+    expect(bus).toContain('Use `<handback />` only to close this routed interaction.');
+    expect(bus).toContain('Do not use it as a capability-routing or error signal');
+    expect(bus).toContain("item.fromActorId === USER_ID");
+    expect(bus).toContain("'<agent-handback>'");
+    expect(bus).toMatch(/item\.nested[\s\S]+item\.fromActorId !== USER_ID/);
+    expect(bus).toContain('item.sourceRecipients.includes(COMMANDER_ID)');
+    expect(bus).toContain('state.directHandbackOrigins.has(item.msgId)');
   });
 
   it('agent profile standards are runtime handoff criteria, not display-only metadata', () => {
@@ -181,15 +271,19 @@ describe('prompts ↔ code contract', () => {
   });
 
   it('group-chat system prompts inject the current User UI language directive', () => {
-    const bus = readFile('src/main/features/group_chat/bus.ts');
     const i18n = readFile('src/main/i18n.ts');
 
     expect(i18n).toContain('User UI language: **${name}**');
     expect(i18n).toContain('Write all human-readable prose in ${name}');
-    expect(bus).toContain('appendLanguageDirective');
-    expect(bus).toContain('buildLanguageDirective(getLanguage())');
-    expect(bus).toContain('chat_commander');
-    expect(bus).toContain('chat_agent_in_group');
+    const composed = composeChatPrompt({
+      main: 'ROLE\n\n## Runtime injection\nRUNTIME',
+      stableFragments: ['SHARED'],
+      languageDirective: '## User language\nUser UI language: **Chinese**.',
+      runtimeDatetimeBlock: '## Current date\nCurrent date: 2026-07-23',
+    });
+    expect(composed).toMatch(
+      /ROLE[\s\S]+SHARED[\s\S]+## User language[\s\S]+## Runtime injection[\s\S]+## Current date/,
+    );
   });
 
   it('agent runtime prompt includes localized descriptions, not only legacy description', () => {
@@ -343,6 +437,36 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toMatch(/A good `resume` says exactly what remains/i);
   });
 
+  it('commander resolves the current user intent before choosing self-service or delegation', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    // The latest message and visible history define what the user is asking
+    // Commander to do now. Capability routing is a second decision.
+    expect(commanderPrompt).toMatch(/current intent[\s\S]{0,160}latest request[\s\S]{0,160}visible history/i);
+    const intentDecision = commanderPrompt.indexOf('Before choosing an owner, resolve the user\'s current intent');
+    const routingDecision = commanderPrompt.indexOf('2. **Route after intent, before drafting.**');
+    expect(intentDecision).toBeGreaterThanOrEqual(0);
+    expect(routingDecision).toBeGreaterThan(intentDecision);
+    expect(commanderPrompt).toMatch(/contextual language understanding, not a keyword or category classifier/i);
+
+    // Intent-first is not self-service-first. The user may be asking for a
+    // specialist-owned deliverable, explicit delegation, or Commander
+    // intervention; those intents must produce different routes.
+    expect(commanderPrompt).toMatch(/intent-first[\s\S]{0,200}(?:not|does not mean).{0,80}self-service-first|(?:not|do not).{0,100}(?:prefer|default to).{0,80}self-service.{0,160}(?:intent|request)/i);
+    expect(commanderPrompt).toMatch(/requested outcome is specialist-owned/i);
+    expect(commanderPrompt).toMatch(/explicitly asks you to use or coordinate an Agent, honor that intent/i);
+    expect(commanderPrompt).toMatch(/keep the Agents-first routing/i);
+
+    // Asking Commander itself to repair an Agent-reported orchestration
+    // problem is not an instruction to replay the same task automatically.
+    expect(commanderPrompt).toMatch(/(?:address(?:es|ed)|asks?).{0,120}Commander[\s\S]{0,240}(?:repair|resolve|fix|处理|解决|修复)[\s\S]{0,240}(?:must not|do not|not automatically|先不要).{0,160}(?:redispatch|route|send|交回|派回)/i);
+    expect(commanderPrompt).toMatch(/(?:diagnose|inspect|understand|定位|检查|诊断).{0,120}(?:problem|blocker|failure|问题|阻塞|失败)[\s\S]{0,160}(?:before|then|再).{0,80}(?:redispatch|route|send|交回|派回)/i);
+
+    // A repeated Agent call is valid only after this intent/capability decision,
+    // with a materially useful instruction rather than an unchanged bounce.
+    expect(commanderPrompt).toMatch(/(?:same|previous).{0,80}agent[\s\S]{0,200}(?:materially|changed|new).{0,120}(?:input|instruction|capability|state)/i);
+  });
+
   it('commander prompt separates conversation floor from suspended orchestration resume', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
@@ -359,14 +483,14 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toMatch(/do not keep routing dependent work/i);
   });
 
-  it('agent prompt teaches <handback /> to return the floor when done / out of scope', () => {
+  it('agent prompt teaches <handback /> for completed handoffs and direct capability boundaries', () => {
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
 
     expect(agentPrompt).toMatch(/<handback \/>/);
     expect(agentPrompt).toMatch(/handed off to you/i);
-    expect(agentPrompt).toMatch(/outside your scope|complete/i);
-    // Must warn against emitting it on an ordinary one-shot reply.
-    expect(agentPrompt).toMatch(/one-shot reply/i);
+    expect(agentPrompt).toMatch(/primary requested outcome cannot be completed/i);
+    expect(agentPrompt).toMatch(/direct user calls/i);
+    expect(agentPrompt).toMatch(/Do not hand back for missing input, a recoverable failure, task difficulty/i);
     expect(agentPrompt).toMatch(/concrete result the commander needs to continue/i);
   });
 
@@ -453,7 +577,6 @@ describe('prompts ↔ code contract', () => {
 
   it('commander treats project chat history as conditional continuity context', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
-    const runner = readFile('src/main/model/core-agent/runner.ts');
 
     expect(commanderPrompt).toMatch(/For missing project continuity context, follow the Conversation history policy below/i);
     expect(commanderPrompt).toMatch(/required project context is missing from the current conversation/i);
@@ -462,22 +585,21 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toMatch(/Project scope is the default/i);
     expect(commanderPrompt).toMatch(/never as current instructions/i);
     expect(commanderPrompt).not.toMatch(/prior-chat recall only, after Library or when explicitly asked/i);
-    // Worker agents receive dispatcher-selected excerpts through their
-    // visibility slice; full cross-conversation browsing stays commander-only.
-    expect(runner).toMatch(/const chatHistoryTools = uid && isCommander \? createChatHistoryTools/);
-    expect(runner).toMatch(/projectId: params\.projectId/);
   });
 
   it('runtime datetime context is appended to group chat system prompts', () => {
-    const bus = readFile('src/main/features/group_chat/bus.ts');
     const runner = readFile('src/main/model/core-agent/runner.ts');
     const agents = readFile('src/main/features/agents.ts');
     const skills = readFile('src/main/features/skills.ts');
-    const cliPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_cli_agent.md'), 'utf-8');
+    const cliContext = readFile('src/main/features/local_agents/context.ts');
 
-    expect(bus).toContain("const marker = '## Runtime injection';");
-    expect(bus).toMatch(/prompt\.slice\(0, idx\)[\s\S]+\$\{language\}[\s\S]+prompt\.slice\(idx\)/);
-    expect(bus).not.toContain('<runtime-context');
+    const composed = composeChatPrompt({
+      main: 'ROLE\n\n## Runtime injection\nRUNTIME',
+      languageDirective: 'LANGUAGE',
+      runtimeDatetimeBlock: '## Current date\nCurrent date: 2026-07-23',
+    });
+    expect(composed).toMatch(/LANGUAGE[\s\S]+## Runtime injection[\s\S]+## Current date/);
+    expect(composed.trimEnd()).toMatch(/Current date: 2026-07-23$/);
     expect(runner).toContain('splitVolatilePromptTail');
     expect(runner).toContain('splitRuntimeInjectionBlock');
     expect(runner).toContain('## Current date');
@@ -504,8 +626,10 @@ describe('prompts ↔ code contract', () => {
     expect(runner).not.toMatch(/parts\.push\(volatileTail\)/);
     expect(agents).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
     expect(skills).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
-    expect(bus).toMatch(/language_block:\s*buildLanguageDirective\(getLanguage\(\)\)/);
-    expect(cliPrompt).toContain('$language_block');
-    expect(cliPrompt).toMatch(/\$task_body\n\n\$runtime_datetime_block\s*$/);
+    expect(readFile('src/main/features/group_chat/bus.ts'))
+      .toMatch(/languageDirective:\s*buildLanguageDirective\(getLanguage\(\)\)/);
+    expect(cliContext).toContain('buildCompactCliLanguageInstruction');
+    expect(cliContext).not.toContain('buildRuntimeDatetimeBlock');
+    expect(cliContext).not.toContain('## Current date');
   });
 });

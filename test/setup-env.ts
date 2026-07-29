@@ -92,9 +92,12 @@ if (process.platform === 'win32') {
       const resolved = path.resolve(ordinaryTarget);
       const tempRoot = path.resolve(os.tmpdir());
       const isTempTree = resolved === tempRoot || resolved.startsWith(`${tempRoot}${path.sep}`);
-      if (isTempTree && options?.recursive && options.maxRetries === undefined) {
+      if (isTempTree && options?.recursive) {
+        const removalOptions = options.maxRetries === undefined
+          ? { ...options, maxRetries: 10, retryDelay: 50 }
+          : options;
         try {
-          return originalRmSync(target, { ...options, maxRetries: 10, retryDelay: 50 });
+          return originalRmSync(target, removalOptions);
         } catch (err) {
           // Some Windows libraries keep a directory handle until the test
           // worker exits. If recursive rm already removed every file and

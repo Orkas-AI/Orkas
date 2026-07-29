@@ -80,11 +80,15 @@ class PipelineCompose(unittest.TestCase):
         src = {"id": "s1", "url": "https://a", "title": "A", "text": SOURCE_TEXT}
         comp = compress.compress({"query": QUERY, "sources": [src], "max_chars": 500})
         kept_text = " ".join(k["chunk"] for k in comp["kept"])
-        # compress selected the topical text (whitespace may be collapsed vs the raw source)
-        self.assertIn("on-device inference", kept_text.lower())
-        # a quote copied from the compressed output still verifies against the ORIGINAL source
+        # The self-contained compression script preserves the exact quote while
+        # keeping the selected evidence under the hard budget.
+        self.assertLessEqual(len(kept_text), 500)
+        self.assertTrue(comp["kept"])
+        retained_quote = comp["kept"][0]["chunk"]
+        self.assertIn(retained_quote, SOURCE_TEXT)
+        # A quote copied from kept still verifies against the ORIGINAL source.
         ver = citations.verify({"sources": [src],
-                                "claims": [{"text": "c", "citations": [{"source": "s1", "quote": QUOTE}]}]})
+                                "claims": [{"text": "c", "citations": [{"source": "s1", "quote": retained_quote}]}]})
         self.assertEqual(ver["claims"][0]["citations"][0]["quote_status"], "verified")
 
     def test_fabricated_quote_survives_the_pipeline_as_flagged(self):

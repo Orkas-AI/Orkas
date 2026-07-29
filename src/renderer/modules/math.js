@@ -33,14 +33,23 @@ function _rootContainsMath(rootEl) {
 function _loadMathJaxRuntime() {
   if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') return Promise.resolve();
   if (_mathJaxLoadPromise) return _mathJaxLoadPromise;
-  _mathJaxLoadPromise = new Promise((resolve, reject) => {
+  const pending = new Promise((resolve, reject) => {
     const script = document.createElement('script');
     script.src = './vendor/mathjax/tex-chtml.js';
     script.async = true;
     script.dataset.orkasMathjax = '1';
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error('failed to load MathJax runtime'));
+    script.onerror = () => {
+      if (typeof script.remove === 'function') script.remove();
+      reject(new Error('failed to load MathJax runtime'));
+    };
     (document.head || document.documentElement).appendChild(script);
+  });
+  _mathJaxLoadPromise = pending.catch((err) => {
+    // A transient disk/read failure must not poison every later formula in
+    // this renderer session. Let the next formula attempt a fresh load.
+    _mathJaxLoadPromise = null;
+    throw err;
   });
   return _mathJaxLoadPromise;
 }
@@ -66,8 +75,8 @@ async function typesetMath(rootEl) {
     // Noise level: debug. Drop to trace / delete once stable.
     const hits = rootEl.querySelectorAll('mjx-container').length;
     if (hits) (_mathLog.info || console.info).call(_mathLog, `typeset ${hits} formula(s)`);
-  } catch (err) {
-    (_mathLog.warn || console.warn).call(_mathLog, 'typeset failed:', (err && err.message) || err);
+  } catch (_err) {
+    (_mathLog.warn || console.warn).call(_mathLog, 'typeset failed');
   }
 }
 
@@ -110,8 +119,8 @@ async function typesetMathHtml(html) {
     const out = host.innerHTML;
     _rememberMathHtml(key, out);
     return out;
-  } catch (err) {
-    (_mathLog.warn || console.warn).call(_mathLog, 'typeset html failed:', (err && err.message) || err);
+  } catch (_err) {
+    (_mathLog.warn || console.warn).call(_mathLog, 'typeset html failed');
     return key;
   } finally {
     if (host.parentElement) host.parentElement.removeChild(host);

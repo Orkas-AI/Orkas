@@ -5,6 +5,7 @@
  * with a CLI-friendly interactive flow: opens browser, waits for callback.
  */
 import { createInterface } from "node:readline";
+import path from "node:path";
 import { createLogger } from "../shared/logger.js";
 import { writeOAuthCredentials, getOAuthCredential } from "./store.js";
 import type { OAuthCredentials, OAuthProviderInterface } from "@earendil-works/pi-ai";
@@ -22,17 +23,49 @@ async function promptText(message: string): Promise<string> {
   });
 }
 
+export interface BrowserOpenCommand {
+  file: string;
+  args: string[];
+  options: {
+    windowsHide: true;
+    timeout: number;
+  };
+}
+
+/**
+ * Build an argv-only browser opener. In particular, Windows `start` is a cmd
+ * builtin whose first quoted token is a window title and whose metacharacters
+ * are shell-active. `rundll32` gives us an inbox executable and a literal URL
+ * argument without passing provider-controlled OAuth URLs through a shell.
+ */
+export function browserOpenCommand(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): BrowserOpenCommand {
+  if (platform === "win32") {
+    const systemRoot = env.SystemRoot || env.WINDIR || "C:\\Windows";
+    return {
+      file: path.win32.join(systemRoot, "System32", "rundll32.exe"),
+      args: ["url.dll,FileProtocolHandler", url],
+      options: { windowsHide: true, timeout: 5_000 },
+    };
+  }
+  return {
+    file: platform === "darwin" ? "open" : "xdg-open",
+    args: [url],
+    options: { windowsHide: true, timeout: 5_000 },
+  };
+}
+
 /** Try to open a URL in the user's browser. */
 async function openBrowser(url: string): Promise<void> {
   try {
-    const { exec } = await import("node:child_process");
-    const cmd =
-      process.platform === "darwin"
-        ? `open "${url}"`
-        : process.platform === "win32"
-          ? `start "${url}"`
-          : `xdg-open "${url}"`;
-    exec(cmd);
+    const { execFile } = await import("node:child_process");
+    const command = browserOpenCommand(url);
+    // Supplying a callback consumes asynchronous spawn/exit errors. Browser
+    // launch remains best-effort and must not delay the OAuth prompt.
+    execFile(command.file, command.args, command.options, () => undefined);
   } catch {
     // Ignore — user can manually open the URL
   }

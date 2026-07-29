@@ -13,6 +13,13 @@ Use this first when `video_studio` `op:"composition.snapshot"` returns `preview_
 
 Do not open a new user Gate. For preview review, inspect every returned frame path at usable scale before choosing a verdict; the contact sheet is only an index. Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, submit one `repair` verdict, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot. Submit `passed` only for the complete current snapshot signature. For the no-preview draft fallback, read `steps.inspect.draft_disposition` when present and re-run draft after a repair.
 
+Treat a rejected `composition.submit_design_review` payload as an internal tool-contract error when the evidence and composition signature are still current. Correct the verdict, object shape, required score names, empty passing findings, or frame-path field and retry the complete call immediately with the same evidence. Do not ask the user, open a gate, recapture frames, rerender, or report a production blocker for a parameter-only error.
+
+Even in a planning-only or “do not actually call tools” response, name
+`composition.submit_design_review` explicitly as the step that records the verdict. “Submit a
+passed verdict” or prose review without the canonical operation is not an executable continuation;
+planning-only means describe the host call, not omit its identity.
+
 ## Activation
 
 The host requires this review before showing a captured preview and may require a post-draft fallback for short work that skipped preview. Review when either authoritative result requests it:
@@ -31,6 +38,7 @@ Do not run this review for non-COMPOSE edit/TTS/clip-selection work. For COMPOSE
 Read only the relevant artifacts:
 
 - `project/composition/composition-manifest.json`, especially `art_direction` and the affected canonical scene
+- Every composition-local image/video in `art_direction.references`, including declared roles, reproduce/edit/guide intent, preserve/may-change boundaries, target scenes, and layout/temporal anchors
 - `project/composition/narration-map.json` as read-only evidence when detailed narration-line alignment matters
 - `project/composition/qa/inspect.json`, or `project/render/draft-report.json` only for fallback review
 - For preview review, the snapshot result's `contact_sheet` and every `frame_paths` item: first frame, every scene midpoint, and payoff/closing frame. Open every path individually; do not infer full coverage from a thumbnail sheet.
@@ -45,17 +53,18 @@ Blockers must identify a specific scene/frame, the visible evidence, and the sma
 
 Blockers:
 
-- First frame is blank, unreadable, or fails to state the approved promise in a promo/version-update/launch deliverable.
+- First frame is blank, unreadable, or fails the dedicated cover contract: approved promise, dominant hero, and at least two recognizable signals of the actual video content.
 - Text is unreadable in the supplied evidence frame, hides the approved promise/CTA, or materially blocks comprehension because of size, safe-zone, overlap, occlusion, or contrast.
 - The draft report's `contract_html` step says approved scene copy, canvas, assets, or runtime dependencies do not match the model-authored HTML.
 - Visual language contradicts an explicit style source or ignores required brand tokens.
+- A reference image or video loses a declared preserve axis, changes something outside `may_change`, violates layout/temporal anchors, misses a requested edit, or is scored below `reference_fidelity.verification.minimum_score`.
 - The piece reads as a slideshow when the approved promise was motion graphics.
 - Motion hides the message, distracts from the focal point, or breaks narration timing.
 - A protected logo/asset/layout was copied without ownership or permission.
 
 Fix:
 
-- First frame is truthful and readable but could be a stronger thumbnail.
+- First frame is truthful and readable but its topic signals are too generic or weak to work as a strong cover.
 - Text has a visible safe-zone, size, overlap, occlusion, or contrast advisory, but the main message remains readable and the draft is useful for Gate D review.
 - Repeated layout, transition, or card pattern three or more times in a row.
 - Palette uses extra chromatic colors beyond the contract.
@@ -63,6 +72,7 @@ Fix:
 - English titles, body copy, captions, subtitles, or CTAs are forced to all caps, or two or more English text roles in one scene use all caps. Restore the approved natural casing and use scale, weight, width, color, or spacing for hierarchy. Existing all caps may remain only when the exact casing appears in approved user copy or an external brand/source and is limited to one short metadata label, acronym, or code; a model-authored art direction or style rationale is not an exception.
 - Scene density is too high for phone viewing.
 - Style-source adaptation is vague: it borrows mood words but no concrete tokens.
+- Reference comparison is vague or based on provenance instead of the declared media intent, roles, protected attributes, allowed changes, and scene/time anchors.
 
 Polish:
 
@@ -90,11 +100,14 @@ Return one compact review object or bullets after the entire evidence set has be
 - `review_scope`: why this review was triggered
 - `reviewed_frame_paths`: every current snapshot frame path inspected; required for preview review
 - `design_direction`: one line
+- `quality_scores`: 0-100 `content_alignment`, `cover_communication`, `hierarchy`, `text_legibility`, `motion_readiness`, and `specificity`; add `reference_fidelity` when a concrete reference contract exists
 - `blockers`: all concrete locations + evidence + repair, not only the first finding
 - `fixes`: concrete location + repair
 - `polish`: optional
 - `next_action`: rerun inspect + snapshot, open the existing Preview Gate, rerun draft for fallback review, open Gate D, or surface blocker
 
 ```json
-{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"first frame + every returned scene midpoint/payoff frame","review_findings":[],"reviewed_frame_paths":["/absolute/path/01-first-frame.png","/absolute/path/02-scene-mid.png","/absolute/path/03-payoff.png"]}
+{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"cover + every returned scene midpoint/payoff frame, with declared reference comparisons","review_findings":[],"quality_scores":{"content_alignment":92,"cover_communication":90,"hierarchy":88,"text_legibility":94,"motion_readiness":86,"specificity":89,"reference_fidelity":91},"reviewed_frame_paths":["/absolute/path/01-first-frame.png","/absolute/path/02-scene-mid.png","/absolute/path/03-payoff.png"]}
 ```
+
+A passing verdict requires overall >=80 and every required dimension >=70. The manifest may set a higher reference-fidelity floor; exact mode uses at least 85. Do not inflate a score to pass: submit `repair` with the concrete mismatch, fix it once, and review the new signature.

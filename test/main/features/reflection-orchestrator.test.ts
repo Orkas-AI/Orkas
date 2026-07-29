@@ -17,6 +17,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -173,6 +174,48 @@ describe('reflection-orchestrator › runOneCycle', () => {
     expect(state.lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBe(new Date(NOW).toISOString());
   });
 
+  it('does not stamp stale work that resolves after account-switch cancellation', async () => {
+    const mod = await loadModule();
+    const controller = new AbortController();
+    const reflect = vi.fn(async (
+      _uid: string,
+      _agentId: string,
+      _sinceMs: number,
+      signal?: AbortSignal,
+    ) => {
+      expect(signal).toBe(controller.signal);
+      controller.abort();
+    });
+
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+      signal: controller.signal,
+    });
+
+    expect(reflect).toHaveBeenCalledOnce();
+    expect(completed).toBe(0);
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
+  });
+
+  it('uses the requested account feature gate instead of the currently active account', async () => {
+    const preferences = path.join(tmpDir, 'u2', 'cloud', 'config', 'preferences.json');
+    fs.mkdirSync(path.dirname(preferences), { recursive: true });
+    fs.writeFileSync(preferences, JSON.stringify({ metacognition_enabled: false }));
+    const mod = await loadModule();
+    const reflect = vi.fn();
+
+    const completed = await mod.runOneCycle('u2', {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+    });
+
+    expect(completed).toBe(0);
+    expect(reflect).not.toHaveBeenCalled();
+  });
+
   it('skips with debug log when feature flag is off', async () => {
     process.env.ORKAS_METACOGNITION = '0';
     try {
@@ -192,6 +235,75 @@ describe('reflection-orchestrator › runOneCycle', () => {
     const completed = await mod.runOneCycle('', { now: () => NOW, reflect, isDirty: async () => true });
     expect(completed).toBe(0);
     expect(reflect).not.toHaveBeenCalled();
+  });
+});
+
+// ── Loop ownership across account switches ─────────────────────────────
+
+describe('reflection-orchestrator › loop lifecycle', () => {
+  it('cancels the old account cycle and re-arms the loop for the new account', async () => {
+    vi.useFakeTimers({
+      now: Date.parse('2026-05-21T12:00:00Z'),
+      toFake: ['Date', 'setTimeout', 'clearTimeout'],
+    });
+    const mod = await loadModule();
+    const users = await import('../../../src/main/features/users');
+    const reflectedUids: string[] = [];
+    const handle = mod.startReflectionLoop(TEST_UID, {
+      reflect: async (uid) => { reflectedUids.push(uid); },
+      isDirty: async () => true,
+    });
+
+    users.activateUser('u2');
+    await vi.advanceTimersByTimeAsync(3_000);
+    // listAgents uses filesystem promises. Give native IO callbacks a chance
+    // to complete without advancing the 30-second background slice timer.
+    for (let i = 0; i < 50; i++) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (mod.readReflectionState('u2').lastReflectedAt[mod.DEFAULT_AGENT_ID]) break;
+    }
+    handle.stop();
+
+    expect(reflectedUids).toEqual(['u2']);
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
+    expect(mod.readReflectionState('u2').lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBeTruthy();
+  });
+
+  it('does not arm a new-account loop when another safety hook rejects the switch', async () => {
+    vi.useFakeTimers({
+      now: Date.parse('2026-05-21T12:00:00Z'),
+      toFake: ['Date', 'setTimeout', 'clearTimeout'],
+    });
+    const mod = await loadModule();
+    const users = await import('../../../src/main/features/users');
+    const hooks = await import('../../../src/main/features/user-switch-hooks');
+    const reflectedUids: string[] = [];
+    const handle = mod.startReflectionLoop(TEST_UID, {
+      reflect: async (uid) => { reflectedUids.push(uid); },
+      isDirty: async () => true,
+    });
+    hooks.registerUserSwitchHook('reflection-test-failure', () => {
+      throw new Error('cleanup failed');
+    });
+
+    try {
+      expect(() => users.activateUser('u2')).toThrow(/user switch cleanup failed/);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(users.getActiveUserId()).toBe(TEST_UID);
+      expect(reflectedUids).toEqual([]);
+
+      hooks.registerUserSwitchHook('reflection-test-failure', () => {});
+      users.activateUser('u2');
+      await vi.advanceTimersByTimeAsync(3_000);
+      for (let i = 0; i < 50; i++) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (mod.readReflectionState('u2').lastReflectedAt[mod.DEFAULT_AGENT_ID]) break;
+      }
+      expect(reflectedUids).toEqual(['u2']);
+    } finally {
+      hooks.registerUserSwitchHook('reflection-test-failure', () => {});
+      handle.stop();
+    }
   });
 });
 

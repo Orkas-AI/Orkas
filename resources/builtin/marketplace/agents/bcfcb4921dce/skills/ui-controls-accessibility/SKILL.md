@@ -10,7 +10,7 @@ category: rnd
 
 ## Requested Outcome Gate
 
-Before rendering, turn every explicitly requested workflow outcome into a compact ledger: `user outcome -> triggering control/event -> rendered state branch -> recovery/next action`. Success and failure are separate outcomes. If a backend is unavailable, give each outcome a distinct, clearly labeled preview control with an explicit action name such as `data-action="import-success"` and `data-action="import-failure"`; wire each action to its own feedback branch and recovery. Do not deliver while any requested outcome exists only in prose, an unreachable conditional, an ambiguous shared trigger, or a generic error state from a different step.
+Before rendering, turn every explicitly requested workflow outcome into a compact ledger: `user outcome -> triggering control/event -> rendered state branch -> recovery/next action`. Success and failure are separate outcomes. When a backend is unavailable but the outcome can be modeled locally, make both outcomes reachable through the primary control flow with documented sample inputs or a deterministic local mock resolver. Preview controls may supplement this proof, but they must not be the only route to an ordinary product failure state. Use distinct preview controls only when no credible primary-flow trigger exists. Do not deliver while any requested outcome exists only in prose, an unreachable conditional, an ambiguous shared trigger, or a generic error state from a different step.
 
 Use this specialist for complex forms, non-trivial composite widgets, accessibility audits, or control/state failures that need deeper guidance. Ordinary controls, focus, labels, and responsive behavior are covered by `ui-design-executor` and do not require loading this skill.
 
@@ -86,7 +86,7 @@ Forms:
 - Put helper/error text near the field.
 - Show required/optional intent clearly.
 - Use inline validation for recoverable errors.
-- Implement the reachable lifecycle: pristine, dirty/touched invalid, submitted-pending with duplicate submission blocked, recoverable server/error feedback, and success. Do not show dirty validation on first render. Every outcome the user explicitly requests (for example import success and import failure) needs its own reachable real-workflow or preview trigger. With no backend, prefer two explicit named preview actions over a hidden flag or an overloaded generic error button; a conditional branch that is never called with one outcome is dead code and does not count.
+- Implement the reachable lifecycle: pristine, dirty/touched invalid, submitted-pending with duplicate submission blocked, recoverable server/error feedback, and success. Do not show dirty validation on first render. Every outcome the user explicitly requests (for example import success and import failure) needs its own reachable trigger. With no backend, prefer documented sample inputs or a deterministic local mock resolver exercised by the normal submit action; preview actions are supplementary and must not replace the primary workflow. A conditional branch that is never called with one outcome is dead code and does not count.
 - Wire field errors with `aria-invalid` and `aria-describedby` where applicable; move or announce focus to the error summary after a failed submit when the form is long.
 
 Data:

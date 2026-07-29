@@ -46,9 +46,11 @@ import type { Api, Model } from '@earendil-works/pi-ai';
 export interface CatalogEntry {
   id: string;                 // pi-ai provider id (matches listPiProviders())
   label: string;              // display label
+  labelKey?: string;          // renderer i18n key for localized generic labels
   docsUrl?: string;           // where to create an API key (shown in the add-key form)
   region?: 'cn';              // 'cn' marks providers whose primary endpoint is in China
   oauthOnly?: boolean;        // if true, hide the API-key path entirely
+  customOpenAICompatible?: boolean; // user supplies base URL + model metadata
   /** Per-provider prerequisite note shown on the card + the add-key form.
    *  Used when the same "brand" has two independent billing/auth surfaces
    *  (e.g. Moonshot pay-as-you-go open platform vs. Kimi Coding Plan
@@ -108,6 +110,12 @@ export const CATALOG: readonly CatalogEntry[] = [
     subscriptionNote: '' },
 
   { id: 'openrouter',         label: 'OpenRouter',    docsUrl: 'https://openrouter.ai/keys' },
+  {
+    id: 'custom',
+    label: 'Custom (OpenAI-compatible)',
+    labelKey: 'provider.custom.label',
+    customOpenAICompatible: true,
+  },
 ];
 
 // ── Curated model lists ─────────────────────────────────────────────────
@@ -126,6 +134,35 @@ export function curatedModelsFor(providerId: string): ProviderModelEntry[] {
   if (configured) return configured.models;
   const list = CURATED_MODELS[providerId];
   return list ? list.map((m) => ({ ...m })) : [];
+}
+
+/** Product boundary for image blocks in one chat-model request. Attachment
+ * storage may keep more files over the life of a conversation, but a single
+ * composer turn currently accepts at most 20 attachments. */
+export const MAX_MODEL_INPUT_IMAGES = 20;
+export const DEFAULT_MODEL_INPUT_IMAGE_LIMIT = 5;
+
+/**
+ * Resolve the image count for one concrete provider/model candidate.
+ *
+ * Model protocol metadata is authoritative for whether images are supported
+ * at all. The configurable catalog may then declare the provider's exact
+ * per-request count. Unknown multimodal models retain the conservative
+ * five-image behavior instead of risking an upstream request rejection.
+ */
+export function modelInputImageLimit(
+  providerId: string,
+  modelId: string,
+  model: Pick<Model<Api>, 'id' | 'input'> | null | undefined,
+): number {
+  if (!model?.input?.includes('image')) return 0;
+  const configured = curatedModelsFor(providerId)
+    .find((entry) => entry.id === modelId || entry.id === model.id);
+  const raw = configured?.maxInputImages;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) {
+    return DEFAULT_MODEL_INPUT_IMAGE_LIMIT;
+  }
+  return Math.min(MAX_MODEL_INPUT_IMAGES, Math.max(0, Math.trunc(raw)));
 }
 
 /**
@@ -394,13 +431,37 @@ export function providerRecommended(id: string): boolean {
   return CATALOG.find((p) => p.id === id)?.recommended === true;
 }
 
+export function providerLabelKey(id: string): string | undefined {
+  return CATALOG.find((p) => p.id === id)?.labelKey;
+}
+
+export function providerUsesCustomOpenAIConfig(id: string): boolean {
+  return CATALOG.find((p) => p.id === id)?.customOpenAICompatible === true;
+}
+
+export interface CustomOpenAICompatibleRuntimeConfig {
+  baseUrl: string;
+  contextWindow: number;
+  maxTokens: number;
+}
+
+export function isSelectableModel(providerId: string, modelId: string): boolean {
+  const provider = String(providerId || '').trim();
+  const requested = String(modelId || '').trim();
+  if (!provider || !requested || !CATALOG.some((entry) => entry.id === provider)) return false;
+  if (provider === 'custom') {
+    return requested.length <= 200 && !/[\u0000-\u001f\u007f]/.test(requested);
+  }
+  return curatedModelsFor(provider).some((model) => model.id === requested);
+}
+
 /**
  * Providers Orkas supports via a custom adapter in
  * `model/core-agent/external-providers.ts`, NOT via pi-ai's built-in
  * provider registry. `listProviders()` treats these as API-key-capable
  * even though `listPiProviders()` doesn't list them.
  */
-export const EXTERNAL_API_PROVIDERS: readonly string[] = ['moonshot', 'deepseek', 'doubao'];
+export const EXTERNAL_API_PROVIDERS: readonly string[] = ['moonshot', 'deepseek', 'doubao', 'custom'];
 
 // ── Image-generation capability map ─────────────────────────────────────
 //

@@ -67,7 +67,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const SCRIPT_EXTS = ['py', 'ts', 'mjs', 'js', 'ps1', 'cmd', 'bat', 'sh', 'rb'];
 const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -480,12 +480,231 @@ function commandFromEnv(value) {
 function findPython(isWin) {
   const configured = commandFromEnv(process.env.ORKAS_PYTHON);
   if (configured) return { cmd: configured, args: [] };
-  if (isWin) {
-    const pyLauncher = findOnPath(['py.exe', 'py']);
-    if (pyLauncher) return { cmd: pyLauncher, args: ['-3'] };
-    return { cmd: 'python', args: [] };
+
+  // Direct development runs use the same repository venv as
+  // scripts/run-python-tests.mjs. Packaged runs normally provide
+  // ORKAS_PYTHON, so this candidate is intentionally only a fallback.
+  const localVenvPython = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    'venv',
+    isWin ? path.join('Scripts', 'python.exe') : path.join('bin', 'python'),
+  );
+  if (existingFile(localVenvPython)) return { cmd: localVenvPython, args: [] };
+
+  const candidates = isWin
+    ? [
+      { cmd: findOnPath(['py.exe', 'py']), args: ['-3'] },
+      { cmd: 'python', args: [] },
+    ]
+    : [
+      { cmd: 'python3', args: [] },
+      { cmd: 'python', args: [] },
+    ];
+  for (const candidate of candidates) {
+    if (!candidate.cmd) continue;
+    const probe = spawnSync(candidate.cmd, [...candidate.args, '--version'], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (!probe.error && probe.status === 0) return candidate;
   }
-  return { cmd: 'python3', args: [] };
+  die(76, 'Python 3 runtime is not available; set ORKAS_PYTHON to a working interpreter');
+}
+
+function findUv() {
+  const configured = commandFromEnv(process.env.ORKAS_UV);
+  if (configured) return configured;
+  return findOnPath(process.platform === 'win32' ? ['uv.exe', 'uv'] : ['uv']);
+}
+
+function skillVenvPython(venv, isWin) {
+  return isWin
+    ? path.join(venv, 'Scripts', 'python.exe')
+    : path.join(venv, 'bin', 'python');
+}
+
+function readSkillPythonRequirements(skillDir, scriptPath) {
+  const scriptBase = path.basename(scriptPath, path.extname(scriptPath));
+  const file = [
+    path.join(skillDir, `requirements.${scriptBase}.txt`),
+    path.join(skillDir, 'requirements.txt'),
+  ].find(existingFile);
+  if (!file) return null;
+  let content = '';
+  try {
+    content = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    die(70, `failed to read skill Python requirements: ${err && err.message}`, { file });
+  }
+  const actionable = content
+    .split(/\r?\n/)
+    .some((line) => {
+      const trimmed = line.trim();
+      return !!trimmed && !trimmed.startsWith('#');
+    });
+  return actionable
+    ? { file, content, sha256: crypto.createHash('sha256').update(content).digest('hex') }
+    : null;
+}
+
+function runSkillDependencyCommand(cmd, args, options = {}) {
+  const result = spawnSync(cmd, args, {
+    cwd: options.cwd,
+    env: options.env || process.env,
+    stdio: 'inherit',
+    windowsHide: true,
+    timeout: options.timeout || 10 * 60 * 1000,
+  });
+  if (result.error) {
+    return { ok: false, error: result.error.message, status: result.status };
+  }
+  if (result.status !== 0) {
+    return { ok: false, error: `${options.label || cmd} exited ${result.status}`, status: result.status };
+  }
+  return { ok: true };
+}
+
+function pythonRuntimeFingerprint(basePython) {
+  const result = spawnSync(basePython.cmd, [...(basePython.args || []), '--version'], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+    timeout: 5_000,
+  });
+  if (result.error || result.status !== 0) return '';
+  return String(result.stdout || result.stderr || '').trim();
+}
+
+/**
+ * Standalone/custom skills can declare pinned Python packages in a skill-root
+ * `requirements.<script>.txt` (preferred) or `requirements.txt` (all Python
+ * scripts). Install them once into a workspace-local, content-addressed venv
+ * before the first matching script run. Never mutate the packaged
+ * ORKAS_PYTHON tree: app updates replace it and macOS code signing treats
+ * bundled resources as immutable.
+ */
+function ensureSkillPythonVenv(skillDir, scriptPath, skillId, basePython, isWin) {
+  const requirements = readSkillPythonRequirements(skillDir, scriptPath);
+  if (!requirements) return null;
+
+  const safeId = safePathSegment(skillId).slice(0, 48) || 'skill';
+  const identity = [
+    path.resolve(skillDir),
+    requirements.sha256,
+    basePython.cmd,
+    ...(basePython.args || []),
+    pythonRuntimeFingerprint(basePython),
+  ].join('\n');
+  const key = `${safeId}-${shortHash(identity)}`;
+  const skillsRoot = path.join(sharedVenvRoot(), 'python', 'skills');
+  const envRoot = path.join(skillsRoot, key);
+  const venv = path.join(envRoot, '.venv');
+  const python = skillVenvPython(venv, isWin);
+  const marker = path.join(envRoot, '.orkas-skill-requirements.json');
+
+  try {
+    const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    if (state
+        && state.schema === 1
+        && state.requirements_sha256 === requirements.sha256
+        && existingFile(python)) {
+      return python;
+    }
+  } catch {
+    /* missing/incomplete cache — install below */
+  }
+
+  fs.mkdirSync(skillsRoot, { recursive: true });
+  const tmpRoot = path.join(skillsRoot, `.${key}-${process.pid}-${Date.now()}`);
+  const tmpVenv = path.join(tmpRoot, '.venv');
+  const tmpPython = skillVenvPython(tmpVenv, isWin);
+  fs.mkdirSync(tmpRoot, { recursive: true });
+
+  const uv = findUv();
+  const installEnv = {
+    ...process.env,
+    UV_CACHE_DIR: process.env.UV_CACHE_DIR
+      || path.join(sharedVenvRoot(), 'python', 'cache'),
+  };
+  process.stderr.write(`[Orkas] Installing Python dependencies for skill ${skillId}...\n`);
+
+  let created;
+  if (uv && (!basePython.args || basePython.args.length === 0)) {
+    created = runSkillDependencyCommand(
+      uv,
+      ['venv', '--python', basePython.cmd, tmpVenv],
+      { cwd: skillDir, env: installEnv, label: 'uv venv' },
+    );
+  } else {
+    created = runSkillDependencyCommand(
+      basePython.cmd,
+      [...(basePython.args || []), '-m', 'venv', tmpVenv],
+      { cwd: skillDir, env: installEnv, label: 'python -m venv' },
+    );
+  }
+  if (!created.ok || !existingFile(tmpPython)) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    die(70, 'failed to create isolated skill Python environment', {
+      skillId,
+      requirements: requirements.file,
+      cause: created.error || 'venv Python missing after creation',
+    });
+  }
+
+  const installed = uv
+    ? runSkillDependencyCommand(
+      uv,
+      ['pip', 'install', '--python', tmpPython, '--requirements', requirements.file],
+      { cwd: skillDir, env: installEnv, label: 'uv pip install' },
+    )
+    : runSkillDependencyCommand(
+      tmpPython,
+      ['-m', 'pip', 'install', '--disable-pip-version-check', '--requirement', requirements.file],
+      { cwd: skillDir, env: installEnv, label: 'pip install' },
+    );
+  if (!installed.ok) {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    die(70, 'failed to install skill Python dependencies', {
+      skillId,
+      requirements: requirements.file,
+      cause: installed.error,
+    });
+  }
+
+  fs.writeFileSync(
+    path.join(tmpRoot, '.orkas-skill-requirements.json'),
+    JSON.stringify({
+      schema: 1,
+      skill_id: skillId,
+      requirements_sha256: requirements.sha256,
+      installed_at: new Date().toISOString(),
+    }, null, 2),
+    'utf8',
+  );
+
+  try {
+    fs.renameSync(tmpRoot, envRoot);
+  } catch (err) {
+    // Another invocation may have completed the same content-addressed venv
+    // while this one installed. A complete winner is safe to reuse.
+    try {
+      const state = JSON.parse(fs.readFileSync(marker, 'utf8'));
+      if (state.requirements_sha256 !== requirements.sha256 || !existingFile(python)) throw err;
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      return python;
+    } catch {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      die(70, 'failed to publish isolated skill Python environment', {
+        skillId,
+        requirements: requirements.file,
+        cause: err && err.message,
+      });
+    }
+  }
+  return python;
 }
 
 function registerTsxLoader() {
@@ -525,14 +744,15 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
       cmd = sharedPython;
     } else if (venvPython) {
       cmd = venvPython;
-    } else if (isWin) {
-      const py = findPython(isWin);
-      cmd = py.cmd;
-      argv0Args = py.args;
     } else {
       const py = findPython(isWin);
-      cmd = py.cmd;
-      argv0Args = py.args;
+      const skillPython = ensureSkillPythonVenv(skillDir, scriptPath, skillId, py, isWin);
+      if (skillPython) {
+        cmd = skillPython;
+      } else {
+        cmd = py.cmd;
+        argv0Args = py.args;
+      }
     }
   } else if (ext === 'sh') {
     if (isWin) {

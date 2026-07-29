@@ -102,12 +102,18 @@ export async function copyLocalFileAtomic(
       }
     }
     try {
-      await fsp.rename(temp, target);
+      // Publish the completed inode without replacing a path that appeared
+      // after the caller allocated the name. `rename` overwrites silently on
+      // POSIX and the old Windows fallback explicitly deleted the winner.
+      await fsp.link(temp, target);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST' && code !== 'EPERM') throw err;
-      await fsp.rm(target, { force: true });
-      await fsp.rename(temp, target);
+      if (code === 'EEXIST') {
+        throw Object.assign(new Error('import target already exists'), {
+          code: 'E_IMPORT_TARGET_EXISTS',
+        });
+      }
+      throw err;
     }
   } finally {
     await fsp.rm(temp, { force: true }).catch(() => {});

@@ -15,6 +15,7 @@ import { createLogger } from '../../logger';
 const log = createLogger('connectors');
 
 let _bootPromise: Promise<void> | null = null;
+let _bootUid: string | null = null;
 let _quitHookInstalled = false;
 
 async function _doBootstrap(uid: string): Promise<void> {
@@ -37,6 +38,9 @@ function _installQuitHook(): void {
 
 export function bootstrap(uid: string): Promise<void> {
   _installQuitHook();
-  if (!_bootPromise) _bootPromise = _doBootstrap(uid);
+  if (!_bootPromise || _bootUid !== uid) {
+    _bootUid = uid;
+    _bootPromise = _doBootstrap(uid);
+  }
   return _bootPromise;
 }

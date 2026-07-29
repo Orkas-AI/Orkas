@@ -24,6 +24,7 @@ import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
+import { registerUserSwitchHook } from '../user-switch-hooks';
 import { broadcastOAuthConnectOutcome } from './oauth-events';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import { isConnectorUsable } from './types';
@@ -31,10 +32,15 @@ import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport
 
 const log = createLogger('connectors:manager');
 
+function _runtimeKey(uid: string, id: string): string {
+  return `${uid}\u0000${id}`;
+}
+
 const _conns = new Map<string, McpConnection>();
 const _verifyLocks = new Map<string, Promise<number>>();
 const _onDemandConnectLocks = new Map<string, Promise<McpConnection>>();
 let _bootedFor: string | null = null;
+let _runtimeEpoch = 0;
 
 /** Per-instance in-flight refresh dedupe. **Why:** OAuth refresh_tokens (GitHub App `ghr_*`,
  *  Notion DCR, etc.) ROTATE on every successful exchange — the old token is invalidated the
@@ -48,6 +54,49 @@ let _bootedFor: string | null = null;
  *  identically. Lock entries auto-clear in the `finally` block so a failed refresh doesn't
  *  jam the slot. */
 const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
+
+function _accountChangedError(): Error & { code: string } {
+  return Object.assign(new Error('connector account changed'), {
+    code: 'E_CONNECTOR_ACCOUNT_CHANGED',
+  });
+}
+
+function _isAccountChangedError(err: unknown): boolean {
+  return (err as { code?: unknown } | null)?.code === 'E_CONNECTOR_ACCOUNT_CHANGED';
+}
+
+async function _publishConnection(
+  uid: string,
+  id: string,
+  conn: McpConnection,
+  epoch: number,
+): Promise<void> {
+  if (epoch !== _runtimeEpoch) {
+    try { await conn.close(); } catch { /* close already logs */ }
+    throw _accountChangedError();
+  }
+  _conns.set(_runtimeKey(uid, id), conn);
+}
+
+function _detachConnectorRuntime(): McpConnection[] {
+  _runtimeEpoch += 1;
+  const all = Array.from(new Set(_conns.values()));
+  _conns.clear();
+  _verifyLocks.clear();
+  _onDemandConnectLocks.clear();
+  _refreshLocks.clear();
+  _bootedFor = null;
+  return all;
+}
+
+registerUserSwitchHook('connectors', () => {
+  // The hook itself must revoke access synchronously before ACTIVE_UID moves.
+  // Closing stdio/HTTP transports is asynchronous, so detach first and finish
+  // the physical cleanup in the background. `_runtimeEpoch` prevents a
+  // pre-switch connect that resolves late from publishing itself afterwards.
+  const detached = _detachConnectorRuntime();
+  void Promise.all(detached.map((conn) => conn.close().catch(() => {})));
+});
 
 export interface OAuthConnectStart {
   attempt_id: string;
@@ -303,10 +352,11 @@ function _normalizeTransientStatusForList(inst: ConnectorInstance): ConnectorIns
 }
 
 async function _removeStoredInstance(uid: string, id: string, reason: string): Promise<void> {
-  const conn = _conns.get(id);
+  const runtimeKey = _runtimeKey(uid, id);
+  const conn = _conns.get(runtimeKey);
   if (conn) {
     try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(id);
+    _conns.delete(runtimeKey);
   }
   const removed = await registry.remove(uid, id);
   if (removed) log.info('removed connector instance', { id, reason });
@@ -338,10 +388,11 @@ function _dropMissingScopeInstanceSoon(uid: string, inst: ConnectorInstance, rea
 }
 
 async function _markAuthorizationError(uid: string, id: string, message: string, reason: string): Promise<void> {
-  const conn = _conns.get(id);
+  const runtimeKey = _runtimeKey(uid, id);
+  const conn = _conns.get(runtimeKey);
   if (conn) {
     try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(id);
+    _conns.delete(runtimeKey);
   }
   const at = _now();
   const updated = await registry.update(uid, id, (cur) => ({
@@ -566,6 +617,8 @@ async function _connectAndCacheTools(
   inst: ConnectorInstance,
   statusPatches?: StatusPatchCollector,
 ): Promise<ConnectorInstance> {
+  const runtimeEpoch = _runtimeEpoch;
+  const runtimeKey = _runtimeKey(uid, inst.id);
   const entry = findCatalogEntry(inst.id);
   let transport: Transport;
   try {
@@ -601,7 +654,7 @@ async function _connectAndCacheTools(
   try {
     await conn.connect();
     const tools = await conn.listTools();
-    _conns.set(inst.id, conn);
+    await _publishConnection(uid, inst.id, conn, runtimeEpoch);
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
       transport,
@@ -613,16 +666,18 @@ async function _connectAndCacheTools(
     }), statusPatches);
   } catch (err) {
     log.warn('connect+list failed', { id: inst.id, error: (err as Error).message });
+    if (_isAccountChangedError(err)) throw err;
     try { await conn.close(); } catch { /* swallow */ }
     let statusErr = err;
     if (_isTransientConnectorFailure(statusErr)) {
       log.info('connect+list hit transient network failure; retrying once', { id: inst.id });
       await _sleep(CONNECT_RETRY_DELAY_MS);
+      let retryConn: McpConnection | undefined;
       try {
-        const retryConn = new McpConnection(inst.id, transport);
+        retryConn = new McpConnection(inst.id, transport);
         await retryConn.connect();
         const tools = await retryConn.listTools();
-        _conns.set(inst.id, retryConn);
+        await _publishConnection(uid, inst.id, retryConn, runtimeEpoch);
         return _patchStatus(uid, inst, (cur) => ({
           ...cur,
           transport,
@@ -633,19 +688,24 @@ async function _connectAndCacheTools(
           updated_at: _nowIso(),
         }), statusPatches);
       } catch (retryErr) {
+        if (retryConn && _conns.get(runtimeKey) !== retryConn) {
+          try { await retryConn.close(); } catch { /* ignore */ }
+        }
         statusErr = retryErr;
         log.warn('connect+list transient retry failed', { id: inst.id, error: (retryErr as Error).message });
       }
     }
+    if (_isAccountChangedError(statusErr)) throw statusErr;
     if (_shouldForceRefreshAfterConnectFailure(entry, inst, statusErr)) {
       log.info('MCP endpoint rejected OAuth token; forcing grant refresh and retrying', { id: inst.id });
+      let retryConn: McpConnection | undefined;
       try {
         const grant = await _refreshGrantIfStale(uid, entry!, inst.id, { force: true });
         const retryTransport = applyTemplate(entry!, grant);
-        const retryConn = new McpConnection(inst.id, retryTransport);
+        retryConn = new McpConnection(inst.id, retryTransport);
         await retryConn.connect();
         const tools = await retryConn.listTools();
-        _conns.set(inst.id, retryConn);
+        await _publishConnection(uid, inst.id, retryConn, runtimeEpoch);
         return _patchStatus(uid, inst, (cur) => ({
           ...cur,
           transport: retryTransport,
@@ -656,10 +716,14 @@ async function _connectAndCacheTools(
           updated_at: _nowIso(),
         }), statusPatches);
       } catch (retryErr) {
+        if (retryConn && _conns.get(runtimeKey) !== retryConn) {
+          try { await retryConn.close(); } catch { /* ignore */ }
+        }
         statusErr = retryErr;
         log.warn('forced OAuth refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
       }
     }
+    if (_isAccountChangedError(statusErr)) throw statusErr;
     const degraded = await _markDegradedOnTransientFailure(
       uid, inst, statusErr, 'connect_list', statusPatches,
     );
@@ -694,7 +758,7 @@ export async function verifyUsableConnectors(uid: string, reason = 'manual'): Pr
     const now = Date.now();
     const due = listInstances(uid).filter((inst) => {
       if (!isConnectorUsable(inst.status) || !isConnectorRuntimeEnabled(inst.id)) return false;
-      if (_conns.get(inst.id)?.isConnected || _isInRetryCooldown(inst)) return false;
+      if (_conns.get(_runtimeKey(uid, inst.id))?.isConnected || _isInRetryCooldown(inst)) return false;
       return now - (_lastVerifiedAt(inst) || 0) >= VERIFY_TTL_MS;
     });
     if (!due.length) return 0;
@@ -716,6 +780,9 @@ export async function verifyUsableConnectors(uid: string, reason = 'manual'): Pr
 
 export async function bootstrap(uid: string): Promise<void> {
   if (!uid || _bootedFor === uid) return;
+  if (_bootedFor && _bootedFor !== uid) {
+    await shutdownAll();
+  }
   _bootedFor = uid;
   const file = registry.load(uid);
   const ids = Object.keys(file.connections);
@@ -769,7 +836,10 @@ export async function bootstrap(uid: string): Promise<void> {
     await _connectAndCacheTools(uid, inst, statusPatches).catch(() => {});
   });
   await registry.updateMany(uid, statusPatches);
-  const connected = Array.from(_conns.values()).filter((c) => c.isConnected).length;
+  const runtimePrefix = `${uid}\u0000`;
+  const connected = Array.from(_conns.entries())
+    .filter(([key, conn]) => key.startsWith(runtimePrefix) && conn.isConnected)
+    .length;
   log.info('connectors bootstrap done', {
     total: ids.length,
     reused_cached: reusedCached,
@@ -838,7 +908,11 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
 /** Drive the full OAuth flow for a catalog entry and bring the resulting MCP connection up.
  *  This is the **only** public install path — there is no free-form / API-key entry point.
  *  Dispatches to server-bridge or DCR depending on `entry.auth_mode`. */
-export async function connectViaOAuth(uid: string, catalogId: string): Promise<ConnectorInstance> {
+export async function connectViaOAuth(
+  uid: string,
+  catalogId: string,
+  opts: { attemptId?: string } = {},
+): Promise<ConnectorInstance> {
   if (!uid) throw new Error('uid required');
   const entry = findCatalogEntry(catalogId);
   if (!entry) throw new Error('unknown catalog id');
@@ -849,7 +923,11 @@ export async function connectViaOAuth(uid: string, catalogId: string): Promise<C
   let dcrClient: ConnectorInstance['dcr_client'];
   if (entry.auth_mode === 'mcp_dcr') {
     try {
-      const result = await startMcpDcrOAuth(uid, entry);
+      const result = await startMcpDcrOAuth(
+        uid,
+        entry,
+        opts.attemptId ? { attemptId: opts.attemptId } : {},
+      );
       grant = result.grant;
       dcrClient = result.client;
     } catch (err) {
@@ -869,7 +947,10 @@ export async function connectViaOAuth(uid: string, catalogId: string): Promise<C
     const existing = registry.load(uid).connections[catalogId] || null;
     const reauthorize = _isGitHubEntry(entry) && (!!existing || registry.shouldReauthorize(uid, catalogId));
     try {
-      grant = await startOAuth(uid, entry, { reauthorize });
+      grant = await startOAuth(uid, entry, {
+        reauthorize,
+        ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
+      });
     } catch (err) {
       if (_isMissingRequiredScopesError(err)) {
         await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');
@@ -934,7 +1015,7 @@ export function beginOAuthConnect(uid: string, catalogId: string): OAuthConnectS
 
   const attemptId = crypto.randomUUID();
   const startedAt = Date.now();
-  void connectViaOAuth(uid, catalogId).then((instance) => {
+  void connectViaOAuth(uid, catalogId, { attemptId }).then((instance) => {
     const failureMessage = instance.status.kind === 'error'
       ? (instance.status.message || 'connector transport error')
       : '';
@@ -976,10 +1057,11 @@ async function _provisionMemberInstance(
   const transport = applyTemplate(entry, grant);
 
   // Tear down any prior live connection for the same id before re-using the slot.
-  const prior = _conns.get(entry.id);
+  const runtimeKey = _runtimeKey(uid, entry.id);
+  const prior = _conns.get(runtimeKey);
   if (prior) {
     try { await prior.close(); } catch { /* swallow */ }
-    _conns.delete(entry.id);
+    _conns.delete(runtimeKey);
   }
 
   const draft: ConnectorInstance = {
@@ -1056,10 +1138,11 @@ export async function addCustomInstance(uid: string, input: CustomConnectorInput
 
 export async function removeInstance(uid: string, id: string): Promise<boolean> {
   if (!uid) return false;
-  const conn = _conns.get(id);
+  const runtimeKey = _runtimeKey(uid, id);
+  const conn = _conns.get(runtimeKey);
   if (conn) {
     try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(id);
+    _conns.delete(runtimeKey);
   }
   return registry.remove(uid, id);
 }
@@ -1071,10 +1154,11 @@ export async function refreshTools(uid: string, id: string): Promise<ToolSchema[
   if (!inst) throw new Error('instance not found');
   // Force refresh-token check by tearing the live conn down and reconnecting through
   // _connectAndCacheTools (which re-resolves transport with a fresh access_token).
-  const prior = _conns.get(id);
+  const runtimeKey = _runtimeKey(uid, id);
+  const prior = _conns.get(runtimeKey);
   if (prior) {
     try { await prior.close(); } catch { /* swallow */ }
-    _conns.delete(id);
+    _conns.delete(runtimeKey);
   }
   const updated = await _connectAndCacheTools(uid, inst);
   return updated.tools_cache;
@@ -1111,10 +1195,11 @@ export async function authorizeGoogleSheetsFiles(uid: string, fileIds?: string[]
     oauth_grant: nextGrant,
     updated_at: _nowIso(),
   }));
-  const conn = _conns.get('gsheets');
+  const runtimeKey = _runtimeKey(uid, 'gsheets');
+  const conn = _conns.get(runtimeKey);
   if (conn) {
     try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete('gsheets');
+    _conns.delete(runtimeKey);
   }
   return picked.pickedFileIds;
 }
@@ -1131,7 +1216,8 @@ export async function callTool(
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
-  const liveConn = _conns.get(id);
+  const runtimeKey = _runtimeKey(uid, id);
+  const liveConn = _conns.get(runtimeKey);
   const grantForCooldown = inst.oauth_grant;
   const grantStaleForCooldown = !!(grantForCooldown?.expires_at
     && grantForCooldown.expires_at - Date.now() <= REFRESH_BUFFER_MS);
@@ -1148,14 +1234,14 @@ export async function callTool(
   // with the fresh one. Same `REFRESH_BUFFER_MS` window the refresh path uses.
   const grant = inst.oauth_grant;
   const stale = !!(grant && grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
-  let conn = _conns.get(id);
+  let conn = _conns.get(runtimeKey);
   if (stale && conn) {
     log.info('connector state stale; tearing down only this instance before reconnect', {
       id,
       stale_grant: stale,
     });
     try { await conn.close(); } catch { /* swallow */ }
-    _conns.delete(id);
+    _conns.delete(runtimeKey);
     conn = undefined;
   }
   if (!conn || !conn.isConnected) {
@@ -1164,21 +1250,21 @@ export async function callTool(
     // from weakening first-call recovery, refreshes the target's schemas, and
     // persists a real failure for the Connectors UI. Coalesce concurrent model
     // calls so only one stdio child/socket is created for this instance.
-    let pending = _onDemandConnectLocks.get(id);
+    let pending = _onDemandConnectLocks.get(runtimeKey);
     if (!pending) {
       pending = (async () => {
-        const current = _conns.get(id);
+        const current = _conns.get(runtimeKey);
         if (current?.isConnected) return current;
         const updated = await _connectAndCacheTools(uid, inst!);
-        const connected = _conns.get(id);
+        const connected = _conns.get(runtimeKey);
         if (!connected?.isConnected) {
           throw new Error(_connectFailureMessage(id, updated));
         }
         return connected;
       })();
-      _onDemandConnectLocks.set(id, pending);
+      _onDemandConnectLocks.set(runtimeKey, pending);
       void pending.finally(() => {
-        if (_onDemandConnectLocks.get(id) === pending) _onDemandConnectLocks.delete(id);
+        if (_onDemandConnectLocks.get(runtimeKey) === pending) _onDemandConnectLocks.delete(runtimeKey);
       }).catch(() => {});
     }
     conn = await _waitForConnectorOrAbort(pending, opts.signal);
@@ -1201,9 +1287,9 @@ export async function callTool(
     const hardAuth = !cancelled && !!entry
       && (_isGoogleAuthFailure(entry, err) || _isDcrAuthFailure(entry, err));
     if (cancelled || transient || hardAuth) {
-      const current = _conns.get(id);
+      const current = _conns.get(runtimeKey);
       if (current === conn) {
-        _conns.delete(id);
+        _conns.delete(runtimeKey);
         try { await current.close(); } catch { /* close already logs */ }
       }
     }
@@ -1266,9 +1352,6 @@ function _connectFailureMessage(id: string, updated: ConnectorInstance): string 
 }
 
 export async function shutdownAll(): Promise<void> {
-  const all = Array.from(_conns.values());
-  _conns.clear();
-  _onDemandConnectLocks.clear();
+  const all = _detachConnectorRuntime();
   await Promise.all(all.map((c) => c.close().catch(() => {})));
-  _bootedFor = null;
 }

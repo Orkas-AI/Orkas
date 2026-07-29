@@ -37,4 +37,35 @@ describe('icons.js', () => {
     expect(fileKindIconHtml('metrics.xlsx')).toContain('is-spreadsheet');
     expect(fileKindIconHtml('launch.pptx')).toContain('is-presentation');
   });
+
+  it('falls back to a safe info icon without reflecting untrusted names or classes', () => {
+    const { uiIconHtml } = loadIcons();
+    const html = uiIconHtml('"><script>alert(1)</script>', 'safe" onload="alert(1) ui-icon');
+
+    expect(html).toContain('class="ui-icon is-info"');
+    expect(html).not.toContain('<script>');
+    expect(html).not.toContain('onload=');
+  });
+
+  it('defines every literal icon referenced by Renderer HTML and JavaScript', () => {
+    const { uiIconHtml } = loadIcons();
+    const rendererRoot = path.join(__dirname, '../../src/renderer');
+    const sources = [
+      fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8'),
+      ...fs.readdirSync(path.join(rendererRoot, 'modules'))
+        .filter((name) => name.endsWith('.js'))
+        .map((name) => fs.readFileSync(path.join(rendererRoot, 'modules', name), 'utf8')),
+    ];
+    const names = new Set<string>();
+    for (const source of sources) {
+      for (const match of source.matchAll(/data-ui-icon=["']([^"']+)["']/g)) names.add(match[1]);
+      for (const match of source.matchAll(/\b(?:window\.)?_?uiIconHtml\(\s*["']([^"']+)["']/g)) names.add(match[1]);
+    }
+
+    expect(names.size).toBeGreaterThan(30);
+    for (const name of names) {
+      const html = uiIconHtml(name);
+      expect(html, `missing icon: ${name}`).toContain(`is-${name}`);
+    }
+  });
 });

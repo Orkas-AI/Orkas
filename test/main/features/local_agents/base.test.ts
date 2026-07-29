@@ -6,6 +6,7 @@ import {
   levelOrInfo,
   LineSplitter,
   StderrTail,
+  stripAnsi,
 } from '../../../../src/main/features/local_agents/backends/base';
 
 describe('local_agents/backends/base', () => {
@@ -41,6 +42,12 @@ describe('local_agents/backends/base', () => {
     expect(levelOrInfo('fatal')).toBe('error');
     expect(levelOrInfo('notice')).toBe('info');
     expect(levelOrInfo(3)).toBe('info');
+  });
+
+  it('strips terminal color and OSC sequences from persisted CLI diagnostics', () => {
+    expect(stripAnsi('\u001b[2m2026-07-21\u001b[0m \u001b[31mERROR\u001b[0m cache failed'))
+      .toBe('2026-07-21 ERROR cache failed');
+    expect(stripAnsi('\u001b]0;secret title\u0007plain')).toBe('plain');
   });
 
   it('sends SIGTERM on abort, escalates to SIGKILL, and cleans up listeners', () => {

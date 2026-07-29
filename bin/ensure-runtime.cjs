@@ -228,6 +228,7 @@ function downloadFile(url, dest) {
 
 function runCommand(cmd, args, opts) {
   const res = spawnSync(cmd, args, {
+    cwd: opts.cwd,
     encoding: 'utf8',
     stdio: opts.quiet ? ['ignore', 'pipe', 'pipe'] : 'inherit',
     timeout: opts.timeoutMs || 5 * 60 * 1000,
@@ -237,12 +238,24 @@ function runCommand(cmd, args, opts) {
   return { ok: true, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
+function tarExtractionPlan(archive, extractDir, archiveType) {
+  const cwd = path.dirname(archive);
+  const target = path.relative(cwd, extractDir).replaceAll(path.sep, '/') || '.';
+  return {
+    cwd,
+    args: archiveType === 'tar.gz'
+      ? ['-xzf', path.basename(archive), '-C', target]
+      : ['-xf', path.basename(archive), '-C', target],
+  };
+}
+
 function extractArchive(archive, extractDir, asset, opts) {
   fs.mkdirSync(extractDir, { recursive: true });
-  const tarArgs = asset.archive === 'tar.gz'
-    ? ['-xzf', archive, '-C', extractDir]
-    : ['-xf', archive, '-C', extractDir];
-  let res = runCommand('tar', tarArgs, opts);
+  // GNU tar treats a Windows drive-letter path as a remote host reference.
+  // Run beside the archive and pass only relative paths so Git Bash/MSYS tar
+  // can extract packaged runtimes on Windows.
+  const tar = tarExtractionPlan(archive, extractDir, asset.archive);
+  let res = runCommand('tar', tar.args, { ...opts, cwd: tar.cwd });
   if (res.ok) return;
 
   if (asset.archive === 'zip') {
@@ -585,4 +598,8 @@ async function main() {
   if (!ok) process.exit(1);
 }
 
-main().catch((err) => die('runtime ensure failed', { error: err && err.message }));
+if (require.main === module) {
+  main().catch((err) => die('runtime ensure failed', { error: err && err.message }));
+} else {
+  module.exports = { tarExtractionPlan };
+}

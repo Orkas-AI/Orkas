@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -6,12 +6,164 @@ import log from 'electron-log/main';
 import {
   detectAll,
   detectOne,
+  detectPreferredVersion,
+  detectPreferredVersionResult,
+  findAllInstalled,
   invalidateCache,
+  localCliCapabilities,
   localCliSearchDirs,
+  localCliResumeStrategy,
+  LOCAL_CLI_CAPABILITIES,
   LOCAL_CLI_TYPES,
+  VERSION_PROBE_TIMEOUT_MS,
 } from '../../../../src/main/features/local_agents/registry';
 
 const isWindows = process.platform === 'win32';
+
+describe('local CLI context capabilities', () => {
+  it('declares the complete conversation contract for every registered backend', () => {
+    expect(Object.keys(LOCAL_CLI_CAPABILITIES).sort()).toEqual([...LOCAL_CLI_TYPES].sort());
+    expect(LOCAL_CLI_CAPABILITIES).toEqual({
+      claude: {
+        resume: 'native',
+        instructionChannel: 'native',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+      },
+      codex: {
+        resume: 'native',
+        instructionChannel: 'native',
+        durableInstructionScope: 'session',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+      },
+      openclaw: {
+        resume: 'session-id',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'session',
+        codingProjectDirectory: false,
+        orkasBridge: false,
+      },
+      opencode: {
+        resume: 'native',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'session',
+        codingProjectDirectory: false,
+        orkasBridge: false,
+      },
+      hermes: {
+        resume: 'none',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: false,
+        orkasBridge: false,
+      },
+    });
+  });
+
+  it('fails closed for an unknown CLI instead of assuming session persistence', () => {
+    expect(localCliCapabilities('unknown')).toEqual({
+      resume: 'none',
+      instructionChannel: 'user-message',
+      durableInstructionScope: 'invocation',
+      codingProjectDirectory: false,
+      orkasBridge: false,
+    });
+    expect(localCliResumeStrategy('unknown')).toBe('none');
+  });
+});
+
+describe('local CLI version probe scheduling', () => {
+  it('allows 15 seconds for production version probes', () => {
+    expect(VERSION_PROBE_TIMEOUT_MS).toBe(15_000);
+  });
+
+  it('starts compatibility probes together while preserving preferred-result order', async () => {
+    const started: string[] = [];
+    const timeouts: number[] = [];
+    const resolvers = new Map<string, (value: string | null) => void>();
+    const pending = detectPreferredVersion(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async (_binPath, timeoutMs, args) => new Promise((resolve) => {
+        started.push(args.join(' '));
+        timeouts.push(timeoutMs);
+        resolvers.set(args.join(' '), resolve);
+      }),
+    );
+
+    // Both child operations must be admitted before either one settles.
+    expect(started).toEqual(['version', '--version']);
+    expect(timeouts).toEqual([15_000, 15_000]);
+    resolvers.get('--version')?.('9.9.9');
+    resolvers.get('version')?.('0.18.2');
+
+    // Declaration order remains authoritative even when the fallback finishes
+    // first, matching the documented Hermes `version` preference.
+    await expect(pending).resolves.toBe('0.18.2');
+  });
+
+  it('does not wait for a lower-priority probe after the preferred one succeeds', async () => {
+    const pending = detectPreferredVersion(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async (_binPath, _timeoutMs, args) => {
+        if (args[0] === 'version') return '0.18.2';
+        return new Promise<string | null>(() => {});
+      },
+    );
+
+    await expect(pending).resolves.toBe('0.18.2');
+  });
+
+  it('uses the fallback only after all higher-priority probes fail', async () => {
+    const settled: string[] = [];
+    const result = await detectPreferredVersion(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async (_binPath, _timeoutMs, args) => {
+        settled.push(args[0]);
+        if (args[0] === 'version') return null;
+        return '0.17.0';
+      },
+    );
+
+    expect(settled).toEqual(['version', '--version']);
+    expect(result).toBe('0.17.0');
+  });
+
+  it('treats a rejected probe as unavailable and still accepts a fallback', async () => {
+    const result = await detectPreferredVersion(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async (_binPath, _timeoutMs, args) => {
+        if (args[0] === 'version') throw new Error('spawn failed');
+        return '0.17.0';
+      },
+    );
+
+    expect(result).toBe('0.17.0');
+  });
+
+  it('reports timeout only when every compatible version probe times out', async () => {
+    const allTimedOut = await detectPreferredVersionResult(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async () => ({ status: 'timeout', version: null }),
+    );
+    expect(allTimedOut).toEqual({ status: 'timeout', version: null });
+
+    const mixedFailure = await detectPreferredVersionResult(
+      '/mock/hermes',
+      [['version'], ['--version']],
+      async (_binPath, _timeoutMs, args) => args[0] === 'version'
+        ? { status: 'failed', version: null }
+        : { status: 'timeout', version: null },
+    );
+    expect(mixedFailure).toEqual({ status: 'failed', version: null });
+  });
+});
 
 function writeMockCli(basePath: string, output: string): string {
   const binPath = isWindows ? `${basePath}.cmd` : basePath;
@@ -66,6 +218,29 @@ function writeArgAwareMockCli(
   return binPath;
 }
 
+function writeCountingMockCli(basePath: string, logPath: string): string {
+  const scriptPath = `${basePath}.js`;
+  const script = [
+    '#!/usr/bin/env node',
+    "const fs = require('node:fs');",
+    `fs.appendFileSync(${JSON.stringify(logPath)}, String(process.argv[2] || '') + '\\n');`,
+    "setTimeout(() => process.stdout.write('2.1.0\\n'), 120);",
+    '',
+  ].join('\n');
+  fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+  fs.writeFileSync(scriptPath, script);
+  if (isWindows) {
+    const binPath = `${basePath}.cmd`;
+    fs.writeFileSync(
+      binPath,
+      `@echo off\r\n"${process.execPath}" "${scriptPath}" %*\r\n`,
+    );
+    return binPath;
+  }
+  fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
 describe('local_agents/registry', () => {
   let tmpDir: string;
   let savedPath: string | undefined;
@@ -112,6 +287,7 @@ describe('local_agents/registry', () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     process.env.PATH = savedPath;
     if (savedHome === undefined) delete process.env.HOME;
     else process.env.HOME = savedHome;
@@ -134,6 +310,29 @@ describe('local_agents/registry', () => {
     const result = await detectAll();
     const types = result.map(r => r.type).sort();
     expect(types).toEqual([...LOCAL_CLI_TYPES].sort());
+  });
+
+  it('finds installed CLIs without starting version processes', async () => {
+    const probeLog = path.join(tmpDir, 'presence-probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'present-opencode'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = path.join(tmpDir, 'missing-claude');
+    process.env.ORKAS_CODEX_PATH = path.join(tmpDir, 'missing-codex');
+    process.env.ORKAS_OPENCLAW_PATH = path.join(tmpDir, 'missing-openclaw');
+    process.env.ORKAS_OPENCODE_PATH = fake;
+    process.env.ORKAS_HERMES_PATH = path.join(tmpDir, 'missing-hermes');
+
+    const result = await findAllInstalled();
+    const opencode = result.find(entry => entry.type === 'opencode');
+
+    expect(opencode).toEqual({
+      type: 'opencode',
+      path: fake,
+      version: null,
+      available: true,
+      validation: 'pending',
+    });
+    expect(fs.existsSync(probeLog)).toBe(false);
   });
 
   it('marks not_found when binary missing on PATH', async () => {
@@ -159,12 +358,44 @@ describe('local_agents/registry', () => {
 
   it('finds Codex in the standalone default ~/.local/bin even when PATH omits it', async () => {
     const binDir = path.join(process.env.HOME!, '.local', 'bin');
-    const fake = writeMockCli(path.join(binDir, 'codex'), 'codex-cli 0.139.0');
+    const fake = writeMockCli(path.join(binDir, 'codex'), 'codex-cli 0.145.0');
     process.env.PATH = '';
 
-    const r = await detectOne('codex');
+    // Restrict this probe to the already-asserted default directory so a real
+    // newer Codex/ChatGPT app on the developer machine cannot replace the
+    // fixture and make the test host-version-dependent.
+    const r = await detectOne('codex', { searchDirs: [binDir] });
     expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? fake.toLowerCase() : fake);
-    expect(r.version).toBe('0.139.0');
+    expect(r.version).toBe('0.145.0');
+    expect(r.available).toBe(true);
+  });
+
+  it('selects the newest Codex installation instead of the first PATH hit', async () => {
+    const oldDir = path.join(tmpDir, 'old-codex');
+    const newDir = path.join(tmpDir, 'new-codex');
+    const oldBin = writeMockCli(path.join(oldDir, 'codex'), 'codex-cli 0.139.0');
+    const newBin = writeMockCli(path.join(newDir, 'codex'), 'codex-cli 0.145.0-alpha.18');
+    process.env.PATH = `${oldDir}${path.delimiter}${newDir}`;
+
+    // PATH is the subject of this case. Exclude host fallback directories so
+    // a bundled GUI-app Codex cannot outrank both controlled candidates.
+    const r = await detectOne('codex', { searchDirs: [] });
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? newBin.toLowerCase() : newBin);
+    expect(r.path).not.toBe(oldBin);
+    expect(r.version).toBe('0.145.0');
+    expect(r.available).toBe(true);
+  });
+
+  it('keeps ORKAS_CODEX_PATH authoritative even when a newer Codex is discoverable', async () => {
+    const pinned = writeMockCli(path.join(tmpDir, 'pinned-codex'), 'codex-cli 0.145.0');
+    const newerDir = path.join(tmpDir, 'newer-codex');
+    writeMockCli(path.join(newerDir, 'codex'), 'codex-cli 0.150.0');
+    process.env.PATH = newerDir;
+    process.env.ORKAS_CODEX_PATH = pinned;
+
+    const r = await detectOne('codex');
+    expect(isWindows ? r.path?.toLowerCase() : r.path).toBe(isWindows ? pinned.toLowerCase() : pinned);
+    expect(r.version).toBe('0.145.0');
     expect(r.available).toBe(true);
   });
 
@@ -175,7 +406,7 @@ describe('local_agents/registry', () => {
     fs.mkdirSync(binDir, { recursive: true });
     fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({
       name: '@openai/codex',
-      version: '0.130.0',
+      version: '0.145.0',
     }));
     const fake = path.join(binDir, 'codex.js');
     fs.writeFileSync(fake, '#!/bin/sh\necho ""\n');
@@ -185,7 +416,7 @@ describe('local_agents/registry', () => {
 
     const r = await detectOne('codex');
     expect(r.path).toBe(fake);
-    expect(r.version).toBe('0.130.0');
+    expect(r.version).toBe('0.145.0');
     expect(r.available).toBe(true);
   });
 
@@ -209,6 +440,21 @@ describe('local_agents/registry', () => {
     expect(r.available).toBe(false);
     expect(r.error).toBe('version_unknown');
     expect(r.path).toBe(fake);
+  });
+
+  it('marks version_timeout when an installed CLI exceeds the probe deadline', async () => {
+    const fake = writeCountingMockCli(
+      path.join(tmpDir, 'slow-opencode'),
+      path.join(tmpDir, 'slow-opencode-probe.log'),
+    );
+    process.env.PATH = '';
+    process.env.ORKAS_OPENCODE_PATH = fake;
+
+    const r = await detectOne('opencode', { versionProbeTimeoutMs: 20 });
+    expect(r.available).toBe(false);
+    expect(r.error).toBe('version_timeout');
+    expect(r.path).toBe(fake);
+    expect(r.errorDetail).toContain('did not finish within 20ms');
   });
 
   it('uses the documented version subcommand for Hermes', async () => {
@@ -240,7 +486,8 @@ describe('local_agents/registry', () => {
     expect(r.error).toBeUndefined();
   });
 
-  it('detectAll caches results within the TTL window', async () => {
+  it('detectAll keeps results cached for the process lifetime until forced', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1_000);
     const fake = writeMockCli(path.join(tmpDir, 'ok-opencode'), '0.10.0');
     process.env.PATH = '';
     process.env.ORKAS_OPENCODE_PATH = fake;
@@ -249,14 +496,45 @@ describe('local_agents/registry', () => {
     const opencodeFirst = first.find(e => e.type === 'opencode')!;
     expect(opencodeFirst.available).toBe(true);
 
-    // Delete the binary; cached result should still report available.
+    // Delete the binary and move far past the former 60-second TTL. A normal
+    // read still uses the process-lifetime cache.
     fs.rmSync(fake);
+    now.mockReturnValue(86_401_000);
     const cached = await detectAll();
     expect(cached.find(e => e.type === 'opencode')!.available).toBe(true);
 
     // Force re-detect bypasses cache.
     const fresh = await detectAll({ force: true });
     expect(fresh.find(e => e.type === 'opencode')!.available).toBe(false);
+  });
+
+  it('coalesces concurrent forced discovery into one set of version processes', async () => {
+    const probeLog = path.join(tmpDir, 'probe-calls.log');
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog);
+    process.env.PATH = '';
+    process.env.ORKAS_CLAUDE_PATH = fake;
+    process.env.ORKAS_CODEX_PATH = fake;
+    process.env.ORKAS_OPENCLAW_PATH = fake;
+    process.env.ORKAS_OPENCODE_PATH = fake;
+    process.env.ORKAS_HERMES_PATH = fake;
+
+    const [first, second] = await Promise.all([
+      detectAll({ force: true }),
+      detectAll({ force: true }),
+    ]);
+
+    expect(second).toBe(first);
+    expect(first.every(entry => entry.available)).toBe(true);
+    const probes = fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/).sort();
+    // Four single-probe CLIs plus Hermes `version` and `--version`.
+    expect(probes).toEqual([
+      '--version',
+      '--version',
+      '--version',
+      '--version',
+      '--version',
+      'version',
+    ]);
   });
 });
 

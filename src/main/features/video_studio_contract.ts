@@ -144,7 +144,25 @@ function schemaIssues(error: z.ZodError): ContractIssue[] {
   }));
 }
 
-function validateManifestSemantics(manifest: CompositionManifest): ContractIssue[] {
+function isEnglishAllCaps(value: string): boolean {
+  const letters = value.match(/[A-Za-z]/g) || [];
+  return letters.length >= 2 && /[A-Z]/.test(value) && !/[a-z]/.test(value);
+}
+
+function isShortUppercaseCode(value: string): boolean {
+  const text = value.replace(/\s+/g, ' ').trim();
+  return /^[A-Z]{2,4}$/.test(text)
+    || (/^[A-Z0-9][A-Z0-9._/+:-]{1,7}$/.test(text) && /[0-9._/+:-]/.test(text));
+}
+
+function isBoundedUppercaseAccent(value: string): boolean {
+  const text = value.replace(/\s+/g, ' ').trim();
+  return text.length <= 24
+    && text.split(/\s+/).filter(Boolean).length <= 3
+    && isEnglishAllCaps(text);
+}
+
+export function validateCompositionManifestSemantics(manifest: CompositionManifest): ContractIssue[] {
   const issues: ContractIssue[] = [];
   const ids = new Set<string>();
   const trackIds = new Set<string>();
@@ -192,6 +210,30 @@ function validateManifestSemantics(manifest: CompositionManifest): ContractIssue
       });
     }
     previousEnd = Math.max(previousEnd, scene.start + scene.duration);
+    if (/^en(?:-|$)/i.test(manifest.composition.language || '')) {
+      const uppercaseCopy = scene.approved_copy.filter(isEnglishAllCaps);
+      const hasAccentRole = scene.roles.some((role) => (
+        ['label', 'eyebrow', 'metadata', 'code'].includes(role.trim().toLowerCase())
+      ));
+      const allowsOneBoundedAccent = uppercaseCopy.length === 1
+        && (
+          isShortUppercaseCode(uppercaseCopy[0])
+          || (hasAccentRole && isBoundedUppercaseAccent(uppercaseCopy[0]))
+        );
+      if (!allowsOneBoundedAccent) {
+        for (const copy of uppercaseCopy) {
+          issues.push({
+            code: 'COMPOSITION_MANIFEST_PRIMARY_COPY_ALL_CAPS',
+            severity: 'error',
+            selector: `composition-manifest.json#scenes.${index}.approved_copy`,
+            sceneId: scene.id,
+            message: `English scene "${scene.id}" contains all-caps approved copy that is not a single bounded metadata accent.`,
+            fixHint: 'Use sentence case or natural title case before production-plan approval; keep at most one short uppercase label, acronym, or code.',
+            source: 'orkas-native-composition-manifest',
+          });
+        }
+      }
+    }
   }
   if (manifest.scenes.length && Math.abs(previousEnd - manifest.composition.duration) > 0.15) {
     issues.push({
@@ -426,7 +468,7 @@ export function migrateLegacyCompositionManifest(contract: unknown, sceneMap: un
 function parseManifest(value: unknown): { manifest: CompositionManifest | null; issues: ContractIssue[] } {
   const parsed = CompositionManifestSchema.safeParse(value);
   if (!parsed.success) return { manifest: null, issues: schemaIssues(parsed.error) };
-  const issues = validateManifestSemantics(parsed.data);
+  const issues = validateCompositionManifestSemantics(parsed.data);
   return {
     manifest: issues.some((issue) => issue.severity === 'error') ? null : parsed.data,
     issues,

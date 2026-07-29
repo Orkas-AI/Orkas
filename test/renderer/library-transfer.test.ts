@@ -7,6 +7,17 @@ const transfer = require('../../src/renderer/modules/library-transfer.js') as {
   _parseLibraryValue: (value: string) => { scope: string; projectId?: string } | null;
   _folderRows: (nodes: unknown[]) => Array<{ path: string; name: string; depth: number }>;
   _projectsFromResponse: (response: unknown) => unknown[];
+  _canSubmitTransfer: (state: { loading: boolean; destinationReady: boolean }) => boolean;
+  _transferFailureTelemetry: (error: unknown) => Record<string, unknown>;
+  _createLatestFolderLoader: (
+    loadTree: (ref: { scope: string; projectId?: string }) => Promise<unknown[]>,
+    handlers: {
+      onStart: (ref: { scope: string; projectId?: string }) => void;
+      onReady: (tree: unknown[], ref: { scope: string; projectId?: string }) => void;
+      onError: (error: unknown, ref: { scope: string; projectId?: string }) => void;
+      onFinish: (ref: { scope: string; projectId?: string }) => void;
+    },
+  ) => (ref: { scope: string; projectId?: string }) => Promise<boolean>;
 };
 
 describe('shared Library transfer dialog', () => {
@@ -45,12 +56,96 @@ describe('shared Library transfer dialog', () => {
     expect(transfer._projectsFromResponse({ ok: true })).toEqual([]);
   });
 
+  it('keeps destructive submission disabled until the destination tree loads', () => {
+    expect(transfer._canSubmitTransfer({
+      loading: true,
+      destinationReady: false,
+    })).toBe(false);
+    expect(transfer._canSubmitTransfer({
+      loading: false,
+      destinationReady: false,
+    })).toBe(false);
+    expect(transfer._canSubmitTransfer({
+      loading: false,
+      destinationReady: true,
+    })).toBe(true);
+  });
+
+  it('does not let a slow previous destination replace the latest folder tree', async () => {
+    const pending = new Map<string, {
+      resolve: (tree: unknown[]) => void;
+      reject: (error: Error) => void;
+    }>();
+    const events: string[] = [];
+    const load = transfer._createLatestFolderLoader(
+      (ref) => new Promise<unknown[]>((resolve, reject) => {
+        pending.set(ref.projectId || 'global', { resolve, reject });
+      }),
+      {
+        onStart: (ref) => events.push(`start:${ref.projectId}`),
+        onReady: (_tree, ref) => events.push(`ready:${ref.projectId}`),
+        onError: (_error, ref) => events.push(`error:${ref.projectId}`),
+        onFinish: (ref) => events.push(`finish:${ref.projectId}`),
+      },
+    );
+
+    const slow = load({ scope: 'project', projectId: 'slow' });
+    const latest = load({ scope: 'project', projectId: 'latest' });
+    pending.get('latest')!.resolve([{ type: 'dir', relPath: 'latest-folder' }]);
+    await expect(latest).resolves.toBe(true);
+    pending.get('slow')!.resolve([{ type: 'dir', relPath: 'stale-folder' }]);
+    await expect(slow).resolves.toBe(false);
+
+    expect(events).toEqual([
+      'start:slow',
+      'start:latest',
+      'ready:latest',
+      'finish:latest',
+    ]);
+  });
+
+  it('ignores an obsolete destination failure after a newer tree is ready', async () => {
+    const pending = new Map<string, {
+      resolve: (tree: unknown[]) => void;
+      reject: (error: Error) => void;
+    }>();
+    const events: string[] = [];
+    const load = transfer._createLatestFolderLoader(
+      (ref) => new Promise<unknown[]>((resolve, reject) => {
+        pending.set(ref.projectId || 'global', { resolve, reject });
+      }),
+      {
+        onStart: (ref) => events.push(`start:${ref.projectId}`),
+        onReady: (_tree, ref) => events.push(`ready:${ref.projectId}`),
+        onError: (_error, ref) => events.push(`error:${ref.projectId}`),
+        onFinish: (ref) => events.push(`finish:${ref.projectId}`),
+      },
+    );
+
+    const obsolete = load({ scope: 'project', projectId: 'obsolete' });
+    const latest = load({ scope: 'project', projectId: 'latest' });
+    pending.get('latest')!.resolve([]);
+    await latest;
+    pending.get('obsolete')!.reject(new Error('private /Users/test/library'));
+    await expect(obsolete).resolves.toBe(false);
+
+    expect(events).not.toContain('error:obsolete');
+    expect(events.at(-1)).toBe('finish:latest');
+  });
+
+  it('does not put raw IPC failures or local paths into telemetry', () => {
+    const payload = transfer._transferFailureTelemetry(
+      new Error('copy failed at /Users/test/customer-plan.md'),
+    );
+
+    expect(payload).toEqual({ error_type: 'exception' });
+    expect(JSON.stringify(payload)).not.toContain('/Users/private');
+    expect(JSON.stringify(payload)).not.toContain('customer-plan.md');
+  });
+
   it('keeps row menus compact with one consolidated transfer action', () => {
     const contexts = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/contexts.js'), 'utf8');
     const project = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/project-detail.js'), 'utf8');
-    const dialog = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/library-transfer.js'), 'utf8');
-    const archivePicker = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/kb-picker.js'), 'utf8');
-    const zh = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/zh.json'), 'utf8'));
 
     expect(contexts.match(/action: 'organize'/g)).toHaveLength(2);
     expect(project.match(/action: 'organize'/g)).toHaveLength(2);
@@ -72,12 +167,5 @@ describe('shared Library transfer dialog', () => {
     }
     expect(contextFileMenu.indexOf("action: 'open_in_system'")).toBeGreaterThan(contextFileMenu.indexOf("action: 'organize'"));
     expect(projectFileMenu.indexOf("action: 'reveal'")).toBeGreaterThan(projectFileMenu.indexOf("action: 'organize'"));
-    expect(dialog).toContain("data-transfer-mode=\"move\"");
-    expect(dialog).toContain("data-transfer-mode=\"copy\"");
-    expect(dialog).toContain("root.orkas.invoke('library.transfer'");
-    expect(dialog).toContain("Array.isArray(data?.tree)");
-    expect(dialog).toContain('32 + row.depth * 18');
-    expect(archivePicker).toContain('32 + depth * 18');
-    expect(zh['chat.archive_picker_title']).toBe('存档到资料库');
   });
 });

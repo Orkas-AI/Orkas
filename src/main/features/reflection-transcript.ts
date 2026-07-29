@@ -22,7 +22,7 @@ import { cloudSessionFileFor, listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
 import { listConversations, type Conversation } from './chats';
 import { buildGmemberSessionId } from './group_chat/state';
-import { querySignals, type Signal, type SignalType } from './expert_signals';
+import { querySignalsForUser, type Signal, type SignalType } from './expert_signals';
 
 const log = createLogger('reflection-transcript');
 
@@ -290,7 +290,7 @@ export async function buildTranscript(
   // anyway, so a permissive aid filter for _default is fine).
   let windowSignals: Signal[] = [];
   try {
-    windowSignals = await querySignals({
+    windowSignals = await querySignalsForUser(uid, {
       since: new Date(sinceMs).toISOString(),
       types: SYSTEM_EVENT_TYPES,
       ...(isDefault ? {} : { aid: agentId }),

@@ -125,8 +125,11 @@ function _matchRoute(method, pathname) {
  * (for streams) .body.getReader() on.
  */
 function _mockJsonResponse(result) {
+  if (result === null || result === undefined) {
+    return _mockErrorResponse('invalid ipc response', 502);
+  }
   return {
-    ok: result && result.ok !== false,
+    ok: result.ok !== false,
     status: result && result.ok === false ? 400 : 200,
     json: async () => result,
   };
@@ -148,6 +151,24 @@ function _monitorIpcError(kind, channel, data) {
       ...(data || {}),
     });
   } catch (_) {}
+}
+
+function _ipcFailureMeta(err) {
+  const meta = {};
+  const name = err && typeof err.name === 'string' ? err.name : '';
+  const code = err && (typeof err.code === 'string' || typeof err.code === 'number')
+    ? String(err.code)
+    : '';
+  if (/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name)) meta.error_name = name;
+  if (/^[A-Za-z0-9_-]{1,64}$/.test(code)) meta.error_code = code;
+  return meta;
+}
+
+function _headerValue(headers, wanted) {
+  if (!headers) return '';
+  if (typeof headers.get === 'function') return headers.get(wanted) || '';
+  const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === wanted.toLowerCase());
+  return key ? headers[key] : '';
 }
 
 function _hasOrkasInvoke() {
@@ -192,8 +213,8 @@ function _streamResponse(channel, payload, signal) {
             try { controller.close(); } catch (_) {}
             return;
           }
-          _monitorIpcError('ipc_stream', channel, { msg: err && err.message ? err.message : String(err) });
-          try { controller.error(err); } catch (_) {}
+          _monitorIpcError('ipc_stream', channel, _ipcFailureMeta(err));
+          try { controller.error(new Error('ipc stream failed')); } catch (_) {}
         });
     },
     cancel() {
@@ -225,17 +246,22 @@ async function _uploadBinary(channel, options, extraParams) {
     return _mockJsonResponse({ ok: false, error: 'ipc bridge unavailable' });
   }
 
-  const rawName = ((options.headers || {})['X-Filename']) || '';
-  const name = rawName ? decodeURIComponent(rawName) : '';
+  const rawName = _headerValue(options.headers, 'X-Filename');
+  let name = '';
+  try {
+    name = rawName ? decodeURIComponent(rawName) : '';
+  } catch (_err) {
+    return _mockJsonResponse({ ok: false, error: 'invalid filename encoding' });
+  }
   const body = options.body;
-  let buf;
-  if (body instanceof ArrayBuffer) buf = body;
-  else if (body && body.buffer instanceof ArrayBuffer) buf = body.buffer;
-  else if (body instanceof Uint8Array) buf = body.buffer;
+  let bytes;
+  if (body instanceof ArrayBuffer) bytes = new Uint8Array(body);
+  else if (body && body.buffer instanceof ArrayBuffer && Number.isFinite(body.byteOffset) && Number.isFinite(body.byteLength)) {
+    bytes = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
   else return _mockJsonResponse({ ok: false, error: 'binary body required' });
 
   // Chunk-wise base64 to avoid stack blowup on large files.
-  const bytes = new Uint8Array(buf);
   let binary = '';
   const step = 0x8000;
   for (let i = 0; i < bytes.length; i += step) {
@@ -246,8 +272,8 @@ async function _uploadBinary(channel, options, extraParams) {
     const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
     return _mockJsonResponse(result);
   } catch (err) {
-    _monitorIpcError('ipc_upload', channel, { msg: err && err.message ? err.message : String(err) });
-    throw err;
+    _monitorIpcError('ipc_upload', channel, _ipcFailureMeta(err));
+    throw new Error('ipc upload failed');
   }
 }
 
@@ -271,9 +297,9 @@ function apiFetch(url, options) {
 
   const route = _matchRoute(method, pathname);
   if (!route) {
-    _shimLog.warn('unmatched route:', method, pathname);
-    _monitorIpcError('ipc_unmatched_route', method + ' ' + pathname);
-    return Promise.resolve(_mockErrorResponse(`unknown route: ${method} ${pathname}`, 404));
+    _shimLog.warn('unmatched API route', { method });
+    _monitorIpcError('ipc_unmatched_route', 'unmatched', { method });
+    return Promise.resolve(_mockErrorResponse('unknown API route', 404));
   }
 
   const { channel, params, opts } = route;
@@ -299,7 +325,7 @@ function apiFetch(url, options) {
   // invoke; path params (e.g. `cid`) are merged into the payload.
   if (channel && typeof channel === 'object' && channel.upload) {
     const uploadChannel = typeof channel.upload === 'string' ? channel.upload : 'contexts.upload';
-    return _uploadBinary(uploadChannel, options, params).catch((err) => _mockErrorResponse((err && err.message) || String(err), 500));
+    return _uploadBinary(uploadChannel, options, params).catch(() => _mockErrorResponse('ipc upload failed', 500));
   }
 
   // Streaming: go through window.orkas.stream + ReadableStream body.
@@ -325,7 +351,7 @@ function apiFetch(url, options) {
       return _mockJsonResponse(result);
     })
     .catch((err) => {
-      _monitorIpcError('ipc_invoke', channel, { msg: err && err.message ? err.message : String(err) });
-      return _mockErrorResponse((err && err.message) || String(err), 500);
+      _monitorIpcError('ipc_invoke', channel, _ipcFailureMeta(err));
+      return _mockErrorResponse('ipc request failed', 500);
     });
 }

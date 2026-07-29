@@ -65,6 +65,12 @@ export function recordRead(ctx: ToolContext, abs: string, st?: fs.Stats, hash?: 
   }
 }
 
+/** Drop the baseline after a successful delete or move. A later file at the
+ * same path must be read again instead of inheriting stale edit authority. */
+export function forgetRead(ctx: ToolContext, abs: string): void {
+  getReadState(ctx)?.delete(abs);
+}
+
 /** A reason an edit is blocked; the model-facing error code + message. */
 export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
 

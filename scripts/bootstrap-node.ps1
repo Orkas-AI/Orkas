@@ -1,19 +1,20 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$PcRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$pcRoot = Split-Path -Parent $PSScriptRoot
-$runtimeRoot = Join-Path $pcRoot 'resources\runtime'
+$runtimeRoot = Join-Path $PcRoot 'resources\runtime'
 $manifestPath = Join-Path $runtimeRoot 'manifest.json'
 $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 
-$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
-$platformKey = switch ($architecture) {
+$platformKey = switch ($Architecture) {
     'X64' { 'win32-x64' }
     'Arm64' { 'win32-arm64' }
-    default { throw "Unsupported Windows architecture for the bundled Node runtime: $architecture" }
+    default { throw "Unsupported Windows architecture for the bundled Node runtime: $Architecture" }
 }
 
 $nodeSpec = $manifest.node
@@ -53,7 +54,7 @@ function Test-InstalledNode {
 
 if (Test-InstalledNode) {
     Write-Host "[node-bootstrap] bundled Node $($nodeSpec.version) is ready"
-    exit 0
+    return
 }
 
 $nodeParent = Split-Path -Parent $nodeRoot

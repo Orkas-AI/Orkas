@@ -2,8 +2,8 @@
 ownerAgent: 79df9cc89f5f
 name: stage-edit
 min_app_version: "1.5.1"
-description_zh: 真实素材的确定性剪辑知识——读素材元数据、按明确时间点切片/拼接/烧字幕/叠加，规划 edit_decisions 时间线再执行；clip-factory / 蒙太奇 / 二次创作产线的核心。
-description_en: Deterministic editing knowledge for real footage — probe inputs, then trim/concat/burn-subtitles/overlay by explicit timecodes via an edit_decisions timeline; core of the clip-factory / montage / repurpose lines.
+description_zh: 真实素材的智能编辑知识——先用转写/OCR/镜头/静音/质量/视觉证据理解视频，再选择确定性时间线编辑或受约束的语义 AI 编辑；clip-factory、蒙太奇、二创和局部内容修改的核心。
+description_en: Intelligent editing knowledge for real footage: understand it through transcript/OCR/scene/silence/quality/vision evidence, then choose deterministic timeline editing or constrained semantic AI editing; core of repurpose, montage, cleanup, and local content changes.
 category: creation
 ---
 
@@ -11,9 +11,20 @@ category: creation
 
 For the VideoStudio EDIT line, the edit decision list lives in `project/plan.json` and `gate-control` owns its Gate B authorization transition. Start/resume execution with `production.status`; do not run trims, assembly, or localization against a changed or unsigned EDL. Runtime `status`/`produced_path` updates do not invalidate the signed creative plan, but changing cuts, copy, source allocation, or delivery settings does.
 
-How to edit **real user-supplied footage** deterministically (cut / join / burn subtitles / overlay), as opposed to composing designed HTML (that is the composition skill). In Orkas, media inspection and editing run through skill scripts, not direct tool calls.
+How to intelligently edit **real user-supplied footage** while keeping the source and every decision auditable. Deterministic operations still handle cuts, joins, captions, overlays, reframes, and audio. When the request changes pixels semantically—remove an object, alter a background, relight a shot, or make another content-aware local change—keep the EDIT route and execute only that bounded segment through signed video `operation:"edit"` after paid-generation approval.
 
 **Where the footage comes from.** A user-uploaded clip arrives as a chat attachment marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — the file is exactly what these media scripts operate on. Copy it into the project's `raw/` (or pass its attachment path directly as `--input`) before probing; never treat a `model_readable="false"` clip as something to skip.
+
+## Intelligent edit contract
+
+Write `project/plan.json::edit_strategy` whenever VideoStudio decides what to change rather than merely executing user-supplied timecodes:
+
+- `mode`: `deterministic` for transcript/OCR/scene/silence/quality/vision-driven timeline decisions, `semantic` for AI pixel changes, or `mixed` when both are necessary.
+- `objectives`: the exact editorial or pixel-level changes requested.
+- `decision_signals`: only evidence actually used (`timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model`).
+- `preserve` and `may_change`: non-empty, non-overlapping boundaries.
+
+Declare every source/reference image or video in top-level `references` with `media_type`, reproduce/edit/guide intent, `intent_basis`, roles, required state, preserve/may-change, and target segment ids. This applies to deterministic trims/highlights as well as semantic edits: `spec.input_id` and `edit_strategy` do not replace the top-level source contract. User-declared requirements override defaults; only an unspecified reference defaults to guide/inferred. Video reproduce/edit/motion/timing contracts need one `{source_start_sec,source_end_sec,target_segment_id}` temporal anchor for every targeted segment. A semantic video edit is represented as `source:"generate"`, `media_kind:"video"`, `operation:"edit"`, with the original in `reference_video_paths`/`reference_video_urls`; it still belongs to the EDIT workflow and its count enters Gate C.
 
 ## How to call the media scripts
 
@@ -35,6 +46,35 @@ The scripts return JSON. A non-zero exit means the operation failed; fix the inp
 
 - **Plan-backed (anything the user may later adjust: narration, multi-shot, segmented edits).** Author `project/plan.json` (the segments EDL — see `stage-plan`) carrying ONLY the operations the user asked for (the deltas) — everything else is the source, passed through untouched. Keep each editable concern SEPARATE in the plan: each narration line in `tracks.narration.segments` with its own `produced_path`, each caption in `tracks.captions.lines` as data, each segment carrying `status`/`produced_path`. A track is active only when it has executable content (narration: voice + non-empty lines; music: path; captions: non-empty lines or `from`); omit or set disabled tracks to `null`, and skip legacy empty objects completely. Assemble with `stage-edit edit_video` (trim → concat → mix → burnsubs). Because plan.json holds every piece separately, a later "fix one caption / re-voice one line" is a one-entry edit + one re-render — do NOT pre-bake (e.g. one big narration file), which destroys that separability.
 - **One-shot deterministic (a plain trim or concat the user just wants done).** Use `stage-edit edit_video` directly; write no plan.json.
+
+For every plan-backed follow-up, start with `production.status` and compare the
+requested delta with the signed EDL. A caption typo/translation, one narration
+line, one cut, or one output in a multi-output batch invalidates only that
+entry and outputs derived from it. Reuse the source probe, transcript/OCR,
+unaffected cuts, audio, and sibling outputs; do not retranscribe or re-run a
+semantic/billable edit unless its signed input actually changed. A replacement
+source clip is different: re-probe and regenerate evidence for that source,
+invalidate its dependent cuts/tracks/drafts, and preserve unrelated inputs and
+history.
+
+File identity is content-addressed; a filesystem locator is not creative
+intent. When a missing EDIT source is found at a new path with the exact
+recorded byte SHA-256, keep its signed logical source identity and approved EDL
+unchanged. Record the new physical path under the plan's excluded
+`_runtime.asset_locators` envelope with the verified hash, and pass that
+resolved path to `stage-edit edit_video`; do not rewrite the signed
+`spec.input_id`, open the gate resolver, re-probe, retranscribe, or re-run OCR.
+`production.status` reports the approval facts but there is no
+`production.reconcile` call. Refresh the locator record, rebuild only outputs
+that were paused by the missing source, run the complete-draft QA, and continue
+in the same turn to the current Final video confirmation.
+
+Each rebuilt edited draft is a new complete review candidate. Show that
+current video plus its QA headline, and bind Final video confirmation to it.
+An older draft reply is acknowledged but cannot approve the rebuilt draft. If
+a local tool/runtime failure prevents rebuilding, expose the latest available
+draft or source evidence, identify the affected edit, and give the concrete
+next action instead of a generic recovery form.
 
 ## The deterministic editing loop
 
@@ -118,4 +158,4 @@ Per repurpose/montage line:
 
 ## Boundary / non-goals
 
-This skill does deterministic, timecode-driven editing only. It does not author HTML compositions (composition skill), does not generate footage (use the generic generation capabilities), and does not decide which moments to keep. For transcription-, scene-, or silence-driven selection, use stage-decide first; stage-edit only executes already chosen timecodes or EDLs.
+This skill owns the EDIT workflow. It executes deterministic EDL operations directly and delegates only bounded semantic pixel changes to the signed video-edit provider path. It does not author HTML compositions. For transcript/scene/silence/quality-driven selection, use stage-decide first and persist its evidence in `edit_strategy` and per-segment reasons.

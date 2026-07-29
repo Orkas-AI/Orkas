@@ -115,8 +115,10 @@ class CliEnvelopeTest(unittest.TestCase):
         cur = make_snapshot(crawl(dict(BASE_PAGE, noindex=True, is_indexable=False, structured_data_types=[])), 70, 88)
         d = tempfile.mkdtemp()
         bp, cp = os.path.join(d, "b.json"), os.path.join(d, "c.json")
-        _json.dump({"ok": True, "data": base}, open(bp, "w"))   # envelope form
-        _json.dump({"ok": True, "data": cur}, open(cp, "w"))
+        with open(bp, "w", encoding="utf-8") as fh:
+            _json.dump({"ok": True, "data": base}, fh)   # envelope form
+        with open(cp, "w", encoding="utf-8") as fh:
+            _json.dump({"ok": True, "data": cur}, fh)
         out = main(["--op", "compare", "--baseline", bp, "--current", cp])
         ids = {f["id"] for f in out["data"]["drift_findings"]}
         self.assertIn("noindex_added", ids)

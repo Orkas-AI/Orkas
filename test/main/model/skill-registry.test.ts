@@ -306,7 +306,12 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
   it('renders system skills in a separate block with SYSTEM_SKILLS_ROOT', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
     writeSkill(systemDir(), 'autotask-creator', 'autotask-creator', 'Create automations');
-    writeSkill(systemDir(), 'coding', 'coding', 'Change project code');
+    writeSkill(
+      systemDir(),
+      'orkas-guide',
+      'orkas-guide',
+      "Provide user-facing guidance about Orkas application features and usage problems, not about Commander's own capabilities or requests for Commander to perform work. Explain what Orkas features are available, where to find them, how to use common workflows, and how to recover from normal in-app problems. Use only for questions about Orkas features, navigation, settings, concepts, availability, or troubleshooting; requests to create a deliverable or use tools belong to the appropriate Agent or Skill.",
+    );
     writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
     writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
     const { getSystemSkillsPromptBlock, getSystemPromptBlock } = await loadRegistry();
@@ -319,14 +324,17 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('Do not load system skills that do not match.');
     expect(systemText).toContain('**agent-creator**');
     expect(systemText).toContain('**autotask-creator**');
-    expect(systemText).toContain('**coding**');
+    expect(systemText).toContain('**orkas-guide**');
+    expect(systemText).toContain('guidance about Orkas application features and usage problems');
+    expect(systemText).toContain("not about Commander's own capabilities");
+    expect(systemText).toContain('requests for Commander to perform work');
     expect(systemText).toContain('**package-installer**');
     expect(systemText).toContain('**skill-creator**');
 
     const regularText = await getSystemPromptBlock();
     expect(regularText).not.toContain('agent-creator');
     expect(regularText).not.toContain('autotask-creator');
-    expect(regularText).not.toContain('**coding**');
+    expect(regularText).not.toContain('orkas-guide');
     expect(regularText).not.toContain('package-installer');
     expect(regularText).not.toContain('skill-creator');
   });

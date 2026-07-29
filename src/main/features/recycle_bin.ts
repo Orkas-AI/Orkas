@@ -1818,13 +1818,23 @@ export async function createAppRecycleBatchForAgent(
   agentId: string,
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(agentId)) return null;
-  const rels = new Set<string>([
-    `cloud/agents/${agentId}`,
+  const agentRoot = `cloud/agents/${agentId}`;
+  const rels = [agentRoot];
+  const optional = [
     `cloud/chats/agent/${agentId}`,
     `cloud/sessions/agent-${agentId}.jsonl`,
     `cloud/sessions/agent-${agentId}.tool-results`,
-  ]);
-  return createAppRecycleBatch(uid, Array.from(rels), { kind: 'agent' });
+    `cloud/memory/agents/${agentId}`,
+  ];
+  for (const relPath of optional) {
+    try {
+      await fsp.stat(resolveCloudRelPath(userCloudRoot(uid), relPath));
+      rels.push(relPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') rels.push(relPath);
+    }
+  }
+  return createAppRecycleBatch(uid, rels, { kind: 'agent', strict: true });
 }
 
 export async function createAppRecycleBatchForSkill(
@@ -1832,12 +1842,25 @@ export async function createAppRecycleBatchForSkill(
   skillId: string,
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(skillId)) return null;
-  return createAppRecycleBatch(uid, [
-    `cloud/skills/${skillId}`,
+  const skillRoot = `cloud/skills/${skillId}`;
+  const rels = [skillRoot];
+  const optional = [
     `cloud/chats/skill/${skillId}`,
     `cloud/sessions/skill-${skillId}.jsonl`,
     `cloud/sessions/skill-${skillId}.tool-results`,
-  ], { kind: 'skill' });
+  ];
+  for (const relPath of optional) {
+    try {
+      await fsp.stat(resolveCloudRelPath(userCloudRoot(uid), relPath));
+      rels.push(relPath);
+    } catch (err) {
+      // Missing edit history is normal. Any other stat failure is retained
+      // in the strict request so deletion cannot proceed without a complete
+      // recovery snapshot.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') rels.push(relPath);
+    }
+  }
+  return createAppRecycleBatch(uid, rels, { kind: 'skill', strict: true });
 }
 
 export async function listRecycleBatches(uid: string): Promise<SyncRecycleBatch[]> {
@@ -1960,7 +1983,12 @@ export async function restoreRecycleBatch(
     }
   }
 
-  const restoredMetadataPaths = await restoreProjectMetadata(uid, batch.metadata);
+  // Relationship metadata must not materialize an empty project when every
+  // archived file is missing or unreadable. It is only a companion repair for
+  // a file that was actually restored (or already exists at the destination).
+  const restoredMetadataPaths = restored.length > 0 || skipped.length > 0
+    ? await restoreProjectMetadata(uid, batch.metadata)
+    : [];
   let reactivated: string[] = [];
   const indexCandidates = Array.from(new Set([...restored, ...skipped, ...restoredMetadataPaths]));
   try {

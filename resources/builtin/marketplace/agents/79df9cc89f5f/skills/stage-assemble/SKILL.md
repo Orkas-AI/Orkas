@@ -27,7 +27,7 @@ Iterate segments in `order`. For each, produce its `produced_path` according to 
 
 - **edit** → `stage-edit`: `stage-edit edit_video --op trim` the `input_id` to `[in_sec, out_sec]` → `project/cuts/<id>.mp4`.
 - **compose** → `stage-compose`: under `project/compositions/<id>/`, write local `script.md`, `shotlist.json`, and `composition-manifest.json` derived exactly from the signed segment's `spec.composition_plan`. Keep it silent (`audio.owner:"none"`, no tracks). Ask `gate-control` to resolve parent Gate B inheritance for the owning plan/segment, then follow the returned doctor/prepare path without creating a child user gate. Continue with visual authoring, native-required inspect/snapshot, and draft to `project/parts/<id>.mp4` only while the binding stays current.
-- **generate** → `stage-generate` (+ `stage-consistency` for recurring characters): proceed only while `production.status` reports the current paid-generation signature. Call `generate_video` or `generate_image` with `production_plan_path:"project/plan.json"` and `production_segment_id:<id>` → `project/assets/<id>.<ext>`. Every auxiliary portrait/keyframe is already its own signed generate segment; do not create unplanned billable calls. The host transaction reuses a completed artifact and blocks an interrupted/failed duplicate. Pass pending/failed state to `gate-control`; never automatically retry or invent a recovery API, and use a new output path for any later authorized retry.
+- **generate** → `stage-generate` (+ `stage-consistency` for recurring characters): proceed only while `production.status` reports the current paid-generation signature. Call `generate_video` or `generate_image` with `production_plan_path:"project/plan.json"` and `production_segment_id:<id>` → `project/assets/<id>.<ext>`. When the segment has `operation:"edit"`, treat it as the bounded semantic-edit executor for the EDIT/AUTO workflow: pass the exact original reference video and obey top-level `references` + `edit_strategy`; never widen it into regeneration. Every auxiliary portrait/keyframe is already its own signed generate segment; do not create unplanned billable calls. The host transaction reuses a completed artifact and blocks an interrupted/failed duplicate. Pass pending/failed state to `gate-control`; never automatically retry or invent a recovery API, and use a new output path for any later authorized retry.
 - **provided** → use `spec.asset_id` as-is (probe it first; conform aspect/fps if needed).
 
 Billable `generate` segments must not run before Gate C has confirmed the exact count from `cost_estimate`, disclosed that the external provider's billing and balance cannot be verified locally, and `production.approve_generation` has persisted that approval. Produce cheap/free segments first, then show one combined `gate_c_decision` form; never interleave per-shot confirmations.
@@ -64,6 +64,34 @@ The craft of making mixed sources feel like one video, on top of the shared craf
 
 The plan plus project-scoped production control is the checkpoint. On a re-run, call `production.status`, skip any segment already `status:"done"` with a present `produced_path`, and let the host return `reused` for a completed generation transaction. Skip assembly tiers whose output already exists and is newer than its inputs. Never infer that a missing chat bubble means a billable segment should run again.
 
+For a partial child failure or a later user revision, preserve every unaffected
+`done` segment and its transaction/source evidence. Reset only the changed or
+failed segment plus assembly tiers derived from it; never regenerate,
+retranscribe, or re-compose sibling segments merely to rebuild the complete
+review artifact. The rebuilt assembly is a new immutable candidate and must
+include all current child outputs. Any earlier Final video confirmation is
+stale for that assembly candidate.
+
+Non-user recovery must advance the parent workflow, not end at the repaired
+child. In the same turn that the affected child becomes valid, rebuild every
+derived parent assembly tier, run parent QA, publish the complete current draft
+and its exact path, and open the single Final video confirmation bound to that
+assembly candidate. Do not return only a child artifact, a recovery summary, or
+an instruction to resume assembly later.
+
+If recovery cannot continue safely, present the latest assembled draft when
+one exists, the completed child artifacts, the exact failed segment and
+finding, and the next actionable option. A partial failure is not permission
+to hide successful work or ask for a generic technical recovery decision.
+
+A recovery description is not a recovery action. When a child fails a free
+validation such as inspect, the executable path must include a concrete
+mutation of that child's canonical input (or the child operation that produces
+the corrected artifact) before the validation is repeated. Never list only the
+same inspect/render call after saying "repair first"; that is an unchanged
+retry and can loop forever. Once the changed child passes, rebuild the parent
+assembly from the preserved completed children.
+
 ## Step 4 — QA report, then gate D
 
 Before showing the draft, run the QA pass and write `project/render_report.json` with these sections:
@@ -86,7 +114,7 @@ A QA `fail` does not go to the user as "here's a broken video". Diagnose which s
 - visual_spotcheck fail (bad frame) → re-produce that one segment (re-trim / re-compose / re-generate), not the whole video.
 - audio fail (uncovered tail) → re-time or extend the narration / trim the tail.
 
-Bound the loop: at most **2** send-back rounds for the same failing check. If it still fails, surface it honestly at gate D with the report and ask the user how to proceed — do not loop forever and do not quietly ship a known-failing draft.
+Bound repetition, not recovery: allow at most **2** send-back rounds for the same failing check and unchanged recovery strategy. If it still fails, preserve the evidence, stop repeating that strategy, and choose a materially different localized repair or return to the earliest affected non-billable step. Do not create a technical confirmation form. If every safe non-billable recovery conflicts with the signed plan, present the concrete conflict at the normal final-video review; a direct user reply may revise the affected scope. A signed-plan change uses the single plan-amendment review, and a new billable provider call uses the paid-generation review. Never loop forever or quietly ship a known-failing draft.
 
 ## Rules
 

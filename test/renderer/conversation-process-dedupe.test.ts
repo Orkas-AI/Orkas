@@ -89,4 +89,20 @@ describe('conversation process event dedupe', () => {
       key(processEvent('runtime', { duration_ms: 65000, status: 'success' })),
     );
   });
+
+  it('keeps equal-duration runtime events for different Commander bubbles distinct', () => {
+    const key = loadDedupeKey();
+
+    expect(key(processEvent('runtime', {
+      phase: 'segment_end',
+      segment_index: 0,
+      duration_ms: 100,
+      bubble_duration_ms: 0,
+    }))).not.toBe(key(processEvent('runtime', {
+      phase: 'segment_end',
+      segment_index: 1,
+      duration_ms: 100,
+      bubble_duration_ms: 0,
+    })));
+  });
 });

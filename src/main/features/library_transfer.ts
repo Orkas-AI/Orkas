@@ -12,6 +12,7 @@ import * as path from 'node:path';
 
 import * as contexts from './contexts';
 import * as projectFiles from './project_files';
+import * as users from './users';
 
 export type LibraryScope = 'global' | 'project';
 export type TransferMode = 'copy' | 'move';
@@ -49,6 +50,14 @@ export type TransferResult =
   };
 
 const MAX_BATCH_ENTRIES = 100;
+
+function isActiveAccount(userId: string): boolean {
+  try {
+    return !!userId && users.getActiveUserId() === userId;
+  } catch {
+    return false;
+  }
+}
 
 function normalizeRel(input: unknown, allowEmpty = false): string {
   if (typeof input !== 'string') throw new Error('invalid_path');
@@ -96,7 +105,7 @@ async function resolveSourceAbs(userId: string, ref: LibraryRef, rel: string): P
   { ok: true; absPath: string } | { ok: false; error: string }
 > {
   if (ref.scope === 'global') {
-    try { return { ok: true, absPath: contexts.resolveContextEntryAbsPath(rel) }; }
+    try { return { ok: true, absPath: contexts.resolveContextEntryAbsPath(rel, userId) }; }
     catch { return { ok: false, error: 'not_found' }; }
   }
   const resolved = await projectFiles.resolveProjectEntryAbsPath(userId, ref.projectId!, rel);
@@ -111,7 +120,7 @@ async function copyInto(
   targetRel: string,
 ): Promise<{ ok: true; fileCount: number; bytes: number } | { ok: false; error: string }> {
   if (destination.scope === 'global') {
-    const copied = contexts.copyContextEntryFromPath(sourceAbs, targetRel);
+    const copied = contexts.copyContextEntryFromPath(sourceAbs, targetRel, userId);
     if (copied.ok === false) return { ok: false, error: copied.error };
     return { ok: true, fileCount: copied.fileCount, bytes: copied.bytes };
   }
@@ -126,7 +135,7 @@ async function copyInto(
 }
 
 async function deleteFrom(userId: string, ref: LibraryRef, rel: string): Promise<{ ok: boolean; error?: string }> {
-  if (ref.scope === 'global') return contexts.deleteContextTarget(rel);
+  if (ref.scope === 'global') return contexts.deleteContextTarget(rel, userId);
   return projectFiles.deleteProjectEntry(userId, ref.projectId!, rel);
 }
 
@@ -136,12 +145,13 @@ async function moveWithin(
   sourceRel: string,
   targetRel: string,
 ): Promise<{ ok: boolean; error?: string }> {
-  if (ref.scope === 'global') return contexts.renameContextEntry(sourceRel, targetRel);
+  if (ref.scope === 'global') return contexts.renameContextEntry(sourceRel, targetRel, userId);
   return projectFiles.renameProjectFile(userId, ref.projectId!, sourceRel, targetRel);
 }
 
 function normalizeError(error: string | undefined): string {
   if (!error) return 'transfer_failed';
+  if (error === 'account_changed') return 'account_changed';
   if (error === 'destination already exists' || error === 'target_exists') return 'target_exists';
   if (error === 'unsupported_destination' || error.includes('unsupported')) return 'unsupported_destination';
   if (error === 'not_found') return 'not_found';
@@ -153,6 +163,8 @@ export async function transferLibraryEntries(
   userId: string,
   request: TransferRequest,
 ): Promise<TransferResult> {
+  if (!isActiveAccount(userId)) return { ok: false, error: 'account_changed' };
+
   let mode: TransferMode;
   let source: LibraryRef;
   let destination: LibraryRef;
@@ -180,6 +192,10 @@ export async function transferLibraryEntries(
     const base = path.posix.basename(sourceRel);
     const targetRel = targetDir ? `${targetDir}/${base}` : base;
     const resultBase = { source: sourceRel, destination: targetRel };
+    if (!isActiveAccount(userId)) {
+      results.push({ ...resultBase, ok: false, error: 'account_changed' });
+      continue;
+    }
     if (sameLibrary && (targetRel === sourceRel || targetRel.startsWith(`${sourceRel}/`))) {
       results.push({ ...resultBase, ok: false, error: targetRel === sourceRel ? 'target_exists' : 'invalid_target' });
       continue;
@@ -198,15 +214,43 @@ export async function transferLibraryEntries(
       results.push({ ...resultBase, ok: false, error: normalizeError(resolved.error) });
       continue;
     }
+    if (!isActiveAccount(userId)) {
+      results.push({ ...resultBase, ok: false, error: 'account_changed' });
+      continue;
+    }
     const copied = await copyInto(userId, destination, resolved.absPath, targetRel);
     if (copied.ok === false) {
       results.push({ ...resultBase, ok: false, error: normalizeError(copied.error) });
       continue;
     }
     if (mode === 'move') {
-      const removed = await deleteFrom(userId, source, sourceRel);
+      if (!isActiveAccount(userId)) {
+        let rollback: { ok: boolean; error?: string };
+        try {
+          rollback = await deleteFrom(userId, destination, targetRel);
+        } catch {
+          rollback = { ok: false, error: 'rollback_failed' };
+        }
+        results.push({
+          ...resultBase,
+          ok: false,
+          error: rollback.ok ? 'account_changed' : 'rollback_failed',
+        });
+        continue;
+      }
+      let removed: { ok: boolean; error?: string };
+      try {
+        removed = await deleteFrom(userId, source, sourceRel);
+      } catch {
+        removed = { ok: false, error: 'source_delete_failed' };
+      }
       if (!removed.ok) {
-        const rollback = await deleteFrom(userId, destination, targetRel);
+        let rollback: { ok: boolean; error?: string };
+        try {
+          rollback = await deleteFrom(userId, destination, targetRel);
+        } catch {
+          rollback = { ok: false, error: 'rollback_failed' };
+        }
         results.push({
           ...resultBase,
           ok: false,

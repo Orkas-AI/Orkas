@@ -117,10 +117,36 @@ function nativePackageContract(nodeModules, platform, arch) {
       id: 'onnxruntime-core',
       candidates: [joinRelative(onnxBase, mac ? `libonnxruntime.${onnxVersion}.dylib` : 'onnxruntime.dll')],
     },
+    {
+      id: 'sharp-binding',
+      candidates: mac
+        ? [
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.3.node`,
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}.node`,
+          ]
+        : [
+            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
+            '@img/sharp-win32-x64/lib/sharp-win32-x64.node',
+          ],
+    },
+    {
+      id: 'sharp-libvips-cpp',
+      candidates: mac
+        ? [
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.3.dylib`,
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.17.3.dylib`,
+          ]
+        : [
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll',
+          ],
+    },
   ];
 
   if (mac) {
     specs.push({ id: 'fsevents', candidates: ['fsevents/fsevents.node'] });
+  } else {
+    specs.push({ id: 'sharp-libvips', candidates: ['@img/sharp-win32-x64/lib/libvips-42.dll'] });
   }
   return specs;
 }
@@ -161,6 +187,9 @@ function requiredNativeVerificationEntries(platform, arch) {
     'better-sqlite3',
     'onnxruntime-binding',
     'onnxruntime-core',
+    'sharp-binding',
+    'sharp-libvips-cpp',
+    ...(platform === 'win32' ? ['sharp-libvips'] : []),
     ...(platform === 'darwin' ? ['fsevents'] : []),
   ];
   return ids.map((id) => `native:${id}:${key}`);

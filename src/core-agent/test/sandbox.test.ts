@@ -312,6 +312,16 @@ describe("augmentPath", () => {
     expect(parts).toContain("/Users/me/google-cloud-sdk/bin");
   });
 
+  it("adds user-level CLI install locations on POSIX", () => {
+    const out = augmentPath("/usr/bin:/bin", "darwin", { HOME: "/Users/me" });
+    const parts = out.split(":");
+
+    expect(parts).toContain("/Users/me/.local/bin");
+    expect(parts).toContain("/Users/me/.npm-global/bin");
+    expect(parts).toContain("/Users/me/bin");
+    expect(parts.indexOf("/Users/me/.local/bin")).toBeLessThan(parts.indexOf("/opt/homebrew/bin"));
+  });
+
   it("keeps user-supplied entries BEFORE canonical ones when the user put them first", () => {
     // /Users/me/tools/bin is user-custom; it must remain ahead of the
     // canonical /usr/bin entry that already existed in the input.
@@ -401,6 +411,15 @@ describe("augmentPath", () => {
       const command = '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval';
       const inv = buildShellInvocation("powershell.exe", command, "win32");
       expect(inv.kind).toBe("powershell");
+      const wrappedCommand = [
+        "& {",
+        command,
+        "$orkasCommandSucceeded = $?",
+        "$orkasNativeExitCode = $LASTEXITCODE",
+        "if ($null -ne $orkasNativeExitCode) { exit $orkasNativeExitCode }",
+        "if (-not $orkasCommandSucceeded) { exit 1 }",
+        "}",
+      ].join("\n");
       expect(inv.args).toEqual([
         "-NoLogo",
         "-NoProfile",
@@ -408,7 +427,7 @@ describe("augmentPath", () => {
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        command,
+        wrappedCommand,
       ]);
     });
 

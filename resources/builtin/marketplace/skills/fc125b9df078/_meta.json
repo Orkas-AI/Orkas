@@ -1,0 +1,26 @@
+{
+  "version": "1.0.2",
+  "updated_at": "2026-07-28T13:32:31.000Z",
+  "min_app_version": "1.6.2",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "descriptions": {
+    "zh": "根据 PRD、产品目标、用户流程或现有应用上下文设计并实现产品 UI，覆盖响应式、可访问性、视觉方向与渲染验证。",
+    "en": "Design and implement product UI from product context with responsive behavior, accessibility, visual direction, and rendered verification."
+  },
+  "routing": {
+    "applicable_domain": [
+      "product UI design and implementation for existing applications",
+      "standalone responsive frontend screens, landing pages, dashboards, and component sets"
+    ],
+    "negative_examples": [
+      "write a complete PRD or discover an undefined product direction",
+      "perform backend-only implementation or broad repository maintenance",
+      "produce visual analysis without a requested UI design or implementation outcome"
+    ],
+    "prerequisites": [
+      "a product goal, user flow, design request, or existing UI context is available",
+      "the requested screen or interaction scope is specific enough to design or implement"
+    ]
+  }
+}

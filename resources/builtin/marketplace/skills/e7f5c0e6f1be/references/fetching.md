@@ -7,7 +7,7 @@ Use fetch mode to collect public social discussion samples for a specific platfo
 | Platform | Script value | Notes |
 |---|---|---|
 | Xiaohongshu | `xhs` | Requires local proxy service at `http://localhost:18060` |
-| X / Twitter | `twitter` | Requires `xreach` CLI |
+| X / Twitter | `twitter` | Uses installed `xreach`, otherwise pinned `xreach-cli` via bundled npx |
 | Reddit | `reddit` | Uses public JSON endpoints; cookies from browser can improve recall |
 | YouTube | `youtube` | Uses `yt-dlp` |
 | Bilibili | `bilibili` | Public recall improves with browser cookies |
@@ -93,8 +93,10 @@ Common item fields:
 
 ## Dependencies
 
-- Common Python packages: `requests`, optional `browser_cookie3`, optional `curl_cffi`.
+- The first `run-skill.cjs social-data fetch` call automatically creates a workspace-local isolated Python environment and installs the exact packages in `requirements.fetch.txt`. The same invocation then continues; users should not need to request a repair or run pip manually.
+- A dependency-bootstrap failure is distinct from a platform failure. Report it as installation/runtime setup failure and stop that platform attempt instead of returning an empty sample or connectivity diagnosis.
+- Pinned Python packages: `requests`, `browser_cookie3`, `curl_cffi`, and `yt-dlp`.
 - Xiaohongshu: external local proxy service `xiaohongshu-mcp`.
-- Twitter/X: `xreach` CLI.
+- Twitter/X: installed `xreach` or the automatic pinned `xreach-cli@0.3.3` npx fallback.
 - YouTube: `yt-dlp` CLI or Python module.
 - Reddit/Bilibili: browser cookies can improve recall; otherwise anonymous fetch may be limited.

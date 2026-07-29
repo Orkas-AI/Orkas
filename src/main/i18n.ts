@@ -129,6 +129,15 @@ export function detectSystemLang(rawLocale: unknown): Lang {
 type Table = Record<string, string>;
 const _tables: Partial<Record<Lang, Table>> = {};
 
+function normalizeTable(value: unknown): Table {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const table: Table = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (typeof raw === 'string') table[key] = raw;
+  }
+  return table;
+}
+
 function localeFile(lang: Lang): string {
   return path.join(__dirname, 'locales', `${lang}.json`);
 }
@@ -140,7 +149,7 @@ function loadTable(lang: Lang): Table {
   try {
     const raw = fs.readFileSync(localeFile(lang), 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') table = parsed as Table;
+    table = normalizeTable(parsed);
   } catch { /* missing or malformed → empty table, lookup falls through */ }
   _tables[lang] = table;
   return table;
@@ -173,7 +182,7 @@ export function getRendererTable(lang: Lang): Table {
   try {
     const raw = fs.readFileSync(rendererLocaleFile(lang), 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') table = parsed as Table;
+    table = normalizeTable(parsed);
   } catch { /* missing → empty; renderer falls through to raw key */ }
   _rendererTables[lang] = table;
   return table;

@@ -6,7 +6,10 @@ import {
   _redactDispatchToolResult,
   _resolveAgentInputsForRuntimeForTest,
 } from '../../../../src/main/features/group_chat/bus';
-import { prompts } from '../../../../src/main/prompts/loader';
+import {
+  buildCliDurableInstructions,
+  buildCliTurnPrompt,
+} from '../../../../src/main/features/local_agents/context';
 
 describe('dispatch tool-result redaction in the process rail', () => {
   // Assert the worker OUTPUT is gone (robust to the i18n'd replacement wording),
@@ -148,17 +151,15 @@ describe('VideoStudio runtime language input', () => {
 });
 
 describe('group_chat CLI output_format prompt hints', () => {
-  it('renders no presentation hints or dashboard schema', () => {
-    const rendered = prompts.load('chat_cli_agent', {
-      agent_name: 'CliAgent',
-      agent_description: 'Runs local CLI tasks.',
-      output_protocol_block: '',
-      language_block: '## User language\n\nUser UI language: **English**.',
-      attachments_block: '',
-      conversation_block: '',
-      task_body: 'Summarize status.',
-      runtime_datetime_block: '## Current date\n\nTimezone: Asia/Shanghai\nCurrent date: 2026-06-05',
-    });
+  it('adds no presentation hints or dashboard schema to CLI context', () => {
+    const rendered = [
+      buildCliDurableInstructions({
+        agentName: 'CliAgent',
+        workflow: 'Run local CLI tasks.',
+        language: 'en',
+      }),
+      buildCliTurnPrompt({ task: 'Summarize status.' }),
+    ].join('\n\n');
 
     expect(rendered).not.toContain('Use plain text or Markdown');
     expect(rendered).not.toContain('automatic output layout');
@@ -168,22 +169,17 @@ describe('group_chat CLI output_format prompt hints', () => {
     expect(rendered).not.toMatch(/\$output_[A-Za-z0-9_]+/);
   });
 
-  it('includes the language directive in CLI prompts', () => {
-    const rendered = prompts.load('chat_cli_agent', {
-      agent_name: 'CliAgent',
-      agent_description: 'Runs local CLI tasks.',
-      output_protocol_block: '',
-      language_block: '## User language\n\nUser UI language: **Simplified Chinese**. Write all human-readable prose in Simplified Chinese.',
-      attachments_block: '',
-      conversation_block: '',
-      task_body: 'Summarize status.',
-      runtime_datetime_block: '## Current date\n\nTimezone: Asia/Shanghai\nCurrent date: 2026-06-05',
+  it('keeps only a compact language directive in durable CLI instructions', () => {
+    const durable = buildCliDurableInstructions({
+      agentName: 'CliAgent',
+      workflow: 'Run local CLI tasks.',
+      language: 'zh',
     });
 
-    expect(rendered).toContain('## User language');
-    expect(rendered).toContain('Write all human-readable prose in Simplified Chinese');
-    expect(rendered.indexOf('## Runtime injection')).toBeLessThan(rendered.indexOf('## User language'));
-    expect(rendered).toContain('## Current date');
+    expect(durable).toContain('## Response language');
+    expect(durable).toContain('Chinese (简体中文)');
+    expect(durable).not.toContain('## Runtime injection');
+    expect(durable).not.toContain('## Current date');
   });
 });
 

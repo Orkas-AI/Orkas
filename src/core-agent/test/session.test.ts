@@ -11,6 +11,8 @@ import {
   COMPLETED_WORK_MODEL_MAX_CHARS,
   COMPLETED_WORK_MODEL_MAX_ENTRIES,
   EXECUTION_PLAN_AUDIT_MAX_ENTRIES,
+  HISTORY_EXACT_FACTS_HEADING,
+  HISTORY_EXACT_FACTS_MAX_ITEMS,
 } from "../src/agent/session.js";
 
 describe("Session", () => {
@@ -265,6 +267,95 @@ describe("Session", () => {
     expect(projected).toBeLessThan(session.estimateModelTokens());
     expect(JSON.stringify(session.getSerializedContextState())).toBe(before);
     expect(session.getPendingHistoryArchive()?.turnIds).toEqual(candidate.turnIds);
+  });
+
+  it("accumulates exact history facts outside probabilistic rolling summaries", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Remember the deployment facts" }]);
+    session.addAssistantMessage([{ type: "text", text: "Recorded." }]);
+    session.completeActiveTurn();
+
+    session.applyHistorySummary(
+      `First semantic summary\n\n${HISTORY_EXACT_FACTS_HEADING}\n- release_id=rel-123`,
+      [1],
+    );
+    session.applyHistorySummary(
+      `Replacement semantic summary\n\n${HISTORY_EXACT_FACTS_HEADING}\n- checksum=sha256:abc`,
+      [1],
+    );
+
+    const state = session.getSerializedContextState()!;
+    expect(state.historySummary).toBe("Replacement semantic summary");
+    expect(state.historyExactFacts).toEqual([
+      "release_id=rel-123",
+      "checksum=sha256:abc",
+    ]);
+
+    const restored = new Session();
+    restored.restoreContextState(state);
+    restored.beginUserTurn([{ type: "text", text: "What next?" }]);
+    const view = JSON.stringify(restored.getMessagesForModel());
+    expect(view).toContain("History retained facts");
+    expect(view).toContain("release_id=rel-123");
+    expect(view).toContain("checksum=sha256:abc");
+  });
+
+  it("retains the newest facts when the bounded history ledger is full", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Remember a bounded fact set" }]);
+    session.addAssistantMessage([{ type: "text", text: "Recorded." }]);
+    session.completeActiveTurn();
+    const state = session.getSerializedContextState()!;
+    state.historyExactFacts = Array.from(
+      { length: HISTORY_EXACT_FACTS_MAX_ITEMS },
+      (_, index) => `fact-${index}`,
+    );
+    session.restoreContextState(state);
+
+    session.applyHistorySummary(
+      `Updated summary\n\n${HISTORY_EXACT_FACTS_HEADING}\n- newest-fact`,
+      [1],
+    );
+
+    const facts = session.getSerializedContextState()!.historyExactFacts!;
+    expect(facts).toHaveLength(HISTORY_EXACT_FACTS_MAX_ITEMS);
+    expect(facts).not.toContain("fact-0");
+    expect(facts.at(-1)).toBe("newest-fact");
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("host-persisted model extraction");
+    expect(view).not.toContain("deterministic host state, not a summary");
+  });
+
+  it("migrates an older sidecar whose history exact facts were embedded in summary prose", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "seed" }]);
+    const state = session.getSerializedContextState()!;
+    state.historySummary =
+      `Legacy semantic summary\n\n${HISTORY_EXACT_FACTS_HEADING}\n- legacy_id=legacy-456`;
+    delete state.historyExactFacts;
+
+    const restored = new Session();
+    restored.beginUserTurn([{ type: "text", text: "placeholder" }]);
+    restored.restoreContextState(state);
+    const migrated = restored.getSerializedContextState()!;
+    expect(migrated.historySummary).toBe("Legacy semantic summary");
+    expect(migrated.historyExactFacts).toEqual(["legacy_id=legacy-456"]);
+  });
+
+  it("promotes active-checkpoint exact facts into cross-turn host state", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Run the build" }]);
+    session.applyActiveCheckpointSummary(
+      `Build observation\n\n${ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING}\n- build_id=build-789`,
+      0,
+    );
+    session.addAssistantMessage([{ type: "text", text: "Build complete." }]);
+    session.completeActiveTurn();
+    session.beginUserTurn([{ type: "text", text: "Continue" }]);
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("History retained facts");
+    expect(view).toContain("build_id=build-789");
   });
 
   it("active checkpoint candidate archives older complete tool step groups and keeps the recent tail", () => {

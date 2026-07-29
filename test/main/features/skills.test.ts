@@ -1421,6 +1421,34 @@ describe('skills › updateCustomSkill', () => {
     expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(true);
   });
 
+  it('renames edit state only for the active account', async () => {
+    writeCustomSkill('alpha');
+    const otherUid = 'u2';
+    const currentChat = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha');
+    const otherChat = path.join(tmpDir, otherUid, 'cloud', 'chats', 'skill', 'alpha');
+    const currentSession = path.join(tmpDir, TEST_UID, 'cloud', 'sessions', 'skill-alpha.jsonl');
+    const otherSession = path.join(tmpDir, otherUid, 'cloud', 'sessions', 'skill-alpha.jsonl');
+    for (const [chat, session] of [
+      [currentChat, currentSession],
+      [otherChat, otherSession],
+    ]) {
+      fs.mkdirSync(chat, { recursive: true });
+      fs.writeFileSync(path.join(chat, 'chat.jsonl'), '{"role":"user"}\n');
+      fs.mkdirSync(path.dirname(session), { recursive: true });
+      fs.writeFileSync(session, '{"role":"user"}\n');
+    }
+
+    const s = await loadSkills();
+    await s.updateCustomSkill('alpha', { name: 'beta' });
+
+    expect(fs.existsSync(currentChat)).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'beta'))).toBe(true);
+    expect(fs.existsSync(currentSession)).toBe(false);
+    expect(fs.existsSync(otherChat)).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, otherUid, 'cloud', 'chats', 'skill', 'beta'))).toBe(false);
+    expect(fs.existsSync(otherSession)).toBe(true);
+  });
+
   it('returns null for missing skill', async () => {
     const s = await loadSkills();
     expect(await s.updateCustomSkill('ghost', { description: 'x' })).toBeNull();
@@ -1452,6 +1480,32 @@ describe('skills › deleteCustomSkill', () => {
     const ok = await s.deleteCustomSkill('target');
     expect(ok).toBe(true);
     expect(fs.existsSync(sessionFile)).toBe(false);
+  });
+
+  it('deletes edit state only for the active account', async () => {
+    writeCustomSkill('target');
+    const otherUid = 'u2';
+    const currentChat = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'target');
+    const otherChat = path.join(tmpDir, otherUid, 'cloud', 'chats', 'skill', 'target');
+    const currentSession = path.join(tmpDir, TEST_UID, 'cloud', 'sessions', 'skill-target.jsonl');
+    const otherSession = path.join(tmpDir, otherUid, 'cloud', 'sessions', 'skill-target.jsonl');
+    for (const [chat, session] of [
+      [currentChat, currentSession],
+      [otherChat, otherSession],
+    ]) {
+      fs.mkdirSync(chat, { recursive: true });
+      fs.writeFileSync(path.join(chat, 'chat.jsonl'), '{"role":"user"}\n');
+      fs.mkdirSync(path.dirname(session), { recursive: true });
+      fs.writeFileSync(session, '{"role":"user"}\n');
+    }
+
+    const s = await loadSkills();
+    expect(await s.deleteCustomSkill('target')).toBe(true);
+
+    expect(fs.existsSync(currentChat)).toBe(false);
+    expect(fs.existsSync(currentSession)).toBe(false);
+    expect(fs.existsSync(otherChat)).toBe(true);
+    expect(fs.existsSync(otherSession)).toBe(true);
   });
 });
 
@@ -1662,6 +1716,18 @@ describe('skills › listSkillTree', () => {
     const r = await s.listSkillTree('custom', 'ghost');
     expect(r.ok).toBe(false);
   });
+
+  it('rejects skill roots that resolve outside the source directory', async () => {
+    const outsideDir = path.join(tmpDir, 'outside-tree');
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'must-not-list');
+    const s = await loadSkills();
+    const escapedId = path.relative(customSkillsDir(), outsideDir);
+
+    const r = await s.listSkillTree('custom', escapedId);
+
+    expect(r).toEqual({ ok: false, error: 'invalid path' });
+  });
 });
 
 describe('skills › buildSkillEditSystemPrompt', () => {
@@ -1687,6 +1753,26 @@ describe('skills › readSkillFile path safety', () => {
     const s = await loadSkills();
     const r = await s.readSkillFile('custom', 'alpha', '../../etc/passwd');
     expect(r.ok).toBe(false);
+  });
+
+  it('rejects skill ids and symlinks that resolve outside the skills root', async () => {
+    writeCustomSkill('alpha');
+    const outsideDir = path.join(tmpDir, 'outside-secret');
+    fs.mkdirSync(outsideDir);
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'must-not-leak');
+    fs.symlinkSync(
+      outsideDir,
+      path.join(customSkillsDir(), 'alpha', 'linked'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+
+    const s = await loadSkills();
+    const escapedId = path.relative(customSkillsDir(), outsideDir);
+    const bySkillId = await s.readSkillFile('custom', escapedId, 'secret.txt');
+    const bySymlink = await s.readSkillFile('custom', 'alpha', 'linked/secret.txt');
+
+    expect(bySkillId).toEqual({ ok: false, error: 'invalid path' });
+    expect(bySymlink).toEqual({ ok: false, error: 'invalid path' });
   });
 
   it('reads SKILL.md by default', async () => {

@@ -32,6 +32,7 @@ import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
 import { fetchWithTimeout } from '../../util/abort';
+import { broadcastOAuthConnectProgress } from './oauth-events';
 import type { CatalogEntry, OAuthGrant } from './types';
 
 const log = createLogger('connectors:oauth');
@@ -47,6 +48,7 @@ const OAUTH_RETRY_BASE_DELAY_MS = 400;
 interface PendingFlow {
   kind: 'connector_oauth' | 'google_picker';
   catalogId: string;
+  attemptId?: string;
   requiredScopes: string[];
   resolve: (result: OAuthGrant | GooglePickerResult) => void;
   reject: (err: Error) => void;
@@ -193,7 +195,7 @@ export function cancelInFlightOAuth(): boolean {
 export async function startOAuth(
   _uid: string,
   entry: CatalogEntry,
-  opts: { reauthorize?: boolean } = {},
+  opts: { reauthorize?: boolean; attemptId?: string } = {},
 ): Promise<OAuthGrant> {
   if (!entry.oauth) throw new Error(`catalog entry ${entry.id} has no oauth config`);
   // Pre-empt any prior in-flight flow — the user clicking another card while one is open is a
@@ -222,6 +224,7 @@ export async function startOAuth(
     _pending = {
       kind: 'connector_oauth',
       catalogId: entry.id,
+      ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       requiredScopes: Array.isArray(entry.required_oauth_scopes) ? entry.required_oauth_scopes.slice() : [],
       resolve: resolve as PendingFlow['resolve'],
       reject,
@@ -293,6 +296,12 @@ export async function handleCallbackUrl(rawUrl: string): Promise<void> {
   }
   const exchangeCode = url.searchParams.get('exchange_code');
   if (!exchangeCode) { _cancelPending('missing exchange_code', 'missing_exchange_code'); return; }
+  if (pending.attemptId) {
+    broadcastOAuthConnectProgress({
+      attempt_id: pending.attemptId,
+      catalog_id: pending.catalogId,
+    });
+  }
 
   try {
     const res = await postConnectorBridgeJson(

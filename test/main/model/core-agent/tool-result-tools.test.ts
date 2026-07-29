@@ -55,6 +55,10 @@ describe('persisted tool-result retrieval', () => {
     expect(ref).toMatch(/^web_fetch\.[a-f0-9]{64}$/);
     expect(resolveToolResultRef(dir, ref)).toMatchObject({ ok: true });
     expect(resolveToolResultRef(dir, '../secret')).toMatchObject({ ok: false, code: 'E_RESULT_REF_INVALID' });
+    expect(resolveToolResultRef(dir, 'call_abc123')).toMatchObject({
+      ok: false,
+      code: 'E_RESULT_REF_NOT_PERSISTED',
+    });
     expect(resolveToolResultRef(dir, 'web_fetch.0000000000000000')).toMatchObject({ ok: false, code: 'E_RESULT_REF_MISSING' });
   });
 

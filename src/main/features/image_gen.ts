@@ -37,6 +37,33 @@ export interface PickedImageGenProfile {
   capability: ImageGenCapability;
 }
 
+export function listOpenImageGenCandidates(): PickedImageGenProfile[] {
+  const out: PickedImageGenProfile[] = [];
+  for (const profile of loadImageProfiles()) {
+    const capability = findImageGenCapability(profile.provider);
+    if (!capability) continue;
+    const model = profile.model || capability.model;
+    if (!isImageProviderModelAllowed(profile.provider, model)) continue;
+    const selectedCapability = { ...capability, model };
+    out.push({
+      entry: {
+        entryId: profile.id,
+        profileId: profile.id,
+        provider: profile.provider,
+        model,
+        apiKey: profile.apiKey,
+      },
+      capability: selectedCapability,
+    });
+  }
+  if (out.length) return out;
+  for (const entry of listApiKeyEntries()) {
+    const capability = findImageGenCapability(entry.provider);
+    if (capability) out.push({ entry, capability });
+  }
+  return out;
+}
+
 /**
  * Pick which (api_key, image-capable provider) pair to use for the next
  * image generation call.
@@ -53,27 +80,7 @@ export interface PickedImageGenProfile {
  *      reuse it. Keeps existing setups working without forcing a re-config.
  */
 export function pickImageGenProfile(): PickedImageGenProfile | null {
-  const dedicated = loadImageProfiles();
-  for (const p of dedicated) {
-    const cap = findImageGenCapability(p.provider);
-    if (!cap) continue;
-    return {
-      entry: {
-        entryId: p.id,
-        profileId: p.id,
-        provider: p.provider,
-        model: cap.model,
-        apiKey: p.apiKey,
-      },
-      capability: cap,
-    };
-  }
-  const chatEntries = listApiKeyEntries();
-  for (const e of chatEntries) {
-    const cap = findImageGenCapability(e.provider);
-    if (cap) return { entry: e, capability: cap };
-  }
-  return null;
+  return listOpenImageGenCandidates()[0] || null;
 }
 
 // ── Public entry ─────────────────────────────────────────────────────────
@@ -230,6 +237,25 @@ export interface AdapterResult {
    *  on disk. */
   width: number;
   height: number;
+}
+
+export const IMAGE_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
+  openai: [
+    { id: 'gpt-image-2', name: 'GPT Image 2' },
+  ],
+  google: [
+    { id: 'gemini-3.1-flash-image-preview', name: 'Nano Banana 2' },
+  ],
+  doubao: [
+    { id: 'doubao-seedream-5-0-lite-260128', name: 'Seedream 5.0 Lite' },
+    { id: 'doubao-seedream-5-0-pro-260628', name: 'Seedream 5.0 Pro' },
+  ],
+};
+
+export function isImageProviderModelAllowed(provider: string, model: string): boolean {
+  const listed = IMAGE_MODELS_BY_PROVIDER[provider];
+  if (listed) return listed.some((item) => item.id === model);
+  return findImageGenCapability(provider)?.model === model;
 }
 
 const OPENAI_BASE = 'https://api.openai.com';

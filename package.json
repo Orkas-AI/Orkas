@@ -28,6 +28,7 @@
     "test:windows-native": "node scripts/run-windows-native-tests.mjs",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:fetch": "node scripts/fetch-officecli.cjs",
+    "test:office-artifacts": "npm run officecli:fetch && tsx scripts/run-office-artifact-smoke.mjs",
     "ffmpeg:fetch": "node scripts/fetch-ffmpeg.cjs",
     "vc:fetch": "node scripts/fetch-win-vc-runtime.cjs --platform win32 --arch x64",
     "whisper:fetch": "node scripts/fetch-whisper.cjs",
@@ -45,7 +46,7 @@
     "@types/node": "^25.6.0",
     "@vitest/coverage-v8": "^4.1.5",
     "7zip-bin": "^5.2.0",
-    "electron": "^41.7.1",
+    "electron": "41.7.1",
     "ffmpeg-static": "^5.3.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
@@ -60,7 +61,9 @@
     "fastembed": "^2.1.0",
     "jimp": "^1.6.1",
     "mammoth": "^1.12.0",
+    "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^5.6.205",
+    "sharp": "^0.35.3",
     "socks-proxy-agent": "^8.0.5",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
@@ -68,6 +71,8 @@
     "zod": "^3.24.0"
   },
   "overrides": {
+    "@hono/node-server": "2.0.11",
+    "esbuild": "0.28.1",
     "tar": "7.5.20"
   },
   "build": {
@@ -104,6 +109,12 @@
       "node_modules/resolve-pkg-maps/**/*",
       "node_modules/esbuild/**/*",
       "node_modules/@esbuild/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*",
+      "node_modules/pdf-lib/**/*",
+      "node_modules/@pdf-lib/**/*",
+      "node_modules/pako/**/*",
+      "node_modules/tslib/**/*",
       "src/core-agent/package.json",
       "src/core-agent/src/**/*.ts",
       "!**/*.{py,pyc}",
@@ -122,6 +133,8 @@
       "node_modules/resolve-pkg-maps/**/*",
       "node_modules/esbuild/**/*",
       "node_modules/@esbuild/**/*",
+      "node_modules/sharp/**/*",
+      "node_modules/@img/**/*",
       "node_modules/better-sqlite3/**/*",
       "node_modules/bindings/**/*",
       "node_modules/file-uri-to-path/**/*",

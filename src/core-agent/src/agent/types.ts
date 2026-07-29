@@ -1,5 +1,6 @@
 import type { Usage, StopReason, MessageContent } from "../shared/types.js";
 import type { HistoryResource } from "./session.js";
+import type { CommandExecutionObservation } from "../tools/base.js";
 
 /** Parameters for starting an agent run. */
 export type AgentRunParams = {
@@ -87,6 +88,15 @@ export type AgentRunTimings = {
   otherMs: number;
 };
 
+/** Existing runner safeguards that had to intervene to make a run converge.
+ * These are diagnostic signals only: they do not redefine task completion. */
+export type AgentRunConvergenceSignal =
+  | "tool_loop_limit_nudge"
+  | "elapsed_convergence_nudge"
+  | "spin_convergence_nudge"
+  | "tool_loop_limit"
+  | "repetitive_tool_calls";
+
 /** Metadata about an agent run. */
 export type AgentRunMeta = {
   /** Duration of the run in milliseconds. */
@@ -105,6 +115,8 @@ export type AgentRunMeta = {
   compactionCount: number;
   /** Non-overlapping wall-time buckets for diagnosis and UI attribution. */
   timings?: AgentRunTimings;
+  /** Bounded, low-cardinality runner convergence interventions. */
+  convergenceSignals?: AgentRunConvergenceSignal[];
   /** Whether the run was aborted. */
   aborted?: boolean;
   /** Error info if the run failed. */
@@ -141,6 +153,7 @@ export type AgentRunEvent =
       errorCode?: string;
       errorSeverity?: "recoverable" | "error";
       durationMs?: number;
+      execution?: CommandExecutionObservation;
     }
   | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage; durationMs?: number }
   | {
@@ -152,9 +165,14 @@ export type AgentRunEvent =
         | "active_process_compaction_start"
         | "active_process_compaction_done"
         | "active_process_compaction_failed";
-      message: string;
       data?: Record<string, unknown>;
     }
   | { type: "retry"; attempt: number; reason: string; waitMs?: number }
-  | { type: "provider_fallback"; reason: "auth" | "no_first_event_timeout"; providerId: string }
+  | {
+      type: "provider_fallback";
+      reason: "auth" | "no_first_event_timeout";
+      providerId: string;
+      candidateIndex?: number;
+      candidateCount?: number;
+    }
   | { type: "done"; result: AgentRunResult };

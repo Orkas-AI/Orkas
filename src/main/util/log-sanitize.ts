@@ -20,10 +20,10 @@
 import * as crypto from 'node:crypto';
 
 const SENSITIVE_FIELD =
-  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie)';
+  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie)';
 
 const SENSITIVE_QUERY_FIELD =
-  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
+  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
 
 const JSON_SECRET_FIELD_RE = new RegExp(
   `(["'])(${SENSITIVE_FIELD})\\1(\\s*:\\s*)(["'])(.*?)\\4`,

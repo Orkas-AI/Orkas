@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -32,6 +32,229 @@ function extractFunction(source: string, name: string): string {
 }
 
 describe('global search conversation navigation', () => {
+  it('derives Library scope from the active project page or project conversation', () => {
+    const context: any = {
+      currentView: 'project',
+      _projectDetailPid: 'project-a',
+      currentCid: '',
+      conversations: [],
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_activeProjectIdForSearch'), context);
+
+    expect(context._activeProjectIdForSearch()).toBe('project-a');
+
+    context.currentView = 'conversation';
+    context.currentCid = 'conversation-b';
+    context.conversations = [
+      { conversation_id: 'conversation-a' },
+      { conversation_id: 'conversation-b', project_id: 'project-b' },
+    ];
+    expect(context._activeProjectIdForSearch()).toBe('project-b');
+
+    context.currentView = 'contexts';
+    expect(context._activeProjectIdForSearch()).toBe('');
+  });
+
+  it('keeps Library body results in relevance order before path tie-breakers', () => {
+    const context: any = { Array, String };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_partitionSearchResults'), context);
+
+    const partitioned = context._partitionSearchResults([
+      { kind: 'context', path: 'a/short.md', score: 0.2 },
+      { kind: 'context', path: 'deep/nested/high.md', score: 0.9 },
+      { kind: 'context', path: 'b/equal.md', score: 0.2 },
+    ]);
+
+    expect(Array.from(partitioned.contexts, (row: any) => row.path)).toEqual([
+      'deep/nested/high.md',
+      'a/short.md',
+      'b/equal.md',
+    ]);
+  });
+
+  it('opens a global Library body hit in the Library viewer', async () => {
+    const setView = vi.fn();
+    const loadRendererFeature = vi.fn(async () => {});
+    const loadContexts = vi.fn(async () => {});
+    const openCtxFile = vi.fn();
+    const context: any = {
+      _SEARCH_KIND_META: { context: {} },
+      _searchActiveIdx: 0,
+      closeGlobalSearch: vi.fn(),
+      setView,
+      loadRendererFeature,
+      loadContexts,
+      openCtxFile,
+      window: { loadRendererFeature },
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_gotoSearchResult'), context);
+
+    await context._gotoSearchResult({
+      kind: 'context',
+      library_scope: 'global',
+      path: 'global/source.md',
+      title: 'Source',
+      match_source: 'content',
+    }, 'keyboard');
+
+    expect(setView).toHaveBeenCalledWith('contexts');
+    expect(loadRendererFeature).toHaveBeenCalledWith('contexts');
+    expect(loadContexts).toHaveBeenCalledOnce();
+    expect(openCtxFile).toHaveBeenCalledWith('global/source.md');
+  });
+
+  it.each([
+    'source.md',
+    'report.pdf',
+    'notes.docx',
+    'scores.xlsx',
+    'slides.pptx',
+    'image.png',
+  ])('opens a project Library body hit in its owning viewer with the %s extension', async (fileName) => {
+    const setView = vi.fn();
+    const openChatFileViewer = vi.fn();
+    const invoke = vi.fn(async () => ({ ok: true, path: `/project/${fileName}` }));
+    const context: any = {
+      _SEARCH_KIND_META: { context: {} },
+      _searchActiveIdx: 0,
+      closeGlobalSearch: vi.fn(),
+      setView,
+      setTimeout: (fn: () => void) => { void fn(); return 1; },
+      openChatFileViewer,
+      window: { orkas: { invoke } },
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_gotoSearchResult'), context);
+
+    await context._gotoSearchResult({
+      kind: 'context',
+      library_scope: 'project',
+      project_id: 'project-a',
+      path: fileName,
+      title: 'Source',
+      match_source: 'content',
+    }, 'mouse');
+    await Promise.resolve();
+
+    expect(setView).toHaveBeenCalledWith('project', 'project-a');
+    expect(invoke).toHaveBeenCalledWith('projects.files.absPath', {
+      projectId: 'project-a',
+      name: fileName,
+    });
+    expect(openChatFileViewer).toHaveBeenCalledWith(
+      `/project/${fileName}`,
+      fileName,
+      { projectId: 'project-a' },
+    );
+  });
+
+  it('does not open a viewer when a stale project search hit no longer resolves', async () => {
+    const openChatFileViewer = vi.fn();
+    const context: any = {
+      _SEARCH_KIND_META: { context: {} },
+      _searchActiveIdx: 0,
+      closeGlobalSearch: vi.fn(),
+      setView: vi.fn(),
+      setTimeout: (fn: () => void) => { void fn(); return 1; },
+      openChatFileViewer,
+      window: {
+        orkas: {
+          invoke: vi.fn(async () => ({ ok: false, error: 'not_found' })),
+        },
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_gotoSearchResult'), context);
+
+    await context._gotoSearchResult({
+      kind: 'context',
+      library_scope: 'project',
+      project_id: 'project-a',
+      path: 'deleted.pdf',
+      match_source: 'content',
+    });
+    await Promise.resolve();
+
+    expect(openChatFileViewer).not.toHaveBeenCalled();
+  });
+
+  it('does not let a slow previous query replace the cleared empty state', async () => {
+    let resolveFetch!: (value: unknown) => void;
+    const rendered: string[] = [];
+    const context: any = {
+      _SEARCH_FETCH_LIMIT: 200,
+      _searchSeq: 0,
+      _searchResults: [],
+      _searchVisibleResults: [{ kind: 'chat', cid: 'stale' }],
+      _searchActiveIdx: 0,
+      _searchLastQuery: 'old',
+      document: {
+        getElementById: (id: string) => (id === 'search-input' ? { value: '' } : null),
+      },
+      _activeProjectIdForSearch: () => '',
+      _setSearchTabsVisible: () => {},
+      _renderSearchEmptyState: () => { rendered.push('empty'); },
+      _renderSearchResults: (query: string) => { rendered.push(`results:${query}`); },
+      _renderSearchError: (message: string) => { rendered.push(`error:${message}`); },
+      apiFetch: () => new Promise((resolve) => { resolveFetch = resolve; }),
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_runSearchNow'), context);
+
+    const oldQuery = context._runSearchNow('old');
+    await Promise.resolve();
+    await context._runSearchNow('');
+    resolveFetch({
+      json: async () => ({
+        ok: true,
+        results: [{ kind: 'chat', cid: 'stale' }],
+      }),
+    });
+    await oldQuery;
+
+    expect(rendered).toEqual(['empty']);
+    expect(Array.from(context._searchResults)).toEqual([]);
+    expect(Array.from(context._searchVisibleResults)).toEqual([]);
+    expect(context._searchActiveIdx).toBe(-1);
+  });
+
+  it('keeps search history isolated between local user accounts', () => {
+    const values = new Map<string, string>();
+    const context: any = {
+      Array,
+      JSON,
+      String,
+      _SEARCH_HISTORY_KEY: 'search_history',
+      _SEARCH_HISTORY_MAX: 12,
+      currentUserId: 'account-a',
+      localStorage: {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => { values.set(key, value); },
+        removeItem: (key: string) => { values.delete(key); },
+      },
+    };
+    vm.createContext(context);
+    const storageKey = searchSource.includes('function _searchHistoryStorageKey')
+      ? extractFunction(searchSource, '_searchHistoryStorageKey')
+      : '';
+    vm.runInContext([
+      storageKey,
+      extractFunction(searchSource, '_loadSearchHistory'),
+      extractFunction(searchSource, '_saveSearchHistory'),
+      extractFunction(searchSource, '_saveSearchHistoryEntry'),
+    ].join('\n'), context);
+
+    context._saveSearchHistoryEntry('alpha-only');
+    context.currentUserId = 'account-b';
+    expect(Array.from(context._loadSearchHistory())).toEqual([]);
+    context._saveSearchHistoryEntry('beta-only');
+    context.currentUserId = 'account-a';
+    expect(Array.from(context._loadSearchHistory())).toEqual(['alpha-only']);
+  });
+
   it('passes the stable message identity into paged conversation loading', () => {
     expect(searchSource).toContain("msgId: r.msg_id || ''");
     expect(searchSource).toContain('msgIndex: r.msg_index');

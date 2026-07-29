@@ -40,8 +40,15 @@ afterEach(async () => {
 // covers this kind of multi-branch decision function (CLAUDE.md §9).
 async function callReadText(
   userId: string,
-  input: { path?: unknown; cid?: unknown; compositionRootOnly?: unknown },
-): Promise<{ ok: boolean; error?: string; size?: number; cap?: number; text?: string }> {
+  input: { path?: unknown; cid?: unknown; htmlPreviewLayoutOnly?: unknown },
+): Promise<{
+  ok: boolean;
+  error?: string;
+  size?: number;
+  cap?: number;
+  text?: string;
+  layout?: { kind: 'fixed-canvas'; width: number; height: number } | null;
+}> {
   const userWorkspace = await import('../../../src/main/features/user_workspace');
   const { chatAttachmentDir } = await import('../../../src/main/paths');
   const { safeId } = await import('../../../src/main/storage');
@@ -68,22 +75,36 @@ async function callReadText(
   catch { return { ok: false, error: 'not_found' }; }
   if (!st.isFile()) return { ok: false, error: 'not_found' };
   const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-  const compositionRootOnly = input?.compositionRootOnly === true;
-  if (!compositionRootOnly && st.size > MAX_TEXT_BYTES) {
+  const htmlPreviewLayoutOnly = input?.htmlPreviewLayoutOnly === true;
+  if (!htmlPreviewLayoutOnly && st.size > MAX_TEXT_BYTES) {
     return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
   }
-  let text: string;
-  if (compositionRootOnly) {
+  if (htmlPreviewLayoutOnly) {
     const stream = fs.createReadStream(norm, { encoding: 'utf8', highWaterMark: 64 * 1024 });
-    const rootPattern = /<[^>]*\bdata-composition-id\s*=\s*["'][^"']+["'][^>]*>/i;
+    const rootPattern = /<[^>]*\b(?:data-preview-layout\s*=\s*["']fixed-canvas["']|data-composition-id\s*=\s*["'][^"']+["'])[^>]*>/i;
     let carry = '';
-    text = '';
+    let layout: { kind: 'fixed-canvas'; width: number; height: number } | null = null;
+    const validLayout = (widthValue: unknown, heightValue: unknown) => {
+      const width = Number(widthValue);
+      const height = Number(heightValue);
+      if (!Number.isInteger(width) || !Number.isInteger(height)
+          || width < 16 || width > 7680 || height < 16 || height > 7680
+          || width * height > 16_777_216) return null;
+      return { kind: 'fixed-canvas' as const, width, height };
+    };
     try {
       for await (const chunk of stream) {
         const combined = carry + String(chunk);
         const match = combined.match(rootPattern);
         if (match) {
-          text = match[0];
+          const attrNumber = (name: string) => {
+            const attr = match[0].match(new RegExp(`\\b${name}\\s*=\\s*["'](\\d+(?:\\.\\d+)?)["']`, 'i'));
+            return attr ? Number(attr[1]) : 0;
+          };
+          layout = validLayout(
+            attrNumber('data-preview-width') || attrNumber('data-width'),
+            attrNumber('data-preview-height') || attrNumber('data-height'),
+          );
           break;
         }
         const lastOpen = combined.lastIndexOf('<');
@@ -98,9 +119,29 @@ async function callReadText(
         });
       }
     }
-  } else {
-    text = fs.readFileSync(norm, 'utf8');
+    if (!layout) {
+      const projectDir = path.dirname(norm);
+      const manifestPath = path.join(projectDir, 'image-manifest.json');
+      try {
+        const manifestStat = fs.lstatSync(manifestPath);
+        if (manifestStat.isFile() && !manifestStat.isSymbolicLink() && manifestStat.size <= 256 * 1024) {
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          const entry = typeof manifest.entry === 'string' && manifest.entry.trim()
+            ? manifest.entry.trim()
+            : 'index.html';
+          const entryAbs = path.resolve(projectDir, entry);
+          const width = Number(manifest.canvas?.width);
+          const height = Number(manifest.canvas?.height);
+          if (isPathAllowed(entryAbs, [projectDir])
+              && entryAbs === norm) {
+            layout = validLayout(width, height);
+          }
+        }
+      } catch { /* no valid ImageStudio manifest */ }
+    }
+    return { ok: true, layout, size: st.size };
   }
+  let text = fs.readFileSync(norm, 'utf8');
   if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   return { ok: true, text, size: st.size };
 }
@@ -204,19 +245,73 @@ describe('produced.readText › size cap', () => {
     expect(res.ok).toBe(true);
   });
 
-  it('finds composition metadata anywhere in an HTML file over the full-read cap', async () => {
+  it('finds generic fixed-canvas metadata anywhere in HTML over the full-read cap', async () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const dir = path.join(tmpDir, 'ws');
     fs.mkdirSync(dir, { recursive: true });
     ws.setWorkspacePath('u10', dir);
     const file = path.join(dir, 'large.html');
-    const root = '<main data-composition-id="main" data-width="1920" data-height="1080">';
-    fs.writeFileSync(file, 'x'.repeat(2 * 1024 * 1024 + 1) + root);
+    fs.writeFileSync(
+      file,
+      'x'.repeat(2 * 1024 * 1024 + 1)
+        + '<main data-preview-layout="fixed-canvas" data-preview-width="1920" data-preview-height="1080">',
+    );
 
-    const res = await callReadText('u10', { path: file, compositionRootOnly: true });
+    const res = await callReadText('u10', { path: file, htmlPreviewLayoutOnly: true });
     expect(res.ok).toBe(true);
-    expect(res.text).toBe(root);
+    expect(res.layout).toEqual({ kind: 'fixed-canvas', width: 1920, height: 1080 });
     expect(res.size).toBeGreaterThan(2 * 1024 * 1024);
+  });
+
+  it('keeps legacy VideoStudio composition attributes on the shared layout path', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(dir, { recursive: true });
+    ws.setWorkspacePath('u13', dir);
+    const file = path.join(dir, 'video.html');
+    fs.writeFileSync(
+      file,
+      '<main data-height="1080" data-composition-id="main" data-width="1920">',
+    );
+
+    const res = await callReadText('u13', { path: file, htmlPreviewLayoutOnly: true });
+    expect(res.ok).toBe(true);
+    expect(res.layout).toEqual({ kind: 'fixed-canvas', width: 1920, height: 1080 });
+  });
+
+  it('normalizes a legacy ImageStudio manifest into the shared HTML canvas layout', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir = path.join(tmpDir, 'ws', 'image-project');
+    fs.mkdirSync(dir, { recursive: true });
+    ws.setWorkspacePath('u11', path.join(tmpDir, 'ws'));
+    const file = path.join(dir, 'index.html');
+    fs.writeFileSync(file, '<!doctype html><main class="poster">Poster</main>');
+    fs.writeFileSync(path.join(dir, 'image-manifest.json'), JSON.stringify({
+      route: 'COMPOSE',
+      canvas: { width: 1600, height: 1600 },
+    }));
+
+    const res = await callReadText('u11', { path: file, htmlPreviewLayoutOnly: true });
+    expect(res.ok).toBe(true);
+    expect(res.layout).toEqual({ kind: 'fixed-canvas', width: 1600, height: 1600 });
+  });
+
+  it('does not apply ImageStudio canvas metadata to another HTML entry', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir = path.join(tmpDir, 'ws', 'image-project');
+    fs.mkdirSync(dir, { recursive: true });
+    ws.setWorkspacePath('u12', path.join(tmpDir, 'ws'));
+    const file = path.join(dir, 'preview.html');
+    fs.writeFileSync(file, '<!doctype html><main>Preview</main>');
+    fs.writeFileSync(path.join(dir, 'image-manifest.json'), JSON.stringify({
+      route: 'COMPOSE',
+      entry: 'index.html',
+      canvas: { width: 1600, height: 1600 },
+    }));
+
+    const res = await callReadText('u12', { path: file, htmlPreviewLayoutOnly: true });
+    expect(res.ok).toBe(true);
+    expect(res.layout).toBeNull();
   });
 });
 

@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
-const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _videoCompositionDimensions } = viewer as {
+const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _htmlCanvasDimensions, _htmlCanvasWidthFit } = viewer as {
   _kindOf: (name: string) => string;
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
@@ -15,7 +15,8 @@ const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl
   _viewerCanAddToLibrary: (name: string, options?: { projectScoped?: boolean }) => boolean;
   _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number; duration?: number; ended?: boolean }) => { autoplay: boolean; startTime: number };
   _viewerVideoSeekTarget: (startTime: number, duration?: number) => number;
-  _videoCompositionDimensions: (html: string) => { width: number; height: number } | null;
+  _htmlCanvasDimensions: (layout: unknown) => { width: number; height: number } | null;
+  _htmlCanvasWidthFit: (width: number, height: number, viewportWidth: number) => { scale: number; renderedHeight: number } | null;
 };
 
 describe('chat-file-viewer › _kindOf', () => {
@@ -184,14 +185,28 @@ describe('chat-file-viewer › _viewerVideoSeekTarget', () => {
   });
 });
 
-describe('chat-file-viewer › VideoStudio composition dimensions', () => {
-  it('reads the authored canvas size regardless of attribute order', () => {
-    expect(_videoCompositionDimensions('<main data-height="1080" data-composition-id="main" data-width="1920"></main>'))
+describe('chat-file-viewer › generic fixed-canvas HTML layout', () => {
+  it('accepts normalized fixed-canvas metadata', () => {
+    expect(_htmlCanvasDimensions({ kind: 'fixed-canvas', width: 1920, height: 1080 }))
       .toEqual({ width: 1920, height: 1080 });
   });
 
-  it('leaves ordinary HTML and invalid canvas sizes on the generic viewer path', () => {
-    expect(_videoCompositionDimensions('<main data-width="1920" data-height="1080"></main>')).toBeNull();
-    expect(_videoCompositionDimensions('<main data-composition-id="main" data-width="99999" data-height="1080"></main>')).toBeNull();
+  it('rejects missing or invalid layout metadata', () => {
+    expect(_htmlCanvasDimensions(null)).toBeNull();
+    expect(_htmlCanvasDimensions({ kind: 'responsive', width: 1920, height: 1080 })).toBeNull();
+    expect(_htmlCanvasDimensions({ kind: 'fixed-canvas', width: 99999, height: 1080 })).toBeNull();
+  });
+
+  it('fits by width and preserves the scaled content height', () => {
+    expect(_htmlCanvasWidthFit(1600, 1600, 1200)).toEqual({ scale: 0.75, renderedHeight: 1200 });
+    expect(_htmlCanvasWidthFit(1920, 1080, 1280)).toEqual({ scale: 2 / 3, renderedHeight: 720 });
+  });
+
+  it('does not shrink a tall canvas just to fit the viewport height', () => {
+    expect(_htmlCanvasWidthFit(1000, 3000, 800)).toEqual({ scale: 0.8, renderedHeight: 2400 });
+  });
+
+  it('does not upscale a canvas narrower than the viewer', () => {
+    expect(_htmlCanvasWidthFit(800, 600, 1200)).toEqual({ scale: 1, renderedHeight: 600 });
   });
 });

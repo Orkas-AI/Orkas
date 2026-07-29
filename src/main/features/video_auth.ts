@@ -116,3 +116,36 @@ export function listVideoModelsByProvider(): Record<string, Array<{ id: string; 
     ]),
   );
 }
+
+export interface VideoProviderPickerOption {
+  id: string;
+  provider: string;
+  model?: string;
+  label: string;
+  docs?: string;
+}
+
+export function flattenVideoProviderOptions(
+  providers: Array<{ id: string; label: string; docs?: string }>,
+): VideoProviderPickerOption[] {
+  return providers.flatMap((provider) => {
+    const models = listVideoModelOptions(provider.id);
+    if (models.length <= 1) {
+      return [{
+        ...provider,
+        provider: provider.id,
+        ...(models[0] ? { model: models[0].id } : {}),
+        label: models[0] ? `${provider.label} · ${models[0].name}` : provider.label,
+      }];
+    }
+    return models.map((model) => ({
+      ...provider,
+      id: `${provider.id}:${model.id}`,
+      provider: provider.id,
+      model: model.id,
+      label: provider.id === 'doubao'
+        ? `DouBao · ${model.name}`
+        : `${provider.label} · ${model.name}`,
+    }));
+  });
+}

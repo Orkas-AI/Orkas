@@ -183,6 +183,145 @@ describe('validateEdl — per-source spec requirements', () => {
     p.cost_estimate = { billable_generations: 1 };
     expect(codes(p).errors).toContain('E_SPEC_GENERATE_SETTINGS_ALIAS');
   });
+
+  it('validates image and video references by intent instead of origin', () => {
+    const p = validPlan();
+    p.references = [
+      {
+        id: 'look',
+        media_type: 'image',
+        source: 'references/look.png',
+        roles: ['composition', 'style'],
+        required: false,
+        preserve: ['visual hierarchy'],
+        may_change: ['content'],
+        target_segment_ids: ['body'],
+      },
+      {
+        id: 'motion',
+        media_type: 'video',
+        source: 'references/motion.mp4',
+        intent: 'reproduce',
+        intent_basis: 'user',
+        roles: ['motion', 'timing'],
+        required: true,
+        preserve: ['camera path', 'beat timing'],
+        may_change: ['subject'],
+        target_segment_ids: ['hook'],
+        temporal_anchors: [{ source_start_sec: 1, source_end_sec: 4, target_segment_id: 'hook' }],
+      },
+    ];
+    expect(validateEdl(p).errors).toEqual([]);
+
+    delete p.references[1].temporal_anchors;
+    expect(codes(p).errors).toContain('E_REFERENCE_VIDEO_TEMPORAL_ANCHORS');
+
+    p.references[0].roles = ['invented-role'];
+    expect(codes(p).errors).toContain('E_REFERENCE_ROLE');
+
+    p.references[0].roles = ['composition'];
+    p.references[0].intent_basis = 'file-origin' as never;
+    expect(codes(p).errors).toContain('E_REFERENCE_INTENT_BASIS');
+  });
+
+  it('treats semantic video editing as an EDIT workflow with a signed AI edit segment', () => {
+    const p = validPlan();
+    p.segments[1] = {
+      id: 'semantic-fix',
+      order: 2,
+      role: 'body',
+      layer: 'primary',
+      source: 'generate',
+      target_sec: 12,
+      spec: {
+        media_kind: 'video',
+        prompt: 'Remove the unwanted sign while preserving the speaker, camera motion, timing, and original audio.',
+        operation: 'edit',
+        reference_video_paths: ['references/source.mp4'],
+        generation_duration_sec: 12,
+        resolution: '720p',
+        quality: 'balanced',
+        generate_audio: true,
+      },
+    };
+    p.references = [{
+      id: 'source-video',
+      media_type: 'video',
+      source: 'references/source.mp4',
+      intent: 'edit',
+      intent_basis: 'user',
+      roles: ['content', 'motion', 'timing', 'audio'],
+      required: true,
+      preserve: ['speaker identity', 'camera motion', 'timing', 'original audio'],
+      may_change: ['unwanted sign'],
+      target_segment_ids: ['semantic-fix'],
+      temporal_anchors: [{ source_start_sec: 0, source_end_sec: 12, target_segment_id: 'semantic-fix' }],
+    }];
+    p.edit_strategy = {
+      mode: 'semantic',
+      objectives: ['Remove the unwanted sign.'],
+      decision_signals: ['vision', 'semantic_model'],
+      preserve: ['speaker identity', 'camera motion', 'timing', 'original audio'],
+      may_change: ['unwanted sign'],
+    };
+    p.cost_estimate = { billable_generations: 1 };
+    expect(validateEdl(p).errors).toEqual([]);
+
+    delete p.edit_strategy;
+    expect(codes(p).errors).toContain('E_SEMANTIC_EDIT_STRATEGY_REQUIRED');
+
+    p.edit_strategy = {
+      mode: 'semantic',
+      objectives: ['Remove the unwanted sign.'],
+      decision_signals: ['vision'],
+      preserve: ['speaker identity'],
+      may_change: ['unwanted sign'],
+    };
+    expect(codes(p).errors).toContain('E_SEMANTIC_EDIT_SIGNAL_REQUIRED');
+  });
+
+  it('accepts evidence-driven intelligent cutting without turning it into AI generation', () => {
+    const p = validPlan();
+    p.references = [{
+      id: 'source-footage',
+      media_type: 'video',
+      source: 'raw/interview.mp4',
+      intent: 'edit',
+      intent_basis: 'user',
+      roles: ['content', 'timing', 'audio'],
+      required: true,
+      preserve: ['complete sentences', 'speaker identity', 'audio sync'],
+      may_change: ['silence', 'filler words', 'shot order'],
+      target_segment_ids: ['hook'],
+      temporal_anchors: [{ source_start_sec: 12, source_end_sec: 20, target_segment_id: 'hook' }],
+    }];
+    p.edit_strategy = {
+      mode: 'deterministic',
+      objectives: ['Build a concise hook from complete high-quality sentences.'],
+      decision_signals: ['transcript', 'silence', 'quality'],
+      preserve: ['complete sentences', 'speaker identity', 'audio sync'],
+      may_change: ['silence', 'filler words', 'shot order'],
+    };
+    expect(validateEdl(p).errors).toEqual([]);
+    expect(p.cost_estimate?.billable_generations).toBe(0);
+  });
+
+  it('blocks undeclared or unbounded semantic video edit sources', () => {
+    const p = validPlan();
+    p.segments[1] = {
+      id: 'semantic-fix', order: 2, role: 'body', layer: 'primary', source: 'generate', target_sec: 12,
+      spec: { media_kind: 'video', prompt: 'change the background', operation: 'edit', reference_video_paths: ['references/source.mp4'] },
+    };
+    p.edit_strategy = {
+      mode: 'semantic',
+      objectives: ['Change the background.'],
+      decision_signals: ['semantic_model'],
+      preserve: ['subject'],
+      may_change: ['background'],
+    };
+    p.cost_estimate = { billable_generations: 1 };
+    expect(codes(p).errors).toContain('E_SEMANTIC_EDIT_REFERENCE_UNDECLARED');
+  });
 });
 
 describe('validateEdl — promise consistency', () => {

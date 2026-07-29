@@ -3,6 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const electronMock = vi.hoisted(() => ({
   openExternal: vi.fn(async () => undefined),
 }));
+const oauthEventMock = vi.hoisted(() => ({
+  progress: vi.fn(),
+}));
 
 vi.mock('electron', () => ({
   app: {
@@ -23,6 +26,10 @@ vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
 
 vi.mock('../../../../src/main/features/config', () => ({
   getLanguage: () => 'en',
+}));
+
+vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
+  broadcastOAuthConnectProgress: oauthEventMock.progress,
 }));
 
 function notionEntry() {
@@ -282,7 +289,7 @@ describe('features/connectors/oauth-dcr', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
-    const pending = startMcpDcrOAuth('uid-1', airtableEntry());
+    const pending = startMcpDcrOAuth('uid-1', airtableEntry(), { attemptId: 'attempt-dcr-return' });
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
     });

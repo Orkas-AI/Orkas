@@ -102,6 +102,7 @@ describe('core-agent client skill sandbox env', () => {
       userId: 'user-secret-123456789',
       sessionId: 'gconv-secret-session-id-12345',
       cid: 'conversation-private-abcdef',
+      turnId: 'turn-private-abcdef',
       agentId: 'agent-private-abcdef',
       projectId: 'project-private-abcdef',
       message: 'please analyze my private launch plan',
@@ -133,6 +134,7 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('Secret Project');
     expect(serialized).not.toContain('secret-session-id');
     expect(serialized).not.toContain('conversation-private');
+    expect(serialized).not.toContain('turn-private');
     expect(serialized).not.toContain('profile-secret');
   });
 
@@ -284,5 +286,47 @@ describe('core-agent client skill sandbox env', () => {
       compactionFailureCount: 1,
     });
     expect(JSON.stringify(summary)).not.toContain('private provider body');
+  });
+
+  it('separates host fallback activity from first model event and first usable content', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1_000);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_fallback',
+      reason: 'no_first_event_timeout',
+      providerId: 'private-provider-id',
+      candidateIndex: 1,
+      candidateCount: 3,
+    }, 1_180);
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_fallback',
+      reason: 'auth',
+      providerId: 'another-private-provider',
+      candidateIndex: 2,
+      candidateCount: 3,
+    }, 1_220);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_delta',
+      id: 'private-call-id',
+      name: 'read_file',
+      inputBytes: 10,
+    }, 1_400);
+
+    const summary = client.summarizeModelRunForLog(stats, 1_500);
+    expect(summary).toMatchObject({
+      firstRawEventMs: 180,
+      firstModelEventMs: 400,
+      firstContentMs: 400,
+      providerFallbackCount: 2,
+      providerFallbackAuthCount: 1,
+      providerFallbackTimeoutCount: 1,
+      providerCandidateCount: 3,
+      lastFallbackCandidateIndex: 2,
+    });
+    expect(JSON.stringify(summary)).not.toContain('private-provider-id');
+    expect(JSON.stringify(summary)).not.toContain('another-private-provider');
+    expect(JSON.stringify(summary)).not.toContain('private-call-id');
+
   });
 });

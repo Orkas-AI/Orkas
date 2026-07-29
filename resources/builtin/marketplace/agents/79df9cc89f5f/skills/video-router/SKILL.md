@@ -10,22 +10,49 @@ category: creation
 
 Host-neutral knowledge for picking a video production line and locking it before work begins. This skill is read for guidance; it describes **what to decide**, not any host's tool mechanics.
 
+## Unavailable production runtime
+
+If the current system explicitly says that production tools, rendering, or
+paid operations are unavailable, routing still must produce useful work. For a
+clear or safely default-filled brief, select and state the line, then continue
+in the same response with a complete **unexecuted production package**:
+assumptions, script/narration, timed storyboard or shotlist, on-screen
+copy/captions, visual and audio direction, provenance/fallback assets, export
+target, preview-review checklist, and final QA checklist. Do not stop at a
+Direction confirmation form and withhold the package. Clearly distinguish
+planned files/media from produced files/media, and reserve future confirmation
+only for an operation the unavailable runtime would actually execute.
+Do not title the package “Direction confirmation”. Make every timed scene
+production-usable with narration, exact visible copy/caption, visual action,
+and edit/transition instruction.
+For a narrated package, include the full verbatim caption line for every
+narration line; a short scene headline is additional on-screen copy, not a
+substitute for captions. Final QA must explicitly probe the produced file and
+verify it can be opened and played through after encoding, in addition to
+checking dimensions, duration, nonblank frames, captions, safe zones, and audio.
+The package language follows an explicit deliverable language in the request;
+otherwise it follows the current User UI language, with English only as the
+unsupported-or-unavailable fallback. Apply that language consistently to
+narration, exact on-screen copy, and captions even when benchmark or transport
+instructions are written in another language.
+
 ## The three capability axes
 
 A finished video is built from one or more of three orthogonal axes. Decide which dominate, then lock them.
 
 - **Generate (A)** — AI-generated footage/imagery: photoreal shots, b-roll, motion, talking-head. Use when the brief needs real-looking or cinematic visuals.
 - **Compose (B)** — deterministic HTML composition: explainers, kinetic typography, motion graphics, captions / lower-thirds / overlays, data viz, title cards, transitions. Use when the visuals are designed rather than filmed. This is the default for explainer/animation work.
-- **Edit (C)** — real-footage editing: cut / join / transitions / mix / reframe / burn-in subtitles, plus highlight selection. Use only when the user supplies source footage to cut.
+- **Edit (C)** — intelligent editing of supplied footage: evidence-based selection/cleanup, deterministic cut/join/reframe/captions/audio work, and semantic AI video editing when the user requests a pixel-level change that timeline operations cannot make.
 
 ## Decision rules
 
 1. Read the brief (topic, aspect ratio, language, duration) and classify the **dominant work object**:
    - "explain / teach / animate / motion-graphics / kinetic text" → **Compose (B)** primary, optionally Generate (A) for b-roll.
    - "make footage of / cinematic / a scene of / a character doing" → **Generate (A)** primary, Compose (B) to overlay captions.
-   - "cut / clip / trim / repurpose my video / make highlights from this recording" → **Edit (C)** primary.
+   - "cut / clip / trim / repurpose / make highlights / remove or change something in my video" → **Edit (C)** primary. Keep EDIT as the route even when one billable `operation:"edit"` video-model segment is required.
 2. Most explainer/animation requests are **Compose-primary**: typographic and motion-graphic scenes assembled as an HTML composition, with AI imagery only where a shot genuinely needs it.
-3. Aspect ratio drives the canvas: 16:9 → 1920×1080, 9:16 → 1080×1920, 1:1 → 1080×1080.
+3. For supplied reference media, classify the requested relationship before choosing execution: `reproduce`, `edit`, or `guide`. Apply the same classification to images and videos regardless of which app, model, camera, or authoring format produced them. Images can control content/identity/composition/structure/style; videos can additionally control motion/timing/audio through temporal anchors.
+4. Aspect ratio drives the canvas: 16:9 → 1920×1080, 9:16 → 1080×1920, 1:1 → 1080×1080.
 
 ## End-to-end (AUTO) — when the job spans lines
 
@@ -45,4 +72,4 @@ AUTO does not abandon the axes — it sequences them through one cross-modal pla
 
 ## Boundary / non-goals
 
-This skill only routes and locks. It does not author compositions (see the composition-authoring skill) and does not itself produce assets or render output.
+This skill only routes and locks. It does not author compositions or execute edits. Semantic editing is not a silent switch to GENERATE: it remains an EDIT/AUTO job whose EDL contains a signed, billable video `operation:"edit"` segment with the original reference video and preservation boundary.

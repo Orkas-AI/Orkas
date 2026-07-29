@@ -1,9 +1,9 @@
 {
   "categories": [
-    { "code": "anim", "name_zh": "动画 / 视频", "name_en": "Animation / Video", "name_ja": "アニメ / 動画", "sort_order": 10 },
-    { "code": "browser", "name_zh": "浏览器", "name_en": "Browser", "name_ja": "ブラウザ", "sort_order": 30 },
-    { "code": "office", "name_zh": "办公", "name_en": "Office", "name_ja": "オフィス", "sort_order": 60 },
-    { "code": "slides", "name_zh": "演示 / PPT", "name_en": "Slides / PPT", "name_ja": "スライド / PPT", "sort_order": 70 }
+    { "code": "anim", "name_zh": "动画 / 视频", "name_en": "Animation / Video", "name_ja": "アニメ / 動画", "name_pt": "Animação / Vídeo", "sort_order": 10 },
+    { "code": "browser", "name_zh": "浏览器", "name_en": "Browser", "name_ja": "ブラウザ", "name_pt": "Navegador", "sort_order": 30 },
+    { "code": "office", "name_zh": "办公", "name_en": "Office", "name_ja": "オフィス", "name_pt": "Escritório", "sort_order": 60 },
+    { "code": "slides", "name_zh": "演示 / PPT", "name_en": "Slides / PPT", "name_ja": "スライド / PPT", "name_pt": "Slides / PPT", "sort_order": 70 }
   ],
   "projects": [
     {
@@ -33,8 +33,8 @@
       "home": false,
       "description_zh": "让 AI 直接帮你操作浏览器、点击和填写网页。",
       "description_en": "Let AI operate the browser for you - click and fill in pages.",
-      "task_zh": "让 AI 帮我操作浏览器",
-      "task_en": "Let AI operate the browser for me"
+      "task_zh": "登录网页、点击按钮和填写表单",
+      "task_en": "Sign in, click buttons, and fill web forms"
     },
     {
       "id": "ppt-master",
@@ -78,8 +78,8 @@
       "home": true,
       "description_zh": "飞书官方 CLI 与 Agent Skills，接入文档、表格、多维表格、消息、日历、任务和会议纪要。",
       "description_en": "Official Lark/Feishu CLI and Agent Skills for Docs, Sheets, Base, messages, calendar, tasks, and meeting notes.",
-      "task_zh": "接入飞书并帮我处理文档、表格或日程",
-      "task_en": "Connect Lark/Feishu and help me work with docs, sheets, or calendar events"
+      "task_zh": "连接飞书文档、消息、日历和任务",
+      "task_en": "Connect Lark docs, messages, calendars, and tasks"
     },
     {
       "id": "crawl4ai",
@@ -93,8 +93,8 @@
       "home": true,
       "description_zh": "抓取网页正文并整理成干净的文档或结构化数据, 装好后 Orkas 会自动调用。",
       "description_en": "Extract a web page's main content into a clean document or structured data; Orkas uses it automatically once installed.",
-      "task_zh": "抓取这个网页的内容整理成文档",
-      "task_en": "Pull this web page into a clean document"
+      "task_zh": "批量抓取网页并输出结构化数据",
+      "task_en": "Batch-extract web pages into structured data"
     }
   ]
 }

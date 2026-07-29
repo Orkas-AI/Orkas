@@ -123,13 +123,16 @@ export function resolveTransition(raw = {}) {
   }
 
   if (input.errorCode === 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED') {
-    if (input.decision === 'revise' && input.scope === 'visual_only' && input.recovery === 'available') {
+    if (input.recovery === 'available') {
       return result({
         nextAction: 'begin_visual_revision_then_edit',
-        authorities: ['edit_current_artifact', 'restart_visual_qa_cycle'],
+        authorities: [
+          ...(input.decision === 'revise' ? ['edit_current_artifact'] : []),
+          'restart_visual_qa_cycle',
+        ],
         allowedOps: ['composition.begin_visual_revision', ...lineOps.edit],
         prohibitedOps: ['emit_form'],
-        reason: 'The current visual-preview or final-video revision decision already authorizes the bounded edit and any non-billable QA-cycle restart it requires.',
+        reason: 'Native QA evidence authorizes the non-billable cycle restart. Begin it immediately without a technical user confirmation.',
       });
     }
     if (input.recovery === 'unknown') {
@@ -150,9 +153,10 @@ export function resolveTransition(raw = {}) {
       });
     }
     return result({
-      nextAction: 'report_visual_qa_blocker',
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
-      reason: 'A technical QA exhaustion never creates a user authorization form. Wait for a real user revision request, which itself authorizes the next bounded cycle.',
+      nextAction: 'query_status',
+      allowedOps: [lineOps.status],
+      prohibitedOps: ['emit_form', 'edit_files', 'composition.begin_visual_revision'],
+      reason: 'The legacy authorization error is not authoritative. Query native status and follow its recovery availability.',
     });
   }
 
@@ -277,9 +281,11 @@ export function resolveTransition(raw = {}) {
 
   if (input.recovery === 'available') {
     return result({
-      nextAction: 'report_visual_qa_blocker',
-      prohibitedOps: ['emit_form', 'edit_files', 'composition.begin_visual_revision'],
-      reason: 'Technical QA exhaustion is not a separate user decision. Report the blocker and wait for a real revision request; never emit a recovery form.',
+      nextAction: 'begin_visual_revision',
+      authorities: ['restart_visual_qa_cycle'],
+      allowedOps: ['composition.begin_visual_revision'],
+      prohibitedOps: ['emit_form'],
+      reason: 'Native QA evidence authorizes an internal non-billable restart. Begin it without waiting for a user revision request.',
     });
   }
 

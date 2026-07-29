@@ -29,6 +29,8 @@ describe('cross_session_memory tool › project tier exposure', () => {
     expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
     expect(tool.description).toContain('project: durable facts, decisions, outcomes, milestones, and conventions that belong to THIS project only');
     expect(tool.description).toContain('would this still hold in another project?');
+    expect(tool.description).toContain('Ambiguous matches are');
+    expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');
   });
 
   it('project target executes against the handler only when the tier is offered', async () => {
@@ -51,5 +53,23 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
     await tool.execute({ action: 'list' }, {} as any);
     expect(h.calls).toEqual([{ op: 'list', tier: 'agent' }]);
+  });
+
+  it('surfaces a rejected ambiguous mutation as a tool error instead of success', async () => {
+    const h = stubHandler();
+    h.remove = vi.fn(() => ({
+      ok: false,
+      error: 'old_text is ambiguous; provide the complete unique entry text',
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+      usage: { current: 51, limit: 100 },
+    }));
+    const tool = createCrossSessionMemoryTool(h, { includeProjectTier: true });
+    const result = await tool.execute({ action: 'remove', target: 'project', old_text: 'release' }, {} as any);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(String(result.content))).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
   });
 });

@@ -123,6 +123,11 @@ export interface StateFile {
    *  single source of truth for "who the user is talking to", mirrored to the
    *  renderer for free since `state_changed` carries the whole StateFile. */
   active_recipient?: string;
+  /** Why the current floor was established. A direct user selection remains
+   *  sticky after a normal external-CLI completion; a Commander hand-off may
+   *  ask that Agent to return the floor when the handed-off interaction ends.
+   *  Missing is the legacy shape and retains Commander-hand-off behavior. */
+  active_recipient_source?: 'user_selection' | 'commander_handoff';
   /** Lightweight suspended-orchestration state. This is deliberately NOT the
    *  old plan DAG: it records only the interactive hand-off that is currently
    *  blocking a larger commander-owned task, plus the instruction needed to
@@ -412,7 +417,13 @@ export async function readState(
           : {}),
         ...(typeof data.active_recipient === 'string' && data.active_recipient
           && data.active_recipient !== COMMANDER_ID
-          ? { active_recipient: data.active_recipient }
+          ? {
+              active_recipient: data.active_recipient,
+              ...(data.active_recipient_source === 'user_selection'
+                || data.active_recipient_source === 'commander_handoff'
+                ? { active_recipient_source: data.active_recipient_source }
+                : {}),
+            }
           : {}),
         ...(orchestrationLedger ? { orchestration_ledger: orchestrationLedger } : {}),
         ...(Array.isArray(data.sync_conflict_resolution?.conflicts)
@@ -603,15 +614,29 @@ export async function transitionStatus(
 
 /** Set the conversation floor (`active_recipient`). Pass an agent id to hand the
  *  user off to that agent; pass `commander` / `user` / empty to reset the floor
- *  to the commander (stored as absence). Mutex-guarded like `setStatus` so a
- *  hand-off can't race a concurrent status write. Returns the new state. */
-export async function setActiveRecipient(uid: string, cid: string, recipientId: string): Promise<StateFile> {
+ *  to the commander (stored as absence). `source` is supplied only when the
+ *  caller establishes a new ownership reason; same-recipient follow-ups preserve
+ *  the existing source. Mutex-guarded like `setStatus` so a hand-off can't race
+ *  a concurrent status write. Returns the new state. */
+export async function setActiveRecipient(
+  uid: string,
+  cid: string,
+  recipientId: string,
+  source?: StateFile['active_recipient_source'],
+): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const next = (recipientId && recipientId !== COMMANDER_ID && recipientId !== USER_ID)
       ? recipientId : '';
-    if (next) s.active_recipient = next;
-    else delete s.active_recipient;
+    const previous = s.active_recipient || '';
+    if (next) {
+      s.active_recipient = next;
+      if (source) s.active_recipient_source = source;
+      else if (previous !== next) delete s.active_recipient_source;
+    } else {
+      delete s.active_recipient;
+      delete s.active_recipient_source;
+    }
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

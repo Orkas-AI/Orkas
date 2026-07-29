@@ -35,6 +35,29 @@ describe('local_agents/sessions', () => {
     expect(await s.getSessionId(TEST_UID, TEST_CID, 'agent-x', 'claude')).toBe('sess-1');
   });
 
+  it('round-trips failed-turn provenance and context compatibility metadata', async () => {
+    const s = await loadSessions();
+    await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'sess-1', {
+      sourceMessageId: 'source-msg',
+      turnId: 'turn-1',
+      runId: 'run-1',
+      terminalStatus: 'failed',
+      durableContextHash: 'durable-hash',
+      cwdFingerprint: 'cwd-hash',
+      contextProtocolVersion: 2,
+    });
+    expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
+      sessionId: 'sess-1',
+      sourceMessageId: 'source-msg',
+      turnId: 'turn-1',
+      runId: 'run-1',
+      terminalStatus: 'failed',
+      durableContextHash: 'durable-hash',
+      cwdFingerprint: 'cwd-hash',
+      contextProtocolVersion: 2,
+    });
+  });
+
   it('invalidates the binding when the CLI changes (runtime swap)', async () => {
     const s = await loadSessions();
     await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'claude', 'sess-1');

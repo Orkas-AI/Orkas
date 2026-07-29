@@ -1,9 +1,6 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import {
   TOOL_CATALOG,
-  DEEP_RESEARCH_AGENT_IDS,
   getToolsSystemPromptBlock,
   isToolVisibleToAgent,
 } from '../../../../src/main/model/core-agent/tool-catalog';
@@ -23,31 +20,9 @@ import { createChatHistoryTools } from '../../../../src/main/model/core-agent/ch
 import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 
-const DEEP_RESEARCH_SKILL_ID = 'ee99fbb42964';
 const SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS = new Set([
   'generate_image:/inputSchema/properties/output_path',
 ]);
-
-const RERANK_OWNER_AGENT_RESOURCES = [
-  { id: '78900d8758bc', name: 'DeepResearcher', kind: 'builtin', hasDeepResearchSkill: true },
-  { id: '5dd962efb425', name: 'KnowledgeManager', kind: 'resource', hasDeepResearchSkill: false },
-  { id: '17c0a2e95df3', name: 'SocialResearcher', kind: 'resource', hasDeepResearchSkill: true },
-  { id: '7083ff63b398', name: 'BrandResearcher', kind: 'resource', hasDeepResearchSkill: true },
-] as const;
-
-function pcRoot(): string {
-  return fs.existsSync(path.join(process.cwd(), 'resources', 'builtin'))
-    ? process.cwd()
-    : path.resolve(process.cwd(), 'PC');
-}
-
-function agentJsonPath(spec: typeof RERANK_OWNER_AGENT_RESOURCES[number]): string {
-  const pc = pcRoot();
-  if (spec.kind === 'builtin') {
-    return path.join(pc, 'resources', 'builtin', 'marketplace', 'agents', spec.id, 'agent.json');
-  }
-  return path.join(path.dirname(pc), 'Resource', 'agents', spec.id, 'agent.json');
-}
 
 /**
  * Collect the tool names runner.ts injects under "everything available"
@@ -102,7 +77,7 @@ function enumerateAllInjectedTools(): AgentTool[] {
     onArtifactCreated: () => {},
     onOutputsPublished: (paths) => paths,
   }));
-  tools.push(...createFileTools({ userId: 'testuid', cid: 'testcid' }));
+  tools.push(...createFileTools({ userId: 'testuid', cid: 'testcid', includeOcrFile: true }));
   tools.push(...createKbTools({ userId: 'testuid' }));
   tools.push(...createChatHistoryTools({ userId: 'testuid' }));
   tools.push(createImageGenTool({ userId: 'testuid', cid: 'testcid' }));
@@ -240,18 +215,25 @@ describe('tool-catalog', () => {
   it('critical tools keep enough provider-visible guidance to choose and call them', () => {
     const checks: Record<string, string[]> = {
       read_file: ['read', 'charstart', 'charend', 'stat_file'],
+      read_files: ['several', 'path', 'charstart', 'charend', 'bounded'],
       stat_file: ['total_chars', 'before', 'read_file'],
       search_files: ['path is unknown', 'substring', 'glob'],
       grep_files: ['pattern', 'glob', 'output_mode'],
       write_file: ['write', 'path', 'content'],
+      apply_patch: ['transactional', 'patch', 'add file', 'update file', 'read'],
       edit_file: ['old_string', 'new_string', 'unique', 'e_stale'],
       publish_outputs: ['complete', 'final', 'paths', 'this turn'],
       create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
+      html_preview: ['local', 'desktop', 'mobile', 'screenshot', 'overflow', 'network'],
       delete_file: ['confirmation', 'confirmation_token', 'path'],
+      process_start: ['persistent', 'command', 'session_id', 'build'],
+      process_read: ['output', 'status', 'cursor'],
+      process_write: ['non-secret', 'stdin', 'chars'],
+      process_stop: ['stop', 'process tree', 'session'],
       interactive_cli_start: ['live user stdin', 'command', 'purpose'],
       generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
       create_docx: ['paragraphs', 'tables', 'images', 'path'],
-      create_xlsx: ['rows', 'sheets', 'formula', 'path'],
+      create_xlsx: ['rows', 'sheets', 'formula', 'path', 'native', 'chart'],
       create_pptx: ['slides', 'shapes', 'images', 'path'],
       cross_session_memory: ['remember', 'agent', 'shared', 'user', 'routing', 'language', 'proper nouns', 'add', 'replace', 'remove', 'list'],
       metacognition: ['competence', 'strategies', 'content limits', 'rejected', 'condense', 'read', 'write'],
@@ -333,37 +315,10 @@ describe('isToolVisibleToAgent (ownerAgent gate)', () => {
     expect(isToolVisibleToAgent('run_worker', 'video-studio')).toBe(true);
   });
 
-  it('an array ownerAgent makes the tool visible to EVERY listed agent', () => {
-    const entry = TOOL_CATALOG.find((e) => e.name === 'research_rerank');
-    expect(Array.isArray(entry?.ownerAgent)).toBe(true);
-    expect(DEEP_RESEARCH_AGENT_IDS.length).toBeGreaterThan(1);
-    expect(entry?.ownerAgent).toEqual(DEEP_RESEARCH_AGENT_IDS);
-    for (const id of DEEP_RESEARCH_AGENT_IDS) {
-      expect(isToolVisibleToAgent('research_rerank', id), id).toBe(true);
-    }
-  });
-
-  it('research_rerank bundled owner ids match the in-repo agent resources', () => {
-    const checked: string[] = [];
-    for (const spec of RERANK_OWNER_AGENT_RESOURCES) {
-      const file = agentJsonPath(spec);
-      if (!fs.existsSync(file)) continue;
-      const raw = fs.readFileSync(file, 'utf8');
-      const agent = JSON.parse(raw) as { agent_id?: string; name?: string; skill_list?: string[] };
-      expect(agent.agent_id).toBe(spec.id);
-      expect(agent.name).toBe(spec.name);
-      expect(Array.isArray(agent.skill_list)).toBe(true);
-      if (spec.hasDeepResearchSkill) {
-        expect(agent.skill_list).toContain(DEEP_RESEARCH_SKILL_ID);
-      }
-      checked.push(spec.id);
-    }
-    expect(checked).toEqual(['78900d8758bc']);
-  });
-
-  it('an array ownerAgent still hides the tool from the commander and non-owners', () => {
-    expect(isToolVisibleToAgent('research_rerank', '')).toBe(false);
-    expect(isToolVisibleToAgent('research_rerank', 'video-studio')).toBe(false);
-    expect(isToolVisibleToAgent('research_rerank', 'some-other-agent')).toBe(false);
+  it('keeps image_studio private to the built-in ImageStudio agent', () => {
+    expect(isToolVisibleToAgent('image_studio', '814b61b027f0')).toBe(true);
+    expect(isToolVisibleToAgent('image_studio', '')).toBe(false);
+    expect(isToolVisibleToAgent('image_studio', '79df9cc89f5f')).toBe(false);
+    expect(isToolVisibleToAgent('video_studio', '814b61b027f0')).toBe(false);
   });
 });

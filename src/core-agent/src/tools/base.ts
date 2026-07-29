@@ -32,9 +32,73 @@ export type ToolResultImage = {
   mediaType: string;
 };
 
+/** One explicit file read observed by a tool. Host-only: providers receive
+ * only ToolResult.content, while Session uses this deterministic metadata to
+ * preserve exact coding state across compaction. */
+export type FileReadObservation = {
+  path: string;
+  hash?: string;
+  charRange?: [number, number];
+  lineRange?: [number, number];
+};
+
+/** One committed file mutation. Text snapshots are host-only and bounded by
+ * the Session change ledger; they never enter provider tool_result content.
+ * beforeExists/afterExists make create/delete/replace semantics unambiguous
+ * even when a large or binary file has no inline snapshot. */
+export type FileChangeObservation = {
+  operation: "create" | "update" | "delete" | "rename";
+  sourcePath: string;
+  destinationPath?: string;
+  beforeExists: boolean;
+  afterExists: boolean;
+  beforeHash?: string;
+  afterHash?: string;
+  beforeBytes?: number;
+  afterBytes?: number;
+  beforeContent?: string;
+  afterContent?: string;
+  binary?: boolean;
+  /** Exact for transactional file tools; partial when inferred around shell. */
+  coverage?: "exact" | "partial";
+};
+
+export type CommandStreamObservation = {
+  bytes: number;
+  truncated: boolean;
+  ref?: string;
+};
+
+/** Structured command outcome retained independently from rendered stdout. */
+export type CommandExecutionObservation = {
+  status:
+    | "succeeded"
+    | "failed"
+    | "timed_out"
+    | "aborted"
+    | "output_limit"
+    | "start_failed";
+  exitCode: number | null;
+  durationMs: number;
+  timedOut: boolean;
+  outputLimitExceeded: boolean;
+  stdout: CommandStreamObservation;
+  stderr: CommandStreamObservation;
+};
+
+export type ToolObservations = {
+  fileReads?: FileReadObservation[];
+  fileChanges?: FileChangeObservation[];
+  execution?: CommandExecutionObservation;
+};
+
 /** Result returned from a tool execution. */
 export type ToolResult = {
   content: string;
+  /** Deterministic host-only facts produced by the tool. AgentRunner records
+   * them with the real tool-call/turn identity; providers never receive this
+   * object directly. */
+  observations?: ToolObservations;
   /** Host-only handoff for process output that was streamed to a session temp
    * file instead of being truncated at the in-memory capture threshold. The
    * final host result transformer must content-address/adopt this file before

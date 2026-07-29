@@ -10,6 +10,8 @@ function loadSettingsSandbox(): any {
     createLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
     t: (key: string) => key === 'settings.entries.model_unavailable'
       ? 'Select an available model'
+      : key === 'settings.entries.credential_missing'
+        ? 'Add the account again'
       : key,
     document: {
       getElementById: () => null,
@@ -43,5 +45,22 @@ describe('settings model whitelist', () => {
     expect(Array.from(state.options, (option: any) => option.value)).toEqual(['current-model']);
     expect(state.value).toBe('');
     expect(state.placeholder).toBe('Select an available model');
+  });
+
+  it('prioritizes a missing credential remediation over changing the model', () => {
+    const sandbox = loadSettingsSandbox();
+
+    expect(sandbox._settingsEntryProblem({
+      profileAvailable: false,
+      modelAvailable: false,
+    })).toBe('Add the account again');
+    expect(sandbox._settingsEntryProblem({
+      profileAvailable: true,
+      modelAvailable: false,
+    })).toBe('Select an available model');
+    expect(sandbox._settingsEntryProblem({
+      profileAvailable: true,
+      modelAvailable: true,
+    })).toBe('');
   });
 });

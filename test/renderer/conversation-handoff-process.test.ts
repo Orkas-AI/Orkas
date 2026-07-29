@@ -214,6 +214,32 @@ describe('_isRoutingOnlyProcessItems (history-reload commander record filter)', 
   });
 });
 
+describe('routing-only Commander history visibility', () => {
+  const dispatchItem = {
+    type: 'event',
+    event: { stream: 'tool', data: { name: 'dispatch_to' } },
+  };
+
+  it('preserves non-empty synthesis after a visible dispatch fan-out', () => {
+    const isRedundant = loadRedundantCommanderRecord();
+    expect(isRedundant({
+      from: 'commander',
+      text: 'Combined recommendation from both agents.',
+      process: [dispatchItem],
+    })).toBe(false);
+  });
+
+  it('still drops empty and abort-only routing tails', () => {
+    const isRedundant = loadRedundantCommanderRecord();
+    expect(isRedundant({ from: 'commander', text: '', process: [dispatchItem] })).toBe(true);
+    expect(isRedundant({
+      from: 'commander',
+      text: '(stopped)',
+      process: [dispatchItem],
+    })).toBe(true);
+  });
+});
+
 // Exact regression from the screenshot: the commander made several invalid
 // manage_execution_plan attempts, then successfully handed the final delivery
 // to VideoStudio. The old routing-only whitelist treated the failed planning

@@ -29,6 +29,7 @@ import {
   marketplaceCacheSkillsDir,
   marketplaceListingsCacheFile,
 } from '../paths';
+import { safeId } from '../storage';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { withMarketplaceCacheLock } from './marketplace_locks';
@@ -39,6 +40,10 @@ const log = createLogger('marketplace_cache');
 const SWEEP_MAX_BYTES = 100 * 1024 * 1024;   // 100 MB hard cap (triggers LRU eviction)
 const SWEEP_TARGET_BYTES = 80 * 1024 * 1024; // evict down to this after a sweep
 const SWEEP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days idle = expired
+
+function _assertSafeMarketplaceId(id: string): void {
+  if (!safeId(id)) throw new Error('invalid marketplace id');
+}
 
 export interface CacheMeta {
   /** Server agent_id / skill_id this directory caches. */
@@ -76,8 +81,14 @@ function _freshnessAt(row: { published_at: number; updated_at?: number }): numbe
 /** Hit check. Caller passes the server-list row's `version` + freshness timestamp; both must match
  *  the cached values. The cache dir itself existing is necessary but not sufficient — a
  *  half-written dir would also exist, hence the field comparison. */
-export async function isCacheFresh(kind: 'agent' | 'skill', id: string, expect: { version: string; published_at: number; updated_at?: number }): Promise<boolean> {
-  const dir = _cacheDir(kind, id);
+export async function isCacheFresh(
+  kind: 'agent' | 'skill',
+  id: string,
+  expect: { version: string; published_at: number; updated_at?: number },
+  uid = getActiveUserId(),
+): Promise<boolean> {
+  if (!safeId(id)) return false;
+  const dir = _cacheDir(kind, id, uid);
   if (!fs.existsSync(dir)) return false;
   const meta = await _readMeta(dir);
   if (!meta) return false;
@@ -86,14 +97,19 @@ export async function isCacheFresh(kind: 'agent' | 'skill', id: string, expect: 
   return true;
 }
 
-function _cacheDir(kind: 'agent' | 'skill', id: string): string {
-  const uid = getActiveUserId();
+function _cacheDir(kind: 'agent' | 'skill', id: string, uid = getActiveUserId()): string {
+  _assertSafeMarketplaceId(id);
   return kind === 'agent' ? marketplaceCacheAgentDir(uid, id) : marketplaceCacheSkillDir(uid, id);
 }
 
 /** Touch `last_used_at` to now — call after a successful detail-page render OR install copy. */
-export async function touchCacheEntry(kind: 'agent' | 'skill', id: string): Promise<void> {
-  const dir = _cacheDir(kind, id);
+export async function touchCacheEntry(
+  kind: 'agent' | 'skill',
+  id: string,
+  uid = getActiveUserId(),
+): Promise<void> {
+  if (!safeId(id)) return;
+  const dir = _cacheDir(kind, id, uid);
   const meta = await _readMeta(dir);
   if (!meta) return;
   meta.last_used_at = Date.now();
@@ -106,8 +122,9 @@ export async function touchCacheEntry(kind: 'agent' | 'skill', id: string): Prom
  *  half-written entry fails `isCacheFresh`. */
 export async function writeAgentCache(
   id: string, agentJson: Record<string, unknown>, meta: { version: string; published_at: number; updated_at?: number },
+  uid = getActiveUserId(),
 ): Promise<void> {
-  const uid = getActiveUserId();
+  _assertSafeMarketplaceId(id);
   await withMarketplaceCacheLock(uid, 'agent', id, async () => {
     const dir = marketplaceCacheAgentDir(uid, id);
     await fsp.rm(dir, { recursive: true, force: true });
@@ -123,11 +140,19 @@ export async function writeAgentCache(
 }
 
 /** Read cached agent.json content. Returns null if missing / unreadable. */
-export async function readAgentCache(id: string): Promise<Record<string, unknown> | null> {
-  const dir = _cacheDir('agent', id);
+export async function readAgentCache(
+  id: string,
+  uid = getActiveUserId(),
+): Promise<Record<string, unknown> | null> {
+  if (!safeId(id)) return null;
+  const dir = _cacheDir('agent', id, uid);
   const file = path.join(dir, 'agent.json');
-  if (!fs.existsSync(file)) return null;
-  try { return JSON.parse(await fsp.readFile(file, 'utf8')) as Record<string, unknown>; }
+  try {
+    const stat = await fsp.lstat(file);
+    if (!stat.isFile()) return null;
+    if (!await _isRealPathInside(dir, file)) return null;
+    return JSON.parse(await fsp.readFile(file, 'utf8')) as Record<string, unknown>;
+  }
   catch { return null; }
 }
 
@@ -137,8 +162,9 @@ export async function writeSkillCache(
   id: string,
   extract: (dir: string) => Promise<void> | void,
   meta: { version: string; published_at: number; updated_at?: number },
+  uid = getActiveUserId(),
 ): Promise<void> {
-  const uid = getActiveUserId();
+  _assertSafeMarketplaceId(id);
   await withMarketplaceCacheLock(uid, 'skill', id, async () => {
     const dir = marketplaceCacheSkillDir(uid, id);
     await fsp.rm(dir, { recursive: true, force: true });
@@ -156,8 +182,8 @@ export async function writeSkillCache(
 /** Skill cache dir (caller copies its contents into the marketplace install dir, OR reads files
  *  directly for detail-page rendering). The `_cache.json` sentinel must NOT propagate to the
  *  install target — `installFromSkillCache` in `marketplace.ts` strips it on copy. */
-export function getSkillCacheDir(id: string): string {
-  return _cacheDir('skill', id);
+export function getSkillCacheDir(id: string, uid = getActiveUserId()): string {
+  return _cacheDir('skill', id, uid);
 }
 
 /** Read a single file from the cached skill dir. Used by the detail-page file viewer. The
@@ -165,21 +191,33 @@ export function getSkillCacheDir(id: string): string {
  *  the cache dir. Returns null on miss / unsafe path / I/O error. Reads up to 256 KB; bigger
  *  files are truncated with a marker so the detail view always renders within reasonable size. */
 export async function readSkillCacheFile(id: string, relFile: string): Promise<string | null> {
+  if (!safeId(id)) return null;
   if (!relFile || relFile === '_cache.json') return null;
   const safe = _safeRel(relFile);
   if (!safe) return null;
   const dir = _cacheDir('skill', id);
   const target = path.resolve(dir, safe);
   if (!target.startsWith(path.resolve(dir) + path.sep) && target !== path.resolve(dir)) return null;
-  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) return null;
   const MAX_BYTES = 256 * 1024;
   try {
+    const stat = await fsp.lstat(target);
+    if (!stat.isFile()) return null;
+    if (!await _isRealPathInside(dir, target)) return null;
     const buf = await fsp.readFile(target);
     if (buf.length > MAX_BYTES) {
       return buf.subarray(0, MAX_BYTES).toString('utf8') + '\n\n[…truncated]';
     }
     return buf.toString('utf8');
   } catch { return null; }
+}
+
+async function _isRealPathInside(dir: string, target: string): Promise<boolean> {
+  try {
+    const [realDir, realTarget] = await Promise.all([fsp.realpath(dir), fsp.realpath(target)]);
+    return realTarget.startsWith(`${realDir}${path.sep}`);
+  } catch {
+    return false;
+  }
 }
 
 function _safeRel(rel: string): string | null {
@@ -193,8 +231,14 @@ function _safeRel(rel: string): string | null {
 /** Return cached skill file list (relative paths, byte sizes). Used by the detail page's file
  *  tree. Skips _cache.json. */
 export async function listSkillCacheFiles(id: string): Promise<{ path: string; bytes: number }[]> {
+  if (!safeId(id)) return [];
   const dir = _cacheDir('skill', id);
   if (!fs.existsSync(dir)) return [];
+  try {
+    if (!fs.lstatSync(dir).isDirectory()) return [];
+  } catch {
+    return [];
+  }
   const out: { path: string; bytes: number }[] = [];
   function walk(d: string, rel = ''): void {
     for (const e of fs.readdirSync(d, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {

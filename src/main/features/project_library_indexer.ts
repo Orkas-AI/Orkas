@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
-import { projectFilesDir, projectLibraryVectorDbPath } from '../paths';
+import { projectFilesDir, projectLibraryVectorDbPath, projectLocalDir } from '../paths';
 import { createLogger } from '../logger';
 import { fileToChunks, type ChunkableKind } from '../util/file_to_chunks';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
@@ -100,6 +100,7 @@ interface Job {
   projectId: string;
   name: string;
   op: 'upsert' | 'delete';
+  projectEpoch: number;
   force?: boolean;
   enqueuedAt: number;
   reason: 'mutation' | 'reconcile' | 'crash_recovery' | 'late_recovery' | 'manual';
@@ -114,6 +115,8 @@ interface Queue {
 }
 
 const _queues = new Map<string, Queue>();
+const _projectEpochs = new Map<string, number>();
+const _deletedProjects = new Set<string>();
 
 export const projectLibraryEvents = new EventEmitter();
 projectLibraryEvents.setMaxListeners(50);
@@ -187,6 +190,19 @@ function releaseActiveKey(q: Queue, key: string): void {
   else q.activeKeys.set(key, count - 1);
 }
 
+function projectKey(uid: string, projectId: string): string {
+  return `${uid}\x00${projectId}`;
+}
+
+function projectEpoch(uid: string, projectId: string): number {
+  return _projectEpochs.get(projectKey(uid, projectId)) || 0;
+}
+
+function jobIsCurrent(uid: string, job: Job): boolean {
+  const key = projectKey(uid, job.projectId);
+  return !_deletedProjects.has(key) && job.projectEpoch === projectEpoch(uid, job.projectId);
+}
+
 export function enqueue(
   uid: string,
   projectId: string,
@@ -201,6 +217,7 @@ export function enqueue(
     safeName = safeFileName(name);
   } catch { return; }
   if (op === 'upsert' && !kindFor(safeName)) return;
+  if (_deletedProjects.has(projectKey(uid, pid))) return;
   const q = queueFor(uid);
   const existing = q.jobs.find((j) => j.projectId === pid && j.name === safeName && j.op === op);
   if (existing) {
@@ -211,6 +228,7 @@ export function enqueue(
     projectId: pid,
     name: safeName,
     op,
+    projectEpoch: projectEpoch(uid, pid),
     force: opts.force === true,
     enqueuedAt: Date.now(),
     reason: opts.reason || (opts.force ? 'manual' : 'mutation'),
@@ -241,12 +259,14 @@ async function runQueue(uid: string): Promise<void> {
   try {
     while (q.jobs.length) {
       const job = q.jobs.shift()!;
+      if (!jobIsCurrent(uid, job)) continue;
       const key = jobKey(job.projectId, job.name);
       retainActiveKey(q, key);
       try {
-        if (job.op === 'delete') await processDelete(uid, job.projectId, job.name);
+        if (job.op === 'delete') await processDelete(uid, job);
         else await processUpsert(uid, job, batch);
       } catch (err) {
+        if (!jobIsCurrent(uid, job)) continue;
         log.warn('project library job failed unexpectedly', {
           user_id: maskId(uid),
           project_id: maskId(job.projectId),
@@ -282,9 +302,17 @@ function jobKey(projectId: string, name: string): string {
   return `${projectId}\x00${name}`;
 }
 
-async function processDelete(uid: string, projectId: string, name: string): Promise<void> {
-  await storeFor(uid, projectId).deleteFile(name);
-  emit({ userId: uid, projectId, name, relPath: name, status: 'deleted' });
+async function processDelete(uid: string, job: Job): Promise<void> {
+  if (!jobIsCurrent(uid, job)) return;
+  await storeFor(uid, job.projectId).deleteFile(job.name);
+  if (!jobIsCurrent(uid, job)) return;
+  emit({
+    userId: uid,
+    projectId: job.projectId,
+    name: job.name,
+    relPath: job.name,
+    status: 'deleted',
+  });
 }
 
 async function processUpsert(
@@ -303,17 +331,22 @@ async function processUpsert(
   let stat: fs.Stats;
   try { stat = await fsp.stat(abs); }
   catch {
+    if (!jobIsCurrent(uid, job)) return;
     await store.deleteFile(name);
+    if (!jobIsCurrent(uid, job)) return;
     emit({ userId: uid, projectId, name, relPath: name, status: 'deleted', kind });
     return;
   }
+  if (!jobIsCurrent(uid, job)) return;
   if (!stat.isFile()) {
     await store.deleteFile(name);
+    if (!jobIsCurrent(uid, job)) return;
     emit({ userId: uid, projectId, name, relPath: name, status: 'deleted', kind });
     return;
   }
 
   const buf = await fsp.readFile(abs);
+  if (!jobIsCurrent(uid, job)) return;
   const sha1 = crypto.createHash('sha1').update(buf).digest('hex');
   const existing = store.getFile(name);
   if (!force && existing && existing.sha1 === sha1 && existing.status === 'ready') {
@@ -323,6 +356,7 @@ async function processUpsert(
 
   const isEmpty = stat.size === 0 || (kind === 'text' && buf.toString('utf8').trim() === '');
   if (isEmpty) {
+    if (!jobIsCurrent(uid, job)) return;
     await store.upsertFile({
       id: name,
       kind,
@@ -331,6 +365,7 @@ async function processUpsert(
       sha1,
       chunks: [],
     });
+    if (!jobIsCurrent(uid, job)) return;
     emit({ userId: uid, projectId, name, relPath: name, status: 'ready', kind, chunks: 0, stage: 'persist' });
     recordVectorizeResult(batch, job, startedAt, {
       result: 'success', stage: 'persist', chunks: 0,
@@ -344,6 +379,7 @@ async function processUpsert(
     return;
   }
 
+  if (!jobIsCurrent(uid, job)) return;
   await store.setFileStatus(name, 'processing', {
     kind,
     bytes: stat.size,
@@ -366,6 +402,7 @@ async function processUpsert(
       stage: 'extract',
       onLateSettlement: (late) => scheduleLateRecovery(uid, job, sha1, late, 'extract'),
     });
+    if (!jobIsCurrent(uid, job)) return;
     if (!chunks.length) throw Object.assign(new Error('fileToChunks returned zero chunks'), { stage: 'extract' });
 
     currentStage = 'embed';
@@ -377,6 +414,7 @@ async function processUpsert(
       stage: 'embed',
       onLateSettlement: (late) => scheduleLateRecovery(uid, job, sha1, late, 'embed'),
     });
+    if (!jobIsCurrent(uid, job)) return;
     currentStage = 'persist';
     await store.upsertFile({
       id: name,
@@ -390,11 +428,13 @@ async function processUpsert(
         embedding: vectors[index],
       })),
     });
+    if (!jobIsCurrent(uid, job)) return;
     emit({ userId: uid, projectId, name, relPath: name, status: 'ready', kind, chunks: chunks.length, stage: 'persist' });
     recordVectorizeResult(batch, job, startedAt, {
       result: 'success', stage: 'persist', chunks: chunks.length,
     });
   } catch (err) {
+    if (!jobIsCurrent(uid, job)) return;
     const msg = (err as Error).message || String(err);
     const stage = err instanceof OperationTimeoutError
       ? (err.stage as 'extract' | 'embed')
@@ -461,6 +501,7 @@ function scheduleLateRecovery<T>(
   const key = jobKey(job.projectId, job.name);
   retainActiveKey(queue, key);
   void late.then(() => {
+    if (!jobIsCurrent(uid, job)) return;
     if (job.attempt >= 2) return;
     const row = storeFor(uid, job.projectId).getFile(job.name);
     if (!row || row.status !== 'failed' || row.sha1 !== expectedSha1) return;
@@ -528,6 +569,9 @@ export async function reconcile(uid: string, projectId: string): Promise<Project
   const startedAt = Date.now();
   const pid = safeProjectId(projectId);
   if (!await projectExists(uid, pid)) return { enqueuedUpsert: 0, enqueuedDelete: 0, unchanged: 0 };
+  // A sync restore can legitimately bring back the same project id after a
+  // local deletion. Reconcile is the authoritative resurrection boundary.
+  _deletedProjects.delete(projectKey(uid, pid));
 
   const root = projectFilesDir(uid, pid);
   const store = storeFor(uid, pid);
@@ -673,6 +717,21 @@ export async function search(
   return storeFor(uid, projectId).search(queryVec, opts);
 }
 
+/** Query only an existing project vector store. Global typeahead must not
+ * create derived state for every project or hash/reconcile every source tree
+ * on each keystroke; normal project mutations and boot maintenance own that
+ * lifecycle. */
+export function searchExisting(
+  uid: string,
+  projectId: string,
+  queryVec: number[] | Float32Array,
+  opts: vs.VecSearchOpts = {},
+): vs.VecSearchHit[] {
+  const pid = safeProjectId(projectId);
+  if (!fs.existsSync(projectLibraryVectorDbPath(uid, pid))) return [];
+  return storeFor(uid, pid).search(queryVec, opts);
+}
+
 export function getFileByPath(uid: string, projectId: string, relPath: string): vs.VecFileRow | null {
   return storeFor(uid, projectId).getFile(relPath);
 }
@@ -696,8 +755,26 @@ export async function drain(uid: string): Promise<void> {
   }
 }
 
+/** Cancel queued/in-flight work and remove all machine-derived data for a
+ * deleted project. An epoch prevents late extraction/embedding settlements
+ * from recreating the vector store after this function returns. */
+export async function dropProjectIndex(uid: string, projectId: string): Promise<void> {
+  const pid = safeProjectId(projectId);
+  const key = projectKey(uid, pid);
+  _deletedProjects.add(key);
+  _projectEpochs.set(key, projectEpoch(uid, pid) + 1);
+  const q = queueFor(uid);
+  q.jobs = q.jobs.filter((job) => job.projectId !== pid);
+
+  const dbDir = path.dirname(projectLibraryVectorDbPath(uid, pid));
+  vs.closeVecStore(dbDir);
+  await fsp.rm(projectLocalDir(uid, pid), { recursive: true, force: true });
+}
+
 export function _resetQueuesForTests(): void {
   _queues.clear();
+  _projectEpochs.clear();
+  _deletedProjects.clear();
   projectLibraryEvents.removeAllListeners();
   projectLibraryEvents.setMaxListeners(50);
 }

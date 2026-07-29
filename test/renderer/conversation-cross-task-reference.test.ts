@@ -135,12 +135,16 @@ describe('conversation cross-task message reference UI', () => {
     expect(styleSource).toContain('.chat-reference-file.is-attachment');
   });
 
-  it('renders references as a static quote block with a source-only title', () => {
-    expect(conversationSource).toContain("t('chat.reference_bundle_title', { title: sourceTitle })");
-    expect(conversationSource).toContain('class="chat-reference-title"');
+  it('renders references as a static quote block and limits source titles to cross-task references', () => {
+    expect(conversationSource).toContain('function _renderMessageReferencesHtml(references, targetCid)');
+    expect(conversationSource).toContain('_renderMessageReferencesHtml(message.references, messageCid)');
+    expect(conversationSource).toContain('_quotePreviewAttribution(ref, targetCid)');
+    expect(conversationSource).toContain('class="chat-reference-author"');
+    expect(conversationSource).not.toContain('class="chat-reference-title"');
     expect(conversationSource).not.toContain('<details class="chat-reference-bundle"');
     expect(conversationSource).not.toContain('chat.reference_bundle_summary');
     expect(styleSource).toContain('border-left: 3px solid rgba(37, 99, 235, 0.45);');
     expect(styleSource).toContain('background: rgba(37, 99, 235, 0.04);');
+    expect(styleSource).toContain('.chat-reference-author { display: block; margin-bottom: 1px; color: #2563eb; font-size: 12px; font-weight: 500; }');
   });
 });

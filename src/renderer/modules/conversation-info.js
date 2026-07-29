@@ -17,6 +17,7 @@ const ConversationInfo = (() => {
   let _fileSeq = 0;
   let _attachmentSeq = 0;
   const _locallyDeletedPaths = new Set();
+  const _expandedDirectoryPaths = new Set();
   let _loading = false;
   let _loadingSource = '';
   let _loadingSeq = 0;
@@ -391,14 +392,31 @@ const ConversationInfo = (() => {
     return prefix + (segments || []).join('/');
   }
 
+  function _directoryStateKey(dirPath) {
+    return _normalizePath(dirPath).replace(/\/+$/, '');
+  }
+
+  function _captureExpandedDirectories(body) {
+    if (!body || typeof body.querySelectorAll !== 'function') return;
+    body.querySelectorAll('.conversation-info-dir[data-directory-key]').forEach((dir) => {
+      const key = _directoryStateKey(dir && dir.dataset && dir.dataset.directoryKey);
+      if (!key) return;
+      if (dir.open) _expandedDirectoryPaths.add(key);
+      else _expandedDirectoryPaths.delete(key);
+    });
+  }
+
   function _renderTreeNode(node, depth) {
     const dirs = Array.from(node.dirs.entries()).sort((a, b) => a[0].localeCompare(b[0]));
     const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
     const moreTitle = _label('common.more', 'More');
     const dirHtml = dirs.map(([name, child]) => {
       const dirPath = child && child.path ? String(child.path) : '';
+      const directoryKey = _directoryStateKey(dirPath);
+      const expandedAttr = directoryKey && _expandedDirectoryPaths.has(directoryKey) ? ' open' : '';
       return `
-      <details class="conversation-info-dir" style="--depth:${depth}">
+      <details class="conversation-info-dir" style="--depth:${depth}"
+               data-directory-key="${escapeHtml(directoryKey)}"${expandedAttr}>
         <summary class="conversation-info-dir-summary" title="${escapeHtml(dirPath || name)}">
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-closed">${_uiIcon('folder', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-open">${_uiIcon('folder-open', 'ui-icon conversation-info-dir-svg-icon')}</span>
@@ -541,6 +559,10 @@ const ConversationInfo = (() => {
     _closeFileMenu();
     const body = document.getElementById('conversation-info-body');
     if (!body) return;
+    // File refreshes replace the tree markup. Capture the live <details>
+    // state first so a background refresh does not collapse folders the user
+    // is working in.
+    _captureExpandedDirectories(body);
     if (!_cid) {
       body.innerHTML = `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.no_conversation', 'Open a conversation to see details'))}</div>`;
       _refreshTabCounts();
@@ -698,6 +720,7 @@ const ConversationInfo = (() => {
   function bind(cid) {
     _cid = cid || null;
     _open = false;
+    _expandedDirectoryPaths.clear();
     _snapshot = { conversation: null, history: [], files: [], fileRoot: '', fileRootExists: false, filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
     _error = '';
     _resetLoading();
@@ -929,10 +952,19 @@ const ConversationInfo = (() => {
   }
 
   async function _addEntryToLibrary(absPath, cidOverride) {
-    if (!_canAddEntryToLibrary(absPath)) return;
+    const targetCid = cidOverride || _cid;
+    if (!_canAddEntryToLibrary(absPath, _isProjectConversation(targetCid))) return;
     try {
       const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
       if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
+      const libraryLabel = res.scope === 'project'
+        ? _label('contexts.transfer.project_library', 'Project Library')
+        : _label('contexts.transfer.global_library', 'Global Library');
+      const message = _label('conversation_info.file_add_to_library_done', 'Added to {library}', {
+        library: libraryLabel,
+      });
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
+      else if (typeof uiAlert === 'function') await uiAlert(message);
       if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
         loadContexts();
       }

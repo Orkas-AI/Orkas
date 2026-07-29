@@ -75,8 +75,60 @@ describe('path-sandbox › isPathAllowed', () => {
     }
   });
 
+  it('rejects a nonexistent child reached through a symlink that escapes the root', () => {
+    const outsideDir = path.dirname(outsideFile);
+    const linkDir = path.join(workspace, 'outside-alias');
+    if (process.platform === 'win32') {
+      // Directory junctions do not require Developer Mode/admin privileges,
+      // so this security probe must stay active on ordinary Windows CI hosts.
+      fs.symlinkSync(outsideDir, linkDir, 'junction');
+    } else {
+      try { fs.symlinkSync(outsideDir, linkDir, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      expect(isPathAllowed(path.join(linkDir, 'not-created-yet.txt'), [workspace])).toBe(false);
+    } finally {
+      try { fs.unlinkSync(linkDir); } catch { /* best-effort */ }
+    }
+  });
+
+  it('accepts an allowed root addressed through a symlink alias', () => {
+    const rootAlias = path.join(tmpRoot, 'workspace-alias');
+    if (process.platform === 'win32') {
+      fs.symlinkSync(workspace, rootAlias, 'junction');
+    } else {
+      try { fs.symlinkSync(workspace, rootAlias, 'dir'); }
+      catch { return; /* platform without symlink support — covered by Windows junction CI */ }
+    }
+    try {
+      expect(isPathAllowed(path.join(rootAlias, 'doc.md'), [rootAlias])).toBe(true);
+    } finally {
+      try { fs.unlinkSync(rootAlias); } catch { /* best-effort */ }
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('uses native case-insensitive containment without prefix confusion', () => {
+    const upperCaseFile = workspaceFile.toUpperCase();
+    expect(isPathAllowed(upperCaseFile, [workspace.toLowerCase()])).toBe(true);
+
+    const sibling = path.join(tmpRoot, 'WS-SIBLING');
+    fs.mkdirSync(sibling);
+    const siblingFile = path.join(sibling, 'DOC.MD');
+    fs.writeFileSync(siblingFile, 'outside');
+    try {
+      expect(isPathAllowed(siblingFile.toLowerCase(), [workspace.toUpperCase()])).toBe(false);
+    } finally {
+      fs.rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
   it('rejects relative paths', () => {
     expect(isPathAllowed('relative/path.md', [workspace])).toBe(false);
+  });
+
+  it('ignores relative and empty allowed roots', () => {
+    expect(isPathAllowed(workspaceFile, ['', 'relative/root'])).toBe(false);
   });
 
   it('rejects empty inputs', () => {

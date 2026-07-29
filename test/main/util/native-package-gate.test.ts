@@ -58,6 +58,9 @@ function windowsFixture(): string {
     'better-sqlite3/build/Release/better_sqlite3.node',
     'fastembed/node_modules/onnxruntime-node/bin/napi-v3/win32/x64/onnxruntime_binding.node',
     'fastembed/node_modules/onnxruntime-node/bin/napi-v3/win32/x64/onnxruntime.dll',
+    '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
+    '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
+    '@img/sharp-win32-x64/lib/libvips-42.dll',
   ]) {
     writePe(root, relativePath);
   }

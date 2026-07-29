@@ -37,6 +37,14 @@ function _wsFolderName(fullPath) {
   return parts[parts.length - 1] || fullPath;
 }
 
+/** Show a localized semantic name for the managed default workspace instead
+ *  of leaking its implementation folder name (`userWorkSpace`). */
+function _wsDisplayName(info) {
+  return info && info.isDefault
+    ? t('workspace.default_header')
+    : _wsFolderName(info && info.currentPath);
+}
+
 /** Build the scope hint payload for a given chip target. The conversation
  *  panel passes `cid` (main resolves cid → conv.project_id); the commander
  *  panel passes `projectId` from the current commander chip pick. */
@@ -53,15 +61,12 @@ function _wsScopeHintFor(target) {
 }
 
 /** Update workspace chip label for one or both targets. */
-function _updateChipForTarget(target) {
+function _syncWorkspaceChipContent(chip, target) {
   const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
-  const sel = target === 'new-chat'
-    ? '#panel-new-chat .workspace-chip'
-    : (target === 'project' ? '#panel-project .workspace-chip' : '#panel-conversation .workspace-chip');
-  const chip = document.querySelector(sel);
-  if (!chip) return;
+  const prefix = chip.querySelector('.workspace-chip-prefix');
+  if (prefix) prefix.textContent = t('workspace.chip_label');
   const label = chip.querySelector('.workspace-chip-label');
-  if (label) label.textContent = _wsFolderName(info.currentPath);
+  if (label) label.textContent = _wsDisplayName(info);
   // Tooltip carries the full path + scope context (project vs default).
   let tooltip = info.currentPath || t('workspace.chip_title');
   if (info.scope === 'project' && typeof getCommanderProjectIdName === 'function') {
@@ -74,10 +79,30 @@ function _updateChipForTarget(target) {
   chip.title = tooltip;
 }
 
+function _updateChipForTarget(target) {
+  const sel = target === 'new-chat'
+    ? '#panel-new-chat .workspace-chip'
+    : (target === 'project' ? '#panel-project .workspace-chip' : '#panel-conversation .workspace-chip');
+  const chip = document.querySelector(sel);
+  if (!chip) return;
+  _syncWorkspaceChipContent(chip, target);
+}
+
 function _updateAllChips() {
   _updateChipForTarget('new-chat');
   _updateChipForTarget('conversation');
   _updateChipForTarget('project');
+}
+
+function _refreshWorkspaceLocalizedUi() {
+  // Dynamic menus are not covered by applyDomI18n(). Close an open instance
+  // so its next render uses the newly selected language.
+  const menu = document.getElementById('workspace-menu');
+  if (menu) {
+    if (typeof menu._closeWorkspaceMenu === 'function') menu._closeWorkspaceMenu();
+    else menu.remove();
+  }
+  _updateAllChips();
 }
 
 // ── Core actions ────────────────────────────────────────────────────
@@ -199,9 +224,82 @@ function _createWorkspaceChip(target) {
 
 // ── Dropdown menu ───────────────────────────────────────────────────
 
+const _WORKSPACE_MENU_EDGE_GAP = 8;
+const _WORKSPACE_MENU_ANCHOR_GAP = 4;
+
+/**
+ * Pick a collision-safe fixed position for the workspace menu. Standard
+ * dropdown behavior is downward-first, with an upward flip only when needed.
+ * The returned max dimensions keep even a tall menu inside the viewport.
+ */
+function _workspaceMenuPlacement(anchorRect, menuRect, viewportWidth, viewportHeight) {
+  const maxWidth = Math.max(0, viewportWidth - (_WORKSPACE_MENU_EDGE_GAP * 2));
+  const renderedWidth = Math.min(menuRect.width, maxWidth);
+  const vertical = _dropdownVerticalPlacement(
+    anchorRect,
+    menuRect.height,
+    viewportHeight,
+    {
+      edge: _WORKSPACE_MENU_EDGE_GAP,
+      gap: _WORKSPACE_MENU_ANCHOR_GAP,
+    },
+  );
+  const maxLeft = Math.max(
+    _WORKSPACE_MENU_EDGE_GAP,
+    viewportWidth - _WORKSPACE_MENU_EDGE_GAP - renderedWidth
+  );
+  const left = Math.min(Math.max(anchorRect.left, _WORKSPACE_MENU_EDGE_GAP), maxLeft);
+
+  return {
+    left,
+    top: vertical.top,
+    maxWidth,
+    maxHeight: vertical.availableHeight,
+    openAbove: vertical.openAbove,
+  };
+}
+
+function _positionWorkspaceMenu(menu, anchor) {
+  const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+  // Clear the previous inline constraints before measuring again after a
+  // window resize. scrollHeight preserves the full content height when the
+  // menu was already constrained.
+  menu.style.maxWidth = '';
+  menu.style.maxHeight = '';
+  menu.style.maxWidth = Math.max(
+    0,
+    viewportWidth - (_WORKSPACE_MENU_EDGE_GAP * 2)
+  ) + 'px';
+
+  const measuredRect = menu.getBoundingClientRect();
+  const menuRect = {
+    width: measuredRect.width,
+    height: Math.max(measuredRect.height, menu.scrollHeight || 0),
+  };
+  const placement = _workspaceMenuPlacement(
+    anchor.getBoundingClientRect(),
+    menuRect,
+    viewportWidth,
+    viewportHeight
+  );
+
+  menu.style.left = placement.left + 'px';
+  menu.style.top = placement.top + 'px';
+  menu.style.bottom = 'auto';
+  menu.style.maxWidth = placement.maxWidth + 'px';
+  menu.style.maxHeight = placement.maxHeight + 'px';
+  menu.dataset.placement = placement.openAbove ? 'top' : 'bottom';
+}
+
 function _showWorkspaceDropdown(anchor, target) {
   const old = document.getElementById('workspace-menu');
-  if (old) { old.remove(); return; }
+  if (old) {
+    if (typeof old._closeWorkspaceMenu === 'function') old._closeWorkspaceMenu();
+    else old.remove();
+    return;
+  }
 
   const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
 
@@ -211,14 +309,10 @@ function _showWorkspaceDropdown(anchor, target) {
 
   anchor.classList.add('workspace-chip--open');
 
-  // ── Default section ──
-  const defaultHeader = document.createElement('div');
-  defaultHeader.className = 'workspace-menu-header';
-  defaultHeader.textContent = t('workspace.default_header');
-  menu.appendChild(defaultHeader);
-
+  // The default item is self-explanatory; a same-named grey section header
+  // above it only repeats the label.
   const defaultItem = _createMenuItem(
-    _wsFolderName(info.defaultPath),
+    _wsDisplayName({ currentPath: info.defaultPath, isDefault: true }),
     info.isDefault,
     () => { _closeMenu(); _resetWorkspace(target); }
   );
@@ -235,11 +329,6 @@ function _showWorkspaceDropdown(anchor, target) {
     }
   }
   if (showRecents.length > 0) {
-    const recentHeader = document.createElement('div');
-    recentHeader.className = 'workspace-menu-header';
-    recentHeader.textContent = t('workspace.recent_header');
-    menu.appendChild(recentHeader);
-
     for (const entry of showRecents) {
       const item = _createMenuItem(
         _wsFolderName(entry.path),
@@ -274,23 +363,34 @@ function _showWorkspaceDropdown(anchor, target) {
   });
   menu.appendChild(openItem);
 
-  const rect = anchor.getBoundingClientRect();
   menu.style.position = 'fixed';
-  menu.style.left = rect.left + 'px';
-  menu.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
-
+  menu.style.visibility = 'hidden';
   document.body.appendChild(menu);
+  _positionWorkspaceMenu(menu, anchor);
+  menu.style.visibility = '';
+
+  const _onViewportChange = (event) => {
+    // Scrolling the constrained menu should not trigger a redundant
+    // measurement on every wheel/touchpad frame.
+    if (event && menu.contains(event.target)) return;
+    _positionWorkspaceMenu(menu, anchor);
+  };
 
   function _closeMenu() {
     menu.remove();
     anchor.classList.remove('workspace-chip--open');
     document.removeEventListener('mousedown', _onOutside);
+    window.removeEventListener('resize', _onViewportChange);
+    window.removeEventListener('scroll', _onViewportChange, true);
   }
   function _onOutside(e) {
     if (!menu.contains(e.target) && !anchor.contains(e.target)) {
       _closeMenu();
     }
   }
+  menu._closeWorkspaceMenu = _closeMenu;
+  window.addEventListener('resize', _onViewportChange);
+  window.addEventListener('scroll', _onViewportChange, true);
   setTimeout(() => document.addEventListener('mousedown', _onOutside), 0);
 }
 
@@ -363,6 +463,14 @@ async function refreshWorkspaceChip() {
   _updateChipForTarget(target);
 }
 
+window.addEventListener('i18n-change', _refreshWorkspaceLocalizedUi);
+
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _mountWorkspaceChipInBar };
+  module.exports = {
+    _mountWorkspaceChipInBar,
+    _showWorkspaceDropdown,
+    _wsDisplayName,
+    _wsInfoByTarget,
+    _workspaceMenuPlacement,
+  };
 }

@@ -47,22 +47,6 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
   fs.writeFileSync(file, messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
 }
 
-async function waitForSearchDoc(
-  ix: Awaited<ReturnType<typeof loadIndexer>>,
-  docId: string,
-  token: string,
-  timeoutMs = 1000,
-): Promise<void> {
-  const paths = await import('../../../../src/main/paths');
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const entry = await ix.getEntry(paths.userChatsIndexPath(TEST_UID), 'chat');
-    if (entry.idx.docs[docId] && entry.idx.postings[token]) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`timed out waiting for ${docId} in chat search index`);
-}
-
 describe('search/indexer › reconcileContextsIndex', () => {
   it('returns silently when CONTEXTS_DIR is missing', async () => {
     const ix = await loadIndexer();
@@ -235,10 +219,11 @@ describe('search/indexer › indexChatMessage (hot path)', () => {
     await ix.reconcileChatsIndex('u1');
 
     // Append index 1 directly — simulates the chats.appendMessage hook
-    ix.indexChatMessage('u1', 'c1', 1, { role: 'assistant', content: 'fresh keyword', time: 't2' });
-
-    // Work is scheduled asynchronously; wait for the actual index mutation.
-    await waitForSearchDoc(ix, 'chat:c1:1', 'fresh');
+    await ix.indexChatMessage('u1', 'c1', 1, {
+      role: 'assistant',
+      content: 'fresh keyword',
+      time: 't2',
+    });
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.docs['chat:c1:1']).toBeDefined();
@@ -247,8 +232,7 @@ describe('search/indexer › indexChatMessage (hot path)', () => {
 
   it('is a no-op for empty content', async () => {
     const ix = await loadIndexer();
-    ix.indexChatMessage('u1', 'c1', 0, { role: 'user', content: '', time: 't' });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await ix.indexChatMessage('u1', 'c1', 0, { role: 'user', content: '', time: 't' });
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.docs).toEqual({});
@@ -283,10 +267,9 @@ describe('search/indexer › chat message shapes (legacy + group-chat)', () => {
 
   it('indexChatMessage hot-path accepts group-chat shape', async () => {
     const ix = await loadIndexer();
-    ix.indexChatMessage('u1', 'c1', 0, {
+    await ix.indexChatMessage('u1', 'c1', 0, {
       from: 'user', ts: 't', text: 'fresh group message',
     } as any);
-    await waitForSearchDoc(ix, 'chat:c1:0', 'fresh');
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: 't' });
@@ -350,8 +333,7 @@ describe('search/indexer › dropChatConversation', () => {
     ]);
     const ix = await loadIndexer();
     await ix.reconcileChatsIndex('u1');
-    ix.dropChatConversation('u1', 'c1');
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await ix.dropChatConversation('u1', 'c1');
     const paths = await import('../../../../src/main/paths');
     const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
     expect(entry.idx.files['c1']).toBeUndefined();

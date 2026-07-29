@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PersistentSession } from "../src/agent/persistent-session.js";
-import type { MessageContent } from "../src/shared/types.js";
+import type { Message, MessageContent } from "../src/shared/types.js";
 
 // Mirrors the constant in persistent-session.ts; kept inline (not exported)
 // so the heal contract is testable without leaking an internal sentinel.
@@ -61,6 +61,150 @@ describe("PersistentSession", () => {
     expect(msgs[1].role).toBe("assistant");
   });
 
+  it("rebases semantic dialogue from a canonical source while preserving compatible compaction", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "PRIVATE_TOOL_TRANSCRIPT" }]);
+    session.addAssistantMessage([{ type: "text", text: "private reply" }]);
+    session.completeActiveTurn();
+    session.addHistoryResource({
+      kind: "final_output",
+      path: "/workspace/video.mp4",
+      name: "video.mp4",
+    });
+
+    const canonical: Message[] = [
+      { role: "user", turnId: 1, content: [{ type: "text", text: "Make the video" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "Commander delegated to VideoStudio" }] },
+      { role: "user", turnId: 2, content: [{ type: "text", text: "Continue the video task" }] },
+      {
+        role: "assistant",
+        turnId: 2,
+        content: [{
+          type: "text",
+          text: "VideoStudio: E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED",
+        }],
+      },
+    ];
+    session.replaceConversationHistory(canonical, "group-main-v1:cid-1");
+
+    let model = JSON.stringify(session.getMessagesForModel());
+    expect(model).toContain("VideoStudio");
+    expect(model).toContain("E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED");
+    expect(model).not.toContain("PRIVATE_TOOL_TRANSCRIPT");
+    expect(session.getSerializedContextState()).toMatchObject({
+      conversationHistorySource: "group-main-v1:cid-1",
+      resources: [expect.objectContaining({ name: "video.mp4" })],
+    });
+
+    session.applyHistorySummary("Summary of the first canonical turn", [1]);
+    session.replaceConversationHistory([
+      ...canonical,
+      { role: "user", turnId: 3, content: [{ type: "text", text: "Third exact request" }] },
+      { role: "assistant", turnId: 3, content: [{ type: "text", text: "Third exact response" }] },
+    ], "group-main-v1:cid-1");
+    expect(session.beginUserTurn([{ type: "text", text: "Fix that blocker." }])).toBe(4);
+
+    model = JSON.stringify(session.getMessagesForModel());
+    expect(model).toContain("Summary of the first canonical turn");
+    expect(model).not.toContain("Make the video");
+    expect(model).toContain("E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED");
+    expect(model).toContain("Third exact request");
+    expect(model).toContain("Fix that blocker.");
+
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getSerializedContextState()?.conversationHistorySource)
+      .toBe("group-main-v1:cid-1");
+    expect(JSON.stringify(restored.getMessages())).toContain("Third exact response");
+
+    restored.replaceConversationHistory(canonical, "group-main-v2:cid-1");
+    expect(restored.getSerializedContextState()?.historySummary).toBeUndefined();
+    expect(JSON.stringify(restored.getMessagesForModel())).toContain("Make the video");
+  });
+
+  it("rewrites only the canonical tail and preserves rolling-compaction state", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    const source = "group-main-v1:cid-incremental";
+    const canonical: Message[] = [
+      { role: "user", turnId: 1, content: [{ type: "text", text: "old one" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "answer one" }] },
+      { role: "user", turnId: 2, content: [{ type: "text", text: "old two" }] },
+      { role: "assistant", turnId: 2, content: [{ type: "text", text: "answer two" }] },
+      { role: "user", turnId: 3, content: [{ type: "text", text: "old three" }] },
+      { role: "assistant", turnId: 3, content: [{ type: "text", text: "stale answer" }] },
+    ];
+    session.replaceConversationHistory(canonical, source, { checkpoint: "cursor-1" });
+    session.applyHistorySummary("summary stays byte-for-byte", [1]);
+    const prefixBefore = fs.readFileSync(file, "utf-8").split("\n").slice(0, 4);
+    const fullSessionRewrite = vi.spyOn(fs, "writeFileSync");
+
+    session.replaceConversationHistory([
+      { role: "user", turnId: 3, content: [{ type: "text", text: "old three" }] },
+      { role: "assistant", turnId: 3, content: [{ type: "text", text: "VideoStudio: E_BLOCKER" }] },
+      { role: "user", turnId: 4, content: [{ type: "text", text: "new four" }] },
+      { role: "assistant", turnId: 4, content: [{ type: "text", text: "answer four" }] },
+    ], source, {
+      replaceFromTurnId: 3,
+      checkpoint: "cursor-2",
+    });
+
+    const prefixAfter = fs.readFileSync(file, "utf-8").split("\n").slice(0, 4);
+    expect(prefixAfter).toEqual(prefixBefore);
+    expect(fullSessionRewrite.mock.calls.some(([target]) => target === `${file}.tmp`)).toBe(false);
+    expect(session.getSerializedContextState()).toMatchObject({
+      conversationHistorySource: source,
+      conversationHistoryCheckpoint: "cursor-2",
+      historySummary: "summary stays byte-for-byte",
+      summaryThroughTurnId: 1,
+    });
+    expect(JSON.stringify(session.getMessagesForModel())).toContain("E_BLOCKER");
+
+    fullSessionRewrite.mockRestore();
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getConversationHistoryCheckpoint(source)).toBe("cursor-2");
+    expect(restored.getSerializedContextState()?.historySummary)
+      .toBe("summary stays byte-for-byte");
+    expect(JSON.stringify(restored.getMessagesForModel())).toContain("E_BLOCKER");
+    expect(JSON.stringify(restored.getMessagesForModel())).toContain("new four");
+  });
+
+  it("rejects an incremental tail that would rewrite an already summarized turn", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    const source = "group-main-v1:cid-summary-boundary";
+    session.replaceConversationHistory([
+      { role: "user", turnId: 1, content: [{ type: "text", text: "one" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "answer" }] },
+      { role: "user", turnId: 2, content: [{ type: "text", text: "two" }] },
+      { role: "assistant", turnId: 2, content: [{ type: "text", text: "answer two" }] },
+    ], source);
+    session.applyHistorySummary("existing summary", [1]);
+
+    expect(() => session.replaceConversationHistory([
+      { role: "user", turnId: 1, content: [{ type: "text", text: "changed" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "changed answer" }] },
+    ], source, { replaceFromTurnId: 1 })).toThrow("already summarized");
+    expect(session.getSerializedContextState()?.historySummary).toBe("existing summary");
+  });
+
+  it("invalidates only the sync cursor when restart repair trims raw history", () => {
+    const source = "group-main-v1:cid-restart-fallback";
+    const session = new PersistentSession({ sessionFile: file });
+    const canonical: Message[] = [];
+    for (let turnId = 1; turnId <= 60; turnId++) {
+      canonical.push(
+        { role: "user", turnId, content: [{ type: "text", text: `user ${turnId}` }] },
+        { role: "assistant", turnId, content: [{ type: "text", text: `answer ${turnId}` }] },
+      );
+    }
+    session.replaceConversationHistory(canonical, source, { checkpoint: "stale-after-trim" });
+    session.applyHistorySummary("retained rolling summary", Array.from({ length: 10 }, (_, i) => i + 1));
+
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getConversationHistoryCheckpoint(source)).toBeUndefined();
+    expect(restored.getSerializedContextState()?.historySummary)
+      .toBe("retained rolling summary");
+    expect(restored.getSerializedContextState()?.summaryThroughTurnId).toBe(10);
+  });
+
   it("persists turn context sidecar without rewriting raw tool history", () => {
     const s1 = new PersistentSession({ sessionFile: file });
     s1.beginUserTurn([{ type: "text", text: "inspect" }]);
@@ -81,6 +225,80 @@ describe("PersistentSession", () => {
     expect(model).toContain("next");
     expect(model).not.toContain("hidden output");
     expect(model).not.toContain("call-1");
+  });
+
+  it("persists workspace observations immediately in the context sidecar", () => {
+    const filePath = path.join(os.tmpdir(), "persisted-workspace.ts");
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "track the file" }]);
+    session.recordToolObservations({
+      toolCallId: "read-1",
+      tool: "read_file",
+      observations: {
+        fileReads: [{ path: filePath, hash: "sha256:known" }],
+      },
+    });
+
+    const context = JSON.parse(fs.readFileSync(`${file}.context.json`, "utf8"));
+    expect(context.workspaceObservations.entries).toHaveLength(1);
+    expect(context.workspaceObservations.entries[0]).toMatchObject({
+      toolCallId: "read-1",
+      tool: "read_file",
+    });
+
+    const restored = new PersistentSession({ sessionFile: file });
+    expect(restored.getWorkspaceObservations().entries).toHaveLength(1);
+  });
+
+  it("coalesces one logical tool completion into one context sidecar rewrite", () => {
+    const session = new PersistentSession({ sessionFile: file });
+    session.beginUserTurn([{ type: "text", text: "run one durable tool" }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-batch",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    const writeSpy = vi.spyOn(fs, "writeFileSync");
+    try {
+      session.withContextMutationBatch(() => {
+        session.recordToolObservations({
+          toolCallId: "call-batch",
+          tool: "bash",
+          observations: {
+            execution: {
+              status: "succeeded",
+              exitCode: 0,
+              durationMs: 10,
+              timedOut: false,
+              outputLimitExceeded: false,
+              stdout: { bytes: 2, truncated: false },
+              stderr: { bytes: 0, truncated: false },
+            },
+          },
+        });
+        session.addToolResult("call-batch", "ok", undefined, false);
+        session.recordCompletedWork({
+          toolCallId: "call-batch",
+          tool: "bash",
+          inputDigest: "8:npm-test",
+          inputSummary: '{"command":"npm test"}',
+          status: "succeeded",
+          resultSummary: "ok",
+          checkpointEpoch: 0,
+        });
+      });
+
+      const contextWrites = writeSpy.mock.calls.filter(
+        ([target]) => target === `${file}.context.json.tmp`,
+      );
+      expect(contextWrites).toHaveLength(1);
+      const serialized = fs.readFileSync(`${file}.context.json`, "utf8");
+      expect(serialized).not.toContain("\n  ");
+      expect(JSON.parse(serialized).completedWork).toHaveLength(1);
+    } finally {
+      writeSpy.mockRestore();
+    }
   });
 
   it("keeps one stable turn across parallel-result healing, same-turn steer, and restart", () => {

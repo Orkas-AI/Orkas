@@ -31,12 +31,41 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function loadSearch() {
-  return import('../../../../src/main/features/search');
+interface TestLibraryHit {
+  rel_path: string;
+  chunk_idx: number;
+  title?: string;
+  content: string;
+  score: number;
+}
+
+function libraryProvider(opts: {
+  globalHits?: (userId: string) => TestLibraryHit[];
+  projects?: Array<{ project_id: string; name: string }>;
+  projectHits?: (userId: string, projectId: string) => TestLibraryHit[];
+} = {}) {
+  return {
+    embedQuery: vi.fn(async () => [1, 0, 0]),
+    searchGlobal: vi.fn((userId: string) => opts.globalHits?.(userId) || []),
+    listProjects: vi.fn(async () => opts.projects || []),
+    searchProject: vi.fn((userId: string, projectId: string) => (
+      opts.projectHits?.(userId, projectId) || []
+    )),
+  };
+}
+
+async function loadSearch(provider = libraryProvider()) {
+  const search = await import('../../../../src/main/features/search');
+  search.__searchTestHooks.setLibraryContentSearchProvider(provider);
+  return search;
 }
 
 function writeContext(rel: string, body: string): void {
-  const full = path.join(tmpDir, TEST_UID, 'cloud', 'contexts', rel);
+  writeContextFor(TEST_UID, rel, body);
+}
+
+function writeContextFor(uid: string, rel: string, body: string): void {
+  const full = path.join(tmpDir, uid, 'cloud', 'contexts', rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, body);
 }
@@ -49,9 +78,13 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
 
 describe('search › searchAll', () => {
   it('returns empty for blank query', async () => {
-    const s = await loadSearch();
+    const provider = libraryProvider();
+    const s = await loadSearch(provider);
     const result = await s.searchAll('u1', '');
     expect(result).toEqual({ results: [] });
+    expect(provider.embedQuery).not.toHaveBeenCalled();
+    expect(provider.searchGlobal).not.toHaveBeenCalled();
+    expect(provider.listProjects).not.toHaveBeenCalled();
   });
 
   it('surfaces a context doc by filename', async () => {
@@ -66,13 +99,327 @@ describe('search › searchAll', () => {
     expect(results[0].snippet).toBe('pangolins.md');
   });
 
-  it('does not match on body content (filename-only search)', async () => {
+  it('finds a global Library file by body content when its filename does not match', async () => {
     writeContext('guide.md', '# Guide\npangolins everywhere in the body');
-    const s = await loadSearch();
+    const s = await loadSearch(libraryProvider({
+      globalHits: (userId) => userId === 'u1' ? [{
+        rel_path: 'guide.md',
+        chunk_idx: 0,
+        title: 'Guide',
+        content: 'pangolins everywhere in the body',
+        score: 0.91,
+      }] : [],
+    }));
     const ix = await import('../../../../src/main/features/search/indexer');
     await ix.reconcileContextsIndex();
     const { results } = await s.searchAll('u1', 'pangolins', { scope: 'context' });
-    expect(results.length).toBe(0);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      kind: 'context',
+      path: 'guide.md',
+      title: 'Guide',
+      match_source: 'content',
+      library_scope: 'global',
+    });
+    expect(results[0].snippet).toMatch(/pangolins/);
+  });
+
+  it('includes the semantic threshold boundary and drops the nearest chunk below it', async () => {
+    const s = await loadSearch(libraryProvider({
+      globalHits: () => [
+        {
+          rel_path: 'boundary.md',
+          chunk_idx: 0,
+          title: 'Boundary',
+          content: 'This pangolins result is exactly on the accepted relevance boundary.',
+          score: 0.45,
+        },
+        {
+          rel_path: 'unrelated.md',
+          chunk_idx: 0,
+          title: 'Unrelated',
+          content: 'This is merely the nearest vector, not a relevant result.',
+          score: 0.449,
+        },
+      ],
+    }));
+
+    const { results } = await s.searchAll('u1', 'pangolins', { scope: 'context' });
+
+    expect(results.map((row) => row.path)).toEqual(['boundary.md']);
+  });
+
+  it('searches global plus every project outside a project, then global plus only the active project inside one', async () => {
+    const provider = libraryProvider({
+      globalHits: () => [{
+        rel_path: 'global-source.md',
+        chunk_idx: 0,
+        content: 'global source contains the nebula marker',
+        score: 0.95,
+      }],
+      projects: [
+        { project_id: 'project-a', name: 'Project A' },
+        { project_id: 'project-b', name: 'Project B' },
+      ],
+      projectHits: (_userId, projectId) => [{
+        rel_path: `${projectId}-source.md`,
+        chunk_idx: 0,
+        content: `${projectId} contains the nebula marker`,
+        score: projectId === 'project-a' ? 0.8 : 0.9,
+      }],
+    });
+    const s = await loadSearch(provider);
+
+    const global = await s.searchAll('u1', 'nebula marker', {
+      scope: 'context',
+      limit: 20,
+    });
+    expect(global.results.map((row) => [
+      row.library_scope,
+      row.project_id || '',
+      row.path,
+    ])).toEqual([
+      ['global', '', 'global-source.md'],
+      ['project', 'project-b', 'project-b-source.md'],
+      ['project', 'project-a', 'project-a-source.md'],
+    ]);
+    expect(provider.searchProject).toHaveBeenCalledTimes(2);
+
+    provider.searchProject.mockClear();
+    const scoped = await s.searchAll('u1', 'nebula marker', {
+      scope: 'context',
+      projectId: 'project-a',
+      limit: 20,
+    });
+    expect(scoped.results.map((row) => [
+      row.library_scope,
+      row.project_id || '',
+      row.path,
+    ])).toEqual([
+      ['global', '', 'global-source.md'],
+      ['project', 'project-a', 'project-a-source.md'],
+    ]);
+    expect(provider.searchProject).toHaveBeenCalledTimes(1);
+    expect(provider.searchProject).toHaveBeenCalledWith(
+      'u1',
+      'project-a',
+      expect.any(Array),
+      20,
+    );
+  });
+
+  it('searches project filenames across all projects and restricts them inside a project', async () => {
+    const projects = await import('../../../../src/main/features/projects');
+    const first = await projects.createProject(TEST_UID, 'First project');
+    const second = await projects.createProject(TEST_UID, 'Second project');
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    for (const [projectId, fileName] of [
+      [first.project.project_id, 'shared-filename-first.md'],
+      [second.project.project_id, 'shared-filename-second.md'],
+    ]) {
+      const root = path.join(
+        tmpDir, TEST_UID, 'cloud', 'projects', projectId, 'contexts',
+      );
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(path.join(root, fileName), '# body');
+    }
+    const s = await loadSearch();
+
+    const global = await s.searchAll(TEST_UID, 'shared-filename', {
+      scope: 'context',
+      limit: 20,
+    });
+    expect(global.results.map((row) => row.project_id).sort()).toEqual([
+      first.project.project_id,
+      second.project.project_id,
+    ].sort());
+
+    const scoped = await s.searchAll(TEST_UID, 'shared-filename', {
+      scope: 'context',
+      projectId: first.project.project_id,
+      limit: 20,
+    });
+    expect(scoped.results.map((row) => row.project_id)).toEqual([
+      first.project.project_id,
+    ]);
+  });
+
+  it('embeds a normalized query once while searching global and multiple project indexes', async () => {
+    const provider = libraryProvider({
+      projects: [
+        { project_id: 'project-a', name: 'Project A' },
+        { project_id: 'project-b', name: 'Project B' },
+      ],
+    });
+    const s = await loadSearch(provider);
+
+    await s.searchLibraryContents('u1', '  Nebula Marker  ', { limit: 7 });
+    await s.searchLibraryContents('u1', 'nebula marker', { limit: 7 });
+
+    expect(provider.embedQuery).toHaveBeenCalledTimes(1);
+    expect(provider.searchGlobal).toHaveBeenCalledTimes(2);
+    expect(provider.searchProject).toHaveBeenCalledTimes(4);
+    expect(provider.searchProject).toHaveBeenCalledWith(
+      'u1',
+      'project-a',
+      [1, 0, 0],
+      7,
+    );
+  });
+
+  it('bounds merged body results while scanning a large project catalog', async () => {
+    const projects = Array.from({ length: 120 }, (_, index) => ({
+      project_id: `project-${index}`,
+      name: `Project ${index}`,
+    }));
+    const provider = libraryProvider({
+      projects,
+      projectHits: (_userId, projectId) => [0, 1].map((chunkIndex) => ({
+        rel_path: `${projectId}/scale-${chunkIndex}.md`,
+        chunk_idx: 0,
+        content: `scale marker content ${projectId} ${chunkIndex}`,
+        score: 0.9,
+      })),
+    });
+    const s = await loadSearch(provider);
+
+    const results = await s.searchLibraryContents('u1', 'scale marker', {
+      limit: 200,
+    });
+
+    expect(results).toHaveLength(200);
+    expect(new Set(results.map((row) => `${row.project_id}:${row.path}`)).size).toBe(200);
+    expect(provider.embedQuery).toHaveBeenCalledTimes(1);
+    expect(provider.searchGlobal).toHaveBeenCalledTimes(1);
+    expect(provider.searchProject).toHaveBeenCalledTimes(120);
+  });
+
+  it('keeps healthy Library scopes searchable when another vector index fails', async () => {
+    const provider = libraryProvider({
+      projects: [
+        { project_id: 'broken-project', name: 'Broken project' },
+        { project_id: 'healthy-project', name: 'Healthy project' },
+      ],
+    });
+    provider.searchGlobal.mockImplementation(() => {
+      throw new Error('global vector db unavailable');
+    });
+    provider.searchProject.mockImplementation((_userId, projectId) => {
+      if (projectId === 'broken-project') throw new Error('project vector db unavailable');
+      return [{
+        rel_path: 'healthy.md',
+        chunk_idx: 0,
+        content: 'healthy project still contains the marker',
+        score: 0.9,
+      }];
+    });
+    const s = await loadSearch(provider);
+
+    const results = await s.searchLibraryContents('u1', 'marker', { limit: 10 });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      library_scope: 'project',
+      project_id: 'healthy-project',
+      path: 'healthy.md',
+    });
+  });
+
+  it('falls back to filename results when query embedding is unavailable', async () => {
+    writeContext('embedding-fallback.md', '# body');
+    const provider = libraryProvider();
+    provider.embedQuery.mockRejectedValue(new Error('embedder unavailable'));
+    const s = await loadSearch(provider);
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileContextsIndex();
+
+    const { results } = await s.searchAll('u1', 'embedding-fallback', {
+      scope: 'context',
+    });
+
+    expect(results.map((row) => row.path)).toEqual(['embedding-fallback.md']);
+    expect(provider.searchGlobal).not.toHaveBeenCalled();
+    expect(provider.listProjects).not.toHaveBeenCalled();
+  });
+
+  it('keeps Library body search isolated to the requested user', async () => {
+    const s = await loadSearch(libraryProvider({
+      globalHits: (userId) => userId === 'u2' ? [{
+        rel_path: 'u2-only.md',
+        chunk_idx: 0,
+        content: 'requested-account-only marker',
+        score: 0.9,
+      }] : [{
+        rel_path: 'u1-only.md',
+        chunk_idx: 0,
+        content: 'active-account-only marker',
+        score: 0.9,
+      }],
+    }));
+
+    const { results } = await s.searchAll('u2', 'marker', { scope: 'context' });
+
+    expect(results.map((row) => row.path)).toEqual(['u2-only.md']);
+  });
+
+  it('deduplicates filename and body hits and keeps an exact filename match', async () => {
+    writeContext('nebula-guide.md', '# Guide\nnebula marker');
+    const s = await loadSearch(libraryProvider({
+      globalHits: () => [{
+        rel_path: 'nebula-guide.md',
+        chunk_idx: 0,
+        content: 'nebula marker in the source body',
+        score: 0.92,
+      }],
+    }));
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileContextsIndex();
+
+    const { results } = await s.searchAll('u1', 'nebula-guide.md', {
+      scope: 'context',
+      limit: 20,
+    });
+
+    expect(results.filter((row) => row.path === 'nebula-guide.md')).toHaveLength(1);
+    expect(results[0]).toMatchObject({
+      path: 'nebula-guide.md',
+      snippet: 'nebula-guide.md',
+      score: 95,
+    });
+    expect(results[0].match_source).toBeUndefined();
+  });
+
+  it('keeps the best chunk per file without merging identical paths from different projects', async () => {
+    const s = await loadSearch(libraryProvider({
+      projects: [
+        { project_id: 'project-a', name: 'Project A' },
+        { project_id: 'project-b', name: 'Project B' },
+      ],
+      projectHits: (_userId, projectId) => [
+        {
+          rel_path: 'same-name.md',
+          chunk_idx: 0,
+          content: `${projectId} weaker chunk`,
+          score: 0.6,
+        },
+        {
+          rel_path: 'same-name.md',
+          chunk_idx: 1,
+          content: `${projectId} best chunk`,
+          score: projectId === 'project-a' ? 0.9 : 0.8,
+        },
+      ],
+    }));
+
+    const results = await s.searchLibraryContents('u1', 'best chunk', { limit: 20 });
+
+    expect(results).toHaveLength(2);
+    expect(results.map((row) => [row.project_id, row.chunk_idx])).toEqual([
+      ['project-a', 1],
+      ['project-b', 1],
+    ]);
   });
 
   it('respects scope=chat (no context results)', async () => {
@@ -94,6 +441,59 @@ describe('search › searchAll', () => {
     await ix.reconcileContextsIndex();
     const { results } = await s.searchAll('u1', 'keyword', { limit: 2 });
     expect(results.length).toBe(2);
+  });
+
+  it('honors a requested single-scope limit above the old 30-row ceiling', async () => {
+    for (let i = 0; i < 40; i++) writeContext(`expanded-limit-${i}.md`, `# D${i}\nbody`);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileContextsIndex();
+
+    const { results } = await s.searchAll('u1', 'expanded limit', {
+      scope: 'context',
+      limit: 40,
+    });
+
+    expect(results).toHaveLength(40);
+  });
+
+  it('reserves space for every result kind in the all-results limit', async () => {
+    const s = await loadSearch();
+    const rows = [
+      ...Array.from({ length: 20 }, (_, index) => ({
+        kind: 'context' as const,
+        path: `context-${index}.md`,
+        snippet: '',
+        score: 100 - index,
+      })),
+      { kind: 'chat' as const, cid: 'chat-1', snippet: '', score: 5 },
+      { kind: 'agent' as const, id: 'agent-1', snippet: '', score: 4 },
+      { kind: 'skill' as const, id: 'skill-1', snippet: '', score: 3 },
+    ];
+
+    const limited = s.__searchTestHooks.limitSearchResults(rows, 8, 'all');
+
+    expect(limited).toHaveLength(8);
+    expect(new Set(limited.map((row) => row.kind))).toEqual(new Set([
+      'context',
+      'chat',
+      'agent',
+      'skill',
+    ]));
+    expect(limited.filter((row) => row.kind === 'context')).toHaveLength(5);
+  });
+
+  it('uses the requested user context index even when another user is active', async () => {
+    writeContextFor('u1', 'private-u1-marker.md', 'active user data');
+    writeContextFor('u2', 'private-u2-marker.md', 'requested user data');
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileContextsIndex('u1');
+    await ix.reconcileContextsIndex('u2');
+
+    const { results } = await s.searchAll('u2', 'private', { scope: 'context' });
+
+    expect(results.map((result) => result.path)).toEqual(['private-u2-marker.md']);
   });
 });
 
@@ -327,21 +727,30 @@ describe('search › reconcileAll', () => {
     await expect(s.reconcileAll()).resolves.toBeUndefined();
   });
 
-  it('skips reserved top-level dirs (users/, logs/, shared/, search/, openclaw/)', async () => {
+  it('skips reserved top-level dirs instead of creating fake per-user indexes', async () => {
     // Create one real user dir with chats, plus some reserved dirs
     writeChat('real_user', 'c1', [{ role: 'user', content: 'target', time: 't' }]);
-    fs.mkdirSync(path.join(tmpDir, 'users'), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, 'logs'), { recursive: true });
-    fs.mkdirSync(path.join(tmpDir, 'openclaw'), { recursive: true });
+    const reserved = ['users', 'logs', 'shared', 'search', 'openclaw', 'venv'];
+    for (const name of reserved) {
+      // A sentinel user-shaped subtree makes the assertion prove that the
+      // top-level directory was skipped, rather than merely observing that
+      // an empty scan happened not to publish an index.
+      writeChat(name, 'must-not-index', [{ role: 'user', content: 'reserved sentinel', time: 't' }]);
+    }
 
     const s = await loadSearch();
     await s.reconcileAll();
 
     const paths = await import('../../../../src/main/paths');
-    // Index for real_user exists, but none for the reserved dirs
     const ix = await import('../../../../src/main/features/search/indexer');
     const entry = await ix.getEntry(paths.userChatsIndexPath('real_user'), 'chat');
     expect(Object.keys(entry.idx.files)).toContain('c1');
+    for (const name of reserved) {
+      const reservedEntry = await ix.getEntry(paths.userChatsIndexPath(name), 'chat');
+      expect(Object.keys(reservedEntry.idx.files), name).not.toContain('must-not-index');
+      expect(fs.existsSync(paths.userContextsIndexPath(name)), name).toBe(false);
+      expect(fs.existsSync(paths.userChatsIndexPath(name)), name).toBe(false);
+    }
   });
 });
 

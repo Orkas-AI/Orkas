@@ -107,8 +107,8 @@ When the user asks to adjust, polish, fix, restyle, extend, or review-and-apply 
 4. Translate the request into a compact change set: requested changes, invariants to preserve, affected files, and acceptance checks.
 5. Patch the smallest coherent set of existing files. Preserve unrelated user edits, content, interactions, stable DOM hooks, relative asset paths, design tokens, and accepted layout decisions.
 6. Do not regenerate the whole artifact or reset it to a generic template for a local change. Broader restructuring is valid only when required by the request or by a blocking craft failure; state that reason.
-7. Update `artifact.json` only after the artifact files are valid. Increment the revision exactly once per completed revision.
-8. Re-run focused checks for the changed area plus four explicit smoke checks: non-blank first render, existing primary workflow, responsive behavior, and local asset/reference resolution.
+7. Validate the changed files, then run focused checks for the requested area plus four explicit smoke checks: non-blank first render, existing primary workflow, responsive behavior, and local asset/reference resolution. When `html_preview` is available, desktop and mobile preview evidence is mandatory; the source-only validator cannot satisfy rendered or responsive checks.
+8. Update `artifact.json` only after those checks pass. Increment the revision exactly once, run the final package validation, and publish. If a required available preview was skipped, leave the revision pending rather than claiming completion.
 
 Before completing a revision, record a compact revision proof with the baseline revision and files inspected, files changed, user/manual edits preserved, requested-change result, the four smoke-check results, and the resulting manifest revision. A generic sentence such as “verified successfully” is not sufficient evidence. If a check could not run, name it as unverified instead of implying success.
 

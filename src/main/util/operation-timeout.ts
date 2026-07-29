@@ -13,11 +13,19 @@ export class OperationTimeoutError extends Error {
 }
 
 export function envTimeoutMs(name: string, fallbackMs: number, minMs = 1_000, maxMs = 30 * 60 * 1000): number {
+  if (!Number.isFinite(minMs) || !Number.isFinite(maxMs) || minMs <= 0 || maxMs < minMs) {
+    throw new RangeError('timeout bounds must be finite, positive, and ordered');
+  }
+  const min = Math.trunc(minMs);
+  const max = Math.trunc(maxMs);
+  const fallback = Number.isFinite(fallbackMs)
+    ? Math.min(max, Math.max(min, Math.trunc(fallbackMs)))
+    : min;
   const raw = process.env[name];
-  if (!raw) return fallbackMs;
+  if (!raw?.trim()) return fallback;
   const value = Number(raw);
-  if (!Number.isFinite(value)) return fallbackMs;
-  return Math.min(maxMs, Math.max(minMs, Math.trunc(value)));
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
 }
 
 /**
@@ -32,9 +40,12 @@ export async function withOperationTimeout<T>(
     timeoutMs: number;
     code: string;
     stage: string;
-    onLateSettlement?: (operation: Promise<T>) => void;
+    onLateSettlement?: (operation: Promise<T>) => void | Promise<void>;
   },
 ): Promise<T> {
+  if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) {
+    throw new RangeError('timeoutMs must be finite and positive');
+  }
   let timer: NodeJS.Timeout | null = null;
   let timedOut = false;
   const timeout = new Promise<never>((_resolve, reject) => {
@@ -48,7 +59,17 @@ export async function withOperationTimeout<T>(
     return await Promise.race([operation, timeout]);
   } finally {
     if (timer) clearTimeout(timer);
-    if (timedOut) opts.onLateSettlement?.(operation);
+    if (timedOut && opts.onLateSettlement) {
+      // Recovery bookkeeping must never replace or delay the stable timeout
+      // seen by the queue. Observe both synchronous and asynchronous callback
+      // failures so a secondary recovery bug cannot become an unhandled
+      // rejection.
+      try {
+        void Promise.resolve(opts.onLateSettlement(operation)).catch(() => {});
+      } catch {
+        // The primary timeout remains authoritative.
+      }
+    }
   }
 }
 

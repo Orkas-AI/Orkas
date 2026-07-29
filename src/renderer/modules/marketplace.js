@@ -861,6 +861,16 @@ document.addEventListener('visibilitychange', () => {
           _mpState.categories = list;
           _mpRender();
         }
+        // Agents and Skills are separate direct-entry surfaces, but both use
+        // this registry for category labels and filters. Repaint whichever
+        // catalog is already loaded so a cold cache cannot leave valid
+        // categories permanently displayed as the General fallback.
+        if (typeof renderAgentsGrid === 'function' && typeof _agentsCache !== 'undefined' && _agentsCache) {
+          renderAgentsGrid(_agentsCache);
+        }
+        if (typeof renderSkillsGrid === 'function' && typeof _skillsCache !== 'undefined' && _skillsCache) {
+          renderSkillsGrid(_skillsCache);
+        }
       }
     }).catch(() => { /* ignore */ });
   } catch { /* preload happens at script load; window.orkas not ready is OK */ }
@@ -1837,11 +1847,13 @@ function _mpInstallFailedName(kind, item, err) {
 function _mpInstallFailedText(kind, item, err) {
   const failedKind = err?.marketplaceKind || kind;
   const failedName = _mpInstallFailedName(kind, item, err);
-  const reason = (err && err.marketplaceAppUpdateRequired)
-    ? t('marketplace.app_update_required')
+  const reason = err?.marketplaceReason === 'account_changed'
+    ? t('marketplace.account_changed')
+    : (err && err.marketplaceAppUpdateRequired)
+      ? t('marketplace.app_update_required')
         .replace('{minimum}', String(err.marketplaceMinAppVersion || _mpMinAppVersion(item) || ''))
         .replace('{current}', String(err.marketplaceCurrentAppVersion || ''))
-    : _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
+      : _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
   const tmpl = t('marketplace.install_failed_resource');
   if (tmpl && tmpl !== 'marketplace.install_failed_resource') {
     return tmpl
@@ -1865,14 +1877,12 @@ function _mpInstallErrorFromResponse(r) {
   return err;
 }
 
-function _mpIsMissingDependencySkillError(requestedKind, err) {
-  const reason = String(err?.marketplaceReason || err?.message || err || '').toLowerCase();
-  return requestedKind === 'agent'
-    && err?.marketplaceKind === 'skill'
-    && (reason === 'not_found' || reason.includes('not_found'));
+function _mpActionErrorCode(err, fallback = 'operation_failed') {
+  const raw = String(err?.marketplaceReason || err?.code || '').trim();
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : fallback;
 }
 
-function _mpTrackInstallFailure(kind, item, err, surface = 'marketplace') {
+function _mpTrackActionResult(startedAt, action, kind, result, errorCode = '') {
   try {
     if (!window.Monitor || !_mpIsMissingDependencySkillError(kind, err)) return;
     (() => {})('marketplace_dependency_skill_missing', {
@@ -1892,6 +1902,15 @@ async function _mpInstall(kind, id, itemOverride = null) {
   if (!item) return;
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
+  const startedAt = Date.now();
+  const initialStatus = _mpInstallStatus(kind, item);
+  const actionName = initialStatus.installed && initialStatus.updateAvailable ? 'update' : 'install';
+  let resultTracked = false;
+  const trackResult = (result, errorCode = '') => {
+    if (resultTracked) return;
+    resultTracked = true;
+    _mpTrackActionResult(startedAt, actionName, kind, result, errorCode);
+  };
   _mpState.installing.add(key);
   _mpRender();
   const invokeInstall = async (force) => {
@@ -1914,11 +1933,11 @@ async function _mpInstall(kind, id, itemOverride = null) {
   try {
     await invokeInstall(false);
     await markInstalled();
+    trackResult('success');
     // Success: no toast — the button flips to "Installed" + state set above is the signal.
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
     const msg = (err && err.message) || String(err);
-    _mpTrackInstallFailure(kind, item, err);
     // Quality validator rejection → show the structured violation list
     // instead of the generic install-failed alert. Falls back to alert if
     // the report can't be loaded.
@@ -1938,17 +1957,24 @@ async function _mpInstall(kind, id, itemOverride = null) {
           try {
             await invokeInstall(true);
             await markInstalled();
+            trackResult('success');
           } catch (forceErr) {
+            trackResult('failure', _mpActionErrorCode(forceErr));
             uiAlert(_mpInstallFailedText(kind, item, forceErr));
           }
+        } else {
+          trackResult('cancelled', 'validation_cancelled');
         }
       } else {
+        trackResult('failure', _mpActionErrorCode(err, 'quality_rejected'));
         uiAlert(_mpInstallFailedText(kind, item, err));
       }
     } else {
+      trackResult('failure', _mpActionErrorCode(err));
       uiAlert(_mpInstallFailedText(kind, item, err));
     }
   } finally {
+    if (!resultTracked) trackResult('failure', 'operation_failed');
     _mpState.installing.delete(key);
     _mpRender();
     if (_mpState.view === 'detail') _mpRenderDetail();
@@ -1968,6 +1994,7 @@ async function _mpUninstall(kind, id) {
   if (!_mpState.uninstalling) _mpState.uninstalling = new Set();
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
+  const startedAt = Date.now();
   _mpState.installing.add(key);
   _mpState.uninstalling.add(key);
   _mpRender();
@@ -1982,8 +2009,10 @@ async function _mpUninstall(kind, id) {
     _mpPersistInstalled();
     if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
+    _mpTrackActionResult(startedAt, 'uninstall', kind, 'success');
     // Success: button flips back to "Install" — no toast needed. (Failures still alert.)
   } catch (err) {
+    _mpTrackActionResult(startedAt, 'uninstall', kind, 'failure', _mpActionErrorCode(err));
     const msg = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
     uiAlert(t('marketplace.uninstall_failed').replace('{reason}', msg));
   } finally {

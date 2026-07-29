@@ -42,6 +42,10 @@ function realOrResolve(p: string): string {
   }
 }
 
+function comparisonKey(p: string): string {
+  return process.platform === 'win32' ? p.toLowerCase() : p;
+}
+
 /**
  * Is `candidate` inside any of `allowedRoots`?
  *
@@ -59,11 +63,13 @@ export function isPathAllowed(candidate: string, allowedRoots: readonly string[]
   if (!path.isAbsolute(candidate)) return false;
 
   const realCand = realOrResolve(candidate);
+  const candidateKey = comparisonKey(realCand);
   for (const root of allowedRoots) {
     if (!root || !path.isAbsolute(root)) continue;
     const realRoot = realOrResolve(root);
-    if (realCand === realRoot) return true;
-    if (realCand.startsWith(realRoot + path.sep)) return true;
+    const rootKey = comparisonKey(realRoot);
+    if (candidateKey === rootKey) return true;
+    if (candidateKey.startsWith(rootKey + path.sep)) return true;
   }
   return false;
 }

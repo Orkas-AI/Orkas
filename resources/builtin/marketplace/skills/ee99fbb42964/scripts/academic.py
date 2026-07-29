@@ -9,6 +9,7 @@ declared academic dependencies. Sources (no API key required):
   openalex       — api.openalex.org JSON (abstract reconstructed from inverted index)
   crossref       — api.crossref.org JSON
   semanticscholar— api.semanticscholar.org graph JSON
+  pubmed         — NCBI E-utilities JSON + XML
 
 Each source is fetched independently; one failing source is recorded in
 `errors` and never aborts the others. Results are normalized to the same record
@@ -27,6 +28,7 @@ source cannot hang the agent loop.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -41,6 +43,7 @@ ALLOWED_HOSTS = {
     "api.openalex.org",
     "api.crossref.org",
     "api.semanticscholar.org",
+    "eutils.ncbi.nlm.nih.gov",
 }
 DEFAULT_LIMIT = 5
 DEFAULT_TIMEOUT = 30.0          # per request; academic APIs can be slow, but must not hang the loop
@@ -91,7 +94,10 @@ def _http_get(url: str, accept: str, timeout: float) -> str:
         raise ValueError("host not allow-listed: {}".format(parts.hostname))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept})
     with _opener().open(req, timeout=timeout) as resp:
-        return resp.read(MAX_BYTES).decode("utf-8", "replace")
+        body = resp.read(MAX_BYTES + 1)
+        if len(body) > MAX_BYTES:
+            raise ValueError("response exceeds {} byte limit".format(MAX_BYTES))
+        return body.decode("utf-8", "replace")
 
 
 # ---- normalization ----------------------------------------------------------
@@ -214,6 +220,88 @@ def parse_semanticscholar(obj: dict) -> list:
     return out
 
 
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _element_text(element) -> str:
+    return _clean("".join(element.itertext())) if element is not None else ""
+
+
+def _pubmed_date(article) -> str:
+    node = article.find(".//ArticleDate")
+    if node is None:
+        node = article.find(".//PubDate")
+    if node is None:
+        return ""
+    year = _clean(node.findtext("Year") or "")
+    month = _clean(node.findtext("Month") or "")
+    day = _clean(node.findtext("Day") or "")
+    if not year:
+        medline = _clean(node.findtext("MedlineDate") or "")
+        return medline
+    parts = [year]
+    if month:
+        try:
+            month_number = int(month)
+        except ValueError:
+            month_number = _MONTHS.get(month[:3].lower())
+        if month_number:
+            parts.append("{:02d}".format(month_number))
+            if day:
+                try:
+                    parts.append("{:02d}".format(int(day)))
+                except ValueError:
+                    pass
+    return "-".join(parts)
+
+
+def parse_pubmed(xml_text: str) -> list:
+    root = ET.fromstring(xml_text)
+    out = []
+    for item in root.findall(".//PubmedArticle"):
+        pmid = _clean(item.findtext(".//MedlineCitation/PMID") or "")
+        title = _element_text(item.find(".//Article/ArticleTitle"))
+        abstract_parts = []
+        for node in item.findall(".//Article/Abstract/AbstractText"):
+            text = _element_text(node)
+            label = _clean(node.attrib.get("Label") or "")
+            if text:
+                abstract_parts.append("{}: {}".format(label, text) if label else text)
+        authors = []
+        for author in item.findall(".//Article/AuthorList/Author"):
+            collective = _clean(author.findtext("CollectiveName") or "")
+            personal = _clean(" ".join(
+                part for part in (
+                    author.findtext("ForeName") or "",
+                    author.findtext("LastName") or "",
+                ) if part
+            ))
+            if collective or personal:
+                authors.append(collective or personal)
+        doi = None
+        for article_id in item.findall(".//PubmedData/ArticleIdList/ArticleId"):
+            if (article_id.attrib.get("IdType") or "").lower() == "doi":
+                doi = _element_text(article_id)
+                break
+        url = "https://pubmed.ncbi.nlm.nih.gov/{}/".format(pmid) if pmid else ""
+        record = _rec(
+            "pubmed",
+            title,
+            " ".join(abstract_parts),
+            authors,
+            _pubmed_date(item),
+            doi,
+            url,
+            pmid or doi or url,
+        )
+        record["pmid"] = pmid or None
+        out.append(record)
+    return out
+
+
 # ---- fetchers ---------------------------------------------------------------
 
 def fetch_arxiv(query, limit, timeout):
@@ -238,9 +326,23 @@ def fetch_semanticscholar(query, limit, timeout):
     return parse_semanticscholar(json.loads(_http_get(url, "application/json", timeout)))
 
 
+def fetch_pubmed(query, limit, timeout):
+    search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urlencode(
+        {"db": "pubmed", "term": query, "retmax": limit, "retmode": "json"})
+    search_result = json.loads(_http_get(search_url, "application/json", timeout))
+    ids = ((search_result.get("esearchresult") or {}).get("idlist") or [])[:limit]
+    ids = [str(value) for value in ids if str(value).strip()]
+    if not ids:
+        return []
+    fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(
+        {"db": "pubmed", "id": ",".join(ids), "retmode": "xml"})
+    return parse_pubmed(_http_get(fetch_url, "application/xml", timeout))
+
+
 FETCHERS = {"arxiv": fetch_arxiv, "openalex": fetch_openalex,
-            "crossref": fetch_crossref, "semanticscholar": fetch_semanticscholar}
-DEFAULT_SOURCES = ["arxiv", "openalex", "crossref", "semanticscholar"]
+            "crossref": fetch_crossref, "semanticscholar": fetch_semanticscholar,
+            "pubmed": fetch_pubmed}
+DEFAULT_SOURCES = ["arxiv", "openalex", "crossref", "semanticscholar", "pubmed"]
 
 
 def _dedup_key(rec: dict) -> str:
@@ -249,21 +351,45 @@ def _dedup_key(rec: dict) -> str:
 
 def search(query: str, sources, limit, timeout) -> dict:
     results, errors, queried, seen = [], [], [], set()
+    jobs = []
+    scheduled = set()
     for s in (sources or DEFAULT_SOURCES):
         fn = FETCHERS.get(s)
         if fn is None:
             errors.append({"source": s, "error": "unknown source"})
             continue
+        if s in scheduled:
+            continue
+        scheduled.add(s)
         queried.append(s)
-        try:
-            for rec in fn(query, limit, timeout):
+        jobs.append((s, fn))
+
+    # Provider calls are independent and can each consume the full timeout.
+    # Run them concurrently, then merge in requested provider order so output
+    # and DOI/title de-dup remain deterministic regardless of completion order.
+    completed = {}
+    if jobs:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
+            futures = {
+                s: pool.submit(fn, query, limit, timeout)
+                for s, fn in jobs
+            }
+            for s, _ in jobs:
+                try:
+                    completed[s] = futures[s].result()
+                except Exception as e:  # external I/O + parse: isolate one provider
+                    errors.append({"source": s, "error": "{}: {}".format(type(e).__name__, e)})
+
+    for s, _ in jobs:
+        for rec in completed.get(s, []):
+            try:
                 key = _dedup_key(rec)
                 if not key or key in seen:
                     continue
                 seen.add(key)
                 results.append(rec)
-        except Exception as e:   # external I/O + parse: isolate a bad source, keep the rest
-            errors.append({"source": s, "error": "{}: {}".format(type(e).__name__, e)})
+            except Exception as e:
+                errors.append({"source": s, "error": "{}: {}".format(type(e).__name__, e)})
     return {"query": query, "sources_queried": queried, "count": len(results),
             "results": results, "errors": errors}
 
@@ -280,8 +406,8 @@ def main(argv):
 
     sources = [s.strip() for s in args.sources.split(",")] if args.sources else DEFAULT_SOURCES
     limit = max(1, min(int(args.limit), 25))
-    # Clamp like --limit: sources are fetched serially, so an oversized timeout
-    # multiplies across all four sources into minutes of silent wall-clock.
+    # Clamp like --limit: provider calls are parallel, but each source still needs
+    # a finite timeout and PubMed performs a bounded search+fetch pair.
     timeout = max(1.0, min(float(args.timeout), 60.0))
     data = search(args.query, sources, limit, timeout)
 

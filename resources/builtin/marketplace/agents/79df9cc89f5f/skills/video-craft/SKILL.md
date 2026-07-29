@@ -70,7 +70,7 @@ The difference between a video that merely renders and one that's actually good.
 
 - Aspect: **9:16** (TikTok/Reels/Shorts), **16:9** (YouTube/web), **1:1** when speaker+context both matter, cinematic letterbox only when the look serves it. Don't center-crop a wide shot and call it vertical — reframe properly or downgrade to 1:1 honestly.
 - Get past the **3-second** threshold: hook in frame 1, change something every 1–3 s in short-form, captions always.
-- The **first frame is the thumbnail/promise** — make it match what you're delivering, and pay it off quickly.
+- The **first frame is the thumbnail/promise** — design it deliberately as a cover, not as an accidental pre-animation state. It needs a readable promise plus concrete signals of the actual subject/result; make it match what you're delivering, and pay it off quickly.
 - Match length to platform norms; the algorithm rewards watch-time/completion, not raw length.
 
 ## 9. Per-line craft — see the matching stage skill

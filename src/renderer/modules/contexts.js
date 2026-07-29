@@ -751,7 +751,27 @@ function _bindCtxTreeHandlers(container) {
 
 // ── Row-level actions ──
 
+function _ctxCreateEntryActionTracker(action) {
+  const startedAt = Date.now();
+  let done = false;
+  return (result, errorCode = '') => {
+    if (done) return;
+    done = true;
+    try {
+      if (!window.Monitor) return;
+      const payload = {
+        result,
+        action,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      Monitor.event('library_entry_action_result', payload);
+    } catch (_) {}
+  };
+}
+
 async function reprocessCtxKbFile(rel) {
+  const trackResult = _ctxCreateEntryActionTracker('reprocess');
   try {
     _kbStatusByPath[rel] = { ...(_kbStatusByPath[rel] || {}), status: 'pending' };
     _updateCtxKbChip(rel);
@@ -762,8 +782,14 @@ async function reprocessCtxKbFile(rel) {
       body: JSON.stringify({ path: rel }),
     });
     const data = await res.json();
-    if (!data.ok) await uiAlert(t('contexts.kb.reprocess_failed'));
+    if (!data.ok) {
+      trackResult('failure', 'reprocess_failed');
+      await uiAlert(t('contexts.kb.reprocess_failed'));
+      return;
+    }
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.kb.reprocess_failed'));
   }
 }
@@ -788,10 +814,15 @@ async function deleteCtxEntry(rel, kind) {
     ? t('contexts.dir.del_confirm', { name })
     : t('contexts.file.del_confirm', { name });
   if (!(await uiConfirm(prompt))) return;
+  const trackResult = _ctxCreateEntryActionTracker('delete');
   try {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(t('contexts.delete_failed')); return; }
+    if (!data.ok) {
+      trackResult('failure', 'delete_failed');
+      await uiAlert(t('contexts.delete_failed'));
+      return;
+    }
     if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
       _clearCtxViewer();
     }
@@ -803,7 +834,9 @@ async function deleteCtxEntry(rel, kind) {
       if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
     }
     await loadContexts();
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.delete_failed'));
   }
 }
@@ -1120,6 +1153,7 @@ async function _commitInlineRename(rel, nextBase) {
   const dir = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
   const dst = dir ? `${dir}/${cleaned}` : cleaned;
   if (dst === rel) { renderCtxTree(); return; }
+  const trackResult = _ctxCreateEntryActionTracker('rename');
   try {
     const res = await apiFetch('/api/contexts/rename', {
       method: 'POST',
@@ -1127,7 +1161,12 @@ async function _commitInlineRename(rel, nextBase) {
       body: JSON.stringify({ src: rel, dst }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(_ctxRenameFailureMessage(data.error)); await loadContexts(); return; }
+    if (!data.ok) {
+      trackResult('failure', 'rename_failed');
+      await uiAlert(_ctxRenameFailureMessage(data.error));
+      await loadContexts();
+      return;
+    }
     if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
     // Re-key any drafts (file rename: one entry; dir rename: every entry
     // under the old prefix) so the draft survives the rename. Iterate a
@@ -1143,7 +1182,9 @@ async function _commitInlineRename(rel, nextBase) {
     }
     _retargetCtxViewerAfterRename(rel, dst);
     await loadContexts();
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.entry.rename_failed'));
     await loadContexts();
   }
@@ -1193,6 +1234,7 @@ async function saveCtxNew() {
     msg.textContent = t('contexts.new.bad_chars'); msg.className = 'form-msg err'; return;
   }
   const joined = _ctxNewTargetDir ? `${_ctxNewTargetDir}/${nameRaw}` : nameRaw;
+  const trackResult = _ctxCreateEntryActionTracker('create_directory');
   try {
     const res = await apiFetch('/api/contexts/mkdir', {
       method: 'POST',
@@ -1205,13 +1247,16 @@ async function saveCtxNew() {
         ? t('contexts.entry.name_exists')
         : t('contexts.dir.create_failed');
       msg.className = 'form-msg err';
+      trackResult('failure', 'create_failed');
       return;
     }
     _ctxExpanded.add(joined);
     closeCtxNewModal();
     if (_ctxNewTargetDir) _ctxExpanded.add(_ctxNewTargetDir);
     await loadContexts();
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     msg.textContent = t('contexts.dir.create_failed');
     msg.className = 'form-msg err';
   }
@@ -1231,6 +1276,7 @@ async function createCtxNewTextFile(parentDir = '') {
   while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
   const name = `${stem}.md`;
   const fullPath = parentDir ? `${parentDir}/${name}` : name;
+  const trackResult = _ctxCreateEntryActionTracker('create_text');
   try {
     const res = await apiFetch('/api/contexts/write', {
       method: 'POST',
@@ -1238,7 +1284,11 @@ async function createCtxNewTextFile(parentDir = '') {
       body: JSON.stringify({ path: fullPath, content: '' }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(t('contexts.file.create_failed')); return; }
+    if (!data.ok) {
+      trackResult('failure', 'create_failed');
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
@@ -1247,7 +1297,9 @@ async function createCtxNewTextFile(parentDir = '') {
     // next renderCtxTree() call.
     _showCtxTextViewer(fullPath, '');
     _enterCtxEdit();
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.file.create_failed'));
   }
 }
@@ -1267,6 +1319,7 @@ async function createCtxNewTodoFile(parentDir = '') {
   const fullPath = parentDir ? `${parentDir}/${name}` : name;
   const heading = t('contexts.new.todo_template_heading');
   const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
+  const trackResult = _ctxCreateEntryActionTracker('create_todo');
   try {
     const res = await apiFetch('/api/contexts/write', {
       method: 'POST',
@@ -1274,13 +1327,19 @@ async function createCtxNewTodoFile(parentDir = '') {
       body: JSON.stringify({ path: fullPath, content: template }),
     });
     const data = await res.json();
-    if (!data.ok) { await uiAlert(t('contexts.file.create_failed')); return; }
+    if (!data.ok) {
+      trackResult('failure', 'create_failed');
+      await uiAlert(t('contexts.file.create_failed'));
+      return;
+    }
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
     _showCtxTextViewer(fullPath, template);
     _enterCtxEdit();
+    trackResult('success');
   } catch (_) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.file.create_failed'));
   }
 }

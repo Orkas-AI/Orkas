@@ -13,19 +13,34 @@ const _bridgeLog = createLogger('bridge');
 const _bridgePermissionQueue = [];
 let _bridgeDialogOpen = false;
 
+function _bridgePermissionLabel(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
 async function _showBridgePermissionDialog(info) {
-  const agent = info.agent_name || info.agent_id || '';
-  const connector = info.connector_name || info.connector_id || '';
-  const tool = info.tool_name || '';
-  const choice = await uiChoice({
-    title: t('bridge.permission.title'),
-    message: t('bridge.permission.message', { agent, connector, tool }),
-    cancelLabel: t('bridge.permission.deny'),
-    choices: [
-      { id: 'allow_once', label: t('bridge.permission.allow_once') },
-      { id: 'allow_always', label: t('bridge.permission.allow_always'), style: '' },
-    ],
-  });
+  const agent = _bridgePermissionLabel(info.agent_name || info.agent_id);
+  const connector = _bridgePermissionLabel(info.connector_name || info.connector_id);
+  const tool = _bridgePermissionLabel(info.tool_name);
+  let choice = null;
+  try {
+    choice = await uiChoice({
+      title: t('bridge.permission.title'),
+      message: t('bridge.permission.message', { agent, connector, tool }),
+      cancelLabel: t('bridge.permission.deny'),
+      choices: [
+        { id: 'allow_once', label: t('bridge.permission.allow_once') },
+        { id: 'allow_always', label: t('bridge.permission.allow_always'), style: '' },
+      ],
+    });
+  } catch (_err) {
+    // A broken dialog must fail closed and must not block later queued
+    // requests. Main also has a timeout, but replying deny gives immediate,
+    // predictable recovery.
+    _bridgeLog.warn('permission dialog failed; denying request');
+  }
   const allow = choice === 'allow_once' || choice === 'allow_always';
   try {
     await window.orkas.invoke('bridge.permission_response', {
@@ -33,8 +48,8 @@ async function _showBridgePermissionDialog(info) {
       allow,
       always: choice === 'allow_always',
     });
-  } catch (err) {
-    _bridgeLog.warn('permission response failed', { error: err && err.message });
+  } catch (_err) {
+    _bridgeLog.warn('permission response failed');
   }
 }
 
@@ -54,9 +69,11 @@ async function _drainBridgePermissionQueue() {
 if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
   try {
     window.orkas.onPushEvent('bridge:permission', (info) => {
-      if (!info || typeof info.request_id !== 'string') return;
+      if (!info || typeof info.request_id !== 'string' || !info.request_id.trim()) return;
       _bridgePermissionQueue.push(info);
-      _drainBridgePermissionQueue();
+      _drainBridgePermissionQueue().catch(() => {
+        _bridgeLog.warn('permission queue failed');
+      });
     });
   } catch (_err) { /* push channel unavailable; bridge calls deny on timeout */ }
 }

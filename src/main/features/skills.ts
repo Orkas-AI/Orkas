@@ -550,9 +550,10 @@ function _writePersistedSkillCatalog(rootStamp: string, stamp: string, data: Ski
   }
 }
 
-function _invalidateSkillListCache(opts: { markDirty?: boolean } = {}): void {
+function _invalidateSkillListCache(opts: { markDirty?: boolean; userId?: string } = {}): void {
+  const userId = opts.userId || getActiveUserId();
   _skillListCache = null;
-  try { fs.rmSync(_skillCatalogCacheFile(), { force: true }); } catch { /* cache is best-effort */ }
+  try { fs.rmSync(userSkillCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
   if (opts.markDirty === false) return;
   // Sync engine dirty signal (lazy-require — stripped in the open-source build). Mirrors the pattern in
   // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
@@ -799,23 +800,54 @@ export function setSkillEnabledForActiveUser(skillId: string, enabled: boolean):
 
 export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | { ok: false; error: string };
 
+function _pathIsWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === ''
+    || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+}
+
+function _resolveContainedSkillRoot(
+  source: SkillSourceInput,
+  skillId: string,
+): { ok: true; skillDir: string; realSkillDir: string } | { ok: false; invalid: boolean } {
+  const base = path.resolve(skillBaseDir(source));
+  const skillDir = path.resolve(base, skillId);
+  if (!_pathIsWithin(base, skillDir)) return { ok: false, invalid: true };
+  try {
+    if (!fs.statSync(skillDir).isDirectory()) return { ok: false, invalid: false };
+    const realBase = fs.realpathSync(base);
+    const realSkillDir = fs.realpathSync(skillDir);
+    if (!_pathIsWithin(realBase, realSkillDir)) return { ok: false, invalid: true };
+    return { ok: true, skillDir, realSkillDir };
+  } catch {
+    return { ok: false, invalid: false };
+  }
+}
+
 export async function readSkillFile(
   source: SkillSourceInput, skillId: string, filepath = 'SKILL.md',
 ): Promise<Result<{ content: string; ext: string; path: string }>> {
-  const base = skillBaseDir(source);
-  const skillDir = path.resolve(base, skillId);
-  const target = path.resolve(skillDir, filepath);
-  if (target !== skillDir && !target.startsWith(skillDir + path.sep)) {
+  const root = _resolveContainedSkillRoot(source, skillId);
+  if ('invalid' in root) {
+    return { ok: false, error: root.invalid ? 'invalid path' : 'file not found' };
+  }
+  const target = path.resolve(root.skillDir, filepath);
+  if (!_pathIsWithin(root.skillDir, target)) {
     return { ok: false, error: 'invalid path' };
   }
-  if (!fs.existsSync(target) || !fs.statSync(target).isFile()) {
-    return { ok: false, error: 'file not found' };
-  }
   try {
+    if (!fs.statSync(target).isFile()) return { ok: false, error: 'file not found' };
+    const realTarget = fs.realpathSync(target);
+    if (!_pathIsWithin(root.realSkillDir, realTarget)) {
+      return { ok: false, error: 'invalid path' };
+    }
     const content = fs.readFileSync(target, 'utf8');
     const ext = path.extname(target).toLowerCase().replace(/^\./, '');
     return { ok: true, content, ext, path: filepath };
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { ok: false, error: 'file not found' };
+    }
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -823,10 +855,9 @@ export async function readSkillFile(
 export async function listSkillTree(
   source: SkillSourceInput, skillId: string,
 ): Promise<Result<{ tree: SkillTreeNode[] }>> {
-  const base = skillBaseDir(source);
-  const skillDir = path.resolve(base, skillId);
-  if (!fs.existsSync(skillDir) || !fs.statSync(skillDir).isDirectory()) {
-    return { ok: false, error: 'skill not found' };
+  const root = _resolveContainedSkillRoot(source, skillId);
+  if ('invalid' in root) {
+    return { ok: false, error: root.invalid ? 'invalid path' : 'skill not found' };
   }
 
   function walk(dir: string, rel = ''): SkillTreeNode[] {
@@ -859,7 +890,7 @@ export async function listSkillTree(
     return out;
   }
 
-  return { ok: true, tree: walk(skillDir) };
+  return { ok: true, tree: walk(root.skillDir) };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -887,8 +918,8 @@ export function isValidSkillId(id: unknown): boolean {
   return SKILL_HEX_ID_RE.test(id) || SKILL_NAME_RE.test(id);
 }
 
-function customSkillDir(skillId: string): string {
-  return path.join(CUSTOM_SKILLS_DIR(), skillId);
+function customSkillDir(skillId: string, userId = getActiveUserId()): string {
+  return path.join(userSkillsDir(userId), skillId);
 }
 
 export function skillMdContent(
@@ -959,8 +990,8 @@ function normalizeSkillMdForWrite(content: string, fallbackName = ''): string {
   return skillMdContent(name, { zh: descPair.description_zh, en: descPair.description_en }, body);
 }
 
-export async function getCustomSkill(skillId: string): Promise<CustomSkill | null> {
-  const d = customSkillDir(skillId);
+async function _getCustomSkillForUser(skillId: string, userId: string): Promise<CustomSkill | null> {
+  const d = customSkillDir(skillId, userId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
   if (!hasSkillMd(d)) return null;
   const md = skillMdFile(d);
@@ -982,6 +1013,10 @@ export async function getCustomSkill(skillId: string): Promise<CustomSkill | nul
     id: skillId, name, ...descPair, category,
     status, source: 'custom', dir: d,
   };
+}
+
+export async function getCustomSkill(skillId: string): Promise<CustomSkill | null> {
+  return _getCustomSkillForUser(skillId, getActiveUserId());
 }
 
 export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
@@ -1061,7 +1096,8 @@ export async function updateCustomSkill(
   },
   options: { skipRename?: boolean } = {},
 ): Promise<CustomSkill | null> {
-  let d = customSkillDir(skillId);
+  const userId = getActiveUserId();
+  let d = customSkillDir(skillId, userId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
   let md = path.join(d, 'SKILL.md');
   let meta: SkillFrontmatter = {}; let body = '';
@@ -1101,9 +1137,9 @@ export async function updateCustomSkill(
   if (newName !== skillId && !options.skipRename) {
     const err = validateSkillName(newName);
     if (err) throw new Error(err);
-    const target = customSkillDir(newName);
+    const target = customSkillDir(newName, userId);
     if (fs.existsSync(target)) throw new Error(t('skills.errors.skill_exists', { name: newName }));
-    if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), newName))) {
+    if (fs.existsSync(path.join(userMarketplaceSkillsDir(userId), newName))) {
       throw new Error(t('skills.errors.builtin_conflict', { name: newName }));
     }
     fs.renameSync(d, target);
@@ -1114,33 +1150,27 @@ export async function updateCustomSkill(
     // The chat.json session_id is bumped to the new id so future turns open
     // a fresh jsonl; the old session jsonl + cache entry are dropped here
     // so the next "create skill named OLDID" doesn't inherit its memory.
-    if (fs.existsSync(WS_ROOT)) {
-      for (const uidEntry of fs.readdirSync(WS_ROOT, { withFileTypes: true })) {
-        if (!uidEntry.isDirectory()) continue;
-        const uid = uidEntry.name;
-        const oldChatDir = userSkillChatDir(uid, skillId);
-        const newChatDir = userSkillChatDir(uid, newName);
-        if (fs.existsSync(oldChatDir) && !fs.existsSync(newChatDir)) {
-          try {
-            fs.renameSync(oldChatDir, newChatDir);
-            invalidateLineCount(path.join(oldChatDir, 'chat.jsonl'));
-            invalidateLineCount(path.join(newChatDir, 'chat.jsonl'));
-            const m = await loadSkillChatMeta(uid, newName);
-            m.session_id = defaultSkillSessionId(newName);
-            await saveSkillChatMeta(uid, newName, m);
-          } catch (err) {
-            log.warn(`rename user=${uid} ${oldChatDir} -> ${newChatDir} failed: ${(err as Error).message}`);
-          }
-        }
-        const oldSid = defaultSkillSessionId(skillId);
-        try { evictSession(oldSid); } catch { /* not in cache */ }
-        const oldSessionJsonl = userSessionFile(uid, oldSid);
-        try { fs.unlinkSync(oldSessionJsonl); }
-        catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            log.warn(`session unlink user=${uid} skill=${skillId} (rename): ${(err as Error).message}`);
-          }
-        }
+    const oldChatDir = userSkillChatDir(userId, skillId);
+    const newChatDir = userSkillChatDir(userId, newName);
+    if (fs.existsSync(oldChatDir) && !fs.existsSync(newChatDir)) {
+      try {
+        fs.renameSync(oldChatDir, newChatDir);
+        invalidateLineCount(path.join(oldChatDir, 'chat.jsonl'));
+        invalidateLineCount(path.join(newChatDir, 'chat.jsonl'));
+        const m = await loadSkillChatMeta(userId, newName);
+        m.session_id = defaultSkillSessionId(newName);
+        await saveSkillChatMeta(userId, newName, m);
+      } catch (err) {
+        log.warn(`rename user=${userId} ${oldChatDir} -> ${newChatDir} failed: ${(err as Error).message}`);
+      }
+    }
+    const oldSid = defaultSkillSessionId(skillId);
+    try { evictSession(oldSid); } catch { /* not in cache */ }
+    const oldSessionJsonl = userSessionFile(userId, oldSid);
+    try { fs.unlinkSync(oldSessionJsonl); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn(`session unlink user=${userId} skill=${skillId} (rename): ${(err as Error).message}`);
       }
     }
     log.info(`renamed ${skillId} -> ${newName}`);
@@ -1155,45 +1185,40 @@ export async function updateCustomSkill(
   removeSkillSidecarDescriptionsSync(d);
   clearSkillImportDraftMarkerSync(currentId);
   log.info(`updated name=${currentId} category=${newCategory || '(none)'}`);
-  _invalidateSkillListCache();
+  _invalidateSkillListCache({ userId });
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
-  return getCustomSkill(currentId);
+  return _getCustomSkillForUser(currentId, userId);
 }
 
 export async function deleteCustomSkill(skillId: string): Promise<boolean> {
-  const d = customSkillDir(skillId);
+  const userId = getActiveUserId();
+  const d = customSkillDir(skillId, userId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return false;
   try { fs.rmSync(d, { recursive: true, force: true }); }
   catch (err) { log.warn(`rmtree failed for ${skillId}: ${(err as Error).message}`); return false; }
 
-  // Drop each user's per-skill edit chat directory + the matching
+  // Drop this account's per-skill edit chat directory + the matching
   // core-agent session jsonl. Without the session purge, recreating a
   // skill with the same name would reload the deleted skill's transcript
   // and the LLM would appear to "remember" the previous attempt.
-  if (fs.existsSync(WS_ROOT)) {
-    for (const uidEntry of fs.readdirSync(WS_ROOT, { withFileTypes: true })) {
-      if (!uidEntry.isDirectory()) continue;
-      const uid = uidEntry.name;
-      const chatDir = userSkillChatDir(uid, skillId);
-      if (fs.existsSync(chatDir)) {
-        try { fs.rmSync(chatDir, { recursive: true, force: true }); }
-        catch (err) { log.warn(`rm failed user=${uid} skill=${skillId}: ${(err as Error).message}`); }
-        invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-      }
-      const sessionId = defaultSkillSessionId(skillId);
-      try { evictSession(sessionId); } catch { /* cache may not hold it */ }
-      const sessionJsonl = userSessionFile(uid, sessionId);
-      try { fs.unlinkSync(sessionJsonl); }
-      catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          log.warn(`session unlink user=${uid} skill=${skillId}: ${(err as Error).message}`);
-        }
-      }
+  const chatDir = userSkillChatDir(userId, skillId);
+  if (fs.existsSync(chatDir)) {
+    try { fs.rmSync(chatDir, { recursive: true, force: true }); }
+    catch (err) { log.warn(`rm failed user=${userId} skill=${skillId}: ${(err as Error).message}`); }
+    invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
+  }
+  const sessionId = defaultSkillSessionId(skillId);
+  try { evictSession(sessionId); } catch { /* cache may not hold it */ }
+  const sessionJsonl = userSessionFile(userId, sessionId);
+  try { fs.unlinkSync(sessionJsonl); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} skill=${skillId}: ${(err as Error).message}`);
     }
   }
 
   log.info(`deleted id=${skillId}`);
-  _invalidateSkillListCache();
+  _invalidateSkillListCache({ userId });
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
   return true;
 }

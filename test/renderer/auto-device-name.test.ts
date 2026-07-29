@@ -76,4 +76,18 @@ describe('auto device display name', () => {
     expect(zh['auto.run_label']).toBe('运行');
     expect(zh['auto.sync_note_create']).toBeUndefined();
   });
+
+  it('renders the row action menu as focusable buttons with focus-visible styling', () => {
+    const source = fs.readFileSync(path.join(rendererRoot, 'modules/auto.js'), 'utf8');
+    const css = fs.readFileSync(path.join(rendererRoot, 'style.css'), 'utf8');
+    for (const action of ['run-now', 'toggle-enabled', 'edit', 'delete']) {
+      expect(source).toMatch(new RegExp(`<button type="button" role="menuitem" class="[^"]*auto-row-menu-item[^"]*" data-action="${action}"`));
+    }
+    expect(source).toContain("m.setAttribute('role', 'menu')");
+    expect(source).toContain("anchorBtn.setAttribute('aria-haspopup', 'menu')");
+    expect(source).toContain("e.key === 'ArrowDown'");
+    expect(source).toContain("_closeAutoRowMenu(true)");
+    expect(source).toContain("menu.querySelector('.auto-row-menu-item')?.focus()");
+    expect(css).toContain('.auto-row-menu-item:focus-visible');
+  });
 });

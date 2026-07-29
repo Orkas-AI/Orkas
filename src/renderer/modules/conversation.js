@@ -23,11 +23,6 @@ function _trackAgentRunResultTelemetry(cid, evData) {
   void evData;
 }
 
-function _maybeShowOrkasCreditGuidance(rawError, source) {
-  void rawError;
-  void source;
-}
-
 function _trimTelemetryText(value, max) {
   const text = _normalizeFeedbackFieldText(value);
   const limit = Math.max(0, Number(max) || 0);
@@ -163,6 +158,17 @@ function _isFailedAssistantContent(rawContent, message = null) {
     || /color\s*:\s*var\(--danger\)/i.test(raw)
     || /style=["'][^"']*var\(--danger\)/i.test(raw)
     || /(?:模型调用失败|model\s+(?:call|invocation)\s+failed)/i.test(raw);
+}
+
+function _isInterruptedAssistantMessage(message = null) {
+  if (!message || typeof message !== 'object') return false;
+  if (_groupMessageSystemKind(message) === 'reply_interrupted') return true;
+  return Array.isArray(message.process) && message.process.some((item) => (
+    item
+    && item.type === 'event'
+    && item.event?.stream === 'runtime'
+    && item.event?.data?.aborted === true
+  ));
 }
 
 function _normalizeFeedbackFieldText(value) {
@@ -605,6 +611,12 @@ function _chatRichUploadPasteFiles(inputId, files) {
   if (!files || !files.length || typeof _chatAttachUpload !== 'function') return false;
   if (inputId === 'new-chat-input') {
     _chatAttachUpload(DRAFT_CID, files, 'paste');
+    return true;
+  }
+  if (inputId === 'project-chat-input'
+      && typeof _projectDetailPid !== 'undefined' && _projectDetailPid
+      && typeof _projectChatDraftCid === 'function') {
+    _chatAttachUpload(_projectChatDraftCid(_projectDetailPid), files, 'paste');
     return true;
   }
   if (inputId === 'chat-input' && currentCid) {
@@ -1146,6 +1158,12 @@ function _renderRecipientChip(target) {
         const a = _agentsCache.find((x) => x && x.agent_id === r.id);
         if (a && a.name) display = a.name;
       }
+      // A conversation can be created in the background (for example by an
+      // automation) after the global Agent summary cache was loaded. Its live
+      // member roster is then the freshest source for the selected Agent name.
+      if (!display && tg === 'conversation' && currentCid) {
+        display = _knownGroupActorLabel(currentCid, r.id) || '';
+      }
       if (!display) display = r.name || r.id;
       nameEl.textContent = display;
       nameEl.removeAttribute('data-i18n');
@@ -1153,6 +1171,9 @@ function _renderRecipientChip(target) {
       nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
       nameEl.textContent = t('chat.recipient_commander');
     }
+  }
+  if (typeof _syncComposerModelChipAvailability === 'function') {
+    _syncComposerModelChipAvailability(target);
   }
 }
 
@@ -1167,8 +1188,7 @@ function onEnterNewChatView() {
   const hasDraft = !!(input && input.value);
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
-  // Empty-state greeting / clock / ready-count — refresh on each view enter
-  // so the time-of-day greeting is correct after a long idle session.
+  // Keep the empty-state heading aligned with the current locale.
   _refreshEmptyStateAll();
   _initEmptyStateScenarios();
   // Open-source-driven「还能帮你做这些」capability strip (below the scenario row).
@@ -1176,107 +1196,455 @@ function onEnterNewChatView() {
 }
 
 // ── Empty-state landing helpers ──────────────────────────────────────────
-// Surface B per PC/docs/design/PATTERNS.md. The time-of-day greeting
-// (early-morning / morning / afternoon / evening) refreshes every 60s
-// while the panel is visible so it stays current across midnight.
-
-let _emptyStateClockTimer = null;
-const _SCENARIO_CONFIGS = {
+// Surface B per PC/docs/design/PATTERNS.md.
+const _SCENARIO_CATALOG = {
   data: {
     templateKey: 'new_chat.quick.tmpl.data',
-    agentId: '78900d8758bc',
+    labelKey: 'new_chat.quick.data',
+    taskKey: 'new_chat.quick.task.data',
+    deliverableKey: 'new_chat.quick.deliver.data',
+    subjectKey: 'new_chat.quick.subject.data',
+    subjectFallback: 'open-source AI desktop apps',
+    thumb: 'research',
+    icon: 'search',
+    tone: 'research',
     agentNames: ['DeepResearcher'],
   },
   video: {
     templateKey: 'new_chat.quick.tmpl.video',
-    agentId: '79df9cc89f5f',
+    labelKey: 'new_chat.quick.video',
+    taskKey: 'new_chat.quick.task.video',
+    deliverableKey: 'new_chat.quick.deliver.video',
+    subjectKey: 'new_chat.quick.subject.video',
+    subjectFallback: 'AI trends',
+    thumb: 'video',
+    icon: 'film',
+    tone: 'video',
     agentNames: ['VideoStudio'],
+  },
+  image: {
+    templateKey: 'new_chat.quick.tmpl.image',
+    labelKey: 'new_chat.quick.image',
+    taskKey: 'new_chat.quick.task.image',
+    deliverableKey: 'new_chat.quick.deliver.image',
+    subjectKey: 'new_chat.quick.subject.image',
+    subjectFallback: 'City Summer Coffee Festival',
+    thumb: 'poster',
+    icon: 'image',
+    tone: 'image',
+    agentNames: ['ImageStudio'],
   },
   ui_design: {
     templateKey: 'new_chat.quick.tmpl.ui_design',
-    agentId: 'bcfcb4921dce',
+    labelKey: 'new_chat.quick.ui_design',
+    taskKey: 'new_chat.quick.task.ui_design',
+    deliverableKey: 'new_chat.quick.deliver.ui_design',
+    subjectKey: 'new_chat.quick.subject.ui_design',
+    subjectFallback: 'a personal finance app',
+    thumb: 'login',
+    icon: 'palette',
+    tone: 'ui',
     agentNames: ['UIDesigner'],
-  },
-  seo_geo: {
-    templateKey: 'new_chat.quick.tmpl.seo_geo',
-    agentId: 'e064dca9e1bd',
-    agentNames: ['SeoGeoAgent'],
   },
   office: {
     templateKey: 'new_chat.quick.tmpl.office',
-    agentId: 'a19101ba698a',
-    agentNames: ['OfficeWriter'],
+    labelKey: 'new_chat.quick.office',
+    taskKey: 'new_chat.quick.task.office',
+    deliverableKey: 'new_chat.quick.deliver.office',
+    subjectKey: 'new_chat.quick.subject.office',
+    subjectFallback: 'an ecommerce store',
+    thumb: 'chart',
+    icon: 'file-text',
+    tone: 'doc',
+    agentNames: ['OfficeWorker', 'OfficeWriter'],
+  },
+  creation: {
+    templateKey: 'new_chat.quick.tmpl.creation',
+    labelKey: 'new_chat.quick.creation',
+    taskKey: 'new_chat.quick.task.creation',
+    deliverableKey: 'new_chat.quick.deliver.creation',
+    subjectKey: 'new_chat.quick.subject.creation',
+    subjectFallback: 'an AI office assistant',
+    thumb: 'article',
+    icon: 'edit-pencil',
+    tone: 'writing',
+    agentNames: ['ContentWriter'],
   },
   rnd: {
     templateKey: 'new_chat.quick.tmpl.rnd',
-    agentId: 'a316881746f9',
+    labelKey: 'new_chat.quick.rnd',
+    taskKey: 'new_chat.quick.task.rnd',
+    deliverableKey: 'new_chat.quick.deliver.rnd',
+    subjectKey: 'new_chat.quick.subject.rnd',
+    subjectFallback: 'a product designer changing careers',
+    thumb: 'web',
+    icon: 'code',
+    tone: 'code',
     agentNames: ['ProductDeveloper'],
   },
+  seo_geo: {
+    templateKey: 'new_chat.quick.tmpl.seo_geo',
+    labelKey: 'new_chat.quick.seo_geo',
+    taskKey: 'new_chat.quick.task.seo_geo',
+    deliverableKey: 'new_chat.quick.deliver.seo_geo',
+    subjectKey: 'new_chat.quick.subject.seo_geo',
+    subjectFallback: 'the orkas.ai website',
+    thumb: 'seo',
+    icon: 'globe',
+    tone: 'search',
+    agentNames: ['SeoGeoAgent'],
+  },
 };
+const _DEFAULT_QUICK_START_ITEMS = [
+  { id: 'data', agent_id: '78900d8758bc' },
+  { id: 'video', agent_id: '79df9cc89f5f' },
+  { id: 'image', agent_id: '814b61b027f0' },
+  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
+  { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'creation', agent_id: '173d4235a431' },
+  { id: 'rnd', agent_id: 'a316881746f9' },
+  { id: 'seo_geo', agent_id: 'e064dca9e1bd' },
+];
+let _quickStartItems = _DEFAULT_QUICK_START_ITEMS.map((item) => ({ ...item }));
+let _quickStartConfigPromise = null;
+let _quickStartSource = 'pc_default';
+let _quickStartLoadTelemetrySent = false;
+let _SCENARIO_CONFIGS = {};
 // English fallback templates — used when the i18n table doesn't yet carry
-// the scenario template key (Step 9 backfills the full set). Each template
-// has at least one `[...]` placeholder that scenario-click jumps the caret to.
+// the scenario template key. These are complete, ready-to-run tasks so a
+// first-time user can click a card and send immediately.
 const _SCENARIO_TEMPLATES_FALLBACK_EN = {
-  data: 'Deep research [topic]: gather recent sources, compare evidence, cite links, and produce a structured report.',
-  video: 'Make a video for [topic/materials]: confirm the style, plan the script/timeline, produce a draft, and ask me to review it.',
-  ui_design: 'Design the UI for [screen / product / workflow]: define the layout, visual direction, states, responsive behavior, and deliver an HTML-first draft.',
-  seo_geo: 'Analyze SEO and GEO for [website/page URL]: crawl the page, diagnose technical/content/schema issues, find opportunities, and produce an action plan.',
-  office: 'Organize [document/materials]: turn it into a polished document, table, presentation, or PDF-ready deliverable.',
-  rnd: 'Build [software/app/feature]: clarify requirements, design the implementation plan, write the code, test it, and verify completion.',
+  data: 'Research open-source AI desktop apps and recommend the best options.',
+  video: 'Create an explainer video about AI trends.',
+  image: 'Design an event poster for the City Summer Coffee Festival.',
+  ui_design: 'Design a sign-in and sign-up UI for a personal finance app.',
+  seo_geo: 'Create an SEO and GEO improvement plan for the orkas.ai website.',
+  office: 'Create a sales report with sample data and charts for an ecommerce store.',
+  creation: 'Write a social post about an AI office assistant.',
+  rnd: 'Build a portfolio website for a product designer changing careers.',
 };
 
-function _pickGreetingKey(date) {
-  const h = (date || new Date()).getHours();
-  if (h < 6)  return 'new_chat.greeting_early';      // 0-5
-  if (h < 12) return 'new_chat.greeting_morning';    // 6-11
-  if (h < 18) return 'new_chat.greeting_afternoon';  // 12-17
-  return 'new_chat.greeting_evening';                // 18-23
+function _normalizeQuickStartItems(raw) {
+  if (!Array.isArray(raw) || !raw.length || raw.length > Object.keys(_SCENARIO_CATALOG).length) return null;
+  const seen = new Set();
+  const items = [];
+  for (const item of raw) {
+    const id = String((item && item.id) || '').trim();
+    const agentId = String((item && item.agent_id) || '').trim();
+    if (!_SCENARIO_CATALOG[id] || seen.has(id) || !/^[A-Za-z0-9_-]{3,64}$/.test(agentId)) return null;
+    seen.add(id);
+    items.push({ id, agent_id: agentId });
+  }
+  return items;
 }
-// Mirrors the latest account-status payload when an account layer exists.
-// the open-source build has no bundled account backend, so this path stays empty.
-let _emptyStateAccountStatus = null;
-let _emptyStateAccountSubBound = false;
-function _ensureEmptyStateAccountSub() {
-  if (_emptyStateAccountSubBound) return;
-  _emptyStateAccountSubBound = true;
+
+function _setQuickStartItems(raw, source) {
+  const normalized = _normalizeQuickStartItems(raw);
+  const items = normalized || _DEFAULT_QUICK_START_ITEMS.map((item) => ({ ...item }));
+  _quickStartItems = items;
+  _quickStartSource = normalized && source === 'server_config' ? 'server_config' : 'pc_default';
+  _SCENARIO_CONFIGS = Object.fromEntries(items.map((item) => [item.id, {
+    ..._SCENARIO_CATALOG[item.id],
+    agentId: item.agent_id,
+  }]));
+  return !!normalized;
 }
-function _emptyStateUserDisplayName() {
-  const u = (_emptyStateAccountStatus && _emptyStateAccountStatus.userInfo) || null;
-  if (!u) return '';
-  // Prefer nickname; fall back to the email local-part so the greeting never
-  // shows a full email address (privacy + visual).
-  const raw = String(u.nickname || u.email || '').trim();
-  return raw.split('@')[0].trim();
+
+function _commanderTelemetryId(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z0-9._-]{1,64}$/.test(text) ? text : '';
 }
-function _refreshEmptyStateGreeting() {
+
+function _normalizeCommanderTemplateAttribution(raw, defaultManual = false) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const entryPoint = String(src.entry_point || src.entryPoint || '').trim();
+  const validEntryPoint = /^(?:manual|quick_start|oss_tool)$/.test(entryPoint)
+    ? entryPoint
+    : (defaultManual ? 'manual' : '');
+  if (!validEntryPoint) return {};
+  const out = { entry_point: validEntryPoint };
+  const resourceId = _commanderTelemetryId(src.resource_id || src.resourceId);
+  const agentId = _commanderTelemetryId(src.agent_id || src.agentId);
+  const source = String(src.source || '').trim();
+  const recipientType = String(src.recipient_type || src.recipientType).trim();
+  const position = Math.round(Number(src.position) || 0);
+  if (resourceId) out.resource_id = resourceId;
+  if (agentId) out.agent_id = agentId;
+  if (/^(?:pc_default|server_config|commander_home)$/.test(source)) out.source = source;
+  if (/^(?:agent|commander)$/.test(recipientType)) out.recipient_type = recipientType;
+  if (position > 0 && position <= 100) out.position = position;
+  return out;
+}
+
+function _setCommanderTemplateAttribution(input, raw) {
+  if (!input || !input.dataset) return {};
+  const value = _normalizeCommanderTemplateAttribution(raw);
+  _clearCommanderTemplateAttribution(input);
+  if (!value.entry_point) return value;
+  input.dataset.commanderEntryPoint = value.entry_point;
+  if (value.resource_id) input.dataset.commanderResourceId = value.resource_id;
+  if (value.agent_id) input.dataset.commanderAgentId = value.agent_id;
+  if (value.source) input.dataset.commanderSource = value.source;
+  if (value.recipient_type) input.dataset.commanderRecipientType = value.recipient_type;
+  if (value.position) input.dataset.commanderPosition = String(value.position);
+  return value;
+}
+
+function _clearCommanderTemplateAttribution(input) {
+  if (!input || !input.dataset) return;
+  delete input.dataset.commanderEntryPoint;
+  delete input.dataset.commanderResourceId;
+  delete input.dataset.commanderAgentId;
+  delete input.dataset.commanderSource;
+  delete input.dataset.commanderRecipientType;
+  delete input.dataset.commanderPosition;
+  delete input.dataset.commanderQuickStartPlaceholder;
+}
+
+function _readCommanderTemplateAttribution(input) {
+  if (!input || !String(input.value || '').trim()) return { entry_point: 'manual' };
+  const dataset = input.dataset || {};
+  return _normalizeCommanderTemplateAttribution({
+    entry_point: dataset.commanderEntryPoint,
+    resource_id: dataset.commanderResourceId,
+    agent_id: dataset.commanderAgentId,
+    source: dataset.commanderSource,
+    recipient_type: dataset.commanderRecipientType,
+    position: dataset.commanderPosition,
+  }, true);
+}
+
+function _bindCommanderTemplateAttributionReset(input) {
+  if (!input || !input.dataset || input.dataset.commanderAttributionBound === '1'
+      || typeof input.addEventListener !== 'function') return;
+  input.dataset.commanderAttributionBound = '1';
+  input.addEventListener('input', () => {
+    const value = String(input.value || '');
+    if (!value.trim()) {
+      _clearCommanderTemplateAttribution(input);
+      return;
+    }
+    const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
+    if (marker && !value.includes(marker)) {
+      delete input.dataset.commanderQuickStartPlaceholder;
+    }
+  });
+}
+
+window.setCommanderTemplateAttribution = _setCommanderTemplateAttribution;
+
+function _findQuickStartPlaceholder(text) {
+  const match = String(text || '').match(/【[^】]+】|\[[^\]]+\]/);
+  if (!match || typeof match.index !== 'number') return null;
+  return { text: match[0], start: match.index, end: match.index + match[0].length };
+}
+
+function _findQuickStartSubject(text, subject) {
+  const value = String(text || '');
+  const marker = String(subject || '').trim();
+  if (!marker) return null;
+  const start = value.indexOf(marker);
+  if (start < 0) return null;
+  return { text: marker, start, end: start + marker.length };
+}
+
+function _unresolvedQuickStartPlaceholder(input) {
+  if (!input || !input.dataset) return '';
+  const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
+  if (!marker) return '';
+  const value = String(input.value || '');
+  const start = value.indexOf(marker);
+  if (start < 0) {
+    delete input.dataset.commanderQuickStartPlaceholder;
+    return '';
+  }
+  input.focus();
+  try { input.setSelectionRange(start, start + marker.length); } catch (_) {}
+  return marker;
+}
+
+function _quickStartText(key, fallback) {
+  const value = key ? t(key) : '';
+  return value && value !== key ? value : fallback;
+}
+
+function _quickStartThumbHtml(thumb) {
+  switch (thumb) {
+    case 'web':
+      return `
+        <span class="quick-thumb-art quick-thumb-web">
+          <span class="quick-thumb-browser-bar"><i></i><i></i><i></i></span>
+          <span class="quick-thumb-web-hero">
+            <i class="quick-thumb-web-title"></i>
+            <i class="quick-thumb-web-copy"></i>
+            <i class="quick-thumb-web-button"></i>
+          </span>
+          <span class="quick-thumb-web-menu"><i></i><i></i><i></i></span>
+        </span>`;
+    case 'research':
+      return `
+        <span class="quick-thumb-art quick-thumb-research">
+          <span class="quick-thumb-paper">
+            <i class="quick-thumb-paper-title"></i>
+            <i class="quick-thumb-paper-line is-wide"></i>
+            <i class="quick-thumb-paper-line is-medium"></i>
+            <i class="quick-thumb-paper-line is-short"></i>
+          </span>
+          <i class="quick-thumb-research-lens"></i>
+        </span>`;
+    case 'login':
+      return `
+        <span class="quick-thumb-art quick-thumb-login">
+          <span class="quick-thumb-window-bar"><i></i><i></i><i></i></span>
+          <i class="quick-thumb-login-visual"></i>
+          <span class="quick-thumb-login-form">
+            <i class="quick-thumb-login-title"></i>
+            <i class="quick-thumb-login-field"></i>
+            <i class="quick-thumb-login-field"></i>
+            <i class="quick-thumb-login-button"></i>
+          </span>
+        </span>`;
+    case 'video':
+      return `
+        <span class="quick-thumb-art quick-thumb-video">
+          <i class="quick-thumb-video-glow"></i>
+          <i class="quick-thumb-video-subject"></i>
+          <i class="quick-thumb-play">${_uiIconHtml('play-triangle', 'quick-thumb-play-icon')}</i>
+          <i class="quick-thumb-video-caption"></i>
+          <span class="quick-thumb-video-progress"><i></i></span>
+        </span>`;
+    case 'chart':
+      return `
+        <span class="quick-thumb-art quick-thumb-chart">
+          <span class="quick-thumb-chart-head"><i></i><b></b></span>
+          <span class="quick-thumb-chart-bars"><i></i><i></i><i></i><i></i><i></i></span>
+          <i class="quick-thumb-chart-trend"></i>
+        </span>`;
+    case 'poster':
+      return `
+        <span class="quick-thumb-art quick-thumb-poster">
+          <i class="quick-thumb-poster-orb"></i>
+          <i class="quick-thumb-poster-product"></i>
+          <span class="quick-thumb-poster-copy"><i></i><i></i></span>
+          <i class="quick-thumb-poster-tag"></i>
+        </span>`;
+    case 'article':
+      return `
+        <span class="quick-thumb-art quick-thumb-article">
+          <i class="quick-thumb-article-cover"></i>
+          <span class="quick-thumb-article-body">
+            <i class="quick-thumb-article-kicker"></i>
+            <i class="quick-thumb-article-title"></i>
+            <i class="quick-thumb-article-line"></i>
+            <i class="quick-thumb-article-line is-short"></i>
+          </span>
+        </span>`;
+    case 'seo':
+      return `
+        <span class="quick-thumb-art quick-thumb-seo">
+          <span class="quick-thumb-search-bar"><i></i><b></b></span>
+          <span class="quick-thumb-search-result"><i></i><i></i></span>
+          <span class="quick-thumb-search-result is-second"><i></i><i></i></span>
+          <span class="quick-thumb-rank"><i></i><b></b><em></em></span>
+        </span>`;
+    default:
+      return `
+        <span class="quick-thumb-art quick-thumb-research">
+          <span class="quick-thumb-paper">
+            <i class="quick-thumb-paper-title"></i>
+            <i class="quick-thumb-paper-line is-wide"></i>
+            <i class="quick-thumb-paper-line is-medium"></i>
+          </span>
+        </span>`;
+  }
+}
+
+function _renderQuickStartScenarios() {
+  const grid = document.getElementById('new-chat-scenario-grid');
+  if (!grid) return;
+  grid.innerHTML = _quickStartItems.map((item) => {
+    const config = _SCENARIO_CONFIGS[item.id];
+    if (!config) return '';
+    const label = _quickStartText(config.labelKey, item.id);
+    const task = _quickStartText(config.taskKey, label);
+    const deliverable = _quickStartText(config.deliverableKey, '');
+    const deliverableLabel = _quickStartText('new_chat.quick.deliver_label', 'Deliverable:');
+    return `
+      <button type="button" class="new-chat-scenario-chip quick-task-card" data-scenario="${escapeHtml(item.id)}" data-tone="${escapeHtml(config.tone || '')}">
+        <span class="quick-thumb" data-thumb="${escapeHtml(config.thumb || 'doc')}" aria-hidden="true">${_quickStartThumbHtml(config.thumb)}</span>
+        <span class="quick-copy">
+          <span class="quick-cat">
+            <span class="quick-icon" aria-hidden="true">${_uiIconHtml(config.icon || 'sparkles', 'new-chat-scenario-icon')}</span>
+            <span class="new-chat-scenario-label quick-cat-name">${escapeHtml(label)}</span>
+          </span>
+          <span class="quick-task">${escapeHtml(task)}</span>
+          <span class="quick-deliver">${escapeHtml(deliverableLabel)} <b>${escapeHtml(deliverable)}</b></span>
+        </span>
+      </button>`;
+  }).join('');
+}
+
+function _refreshQuickStartConfig(row) {
+  if (_quickStartConfigPromise || !window.orkas || typeof window.orkas.invoke !== 'function') return;
+  _quickStartConfigPromise = window.orkas.invoke('clientConfig.getQuickStart')
+    .then((res) => {
+      const items = _normalizeQuickStartItems(res && res.items);
+      if (!items) {
+        _convLog.warn('Commander quick-start config rejected in renderer', {
+          source: String((res && res.source) || 'unknown'),
+        });
+        return;
+      }
+      _setQuickStartItems(items, res && res.source);
+      _renderQuickStartScenarios();
+      _bindEmptyStateScenarioButtons(row);
+    })
+    .catch((err) => {
+      _convLog.warn('Commander quick-start config load failed; using open defaults', {
+        error: err && err.message ? err.message : String(err || ''),
+      });
+    })
+    .finally(() => { _quickStartConfigPromise = null; });
+}
+
+_setQuickStartItems(_quickStartItems, 'pc_default');
+
+let _emptyStateAccountName = '';
+
+function _emptyStateNameFromAccount(payload) {
+  const userInfo = payload && payload.userInfo;
+  if (!userInfo || typeof userInfo !== 'object') return '';
+  return String(userInfo.nickname || userInfo.name || userInfo.display_name || '').trim();
+}
+
+function _renderEmptyStateHeading() {
   const el = document.getElementById('new-chat-greeting');
   if (!el) return;
-  const key = _pickGreetingKey();
-  const name = _emptyStateUserDisplayName();
-  const vars = { name: name || (t('common.user_fallback') !== 'common.user_fallback' ? t('common.user_fallback') : 'there') };
-  const raw = t(key, vars);
-  // i18n miss: render a stable English fallback so the prefix doesn't show
-  // the raw key. Step 9 adds the keys and this branch becomes dead code.
-  if (raw && raw !== key) { el.textContent = raw; return; }
-  const fallbacks = {
-    'new_chat.greeting_early':      `Up early, ${vars.name}`,
-    'new_chat.greeting_morning':    `Good morning, ${vars.name}`,
-    'new_chat.greeting_afternoon':  `Good afternoon, ${vars.name}`,
-    'new_chat.greeting_evening':    `Good evening, ${vars.name}`,
-  };
-  el.textContent = fallbacks[key] || `Hello, ${vars.name}`;
+  const fallbackName = _quickStartText('common.user_fallback', 'Friend');
+  const name = _emptyStateAccountName || fallbackName;
+  const heading = t('new_chat.title', { name });
+  el.textContent = heading && heading !== 'new_chat.title'
+    ? heading
+    : `${name}, what do you want to accomplish?`;
+}
+
+function _updateEmptyStateAccount(payload) {
+  _emptyStateAccountName = _emptyStateNameFromAccount(payload);
+  _renderEmptyStateHeading();
+}
+
+function _refreshEmptyStateAccount() {
+  // The open-source build has no Orkas account profile. Keep the localized
+  // Friend fallback while preserving the shared heading renderer.
+  _updateEmptyStateAccount(null);
+}
+
+function _refreshEmptyStateHeading() {
+  _renderEmptyStateHeading();
+  _refreshEmptyStateAccount();
 }
 function _refreshEmptyStateAll() {
-  _ensureEmptyStateAccountSub();
-  _refreshEmptyStateGreeting();
-  // Boot once: schedule the recurring tick that keeps the greeting honest
-  // across hour / midnight boundaries. 60s cadence; the greeting only
-  // shifts a few times a day, so this is cheap.
-  if (!_emptyStateClockTimer) {
-    _emptyStateClockTimer = setInterval(() => {
-      _refreshEmptyStateGreeting();
-    }, 60 * 1000);
-  }
+  _refreshEmptyStateHeading();
 }
 
 // ── Conversation header (Surface C top) ─────────────────────────────────
@@ -1385,9 +1753,12 @@ function _scenarioFindAgent(config) {
   return list.find((a) => a && a.enabled !== false && names.includes(a.name || '')) || null;
 }
 
-async function _scenarioApplyAgent(config) {
-  if (!config || typeof setChatRecipient !== 'function') return null;
+async function _scenarioApplyAgent(config, scenarioId) {
+  if (!config || typeof setChatRecipient !== 'function') {
+    return { kind: 'unavailable', reason: 'recipient_api_missing' };
+  }
   let agent = _scenarioFindAgent(config);
+  let registryFailed = false;
   if (!agent && typeof loadAgents === 'function') {
     try {
       await loadAgents(false);
@@ -1396,11 +1767,26 @@ async function _scenarioApplyAgent(config) {
         await loadAgents(true);
         agent = _scenarioFindAgent(config);
       }
-    } catch (_) { /* keep commander when the registry is unavailable */ }
+    } catch (err) {
+      registryFailed = true;
+      _convLog.warn('Commander quick-start Agent registry load failed', {
+        resource_id: String(scenarioId || ''),
+        agent_id: String(config.agentId || ''),
+        error: err && err.message ? err.message : String(err || ''),
+      });
+    }
   }
   if (!agent) {
     setChatRecipient('new-chat', { kind: 'commander' });
-    return { kind: 'commander' };
+    _convLog.warn('Commander quick-start Agent unavailable; falling back to Commander', {
+      resource_id: String(scenarioId || ''),
+      agent_id: String(config.agentId || ''),
+      reason: registryFailed ? 'agent_registry_error' : 'agent_missing',
+    });
+    return {
+      kind: 'commander',
+      reason: registryFailed ? 'agent_registry_error' : 'agent_missing',
+    };
   }
   setChatRecipient('new-chat', {
     kind: 'agent',
@@ -1410,42 +1796,125 @@ async function _scenarioApplyAgent(config) {
   return { kind: 'agent', agent };
 }
 
-// Scenario chips — bound once in init() (state.js calls into here via
-// _initEmptyStateScenarios). Click pre-fills the textarea with the per-chip
-// template, switches the new-chat recipient to the matching installed agent
-// when available (otherwise commander handles it), and moves the caret to
-// the first `[...]` placeholder so the user keeps typing the specific
-// question, not editing scaffolding.
-function _initEmptyStateScenarios() {
-  const row = document.getElementById('new-chat-scenarios');
-  if (!row || row.dataset.bound === '1') return;
-  row.dataset.bound = '1';
-  row.querySelectorAll('.new-chat-scenario-chip').forEach((btn) => {
+// Quick-start cards prefill the composer and bind its configured specialist.
+// Cards are individually marked as bound because a client-config refresh or
+// locale change replaces the grid without replacing the containing section.
+function _bindEmptyStateScenarioButtons(row) {
+  if (!row) return;
+  const buttons = Array.from(row.querySelectorAll('.new-chat-scenario-chip'));
+  buttons.forEach((btn, index) => {
+    if (btn.dataset.quickStartBound === '1') return;
+    btn.dataset.quickStartBound = '1';
     btn.addEventListener('click', async () => {
       const id = btn.dataset.scenario || '';
       const config = _SCENARIO_CONFIGS[id];
+      const position = index + 1;
+      const startedAt = Date.now();
+      const telemetry = {
+        resource_id: id,
+        agent_id: String((config && config.agentId) || ''),
+        position,
+        source: _quickStartSource,
+      };
+      _convTrackClick('commander_quick_start', telemetry);
+      if (!config) {
+        _convLog.warn('Commander quick-start scenario config missing', { resource_id: id, position });
+        _convTrackEvent('commander_quick_start_result', {
+          ...telemetry,
+          result: 'failure',
+          reason: 'config_missing',
+          duration_ms: Date.now() - startedAt,
+        });
+        return;
+      }
       const key = config && config.templateKey;
       const raw = key ? t(key) : '';
       const tmpl = (raw && raw !== key) ? raw : (_SCENARIO_TEMPLATES_FALLBACK_EN[id] || '');
-      if (!tmpl) return;
-      const applied = await _scenarioApplyAgent(config);
-      if (!applied) return;
+      if (!tmpl) {
+        _convLog.warn('Commander quick-start template missing', { resource_id: id, position });
+        _convTrackEvent('commander_quick_start_result', {
+          ...telemetry,
+          result: 'failure',
+          reason: 'template_missing',
+          duration_ms: Date.now() - startedAt,
+        });
+        return;
+      }
+      const applied = await _scenarioApplyAgent(config, id);
+      if (!applied || applied.kind === 'unavailable') {
+        _convLog.warn('Commander quick-start recipient API unavailable', { resource_id: id, position });
+        _convTrackEvent('commander_quick_start_result', {
+          ...telemetry,
+          result: 'failure',
+          reason: (applied && applied.reason) || 'recipient_unavailable',
+          duration_ms: Date.now() - startedAt,
+        });
+        return;
+      }
       const input = document.getElementById('new-chat-input');
-      if (!input) return;
+      if (!input) {
+        _convLog.warn('Commander quick-start composer missing', { resource_id: id, position });
+        _convTrackEvent('commander_quick_start_result', {
+          ...telemetry,
+          result: 'failure',
+          reason: 'composer_missing',
+          duration_ms: Date.now() - startedAt,
+        });
+        return;
+      }
       input.value = tmpl;
+      _setCommanderTemplateAttribution(input, {
+        entry_point: 'quick_start',
+        ...telemetry,
+        recipient_type: applied.kind === 'agent' ? 'agent' : 'commander',
+      });
       input.focus();
-      // Caret on the first `[...]` placeholder so the user types directly
-      // into the slot. autoGrow recomputes height after value change.
-      const m = tmpl.match(/\[[^\]]*\]/);
-      if (m && typeof m.index === 'number') {
-        input.setSelectionRange(m.index, m.index + m[0].length);
+      // Select the concrete subject (coffee machine, login page, etc.) so the
+      // user's next keystroke customizes the example immediately. Server-fed
+      // templates may still carry a real placeholder; retain the existing
+      // blocking behavior for those templates only.
+      const subject = _quickStartText(config.subjectKey, config.subjectFallback || '');
+      const editableSubject = _findQuickStartSubject(tmpl, subject);
+      const placeholder = _findQuickStartPlaceholder(tmpl);
+      if (editableSubject) {
+        delete input.dataset.commanderQuickStartPlaceholder;
+        input.setSelectionRange(editableSubject.start, editableSubject.end);
+      } else if (placeholder) {
+        input.dataset.commanderQuickStartPlaceholder = placeholder.text;
+        input.setSelectionRange(placeholder.start, placeholder.end);
       } else {
+        delete input.dataset.commanderQuickStartPlaceholder;
         input.setSelectionRange(tmpl.length, tmpl.length);
       }
       try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      _convTrackEvent('commander_quick_start_result', {
+        ...telemetry,
+        result: applied.kind === 'agent' ? 'success' : 'fallback',
+        reason: applied.reason || '',
+        recipient_type: applied.kind === 'agent' ? 'agent' : 'commander',
+        duration_ms: Date.now() - startedAt,
+      });
     });
   });
 }
+
+function _initEmptyStateScenarios() {
+  const row = document.getElementById('new-chat-scenarios');
+  if (!row) return;
+  _bindCommanderTemplateAttributionReset(document.getElementById('new-chat-input'));
+  const grid = document.getElementById('new-chat-scenario-grid');
+  if (grid && !grid.children.length) _renderQuickStartScenarios();
+  _bindEmptyStateScenarioButtons(row);
+  _refreshQuickStartConfig(row);
+}
+
+window.addEventListener('i18n-change', () => {
+  const row = document.getElementById('new-chat-scenarios');
+  if (!row) return;
+  _renderEmptyStateHeading();
+  _renderQuickStartScenarios();
+  _bindEmptyStateScenarioButtons(row);
+});
 function onEnterConversationView() {
   if (_messageSelectionState && _messageSelectionState.cid !== currentCid) _exitMessageSelection();
   _renderRecipientChip('conversation');
@@ -1596,7 +2065,7 @@ function _groupEventDedupeKey(evData) {
         return `process:event:${actor}:${turnId}:context:${phase}:${payload.tokensBefore || ''}:${payload.tokensAfter || ''}`;
       }
       if (evt.stream === 'runtime') {
-        return `process:event:${actor}:${turnId}:runtime:${payload.duration_ms || payload.durationMs || payload.elapsedMs || ''}:${payload.phase || payload.status || ''}:${payload.attempt || ''}`;
+        return `process:event:${actor}:${turnId}:runtime:${payload.bubble_duration_ms ?? payload.duration_ms ?? payload.durationMs ?? payload.elapsedMs ?? ''}:${payload.phase || payload.status || ''}:${payload.segment_index ?? ''}:${payload.attempt || ''}`;
       }
       if (evt.stream === 'tool' && String(phase) === 'progress') {
         const progressPhase = String(payload.progress_phase || '');
@@ -1634,6 +2103,9 @@ function _backgroundGroupEventDedupeKey(evData) {
   if (evData.type === 'aborted') return 'aborted';
   if (evData.type === 'turn_silent') {
     return `turn_silent:${evData.actor || ''}:${evData.turn_id || evData.turnId || ''}`;
+  }
+  if (evData.type === 'segment_boundary') {
+    return `segment_boundary:${evData.actor || ''}:${evData.turn_id || evData.turnId || ''}`;
   }
   return '';
 }
@@ -1994,6 +2466,23 @@ if (typeof window !== 'undefined') {
 // @-prefix that would route somewhere.
 const _LEADING_MENTION_RE = /^@([A-Za-z0-9_一-鿿-]+)\s?/u;
 
+// `@commander` / `@指挥官` is a transport-only routing marker. The group bus
+// removes it before persisting the user message, but the optimistic bubble is
+// painted from the outbound payload before that echo arrives. Mirror the bus's
+// reserved-recipient cleanup at the display boundary so live and historical
+// bubbles agree without changing the payload used for routing or retry.
+function _stripCommanderRoutingMentionsForDisplay(raw) {
+  let text = String(raw || '');
+  text = text.replace(
+    /(^|\s|[,，:：。！？!?])@(?:commander|指挥官)(?=$|\s|[,，:：。！？!?])/giu,
+    '$1',
+  );
+  text = text.replace(/[ \t]+([,，:：。！？!?])/g, '$1');
+  text = text.replace(/[ \t]{2,}/g, ' ');
+  text = text.replace(/\n[ \t]+/g, '\n');
+  return text.trim();
+}
+
 function _normaliseRecipientSnapshot(snapshot) {
   const r = _normRecipient(snapshot);
   if (!r) return null;
@@ -2301,6 +2790,7 @@ async function _refreshGroupMembers(cid) {
       // `onEnterConversationView → _refreshChatHeader` call fires before
       // this async fetch lands), and stale ones don't repaint after `@`.
       if (cid === currentCid) {
+        try { _renderRecipientChip('conversation'); } catch (_) { /* not yet bound */ }
         try { _refreshChatHeader(); } catch (_) { /* not yet bound */ }
       }
       // Roster change can flip the inline "create agent" button visibility:
@@ -2523,10 +3013,20 @@ function _findRenderedGroupMessage(container, message, exclude = null) {
   }
   const sig = _groupMessageRenderSignature(message);
   if (!sig) return null;
-  const existingBySig = container.querySelector(
+  // A signature is only a fallback for an optimistic/live node that has not
+  // received its persisted id yet. Two real messages can legitimately have
+  // the same actor, text and second-resolution timestamp (most visibly when a
+  // queued turn receives the same deterministic reply as the turn before it).
+  // Never collapse those records merely because their render signatures
+  // collide: once both sides have ids, identity is authoritative.
+  const existingBySig = Array.from(container.querySelectorAll(
     `.chat-message[data-group-msg-sig="${CSS.escape(sig)}"]`,
-  );
-  if (existingBySig && existingBySig !== exclude) return existingBySig;
+  )).find((candidate) => {
+    if (candidate === exclude) return false;
+    const candidateId = candidate.dataset.msgId || '';
+    return !msgId || !candidateId || candidateId === String(msgId);
+  });
+  if (existingBySig) return existingBySig;
   return null;
 }
 
@@ -4168,11 +4668,24 @@ async function _deleteConversationWithConfirm(cid, opts = {}) {
     ? conversations.find((item) => item && item.conversation_id === cid)
     : null;
   abortConvStream(cid);
-  _forgetConvLocal(cid);
   const projectId = _projectIdForConversation(cid);
-  await apiFetch(`/api/conversations/${encodeURIComponent(cid)}?project_id=${encodeURIComponent(projectId)}`, {
-    method: 'DELETE',
-  });
+  try {
+    const response = await apiFetch(
+      `/api/conversations/${encodeURIComponent(cid)}?project_id=${encodeURIComponent(projectId)}`,
+      { method: 'DELETE' },
+    );
+    let result = null;
+    try { result = await response.json(); } catch (_) { /* status remains authoritative */ }
+    if (!response.ok || result?.ok === false) {
+      throw new Error(result?.error || `delete failed (${response.status || 'unknown'})`);
+    }
+  } catch (err) {
+    const reason = err && err.message ? err.message : String(err || 'delete failed');
+    _convLog.warn('delete conversation failed', { cid, error: reason });
+    await uiAlert(t('chat.message_delete_failed', { reason }));
+    return false;
+  }
+  _forgetConvLocal(cid);
   if (currentCid === cid) setView('new-chat');
   conversations = (Array.isArray(conversations) ? conversations : [])
     .filter((item) => item && item.conversation_id !== cid);
@@ -4193,6 +4706,7 @@ async function _deleteConversationWithConfirm(cid, opts = {}) {
   }
   renderConversationList();
   if (typeof opts.afterDelete === 'function') await opts.afterDelete(cid);
+  return true;
 }
 
 function _conversationActionItems(cid, opts = {}) {
@@ -4238,7 +4752,7 @@ function _openConversationActionMenu(anchorBtn, cid, opts = {}) {
 
   const items = _conversationActionItems(cid, opts);
   menu.innerHTML = items.map((it, idx) =>
-    `<div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}" data-action-idx="${idx}">${escapeHtml(it.label)}</div>`
+    `<div class="ctx-row-menu-item${it.danger ? ' is-danger' : ''}" data-action="${escapeHtml(it.action)}" data-action-idx="${idx}">${escapeHtml(it.label)}</div>`
   ).join('');
   menu.dataset.cid = cid;
 
@@ -4809,6 +5323,14 @@ async function loadConversationHistory(cid, opts = {}) {
   const container = document.getElementById('chat-history');
   const preserveScroll = opts && opts.preserveScroll === true;
   const scrollSnapshot = preserveScroll ? _captureHistoryReloadScroll(container) : null;
+  // A task switch rebuilds this container. Cancel any delayed send-time pin
+  // before replacing its children; otherwise a queued double-rAF callback can
+  // re-append the old turn's spacer after the new task has rendered. A
+  // preserve-scroll reconcile may run mid-stream, so keep the active turn's
+  // pin in that one case.
+  if (!preserveScroll || !isConvPending(cid)) {
+    _setChatScrollOffset(false, container);
+  }
   container.classList.remove('has-scroll-offset');
   if (!preserveScroll) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
@@ -5075,6 +5597,7 @@ function _messageRecordHasMountedSidecars(gm, el, opts = {}) {
   if (Array.isArray(gm.artifacts) && gm.artifacts.length && !el.querySelector('.chat-artifact-host')) return false;
   if (Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length && !el.querySelector('.chat-marketplace-request')) return false;
   if (_processItemsHaveRenderableLine(gm.process) && !el.querySelector('.stream-process')) return false;
+  if (_isInterruptedAssistantMessage(gm) && !el.querySelector('.bubble-retry-btn')) return false;
   return true;
 }
 
@@ -5341,6 +5864,12 @@ function _releaseChatScrollPinForUser(el) {
   _markStickyPausedByUser(el);
   return true;
 }
+function _hasMovedAwayFromChatScrollPin(el, threshold = 2) {
+  if (!el || !el._scrollPinActive) return false;
+  const target = Number(el._scrollPinTargetTop);
+  if (!Number.isFinite(target)) return false;
+  return Math.abs(Number(el.scrollTop || 0) - target) > threshold;
+}
 function _isStickyPausedByUser(el) {
   if (!el || !el._stickyUserPaused) return false;
   if (_isNearFollowTarget(el)) {
@@ -5366,6 +5895,16 @@ function _bindStickToBottom(el) {
     if (releasedPin || !_isNearFollowTarget(el)) _markStickyPausedByUser(el);
   }, { passive: true });
   el.addEventListener('scroll', () => {
+    // Wheel/touch listeners cover direct gestures, but scrollbar dragging,
+    // keyboard scrolling, accessibility controls, and momentum scrolling can
+    // reach us as a bare `scroll` event. Track the send-time pin's exact
+    // target so those paths release the artificial spacer as soon as the
+    // viewport actually moves. A scroll event that lands on the target is
+    // the delayed result of our own pin assignment and must remain inert.
+    if (el._scrollPinActive) {
+      if (!_hasMovedAwayFromChatScrollPin(el)) return;
+      _releaseChatScrollPinForUser(el);
+    }
     const nearBottom = _isNearFollowTarget(el);
     if (nearBottom) {
       el._stickyUserPaused = false;
@@ -5735,23 +6274,27 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
 
   const rawContent = message.content || '';
   const isHtmlSnippet = typeof rawContent === 'string' && rawContent.startsWith('<');
-  // User messages carrying an `<agent-input-submission>` tag (form submit
-  // replay) strip the XML tag for display — the bullet list above it
-  // describes the same values, and the LLM still parses the tag from the
-  // stored raw text. Assistant messages get a defensive structural-block
-  // strip covering `<agent>` / `<agent-input-form>` / `<agent-input-submission>`
-  // in case the backend's extractor missed a format variant (see
+  // User messages strip structural tags and transport-only commander routing
+  // mentions for display. Keep `rawContent` untouched for retry and delivery.
+  // Assistant messages get a defensive structural-block strip covering
+  // `<agent>` / `<agent-input-form>` / `<agent-input-submission>` in case the
+  // backend's extractor missed a format variant (see
   // `_stripSurvivingStructuralBlocks` in strip-structural-blocks.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
-    if (role === 'user') displayContent = _stripUserStructuralBlocksForDisplay(rawContent);
+    if (role === 'user') {
+      displayContent = _stripCommanderRoutingMentionsForDisplay(
+        _stripUserStructuralBlocksForDisplay(rawContent),
+      );
+    }
     else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
     ? sanitizeHtml(rawContent)
     : `<div class="markdown-body">${_renderMessageMarkdown(displayContent)}</div>`;
 
-  const attachmentCid = message.attachment_cid || message.attachments_cid || opts.cid || currentCid;
+  const messageCid = opts.cid || currentCid;
+  const attachmentCid = message.attachment_cid || message.attachments_cid || messageCid;
   const attachmentsHtml = (role === 'user' && Array.isArray(message.attachments) && message.attachments.length)
     ? _renderMessageAttachmentsHtml(message.attachments, attachmentCid)
     : '';
@@ -5759,9 +6302,10 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     ? message.produced
     : null;
   const referencesHtml = (role === 'user' && Array.isArray(message.references) && message.references.length)
-    ? _renderMessageReferencesHtml(message.references)
+    ? _renderMessageReferencesHtml(message.references, messageCid)
     : '';
   const failedAssistant = role === 'assistant' && _isFailedAssistantContent(rawContent, message);
+  const interruptedAssistant = role === 'assistant' && _isInterruptedAssistantMessage(message);
   const createdAgentsList = role === 'assistant' ? _normalizeCreatedAgents(message) : null;
   const createdAgentHtml = createdAgentsList
     ? _renderMessageCreatedAgentHtml(createdAgentsList)
@@ -5813,6 +6357,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     }
   }
   if (failedAssistant) msgDiv.dataset.failed = '1';
+  if (interruptedAssistant) msgDiv.dataset.interrupted = '1';
   _stampRenderedGroupMessage(msgDiv, message);
   // Stash chip-tracked produced paths on the DOM so the 引用 handler can
   // attach them to the quote payload without plumbing message into every
@@ -5871,6 +6416,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // raw-markdown replies; sanitized HTML status stubs are not archivable.
   if (role === 'assistant' && failedAssistant) {
     _attachFailedAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent));
+    // Live group-bus messages can arrive without a matching streaming
+    // placeholder (fast preflight failures and reconnect races). History
+    // hydration must stay silent, but a newly appended live failure still
+    // needs the same billing guidance as the placeholder-finalization path.
+  } else if (role === 'assistant' && interruptedAssistant) {
+    _attachInterruptedAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent), {
+      archive: !isHtmlSnippet && archive,
+    });
   } else if (role === 'assistant') {
     _attachAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent), {
       archive: !isHtmlSnippet && archive,
@@ -6002,11 +6555,7 @@ function _marketplaceTrackInstallFailure(req, installError, surface = 'conversat
   _convTrackError('marketplace_dependency_skill_missing', {
     surface,
     requested_kind: req?.kind || '',
-    requested_id: req?.id || '',
-    requested_name: req?.name || '',
-    dependency_skill_id: installError?.id || '',
-    dependency_skill_name: installError?.name || '',
-    reason: installError?.reason || '',
+    reason: 'not_found',
   });
 }
 
@@ -6196,6 +6745,8 @@ async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision
 function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
   const bubble = msgDiv.querySelector('.chat-bubble');
   if (!bubble) return;
+  const runtimeText = _processSummaryRuntimeFromItems(items);
+  const displayItems = _processItemsForDisplay(items);
   const details = document.createElement('details');
   details.className = 'stream-process';
   if (expanded) details.open = true;
@@ -6208,8 +6759,8 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
     <div class="stream-process-body"></div>
   `;
   const body = details.querySelector('.stream-process-body');
-  _setProcessSummaryRuntime(details, _processSummaryRuntimeFromItems(items));
-  for (const item of items) {
+  _setProcessSummaryRuntime(details, runtimeText);
+  for (const item of displayItems) {
     let text = '';
     const itemEvent = item && item.type === 'event'
       ? item.event
@@ -6230,7 +6781,8 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
     _setProcessLineContent(line, text, kind);
     body.appendChild(line);
   }
-  if (body.childElementCount === 0) return;  // nothing renderable
+  if (body.childElementCount === 0 && !runtimeText) return;
+  if (body.childElementCount === 0) details.classList.add('runtime-only');
   bubble.insertBefore(details, bubble.firstChild);
 }
 
@@ -6278,24 +6830,22 @@ function _referenceDisplayName(ref) {
 
 function _quotePreviewAttribution(quote, targetCid) {
   const fromName = _referenceDisplayName(quote);
-  const sourceCid = String(quote?.sourceCid || '');
+  const sourceCid = String(quote?.source_cid || quote?.sourceCid || '');
   if (!sourceCid || sourceCid === String(targetCid || '')) {
     return t('chat.quote_from', { name: fromName });
   }
-  const sourceTitle = quote.sourceTitle || _conversationTitleForCid(sourceCid);
+  const sourceTitle = quote.source_title || quote.sourceTitle || _conversationTitleForCid(sourceCid);
   return t('chat.reference_from_task', { title: sourceTitle, name: fromName });
 }
 
-function _renderMessageReferencesHtml(references) {
+function _renderMessageReferencesHtml(references, targetCid) {
   const refs = Array.isArray(references) ? references.slice(0, 20) : [];
   if (!refs.length) return '';
-  const sourceTitle = refs[0].source_title || t('chat.reference_unknown_task');
-  const title = t('chat.reference_bundle_title', { title: sourceTitle });
   const rows = refs.map((ref) => {
-    const name = _referenceDisplayName(ref);
+    const attribution = _quotePreviewAttribution(ref, targetCid);
     const text = String(ref.text || '').replace(/\s+/g, ' ').trim();
     return `<div class="chat-reference-message">
-      <span class="chat-reference-author">${escapeHtml(name)}</span>
+      <span class="chat-reference-author">${escapeHtml(attribution)}</span>
       <span class="chat-reference-text">${escapeHtml(text)}</span>
     </div>`;
   }).join('');
@@ -6316,7 +6866,6 @@ function _renderMessageReferencesHtml(references) {
   }).join('');
   const files = `${attachmentFiles}${producedFiles}`;
   return `<div class="chat-reference-bundle">
-    <div class="chat-reference-title">${escapeHtml(title)}</div>
     <div class="chat-reference-list">${rows}</div>
     ${files ? `<div class="chat-reference-files">${files}</div>` : ''}
   </div>`;
@@ -6596,6 +7145,16 @@ function _attachFailedAssistantActions(msgDiv, getContent) {
   _attachBubbleActions(msgDiv, getContent, {
     archive: false,
     retry: true,
+  });
+}
+
+function _attachInterruptedAssistantActions(msgDiv, getContent, opts) {
+  if (!msgDiv) return;
+  msgDiv.dataset.interrupted = '1';
+  _attachBubbleActions(msgDiv, getContent, {
+    archive: !opts || opts.archive !== false,
+    retry: true,
+    report: true,
   });
 }
 
@@ -6902,7 +7461,10 @@ function _syncBubbleReferenceActionState(msgDiv) {
 function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const includeArchive = opts.archive !== false;
   const includeRetry = opts.retry === true;
-  const mode = includeRetry ? 'failed' : (includeArchive ? 'assistant' : 'user');
+  const includeReport = opts.report === true;
+  const mode = includeRetry
+    ? (includeArchive ? 'assistant-retry' : 'failed')
+    : (includeReport ? (includeArchive ? 'assistant' : 'assistant-feedback') : (includeArchive ? 'assistant' : 'user'));
   // Archive button lives in the `.chat-msg-actions` row below the bubble
   // (alongside produced-file chips). Lazily create the row if a caller
   // (e.g. streaming placeholders that didn't allocate one) needs it.
@@ -7150,14 +7712,58 @@ async function handleNewChatSubmit() {
   const raw = (input.value || '').trim();
   const quotes = _getQuotes(DRAFT_CID).slice();
   if (!raw && !quotes.length) return;
-  if (typeof unresolvedOssTemplatePlaceholder === 'function'
-    && unresolvedOssTemplatePlaceholder(input)) {
-    await uiAlert(t('oss.task_required'));
+  const requestText = raw || t('chat.reference_default_prompt');
+  const draftItems = _chatAttachList(DRAFT_CID);
+  const pendingUseSelections = (typeof getChatUseSelections === 'function')
+    ? getChatUseSelections('new-chat')
+    : [];
+  const entryAttribution = _readCommanderTemplateAttribution(input);
+  const sendAttemptStartedAt = performance.now();
+  const sendAttempt = {
+    conversation_id: '',
+    source_view: 'new_chat',
+    content_length: requestText.length,
+    attachment_count: draftItems.filter((a) => a.status !== 'error').length,
+    ...entryAttribution,
+  };
+  const unresolvedQuickStart = _unresolvedQuickStartPlaceholder(input);
+  const unresolvedOss = typeof unresolvedOssTemplatePlaceholder === 'function'
+    ? unresolvedOssTemplatePlaceholder(input)
+    : '';
+  if (unresolvedQuickStart || unresolvedOss) {
+    _convTrackEvent('commander_template_send_blocked', {
+      ...entryAttribution,
+      reason: 'placeholder_unresolved',
+    });
+    _trackChatSendResult('failure', {
+      ...sendAttempt,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'preflight',
+      failure_reason: 'template_incomplete',
+    });
+    await uiAlert(t(unresolvedQuickStart ? 'new_chat.quick.task_required' : 'oss.task_required'));
     return;
   }
-  if (!ensureModelConfigured()) return;
+  if (!ensureModelConfigured()) {
+    _trackChatSendResult('failure', {
+      ...sendAttempt,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'preflight',
+      failure_reason: 'model_not_configured',
+    });
+    return;
+  }
+  if (draftItems.some((a) => a.status === 'uploading')) {
+    _trackChatSendResult('failure', {
+      ...sendAttempt,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'preflight',
+      failure_reason: 'attachment_uploading',
+    });
+    await uiAlert(t('chat.attach_still_uploading'));
+    return;
+  }
   const references = _referenceSnapshotsForQuotes(quotes);
-  const requestText = raw || t('chat.reference_default_prompt');
   const useSelections = (typeof consumeChatUseSelections === 'function')
     ? consumeChatUseSelections('new-chat')
     : [];
@@ -7165,20 +7771,22 @@ async function handleNewChatSubmit() {
   // here and conv-create doesn't reset it before we can transfer.
   const recipientSnapshot = _recipientSnapshotForSend('new-chat');
   _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
+  // Keep the title seed separate from transport content. `content` may gain
+  // an injected leading `@Agent` for routing, while task titles describe only
+  // the user's request.
+  const titleText = (typeof transformChatUseTokens === 'function')
+    ? transformChatUseTokens(requestText)
+    : requestText;
   const content = applyRecipientPrefix(transformWithChatUse(requestText), 'new-chat', {
     recipientSnapshot,
   });
-  const draftItems = _chatAttachList(DRAFT_CID);
-  if (draftItems.some((a) => a.status === 'uploading')) {
-    await uiAlert(t('chat.attach_still_uploading'));
-    return;
-  }
   const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
-  const sendAttemptStartedAt = performance.now();
   _convLog.info('new chat submit', {
     content_length: content.length,
     use: useSelections.map((sel) => sel.kind),
     attachments: draftNames.length,
+    entry_point: entryAttribution.entry_point,
+    resource_id: entryAttribution.resource_id || '',
   });
   if (window.Monitor) (() => {})('chat_send', {
     source_view: 'new_chat',
@@ -7205,8 +7813,7 @@ async function handleNewChatSubmit() {
     // Use the shared `_autoTitle` so this matches backend `autoTitle` —
     // otherwise the optimistic + backend-refreshed titles disagree and
     // the sidebar entry flips on the next loadConversations.
-    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(requestText) : requestText;
-    conv.title = _autoTitle(titleSeed);
+    conv.title = _autoTitle(titleText);
     // Backend `createConversation` returns `created_at`/`updated_at` but
     // NOT the derived `last_active_at` (that lives only in `listConversations`'
     // output). Set it explicitly so `timeBucket` puts the brand-new row in
@@ -7215,13 +7822,16 @@ async function handleNewChatSubmit() {
     conversations.unshift(conv);
     renderConversationList();
   } catch (e) {
+    _convLog.warn('new chat conversation creation failed', {
+      entry_point: entryAttribution.entry_point,
+      resource_id: entryAttribution.resource_id || '',
+      error: e && e.message ? e.message : String(e || ''),
+    });
     _trackChatSendResult('failure', {
-      conversation_id: '',
-      source_view: 'new_chat',
-      content_length: content.length,
-      attachment_count: draftNames.length,
+      ...sendAttempt,
       duration_ms: performance.now() - sendAttemptStartedAt,
       failure_stage: 'conversation_create',
+      failure_reason: 'conversation_create_failed',
     });
     await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
     if (newBtn) newBtn.disabled = false;
@@ -7241,7 +7851,12 @@ async function handleNewChatSubmit() {
       });
       const data = await res.json();
       if (data.ok) {
-        attachments = draftNames;
+        const adoptedNameBySource = new Map(
+          (Array.isArray(data.items) ? data.items : [])
+            .filter((item) => item && item.sourceName && item.targetName)
+            .map((item) => [item.sourceName, item.targetName]),
+        );
+        attachments = draftNames.map((name) => adoptedNameBySource.get(name) || name);
       } else {
         _convLog.warn('adopt draft attachments failed', data.error);
         await uiAlert(t('chat.attach_adopt_failed', { reason: data.error || t('chat.unknown_error') }));
@@ -7259,6 +7874,7 @@ async function handleNewChatSubmit() {
   _chatAttachClear(convId);
   _clearQuotes(DRAFT_CID);
 
+  _clearCommanderTemplateAttribution(input);
   input.value = '';
   autoGrow(input, 260);
   // Also clear the conversation-view input. setView with skipLoad:true
@@ -7278,6 +7894,7 @@ async function handleNewChatSubmit() {
   _renderRecipientChip('conversation');
   if (newBtn) newBtn.disabled = false;
   const extra = {
+    title_text: titleText,
     ...(attachments.length ? { attachments } : {}),
     ...(useSelections.length ? { use_selections: useSelections } : {}),
     ...(references.length ? { references } : {}),
@@ -7292,28 +7909,43 @@ async function handleChatSubmit() {
   // A bare quote with no extra text is a legitimate "look at this" forward;
   // only reject when both the textarea AND the quote are empty.
   if (!raw && !_getQuotes(currentCid).length) return;
-  if (!ensureModelConfigured()) return;
   const cid = currentCid;
   const quotes = _getQuotes(cid).slice();
-  const references = _referenceSnapshotsForQuotes(quotes);
   const requestText = raw || t('chat.reference_default_prompt');
   const useSelections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('conversation')
     : [];
   const attachList = _chatAttachList(cid);
-  if (attachList.some((a) => a.status === 'uploading')) {
-    await uiAlert(t('chat.attach_still_uploading'));
-    return;
-  }
   const attachments = attachList.filter((a) => a.status !== 'error').map((a) => a.name);
   _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
   if (window.Monitor) (() => {})('chat_send', {
     source_view: 'conversation',
-    content_length: raw.length,
+    content_length: requestText.length,
     has_skill: useSelections.some((sel) => sel.kind === 'skill'),
     has_connector: useSelections.some((sel) => sel.kind === 'connector'),
     attachment_count: attachments.length,
   });
+  if (!ensureModelConfigured()) {
+    _trackChatSendResult('failure', {
+      ...sendAttempt,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'preflight',
+      failure_reason: 'model_not_configured',
+    });
+    return;
+  }
+  if (attachList.some((a) => a.status === 'uploading')) {
+    _trackChatSendResult('failure', {
+      ...sendAttempt,
+      duration_ms: performance.now() - sendAttemptStartedAt,
+      failure_stage: 'preflight',
+      failure_reason: 'attachment_uploading',
+    });
+    await uiAlert(t('chat.attach_still_uploading'));
+    return;
+  }
+  const references = _referenceSnapshotsForQuotes(quotes);
+  _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
 
   // If this conversation is already streaming OR has queued items waiting,
   // enqueue the new message instead of sending it now. Keep the raw text so
@@ -7324,6 +7956,12 @@ async function handleChatSubmit() {
   const recipientSnapshot = _takeRecipientSnapshotForSend('conversation');
   if (isConvPending(cid) || (messageQueues.get(cid) || []).length) {
     if (attachments.length) {
+      _trackChatSendResult('failure', {
+        ...sendAttempt,
+        duration_ms: performance.now() - sendAttemptStartedAt,
+        failure_stage: 'preflight',
+        failure_reason: 'attachment_queue_blocked',
+      });
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
@@ -7384,7 +8022,7 @@ function _taskTurnRunId() {
   return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
-function _taskTurnStart(cid, content, extra, startedAt) {
+function _taskTurnStart(cid, content, extra, startedAt, context = {}) {
   if (!cid) return;
   const attachments = Array.isArray(extra && extra.attachments) ? extra.attachments.map(String) : [];
   const ts = Math.round(startedAt || Date.now());
@@ -7526,6 +8164,35 @@ function _taskTurnAddMessage(run, msg) {
   });
 }
 
+function _taskTurnSampleMessage(msg) {
+  const role = msg && msg.role === 'user' ? 'user' : 'assistant';
+  const rawText = String(msg && msg.text || '');
+  let text = rawText;
+  if (role === 'user') {
+    try {
+      text = _stripUserStructuralBlocksForDisplay(rawText);
+    } catch (_) {
+      text = rawText;
+    }
+  }
+  const actorName = role === 'assistant'
+    ? String(msg && msg.actor_name || '').trim().slice(0, 128)
+    : '';
+  return {
+    role,
+    actor: String(msg && msg.actor || (role === 'user' ? 'user' : '')).slice(0, 128),
+    ...(actorName ? { actor_name: actorName } : {}),
+    text,
+    created_at_ms: Math.max(0, Math.round(Number(msg && msg.created_at_ms) || 0)),
+    ...(msg && msg.message_id ? { message_id: String(msg.message_id).slice(0, 64) } : {}),
+    ...(msg && msg.partial ? { partial: true } : {}),
+    ...(msg && msg.attachment_count ? { attachment_count: msg.attachment_count } : {}),
+    ...(msg && Array.isArray(msg.attachment_names) && msg.attachment_names.length
+      ? { attachment_names: msg.attachment_names.map(String) }
+      : {}),
+  };
+}
+
 function _taskTurnRecordProcess(run, evData) {
   const processData = evData && evData.data ? evData.data : {};
   let processLine = '';
@@ -7621,6 +8288,15 @@ function _taskTurnRecordStreamEvent(cid, ev) {
     return;
   }
   if (evData.type === 'process') {
+    _taskTurnMarkModelEvent(run);
+    const processData = evData.data && typeof evData.data === 'object' ? evData.data : {};
+    const processEvent = processData.event && typeof processData.event === 'object'
+      ? processData.event
+      : null;
+    if (processData.type === 'progress'
+        || (processData.type === 'event' && String(processEvent && processEvent.stream || '') !== 'runtime')) {
+      _taskTurnMarkContent(run);
+    }
     _taskTurnAddAgent(run, evData.actor);
     _taskTurnRecordProcess(run, evData);
     return;
@@ -7734,14 +8410,11 @@ function _makeConvChatController(cid, options = {}) {
       onDone(msgEl, id, result = {}) {
         // Final cleanup is owned by the controller that still represents this
         // conversation's active send.
-        // `_finishStreamingMsg` synchronously drains the next queued
-        // message (via `_dispatchNextQueued` → new `ctrl.send`), which
-        // appends the user bubble + RE-ARMS the scroll-pin spacer for the
-        // new turn. We must NOT call `_setChatScrollOffset(false)` here —
-        // the controller finally block already removed the OLD spacer
-        // before invoking us, so a second removal would strip the spacer
-        // the new turn just added and the queued user message would render
-        // off-screen until later layout shifts pushed it into view.
+        // `_finishStreamingMsg` releases the OLD pin before it synchronously
+        // drains the next queued message (`_dispatchNextQueued` → new
+        // `ctrl.send`). We must NOT release again after it returns: the new
+        // turn may already have appended its user bubble and scheduled its
+        // own scroll pin.
         // A stale controller must never settle or clear a newer send for the
         // same conversation. Reuse the existing controller identity instead
         // of introducing another run token.
@@ -7767,10 +8440,14 @@ async function sendInConversation(cid, content, extra, options = {}) {
   if (!cid) return { started: false, aborted: false, errored: false, result: 'failure' };
   const startedAt = performance.now();
   const sendOptions = options && typeof options === 'object' ? options : {};
+  const entryAttribution = _normalizeCommanderTemplateAttribution(sendOptions);
   const statAgentId = String(sendOptions.agent_id || '');
   let doneResult = null;
   let taskStarted = false;
   const attachmentCount = Array.isArray(extra && extra.attachments) ? extra.attachments.length : 0;
+  const measuredContentLength = Number.isFinite(Number(sendOptions.content_length))
+    ? Math.max(0, Math.round(Number(sendOptions.content_length)))
+    : String(content || '').length;
   if (isConvPending(cid)) {
     // Queued input starts a new execution stream after the current one ends,
     // so it must not be merged into the active task-turn sample.
@@ -7785,7 +8462,10 @@ async function sendInConversation(cid, content, extra, options = {}) {
   const ctrl = _makeConvChatController(cid, {
     onStarted() {
       taskStarted = true;
-      _taskTurnStart(cid, content, extra, Date.now());
+      _taskTurnStart(cid, content, extra, Date.now(), {
+        source_view: sendOptions.source_view,
+        entry_point: entryAttribution.entry_point,
+      });
       if (typeof sendOptions.onStarted === 'function') {
         try { sendOptions.onStarted(); } catch (_) {}
       }
@@ -7811,6 +8491,12 @@ async function sendInConversation(cid, content, extra, options = {}) {
     const aborted = !!terminal.aborted;
     const errored = !!terminal.errored || !started;
     const result = aborted ? 'cancelled' : (errored ? 'failure' : 'success');
+    const terminalReason = String(terminal.reason || '');
+    const failureReason = started
+      ? 'stream_error'
+      : terminalReason === 'model_not_configured'
+        ? 'model_not_configured'
+        : 'stream_not_started';
     if (statAgentId) {
       _notifyAgentRunFinished(statAgentId, {
         duration_ms: durationMs,
@@ -7835,15 +8521,18 @@ async function sendInConversation(cid, content, extra, options = {}) {
         result: 'failure',
         conversation_id: cid,
         source_view: sendOptions.source_view || 'conversation',
-        content_length: String(content || '').length,
+        content_length: measuredContentLength,
         attachment_count: attachmentCount,
         duration_ms: durationMs,
         failure_stage: taskStarted ? 'stream' : 'preflight',
+        failure_reason: taskStarted ? 'stream_error' : 'stream_not_started',
+        ...entryAttribution,
       });
       (() => {})('chat_send', {
         conversation_id: cid,
         error_type: 'stream',
         error_message: err && err.message ? err.message : String(err),
+        ...entryAttribution,
       });
     }
     if (taskStarted && _convChatCtrls.get(cid) === ctrl) {
@@ -8142,6 +8831,20 @@ window.ConversationRuntime = {
 
 const _chatScrollOffsetObservers = new WeakMap();
 
+function _cancelScheduledChatScrollPin(container) {
+  if (!container) return 0;
+  container._scrollPinScheduleEpoch = Number(container._scrollPinScheduleEpoch || 0) + 1;
+  if (container._scrollPinOuterRaf != null && typeof cancelAnimationFrame === 'function') {
+    try { cancelAnimationFrame(container._scrollPinOuterRaf); } catch (_) {}
+  }
+  if (container._scrollPinInnerRaf != null && typeof cancelAnimationFrame === 'function') {
+    try { cancelAnimationFrame(container._scrollPinInnerRaf); } catch (_) {}
+  }
+  container._scrollPinOuterRaf = null;
+  container._scrollPinInnerRaf = null;
+  return container._scrollPinScheduleEpoch;
+}
+
 function _stopChatScrollOffsetObserver(container) {
   const state = _chatScrollOffsetObservers.get(container);
   if (!state) return;
@@ -8221,7 +8924,9 @@ function _setChatScrollOffset(on, containerOrId = 'chat-history') {
   if (!container) return;
   const existing = container.querySelector(':scope > .chat-scroll-spacer');
   if (!on) {
+    _cancelScheduledChatScrollPin(container);
     container._scrollPinActive = false;
+    delete container._scrollPinTargetTop;
     _stopChatScrollOffsetObserver(container);
     if (existing) existing.remove();
     return;
@@ -8247,6 +8952,7 @@ function _setChatScrollOffset(on, containerOrId = 'chat-history') {
   const naturalMaxScrollTop = Math.max(0, naturalScrollHeight - container.clientHeight);
   const needed = Math.max(0, targetScrollTop - naturalMaxScrollTop);
   spacer.style.height = `${needed}px`;
+  container._scrollPinTargetTop = targetScrollTop;
   // Place the sent user message near the top once. Later stream mutations
   // leave the outer chat scroll alone.
   const isStillFollowingPin = Math.abs(container.scrollTop - targetScrollTop) <= 48
@@ -8484,7 +9190,6 @@ function _createStreamingAssistantMessage(container, opts = {}) {
       <div class="stream-activity" data-role="activity" style="display:none">
         <span class="stream-activity-pulse" aria-hidden="true"></span>
         <span class="stream-activity-text" data-role="activity-text"></span>
-        <span class="stream-activity-meta" data-role="activity-meta"></span>
       </div>
       <div class="stream-final" data-role="final" style="display:none"></div>
       <div class="stream-thinking" data-role="thinking" aria-label="${escapeHtml(t('chat.thinking_short'))}">
@@ -8581,13 +9286,17 @@ function _formatToolDuration(ms) {
   return _formatProcessDuration(value);
 }
 
-function _runtimeDurationFromEvent(evt) {
-  if (!evt || typeof evt !== 'object' || evt.stream !== 'runtime') return '';
+function _runtimeDurationMsFromEvent(evt) {
+  if (!evt || typeof evt !== 'object' || evt.stream !== 'runtime') return null;
   const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
-  const duration = data.duration_ms ?? data.durationMs ?? data.elapsedMs;
+  const duration = data.bubble_duration_ms ?? data.duration_ms ?? data.durationMs ?? data.elapsedMs;
   const n = Number(duration);
-  if (!Number.isFinite(n)) return '';
-  return _formatProcessDuration(n);
+  return Number.isFinite(n) ? Math.max(0, n) : null;
+}
+
+function _runtimeDurationFromEvent(evt) {
+  const durationMs = _runtimeDurationMsFromEvent(evt);
+  return durationMs == null ? '' : _formatProcessDuration(durationMs);
 }
 
 function _runtimeDurationFromProcessItem(item) {
@@ -8595,6 +9304,21 @@ function _runtimeDurationFromProcessItem(item) {
     ? item.event
     : (item && item.type === 'progress' ? item.event : null);
   return _runtimeDurationFromEvent(evt);
+}
+
+function _runtimeEventFromProcessItem(item) {
+  const evt = item && item.type === 'event'
+    ? item.event
+    : (item && item.type === 'progress' ? item.event : null);
+  return _runtimeDurationMsFromEvent(evt) == null ? null : evt;
+}
+
+// Duration-bearing runtime items feed the process-summary clock and are not
+// process milestones. Hiding every one here keeps elapsed time in exactly one
+// place. Runtime retry/progress records carry no duration and remain visible.
+function _processItemsForDisplay(items) {
+  if (!Array.isArray(items)) return [];
+  return items.filter((item) => !_runtimeEventFromProcessItem(item));
 }
 
 function _processSummaryRuntimeFromItems(items) {
@@ -8624,9 +9348,34 @@ function _setProcessSummaryRuntime(root, durationText) {
   if (details.dataset) details.dataset.runtimeDuration = text;
 }
 
-function _setProcessSummaryRuntimeFromEvent(root, evt) {
-  const duration = _runtimeDurationFromEvent(evt);
-  if (duration) _setProcessSummaryRuntime(root, duration);
+// The process summary is the single visible elapsed-time surface. `elapsedMs`
+// drives it from turn start; a duration-bearing runtime event replaces it with
+// the backend's authoritative terminal value.
+function _updateStreamingRuntimeSummary(msg, evt, elapsedMs) {
+  if (!msg) return null;
+  const eventDurationMs = _runtimeDurationMsFromEvent(evt);
+  const hasRuntimeEvent = eventDurationMs != null;
+  const fallbackDurationMs = Number(elapsedMs);
+  if (!hasRuntimeEvent && !Number.isFinite(fallbackDurationMs)) return null;
+
+  const container = msg.querySelector('[data-role="process-container"]');
+  if (container) container.style.display = '';
+  if (!container) return null;
+
+  // A real end event freezes the clock. A segment_end value may be followed
+  // by more work in the same adopted placeholder, so the live clock remains
+  // allowed to advance until the final `phase:end` event arrives.
+  if (!hasRuntimeEvent && container.dataset.runtimeTerminal === '1') return container;
+  const phase = hasRuntimeEvent ? String(evt?.data?.phase || '') : '';
+  const durationMs = hasRuntimeEvent ? eventDurationMs : Math.max(0, fallbackDurationMs);
+  container.dataset.runtimeDurationMs = String(Math.max(0, Math.round(durationMs)));
+  if (hasRuntimeEvent && phase !== 'segment_end' && phase !== 'retrying') {
+    container.dataset.runtimeTerminal = '1';
+  } else {
+    delete container.dataset.runtimeTerminal;
+  }
+  _setProcessSummaryRuntime(msg, _formatProcessDuration(durationMs));
+  return container;
 }
 
 function _eventProcessKind(evt, text) {
@@ -8776,10 +9525,14 @@ function _isRedundantRoutingOnlyCommanderRecord(gm) {
       || (Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length)) {
     return false;
   }
-  // A terminal-handoff compatibility match may have arbitrary prep tools in
-  // its trail. Preserve real prose defensively; the regression record is an
-  // empty tail (its narration, if any, was already emitted as a seg bubble).
-  if (terminalHandoff && String(gm.text || '').trim()) return false;
+  // Tool shape alone cannot prove the body is redundant. In particular, a
+  // dispatch_to fan-out legitimately ends with non-empty Commander synthesis
+  // while its process trail remains "routing only". Preserve all real prose;
+  // the cleanup target is an empty tail (or the abort-only compatibility stub)
+  // whose narration, if any, already lives in a preceding segment.
+  const text = String(gm.text || '').trim();
+  const abortOnly = text === '(stopped)' || text === '（已中断）';
+  if (text && !abortOnly) return false;
   return true;
 }
 
@@ -8820,9 +9573,10 @@ function _streamingAppendProgress(msg, text, kindHint, eventName) {
 
 // ── Always-visible liveness strip ──────────────────────────────────────
 // Long turns emit most detail into the collapsible process rail, so the
-// bubble keeps one concise always-visible status + elapsed clock. Specific
-// tool names/counts, inferred steps and ETA stay out of this strip because
-// reconnects and suppressed worker events can make those incomplete.
+// bubble keeps one concise always-visible status. The same timer drives the
+// process-summary clock above; it is intentionally not painted again here.
+// Specific tool names/counts, inferred steps and ETA stay out of this strip
+// because reconnects and suppressed worker events can make those incomplete.
 function _streamingUpdateActivity(msg, text) {
   if (!msg || msg.dataset.activityDone === '1') return;
   const row = msg.querySelector('[data-role="activity"]');
@@ -8862,8 +9616,6 @@ function _activityMonotonicNow() {
 }
 
 function _streamingPaintActivityMeta(msg) {
-  const meta = msg.querySelector('[data-role="activity-meta"]');
-  if (!meta) return;
   const wallNow = Date.now();
   const rawT0 = Number(msg.dataset.activityStart);
   const t0 = Number.isFinite(rawT0) && rawT0 > 0 ? rawT0 : wallNow;
@@ -8878,14 +9630,12 @@ function _streamingPaintActivityMeta(msg) {
     clock.elapsedMs = Math.max(wallElapsedMs, clock.elapsedMs + monotonicDelta);
     clock.monotonicAt = monotonicNow;
   }
-  const secs = Math.max(0, Math.floor(clock.elapsedMs / 1000));
-  const mm = Math.floor(secs / 60);
-  const ss = String(secs % 60).padStart(2, '0');
-  meta.textContent = `${mm}:${ss}`;
+  _updateStreamingRuntimeSummary(msg, null, clock.elapsedMs);
 }
 
 function _streamingStopActivity(msg) {
   if (!msg) return;
+  if (msg.dataset.activityDone !== '1') _streamingPaintActivityMeta(msg);
   msg.dataset.activityDone = '1';
   if (msg._activityTimer) {
     clearInterval(msg._activityTimer);
@@ -9000,6 +9750,32 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   }
 }
 
+// Freeze the body the user has been watching into the process rail and clear
+// the streaming buffer before canonical text replaces it. Codex triggers this
+// at its commentary → final_answer phase boundary; Claude Code triggers it
+// when its successful terminal result arrives. The bus persists the same text
+// as a process item. Idempotence protects reconnect/replay duplicates.
+function _streamingFinalizeCommentary(msg, text) {
+  if (!msg || msg.dataset.commentaryFinalized === '1') return;
+  msg.dataset.commentaryFinalized = '1';
+
+  const commentary = typeof text === 'string' && text.length
+    ? text
+    : (msg.dataset.streamBuf || '');
+  if (commentary) _streamingAppendProgress(msg, commentary, 'think');
+
+  _cancelPendingStreamRaf(msg);
+  msg.dataset.streamBuf = '';
+  msg.dataset.finalText = '';
+  delete msg.dataset.streamDisplay;
+  delete msg.dataset.streamPaintedDisplay;
+  const finalEl = msg.querySelector('[data-role="final"]');
+  if (finalEl) {
+    finalEl.innerHTML = '';
+    finalEl.style.display = 'none';
+  }
+}
+
 function _streamingSetError(msg, text) {
   _hideThinking(msg);
   _streamingStopActivity(msg);
@@ -9050,6 +9826,7 @@ function _streamingSetError(msg, text) {
 function _streamingMarkAborted(msg) {
   _hideThinking(msg);
   _streamingStopActivity(msg);
+  msg.dataset.interrupted = '1';
   // Freeze any live preview line so it's not misread as still generating.
   const live = msg.querySelector('.stream-process-live');
   if (live) {
@@ -9065,6 +9842,11 @@ function _streamingMarkAborted(msg) {
   }
   const details = msg.querySelector('.stream-process');
   if (details) details.style.display = '';
+  _attachInterruptedAssistantActions(
+    msg,
+    () => _messageTextForActions(msg, msg.dataset.finalText || msg.dataset.streamBuf || ''),
+    { archive: false },
+  );
 }
 
 function _finishStreamingMsg(cid) {
@@ -9089,6 +9871,12 @@ function _finishStreamingMsg(cid) {
   // the cleaned content or is removed entirely if both process + final
   // were empty.
   if (cid === currentCid) {
+    // UI finalization and the primary send stream are independent terminal
+    // paths in group chat. Release the pin again at the shared run-settlement
+    // boundary so observer/recovery completion cannot leave the artificial
+    // spacer behind. This runs before `_dispatchNextQueued`, so it cannot
+    // remove the next queued turn's newly-created spacer.
+    _setChatScrollOffset(false, document.getElementById('chat-history'));
     _settleDanglingActorPlaceholders(cid, { preserveProcess: wasAborted });
     _updateConvSendUI(cid);
   }
@@ -9137,12 +9925,25 @@ function _scrollToMessageTopNow(msgEl, container) {
 
 function _pinMessageToTopWithDynamicSpacer(msgEl, container) {
   if (!msgEl || !container) return;
+  // Start from a clean generation. The pin is intentionally delayed for two
+  // frames so layout can settle, but the stream can also finish or the user
+  // can switch tasks during that delay. `_setChatScrollOffset(false)` bumps
+  // the epoch, making both callbacks harmless even when a test/runtime cannot
+  // cancel an already-queued animation frame.
+  _setChatScrollOffset(false, container);
+  const epoch = Number(container._scrollPinScheduleEpoch || 0);
   container._stickyEnabled = false;
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    if (!msgEl.isConnected || !container.isConnected) return;
-    _setChatScrollOffset(true, container);
-    _scrollToMessageTopNow(msgEl, container);
-  }));
+  container._scrollPinOuterRaf = requestAnimationFrame(() => {
+    container._scrollPinOuterRaf = null;
+    if (Number(container._scrollPinScheduleEpoch || 0) !== epoch) return;
+    container._scrollPinInnerRaf = requestAnimationFrame(() => {
+      container._scrollPinInnerRaf = null;
+      if (Number(container._scrollPinScheduleEpoch || 0) !== epoch) return;
+      if (!msgEl.isConnected || !container.isConnected) return;
+      _setChatScrollOffset(true, container);
+      _scrollToMessageTopNow(msgEl, container);
+    });
+  });
 }
 
 // ─── Generic chat controller ─────────────────────────────────────────────
@@ -9735,7 +10536,11 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
   if (ev.type === 'progress') {
     const evt = ev.event && ev.event.stream ? ev.event : null;
     const line = evt ? (_formatEventLine(evt) || ev.text) : ev.text;
-    _streamingAppendProgress(msg, line, evt ? _eventProcessKind(evt, line) : undefined);
+    if (_runtimeDurationMsFromEvent(evt) != null) {
+      _updateStreamingRuntimeSummary(msg, evt);
+    } else {
+      _streamingAppendProgress(msg, line, evt ? _eventProcessKind(evt, line) : undefined);
+    }
   } else if (ev.type === 'event') {
     const inner = ev.event || {};
     // Group-chat bus events arrive as `{stream:'group', data:GroupEvent}`.
@@ -9786,11 +10591,44 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
 // globally. Falling back to actor id is legacy-only for older events/history
 // reconciliation paths that cannot know the original turn id.
 const _groupPlaceholders = new Map(); // key = `${cid}:turn:${turnId}` or `${cid}:actor:${actorId}` → element
+// A Commander turn that visibly dispatches before producing prose must not
+// keep its turn-start placeholder above the nested agent bubbles. The bus emits
+// a live boundary; state snapshots may still list Commander as active while the
+// agents run, so suppress placeholder recreation until Commander's next real
+// process/delta/final event.
+const _groupSegmentBoundaryTurns = new Map(); // placeholder key → actor id
 
 function _normaliseTurnId(turnId) { return turnId == null ? '' : String(turnId); }
 function _phKey(cid, actorId, turnId) {
   const tid = _normaliseTurnId(turnId);
   return tid ? `${cid}:turn:${tid}` : `${cid}:actor:${actorId || ''}`;
+}
+
+function _segmentBoundaryKey(cid, actorId, turnId) {
+  return _phKey(cid, actorId, turnId);
+}
+
+function _isSegmentBoundarySuppressed(cid, actorId, turnId) {
+  const tid = _normaliseTurnId(turnId);
+  if (tid) return _groupSegmentBoundaryTurns.has(_segmentBoundaryKey(cid, actorId, tid));
+  for (const [key, suppressedActor] of _groupSegmentBoundaryTurns) {
+    if (!key.startsWith(`${cid}:`)) continue;
+    if (suppressedActor === String(actorId || '')) return true;
+  }
+  return false;
+}
+
+function _clearSegmentBoundarySuppression(cid, actorId, turnId) {
+  const tid = _normaliseTurnId(turnId);
+  if (tid) {
+    _groupSegmentBoundaryTurns.delete(_segmentBoundaryKey(cid, actorId, tid));
+    return;
+  }
+  for (const [key, suppressedActor] of Array.from(_groupSegmentBoundaryTurns.entries())) {
+    if (key.startsWith(`${cid}:`) && suppressedActor === String(actorId || '')) {
+      _groupSegmentBoundaryTurns.delete(key);
+    }
+  }
 }
 
 function _eventTurnId(evData) {
@@ -9824,6 +10662,15 @@ function _seedPlaceholderActivityStart(ph, startedAtMs) {
   if (!Number.isFinite(current) || current <= 0 || next < current) {
     ph.dataset.activityStart = String(next);
   }
+}
+
+function _startPlaceholderActivity(ph, startedAtMs) {
+  if (!ph) return;
+  _seedPlaceholderActivityStart(ph, startedAtMs);
+  // Empty label preserves a more specific existing state ("writing", retry)
+  // while still starting the generic liveness strip and total-time clock for
+  // a newly claimed turn.
+  _streamingUpdateActivity(ph, '');
 }
 
 function _stampPlaceholderTriggerMsg(ph, msgId) {
@@ -9886,13 +10733,14 @@ function _refreshActorPlaceholders(cid, actorId) {
 
 function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId, startedAtMs) {
   const tid = _normaliseTurnId(turnId);
+  if (_isSegmentBoundarySuppressed(cid, actorId, tid)) return null;
   const sourceMsgId = _normaliseTurnId(triggerMsgId);
   const k = _phKey(cid, actorId, tid);
   const allowFallback = !!actorId && actorId !== 'commander';
   let ph = _groupPlaceholders.get(k);
   if (ph && ph.parentElement) {
     _stampPlaceholderTriggerMsg(ph, sourceMsgId);
-    _seedPlaceholderActivityStart(ph, startedAtMs);
+    _startPlaceholderActivity(ph, startedAtMs);
     return ph;
   }
 
@@ -9904,7 +10752,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
       _groupPlaceholders.delete(legacyK);
       legacyPh.dataset.turnId = tid;
       _stampPlaceholderTriggerMsg(legacyPh, sourceMsgId);
-      _seedPlaceholderActivityStart(legacyPh, startedAtMs);
+      _startPlaceholderActivity(legacyPh, startedAtMs);
       _setPlaceholderActor(legacyPh, actorId, { cid, allowFallback });
       _groupPlaceholders.set(k, legacyPh);
       return legacyPh;
@@ -9925,7 +10773,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
       && (!fallbackPh.dataset.turnId || !tid || fallbackPh.dataset.turnId === tid)) {
     if (tid) fallbackPh.dataset.turnId = tid;
     _stampPlaceholderTriggerMsg(fallbackPh, sourceMsgId);
-    _seedPlaceholderActivityStart(fallbackPh, startedAtMs);
+    _startPlaceholderActivity(fallbackPh, startedAtMs);
     _setPlaceholderActor(fallbackPh, actorId, { cid, allowFallback });
     _groupPlaceholders.set(k, fallbackPh);
     return fallbackPh;
@@ -9946,7 +10794,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId,
   }
   ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true, triggerMsgId: sourceMsgId });
   if (tid) ph.dataset.turnId = tid;
-  _seedPlaceholderActivityStart(ph, startedAtMs);
+  _startPlaceholderActivity(ph, startedAtMs);
   _setPlaceholderActor(ph, actorId, { cid, allowFallback });
   _groupPlaceholders.set(k, ph);
   if (actorId && actorId !== 'commander' && !_knownGroupActorLabel(cid, actorId)) {
@@ -10100,14 +10948,18 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   // tool calls stay scannable after the reply lands.
   const text = String(gm.text || '');
   const failedAssistant = _isFailedAssistantContent(text, gm);
-  _streamingSetFinal(ph, text, { archive: archive && !failedAssistant });
+  const interruptedAssistant = _isInterruptedAssistantMessage(gm);
+  _streamingSetFinal(ph, text, { archive: archive && !failedAssistant && !interruptedAssistant });
   if (failedAssistant) {
     _attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));
     _handleModelOutputErrorForUi(cid, ph, _failedAssistantErrorText(ph) || text, {
       stage: 'actor_final',
       error_type: 'model_output',
       failure_kind: String(gm.failure_kind || ''),
+      failure_code: String(gm.failure_code || ''),
     });
+  } else if (interruptedAssistant) {
+    _attachInterruptedAssistantActions(ph, () => _messageTextForActions(ph, text), { archive });
   }
 
   // Lazily allocate the below-bubble actions row (post-stream placeholders
@@ -10175,6 +11027,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'process', cid, actor, turn_id?, data: { type, text?, event? } }
 //   { type: 'agent_run_result', cid, actor, actor_type, turn_id?, data }
 //   { type: 'artifact_created', cid, actor, turn_id?, artifact: { id, title, agent_id } }
+//   { type: 'segment_boundary', cid, actor, turn_id? }
 //   { type: 'state_changed', cid, state: { status, in_flight }, active_turns? }
 //   { type: 'member_joined', cid, actor }
 //   { type: 'aborted', cid }
@@ -10245,6 +11098,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   if (evData.type === 'message') {
     const gm = evData.msg;
     if (!gm) return;
+    _clearSegmentBoundarySuppression(
+      cid,
+      String(gm.from || ''),
+      _eventTurnId(evData) || gm.turn_id,
+    );
     // The user's own send is already rendered optimistically by the input
     // handler. Still stamp it with the persisted message id once the bus echoes
     // the write, so history reconciliation can prove the DOM matches jsonl
@@ -10329,6 +11187,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     const turnId = _eventTurnId(evData);
     const data = evData.data || {};
     if (!actor) return;
+    _clearSegmentBoundarySuppression(cid, actor, turnId);
     if (actor !== 'commander') _removeEmptyActorPlaceholder(cid, 'commander');
     // A renderer can attach after the actor's initial `state_changed(running)`
     // event has already passed (refresh, tab switch, scheduled/remote run).
@@ -10362,7 +11221,10 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       }
     }
     try {
-      if (data.type === 'delta' && typeof data.text === 'string') {
+      if (data.type === 'commentary-finalized') {
+        _streamingFinalizeCommentary(target, data.text);
+        _streamingUpdateActivity(target, t('chat.activity_writing'));
+      } else if (data.type === 'delta' && typeof data.text === 'string') {
         // Token-by-token streaming → write into the placeholder's final
         // body so the user sees the reply form character-by-character.
         _streamingAppendFinalDelta(target, data.text);
@@ -10370,8 +11232,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       } else if (data.type === 'progress' && data.text) {
         const evt = data.event && data.event.stream ? data.event : null;
         const line = evt ? (_formatEventLine(evt) || String(data.text)) : String(data.text);
-        if (evt) _setProcessSummaryRuntimeFromEvent(target, evt);
-        _streamingAppendProgress(target, line, evt ? _eventProcessKind(evt, line) : undefined);
+        if (_runtimeDurationMsFromEvent(evt) != null) {
+          _updateStreamingRuntimeSummary(target, evt);
+        } else {
+          _streamingAppendProgress(target, line, evt ? _eventProcessKind(evt, line) : undefined);
+        }
         if (evt) _streamingUpdateActivityFromEvent(target, evt);
         else _streamingUpdateActivity(target, t('chat.activity_working'));
       } else if (data.type === 'event') {
@@ -10405,6 +11270,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     const turnId = _eventTurnId(evData);
     const artifact = evData.artifact || {};
     if (!actor || !artifact.id) return;
+    _clearSegmentBoundarySuppression(cid, actor, turnId);
     if (!isGroupConversationBusy(cid)) {
       setGroupConversationBusy(cid, true);
       _updateConvSidebarBadge(cid, true);
@@ -10416,6 +11282,14 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     if (bubble && typeof window.mountMessageArtifacts === 'function') {
       window.mountMessageArtifacts(bubble, [artifact], cid);
       _stickBottomFromMsg(target);
+    }
+  } else if (evData.type === 'segment_boundary') {
+    const actor = String(evData.actor || '');
+    const turnId = _eventTurnId(evData);
+    if (actor) {
+      _groupSegmentBoundaryTurns.set(_segmentBoundaryKey(cid, actor, turnId), actor);
+      const ph = _consumeActorPlaceholder(cid, actor, turnId);
+      if (ph?.parentElement) ph.remove();
     }
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
@@ -10521,6 +11395,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     //       useful to preserve; an empty zombie bubble is just noise.
     const actorId = String(evData.actor || '');
     if (actorId) {
+      _clearSegmentBoundarySuppression(cid, actorId, _eventTurnId(evData));
       const ph = _consumeActorPlaceholder(cid, actorId, _eventTurnId(evData));
       if (ph) {
         const processBody = ph.querySelector('[data-role="process"]');
@@ -10854,8 +11729,10 @@ function _formatEventLine(evt) {
     const phase = String(data?.phase || '');
     if (phase === 'history_summary_start') return t('chat.stream.context_history_start');
     if (phase === 'history_summary_done') return t('chat.stream.context_history_done');
+    if (phase === 'history_summary_failed') return t('chat.stream.context_history_failed');
     if (phase === 'active_process_compaction_start') return t('chat.stream.context_active_start');
     if (phase === 'active_process_compaction_done') return t('chat.stream.context_active_done');
+    if (phase === 'active_process_compaction_failed') return t('chat.stream.context_active_failed');
     return t('chat.stream.context_update');
   }
 
@@ -10869,14 +11746,16 @@ function _formatEventLine(evt) {
   }
 
   if (stream === 'runtime') {
-    const duration = data?.duration_ms ?? data?.durationMs ?? data?.elapsedMs;
-    const parts = [t('chat.stream.runtime_total', { duration: _formatProcessDuration(duration) })];
-    const timingParts = [
+    const runtimeDurationMs = _runtimeDurationMsFromEvent(evt);
+    if (runtimeDurationMs == null) return null;
+    const bubbleDuration = data?.bubble_duration_ms;
+    const parts = [t('chat.stream.runtime_total', { duration: _formatProcessDuration(runtimeDurationMs) })];
+    const timingParts = bubbleDuration == null ? [
       ['provider_ms', 'chat.stream.runtime_model'],
       ['tool_ms', 'chat.stream.runtime_tools'],
       ['compaction_ms', 'chat.stream.runtime_context'],
       ['retry_wait_ms', 'chat.stream.runtime_retry'],
-    ];
+    ] : [];
     for (const [key, label] of timingParts) {
       const value = Number(data?.[key]);
       if (Number.isFinite(value) && value > 0) {
@@ -11075,7 +11954,10 @@ function _renderAgentEvent(msg, evt) {
   if (!evt || typeof evt !== 'object') return;
   const { stream, data } = evt;
   if (!stream) return;
-  if (stream === 'runtime') _setProcessSummaryRuntimeFromEvent(msg, evt);
+  if (stream === 'runtime' && _runtimeDurationMsFromEvent(evt) != null) {
+    _updateStreamingRuntimeSummary(msg, evt);
+    return;
+  }
 
   if (stream === 'assistant') {
     const text = data?.text;
@@ -11510,15 +12392,21 @@ function _initChatSelectionMenu() {
     // this file) — not `.chat-msg` (that's the attachment / produced-chip
     // namespace).
     if (!(e.target instanceof Element) || !e.target.closest('.chat-message')) return;
+    if (!sel.anchorNode || !sel.focusNode
+      || !container.contains(sel.anchorNode) || !container.contains(sel.focusNode)) return;
     e.preventDefault();
     const snapshot = String(text);   // copy now — getSelection() can be cleared by the click
     if (typeof showContextMenu !== 'function') return;
     showContextMenu(e, [
       {
         label: t('chat.menu.copy'),
-        onClick: () => {
-          try { navigator.clipboard.writeText(snapshot); }
-          catch (_) { /* swallow — older Electron/old clipboard API */ }
+        onClick: async () => {
+          try {
+            await navigator.clipboard.writeText(snapshot);
+          } catch (_) {
+            if (typeof uiToast === 'function') uiToast(t('chat.copy_failed'), { variant: 'error' });
+            else if (typeof uiAlert === 'function') await uiAlert(t('chat.copy_failed'));
+          }
         },
       },
       {

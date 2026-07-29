@@ -163,7 +163,8 @@ function installLockedPackageTarball(tgz, packageDir, options = {}) {
   try {
     const tgzPath = path.join(tmp, 'package.tgz');
     fs.writeFileSync(tgzPath, tgz);
-    const result = run('tar', ['-xzf', tgzPath, '-C', tmp], {
+    const result = run('tar', ['-xzf', path.basename(tgzPath), '-C', tmp], {
+      cwd: tmp,
       encoding: 'utf8',
       timeout: 60_000,
     });
@@ -432,7 +433,11 @@ async function downloadCrossFfprobe(expectedSha) {
   try {
     const tgzPath = path.join(tmp, 'pkg.tgz');
     fs.writeFileSync(tgzPath, tgz);
-    const r = spawnSync('tar', ['-xzf', tgzPath, '-C', tmp], { encoding: 'utf8', timeout: 60_000 });
+    const r = spawnSync('tar', ['-xzf', path.basename(tgzPath), '-C', tmp], {
+      cwd: tmp,
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
     if (r.error) throw new Error(`tar extract failed: ${r.error.message}`);
     if (r.status !== 0) throw new Error(`tar extract exited ${r.status}: ${(r.stderr || '').slice(-500)}`);
     const bin = fs.readFileSync(path.join(tmp, 'package', `ffprobe${exe}`));

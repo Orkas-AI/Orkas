@@ -98,8 +98,9 @@ let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
 let _autoFormMounted = false;  // _aiSelectMount only once
 let _autoEditingTaskId = null; // null = create mode, taskId = edit mode
-// Current device fingerprint — fetched lazily on first row render. Used to
-// decide which device chip to show ("this device" vs. the task's stored hostname).
+// Current persistent installation identity — fetched lazily on first row
+// render. Used to decide which device chip to show ("this device" vs. the
+// task's stored hostname).
 let _autoCurrentDevice = null; // { id, name } | null
 async function _ensureAutoCurrentDevice() {
   if (_autoCurrentDevice) return _autoCurrentDevice;
@@ -659,12 +660,29 @@ function _refreshAutoExpandedTaskConvs() {
 // One shared popover for all auto-task ⋯ menus. Mirrors `.agent-row-menu`:
 // fixed-position, click-outside closes, Escape closes.
 let _autoMenuEl = null;
+let _autoMenuAnchorEl = null;
 function _ensureAutoMenu() {
   if (_autoMenuEl) return _autoMenuEl;
   const m = document.createElement('div');
   m.className = 'auto-row-menu';
+  m.id = 'auto-row-menu-popover';
+  m.setAttribute('role', 'menu');
   m.style.display = 'none';
   document.body.appendChild(m);
+  m.addEventListener('keydown', (e) => {
+    const items = Array.from(m.querySelectorAll('[role="menuitem"]'));
+    if (!items.length) return;
+    const index = Math.max(0, items.indexOf(document.activeElement));
+    let next = null;
+    if (e.key === 'ArrowDown') next = items[(index + 1) % items.length];
+    else if (e.key === 'ArrowUp') next = items[(index - 1 + items.length) % items.length];
+    else if (e.key === 'Home') next = items[0];
+    else if (e.key === 'End') next = items[items.length - 1];
+    if (next) {
+      e.preventDefault();
+      next.focus();
+    }
+  });
   document.addEventListener('click', (e) => {
     if (!_autoMenuEl || _autoMenuEl.style.display === 'none') return;
     if (_autoMenuEl.contains(e.target)) return;
@@ -672,21 +690,48 @@ function _ensureAutoMenu() {
     _closeAutoRowMenu();
   });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && _autoMenuEl && _autoMenuEl.style.display !== 'none') _closeAutoRowMenu();
+    if (e.key === 'Escape' && _autoMenuEl && _autoMenuEl.style.display !== 'none') {
+      e.preventDefault();
+      _closeAutoRowMenu(true);
+    }
   });
   window.addEventListener('scroll', _closeAutoRowMenu, true);
   window.addEventListener('resize', _closeAutoRowMenu);
   _autoMenuEl = m;
   return m;
 }
-function _closeAutoRowMenu() {
+function _closeAutoRowMenu(restoreFocus = false) {
+  const anchor = _autoMenuAnchorEl;
+  _autoMenuAnchorEl = null;
   if (_autoMenuEl) {
     _autoMenuEl.style.display = 'none';
     _autoMenuEl.innerHTML = '';
+    _autoMenuEl.removeAttribute('aria-label');
   }
+  if (anchor) anchor.setAttribute('aria-expanded', 'false');
   for (const el of document.querySelectorAll('.auto-row.is-menu-open')) {
     el.classList.remove('is-menu-open');
   }
+  if (restoreFocus && anchor && anchor.isConnected) anchor.focus();
+}
+
+function _autoCreateActionTracker(action) {
+  const startedAt = Date.now();
+  let done = false;
+  return (result, errorCode = '') => {
+    if (done) return;
+    done = true;
+    try {
+      if (!window.Monitor) return;
+      const payload = {
+        result,
+        action,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      Monitor.event('auto_task_action_result', payload);
+    } catch (_) {}
+  };
 }
 
 function _openAutoRowMenu(anchorBtn, task, opts) {
@@ -698,37 +743,70 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
   }
   for (const el of document.querySelectorAll('.auto-row.is-menu-open')) el.classList.remove('is-menu-open');
   anchorBtn.closest('.auto-row')?.classList.add('is-menu-open');
+  _autoMenuAnchorEl = anchorBtn;
+  anchorBtn.setAttribute('aria-haspopup', 'menu');
+  anchorBtn.setAttribute('aria-controls', menu.id);
+  anchorBtn.setAttribute('aria-expanded', 'true');
+  menu.setAttribute('aria-label', anchorBtn.getAttribute('aria-label') || '');
   menu.dataset.taskId = task.id;
   const toggleLabel = task.enabled ? t('auto.disable_btn') : t('auto.enable_btn');
   menu.innerHTML = `
-    <div class="auto-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>
-    <div class="auto-row-menu-item" data-action="edit">${escapeHtml(t('auto.edit_btn'))}</div>
-    <div class="auto-row-menu-item is-danger" data-action="delete">${escapeHtml(t('auto.delete_btn'))}</div>
+    <button type="button" role="menuitem" class="auto-row-menu-item" data-action="run-now">${escapeHtml(t('auto.run_now'))}</button>
+    <button type="button" role="menuitem" class="auto-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</button>
+    <button type="button" role="menuitem" class="auto-row-menu-item" data-action="edit">${escapeHtml(t('auto.edit_btn'))}</button>
+    <button type="button" role="menuitem" class="auto-row-menu-item is-danger" data-action="delete">${escapeHtml(t('auto.delete_btn'))}</button>
   `;
   for (const item of menu.querySelectorAll('.auto-row-menu-item')) {
     item.addEventListener('click', async (e) => {
       e.stopPropagation();
       const action = item.dataset.action;
       _closeAutoRowMenu();
-      if (action === 'toggle-enabled') {
+      if (action === 'run-now') {
+        const trackResult = _autoCreateActionTracker('run_now');
+        try {
+          const res = await window.orkas.invoke('autoTasks.runNow', { taskId: task.id });
+          const cid = res && res.cid;
+          if (!cid) throw new Error('manual run did not return a conversation id');
+          trackResult('success');
+          setView('conversation', cid, { entryPoint: 'auto_task_run_now' });
+        } catch (err) {
+          trackResult('failure', 'run_failed');
+          _autoLog.warn('manual run failed', err);
+          await uiAlert(t('auto.run_failed'));
+        }
+      } else if (action === 'toggle-enabled') {
         const next = !task.enabled;
+        const trackResult = _autoCreateActionTracker('toggle');
         try {
           const res = await window.orkas.invoke('autoTasks.setEnabled', { taskId: task.id, enabled: next });
           if (res && res.ok && res.task) {
+            trackResult('success');
             Object.assign(task, res.task);
             const row = document.querySelector(`.auto-row[data-task-id="${task.id}"]`);
             if (row) row.classList.toggle('is-disabled', !next);
             if (opts && typeof opts.afterChange === 'function') opts.afterChange();
+          } else {
+            trackResult('failure', 'update_failed');
           }
-        } catch (err) { _autoLog.warn('toggle failed', err); }
+        } catch (err) {
+          trackResult('failure', 'invoke_failed');
+          _autoLog.warn('toggle failed', err);
+        }
       } else if (action === 'edit') {
         if (opts && typeof opts.onEdit === 'function') opts.onEdit(task);
       } else if (action === 'delete') {
         if (!(await uiConfirm(t('auto.delete_confirm')))) return;
+        const trackResult = _autoCreateActionTracker('delete');
         try {
           const res = await window.orkas.invoke('autoTasks.delete', { taskId: task.id });
-          if (res && res.deleted && opts && typeof opts.afterChange === 'function') opts.afterChange();
+          if (res && res.deleted) {
+            trackResult('success');
+            if (opts && typeof opts.afterChange === 'function') opts.afterChange();
+          } else {
+            trackResult('failure', 'delete_failed');
+          }
         } catch (err) {
+          trackResult('failure', 'invoke_failed');
           await uiAlert(t('auto.delete_failed', { reason: (err && err.message) || err }));
         }
       }
@@ -745,6 +823,7 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
   if (left < 8) left = 8;
   menu.style.top = top + 'px';
   menu.style.left = left + 'px';
+  menu.querySelector('.auto-row-menu-item')?.focus();
 }
 
 // ─── Global auto tab — list rendering + form wiring ────────────────
@@ -755,7 +834,7 @@ async function loadAutoList(force) {
   if (!listEl) return;
   await _refreshAutoSyncNotice();
   if (_autoLoadedOnce && !force) return;
-  // Fetch device fingerprint in parallel with the task list so the device
+  // Fetch device identity in parallel with the task list so the device
   // chip can paint on the first render.
   await _ensureAutoCurrentDevice();
   try {
@@ -1609,14 +1688,18 @@ function _autoSyncFreqRows(type) {
 
 function _repaintAutoRecipientChip() {
   const nameEl = document.getElementById('auto-recipient-name');
-  if (!nameEl) return;
   const rec = _autoCurrentRecipient;
-  if (!rec || rec.kind === 'commander' || !rec.id) {
-    nameEl.textContent = t('chat.recipient_commander');
-    nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
-  } else {
-    nameEl.removeAttribute('data-i18n');
-    nameEl.textContent = rec.name || rec.id;
+  if (nameEl) {
+    if (!rec || rec.kind === 'commander' || !rec.id) {
+      nameEl.textContent = t('chat.recipient_commander');
+      nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
+    } else {
+      nameEl.removeAttribute('data-i18n');
+      nameEl.textContent = rec.name || rec.id;
+    }
+  }
+  if (typeof _syncComposerModelChipAvailability === 'function') {
+    _syncComposerModelChipAvailability('auto');
   }
 }
 
@@ -1975,63 +2058,6 @@ if (typeof window !== 'undefined') {
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindAutoAddButton, { once: true });
   else bindAutoAddButton();
-}
-
-// ─── Boot-time fire subscription ─────────────────────────────────────────
-// An auto fire creates the conv in main, so the renderer's local
-// `conversations` array doesn't know about it. Subscribe once on boot to
-// the long-lived `autoTasks.events` stream; on each `conv_created`
-// event, reload the conversation list.
-
-function startAutoEventsSubscription() {
-  if (_autoEventsHandle) return;
-  if (!window.orkas || typeof window.orkas.stream !== 'function') return;
-  try {
-    _autoEventsHandle = window.orkas.stream('autoTasks.events', {}, (ev) => {
-      const inner = ev && ev.event;
-      if (!inner) return;
-      if (inner.type === 'fire_failed') {
-        const taskId = inner.taskId || inner.task_id || '';
-        const cid = inner.cid || inner.conversation_id || '';
-        const errorCode = inner.error_code || 'unknown';
-        _autoTrackEvent('auto_task_fire_result', {
-          result: 'failure',
-          task_id: taskId,
-          conversation_id: cid,
-          duration_ms: Number(inner.duration_ms) || 0,
-          error_code: errorCode,
-        });
-        _autoTrackError('auto_task_fire', {
-          task_id: taskId,
-          conversation_id: cid,
-          error_type: 'runtime',
-          error_code: errorCode,
-          error_message: errorCode,
-        });
-      } else if (inner.type === 'conv_created') {
-        _autoTrackEvent('auto_task_fire_result', {
-          result: 'success',
-          task_id: inner.taskId || inner.task_id || '',
-          conversation_id: inner.cid || inner.conversation_id || '',
-          duration_ms: Number(inner.duration_ms) || 0,
-        });
-        if (typeof loadConversations === 'function') {
-          loadConversations().catch((err) => _autoLog.warn('reload after fire failed', err));
-        }
-      } else {
-        return;
-      }
-      // Refresh task last_run if the auto tab has been opened.
-      if (_autoLoadedOnce) loadAutoList(true).catch(() => {});
-    });
-    _autoEventsHandle.promise.catch(() => { /* ignore */ });
-  } catch (err) {
-    _autoLog.warn('subscribe autoTasks.events failed', err);
-  }
-}
-
-if (typeof window !== 'undefined') {
-  window.startAutoEventsSubscription = startAutoEventsSubscription;
 }
 
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {

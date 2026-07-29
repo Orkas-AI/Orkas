@@ -721,7 +721,10 @@ function extractGithubTarball(archivePath, destDir) {
   fs.rmSync(extractDir, { recursive: true, force: true });
   fs.mkdirSync(extractDir, { recursive: true });
   try {
-    const res = run('tar', ['-xzf', archivePath, '-C', extractDir], { timeoutMs: 5 * 60 * 1000 });
+    const res = run('tar', ['-xzf', path.basename(archivePath), '-C', extractDir], {
+      cwd: path.dirname(archivePath),
+      timeoutMs: 5 * 60 * 1000,
+    });
     if (res.status !== 0) {
       die(1, 'failed to extract GitHub tarball', { stdout: (res.stdout || '').slice(-2000) });
     }

@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import { userLocalRoot } from '../paths';
+import { projectVideoApprovalIntent } from './video_approval_identity';
 
 export type VideoProductionGenerationKind = 'image' | 'video';
 
@@ -78,15 +79,6 @@ export type VideoProductionPlanIdentity = {
 };
 
 const mutexes = new Map<string, Mutex>();
-const RUNTIME_PLAN_KEYS = new Set([
-  'status',
-  'produced_path',
-  'provider_task_id',
-  'generated_at',
-  'completed_at',
-  'error_code',
-]);
-
 function mutexFor(statePath: string): Mutex {
   const key = path.resolve(statePath);
   const existing = mutexes.get(key);
@@ -100,15 +92,72 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-function normalizedApprovalValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizedApprovalValue);
-  if (!isRecord(value)) return value;
-  const normalized: Record<string, unknown> = {};
-  for (const key of Object.keys(value).sort()) {
-    if (RUNTIME_PLAN_KEYS.has(key)) continue;
-    normalized[key] = normalizedApprovalValue(value[key]);
+function nonEmptyStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && !!item.trim()).map((item) => item.trim())
+    : [];
+}
+
+function assertSemanticVideoEditContract(
+  plan: Record<string, unknown>,
+  segment: Record<string, unknown>,
+  spec: Record<string, unknown>,
+): void {
+  const segmentId = String(segment.id || '').trim();
+  const sourceVideos = [
+    ...nonEmptyStringList(spec.reference_video_paths),
+    ...nonEmptyStringList(spec.reference_video_urls),
+  ];
+  if (!sourceVideos.length) {
+    throw new Error(`E_VIDEO_PRODUCTION_SEMANTIC_EDIT_REFERENCE_REQUIRED: segment ${segmentId} requires an original reference video`);
   }
-  return normalized;
+  const strategy = isRecord(plan.edit_strategy) ? plan.edit_strategy : null;
+  if (!strategy || (strategy.mode !== 'semantic' && strategy.mode !== 'mixed')) {
+    throw new Error(`E_VIDEO_PRODUCTION_SEMANTIC_EDIT_STRATEGY_REQUIRED: segment ${segmentId} requires edit_strategy.mode=semantic|mixed`);
+  }
+  const objectives = nonEmptyStringList(strategy.objectives);
+  const signals = nonEmptyStringList(strategy.decision_signals);
+  const preserve = nonEmptyStringList(strategy.preserve);
+  const mayChange = nonEmptyStringList(strategy.may_change);
+  if (!objectives.length || !signals.includes('semantic_model') || !preserve.length || !mayChange.length
+    || preserve.some((item) => mayChange.includes(item))) {
+    throw new Error(`E_VIDEO_PRODUCTION_SEMANTIC_EDIT_BOUNDARY_INVALID: segment ${segmentId} needs objectives, semantic_model evidence, and non-overlapping preserve/may_change boundaries`);
+  }
+  const references = Array.isArray(plan.references) ? plan.references.filter(isRecord) : [];
+  for (const source of sourceVideos) {
+    const reference = references.find((item) => item.source === source
+      && item.media_type === 'video'
+      && item.intent === 'edit'
+      && item.required === true
+      && nonEmptyStringList(item.target_segment_ids).includes(segmentId));
+    if (!reference) {
+      throw new Error(`E_VIDEO_PRODUCTION_SEMANTIC_EDIT_REFERENCE_UNDECLARED: ${source} must be a required top-level video reference with intent=edit targeting ${segmentId}`);
+    }
+    const referencePreserve = nonEmptyStringList(reference.preserve);
+    const referenceMayChange = nonEmptyStringList(reference.may_change);
+    const referenceRoles = nonEmptyStringList(reference.roles);
+    const temporalAnchors = Array.isArray(reference.temporal_anchors) ? reference.temporal_anchors.filter(isRecord) : [];
+    const hasTargetAnchor = temporalAnchors.some((anchor) => anchor.target_segment_id === segmentId
+      && typeof anchor.source_start_sec === 'number'
+      && Number.isFinite(anchor.source_start_sec)
+      && anchor.source_start_sec >= 0
+      && typeof anchor.source_end_sec === 'number'
+      && Number.isFinite(anchor.source_end_sec)
+      && anchor.source_end_sec > anchor.source_start_sec);
+    if (!referenceRoles.length || !referencePreserve.length || !referenceMayChange.length
+      || referencePreserve.some((item) => referenceMayChange.includes(item))
+      || preserve.some((item) => referenceMayChange.includes(item))
+      || mayChange.some((item) => referencePreserve.includes(item))
+      || !hasTargetAnchor) {
+      throw new Error(`E_VIDEO_PRODUCTION_SEMANTIC_EDIT_REFERENCE_INVALID: ${source} needs roles, compatible preserve/may_change boundaries, and a temporal anchor targeting ${segmentId}`);
+    }
+  }
+}
+
+function normalizedApprovalValue(value: unknown): unknown {
+  return projectVideoApprovalIntent(value, {
+    excludeRootKeys: ['schema_version'],
+  });
 }
 
 function stableJson(value: unknown): string {
@@ -268,6 +317,9 @@ export async function readVideoProductionPlanIdentity(planPath: string): Promise
         || (spec.quality !== undefined && !['economy', 'balanced', 'quality'].includes(String(spec.quality)))
         || (spec.generate_audio !== undefined && typeof spec.generate_audio !== 'boolean')) {
         throw new Error(`E_VIDEO_PRODUCTION_GENERATE_SETTINGS_INVALID: video segment ${segment.id} has invalid operation, duration, resolution, quality, or audio intent`);
+      }
+      if (spec.media_kind === 'video' && spec.operation === 'edit') {
+        assertSemanticVideoEditContract(plan, segment, spec);
       }
     }
     if (segment.source === 'compose') {

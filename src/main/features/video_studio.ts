@@ -55,6 +55,7 @@ import {
   type FrameSampleEvidence,
   type FrameSamplePlan,
   type Issue,
+  type VisibleSemanticElementEvidence,
 } from './video_studio_qa';
 import { extractCssImports, extractCssUrls, extractHtmlResourceRefs, parseHtmlStructure, type HtmlResourceRef } from './video_studio_html_check';
 import { hardenedWebPreferences } from '../util/window-security';
@@ -791,11 +792,79 @@ type CompositionPreflightResult = {
   report: Record<string, unknown>;
 };
 
+export type CompositionPreflightProfile = 'visual-preview' | 'delivery';
+
 function stepIssues(step: Record<string, unknown>): Issue[] {
   return Array.isArray(step.issues) ? step.issues.filter((issue): issue is Issue => !!issue && typeof issue === 'object') : [];
 }
 
-export async function preflightComposition(p: CompositionOptions): Promise<CompositionPreflightResult> {
+function deferErrorsForVisualPreview(
+  step: Record<string, unknown>,
+  profile: CompositionPreflightProfile,
+  shouldDefer: (issue: Issue) => boolean,
+): Record<string, unknown> {
+  if (profile === 'delivery') return step;
+  const originalIssues = stepIssues(step);
+  const issues = originalIssues.map((issue) => (
+    issue.severity === 'error' && shouldDefer(issue)
+      ? {
+        ...issue,
+        severity: 'warning' as const,
+        message: `${issue.message} This remains a delivery blocker, but it does not block visual inspection or preview evidence.`,
+      }
+      : issue
+  ));
+  const deferredDeliveryErrorCount = originalIssues
+    .filter((issue) => issue.severity === 'error' && shouldDefer(issue)).length;
+  const remainingErrorCount = issues.filter((issue) => issue.severity === 'error').length;
+  return {
+    ...step,
+    ok: remainingErrorCount === 0,
+    error_count: remainingErrorCount,
+    warning_count: issues.filter((issue) => issue.severity === 'warning').length,
+    issue_count: issues.length,
+    issues,
+    deferred_for_delivery: deferredDeliveryErrorCount > 0,
+    deferred_delivery_error_count: deferredDeliveryErrorCount,
+  };
+}
+
+function deliveryRequirementsForPreflightProfile(
+  step: Record<string, unknown>,
+  profile: CompositionPreflightProfile,
+): Record<string, unknown> {
+  return deferErrorsForVisualPreview(
+    step,
+    profile,
+    (issue) => issue.code === 'DELIVERY_NARRATION_MISSING',
+  );
+}
+
+function audioTimingForPreflightProfile(
+  step: Record<string, unknown>,
+  profile: CompositionPreflightProfile,
+): Record<string, unknown> {
+  return deferErrorsForVisualPreview(step, profile, () => true);
+}
+
+function hasIncompleteNarration(issues: Issue[]): boolean {
+  return issues.some((issue) => (
+    issue.code === 'DELIVERY_NARRATION_MISSING'
+    || issue.code === 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED'
+    || issue.code === 'NARRATION_ASSET_MISSING'
+    || issue.code === 'NARRATION_DECLARED_BUT_SILENT'
+  ));
+}
+
+function narrationPendingInPreflight(preflight: CompositionPreflightResult): boolean {
+  return Number(preflight.report.deferred_delivery_error_count || 0) > 0
+    || hasIncompleteNarration(preflight.issues);
+}
+
+export async function preflightComposition(
+  p: CompositionOptions,
+  profile: CompositionPreflightProfile = 'delivery',
+): Promise<CompositionPreflightResult> {
   const manifestLoad = await ensureCompositionManifest(p.compositionDirAbs, { writeGenerated: true });
   const loaded = await loadCompositionMeta(p.compositionDirAbs);
   const legacyContractLoad = await loadDesignContract(p.compositionDirAbs);
@@ -808,6 +877,7 @@ export async function preflightComposition(p: CompositionOptions): Promise<Compo
     const report = {
       status: 'failed',
       stage: 'preflight',
+      profile,
       blocking_error_count: blockingErrorCount,
       advisory_count: issues.filter((issue) => issue.severity === 'warning').length,
       manifest: {
@@ -851,19 +921,19 @@ export async function preflightComposition(p: CompositionOptions): Promise<Compo
     p.compositionDirAbs,
   );
   const sourceAlignment = await runSourceAlignmentQa(canonicalSceneMapLoad, shotlistLoad);
-  const deliveryRequirements = await runDeliveryRequirementsQa(
+  const deliveryRequirements = deliveryRequirementsForPreflightProfile(await runDeliveryRequirementsQa(
     loaded.meta,
     canonicalSceneMapLoad,
     shotlistLoad,
     p.compositionDirAbs,
-  );
-  const audioTiming = await runAudioTimingQa(
+  ), profile);
+  const audioTiming = audioTimingForPreflightProfile(await runAudioTimingQa(
     loaded.meta,
     canonicalContractLoad,
     canonicalSceneMapLoad,
     narrationMapLoad,
     p.compositionDirAbs,
-  );
+  ), profile);
   const steps = {
     manifest: {
       ok: manifestLoad.ok,
@@ -885,17 +955,35 @@ export async function preflightComposition(p: CompositionOptions): Promise<Compo
     ...stepIssues(audioTiming),
   ];
   const blockingErrorCount = issues.filter((issue) => issue.severity === 'error').length;
+  const deferredDeliveryErrorCount = Number(deliveryRequirements.deferred_delivery_error_count || 0)
+    + Number(audioTiming.deferred_delivery_error_count || 0);
+  const narrationIncomplete = deferredDeliveryErrorCount > 0 || hasIncompleteNarration(issues);
   const report = {
     status: blockingErrorCount ? 'failed' : 'passed',
     stage: 'preflight',
+    profile,
     blocking_error_count: blockingErrorCount,
+    deferred_delivery_error_count: deferredDeliveryErrorCount,
+    completeness: narrationIncomplete
+      ? 'visual_only'
+      : 'complete',
     advisory_count: issues.filter((issue) => issue.severity === 'warning').length,
     manifest: steps.manifest,
     steps,
     issues,
     next_allowed_ops: blockingErrorCount
-      ? ['composition.prepare']
-      : ['composition.inspect', 'composition.snapshot', 'composition.draft'],
+      ? narrationIncomplete
+        ? [
+          'composition.prepare',
+          'composition.materialize_narration',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ]
+        : ['composition.prepare']
+      : profile === 'visual-preview' && deferredDeliveryErrorCount > 0
+        ? ['composition.inspect', 'composition.snapshot', 'composition.materialize_narration']
+        : ['composition.inspect', 'composition.snapshot', 'composition.draft'],
   };
   return {
     ok: blockingErrorCount === 0,
@@ -967,7 +1055,7 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
 }
 
 export async function lintComposition(p: CompositionOptions): Promise<VideoStudioResult> {
-  const preflight = await preflightComposition(p);
+  const preflight = await preflightComposition(p, 'visual-preview');
   const findings = findingsJson(preflight.issues, {
     engine: 'orkas-native',
     profile: 'orkas-html-composition',
@@ -975,7 +1063,7 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
     preflight: preflight.report,
   });
   if (!preflight.ok) {
-    const narrationPending = preflight.issues.some((issue) => issue.code === 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED');
+    const narrationPending = narrationPendingInPreflight(preflight);
     return {
       ok: false,
       op: 'composition.lint',
@@ -986,9 +1074,12 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
       blocking_error_count: preflight.issues.filter((issue) => issue.severity === 'error').length,
       preflight: preflight.report,
       findings,
-      next_allowed_ops: narrationPending ? ['composition.materialize_narration'] : ['composition.prepare'],
+      next_allowed_ops: narrationPending
+        ? ['composition.prepare', 'composition.materialize_narration']
+        : ['composition.prepare'],
     };
   }
+  const narrationPending = narrationPendingInPreflight(preflight);
   return {
     ok: true,
     op: 'composition.lint',
@@ -997,7 +1088,11 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
     blocking_error_count: 0,
     preflight: preflight.report,
     findings,
-    next_allowed_ops: ['composition.inspect', 'composition.snapshot', 'composition.draft'],
+    preview_completeness: narrationPending ? 'visual_only' : 'complete',
+    narration_pending: narrationPending,
+    next_allowed_ops: narrationPending
+      ? ['composition.inspect', 'composition.snapshot', 'composition.materialize_narration']
+      : ['composition.inspect', 'composition.snapshot', 'composition.draft'],
   };
 }
 
@@ -1366,19 +1461,25 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
   visible_scene_ids: string[];
   visible_roles: string[];
   visible_text: string;
+  visible_elements: VisibleSemanticElementEvidence[];
 }> {
   return await withVideoStudioTimeout(win.webContents.executeJavaScript(`
 (() => {
+  const viewportWidth = Math.max(1, document.documentElement.clientWidth || window.innerWidth || 1);
+  const viewportHeight = Math.max(1, document.documentElement.clientHeight || window.innerHeight || 1);
   const visible = (el) => {
     const rect = el.getBoundingClientRect();
     if (rect.width <= 1 || rect.height <= 1) return false;
+    const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+    const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+    if (visibleWidth <= 1 || visibleHeight <= 1) return false;
     let node = el;
     let opacity = 1;
     while (node && node.nodeType === Node.ELEMENT_NODE) {
       const style = getComputedStyle(node);
       if (style.display === 'none' || style.visibility === 'hidden') return false;
       opacity *= Number(style.opacity || 1);
-      if (opacity <= 0.01) return false;
+      if (opacity <= 0.1) return false;
       node = node.parentElement;
     }
     return true;
@@ -1391,8 +1492,32 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
   const roles = roleEls
     .map((el) => String(el.getAttribute('data-role') || '').trim())
     .filter(Boolean);
-  const text = roleEls
-    .map((el) => String(el.textContent || '').replace(/\\s+/g, ' ').trim())
+  const visibleElements = Array.from(document.querySelectorAll('[data-role], [data-cover-signal], [data-cover-hero]'))
+    .filter(visible)
+    .map((el) => {
+      const rect = el.getBoundingClientRect();
+      const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+      const sceneOwner = el.closest('[data-scene-id]');
+      const style = getComputedStyle(el);
+      const role = String(el.getAttribute('data-role') || '').trim();
+      const text = String(el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 500);
+      const coverSignal = String(el.getAttribute('data-cover-signal') || '').trim();
+      return {
+        ...(sceneOwner ? { scene_id: String(sceneOwner.getAttribute('data-scene-id') || '').trim() } : {}),
+        ...(role ? { role } : {}),
+        ...(text ? { text } : {}),
+        text_transform: String(style.textTransform || 'none').trim().toLowerCase(),
+        ...(coverSignal ? { cover_signal: coverSignal } : {}),
+        ...(el.hasAttribute('data-cover-hero') ? { cover_hero: true } : {}),
+        width_ratio: Number((visibleWidth / viewportWidth).toFixed(4)),
+        height_ratio: Number((visibleHeight / viewportHeight).toFixed(4)),
+        area_ratio: Number(((visibleWidth * visibleHeight) / (viewportWidth * viewportHeight)).toFixed(4)),
+      };
+    });
+  const text = visibleElements
+    .filter((element) => !!element.role)
+    .map((element) => element.text || '')
     .filter(Boolean)
     .join(' ')
     .slice(0, 1000);
@@ -1400,9 +1525,15 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
     visible_scene_ids: [...new Set(scenes)],
     visible_roles: [...new Set(roles)],
     visible_text: text,
+    visible_elements: visibleElements,
   };
 })()
-`, true) as Promise<{ visible_scene_ids: string[]; visible_roles: string[]; visible_text: string }>,
+`, true) as Promise<{
+  visible_scene_ids: string[];
+  visible_roles: string[];
+  visible_text: string;
+  visible_elements: VisibleSemanticElementEvidence[];
+}>,
   COMPOSITION_SCRIPT_TIMEOUT_MS,
   'E_SEMANTIC_EVIDENCE_TIMEOUT',
   'composition semantic evidence collection timed out.');
@@ -1436,8 +1567,41 @@ export function previewArtifactPaths(
   };
 }
 
+export function videoCoverArtifactPath(videoAbsPath: string): string {
+  const resolved = path.resolve(videoAbsPath);
+  const extension = path.extname(resolved);
+  const stem = extension ? resolved.slice(0, -extension.length) : resolved;
+  return `${stem}-cover.png`;
+}
+
+export async function materializeVideoCover(
+  videoAbsPath: string,
+  frameEvidence: FrameEvidence | null,
+): Promise<{ path: string; source_frame: string; label: string }> {
+  const sample = frameEvidence?.samples.find((item) => item.label === 'first-frame')
+    || frameEvidence?.samples[0];
+  if (!sample?.path) {
+    throw new VideoStudioRuntimeError(
+      'E_COVER_FRAME_MISSING',
+      'The dedicated frame-0 cover could not be exported because first-frame evidence is missing.',
+    );
+  }
+  const source = path.resolve(sample.path);
+  const target = videoCoverArtifactPath(videoAbsPath);
+  const sourceStat = await fs.stat(source).catch(() => null);
+  if (!sourceStat?.isFile()) {
+    throw new VideoStudioRuntimeError(
+      'E_COVER_FRAME_MISSING',
+      `The dedicated frame-0 cover source is missing: ${source}`,
+    );
+  }
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  if (source !== target) await fs.copyFile(source, target);
+  return { path: target, source_frame: source, label: sample.label };
+}
+
 export async function inspectComposition(p: CompositionOptions): Promise<VideoStudioResult> {
-  const preflight = await preflightComposition(p);
+  const preflight = await preflightComposition(p, 'visual-preview');
   if (!preflight.ok || !preflight.meta) {
     const result = {
       ok: false,
@@ -1455,6 +1619,7 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
     return result;
   }
   const meta = preflight.meta;
+  const narrationPending = narrationPendingInPreflight(preflight);
   const issues: Issue[] = [...preflight.issues];
   const samplePlans = buildInspectFrameSamplePlan(meta, preflight.sceneMapLoad.value, 30);
   const samples = samplePlans.map((plan) => plan.timeSec);
@@ -1504,6 +1669,8 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
       blocking_error_count: blockingErrorCount,
       fatal_error_count: fatalErrorCount,
       preflight: preflight.report,
+      preview_completeness: narrationPending ? 'visual_only' : 'complete',
+      narration_pending: narrationPending,
       findings,
       next_allowed_ops: ['composition.lint', 'composition.inspect'],
     } as VideoStudioResult;
@@ -1522,6 +1689,8 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
       visual_review_required: true,
       preview_capture_allowed: true,
       preflight: preflight.report,
+      preview_completeness: narrationPending ? 'visual_only' : 'complete',
+      narration_pending: narrationPending,
       findings,
       inspect_disposition: disposition,
       next_allowed_ops: ['composition.snapshot'],
@@ -1537,8 +1706,12 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
     blocking_error_count: 0,
     fatal_error_count: 0,
     preflight: preflight.report,
+    preview_completeness: narrationPending ? 'visual_only' : 'complete',
+    narration_pending: narrationPending,
     findings,
-    next_allowed_ops: ['composition.snapshot', 'composition.draft'],
+    next_allowed_ops: narrationPending
+      ? ['composition.snapshot', 'composition.materialize_narration']
+      : ['composition.snapshot', 'composition.draft'],
   } as VideoStudioResult;
   await writeJsonIfRequested(p.findingsAbsPath, result);
   return result;
@@ -1750,7 +1923,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
   if (!p.snapshotAbsPath) {
     return { ok: false, op: 'composition.snapshot', errorCode: 'E_OUTPUT_REQUIRED', message: 'snapshot output path is required.' };
   }
-  const preflight = await preflightComposition(p);
+  const preflight = await preflightComposition(p, 'visual-preview');
   if (!preflight.ok || !preflight.meta || !preflight.manifest) {
     const result = {
       ok: false,
@@ -1768,6 +1941,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
   }
   const meta = preflight.meta;
   const manifest = preflight.manifest;
+  const narrationPending = narrationPendingInPreflight(preflight);
   const inspect = await inspectComposition({ ...p, findingsAbsPath: undefined });
   const inspectDisposition = summarizeDraftInspectDisposition(String(inspect.findings || ''));
   const fatalInspectCount = Number(inspectDisposition.fatal_error_count || 0);
@@ -1782,6 +1956,8 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       blocking_error_count: Number(inspectDisposition.blocking_error_count || inspect.blocking_error_count || 1),
       fatal_error_count: Math.max(1, fatalInspectCount),
       preflight: preflight.report,
+      preview_completeness: narrationPending ? 'visual_only' : 'complete',
+      narration_pending: narrationPending,
       findings: inspect.findings,
       inspect_disposition: inspectDisposition,
       preview_ready: false,
@@ -1896,6 +2072,8 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       sceneCount: manifest.scenes.length,
       expectedSceneIds: manifest.scenes.map((scene) => scene.id),
       requireSemanticCoverage: true,
+      designContract: preflight.contractLoad.value,
+      sceneMap: preflight.sceneMapLoad.value,
     });
     const st = await fs.stat(contactSheet);
     if (previewQa.ok === false) {
@@ -1914,6 +2092,8 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         frame_evidence: frameEvidence,
         preview_qa: previewQa,
         preflight: preflight.report,
+        preview_completeness: narrationPending ? 'visual_only' : 'complete',
+        narration_pending: narrationPending,
         visual_regression: visualRegression,
         design_review_inputs: designReviewInputs,
         preview_ready: false,
@@ -1948,6 +2128,8 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         preview_qa: reviewQa,
         inspect_disposition: inspectDisposition,
         preflight: preflight.report,
+        preview_completeness: narrationPending ? 'visual_only' : 'complete',
+        narration_pending: narrationPending,
         visual_regression: visualRegression,
         design_review_inputs: designReviewInputs,
         preview_ready: false,
@@ -1970,6 +2152,8 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       frame_evidence: frameEvidence,
       preview_qa: previewQa,
       preflight: preflight.report,
+      preview_completeness: narrationPending ? 'visual_only' : 'complete',
+      narration_pending: narrationPending,
       visual_regression: visualRegression,
       design_review_inputs: designReviewInputs,
       preview_ready: true,
@@ -2722,17 +2906,28 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
   if (repairBudget.blocked) {
     report.error = {
       code: 'E_REPAIR_BUDGET_EXCEEDED',
-      message: `Draft repair budget exceeded: the initial draft plus ${DRAFT_REPAIR_MAX_PASSES} repair pass(es) still failed. Stop and report the blocker instead of continuing to patch.`,
+      message: `The initial draft plus ${DRAFT_REPAIR_MAX_PASSES} materially different repair pass(es) still failed for this input history. Stop repeating the same render strategy, preserve the evidence, and make a different canonical edit before retrying.`,
     };
     await writeReportIfRequested(p.reportAbsPath, report);
     return {
       ok: false,
       op: 'composition.draft',
       errorCode: 'E_REPAIR_BUDGET_EXCEEDED',
-      message: String((report.error as Record<string, unknown>).message),
+      message: 'The previous draft repair strategies did not resolve the recorded quality failure for this exact composition input. Preserve the current artifacts, inspect the last failure, make a materially different edit to the canonical inputs, and retry after the input signature changes.',
       report,
       repair_budget: repairBudget.summary,
       last_error: repairBudget.summary.last_error,
+      blocked_operation: 'composition.draft',
+      same_input_retry_allowed: false,
+      requires_user_decision: false,
+      allowed_recovery_ops: [
+        'composition.status',
+        'composition.reconcile',
+        'composition.prepare',
+        'composition.lint',
+        'composition.inspect',
+      ],
+      next_action: 'repair_inputs_then_retry_draft',
     };
   }
 
@@ -2747,10 +2942,18 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
   };
   if (!preflight.ok || !preflight.meta || !preflight.manifest) {
     const firstError = preflight.issues.find((issue) => issue.severity === 'error');
+    const narrationPending = narrationPendingInPreflight(preflight);
     return failDraft(report, p, 'E_PREFLIGHT_BLOCKED', 'composition manifest/HTML/source/audio preflight failed before rendering.', {
       repair_target: firstError?.selector || 'composition-manifest.json',
       preflight: preflight.report,
-      next_allowed_ops: ['composition.prepare'],
+      next_allowed_ops: narrationPending
+        ? [
+          'composition.materialize_narration',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ]
+        : ['composition.prepare'],
     }, repairBudget);
   }
 
@@ -2814,6 +3017,14 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
 
   const renderPath = String(render.path || p.outputAbsPath || '');
   const renderedFrameEvidence = ((render as { frame_evidence?: FrameEvidence }).frame_evidence ?? null);
+  const renderedCandidate = {
+    path: renderPath,
+    media: render.media,
+    contact_sheet: renderedFrameEvidence?.contact_sheet || '',
+    frame_paths: renderedFrameEvidence?.frame_paths || [],
+    frame_evidence: renderedFrameEvidence,
+    draft_ready: false,
+  };
   const reviewContractLoad = preflight.contractLoad;
   const reviewSceneMapLoad = preflight.sceneMapLoad;
   const baselineAbsPath = p.visualBaselineAbsPath || path.join(p.compositionDirAbs, 'qa', 'visual-baseline.json');
@@ -2868,6 +3079,7 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     steps.media_qa = mediaQa;
     if (mediaQa.ok === false) {
       return failDraft(report, p, 'E_MEDIA_QA_BLOCKED', 'draft media QA failed.', {
+        ...renderedCandidate,
         media_qa: mediaQa,
       }, repairBudget);
     }
@@ -2875,13 +3087,27 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
       sceneCount: preflight.manifest.scenes.length,
       expectedSceneIds: preflight.manifest.scenes.map((scene) => scene.id),
       requireSemanticCoverage: true,
+      designContract: preflight.contractLoad.value,
+      sceneMap: preflight.sceneMapLoad.value,
     });
     steps.video_qa = videoQa;
     if (videoQa.ok === false) {
       return failDraft(report, p, 'E_VIDEO_QA_BLOCKED', 'video-level QA failed; repair the canonical manifest, mapped content, or visual HTML before Gate D.', {
+        ...renderedCandidate,
         video_qa: videoQa,
       }, repairBudget);
     }
+  }
+
+  let coverArtifact: { path: string; source_frame: string; label: string };
+  try {
+    coverArtifact = await materializeVideoCover(renderPath, renderedFrameEvidence);
+  } catch (err) {
+    const code = err instanceof VideoStudioRuntimeError ? err.errorCode : 'E_COVER_EXPORT_FAILED';
+    return failDraft(report, p, code, (err as Error).message || 'Dedicated video cover export failed.', {
+      ...renderedCandidate,
+      frame_evidence: renderedFrameEvidence,
+    }, repairBudget);
   }
 
   const successBudget = await recordDraftSuccess(repairBudget, p.reportAbsPath, render.path as string | undefined);
@@ -2889,6 +3115,7 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
   report.repair_budget = successBudget;
   report.ok = true;
   report.media = { path: renderPath, bytes: finalBytes };
+  report.cover = coverArtifact;
   report.video_qa = (steps.video_qa as Record<string, unknown>) || null;
   report.render_profile = (steps.render_profile as Record<string, unknown>) || null;
   report.visual_regression = visualRegression;
@@ -2900,6 +3127,8 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     ok: true,
     op: 'composition.draft',
     path: renderPath,
+    cover_path: coverArtifact.path,
+    cover_media: versionedChatMediaLocalUrl(coverArtifact.path),
     bytes: finalBytes,
     report_path: p.reportAbsPath || '',
     findings_path: p.findingsAbsPath || '',

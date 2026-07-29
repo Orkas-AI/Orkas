@@ -53,6 +53,21 @@ describe('expert_signals.skill_path › positives', () => {
       agent_id: 'agent_x',
     });
   });
+
+  it('B: <uid>/local/marketplace/agents/<aid>/skills/<sid>/SKILL.md (carries agent_id)', async () => {
+    const { parseSkillPath } = await import('../../../../src/main/features/expert_signals/skill_path');
+    const p = await import('../../../../src/main/paths');
+    const abs = path.join(
+      p.userMarketplaceAgentSkillsDir('uid1', 'platform_agent'),
+      'image-router',
+      'SKILL.md',
+    );
+    expect(parseSkillPath(abs, 'uid1')).toEqual({
+      system: 'B',
+      skill_id: 'image-router',
+      agent_id: 'platform_agent',
+    });
+  });
 });
 
 describe('expert_signals.skill_path › negatives', () => {
@@ -84,6 +99,19 @@ describe('expert_signals.skill_path › negatives', () => {
     const p = await import('../../../../src/main/paths');
     // Wrong shape: <agents-root>/<aid>/meta/<sid>/SKILL.md (meta, not skills)
     const abs = path.join(p.userAgentsDir('uid1'), 'agent_x', 'meta', 'sid', 'SKILL.md');
+    expect(parseSkillPath(abs, 'uid1')).toBeNull();
+  });
+
+  it('marketplace System B path missing the literal "skills" segment → null', async () => {
+    const { parseSkillPath } = await import('../../../../src/main/features/expert_signals/skill_path');
+    const p = await import('../../../../src/main/paths');
+    const abs = path.join(
+      p.userMarketplaceAgentsDir('uid1'),
+      'platform_agent',
+      'private_skills',
+      'sid',
+      'SKILL.md',
+    );
     expect(parseSkillPath(abs, 'uid1')).toBeNull();
   });
 

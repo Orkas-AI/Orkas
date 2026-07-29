@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { whichBin } from '../../../../src/main/features/local_agents/which';
+import { whichBin, whichBins } from '../../../../src/main/features/local_agents/which';
 
 const isWindows = process.platform === 'win32';
 
@@ -66,6 +66,17 @@ describe('local_agents/which › whichBin', () => {
       process.env.PATH = `${a}${path.delimiter}${b}`;
       expect(await whichBin('foo')).toBe(ap);
     });
+
+    it('returns every match in PATH order when requested', async () => {
+      const a = fs.mkdtempSync(path.join(tmpDir, 'all-a-'));
+      const b = fs.mkdtempSync(path.join(tmpDir, 'all-b-'));
+      const ap = path.join(a, 'foo');
+      const bp = path.join(b, 'foo');
+      fs.writeFileSync(ap, ''); fs.chmodSync(ap, 0o755);
+      fs.writeFileSync(bp, ''); fs.chmodSync(bp, 0o755);
+      process.env.PATH = `${a}${path.delimiter}${b}`;
+      expect(await whichBins('foo')).toEqual([ap, bp]);
+    });
   }
 
   if (isWindows) {
@@ -102,6 +113,17 @@ describe('local_agents/which › whichBin', () => {
       fs.writeFileSync(binPath, '@echo hi\r\n');
 
       expect(await whichBin(binPath.replace(/\\/g, '/'))).toBe(path.resolve(binPath));
+    });
+
+    it('finds a command when a spaced Windows PATH entry is quoted', async () => {
+      const spacedDir = path.join(tmpDir, 'CLI Tools');
+      const binPath = path.join(spacedDir, 'quoted.CMD');
+      fs.mkdirSync(spacedDir);
+      fs.writeFileSync(binPath, '@echo hi\r\n');
+      process.env.PATH = `"${spacedDir}"`;
+      process.env.PATHEXT = '.CMD';
+
+      expect((await whichBin('quoted'))?.toLowerCase()).toBe(binPath.toLowerCase());
     });
   }
 

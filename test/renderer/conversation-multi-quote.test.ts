@@ -55,7 +55,7 @@ function loadQuoteAttributionRuntime() {
     String,
     t: (key: string, values: Record<string, string>) => {
       if (key === 'chat.quote_from') return `Quoted from ${values.name}`;
-      if (key === 'chat.reference_from_task') return `From ${values.title} · ${values.name}`;
+      if (key === 'chat.reference_from_task') return `Quoted from ${values.title} @${values.name}`;
       return key;
     },
   };
@@ -64,6 +64,30 @@ function loadQuoteAttributionRuntime() {
     function _referenceDisplayName(ref) { return ref.fromName || 'Unknown'; }
     function _conversationTitleForCid(cid) { return 'Title for ' + cid; }
     ${extractFunction(pcSource, '_quotePreviewAttribution')}
+  `, context);
+  return context;
+}
+
+function loadMessageReferenceRuntime() {
+  const context: any = {
+    String,
+    Array,
+    Math,
+    escapeHtml: (value: unknown) => String(value),
+    _chatFileIconHtml: () => '',
+    _referenceDisplayName: (ref: any) => ref.from_name || 'Unknown',
+    _conversationTitleForCid: (cid: string) => `Title for ${cid}`,
+    t: (key: string, values: Record<string, string>) => {
+      if (key === 'chat.quote_from') return `Quoted from @${values.name}:`;
+      if (key === 'chat.reference_from_task') return `Quoted from ${values.title} @${values.name}`;
+      if (key === 'chat.reference_unknown_task') return 'Unknown task';
+      return key;
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(`
+    ${extractFunction(pcSource, '_quotePreviewAttribution')}
+    ${extractFunction(pcSource, '_renderMessageReferencesHtml')}
   `, context);
   return context;
 }
@@ -140,7 +164,7 @@ describe('conversation multi-message quote', () => {
     `, context);
 
     expect(context.__sameTask).toBe('Quoted from User');
-    expect(context.__crossTask).toBe('From Source task · User');
+    expect(context.__crossTask).toBe('Quoted from Source task @User');
     expect(context.__legacySameTask).toBe('Quoted from User');
   });
 

@@ -17,13 +17,20 @@
  * so a botched local setup never blocks `npm install`.
  */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-function tryGitTopLevel() {
+export function tryGitTopLevel({
+  cwd = process.cwd(),
+  execFile = execFileSync,
+} = {}) {
   try {
-    return execSync('git rev-parse --show-toplevel', { stdio: ['ignore', 'pipe', 'ignore'] })
+    return execFile('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
       .toString()
       .trim();
   } catch {
@@ -31,22 +38,39 @@ function tryGitTopLevel() {
   }
 }
 
-const repoRoot = tryGitTopLevel();
-if (!repoRoot) {
-  // Not a git checkout — npm install from a published tarball, CI install
-  // with .git stripped, etc. Silently no-op.
-  process.exit(0);
+export function installGitHooks({
+  cwd = process.cwd(),
+  execFile = execFileSync,
+  fileSystem = fs,
+  log = console.log,
+  warn = console.warn,
+} = {}) {
+  const repoRoot = tryGitTopLevel({ cwd, execFile });
+  if (!repoRoot) {
+    // Not a git checkout — npm install from a published tarball, CI install
+    // with .git stripped, etc. Silently no-op.
+    return { status: 'no_repository' };
+  }
+
+  const hooksDir = path.join(repoRoot, '.githooks');
+  if (!fileSystem.existsSync(hooksDir)) {
+    // No hooks vendored in this checkout — nothing to wire up.
+    return { status: 'no_hooks', repoRoot, hooksDir };
+  }
+
+  try {
+    execFile('git', ['config', 'core.hooksPath', hooksDir], {
+      cwd: repoRoot,
+      stdio: 'ignore',
+    });
+    log('[install-git-hooks] repository hooks configured');
+    return { status: 'installed', repoRoot, hooksDir };
+  } catch {
+    warn('[install-git-hooks] skipped: git config failed');
+    return { status: 'config_failed', repoRoot, hooksDir };
+  }
 }
 
-const hooksDir = path.join(repoRoot, '.githooks');
-if (!fs.existsSync(hooksDir)) {
-  // No hooks vendored in this checkout — nothing to wire up.
-  process.exit(0);
-}
-
-try {
-  execSync(`git config core.hooksPath "${hooksDir}"`, { stdio: 'ignore' });
-  console.log(`[install-git-hooks] core.hooksPath -> ${hooksDir}`);
-} catch (err) {
-  console.warn(`[install-git-hooks] skipped: ${(err && err.message) || err}`);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  installGitHooks();
 }

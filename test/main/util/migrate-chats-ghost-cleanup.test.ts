@@ -126,4 +126,30 @@ describe('migrate-chats-ghost-cleanup', () => {
       warnings: 0,
     });
   });
+
+  it('does not stamp a corrupt index and retries after it becomes readable', async () => {
+    fs.mkdirSync(chatsDir(), { recursive: true });
+    fs.writeFileSync(indexFile(), '{not-json', 'utf8');
+    const { migrateChatsGhostCleanup } = await import('../../../src/main/util/migrate-chats-ghost-cleanup');
+
+    const failed = migrateChatsGhostCleanup(TEST_UID, Date.parse('2026-05-29T00:00:00Z'));
+
+    expect(failed.warnings).toBe(1);
+    expect(migrationTags()).not.toContain(GHOST_MIGRATION_TAG);
+
+    writeIndex([{
+      conversation_id: 'gone-after-repair',
+      title: 'recoverable ghost',
+      created_at: '2026-05-01T00:00:00Z',
+      updated_at: '2026-05-01T00:00:00Z',
+    }]);
+    const retried = migrateChatsGhostCleanup(
+      TEST_UID,
+      Date.parse('2026-05-29T00:00:00Z'),
+    );
+
+    expect(retried.tombstoned).toBe(1);
+    expect(JSON.parse(fs.readFileSync(indexFile(), 'utf8'))[0].deleted_at).toBeTruthy();
+    expect(migrationTags()).toContain(GHOST_MIGRATION_TAG);
+  });
 });

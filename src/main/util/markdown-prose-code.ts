@@ -71,8 +71,11 @@ export function splitMarkdownProseCode(text: string): ProseCodeSegment[] {
               if (cc >= count) {
                 let lineEnd = s + cc;
                 while (lineEnd < n && text[lineEnd] !== '\n') lineEnd++;
-                close = lineEnd;
-                break;
+                const suffix = text.slice(s + cc, lineEnd);
+                if (/^[ \t\r]*$/.test(suffix)) {
+                  close = lineEnd;
+                  break;
+                }
               }
             }
             while (scan < n && text[scan] !== '\n') scan++;
@@ -162,6 +165,23 @@ function isInlineQuotedOpening(text: string, idx: number): boolean {
   return isInsideQuotedSpanOnLine(text, idx) && !isLineStartOpening(text, idx);
 }
 
+function openingTagEnd(text: string, from: number): number {
+  let quote = '';
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === '\'') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '>') return i;
+  }
+  return -1;
+}
+
 /** Find every `<TAG>...</TAG>` (or unclosed `<TAG>...EOF`) range whose
  *  OPENING tag falls in an outer prose segment or an explicit XML fence.
  *  The tagged container is
@@ -205,14 +225,18 @@ export function findOuterTagRanges(text: string, tagName: string): Array<[number
         from = openIdx + openLeader.length;
         continue;
       }
-      const tagEnd = text.indexOf('>', openIdx + openLeader.length);
+      const tagEnd = openingTagEnd(text, openIdx + openLeader.length);
       if (tagEnd < 0) {
         ranges.push([openIdx, text.length]);
         from = text.length;
         break;
       }
-      const closeIdx = text.indexOf(closeLiteral, tagEnd + 1);
-      const endPos = closeIdx < 0 ? text.length : closeIdx + closeLiteral.length;
+      const openingTag = text.slice(openIdx, tagEnd + 1);
+      const selfClosing = /\/\s*>$/.test(openingTag);
+      const closeIdx = selfClosing ? -1 : text.indexOf(closeLiteral, tagEnd + 1);
+      const endPos = selfClosing
+        ? tagEnd + 1
+        : closeIdx < 0 ? text.length : closeIdx + closeLiteral.length;
       ranges.push([openIdx, endPos]);
       from = endPos;
     }

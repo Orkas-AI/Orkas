@@ -22,17 +22,21 @@
  * question is "is this skill paying off?", which is a per-skill answer.
  * Per-agent breakdown can be re-added when actually requested.
  *
- * Display name resolution falls through `listSkills()` (covers A.custom +
- * A.platform via the SkillLoader cache); B-system skills (agent self-
- * evolved) fall back to `skill_id` since their id == name by convention
- * (CLAUDE.md §6).
+ * Display names are read from the requested account's custom and
+ * marketplace roots. B-system skills (agent self-evolved) fall back to
+ * `skill_id` since their id == name by convention.
  */
 
-import { querySignals } from './expert_signals';
-import { listSkills } from './skills';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import { querySignalsForUser } from './expert_signals';
+import { parseSkillFrontmatter } from './skills';
 import type { Signal } from './expert_signals/types';
 import type { SkillSystem } from './expert_signals/types';
 import { createLogger } from '../logger';
+import { userMarketplaceSkillsDir, userSkillsDir } from '../paths';
+import { logErrorSummary } from '../util/log-redact';
 
 const log = createLogger('skill-metrics');
 
@@ -68,6 +72,9 @@ export interface SkillMetricsReport {
   rows: SkillMetricRow[];
   summary: Record<SkillHealthStatus, number> & { total: number };
   total_signals_scanned: number;
+  data_status: 'ok' | 'error';
+  /** The storage hard cap was reached, so the report may be incomplete. */
+  truncated: boolean;
 }
 
 export interface SkillMetricsOpts {
@@ -76,9 +83,10 @@ export interface SkillMetricsOpts {
 }
 
 export async function aggregateSkillMetrics(
+  userId: string,
   opts: SkillMetricsOpts = {},
 ): Promise<SkillMetricsReport> {
-  const days = Math.max(1, opts.sinceDays ?? DEFAULT_DAYS);
+  const days = _normalizeDays(opts.sinceDays);
   const until = new Date();
   const since = new Date(until.getTime() - days * 24 * 60 * 60 * 1000);
   const sinceIso = since.toISOString();
@@ -86,93 +94,86 @@ export async function aggregateSkillMetrics(
 
   let signals: Signal[];
   try {
-    signals = await querySignals({
+    signals = await querySignalsForUser(userId, {
       since: sinceIso,
       until: untilIso,
       types: ['skill_advertised', 'skill_invoked', 'correction', 'edit', 'skill_ineffective'],
       limit: QUERY_HARD_LIMIT,
     });
   } catch (err) {
-    log.warn(`querySignals failed: ${(err as Error).message}`);
+    log.warn('skill metrics query failed', { error: logErrorSummary(err) });
     return {
       range: { since: sinceIso, until: untilIso },
       rows: [],
       summary: _emptyHealthSummary(),
       total_signals_scanned: 0,
+      data_status: 'error',
+      truncated: false,
     };
   }
 
-  // Per-skill counts keyed by `${system}::${skill_id}` — `::` is safe
-  // because neither system labels (A.custom / A.platform / B) nor skill
-  // ids (kebab / snake / 12-hex per CLAUDE.md §6) contain it.
-  const advert = new Map<string, number>();
-  const invoke = new Map<string, number>();
-  const ineffective = new Map<string, number>();
-  // Per-turn JOIN side: which skills were invoked, and did the user
-  // react with a correction/edit?
-  const turnInvokes = new Map<string, Set<string>>();
+  // Metrics are per turn, not per emitted JSONL line. Multiple callbacks can
+  // observe the same advertise/read/failure event; Set-based aggregation
+  // prevents those duplicates from producing rates above 100%.
+  const advertisedTurns = new Map<string, Set<string>>();
+  const invokedTurns = new Map<string, Set<string>>();
+  const ineffectiveTurns = new Map<string, Set<string>>();
   const turnHadReaction = new Set<string>();
 
   for (const sig of signals) {
+    const turn = _signalTurnKey(sig);
+    if (!turn) continue;
     if (sig.type === 'skill_advertised') {
-      const system = sig.delta?.system;
+      const system = _validSystem(sig.delta?.system);
       const ids = sig.delta?.skill_ids;
-      if (!system || !ids) continue;
+      if (!system || !Array.isArray(ids)) continue;
       for (const id of ids) {
-        const k = `${system}::${id}`;
-        advert.set(k, (advert.get(k) || 0) + 1);
+        const validId = _validSkillId(id);
+        if (!validId) continue;
+        _addTurn(advertisedTurns, `${system}::${validId}`, turn);
       }
     } else if (sig.type === 'skill_invoked') {
-      const system = sig.delta?.system;
-      const id = sig.delta?.skill_id;
+      const system = _validSystem(sig.delta?.system);
+      const id = _validSkillId(sig.delta?.skill_id);
       if (!system || !id) continue;
       const k = `${system}::${id}`;
-      invoke.set(k, (invoke.get(k) || 0) + 1);
-      // Buffer for the per-turn JOIN below.
-      let set = turnInvokes.get(sig.turn_id);
-      if (!set) { set = new Set(); turnInvokes.set(sig.turn_id, set); }
-      set.add(k);
+      _addTurn(invokedTurns, k, turn);
     } else if (sig.type === 'correction' || sig.type === 'edit') {
-      turnHadReaction.add(sig.turn_id);
+      turnHadReaction.add(turn);
     } else if (sig.type === 'skill_ineffective') {
-      const system = sig.delta?.system;
-      const id = sig.delta?.skill_id;
+      const system = _validSystem(sig.delta?.system);
+      const id = _validSkillId(sig.delta?.skill_id);
       if (!system || !id) continue;
-      const k = `${system}::${id}`;
-      ineffective.set(k, (ineffective.get(k) || 0) + 1);
+      _addTurn(ineffectiveTurns, `${system}::${id}`, turn);
     }
   }
 
-  // Modified-after-hit JOIN: a turn with both `skill_invoked` and one
-  // of (correction | edit) credits every skill invoked in that turn.
+  // Modified-after-hit JOIN: a conversation turn with both `skill_invoked`
+  // and one of (correction | edit) credits every skill invoked in that turn.
   // Over-attributes on purpose when multiple skills load in one turn —
   // the alternative is causal attribution we don't have.
   const modifiedAfterHit = new Map<string, number>();
-  for (const [turn_id, keys] of turnInvokes) {
-    if (!turnHadReaction.has(turn_id)) continue;
-    for (const k of keys) {
-      modifiedAfterHit.set(k, (modifiedAfterHit.get(k) || 0) + 1);
+  const ineffective = new Map<string, number>();
+  for (const [k, turns] of invokedTurns) {
+    let modifiedCount = 0;
+    let ineffectiveCount = 0;
+    const failedTurns = ineffectiveTurns.get(k);
+    for (const turn of turns) {
+      if (turnHadReaction.has(turn)) modifiedCount += 1;
+      if (failedTurns?.has(turn)) ineffectiveCount += 1;
     }
+    modifiedAfterHit.set(k, modifiedCount);
+    ineffective.set(k, ineffectiveCount);
   }
 
-  // Display-name lookup — listSkills() is mtime-cached per directory
-  // (features/skills.ts:_skillDirStamp) so this is cheap. Returns the
-  // SKILL.md frontmatter `name`; falls back to skill_id when the entry
-  // is missing (B-system skills, freshly-uninstalled platform skills).
-  const nameMap = new Map<string, string>();
-  try {
-    const skills = await listSkills();
-    for (const s of skills) nameMap.set(s.id, s.name || s.id);
-  } catch (err) {
-    log.warn(`listSkills failed (display names will fall back to ids): ${(err as Error).message}`);
-  }
+  const nameMap = _readSkillDisplayNames(userId);
 
-  const keys = new Set<string>([...advert.keys(), ...invoke.keys(), ...ineffective.keys()]);
+  const keys = new Set<string>([...advertisedTurns.keys(), ...invokedTurns.keys()]);
   const rows: SkillMetricRow[] = [];
   for (const k of keys) {
     const [system, id] = _decodeKey(k);
-    const ad = advert.get(k) || 0;
-    const iv = invoke.get(k) || 0;
+    const ad = advertisedTurns.get(k)?.size || 0;
+    const iv = invokedTurns.get(k)?.size || 0;
     const moh = modifiedAfterHit.get(k) || 0;
     const ineff = ineffective.get(k) || 0;
     const base = {
@@ -181,7 +182,7 @@ export async function aggregateSkillMetrics(
       display_name: nameMap.get(id) || id,
       advertised: ad,
       invoked: iv,
-      invocation_rate: ad > 0 ? iv / ad : 0,
+      invocation_rate: ad > 0 ? Math.min(1, iv / ad) : 0,
       modified_after_hit: moh,
       modified_after_hit_rate: iv > 0 ? moh / iv : 0,
       ineffective: ineff,
@@ -213,7 +214,83 @@ export async function aggregateSkillMetrics(
     rows,
     summary: _summarizeHealth(rows),
     total_signals_scanned: signals.length,
+    data_status: 'ok',
+    truncated: signals.length >= QUERY_HARD_LIMIT,
   };
+}
+
+function _normalizeDays(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_DAYS;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_DAYS;
+  return Math.min(30, Math.max(1, Math.floor(parsed)));
+}
+
+function _signalTurnKey(signal: Signal): string | null {
+  if (typeof signal.cid !== 'string' || !signal.cid) return null;
+  if (typeof signal.turn_id !== 'string' || !signal.turn_id) return null;
+  return `${signal.cid}\u0000${signal.turn_id}`;
+}
+
+function _validSystem(value: unknown): SkillSystem | null {
+  return value === 'A.custom' || value === 'A.platform' || value === 'B'
+    ? value
+    : null;
+}
+
+function _validSkillId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const id = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id) ? id : null;
+}
+
+function _addTurn(map: Map<string, Set<string>>, key: string, turn: string): void {
+  let turns = map.get(key);
+  if (!turns) {
+    turns = new Set<string>();
+    map.set(key, turns);
+  }
+  turns.add(turn);
+}
+
+function _readSkillDisplayNames(userId: string): Map<string, string> {
+  const names = new Map<string, string>();
+  let failures = 0;
+  // Custom wins by id, so read marketplace first and overlay custom.
+  for (const root of [userMarketplaceSkillsDir(userId), userSkillsDir(userId)]) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.existsSync(root)
+        ? fs.readdirSync(root, { withFileTypes: true })
+        : [];
+    } catch (err) {
+      failures += 1;
+      log.warn('skill metrics name catalog read failed', {
+        error: logErrorSummary(err),
+      });
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const id = _validSkillId(entry.name);
+      if (!id) continue;
+      try {
+        const meta = parseSkillFrontmatter(
+          fs.readFileSync(path.join(root, entry.name, 'SKILL.md'), 'utf8'),
+        );
+        const name = typeof meta.name === 'string' ? meta.name.trim() : '';
+        if (name) names.set(id, name);
+      } catch {
+        failures += 1;
+      }
+    }
+  }
+  if (failures > 0) {
+    log.warn('some skill metric display names could not be read', {
+      failed_count: failures,
+    });
+  }
+  return names;
 }
 
 function _decodeKey(k: string): [SkillSystem, string] {

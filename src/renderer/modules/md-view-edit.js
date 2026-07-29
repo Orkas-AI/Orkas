@@ -117,6 +117,8 @@ function mountMdViewEdit(opts) {
     draft: '',
     preview: false,
     destroyed: false,
+    saving: false,
+    savePromise: null,
     // Suppress an automatic re-render after an external setMode call so the
     // caller can chain `setMode('edit')` then push focus / scroll
     // synchronously without fighting the controller.
@@ -329,7 +331,7 @@ function _mveRender(state) {
 
 function _mveRenderError(state, msg) {
   const body = state.bodyEl;
-  body.innerHTML = `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.viewer.read_failed', { reason: msg }) || `Failed to read file: ${msg}`)}</div>`;
+  body.innerHTML = `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.read_failed'))}</div>`;
   state.actionsEl.innerHTML = '';
 }
 
@@ -377,6 +379,7 @@ function _mveRenderView(state) {
 }
 
 function _mveEnterEdit(state) {
+  if (!state.caps.edit) return;
   state.mode = 'edit';
   // Only seed the draft from canonical content if we don't have a draft yet
   // — caller-provided initialDraft and prior edit state both reach here.
@@ -462,23 +465,46 @@ function _mveCancelEdit(state) {
   _mveEmitDirty(state);
 }
 
+function _mveSetSavingUi(state, saving) {
+  const ta = state.bodyEl.querySelector('[data-mve-textarea]');
+  if (ta) ta.disabled = saving;
+  state.actionsEl
+    .querySelectorAll('[data-mve-action="save"], [data-mve-action="cancel"]')
+    .forEach(btn => { btn.disabled = saving; });
+}
+
 async function _mveSave(state) {
+  if (state.saving && state.savePromise) return state.savePromise;
   const ta = state.bodyEl.querySelector('[data-mve-textarea]');
   if (ta) state.draft = ta.value;
   const next = state.draft;
-  const res = await _mveWriteSource(state.source, next);
-  if (!res.ok) {
-    await uiAlert(t('contexts.save_failed'));
-    return;
-  }
-  state.content = next;
-  state.preview = false;
-  _mveRenderView(state);
-  _mveEmitDraftChange(state, /* cleared = */ true);
-  _mveEmitDirty(state);
-  if (state.callbacks.onSaved) {
-    try { state.callbacks.onSaved(next); }
-    catch (e) { _mveLog.warn('onSaved threw', e); }
+  state.saving = true;
+  _mveSetSavingUi(state, true);
+  const operation = (async () => {
+    const res = await _mveWriteSource(state.source, next);
+    if (state.destroyed) return;
+    if (!res.ok) {
+      await uiAlert(t('contexts.save_failed'));
+      return;
+    }
+    state.content = next;
+    state.draft = next;
+    state.preview = false;
+    _mveRenderView(state);
+    _mveEmitDraftChange(state, /* cleared = */ true);
+    _mveEmitDirty(state);
+    if (state.callbacks.onSaved) {
+      try { state.callbacks.onSaved(next); }
+      catch (e) { _mveLog.warn('onSaved threw', e); }
+    }
+  })();
+  state.savePromise = operation;
+  try {
+    await operation;
+  } finally {
+    if (state.savePromise === operation) state.savePromise = null;
+    state.saving = false;
+    if (!state.destroyed) _mveSetSavingUi(state, false);
   }
 }
 
@@ -510,7 +536,23 @@ function _mveSendDraftToChat(state) {
 function _mveScanTaskLines(content) {
   const lines = (content || '').split('\n');
   const out = [];
+  let fence = null;
   for (let i = 0; i < lines.length; i++) {
+    const fenceMatch = lines[i].match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1];
+      if (!fence) {
+        fence = { char: marker[0], length: marker.length };
+      } else if (
+        marker[0] === fence.char
+        && marker.length >= fence.length
+        && !fenceMatch[2].trim()
+      ) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence) continue;
     const m = lines[i].match(_MVE_TODO_LINE_RE);
     if (m) out.push({ lineIdx: i, checked: m[2].toLowerCase() === 'x' });
   }
@@ -638,11 +680,13 @@ function _mveLinePrefix(state, ta, prefixFn) {
   const { lineStart, lineEnd } = _mveLineSpan(value, ta.selectionStart, ta.selectionEnd);
   const block = value.slice(lineStart, lineEnd);
   const lines = block.split('\n');
-  const firstPrefix = prefixFn(0);
-  const allMatch = lines.every(line => line.length === 0 || line.startsWith(firstPrefix));
+  const allMatch = lines.every((line, idx) => line.length === 0 || line.startsWith(prefixFn(idx)));
   let rebuilt;
-  if (allMatch && firstPrefix) {
-    rebuilt = lines.map(line => line.startsWith(firstPrefix) ? line.slice(firstPrefix.length) : line).join('\n');
+  if (allMatch) {
+    rebuilt = lines.map((line, idx) => {
+      const prefix = prefixFn(idx);
+      return prefix && line.startsWith(prefix) ? line.slice(prefix.length) : line;
+    }).join('\n');
   } else {
     rebuilt = lines.map((line, idx) => `${prefixFn(idx)}${line}`).join('\n');
   }
@@ -813,7 +857,12 @@ function _mveEmitDraftChange(state, cleared = false) {
 // CommonJS bridge for unit tests (CLAUDE.md §9 testability exception).
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
+    _mveApplyMd,
+    _mveEnterEdit,
+    _mveOnKey,
+    _mveSave,
     _mveScanTaskLines,
+    _mveWriteSource,
     _MVE_TODO_LINE_RE,
   };
 }

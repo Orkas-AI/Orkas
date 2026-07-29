@@ -20,17 +20,26 @@ if (process.platform !== 'win32' && process.platform !== 'darwin') {
 // release-only `test:windows-native` lane because it requires downloaded
 // FFmpeg, model, VC runtime, and CPU-dispatch payloads.
 const commonSuites = [
+  'src/core-agent/test/oauth-flow.test.ts',
   'src/core-agent/test/tools.test.ts',
+  'src/core-agent/test/process-session.test.ts',
+  'src/core-agent/test/workspace-state.test.ts',
   'src/core-agent/test/sandbox.test.ts',
   'test/main/model/core-agent/file-tools.test.ts',
   'test/main/model/core-agent/tool-result-tools.test.ts',
   'test/main/model/core-agent/local-tools.test.ts',
+  'test/main/model/core-agent/html-preview-tool.test.ts',
+  'test/main/features/html_preview.test.ts',
   'test/main/model/local-tools.test.ts',
   'test/main/model/core-agent/video-studio-state-tool.test.ts',
+  'test/main/model/core-agent/image-studio-tool.test.ts',
   'test/main/model/core-agent/office-tools.test.ts',
+  'test/main/model/core-agent/pdf-tools.test.ts',
   'test/main/features/office/office_engine.test.ts',
   'test/main/features/ocr_runtime.test.ts',
   'test/main/features/notification_permissions.test.ts',
+  'test/main/features/generation_reference_assets.test.ts',
+  'test/main/index-process.test.ts',
   'test/main/features/local_agents/base.test.ts',
   'test/main/features/local_agents/spawn-command.test.ts',
   'test/main/features/local_agents/version.test.ts',
@@ -39,6 +48,7 @@ const commonSuites = [
   'test/main/features/packages.test.ts',
   'test/main/util/media_probe.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
+  'test/main/install-data-root.test.ts',
 ];
 
 const platformSuites = process.platform === 'win32'

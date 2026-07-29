@@ -23,6 +23,7 @@ import { writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
 import { scanForInjection } from './memory';
 import { getActiveUserId } from './users';
+import { getMetacognitionEnabledForUser } from './config';
 
 const log = createLogger('metacognition');
 
@@ -41,16 +42,13 @@ export const STRATEGIES_CHAR_LIMIT = 4000;   // ~1300 tokens — strategies is a
 // runner.ts and reflection-orchestrator.ts both read from here; don't sprinkle the
 // env check around again.
 export function isFeatureEnabled(): boolean {
+  return isFeatureEnabledForUser(getActiveUserId());
+}
+
+/** Account-explicit feature gate for background/model work. */
+export function isFeatureEnabledForUser(uid: string): boolean {
   if (process.env.ORKAS_METACOGNITION === '0') return false;
-  // Lazy-require to break a potential cycle: features/config -> features/avatars
-  // -> ... is light, but metacognition is called early during startup; play
-  // safe and use require so it lands in the module cache.
-  try {
-    const cfg = require('./config') as typeof import('./config');
-    return cfg.getMetacognitionEnabled();
-  } catch {
-    return true;
-  }
+  return getMetacognitionEnabledForUser(uid);
 }
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -68,9 +66,8 @@ function normalizeAgentId(agentId: string | undefined | null): string {
   return agentId || DEFAULT_AGENT_ID;
 }
 
-function fileForTarget(agentId: string, target: 'competence' | 'strategies'): string {
+function fileForTargetForUser(uid: string, agentId: string, target: 'competence' | 'strategies'): string {
   const id = normalizeAgentId(agentId);
-  const uid = getActiveUserId();
   return target === 'competence' ? agentCompetenceFile(uid, id) : agentStrategiesFile(uid, id);
 }
 
@@ -82,7 +79,18 @@ function limitForTarget(target: 'competence' | 'strategies'): number {
 
 /** Read the full content of a metacognition file. */
 export function readContent(agentId: string, target: 'competence' | 'strategies'): MetacognitionOpResult {
-  const filePath = fileForTarget(agentId, target);
+  return readContentForUser(getActiveUserId(), agentId, target);
+}
+
+/** Read metacognition for an explicit account.
+ *
+ * Use this from asynchronous work that can outlive the active account. */
+export function readContentForUser(
+  uid: string,
+  agentId: string,
+  target: 'competence' | 'strategies',
+): MetacognitionOpResult {
+  const filePath = fileForTargetForUser(uid, agentId, target);
   const limit = limitForTarget(target);
   let content = '';
   try {
@@ -99,6 +107,16 @@ export function readContent(agentId: string, target: 'competence' | 'strategies'
 
 /** Write (replace) the full content of a metacognition file. */
 export function writeContent(agentId: string, target: 'competence' | 'strategies', content: string): MetacognitionOpResult {
+  return writeContentForUser(getActiveUserId(), agentId, target, content);
+}
+
+/** Replace metacognition for an explicit account. */
+export function writeContentForUser(
+  uid: string,
+  agentId: string,
+  target: 'competence' | 'strategies',
+  content: string,
+): MetacognitionOpResult {
   const trimmed = content.trim();
   const limit = limitForTarget(target);
   const id = normalizeAgentId(agentId);
@@ -132,7 +150,7 @@ export function writeContent(agentId: string, target: 'competence' | 'strategies
     };
   }
 
-  const filePath = fileForTarget(agentId, target);
+  const filePath = fileForTargetForUser(uid, agentId, target);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   writeTextAtomicSync(filePath, trimmed);
 
@@ -147,7 +165,16 @@ export function writeContent(agentId: string, target: 'competence' | 'strategies
 
 /** Clear a metacognition file. */
 export function clearContent(agentId: string, target: 'competence' | 'strategies'): void {
-  const filePath = fileForTarget(agentId, target);
+  clearContentForUser(getActiveUserId(), agentId, target);
+}
+
+/** Clear metacognition for an explicit account. */
+export function clearContentForUser(
+  uid: string,
+  agentId: string,
+  target: 'competence' | 'strategies',
+): void {
+  const filePath = fileForTargetForUser(uid, agentId, target);
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomicSync(filePath, '');
@@ -158,7 +185,12 @@ export function clearContent(agentId: string, target: 'competence' | 'strategies
 
 /** Remove all metacognition data for an agent (used on agent deletion). */
 export function purgeAgent(agentId: string): void {
-  const dir = agentMetaDir(getActiveUserId(), normalizeAgentId(agentId));
+  purgeAgentForUser(getActiveUserId(), agentId);
+}
+
+/** Remove all metacognition data for one agent in an explicit account. */
+export function purgeAgentForUser(uid: string, agentId: string): void {
+  const dir = agentMetaDir(uid, normalizeAgentId(agentId));
   try {
     fs.rmSync(dir, { recursive: true, force: true });
     log.info(`purged metacognition for agent ${agentId}`);
@@ -174,8 +206,13 @@ export function purgeAgent(agentId: string): void {
  * Returns empty string if no content exists for this agent.
  */
 export function formatForSystemPrompt(agentId: string): string {
-  const comp = readContent(agentId, 'competence');
-  const strat = readContent(agentId, 'strategies');
+  return formatForSystemPromptForUser(getActiveUserId(), agentId);
+}
+
+/** Format metacognition for a model turn owned by an explicit account. */
+export function formatForSystemPromptForUser(uid: string, agentId: string): string {
+  const comp = readContentForUser(uid, agentId, 'competence');
+  const strat = readContentForUser(uid, agentId, 'strategies');
 
   if (!comp.content && !strat.content) return '';
 

@@ -44,7 +44,7 @@ const https = require('node:https');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
-const VERSION = 'v1.0.131';
+const VERSION = 'v1.0.139';
 const REPO = 'iOfficeAI/OfficeCLI';
 const RELEASE_BASE_URL = process.env.OFFICECLI_RELEASE_BASE_URL || `https://github.com/${REPO}/releases/download/${VERSION}`;
 const LICENSE_URL = process.env.OFFICECLI_LICENSE_URL || `https://raw.githubusercontent.com/${REPO}/${VERSION}/LICENSE`;
@@ -64,10 +64,10 @@ const ASSETS = {
 
 // Pinned sha256 for VERSION (from the release SHA256SUMS). Update with VERSION.
 const SHA256 = {
-  'officecli-mac-arm64': '1a10e73e73e1a3aa278d75af8e966ce932691bbf9958a06578638c42181894fb',
-  'officecli-mac-x64': 'daa90b846c85a2ca61eec743fd41da6d02f74c7c68560ccecfdab2e977737730',
-  'officecli-win-x64.exe': 'b67e6f95c309707fad51fad2da26a87aa8d967774cde9f7b47bb452811164e73',
-  'officecli-win-arm64.exe': 'f4224772a7d450053fcacaa54175704e89d99ca23535e7d24fc340bc6dcef43e',
+  'officecli-mac-arm64': '393874f79db58222bdbede7f4f942f2536580386923857d1b5ad9754efe80c19',
+  'officecli-mac-x64': '6a931d424975dded6ae413c8c1f63d00dfb30a4bd4bd50352964782d13299f5c',
+  'officecli-win-x64.exe': '864e0580c8e8c91a6aa4a4c1e8900551c8d4aa648ff10136ceed3a6ba5310888',
+  'officecli-win-arm64.exe': '6d80a93ba0c9cafb2b52048efbb403cd761b35126130fa8166383599aa91d96e',
 };
 
 function parseArgs(argv) {
@@ -348,7 +348,18 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(`[officecli] ERROR: ${err.message}`);
-  process.exit(1);
+// This file is also the single source of truth consumed by the real-binary
+// smoke and packaged-artifact validator. Keep imports side-effect free so
+// those gates cannot silently drift from the version/hash used by packaging.
+module.exports = Object.freeze({
+  VERSION,
+  ASSETS: Object.freeze({ ...ASSETS }),
+  SHA256: Object.freeze({ ...SHA256 }),
 });
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`[officecli] ERROR: ${err.message}`);
+    process.exit(1);
+  });
+}

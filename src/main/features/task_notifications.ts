@@ -22,7 +22,7 @@ export interface TaskNotificationRuntime {
   setBadgeCount(count: number): void;
   onDidFocus(listener: () => void): () => void;
   createNotification(options: { title: string; body: string }): TaskNotificationHandle;
-  openConversation(conversationId: string, status: TaskTerminalStatus): void;
+  openConversation(conversationId: string, status: TaskTerminalStatus, userId: string): void;
 }
 
 type TaskTerminalSubscribe = (listener: TaskTerminalListener) => () => void;
@@ -62,6 +62,7 @@ export function startTaskNotifications(
   updateBadge(0);
   const stopFocusListener = runtime.onDidFocus(clearUnread);
   const unsubscribe = subscribe((event: TaskTerminalEvent) => {
+    let badgeIncremented = false;
     try {
       if (event.status === 'cancelled') return;
       if (runtime.getActiveUserId() !== event.user_id) return;
@@ -69,6 +70,7 @@ export function startTaskNotifications(
       if (runtime.hasFocusedWindow() || !runtime.isSupported()) return;
 
       updateBadge(unreadCount + 1);
+      badgeIncremented = true;
       const notification = runtime.createNotification(copyFor(event.status));
       notification.onClick(() => {
         try {
@@ -76,7 +78,7 @@ export function startTaskNotifications(
           // local conversation namespace after an account switch.
           if (runtime.getActiveUserId() !== event.user_id) return;
           clearUnread();
-          runtime.openConversation(event.conversation_id, event.status);
+          runtime.openConversation(event.conversation_id, event.status, event.user_id);
         } catch (err) {
           log.warn('task notification click failed', { error: (err as Error)?.message || String(err) });
         }
@@ -84,7 +86,9 @@ export function startTaskNotifications(
       notification.show();
     } catch (err) {
       // Notifications are a best-effort attention layer. They must never
-      // affect persistence, task completion, or the worker scheduler.
+      // affect persistence, task completion, the worker scheduler, or leave a
+      // badge for a notification the operating system never accepted.
+      if (badgeIncremented) updateBadge(unreadCount - 1);
       log.warn('native task notification failed', { error: (err as Error)?.message || String(err) });
     }
   });

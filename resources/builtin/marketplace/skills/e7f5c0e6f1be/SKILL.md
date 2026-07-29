@@ -39,6 +39,9 @@ Do not use for:
    - Follow `references/fetching.md`.
    - One platform per script call: `xhs`, `twitter`, `reddit`, `youtube`, or `bilibili`.
    - Expand the user's topic into 3-8 short divergent keyword groups unless the user explicitly restricts keywords.
+   - Run the normal `run-skill.cjs` command directly. On the first fetch it automatically installs the pinned Python packages from `requirements.fetch.txt` into a workspace-local isolated environment, then continues the same request. Do not preflight with ad-hoc imports or ask the user to repair missing Python packages.
+   - Twitter/X uses an installed `xreach` first and otherwise falls back to the pinned `xreach-cli` through Orkas' bundled npx.
+   - If automatic dependency installation itself fails, report that bootstrap failure distinctly and stop that platform attempt. Do not misclassify it as a platform connectivity or empty-results issue.
    - Report `diag.status`, failures, empty results, and platform dependency limits.
    - Browser cookies are off by default. Before adding `--use-browser-cookies` for Reddit or Bilibili, explicitly ask the user for permission and disclose that the script will inspect installed browser cookie stores for that platform domain. Continue anonymously when permission is absent or declined.
 
@@ -124,12 +127,14 @@ For performance analysis:
 ## External Dependencies
 
 - Python 3 for bundled scripts.
-- Fetch mode may need `requests`, `browser_cookie3`, `curl_cffi`, `xreach`, `yt-dlp`, or a local Xiaohongshu proxy depending on platform.
+- `requests`, `browser_cookie3`, `curl_cffi`, and `yt-dlp` are pinned in `requirements.fetch.txt`; `run-skill.cjs` installs them once into the workspace dependency cache before first fetch. Analysis-only scripts do not install fetch dependencies.
+- Twitter/X uses `xreach` when already installed, otherwise pinned `xreach-cli@0.3.3` via bundled npx.
+- Xiaohongshu still requires the external local proxy service at `http://localhost:18060`; this service is not auto-installed or auto-started.
 - Analysis mode needs user-provided JSON, table data, or exported platform/campaign metrics.
 
 ## Limits And Known Issues
 
-- Fetch coverage varies by platform, login state, rate limits, anti-bot behavior, and local dependencies.
+- Fetch coverage varies by platform, login state, rate limits, anti-bot behavior, and external service availability.
 - Public fetches are samples, not complete platform analytics.
 - Anonymous Reddit/Bilibili recall can be weak; browser login cookies may improve results only after explicit user permission and the `--use-browser-cookies` flag.
 - Xiaohongshu requires an external local proxy service at `http://localhost:18060`.

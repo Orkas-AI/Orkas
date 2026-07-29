@@ -62,11 +62,14 @@ describe('renderer lazy feature loader', () => {
   it('loads public Agent and Skill surfaces without private publishing modules', async () => {
     const agents = loadFeatureLoader();
     await agents.context.loadRendererFeature('agents');
-    expect(agents.appended.map((script) => script.src)).toEqual([]);
+    expect(agents.appended.map((script) => script.src)).toEqual([
+      './modules/marketplace.js',
+    ]);
 
     const skills = loadFeatureLoader();
     await skills.context.loadRendererFeature('skills');
     expect(skills.appended.map((script) => script.src)).toEqual([
+      './modules/marketplace.js',
       './modules/skills.js',
       './modules/skills-bindings.js',
     ]);
@@ -175,6 +178,18 @@ describe('renderer lazy feature loader', () => {
     expect(lazyBoundary).toContain('_loadViewFeature(feature, view, run)');
   });
 
+  it('bridges the first Skills create click while its lazy bindings load', () => {
+    const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/state.js'), 'utf8');
+    const start = source.indexOf("document.getElementById('create-skill-btn')");
+    const end = source.indexOf("document.getElementById('agents-more-btn')", start);
+    const handler = source.slice(start, end);
+
+    expect(handler).toContain("load('skills')");
+    expect(handler).toContain("typeof openSkillModal === 'function'");
+    expect(handler).toContain("currentView !== 'skills'");
+    expect(handler).toContain('openSkillModal()');
+  });
+
   it('primes the cached project shell before deferring the project feature', () => {
     const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/boot.js'), 'utf8');
     const projectBranch = source.slice(source.indexOf("} else if (view === 'project')"));
@@ -210,23 +225,36 @@ describe('renderer lazy feature loader', () => {
     expect(detailOpen).not.toContain('loadAgents(true)');
   });
 
-  it('does not probe local CLI runtimes until their selector is opened', () => {
-    const source = fs.readFileSync(
+  it('does not probe local CLI runtimes until the External selector is opened', () => {
+    const localAgents = fs.readFileSync(
       path.join(__dirname, '../../src/renderer/modules/local-agents.js'), 'utf8');
+    const agents = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
+    const switchStart = agents.indexOf('function _switchAgentTab');
+    const switchEnd = agents.indexOf('window._switchAgentTab', switchStart);
+    const openStart = agents.indexOf('function openAgentModal');
+    const openEnd = agents.indexOf('window.openAgentModal', openStart);
 
-    expect(source).not.toContain('setTimeout(() => { loadLocalCliEntries');
-    expect(source).toContain('async function mountExternalCliSelect');
-    expect(source).toContain('const entries = await loadLocalCliEntries({ force: true })');
+    expect(localAgents).not.toContain('setTimeout(() => { loadLocalCliEntries');
+    expect(localAgents).toContain('async function mountExternalCliSelect');
+    expect(localAgents).toContain('_findInstalledLocalCliEntries()');
+    expect(localAgents).toContain('_validateInstalledLocalCliEntries(');
+    expect(localAgents).toContain("window.orkas.invoke('localAgents.detect', { type })");
+    expect(localAgents).not.toContain('LOCAL_CLI_RENDERER_CACHE_TTL_MS');
+    expect(agents.slice(switchStart, switchEnd)).toContain("if (tab === 'external'");
+    expect(agents.slice(switchStart, switchEnd)).toContain('mountExternalCliSelect');
+    expect(agents.slice(openStart, openEnd)).not.toContain('mountExternalCliSelect');
   });
 
-  it('re-probes local CLI runtimes when an Agent detail selector is rendered', () => {
+  it('shares cached local CLI discovery with an Agent detail selector', () => {
     const source = fs.readFileSync(
       path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
     const start = source.indexOf('async function _renderAgentDetailRuntime');
     const end = source.indexOf('async function _renderAgentDetailProjectDir', start);
     const runtimeSelector = source.slice(start, end);
 
-    expect(runtimeSelector).toContain('loadLocalCliEntries({ force: true })');
+    expect(runtimeSelector).toContain('loadLocalCliEntries()');
+    expect(runtimeSelector).not.toContain('loadLocalCliEntries({ force: true })');
     expect(runtimeSelector).toContain('const currentEntry = entries.find');
     expect(runtimeSelector).toContain('window.getLocalCliUnavailableHint(currentEntry)');
     expect(runtimeSelector).not.toContain("hint: t('agent.cli_missing')");

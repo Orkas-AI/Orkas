@@ -45,8 +45,16 @@ import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('contexts');
 
-function contextsRoot(): string {
-  return userContextsDir(getActiveUserId());
+function contextsRoot(userId: string = getActiveUserId()): string {
+  return userContextsDir(userId);
+}
+
+function isActiveUser(userId: string): boolean {
+  try {
+    return getActiveUserId() === userId;
+  } catch {
+    return false;
+  }
 }
 
 export const CONTEXTS_INDEX_FILENAME = '_INDEX.md';
@@ -131,6 +139,7 @@ export interface ContextIndexEntry {
 }
 
 interface IndexCache {
+  userId: string;
   mtime: number;
   rootMarkdown: string;
   flatMarkdown: string;
@@ -139,7 +148,10 @@ interface IndexCache {
 
 // ── Path safety ──────────────────────────────────────────────────────────
 
-interface ResolveOpts { mustExist?: boolean }
+interface ResolveOpts {
+  mustExist?: boolean;
+  userId?: string;
+}
 
 function contextPathSegments(relpath: string): string[] {
   const s = String(relpath || '').trim().replace(/^\/+|\/+$/g, '');
@@ -155,10 +167,13 @@ export function hasHiddenContextPathSegment(relpath: string): boolean {
  * Returns absolute path; throws on traversal, absolute inputs, empty
  * segments, or (when mustExist) missing files.
  */
-function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): string {
+function resolvePath(
+  relpath: string,
+  { mustExist = false, userId = getActiveUserId() }: ResolveOpts = {},
+): string {
   if (typeof relpath !== 'string') throw new Error('path required');
   const s = relpath.trim().replace(/^\/+|\/+$/g, '');
-  if (!s) return path.resolve(contextsRoot());
+  if (!s) return path.resolve(contextsRoot(userId));
   const parts = contextPathSegments(s);
   if (parts.some((p) => p === '' || p === '.' || p === '..')) throw new Error('invalid path segment');
   if (parts.some((p) => p.includes('\x00'))) throw new Error('invalid character');
@@ -173,7 +188,7 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
       throw new Error(t('errors.kb_name_too_long', { name: p }));
     }
   }
-  const root = path.resolve(contextsRoot());
+  const root = path.resolve(contextsRoot(userId));
   const target = path.resolve(root, s);
   const rel = path.relative(root, target);
   if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('path escapes contexts root');
@@ -196,8 +211,8 @@ export function resolveContextFileAbsPath(relpath: string): string {
 /** Resolve either a file or folder for internal Library transfer workflows.
  * Renderer callers still pass only relative paths through IPC; absolute paths
  * never cross the bridge. */
-export function resolveContextEntryAbsPath(relpath: string): string {
-  return resolvePath(relpath, { mustExist: true });
+export function resolveContextEntryAbsPath(relpath: string, userId?: string): string {
+  return resolvePath(relpath, { mustExist: true, userId });
 }
 
 function extOf(name: string): string {
@@ -599,9 +614,9 @@ export async function importContextFileFromPath(
 }
 
 /** User-facing delete — files or dirs (recursive), refuses to touch the root index. */
-export function deleteContextTarget(relpath: string): Result {
+export function deleteContextTarget(relpath: string, userId: string = getActiveUserId()): Result {
   let p: string;
-  try { p = resolvePath(relpath, { mustExist: true }); }
+  try { p = resolvePath(relpath, { mustExist: true, userId }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (path.basename(p) === CONTEXTS_INDEX_FILENAME) {
     return { ok: false, error: t('errors.cant_delete_index') };
@@ -612,12 +627,11 @@ export function deleteContextTarget(relpath: string): Result {
     if (st.isDirectory()) fs.rmSync(p, { recursive: true, force: true });
     else fs.unlinkSync(p);
   } catch (err) { return { ok: false, error: (err as Error).message }; }
-  invalidateIndex();
-  const uid = getActiveUserId();
+  invalidateIndex(userId);
   for (const r of droppedRels) {
-    search.dropContext(uid, r);
-    kbIndexer.enqueue(uid, r, 'delete');
-    notifyDeletedContext(r);
+    search.dropContext(userId, r);
+    kbIndexer.enqueue(userId, r, 'delete');
+    if (isActiveUser(userId)) notifyDeletedContext(r);
   }
   return { ok: true };
 }
@@ -699,9 +713,10 @@ function validateContextCopySource(sourceAbs: string): Result<{ fileCount: numbe
 export function copyContextEntryFromPath(
   sourceAbs: string,
   targetRel: string,
+  userId: string = getActiveUserId(),
 ): Result<{ path: string; fileCount: number; bytes: number }> {
   let targetAbs: string;
-  try { targetAbs = resolvePath(targetRel); }
+  try { targetAbs = resolvePath(targetRel, { userId }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
   const targetParent = path.dirname(targetAbs);
@@ -732,19 +747,25 @@ export function copyContextEntryFromPath(
     return { ok: false, error: (err as Error).message };
   }
 
-  invalidateIndex();
-  const uid = getActiveUserId();
+  invalidateIndex(userId);
   for (const rel of _collectRelsUnder(targetAbs, targetRel)) {
-    search.upsertContext(uid, rel);
-    kbIndexer.enqueue(uid, rel, 'upsert');
-    notifyDirtyContext(rel);
+    search.upsertContext(userId, rel);
+    kbIndexer.enqueue(userId, rel, 'upsert');
+    if (isActiveUser(userId)) notifyDirtyContext(rel);
   }
   return { ok: true, path: targetRel, fileCount: checked.fileCount, bytes: checked.bytes };
 }
 
-export function renameContextEntry(srcRel: string, dstRel: string): Result<{ src: string; dst: string }> {
+export function renameContextEntry(
+  srcRel: string,
+  dstRel: string,
+  userId: string = getActiveUserId(),
+): Result<{ src: string; dst: string }> {
   let src: string; let dst: string;
-  try { src = resolvePath(srcRel, { mustExist: true }); dst = resolvePath(dstRel); }
+  try {
+    src = resolvePath(srcRel, { mustExist: true, userId });
+    dst = resolvePath(dstRel, { userId });
+  }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (fs.existsSync(dst)) return { ok: false, error: 'destination already exists' };
   const srcIsFile = fs.statSync(src).isFile();
@@ -755,17 +776,16 @@ export function renameContextEntry(srcRel: string, dstRel: string): Result<{ src
   fs.mkdirSync(path.dirname(dst), { recursive: true });
   try { fs.renameSync(src, dst); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
-  invalidateIndex();
-  const uid = getActiveUserId();
+  invalidateIndex(userId);
   for (const r of oldRels) {
-    search.dropContext(uid, r);
-    kbIndexer.enqueue(uid, r, 'delete');
-    notifyDeletedContext(r);
+    search.dropContext(userId, r);
+    kbIndexer.enqueue(userId, r, 'delete');
+    if (isActiveUser(userId)) notifyDeletedContext(r);
   }
   for (const r of _collectRelsUnder(dst, dstRel)) {
-    search.upsertContext(uid, r);
-    kbIndexer.enqueue(uid, r, 'upsert');
-    notifyDirtyContext(r);
+    search.upsertContext(userId, r);
+    kbIndexer.enqueue(userId, r, 'upsert');
+    if (isActiveUser(userId)) notifyDirtyContext(r);
   }
   return { ok: true, src: srcRel, dst: dstRel };
 }
@@ -798,12 +818,12 @@ export function firstHeading(text: string, maxChars = 100): string {
 // and the organizer-view backward-compat caller.
 
 const indexCache: IndexCache = {
-  mtime: 0, rootMarkdown: '', flatMarkdown: '', entries: [],
+  userId: '', mtime: 0, rootMarkdown: '', flatMarkdown: '', entries: [],
 };
 
-export function invalidateIndex(): void {
-  indexCache.mtime = 0;
-  try { rebuildIndex(); }
+export function invalidateIndex(userId: string = getActiveUserId()): void {
+  if (indexCache.userId === userId) indexCache.mtime = 0;
+  try { rebuildIndex(userId); }
   catch (err) { log.warn(`index rebuild failed: ${(err as Error).message}`); }
 }
 
@@ -840,12 +860,13 @@ function collectAllEntries(root: string, relBase = ''): ContextIndexEntry[] {
   return out;
 }
 
-export function rebuildIndex(): IndexCache {
-  fs.mkdirSync(contextsRoot(), { recursive: true });
-  const allEntries = collectAllEntries(contextsRoot(), '');
+export function rebuildIndex(userId: string = getActiveUserId()): IndexCache {
+  const root = contextsRoot(userId);
+  fs.mkdirSync(root, { recursive: true });
+  const allEntries = collectAllEntries(root, '');
 
   // Root-level view: subdirs with counts + root-level files with titles.
-  const { dirs: rootDirs, files: rootFiles } = walkContextNodes(contextsRoot(), '');
+  const { dirs: rootDirs, files: rootFiles } = walkContextNodes(root, '');
   const dirCounts = new Map<string, number>();
   for (const e of allEntries) {
     const top = e.path.includes('/') ? e.path.split('/')[0] : '';
@@ -882,7 +903,7 @@ export function rebuildIndex(): IndexCache {
   }
   try {
     fs.writeFileSync(
-      path.join(contextsRoot(), CONTEXTS_INDEX_FILENAME),
+      path.join(root, CONTEXTS_INDEX_FILENAME),
       lines.join('\n').trimEnd() + '\n',
       'utf8',
     );
@@ -890,26 +911,32 @@ export function rebuildIndex(): IndexCache {
 
   // Full root markdown — re-read what we just wrote, for getContextIndexMarkdown.
   let rootMd = '';
-  try { rootMd = fs.readFileSync(path.join(contextsRoot(), CONTEXTS_INDEX_FILENAME), 'utf8'); }
+  try { rootMd = fs.readFileSync(path.join(root, CONTEXTS_INDEX_FILENAME), 'utf8'); }
   catch { rootMd = t('contexts.index.empty_kb'); }
 
   const flatLines = allEntries.length
     ? allEntries.map((e) => `- \`${e.path}\`${e.title ? ` — ${e.title}` : ''}`).join('\n')
     : t('contexts.index.empty_kb');
 
-  indexCache.mtime = Date.now();
-  indexCache.rootMarkdown = rootMd;
-  indexCache.flatMarkdown = flatLines;
-  indexCache.entries = allEntries;
-  return indexCache;
+  const rebuilt: IndexCache = {
+    userId,
+    mtime: Date.now(),
+    rootMarkdown: rootMd,
+    flatMarkdown: flatLines,
+    entries: allEntries,
+  };
+  if (isActiveUser(userId)) Object.assign(indexCache, rebuilt);
+  return rebuilt;
 }
 
 export async function getContextIndexMarkdown(): Promise<string> {
-  if (indexCache.mtime === 0) rebuildIndex();
+  const userId = getActiveUserId();
+  if (indexCache.userId !== userId || indexCache.mtime === 0) rebuildIndex(userId);
   return indexCache.rootMarkdown;
 }
 
 export async function getContextIndexEntries(): Promise<ContextIndexEntry[]> {
-  if (indexCache.mtime === 0) rebuildIndex();
+  const userId = getActiveUserId();
+  if (indexCache.userId !== userId || indexCache.mtime === 0) rebuildIndex(userId);
   return [...indexCache.entries];
 }

@@ -13,7 +13,7 @@ const _chatMdDrawerLog = createLogger('chat-md-drawer');
 let _cmdState = null;   // { controller, source, title, dirty }
 let _cmdDiscardConfirmPending = false;
 
-async function openChatMdDrawer({ source, initialMode, title }) {
+async function openChatMdDrawer({ source, initialMode, title } = {}) {
   if (!source || typeof source.kind !== 'string') {
     _chatMdDrawerLog.warn('openChatMdDrawer called without source.kind');
     return;
@@ -41,31 +41,41 @@ async function openChatMdDrawer({ source, initialMode, title }) {
 
   _cmdState = { controller: null, source, title: resolvedTitle, dirty: false };
 
-  _cmdState.controller = mountMdViewEdit({
-    bodyEl,
-    actionsEl,
-    source,
-    initialMode: source.kind === 'ephemeral' ? 'edit' : (initialMode || 'view'),
-    callbacks: {
-      onDirtyChange: (dirty) => { if (_cmdState) _cmdState.dirty = !!dirty; },
-      onReveal: () => {
-        if (source.kind !== 'workspace') return;
-        try {
-          const payload = { path: source.absPath };
-          if (source.cid) payload.cid = source.cid;
-          window.orkas.invoke('workspace.revealPath', payload);
-        } catch (err) {
-          _chatMdDrawerLog.warn('revealPath failed', err);
-        }
+  try {
+    _cmdState.controller = mountMdViewEdit({
+      bodyEl,
+      actionsEl,
+      source,
+      initialMode: source.kind === 'ephemeral' ? 'edit' : (initialMode || 'view'),
+      callbacks: {
+        onDirtyChange: (dirty) => { if (_cmdState) _cmdState.dirty = !!dirty; },
+        onReveal: () => {
+          if (source.kind !== 'workspace') return;
+          try {
+            const payload = { path: source.absPath };
+            if (source.cid) payload.cid = source.cid;
+            window.orkas.invoke('workspace.revealPath', payload);
+          } catch (err) {
+            _chatMdDrawerLog.warn('revealPath failed', err);
+          }
+        },
+        // The drawer does not surface a delete action; setting it here would
+        // be ignored (capability defaults already skip delete for workspace).
+        onSendToChatInput: (text) => {
+          const ok = _sendDraftToChatInput(text);
+          if (ok) void closeChatMdDrawer({ force: true });
+        },
       },
-      // The drawer does not surface a delete action; setting it here would
-      // be ignored (capability defaults already skip delete for workspace).
-      onSendToChatInput: (text) => {
-        const ok = _sendDraftToChatInput(text);
-        if (ok) void closeChatMdDrawer({ force: true });
-      },
-    },
-  });
+    });
+  } catch (err) {
+    _chatMdDrawerLog.error('failed to mount markdown drawer', err);
+    bodyEl.innerHTML = '';
+    actionsEl.innerHTML = '';
+    panel.classList.remove('is-open');
+    panel.hidden = true;
+    _teardownCmd();
+    return;
+  }
 
   _bindCloseHandlers();
 }
@@ -147,11 +157,13 @@ function _sendDraftToChatInput(text) {
     _chatMdDrawerLog.warn('chat-input not found — drawer "send to chat" no-op');
     return false;
   }
+  const draft = String(text == null ? '' : text);
+  if (!draft.trim()) return false;
   // Prepend a newline when there's already content so the snippet doesn't
   // smash into the existing draft.
   const existing = input.value || '';
   const joiner = existing && !existing.endsWith('\n') ? '\n' : '';
-  input.value = `${existing}${joiner}${text}`;
+  input.value = `${existing}${joiner}${draft}`;
   input.dispatchEvent(new Event('input', { bubbles: true }));
   input.focus();
   // Move caret to end so the user sees the inserted block.
@@ -167,3 +179,15 @@ function _sendDraftToChatInput(text) {
 window.openChatMdDrawer  = openChatMdDrawer;
 window.closeChatMdDrawer = closeChatMdDrawer;
 window.isChatMdDrawerOpen = isChatMdDrawerOpen;
+
+// Focused CommonJS bridge for deterministic renderer tests. The production
+// bundle runs this file as a browser script, where `module` is absent.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    openChatMdDrawer,
+    closeChatMdDrawer,
+    isChatMdDrawerOpen,
+    _defaultTitle,
+    _sendDraftToChatInput,
+  };
+}

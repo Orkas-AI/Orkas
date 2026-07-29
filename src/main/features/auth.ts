@@ -73,13 +73,17 @@ import {
   EXTERNAL_API_PROVIDERS,
   isVisibleProvider,
   curatedModelsFor,
+  isSelectableModel,
   resolveConfiguredPiModel,
   pickLatestGenerations,
   providerLabel,
+  providerLabelKey,
   providerDocsUrl,
   providerSubscriptionNote,
   providerRecommended,
+  providerUsesCustomOpenAIConfig,
   sortProviderIds,
+  type CustomOpenAICompatibleRuntimeConfig,
 } from '../model/provider_catalog';
 import {
   assertModelProviderAllowed,
@@ -89,6 +93,7 @@ import { isCooledDown, getCooldown, clearCooldown } from '../model/core-agent/pr
 import type { KeyFailureKind } from '../model/core-agent/auth-error';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 
 const log = createLogger('auth');
 
@@ -172,6 +177,10 @@ interface ApiKeyProfile {
   provider: string;
   label: string;
   key: string;
+  /** Present only for the `custom` OpenAI-compatible provider. */
+  baseUrl?: string;
+  contextWindow?: number;
+  maxTokens?: number;
   email?: string;
   createdAt: number;
   lastUsed: number;
@@ -223,6 +232,8 @@ export interface SearchProfile {
 export interface ImageProfile {
   id: string;
   provider: string;          // openai / google / doubao / ...
+  /** Explicit image model selected in Settings. */
+  model?: string;
   apiKey: string;
   label: string;
   createdAt: number;
@@ -531,8 +542,10 @@ function isStoredProfileAllowed(profile: StoredProfile | undefined): profile is 
 
 function isEntryAllowed(store: ProfilesFile, entry: Entry): boolean {
   const prof = store.profiles[entry.profileId];
-  return isModelProviderAllowed(entry.provider, entry.model)
-    && !isStoredProfileBlocked(prof);
+  return !!prof
+    && isModelProviderAllowed(entry.provider, entry.model)
+    && !isStoredProfileBlocked(prof)
+    && (!providerUsesCustomOpenAIConfig(entry.provider) || !!customRuntimeConfigFromProfile(prof));
 }
 
 function makeProfileId(provider: string, label: string): string {
@@ -554,6 +567,86 @@ function autoLabel(store: ProfilesFile, provider: string): string {
 function sanitizeLabel(input: string): string {
   const clean = String(input || '').trim().replace(/[^a-zA-Z0-9_\-]/g, '-').slice(0, 40);
   return clean || 'default';
+}
+
+function sanitizeCustomLabel(input: string): string {
+  const clean = String(input || '').trim().replace(/[^\p{L}\p{N}_-]/gu, '-').slice(0, 40);
+  return clean || 'default';
+}
+
+const CUSTOM_MODEL_PROVIDER = 'custom';
+const DEFAULT_CUSTOM_CONTEXT_WINDOW = 131_072;
+const DEFAULT_CUSTOM_MAX_TOKENS = 8_192;
+const MAX_CUSTOM_TOKEN_LIMIT = 16_777_216;
+
+function customConfigError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code });
+}
+
+export function normalizeCustomModelBaseUrl(raw: string): string {
+  const value = String(raw || '').trim();
+  if (!value) throw customConfigError('CUSTOM_BASE_URL_REQUIRED', 'API base URL required');
+  if (value.length > 2048) throw customConfigError('CUSTOM_BASE_URL_INVALID', 'API base URL is too long');
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw customConfigError('CUSTOM_BASE_URL_INVALID', 'API base URL must be a valid http(s) URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw customConfigError('CUSTOM_BASE_URL_INVALID', 'API base URL must use http or https');
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw customConfigError(
+      'CUSTOM_BASE_URL_INVALID',
+      'API base URL cannot include credentials, query parameters, or a fragment',
+    );
+  }
+  const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
+  if (chatPathIndex >= 0) {
+    url.pathname = url.pathname.slice(0, chatPathIndex).replace(/\/+$/, '') || '/';
+  }
+  return url.toString().replace(/\/+$/, '');
+}
+
+function normalizeCustomTokenLimit(
+  raw: number | string | null | undefined,
+  fallback: number,
+  field: 'contextWindow' | 'maxTokens',
+): number {
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = Number(raw);
+  const minimum = field === 'contextWindow' ? 1_024 : 1;
+  if (!Number.isInteger(value) || value < minimum || value > MAX_CUSTOM_TOKEN_LIMIT) {
+    throw customConfigError(
+      'CUSTOM_TOKEN_LIMIT_INVALID',
+      `${field} must be an integer between ${minimum} and ${MAX_CUSTOM_TOKEN_LIMIT}`,
+    );
+  }
+  return value;
+}
+
+function customRuntimeConfigFromProfile(
+  profile: StoredProfile | undefined,
+): CustomOpenAICompatibleRuntimeConfig | null {
+  if (!profile || profile.type !== 'api_key' || profile.provider !== CUSTOM_MODEL_PROVIDER) return null;
+  try {
+    const baseUrl = normalizeCustomModelBaseUrl(profile.baseUrl || '');
+    const contextWindow = normalizeCustomTokenLimit(
+      profile.contextWindow,
+      DEFAULT_CUSTOM_CONTEXT_WINDOW,
+      'contextWindow',
+    );
+    const maxTokens = normalizeCustomTokenLimit(
+      profile.maxTokens,
+      DEFAULT_CUSTOM_MAX_TOKENS,
+      'maxTokens',
+    );
+    if (maxTokens > contextWindow) return null;
+    return { baseUrl, contextWindow, maxTokens };
+  } catch {
+    return null;
+  }
 }
 
 let _entryCounter = 0;
@@ -639,9 +732,11 @@ export interface ProfileView {
 export interface ProviderEntry {
   id: string;
   label: string;
+  labelKey?: string;
   featured: boolean;
   supportsApiKey: boolean;
   supportsOAuth: boolean;
+  customOpenAICompatible?: boolean;
   /** If OAuth on this provider actually logs in via a different pi-ai
    *  provider (e.g. `openai` → `openai-codex`), this carries the target id
    *  so the renderer can call `startOAuth(oauthProvider)` accordingly. */
@@ -759,9 +854,11 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     return {
       id,
       label: providerLabel(id),
+      labelKey: providerLabelKey(id),
       featured: featuredIds.has(id),
       supportsApiKey,
       supportsOAuth,
+      customOpenAICompatible: providerUsesCustomOpenAIConfig(id),
       oauthProvider: directOAuth ? id : (supportsOAuth ? aliasOAuth : undefined),
       docsUrl: providerDocsUrl(id),
       subscriptionNote: providerSubscriptionNote(id),
@@ -812,6 +909,9 @@ export async function addApiKey(
   if (!id) throw new Error('provider required');
   if (!key) throw new Error('api key required');
   assertModelProviderAllowed(id);
+  if (providerUsesCustomOpenAIConfig(id)) {
+    throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
+  }
 
   const store = loadProfiles();
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
@@ -834,6 +934,135 @@ export async function addApiKey(
   clearCooldown(profileId);
   invalidateCoreAgentRunner();
   return { profileId };
+}
+
+export async function addApiKeyEntry(
+  providerId: string,
+  modelId: string,
+  apiKey: string,
+  label?: string,
+): Promise<{ profileId: string; entryId: string }> {
+  const id = String(providerId || '').trim();
+  const model = String(modelId || '').trim();
+  const key = String(apiKey || '').trim();
+  if (!id) throw new Error('provider required');
+  if (!model) throw new Error('model required');
+  if (!key) throw new Error('api key required');
+  assertModelProviderAllowed(id, model);
+  if (providerUsesCustomOpenAIConfig(id)) {
+    throw customConfigError('CUSTOM_CONFIG_REQUIRED', 'Use the custom model configuration flow');
+  }
+
+  const store = loadProfiles();
+  const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
+  const profileId = makeProfileId(id, chosenLabel);
+  const now = Date.now();
+  const existingProfile = store.profiles[profileId];
+  store.profiles[profileId] = {
+    type: 'api_key',
+    provider: id,
+    label: chosenLabel,
+    key,
+    email: (existingProfile as ApiKeyProfile | undefined)?.email,
+    createdAt: existingProfile?.createdAt ?? now,
+    lastUsed: 0,
+  };
+  const existingEntry = store.entries.find((entry) => (
+    entry.provider === id && entry.model === model && entry.profileId === profileId
+  ));
+  const entryId = existingEntry?.entryId || nextEntryId();
+  if (!existingEntry) {
+    store.entries.unshift({
+      entryId,
+      provider: id,
+      model,
+      profileId,
+      lastUsed: 0,
+      createdAt: now,
+    });
+  }
+  saveProfiles(store);
+  clearCooldown(profileId);
+  invalidateCoreAgentRunner();
+  return { profileId, entryId };
+}
+
+export interface AddCustomModelEntryInput {
+  label?: string;
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  contextWindow?: number | string | null;
+  maxTokens?: number | string | null;
+}
+
+export async function addCustomModelEntry(
+  input: AddCustomModelEntryInput,
+): Promise<{ profileId: string; entryId: string }> {
+  const rawLabel = String(input?.label || '').trim();
+  const model = String(input?.model || '').trim();
+  const key = String(input?.apiKey || '').trim();
+  if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
+  if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
+  assertModelProviderAllowed(CUSTOM_MODEL_PROVIDER, model);
+  if (!isSelectableModel(CUSTOM_MODEL_PROVIDER, model)) {
+    throw customConfigError('CUSTOM_MODEL_INVALID', 'Model ID is invalid');
+  }
+  const baseUrl = normalizeCustomModelBaseUrl(input.baseUrl);
+  const contextWindow = normalizeCustomTokenLimit(
+    input.contextWindow,
+    DEFAULT_CUSTOM_CONTEXT_WINDOW,
+    'contextWindow',
+  );
+  const maxTokens = normalizeCustomTokenLimit(
+    input.maxTokens,
+    DEFAULT_CUSTOM_MAX_TOKENS,
+    'maxTokens',
+  );
+  if (maxTokens > contextWindow) {
+    throw customConfigError(
+      'CUSTOM_TOKEN_LIMIT_INVALID',
+      'Maximum output tokens cannot exceed the context window',
+    );
+  }
+
+  const store = loadProfiles();
+  const chosenLabel = rawLabel
+    ? sanitizeCustomLabel(rawLabel)
+    : autoLabel(store, CUSTOM_MODEL_PROVIDER);
+  const profileId = makeProfileId(CUSTOM_MODEL_PROVIDER, chosenLabel);
+  const now = Date.now();
+  const existingProfile = store.profiles[profileId];
+  const existingEntry = store.entries.find((entry) => (
+    entry.provider === CUSTOM_MODEL_PROVIDER
+    && entry.model === model
+    && entry.profileId === profileId
+  ));
+  const entryId = existingEntry?.entryId || nextEntryId();
+  store.profiles[profileId] = {
+    type: 'api_key',
+    provider: CUSTOM_MODEL_PROVIDER,
+    label: chosenLabel,
+    key,
+    baseUrl,
+    contextWindow,
+    maxTokens,
+    createdAt: existingProfile?.createdAt ?? now,
+    lastUsed: 0,
+  };
+  store.entries = store.entries.filter((entry) => entry.profileId !== profileId);
+  store.entries.unshift({
+    entryId,
+    provider: CUSTOM_MODEL_PROVIDER,
+    model,
+    profileId,
+    lastUsed: 0,
+    createdAt: existingEntry?.createdAt ?? now,
+  });
+  saveProfiles(store);
+  clearCooldown(profileId);
+  invalidateCoreAgentRunner();
+  return { profileId, entryId };
 }
 
 export async function removeCredential(profileId: string): Promise<{ removed: boolean }> {
@@ -878,9 +1107,13 @@ export interface EntryView {
   entryId: string;
   provider: string;
   providerLabel: string;
+  providerLabelKey?: string;
   model: string;
   modelName: string;
+  modelEditable: boolean;
+  modelAvailable: boolean;
   profileId: string;
+  profileAvailable: boolean;
   profileLabel: string;
   profileType: 'api_key' | 'oauth';
   profileMasked?: string;
@@ -895,9 +1128,13 @@ function entryToView(e: Entry, store: ProfilesFile, modelNameLookup: (p: string,
     entryId: e.entryId,
     provider: e.provider,
     providerLabel: providerLabel(e.provider),
+    providerLabelKey: providerLabelKey(e.provider),
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
+    modelEditable: !providerUsesCustomOpenAIConfig(e.provider),
+    modelAvailable: isSelectableModel(e.provider, e.model),
     profileId: e.profileId,
+    profileAvailable: !!prof,
     profileLabel: prof?.label || e.profileId.split(':').slice(1).join(':') || '(missing)',
     profileType: (prof?.type as 'api_key' | 'oauth') || 'api_key',
     createdAt: e.createdAt,
@@ -931,12 +1168,14 @@ async function buildModelNameLookup(): Promise<(p: string, m: string) => string>
   };
 }
 
-export async function listEntries(): Promise<{ entries: EntryView[] }> {
+export async function listEntries(
+  opts: { includeUnavailable?: boolean } = {},
+): Promise<{ entries: EntryView[] }> {
   const store = loadProfiles();
   const lookup = await buildModelNameLookup();
   return {
     entries: store.entries
-      .filter((e) => isEntryAllowed(store, e))
+      .filter((e) => opts.includeUnavailable === true || isEntryAllowed(store, e))
       .map((e) => entryToView(e, store, lookup)),
   };
 }
@@ -1308,6 +1547,7 @@ export interface ChatEntryChoice {
   provider: string;
   model: string;
   apiKey: string;
+  customConfig?: CustomOpenAICompatibleRuntimeConfig;
 }
 
 /**
@@ -1321,7 +1561,9 @@ function groupEntries(entries: Entry[]): Entry[][] {
   let current: Entry[] = [];
   let currentKey = '';
   for (const e of entries) {
-    const key = `${e.provider}::${e.model}`;
+    const key = providerUsesCustomOpenAIConfig(e.provider)
+      ? `${e.provider}::${e.model}::${e.profileId}`
+      : `${e.provider}::${e.model}`;
     if (key !== currentKey) {
       if (current.length) groups.push(current);
       current = [e];
@@ -1456,12 +1698,14 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
     }
     const apiKey = await resolveEntryApiKey(store, entry);
     if (!apiKey) continue;
+    const customConfig = customRuntimeConfigFromProfile(store.profiles[entry.profileId]);
     choices.push({
       entryId: entry.entryId,
       profileId: entry.profileId,
       provider: entry.provider,
       model: entry.model,
       apiKey,
+      ...(customConfig ? { customConfig } : {}),
     });
   }
   return choices;
@@ -1487,7 +1731,11 @@ export async function pickChatEntry(): Promise<ChatEntryChoice | null> {
 
 /** Retained for one legacy caller (testConnection with a specific provider). */
 export async function pickRotationKey(providerId: string): Promise<{
-  profileId: string; provider: string; label: string; apiKey: string;
+  profileId: string;
+  provider: string;
+  label: string;
+  apiKey: string;
+  customConfig?: CustomOpenAICompatibleRuntimeConfig;
 } | null> {
   const id = String(providerId || '').trim();
   if (!id) return null;
@@ -1506,10 +1754,18 @@ export async function pickRotationKey(providerId: string): Promise<{
     else if (Date.now() < prof.expires) apiKey = prof.access;
     else apiKey = await refreshOAuthProfile(pid).catch(() => undefined);
     if (!apiKey) continue;
+    const customConfig = customRuntimeConfigFromProfile(prof);
+    if (providerUsesCustomOpenAIConfig(id) && !customConfig) continue;
     const fresh = loadProfiles();
     const target = fresh.profiles[pid];
     if (target) { target.lastUsed = Date.now(); saveProfiles(fresh); }
-    return { profileId: pid, provider: id, label: prof.label, apiKey };
+    return {
+      profileId: pid,
+      provider: id,
+      label: prof.label,
+      apiKey,
+      ...(customConfig ? { customConfig } : {}),
+    };
   }
   return null;
 }
@@ -1560,6 +1816,21 @@ export interface TestConnectionResult {
   profileId?: string;
 }
 
+function sanitizeConnectionError(
+  err: unknown,
+  sensitive: { apiKey?: string; customConfig?: CustomOpenAICompatibleRuntimeConfig },
+): string {
+  let message = (err as Error)?.message || String(err);
+  for (const [value, replacement] of [
+    [sensitive.apiKey, '[credential]'],
+    [sensitive.customConfig?.baseUrl, '[custom endpoint]'],
+  ] as const) {
+    const literal = String(value || '');
+    if (literal) message = message.split(literal).join(replacement);
+  }
+  return sanitizeLogTextForUpload(message);
+}
+
 export async function testConnection(
   providerId: string,
   modelId?: string,
@@ -1574,6 +1845,7 @@ export async function testConnection(
 
   let chosenProfileId: string | undefined = profileId;
   let apiKey: string | undefined;
+  let customConfig: CustomOpenAICompatibleRuntimeConfig | undefined;
 
   if (chosenProfileId) {
     const store = loadProfiles();
@@ -1582,12 +1854,20 @@ export async function testConnection(
     if (prof.type === 'api_key') apiKey = prof.key;
     else if (Date.now() < prof.expires) apiKey = prof.access;
     else apiKey = await refreshOAuthProfile(chosenProfileId).catch(() => undefined);
+    customConfig = customRuntimeConfigFromProfile(prof) || undefined;
   } else {
     const choice = await pickRotationKey(pid);
-    if (choice) { apiKey = choice.apiKey; chosenProfileId = choice.profileId; }
+    if (choice) {
+      apiKey = choice.apiKey;
+      chosenProfileId = choice.profileId;
+      customConfig = choice.customConfig;
+    }
   }
 
   if (!apiKey) return { ok: false, error: 'no credential stored for this provider', profileId: chosenProfileId };
+  if (providerUsesCustomOpenAIConfig(pid) && !customConfig) {
+    return { ok: false, error: 'custom model configuration is incomplete', profileId: chosenProfileId };
+  }
 
   // Orkas-side external providers bypass pi-ai's catalog — route directly
   // to their factory so we don't hit the "provider has no models registered"
@@ -1610,6 +1890,12 @@ export async function testConnection(
         // Default probe = Seed 2.0 Lite (cheaper than Pro).
         probeModel = probeModel || 'doubao-seed-2-0-lite-260215';
         provider = await ext.createDoubaoProvider({ apiKey, modelId: probeModel });
+      } else if (pid === CUSTOM_MODEL_PROVIDER && customConfig) {
+        provider = await ext.createCustomOpenAICompatibleProvider({
+          apiKey,
+          modelId: probeModel,
+          ...customConfig,
+        });
       } else {
         throw new Error(`external provider "${pid}" has no test-connection factory yet`);
       }
@@ -1622,7 +1908,7 @@ export async function testConnection(
       if (chosenProfileId) clearCooldown(chosenProfileId);
       return { ok: true, durationMs: Date.now() - t0, model: msg.model || probeModel, profileId: chosenProfileId };
     } catch (err) {
-      const errMsg = (err as Error).message || String(err);
+      const errMsg = sanitizeConnectionError(err, { apiKey, customConfig });
       log.warn('testConnection failed (external provider)', {
         provider: pid,
         model: modelForTest,

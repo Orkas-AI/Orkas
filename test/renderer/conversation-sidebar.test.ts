@@ -53,6 +53,12 @@ function loadConversationRenderer() {
       'agents.use_label': `Agent: ${params?.agent || ''}`,
       'skills.use_label': `Skill: ${params?.skill || ''}`,
       'chat.stream.compaction_tokens': `Context compressed: ${params?.before} -> ${params?.after} tokens`,
+      'chat.stream.context_history_start': 'Organizing history context',
+      'chat.stream.context_history_done': 'History context organized',
+      'chat.stream.context_history_failed': 'History context could not be organized',
+      'chat.stream.context_active_start': 'Organizing current tool context',
+      'chat.stream.context_active_done': 'Current tool context organized',
+      'chat.stream.context_active_failed': 'Current tool context could not be organized',
       'chat.stream.runtime_total': `Total time ${params?.duration}`,
       'chat.stream.runtime_model': `model ${params?.duration}`,
       'chat.stream.runtime_tools': `tools ${params?.duration}`,
@@ -132,6 +138,43 @@ describe('conversation history initial window', () => {
     expect(context._historyRequestUrl('c1')).toBe('/api/conversations/c1/history?limit=10&project_id=p1');
     expect(context._historyRequestUrl('c1', 999)).toBe('/api/conversations/c1/history?limit=10&before=999&project_id=p1');
     expect(context._historyRequestUrl('global')).toBe('/api/conversations/global/history?limit=10&project_id=');
+  });
+
+  it('cancels an old turn pin before rebuilding history for a task switch', () => {
+    const context = loadConversationRenderer();
+    const frames: Function[] = [];
+    const appended: any[] = [];
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      querySelector: () => null,
+      appendChild(node: any) { appended.push(node); },
+    } as any;
+    const msg = { isConnected: true } as any;
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.requestAnimationFrame = (fn: Function) => {
+      frames.push(fn);
+      return frames.length;
+    };
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._refreshGroupMembers = async () => [];
+    context.apiFetch = () => new Promise(() => {});
+
+    context._pinMessageToTopWithDynamicSpacer(msg, history);
+    expect(frames).toHaveLength(1);
+
+    void context.loadConversationHistory('c1');
+    frames.shift()?.();
+
+    expect(history._scrollPinActive).toBe(false);
+    expect(appended).toHaveLength(0);
   });
 
   it('recognizes a stale deleted-conversation result as recoverable', () => {
@@ -477,6 +520,120 @@ describe('conversation sticky scroll', () => {
     expect(el._stickyUserPaused).toBe(true);
   });
 
+  it('releases the send-time scroll pin when a bare scroll moves away from its target', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el._scrollPinTargetTop = 500;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.scrollTop = 320;
+    el.dispatch('scroll');
+
+    expect(spacer.removed).toBe(true);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._scrollPinTargetTop).toBeUndefined();
+    expect(el._stickyEnabled).toBe(false);
+    expect(el._stickyUserPaused).toBe(true);
+    expect(el.scrollTop).toBe(320);
+  });
+
+  it('keeps the send-time scroll pin for its own delayed scroll event', () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    el._scrollPinActive = true;
+    el._scrollPinTargetTop = 500;
+    el.querySelector = (selector: string) => (
+      selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+    );
+
+    context._bindStickToBottom(el);
+    el.dispatch('scroll');
+
+    expect(spacer.removed).toBe(false);
+    expect(el._scrollPinActive).toBe(true);
+    expect(el._scrollPinTargetTop).toBe(500);
+  });
+
+  it('cancels a delayed send-time pin when the stream settles before layout frames run', () => {
+    const context = loadConversationRenderer();
+    const frames: Function[] = [];
+    context.requestAnimationFrame = (fn: Function) => {
+      frames.push(fn);
+      return frames.length;
+    };
+    const appended: any[] = [];
+    const el = {
+      isConnected: true,
+      _stickyEnabled: true,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      querySelector: () => null,
+      appendChild(node: any) { appended.push(node); },
+    } as any;
+    const msg = { isConnected: true } as any;
+
+    context._pinMessageToTopWithDynamicSpacer(msg, el);
+    expect(frames).toHaveLength(1);
+
+    // Mirrors createChatController's terminal finally block. The already
+    // queued rAF is intentionally still invoked below to prove the epoch
+    // guard works even when the host cannot cancel it.
+    context._setChatScrollOffset(false, el);
+    frames.shift()?.();
+
+    expect(appended).toHaveLength(0);
+    expect(el._scrollPinActive).toBe(false);
+    expect(el._scrollPinInnerRaf).toBeNull();
+  });
+
+  it('clears the active task scroll pin before terminal settlement drains its queue', () => {
+    const context = loadConversationRenderer();
+    const spacer = {
+      removed: false,
+      remove() { this.removed = true; },
+    };
+    const history = {
+      _scrollPinActive: true,
+      querySelector: (selector: string) => (
+        selector === ':scope > .chat-scroll-spacer' && !spacer.removed ? spacer : null
+      ),
+    } as any;
+    let pinAtQueueDrain: boolean | null = null;
+    context.currentCid = 'c1';
+    context.pendingConvs.set('c1', { aborted: false });
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._stopRuntimeActorRecovery = () => {};
+    context._stopGroupEventObserver = () => {};
+    context.isGroupConversationBusy = () => false;
+    context.stopPolling = () => {};
+    context._updateConvSidebarBadge = () => {};
+    context._settleDanglingActorPlaceholders = () => {};
+    context._updateConvSendUI = () => {};
+    context._dispatchNextQueued = () => {
+      pinAtQueueDrain = history._scrollPinActive;
+    };
+
+    context._finishStreamingMsg('c1');
+
+    expect(spacer.removed).toBe(true);
+    expect(history._scrollPinActive).toBe(false);
+    expect(pinAtQueueDrain).toBe(false);
+  });
+
   it('resumes bottom-follow after the user returns to the bottom', () => {
     const context = loadConversationRenderer();
     const el = fakeScrollEl();
@@ -658,6 +815,10 @@ describe('conversation history reconcile', () => {
         if (selector.includes('data-msg-id')) return null;
         if (selector.includes('data-group-msg-sig')) return el;
         return null;
+      },
+      querySelectorAll(selector: string) {
+        if (selector.includes('data-group-msg-sig')) return [el];
+        return [];
       },
     };
 
@@ -1084,6 +1245,25 @@ describe('conversation process read_file resource labels', () => {
 });
 
 describe('conversation process metadata formatting', () => {
+  it('formats every semantic context phase through localized renderer copy', () => {
+    const context = loadConversationRenderer();
+    const phases = [
+      ['history_summary_start', 'Organizing history context'],
+      ['history_summary_done', 'History context organized'],
+      ['history_summary_failed', 'History context could not be organized'],
+      ['active_process_compaction_start', 'Organizing current tool context'],
+      ['active_process_compaction_done', 'Current tool context organized'],
+      ['active_process_compaction_failed', 'Current tool context could not be organized'],
+    ];
+
+    for (const [phase, expected] of phases) {
+      expect(context._formatEventLine({
+        stream: 'context',
+        data: { phase, message: '不应显示的底层文案' },
+      })).toBe(expected);
+    }
+  });
+
   it('formats compaction and total runtime events for the process pane', () => {
     const context = loadConversationRenderer();
 
@@ -1105,6 +1285,15 @@ describe('conversation process metadata formatting', () => {
         retry_wait_ms: 5_000,
       },
     });
+    const segmentedRuntime = context._formatEventLine({
+      stream: 'runtime',
+      data: {
+        duration_ms: 180_000,
+        bubble_duration_ms: 12_000,
+        provider_ms: 80_000,
+        tool_ms: 100_000,
+      },
+    });
     const tool = context._formatEventLine({
       stream: 'tool',
       data: { phase: 'end', name: 'manage_execution_plan', duration_ms: 17 },
@@ -1114,6 +1303,7 @@ describe('conversation process metadata formatting', () => {
     expect(runtime).toBe('Total time 1m 5s');
     expect(runtimeWithBreakdown)
       .toBe('Total time 1m 5s · model 40s · tools 5s · context 15s · retry wait 5s');
+    expect(segmentedRuntime).toBe('Total time 12s');
     expect(tool).toContain('manage_execution_plan');
     expect(tool).toContain('17ms');
     expect(context._processSummaryRuntimeFromItems([
@@ -1124,11 +1314,104 @@ describe('conversation process metadata formatting', () => {
       { type: 'event', event: { stream: 'runtime', data: { durationMs: 1_234 } } },
     ])).toBe('1s');
     expect(context._processSummaryRuntimeFromItems([
+      {
+        type: 'event',
+        event: {
+          stream: 'runtime',
+          data: { duration_ms: 180_000, bubble_duration_ms: 12_000 },
+        },
+      },
+    ])).toBe('12s');
+    expect(context._processSummaryRuntimeFromItems([
       { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
     ])).toBe('');
     expect(context._eventProcessKind({ stream: 'context', data: {} }, 'Context prepared')).toBe('context');
     expect(context._eventProcessKind({ stream: 'compaction', data: {} }, compaction)).toBe('context');
     expect(context._eventProcessKind({ stream: 'runtime', data: {} }, runtime)).toBe('bound');
+  });
+
+  it('keeps duration events out of persisted process rows while retaining retry progress', () => {
+    const context = loadConversationRenderer();
+    const segmentRuntime = {
+      type: 'event',
+      event: {
+        stream: 'runtime',
+        data: { phase: 'segment_end', duration_ms: 20, bubble_duration_ms: 0 },
+      },
+    };
+    const retry = {
+      type: 'progress',
+      text: 'Retrying',
+      event: { stream: 'runtime', data: { phase: 'retrying', attempt: 2 } },
+    };
+    const tool = {
+      type: 'event',
+      event: { stream: 'tool', data: { phase: 'end', name: 'read_file', duration_ms: 6 } },
+    };
+    const finalRuntime = {
+      type: 'event',
+      event: { stream: 'runtime', data: { phase: 'end', duration_ms: 40_000 } },
+    };
+
+    const displayed = context._processItemsForDisplay([
+      segmentRuntime,
+      tool,
+      retry,
+      finalRuntime,
+    ]);
+
+    expect(displayed).toHaveLength(2);
+    expect(displayed[0]).toEqual(tool);
+    expect(displayed[1]).toEqual(retry);
+    expect(displayed.filter((item: any) => (
+      item.event?.stream === 'runtime'
+      && item.event?.data?.duration_ms != null
+    ))).toHaveLength(0);
+    expect(context._processSummaryRuntimeFromItems([
+      segmentRuntime,
+      tool,
+      retry,
+      finalRuntime,
+    ])).toBe('40s');
+    expect(context._formatEventLine(retry.event)).toBeNull();
+  });
+
+  it('updates only the summary clock and freezes the final value', () => {
+    const context = loadConversationRenderer();
+    const summary = { textContent: '', hidden: true };
+    const container = {
+      style: { display: 'none' },
+      dataset: {} as Record<string, string>,
+      querySelector: (selector: string) => (
+        selector === '.stream-process-runtime' ? summary : null
+      ),
+    };
+    const msg: any = {
+      dataset: {},
+      querySelector(selector: string) {
+        if (selector === '[data-role="process-container"]') return container;
+        if (selector === '.stream-process') return container;
+        return null;
+      },
+    };
+
+    context._updateStreamingRuntimeSummary(msg, {
+      stream: 'runtime',
+      data: { phase: 'segment_end', duration_ms: 5, bubble_duration_ms: 0 },
+    });
+    context._updateStreamingRuntimeSummary(msg, null, 40_000);
+
+    expect(summary.textContent).toBe('40s');
+    expect(container.dataset.runtimeDurationMs).toBe('40000');
+
+    context._updateStreamingRuntimeSummary(msg, {
+      stream: 'runtime',
+      data: { phase: 'end', duration_ms: 42_000 },
+    });
+    context._updateStreamingRuntimeSummary(msg, null, 50_000);
+
+    expect(summary.textContent).toBe('42s');
+    expect(container.dataset.runtimeDurationMs).toBe('42000');
   });
 });
 
@@ -1239,6 +1522,37 @@ describe('conversation auto recipient', () => {
     expect(context.__stillPending).toBe(false);
     expect(context.applyRecipientPrefix('回来', 'conversation', { recipientSnapshot: context.__snap }))
       .toBe('@commander 回来');
+  });
+
+  it('keeps the commander floor-reset marker in transport but hides it in the user bubble', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _serverFloorByCid.set("c1", "a1");
+      setChatRecipient("conversation", { kind: "commander" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+    `, context);
+
+    const outbound = context.applyRecipientPrefix(
+      '你看下怎么处理',
+      'conversation',
+      { recipientSnapshot: context.__snap },
+    );
+
+    expect(outbound).toBe('@commander 你看下怎么处理');
+    expect(context._stripCommanderRoutingMentionsForDisplay(outbound))
+      .toBe('你看下怎么处理');
+  });
+
+  it('normalizes commander routing markers on replay without hiding agent mentions', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._stripCommanderRoutingMentionsForDisplay('@指挥官\n> 引用内容'))
+      .toBe('> 引用内容');
+    expect(context._stripCommanderRoutingMentionsForDisplay('请让 @commander 看一下'))
+      .toBe('请让 看一下');
+    expect(context._stripCommanderRoutingMentionsForDisplay('@FamilyTutor 继续'))
+      .toBe('@FamilyTutor 继续');
   });
 
   it('drains queued messages with the enqueue-time recipient snapshot', () => {
@@ -1416,7 +1730,14 @@ describe('conversation controller settlement', () => {
       },
     });
 
-    const result = await context.sendInConversation('c1', 'hello');
+    const result = await context.sendInConversation('c1', 'hello', undefined, {
+      entry_point: 'quick_start',
+      resource_id: 'creation',
+      agent_id: '173d4235a431',
+      recipient_type: 'agent',
+      position: 6,
+      source: 'pc_default',
+    });
 
     expect(result.result).toBe(expected);
   });
@@ -1438,20 +1759,89 @@ describe('conversation controller settlement', () => {
 });
 
 describe('new chat quick-start scenarios', () => {
+  it('uses the account name in the centered prompt and falls back to Friend without one', () => {
+    const context = loadConversationRenderer();
+    const greeting = { textContent: '' };
+    context.t = (key: string, params: any = {}) => ({
+      'new_chat.title': `${params.name}, what do you want to accomplish?`,
+      'common.user_fallback': 'Friend',
+    }[key] || key);
+    context.document.getElementById = (id: string) => (
+      id === 'new-chat-greeting' ? greeting : null
+    );
+
+    context._updateEmptyStateAccount({ userInfo: { nickname: 'Avery' } });
+    expect(greeting.textContent).toBe('Avery, what do you want to accomplish?');
+
+    context._updateEmptyStateAccount({ userInfo: { email: 'avery@example.com' } });
+    expect(greeting.textContent).toBe('Friend, what do you want to accomplish?');
+  });
+
+  it('renders all eight quick-start cards when the new-chat view is entered', () => {
+    const context = loadConversationRenderer();
+    const heading = { textContent: '' };
+    const recipientName = {
+      textContent: '',
+      setAttribute() {},
+      removeAttribute() {},
+    };
+    const input = {
+      value: '',
+      dataset: {},
+      addEventListener() {},
+    };
+    const grid = {
+      children: [],
+      innerHTML: '',
+    };
+    const row = {
+      querySelectorAll: () => [],
+    };
+    context.document.getElementById = (id: string) => ({
+      'new-chat-greeting': heading,
+      'new-chat-recipient-name': recipientName,
+      'new-chat-input': input,
+      'new-chat-scenario-grid': grid,
+      'new-chat-scenarios': row,
+    } as Record<string, unknown>)[id] || null;
+
+    context.onEnterNewChatView();
+
+    expect(heading.textContent).toBe('Friend, what do you want to accomplish?');
+    expect([...grid.innerHTML.matchAll(/data-scenario="([^"]+)"/g)].map((match) => match[1])).toEqual([
+      'data',
+      'video',
+      'image',
+      'ui_design',
+      'office',
+      'creation',
+      'rnd',
+      'seo_geo',
+    ]);
+  });
+
   it('falls back to commander without toast when the scenario agent is missing', async () => {
     const context = loadConversationRenderer();
     const toasts: any[] = [];
+    const clicks: any[] = [];
+    const events: any[] = [];
+    const classChanges: string[] = [];
     let clickHandler: Function | null = null;
     const input = {
       value: '',
       focused: false,
       selection: [0, 0],
+      dataset: {},
       focus() { this.focused = true; },
       setSelectionRange(start: number, end: number) { this.selection = [start, end]; },
       dispatchEvent() {},
     };
     const chip = {
       dataset: { scenario: 'ui_design' },
+      classList: {
+        add(name: string) { classChanges.push(`add:${name}`); },
+        remove(name: string) { classChanges.push(`remove:${name}`); },
+      },
       addEventListener(type: string, fn: Function) {
         if (type === 'click') clickHandler = fn;
       },
@@ -1462,6 +1852,13 @@ describe('new chat quick-start scenarios', () => {
     };
 
     context._agentsCache = [];
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.loadAgents = async () => [];
+    context._setQuickStartItems([{ id: 'ui_design', agent_id: 'missing-ui-agent' }]);
     context.uiToast = (...args: any[]) => toasts.push(args);
     context.autoGrow = () => {};
     context.Event = class {
@@ -1479,8 +1876,126 @@ describe('new chat quick-start scenarios', () => {
     await clickHandler!();
 
     expect(context.getChatRecipient('new-chat')).toMatchObject({ kind: 'commander' });
-    expect(input.value).toContain('Design the UI');
+    expect(input.value).toContain('a personal finance app');
     expect(input.focused).toBe(true);
+    expect(input.value.slice(input.selection[0], input.selection[1])).toBe('a personal finance app');
+    expect(classChanges).toEqual([]);
     expect(toasts).toHaveLength(0);
+    expect(clicks).toEqual([]);
+    expect(events).toEqual([]);
+    expect(input.dataset).toMatchObject({
+      commanderEntryPoint: 'quick_start',
+      commanderResourceId: 'ui_design',
+      commanderRecipientType: 'commander',
+    });
+    expect(input.dataset.commanderQuickStartPlaceholder).toBeUndefined();
+  });
+
+  it('binds article writing to the dedicated default-installed ContentWriter', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      dataset: {},
+      focus() {},
+      setSelectionRange() {},
+      dispatchEvent() {},
+    };
+    const card = {
+      dataset: { scenario: 'creation' },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      querySelectorAll: () => [card],
+    };
+
+    context._agentsCache = [{
+      agent_id: '173d4235a431',
+      name: 'ContentWriter',
+      enabled: true,
+    }];
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({
+      kind: 'agent',
+      id: '173d4235a431',
+      name: 'ContentWriter',
+    });
+    expect(input.value).toContain('Write');
+    expect(events).toEqual([]);
+  });
+
+  it('binds software development to the default-installed ProductDeveloper', async () => {
+    const context = loadConversationRenderer();
+    const events: any[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      dataset: {},
+      focus() {},
+      setSelectionRange() {},
+      dispatchEvent() {},
+    };
+    const card = {
+      dataset: { scenario: 'rnd' },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      querySelectorAll: () => [card],
+    };
+
+    context._agentsCache = [{
+      agent_id: 'a316881746f9',
+      name: 'ProductDeveloper',
+      enabled: true,
+    }];
+    context.Monitor = {
+      click() {},
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({
+      kind: 'agent',
+      id: 'a316881746f9',
+      name: 'ProductDeveloper',
+    });
+    expect(input.value).toContain('Build');
+    expect(events).toEqual([]);
   });
 });

@@ -1,6 +1,5 @@
 /**
- * Device fingerprint helper — resolves a stable per-machine identifier
- * (MAC address of the first non-internal NIC) + the display hostname.
+ * Legacy network fingerprint + display hostname helper.
  *
  * Used by `features/auto_tasks.ts` to bind each task to one machine: only
  * that machine fires the task, but every device can read / edit the task
@@ -33,13 +32,11 @@ export interface DeviceFingerprint {
 }
 
 let _cached: DeviceFingerprint | null = null;
+let _cachedLegacyIds: string[] | null = null;
 let _overrideForTests: DeviceFingerprint | null = null;
 
-export function getCurrentDevice(): DeviceFingerprint {
-  if (_overrideForTests) return _overrideForTests;
-  if (_cached) return _cached;
-  const name = (os.hostname() || '').trim() || `PC (${process.platform})`;
-  let mac = '';
+function resolveLegacyDeviceIds(): string[] {
+  const ids = new Set<string>();
   try {
     const ifaces = os.networkInterfaces();
     for (const list of Object.values(ifaces)) {
@@ -47,23 +44,38 @@ export function getCurrentDevice(): DeviceFingerprint {
       for (const addr of list) {
         if (addr.internal) continue;
         if (!addr.mac || addr.mac === '00:00:00:00:00:00') continue;
-        mac = addr.mac.toLowerCase();
-        break;
+        ids.add(addr.mac.toLowerCase());
       }
-      if (mac) break;
     }
   } catch (err) {
     log.warn(`os.networkInterfaces failed: ${(err as Error).message}`);
   }
+  return Array.from(ids);
+}
+
+export function getCurrentDevice(): DeviceFingerprint {
+  if (_overrideForTests) return _overrideForTests;
+  if (_cached) return _cached;
+  const name = (os.hostname() || '').trim() || `PC (${process.platform})`;
+  const mac = getLegacyDeviceIds()[0] || '';
   _cached = { id: mac, name };
   return _cached;
 }
 
+export function getLegacyDeviceIds(): string[] {
+  if (_overrideForTests) return _overrideForTests.id ? [_overrideForTests.id.toLowerCase()] : [];
+  if (!_cachedLegacyIds) _cachedLegacyIds = resolveLegacyDeviceIds();
+  return [..._cachedLegacyIds];
+}
+
 /** Test seam — drop the memo so subsequent calls re-resolve. */
-export function _resetDeviceCacheForTests(): void { _cached = null; }
+export function _resetDeviceCacheForTests(): void {
+  _cached = null;
+  _cachedLegacyIds = null;
+}
 
 /** Test seam — force a deterministic fingerprint, including an empty id. */
 export function _setDeviceFingerprintForTests(next: DeviceFingerprint | null): void {
   _overrideForTests = next;
-  _cached = null;
+  _resetDeviceCacheForTests();
 }

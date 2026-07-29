@@ -107,6 +107,24 @@ describe('preload bridge', () => {
     expect(ipcRenderer.removeListener).toHaveBeenCalledWith('marketplace:changed', registered);
   });
 
+  it('allows approval push channels, rejects exact-channel near misses, and contains handler failures', () => {
+    const { api, emit } = loadPreload();
+    const bashHandler = vi.fn(() => { throw new Error('renderer callback failed'); });
+    const bashCancelledHandler = vi.fn();
+    const bridgeHandler = vi.fn();
+
+    api.onPushEvent('bash:permission', bashHandler);
+    api.onPushEvent('bash:permission_cancelled', bashCancelledHandler);
+    api.onPushEvent('bridge:permission', bridgeHandler);
+
+    expect(() => emit('bash:permission', { request_id: 'bash-1' })).not.toThrow();
+    emit('bash:permission_cancelled', { request_ids: ['bash-1'] });
+    emit('bridge:permission', { request_id: 'bridge-1' });
+    expect(bashHandler).toHaveBeenCalledOnce();
+    expect(bashCancelledHandler).toHaveBeenCalledWith({ request_ids: ['bash-1'] });
+    expect(bridgeHandler).toHaveBeenCalledWith({ request_id: 'bridge-1' });
+  });
+
   it('delivers stream events, resolves on done, and cleans the listener', async () => {
     const { api, emit, ipcRenderer, listeners } = loadPreload();
     const onEvent = vi.fn();

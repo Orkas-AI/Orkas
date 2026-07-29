@@ -191,9 +191,28 @@ export function buildShellInvocation(
 
   const kind = inferShellKind(shell, platform);
   if (platform === "win32" && kind === "powershell") {
+    // powershell.exe otherwise normalizes a failed native child's exit code to
+    // 1. Preserve $LASTEXITCODE so process tools can report the real code.
+    const powershellCommand = [
+      "& {",
+      command,
+      "$orkasCommandSucceeded = $?",
+      "$orkasNativeExitCode = $LASTEXITCODE",
+      "if ($null -ne $orkasNativeExitCode) { exit $orkasNativeExitCode }",
+      "if (-not $orkasCommandSucceeded) { exit 1 }",
+      "}",
+    ].join("\n");
     return {
       command: shell,
-      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+      args: [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        powershellCommand,
+      ],
       kind,
     };
   }
@@ -279,6 +298,21 @@ function maybeWrapWithMacWriteSandbox(
     command: "/usr/bin/sandbox-exec",
     args: ["-p", macWriteSandboxProfile(dirs), invocation.command, ...invocation.args],
   };
+}
+
+/** Build the same shell invocation and optional macOS write sandbox used by
+ * SandboxExecutor. Persistent process tools reuse this so moving a command
+ * from foreground execution to a long-lived session does not widen its file
+ * access. */
+export function buildSandboxedShellInvocation(
+  shell: string,
+  command: string,
+  allowedDirs?: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+): SpawnInvocation {
+  const invocation = buildShellInvocation(shell, command, platform);
+  if (platform !== process.platform) return invocation;
+  return maybeWrapWithMacWriteSandbox(invocation, allowedDirs);
 }
 
 function decodedTextScore(text: string): number {
@@ -386,6 +420,15 @@ function buildPosixCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
     out.push(normalized);
   };
 
+  // Keep the shell tool's command discovery aligned with local-agent
+  // discovery. Finder-launched macOS apps commonly inherit a PATH without
+  // these user-level install roots, even though the local-agent registry can
+  // resolve and launch CLIs from them by absolute path.
+  if (home) {
+    add(path.posix.join(home, ".local", "bin"));
+    add(path.posix.join(home, ".npm-global", "bin"));
+    add(path.posix.join(home, "bin"));
+  }
   for (const entry of CANONICAL_PATH_ENTRIES) add(entry);
   add("/opt/homebrew/share/google-cloud-sdk/bin");
   add("/usr/local/share/google-cloud-sdk/bin");

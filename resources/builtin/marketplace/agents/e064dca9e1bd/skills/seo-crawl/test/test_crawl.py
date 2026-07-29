@@ -12,13 +12,17 @@ import gzip
 import os
 import sys
 import unittest
+from unittest import mock
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 import crawl  # noqa: E402
 import url_safety  # noqa: E402
-from crawl import _PageParser, _decode_body, crawl_file, extract_fields, fetch  # noqa: E402
+from crawl import (  # noqa: E402
+    _PageParser, _decode_body, crawl_file, extract_fields, fetch,
+    representative_internal_links,
+)
 from url_safety import (  # noqa: E402
     URLSafetyError, assert_proxy_target_safe, is_safe_ip, normalize_hostname,
     resolve_and_pin, validate_url_strict,
@@ -121,6 +125,42 @@ class ExtractTest(unittest.TestCase):
         self.assertGreater(self.f["word_count"], 5)
 
 
+class RepresentativeLinksTest(unittest.TestCase):
+    def test_prioritizes_distinct_sections_before_filling(self):
+        links = [
+            "https://example.com/blog/a",
+            "https://example.com/blog/b",
+            "https://example.com/compare/a-vs-b",
+            "https://example.com/docs/start",
+            "https://example.com/marketplace",
+            "https://example.com/pricing",
+            "https://example.com/security",
+            "https://example.com/use/developers",
+        ]
+        self.assertEqual(
+            representative_internal_links(links, limit=5),
+            [
+                "https://example.com/pricing",
+                "https://example.com/compare/a-vs-b",
+                "https://example.com/use/developers",
+                "https://example.com/docs/start",
+                "https://example.com/blog/a",
+            ],
+        )
+
+    def test_deduplicates_and_fills_unclassified_paths(self):
+        links = [
+            "https://example.com/about",
+            "https://example.com/about",
+            "https://example.com/contact",
+        ]
+        self.assertEqual(
+            representative_internal_links(links, limit=12),
+            ["https://example.com/about", "https://example.com/contact"],
+        )
+        self.assertEqual(representative_internal_links(links, limit=0), [])
+
+
 class NoindexTest(unittest.TestCase):
     def test_noindex_detected_from_meta_only(self):
         f = extract_fields(NOINDEX_HTML, "https://orkas.ai/hidden", status=200)
@@ -159,6 +199,17 @@ class FileModeTest(unittest.TestCase):
         self.assertEqual(page["title"], "Orkas — local-first AI agents")
         self.assertEqual(page["canonical"], "https://orkas.ai/")
         self.assertEqual(out["site"]["source"], "file")
+
+    def test_out_creates_parent_directory(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "page.html")
+            out = os.path.join(tmp, "nested", "crawl.json")
+            with open(source, "w", encoding="utf-8") as fh:
+                fh.write(GOOD_HTML)
+            result = crawl.main(["--file", source, "--out", out])
+            self.assertTrue(result["ok"])
+            self.assertTrue(os.path.isfile(out))
 
 
 class SsrfGuardTest(unittest.TestCase):
@@ -225,6 +276,38 @@ class ProxyTargetSsrfTest(unittest.TestCase):
         self._resolves_to(["8.8.8.8", "10.0.0.5"])
         with self.assertRaises(URLSafetyError):
             assert_proxy_target_safe("split.example", 443)
+
+
+class ProxyDiscoveryTest(unittest.TestCase):
+    def test_uses_os_system_proxy_when_environment_is_empty(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                    crawl,
+                    "getproxies",
+                    return_value={"https": "http://127.0.0.1:7897"}):
+                self.assertEqual(crawl._proxy_for("https", "orkas.ai"), ("127.0.0.1", 7897))
+
+    def test_explicit_environment_proxy_wins_over_system_proxy(self):
+        with mock.patch.dict(
+                os.environ,
+                {"HTTPS_PROXY": "http://127.0.0.1:9000"},
+                clear=True):
+            with mock.patch.object(
+                    crawl,
+                    "getproxies",
+                    return_value={"https": "http://127.0.0.1:7897"}):
+                self.assertEqual(crawl._proxy_for("https", "orkas.ai"), ("127.0.0.1", 9000))
+
+    def test_honors_system_bypass_with_windows_separator(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.object(
+                    crawl,
+                    "getproxies",
+                    return_value={
+                        "https": "http://127.0.0.1:7897",
+                        "no": "localhost;*.example.com",
+                    }):
+                self.assertIsNone(crawl._proxy_for("https", "www.example.com"))
 
 
 class SsrfObfuscationTest(unittest.TestCase):

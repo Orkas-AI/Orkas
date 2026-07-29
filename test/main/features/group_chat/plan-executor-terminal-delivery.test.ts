@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { onTurnFinished, type TurnFinishedEvent } from '../../../../src/main/features/group_chat/plan_executor';
+import { getCurrentLang, setCurrentLang } from '../../../../src/main/i18n';
 
 function commanderEvent(overrides: Partial<TurnFinishedEvent> = {}): TurnFinishedEvent {
   return {
@@ -86,6 +87,30 @@ describe('group_chat plan executor terminal delivery', () => {
     expect(text).toContain('Agent run failed');
     expect(text).toContain('ACP handshake failed');
     expect(text).not.toContain('Model call failed');
+  });
+
+  it('shows a concise storage error without a model-failure wrapper', async () => {
+    const prevLang = getCurrentLang();
+    setCurrentLang('zh');
+    try {
+      const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
+        errText: '存储空间不足，请释放空间后重试。',
+        activityEvents: 0,
+        failureKind: 'model',
+        failureCode: 'storage_full',
+      }));
+
+      expect(outcome).toMatchObject({
+        kind: 'persist',
+        failureKind: 'model',
+        failureCode: 'storage_full',
+      });
+      const text = outcome.kind === 'persist' ? outcome.text : '';
+      expect(text).toBe('<span style="color:var(--danger)">存储空间不足，请释放空间后重试。</span>');
+      expect(text).not.toContain('模型调用失败');
+    } finally {
+      setCurrentLang(prevLang);
+    }
   });
 
   it('preserves host validation metadata alongside partial assistant text', async () => {

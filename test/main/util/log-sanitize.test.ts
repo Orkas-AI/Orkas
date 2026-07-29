@@ -38,8 +38,10 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   });
 
   it('masks secret-looking key=value fragments', () => {
-    const out = sanitizeLogTextForUpload('refresh_token=rt-value session_id=sid-value uid=ABCDEF1234567890 ok=true');
-    expect(out).toBe('refresh_token=*** session_id=*** uid=ABCD...7890 ok=true');
+    const out = sanitizeLogTextForUpload(
+      'refresh_token=rt-value session_id=sid-value cid=private-conversation uid=ABCDEF1234567890 ok=true',
+    );
+    expect(out).toBe('refresh_token=*** session_id=*** cid=*** uid=ABCD...7890 ok=true');
   });
 
   it('masks secret-looking JSON fields', () => {

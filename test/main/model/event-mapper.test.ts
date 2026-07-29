@@ -43,18 +43,37 @@ type AgentRunEvent =
       };
     }
   | { type: 'retry'; attempt: number; reason: string }
-  | { type: 'provider_fallback'; reason: 'auth'; providerId: string }
+  | {
+      type: 'provider_fallback';
+      reason: 'auth';
+      providerId: string;
+      candidateIndex?: number;
+      candidateCount?: number;
+    }
   | {
       type: 'context_status';
       phase:
         | 'history_summary_start'
         | 'history_summary_done'
+        | 'history_summary_failed'
         | 'active_process_compaction_start'
-        | 'active_process_compaction_done';
-      message: string;
+        | 'active_process_compaction_done'
+        | 'active_process_compaction_failed';
       data?: Record<string, unknown>;
     }
-  | { type: 'done'; result: { text: string; meta: { error: null | { message: string } } } };
+  | {
+      type: 'done';
+      result: {
+        text: string;
+        meta: {
+          error: null | {
+            kind?: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
+            message: string;
+            code?: string;
+          };
+        };
+      };
+    };
 
 async function* toAsync<T>(items: T[]): AsyncIterable<T> {
   for (const it of items) yield it;
@@ -296,20 +315,20 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(retryProgress.text).not.toContain('retry #');
   });
 
-  it('context_status event → progress row plus structured context event', async () => {
+  it('context_status event → semantic context event without language-specific text', async () => {
     const out = await collect([
       {
         type: 'context_status',
         phase: 'history_summary_start',
-        message: '正在整理历史上下文...',
         data: { turns: 13 },
       },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
-    const row = out.find((e) => e.type === 'progress' && e.event?.stream === 'context');
-    expect(row.text).toBe('正在整理历史上下文...');
+    const row = out.find((e) => e.type === 'event' && e.event?.stream === 'context');
+    expect(row).toBeDefined();
     expect(row.event.data.phase).toBe('history_summary_start');
     expect(row.event.data.turns).toBe(13);
+    expect(JSON.stringify(row)).not.toContain('上下文');
   });
 
   it('retry event with attempt>=2 → shows the attempt number', async () => {
@@ -339,7 +358,13 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     setCurrentLang('zh');
     try {
       const out = await collect([
-        { type: 'provider_fallback', reason: 'auth', providerId: 'openai-codex' },
+        {
+          type: 'provider_fallback',
+          reason: 'auth',
+          providerId: 'openai-codex',
+          candidateIndex: 1,
+          candidateCount: 3,
+        },
         { type: 'done', result: { text: '', meta: { error: null } } },
       ]);
       const progress = out.find((e) => e.type === 'progress');
@@ -348,7 +373,13 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       expect(progress.text).not.toContain('网络异常');
       expect(progress.event).toEqual({
         stream: 'provider',
-        data: { phase: 'fallback', reason: 'auth', provider_id: 'openai-codex' },
+        data: {
+          phase: 'fallback',
+          reason: 'auth',
+          provider_id: 'openai-codex',
+          candidate_index: 1,
+          candidate_count: 3,
+        },
       });
     } finally {
       setCurrentLang('en');
@@ -457,6 +488,136 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       expect(out).toEqual([{ type: 'final', text: '（工具循环轮次已达上限）' }]);
     } finally {
       setCurrentLang('en');
+    }
+  });
+
+  it('localizes storage exhaustion and emits a stable failure code', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error: {
+                kind: 'provider_error',
+                message: 'ENOSPC: no space left on device, write',
+                // Legacy/provider adapters may preserve only the generic code;
+                // the exact ENOSPC message must still map to storage_full.
+                code: 'PROVIDER_ERROR',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([{
+        type: 'error',
+        text: '存储空间不足，请释放空间后重试。',
+        failureKind: 'model',
+        failureCode: 'storage_full',
+        failurePhase: 'provider_wait',
+      }]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('preserves an explicit empty provider terminal as empty_response', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error: {
+                kind: 'provider_error',
+                message: 'empty response',
+                code: 'PROVIDER_EMPTY_RESPONSE',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([{
+        type: 'error',
+        text: '模型未返回内容',
+        failureKind: 'model',
+        failureCode: 'empty_response',
+        failurePhase: 'provider_wait',
+      }]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('localizes a mid-stream cutoff and classifies it as provider_network', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        { type: 'text_delta', text: '已完成一部分' },
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error: {
+                kind: 'provider_error',
+                message: 'terminated',
+                code: 'PROVIDER_ERROR',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([
+        { type: 'delta', text: '已完成一部分' },
+        {
+          type: 'error',
+          text: '模型连接不稳定，请稍后再试。',
+          failureKind: 'model',
+          failureCode: 'provider_network',
+          failurePhase: 'model_text',
+        },
+      ]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('keeps an explicit request timeout in the provider_timeout category', async () => {
+    for (const error of [
+      {
+        kind: 'timeout' as const,
+        message: 'Request timed out',
+        code: 'PROVIDER_ERROR',
+      },
+      {
+        kind: 'provider_error' as const,
+        message: 'socket request failed',
+        code: 'ETIMEDOUT',
+      },
+    ]) {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              error,
+            },
+          },
+        },
+      ]);
+      expect(out).toEqual([{
+        type: 'error',
+        text: 'The model connection is unstable. Try again later.',
+        failureKind: 'model',
+        failureCode: 'provider_timeout',
+        failurePhase: 'provider_wait',
+      }]);
     }
   });
 });

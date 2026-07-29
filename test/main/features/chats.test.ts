@@ -109,6 +109,29 @@ describe('chats › createConversation', () => {
 });
 
 describe('chats › message history tombstones', () => {
+  it('upgrades legacy assistant media URLs for display without rewriting user text', async () => {
+    const chats = await loadChats();
+    const mediaUrls = await import('../../../src/main/util/chat-media-url');
+    const conv = await chats.createConversation(TEST_UID, { title: 'legacy media' });
+    const historyFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const imagePath = path.join(tmpDir, 'workspace', 'poster.png');
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, 'current-poster');
+    const unversioned = mediaUrls.chatMediaLocalUrl(imagePath);
+    const rows = [
+      { id: 'm1', ts: '2026-07-10T10:00:00Z', from: 'commander', to: ['user'], text: `![poster](${unversioned})` },
+      { id: 'm2', ts: '2026-07-10T10:01:00Z', from: 'user', to: ['commander'], text: `keep ${unversioned}` },
+    ];
+    fs.writeFileSync(historyFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+
+    const page = await chats.getMessagesPage(TEST_UID, conv.conversation_id, 10);
+
+    expect(page.history[0].text).toMatch(/\?v=\d+-\d+-14/);
+    expect(page.history[1].text).toBe(`keep ${unversioned}`);
+    expect(fs.readFileSync(historyFile, 'utf8')).toContain(`![poster](${unversioned})`);
+  });
+
   it('fills each page with visible messages while skipping deleted rows', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'history' });
@@ -1213,6 +1236,29 @@ describe('chats › autoTitle on first send', () => {
     await dropConv(TEST_UID, conv.conversation_id);
   });
 
+  it('uses pre-routing text for the title while preserving the @Agent message', async () => {
+    vi.resetModules();
+    const groupChat = await import('../../../src/main/features/group_chat');
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: '新对话' });
+
+    const res = await groupChat.send({
+      userId: TEST_UID,
+      cid: conv.conversation_id,
+      text: '@VideoStudio 制作一条面向普通用户的科普视频',
+      title_text: '制作一条面向普通用户的科普视频',
+    });
+
+    expect(res.ok).toBe(true);
+    expect(res.msg?.text).toBe('@VideoStudio 制作一条面向普通用户的科普视频');
+    const after = await chats.getConversation(TEST_UID, conv.conversation_id);
+    expect(after?.title).toBe('制作一条面向普通用户的科普视频');
+    expect(after?.title).not.toContain('@VideoStudio');
+
+    const { dropConv } = await import('../../../src/main/features/group_chat/bus');
+    await dropConv(TEST_UID, conv.conversation_id);
+  });
+
   it('does NOT overwrite an existing user-set title', async () => {
     vi.resetModules();
     const groupChat = await import('../../../src/main/features/group_chat');
@@ -1251,6 +1297,24 @@ describe('chats › autoTitle on first send', () => {
 
 describe('chats › sweepStaleProcessing', () => {
   const staleActiveAt = () => new Date(Date.now() - 60_000).toISOString();
+
+  it('does not load the Group Chat runtime when the compact journal is empty', async () => {
+    const paths = await import('../../../src/main/paths');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [] }));
+    let busLoaded = false;
+    vi.doMock('../../../src/main/features/group_chat/bus', () => {
+      busLoaded = true;
+      return { isQuiescent: () => true };
+    });
+    vi.resetModules();
+
+    const chats = await loadChats();
+    await expect(chats.sweepStaleProcessing(TEST_UID)).resolves.toEqual({ swept: 0 });
+    expect(busLoaded).toBe(false);
+    vi.doUnmock('../../../src/main/features/group_chat/bus');
+  });
 
   it('does not interrupt a conversation that started in the current process before the deferred sweep', async () => {
     const chats = await loadChats();
@@ -1372,6 +1436,9 @@ describe('chats › sweepStaleProcessing', () => {
     fs.rmSync(path.join(chatsDir, '_index.json'), { force: true });
     fs.rmSync(path.join(chatsDir, conv.conversation_id, 'meta.json'), { force: true });
     fs.rmSync(path.join(chatsDir, `${conv.conversation_id}.jsonl`), { force: true });
+    const searchIndexer = await import('../../../src/main/features/search/indexer');
+    await searchIndexer.reconcileChatsIndex(TEST_UID);
+    expect(searchIndexer.isChatsIndexTrusted(TEST_UID)).toBe(true);
 
     const res = await chats.sweepStaleProcessing();
     expect(res.swept).toBe(1);
@@ -1390,6 +1457,11 @@ describe('chats › sweepStaleProcessing', () => {
         model_text: expect.stringContaining('interrupted'),
       }),
     ]);
+    const paths = await import('../../../src/main/paths');
+    const searchEntry = await searchIndexer.getEntry(paths.userChatsIndexPath(TEST_UID), 'chat');
+    expect(searchEntry.idx.docs[`chat:${conv.conversation_id}:0`]).toMatchObject({
+      role: '79df9cc89f5f',
+    });
     expect((await chats.sweepStaleProcessing()).swept).toBe(0);
     expect(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`),

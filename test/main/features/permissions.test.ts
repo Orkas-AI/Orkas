@@ -17,6 +17,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -85,6 +86,17 @@ describe('permissions › legacy helpers', () => {
     const dir = path.dirname(permissionsFile());
     const stray = fs.readdirSync(dir).filter((n) => n.endsWith('.tmp'));
     expect(stray).toEqual([]);
+  });
+
+  it('advances the sync clock even when multiple writes share the same millisecond', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000);
+    const perm = await import('../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
+    const first = JSON.parse(fs.readFileSync(permissionsFile(), 'utf8'))._field_updated_at.localExec;
+
+    perm.setLocalExecMode('all_files_approval');
+    const second = JSON.parse(fs.readFileSync(permissionsFile(), 'utf8'))._field_updated_at.localExec;
+    expect(second).toBe(first + 1);
   });
 });
 
@@ -158,5 +170,20 @@ describe('permissions › three-mode model', () => {
   it('rejects an invalid mode', async () => {
     const perm = await import('../../../src/main/features/permissions');
     expect(() => perm.setLocalExecMode('bogus' as never)).toThrow();
+  });
+
+  it('keeps permission modes isolated by active account', async () => {
+    const perm = await import('../../../src/main/features/permissions');
+    const users = await import('../../../src/main/features/users');
+    perm.setLocalExecMode('all_files_auto');
+
+    users.activateUser('u2');
+    expect(perm.getLocalExecMode()).toBe('all_files_approval');
+    perm.setLocalExecMode('workspace_approval');
+
+    users.activateUser(TEST_UID);
+    expect(perm.getLocalExecMode()).toBe('all_files_auto');
+    users.activateUser('u2');
+    expect(perm.getLocalExecMode()).toBe('workspace_approval');
   });
 });

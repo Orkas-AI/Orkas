@@ -259,16 +259,16 @@ describe('local_agents/bridge › KB project scope', () => {
       const text = (r.reply as any).result.text;
       expect(text).toMatch(/global total=1 ready=1/);
       expect(text).toMatch(/project total=1 ready=1/);
-      expect(text).toMatch(/scope=global path=global-note\.md/);
-      expect(text).toMatch(/scope=project path=project-note\.md/);
+      expect(text).toContain('scope=global path="global-note.md"');
+      expect(text).toContain('scope=project path="project-note.md"');
 
       const search = await rpcOnce(bridge.socketPath, {
         id: 6, token: bridge.token, method: 'kb.search', params: { query: 'bridge alpha', k: 10 },
       });
       expect((search.reply as any).ok).toBe(true);
       const searchText = (search.reply as any).result.text;
-      expect(searchText).toMatch(/scope=global path=global-note\.md/);
-      expect(searchText).toMatch(/scope=project path=project-note\.md/);
+      expect(searchText).toContain('scope=global path="global-note.md"');
+      expect(searchText).toContain('scope=project path="project-note.md"');
     } finally {
       await bridge.close();
     }
@@ -295,7 +295,7 @@ describe('local_agents/bridge › KB project scope', () => {
       const text = (r.reply as any).result.text;
       expect(text).toMatch(/global total=1 ready=1/);
       expect(text).not.toContain('project total=');
-      expect(text).toMatch(/scope=global path=global-only\.md/);
+      expect(text).toContain('scope=global path="global-only.md"');
       expect(text).not.toMatch(/project-hidden\.md/);
 
       const search = await rpcOnce(bridge.socketPath, {
@@ -303,7 +303,7 @@ describe('local_agents/bridge › KB project scope', () => {
       });
       expect((search.reply as any).ok).toBe(true);
       const searchText = (search.reply as any).result.text;
-      expect(searchText).toMatch(/scope=global path=global-only\.md/);
+      expect(searchText).toContain('scope=global path="global-only.md"');
       expect(searchText).not.toMatch(/project-hidden\.md/);
       expect(searchText).not.toMatch(/scope=project/);
     } finally {
@@ -366,6 +366,26 @@ describe('local_agents/bridge_permissions', () => {
       });
       perms.cancelForCid('c9');
       await expect(p).resolves.toBe(false);
+    } finally {
+      perms._setBroadcastForTest(null);
+    }
+  });
+
+  it('fails closed immediately when no renderer can receive the approval prompt', async () => {
+    const perms = await import('../../../../src/main/features/local_agents/bridge_permissions');
+    let requestId = '';
+    perms._setBroadcastForTest((_channel, payload) => {
+      requestId = (payload as { request_id: string }).request_id;
+      return false;
+    });
+    try {
+      const decision = perms.requestPermission({
+        uid: TEST_UID, cid: 'c-no-window', agentId: 'a1', agentName: 'A',
+        connectorId: 'notion', connectorName: 'Notion', toolName: 'create_page',
+      });
+
+      await expect(decision).resolves.toBe(false);
+      expect(perms.respond(requestId, true, true)).toBe(false);
     } finally {
       perms._setBroadcastForTest(null);
     }

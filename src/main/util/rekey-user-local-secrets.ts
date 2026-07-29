@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import { userAuthProfilesFile } from '../paths';
 import * as localSecrets from './local-secret-store';
 import { createLogger } from '../logger';
-import { maskId } from './log-redact';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('local-secret-rekey');
 
@@ -72,7 +72,10 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
   try {
     raw = fs.readFileSync(file, 'utf8');
   } catch (err) {
-    log.warn('failed to read auth profiles for rekey', { file, error: (err as Error).message });
+    log.warn('failed to read auth profiles for rekey', {
+      targetOwner: maskId(targetOwner),
+      error: logErrorSummary(err),
+    });
     return;
   }
 
@@ -80,11 +83,16 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
   try {
     dec = tryReadAuthProfilesPlaintext(raw, candidateOwners);
   } catch (err) {
-    log.warn('failed to parse auth profiles for rekey', { file, error: (err as Error).message });
+    log.warn('failed to parse auth profiles for rekey', {
+      targetOwner: maskId(targetOwner),
+      error: logErrorSummary(err),
+    });
     return;
   }
   if (!dec) {
-    log.warn('failed to decrypt auth profiles for rekey', { file, owners: candidateOwners.map(maskId) });
+    log.warn('failed to decrypt auth profiles for rekey', {
+      owners: candidateOwners.map(maskId),
+    });
     return;
   }
   if (dec.ownerId === targetOwner && !dec.needsRewrite) return;
@@ -99,6 +107,9 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
       toOwner: maskId(targetOwner),
     });
   } catch (err) {
-    log.warn('failed to write rekeyed auth profiles', { file, error: (err as Error).message });
+    log.warn('failed to write rekeyed auth profiles', {
+      targetOwner: maskId(targetOwner),
+      error: logErrorSummary(err),
+    });
   }
 }

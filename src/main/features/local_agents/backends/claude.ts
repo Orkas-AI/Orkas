@@ -245,7 +245,9 @@ export const claudeBackend: LocalBackend = {
 /** Args mirroring the multica skeleton, distilled to what we actually
  *  use in v1: stream-json in/out, `--print` (non-interactive),
  *  bypass permissions for daemon-style execution, optional model. */
-export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs' | 'bridge'>): string[] {
+export function buildClaudeArgs(opts: Pick<BackendRunOptions,
+  'model' | 'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt'
+>): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
   // into "many partial chunks streamed as the model generates". Without
@@ -268,9 +270,16 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeS
   // tell the agent the bridge exists via an appended system prompt.
   if (opts.bridge) {
     args.push('--mcp-config', opts.bridge.mcpConfigPath);
-    if (opts.bridge.appendSystemPrompt) {
-      args.push('--append-system-prompt', opts.bridge.appendSystemPrompt);
-    }
+  }
+  const appendedSystemPrompt = [
+    opts.systemPrompt,
+    opts.bridge?.appendSystemPrompt,
+  ].map((part) => String(part || '').trim()).filter(Boolean).join('\n\n');
+  // Claude Code treats append-system-prompt as invocation-scoped: a resumed
+  // process does not recover an omitted append from the saved conversation.
+  // Keep the stable bundle byte-identical, but pass it on every invocation.
+  if (appendedSystemPrompt) {
+    args.push('--append-system-prompt', appendedSystemPrompt);
   }
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;

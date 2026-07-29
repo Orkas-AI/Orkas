@@ -18,6 +18,7 @@
  */
 
 import { t } from '../../i18n';
+import { isStorageFullError } from '../../../core-agent/src/shared/errors';
 import type { ChatFormPayload } from './router';
 import type { GroupMessageFailureKind } from './visibility';
 
@@ -117,7 +118,7 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
     // already landed, append the error pill instead of dropping the partial.
     const partial = evt.finalText || '';
     const body = evt.errText
-      ? (partial ? `${partial}\n\n${errorBubble(evt.errText, evt.failureKind)}` : errorBubble(evt.errText, evt.failureKind))
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText, evt.failureKind, evt.failureCode)}` : errorBubble(evt.errText, evt.failureKind, evt.failureCode))
       : partial;
     return {
       kind: 'persist',
@@ -137,10 +138,10 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
       return { kind: 'persist', text: '', ...failureFields(evt) };
     }
     // Real failure (zero-activity empty, or other err).
-    return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind), ...failureFields(evt, true) };
+    return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode), ...failureFields(evt, true) };
   }
   // agent empty + no side effects.
-  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind), ...failureFields(evt, true) };
+  if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode), ...failureFields(evt, true) };
   return { kind: 'persist', text: '(no reply)', ...failureFields(evt) };
 }
 
@@ -172,9 +173,11 @@ function failureFields(
   return { failureKind, ...(failureCode ? { failureCode } : {}) };
 }
 
-function errorBubble(msg: string, failureKind?: GroupMessageFailureKind): string {
+function errorBubble(msg: string, failureKind?: GroupMessageFailureKind, failureCode?: string): string {
   let visible: string;
-  if (failureKind === 'dependency') {
+  if (isStorageFullError({ message: msg, code: failureCode })) {
+    visible = t('errors.storage_full');
+  } else if (failureKind === 'dependency') {
     visible = normalizeRunError(msg);
   } else if (failureKind && failureKind !== 'model' && failureKind !== 'config') {
     visible = t('agent.run_failed', { message: normalizeRunError(msg) });

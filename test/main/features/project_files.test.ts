@@ -209,6 +209,24 @@ describe('project_files › copyProjectEntryFromPath', () => {
     });
   });
 
+  it('rejects a folder containing invalid UTF-8 without publishing a partial copy', async () => {
+    const projectFiles = await import('../../../src/main/features/project_files');
+    const source = path.join(tmpDir, 'corrupt-folder');
+    fs.mkdirSync(source);
+    fs.writeFileSync(path.join(source, 'good.md'), '# good');
+    fs.writeFileSync(path.join(source, 'corrupt.txt'), Buffer.from([0xff, 0xfe]));
+    const root = path.join(tmpDir, 'u1', 'cloud', 'projects', 'p1', 'contexts');
+    fs.mkdirSync(path.join(root, 'imports'), { recursive: true });
+
+    const copied = await projectFiles.copyProjectEntryFromPath(
+      'u1', 'p1', source, 'imports/corrupt-folder',
+    );
+
+    expect(copied).toMatchObject({ ok: false, error: 'unsupported_destination' });
+    expect(fs.existsSync(path.join(root, 'imports/corrupt-folder'))).toBe(false);
+    expect(enqueueCalls).toEqual([]);
+  });
+
   it('rejects an unsupported source file for the project destination', async () => {
     const projectFiles = await import('../../../src/main/features/project_files');
     const source = path.join(tmpDir, 'unsupported.exe');
@@ -228,4 +246,26 @@ describe('project_files › copyProjectEntryFromPath', () => {
 
     expect(copied).toMatchObject({ ok: false, error: 'not_found' });
   });
+});
+
+describe('project_files › path safety', () => {
+  it.skipIf(process.platform === 'win32')(
+    'rejects a project Library symlink before it can read or overwrite an outside file',
+    async () => {
+      const projectFiles = await import('../../../src/main/features/project_files');
+      const root = path.join(tmpDir, 'u1', 'cloud', 'projects', 'p1', 'contexts');
+      fs.mkdirSync(root, { recursive: true });
+      const outside = path.join(tmpDir, 'outside.md');
+      fs.writeFileSync(outside, 'outside');
+      fs.symlinkSync(outside, path.join(root, 'leak.md'));
+
+      expect(await projectFiles.resolveProjectFileAbsPath('u1', 'p1', 'leak.md'))
+        .toMatchObject({ ok: false, error: 'symlink_not_supported' });
+      expect(await projectFiles.readProjectTextFile('u1', 'p1', 'leak.md'))
+        .toMatchObject({ ok: false, error: 'symlink_not_supported' });
+      expect(await projectFiles.updateProjectTextFile('u1', 'p1', 'leak.md', 'overwritten'))
+        .toMatchObject({ ok: false, error: 'symlink_not_supported' });
+      expect(fs.readFileSync(outside, 'utf8')).toBe('outside');
+    },
+  );
 });

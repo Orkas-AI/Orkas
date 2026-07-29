@@ -22,6 +22,7 @@ import {
 } from '../paths';
 import { createLogger } from '../logger';
 import { safeId } from '../storage';
+import { minAppVersionFrom } from '../util/app-version-compat';
 import { sha256OfFile } from '../util/sha256';
 import {
   MARKETPLACE_RESOURCE_MANIFEST_NAME,
@@ -136,6 +137,10 @@ function _builtinAgentUpdatedAt(agentJson: Record<string, unknown>): number {
   return _timestampMs(agentJson.updated_at);
 }
 
+function _builtinAgentMinAppVersion(agentJson: Record<string, unknown>): string {
+  return minAppVersionFrom(agentJson);
+}
+
 function _builtinAgentReseedIfDeletedBefore(srcDir: string, agentJson: Record<string, unknown>): number {
   const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
   return _timestampMs(meta?.reseed_if_deleted_before)
@@ -150,6 +155,10 @@ function _builtinSkillVersion(srcDir: string): string {
 function _builtinSkillUpdatedAt(srcDir: string): number {
   const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
   return _timestampMs(meta?.updated_at);
+}
+
+function _builtinSkillMinAppVersion(srcDir: string): string {
+  return minAppVersionFrom(_readJsonObject(path.join(srcDir, '_meta.json')) || {});
 }
 
 function _builtinSkillReseedIfDeletedBefore(srcDir: string): number {
@@ -355,6 +364,7 @@ function _shouldOverlayMarketplaceSkillFromBuiltin(
 
 function _agentSeedInstallRow(installId: string, agentJson: Record<string, unknown>, installedAt: number): AgentInstall {
   const updatedAt = _builtinAgentUpdatedAt(agentJson);
+  const minAppVersion = _builtinAgentMinAppVersion(agentJson);
   return {
     id: installId,
     version: _builtinAgentVersion(agentJson),
@@ -366,6 +376,7 @@ function _agentSeedInstallRow(installId: string, agentJson: Record<string, unkno
     create_uid: BUILTIN_CREATE_UID,
     default_install: true,
     seed_source: 'builtin',
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
   };
 }
 
@@ -374,6 +385,7 @@ function _skillSeedInstallRow(
   installedAt: number,
   version = DEFAULT_MARKETPLACE_VERSION,
   updatedAt = 0,
+  minAppVersion = '',
 ): SkillInstall {
   return {
     id: installId,
@@ -385,6 +397,7 @@ function _skillSeedInstallRow(
     create_uid: BUILTIN_CREATE_UID,
     default_install: true,
     seed_source: 'builtin',
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
   };
 }
 
@@ -397,7 +410,7 @@ async function _writeAgentSeed(
 ): Promise<void> {
   const target = userMarketplaceAgentDir(uid, installId);
   const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _safeManagedFiles(existing.builtin_files);
+  const previousFiles = _previousManagedFiles(target, existing, 'agent', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await fsp.mkdir(target, { recursive: true });
   await _removeStaleManagedFiles(target, previousFiles, files);
@@ -410,6 +423,7 @@ async function _writeAgentSeed(
   const contentSha = sha256OfFile(path.join(target, 'agent.json'));
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const updatedAt = _builtinAgentUpdatedAt(agentJson);
+  const minAppVersion = _builtinAgentMinAppVersion(agentJson);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
@@ -423,6 +437,7 @@ async function _writeAgentSeed(
       create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : BUILTIN_CREATE_UID,
       default_install: typeof existing.default_install === 'boolean' ? existing.default_install : true,
       seed_source: 'builtin',
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       agent_json_url: typeof existing.agent_json_url === 'string' ? existing.agent_json_url : '',
       agent_skills_bundle_url: typeof existing.agent_skills_bundle_url === 'string' ? existing.agent_skills_bundle_url : '',
       ...(contentSha ? { content_sha: contentSha } : {}),
@@ -443,7 +458,7 @@ async function _writeAgentMarketplaceOverlay(
 ): Promise<void> {
   const target = userMarketplaceAgentDir(uid, installId);
   const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _safeManagedFiles(existing.builtin_files);
+  const previousFiles = _previousManagedFiles(target, existing, 'agent', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await fsp.mkdir(target, { recursive: true });
   await _removeStaleManagedFiles(target, previousFiles, files);
@@ -457,6 +472,7 @@ async function _writeAgentMarketplaceOverlay(
   const contentSha = sha256OfFile(path.join(target, 'agent.json'));
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const updatedAt = _builtinAgentUpdatedAt(agentJson);
+  const minAppVersion = _builtinAgentMinAppVersion(agentJson);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
@@ -474,6 +490,7 @@ async function _writeAgentMarketplaceOverlay(
         ? existing.default_install
         : manifestRow.default_install === true,
       seed_source: 'builtin',
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       agent_json_url: typeof existing.agent_json_url === 'string' ? existing.agent_json_url : manifestRow.agent_json_url,
       agent_skills_bundle_url: typeof existing.agent_skills_bundle_url === 'string'
         ? existing.agent_skills_bundle_url
@@ -507,6 +524,24 @@ function _safeManagedFiles(value: unknown): string[] {
     .map((rel) => _normalizeManagedRel(rel))
     .filter((rel): rel is string => !!rel)))
     .sort((a, b) => a.localeCompare(b));
+}
+
+function _resourceSeedManagedFiles(target: string, kind: 'agent' | 'skill', id: string): string[] {
+  const manifest = _readJsonObject(path.join(target, MARKETPLACE_RESOURCE_MANIFEST_NAME));
+  if (!manifest || manifest.kind !== kind || manifest.id !== id) return [];
+  return _safeManagedFiles(manifest.files);
+}
+
+function _previousManagedFiles(
+  target: string,
+  existing: Record<string, unknown>,
+  kind: 'agent' | 'skill',
+  id: string,
+): string[] {
+  return Array.from(new Set([
+    ..._safeManagedFiles(existing.builtin_files),
+    ..._resourceSeedManagedFiles(target, kind, id),
+  ])).sort((a, b) => a.localeCompare(b));
 }
 
 async function _copyManagedFiles(src: string, dst: string, files: string[]): Promise<void> {
@@ -560,7 +595,7 @@ async function _writeSkillSeed(
 ): Promise<void> {
   const target = userMarketplaceSkillDir(uid, installId);
   const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _safeManagedFiles(existing.builtin_files);
+  const previousFiles = _previousManagedFiles(target, existing, 'skill', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await fsp.mkdir(target, { recursive: true });
   await _removeStaleManagedFiles(target, previousFiles, files);
@@ -569,6 +604,7 @@ async function _writeSkillSeed(
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const version = _builtinSkillVersion(srcDir);
   const updatedAt = _builtinSkillUpdatedAt(srcDir);
+  const minAppVersion = _builtinSkillMinAppVersion(srcDir);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
@@ -582,6 +618,7 @@ async function _writeSkillSeed(
       create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : BUILTIN_CREATE_UID,
       default_install: typeof existing.default_install === 'boolean' ? existing.default_install : true,
       seed_source: 'builtin',
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       bundle_url: typeof existing.bundle_url === 'string' ? existing.bundle_url : '',
       ...(contentSha ? { content_sha: contentSha } : {}),
       ...(contentTreeHash ? { content_tree_hash: contentTreeHash } : {}),
@@ -600,7 +637,7 @@ async function _writeSkillMarketplaceOverlay(
 ): Promise<void> {
   const target = userMarketplaceSkillDir(uid, installId);
   const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _safeManagedFiles(existing.builtin_files);
+  const previousFiles = _previousManagedFiles(target, existing, 'skill', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await fsp.mkdir(target, { recursive: true });
   await _removeStaleManagedFiles(target, previousFiles, files);
@@ -609,6 +646,7 @@ async function _writeSkillMarketplaceOverlay(
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const version = _builtinSkillVersion(srcDir);
   const updatedAt = _builtinSkillUpdatedAt(srcDir);
+  const minAppVersion = _builtinSkillMinAppVersion(srcDir);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
@@ -626,6 +664,7 @@ async function _writeSkillMarketplaceOverlay(
         ? existing.default_install
         : manifestRow.default_install === true,
       seed_source: 'builtin',
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       bundle_url: typeof existing.bundle_url === 'string' ? existing.bundle_url : manifestRow.bundle_url,
       ...((existing.status || existing.state || manifestRow.status || manifestRow.state)
         ? { status: existing.status || existing.state || manifestRow.status || manifestRow.state }
@@ -737,6 +776,7 @@ export async function seedBuiltinMarketplaceForUser(
     }
     const packagedVersion = _builtinSkillVersion(srcDir);
     const packagedUpdatedAt = _builtinSkillUpdatedAt(srcDir);
+    const packagedMinAppVersion = _builtinSkillMinAppVersion(srcDir);
     const manifestSkillIndex = manifest.skills.findIndex((s) => s.id === installId);
     const manifestSkill = manifestSkillIndex >= 0 ? manifest.skills[manifestSkillIndex] : null;
     const targetSkillMd = path.join(userMarketplaceSkillDir(uid, installId), 'SKILL.md');
@@ -763,6 +803,7 @@ export async function seedBuiltinMarketplaceForUser(
             installedAt,
             packagedVersion,
             packagedUpdatedAt,
+            packagedMinAppVersion,
           );
           manifestChanged = true;
         }
@@ -778,6 +819,7 @@ export async function seedBuiltinMarketplaceForUser(
           installedAt,
           packagedVersion,
           packagedUpdatedAt,
+          packagedMinAppVersion,
         );
         manifestChanged = true;
       }
@@ -786,7 +828,13 @@ export async function seedBuiltinMarketplaceForUser(
       result.seeded_skills++;
     }
     if (!installedSkills.has(installId)) {
-      manifest.skills.push(_skillSeedInstallRow(installId, Date.now(), packagedVersion, packagedUpdatedAt));
+      manifest.skills.push(_skillSeedInstallRow(
+        installId,
+        Date.now(),
+        packagedVersion,
+        packagedUpdatedAt,
+        packagedMinAppVersion,
+      ));
       installedSkills.add(installId);
       result.manifest_skills++;
     }

@@ -76,6 +76,44 @@ describe('features/config › readConfig / writeConfig', () => {
   });
 });
 
+describe('features/config › Commander avatar', () => {
+  it('persists a valid crown color without changing unrelated preferences', async () => {
+    const { appConfig } = await load();
+    appConfig.writeConfig({ language: 'pt' });
+
+    expect(appConfig.setCommanderAvatar({ icon: 'crown', color: 'sky' }))
+      .toEqual({ icon: 'crown', color: 'sky' });
+    expect(appConfig.getCommanderAvatar()).toEqual({ icon: 'crown', color: 'sky' });
+    expect(appConfig.readPreferences()).toMatchObject({
+      language: 'pt',
+      commander_avatar: { icon: 'crown', color: 'sky' },
+    });
+  });
+
+  it('rejects another known icon and leaves the last valid choice untouched', async () => {
+    const { appConfig } = await load();
+    appConfig.setCommanderAvatar({ icon: 'crown', color: 'gold' });
+
+    expect(() => appConfig.setCommanderAvatar({ icon: 'bot', color: 'sky' }))
+      .toThrow('invalid avatar tokens');
+    expect(appConfig.getCommanderAvatar()).toEqual({ icon: 'crown', color: 'gold' });
+  });
+
+  it('repairs a legacy known non-crown icon while preserving its valid color', async () => {
+    const { appConfig } = await load();
+    appConfig.writeConfig({ commander_avatar: { icon: 'bot', color: 'sky' } });
+
+    expect(appConfig.getCommanderAvatar()).toEqual({ icon: 'crown', color: 'sky' });
+  });
+
+  it('falls back when the stored color is not in the catalog', async () => {
+    const { appConfig } = await load();
+    appConfig.writeConfig({ commander_avatar: { icon: 'crown', color: 'not-a-color' } });
+
+    expect(appConfig.getCommanderAvatar()).toBeNull();
+  });
+});
+
 describe('features/config › task notifications', () => {
   it('defaults to enabled when the preference has never been written', async () => {
     const { appConfig } = await load();
@@ -205,5 +243,19 @@ describe('features/config › getLanguage', () => {
     expect(appConfig.getLanguageForUser('u2')).toBe('ja');
     expect(i18n.getCurrentLang()).toBe('ja');
     expect(process.env.ORKAS_ACCEPT_LANGUAGE).toMatch(/^ja-JP/);
+  });
+
+  it('can read a background account language without mutating active process language', async () => {
+    const { appConfig, i18n } = await load();
+    const paths = await import('../../../src/main/paths');
+    const prefPath = paths.userPreferencesFile('u2');
+    fs.mkdirSync(path.dirname(prefPath), { recursive: true });
+    fs.writeFileSync(prefPath, JSON.stringify({ language: 'ja' }));
+    i18n.setCurrentLang('zh');
+    const acceptLanguage = process.env.ORKAS_ACCEPT_LANGUAGE;
+
+    expect(appConfig.resolveLanguageForUser('u2')).toBe('ja');
+    expect(i18n.getCurrentLang()).toBe('zh');
+    expect(process.env.ORKAS_ACCEPT_LANGUAGE).toBe(acceptLanguage);
   });
 });

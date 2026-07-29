@@ -16,6 +16,9 @@ describe('local-agent live test support', () => {
       agents: LOCAL_AGENT_TYPES,
       installMissing: true,
       installOnly: false,
+      benchmark: false,
+      k: 3,
+      noSave: false,
       help: false,
     });
   });

@@ -13,8 +13,9 @@
  *     `<uid>/local/contexts/.kb.legacy-<ts>` so we never delete user data
  *     automatically and never leave derived KB data in the cloud sync tree.
  *     Log warn so support can investigate. Stamp.
- *   - Old path is a file (not a directory): leave it alone (corrupt FS state),
- *     stamp anyway since the schema says it should be a directory.
+ *   - Old path is a file (not a directory): preserve it under the local
+ *     contexts directory as a legacy artifact. Do not stamp if that move
+ *     fails, because the bytes must not be stranded in the syncable tree.
  *   - Older builds may already have created
  *     `<uid>/cloud/contexts/.kb.legacy-*`; a second one-shot moves those
  *     backup dirs to `<uid>/local/contexts/`.
@@ -30,6 +31,7 @@ import {
   userLocalConfigDir,
 } from '../paths';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('migrate');
 const MIGRATION_TAG = 'kb-to-local-contexts-v1';
@@ -57,7 +59,10 @@ function stamp(uid: string, tag = MIGRATION_TAG): void {
     fs.mkdirSync(path.dirname(f), { recursive: true });
     fs.appendFileSync(f, `${tag}\n`);
   } catch (err) {
-    log.warn(`stamp failed uid=${uid}: ${(err as Error).message}`);
+    log.warn('kb migration stamp failed', {
+      userId: maskId(uid),
+      error: logErrorSummary(err),
+    });
   }
 }
 
@@ -83,7 +88,22 @@ export function migrateKbToLocalContexts(uid: string): void {
   try { legacyIsDir = fs.statSync(legacyKb).isDirectory(); } catch { /* ignore */ }
 
   if (!legacyIsDir) {
-    log.warn(`kb migration: legacy .kb at ${legacyKb} is not a directory; leaving alone`);
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const preserved = uniquePath(
+      path.join(userLocalContextsDir(uid), `.kb.legacy-file-${ts}`),
+    );
+    log.warn('kb migration legacy index is not a directory; preserving it locally', {
+      userId: maskId(uid),
+    });
+    try {
+      movePathSync(legacyKb, preserved);
+    } catch (err) {
+      log.warn('kb migration could not preserve the malformed legacy index', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
+      return;
+    }
     stamp(uid);
     migrateLegacyKbBackupsToLocal(uid);
     return;
@@ -95,14 +115,20 @@ export function migrateKbToLocalContexts(uid: string): void {
   if (newExists) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const sidelined = uniquePath(path.join(userLocalContextsDir(uid), `.kb.legacy-${ts}`));
-    log.warn(
-      `kb migration: both ${legacyKb} and ${newKb} exist; keeping ${newKb}, ` +
-      `renaming legacy → ${sidelined}`,
-    );
+    log.warn('kb migration found both current and legacy indexes; preserving both', {
+      userId: maskId(uid),
+    });
     try {
       movePathSync(legacyKb, sidelined);
     } catch (err) {
-      log.warn(`kb migration: rename-to-sidelined failed: ${(err as Error).message}`);
+      log.warn('kb migration could not preserve the legacy index', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
+      // The legacy index is still in the syncable tree. Do not stamp this
+      // attempt complete; the next activation must retry the preservation
+      // move instead of abandoning those bytes permanently.
+      return;
     }
     stamp(uid);
     migrateLegacyKbBackupsToLocal(uid);
@@ -110,25 +136,16 @@ export function migrateKbToLocalContexts(uid: string): void {
   }
 
   try {
-    fs.renameSync(legacyKb, newKb);
-    log.info(`kb migration: moved ${legacyKb} → ${newKb}`);
+    movePathSync(legacyKb, newKb);
+    log.info('kb migration moved the machine-private index', {
+      userId: maskId(uid),
+    });
   } catch (err) {
-    // Cross-device rename can fail on some filesystems. Fall back to a copy +
-    // delete; better to slow-pass than to leave the user without their index.
-    const msg = (err as Error).message;
-    if ((err as NodeJS.ErrnoException).code === 'EXDEV') {
-      log.warn(`kb migration: cross-device rename, falling back to copy`);
-      try {
-        copyDirSync(legacyKb, newKb);
-        rmRfSync(legacyKb);
-      } catch (err2) {
-        log.error(`kb migration: copy fallback failed: ${(err2 as Error).message}`);
-        return; // do NOT stamp — retry next boot
-      }
-    } else {
-      log.error(`kb migration: rename failed: ${msg}`);
-      return;
-    }
+    log.error('kb migration move failed', {
+      userId: maskId(uid),
+      error: logErrorSummary(err),
+    });
+    return;
   }
   stamp(uid);
   migrateLegacyKbBackupsToLocal(uid);
@@ -143,8 +160,15 @@ function migrateLegacyKbBackupsToLocal(uid: string): void {
   let names: string[] = [];
   try {
     names = fs.readdirSync(cloudContexts).filter((name) => name.startsWith('.kb.legacy-'));
-  } catch {
-    stamp(uid, LEGACY_BACKUP_TAG);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      stamp(uid, LEGACY_BACKUP_TAG);
+    } else {
+      log.warn('kb migration legacy-backup scan failed', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
+    }
     return;
   }
 
@@ -153,10 +177,15 @@ function migrateLegacyKbBackupsToLocal(uid: string): void {
     const dst = uniquePath(path.join(localContexts, name));
     try {
       movePathSync(src, dst);
-      log.info(`kb migration: moved legacy backup ${src} → ${dst}`);
+      log.info('kb migration moved a legacy backup', {
+        userId: maskId(uid),
+      });
     } catch (err) {
       ok = false;
-      log.warn(`kb migration: move legacy backup failed: ${(err as Error).message}`);
+      log.warn('kb migration legacy-backup move failed', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
     }
   }
   if (ok) stamp(uid, LEGACY_BACKUP_TAG);
@@ -169,6 +198,8 @@ function copyDirSync(src: string, dst: string): void {
     const d = path.join(dst, e.name);
     if (e.isDirectory()) copyDirSync(s, d);
     else if (e.isFile()) fs.copyFileSync(s, d);
+    else if (e.isSymbolicLink()) fs.symlinkSync(fs.readlinkSync(s), d);
+    else throw new Error('Unsupported entry in legacy KB index');
   }
 }
 
@@ -188,8 +219,21 @@ function movePathSync(src: string, dst: string): void {
     fs.renameSync(src, dst);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
-    copyPathSync(src, dst);
-    rmRfSync(src);
+    // Copy into a sibling temporary path and publish with a same-filesystem
+    // rename. Copying directly to `dst` can leave a partial canonical index;
+    // the next boot would then treat that partial directory as authoritative
+    // and sideline the complete legacy source.
+    const temporary = uniquePath(
+      `${dst}.migrating-${process.pid}-${Date.now()}`,
+    );
+    try {
+      copyPathSync(src, temporary);
+      fs.renameSync(temporary, dst);
+      rmRfSync(src);
+    } catch (copyError) {
+      rmRfSync(temporary);
+      throw copyError;
+    }
   }
 }
 

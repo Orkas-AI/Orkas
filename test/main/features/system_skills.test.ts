@@ -31,6 +31,22 @@ function packagedSystemSkill(id: string): string {
   );
 }
 
+function packagedSystemSkillReference(id: string, reference: string): string {
+  return fs.readFileSync(
+    path.resolve(
+      process.cwd(),
+      'resources',
+      'builtin',
+      'system',
+      'skills',
+      id,
+      'references',
+      reference,
+    ),
+    'utf8',
+  );
+}
+
 function frontmatterOf(md: string): string {
   expect(md.startsWith('---\n')).toBe(true);
   const end = md.indexOf('\n---', 4);
@@ -49,7 +65,6 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
-      ['coding', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
     ]);
@@ -76,7 +91,6 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
-      ['coding', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
     ]);
@@ -96,7 +110,12 @@ describe('system skills reconciliation', () => {
     await systemSkills.reconcileAllForActiveUser();
     fs.writeFileSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'), '{}');
     const skipped = await systemSkills.reconcileAllForActiveUser();
-    expect(skipped.map((r) => r.action)).toEqual(['skipped', 'skipped', 'skipped', 'skipped', 'skipped']);
+    expect(skipped.map((r) => r.action)).toEqual([
+      'skipped',
+      'skipped',
+      'skipped',
+      'skipped',
+    ]);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'))).toBe(false);
 
     const skillManifest = paths.userSystemSkillsManifestFile(UID);
@@ -169,26 +188,27 @@ describe('system skills reconciliation', () => {
     expect(fs.existsSync(path.join(skillDir, 'SKILL.md'))).toBe(false);
   });
 
-  it('deletes local system skills that are no longer in the packaged manifest', async () => {
+  it('deletes retired system skills from existing user mirrors', async () => {
     const users = await import('../../../src/main/features/users');
     const systemSkills = await import('../../../src/main/features/system_skills');
     const paths = await import('../../../src/main/paths');
     users.activateUser(UID);
 
     await systemSkills.reconcileAllForActiveUser();
-    const oldDir = paths.userSystemSkillDir(UID, 'old-creator');
+    const retiredId = 'retired-system-skill';
+    const oldDir = paths.userSystemSkillDir(UID, retiredId);
     fs.mkdirSync(oldDir, { recursive: true });
     fs.writeFileSync(path.join(oldDir, 'SKILL.md'), 'old');
     const manifestFile = paths.userSystemSkillsManifestFile(UID);
     const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-    manifest.push({ id: 'old-creator', update_at: 1 });
+    manifest.push({ id: retiredId, update_at: 1 });
     fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2));
 
     const results = await systemSkills.reconcileAllForActiveUser();
-    expect(results.find((r) => r.id === 'old-creator')?.action).toBe('deleted');
+    expect(results.find((r) => r.id === retiredId)?.action).toBe('deleted');
     expect(fs.existsSync(oldDir)).toBe(false);
     const nextManifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-    expect(nextManifest.some((entry: any) => entry.id === 'old-creator')).toBe(false);
+    expect(nextManifest.some((entry: any) => entry.id === retiredId)).toBe(false);
   });
 
   it('does not allow repo-shipped builtin skills to be added', async () => {
@@ -208,19 +228,6 @@ describe('system skills reconciliation', () => {
 });
 
 describe('system creator skill contracts', () => {
-  it('describes coding by its semantic use boundary rather than trigger keywords', () => {
-    const fm = frontmatterOf(packagedSystemSkill('coding'));
-    expect(fm).toContain('Use for implementing or changing code in an existing project');
-    expect(fm).toContain('Do not use for explanation-only requests or disposable one-line scripts.');
-    expect(fm).not.toContain('Triggers:');
-  });
-
-  it('keeps coding plans on the durable execution-plan tool', () => {
-    const md = packagedSystemSkill('coding');
-    expect(md).toContain('durable plan/TODO tool (`manage_execution_plan`)');
-    expect(md).not.toContain('plan/TODO tool (`plan_set`)');
-  });
-
   it('keeps creator SKILL.md frontmatter portable', () => {
     for (const id of ['agent-creator', 'skill-creator']) {
       const fm = frontmatterOf(packagedSystemSkill(id));
@@ -250,7 +257,22 @@ describe('system creator skill contracts', () => {
     expect(md).toContain('Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions');
     expect(md).toContain('Default: one current-language description only');
     expect(md).toContain('Do **not** show source provenance by default');
+    expect(md).toContain('No container, no mutation, no success claim');
+    expect(md).toContain('the number of valid containers must equal the number of Agents');
+    expect(md).toContain('An Agent role is not a model runtime');
+    expect(md).toContain('Do not name or describe role-based Agents as ChatGPT');
     expect(md).not.toContain('Both are required');
+  });
+
+  it('does not package the hosted-product Orkas guide', () => {
+    expect(fs.existsSync(path.resolve(
+      process.cwd(),
+      'resources',
+      'builtin',
+      'system',
+      'skills',
+      'orkas-guide',
+    ))).toBe(false);
   });
 
   it('keeps intentional creator-skill category and provenance rules in parity', () => {

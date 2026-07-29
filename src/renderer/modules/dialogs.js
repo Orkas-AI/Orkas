@@ -13,16 +13,64 @@ function _dialogLabel(key, zhFallback) {
   try { const v = t(key); return v === key ? zhFallback : v; } catch (_) { return zhFallback; }
 }
 
+let _uiDialogSeq = 0;
+
+function _uiNextDialogId() {
+  return `ui-dialog-${++_uiDialogSeq}`;
+}
+
+function _uiIsTopDialogOverlay(overlay) {
+  const open = document.querySelectorAll('.ui-dialog-overlay.open');
+  return open.length === 0 || open[open.length - 1] === overlay;
+}
+
+function _uiTrapDialogTab(overlay, e) {
+  if (e.key !== 'Tab') return false;
+  const focusable = Array.from(overlay.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), a[href]',
+  )).filter((element) => element.offsetParent !== null);
+  if (!focusable.length) {
+    e.preventDefault();
+    return true;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+function _uiRestoreDialogFocus(previousFocus) {
+  if (
+    previousFocus
+    && typeof previousFocus.focus === 'function'
+    && document.body.contains(previousFocus)
+  ) {
+    previousFocus.focus();
+  }
+}
+
 function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const messageId = `${dialogId}-message`;
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const okText = escapeHtml(okLabel || _dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
-        <div class="modal-body ui-dialog-message">${msgHtml}</div>
+      <div class="modal ui-dialog modal-standard" role="${showCancel ? 'dialog' : 'alertdialog'}" aria-modal="true" aria-labelledby="${messageId}">
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="modal-actions">
           ${showCancel ? `<button class="btn" data-act="cancel">${cancelText}</button>` : ''}
           <button class="btn btn-primary" data-act="ok">${okText}</button>
@@ -33,22 +81,42 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
 
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    let finished = false;
     const onKey = (e) => {
       // IME guard (CLAUDE.md §8) — Enter while composing should commit
       // the IME candidate, not auto-confirm the dialog.
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') finish(false);
-      else if (e.key === 'Enter') finish(true);
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      } else if (e.key === 'Enter') {
+        // Preserve native button activation: Enter on Cancel must cancel,
+        // while Enter on OK must confirm. Only a non-interactive target uses
+        // the dialog's default action.
+        const interactive = e.target && typeof e.target.closest === 'function'
+          ? e.target.closest('button, input, textarea, select, a[href]')
+          : null;
+        if (interactive) return;
+        e.preventDefault();
+        finish(true);
+      }
     };
     const finish = (val) => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
     okBtn.addEventListener('click', () => finish(true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => finish(false));
     document.addEventListener('keydown', onKey, true);
-    setTimeout(() => okBtn.focus(), 0);
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) okBtn.focus();
+    }, 0);
   });
 }
 
@@ -131,16 +199,20 @@ function uiToast(message, opts) {
 // cancel / Esc.
 function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const titleId = `${dialogId}-title`;
+    const messageId = `${dialogId}-message`;
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
-    const titleHtml = title ? `<div class="modal-title ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title" id="${titleId}">${escapeHtml(String(title))}</div>` : '';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const dangerText = escapeHtml(dangerLabel || _dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog ui-dialog-danger modal-standard" role="dialog" aria-modal="true">
+      <div class="modal ui-dialog ui-dialog-danger modal-standard" role="alertdialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
         ${titleHtml}
-        <div class="modal-body ui-dialog-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${cancelText}</button>
           <button class="btn btn-danger" data-act="ok">${dangerText}</button>
@@ -151,22 +223,33 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    let finished = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') finish(false);
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(false);
+      }
       // Enter does NOT auto-fire danger — the user must explicitly click
       // the red button. Reduces accidental confirmation on irreversible
       // actions. (Standard uiConfirm keeps Enter-to-confirm.)
     };
     const finish = (val) => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
     okBtn.addEventListener('click', () => finish(true));
     cancelBtn.addEventListener('click', () => finish(false));
     document.addEventListener('keydown', onKey, true);
-    setTimeout(() => cancelBtn.focus(), 0);  // focus cancel by default — safer
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) cancelBtn.focus();
+    }, 0);  // focus cancel by default — safer
   });
 }
 
@@ -181,9 +264,13 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // or more neutral/contextual choices on the left edge of the actions row.
 function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel } = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const titleId = `${dialogId}-title`;
+    const messageId = `${dialogId}-message`;
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
-    const titleHtml = title ? `<div class="modal-title ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const titleHtml = title ? `<div class="modal-title ui-dialog-title" id="${titleId}">${escapeHtml(String(title))}</div>` : '';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
     const renderChoice = (c, extraClass = '') => {
@@ -196,9 +283,9 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
     const choiceHtml = choices.map((c) => renderChoice(c)).join('');
     overlay.innerHTML = `
-      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${title ? titleId : messageId}"${title ? ` aria-describedby="${messageId}"` : ''}>
         ${titleHtml}
-        <div class="modal-body ui-dialog-message">${msgHtml}</div>
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="modal-actions">
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -208,21 +295,34 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     `;
     document.body.appendChild(overlay);
 
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    let finished = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') finish(null);
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(null);
+      }
       // No Enter-to-confirm — caller must pick a choice explicitly.
     };
     const finish = (val) => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
     overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
       btn.addEventListener('click', () => finish(btn.dataset.id || null));
     });
-    overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => finish(null));
+    cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);
+    setTimeout(() => {
+      if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) cancelBtn.focus();
+    }, 0);
   });
 }
 
@@ -230,16 +330,19 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
 // null on cancel. Mirrors native `prompt()` semantics.
 function uiPrompt(message, defaultValue = '', options = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = _uiNextDialogId();
+    const messageId = `${dialogId}-message`;
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(_dialogLabel('common.cancel', 'Cancel'));
     const okText = escapeHtml(_dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
-      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true">
-        <div class="modal-body ui-dialog-message">${msgHtml}</div>
+      <div class="modal ui-dialog modal-standard" role="dialog" aria-modal="true" aria-labelledby="${messageId}">
+        <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         <div class="form-row" style="margin-top:12px;margin-bottom:0">
-          <input type="text" class="ui-dialog-input" />
+          <input type="text" class="ui-dialog-input" aria-labelledby="${messageId}" />
         </div>
         <div class="modal-actions">
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -256,21 +359,36 @@ function uiPrompt(message, defaultValue = '', options = {}) {
     }
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    let finished = false;
     const onKey = (e) => {
       // IME guard (CLAUDE.md §8) — Enter while composing in the prompt
       // input belongs to the IME, not to the dialog confirm action.
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape') finish(null);
-      else if (e.key === 'Enter' && e.target === input) finish(input.value);
+      if (!_uiIsTopDialogOverlay(overlay)) return;
+      if (_uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish(null);
+      } else if (e.key === 'Enter' && e.target === input) {
+        e.preventDefault();
+        finish(input.value);
+      }
     };
     const finish = (val) => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
     okBtn.addEventListener('click', () => finish(input.value));
     cancelBtn.addEventListener('click', () => finish(null));
     document.addEventListener('keydown', onKey, true);
-    setTimeout(() => { input.focus(); input.select(); }, 0);
+    setTimeout(() => {
+      if (!_uiIsTopDialogOverlay(overlay) || !document.body.contains(overlay)) return;
+      input.focus();
+      input.select();
+    }, 0);
   });
 }

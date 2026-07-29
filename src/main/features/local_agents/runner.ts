@@ -17,9 +17,18 @@
  *     channel so the caller has a single completion contract.
  */
 
+import * as path from 'node:path';
+
 import { createLogger } from '../../logger.js';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact.js';
-import { detectOne, type LocalCliEntry, type LocalCliType } from './registry.js';
+import { sanitizeLogTextForUpload } from '../../util/log-sanitize.js';
+import { redactPaths } from '../../util/redact.js';
+import {
+  detectOne,
+  localCliCapabilities,
+  type LocalCliEntry,
+  type LocalCliType,
+} from './registry.js';
 import { claudeBackend } from './backends/claude.js';
 import { codexBackend } from './backends/codex.js';
 import { openclawBackend } from './backends/openclaw.js';
@@ -29,6 +38,7 @@ import { type LocalBackend, type LocalEvent } from './backends/base.js';
 import * as persist from './persist.js';
 import { sessionToolResultsDir } from '../../paths.js';
 import { maybeSpillToolResult } from '../../util/tool-result-cap.js';
+import { isCliResumeRejectedMessage } from './context.js';
 
 const log = createLogger('local-agents:runner');
 
@@ -139,11 +149,62 @@ const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
   hermes: hermesBackend,
 };
 
+const MAX_PUBLIC_DIAGNOSTIC_CHARS = 4_096;
+
+function sanitizePublicDiagnostic(value: unknown): string {
+  const sanitized = redactPaths(sanitizeLogTextForUpload(String(value ?? '')));
+  return sanitized.length > MAX_PUBLIC_DIAGNOSTIC_CHARS
+    ? `${sanitized.slice(0, MAX_PUBLIC_DIAGNOSTIC_CHARS)}…`
+    : sanitized;
+}
+
+/** Strip private reasoning and machine diagnostics before events cross the
+ * runner boundary. Backends retain raw values long enough to classify their
+ * protocol, while persistence and the process rail receive
+ * only bounded/redacted diagnostics. User-authored answer and tool result
+ * events remain intact because those are intentional task output. */
+export function redactPrivateLocalAgentEvent(event: LocalEvent): LocalEvent {
+  if (!event) return event;
+  if (event.type === 'thinking') {
+    const rawChars = typeof event.text === 'string' ? event.text.length : Number(event.chars);
+    const chars = Number.isFinite(rawChars) && rawChars > 0 ? Math.round(rawChars) : 0;
+    return { type: 'thinking', chars };
+  }
+  if (event.type === 'process-info') {
+    const rawCommand = typeof event.cmd === 'string' ? event.cmd : '';
+    const command = path.posix.basename(path.win32.basename(rawCommand));
+    return {
+      type: 'process-info',
+      pid: event.pid,
+      cmd: command || 'cli',
+      argCount: Array.isArray(event.args) ? event.args.length : 0,
+    };
+  }
+  if (event.type === 'stderr-line' || event.type === 'raw-line') {
+    return { ...event, line: sanitizePublicDiagnostic(event.line) };
+  }
+  if (event.type === 'log') {
+    return { ...event, message: sanitizePublicDiagnostic(event.message) };
+  }
+  if (event.type === 'done') {
+    return {
+      ...event,
+      ...(typeof event.error === 'string'
+        ? { error: sanitizePublicDiagnostic(event.error) }
+        : {}),
+      ...(typeof event.stderrTail === 'string'
+        ? { stderrTail: sanitizePublicDiagnostic(event.stderrTail) }
+        : {}),
+    };
+  }
+  return event;
+}
+
 /** CLIs with a supported MCP-config injection path (claude:
  *  `--mcp-config`; codex: `-c mcp_servers.…`). Others run without the
  *  bridge until an injection mechanism exists for them. */
 function _bridgeSupported(cli: LocalCliType): boolean {
-  return cli === 'claude' || cli === 'codex';
+  return localCliCapabilities(cli).orkasBridge;
 }
 
 /** Appended to the CLI agent's system prompt when the bridge is live.
@@ -380,8 +441,12 @@ export function recordLocalAgentEventForLog(stats: LocalAgentRunLogDiagnostics, 
       }
       break;
     case 'thinking':
-      stats.thinkingChars += typeof e.text === 'string' ? e.text.length : 0;
-      noteLocalEventTimelineForLog(stats, 'thinking', nowMs, `chars=${typeof e.text === 'string' ? e.text.length : 0}`);
+      {
+        const rawChars = typeof e.text === 'string' ? e.text.length : Number(e.chars);
+        const chars = Number.isFinite(rawChars) && rawChars > 0 ? Math.round(rawChars) : 0;
+        stats.thinkingChars += chars;
+        noteLocalEventTimelineForLog(stats, 'thinking', nowMs, `chars=${chars}`);
+      }
       break;
     case 'stderr-line':
       stats.stderrLines += 1;
@@ -503,6 +568,9 @@ export function localAgentRunContextForLog(opts: {
   customArgs?: readonly string[];
   resumeSessionId?: string;
   prompt?: string;
+  systemPrompt?: string;
+  resumeFallbackPrompt?: string;
+  reuseSessionInstructions?: boolean;
   cwd?: string;
   runId?: string;
   cliAvailable?: boolean;
@@ -526,6 +594,9 @@ export function localAgentRunContextForLog(opts: {
     custom_arg_count: opts.customArgs?.length || 0,
     has_resume_session: !!opts.resumeSessionId,
     prompt_chars: String(opts.prompt || '').length,
+    system_prompt_chars: String(opts.systemPrompt || '').length,
+    resume_fallback_chars: String(opts.resumeFallbackPrompt || '').length,
+    reuse_session_instructions: !!opts.reuseSessionInstructions,
     has_cwd: !!opts.cwd,
     cwd: opts.cwd ? logPathRef(opts.cwd) : undefined,
     timeout_ms: opts.timeoutMs,
@@ -548,10 +619,13 @@ export interface RunCliAgentOpts {
   /** If set, the dispatch resumes a CLI-side session (claude
    *  `--resume <id>`) and the caller has already trimmed the prompt
    *  to "just the new turn" content — the CLI provides the prior
-   *  context out of its own memory. The backend ignores the field
-   *  when it doesn't support resume. */
+   *  context out of its own memory. The caller only sets this for a
+   *  backend whose registry capability supports continuation. */
   resumeSessionId?: string;
   prompt: string;
+  systemPrompt?: string;
+  resumeFallbackPrompt?: string;
+  reuseSessionInstructions?: boolean;
   cwd: string;
   signal: AbortSignal;
   /** Forwarded each backend event verbatim, after persistence. */
@@ -580,6 +654,9 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     customArgs: opts.customArgs,
     resumeSessionId: opts.resumeSessionId,
     prompt: opts.prompt,
+    systemPrompt: opts.systemPrompt,
+    resumeFallbackPrompt: opts.resumeFallbackPrompt,
+    reuseSessionInstructions: opts.reuseSessionInstructions,
     cwd: opts.cwd,
     bridgeSupported: _bridgeSupported(opts.cli),
   });
@@ -622,6 +699,9 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     customArgs: opts.customArgs,
     resumeSessionId: opts.resumeSessionId,
     prompt: opts.prompt,
+    systemPrompt: opts.systemPrompt,
+    resumeFallbackPrompt: opts.resumeFallbackPrompt,
+    reuseSessionInstructions: opts.reuseSessionInstructions,
     cwd: opts.cwd,
     runId: handle.runId,
     cliAvailable: entry.available,
@@ -642,7 +722,19 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   const cliSessionId = `cli-${opts.cli}-${handle.runId}`;
   const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
   let lastEventAt = Date.now();
-  const onEvent = (e: LocalEvent) => {
+  let inspectResumeAttempt = !!(opts.resumeSessionId && opts.resumeFallbackPrompt);
+  let resumeRejected = false;
+  let resumeAttemptExecuted = false;
+  let deferredDone: LocalEvent | null = null;
+  const setTerminal = (e: LocalEvent) => {
+    terminal = {
+      status: (e.status as RunCliAgentResult['status']) || 'failed',
+      output: typeof e.output === 'string' ? e.output : undefined,
+      error: typeof e.error === 'string' ? e.error : undefined,
+      sessionId: typeof e.sessionId === 'string' ? e.sessionId : undefined,
+    };
+  };
+  const commitEvent = (e: LocalEvent) => {
     // Self-emitted idle pulses don't count as "the CLI did something"
     // — without this carve-out we'd reset our own deadline and stop
     // pulsing during a real stall.
@@ -674,14 +766,39 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       persist.appendOutput(handle, e.text);
     }
     if (e.type === 'done') {
-      terminal = {
-        status: (e.status as RunCliAgentResult['status']) || 'failed',
-        output: typeof e.output === 'string' ? e.output : undefined,
-        error: typeof e.error === 'string' ? e.error : undefined,
-        sessionId: typeof e.sessionId === 'string' ? e.sessionId : undefined,
-      };
+      setTerminal(e);
     }
     opts.onEvent(e);
+  };
+  const onEvent = (rawEvent: LocalEvent) => {
+    const e = redactPrivateLocalAgentEvent(rawEvent);
+    if (inspectResumeAttempt) {
+      if (
+        (e.type === 'stderr-line' && isCliResumeRejectedMessage(e.line))
+        || (e.type === 'done' && isCliResumeRejectedMessage(e.error))
+      ) {
+        resumeRejected = true;
+      }
+      if (e.type === 'done' && resumeRejected) e.resumeRejected = true;
+      if (
+        e.type === 'text-delta'
+        || e.type === 'tool-event'
+        || e.type === 'file-change'
+        || e.type === 'permission-request'
+        || (e.type === 'status' && e.status === 'running')
+      ) {
+        resumeAttemptExecuted = true;
+      }
+      // Hold only the terminal marker until we know whether this was a
+      // pre-execution stale-session rejection. Diagnostic stderr/process rows
+      // remain visible; users still get exactly one terminal event.
+      if (e.type === 'done') {
+        deferredDone = e;
+        setTerminal(e);
+        return;
+      }
+    }
+    commitEvent(e);
   };
 
   // Idle ticker — purely informational; never kills the process itself.
@@ -730,40 +847,80 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     }
   }
 
-  try {
-    await backend.run({
-      binPath: entry.path,
-      prompt: opts.prompt,
-      cwd: opts.cwd,
-      model: opts.model,
-      customArgs: opts.customArgs,
-      resumeSessionId: opts.resumeSessionId,
-      signal: opts.signal,
-      onEvent,
-      timeoutMs,
-      idleKillMs,
-      // Activity clock for the backend's idle-kill watchdog. Reads the
-      // same `lastEventAt` the idle heartbeat uses (self-emitted idle
-      // pulses excluded), so heartbeat rows always precede a kill.
-      lastEventAt: () => lastEventAt,
-      idleMs: BACKEND_IDLE_MS[opts.cli],
-      ...(bridge ? {
-        bridge: {
-          mcpConfigPath: bridge.mcpConfigPath,
-          server: {
-            command: bridge.serverEnv.ORKAS_NODE || process.execPath,
-            args: [`${bridge.serverEnv.ORKAS_PC_DIR}/bin/orkas-bridge.cjs`],
-            env: bridge.serverEnv,
+  const runBackendAttempt = async (attempt: {
+    prompt: string;
+    resumeSessionId?: string;
+    reuseSessionInstructions?: boolean;
+  }) => {
+    try {
+      await backend.run({
+        binPath: entry.path,
+        prompt: attempt.prompt,
+        systemPrompt: opts.systemPrompt,
+        resumeFallbackPrompt: opts.resumeFallbackPrompt,
+        reuseSessionInstructions: attempt.reuseSessionInstructions,
+        cwd: opts.cwd,
+        model: opts.model,
+        customArgs: opts.customArgs,
+        resumeSessionId: attempt.resumeSessionId,
+        signal: opts.signal,
+        onEvent,
+        timeoutMs,
+        idleKillMs,
+        // Activity clock for the backend's idle-kill watchdog. Reads the
+        // same `lastEventAt` the idle heartbeat uses (self-emitted idle
+        // pulses excluded), so heartbeat rows always precede a kill.
+        lastEventAt: () => lastEventAt,
+        idleMs: BACKEND_IDLE_MS[opts.cli],
+        ...(bridge ? {
+          bridge: {
+            mcpConfigPath: bridge.mcpConfigPath,
+            server: {
+              command: bridge.serverEnv.ORKAS_NODE || process.execPath,
+              args: [`${bridge.serverEnv.ORKAS_PC_DIR}/bin/orkas-bridge.cjs`],
+              env: bridge.serverEnv,
+            },
+            appendSystemPrompt: BRIDGE_SYSTEM_PROMPT,
           },
-          appendSystemPrompt: BRIDGE_SYSTEM_PROMPT,
-        },
-      } : {}),
+        } : {}),
+      });
+    } catch (err) {
+      const msg = (err as Error).message || String(err);
+      log.error('local agent backend threw', { ...runLogContext, error: logErrorSummary(err) });
+      if (!terminal) {
+        onEvent({ type: 'done', status: 'failed', error: msg });
+      }
+    }
+  };
+
+  try {
+    await runBackendAttempt({
+      prompt: opts.prompt,
+      resumeSessionId: opts.resumeSessionId,
+      reuseSessionInstructions: opts.reuseSessionInstructions,
     });
-  } catch (err) {
-    const msg = (err as Error).message || String(err);
-    log.error('local agent backend threw', { ...runLogContext, error: logErrorSummary(err) });
     if (!terminal) {
-      onEvent({ type: 'done', status: 'failed', error: msg });
+      onEvent({ type: 'done', status: 'failed', error: 'backend exited without terminal event' });
+    }
+    const mayRecoverFresh = inspectResumeAttempt
+      && resumeRejected
+      && terminal?.status === 'failed'
+      && !resumeAttemptExecuted
+      && !opts.signal.aborted;
+    if (mayRecoverFresh) {
+      log.warn('local agent resume rejected before execution; retrying with bounded recovery', {
+        ...runLogContext,
+        recovery_prompt_chars: String(opts.resumeFallbackPrompt || '').length,
+      });
+      commitEvent({ type: 'status', status: 'resume-rejected' });
+      inspectResumeAttempt = false;
+      deferredDone = null;
+      terminal = null;
+      resumeRejected = false;
+      await runBackendAttempt({
+        prompt: opts.resumeFallbackPrompt!,
+        reuseSessionInstructions: false,
+      });
     }
   } finally {
     if (bridge) {
@@ -779,6 +936,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   if (!terminal) {
     onEvent({ type: 'done', status: 'failed', error: 'backend exited without terminal event' });
     terminal = { status: 'failed', error: 'backend exited without terminal event' };
+  }
+  if (deferredDone) {
+    const done = deferredDone;
+    deferredDone = null;
+    commitEvent(done);
   }
 
   const finalOutput = terminal.output ?? streamedOutput;

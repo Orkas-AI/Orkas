@@ -48,7 +48,21 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
+// Electron boots main/ through tsx/cjs. Keep #core-agent type-only here:
+// importing runtime values from its barrel eagerly require()s ESM-only pi-ai
+// and crashes startup with ERR_PACKAGE_PATH_NOT_EXPORTED. Runtime helpers
+// come from their leaf modules so the normal lazy ESM boundary stays intact.
+import type {
+  AgentTool,
+  ToolContext,
+  ToolResult,
+} from '#core-agent';
+import {
+  createApplyPatchTool as createCoreApplyPatchTool,
+  type ApplyPatchCommittedFile,
+} from '../../../core-agent/src/tools/apply-patch';
+import { getProcessSessionTools } from '../../../core-agent/src/tools/process-session';
+import type { FileChangeObservation } from '../../../core-agent/src/tools/base';
 import {
   BASH_PROGRESS_INTERVAL_MS,
   bashTool as coreBashTool,
@@ -86,13 +100,17 @@ import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
 import {
+  renderResponsiveHtmlPreview,
+  type HtmlPreviewViewport,
+} from '../../features/html_preview';
+import {
   cancelConfirmation as cancelDeleteConfirmation,
   consumeGrantedConfirmation,
   requestConfirmation as requestDeleteConfirmation,
   waitForConfirmationVisible as waitForDeleteConfirmationVisible,
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
-import { checkEditFreshness, recordRead } from './read-tracker';
+import { checkEditFreshness, forgetRead, recordRead } from './read-tracker';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { t } from '../../i18n';
@@ -103,7 +121,7 @@ import {
   startInteractiveCliSession,
 } from './interactive-cli-sessions';
 import type { InteractiveCliSessionView } from './interactive-cli-sessions';
-import { VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
+import { IMAGE_STUDIO_AGENT_ID, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
 import {
   browserAutomationHitWaf,
   browserRuntimeInstallRequiresExplicitRequest,
@@ -221,6 +239,17 @@ function translateFixedBashError(result: ToolResult): ToolResult {
   const content = result.content || '';
   if (!content) return result;
 
+  const structured = /^<command-result status="([^"]+)" exit_code="([^"]+)" duration_ms="(\d+)"[^>]*>\n\[no command output\]\n<\/command-result>$/.exec(content);
+  if (structured?.[1] === 'succeeded') {
+    return { ...result, content: '' };
+  }
+  if (structured?.[1] === 'timed_out') {
+    return { ...result, content: bashMsg('timeout', { ms: structured[3] }) };
+  }
+  if (structured?.[1] === 'failed' && structured[2] !== 'null') {
+    return { ...result, content: bashMsg('exit_code', { code: structured[2] }) };
+  }
+
   let m = /^Command timed out after (\d+)ms$/.exec(content);
   if (m) return { ...result, content: bashMsg('timeout', { ms: m[1] }) };
 
@@ -263,9 +292,27 @@ const BASH_PRODUCED_SKIP_FILES = new Set([
 const BASH_OUTPUT_MANIFEST_NAME = '.orkas-output-manifest';
 const BASH_OUTPUT_MANIFEST_MAX_BYTES = 256 * 1024;
 const BASH_OUTPUT_MANIFEST_MAX_FILES = 500;
+const BASH_SNAPSHOT_FILE_MAX_BYTES = 512 * 1024;
+const BASH_SNAPSHOT_TOTAL_MAX_BYTES = 8 * 1024 * 1024;
+const PROCESS_WORKSPACE_SNAPSHOT_MAX = 64;
+const PROCESS_WORKSPACE_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
-type BashFileSnapshotEntry = { mtimeMs: number; size: number };
+type BashFileSnapshotEntry = {
+  mtimeMs: number;
+  size: number;
+  hash?: string;
+  content?: string;
+  binary: boolean;
+};
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
+type ProcessWorkspaceSnapshot = {
+  root: string;
+  command: string;
+  before: BashFileSnapshot;
+  createdAt: number;
+};
+
+const processWorkspaceSnapshots = new Map<string, ProcessWorkspaceSnapshot>();
 
 function shouldSkipBashProducedDir(name: string): boolean {
   return BASH_PRODUCED_SKIP_DIRS.has(name);
@@ -278,6 +325,7 @@ function shouldSkipBashProducedFile(name: string): boolean {
 function collectBashFileSnapshot(root: string): BashFileSnapshot {
   const out: BashFileSnapshot = new Map();
   const absRoot = path.resolve(root);
+  let captureBytesRemaining = BASH_SNAPSHOT_TOTAL_MAX_BYTES;
   const visit = (dir: string) => {
     if (out.size >= BASH_PRODUCED_SCAN_LIMIT) return;
     let entries: fs.Dirent[];
@@ -296,7 +344,28 @@ function collectBashFileSnapshot(root: string): BashFileSnapshot {
       try { st = fs.statSync(abs); }
       catch { continue; }
       if (!st.isFile()) continue;
-      out.set(path.resolve(abs), { mtimeMs: st.mtimeMs, size: st.size });
+      let hash: string | undefined;
+      let content: string | undefined;
+      let binary = kindOf(abs) !== 'text';
+      if (
+        st.size <= BASH_SNAPSHOT_FILE_MAX_BYTES
+        && st.size <= captureBytesRemaining
+      ) {
+        try {
+          const body = fs.readFileSync(abs);
+          captureBytesRemaining -= body.length;
+          hash = `sha256:${crypto.createHash('sha256').update(body).digest('hex')}`;
+          binary = body.includes(0);
+          if (!binary) content = body.toString('utf8');
+        } catch { /* keep bounded metadata-only snapshot */ }
+      }
+      out.set(path.resolve(abs), {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        ...(hash ? { hash } : {}),
+        ...(content !== undefined ? { content } : {}),
+        binary,
+      });
     }
   };
   visit(absRoot);
@@ -532,21 +601,63 @@ async function emitBashProducedFiles(
   root: string,
   command: string,
   manifestedPaths: readonly string[] = [],
-): Promise<void> {
-  if (!opts.onFileWritten) return;
+): Promise<FileChangeObservation[]> {
   const after = collectBashFileSnapshot(root);
   const isExternalDownload = _buildExternalDownloadSkipper(command, root);
   const discovered = new Set<string>(manifestedPaths);
   for (const [abs, next] of after) {
     const prev = before.get(abs);
-    if (prev && prev.mtimeMs === next.mtimeMs && prev.size === next.size) continue;
+    const capturedChanged = !!prev?.hash && !!next.hash && prev.hash !== next.hash;
+    if (
+      prev
+      && prev.mtimeMs === next.mtimeMs
+      && prev.size === next.size
+      && !capturedChanged
+    ) continue;
     if (isExternalDownload(abs)) continue;
     discovered.add(abs);
   }
-  for (const abs of discovered) {
-    try { await opts.onFileWritten(abs); }
-    catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
+  if (opts.onFileWritten) {
+    for (const abs of discovered) {
+      try { await opts.onFileWritten(abs); }
+      catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
+    }
   }
+  const changes: FileChangeObservation[] = [];
+  for (const abs of discovered) {
+    const prev = before.get(abs);
+    const next = after.get(abs);
+    if (!next || isExternalDownload(abs)) continue;
+    changes.push({
+      operation: prev ? 'update' : 'create',
+      sourcePath: abs,
+      beforeExists: !!prev,
+      afterExists: true,
+      ...(prev ? { beforeBytes: prev.size } : {}),
+      afterBytes: next.size,
+      ...(prev?.hash ? { beforeHash: prev.hash } : {}),
+      ...(next.hash ? { afterHash: next.hash } : {}),
+      ...(prev?.content !== undefined ? { beforeContent: prev.content } : {}),
+      ...(next.content !== undefined ? { afterContent: next.content } : {}),
+      binary: !!prev?.binary || next.binary,
+      coverage: (!prev || !!prev.hash) && !!next.hash ? 'exact' : 'partial',
+    });
+  }
+  for (const [abs, prev] of before) {
+    if (after.has(abs) || isExternalDownload(abs)) continue;
+    changes.push({
+      operation: 'delete',
+      sourcePath: abs,
+      beforeExists: true,
+      afterExists: false,
+      beforeBytes: prev.size,
+      ...(prev.hash ? { beforeHash: prev.hash } : {}),
+      ...(prev.content !== undefined ? { beforeContent: prev.content } : {}),
+      binary: prev.binary,
+      coverage: prev.hash ? 'exact' : 'partial',
+    });
+  }
+  return changes;
 }
 
 function readBashOutputManifest(manifestPath: string, root: string): string[] {
@@ -838,6 +949,36 @@ export function formatScriptProgress(p: Record<string, unknown>): string {
   return parts.length ? `${parts.join(' ')}${pct}${t}${elapsed}` : 'script progress';
 }
 
+function withDirectCommandObservation(result: ToolResult, input: {
+  status: 'succeeded' | 'failed' | 'timed_out' | 'aborted' | 'output_limit' | 'start_failed';
+  exitCode: number | null;
+  durationMs: number;
+  timedOut: boolean;
+  outputLimitExceeded: boolean;
+  stdout: string;
+  stderr: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+}): ToolResult {
+  return {
+    ...result,
+    observations: {
+      ...(result.observations ?? {}),
+      execution: {
+        status: input.status,
+        exitCode: input.exitCode,
+        durationMs: input.durationMs,
+        timedOut: input.timedOut,
+        outputLimitExceeded: input.outputLimitExceeded,
+        stdout: { bytes: input.stdoutBytes, truncated: input.stdoutTruncated },
+        stderr: { bytes: input.stderrBytes, truncated: input.stderrTruncated },
+      },
+    },
+  };
+}
+
 async function executeDirectOrkasCli(
   invocation: OrkasCliInvocation,
   input: Record<string, unknown>,
@@ -870,6 +1011,7 @@ async function executeDirectOrkasCli(
     const stderrChunks: Buffer[] = [];
     let totalBytes = 0;
     let timedOut = false;
+    let aborted = false;
     let outputLimitExceeded = false;
     let truncatedKind: 'stdout' | 'stderr' | null = null;
     let settled = false;
@@ -923,13 +1065,46 @@ async function executeDirectOrkasCli(
           else stderr += '\n... [output truncated by sandbox]';
         }
       }
+      const status = timedOut
+        ? 'timed_out' as const
+        : aborted
+          ? 'aborted' as const
+          : outputLimitExceeded
+            ? 'output_limit' as const
+            : code === 0
+              ? 'succeeded' as const
+              : 'failed' as const;
+      const metadata = {
+        status,
+        exitCode: code,
+        durationMs: Date.now() - startedAt,
+        timedOut,
+        outputLimitExceeded,
+        stdout,
+        stderr,
+        stdoutBytes: capturedStdout?.bytes ?? Buffer.byteLength(stdout),
+        stderrBytes: capturedStderr?.bytes ?? Buffer.byteLength(stderr),
+        stdoutTruncated: !!capturedStdout?.streamedOutput || truncatedKind === 'stdout',
+        stderrTruncated: !!capturedStderr?.streamedOutput || truncatedKind === 'stderr',
+      };
       const discardCaptured = () => {
         discardStreamedToolOutput(capturedStdout?.streamedOutput);
         discardStreamedToolOutput(capturedStderr?.streamedOutput);
       };
       if (timedOut) {
         discardCaptured();
-        finish({ content: bashMsg('timeout', { ms: timeoutMs }), isError: true });
+        finish(withDirectCommandObservation(
+          { content: bashMsg('timeout', { ms: timeoutMs }), isError: true },
+          metadata,
+        ));
+        return;
+      }
+      if (aborted) {
+        discardCaptured();
+        finish(withDirectCommandObservation(
+          { content: 'Command aborted', isError: true },
+          metadata,
+        ));
         return;
       }
       if (outputLimitExceeded) {
@@ -938,11 +1113,11 @@ async function executeDirectOrkasCli(
         discardStreamedToolOutput(useStderr
           ? capturedStdout?.streamedOutput
           : capturedStderr?.streamedOutput);
-        finish({
+        finish(withDirectCommandObservation({
           content: useStderr ? stderr : stdout,
           ...(selected?.streamedOutput ? { streamedOutput: selected.streamedOutput } : {}),
           isError: true,
-        });
+        }, metadata));
         return;
       }
       if (code !== 0) {
@@ -951,20 +1126,20 @@ async function executeDirectOrkasCli(
         discardStreamedToolOutput(useStderr
           ? capturedStdout?.streamedOutput
           : capturedStderr?.streamedOutput);
-        finish({
+        finish(withDirectCommandObservation({
           content: (useStderr ? stderr : stdout) || bashMsg('exit_code', { code: code ?? 'null' }),
           ...(selected?.streamedOutput ? { streamedOutput: selected.streamedOutput } : {}),
           isError: true,
-        });
+        }, metadata));
         return;
       }
       discardStreamedToolOutput(capturedStderr?.streamedOutput);
-      finish({
+      finish(withDirectCommandObservation({
         content: stdout,
         ...(capturedStdout?.streamedOutput
           ? { streamedOutput: capturedStdout.streamedOutput }
           : {}),
-      });
+      }, metadata));
     };
 
     const killChild = () => {
@@ -1029,7 +1204,10 @@ async function executeDirectOrkasCli(
     if (typeof timeout.unref === 'function') timeout.unref();
 
     if (ctx.signal) {
-      abortListener = () => killChild();
+      abortListener = () => {
+        aborted = true;
+        killChild();
+      };
       if (ctx.signal.aborted) abortListener();
       else ctx.signal.addEventListener('abort', abortListener, { once: true });
     }
@@ -1055,7 +1233,22 @@ async function executeDirectOrkasCli(
     child.on('error', (err) => {
       stdoutCapture?.discard();
       stderrCapture?.discard();
-      finish({ content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true });
+      finish(withDirectCommandObservation(
+        { content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true },
+        {
+          status: 'start_failed',
+          exitCode: null,
+          durationMs: Date.now() - startedAt,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: '',
+          stderr: err.message,
+          stdoutBytes: 0,
+          stderrBytes: Buffer.byteLength(err.message),
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        },
+      ));
     });
     child.on('close', (code) => {
       finishFromChunks(code);
@@ -1082,7 +1275,7 @@ async function executeCoreBashWithOutputTracking(
   const command = String(input.command ?? '');
   const manifestPath = path.join(outputDir, BASH_OUTPUT_MANIFEST_NAME);
   try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort stale cleanup */ }
-  const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
+  const before = collectBashFileSnapshot(outputDir);
   const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
   try {
@@ -1094,11 +1287,22 @@ async function executeCoreBashWithOutputTracking(
     const result = direct && !macWriteSandboxActive
       ? await executeDirectOrkasCli(direct, input, ctx, workingDir)
       : await coreBashTool.execute(input, ctx);
-    if (!result.isError) {
-      const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
-      await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
-    }
-    return translateFixedBashError(result);
+    const manifestedPaths = readBashOutputManifest(manifestPath, outputDir);
+    const fileChanges = await emitBashProducedFiles(opts, before, outputDir, command, manifestedPaths);
+    return translateFixedBashError({
+      ...result,
+      ...(fileChanges.length
+        ? {
+            observations: {
+              ...(result.observations ?? {}),
+              fileChanges: [
+                ...(result.observations?.fileChanges ?? []),
+                ...fileChanges,
+              ],
+            },
+          }
+        : {}),
+    });
   } finally {
     try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort */ }
     restoreWritableRoots();
@@ -1260,6 +1464,17 @@ const BASH_GENERIC_FLAGS_WITH_VALUE = new Set([
 ]);
 const BASH_GREP_FLAGS_WITH_VALUE = new Set([...BASH_GENERIC_FLAGS_WITH_VALUE, '-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--after-context', '--before-context', '--context', '--glob', '-g', '--type', '-t']);
 const BASH_AWK_FLAGS_WITH_VALUE = new Set([...BASH_GENERIC_FLAGS_WITH_VALUE, '-f', '-v', '-F']);
+const POWERSHELL_CONTENT_WRITE_CMDS = new Set(['set-content', 'add-content', 'clear-content', 'out-file']);
+const POWERSHELL_PATH_FLAGS = new Set(['-path', '-literalpath', '-filepath']);
+const POWERSHELL_CONTENT_FLAGS_WITH_VALUE = new Set([
+  ...POWERSHELL_PATH_FLAGS,
+  '-value',
+  '-encoding',
+  '-filter',
+  '-include',
+  '-exclude',
+  '-stream',
+]);
 
 function tokenizeBashPathGuard(input: string): BashPathToken[] {
   const toks: BashPathToken[] = [];
@@ -1446,6 +1661,19 @@ function bashNonFlagOperands(args: string[], flagsWithValue: Set<string> = BASH_
   return out;
 }
 
+function powershellContentWriteOperands(args: string[]): string[] {
+  const explicit: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i].toLowerCase();
+    if (POWERSHELL_PATH_FLAGS.has(flag) && args[i + 1]) {
+      explicit.push(args[i + 1]);
+      i += 1;
+    }
+  }
+  if (explicit.length) return explicit;
+  return bashNonFlagOperands(args, POWERSHELL_CONTENT_FLAGS_WITH_VALUE).slice(0, 1);
+}
+
 function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<string, string> {
   return {
     ...(ctx.state.sandboxEnv as Record<string, string> | undefined),
@@ -1588,7 +1816,11 @@ function collectBashMutationCandidates(command: string, workingDir: string, env:
     if (!eff) continue;
     const { cmd, args } = eff;
 
-    if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
+    if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
+      for (const operand of powershellContentWriteOperands(args)) {
+        addBashCandidate(out, operand, cmd, workingDir, env);
+      }
+    } else if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
       for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
@@ -1817,6 +2049,33 @@ function editableFileHash(body: string): string {
   return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
 }
 
+function deletedFileObservation(abs: string, st: fs.Stats): FileChangeObservation {
+  if (kindOf(abs) === 'text') {
+    try {
+      const beforeContent = fs.readFileSync(abs, 'utf8');
+      return {
+        operation: 'delete',
+        sourcePath: abs,
+        beforeExists: true,
+        afterExists: false,
+        beforeHash: editableFileHash(beforeContent),
+        beforeBytes: Buffer.byteLength(beforeContent),
+        beforeContent,
+        coverage: 'exact',
+      };
+    } catch { /* metadata-only fallback below */ }
+  }
+  return {
+    operation: 'delete',
+    sourcePath: abs,
+    beforeExists: true,
+    afterExists: false,
+    beforeBytes: st.size,
+    binary: true,
+    coverage: 'exact',
+  };
+}
+
 function editRecoveryContext(body: string, needle: string, fileHash: string): string {
   const maxChars = 1_200;
   let matchAt = body.indexOf(needle);
@@ -2015,12 +2274,15 @@ const VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS: RegExp[] = [
   /\b(?:puppeteer(?:-core)?|playwright)\b/i,
 ];
 
-function videoStudioUnmanagedRuntimeError(command: string, cwd?: string): string | null {
+function studioUnmanagedRuntimeError(command: string, cwd: string | undefined, studio: 'VideoStudio' | 'ImageStudio'): string | null {
   const inspect = (text: string): boolean => VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS.some((pattern) => pattern.test(text));
+  const isVideoStudio = studio === 'VideoStudio';
   if (inspect(command)) {
     return errText(
-      'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
-      'VideoStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native video_studio composition.lint/inspect/snapshot operations and their persisted findings instead.',
+      isVideoStudio ? 'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN' : 'E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
+      isVideoStudio
+        ? 'VideoStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native video_studio composition.lint/inspect/snapshot operations and their persisted findings instead.'
+        : 'ImageStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native image_studio project.inspect/project.snapshot operations instead.',
     );
   }
   const scriptRe = /\b(?:python3?|node|bash|sh|zsh)\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))/gi;
@@ -2033,8 +2295,10 @@ function videoStudioUnmanagedRuntimeError(command: string, cwd?: string): string
       const st = fs.statSync(abs);
       if (st.isFile() && st.size <= 512 * 1024 && inspect(fs.readFileSync(abs, 'utf8'))) {
         return errText(
-          'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
-          'the requested script starts or installs an unmanaged browser/server runtime. Use native video_studio QA operations instead.',
+          isVideoStudio ? 'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN' : 'E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
+          isVideoStudio
+            ? 'the requested script starts or installs an unmanaged browser/server runtime. Use native video_studio QA operations instead.'
+            : 'the requested script starts or installs an unmanaged browser/server runtime. Use native image_studio QA operations instead.',
         );
       }
     } catch {
@@ -2045,9 +2309,9 @@ function videoStudioUnmanagedRuntimeError(command: string, cwd?: string): string
 }
 
 function guardVideoStudioUnmanagedRuntime(opts: LocalToolsOpts, command: string, cwd?: string): string | null {
-  return opts.agentId === VIDEO_STUDIO_AGENT_ID
-    ? videoStudioUnmanagedRuntimeError(command, cwd)
-    : null;
+  if (opts.agentId === VIDEO_STUDIO_AGENT_ID) return studioUnmanagedRuntimeError(command, cwd, 'VideoStudio');
+  if (opts.agentId === IMAGE_STUDIO_AGENT_ID) return studioUnmanagedRuntimeError(command, cwd, 'ImageStudio');
+  return null;
 }
 
 function unquotedShellSurface(command: string): string {
@@ -2096,6 +2360,7 @@ export function windowsPowerShellCompatibilityError(
   if (/(?:^|[;\r\n]\s*)(?:source|export)\b/m.test(surface)) findings.push('source/export');
   if (/(?:^|[;|\r\n]\s*)head(?:\s|$)/m.test(surface)) findings.push('head');
   if (/(?:^|[;|\r\n]\s*)mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
+  if (/(?:^|[;|&\r\n]\s*)mkdir\s+-p(?:\s|$)/m.test(surface)) findings.push('POSIX mkdir -p');
   if (/\/dev\/null\b/.test(surface)) findings.push('/dev/null');
   if (/^\s*[A-Za-z_][A-Za-z0-9_]*=[^\s;]+\s+\S/m.test(surface)) findings.push('POSIX inline environment assignment');
   if (!findings.length) return null;
@@ -2104,7 +2369,8 @@ export function windowsPowerShellCompatibilityError(
     `host shell is Windows PowerShell, but the command contains ${findings.join(', ')}. `
     + 'Rewrite it as PowerShell before retrying: use `;` for sequencing, `$env:NAME = value` for environment variables, '
     + '`$null` for discarded output, `Select-Object -First N` for head, and a `[System.IO.Path]::GetTempFileName()` or '
-    + '`New-Item` temporary path. For a multi-line script, write a `.ps1` file and invoke it with PowerShell.',
+    + '`New-Item` temporary path. Create directories with `New-Item -ItemType Directory -Force -Path ...`. '
+    + 'For a multi-line script, write a `.ps1` file and invoke it with PowerShell.',
   );
 }
 
@@ -2115,7 +2381,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     ? 'This tool is the host shell (PowerShell on Windows), despite its compatibility name `bash`. ' +
       'Use `$env:NAME` for environment variables, `;` for sequencing, and PowerShell-native ' +
       'pipelines. Do not use POSIX-only `&&`, heredocs, `source`/`export`, `/dev/null`, `head`, ' +
-      'or `mktemp`. Invoke a quoted executable with `&`, for example ' +
+      '`mktemp`, or `mkdir -p`. Invoke a quoted executable with `&`, for example ' +
       '`& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ...`. '
     : '';
   const outputDirDescription = process.platform === 'win32'
@@ -2325,7 +2591,11 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
 async function gateInteractiveCliStart(
   opts: LocalToolsOpts,
   command: string,
-  settings?: { allowNoBrowserAuth?: boolean; workingDir?: string },
+  settings?: {
+    allowNoBrowserAuth?: boolean;
+    workingDir?: string;
+    approvedReasons?: readonly LocalAccessRiskCategory[];
+  },
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
   const mode = getLocalExecMode();
@@ -2374,7 +2644,11 @@ async function gateInteractiveCliStart(
   }
   if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
     const base = classifyBashCommand(command);
-    const reasons = classifyConfiguredBashCommand(command, base.reasons);
+    const approvedReasons = settings?.approvedReasons ?? [];
+    const baseReasons = base.reasons.filter((reason) => !approvedReasons.includes(reason));
+    const reasons = classifyConfiguredBashCommand(command, baseReasons, {
+      includePathPatterns: !approvedReasons.includes('sensitive_path'),
+    });
     if (reasons.length) {
       const decision = await requestBashDecision({
         uid: opts.userId ?? '',
@@ -2482,7 +2756,9 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
       properties: {
         command: {
           type: 'string',
-          description: 'Shell command to start in the conversation workspace. Required.',
+          description: process.platform === 'win32'
+            ? 'PowerShell command to start in the conversation workspace. Invoke a quoted executable path with `&`. Required.'
+            : 'Shell command to start in the conversation workspace. Required.',
         },
         max_lifetime_ms: {
           type: 'number',
@@ -2521,8 +2797,16 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
         sandboxEnv: (ctx.state.sandboxEnv ?? {}) as Record<string, string>,
         maxLifetimeMs: Number(input.max_lifetime_ms),
       });
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const latest = readInteractiveCliSession(opts.userId ?? '', view.session_id);
+      const observeDeadline = Date.now() + (process.platform === 'win32' ? 5_000 : 1_000);
+      let latest = view;
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        latest = readInteractiveCliSession(opts.userId ?? '', view.session_id);
+      } while (
+        latest.status === 'running'
+        && !latest.output
+        && Date.now() < observeDeadline
+      );
       if (latest.status !== 'running') {
         const result = interactiveCliToolPayload(latest);
         return {
@@ -2530,7 +2814,11 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
           isError: latest.status === 'error',
         };
       }
-      return jsonToolResult(interactiveCliToolPayload(latest));
+      const result = interactiveCliToolPayload(latest);
+      return {
+        content: JSON.stringify(result, null, 2),
+        ...(result.agent_should_stop === true ? { endTurn: true } : {}),
+      };
     },
   };
 }
@@ -2553,7 +2841,13 @@ function createInteractiveCliReadTool(opts: LocalToolsOpts): AgentTool {
       const sessionId = String(input.session_id ?? '').trim();
       if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
       try {
-        return jsonToolResult(interactiveCliToolPayload(readInteractiveCliSession(opts.userId ?? '', sessionId)));
+        const result = interactiveCliToolPayload(
+          readInteractiveCliSession(opts.userId ?? '', sessionId),
+        );
+        return {
+          content: JSON.stringify(result, null, 2),
+          ...(result.agent_should_stop === true ? { endTurn: true } : {}),
+        };
       } catch (err) {
         return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
       }
@@ -2648,6 +2942,120 @@ function createInteractiveCliCloseTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
+function processSessionContext(opts: LocalToolsOpts, ctx: ToolContext): ToolContext {
+  const workingDir = path.resolve(ctx.workingDir ?? '.');
+  return {
+    ...ctx,
+    state: {
+      ...ctx.state,
+      processSessionOwner: `${opts.userId ?? ''}:${opts.cid ?? ''}`,
+      sandboxAllowedDirs: bashWritableRootsFor(opts, workingDir),
+    },
+  };
+}
+
+function parseProcessToolPayload(result: ToolResult): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(String(result.content || '')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function pruneProcessWorkspaceSnapshots(now = Date.now()): void {
+  for (const [sessionId, snapshot] of processWorkspaceSnapshots) {
+    if (now - snapshot.createdAt > PROCESS_WORKSPACE_SNAPSHOT_MAX_AGE_MS) {
+      processWorkspaceSnapshots.delete(sessionId);
+    }
+  }
+  while (processWorkspaceSnapshots.size >= PROCESS_WORKSPACE_SNAPSHOT_MAX) {
+    const oldest = processWorkspaceSnapshots.keys().next().value as string | undefined;
+    if (!oldest) break;
+    processWorkspaceSnapshots.delete(oldest);
+  }
+}
+
+function processPayloadIsTerminal(payload: Record<string, unknown> | null): boolean {
+  const status = String(payload?.status ?? '');
+  return status === 'exited' || status === 'error' || status === 'stopped';
+}
+
+async function finalizeProcessWorkspaceSnapshot(
+  opts: LocalToolsOpts,
+  result: ToolResult,
+  snapshot: ProcessWorkspaceSnapshot,
+): Promise<ToolResult> {
+  const fileChanges = await emitBashProducedFiles(
+    opts,
+    snapshot.before,
+    snapshot.root,
+    snapshot.command,
+  );
+  if (!fileChanges.length) return result;
+  return {
+    ...result,
+    observations: {
+      ...(result.observations ?? {}),
+      fileChanges: [
+        ...(result.observations?.fileChanges ?? []),
+        ...fileChanges,
+      ],
+    },
+  };
+}
+
+/** Permission-gated PC adapters for core-agent's persistent process sessions.
+ * The core owns process lifecycle/cursors; PC owns command approval and
+ * conversation isolation. */
+function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
+  return getProcessSessionTools().map((coreTool) => ({
+    ...coreTool,
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+      if (coreTool.name === 'process_start') {
+        const command = String(input.command ?? '').trim();
+        if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
+        const workingDir = path.resolve(ctx.workingDir ?? '.');
+        const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDir);
+        if (filesystemGate.result) return filesystemGate.result;
+        const gate = await gateInteractiveCliStart(opts, command, {
+          workingDir,
+          approvedReasons: filesystemGate.approvedReasons,
+        }, ctx);
+        if (gate) return gate;
+        pruneProcessWorkspaceSnapshots();
+        const snapshot: ProcessWorkspaceSnapshot = {
+          root: workingDir,
+          command,
+          before: collectBashFileSnapshot(workingDir),
+          createdAt: Date.now(),
+        };
+        const result = await coreTool.execute(input, processSessionContext(opts, ctx));
+        const payload = parseProcessToolPayload(result);
+        const sessionId = String(payload?.session_id ?? '').trim();
+        if (!sessionId) return result;
+        if (processPayloadIsTerminal(payload)) {
+          return finalizeProcessWorkspaceSnapshot(opts, result, snapshot);
+        }
+        processWorkspaceSnapshots.set(sessionId, snapshot);
+        return result;
+      }
+      const result = await coreTool.execute(input, processSessionContext(opts, ctx));
+      if (coreTool.name !== 'process_read' && coreTool.name !== 'process_stop') return result;
+      const payload = parseProcessToolPayload(result);
+      if (!processPayloadIsTerminal(payload)) return result;
+      const sessionId = String(payload?.session_id ?? input.session_id ?? '').trim();
+      const snapshot = processWorkspaceSnapshots.get(sessionId);
+      if (!snapshot) return result;
+      processWorkspaceSnapshots.delete(sessionId);
+      return finalizeProcessWorkspaceSnapshot(opts, result, snapshot);
+    },
+  }));
+}
+
 /** Wrapped `write_file` tool — uniquify-on-collision + onFileWritten emit. */
 function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
@@ -2695,6 +3103,75 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         };
       }
       return result;
+    },
+  };
+}
+
+function patchRecoveryContext(body: string, fileHash: string): string {
+  const maxChars = 1_600;
+  const excerpt = body.slice(0, maxChars);
+  return [
+    `<patch-recovery file_hash="${fileHash}" total_chars="${body.length}">`,
+    excerpt + (body.length > maxChars ? `\n...[${body.length - maxChars} chars omitted]` : ''),
+    '</patch-recovery>',
+    'Read the current file and rebuild the patch against these bytes; do not retry the unchanged patch.',
+  ].join('\n');
+}
+
+/** PC host adapter for core-agent's generic patch transaction. The core owns
+ * parsing, hunk application, staging, commit, and rollback; this layer only
+ * injects Orkas permission, path, OCC, lock, and produced-file policies. */
+function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
+  const coreTool = createCoreApplyPatchTool({
+    async validatePath(check, ctx) {
+      const scopeErr = await gateEditPath(opts, check.path, ctx);
+      return scopeErr ? { content: scopeErr, isError: true } : undefined;
+    },
+    async acquirePaths(paths) {
+      const releases: Array<() => void> = [];
+      for (const abs of [...paths].sort()) releases.push(await fileEditLock(abs).acquire());
+      return () => {
+        for (const release of releases.reverse()) release();
+      };
+    },
+    validateExisting(snapshot, _check, ctx) {
+      if (kindOf(snapshot.path) !== 'text') {
+        return {
+          content: errText('E_NOT_EDITABLE', `${snapshot.path}: apply_patch supports regular text files only`),
+          isError: true,
+        };
+      }
+      const freshness = checkEditFreshness(ctx, snapshot.path, snapshot.stat, {
+        currentHash: snapshot.hash,
+      });
+      if (!freshness) return undefined;
+      recordRead(ctx, snapshot.path, snapshot.stat, snapshot.hash);
+      return {
+        content:
+          `${errText(freshness.code, freshness.msg)}\n`
+          + patchRecoveryContext(snapshot.content, snapshot.hash),
+        isError: true,
+      };
+    },
+    validateContent(check) {
+      const oauthErr = guardGoogleWorkspaceOauthClientMismatchText(check.content);
+      return oauthErr ? { content: oauthErr, isError: true } : undefined;
+    },
+    async onCommitted(file: ApplyPatchCommittedFile, ctx) {
+      if (file.operation === 'delete' || file.destinationPath !== file.sourcePath) {
+        forgetRead(ctx, file.sourcePath);
+      }
+      if (file.operation !== 'delete') {
+        recordRead(ctx, file.destinationPath, undefined, file.afterHash);
+        await opts.onFileWritten?.(file.destinationPath);
+      }
+    },
+  });
+  return {
+    ...coreTool,
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+      return coreTool.execute(input, ctx);
     },
   };
 }
@@ -2854,6 +3331,21 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
 
         return {
           content: `<file path="${abs}" edited="${replaced}" kind="${kind}" file_hash="${nextHash}"/>`,
+          observations: {
+            fileChanges: [{
+              operation: 'update',
+              sourcePath: abs,
+              beforeExists: true,
+              afterExists: true,
+              beforeHash: currentHash,
+              afterHash: nextHash,
+              beforeBytes: Buffer.byteLength(body),
+              afterBytes: Buffer.byteLength(next),
+              beforeContent: body,
+              afterContent: next,
+              coverage: 'exact',
+            }],
+          },
         };
       } finally {
         release();
@@ -3042,6 +3534,161 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
         return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
       } catch (err) {
         return { content: `Error generating PDF: ${(err as Error).message}`, isError: true };
+      }
+    },
+  };
+}
+
+const HTML_PREVIEW_MAX_ENTRY_BYTES = 2 * 1024 * 1024;
+
+function htmlPreviewViewport(
+  name: HtmlPreviewViewport['name'],
+  input: unknown,
+  fallback: { width: number; height: number },
+): HtmlPreviewViewport | string {
+  const value = input && typeof input === 'object'
+    ? input as Record<string, unknown>
+    : {};
+  const width = value.width === undefined ? fallback.width : Number(value.width);
+  const height = value.height === undefined ? fallback.height : Number(value.height);
+  const widthBounds = name === 'desktop' ? [768, 1920] : [320, 480];
+  if (
+    !Number.isInteger(width)
+    || width < widthBounds[0]
+    || width > widthBounds[1]
+  ) {
+    return errText(
+      'E_BAD_INPUT',
+      `${name}.width must be an integer from ${widthBounds[0]} to ${widthBounds[1]}`,
+    );
+  }
+  if (!Number.isInteger(height) || height < 480 || height > 1400) {
+    return errText('E_BAD_INPUT', `${name}.height must be an integer from 480 to 1400`);
+  }
+  return { name, width, height };
+}
+
+function guardHtmlPreviewPath(opts: LocalToolsOpts, abs: string): string | null {
+  const roots = [...allowedRootsFor(opts), ...(opts.readOnlyExtraRoots ?? [])];
+  if (roots.length && isPathAllowed(abs, roots)) return null;
+  if (!localAccessAllowsOutsideWorkspace()) {
+    return errText(
+      'E_PATH_OUT_OF_SCOPE',
+      `HTML path is outside the current workspace/attachment scope: ${abs}`,
+    );
+  }
+  return null;
+}
+
+function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'html_preview',
+    description:
+      'Render local .html in the packaged isolated browser at desktop and mobile viewports. ' +
+      'Returns screenshots plus bounded runtime, resource, overflow, image, Tab-focus, link/form, and download evidence. ' +
+      'Network and host permissions (clipboard, media, display capture, filesystem, and devices) are denied. ' +
+      'Fails on detected defects; repair and rerun. Interactions use sample-only form fill, local links, and cancelled downloads; add app-specific tests when needed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Existing local .html/.htm entry path, absolute or relative to $working_dir.',
+        },
+        desktop: {
+          type: 'object',
+          description: 'Optional desktop viewport; defaults to 1440x900.',
+          properties: {
+            width: { type: 'number', description: 'Desktop width from 768 to 1920.' },
+            height: { type: 'number', description: 'Desktop height from 480 to 1400.' },
+          },
+        },
+        mobile: {
+          type: 'object',
+          description: 'Optional mobile viewport; defaults to 390x844.',
+          properties: {
+            width: { type: 'number', description: 'Mobile width from 320 to 480.' },
+            height: { type: 'number', description: 'Mobile height from 480 to 1400.' },
+          },
+        },
+      },
+      required: ['path'],
+    },
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const rawPath = String(input.path ?? '').trim();
+      if (!rawPath) {
+        return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      }
+      const abs = resolveAbs(ctx, rawPath);
+      if (!/\.html?$/i.test(abs)) {
+        return {
+          content: errText('E_BAD_INPUT', '`path` must point to an .html or .htm file'),
+          isError: true,
+        };
+      }
+      const scopeError = guardHtmlPreviewPath(opts, abs);
+      if (scopeError) return { content: scopeError, isError: true };
+      const sensitiveError = await gateSensitiveLocalPath(
+        opts,
+        abs,
+        'html_preview',
+        'read',
+        ctx,
+      );
+      if (sensitiveError) return { content: sensitiveError, isError: true };
+
+      let stat: fs.Stats;
+      try {
+        stat = fs.lstatSync(abs);
+      } catch (error) {
+        return {
+          content: errText('E_HTML_PREVIEW_NOT_FOUND', (error as Error).message),
+          isError: true,
+        };
+      }
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        return {
+          content: errText('E_HTML_PREVIEW_NOT_FILE', 'entry must be a regular non-symlink file'),
+          isError: true,
+        };
+      }
+      if (stat.size <= 0 || stat.size > HTML_PREVIEW_MAX_ENTRY_BYTES) {
+        return {
+          content: errText(
+            'E_HTML_PREVIEW_SIZE',
+            `entry must be between 1 byte and ${HTML_PREVIEW_MAX_ENTRY_BYTES} bytes`,
+          ),
+          isError: true,
+        };
+      }
+
+      const desktop = htmlPreviewViewport('desktop', input.desktop, { width: 1440, height: 900 });
+      if (typeof desktop === 'string') return { content: desktop, isError: true };
+      const mobile = htmlPreviewViewport('mobile', input.mobile, { width: 390, height: 844 });
+      if (typeof mobile === 'string') return { content: mobile, isError: true };
+
+      try {
+        const rendered = await renderResponsiveHtmlPreview(
+          abs,
+          [desktop, mobile],
+        );
+        return {
+          content: JSON.stringify(rendered.evidence),
+          images: rendered.screenshots.map((data) => ({
+            data: data.toString('base64'),
+            mediaType: 'image/png',
+          })),
+          ...(rendered.evidence.ok ? {} : { isError: true }),
+        };
+      } catch (error) {
+        return {
+          content: errText(
+            'E_HTML_PREVIEW_FAILED',
+            (error as Error).message || String(error),
+          ),
+          isError: true,
+        };
       }
     },
   };
@@ -3252,6 +3899,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
             isError: true,
           };
         }
+        const observation = deletedFileObservation(abs, st);
         try { fs.unlinkSync(abs); }
         catch (err) {
           const msg = (err as Error).message;
@@ -3262,7 +3910,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
         log.info('delete_file removed', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-        return { content: `Deleted ${abs}` };
+        return { content: `Deleted ${abs}`, observations: { fileChanges: [observation] } };
       }
 
       // ── Step 1: no token → check file exists, mint token + emit card.
@@ -3282,6 +3930,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         };
       }
       if (!requiresConfirmation) {
+        const observation = deletedFileObservation(abs, st);
         try { fs.unlinkSync(abs); }
         catch (err) {
           const msg = (err as Error).message;
@@ -3296,7 +3945,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           path: logPathRef(abs),
           reason: isInWritableWorkspaceScope(opts, abs) ? 'workspace_scope' : 'all_files_auto',
         });
-        return { content: `Deleted ${abs}` };
+        return { content: `Deleted ${abs}`, observations: { fileChanges: [observation] } };
       }
       const newToken = requestDeleteConfirmation(abs, {
         display_path: rawPath,
@@ -3343,15 +3992,18 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
 export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   const tools: AgentTool[] = [
     createBashTool(opts),
+    ...createHostProcessTools(opts),
     createInteractiveCliStartTool(opts),
     createInteractiveCliReadTool(opts),
     createInteractiveCliSendTool(opts),
     createInteractiveCliCloseTool(opts),
     createWriteFileTool(opts),
+    createHostApplyPatchTool(opts),
     createEditFileTool(opts),
     createDeleteFileTool(opts),
     createMarkdownToPdfTool(opts),
     createHtmlToPdfTool(opts),
+    createHtmlPreviewTool(opts),
   ];
   if (opts.onOutputsPublished) tools.push(createPublishOutputsTool(opts));
   // `create_artifact` only makes sense on a conversation surface that

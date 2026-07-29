@@ -307,6 +307,187 @@ describe('auth › listProviders grouping', () => {
   });
 });
 
+describe('auth › custom OpenAI-compatible model configuration', () => {
+  it('atomically stores endpoint metadata and carries it into the runtime choice', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      label: '公司网关',
+      baseUrl: 'https://gateway.example.test/v1/',
+      model: 'acme/reasoner-v2',
+      apiKey: 'sk-custom-runtime-xxxxxxxx',
+      contextWindow: 262_144,
+      maxTokens: 16_384,
+    });
+
+    expect(added.profileId).toBe('custom:公司网关');
+    expect((await a.listEntries()).entries).toEqual([
+      expect.objectContaining({
+        provider: 'custom',
+        providerLabelKey: 'provider.custom.label',
+        model: 'acme/reasoner-v2',
+        modelEditable: false,
+        modelAvailable: true,
+        profileMasked: 'sk-c…xxxx',
+      }),
+    ]);
+    expect(await a.pickChatEntryGroup()).toEqual([
+      expect.objectContaining({
+        entryId: added.entryId,
+        provider: 'custom',
+        model: 'acme/reasoner-v2',
+        apiKey: 'sk-custom-runtime-xxxxxxxx',
+        customConfig: {
+          baseUrl: 'https://gateway.example.test/v1',
+          contextWindow: 262_144,
+          maxTokens: 16_384,
+        },
+      }),
+    ]);
+
+    const custom = (await a.listProviders()).providers.find((provider) => provider.id === 'custom');
+    expect(custom).toMatchObject({
+      labelKey: 'provider.custom.label',
+      supportsApiKey: true,
+      supportsOAuth: false,
+      customOpenAICompatible: true,
+    });
+  });
+
+  it('assigns provider-local labels when the optional label is blank', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const first = await a.addCustomModelEntry({
+      baseUrl: 'https://first.example.test/v1',
+      model: 'first-model',
+      apiKey: 'sk-custom-first-xxxxxxxx',
+    });
+    const second = await a.addCustomModelEntry({
+      label: '   ',
+      baseUrl: 'https://second.example.test/v1',
+      model: 'second-model',
+      apiKey: 'sk-custom-second-xxxxxxxx',
+    });
+
+    expect(first.profileId).toBe('custom:default');
+    expect(second.profileId).toBe('custom:account2');
+  });
+
+  it('normalizes full chat URLs and rejects impossible limits without a partial credential', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const base = {
+      label: 'full-endpoint',
+      model: 'acme/reasoner-v2',
+      apiKey: 'sk-custom-invalid-xxxxxxxx',
+    };
+
+    await expect(a.addApiKeyEntry(
+      'custom',
+      base.model,
+      base.apiKey,
+      'generic-bypass',
+    )).rejects.toMatchObject({ code: 'CUSTOM_CONFIG_REQUIRED' });
+    const normalized = await a.addCustomModelEntry({
+      ...base,
+      baseUrl: 'https://gateway.example.test/v1/chat/completions/stream',
+    });
+    expect((await a.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: normalized.entryId,
+      customConfig: {
+        baseUrl: 'https://gateway.example.test/v1',
+        contextWindow: 131_072,
+        maxTokens: 8_192,
+      },
+    });
+    await expect(a.addCustomModelEntry({
+      ...base,
+      label: 'invalid-limits',
+      baseUrl: 'https://gateway.example.test/v1',
+      contextWindow: 4_096,
+      maxTokens: 8_192,
+    })).rejects.toMatchObject({ code: 'CUSTOM_TOKEN_LIMIT_INVALID' });
+
+    expect((await a.listEntries()).entries).toHaveLength(1);
+    expect(
+      (await a.listProviders()).providers.find((provider) => provider.id === 'custom')?.profiles,
+    ).toEqual([
+      expect.objectContaining({ profileId: 'custom:full-endpoint' }),
+    ]);
+  });
+
+  it('uses conservative runtime limits when optional advanced fields are blank', async () => {
+    const a = await import('../../../src/main/features/auth');
+    await a.addCustomModelEntry({
+      label: 'local',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'local-model',
+      apiKey: 'local-development-key',
+      contextWindow: '',
+      maxTokens: '',
+    });
+
+    expect((await a.pickChatEntryGroup())[0]?.customConfig).toEqual({
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      contextWindow: 131_072,
+      maxTokens: 8_192,
+    });
+  });
+
+  it('keeps same-model custom endpoints as ordered fallbacks instead of rotating them as keys', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const fallback = await a.addCustomModelEntry({
+      label: 'fallback',
+      baseUrl: 'https://fallback.example.test/v1',
+      model: 'shared-model-id',
+      apiKey: 'sk-fallback-xxxxxxxx',
+    });
+    const primary = await a.addCustomModelEntry({
+      label: 'primary',
+      baseUrl: 'https://primary.example.test/v1',
+      model: 'shared-model-id',
+      apiKey: 'sk-primary-xxxxxxxx',
+    });
+
+    a.bumpEntryLastUsed(primary.entryId);
+    expect((await a.pickChatEntryGroup()).map((choice) => choice.entryId)).toEqual([
+      primary.entryId,
+      fallback.entryId,
+    ]);
+  });
+
+  it('does not expose custom credentials or endpoint metadata in connection-test errors', async () => {
+    vi.doMock('#core-agent', () => ({}));
+    vi.doMock('../../../src/main/model/core-agent/external-providers', () => ({
+      createCustomOpenAICompatibleProvider: vi.fn(async (config: {
+        apiKey: string;
+        baseUrl: string;
+      }) => ({
+        complete: vi.fn(async () => {
+          throw new Error(
+            `API key ${config.apiKey} rejected by ${config.baseUrl}`
+            + '?signature=provider-secret for admin@example.test at /Users/test/private',
+          );
+        }),
+      })),
+    }));
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      label: 'private-gateway',
+      baseUrl: 'https://gateway.internal.example/v1',
+      model: 'private-model',
+      apiKey: 'opaque-connection-secret-xxxxxxxx',
+    });
+
+    const result = await a.testConnection('custom', 'private-model', added.profileId);
+
+    expect(result).toMatchObject({ ok: false, profileId: added.profileId });
+    expect(result.error).toContain('rejected');
+    expect(result.error).not.toContain('opaque-connection-secret-xxxxxxxx');
+    expect(result.error).not.toContain('gateway.internal.example');
+    expect(result.error).not.toContain('provider-secret');
+    expect(result.error).not.toContain('admin@example.test');
+    expect(result.error).not.toContain('/Users/test/private');
+  });
+});
+
 describe('auth › pickRotationKey', () => {
   it('returns null when no profile is configured', async () => {
     const a = await import('../../../src/main/features/auth');
@@ -461,8 +642,10 @@ describe('auth › entries (priority list)', () => {
     expect(pick).not.toBeNull();
     expect(pick!.entryId).toBe(e2.entryId);
     expect(pick!.provider).toBe('openai');
-    // Sanity: e1 is still in the list (we didn't remove the entry, only the credential)
-    const { entries } = await a.listEntries();
+    // The normal runtime list excludes the dangling entry, while Settings'
+    // explicit remediation query retains it so the user can repair/delete it.
+    expect((await a.listEntries()).entries.map((e) => e.entryId)).not.toContain(e1.entryId);
+    const { entries } = await a.listEntries({ includeUnavailable: true });
     expect(entries.map((e) => e.entryId)).toContain(e1.entryId);
   });
 
@@ -570,6 +753,41 @@ describe('auth › hasConfiguredModel', () => {
     expect(a.hasConfiguredModel()).toEqual({ configured: false });
     await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: p.profileId });
     expect(a.hasConfiguredModel()).toEqual({ configured: true });
+  });
+
+  it('does not treat a remediation-only entry with a missing credential as runnable', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const profile = await a.addApiKey('anthropic', 'k-dangling-xxxxxxxx');
+    const entry = await a.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-8',
+      profileId: profile.profileId,
+    });
+
+    const storePath = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const store = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(storePath, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    delete store.profiles[profile.profileId];
+    fs.writeFileSync(storePath, localSecrets.encryptLocalSecret(ctx, JSON.stringify(store)), 'utf8');
+
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect((await a.listEntries({ includeUnavailable: true })).entries).toEqual([
+      expect.objectContaining({
+        entryId: entry.entryId,
+        profileId: profile.profileId,
+        profileAvailable: false,
+        profileLabel: 'default',
+      }),
+    ]);
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+    expect(await a.getConfig()).toEqual({ provider: '', model: '' });
+    expect(await a.pickChatEntry()).toBeNull();
   });
 
   it('falls back to the ANTHROPIC_API_KEY env var when set', async () => {

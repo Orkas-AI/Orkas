@@ -67,6 +67,9 @@ describe('local_agents/runner', () => {
       customArgs: ['--token', 'super-secret-token'],
       resumeSessionId: 'resume-private-session-id',
       prompt: 'private prompt body',
+      systemPrompt: 'private durable instructions',
+      resumeFallbackPrompt: 'private recovered transcript',
+      reuseSessionInstructions: true,
       cwd: '/Users/test/Secret Workspace',
       runId: 'abcdef123456',
       cliAvailable: true,
@@ -78,11 +81,16 @@ describe('local_agents/runner', () => {
     });
 
     expect(ctx.prompt_chars).toBe('private prompt body'.length);
+    expect(ctx.system_prompt_chars).toBe('private durable instructions'.length);
+    expect(ctx.resume_fallback_chars).toBe('private recovered transcript'.length);
+    expect(ctx.reuse_session_instructions).toBe(true);
     expect(ctx.custom_arg_count).toBe(2);
     expect(ctx.has_resume_session).toBe(true);
     expect(ctx.has_cwd).toBe(true);
     const serialized = JSON.stringify(ctx);
     expect(serialized).not.toContain('private prompt body');
+    expect(serialized).not.toContain('private durable instructions');
+    expect(serialized).not.toContain('private recovered transcript');
     expect(serialized).not.toContain('super-secret-token');
     expect(serialized).not.toContain('resume-private-session-id');
     expect(serialized).not.toContain('/Users/alice');
@@ -246,6 +254,32 @@ describe('local_agents/runner', () => {
     });
   });
 
+  it('preserves a distinct version timeout when the installed CLI probe exceeds its deadline', async () => {
+    mockDetect.mockResolvedValue({
+      type: 'claude', available: false, path: '/usr/local/bin/claude', version: null,
+      error: 'version_timeout', errorDetail: 'version probe timed out',
+    });
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'claude', prompt: 'hi', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(result).toMatchObject({
+      status: 'missing_cli',
+      cliError: 'version_timeout',
+      cliPath: '/usr/local/bin/claude',
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      cliError: 'version_timeout',
+      cliPath: '/usr/local/bin/claude',
+    });
+  });
+
   it('persists prompt + events.jsonl + meta.json on a completed run', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent }) => {
@@ -281,6 +315,114 @@ describe('local_agents/runner', () => {
     expect(meta.endedAt).toBeTruthy();
   });
 
+  it('removes private thinking text before forwarding or persistence', async () => {
+    const privateThought = 'PRIVATE_THOUGHT_SENTINEL: recall the user profile';
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'thinking', text: privateThought });
+      onEvent({ type: 'done', status: 'completed', output: 'Public answer' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-private-thinking', agentId: 'agent-x',
+      cli: 'claude', prompt: 'answer publicly', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(events[0]).toEqual({ type: 'thinking', chars: privateThought.length });
+    expect(JSON.stringify(events)).not.toContain('PRIVATE_THOUGHT_SENTINEL');
+
+    const eventsPath = path.join(
+      tmpDir,
+      TEST_UID,
+      'local',
+      'file_cache',
+      'local-agent-runs',
+      result.runId,
+      'events.jsonl',
+    );
+    const persisted = fs.readFileSync(eventsPath, 'utf8');
+    expect(persisted).not.toContain('PRIVATE_THOUGHT_SENTINEL');
+    expect(JSON.parse(persisted.trim().split('\n')[0])).toEqual({
+      type: 'thinking',
+      chars: privateThought.length,
+    });
+  });
+
+  it('redacts private CLI diagnostics before forwarding or persistence', async () => {
+    const privatePath = '/Users/test/private/customer-plan.md';
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    mockDetect.mockResolvedValue({
+      type: 'claude',
+      available: true,
+      path: '/fake/claude',
+      version: '2.0.0',
+    });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'process-info',
+        pid: 42,
+        cwd: privatePath,
+        cmd: '/Users/test/bin/claude',
+        args: ['--api-key', privateToken],
+      });
+      onEvent({ type: 'stderr-line', line: `failed ${privatePath} api_key=${privateToken}` });
+      onEvent({ type: 'raw-line', line: `Authorization: Bearer ${privateToken}` });
+      onEvent({
+        type: 'log',
+        level: 'warn',
+        message: `owner=alice@example.com file=${privatePath}`,
+      });
+      onEvent({
+        type: 'done',
+        status: 'failed',
+        error: `CLI failed at ${privatePath}`,
+        stderrTail: `api_key=${privateToken}`,
+      });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-private-diagnostics',
+      agentId: 'agent-x',
+      cli: 'claude',
+      prompt: 'run',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+    });
+
+    expect(events[0]).toMatchObject({
+      type: 'process-info',
+      pid: 42,
+      cmd: 'claude',
+      argCount: 2,
+    });
+    expect(events[0]).not.toHaveProperty('cwd');
+    expect(events[0]).not.toHaveProperty('args');
+    expect(result.error).toContain('<abs-path:');
+    expect(JSON.stringify(events)).toContain('***');
+
+    const eventsPath = path.join(
+      tmpDir,
+      TEST_UID,
+      'local',
+      'file_cache',
+      'local-agent-runs',
+      result.runId,
+      'events.jsonl',
+    );
+    const publicDiagnostics = `${JSON.stringify(events)}\n${fs.readFileSync(eventsPath, 'utf8')}`;
+    for (const privateValue of [privatePath, privateToken, 'alice@example.com']) {
+      expect(publicDiagnostics).not.toContain(privateValue);
+    }
+  });
+
   it('reports backend exception as a failed done event', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async () => { throw new Error('spawn went sideways'); };
@@ -295,6 +437,91 @@ describe('local_agents/runner', () => {
     expect(result.status).toBe('failed');
     const done = events.find(e => e.type === 'done');
     expect(done?.error).toMatch(/spawn went sideways/);
+  });
+
+  it('retries a pre-execution stale resume once with bounded recovery', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const attempts: any[] = [];
+    mockBackendImpl = async (opts) => {
+      attempts.push(opts);
+      if (attempts.length === 1) {
+        opts.onEvent({ type: 'stderr-line', line: 'No conversation found with session ID old-session' });
+        opts.onEvent({ type: 'done', status: 'failed', error: 'claude exited with code 1' });
+        return;
+      }
+      opts.onEvent({
+        type: 'done',
+        status: 'completed',
+        output: 'Recovered answer',
+        sessionId: 'new-session',
+      });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-stale-resume',
+      agentId: 'agent-x',
+      cli: 'claude',
+      prompt: '继续',
+      systemPrompt: 'durable instructions',
+      resumeFallbackPrompt: 'bounded history\n\n继续',
+      reuseSessionInstructions: true,
+      resumeSessionId: 'old-session',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(attempts).toHaveLength(2);
+    expect(attempts[0]).toMatchObject({
+      prompt: '继续',
+      resumeSessionId: 'old-session',
+      reuseSessionInstructions: true,
+    });
+    expect(attempts[1]).toMatchObject({
+      prompt: 'bounded history\n\n继续',
+      reuseSessionInstructions: false,
+    });
+    expect(attempts[1].resumeSessionId).toBeUndefined();
+    expect(events.filter((event) => event.type === 'done')).toEqual([
+      expect.objectContaining({ status: 'completed', sessionId: 'new-session' }),
+    ]);
+    expect(result).toMatchObject({
+      status: 'completed',
+      output: 'Recovered answer',
+    });
+  });
+
+  it('does not fresh-retry after a resumed session has begun executing', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    let attempts = 0;
+    mockBackendImpl = async (opts) => {
+      attempts += 1;
+      opts.onEvent({ type: 'status', status: 'running' });
+      opts.onEvent({ type: 'stderr-line', line: 'session expired after execution began' });
+      opts.onEvent({ type: 'done', status: 'failed', error: 'failed after execution' });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-executed-resume',
+      agentId: 'agent-x',
+      cli: 'claude',
+      prompt: '继续',
+      resumeFallbackPrompt: 'bounded history\n\n继续',
+      resumeSessionId: 'old-session',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(attempts).toBe(1);
+    expect(result.status).toBe('failed');
+    expect(events.filter((event) => event.type === 'done')).toHaveLength(1);
   });
 
   it('falls back to a synthetic failed done when backend exits without one', async () => {

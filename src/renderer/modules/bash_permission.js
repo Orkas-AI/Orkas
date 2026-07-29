@@ -12,6 +12,8 @@ const _bashPermLog = createLogger('bash-permission');
 
 const _bashPermQueue = [];
 let _bashPermDialogOpen = false;
+const _bashPermCancelled = new Set();
+const _bashPermDialogClosers = new Map();
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const _BASH_PERMISSION_DEFAULT_MODE = 'all_files_approval';
@@ -87,7 +89,7 @@ async function _setBashPermissionMode(mode) {
   }
 }
 
-function _showBashPermissionModeDialog({ title, message, currentMode }) {
+function _showBashPermissionModeDialog({ title, message, currentMode, requestId }) {
   const modes = _bashPermissionModeOptions();
   const safeCurrentMode = _bashIsMode(currentMode) ? currentMode : _BASH_PERMISSION_DEFAULT_MODE;
   const modeTitle = _bashT('bash.permission.mode_title', 'Permission level');
@@ -97,7 +99,34 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
   try {
     const hook = window && window.__orkasBashPermissionDialogForTest;
     if (typeof hook === 'function') {
-      return Promise.resolve(hook({ title, message, currentMode: safeCurrentMode, modeTitle, modeHint, modes }));
+      return new Promise((resolve) => {
+        let finished = false;
+        const finish = (result) => {
+          if (finished) return;
+          finished = true;
+          if (requestId) _bashPermDialogClosers.delete(requestId);
+          resolve(result);
+        };
+        if (requestId) {
+          _bashPermDialogClosers.set(requestId, () => finish({
+            choice: 'deny',
+            mode: safeCurrentMode,
+            cancelled: true,
+          }));
+          if (_bashPermCancelled.has(requestId)) {
+            finish({ choice: 'deny', mode: safeCurrentMode, cancelled: true });
+            return;
+          }
+        }
+        Promise.resolve(hook({
+          title,
+          message,
+          currentMode: safeCurrentMode,
+          modeTitle,
+          modeHint,
+          modes,
+        })).then(finish, () => finish({ choice: 'deny', mode: safeCurrentMode }));
+      });
     }
   } catch (_) { /* ignore test hook lookup failures */ }
 
@@ -179,13 +208,21 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
       modeMenu.style.width = `${menuWidth}px`;
       modeMenu.style.left = `${Math.max(12, Math.min(triggerRect.left - overlayRect.left, overlayRect.width - menuWidth - 12))}px`;
       const gap = 8;
+      modeMenu.style.maxHeight = '';
       const menuHeight = modeMenu.offsetHeight;
-      const topAbove = triggerRect.top - overlayRect.top - menuHeight - gap;
-      const topBelow = triggerRect.bottom - overlayRect.top + gap;
-      const top = topAbove >= 12
-        ? topAbove
-        : Math.min(topBelow, Math.max(12, overlayRect.height - menuHeight - 12));
-      modeMenu.style.top = `${top}px`;
+      const triggerWithinOverlay = {
+        top: triggerRect.top - overlayRect.top,
+        bottom: triggerRect.bottom - overlayRect.top,
+      };
+      const placement = _dropdownVerticalPlacement(
+        triggerWithinOverlay,
+        menuHeight,
+        overlayRect.height,
+        { edge: 12, gap },
+      );
+      modeMenu.style.top = `${placement.top}px`;
+      modeMenu.style.maxHeight = `${Math.min(280, placement.availableHeight)}px`;
+      modeMenu.dataset.placement = placement.openAbove ? 'top' : 'bottom';
     };
     const openMenu = () => {
       if (!modeMenu) return;
@@ -227,13 +264,21 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
         finish('deny');
       }
     };
-    const finish = (choice) => {
+    let finished = false;
+    const finish = (choice, cancelled = false) => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       document.removeEventListener('click', onDocClick, true);
+      if (requestId) _bashPermDialogClosers.delete(requestId);
       const mode = selectedMode();
       overlay.remove();
-      resolve({ choice, mode });
+      resolve({ choice, mode, cancelled });
     };
+    if (requestId) {
+      _bashPermDialogClosers.set(requestId, () => finish('deny', true));
+      if (_bashPermCancelled.has(requestId)) finish('deny', true);
+    }
     overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
       btn.addEventListener('click', () => finish(btn.dataset.id || 'deny'));
     });
@@ -246,6 +291,8 @@ function _showBashPermissionModeDialog({ title, message, currentMode }) {
 }
 
 async function _showBashPermissionDialog(info) {
+  const requestId = String(info.request_id || '');
+  if (_bashPermCancelled.delete(requestId)) return;
   const agent = _bashAgentLabel(info);
   const reasonsText = _bashReasonText(info.reasons);
   const command = String(info.command || '');
@@ -261,11 +308,17 @@ async function _showBashPermissionDialog(info) {
     : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + command;
 
   const currentMode = await _getBashPermissionCurrentMode();
+  if (_bashPermCancelled.delete(requestId)) return;
   const result = await _showBashPermissionModeDialog({
     title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
     message,
     currentMode,
+    requestId,
   });
+  if (result && result.cancelled) {
+    _bashPermCancelled.delete(requestId);
+    return;
+  }
   const choice = result && typeof result === 'object' ? result.choice : result;
   const selectedMode = _bashIsMode(result && result.mode) ? result.mode : currentMode;
   let decision = (choice === 'allow_once' || choice === 'allow_run') ? choice : 'deny';
@@ -324,6 +377,24 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
       if (!info || typeof info.request_id !== 'string') return;
       _bashPermQueue.push(info);
       _drainBashPermissionQueue();
+    });
+    window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {
+      const ids = Array.isArray(payload && payload.request_ids)
+        ? payload.request_ids.filter((id) => typeof id === 'string')
+        : [];
+      for (const id of ids) {
+        _bashPermCancelled.add(id);
+        const close = _bashPermDialogClosers.get(id);
+        if (close) close();
+      }
+      if (ids.length) {
+        const cancelled = new Set(ids);
+        for (let i = _bashPermQueue.length - 1; i >= 0; i -= 1) {
+          if (cancelled.has(_bashPermQueue[i] && _bashPermQueue[i].request_id)) {
+            _bashPermQueue.splice(i, 1);
+          }
+        }
+      }
     });
   } catch (_err) { /* push channel unavailable; bash calls deny on timeout */ }
 }

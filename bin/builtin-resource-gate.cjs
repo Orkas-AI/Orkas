@@ -14,25 +14,55 @@ const BUILTIN_EXTRA_RESOURCE_FILTERS = Object.freeze([
 ]);
 const SAFE_SKILL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const MARKETPLACE_ID = /^[0-9a-f]{12}$/;
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const CATEGORY_CODE = /^[a-z][a-z0-9_-]{0,79}$/;
+const INPUT_ID = /^[a-z_][a-z0-9_]{0,31}$/;
+const INPUT_TYPES = new Set(['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory']);
+const OUTPUT_FORMATS = new Set(['auto', 'text', 'dashboard', 'artifact']);
+const INPUT_UI_LANGUAGES = new Set(['zh', 'en', 'ja', 'pt']);
+const AVATAR_CATALOG = readJson(
+  'avatar catalog',
+  path.resolve(__dirname, '..', 'src', 'main', 'data', 'avatars.json'),
+);
+const AVATAR_ICONS = new Set(
+  Array.isArray(AVATAR_CATALOG.icons) ? AVATAR_CATALOG.icons.map((entry) => entry.id) : [],
+);
+const AVATAR_COLORS = new Set(
+  Array.isArray(AVATAR_CATALOG.colors) ? AVATAR_CATALOG.colors.map((entry) => entry.id) : [],
+);
 const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
   system_skills: Object.freeze([
     'agent-creator',
     'autotask-creator',
-    'coding',
     'package-installer',
     'skill-creator',
   ]),
   marketplace_agents: Object.freeze([
+    '173d4235a431',
     '78900d8758bc',
     '79df9cc89f5f',
+    '814b61b027f0',
+    'a19101ba698a',
+    'a316881746f9',
     'bcfcb4921dce',
     'e064dca9e1bd',
   ]),
   marketplace_skills: Object.freeze([
+    '081c15ffbab4',
+    '36bd44ae956c',
     '6743aa0797a2',
+    '68fb048b85cb',
+    '88aca13869d9',
+    '9b1241732f3a',
     '9be6fda271a5',
+    '9dfbd4e00c0d',
+    'b1f384166705',
+    'c72c656eca12',
     'e7f5c0e6f1be',
     'ee99fbb42964',
+    'f283632103ba',
+    'f347f715469c',
+    'fc125b9df078',
   ]),
 });
 
@@ -229,8 +259,13 @@ function standaloneSkillInventory(root) {
     const meta = readJson(`builtin marketplace skill ${id} metadata`, path.join(dir, '_meta.json'));
     const version = typeof meta.version === 'string' ? meta.version.trim() : '';
     const updatedAt = typeof meta.updated_at === 'string' ? meta.updated_at.trim() : '';
-    if (!version || !updatedAt || !Number.isFinite(Date.parse(updatedAt))) {
+    if (!SEMVER.test(version) || !updatedAt || !Number.isFinite(Date.parse(updatedAt))) {
       throw new Error(`[builtin-resource-gate] invalid version/update metadata for builtin marketplace skill ${id}`);
+    }
+    if ('min_app_version' in meta && (
+      typeof meta.min_app_version !== 'string' || !SEMVER.test(meta.min_app_version.trim())
+    )) {
+      throw new Error(`[builtin-resource-gate] invalid min_app_version for builtin marketplace skill ${id}`);
     }
     rows.push({ id, name: frontmatter.name, version, updated_at: updatedAt });
   }
@@ -267,6 +302,188 @@ function embeddedSkillNames(agentId, agentDir) {
   return names.sort();
 }
 
+function invalidAgentContract(id, detail) {
+  throw new Error(`[builtin-resource-gate] builtin marketplace agent ${id} ${detail}`);
+}
+
+function validateBuiltinAgentInput(id, input, index, seen) {
+  const label = `input[${index}]`;
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    invalidAgentContract(id, `${label} must be an object`);
+  }
+  const inputId = typeof input.id === 'string' ? input.id.trim() : '';
+  if (!INPUT_ID.test(inputId) || seen.has(inputId)) {
+    invalidAgentContract(id, `${label} has an invalid or duplicate id`);
+  }
+  seen.add(inputId);
+  if (typeof input.label !== 'string' || !input.label.trim()) {
+    invalidAgentContract(id, `input ${inputId} needs a user-facing label`);
+  }
+  if (!INPUT_TYPES.has(input.type)) {
+    invalidAgentContract(id, `input ${inputId} has unsupported type ${JSON.stringify(input.type)}`);
+  }
+  if (typeof input.required !== 'boolean') {
+    invalidAgentContract(id, `input ${inputId} required must be boolean`);
+  }
+  for (const key of ['description', 'placeholder']) {
+    if (key in input && (typeof input[key] !== 'string' || !input[key].trim())) {
+      invalidAgentContract(id, `input ${inputId} ${key} must be a non-empty string when present`);
+    }
+  }
+
+  let optionValues = null;
+  if (input.type === 'select' || input.type === 'multiselect') {
+    if (!Array.isArray(input.options) || input.options.length === 0) {
+      invalidAgentContract(id, `input ${inputId} needs non-empty options`);
+    }
+    optionValues = new Set();
+    for (const [optionIndex, option] of input.options.entries()) {
+      const value = option && typeof option.value === 'string' ? option.value : '';
+      const optionLabel = option && typeof option.label === 'string' ? option.label.trim() : '';
+      if (!value || !optionLabel || optionValues.has(value)) {
+        invalidAgentContract(id, `input ${inputId} option[${optionIndex}] has an invalid value, label, or duplicate`);
+      }
+      optionValues.add(value);
+    }
+  } else if ('options' in input) {
+    invalidAgentContract(id, `input ${inputId} must not declare options for type ${input.type}`);
+  }
+
+  if (input.type === 'text' || input.type === 'textarea' || input.type === 'directory') {
+    if (typeof input.default !== 'string') {
+      invalidAgentContract(id, `input ${inputId} default must be a string`);
+    }
+    if (input.type === 'directory' && input.default !== '') {
+      invalidAgentContract(id, `input ${inputId} directory default must be empty`);
+    }
+  } else if (input.type === 'number') {
+    if (typeof input.default !== 'number' || !Number.isFinite(input.default)) {
+      invalidAgentContract(id, `input ${inputId} default must be a finite number`);
+    }
+    for (const bound of ['min', 'max']) {
+      if (bound in input && (typeof input[bound] !== 'number' || !Number.isFinite(input[bound]))) {
+        invalidAgentContract(id, `input ${inputId} ${bound} must be a finite number`);
+      }
+    }
+    if (typeof input.min === 'number' && typeof input.max === 'number' && input.min > input.max) {
+      invalidAgentContract(id, `input ${inputId} min must not exceed max`);
+    }
+    if (typeof input.min === 'number' && input.default < input.min) {
+      invalidAgentContract(id, `input ${inputId} default is below min`);
+    }
+    if (typeof input.max === 'number' && input.default > input.max) {
+      invalidAgentContract(id, `input ${inputId} default is above max`);
+    }
+  } else if (input.type === 'boolean') {
+    if (typeof input.default !== 'boolean') {
+      invalidAgentContract(id, `input ${inputId} default must be boolean`);
+    }
+  } else if (input.type === 'select') {
+    if (typeof input.default !== 'string' || !optionValues.has(input.default)) {
+      invalidAgentContract(id, `input ${inputId} default must match an option`);
+    }
+  } else if (input.type === 'multiselect') {
+    if (!Array.isArray(input.default) || input.default.some((value) => typeof value !== 'string' || !optionValues.has(value))) {
+      invalidAgentContract(id, `input ${inputId} default must contain only declared option values`);
+    }
+    if (new Set(input.default).size !== input.default.length) {
+      invalidAgentContract(id, `input ${inputId} default must not contain duplicates`);
+    }
+  } else if (input.type === 'file') {
+    if ('multiple' in input && typeof input.multiple !== 'boolean') {
+      invalidAgentContract(id, `input ${inputId} multiple must be boolean`);
+    }
+    const expectedDefault = input.multiple === true ? [] : '';
+    if (Array.isArray(expectedDefault)) {
+      if (!Array.isArray(input.default) || input.default.length !== 0) {
+        invalidAgentContract(id, `input ${inputId} multiple-file default must be an empty array`);
+      }
+    } else if (input.default !== expectedDefault) {
+      invalidAgentContract(id, `input ${inputId} file default must be empty`);
+    }
+    if ('accept' in input && (typeof input.accept !== 'string' || !input.accept.trim())) {
+      invalidAgentContract(id, `input ${inputId} accept must be a non-empty string when present`);
+    }
+  }
+  if (input.type !== 'number' && ('min' in input || 'max' in input)) {
+    invalidAgentContract(id, `input ${inputId} must not declare numeric bounds for type ${input.type}`);
+  }
+  if (input.type !== 'file' && ('multiple' in input || 'accept' in input)) {
+    invalidAgentContract(id, `input ${inputId} must not declare file options for type ${input.type}`);
+  }
+
+  if ('default_by_ui_language' in input) {
+    if (input.type !== 'select' || !input.default_by_ui_language
+      || typeof input.default_by_ui_language !== 'object'
+      || Array.isArray(input.default_by_ui_language)) {
+      invalidAgentContract(id, `input ${inputId} language defaults require a select input`);
+    }
+    const entries = Object.entries(input.default_by_ui_language);
+    if (entries.length === 0) {
+      invalidAgentContract(id, `input ${inputId} language defaults must not be empty`);
+    }
+    for (const [language, value] of entries) {
+      if (!INPUT_UI_LANGUAGES.has(language) || typeof value !== 'string' || !optionValues.has(value)) {
+        invalidAgentContract(id, `input ${inputId} has an invalid ${language} language default`);
+      }
+    }
+  }
+}
+
+function validateBuiltinAgentContract(agent, id) {
+  const textFields = ['name', 'description_zh', 'description_en', 'workflow'];
+  for (const field of textFields) {
+    if (typeof agent[field] !== 'string' || !agent[field].trim()) {
+      invalidAgentContract(id, `requires non-empty ${field}`);
+    }
+  }
+  if (typeof agent.version !== 'string' || !SEMVER.test(agent.version.trim())) {
+    invalidAgentContract(id, 'version must be semantic x.y.z');
+  }
+  for (const field of ['created_at', 'updated_at']) {
+    if (typeof agent[field] !== 'string' || !Number.isFinite(Date.parse(agent[field]))) {
+      invalidAgentContract(id, `${field} must be an ISO-compatible date`);
+    }
+  }
+  if (typeof agent.category !== 'string' || !CATEGORY_CODE.test(agent.category.trim())) {
+    invalidAgentContract(id, 'category must be a safe marketplace category code');
+  }
+  if (typeof agent.interactive !== 'boolean') {
+    invalidAgentContract(id, 'interactive must be boolean');
+  }
+  if (typeof agent.icon !== 'string' || !AVATAR_ICONS.has(agent.icon)) {
+    invalidAgentContract(id, `icon must be a supported avatar token`);
+  }
+  if (typeof agent.color !== 'string' || !AVATAR_COLORS.has(agent.color)) {
+    invalidAgentContract(id, `color must be a supported avatar token`);
+  }
+  if ('output_format' in agent && !OUTPUT_FORMATS.has(agent.output_format)) {
+    invalidAgentContract(id, 'output_format must be auto, text, dashboard, or artifact');
+  }
+  if ('min_app_version' in agent && (
+    typeof agent.min_app_version !== 'string' || !SEMVER.test(agent.min_app_version.trim())
+  )) {
+    invalidAgentContract(id, 'min_app_version must be semantic x.y.z when present');
+  }
+  if ('runtime' in agent) {
+    const runtime = agent.runtime;
+    if (!runtime || typeof runtime !== 'object' || Array.isArray(runtime)
+      || !['in_process', 'cli'].includes(runtime.kind)
+      || (runtime.kind === 'cli' && (typeof runtime.cli !== 'string' || !runtime.cli.trim()))) {
+      invalidAgentContract(id, 'runtime must be a supported in_process or cli definition');
+    }
+  }
+  if (!Array.isArray(agent.inputs) || agent.inputs.length === 0) {
+    invalidAgentContract(id, 'inputs must contain at least one user-facing field');
+  }
+  const seen = new Set();
+  agent.inputs.forEach((input, index) => validateBuiltinAgentInput(id, input, index, seen));
+  if (!agent.inputs.some((input) => input.required === true)) {
+    invalidAgentContract(id, 'inputs must contain at least one required field');
+  }
+  return true;
+}
+
 function marketplaceAgentInventory(root, standaloneSkills) {
   const agentsRoot = path.join(root, 'marketplace', 'agents');
   const standaloneRefs = new Set();
@@ -281,6 +498,7 @@ function marketplaceAgentInventory(root, standaloneSkills) {
     }
     const dir = path.join(agentsRoot, id);
     const agent = readJson(`builtin marketplace agent ${id}`, path.join(dir, 'agent.json'));
+    validateBuiltinAgentContract(agent, id);
     const name = typeof agent.name === 'string' ? agent.name.trim() : '';
     const version = typeof agent.version === 'string' ? agent.version.trim() : '';
     const icon = typeof agent.icon === 'string' ? agent.icon.trim() : '';
@@ -394,6 +612,7 @@ module.exports = {
   contentTreeSha256,
   createBuiltinManifest,
   requiredBuiltinVerificationEntries,
+  validateBuiltinAgentContract,
   verifyBuiltinExtraResourcesConfig,
   verifyBuiltinRoot,
 };

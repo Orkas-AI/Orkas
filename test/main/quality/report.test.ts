@@ -60,4 +60,52 @@ describe('quality report persistence lifecycle', () => {
 
     await expect(reports.readReport({ uid: 'u1', kind: 'agent', id: 'writer' })).resolves.toBeNull();
   });
+
+  it('treats a corrupt persisted payload as unavailable instead of a clean report', async () => {
+    const reports = await import('../../../src/main/quality/report');
+    const paths = await import('../../../src/main/paths');
+    const file = paths.qualitySkillReportFile('u1', 'corrupt-skill');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{not-json', 'utf8');
+
+    await expect(reports.readReport({
+      uid: 'u1',
+      kind: 'skill',
+      id: 'corrupt-skill',
+    })).resolves.toBeNull();
+
+    fs.writeFileSync(file, '{}', 'utf8');
+    await expect(reports.readReport({
+      uid: 'u1',
+      kind: 'skill',
+      id: 'corrupt-skill',
+    })).resolves.toBeNull();
+
+    fs.writeFileSync(file, JSON.stringify({
+      ...report('1'),
+      ok: false,
+      violations: [],
+    }), 'utf8');
+    await expect(reports.readReport({
+      uid: 'u1',
+      kind: 'skill',
+      id: 'corrupt-skill',
+    })).resolves.toBeNull();
+  });
+
+  it('rejects unsafe identifiers at the persistence boundary', async () => {
+    const reports = await import('../../../src/main/quality/report');
+
+    await expect(reports.persistReport({
+      uid: 'u1',
+      kind: 'skill',
+      id: '../config/auth-profiles',
+      report: report('1'),
+    })).rejects.toThrow('invalid quality report id');
+    await expect(reports.readReport({
+      uid: 'u1',
+      kind: 'agent',
+      id: 'writer/../../secret',
+    })).rejects.toThrow('invalid quality report id');
+  });
 });

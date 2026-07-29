@@ -52,6 +52,43 @@ describe('features/window_state', () => {
     });
   });
 
+  it('fits default bounds to a small primary work area', async () => {
+    electronMock.screen.getAllDisplays.mockReturnValue([
+      { workArea: { x: 0, y: 0, width: 1024, height: 600 } },
+    ]);
+    electronMock.screen.getPrimaryDisplay.mockReturnValue({
+      workArea: { x: 0, y: 0, width: 1024, height: 600 },
+    });
+    const { state } = await load();
+
+    expect(state.restoreWindowState()).toEqual({
+      bounds: { width: 1024, height: 600 },
+      isMaximized: false,
+    });
+  });
+
+  it('clamps a positioned window to the single display it actually occupies', async () => {
+    electronMock.screen.getAllDisplays.mockReturnValue([
+      { workArea: { x: 0, y: 0, width: 1920, height: 1080 } },
+      { workArea: { x: 1920, y: 0, width: 1080, height: 1920 } },
+    ]);
+    electronMock.screen.getPrimaryDisplay.mockReturnValue({
+      workArea: { x: 0, y: 0, width: 1920, height: 1080 },
+    });
+    const { paths, state } = await load();
+    fs.writeFileSync(paths.WINDOW_STATE_FILE, JSON.stringify({
+      x: 1920,
+      y: 0,
+      width: 1800,
+      height: 1800,
+    }));
+
+    expect(state.restoreWindowState()).toEqual({
+      bounds: { x: 1920, y: 0, width: 1080, height: 1800 },
+      isMaximized: false,
+    });
+  });
+
   it('restores a visible saved position and size', async () => {
     const { paths, state } = await load();
     fs.writeFileSync(paths.WINDOW_STATE_FILE, JSON.stringify({
@@ -83,6 +120,25 @@ describe('features/window_state', () => {
     });
   });
 
+  it('restores a visible negative-coordinate position on a left-side monitor', async () => {
+    electronMock.screen.getAllDisplays.mockReturnValue([
+      { workArea: { x: -1920, y: 0, width: 1920, height: 1080 } },
+      { workArea: { x: 0, y: 0, width: 1440, height: 900 } },
+    ]);
+    const { paths, state } = await load();
+    fs.writeFileSync(paths.WINDOW_STATE_FILE, JSON.stringify({
+      x: -1800,
+      y: 80,
+      width: 1100,
+      height: 760,
+    }));
+
+    expect(state.restoreWindowState()).toEqual({
+      bounds: { x: -1800, y: 80, width: 1100, height: 760 },
+      isMaximized: false,
+    });
+  });
+
   it('persists normal bounds for a maximized window', async () => {
     const { paths, state } = await load();
     const win = {
@@ -102,5 +158,44 @@ describe('features/window_state', () => {
       height: 760,
       isMaximized: true,
     });
+  });
+
+  it('does not throw when close-time state persistence fails', async () => {
+    const { paths, state } = await load();
+    fs.mkdirSync(paths.WINDOW_STATE_FILE, { recursive: true });
+    const win = {
+      getBounds: vi.fn(() => ({ x: 20, y: 20, width: 1000, height: 700 })),
+      getNormalBounds: vi.fn(() => ({ x: 20, y: 20, width: 1000, height: 700 })),
+      isDestroyed: vi.fn(() => false),
+      isMaximized: vi.fn(() => false),
+      isMinimized: vi.fn(() => false),
+    };
+
+    expect(() => state.saveWindowStateNow(win as never)).not.toThrow();
+    expect(fs.statSync(paths.WINDOW_STATE_FILE).isDirectory()).toBe(true);
+  });
+
+  it('does not replace the last usable bounds when Windows closes while minimized', async () => {
+    const { paths, state } = await load();
+    const previous = {
+      x: 120,
+      y: 90,
+      width: 1180,
+      height: 760,
+      isMaximized: false,
+    };
+    fs.writeFileSync(paths.WINDOW_STATE_FILE, JSON.stringify(previous));
+    const win = {
+      getBounds: vi.fn(() => ({ x: -32000, y: -32000, width: 160, height: 28 })),
+      getNormalBounds: vi.fn(() => ({ x: 120, y: 90, width: 1180, height: 760 })),
+      isDestroyed: vi.fn(() => false),
+      isMaximized: vi.fn(() => false),
+      isMinimized: vi.fn(() => true),
+    };
+
+    state.saveWindowStateNow(win as never);
+
+    expect(JSON.parse(fs.readFileSync(paths.WINDOW_STATE_FILE, 'utf8'))).toEqual(previous);
+    expect(win.getBounds).not.toHaveBeenCalled();
   });
 });

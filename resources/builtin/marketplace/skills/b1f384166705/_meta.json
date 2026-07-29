@@ -1,0 +1,26 @@
+{
+  "version": "1.0.2",
+  "updated_at": "2026-07-28T13:32:31.000Z",
+  "min_app_version": "1.6.2",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "descriptions": {
+    "zh": "用于 SwiftUI 架构与重构、Observation/MV 状态边界、SwiftUI 性能审计，以及通过 Orkas Skill Runner 执行 xctrace/Time Profiler 原生热点分析。",
+    "en": "Use for SwiftUI architecture and refactoring, Observation/MV state boundaries, SwiftUI performance audits, and native xctrace/Time Profiler hotspot analysis through the Orkas Skill Runner."
+  },
+  "routing": {
+    "applicable_domain": [
+      "SwiftUI source architecture, state ownership, rendering, layout, and performance",
+      "macOS or iOS native Time Profiler traces with a matching binary and symbols"
+    ],
+    "negative_examples": [
+      "web or server performance analysis",
+      "generic code review without SwiftUI or Apple-native concerns",
+      "native profiling without a target binary, trace, reproduction path, or required permissions"
+    ],
+    "prerequisites": [
+      "SwiftUI source or native trace evidence is available for analysis",
+      "macOS, Xcode command line tools, matching symbols, and permission are available before recording a native trace"
+    ]
+  }
+}

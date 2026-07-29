@@ -8,6 +8,7 @@ let currentView = 'new-chat';
 let currentCid = null;
 let conversations = [];
 let _pendingTaskNotificationNavigation = null;
+let _pendingSkillCreateOpen = false;
 
 // Per-conversation pending state
 // key: cid, value: { loadingEl: HTMLElement | null, needsIndicator: bool,
@@ -55,15 +56,19 @@ function _handleModifiedComposerEnter(e) {
 }
 
 function _normalizeTaskNotificationNavigation(payload) {
+  const userId = typeof payload?.user_id === 'string'
+    ? payload.user_id.trim()
+    : '';
   const conversationId = typeof payload?.conversation_id === 'string'
     ? payload.conversation_id.trim()
     : '';
   const terminalStatus = typeof payload?.terminal_status === 'string'
     ? payload.terminal_status
     : '';
+  if (!userId || !/^[A-Za-z0-9_-]+$/.test(userId)) return null;
   if (!conversationId || !/^[A-Za-z0-9_-]+$/.test(conversationId)) return null;
   if (!['completed', 'failed', 'waiting_input'].includes(terminalStatus)) return null;
-  return { conversationId, terminalStatus };
+  return { userId, conversationId, terminalStatus };
 }
 
 function _openTaskNotificationConversation(payload) {
@@ -71,12 +76,14 @@ function _openTaskNotificationConversation(payload) {
   if (!target) return false;
   if (!currentUserId) {
     _pendingTaskNotificationNavigation = {
+      user_id: target.userId,
       conversation_id: target.conversationId,
       terminal_status: target.terminalStatus,
     };
     return false;
   }
   _pendingTaskNotificationNavigation = null;
+  if (currentUserId !== target.userId) return false;
   setView('conversation', target.conversationId, { entryPoint: 'task_notification' });
   return true;
 }
@@ -90,6 +97,9 @@ function _consumePendingTaskNotificationConversation() {
 // build decorates this boundary with click tracking; the open build still
 // needs the routing wrapper because every sidebar handler calls it.
 function _setViewFromSidebar(targetView) {
+  // The shell becomes clickable before asynchronous boot stages finish.
+  // Preserve explicit user navigation over the later startup restore.
+  if (typeof _markBootUserNavigation === 'function') _markBootUserNavigation();
   setView(targetView);
 }
 
@@ -221,8 +231,10 @@ function startPolling(cid) {
 }
 
 function stopPolling(cid) {
-  const t = pollTimers.get(cid);
-  if (t) { clearInterval(t); pollTimers.delete(cid); }
+  if (!pollTimers.has(cid)) return;
+  const timer = pollTimers.get(cid);
+  clearInterval(timer);
+  pollTimers.delete(cid);
 }
 
 function _onPolledResponse(cid, contentOrMessage, isError = false) {
@@ -378,12 +390,40 @@ function bindStaticHandlers() {
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('new-chat-external-agent-btn')?.addEventListener('click', () => {
-    setView('agents', null, { entryPoint: 'new_chat_external_agent' });
-    openAgentModal({ initialTab: 'external' });
+    _trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' });
+    openAgentModal({
+      initialTab: 'external',
+      externalOnly: true,
+      returnFocusId: 'new-chat-input',
+      entryPoint: 'new_chat_external_agent',
+      sourceView: currentView || '',
+    });
   });
   document.getElementById('create-agent-btn')?.addEventListener('click', () => {
     _trackAgentCreateOpen('agents_create_button');
-    openAgentModal();
+    openAgentModal({
+      entryPoint: 'agents_create_button',
+      sourceView: currentView || '',
+    });
+  });
+  // Skills is a lazy renderer feature. A fast click can land after the panel
+  // becomes visible but before skills-bindings.js has attached its handler.
+  // Bridge that first click through the shared feature-loader promise; once
+  // loaded, the normal binding handles all subsequent clicks.
+  document.getElementById('create-skill-btn')?.addEventListener('click', () => {
+    if (typeof openSkillModal === 'function' || _pendingSkillCreateOpen) return;
+    const load = typeof loadRendererFeature === 'function'
+      ? loadRendererFeature
+      : window.loadRendererFeature;
+    if (typeof load !== 'function') return;
+    _pendingSkillCreateOpen = true;
+    Promise.resolve(load('skills'))
+      .then(() => {
+        if (currentView !== 'skills' || typeof openSkillModal !== 'function') return;
+        openSkillModal();
+      })
+      .catch(() => {})
+      .finally(() => { _pendingSkillCreateOpen = false; });
   });
   document.getElementById('agents-more-btn')?.addEventListener('click', () => {
     const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;

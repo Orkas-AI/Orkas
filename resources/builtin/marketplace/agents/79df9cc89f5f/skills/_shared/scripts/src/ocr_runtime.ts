@@ -217,7 +217,9 @@ async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
       data: { runtimePath: venv },
     });
     await withHeartbeat(
-      execFileAsync(uv, ['venv', '--python', bundledPython, venv], {
+      // Verification already proved this environment is unusable. `--clear`
+      // makes recovery deterministic after an interrupted first install.
+      execFileAsync(uv, ['venv', '--clear', '--python', bundledPython, venv], {
         timeout: INSTALL_TIMEOUT_MS,
         env,
         windowsHide: true,

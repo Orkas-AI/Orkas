@@ -63,6 +63,7 @@ let _projectLibrarySelectionAnchor = null;
 const _projectLibraryDrafts = new Map();
 let _projectKbStatusRefreshTimer = null;
 let _projectKbReconcileInFlight = false;
+let _projectKbReconciledLoadSeq = -1;
 let _projectDetailLoadSeq = 0;
 let _projectAutoTabLoad = null;
 let _projectAutoLoadedSeq = 0;
@@ -720,6 +721,11 @@ async function _saveProjectMemoryEditor() {
     isEdit ? 'memory.replace' : 'memory.add',
     isEdit ? { oldText, content } : { content },
   );
+  _projectTrackEvent('memory_entry_save_result', {
+    result: ok ? 'success' : 'failure',
+    target: 'project',
+    mode: isEdit ? 'edit' : 'add',
+  });
   if (ok) _closeProjectMemoryEditor();
 }
 
@@ -778,6 +784,10 @@ function _bindProjectMemory() {
         : false;
       if (!confirmed) return;
       const ok = await _mutateProjectMemory('memory.remove', { oldText: text });
+      _projectTrackEvent('memory_entry_delete_result', {
+        result: ok ? 'success' : 'failure',
+        target: 'project',
+      });
       if (ok && _projectMemoryEditor?.oldText === text) _closeProjectMemoryEditor();
     });
   }
@@ -920,10 +930,16 @@ async function _saveProjectTodoEditor() {
   const input = document.getElementById('project-todo-input');
   const title = String(input?.value || '').trim();
   if (!title || !_projectDetailPid) return;
+  const startedAt = Date.now();
   const ok = await _todoMutate(() => window.orkas.invoke('projects.tasks.create', {
     projectId: _projectDetailPid,
     title,
   }));
+  _projectTrackEvent('project_todo_action_result', {
+    result: ok ? 'success' : 'failure',
+    action: 'create',
+    duration_ms: Math.max(0, Date.now() - startedAt),
+  });
   if (ok) _closeProjectTodoEditor();
 }
 
@@ -973,7 +989,16 @@ function _bindProjectTodos() {
       if (!tid || !_projectDetailPid || _projectTodoMutating) return;
       const deleteBtn = target?.closest?.('[data-action="todo-delete"]');
       if (deleteBtn) {
-        await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', { projectId: _projectDetailPid, taskId: tid }));
+        const startedAt = Date.now();
+        const ok = await _todoMutate(() => window.orkas.invoke('projects.tasks.delete', {
+          projectId: _projectDetailPid,
+          taskId: tid,
+        }));
+        _projectTrackEvent('project_todo_action_result', {
+          result: ok ? 'success' : 'failure',
+          action: 'delete',
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
         return;
       }
       const fromStatus = row.dataset.status || 'todo';
@@ -1318,11 +1343,6 @@ function _hasActiveProjectKbStatuses() {
     st && (st.status === 'pending' || st.status === 'processing'));
 }
 
-function _hasPendingProjectKbStatuses() {
-  return Object.values(_projectKbStatusByName || {}).some((st) =>
-    st && st.status === 'pending');
-}
-
 async function _refreshProjectKbStatusSnapshot(pid) {
   if (!pid || pid !== _projectDetailPid) return;
   const res = await window.orkas.invoke('projects.files.status', { projectId: pid, skipReconcile: true });
@@ -1336,13 +1356,28 @@ async function _refreshProjectKbStatusSnapshot(pid) {
 }
 
 function _kickProjectKbReconcileIfNeeded() {
-  if (_projectKbReconcileInFlight || !_hasPendingProjectKbStatuses()) return;
+  // A persisted `processing` row can be left behind when the app closes
+  // during extraction or embedding. The main-process reconciler can
+  // distinguish a live queue owner from this orphaned state and recover it,
+  // so active processing rows must trigger the same repair pass as pending
+  // rows. Otherwise a restart leaves the Library chip spinning forever.
+  if (
+    _projectKbReconcileInFlight
+    || _projectKbReconciledLoadSeq === _projectDetailLoadSeq
+    || !_hasActiveProjectKbStatuses()
+  ) return;
   const pid = _projectDetailPid;
   if (!pid) return;
+  const loadSeq = _projectDetailLoadSeq;
+  _projectKbReconciledLoadSeq = loadSeq;
   _projectKbReconcileInFlight = true;
   window.orkas.invoke('projects.files.reconcile', { projectId: pid })
     .then(() => _refreshProjectKbStatusSnapshot(pid))
-    .catch((err) => _projectDetailLog.warn('project kb reconcile failed', err))
+    .catch((err) => {
+      // A later polling tick may retry a transient IPC/storage failure.
+      if (_projectKbReconciledLoadSeq === loadSeq) _projectKbReconciledLoadSeq = -1;
+      _projectDetailLog.warn('project kb reconcile failed', err);
+    })
     .finally(() => {
       _projectKbReconcileInFlight = false;
       _scheduleProjectKbStatusRefreshIfNeeded();
@@ -2934,7 +2969,37 @@ async function _submitProjectChat() {
   const draftCid = _projectChatDraftCid(_projectDetailPid);
   const quotes = (typeof _getQuotes === 'function') ? _getQuotes(draftCid).slice() : [];
   if (!raw && !quotes.length) return;
-  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) {
+    const startedAt = performance.now();
+    const blockedPayload = {
+      project_id: _projectDetailPid,
+      source_view: 'project',
+      content_length: raw.length,
+      recipient_type: 'commander',
+      has_skill: false,
+      has_connector: false,
+      attachment_count: 0,
+      has_project: true,
+    };
+    _projectTrackClick('project_chat_send', blockedPayload);
+    _projectTrackClick('chat_send', blockedPayload);
+    const resultPayload = {
+      result: 'failure',
+      conversation_id: '',
+      source_view: 'project',
+      content_length: raw.length,
+      attachment_count: 0,
+      duration_ms: Math.max(0, Math.round(performance.now() - startedAt)),
+      failure_stage: 'preflight',
+      failure_reason: 'model_not_configured',
+    };
+    if (typeof _trackChatSendResult === 'function') {
+      _trackChatSendResult('failure', resultPayload);
+    } else {
+      _projectTrackEvent('chat_send_result', resultPayload);
+    }
+    return;
+  }
   const references = (typeof _referenceSnapshotsForQuotes === 'function')
     ? _referenceSnapshotsForQuotes(quotes)
     : [];
@@ -2947,6 +3012,9 @@ async function _submitProjectChat() {
     : null;
   const withUse = (typeof transformWithChatUse === 'function')
     ? transformWithChatUse(requestText)
+    : requestText;
+  const titleText = (typeof transformChatUseTokens === 'function')
+    ? transformChatUseTokens(requestText)
     : requestText;
   const content = (typeof applyRecipientPrefix === 'function')
     ? applyRecipientPrefix(withUse, 'project')
@@ -2977,8 +3045,7 @@ async function _submitProjectChat() {
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
     const conv = data.conversation;
     convId = conv.conversation_id;
-    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(requestText) : requestText;
-    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleSeed) : titleSeed.slice(0, 32);
+    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleText) : titleText.slice(0, 32);
     conversations.unshift(conv);
     renderConversationList();
     if (typeof loadProjects === 'function') loadProjects(true);
@@ -3044,6 +3111,7 @@ async function _submitProjectChat() {
   if (btn) btn.disabled = false;
   if (typeof sendInCurrentConversation === 'function') {
     const extra = {
+      title_text: titleText,
       ...(_adopted.length ? { attachments: _adopted } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(references.length ? { references } : {}),

@@ -4,7 +4,10 @@ Use this workflow for every deep-research request unless the user explicitly ask
 
 ## Phase 1: Clarify
 
-Ask two or three questions that materially affect the research design:
+Ask only questions whose answers materially affect the research design. If the
+request already fixes the decision, audience, depth, scope, and deliverable,
+proceed without a ceremonial clarification round. Otherwise ask at most two or
+three focused questions:
 
 - What decision, claim, or problem should the research answer?
 - How deep should the output be: executive overview, detailed report, or exhaustive review?
@@ -15,7 +18,10 @@ Do not begin external evidence collection while the central question is still va
 
 ## Phase 2: Plan
 
-Present the full plan before execution and wait for approval.
+Present a concise plan before expensive or broad execution. Wait for approval
+only when the plan introduces a material scope/cost choice, the user requested a
+plan gate, or the task is still ambiguous; otherwise continue after stating the
+plan.
 
 Include:
 
@@ -77,7 +83,7 @@ The final report must include:
 There are three major stop points:
 
 1. Clarification before research.
-2. Research-plan approval before execution.
+2. Research-plan approval before execution when scope/cost requires a user choice.
 3. Final report delivery after synthesis.
 
 Do not insert extra approval stops during the execution phase unless the research plan becomes impossible, unsafe, or clearly mis-scoped.

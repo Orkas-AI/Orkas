@@ -56,10 +56,11 @@ skip this — that is plain `stage-edit`.
      you can see images (you are the vision — no separate vision model). If you CANNOT see images, ground
      on `scenes` + `quality` only and mark every visual judgment UNVERIFIED, or ask the user which moments
      matter — NEVER invent what is on screen, and never escalate to a separate billable vision model.
-3. **Record evidence — make every cut auditable.** For each kept/cut segment in `plan.json`, set
+3. **Record the edit strategy and references.** Write `plan.json::edit_strategy` with deterministic/mixed mode, concrete objectives, only the transcript/OCR/scene/silence/quality/vision signals actually used, and non-overlapping preserve/may-change boundaries. Record every source or guiding image/video in top-level `references`; video timing or motion guidance needs temporal anchors.
+4. **Record evidence — make every cut auditable.** For each kept/cut segment in `plan.json`, set
    `reason` (why this moment), `confidence`, and `evidence` (the auto-cut tools return removed/kept
    spans; for your own selections, cite the signal). This is the whole point — not a black box.
-4. **Produce** the tightened clip (the auto-cut tools output it directly; for selection, trim the kept
+5. **Produce** the tightened clip (the auto-cut tools output it directly; for selection, trim the kept
    spans and concat per `stage-edit`).
 
 ## Honest ceiling — present a DRAFT, let the user decide

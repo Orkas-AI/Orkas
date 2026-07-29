@@ -154,6 +154,15 @@ export function resolveToolResultRef(
   toolResultsDir: string,
   ref: string,
 ): { ok: true; path: string } | { ok: false; code: string; message: string } {
+  if (/^call[_-]/i.test(ref)) {
+    return {
+      ok: false,
+      code: 'E_RESULT_REF_NOT_PERSISTED',
+      message:
+        'A tool-call ID is not a persisted-output ref. Use only the opaque ref from '
+        + '<persisted-output ref="...">; otherwise read the task file/ledger directly.',
+    };
+  }
   // Accept legacy 64-bit refs plus the current full SHA-256 refs. New writes
   // always use 64 hex chars; compatibility here keeps existing conversations
   // and persisted markers readable after upgrade.

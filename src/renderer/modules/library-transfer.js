@@ -32,6 +32,34 @@
     return Array.isArray(response?.projects) ? response.projects : [];
   }
 
+  function _canSubmitTransfer(state) {
+    return state?.loading === false && state?.destinationReady === true;
+  }
+
+  function _transferFailureTelemetry(_error) {
+    return { error_type: 'exception' };
+  }
+
+  function _createLatestFolderLoader(loadTree, handlers) {
+    let latestRequest = 0;
+    return async (ref) => {
+      const request = ++latestRequest;
+      handlers.onStart(ref);
+      try {
+        const tree = await loadTree(ref);
+        if (request !== latestRequest) return false;
+        handlers.onReady(tree, ref);
+        return true;
+      } catch (error) {
+        if (request !== latestRequest) return false;
+        handlers.onError(error, ref);
+        return false;
+      } finally {
+        if (request === latestRequest) handlers.onFinish(ref);
+      }
+    };
+  }
+
   function _icon(name, cls) {
     return root && typeof root.uiIconHtml === 'function' ? root.uiIconHtml(name, cls) : '';
   }
@@ -44,6 +72,7 @@
       not_found: 'contexts.transfer.error_not_found',
       source_delete_failed: 'contexts.transfer.error_source_delete',
       rollback_failed: 'contexts.transfer.error_rollback',
+      account_changed: 'contexts.transfer.error_account_changed',
     }[String(code || '')] || 'contexts.transfer.error_generic';
     return t(key);
   }
@@ -135,6 +164,7 @@
     let targetDir = '';
     let currentRef = _parseLibraryValue(initialLibrary) || { scope: 'global' };
     let loadingFolders = false;
+    let destinationReady = false;
     const folderEl = overlay.querySelector('[data-transfer-folders]');
     const errorEl = overlay.querySelector('[data-transfer-error]');
     const confirmBtn = overlay.querySelector('[data-transfer-confirm]');
@@ -171,22 +201,32 @@
         });
       });
     };
-    const refreshFolders = async (value) => {
-      const ref = _parseLibraryValue(value);
-      if (!ref) return;
-      currentRef = ref;
-      loadingFolders = true;
-      confirmBtn.disabled = true;
-      folderEl.innerHTML = `<div class="library-transfer-loading">${escapeHtml(t('common.loading'))}</div>`;
-      showError('');
-      try { renderFolders(await _loadFolderTree(ref)); }
-      catch (_) {
+    const loadFolders = _createLatestFolderLoader(_loadFolderTree, {
+      onStart: (ref) => {
+        currentRef = ref;
+        loadingFolders = true;
+        destinationReady = false;
+        confirmBtn.disabled = true;
+        folderEl.innerHTML = `<div class="library-transfer-loading">${escapeHtml(t('common.loading'))}</div>`;
+        showError('');
+      },
+      onReady: (tree) => {
+        renderFolders(tree);
+        destinationReady = true;
+      },
+      onError: () => {
         folderEl.innerHTML = '';
         showError(t('contexts.transfer.load_failed'));
-      } finally {
+      },
+      onFinish: () => {
         loadingFolders = false;
-        confirmBtn.disabled = false;
-      }
+        confirmBtn.disabled = !_canSubmitTransfer({ loading: loadingFolders, destinationReady });
+      },
+    });
+    const refreshFolders = (value) => {
+      const ref = _parseLibraryValue(value);
+      if (!ref) return Promise.resolve(false);
+      return loadFolders(ref);
     };
 
     const selector = _aiSelectMount(overlay.querySelector('[data-transfer-library]'), {
@@ -212,7 +252,7 @@
     overlay.querySelector('[data-transfer-close]')?.addEventListener('click', close);
     overlay.querySelector('[data-transfer-cancel]')?.addEventListener('click', close);
     confirmBtn.addEventListener('click', async () => {
-      if (loadingFolders || confirmBtn.disabled) return;
+      if (!_canSubmitTransfer({ loading: loadingFolders, destinationReady }) || confirmBtn.disabled) return;
       const startedAt = performance.now();
       confirmBtn.disabled = true;
       showError('');
@@ -266,8 +306,7 @@
           mode,
           source_scope: source.scope,
           destination_scope: currentRef.scope,
-          error_type: 'exception',
-          error_message: String(err?.message || 'transfer_failed').slice(0, 120),
+          ..._transferFailureTelemetry(err),
         }, 'error');
         showError(t('contexts.transfer.error_generic'));
         confirmBtn.disabled = false;
@@ -286,6 +325,14 @@
   const api = Object.freeze({ open: openLibraryTransfer });
   root.LibraryTransfer = api;
   if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { _libraryValue, _parseLibraryValue, _folderRows, _projectsFromResponse };
+    module.exports = {
+      _libraryValue,
+      _parseLibraryValue,
+      _folderRows,
+      _projectsFromResponse,
+      _canSubmitTransfer,
+      _transferFailureTelemetry,
+      _createLatestFolderLoader,
+    };
   }
 })(typeof window !== 'undefined' ? window : globalThis);

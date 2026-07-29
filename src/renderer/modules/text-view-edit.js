@@ -65,6 +65,8 @@ function mountTextViewEdit(opts) {
     draft: '',
     mode: opts.initialMode === 'edit' ? 'edit' : 'view',
     destroyed: false,
+    saving: false,
+    savePromise: null,
   };
   state.draft = state.content;
 
@@ -189,21 +191,23 @@ function _tveRenderEditor(state) {
       state.draft = ta.value;
       _tveEmitDirty(state);
     });
-    ta.addEventListener('keydown', (e) => {
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        const start = ta.selectionStart;
-        const end = ta.selectionEnd;
-        const before = ta.value.slice(0, start);
-        const after = ta.value.slice(end);
-        ta.value = `${before}\t${after}`;
-        ta.selectionStart = ta.selectionEnd = start + 1;
-        state.draft = ta.value;
-        _tveEmitDirty(state);
-      }
-    });
+    ta.addEventListener('keydown', (e) => _tveOnKey(state, ta, e));
     ta.focus();
   }
+  _tveEmitDirty(state);
+}
+
+function _tveOnKey(state, ta, e) {
+  if (e.isComposing || e.keyCode === 229) return;
+  if (e.key !== 'Tab') return;
+  e.preventDefault();
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  ta.value = `${before}\t${after}`;
+  ta.selectionStart = ta.selectionEnd = start + 1;
+  state.draft = ta.value;
   _tveEmitDirty(state);
 }
 
@@ -212,28 +216,52 @@ function _tveCancelEdit(state) {
   _tveRenderView(state);
 }
 
+function _tveSetSavingUi(state, saving) {
+  const ta = state.bodyEl.querySelector('[data-tve-textarea]');
+  if (ta) ta.disabled = saving;
+  state.actionsEl
+    .querySelectorAll('[data-tve-action="save"], [data-tve-action="cancel"]')
+    .forEach(btn => { btn.disabled = saving; });
+}
+
 async function _tveSave(state) {
+  if (state.saving && state.savePromise) return state.savePromise;
   const ta = state.bodyEl.querySelector('[data-tve-textarea]');
   if (ta) state.draft = ta.value;
   const next = state.draft;
-  try {
-    const payload = { path: state.source.absPath, content: next };
-    if (state.source.cid) payload.cid = state.source.cid;
-    if (state.source.projectId) payload.projectId = state.source.projectId;
-    const res = await window.orkas.invoke('produced.writeText', payload);
-    if (!res || !res.ok) {
+  state.saving = true;
+  _tveSetSavingUi(state, true);
+  const operation = (async () => {
+    try {
+      const payload = { path: state.source.absPath, content: next };
+      if (state.source.cid) payload.cid = state.source.cid;
+      if (state.source.projectId) payload.projectId = state.source.projectId;
+      const res = await window.orkas.invoke('produced.writeText', payload);
+      if (state.destroyed) return;
+      if (!res || !res.ok) {
+        await uiAlert(_tveLabel('contexts.save_failed', 'Save failed. Please try again.'));
+        return;
+      }
+    } catch (err) {
+      if (state.destroyed) return;
       await uiAlert(_tveLabel('contexts.save_failed', 'Save failed. Please try again.'));
       return;
     }
-  } catch (err) {
-    await uiAlert(_tveLabel('contexts.save_failed', 'Save failed. Please try again.'));
-    return;
-  }
-  state.content = next;
-  _tveRenderView(state);
-  if (state.callbacks.onSaved) {
-    try { state.callbacks.onSaved(next); }
-    catch (err) { _tveLog.warn('onSaved threw', err); }
+    state.content = next;
+    state.draft = next;
+    _tveRenderView(state);
+    if (state.callbacks.onSaved) {
+      try { state.callbacks.onSaved(next); }
+      catch (err) { _tveLog.warn('onSaved threw', err); }
+    }
+  })();
+  state.savePromise = operation;
+  try {
+    await operation;
+  } finally {
+    if (state.savePromise === operation) state.savePromise = null;
+    state.saving = false;
+    if (!state.destroyed) _tveSetSavingUi(state, false);
   }
 }
 
@@ -263,4 +291,13 @@ function _tveLabel(key, fallback, vars) {
     const v = vars ? t(key, vars) : t(key);
     return v === key ? fallback : v;
   } catch (_) { return fallback; }
+}
+
+// CommonJS bridge for deterministic editor-state tests.
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = {
+    _tveEnterEdit,
+    _tveOnKey,
+    _tveSave,
+  };
 }

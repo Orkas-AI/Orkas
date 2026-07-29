@@ -66,12 +66,31 @@ function _renderViolationCard(v) {
   `;
 }
 
+function _reportViolations(report) {
+  if (!report || !Array.isArray(report.violations)) return [];
+  return report.violations.filter((violation) => (
+    violation
+    && typeof violation === 'object'
+    && !Array.isArray(violation)
+    && ['EXTREME', 'MEDIUM', 'LOW'].includes(violation.level)
+    && typeof violation.rule === 'string'
+    && typeof violation.field === 'string'
+    && typeof violation.snippet === 'string'
+    && typeof violation.suggested_fix === 'string'
+  ));
+}
+
 function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
   return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const dialogId = typeof _uiNextDialogId === 'function'
+      ? _uiNextDialogId()
+      : 'quality-report-dialog';
+    const titleId = `${dialogId}-title`;
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
 
-    const violations = (report && Array.isArray(report.violations)) ? report.violations : [];
+    const violations = _reportViolations(report);
     // Sort: EXTREME first, then MEDIUM, then LOW. Within a level keep
     // original order (the validator already emits them in detection order).
     const order = { EXTREME: 0, MEDIUM: 1, LOW: 2 };
@@ -93,8 +112,8 @@ function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
     const force = forceLabel ? escapeHtml(forceLabel) : '';
 
     overlay.innerHTML = `
-      <div class="modal modal-standard ui-dialog quality-report-dialog" role="dialog" aria-modal="true" aria-labelledby="quality-report-title" style="max-width:640px;width:90vw;">
-        <div class="modal-title ui-dialog-title" id="quality-report-title">${titleText}</div>
+      <div class="modal modal-standard ui-dialog quality-report-dialog" role="dialog" aria-modal="true" aria-labelledby="${titleId}" style="max-width:640px;width:90vw;">
+        <div class="modal-title ui-dialog-title" id="${titleId}">${titleText}</div>
         <div class="modal-body quality-report-body" style="max-height:60vh;overflow-y:auto;">
           ${bodyHtml}
         </div>
@@ -107,13 +126,39 @@ function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
     document.body.appendChild(overlay);
 
     const okBtn = overlay.querySelector('[data-act="ok"]');
+    let finished = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape' || e.key === 'Enter') finish('close');
+      if (
+        typeof _uiIsTopDialogOverlay === 'function'
+        && !_uiIsTopDialogOverlay(overlay)
+      ) return;
+      if (typeof _uiTrapDialogTab === 'function' && _uiTrapDialogTab(overlay, e)) return;
+      if (e.key === 'Escape') {
+        e.preventDefault?.();
+        finish('close');
+        return;
+      }
+      if (e.key === 'Enter') {
+        // Buttons must keep their native keyboard activation. In particular,
+        // Enter on the explicit override button must resolve to "force", not
+        // be intercepted by the document-level default-close shortcut.
+        const interactive = e.target && typeof e.target.closest === 'function'
+          ? e.target.closest('button, input, textarea, select, a[href]')
+          : null;
+        if (interactive) return;
+        e.preventDefault?.();
+        finish('close');
+      }
     };
     const finish = (action = 'close') => {
+      if (finished) return;
+      finished = true;
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
+      if (typeof _uiRestoreDialogFocus === 'function') {
+        _uiRestoreDialogFocus(previousFocus);
+      }
       resolve(action);
     };
     overlay.querySelector('[data-act="force"]')?.addEventListener('click', () => finish('force'));
@@ -126,7 +171,11 @@ function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
 /** Fetch the latest persisted quality report for a skill or agent.
  *  Returns null on missing report / IPC error. */
 async function readQualityReport(kind, id) {
-  if (!id || (kind !== 'skill' && kind !== 'agent')) return null;
+  if (
+    typeof id !== 'string'
+    || !/^[A-Za-z0-9_-]+$/.test(id)
+    || (kind !== 'skill' && kind !== 'agent')
+  ) return null;
   try {
     const channel = kind === 'skill' ? 'readSkillReport' : 'readAgentReport';
     const r = await window.orkas.quality[channel](id);

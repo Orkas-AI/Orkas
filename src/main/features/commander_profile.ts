@@ -15,12 +15,14 @@ export interface CommanderLocalizedText {
   zh?: string;
   en?: string;
   ja?: string;
+  pt?: string;
 }
 
 export interface CommanderLocalizedList {
   zh?: string[];
   en?: string[];
   ja?: string[];
+  pt?: string[];
 }
 
 export interface CommanderProfile {

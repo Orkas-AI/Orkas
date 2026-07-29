@@ -117,16 +117,96 @@ describe('migrate-agent-layout', () => {
     expect(fs.existsSync(path.join(agentsRoot(TEST_UID), 'a2.json'))).toBe(false);
   });
 
-  it('drops redundant flat <aid>.json when <aid>/agent.json already exists', async () => {
+  it('deduplicates an identical flat <aid>.json when agent.json already exists', async () => {
     ensure(path.join(agentsRoot(TEST_UID), 'a1'));
-    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'), '{"new":true}');
-    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1.json'), '{"old":true}');
+    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'), '{"same":true}');
+    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1.json'), '{"same":true}');
 
     const { migrateAgentLayout } = await import('../../../src/main/util/migrate-agent-layout');
     migrateAgentLayout(TEST_UID);
 
     expect(fs.existsSync(path.join(agentsRoot(TEST_UID), 'a1.json'))).toBe(false);
-    expect(JSON.parse(fs.readFileSync(path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'), 'utf8'))).toEqual({ new: true });
+    expect(JSON.parse(fs.readFileSync(path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'), 'utf8'))).toEqual({ same: true });
+  });
+
+  it('preserves a divergent flat agent beside the current spec for recovery', async () => {
+    const current = path.join(agentsRoot(TEST_UID), 'a1', 'agent.json');
+    const legacy = path.join(agentsRoot(TEST_UID), 'a1.json');
+    ensure(path.dirname(current));
+    fs.writeFileSync(current, '{"name":"current"}');
+    fs.writeFileSync(legacy, '{"name":"legacy"}');
+
+    const { migrateAgentLayout } = await import('../../../src/main/util/migrate-agent-layout');
+    const stats = migrateAgentLayout(TEST_UID);
+
+    expect(stats.warnings).toBe(1);
+    expect(fs.readFileSync(current, 'utf8')).toBe('{"name":"current"}');
+    expect(fs.existsSync(legacy)).toBe(false);
+    const conflictDir = path.join(agentsRoot(TEST_UID), 'a1', 'migration_conflicts');
+    const conflicts = fs.readdirSync(conflictDir);
+    expect(conflicts).toHaveLength(1);
+    expect(fs.readFileSync(path.join(conflictDir, conflicts[0]), 'utf8'))
+      .toBe('{"name":"legacy"}');
+  });
+
+  it('preserves divergent legacy metadata without replacing current learning state', async () => {
+    const currentMeta = path.join(
+      agentsRoot(TEST_UID),
+      'a1',
+      'meta',
+      'COMPETENCE.md',
+    );
+    const legacyMeta = path.join(oldMetaRoot(TEST_UID), 'a1', 'COMPETENCE.md');
+    ensure(path.dirname(currentMeta));
+    ensure(path.dirname(legacyMeta));
+    fs.writeFileSync(currentMeta, 'current competence');
+    fs.writeFileSync(legacyMeta, 'legacy competence');
+
+    const { migrateAgentLayout } = await import('../../../src/main/util/migrate-agent-layout');
+    const stats = migrateAgentLayout(TEST_UID);
+
+    expect(stats.warnings).toBe(1);
+    expect(fs.readFileSync(currentMeta, 'utf8')).toBe('current competence');
+    expect(fs.existsSync(legacyMeta)).toBe(false);
+    const conflictDir = path.join(
+      agentsRoot(TEST_UID),
+      'a1',
+      'migration_conflicts',
+      'meta',
+    );
+    const conflicts = fs.readdirSync(conflictDir);
+    expect(conflicts).toHaveLength(1);
+    expect(fs.readFileSync(path.join(conflictDir, conflicts[0]), 'utf8'))
+      .toBe('legacy competence');
+  });
+
+  it('does not stamp a blocked agent move and retries after the obstruction is removed', async () => {
+    ensure(agentsRoot(TEST_UID));
+    const legacy = path.join(agentsRoot(TEST_UID), 'a1.json');
+    const blockingTarget = path.join(agentsRoot(TEST_UID), 'a1');
+    fs.writeFileSync(legacy, '{"agent_id":"a1"}');
+    fs.writeFileSync(blockingTarget, 'not-a-directory');
+    const { migrateAgentLayout } = await import('../../../src/main/util/migrate-agent-layout');
+
+    const failed = migrateAgentLayout(TEST_UID);
+
+    expect(failed.warnings).toBe(1);
+    expect(fs.existsSync(legacy)).toBe(true);
+    expect(
+      fs.existsSync(migrationsFile(TEST_UID))
+        ? fs.readFileSync(migrationsFile(TEST_UID), 'utf8')
+        : '',
+    ).not.toContain('agent-as-directory-v1');
+
+    fs.unlinkSync(blockingTarget);
+    const retried = migrateAgentLayout(TEST_UID);
+    expect(retried.agentsConverted).toBe(1);
+    expect(fs.readFileSync(
+      path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'),
+      'utf8',
+    )).toBe('{"agent_id":"a1"}');
+    expect(fs.readFileSync(migrationsFile(TEST_UID), 'utf8'))
+      .toContain('agent-as-directory-v1');
   });
 
   it('handles no-op uid (no agents, no meta) — stamps and returns zeros', async () => {

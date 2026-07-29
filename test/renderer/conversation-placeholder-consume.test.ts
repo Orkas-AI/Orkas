@@ -149,6 +149,7 @@ function loadActivityHelpers() {
     extractFunction('_normaliseActiveTurns'),
     extractFunction('_seedPlaceholderActivityStart'),
     extractFunction('_activityMonotonicNow'),
+    'const _updateStreamingRuntimeSummary = (msg, _evt, elapsedMs) => { msg.runtimeElapsedMs = elapsedMs; };',
     extractFunction('_streamingPaintActivityMeta'),
     '({ normalise: _normaliseActiveTurns, seed: _seedPlaceholderActivityStart, paint: _streamingPaintActivityMeta });',
   ].join('\n'), sandbox) as {
@@ -519,20 +520,18 @@ describe('conversation activity elapsed clock', () => {
     expect(replacement.dataset.activityStart).toBe('10000');
   });
 
-  it('keeps a concise elapsed-only label advancing when the wall clock moves backwards', () => {
+  it('keeps the summary elapsed clock advancing when the wall clock moves backwards', () => {
     const { paint, setTimes } = loadActivityHelpers();
-    const meta = { textContent: '' };
     const msg: Record<string, any> = {
       dataset: { activityStart: '10000', activityTools: '2' },
-      querySelector: () => meta,
+      querySelector: () => null,
     };
 
     paint(msg);
-    expect(meta.textContent).toBe('1:40');
+    expect(msg.runtimeElapsedMs).toBe(100_000);
 
     setTimes(30_000, 2_000);
     paint(msg);
-    expect(meta.textContent).toBe('1:41');
-    expect(meta.textContent).not.toContain('tools');
+    expect(msg.runtimeElapsedMs).toBe(101_000);
   });
 });

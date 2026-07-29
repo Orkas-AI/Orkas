@@ -234,4 +234,29 @@ describe('migrate-session-ids', () => {
     const { migrateLegacySessionIds } = await import('../../../src/main/util/migrate-session-ids');
     expect(() => migrateLegacySessionIds(TEST_UID)).not.toThrow();
   });
+
+  it('does not stamp a failed index parse and retries after the file is repaired', async () => {
+    touch(chatsIndexFile(TEST_UID), '{not-json');
+    const { migrateLegacySessionIds } = await import('../../../src/main/util/migrate-session-ids');
+
+    const failed = migrateLegacySessionIds(TEST_UID);
+
+    expect(failed.fieldsRewritten).toBe(0);
+    expect(
+      fs.existsSync(migrationsFile(TEST_UID))
+        ? fs.readFileSync(migrationsFile(TEST_UID), 'utf8')
+        : '',
+    ).not.toContain('drop-session-id-uid-prefix-v2');
+
+    touch(chatsIndexFile(TEST_UID), JSON.stringify([
+      { conversation_id: 'cv1', session_id: '99999999-gconv-cv1' },
+    ]));
+    const retried = migrateLegacySessionIds(TEST_UID);
+
+    expect(retried.fieldsRewritten).toBe(1);
+    expect(JSON.parse(fs.readFileSync(chatsIndexFile(TEST_UID), 'utf8'))[0].session_id)
+      .toBe('gconv-cv1');
+    expect(fs.readFileSync(migrationsFile(TEST_UID), 'utf8'))
+      .toContain('drop-session-id-uid-prefix-v2');
+  });
 });

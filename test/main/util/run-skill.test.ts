@@ -256,4 +256,156 @@ describe('run-skill.cjs', () => {
     expect(out.script).toMatch(/run\.py$/);
     expect(out.argv).toBe('arg1');
   });
+
+  itOnNonWindows('installs declared Python requirements once before the first skill run', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'cold-python');
+    const scriptsDir = path.join(skillDir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: cold-python\ndescription: dependency bootstrap fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(path.join(skillDir, 'requirements.run.txt'), 'fixture-package==1.0.0\n');
+    fs.writeFileSync(path.join(scriptsDir, 'run.py'), 'print("the fake isolated python handles this")\n');
+    fs.writeFileSync(path.join(scriptsDir, 'inspect.py'), 'print("this script has no dependency manifest")\n');
+
+    const fakePython = path.join(tmpDir, 'fake-python');
+    fs.writeFileSync(fakePython, [
+      '#!/bin/sh',
+      'if [ "$1" = "-m" ] && [ "$2" = "venv" ]; then',
+      '  mkdir -p "$3/bin"',
+      '  cp "$0" "$3/bin/python"',
+      '  chmod +x "$3/bin/python"',
+      '  exit 0',
+      'fi',
+      'if [ "$1" = "-m" ] && [ "$2" = "pip" ]; then',
+      '  if [ "$FAIL_SKILL_PIP" = "1" ]; then exit 9; fi',
+      '  exit 0',
+      'fi',
+      'if [ "$1" = "--version" ]; then',
+      '  printf \'Python 3.12.99\\n\'',
+      '  exit 0',
+      'fi',
+      'printf \'{"python":"isolated","runner":"%s","script":"%s","argv":"%s"}\\n\' "$0" "$1" "$2"',
+      '',
+    ].join('\n'));
+    fs.chmodSync(fakePython, 0o755);
+
+    const env = {
+      ORKAS_PYTHON: fakePython,
+      ORKAS_UV: '',
+      ORKAS_VENV_ROOT: path.join(tmpDir, 'venv'),
+      PATH: '/usr/bin:/bin',
+    };
+    const unrelated = runSkill('cold-python', 'inspect', ['plain'], env);
+    expect(unrelated.status).toBe(0);
+    expect(unrelated.stderr).not.toContain('Installing Python dependencies');
+    expect(JSON.parse(unrelated.stdout.trim())).toMatchObject({
+      runner: fakePython,
+      argv: 'plain',
+    });
+
+    const failed = runSkill('cold-python', 'run', ['failed'], {
+      ...env,
+      FAIL_SKILL_PIP: '1',
+    });
+    expect(failed.status).toBe(70);
+    expect(failed.stderr).toContain('failed to install skill Python dependencies');
+
+    const first = runSkill('cold-python', 'run', ['first'], env);
+    expect(first.status).toBe(0);
+    expect(first.stderr).toContain('Installing Python dependencies for skill cold-python');
+    expect(JSON.parse(first.stdout.trim())).toMatchObject({
+      python: 'isolated',
+      argv: 'first',
+    });
+    expect(JSON.parse(first.stdout.trim()).runner).toContain(
+      path.join('venv', 'python', 'skills', 'cold-python-'),
+    );
+
+    const second = runSkill('cold-python', 'run', ['second'], env);
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toContain('Installing Python dependencies');
+    expect(JSON.parse(second.stdout.trim())).toMatchObject({
+      python: 'isolated',
+      argv: 'second',
+    });
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'installs declared Python requirements once into a Windows Scripts venv',
+    () => {
+      const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'cold-python-win');
+      const scriptsDir = path.join(skillDir, 'scripts');
+      const installLog = path.join(tmpDir, 'windows-python-install.log');
+      fs.mkdirSync(scriptsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillDir, 'SKILL.md'),
+        '---\nname: cold-python-win\ndescription: Windows dependency bootstrap fixture\n---\n\nbody\n',
+      );
+      fs.writeFileSync(path.join(skillDir, 'requirements.run.txt'), 'fixture-package==1.0.0\n');
+      fs.writeFileSync(
+        path.join(scriptsDir, 'run.py'),
+        'process.stdout.write(JSON.stringify({ python: "isolated", runner: process.execPath, argv: process.argv[2] }));\n',
+      );
+      fs.writeFileSync(
+        path.join(skillDir, 'venv'),
+        [
+          'const fs = require("node:fs");',
+          'const path = require("node:path");',
+          'const venv = process.argv.at(-1);',
+          'const python = path.join(venv, "Scripts", "python.exe");',
+          'fs.mkdirSync(path.dirname(python), { recursive: true });',
+          'try { fs.linkSync(process.execPath, python); } catch { fs.copyFileSync(process.execPath, python); }',
+          'fs.appendFileSync(process.env.FAKE_SKILL_PYTHON_LOG, `venv:${python}\\n`);',
+          '',
+        ].join('\n'),
+      );
+      fs.writeFileSync(
+        path.join(skillDir, 'pip'),
+        [
+          'const fs = require("node:fs");',
+          'fs.appendFileSync(process.env.FAKE_SKILL_PYTHON_LOG, `pip:${JSON.stringify(process.argv.slice(2))}\\n`);',
+          'if (process.env.FAIL_SKILL_PIP === "1") process.exit(9);',
+          '',
+        ].join('\n'),
+      );
+
+      const env = {
+        ORKAS_PYTHON: TEST_NODE,
+        ORKAS_UV: TEST_NODE,
+        ORKAS_VENV_ROOT: path.join(tmpDir, 'venv'),
+        FAKE_SKILL_PYTHON_LOG: installLog,
+      };
+      const failed = runSkill('cold-python-win', 'run', ['failed'], {
+        ...env,
+        FAIL_SKILL_PIP: '1',
+      });
+      expect(failed.status).toBe(70);
+      expect(failed.stderr).toContain('failed to install skill Python dependencies');
+
+      const first = runSkill('cold-python-win', 'run', ['first'], env);
+      expect(first.status).toBe(0);
+      expect(first.stderr).toContain('Installing Python dependencies for skill cold-python-win');
+      const firstOut = JSON.parse(first.stdout.trim());
+      expect(firstOut).toMatchObject({ python: 'isolated', argv: 'first' });
+      expect(firstOut.runner).toContain(path.join('venv', 'python', 'skills', 'cold-python-win-'));
+      expect(firstOut.runner).toMatch(/[\\/]Scripts[\\/]python\.exe$/);
+
+      const installEvents = fs.readFileSync(installLog, 'utf8').trim().split(/\r?\n/);
+      expect(installEvents.filter((line) => line.startsWith('venv:'))).toHaveLength(2);
+      expect(installEvents.filter((line) => line.startsWith('pip:'))).toHaveLength(2);
+      expect(installEvents.at(-1)).toContain('Scripts\\\\python.exe');
+
+      const second = runSkill('cold-python-win', 'run', ['second'], env);
+      expect(second.status).toBe(0);
+      expect(second.stderr).not.toContain('Installing Python dependencies');
+      expect(JSON.parse(second.stdout.trim())).toMatchObject({
+        python: 'isolated',
+        runner: firstOut.runner,
+        argv: 'second',
+      });
+      expect(fs.readFileSync(installLog, 'utf8').trim().split(/\r?\n/)).toEqual(installEvents);
+    },
+  );
 });

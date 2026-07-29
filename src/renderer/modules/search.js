@@ -98,7 +98,10 @@ function closeGlobalSearch() {
 
 function _scheduleSearch(query) {
   if (_searchTimer) clearTimeout(_searchTimer);
-  _searchTimer = setTimeout(() => _runSearchNow(query), 150);
+  // Library body search embeds the settled query once. A slightly longer
+  // debounce avoids running native inference for every intermediate IME or
+  // fast-typing state while keeping filename/chat feedback responsive.
+  _searchTimer = setTimeout(() => _runSearchNow(query), 300);
 }
 
 function _activeProjectIdForSearch() {
@@ -117,7 +120,16 @@ function _activeProjectIdForSearch() {
 async function _runSearchNow(queryArg) {
   const input = document.getElementById('search-input');
   const query = (queryArg !== undefined ? queryArg : (input?.value || '')).trim();
-  if (!query) { _setSearchTabsVisible(false); _renderSearchEmptyState(); return; }
+  if (!query) {
+    _searchSeq++;
+    _searchResults = [];
+    _searchVisibleResults = [];
+    _searchActiveIdx = -1;
+    _searchLastQuery = '';
+    _setSearchTabsVisible(false);
+    _renderSearchEmptyState();
+    return;
+  }
   const seq = ++_searchSeq;
   try {
     const projectId = _activeProjectIdForSearch();
@@ -148,7 +160,7 @@ async function _runSearchNow(queryArg) {
 //   - chats:    main-conversation messages, sorted by time DESC (recency)
 //   - agents:   agent body matches, sorted by score DESC then name
 //   - skills:   skill body matches, sorted by score DESC then name
-//   - contexts: KB path matches, sorted by directory depth ASC then path
+//   - contexts: Library filename/body matches, sorted by relevance then path
 // Skill/agent EDIT conversations were removed from search — only the
 // main-conversation jsonls feed the chats bucket.
 function _partitionSearchResults(results) {
@@ -170,6 +182,8 @@ function _partitionSearchResults(results) {
     .filter((r) => r.kind === 'context')
     .slice()
     .sort((a, b) => {
+      const scoreDelta = (b.score || 0) - (a.score || 0);
+      if (scoreDelta !== 0) return scoreDelta;
       const pa = String(a.path || ''); const pb = String(b.path || '');
       const da = pa.split('/').length; const db = pb.split('/').length;
       if (da !== db) return da - db;
@@ -181,6 +195,7 @@ function _partitionSearchResults(results) {
 function _renderSearchEmptyState() {
   const body = document.getElementById('search-body');
   if (!body) return;
+  body.classList.add('is-start-state');
   const history = _loadSearchHistory();
   const historyHtml = history.length
     ? `
@@ -210,6 +225,7 @@ function _renderSearchEmptyState() {
 function _renderSearchError(msg) {
   const body = document.getElementById('search-body');
   if (!body) return;
+  body.classList.remove('is-start-state');
   body.innerHTML = `<div class="search-empty" style="color:var(--danger)">${escapeHtml(t('search.failed', { msg: msg || '' }))}</div>`;
 }
 
@@ -286,6 +302,7 @@ let _searchVisibleResults = [];
 function _renderSearchResults(query) {
   const body = document.getElementById('search-body');
   if (!body) return;
+  body.classList.remove('is-start-state');
   if (!_searchResults.length) {
     _searchVisibleResults = [];
     body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
@@ -384,7 +401,10 @@ async function _gotoSearchResult(r) {
         try {
           const res = await window.orkas.invoke('projects.files.absPath', { projectId: r.project_id, name: r.path });
           if (res && res.ok && typeof openChatFileViewer === 'function') {
-            openChatFileViewer(res.path, r.title || r.path, { projectId: r.project_id });
+            // Preserve the source extension for viewer kind detection. A
+            // semantic hit title may be an extracted document heading rather
+            // than a filename, which would otherwise fall into "unsupported".
+            openChatFileViewer(res.path, r.path, { projectId: r.project_id });
           }
         } catch (_) { /* navigation best-effort */ }
       }, 120);
@@ -433,14 +453,31 @@ async function _gotoSearchResult(r) {
 
 function _loadSearchHistory() {
   try {
-    const raw = localStorage.getItem(_SEARCH_HISTORY_KEY);
+    const key = _searchHistoryStorageKey();
+    let raw = localStorage.getItem(key);
+    // Assign the one pre-account-scoping history list to the first active
+    // account that opens search, then remove the shared copy so a later local
+    // account cannot inherit it.
+    if (raw == null) {
+      raw = localStorage.getItem(_SEARCH_HISTORY_KEY);
+      if (raw != null) {
+        localStorage.setItem(key, raw);
+        localStorage.removeItem(_SEARCH_HISTORY_KEY);
+      }
+    }
     const arr = raw ? JSON.parse(raw) : [];
     return Array.isArray(arr) ? arr : [];
   } catch { return []; }
 }
 
+function _searchHistoryStorageKey() {
+  const lexicalUid = (typeof currentUserId === 'string') ? currentUserId.trim() : '';
+  const globalUid = (typeof globalThis.currentUserId === 'string') ? globalThis.currentUserId.trim() : '';
+  return `${_SEARCH_HISTORY_KEY}:${lexicalUid || globalUid || 'anonymous'}`;
+}
+
 function _saveSearchHistory(arr) {
-  try { localStorage.setItem(_SEARCH_HISTORY_KEY, JSON.stringify(arr)); } catch {}
+  try { localStorage.setItem(_searchHistoryStorageKey(), JSON.stringify(arr)); } catch {}
 }
 
 function _saveSearchHistoryEntry(query) {

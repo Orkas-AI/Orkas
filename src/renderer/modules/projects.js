@@ -37,6 +37,7 @@ function _projectUiIconHtml(name, className) {
 // Live cache of projects fetched from the backend. Mirrors `_agentsCache` /
 // `_skillsCache` patterns. `null` = not yet fetched.
 let _projectsCache = null;
+let _projectsLoadRequestId = 0;
 
 // Per-project expand/collapse state, persisted across sessions so the user's
 // layout sticks. Default: collapsed.
@@ -57,7 +58,18 @@ _loadProjectsExpanded();
 // In-flight inline-create / inline-rename state. Only one editing row at a
 // time across the whole sidebar.
 let _projectsInlineCreate = false;
+let _projectsInlineCreateDraft = '';
+let _projectsInlineCreateError = '';
+let _projectsInlineCreateSubmitting = false;
+let _projectsInlineCreateRequestId = 0;
+let _projectsInlineCreateRerendering = false;
 let _projectsInlineRenamePid = null;
+let _projectsInlineRenameOriginal = '';
+let _projectsInlineRenameDraft = '';
+let _projectsInlineRenameError = '';
+let _projectsInlineRenameSubmitting = false;
+let _projectsInlineRenameRequestId = 0;
+let _projectsInlineRenameRerendering = false;
 
 // ── Public API: cache + render ──────────────────────────────────────────
 
@@ -66,12 +78,25 @@ async function loadProjects(forceRefresh) {
     renderProjectsSection();
     return _projectsCache;
   }
+  const requestId = ++_projectsLoadRequestId;
+  const previousProjects = Array.isArray(_projectsCache) ? _projectsCache : [];
   try {
     const res = await window.orkas.invoke('projects.list', {});
-    _projectsCache = (res && res.ok && Array.isArray(res.projects)) ? res.projects : [];
+    if (requestId !== _projectsLoadRequestId) {
+      return Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
+    }
+    if (res && res.ok && Array.isArray(res.projects)) {
+      _projectsCache = res.projects;
+    } else {
+      _projectsLog.warn('load projects rejected', { error: res && res.error });
+      _projectsCache = previousProjects;
+    }
   } catch (err) {
+    if (requestId !== _projectsLoadRequestId) {
+      return Array.isArray(_projectsCache) ? _projectsCache : previousProjects;
+    }
     _projectsLog.warn('load projects failed', err);
-    _projectsCache = [];
+    _projectsCache = previousProjects;
   }
   renderProjectsSection();
   return _projectsCache;
@@ -113,6 +138,20 @@ function _convsByProject() {
 function renderProjectsSection() {
   const container = document.getElementById('projects-list');
   if (!container) return;
+  const currentCreateInput = _projectsInlineCreate
+    ? document.getElementById('project-create-input')
+    : null;
+  const restoreCreateFocus = !!currentCreateInput
+    && document.activeElement === currentCreateInput;
+  const createSelectionStart = restoreCreateFocus ? currentCreateInput.selectionStart : null;
+  const createSelectionEnd = restoreCreateFocus ? currentCreateInput.selectionEnd : null;
+  const currentRenameInput = _projectsInlineRenamePid
+    ? document.querySelector('input.project-rename-input[data-rename-pid]')
+    : null;
+  const restoreRenameFocus = !!currentRenameInput
+    && document.activeElement === currentRenameInput;
+  const renameSelectionStart = restoreRenameFocus ? currentRenameInput.selectionStart : null;
+  const renameSelectionEnd = restoreRenameFocus ? currentRenameInput.selectionEnd : null;
   const projects = Array.isArray(_projectsCache) ? _projectsCache : [];
   if (!projects.length && !_projectsInlineCreate) {
     // No projects + not creating — render nothing (the `+` button at the
@@ -140,23 +179,59 @@ function renderProjectsSection() {
   for (const p of projects) {
     rows.push(_renderProjectRow(p, byPid.get(p.project_id) || []));
   }
-  container.innerHTML = rows.join('');
+  // Replacing the focused input can emit `blur` in Electron. That is a
+  // renderer-owned refresh, not user intent to submit the draft.
+  _projectsInlineCreateRerendering = !!currentCreateInput;
+  _projectsInlineRenameRerendering = !!currentRenameInput;
+  try {
+    container.innerHTML = rows.join('');
+  } finally {
+    _projectsInlineCreateRerendering = false;
+    _projectsInlineRenameRerendering = false;
+  }
 
   _bindProjectsHandlers(container);
+  if (restoreCreateFocus) {
+    const nextCreateInput = document.getElementById('project-create-input');
+    if (nextCreateInput) {
+      nextCreateInput.focus();
+      if (createSelectionStart !== null && createSelectionEnd !== null) {
+        try { nextCreateInput.setSelectionRange(createSelectionStart, createSelectionEnd); } catch (_) {}
+      }
+    }
+  }
+  if (restoreRenameFocus) {
+    const nextRenameInput = document.querySelector('input.project-rename-input[data-rename-pid]');
+    if (nextRenameInput) {
+      nextRenameInput.focus();
+      if (renameSelectionStart !== null && renameSelectionEnd !== null) {
+        try { nextRenameInput.setSelectionRange(renameSelectionStart, renameSelectionEnd); } catch (_) {}
+      }
+    }
+  }
   // Re-paint pending / queued badges on the conv items we just (re)rendered.
   if (typeof _refreshAllConvBadges === 'function') _refreshAllConvBadges();
 }
 
 function _renderInlineCreateRow() {
   const placeholder = escapeHtml(t('sidebar.project_create_placeholder'));
+  const draft = escapeHtml(_projectsInlineCreateDraft);
+  const errorClass = _projectsInlineCreateError ? ' is-error' : '';
+  const errorHint = _projectsInlineCreateError
+    ? `<div class="project-inline-error">${escapeHtml(_projectInlineErrorText(_projectsInlineCreateError))}</div>`
+    : '';
+  const submittingState = _projectsInlineCreateSubmitting
+    ? ' disabled aria-busy="true"'
+    : '';
   // Match the same icon-only chrome as the regular project rows (no caret,
   // KB-style folder SVG) so the create row reads as "a project being born"
   // rather than a separate widget shape.
   return `
     <div class="project-row project-row-create" data-create>
       <span class="project-icon">${_projectUiIconHtml('folder', 'project-folder-icon')}</span>
-      <input type="text" class="project-rename-input" id="project-create-input"
-             placeholder="${placeholder}" autocomplete="off" spellcheck="false" />
+      <input type="text" class="project-rename-input${errorClass}" id="project-create-input"
+             value="${draft}" placeholder="${placeholder}" autocomplete="off" spellcheck="false"${submittingState} />
+      ${errorHint}
     </div>
   `;
 }
@@ -170,9 +245,17 @@ function _renderProjectRow(p, convs) {
     : _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
+  const renameErrorClass = editing && _projectsInlineRenameError ? ' is-error' : '';
+  const renameSubmittingState = editing && _projectsInlineRenameSubmitting
+    ? ' disabled aria-busy="true"'
+    : '';
+  const renameErrorHint = editing && _projectsInlineRenameError
+    ? `<div class="project-inline-error">${escapeHtml(_projectInlineErrorText(_projectsInlineRenameError))}</div>`
+    : '';
   const nameNode = editing
-    ? `<input type="text" class="project-rename-input" data-rename-pid="${escapeHtml(p.project_id)}"
-              value="${escapeHtml(p.name || '')}" autocomplete="off" spellcheck="false" />`
+    ? `<input type="text" class="project-rename-input${renameErrorClass}" data-rename-pid="${escapeHtml(p.project_id)}"
+              value="${escapeHtml(_projectsInlineRenameDraft)}" autocomplete="off" spellcheck="false"${renameSubmittingState} />
+       ${renameErrorHint}`
     : `<span class="project-name" title="${safeName}">${safeName}</span>`;
   let html = `
     <div class="project-row${selected ? ' active' : ''}" data-pid="${escapeHtml(p.project_id)}">
@@ -317,9 +400,18 @@ async function _toggleProjectExpand(pid) {
 
 function _startProjectInlineCreate() {
   if (_projectsInlineCreate) return;
+  if (_projectsInlineRenameSubmitting) return;
   _projectsTrackClick('project_create_open', {});
   _projectsInlineRenamePid = null;
+  _projectsInlineRenameOriginal = '';
+  _projectsInlineRenameDraft = '';
+  _projectsInlineRenameError = '';
+  _projectsInlineRenameRequestId += 1;
   _projectsInlineCreate = true;
+  _projectsInlineCreateDraft = '';
+  _projectsInlineCreateError = '';
+  _projectsInlineCreateSubmitting = false;
+  _projectsInlineCreateRequestId += 1;
   renderProjectsSection();
   setTimeout(() => {
     const input = document.getElementById('project-create-input');
@@ -330,33 +422,42 @@ function _startProjectInlineCreate() {
 function _cancelProjectInlineCreate() {
   if (!_projectsInlineCreate) return;
   _projectsInlineCreate = false;
+  _projectsInlineCreateDraft = '';
+  _projectsInlineCreateError = '';
+  _projectsInlineCreateSubmitting = false;
+  _projectsInlineCreateRequestId += 1;
   renderProjectsSection();
 }
 
 function _bindInlineCreateInput(input) {
   input.addEventListener('click', (e) => e.stopPropagation());
   if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(input);
-  let committed = false;
+  let consumed = false;
   const commit = async (accept) => {
-    if (committed) return;
-    committed = true;
+    if (consumed || _projectsInlineCreateSubmitting) return;
+    consumed = true;
+    _projectsInlineCreateDraft = input.value;
     const name = _normaliseProjectNameFinal(input.value);
     if (!accept || !name) {
       _cancelProjectInlineCreate();
       return;
     }
+    _projectsInlineCreateSubmitting = true;
+    input.disabled = true;
+    _projectsInlineCreateError = '';
+    const requestId = ++_projectsInlineCreateRequestId;
     const startedAt = performance.now();
     _projectsTrackClick('project_create_submit', { name_length: name.length });
     try {
       const res = await window.orkas.invoke('projects.create', { name });
+      if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
       if (!res || !res.ok) {
         _projectsTrackEvent('project_create_result', {
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
         });
-        // Re-enter editing mode + show inline error.
-        committed = false;
-        _showProjectInlineError(input, res && res.error);
+        _projectsInlineCreateSubmitting = false;
+        _showProjectInlineCreateError(res && res.error);
         return;
       }
       // Auto-expand the freshly created project, then select it below so the
@@ -373,11 +474,15 @@ function _bindInlineCreateInput(input) {
         _saveProjectsExpanded();
       }
       _projectsInlineCreate = false;
+      _projectsInlineCreateDraft = '';
+      _projectsInlineCreateError = '';
+      _projectsInlineCreateSubmitting = false;
       await loadProjects(true);
       if (pid && typeof setView === 'function') {
         setView('project', pid, { entryPoint: 'project_create' });
       }
     } catch (err) {
+      if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
       _projectsTrackEvent('project_create_result', {
         result: 'failure',
         duration_ms: Math.round(performance.now() - startedAt),
@@ -385,8 +490,8 @@ function _bindInlineCreateInput(input) {
       _projectsTrackError('project_create', {
         error_type: 'exception',
       });
-      committed = false;
-      _showProjectInlineError(input, err && err.message);
+      _projectsInlineCreateSubmitting = false;
+      _showProjectInlineCreateError(err && err.message);
     }
   };
   input.addEventListener('keydown', (e) => {
@@ -394,8 +499,13 @@ function _bindInlineCreateInput(input) {
     if (e.key === 'Enter') { e.preventDefault(); commit(true); }
     else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
   });
-  input.addEventListener('blur', () => commit(true));
+  input.addEventListener('blur', () => {
+    if (_projectsInlineCreateRerendering || input.isConnected === false) return;
+    return commit(true);
+  });
   input.addEventListener('input', () => {
+    _projectsInlineCreateDraft = input.value;
+    _projectsInlineCreateError = '';
     _clearProjectInlineError(input);
   });
 }
@@ -403,8 +513,24 @@ function _bindInlineCreateInput(input) {
 // ── Inline rename ───────────────────────────────────────────────────────
 
 function _startProjectInlineRename(pid) {
+  // Once create has reached Main, keep its UI ownership until the response
+  // arrives. Hiding the editor here would make a successful response fail the
+  // request-id guard and leave the user with an apparently missing project.
+  if (_projectsInlineCreateSubmitting || _projectsInlineRenameSubmitting) return;
+  const project = Array.isArray(_projectsCache)
+    ? _projectsCache.find((item) => item && item.project_id === pid)
+    : null;
+  if (!project) return;
   _projectsInlineCreate = false;
+  _projectsInlineCreateDraft = '';
+  _projectsInlineCreateError = '';
+  _projectsInlineCreateRequestId += 1;
   _projectsInlineRenamePid = pid;
+  _projectsInlineRenameOriginal = String(project.name || '');
+  _projectsInlineRenameDraft = _projectsInlineRenameOriginal;
+  _projectsInlineRenameError = '';
+  _projectsInlineRenameSubmitting = false;
+  _projectsInlineRenameRequestId += 1;
   renderProjectsSection();
   setTimeout(() => {
     const input = document.querySelector(`input.project-rename-input[data-rename-pid="${CSS.escape(pid)}"]`);
@@ -418,6 +544,11 @@ function _startProjectInlineRename(pid) {
 function _cancelProjectInlineRename() {
   if (!_projectsInlineRenamePid) return;
   _projectsInlineRenamePid = null;
+  _projectsInlineRenameOriginal = '';
+  _projectsInlineRenameDraft = '';
+  _projectsInlineRenameError = '';
+  _projectsInlineRenameSubmitting = false;
+  _projectsInlineRenameRequestId += 1;
   renderProjectsSection();
 }
 
@@ -425,16 +556,21 @@ function _bindInlineRenameInput(input) {
   input.addEventListener('click', (e) => e.stopPropagation());
   if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(input);
   const pid = input.dataset.renamePid;
-  const original = input.value;
-  let committed = false;
+  const original = _projectsInlineRenameOriginal;
+  let consumed = false;
   const commit = async (accept) => {
-    if (committed) return;
-    committed = true;
+    if (consumed || _projectsInlineRenameSubmitting) return;
+    consumed = true;
+    _projectsInlineRenameDraft = input.value;
     const next = _normaliseProjectNameFinal(input.value);
     if (!accept || !next || next === original) {
       _cancelProjectInlineRename();
       return;
     }
+    _projectsInlineRenameSubmitting = true;
+    input.disabled = true;
+    _projectsInlineRenameError = '';
+    const requestId = ++_projectsInlineRenameRequestId;
     const startedAt = performance.now();
     _projectsTrackClick('project_rename_submit', {
       project_id: pid,
@@ -442,14 +578,18 @@ function _bindInlineRenameInput(input) {
     });
     try {
       const res = await window.orkas.invoke('projects.rename', { projectId: pid, name: next });
+      if (
+        requestId !== _projectsInlineRenameRequestId
+        || _projectsInlineRenamePid !== pid
+      ) return;
       if (!res || !res.ok) {
         _projectsTrackEvent('project_rename_result', {
           project_id: pid,
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
         });
-        committed = false;
-        _showProjectInlineError(input, res && res.error);
+        _projectsInlineRenameSubmitting = false;
+        _showProjectInlineRenameError(res && res.error);
         return;
       }
       _projectsTrackEvent('project_rename_result', {
@@ -458,8 +598,16 @@ function _bindInlineRenameInput(input) {
         duration_ms: Math.round(performance.now() - startedAt),
       });
       _projectsInlineRenamePid = null;
+      _projectsInlineRenameOriginal = '';
+      _projectsInlineRenameDraft = '';
+      _projectsInlineRenameError = '';
+      _projectsInlineRenameSubmitting = false;
       await loadProjects(true);
     } catch (err) {
+      if (
+        requestId !== _projectsInlineRenameRequestId
+        || _projectsInlineRenamePid !== pid
+      ) return;
       _projectsTrackEvent('project_rename_result', {
         project_id: pid,
         result: 'failure',
@@ -469,8 +617,8 @@ function _bindInlineRenameInput(input) {
         project_id: pid,
         error_type: 'exception',
       });
-      committed = false;
-      _showProjectInlineError(input, err && err.message);
+      _projectsInlineRenameSubmitting = false;
+      _showProjectInlineRenameError(err && err.message);
     }
   };
   input.addEventListener('keydown', (e) => {
@@ -478,8 +626,13 @@ function _bindInlineRenameInput(input) {
     if (e.key === 'Enter') { e.preventDefault(); commit(true); }
     else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
   });
-  input.addEventListener('blur', () => commit(true));
+  input.addEventListener('blur', () => {
+    if (_projectsInlineRenameRerendering || input.isConnected === false) return;
+    return commit(true);
+  });
   input.addEventListener('input', () => {
+    _projectsInlineRenameDraft = input.value;
+    _projectsInlineRenameError = '';
     _clearProjectInlineError(input);
   });
 }
@@ -490,22 +643,31 @@ function _normaliseProjectNameFinal(raw) {
   return name;
 }
 
-function _showProjectInlineError(input, code) {
-  if (!input) return;
-  input.classList.add('is-error');
-  // Build / replace a sibling hint right below the input.
-  let hint = input.parentElement?.querySelector('.project-inline-error');
-  if (!hint) {
-    hint = document.createElement('div');
-    hint.className = 'project-inline-error';
-    input.parentElement?.appendChild(hint);
-  }
+function _projectInlineErrorText(code) {
   let key = 'project.error.generic';
   if (code === 'name_dup') key = 'project.name_dup_inline';
   else if (code === 'name_empty') key = 'project.name_empty';
-  hint.textContent = t(key);
-  // Re-focus so the user can keep editing without an extra click.
-  setTimeout(() => input.focus(), 0);
+  return t(key);
+}
+
+function _showProjectInlineCreateError(code) {
+  if (!_projectsInlineCreate) return;
+  _projectsInlineCreateError = code || 'generic';
+  renderProjectsSection();
+  setTimeout(() => {
+    const input = document.getElementById('project-create-input');
+    if (input) input.focus();
+  }, 0);
+}
+
+function _showProjectInlineRenameError(code) {
+  if (!_projectsInlineRenamePid) return;
+  _projectsInlineRenameError = code || 'generic';
+  renderProjectsSection();
+  setTimeout(() => {
+    const input = document.querySelector('input.project-rename-input[data-rename-pid]');
+    if (input) input.focus();
+  }, 0);
 }
 
 function _clearProjectInlineError(input) {

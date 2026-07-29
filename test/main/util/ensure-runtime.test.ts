@@ -3,8 +3,17 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createRequire } from 'node:module';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
+const require = createRequire(import.meta.url);
+const ensureRuntime = require('../../../bin/ensure-runtime.cjs') as {
+  tarExtractionPlan: (
+    archive: string,
+    extractDir: string,
+    archiveType: string,
+  ) => { cwd: string; args: string[] };
+};
 
 let tmpDir: string;
 
@@ -127,6 +136,17 @@ function runEnsureMutable(root: string, manifest: string, key: string) {
 }
 
 describe('ensure-runtime.cjs', () => {
+  it('passes runtime archives to tar without a Windows drive-letter path', () => {
+    const archive = path.join(tmpDir, 'python.download.tar.gz');
+    const extractDir = path.join(tmpDir, 'python.extract');
+
+    const plan = ensureRuntime.tarExtractionPlan(archive, extractDir, 'tar.gz');
+
+    expect(plan.cwd).toBe(tmpDir);
+    expect(plan.args).toEqual(['-xzf', 'python.download.tar.gz', '-C', 'python.extract']);
+    expect(plan.args[1]).not.toContain(':');
+  });
+
   it('accepts a runtime dir with a matching marker and executable', () => {
     const key = `${process.platform}-${process.arch}`;
     const executable = process.platform === 'win32' ? 'python/python.exe' : 'python/bin/python3';

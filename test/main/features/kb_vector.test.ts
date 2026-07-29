@@ -187,6 +187,35 @@ describe('kb_vector › upsertFile', () => {
       chunks: [{ title: 't', content: 'c', embedding: [1, 2, 3] }],
     })).rejects.toThrow(/embedding dim mismatch/);
   });
+
+  it('keeps the previous searchable revision when a replacement transaction fails', async () => {
+    const kb = await loadKb();
+    await kb.upsertFile(TEST_UID, {
+      relPath: 'atomic.md',
+      kind: 'text',
+      bytes: 10,
+      mtime: 1,
+      sha1: 'v1',
+      chunks: [{ title: 'old', content: 'trusted old revision', embedding: fakeVec(1) }],
+    });
+
+    await expect(kb.upsertFile(TEST_UID, {
+      relPath: 'atomic.md',
+      kind: 'text',
+      bytes: 20,
+      mtime: 2,
+      sha1: 'v2',
+      chunks: [{ title: 'new', content: 'incomplete replacement', embedding: [1, 2, 3] }],
+    })).rejects.toThrow(/embedding dim mismatch/);
+
+    const row = kb.getFileByPath(TEST_UID, 'atomic.md');
+    expect(row).toMatchObject({ status: 'ready', sha1: 'v1', chunks: 1 });
+    expect(kb.readFileChunks(TEST_UID, 'atomic.md')).toEqual([
+      expect.objectContaining({ title: 'old', content: 'trusted old revision' }),
+    ]);
+    expect(kb.search(TEST_UID, fakeVec(1), { path: 'atomic.md', k: 1 })[0]?.content)
+      .toBe('trusted old revision');
+  });
 });
 
 describe('kb_vector › deleteFile', () => {
@@ -244,6 +273,28 @@ describe('kb_vector › search', () => {
     expect(hits[0].rel_path).toBe('notes/a.md');
     expect(hits[0].chunk_idx).toBe(1);
     expect(hits[0].score).toBeCloseTo(1, 3);
+  });
+
+  it('does not create derived Library state when interactive search has no index', async () => {
+    const kb = await loadKb();
+    const paths = await import('../../../src/main/paths');
+
+    expect(kb.searchExisting(TEST_UID, fakeVec(1), { k: 5 })).toEqual([]);
+    expect(fs.existsSync(paths.userKbVectorDbPath(TEST_UID))).toBe(false);
+    expect(fs.existsSync(paths.userKbConfigPath(TEST_UID))).toBe(false);
+  });
+
+  it('queries an existing Library index through the read-only interactive path', async () => {
+    const kb = await loadKb();
+    await seed(kb);
+
+    const hits = kb.searchExisting(TEST_UID, fakeVec(1, 0), { k: 1 });
+
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatchObject({
+      rel_path: 'notes/a.md',
+      content: 'content A1',
+    });
   });
 
   it('filters by dir', async () => {

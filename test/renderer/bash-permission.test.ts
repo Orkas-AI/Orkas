@@ -5,8 +5,13 @@ import * as vm from 'node:vm';
 
 type DialogResult = string | { choice: string; mode?: string };
 
-function loadHarness(dialogResult: DialogResult, invokeImpl?: (channel: string, payload: any) => Promise<any>) {
+function loadHarness(
+  dialogResult: DialogResult,
+  invokeImpl?: (channel: string, payload: any) => Promise<any>,
+  dialogImpl?: (arg: any) => Promise<any>,
+) {
   let pushHandler: ((info: any) => void) | null = null;
+  let cancelHandler: ((info: any) => void) | null = null;
   const dialogArgs: any[] = [];
   const invokeCalls: Array<{ channel: string; payload: any }> = [];
   const monitorEvent = vi.fn();
@@ -56,6 +61,7 @@ function loadHarness(dialogResult: DialogResult, invokeImpl?: (channel: string, 
       Monitor: { event: monitorEvent },
       __orkasBashPermissionDialogForTest: vi.fn(async (arg: any) => {
         dialogArgs.push(arg);
+        if (dialogImpl) return dialogImpl(arg);
         return {
           choice: normalizedResult.choice,
           mode: normalizedResult.mode || arg.currentMode,
@@ -71,6 +77,7 @@ function loadHarness(dialogResult: DialogResult, invokeImpl?: (channel: string, 
         }),
         onPushEvent: vi.fn((name: string, cb: (info: any) => void) => {
           if (name === 'bash:permission') pushHandler = cb;
+          if (name === 'bash:permission_cancelled') cancelHandler = cb;
         }),
       },
     },
@@ -80,8 +87,9 @@ function loadHarness(dialogResult: DialogResult, invokeImpl?: (channel: string, 
   const code = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/bash_permission.js'), 'utf8');
   vm.runInContext(code, context, { filename: 'bash_permission.js' });
   if (!pushHandler) throw new Error('bash:permission handler was not registered');
+  if (!cancelHandler) throw new Error('bash:permission_cancelled handler was not registered');
 
-  return { context, pushHandler, dialogArgs, invokeCalls, monitorEvent, warn };
+  return { context, pushHandler, cancelHandler, dialogArgs, invokeCalls, monitorEvent, warn };
 }
 
 async function flush() {
@@ -195,5 +203,25 @@ describe('renderer bash permission prompt', () => {
       { channel: 'permissions.setLocalExecMode', payload: { mode: 'all_files_auto' } },
       { channel: 'bash.permission_response', payload: { request_id: 'req-2', decision: 'deny' } },
     ]);
+  });
+
+  it('closes a cancelled prompt without sending a stale renderer response', async () => {
+    const h = loadHarness('deny', undefined, async () => new Promise(() => {}));
+
+    h.pushHandler({
+      request_id: 'req-cancelled',
+      agent_name: 'Agent',
+      command: 'rm protected.txt',
+      reasons: ['network_egress'],
+    });
+    await flush();
+    h.cancelHandler({ request_ids: ['req-cancelled'], cid: 'c1' });
+    await flush();
+
+    expect(h.dialogArgs).toHaveLength(1);
+    expect(h.invokeCalls).toEqual([
+      { channel: 'permissions.getLocalExec', payload: undefined },
+    ]);
+    expect(h.monitorEvent).not.toHaveBeenCalled();
   });
 });

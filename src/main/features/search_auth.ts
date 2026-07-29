@@ -24,6 +24,7 @@ import {
 } from './auth';
 import { createLogger } from '../logger';
 import { searchAdaptersByProvider, runSearchAdapter } from '../model/core-agent/search-adapters';
+import { logErrorSummary } from '../util/log-redact';
 
 const log = createLogger('search-auth');
 
@@ -73,6 +74,10 @@ export function addSearchProfile(input: AddSearchProfileInput): { ok: true; id: 
     return { ok: false, error: `unknown search provider "${provider}"` };
   }
   const list = loadSearchProfiles();
+  const existing = list.find((profile) => (
+    profile.provider === provider && profile.apiKey === apiKey
+  ));
+  if (existing) return { ok: true, id: existing.id };
   const profile: SearchProfile = {
     id: nextSearchProfileId(),
     provider,
@@ -115,6 +120,23 @@ export interface TestSearchProfileResult {
   resultCount?: number;
 }
 
+function userFacingSearchProbeError(err: unknown): string {
+  const value = err as { name?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
+  const message = String(value?.message || err || '');
+  const explicitStatus = Number(value?.status || value?.statusCode);
+  const statusMatch = message.match(/\b(401|402|403|408|429)\b/);
+  const status = Number.isFinite(explicitStatus) && explicitStatus > 0
+    ? explicitStatus
+    : Number(statusMatch?.[1] || 0);
+  if (status === 401 || status === 403) return 'search credentials rejected';
+  if (status === 402) return 'search credits unavailable';
+  if (status === 429) return 'search rate limited';
+  if (status === 408 || value?.name === 'AbortError' || /timed?\s*out/i.test(message)) {
+    return 'search request timed out';
+  }
+  return 'search request failed';
+}
+
 export async function testSearchProfile(id: string): Promise<TestSearchProfileResult> {
   const list = loadSearchProfiles();
   const target = list.find((p) => p.id === id);
@@ -124,8 +146,15 @@ export async function testSearchProfile(id: string): Promise<TestSearchProfileRe
     const res = await runSearchAdapter(target, 'Orkas connectivity probe', 1);
     return { ok: true, durationMs: Date.now() - t0, resultCount: res.results.length };
   } catch (err) {
-    const msg = (err as Error).message || String(err);
-    log.warn('search profile test failed', { id, provider: target.provider, error: msg });
-    return { ok: false, durationMs: Date.now() - t0, error: msg };
+    log.warn('search profile test failed', {
+      id,
+      provider: target.provider,
+      error: logErrorSummary(err),
+    });
+    return {
+      ok: false,
+      durationMs: Date.now() - t0,
+      error: userFacingSearchProbeError(err),
+    };
   }
 }

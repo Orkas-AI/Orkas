@@ -544,6 +544,9 @@ async function loadAgents(forceRefresh, opts = {}) {
         });
         _agentsCache = sortedAgents;
         _agentsCacheIsSummary = summary;
+        if (typeof _syncComposerModelChipAvailability === 'function') {
+          _syncComposerModelChipAvailability();
+        }
         // Sidebar conv-row badges read agent icon+color from `_agentsCache`
         // (via `_renderConvAgentStackHtml`). Boot order is loadConversations
         // → loadAgents, so the first sidebar render lands before the cache
@@ -804,9 +807,11 @@ function renderAgentsGrid(agents) {
  *  success, refreshes the grid + detail page. */
 async function _flipAgentEnabled(agentId, nextEnabled) {
   if (_isCommanderAgent(agentId)) return false;
+  const trackResult = _createAgentManageTracker('toggle');
   try {
     const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
     if (!res || !res.ok) {
+      trackResult('failure', 'update_failed');
       await uiAlert(t('component.toggle_failed'));
       return false;
     }
@@ -816,11 +821,32 @@ async function _flipAgentEnabled(agentId, nextEnabled) {
     if (_selectedAgent?.id === agentId) {
       _renderAgentEnabledButton({ id: agentId, enabled: nextEnabled });
     }
+    trackResult('success');
     return true;
   } catch (err) {
+    trackResult('failure', 'invoke_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
+}
+
+function _createAgentManageTracker(action) {
+  const startedAt = Date.now();
+  let done = false;
+  return (result, errorCode = '') => {
+    if (done) return;
+    done = true;
+    try {
+      if (!window.Monitor) return;
+      const payload = {
+        result,
+        action,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      Monitor.event('agent_manage_result', payload);
+    } catch (_) {}
+  };
 }
 
 // ─── View switching: grid ↔ detail ─────────────────────────────────────
@@ -1829,11 +1855,11 @@ async function _renderAgentDetailRuntime(agent) {
     return;
   }
 
-  // Re-probe when the detail selector is rendered. A CLI can be installed
-  // while Orkas is already open, and the renderer cache otherwise keeps the
-  // old missing result indefinitely.
+  // Share the process-lifetime discovery cache with the create panel.
+  // Opening a detail must not synchronously force the same version processes
+  // to run again; entering the External create panel owns explicit refreshes.
   const entries = (typeof loadLocalCliEntries === 'function')
-    ? await loadLocalCliEntries({ force: true })
+    ? await loadLocalCliEntries()
     : [];
   const available = entries.filter(e => e.available);
   const seen = new Set(available.map(e => e.type));
@@ -2325,7 +2351,7 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
 // can be refined.
 //
 // "External" — bind a local CLI as the runtime. The CLI selector sits
-// at the top (default "not selected"); selecting a CLI auto-fills
+// at the top and defaults to the first available CLI, which auto-fills
 // name + description from
 // CLI_DEFAULTS. The user can override either; subsequent CLI swaps
 // only re-fill fields that still match the previous CLI's defaults
@@ -2336,18 +2362,33 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
 // nothing applied yet (untouched-default state, or the "create" tab).
 
 function _switchAgentTab(tab) {
+  _agentModalActiveTab = tab;
   const tabs = document.querySelectorAll('#agent-modal-tabs [data-agent-tab]');
   tabs.forEach((el) => el.classList.toggle('is-active', el.dataset.agentTab === tab));
   const panels = document.querySelectorAll('#agent-modal [data-agent-panel]');
   panels.forEach((el) => el.classList.toggle('is-active', el.dataset.agentPanel === tab));
   const msgEl = document.getElementById('agent-form-msg');
   if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
+  _syncAgentCreateSaveButton(tab);
   setTimeout(() => {
     const focusId = tab === 'external' ? 'agent-modal-ext-cli-select' : 'agent-name-input';
     const el = document.getElementById(focusId);
+    const modal = document.getElementById('agent-modal');
+    const activeEl = document.activeElement;
+    // Opening the modal is asynchronous. If the user has already moved into
+    // another field, do not let this deferred initial-focus task steal focus
+    // and redirect their keystrokes back into the name input.
+    if (modal && activeEl && modal.contains(activeEl) && activeEl !== el) return;
     // ai-select wrapper isn't focusable directly; just leave it alone.
     if (el && typeof el.focus === 'function' && el.tagName !== 'DIV') el.focus();
   }, 30);
+  // CLI discovery is process-heavy and belongs only to the External flow.
+  // Start it when that panel actually becomes visible, not whenever the
+  // default in-process create modal opens.
+  if (tab === 'external') _trackExternalAgentFlowEnter();
+  if (tab === 'external' && typeof mountExternalCliSelect === 'function') {
+    mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
+  }
 }
 window._switchAgentTab = _switchAgentTab;
 
@@ -2356,6 +2397,62 @@ window._switchAgentTab = _switchAgentTab;
 // this set so subsequent CLI swaps don't overwrite the typed value.
 let _extActiveCli = null;
 let _extDefaultFieldsAtMount = { name: false, desc: false };
+let _agentModalReturnFocusId = '';
+let _agentModalEntryPoint = '';
+let _agentModalSourceView = '';
+let _agentModalOpenedAt = 0;
+let _agentModalHadExternalSubmitAttempt = false;
+let _agentModalExternalFlowEntered = false;
+let _externalAgentCreateAvailable = false;
+let _agentModalActiveTab = 'create';
+
+function _syncAgentCreateSaveButton(tab = '') {
+  const activeTab = tab
+    || _agentModalActiveTab;
+  const saveButton = document.getElementById('agent-save-btn');
+  if (saveButton) {
+    saveButton.disabled = activeTab === 'external' && !_externalAgentCreateAvailable;
+  }
+}
+
+function setExternalAgentCreateAvailability(available) {
+  _externalAgentCreateAvailable = available === true;
+  _syncAgentCreateSaveButton();
+}
+window.setExternalAgentCreateAvailability = setExternalAgentCreateAvailability;
+
+function _trackExternalAgentFlowEnter() {
+  if (_agentModalExternalFlowEntered) return;
+  _agentModalExternalFlowEntered = true;
+  try {
+    if (window.Monitor) Monitor.event('agent_create_flow_enter', {
+      agent_type: 'cli',
+      entry_point: _agentModalEntryPoint,
+      source_view: _agentModalSourceView,
+    });
+  } catch (_) {}
+}
+
+function _trackAgentCreateBlocked({
+  agentType,
+  startedAt,
+  errorCode,
+  cli = '',
+  outputFormat = '',
+}) {
+  if (!window.Monitor) return;
+  const payload = {
+    result: 'blocked',
+    agent_type: agentType,
+    duration_ms: Math.round(Math.max(0, performance.now() - startedAt)),
+    error_code: errorCode,
+  };
+  if (cli) payload.cli = cli;
+  if (outputFormat) payload.output_format = outputFormat;
+  try {
+    Monitor.event('agent_create_result', payload);
+  } catch (_) {}
+}
 
 /** Decide whether a current `name` value still counts as "the default
  *  for `defaultName`" — meaning a CLI swap should overwrite it. We
@@ -2371,6 +2468,14 @@ function _isDefaultlikeName(value, defaultName) {
   const escaped = defaultName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp('^' + escaped + '\\s*(?:[-_]\\s*)?(?:\\(\\s*\\d+\\s*\\)|\\d+)$');
   return re.test(value);
+}
+
+function _nextDefaultAgentNameSuffix(value, defaultName) {
+  if (!_isDefaultlikeName(value, defaultName)) return null;
+  if (value === defaultName) return 2;
+  const suffix = String(value).slice(defaultName.length).match(/\d+/);
+  const current = suffix ? Number.parseInt(suffix[0], 10) : 1;
+  return Number.isFinite(current) ? Math.max(2, current + 1) : 2;
 }
 
 function _applyExternalCliDefaults(cliType, { force = false } = {}) {
@@ -2411,6 +2516,20 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
 function openAgentModal(options = {}) {
   const requestedTab = typeof options === 'string' ? options : options?.initialTab;
   const initialTab = requestedTab === 'external' ? 'external' : 'create';
+  const externalOnly = typeof options === 'object' && options?.externalOnly === true;
+  _agentModalReturnFocusId = typeof options === 'object'
+    ? String(options?.returnFocusId || '')
+    : '';
+  _agentModalEntryPoint = typeof options === 'object'
+    ? String(options?.entryPoint || '')
+    : '';
+  _agentModalSourceView = typeof options === 'object'
+    ? String(options?.sourceView || '')
+    : '';
+  _agentModalOpenedAt = performance.now();
+  _agentModalHadExternalSubmitAttempt = false;
+  _agentModalExternalFlowEntered = false;
+  _externalAgentCreateAvailable = false;
   const modal = document.getElementById('agent-modal');
   const msgEl = document.getElementById('agent-form-msg');
   msgEl.textContent = '';
@@ -2427,6 +2546,7 @@ function openAgentModal(options = {}) {
   if (extDesc) extDesc.value = '';
   _extActiveCli = null;
   _extDefaultFieldsAtMount = { name: true, desc: true };
+  if (typeof setExternalCliValue === 'function') setExternalCliValue(null);
   if (typeof window.bindNameLimitControl === 'function') {
     window.bindNameLimitControl(nameInput);
     window.bindNameLimitControl(extName);
@@ -2434,6 +2554,7 @@ function openAgentModal(options = {}) {
 
   // Wire tabs (idempotent).
   const tabBar = document.getElementById('agent-modal-tabs');
+  if (tabBar) tabBar.hidden = externalOnly;
   if (tabBar && !tabBar.dataset.wired) {
     tabBar.querySelectorAll('[data-agent-tab]').forEach((btn) => {
       btn.addEventListener('click', () => _switchAgentTab(btn.dataset.agentTab));
@@ -2442,22 +2563,37 @@ function openAgentModal(options = {}) {
   }
   _switchAgentTab(initialTab);
 
-  // Refresh the External-tab CLI selector. Re-mount each open so newly-
-  // installed CLIs surface without an app restart.
-  if (typeof mountExternalCliSelect === 'function') {
-    mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
-  }
-
   modal.classList.add('open');
-  const focusId = initialTab === 'external' ? 'agent-ext-name-input' : 'agent-name-input';
-  setTimeout(() => document.getElementById(focusId)?.focus(), 50);
 }
 window.openAgentModal = openAgentModal;
 
-function closeAgentModal() {
+function closeAgentModal(options = {}) {
+  const restoreFocus = options?.restoreFocus === true;
+  const returnFocusId = _agentModalReturnFocusId;
+  _agentModalReturnFocusId = '';
   document.getElementById('agent-modal').classList.remove('open');
+  _agentModalOpenedAt = 0;
+  _agentModalHadExternalSubmitAttempt = false;
+  _agentModalExternalFlowEntered = false;
+  _agentModalEntryPoint = '';
+  _agentModalSourceView = '';
+  _agentModalActiveTab = 'create';
+  if (restoreFocus && returnFocusId) {
+    setTimeout(() => document.getElementById(returnFocusId)?.focus(), 0);
+  }
 }
 window.closeAgentModal = closeAgentModal;
+
+function _trackExternalAgentCreateCancel() {
+  // Analytics is intentionally disabled in the open-source build.
+}
+
+function cancelAgentModal() {
+  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
+  if (activeTab === 'external') _trackExternalAgentCreateCancel();
+  closeAgentModal({ restoreFocus: true });
+}
+window.cancelAgentModal = cancelAgentModal;
 
 async function saveAgentModal() {
   const msgEl = document.getElementById('agent-form-msg');
@@ -2468,14 +2604,22 @@ async function saveAgentModal() {
 window.saveAgentModal = saveAgentModal;
 
 async function _saveCreateAgent({ msgEl }) {
+  const startedAt = performance.now();
+  const outputFormat = 'auto';
+  let terminalResultTracked = false;
   const rawName = document.getElementById('agent-name-input').value;
   const name = rawName.trim();
   const description = document.getElementById('agent-desc-input').value.trim();
-
   if (!name) {
     msgEl.textContent = t('agents.input_name_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
+    _trackAgentCreateBlocked({
+      agentType: 'default',
+      startedAt,
+      errorCode: 'no_name',
+      outputFormat,
+    });
     return;
   }
   const hasWhitespace = /\s/.test(rawName);
@@ -2484,25 +2628,39 @@ async function _saveCreateAgent({ msgEl }) {
     msgEl.textContent = t('agents.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
+    _trackAgentCreateBlocked({
+      agentType: 'default',
+      startedAt,
+      errorCode: 'name_invalid',
+      outputFormat,
+    });
     return;
   }
   if (reserved) {
     msgEl.textContent = t('agents.name_reserved');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-name-input').focus();
+    _trackAgentCreateBlocked({
+      agentType: 'default',
+      startedAt,
+      errorCode: 'name_reserved',
+      outputFormat,
+    });
     return;
   }
   if (!description) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-desc-input').focus();
+    _trackAgentCreateBlocked({
+      agentType: 'default',
+      startedAt,
+      errorCode: 'no_desc',
+      outputFormat,
+    });
     return;
   }
 
-  const outputFormat = 'auto';
-
-  const startedAt = performance.now();
-  if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'default', output_format: outputFormat });
   try {
     // Leave the icon unset so the immediately-started agent authoring model
     // can choose semantically from the controlled catalog. The renderer's
@@ -2517,6 +2675,7 @@ async function _saveCreateAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
+      terminalResultTracked = true;
       if (window.Monitor) {
         (() => {})('agent_create_result', {
           result: 'failure',
@@ -2535,6 +2694,7 @@ async function _saveCreateAgent({ msgEl }) {
       }
       return;
     }
+    terminalResultTracked = true;
     if (window.Monitor) (() => {})('agent_create_result', {
       result: 'success',
       agent_id: data.agent.agent_id,
@@ -2552,7 +2712,7 @@ async function _saveCreateAgent({ msgEl }) {
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
-    if (window.Monitor) {
+    if (window.Monitor && !terminalResultTracked) {
       (() => {})('agent_create_result', {
         result: 'failure',
         agent_type: 'default',
@@ -2570,20 +2730,57 @@ async function _saveCreateAgent({ msgEl }) {
 }
 
 async function _saveExternalAgent({ msgEl }) {
+  const startedAt = performance.now();
+  _agentModalHadExternalSubmitAttempt = true;
+  let terminalResultTracked = false;
   const cli = (typeof getExternalCliValue === 'function') ? getExternalCliValue() : null;
-  const rawName = document.getElementById('agent-ext-name-input').value;
-  const name = rawName.trim();
-  const desc = document.getElementById('agent-ext-desc-input').value.trim();
-
+  const cliWarning = (typeof getExternalCliSelectionWarning === 'function')
+    ? getExternalCliSelectionWarning()
+    : '';
+  const nameEl = document.getElementById('agent-ext-name-input');
+  const descEl = document.getElementById('agent-ext-desc-input');
+  const originalName = nameEl.value;
+  const rawName = originalName.replace(/\s+/g, '');
+  if (rawName !== originalName) nameEl.value = rawName;
+  let name = rawName.trim();
+  let desc = descEl.value.trim();
+  const cliDefaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
+  if (!desc && cliDefaults) {
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    desc = String(pickDesc(cliDefaults, lang) || '').trim();
+    if (desc) descEl.value = desc;
+  }
   if (!cli) {
     msgEl.textContent = t('agents.ext_cli_needed');
     msgEl.className = 'form-msg err';
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'no_cli',
+    });
+    return;
+  }
+  if (cliWarning) {
+    msgEl.textContent = cliWarning;
+    msgEl.className = 'form-msg err';
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'cli_version_too_old',
+      cli,
+    });
     return;
   }
   if (!name) {
     msgEl.textContent = t('agents.input_name_needed');
     msgEl.className = 'form-msg err';
-    document.getElementById('agent-ext-name-input').focus();
+    nameEl.focus();
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'no_name',
+      cli,
+    });
     return;
   }
   const hasWhitespace = /\s/.test(rawName);
@@ -2591,43 +2788,70 @@ async function _saveExternalAgent({ msgEl }) {
   if (hasWhitespace || (!reserved && !_isValidAgentNameCharset(rawName))) {
     msgEl.textContent = t('agents.name_invalid');
     msgEl.className = 'form-msg err';
-    document.getElementById('agent-ext-name-input').focus();
+    nameEl.focus();
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'name_invalid',
+      cli,
+    });
     return;
   }
   if (reserved) {
     msgEl.textContent = t('agents.name_reserved');
     msgEl.className = 'form-msg err';
-    document.getElementById('agent-ext-name-input').focus();
+    nameEl.focus();
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'name_reserved',
+      cli,
+    });
     return;
   }
   if (!desc) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
-    document.getElementById('agent-ext-desc-input').focus();
+    descEl.focus();
+    _trackAgentCreateBlocked({
+      agentType: 'cli',
+      startedAt,
+      errorCode: 'no_desc',
+      cli,
+    });
     return;
   }
 
-  const startedAt = performance.now();
-  if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'cli', cli });
   try {
-    const body = {
-      name,
-      description: desc,
-      // CLI-backed agents do not run the LLM authoring pass, so use the
-      // stable role-specific coding avatar instead of a random pair.
-      icon: 'code', color: 'sage',
-      runtime: { kind: 'cli', cli },
-      category: 'general',
-    };
-    const res = await apiFetch('/api/agents/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json();
+    const defaultName = cliDefaults?.name || '';
+    let nextSuffix = _nextDefaultAgentNameSuffix(name, defaultName);
+    let data = null;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const body = {
+        name,
+        description: desc,
+        // CLI-backed agents do not run the LLM authoring pass, so use the
+        // stable role-specific coding avatar instead of a random pair.
+        icon: 'code', color: 'sage',
+        runtime: { kind: 'cli', cli },
+        category: 'general',
+      };
+      const res = await apiFetch('/api/agents/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      data = await res.json();
+      if (data.ok && data.agent) break;
+      if (data.code !== 'E_AGENT_NAME_TAKEN' || nextSuffix === null || attempt === 19) break;
+      name = `${defaultName}-${nextSuffix}`;
+      nextSuffix += 1;
+      nameEl.value = name;
+    }
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
+      terminalResultTracked = true;
       if (window.Monitor) {
         (() => {})('agent_create_result', {
           result: 'failure',
@@ -2646,6 +2870,7 @@ async function _saveExternalAgent({ msgEl }) {
       }
       return;
     }
+    terminalResultTracked = true;
     if (window.Monitor) (() => {})('agent_create_result', {
       result: 'success',
       agent_id: data.agent.agent_id,
@@ -2663,7 +2888,7 @@ async function _saveExternalAgent({ msgEl }) {
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
-    if (window.Monitor) {
+    if (window.Monitor && !terminalResultTracked) {
       (() => {})('agent_create_result', {
         result: 'failure',
         agent_type: 'cli',
@@ -2725,7 +2950,9 @@ async function deleteSelectedAgent() {
     _showAgentsGridView();
     await loadAgents(true);
     await loadConversations();
+    trackResult('success');
   } catch (e) {
+    trackResult('failure', 'delete_failed');
     await uiAlert(t('agents.delete_failed_with', { reason: e.message || e }));
   }
 }
@@ -2950,13 +3177,9 @@ async function useSkill(skillId, skillName) {
 // auto-injected on the backend. The selection does NOT persist — the user
 // picks an agent each time they need one.
 
-// Place popover above the **input area** (not just the anchor button) so
-// it never covers the textarea — the toolbar buttons sit at the bottom of
-// the input area, and computing "above" from the button alone meant the
-// popover's bottom edge landed on top of the textarea above. We look for
-// any chat-input wrapper / area ancestor (main conv, new-chat, skill-edit,
-// agent-edit) and use its top as the "above" reference, falling back to
-// the anchor's own rect for unrelated anchors.
+// When a dropdown must flip upward, place it above the **input area** (not
+// just the anchor button) so it never covers the textarea. Downward remains
+// the standard first choice shared by every anchored dropdown.
 const _INPUT_AREA_CLASS_RE = /(?:^|\s)(?:chat|new-chat|skills-chat|agents-chat)-input-(?:wrapper|area)(?:\s|$)/;
 function _findInputAreaTop(anchorEl) {
   let cur = anchorEl;
@@ -2986,9 +3209,12 @@ function _positionPopoverAboveOrBelow(popover, anchorEl) {
   // chat panels while still working for any other future anchor.
   const aboveRef = _findInputAreaTop(anchorEl);
   const refTop = aboveRef !== null ? aboveRef : rect.top;
-  const availAbove = refTop - margin - gap;
-  const availBelow = window.innerHeight - rect.bottom - margin - gap;
-  const preferAbove = popRect.height <= availAbove || availAbove >= availBelow;
+  const placement = _dropdownVerticalPlacement(
+    rect,
+    popRect.height,
+    window.innerHeight,
+    { edge: margin, gap, aboveReferenceTop: refTop },
+  );
 
   let left = rect.left;
   if (left + popRect.width > window.innerWidth - margin) {
@@ -2996,18 +3222,12 @@ function _positionPopoverAboveOrBelow(popover, anchorEl) {
   }
   if (left < margin) left = margin;
 
-  let top;
-  if (preferAbove) {
-    const maxH = Math.max(0, availAbove);
-    if (popRect.height > maxH) popover.style.maxHeight = maxH + 'px';
-    top = Math.max(margin, refTop - Math.min(popRect.height, maxH) - gap);
-  } else {
-    const maxH = Math.max(0, availBelow);
-    if (popRect.height > maxH) popover.style.maxHeight = maxH + 'px';
-    top = rect.bottom + gap;
+  if (popRect.height > placement.availableHeight) {
+    popover.style.maxHeight = placement.availableHeight + 'px';
   }
   popover.style.left = left + 'px';
-  popover.style.top = top + 'px';
+  popover.style.top = placement.top + 'px';
+  popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
 }
 
 // Expose so skills.js can reuse the same positioning math (DRY across the

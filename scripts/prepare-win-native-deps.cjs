@@ -73,6 +73,21 @@ function allFilesExist(files) {
   return files.every((file) => fs.existsSync(file) && fs.statSync(file).isFile());
 }
 
+function extractTarballInTarget(targetDir, tarball, deps = {}) {
+  const fsImpl = deps.fsImpl || fs;
+  const runImpl = deps.runImpl || run;
+  const archiveName = path.win32.basename(tarball);
+  const localTarball = path.win32.join(targetDir, archiveName);
+  fsImpl.copyFileSync(tarball, localTarball);
+  try {
+    // GNU tar treats a Windows absolute archive path (`C:\...`) as a remote
+    // host specification when release packaging runs under Git Bash/MSYS.
+    runImpl(targetDir, 'tar', ['-xzf', archiveName, '--strip-components=1']);
+  } finally {
+    fsImpl.rmSync(localTarball, { force: true });
+  }
+}
+
 function ensurePackageFromRegistry(packageName, requiredFiles = []) {
   const version = readLockPackage(LOCK_FILE, packageName);
   const targetDir = packagePath(PC_DIR, packageName);
@@ -88,7 +103,7 @@ function ensurePackageFromRegistry(packageName, requiredFiles = []) {
     const tarball = npmPack(tmpDir, `${packageName}@${version}`);
     removeTree(targetDir);
     fs.mkdirSync(targetDir, { recursive: true });
-    run(targetDir, 'tar', ['-xzf', tarball, '--strip-components=1']);
+    extractTarballInTarget(targetDir, tarball);
   } finally {
     removeTree(tmpDir);
   }
@@ -110,6 +125,7 @@ function expectedState(electronVersion) {
       '@napi-rs/canvas-win32-x64-msvc': readLockPackage(LOCK_FILE, '@napi-rs/canvas-win32-x64-msvc'),
       '@anush008/tokenizers-win32-x64-msvc': readLockPackage(LOCK_FILE, '@anush008/tokenizers-win32-x64-msvc'),
       'better-sqlite3': readLockPackage(LOCK_FILE, 'better-sqlite3'),
+      '@img/sharp-win32-x64': readLockPackage(LOCK_FILE, '@img/sharp-win32-x64'),
     },
   };
 }
@@ -132,6 +148,7 @@ function removeDirectories(parentDir, shouldRemove, fsImpl = fs) {
 function main() {
   const electronVersion = readElectronVersion(PC_DIR);
   const state = expectedState(electronVersion);
+  const sharpVersion = state.packages['@img/sharp-win32-x64'];
   const sqliteVecDir = path.join(PC_DIR, 'node_modules', 'sqlite-vec');
   const betterSqliteDir = path.join(PC_DIR, 'node_modules', 'better-sqlite3');
   const betterSqliteBinary = path.join(betterSqliteDir, 'build', 'Release', 'better_sqlite3.node');
@@ -141,6 +158,9 @@ function main() {
     betterSqlite: betterSqliteBinary,
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', 'canvas-win32-x64-msvc', 'skia.win32-x64-msvc.node'),
     tokenizers: path.join(PC_DIR, 'node_modules', '@anush008', 'tokenizers-win32-x64-msvc', 'tokenizers.win32-x64-msvc.node'),
+    sharp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', `sharp-win32-x64-${sharpVersion}.node`),
+    sharpVipsCpp: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-cpp-8.18.3.dll'),
+    sharpVips: path.join(PC_DIR, 'node_modules', '@img', 'sharp-win32-x64', 'lib', 'libvips-42.dll'),
   };
 
   if (!fs.existsSync(sqliteVecDir) || !fs.statSync(sqliteVecDir).isDirectory()) {
@@ -150,7 +170,12 @@ function main() {
     throw new Error(`better-sqlite3 is not installed: ${betterSqliteDir}`);
   }
 
-  const prepared = markerMatches(PC_DIR, state, Object.values(required), () => isPeX64(betterSqliteBinary));
+  const prepared = markerMatches(PC_DIR, state, Object.values(required), () => [
+    betterSqliteBinary,
+    required.sharp,
+    required.sharpVipsCpp,
+    required.sharpVips,
+  ].every(isPeX64));
   removeLegacyMarker();
   if (prepared) {
     console.log(`[prepare-win-native-deps] using cached Windows native dependencies for Electron ${electronVersion}`);
@@ -162,6 +187,7 @@ function main() {
   ensurePackageFromRegistry('sqlite-vec-windows-x64', [required.sqliteVec]);
   ensurePackageFromRegistry('@napi-rs/canvas-win32-x64-msvc', [required.canvas]);
   ensurePackageFromRegistry('@anush008/tokenizers-win32-x64-msvc', [required.tokenizers]);
+  ensurePackageFromRegistry('@img/sharp-win32-x64', [required.sharp, required.sharpVipsCpp, required.sharpVips]);
 
   if (packageVersion(PC_DIR, 'better-sqlite3') === state.packages['better-sqlite3'] && isPeX64(betterSqliteBinary)) {
     console.log(`[prepare-win-native-deps] reusing better-sqlite3 Electron ${electronVersion} win32-x64 prebuild`);
@@ -186,6 +212,10 @@ function main() {
   removeDirectories(path.join(PC_DIR, 'node_modules'), (name) => /^sqlite-vec-(darwin|linux)-/i.test(name));
   removeDirectories(path.join(PC_DIR, 'node_modules', '@napi-rs'), (name) => /^canvas-/i.test(name) && name !== 'canvas-win32-x64-msvc');
   removeDirectories(path.join(PC_DIR, 'node_modules', '@anush008'), (name) => /^tokenizers-/i.test(name) && name !== 'tokenizers-win32-x64-msvc');
+  removeDirectories(path.join(PC_DIR, 'node_modules', '@img'), (name) => (
+    (/^sharp-(darwin|linux|win32)-/i.test(name) && name !== 'sharp-win32-x64')
+    || /^sharp-libvips-/i.test(name)
+  ));
   removeTree(path.join(PC_DIR, 'node_modules', 'fsevents'));
 
   ensureFile(
@@ -211,12 +241,21 @@ function main() {
     'Windows tokenizers runtime binary',
     required.tokenizers,
   );
+  for (const [label, file] of [
+    ['Windows sharp runtime binding', required.sharp],
+    ['Windows sharp libvips C++ runtime', required.sharpVipsCpp],
+    ['Windows sharp libvips runtime', required.sharpVips],
+  ]) {
+    ensureFile(label, file);
+    if (!isPeX64(file)) throw new Error(`${label} is not PE x64: ${file}`);
+  }
   writeMarker(PC_DIR, state);
 }
 
 module.exports = {
   WINDOWS_RM_OPTIONS,
   allFilesExist,
+  extractTarballInTarget,
   npmCmd,
   removeDirectories,
   removeTree,

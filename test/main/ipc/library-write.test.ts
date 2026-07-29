@@ -4,6 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
+const embedMocks = vi.hoisted(() => ({
+  embedTexts: vi.fn(async (texts: string[]) => texts.map(() => new Array(512).fill(0))),
+  embedQuery: vi.fn(async () => new Array(512).fill(0)),
+}));
+
 vi.mock('electron', () => ({
   app: { isPackaged: false },
   ipcMain: { handle: vi.fn(), on: vi.fn() },
@@ -13,8 +18,8 @@ vi.mock('electron', () => ({
 }));
 
 vi.mock('../../../src/main/features/kb_embed', () => ({
-  embedTexts: async (texts: string[]) => texts.map(() => new Array(512).fill(0)),
-  embedQuery: async () => new Array(512).fill(0),
+  embedTexts: embedMocks.embedTexts,
+  embedQuery: embedMocks.embedQuery,
   closeEmbedder: () => {},
 }));
 
@@ -27,6 +32,12 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  embedMocks.embedTexts.mockReset();
+  embedMocks.embedTexts.mockImplementation(async (texts: string[]) => (
+    texts.map(() => new Array(512).fill(0))
+  ));
+  embedMocks.embedQuery.mockReset();
+  embedMocks.embedQuery.mockResolvedValue(new Array(512).fill(0));
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
@@ -49,6 +60,33 @@ function ctx(userId = TEST_UID): any {
 }
 
 describe('library.writeText', () => {
+  it('does not recreate a deleted project vector store when in-flight embedding settles late', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const projectLibrary = await import('../../../src/main/features/project_library_indexer');
+    const { projectFilesDir, projectLocalDir } = await import('../../../src/main/paths');
+    const project = await projects.createProject(TEST_UID, 'Delete During Index');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const source = path.join(projectFilesDir(TEST_UID, projectId), 'late.md');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, 'content whose embedding finishes after deletion', 'utf8');
+
+    let releaseEmbedding: ((vectors: number[][]) => void) | null = null;
+    embedMocks.embedTexts.mockImplementationOnce(() => new Promise<number[][]>((resolve) => {
+      releaseEmbedding = resolve;
+    }));
+    projectLibrary.enqueue(TEST_UID, projectId, 'late.md');
+    await vi.waitFor(() => expect(embedMocks.embedTexts).toHaveBeenCalledOnce());
+
+    const deleted = await projects.deleteProject(TEST_UID, projectId);
+    expect(deleted.ok).toBe(true);
+    releaseEmbedding?.([new Array(512).fill(0)]);
+    await projectLibrary.drain(TEST_UID);
+
+    expect(fs.existsSync(projectLocalDir(TEST_UID, projectId))).toBe(false);
+    expect(await projects.projectExists(TEST_UID, projectId)).toBe(false);
+  });
+
   it('recovers an orphaned project processing row and completes it', async () => {
     const projects = await import('../../../src/main/features/projects');
     const projectLibrary = await import('../../../src/main/features/project_library_indexer');
@@ -178,6 +216,44 @@ describe('library.importProduced', () => {
     expect(res.ok).toBe(true);
     expect(res.scope).toBe('project');
     expect(fs.readFileSync(path.join(projectFilesDir(TEST_UID, projectId), 'reports', 'result.txt'), 'utf8')).toBe('produced body');
+
+    await projectLibrary.drain(TEST_UID);
+  });
+
+  it('keeps repeated produced-file imports as distinct project Library entries without leaking to global Library', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const userWorkspace = await import('../../../src/main/features/user_workspace');
+    const projectLibrary = await import('../../../src/main/features/project_library_indexer');
+    const { projectFilesDir, userContextsDir } = await import('../../../src/main/paths');
+    const { _libraryImportProducedForTest } = await import('../../../src/main/ipc/index');
+
+    const project = await projects.createProject(TEST_UID, 'Repeated Produced Import');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { projectId });
+    const workspace = userWorkspace.getWorkspacePath(TEST_UID, projectId);
+    fs.mkdirSync(workspace, { recursive: true });
+    const source = path.join(workspace, 'poster.md');
+    fs.writeFileSync(source, '# reusable project output', 'utf8');
+
+    const first = await _libraryImportProducedForTest({
+      cid: conv.conversation_id,
+      path: source,
+    }, ctx());
+    const second = await _libraryImportProducedForTest({
+      cid: conv.conversation_id,
+      path: source,
+    }, ctx());
+
+    expect(first).toMatchObject({ ok: true, scope: 'project', projectId });
+    expect(second).toMatchObject({ ok: true, scope: 'project', projectId });
+    expect(first.info.relPath).not.toBe(second.info.relPath);
+    expect(fs.readFileSync(path.join(projectFilesDir(TEST_UID, projectId), first.info.relPath), 'utf8'))
+      .toBe('# reusable project output');
+    expect(fs.readFileSync(path.join(projectFilesDir(TEST_UID, projectId), second.info.relPath), 'utf8'))
+      .toBe('# reusable project output');
+    expect(fs.existsSync(path.join(userContextsDir(TEST_UID), 'poster.md'))).toBe(false);
 
     await projectLibrary.drain(TEST_UID);
   });

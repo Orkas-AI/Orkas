@@ -68,4 +68,46 @@ describe('marketplace install manifest', () => {
       'agent-recent': expect.any(Number),
     });
   });
+
+  it('drops unsafe synced ids and rejects unsafe local manifest mutations', async () => {
+    const dir = path.join(tmpDir, 'u1', 'cloud', 'marketplace');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'installs.json'), JSON.stringify({
+      version: 1,
+      agents: [{
+        id: '../../config',
+        version: '1.0.0',
+        published_at: 1,
+        agent_json_url: 'https://cdn.test/a.json',
+        installed_at: 1,
+      }],
+      skills: [{
+        id: '../../../outside',
+        version: '1.0.0',
+        published_at: 1,
+        bundle_url: 'https://cdn.test/s.zip',
+        installed_at: 1,
+      }],
+      _deleted_at: {
+        agents: { '../../config': Date.now() },
+        skills: { 'safe-skill': Date.now() },
+      },
+    }), 'utf8');
+
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await expect(installs.readInstalls('u1')).resolves.toMatchObject({
+      agents: [],
+      skills: [],
+      _deleted_at: { skills: { 'safe-skill': expect.any(Number) } },
+    });
+    await expect(installs.addSkillInstall('u1', {
+      id: '../../config',
+      version: '1.0.0',
+      published_at: 1,
+      bundle_url: 'https://cdn.test/s.zip',
+    })).rejects.toThrow('invalid marketplace id');
+    await expect(installs.removeAgentInstall('u1', '../agents')).rejects.toThrow(
+      'invalid marketplace id',
+    );
+  });
 });

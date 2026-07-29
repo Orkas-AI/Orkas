@@ -40,6 +40,18 @@ function filesBelow(dir, prefix = '') {
   return out.sort();
 }
 
+function symlinksBelow(dir, prefix = '') {
+  const out = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === '.DS_Store' || entry.name.endsWith('.zip')) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const abs = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) out.push(rel);
+    else if (entry.isDirectory()) out.push(...symlinksBelow(abs, rel));
+  }
+  return out.sort();
+}
+
 function isSafeRelative(value) {
   if (typeof value !== 'string' || !value || path.isAbsolute(value)) return false;
   const parts = value.replaceAll('\\', '/').split('/');
@@ -75,10 +87,12 @@ function checkHtml(entryPath, html) {
 
   const scriptRe = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
   let scriptIndex = 0;
+  const inlineScripts = [];
   for (const match of html.matchAll(scriptRe)) {
     const attrs = match[1] || '';
     if (/\bsrc\s*=/i.test(attrs)) continue;
     scriptIndex += 1;
+    inlineScripts.push(match[2]);
     if (/\btype\s*=\s*["']module["']/i.test(attrs)) {
       warn('inline-script-syntax', `inline module script ${scriptIndex} needs a module-aware runtime check`);
       continue;
@@ -95,8 +109,34 @@ function checkHtml(entryPath, html) {
   if (generatedHandler.test(html)) fail('runtime-event-wiring', 'generated markup contains an inline event handler');
   else pass('runtime-event-wiring');
 
+  const inlineCode = inlineScripts.join('\n');
+  const hasInitializer =
+    /\b(?:function\s+)?(?:init|boot|start|render)[A-Za-z0-9_$]*\s*(?:=|\()/i.test(inlineCode) ||
+    /\b(?:document|window)\.addEventListener\s*\(\s*["']DOMContentLoaded["']\s*,/i.test(inlineCode) ||
+    /\bdocument\.readyState\b/i.test(inlineCode);
+  const hasInteractiveMarkup = /<(?:button|form|input|select|textarea)\b|role\s*=\s*["'](?:tab|dialog)["']|data-action\s*=/i.test(html);
+  if (hasInitializer && hasInteractiveMarkup) {
+    const unguardedNamedReadyCallback =
+      /\b(?:document|window)\.addEventListener\s*\(\s*["']DOMContentLoaded["']\s*,\s*(?!(?:safeInit|guardedInit|bootSafely|startSafely)\b)[A-Za-z_$][A-Za-z0-9_$]*\s*(?=[,)])/i.test(inlineCode);
+    const namedGuardedInitializer =
+      /(?:function\s+(?:safeInit|guardedInit|bootSafely|startSafely)\s*\([^)]*\)|(?:const|let)\s+(?:safeInit|guardedInit|bootSafely|startSafely)\s*=\s*(?:function\s*\([^)]*\)|\([^)]*\)\s*=>))\s*\{[\s\S]{0,12000}\btry\s*\{[\s\S]{0,12000}\b(?!(?:if|for|while|switch|catch|with)\b)[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)[\s\S]{0,12000}\bcatch\s*\([^)]*\)\s*\{[\s\S]{0,3000}(?:textContent|innerHTML|replaceChildren|hidden\s*=\s*false)/i.test(inlineCode) &&
+      /\b(?:document|window)\.addEventListener\s*\(\s*["']DOMContentLoaded["']\s*,\s*(?:safeInit|guardedInit|bootSafely|startSafely)\b|\b(?:safeInit|guardedInit|bootSafely|startSafely)\s*\(\s*\)/i.test(inlineCode);
+    const inlineGuardedReadyCallback =
+      /\b(?:document|window)\.addEventListener\s*\(\s*["']DOMContentLoaded["']\s*,\s*(?:function\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{[\s\S]{0,600}\btry\s*\{[\s\S]{0,5000}\b(?!(?:if|for|while|switch|catch|with)\b)[A-Za-z_$][A-Za-z0-9_$]*\s*\([^)]*\)[\s\S]{0,5000}\bcatch\s*\([^)]*\)\s*\{[\s\S]{0,3000}(?:textContent|innerHTML|replaceChildren|hidden\s*=\s*false)/i.test(inlineCode);
+    if (unguardedNamedReadyCallback || (!namedGuardedInitializer && !inlineGuardedReadyCallback)) {
+      fail(
+        'runtime-guarded-init',
+        'interactive HTML with an initializer must invoke it through a guarded callback that exposes an actionable fallback',
+      );
+    } else {
+      pass('runtime-guarded-init');
+    }
+  } else {
+    pass('runtime-guarded-init');
+  }
+
   const localRefs = new Set();
-  for (const match of html.matchAll(/\b(?:src|href)\s*=\s*["']([^"']+)["']/gi)) {
+  for (const match of html.matchAll(/(?:^|[\s<])(?:src|href)\s*=\s*["']([^"']+)["']/gim)) {
     localRefs.add(match[1].trim());
   }
   for (const match of html.matchAll(/\burl\(\s*["']?([^"')]+)["']?\s*\)/gi)) {
@@ -115,6 +155,12 @@ function checkHtml(entryPath, html) {
       fail('local-references', `reference escapes artifact directory: ${localPath}`);
     } else if (!fs.existsSync(resolved)) {
       fail('local-references', `missing local reference: ${localPath}`);
+    } else {
+      const realRoot = fs.realpathSync(root);
+      const realResolved = fs.realpathSync(resolved);
+      if (realResolved !== realRoot && !realResolved.startsWith(`${realRoot}${path.sep}`)) {
+        fail('artifact-boundary', `reference resolves outside artifact directory: ${localPath}`);
+      }
     }
   }
   pass('local-references');
@@ -124,6 +170,9 @@ if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
   fail('artifact-directory', `not a directory: ${root}`);
 } else {
   pass('artifact-directory');
+  const symlinks = symlinksBelow(root);
+  if (symlinks.length) fail('artifact-boundary', `symbolic links are not allowed: ${symlinks.join(', ')}`);
+  else pass('artifact-boundary');
 }
 
 let manifest = null;

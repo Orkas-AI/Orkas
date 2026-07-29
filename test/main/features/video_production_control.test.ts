@@ -92,6 +92,45 @@ describe('VideoStudio project production control', () => {
       .rejects.toThrow(/E_VIDEO_PRODUCTION_GATE_B_STALE/);
   });
 
+  it('keeps approval across catalog refreshes but invalidates stable voice intent changes', async () => {
+    const approvedPlan = plan();
+    approvedPlan.schema_version = 1;
+    approvedPlan.tracks = {
+      narration: {
+        synthesis: {
+          route_ref: 'managed:orkas-voice',
+          voice_ref: 'managed:orkas-voice:voice:vivi',
+          display_name: 'Vivi',
+          provider_model: 'catalog-v1',
+          language: 'zh-CN',
+          speed: 0.95,
+        },
+        segments: [{ text: '一句旁白', start_sec: 0, target_sec: 5 }],
+      },
+    };
+    writePlan(approvedPlan);
+    const approved = await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
+
+    const refreshed = structuredClone(approvedPlan);
+    refreshed.schema_version = 2;
+    const synthesis = ((refreshed.tracks as any).narration.synthesis) as Record<string, unknown>;
+    synthesis.display_name = 'vivi 2.0';
+    synthesis.provider_model = 'catalog-v2';
+    synthesis._catalog = { revision: 12 };
+    (refreshed.segments as Array<Record<string, unknown>>)[0]._runtime = {
+      worker: 'worker-2',
+      attempt_count: 2,
+    };
+    writePlan(refreshed);
+    expect((await validateVideoProductionPlanApproval({ statePath, planPath })).identity.signature)
+      .toBe(approved.identity.signature);
+
+    synthesis.voice_ref = 'managed:orkas-voice:voice:other';
+    writePlan(refreshed);
+    await expect(validateVideoProductionPlanApproval({ statePath, planPath }))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_GATE_B_STALE/);
+  });
+
   it('binds Gate C to exact intents and reuses one completed transaction', async () => {
     await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
     await approveVideoProductionGeneration({ statePath, planPath, turnId: 'turn-c' });
@@ -319,5 +358,43 @@ describe('VideoStudio project production control', () => {
     writePlan(invalidOperationPlan);
     await expect(approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' }))
       .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATE_SETTINGS_INVALID/);
+  });
+
+  it('enforces the intelligent semantic-edit contract at the native Gate B boundary', async () => {
+    const semanticEdit = plan();
+    const segment = (semanticEdit.segments as Array<Record<string, any>>)[0];
+    const spec = segment.spec as Record<string, unknown>;
+    spec.operation = 'edit';
+    spec.prompt = 'Remove the sign while preserving the subject, camera motion, timing, and original audio.';
+    spec.reference_video_paths = ['references/source.mp4'];
+    writePlan(semanticEdit);
+    await expect(approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' }))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_SEMANTIC_EDIT_STRATEGY_REQUIRED/);
+
+    semanticEdit.edit_strategy = {
+      mode: 'semantic',
+      objectives: ['Remove the sign.'],
+      decision_signals: ['vision', 'semantic_model'],
+      preserve: ['subject', 'camera motion', 'timing', 'original audio'],
+      may_change: ['sign'],
+    };
+    semanticEdit.references = [{
+      id: 'source-video',
+      media_type: 'video',
+      source: 'references/source.mp4',
+      intent: 'edit',
+      roles: ['content', 'motion', 'timing', 'audio'],
+      required: true,
+      preserve: ['subject', 'camera motion', 'timing', 'original audio'],
+      may_change: ['sign'],
+      target_segment_ids: ['shot-1'],
+      temporal_anchors: [{ source_start_sec: 0, source_end_sec: 5, target_segment_id: 'shot-1' }],
+    }];
+    writePlan(semanticEdit);
+    const approved = await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
+    expect(approved.identity.generation_intents[0]).toMatchObject({
+      operation: 'edit',
+      reference_video_paths: ['references/source.mp4'],
+    });
   });
 });

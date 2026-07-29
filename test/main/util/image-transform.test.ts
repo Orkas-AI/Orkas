@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { prepareFeedbackUploadImage, toCompressedGrayJpeg } from '../../../src/main/util/image-transform';
+import {
+  flattenTransparentImageToJpeg,
+  prepareFeedbackUploadImage,
+  toCompressedGrayJpeg,
+} from '../../../src/main/util/image-transform';
 
 let sourcePng: Buffer;
 
@@ -47,6 +51,36 @@ describe('image-transform › toCompressedGrayJpeg', () => {
     const r = await toCompressedGrayJpeg(smallPng, { maxDim: 1024 });
     expect(r.width).toBe(100);
     expect(r.height).toBe(80);
+  });
+
+  it('flattens transparent images onto white before JPEG encoding', async () => {
+    const { Jimp } = await import('jimp' as any);
+    const transparent: any = new Jimp({ width: 80, height: 60, color: 0x00000000 });
+    transparent.scan(25, 20, 30, 20, function (this: any, _x: number, _y: number, idx: number) {
+      this.bitmap.data[idx + 0] = 0;
+      this.bitmap.data[idx + 1] = 0;
+      this.bitmap.data[idx + 2] = 0;
+      this.bitmap.data[idx + 3] = 255;
+    });
+    const input: Buffer = await transparent.getBuffer('image/png');
+
+    const result = await toCompressedGrayJpeg(input, { maxDim: 100, quality: 90 });
+    const output: any = await Jimp.read(result.buf);
+    const background = output.getPixelColor(5, 5);
+    const foreground = output.getPixelColor(40, 30);
+
+    expect((background >>> 24) & 0xff).toBeGreaterThan(240);
+    expect((foreground >>> 24) & 0xff).toBeLessThan(20);
+  });
+
+  it('only creates an OCR normalization copy for images with transparency', async () => {
+    await expect(flattenTransparentImageToJpeg(sourcePng)).resolves.toBeNull();
+
+    const { Jimp } = await import('jimp' as any);
+    const transparent: any = new Jimp({ width: 20, height: 20, color: 0x00000000 });
+    const input: Buffer = await transparent.getBuffer('image/png');
+    const normalized = await flattenTransparentImageToJpeg(input);
+    expect(normalized?.mimeType).toBe('image/jpeg');
   });
 
   it('rejects empty buffer', async () => {

@@ -52,6 +52,7 @@ describe('local_agents/spawn-command', () => {
     try {
       const capture = path.join(tmpDir, 'capture.cjs');
       const shim = path.join(tmpDir, 'node_modules', '.bin', 'capture.cmd');
+      const powershellShim = path.join(tmpDir, 'node_modules', '.bin', 'capture.ps1');
       fs.mkdirSync(path.dirname(shim), { recursive: true });
       fs.writeFileSync(capture, 'process.stdout.write(JSON.stringify(process.argv.slice(2)));');
       fs.writeFileSync(shim, [
@@ -59,7 +60,21 @@ describe('local_agents/spawn-command', () => {
         `"%ORKAS_TEST_NODE%" "${capture}" %*`,
         '',
       ].join('\r\n'));
-      const args = ['plain', 'space value', 'value & echo unsafe', '100%', 'quote"value', 'C:\\tail\\'];
+      fs.writeFileSync(powershellShim, [
+        '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
+        '& "node.exe" "$basedir/../../capture.cjs" $args',
+        'exit $LASTEXITCODE',
+        '',
+      ].join('\r\n'));
+      const args = [
+        'plain',
+        'space value',
+        'value & echo unsafe',
+        '100%',
+        'quote"value',
+        'C:\\tail\\',
+        'first line\nsecond line',
+      ];
       const env = {
         ...process.env,
         ORKAS_TEST_NODE: TEST_NODE,
@@ -75,6 +90,32 @@ describe('local_agents/spawn-command', () => {
 
       expect(result.status, result.stderr).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual(args);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    }
+  });
+
+  it.runIf(process.platform === 'win32')('launches a bare installer command shim without Node spawn EINVAL', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-installer-shim-'));
+    try {
+      const shim = path.join(tmpDir, 'package-installer.cmd');
+      fs.writeFileSync(shim, '@echo off\r\necho %~1^|%~2\r\n');
+      const env = {
+        ...process.env,
+        PATH: `${tmpDir};${process.env.PATH || ''}`,
+        ComSpec: process.env.ComSpec || process.env.COMSPEC || 'cmd.exe',
+      };
+      const resolved = resolveCliCommand('package-installer.cmd', ['install', '--no-save'], 'win32', env);
+      const result = spawnSync(resolved.command, resolved.args, {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        env,
+        windowsHide: true,
+        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim()).toBe('install|--no-save');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }

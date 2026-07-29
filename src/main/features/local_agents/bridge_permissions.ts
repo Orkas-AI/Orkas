@@ -9,7 +9,8 @@
  *   2. Otherwise a `bridge:permission` push event asks the renderer to
  *      show the allow-once / always-allow / deny dialog; the renderer
  *      answers through the `bridge.permission_response` IPC.
- *   3. No answer within the timeout (user away / window closed) → DENY.
+ *   3. No live renderer at delivery time → immediate DENY. A delivered
+ *      request with no answer before the timeout (user away) also denies.
  *      The CLI agent gets a structured error it can relay.
  *
  * Why all calls and not just "writes": classifying an arbitrary MCP tool
@@ -106,15 +107,13 @@ const _pending = new Map<string, Pending>();
  *  degrades cleanly in tests / the open-source build builds without the IPC bridge. */
 function _broadcast(channel: string, payload: unknown): boolean {
   if (_broadcastOverride) {
-    _broadcastOverride(channel, payload);
-    return true;
+    return _broadcastOverride(channel, payload) !== false;
   }
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
+    const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => boolean };
     if (!ipc.broadcastToRenderer) return false;
-    ipc.broadcastToRenderer(channel, payload);
-    return true;
+    return ipc.broadcastToRenderer(channel, payload);
   } catch {
     return false;
   }
@@ -122,14 +121,14 @@ function _broadcast(channel: string, payload: unknown): boolean {
 
 /** Test seam: capture the `bridge:permission` push without loading the
  *  electron-backed ipc module. Pass null to restore the default. */
-let _broadcastOverride: ((channel: string, payload: unknown) => void) | null = null;
-export function _setBroadcastForTest(fn: ((channel: string, payload: unknown) => void) | null): void {
+let _broadcastOverride: ((channel: string, payload: unknown) => void | boolean) | null = null;
+export function _setBroadcastForTest(fn: ((channel: string, payload: unknown) => void | boolean) | null): void {
   _broadcastOverride = fn;
 }
 
 /**
  * Gate one bridge connector call. Resolves true (allowed) / false.
- * Never throws — a broken push channel degrades to deny-after-timeout.
+ * Never throws — a broken push channel degrades to immediate deny.
  */
 export async function requestPermission(opts: {
   uid: string;
@@ -167,7 +166,10 @@ export async function requestPermission(opts: {
     if (typeof timer.unref === 'function') timer.unref();
     _pending.set(requestId, { info, uid: opts.uid, resolve, timer });
     if (!_broadcast('bridge:permission', info)) {
-      log.warn('no renderer broadcast available — permission will deny on timeout', { request_id: maskId(requestId) });
+      _pending.delete(requestId);
+      clearTimeout(timer);
+      log.warn('no renderer broadcast available — permission denied', { request_id: maskId(requestId) });
+      resolve(false);
     }
   });
 }

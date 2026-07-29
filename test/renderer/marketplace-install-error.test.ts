@@ -13,9 +13,9 @@ function loadMarketplaceRenderer(): any {
     'utf8',
   );
   const storage = new Map<string, string>();
-  const monitorErrors: Array<{ action: string; data: Record<string, unknown> }> = [];
+  const monitorEvents: Array<{ action: string; data: Record<string, unknown> }> = [];
   const monitor = {
-    error: (action: string, data: Record<string, unknown>) => { monitorErrors.push({ action, data }); },
+    event: (action: string, data: Record<string, unknown>) => { monitorEvents.push({ action, data }); },
   };
   const context: any = {
     console,
@@ -39,12 +39,13 @@ function loadMarketplaceRenderer(): any {
       Monitor: monitor,
     },
     Monitor: monitor,
-    _monitorErrors: monitorErrors,
+    _monitorEvents: monitorEvents,
     t: (key: string) => ({
       'marketplace.install_failed': 'Install failed: {reason}',
       'marketplace.install_failed_resource': 'Install failed: {kind}: {name}. {reason}',
       'marketplace.action_failed_retry_later': 'Marketplace is temporarily unavailable. Please try again later.',
       'marketplace.app_update_required': 'Requires Orkas {minimum} or newer (current {current}). Update Orkas, then install.',
+      'marketplace.account_changed': 'The active account changed. Reopen Marketplace and try again.',
       'marketplace.requires_app': 'Needs Orkas {version}+',
       'marketplace_request.kind_agent': 'Agent',
       'marketplace_request.kind_skill': 'Skill',
@@ -147,27 +148,17 @@ describe('marketplace install error display', () => {
     expect(text).not.toContain('timed out after 60s');
   });
 
-  it('does not send missing dependency skill telemetry in the open build', () => {
+  it('does not expose missing dependency skill telemetry in the open build', () => {
     const ctx = loadMarketplaceRenderer();
-    ctx._mpTrackInstallFailure('agent', { id: 'agent-1', name: 'ResearchTutor' }, {
-      marketplaceKind: 'skill',
-      marketplaceId: 'stale-skill-id',
-      marketplaceName: 'missing-friendly-skill',
-      marketplaceReason: 'not_found',
-    });
 
-    expect(ctx._monitorErrors).toEqual([]);
+    expect(ctx._mpTrackInstallFailure).toBeUndefined();
+    expect(ctx._monitorEvents).toEqual([]);
   });
 
-  it('does not report non-missing dependency failures as missing skills', () => {
+  it('does not promote raw failure text into the error-code dimension', () => {
     const ctx = loadMarketplaceRenderer();
-    ctx._mpTrackInstallFailure('agent', { id: 'agent-1', name: 'ResearchTutor' }, {
-      marketplaceKind: 'skill',
-      marketplaceId: 'dep-skill',
-      marketplaceName: 'draft-skill',
-      marketplaceReason: 'status_not_approved:reviewing',
-    });
-
-    expect(ctx._monitorErrors).toEqual([]);
+    expect(ctx._mpActionErrorCode({
+      message: 'failed to install /Users/test/secret-skill for alice@example.test',
+    })).toBe('operation_failed');
   });
 });

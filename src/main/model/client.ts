@@ -14,7 +14,7 @@
  * cross-module contract between features/ and model/.
  */
 
-import type { AgentTool, HistoryResource } from '#core-agent';
+import type { AgentTool, HistoryResource, Message } from '#core-agent';
 
 import {
   abortActiveSession as _abortActiveSession,
@@ -58,6 +58,15 @@ export interface ChatOptions {
   userId: string;
   message: string;
   sessionId?: string;
+  /** Host-authoritative completed dialogue to mirror into the execution
+   * session before starting a normal turn. Used by group-chat Commander,
+   * whose semantic history includes replies from every visible actor. */
+  conversationHistory?: {
+    source: string;
+    messages: Message[];
+    replaceFromTurnId?: number;
+    checkpoint?: string;
+  };
   /** Continue a verified failed active turn in the same persistent session.
    * Falls back to a normal new turn if no active turn remains. */
   resumeActiveTurn?: boolean;

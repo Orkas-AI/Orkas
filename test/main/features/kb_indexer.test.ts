@@ -4,6 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
+import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
+import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
+import { makeMinimalPptx, makeMinimalXlsx } from '../../fixtures/make-minimal-office';
+
 /**
  * Tests kb_indexer's queue + reconcile logic. kb_embed is mocked to avoid
  * loading the 95MB ONNX model on every test run.
@@ -119,6 +123,42 @@ describe('kb_indexer › enqueue + processJob', () => {
     expect(statuses).toContain('ready');
     expect(statuses.indexOf('pending')).toBeLessThan(statuses.indexOf('processing'));
     expect(statuses.indexOf('processing')).toBeLessThan(statuses.indexOf('ready'));
+  });
+
+  it('extracts and stores searchable chunks for PDF and Office formats', async () => {
+    const fixtures: Array<[string, Buffer, string]> = [
+      ['report.pdf', makeMinimalPdf(['PDF orbit marker 741']), 'PDF orbit marker 741'],
+      [
+        'notes.docx',
+        makeMinimalDocx({ heading: 'Notes', paragraphs: ['DOCX orbit marker 742'] }),
+        'DOCX orbit marker 742',
+      ],
+      [
+        'scores.xlsx',
+        makeMinimalXlsx({ rows: [['Metric'], ['XLSX orbit marker 743']] }),
+        'XLSX orbit marker 743',
+      ],
+      [
+        'slides.pptx',
+        makeMinimalPptx({ slides: [['Roadmap', 'PPTX orbit marker 744']] }),
+        'PPTX orbit marker 744',
+      ],
+    ];
+    for (const [name, buffer] of fixtures) writeCtxBuffer(name, buffer);
+    const idx = await import('../../../src/main/features/kb_indexer');
+    const kb = await import('../../../src/main/features/kb_vector');
+
+    for (const [name] of fixtures) idx.enqueue(TEST_UID, name);
+    await idx.drain(TEST_UID);
+
+    for (const [name, _buffer, marker] of fixtures) {
+      expect(kb.getFileByPath(TEST_UID, name)).toMatchObject({
+        status: 'ready',
+      });
+      expect(
+        kb.readFileChunks(TEST_UID, name).map((chunk) => chunk.content).join('\n'),
+      ).toContain(marker);
+    }
   });
 
   it('emits deleted event + drops row on op=delete', async () => {
@@ -259,6 +299,36 @@ describe('kb_indexer › enqueue + processJob', () => {
     expect(row?.chunks).toBe(1);
     const chunks = kb.readFileChunks(TEST_UID, 'photo.png');
     expect(chunks[0]?.content).toMatch(/automatic visual description is unavailable/);
+  });
+
+  it('times out stalled image vision before the extraction deadline and continues the queue', async () => {
+    process.env.ORKAS_LIBRARY_IMAGE_DESCRIBE_TIMEOUT_MS = '50';
+    process.env.ORKAS_LIBRARY_EXTRACT_TIMEOUT_MS = '1000';
+    try {
+      const { Jimp } = await import('jimp' as any);
+      const img: any = new Jimp({ width: 16, height: 16, color: 0x336699FF });
+      writeCtxBuffer('stalled-photo.png', await img.getBuffer('image/png'));
+      writeCtx('after-image.md', 'This document must still be indexed after stalled vision.');
+      chatWithModelMock.mockImplementationOnce(() => new Promise(() => {}));
+
+      const idx = await import('../../../src/main/features/kb_indexer');
+      const kb = await import('../../../src/main/features/kb_vector');
+      idx.enqueue(TEST_UID, 'stalled-photo.png');
+      idx.enqueue(TEST_UID, 'after-image.md');
+      await idx.drain(TEST_UID);
+
+      expect(kb.getFileByPath(TEST_UID, 'stalled-photo.png')).toMatchObject({
+        status: 'ready',
+        chunks: 1,
+      });
+      expect(kb.readFileChunks(TEST_UID, 'stalled-photo.png')[0]?.content).toMatch(
+        /automatic visual description is unavailable/,
+      );
+      expect(kb.getFileByPath(TEST_UID, 'after-image.md')?.status).toBe('ready');
+    } finally {
+      delete process.env.ORKAS_LIBRARY_IMAGE_DESCRIBE_TIMEOUT_MS;
+      delete process.env.ORKAS_LIBRARY_EXTRACT_TIMEOUT_MS;
+    }
   });
 
   it('short-circuits empty files to ready with 0 chunks (no embed call)', async () => {

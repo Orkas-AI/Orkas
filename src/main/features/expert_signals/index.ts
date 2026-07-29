@@ -15,7 +15,11 @@
  * triggering logic.
  */
 
-import { appendSignal, querySignals as _querySignals } from './storage';
+import {
+  appendSignal,
+  querySignals as _querySignals,
+  querySignalsForUser as _querySignalsForUser,
+} from './storage';
 import type { Signal, SignalFilter, SignalInput } from './types';
 
 export type {
@@ -35,4 +39,13 @@ export function emitSignal(uid: string, input: SignalInput): void {
 /** Query signals across one or more daily files. */
 export async function querySignals(filter: SignalFilter = {}): Promise<Signal[]> {
   return _querySignals(filter);
+}
+
+/** Query one account explicitly. Required for background work that may
+ * overlap an account switch. */
+export async function querySignalsForUser(
+  uid: string,
+  filter: SignalFilter = {},
+): Promise<Signal[]> {
+  return _querySignalsForUser(uid, filter);
 }

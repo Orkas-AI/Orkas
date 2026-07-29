@@ -102,6 +102,18 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       };
       if (opts.model) sessionNewParams.model = opts.model;
 
+      let sessionNewSent = false;
+      const sendSessionNew = () => {
+        if (sessionNewSent) return;
+        sessionNewSent = true;
+        send({
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'session/new',
+          params: sessionNewParams,
+        });
+      };
+
       const splitter = new LineSplitter();
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
@@ -118,6 +130,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             opts.onEvent({ type: 'raw-line', line: trimmed });
             return;
           }
+          if (Number(env.id) === 1 && !env.error) sendSessionNew();
           handleAcpMessage(env, {
             onSessionNew: id => {
               sessionId = id;
@@ -173,24 +186,10 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
       });
 
-      // Initialize response handler — sends session/new only after
-      // the server acked initialize. We track this through the
-      // generic message handler by id matching.
-      child.on('message', () => { /* noop */ });
-
-      // Drive the session/new request once we see the initialize
-      // response (id=1). We piggy-back on the first object that sets
-      // sessionId being the session/new response, but to keep flow
-      // explicit we send session/new immediately after initialize
-      // ack — the ACP spec allows this since session/new doesn't need
-      // any post-initialize state.
-      const sendSessionNew = () => send({
-        jsonrpc: '2.0', id: 2, method: 'session/new',
-        params: sessionNewParams,
-      });
       // Fire-and-forget timeout to be sure session/new goes; some CLIs
       // ack initialize without printing anything we'd recognize as the
-      // ack, and then sit idle.
+      // ack, and then sit idle. The one-shot guard prevents a late fallback
+      // from creating a second session after a normal initialize response.
       const initTimer = setTimeout(sendSessionNew, 250);
       if (typeof initTimer.unref === 'function') initTimer.unref();
 

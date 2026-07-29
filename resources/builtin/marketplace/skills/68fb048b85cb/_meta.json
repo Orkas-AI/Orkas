@@ -1,0 +1,27 @@
+{
+  "version": "1.0.2",
+  "updated_at": "2026-07-28T13:32:31.000Z",
+  "min_app_version": "1.6.2",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "descriptions": {
+    "zh": "用于仓库级产品研发：从已明确需求到聚焦实现、工程测试和证据化交付，覆盖仓库勘察、技术决策、功能开发、bug 修复、重构、评审、调试、迁移与变更安全。",
+    "en": "Use for repository-aware product engineering from accepted requirements to focused implementation, engineering tests, review, and evidence-backed delivery."
+  },
+  "routing": {
+    "applicable_domain": [
+      "existing software repositories with a clear feature, bug, refactor, review, performance, build, or test objective",
+      "technical decisions, migrations, dependency changes, and implementation verification"
+    ],
+    "negative_examples": [
+      "discover what product to build when the user problem and success criteria are still vague",
+      "make a disposable demo only to validate an idea",
+      "write product acceptance scenarios without implementing or testing code",
+      "triage pull requests or operate GitHub as a repository maintainer"
+    ],
+    "prerequisites": [
+      "a workspace or repository is available when code changes are requested",
+      "the desired behavior or engineering question is specific enough to inspect"
+    ]
+  }
+}

@@ -968,7 +968,7 @@ describe('builtin marketplace seed', () => {
   it('overlays newer builtin skill over a resource-owned marketplace skill even after local edits', async () => {
     const skillId = '6743aa0797a2';
     writeBuiltinSkill(skillId, 'brand-research');
-    writeBuiltinSkillMeta(skillId, { version: '1.0.2' });
+    writeBuiltinSkillMeta(skillId, { version: '1.0.2', min_app_version: '1.7.0' });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
@@ -978,8 +978,11 @@ describe('builtin marketplace seed', () => {
     const originalSkill = '---\nname: brand-research\ndescription: public\n---\n\npublic body\n';
     const editedSkill = '---\nname: brand-research\ndescription: edited\n---\n\nlocal edit\n';
     fs.writeFileSync(path.join(localRoot, 'SKILL.md'), originalSkill, 'utf8');
+    fs.mkdirSync(path.join(localRoot, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(localRoot, 'scripts', 'legacy.py'), 'legacy resource helper\n', 'utf8');
     writeResourceSeedManifest(localRoot, 'skill', skillId);
     fs.writeFileSync(path.join(localRoot, 'SKILL.md'), editedSkill, 'utf8');
+    fs.writeFileSync(path.join(localRoot, 'runtime-note.txt'), 'preserve local runtime data\n', 'utf8');
     fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
       version: '1.0.1',
       published_at: 10,
@@ -1011,8 +1014,12 @@ describe('builtin marketplace seed', () => {
       version: '1.0.2',
       seed_source: 'builtin',
       bundle_url: 'https://cdn.test/brand-research.zip',
+      min_app_version: '1.7.0',
     });
     expect(fs.existsSync(path.join(localRoot, MARKETPLACE_RESOURCE_MANIFEST_NAME))).toBe(false);
+    expect(fs.existsSync(path.join(localRoot, 'scripts', 'legacy.py'))).toBe(false);
+    expect(fs.readFileSync(path.join(localRoot, 'runtime-note.txt'), 'utf8'))
+      .toBe('preserve local runtime data\n');
   });
 
   it('overlays newer builtin skill content even when the marketplace install was locally edited', async () => {

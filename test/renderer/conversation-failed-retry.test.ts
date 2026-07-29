@@ -29,6 +29,14 @@ function loadFailedClassifier(): (raw: string, message?: Record<string, unknown>
   return vm.runInNewContext(`(${fnSource})`, {});
 }
 
+function loadInterruptedClassifier(): (message?: Record<string, unknown> | null) => boolean {
+  const fnSource = [
+    extractFunction('_groupMessageSystemKind'),
+    extractFunction('_isInterruptedAssistantMessage'),
+  ].join('\n');
+  return vm.runInNewContext(`${fnSource}\n_isInterruptedAssistantMessage;`, {});
+}
+
 function loadModelOutputTracker() {
   const source = [
     extractFunction('_normalizeFeedbackFieldText'),
@@ -40,7 +48,7 @@ function loadModelOutputTracker() {
     const calls = [];
     function _convTrackError(action, data) { calls.push({ action, data }); }
     function _groupActorLabel(actorId) { return actorId === 'commander' ? 'Commander' : ''; }
-    function _maybeShowOrkasCreditGuidance() {}
+    const window = {};
     ${source}
     ({ track: _handleModelOutputErrorForUi, calls });
   `, {});
@@ -56,17 +64,38 @@ describe('conversation failed assistant retry actions', () => {
     expect(isFailed('普通回复，没有失败状态')).toBe(false);
   });
 
+  it('classifies persisted stop and startup-recovery records without matching ordinary prose', () => {
+    const isInterrupted = loadInterruptedClassifier();
+
+    expect(isInterrupted({
+      process: [{
+        type: 'event',
+        event: { stream: 'runtime', data: { phase: 'end', aborted: true } },
+      }],
+    })).toBe(true);
+    expect(isInterrupted({ _system_kind: 'reply_interrupted' })).toBe(true);
+    expect(isInterrupted({
+      content: 'The user discussed an interrupted download.',
+      process: [{
+        type: 'event',
+        event: { stream: 'runtime', data: { phase: 'end', aborted: false } },
+      }],
+    })).toBe(false);
+  });
+
   it('uses the standard bubble action colors for retry', () => {
     expect(styleSource).not.toMatch(/\.bubble-retry-btn\s*\{/);
     expect(source).toContain("retryBtn.className = 'bubble-action-btn bubble-retry-btn';");
   });
 
-  it('routes live placeholder failures through retry actions instead of archive actions', () => {
+  it('routes live failed and interrupted placeholders through retry actions', () => {
     const finalizeBody = extractFunction('_finalizeActorPlaceholder');
 
     expect(finalizeBody).toContain('const failedAssistant = _isFailedAssistantContent(text, gm);');
-    expect(finalizeBody).toContain('_streamingSetFinal(ph, text, { archive: archive && !failedAssistant });');
+    expect(finalizeBody).toContain('const interruptedAssistant = _isInterruptedAssistantMessage(gm);');
+    expect(finalizeBody).toContain('archive: archive && !failedAssistant && !interruptedAssistant');
     expect(finalizeBody).toContain('_attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));');
+    expect(finalizeBody).toContain('_attachInterruptedAssistantActions(ph, () => _messageTextForActions(ph, text), { archive });');
     expect(finalizeBody).toContain("failure_kind: String(gm.failure_kind || '')");
 
     const failedActionsBody = extractFunction('_attachFailedAssistantActions');
@@ -74,9 +103,17 @@ describe('conversation failed assistant retry actions', () => {
     expect(failedActionsBody).toContain('archive: false');
     expect(failedActionsBody).toContain('retry: true');
     expect(failedActionsBody).not.toContain('report: true');
-    expect(source).toContain("const mode = includeRetry ? 'failed'");
+    expect(source).toContain("const mode = includeRetry\n    ? (includeArchive ? 'assistant-retry' : 'failed')");
     expect(source).toContain('class="chat-bubble-more-wrap"');
     expect(source).toContain('_attachBubbleRetryBtn(directActions, msgDiv)');
+
+    const interruptedActionsBody = extractFunction('_attachInterruptedAssistantActions');
+    expect(interruptedActionsBody).toContain("msgDiv.dataset.interrupted = '1';");
+    expect(interruptedActionsBody).toContain('retry: true');
+    expect(interruptedActionsBody).toContain('report: true');
+    expect(source).toContain("else if (role === 'assistant' && interruptedAssistant)");
+    expect(source).toContain('} else if (interruptedAssistant) {');
+    expect(extractFunction('_streamingMarkAborted')).toContain('_attachInterruptedAssistantActions(');
   });
 
   it('does not send model output error telemetry in the open build', () => {

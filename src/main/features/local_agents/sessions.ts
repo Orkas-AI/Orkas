@@ -1,15 +1,16 @@
 /**
  * Per-conversation CLI session bindings.
  *
- * Each (cid, aid, cli) tuple gets a CLI-reported session id so the
- * next dispatch can pass `--resume <id>`. The CLI keeps its own
+ * Each resumable (cid, aid, cli) tuple gets a CLI-reported session id so the
+ * next dispatch can pass the backend's continuation handle. The CLI keeps its own
  * conversation memory; we only persist the handle. Host prompts stay
  * current-turn-only while this handle is valid; if the handle is absent
  * after prior visible turns (for example cwd changed), group_chat may
  * bridge that transcript once into the fresh CLI session.
  *
  * Storage: `<uid>/local/cli-sessions/<cid>.json`, shape:
- *   { "<aid>": { "cli": "claude", "sessionId": "...", "updatedAt": "..." } }
+ *   { "<aid>": { "cli": "claude", "sessionId": "...", "updatedAt": "...",
+ *                  "sourceMessageId": "...", "turnId": "..." } }
  *
  * Why under `local/` instead of `cloud/`: session ids reference
  * machine-local CLI state (e.g. `~/.claude/projects/...`); a synced
@@ -31,10 +32,26 @@ import { logErrorRef, maskId } from '../../util/log-redact.js';
 
 const log = createLogger('local-agents:sessions');
 
-interface CliSessionRecord {
+export interface CliSessionRecord {
   cli: string;
   sessionId: string;
   updatedAt: string;
+  /** Hash of the low-churn CLI instruction bundle applied to this session.
+   * Missing on v1 records; native-instruction adapters can safely refresh it,
+   * while user-message-only adapters treat the record as a fresh boundary. */
+  durableContextHash?: string;
+  /** Hash of the effective cwd. Session stores for some CLIs are cwd-scoped,
+   * so a mismatch must never suppress the one-time recovery context. */
+  cwdFingerprint?: string;
+  contextProtocolVersion?: number;
+  /** User/group message that launched the most recently persisted CLI run.
+   * Failed-turn retry uses this to avoid attaching an older bubble to a newer
+   * native CLI session. Missing on legacy records, which remain resumable for
+   * ordinary continuation. */
+  sourceMessageId?: string;
+  turnId?: string;
+  runId?: string;
+  terminalStatus?: string;
 }
 
 interface CliSessionsFile {
@@ -69,17 +86,50 @@ async function write(uid: string, cid: string, data: CliSessionsFile): Promise<v
  * (runtime swapped). Caller treats null as a fresh CLI session.
  */
 export async function getSessionId(uid: string, cid: string, aid: string, cli: string): Promise<string | null> {
+  return (await getBinding(uid, cid, aid, cli))?.sessionId || null;
+}
+
+/** Return the full binding when provenance is needed for failed-turn retry. */
+export async function getBinding(uid: string, cid: string, aid: string, cli: string): Promise<CliSessionRecord | null> {
   const file = await read(uid, cid);
   const r = file[aid];
   if (!r || r.cli !== cli) return null;
-  return r.sessionId || null;
+  return r.sessionId ? { ...r } : null;
 }
 
-/** Persist the session id reported by the CLI after a successful run. */
-export async function setSessionId(uid: string, cid: string, aid: string, cli: string, sessionId: string): Promise<void> {
+/** Persist the session id reported by the CLI after any terminal run. */
+export async function setSessionId(
+  uid: string,
+  cid: string,
+  aid: string,
+  cli: string,
+  sessionId: string,
+  provenance: Partial<Pick<CliSessionRecord,
+    | 'sourceMessageId'
+    | 'turnId'
+    | 'runId'
+    | 'terminalStatus'
+    | 'durableContextHash'
+    | 'cwdFingerprint'
+    | 'contextProtocolVersion'
+  >> = {},
+): Promise<void> {
   if (!sessionId) return;
   const file = await read(uid, cid);
-  file[aid] = { cli, sessionId, updatedAt: new Date().toISOString() };
+  file[aid] = {
+    cli,
+    sessionId,
+    updatedAt: new Date().toISOString(),
+    ...(provenance.sourceMessageId ? { sourceMessageId: provenance.sourceMessageId } : {}),
+    ...(provenance.turnId ? { turnId: provenance.turnId } : {}),
+    ...(provenance.runId ? { runId: provenance.runId } : {}),
+    ...(provenance.terminalStatus ? { terminalStatus: provenance.terminalStatus } : {}),
+    ...(provenance.durableContextHash ? { durableContextHash: provenance.durableContextHash } : {}),
+    ...(provenance.cwdFingerprint ? { cwdFingerprint: provenance.cwdFingerprint } : {}),
+    ...(provenance.contextProtocolVersion
+      ? { contextProtocolVersion: provenance.contextProtocolVersion }
+      : {}),
+  };
   try { await write(uid, cid, file); }
   catch (err) {
     log.warn('setSessionId failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });

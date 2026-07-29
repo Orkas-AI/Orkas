@@ -290,7 +290,11 @@ def compare(baseline: dict, current: dict) -> dict:
 
 
 def _load(path):
-    raw = sys.stdin.read() if not path or path == "-" else open(path, encoding="utf-8").read()
+    if not path or path == "-":
+        raw = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
     return json.loads(raw)
 
 

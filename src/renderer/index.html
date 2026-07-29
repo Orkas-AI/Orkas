@@ -59,28 +59,31 @@
         </button>
       </div>
       <div class="sidebar-resize-handle" id="sidebar-resize-handle"
-           role="separator" aria-orientation="vertical"
+           role="separator" aria-orientation="vertical" tabindex="0"
+           data-i18n-aria-label="sidebar.resize_title"
+           aria-label="Drag to resize · double-click to reset"
            data-i18n-title="sidebar.resize_title"
            title="Drag to resize · double-click to reset"></div>
     </aside>
 
     <main class="main-content">
       <!-- New Chat Landing — empty state per PC/docs/design/PATTERNS.md
-           (Surface B). 720px centered column: time-of-day greeting +
-           subtitle + composer (80px textarea) + 6 scenario chips.
-           Greeting is filled in by JS lifecycle hooks; see
-           _refreshEmptyStateGreeting. -->
+           (Surface B). 720px centered column: account-aware heading +
+           subtitle + composer (80px textarea) + quick-start task cards.
+           The heading is filled in by JS lifecycle hooks; see
+           _refreshEmptyStateHeading. -->
       <section class="panel active" id="panel-new-chat">
-        <button type="button" class="new-chat-external-agent-btn" id="new-chat-external-agent-btn">
+        <button type="button" class="new-chat-external-agent-btn" id="new-chat-external-agent-btn"
+                data-i18n-aria-label="new_chat.external_agent_entry" aria-label="Connect Codex, Claude Code &amp; other AI tools">
           <span data-ui-icon="terminal" data-ui-icon-class="new-chat-external-agent-icon"></span>
           <span class="new-chat-external-agent-label">
-            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other AI coding tools</span>
+            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other AI tools</span>
             <span data-ui-icon="arrow-right" data-ui-icon-class="new-chat-external-agent-arrow"></span>
           </span>
         </button>
         <div class="new-chat-center">
           <div class="new-chat-header">
-            <h1 class="new-chat-greeting" id="new-chat-greeting"></h1>
+            <h1 class="new-chat-greeting" id="new-chat-greeting" data-i18n="new_chat.title_fallback">Friend, what do you want to accomplish?</h1>
             <p class="new-chat-subtitle" data-i18n="new_chat.subtitle"></p>
           </div>
           <div class="new-chat-input-wrapper">
@@ -93,7 +96,7 @@
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
               <div class="chat-quote-preview" id="new-chat-quote-preview" style="display:none"></div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="For example: Analyze this file, identify the key issues, and suggest improvements" rows="2"></textarea>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
                    [skill] | spacer | [send]. The open-source build strips
@@ -121,49 +124,34 @@
               </div>
             </div>
           </div>
-          <!-- Quick-scenario chip row. Each chip pre-fills the textarea with
-               its template (per PC/docs/design/README §Surface B) and moves
-               the caret to the first [...] placeholder. Wired by
-               _initEmptyStateScenarios() in conversation.js. -->
-          <div class="new-chat-scenarios" id="new-chat-scenarios">
-            <button type="button" class="new-chat-scenario-chip" data-scenario="data">
-              <span data-ui-icon="search" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.data">Research</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="video">
-              <span data-ui-icon="film" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.video">Make video</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="ui_design">
-              <span data-ui-icon="palette" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.ui_design">UI Design</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="seo_geo">
-              <span data-ui-icon="globe" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.seo_geo">AI Search Visibility</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="office">
-              <span data-ui-icon="file-text" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.office">Documents</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="rnd">
-              <span data-ui-icon="code" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.rnd">Build app</span>
-            </button>
-          </div>
-          <!-- Open-source-driven「还能帮你做这些」capability strip. Task cards are
+          <!-- Server-orderable quick start list. Main-process client config
+               supplies the ordered ids; conversation.js renders localized
+               cards and binds their matching built-in/default agent. -->
+          <section class="new-chat-scenarios quick-panel" id="new-chat-scenarios" aria-labelledby="quick-panel-title">
+            <div class="quick-panel-head">
+              <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
+              <span class="quick-panel-rule" aria-hidden="true"></span>
+            </div>
+            <div class="quick-grid" id="new-chat-scenario-grid"></div>
+          </section>
+          <!-- Open-source-driven optional extension rail. Tool cards are
                rendered + wired by modules/oss.js::initOssEntry() (data from the
-               curated marketplace projects catalog). Cards only show the task +
-               "由 X 开源驱动"; repo/star/driver detail lives in the marketplace
+               curated marketplace projects catalog). The home subset excludes
+               capabilities already covered by Quick start agents. Cards show project name,
+               category and the distinct extension it adds; repo/star/driver detail lives in the marketplace
                「开源项目」专区. -->
           <div class="oss-entry" id="oss-entry" style="display:none">
             <div class="oss-entry-head">
-              <span data-ui-icon="sparkles" data-ui-icon-class="oss-entry-spark"></span>
-              <span class="oss-entry-title" data-i18n="oss.title">You can also ask for these</span>
-              <span class="oss-entry-sub" data-i18n="oss.subtitle">Just describe what you need — Orkas sets up the right tools.</span>
+              <span class="oss-entry-title" data-i18n="oss.title">Open-source tools</span>
+              <span class="oss-entry-sub">
+                <span data-i18n="oss.subtitle">Extend Commander’s capabilities</span>
+                <span class="oss-entry-sub-divider" aria-hidden="true">·</span>
+                <span data-i18n="oss.optional">Install as needed</span>
+              </span>
+              <span class="oss-entry-rule" aria-hidden="true"></span>
               <button type="button" class="oss-entry-more" id="oss-entry-more">
-                <span data-i18n="oss.more">More capabilities</span>
-                <span data-ui-icon="arrow-right" data-ui-icon-class="oss-entry-more-arrow"></span>
+                <span data-i18n="oss.more">More</span>
+                <span data-ui-icon="chevron-right" data-ui-icon-class="oss-entry-more-arrow" aria-hidden="true"></span>
               </button>
             </div>
             <div class="oss-entry-grid" id="oss-entry-grid"></div>
@@ -1077,13 +1065,13 @@
               <div class="settings-group settings-model-auth-group">
                 <div class="settings-group-head">
                   <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
-                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
+                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Choose a listed model or enter a custom endpoint, then add authorization.</div>
                 </div>
                 <div class="settings-row">
                   <label data-i18n="settings.provider">Provider</label>
                   <div class="ai-select" id="settings-picker-provider"></div>
                 </div>
-                <div class="settings-row">
+                <div class="settings-row" id="settings-picker-model-row">
                   <label data-i18n="settings.model">Model</label>
                   <div class="ai-select" id="settings-picker-model"></div>
                 </div>
@@ -1114,7 +1102,7 @@
                 </div>
                 <div class="settings-row">
                   <label data-i18n="settings.search.api_key">API Key</label>
-                  <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
+                  <input type="password" class="form-input" id="settings-search-key-input" autocomplete="new-password" spellcheck="false" />
                 </div>
                 <div class="settings-row">
                   <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
@@ -1136,7 +1124,7 @@
                 </div>
                 <div class="settings-row">
                   <label data-i18n="settings.image.api_key">API Key</label>
-                  <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
+                  <input type="password" class="form-input" id="settings-image-key-input" autocomplete="new-password" spellcheck="false" />
                 </div>
                 <div class="settings-row">
                   <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
@@ -1158,7 +1146,7 @@
                 </div>
                 <div class="settings-row" id="settings-video-key-row">
                   <label data-i18n="settings.video.api_key">API Key</label>
-                  <input type="text" class="form-input" id="settings-video-key-input" autocomplete="off" spellcheck="false" />
+                  <input type="password" class="form-input" id="settings-video-key-input" autocomplete="new-password" spellcheck="false" />
                 </div>
                 <div class="settings-row">
                   <button class="btn btn-primary" id="settings-video-add-btn" data-i18n="settings.video.add">+ Add video key</button>
@@ -1179,7 +1167,7 @@
                 </div>
                 <div class="settings-row" id="settings-tts-key-row">
                   <label data-i18n="settings.tts.api_key">API Key</label>
-                  <input type="text" class="form-input" id="settings-tts-key-input" autocomplete="off" spellcheck="false" />
+                  <input type="password" class="form-input" id="settings-tts-key-input" autocomplete="new-password" spellcheck="false" />
                 </div>
                 <div class="settings-row tts-row-voice" hidden>
                   <label data-i18n="settings.tts.voice">Voice</label>
@@ -1257,9 +1245,27 @@
            CLI's defaults but stay editable. claude / codex get a
            project-directory setting on the detail page after creation. -->
       <div class="skill-modal-panel" data-agent-panel="external">
+        <div class="agent-cli-prerequisite" role="note">
+          <span data-i18n="agent_modal.ext_cli_prerequisite_body">Supports Claude Code, Codex, OpenClaw, OpenCode, and Hermes. Install and configure one to connect.</span>
+        </div>
         <div class="form-row">
-          <label data-i18n="agent_modal.ext_cli_label">Agent</label>
-          <div class="ai-select" id="agent-modal-ext-cli-select"></div>
+          <label>
+            <span data-i18n="agent_modal.ext_cli_label">Agent</span>
+            <span class="agent-cli-detection-status" id="agent-modal-ext-cli-status" role="status" aria-live="polite" hidden>
+              <span class="agent-cli-detection-spinner" aria-hidden="true"></span>
+              <span data-i18n="agent_modal.ext_cli_updating">Updating…</span>
+            </span>
+          </label>
+          <div class="agent-cli-select-row">
+            <div class="ai-select" id="agent-modal-ext-cli-select"></div>
+            <span
+              class="agent-cli-selection-warning"
+              id="agent-modal-ext-cli-warning"
+              role="status"
+              aria-live="polite"
+              hidden
+            ></span>
+          </div>
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_name">Name</label>
@@ -1273,7 +1279,7 @@
 
       <div class="form-msg" id="agent-form-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeAgentModal()" data-i18n="common.cancel">Cancel</button>
+        <button class="btn" onclick="cancelAgentModal()" data-i18n="common.cancel">Cancel</button>
         <button class="btn btn-primary" id="agent-save-btn" onclick="saveAgentModal()" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
@@ -1536,7 +1542,7 @@
         <button class="search-tab" data-tab="skill" data-i18n="search.tab.skill">Skills</button>
         <button class="search-tab" data-tab="context" data-i18n="search.tab.context">Library</button>
       </div>
-      <div class="search-body" id="search-body">
+      <div class="search-body is-start-state" id="search-body">
         <div class="search-empty" data-i18n="search.empty_hint">Type a keyword to start searching</div>
       </div>
     </div>
@@ -1559,6 +1565,8 @@
   <script src="./modules/chat-use.js"></script>
   <script src="./modules/user-error.js"></script>
   <script src="./modules/model-guard.js"></script>
+  <script src="./modules/dropdown-placement.js"></script>
+  <script src="./modules/composer-model-picker.js"></script>
   <script src="./modules/delete-file-confirm.js"></script>
   <script src="./modules/boot.js"></script>
   <script src="./modules/avatar.js"></script>

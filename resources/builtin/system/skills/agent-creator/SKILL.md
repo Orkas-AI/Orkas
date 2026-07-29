@@ -19,8 +19,25 @@ You **must** consult before emitting any `<agent>` container. The protocol below
 ## Hard rules (non-negotiable)
 
 - **Mutation only via `<agent>` container.** Do NOT use `edit_file` / `write_file` / `bash` to mutate `agent.json` directly. Read for inspection is allowed; every write goes through the container — the sandbox physically blocks direct writes, the rule here keeps you from wasting tool calls probing it.
+- **No container, no mutation, no success claim.** A new or updated Agent exists
+  only after this same final reply contains one valid `<agent>` container for
+  that exact Agent and the host applies it. If you emit no container, describe
+  the result only as a proposal, clarification, or blocked request; never say
+  the Agent is ready, created, updated, installed, or available. For a team,
+  the number of valid containers must equal the number of Agents you claim to
+  have created. The host-owned created-Agent chips are the persistence proof.
 - **Do NOT dump the container as a workspace file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server; the server parses it inline. An extra `write_file` only leaks an unused XML file.
 - **One container per agent being created/edited this turn.** Several containers in one turn are legal only when the user's request spans distinct agents ("tighten the workflow on A and B"). Each container is parsed and applied independently. End the turn after — do NOT call `dispatch_to`.
+- **An Agent role is not a model runtime.** LLM-managed Agent fields define
+  responsibility and workflow; they do not select or impersonate an external
+  model/provider. Do not name or describe role-based Agents as ChatGPT, Claude,
+  DeepSeek, Kiwi, or another model merely to simulate that model's
+  "personality", "style", or "character". When the user requests real
+  multi-model routing, first distinguish configured official/custom models,
+  external CLI runtimes, and service connectors from ordinary Agent roles. If
+  the requested runtimes are unavailable, state that boundary and offer
+  neutral capability-based roles only as an explicit alternative; do not claim
+  Orkas uses an unverified provider behind them.
 - **Source-preservation default.** When the user supplies existing source content as the reference (pasted prompt, source `agent.json`, YAML/JSON agent spec, README, workflow, examples, or an agent directory), treat the source as canonical. Preserve the agent's core prompt, role/persona, goals, step order, tool rules, input/output contract, examples, safety rules, and stop/confirmation points. Only adapt it to Orkas container fields, valid tool/skill names, category, and editable `agent.json` shape. Do NOT replace a detailed source prompt with a generic newly invented workflow unless the user explicitly asks for a rewrite.
 - **No silent category defaults.** Before the final reply for any create / edit / import, run the category sanity pass below. Do not say "done" while `<category>` is missing, invalid, inherited from an invalid source value such as `code`, or merely the fallback `general` without evidence.
 - **Output language follows the user's UI language** — `<name>`, `<description>`, `<workflow>` step titles + body, `<inputs>` `label` values, `<knowhow>` / `<standards>` string values, and the prose around the container all go in the user's current UI language (per the "User language" directive in the system prompt; that directive's coverage applies even though this file reaches you as a `read_file` result). Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions. XML tag names, backticked tool / skill names, JSON keys, file paths, and `select` `value` strings stay as-is / English.

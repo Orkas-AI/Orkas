@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   buildDocxBatch, buildXlsxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, columnLetter,
+  serializeOfficeBatch,
   type DocxParagraphSpec, type XlsxCell, type EditOp,
 } from '../../../../src/main/model/core-agent/office-batch';
 
@@ -33,9 +34,12 @@ describe('buildDocxBatch', () => {
     expect(ops[0].props).toEqual({ text: 'x' });
   });
 
-  it('serializes to JSON without manual escaping (stdin payload)', () => {
-    const json = JSON.stringify(buildDocxBatch([{ text: 'a"b\n,。' }]));
-    expect(JSON.parse(json)[0].props.text).toBe('a"b\n,。');
+  it('serializes Unicode operations as ASCII-only JSON for hidden Windows stdin', () => {
+    const text = 'a"b\n,季度报告 😀';
+    const json = serializeOfficeBatch(buildDocxBatch([{ text }]));
+    expect(Buffer.from(json, 'ascii').toString('ascii')).toBe(json);
+    expect(json).toContain('\\u5b63');
+    expect(JSON.parse(json)[0].props.text).toBe(text);
   });
 
   it('passes inline run styling through, coercing bool/number to strings', () => {
@@ -76,16 +80,100 @@ describe('buildXlsxWorkbookBatch', () => {
     ]);
     expect(ops).toEqual([
       { command: 'set', path: '/Sheet1', props: { name: 'Data' } },
+      { command: 'add', parent: '/', type: 'sheet', props: { name: 'Summary' } },
       { command: 'add', parent: '/Data', type: 'column', props: { name: 'A', width: '24' } },
       { command: 'set', path: '/Data/A1', props: { value: 'x' } },
-      { command: 'add', parent: '/', type: 'sheet', props: { name: 'Summary' } },
       { command: 'set', path: '/Summary/A1', props: { value: 'total', bold: 'true' } },
     ]);
+  });
+
+  it('creates all sheets before cross-sheet formulas and all cells before charts', () => {
+    const ops = buildXlsxWorkbookBatch([
+      {
+        name: '看板',
+        rows: [['销售额'], [{ formula: 'SUM(数据!B2:B3)' }]],
+        charts: [{
+          type: 'line',
+          dataRange: '数据!B1:B3',
+          categories: '数据!A2:A3',
+        }],
+      },
+      {
+        name: '数据',
+        rows: [['日期', '销售额'], ['7月1日', 100], ['7月2日', 120]],
+      },
+    ]);
+    const addDataSheet = ops.findIndex((op) => 'type' in op && op.type === 'sheet');
+    const dashboardFormula = ops.findIndex((op) => 'path' in op && op.path === '/看板/A2');
+    const finalDataCell = ops.findIndex((op) => 'path' in op && op.path === '/数据/B3');
+    const chart = ops.findIndex((op) => 'type' in op && op.type === 'chart');
+    expect(addDataSheet).toBeLessThan(dashboardFormula);
+    expect(dashboardFormula).toBeLessThan(finalDataCell);
+    expect(finalDataCell).toBeLessThan(chart);
   });
 
   it('keeps the default name when the first sheet is unnamed (no rename op)', () => {
     expect(buildXlsxWorkbookBatch([{ rows: [['a']] }])).toEqual([
       { command: 'set', path: '/Sheet1/A1', props: { value: 'a' } },
+    ]);
+  });
+
+  it('adds native charts after their source cells with range, labels, axes, and placement', () => {
+    const ops = buildXlsxWorkbookBatch([
+      {
+        name: '趋势',
+        rows: [['日期', '销售额'], ['7月1日', 120], ['7月2日', 180]],
+        charts: [{
+          type: 'line',
+          dataRange: '趋势!B1:B3',
+          categories: '趋势!A2:A3',
+          title: '每日销售额趋势',
+          anchor: 'D2:L18',
+          legend: 'none',
+          catTitle: '日期',
+          axistitle: '销售额（元）',
+          axismin: 0,
+          gridlines: true,
+          marker: 'circle:6',
+        }],
+      },
+    ]);
+    expect(ops.at(-2)).toEqual({
+      command: 'add',
+      parent: '/趋势',
+      type: 'chart',
+      props: {
+        chartType: 'line',
+        dataRange: '趋势!B1:B3',
+        categories: '趋势!A2:A3',
+        title: '每日销售额趋势',
+        anchor: 'D2:L18',
+        legend: 'none',
+        catTitle: '日期',
+        axistitle: '销售额（元）',
+        axismin: '0',
+        gridlines: 'true',
+        marker: 'circle:6',
+      },
+    });
+    expect(ops.at(-1)).toEqual({
+      command: 'set',
+      path: '/趋势/chart[1]',
+      props: { axismin: '0' },
+    });
+    expect(ops.findIndex((op) => 'path' in op && op.path === '/趋势/B3'))
+      .toBeLessThan(ops.findIndex((op) => 'type' in op && op.type === 'chart'));
+  });
+
+  it('drops malformed charts without a chart type', () => {
+    expect(buildXlsxWorkbookBatch([{
+      rows: [['A', 'B'], ['x', 1]],
+      charts: [{ dataRange: 'Sheet1!A1:B2' }],
+    }])).toEqual([
+      { command: 'set', path: '/Sheet1/A1', props: { value: 'A' } },
+      { command: 'set', path: '/Sheet1/B1', props: { value: 'B' } },
+      { command: 'set', path: '/Sheet1/A2', props: { value: 'x' } },
+      { command: 'set', path: '/Sheet1/B2', props: { value: '1' } },
     ]);
   });
 });

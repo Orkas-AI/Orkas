@@ -11,6 +11,11 @@ class FakeElement {
   type = '';
   title = '';
   innerHTML = '';
+  id = '';
+  textContent = '';
+  scrollHeight = 0;
+  style: Record<string, string> = {};
+  rect = { top: 0, bottom: 150, left: 0, width: 200, height: 150 };
 
   constructor(tagName = 'div') {
     this.tagName = tagName.toUpperCase();
@@ -60,6 +65,15 @@ class FakeElement {
 
   addEventListener() {}
 
+  contains(target: FakeElement): boolean {
+    if (target === this) return true;
+    return this.childNodes.some((child) => child.contains(target));
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
+
   querySelector(selector: string): FakeElement | null {
     return this.querySelectorAll(selector)[0] || null;
   }
@@ -101,18 +115,53 @@ function makeBar() {
 }
 
 function loadUserWorkspace() {
+  // Production loads this dependency first via index.html.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const placement = require('../../src/renderer/modules/dropdown-placement.js');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (globalThis as any)._dropdownVerticalPlacement = placement._dropdownVerticalPlacement;
+  const body = new FakeElement('body');
+  const windowListeners = new Map<string, Array<() => void>>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).document = {
+    body,
+    documentElement: { clientWidth: 800, clientHeight: 600 },
     createElement: (tagName: string) => new FakeElement(tagName),
+    querySelector: () => null,
+    getElementById: (id: string) => {
+      const visit = (node: FakeElement): FakeElement | null => {
+        if (node.id === id) return node;
+        for (const child of node.childNodes) {
+          const found = visit(child);
+          if (found) return found;
+        }
+        return null;
+      };
+      return visit(body);
+    },
+    addEventListener: () => {},
+    removeEventListener: () => {},
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).window = {
+    innerWidth: 800,
+    innerHeight: 600,
     uiIconHtml: () => '<span class="workspace-chip-chevron"></span>',
+    addEventListener: (type: string, listener: () => void) => {
+      const listeners = windowListeners.get(type) || [];
+      listeners.push(listener);
+      windowListeners.set(type, listeners);
+    },
+    removeEventListener: () => {},
   };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (globalThis as any).__workspaceWindowListeners = windowListeners;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).t = (key: string) => ({
     'workspace.chip_title': 'Pick workspace',
     'workspace.chip_label': 'Workspace: ',
+    'workspace.default_header': 'Default',
+    'workspace.unselected': 'Not selected',
   } as Record<string, string>)[key] || key;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).escapeHtml = (value: unknown) => String(value ?? '');
@@ -120,6 +169,21 @@ function loadUserWorkspace() {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   return require('../../src/renderer/modules/user-workspace.js') as {
     _mountWorkspaceChipInBar: (bar: FakeElement, target: string) => FakeElement | null;
+    _showWorkspaceDropdown: (anchor: FakeElement, target: string) => void;
+    _wsDisplayName: (info: { currentPath: string; isDefault: boolean }) => string;
+    _wsInfoByTarget: Record<string, {
+      currentPath: string;
+      defaultPath: string;
+      isDefault: boolean;
+      recentPaths: string[];
+      scope: string;
+    }>;
+    _workspaceMenuPlacement: (
+      anchorRect: { top: number; bottom: number; left: number },
+      menuRect: { width: number; height: number },
+      viewportWidth: number,
+      viewportHeight: number,
+    ) => { left: number; top: number; maxWidth: number; maxHeight: number; openAbove: boolean };
   };
 }
 
@@ -155,5 +219,140 @@ describe('user workspace chip mount', () => {
     expect(mounted).toBe(first);
     expect(duplicate.parentNode).toBeNull();
     expect(bar.querySelectorAll('.workspace-chip[data-ws-target="conversation"]')).toHaveLength(1);
+  });
+
+  it('shows a localized semantic label for the default workspace', () => {
+    const { _wsDisplayName } = loadUserWorkspace();
+
+    expect(_wsDisplayName({
+      currentPath: '/Users/test/userWorkSpace',
+      isDefault: true,
+    })).toBe('Default');
+  });
+
+  it('keeps the folder name for a custom workspace', () => {
+    const { _wsDisplayName } = loadUserWorkspace();
+
+    expect(_wsDisplayName({
+      currentPath: '/Users/test/client-project',
+      isDefault: false,
+    })).toBe('client-project');
+  });
+
+  it('refreshes the dynamic prefix and default label after a language change', () => {
+    const { _wsInfoByTarget } = loadUserWorkspace();
+    const chip = new FakeElement('button');
+    const prefix = new FakeElement('span');
+    prefix.className = 'workspace-chip-prefix';
+    const label = new FakeElement('span');
+    label.className = 'workspace-chip-label';
+    chip.appendChild(prefix);
+    chip.appendChild(label);
+    _wsInfoByTarget['new-chat'] = {
+      currentPath: '',
+      defaultPath: '/Users/test/userWorkSpace',
+      isDefault: true,
+      recentPaths: [],
+      scope: 'default',
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).t = (key: string) => ({
+      'workspace.chip_title': '点击选择工作区',
+      'workspace.chip_label': '工作区：',
+      'workspace.default_header': '默认',
+    } as Record<string, string>)[key] || key;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).document.querySelector = (selector: string) => (
+      selector === '#panel-new-chat .workspace-chip' ? chip : null
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const listeners = (globalThis as any).__workspaceWindowListeners as Map<string, Array<() => void>>;
+
+    for (const listener of listeners.get('i18n-change') || []) listener();
+
+    expect(prefix.textContent).toBe('工作区：');
+    expect(label.textContent).toBe('默认');
+    expect(chip.title).toBe('点击选择工作区');
+  });
+});
+
+describe('user workspace menu placement', () => {
+  beforeEach(() => {
+    delete require.cache[require.resolve('../../src/renderer/modules/user-workspace.js')];
+  });
+
+  it('constrains a tall and wide menu to the application viewport', () => {
+    const { _workspaceMenuPlacement } = loadUserWorkspace();
+
+    expect(_workspaceMenuPlacement(
+      { top: 150, bottom: 180, left: -20 },
+      { width: 280, height: 320 },
+      260,
+      240,
+    )).toEqual({
+      left: 8,
+      top: 8,
+      maxWidth: 244,
+      maxHeight: 138,
+      openAbove: true,
+    });
+  });
+
+  it('opens below when there is more room beneath the anchor', () => {
+    const { _workspaceMenuPlacement } = loadUserWorkspace();
+
+    expect(_workspaceMenuPlacement(
+      { top: 20, bottom: 50, left: 24 },
+      { width: 200, height: 150 },
+      400,
+      240,
+    )).toEqual({
+      left: 24,
+      top: 54,
+      maxWidth: 384,
+      maxHeight: 178,
+      openAbove: false,
+    });
+  });
+
+  it('still opens below when it fits there and there is more room above', () => {
+    const { _workspaceMenuPlacement } = loadUserWorkspace();
+
+    expect(_workspaceMenuPlacement(
+      { top: 500, bottom: 530, left: 24 },
+      { width: 200, height: 120 },
+      800,
+      800,
+    )).toEqual({
+      left: 24,
+      top: 534,
+      maxWidth: 784,
+      maxHeight: 258,
+      openAbove: false,
+    });
+  });
+
+  it('shows default first and omits section headers when recent workspaces exist', () => {
+    const { _showWorkspaceDropdown, _wsInfoByTarget } = loadUserWorkspace();
+    const anchor = new FakeElement('button');
+    anchor.rect = { top: 500, bottom: 530, left: 24, width: 120, height: 30 };
+    _wsInfoByTarget['new-chat'] = {
+      currentPath: '/Users/test/userWorkSpace',
+      defaultPath: '/Users/test/userWorkSpace',
+      isDefault: true,
+      recentPaths: ['/Users/test/logs'],
+      scope: 'default',
+    };
+
+    _showWorkspaceDropdown(anchor, 'new-chat');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body = (globalThis as any).document.body as FakeElement;
+    const menu = body.querySelector('.workspace-menu');
+    expect(menu).not.toBeNull();
+    expect(menu?.querySelectorAll('.workspace-menu-header')).toHaveLength(0);
+    const items = menu?.querySelectorAll('.workspace-menu-item') || [];
+    expect(items[0]?.childNodes[0]?.textContent).toBe('Default');
+    expect(items[1]?.childNodes[0]?.textContent).toBe('logs');
   });
 });
