@@ -90,10 +90,9 @@ function _safeHref(url) {
 // handlers, and dangerous URL schemes while preserving the markdown
 // renderer's legitimate output: tables, lists, code, links, images, the
 // :::chart-bar / :::dashboard SVG, and the MathJax delimiters (typeset later
-// on the live DOM). In the Node test env DOMPurify is absent (no DOM) so this
-// returns the input unchanged — the pure `_safeHref` / escaping in the link
-// builders is the node-tested layer; DOMPurify is the authoritative backstop
-// in the real renderer.
+// on the live DOM). Pure Node tests have no renderer DOM and preserve their
+// generated markup for inspection. In a real renderer, however, a missing
+// DOMPurify runtime fails closed by escaping the whole snippet as text.
 let _sanitizeHookInstalled = false;
 let _sanitizeMissingWarned = false;
 let _sanitizeSvgIconMissingWarned = false;
@@ -102,15 +101,18 @@ function _domPurify() {
   if (typeof DOMPurify !== 'undefined') return DOMPurify; // eslint-disable-line no-undef
   return null;
 }
+function _sanitizeHtmlWithoutPurifier(html) {
+  return escapeHtml(html === null || html === undefined ? '' : String(html));
+}
 function sanitizeHtml(html) {
   const s = (html === null || html === undefined) ? '' : String(html);
   const DP = _domPurify();
   if (!DP || typeof DP.sanitize !== 'function') {
     if (typeof window !== 'undefined' && !_sanitizeMissingWarned) {
       _sanitizeMissingWarned = true;
-      try { console.error('[security] DOMPurify unavailable — HTML sanitization is OFF'); } catch (_) {}
+      try { console.error('[security] DOMPurify unavailable — rendering HTML as text'); } catch (_) {}
     }
-    return s;
+    return typeof window === 'undefined' ? s : _sanitizeHtmlWithoutPurifier(s);
   }
   if (!_sanitizeHookInstalled && typeof DP.addHook === 'function') {
     // Any link opening a new browsing context must carry rel=noopener noreferrer.
@@ -1595,6 +1597,25 @@ function formatTime(iso) {
 // Keyboard: Enter/Space toggles the popover, arrow keys to nav, Esc to close.
 
 const AI_SELECT_BASE_POPOVER_Z_INDEX = 14000;
+let _aiSelectIdSeq = 0;
+
+function _aiSelectNormalizeOptions(options) {
+  if (!Array.isArray(options)) return [];
+  const seen = new Set();
+  const normalized = [];
+  for (const raw of options) {
+    if (!raw || typeof raw !== 'object' || typeof raw.value !== 'string' || seen.has(raw.value)) continue;
+    seen.add(raw.value);
+    normalized.push({
+      ...raw,
+      label: raw.label === null || raw.label === undefined ? raw.value : String(raw.label),
+      hint: raw.hint === null || raw.hint === undefined ? '' : String(raw.hint),
+      iconName: raw.iconName === null || raw.iconName === undefined ? '' : String(raw.iconName),
+      ...(raw.disabled === true ? { disabled: true } : {}),
+    });
+  }
+  return normalized;
+}
 
 function _aiSelectNextZIndex(values, fallback = AI_SELECT_BASE_POPOVER_Z_INDEX) {
   let z = fallback;
@@ -1634,7 +1655,7 @@ function _aiSelectPopoverZIndexFor(el) {
 function _aiSelectMount(el, config) {
   if (!el) return null;
   const state = {
-    options: [],        // [{value, label, hint?, iconName?}]
+    options: [],        // [{value, label, hint?, iconName?, disabled?}]
     value: '',
     placeholder: (t('ai_select.placeholder')),
     onChange: () => {},
@@ -1642,18 +1663,32 @@ function _aiSelectMount(el, config) {
     activeIdx: -1,
   };
   Object.assign(state, config || {});
+  state.options = _aiSelectNormalizeOptions(state.options);
+  state.value = typeof state.value === 'string' ? state.value : '';
+  state.placeholder = String(state.placeholder || t('ai_select.placeholder'));
+  if (state.value && !state.options.some(
+    option => option.value === state.value && !option.disabled,
+  )) state.value = '';
 
   const caretIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
     ? window.uiIconHtml('chevron-down', 'ai-select-caret')
     : '';
 
   el.classList.add('ai-select');
+  const controlId = el.id || `ai-select-${++_aiSelectIdSeq}`;
+  const triggerId = `${controlId}-trigger`;
+  const listboxId = `${controlId}-listbox`;
+  const accessibleName = () => String(
+    state.ariaLabel
+    || el.getAttribute?.('aria-label')
+    || state.placeholder,
+  );
   el.innerHTML = `
-    <button type="button" class="ai-select-trigger" aria-haspopup="listbox">
+    <button type="button" class="ai-select-trigger" id="${escapeHtml(triggerId)}" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="${escapeHtml(listboxId)}" aria-label="${escapeHtml(accessibleName())}">
       <span class="ai-select-label"></span>
       ${caretIcon}
     </button>
-    <div class="ai-select-popover" role="listbox" hidden></div>
+    <div class="ai-select-popover" id="${escapeHtml(listboxId)}" role="listbox" aria-labelledby="${escapeHtml(triggerId)}" hidden></div>
   `;
 
   const trigger = el.querySelector('.ai-select-trigger');
@@ -1674,6 +1709,7 @@ function _aiSelectMount(el, config) {
   };
 
   const renderTrigger = () => {
+    trigger.setAttribute('aria-label', accessibleName());
     const opt = state.options.find(o => o.value === state.value);
     if (opt) {
       renderOptionLabel(labelEl, opt);
@@ -1697,8 +1733,14 @@ function _aiSelectMount(el, config) {
     state.options.forEach((opt, idx) => {
       const item = document.createElement('div');
       item.className = 'ai-select-item';
+      item.id = `${listboxId}-option-${idx}`;
+      item.dataset.value = opt.value;
       item.setAttribute('role', 'option');
-      if (opt.value === state.value) item.classList.add('active');
+      const selected = opt.value === state.value;
+      item.setAttribute('aria-selected', selected ? 'true' : 'false');
+      item.setAttribute('aria-disabled', opt.disabled ? 'true' : 'false');
+      if (selected) item.classList.add('active');
+      if (opt.disabled) item.classList.add('disabled');
       if (idx === state.activeIdx) item.classList.add('hover');
       const main = document.createElement('div');
       main.className = 'ai-select-item-label';
@@ -1712,14 +1754,21 @@ function _aiSelectMount(el, config) {
       }
       item.addEventListener('mousedown', (e) => {
         e.preventDefault();
+        if (opt.disabled) return;
         _aiSelectPick(api, opt.value);
       });
       item.addEventListener('mouseenter', () => {
+        if (opt.disabled) return;
         state.activeIdx = idx;
         popover.querySelectorAll('.ai-select-item').forEach((n, i) => n.classList.toggle('hover', i === idx));
       });
       popover.appendChild(item);
     });
+    const active = state.activeIdx >= 0
+      ? popover.querySelectorAll('.ai-select-item')[state.activeIdx]
+      : null;
+    if (active) trigger.setAttribute('aria-activedescendant', active.id);
+    else trigger.removeAttribute('aria-activedescendant');
   };
 
   // Portal the popover to <body> while open so an ancestor with
@@ -1736,24 +1785,31 @@ function _aiSelectMount(el, config) {
     const rect = trigger.getBoundingClientRect();
     popover.style.position = 'fixed';
     popover.style.left = rect.left + 'px';
-    popover.style.top = (rect.bottom + 4) + 'px';
     popover.style.width = rect.width + 'px';
-    // Flip up if the popover would overflow the viewport bottom.
+    popover.style.maxHeight = '';
     const popH = popover.offsetHeight || 260;
-    if (rect.bottom + 4 + popH > window.innerHeight - 8 && rect.top - 4 - popH > 8) {
-      popover.style.top = (rect.top - 4 - popH) + 'px';
-    }
+    const placement = _dropdownVerticalPlacement(rect, popH, window.innerHeight, {
+      edge: 8,
+      gap: 4,
+    });
+    popover.style.top = placement.top + 'px';
+    popover.style.maxHeight = Math.min(260, placement.availableHeight) + 'px';
+    popover.dataset.placement = placement.openAbove ? 'top' : 'bottom';
     popover.style.zIndex = String(_aiSelectPopoverZIndexFor(el));
   };
   const open = () => {
     if (state.open) return;
     state.open = true;
     el.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');
     popover.hidden = false;
     portalParent = popover.parentNode;
     portalNextSibling = popover.nextSibling;
     document.body.appendChild(popover);
-    state.activeIdx = Math.max(0, state.options.findIndex(o => o.value === state.value));
+    const selectedIdx = state.options.findIndex(o => o.value === state.value && !o.disabled);
+    state.activeIdx = selectedIdx >= 0
+      ? selectedIdx
+      : state.options.findIndex(option => !option.disabled);
     renderPopover();
     reposition();
     setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
@@ -1766,12 +1822,16 @@ function _aiSelectMount(el, config) {
     if (!state.open) return;
     state.open = false;
     el.classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
+    trigger.removeAttribute('aria-activedescendant');
     popover.hidden = true;
     popover.style.position = '';
     popover.style.left = '';
     popover.style.top = '';
     popover.style.width = '';
+    popover.style.maxHeight = '';
     popover.style.zIndex = '';
+    delete popover.dataset.placement;
     // Restore popover to its original parent if that parent is still
     // attached to the document. If the host widget got removed mid-open
     // (e.g., the detail page re-rendered and replaced our slot), just
@@ -1794,6 +1854,12 @@ function _aiSelectMount(el, config) {
   const onDocDown = (e) => {
     if (!el.contains(e.target) && !popover.contains(e.target)) close();
   };
+  const nextEnabledIndex = (start, step) => {
+    for (let idx = start; idx >= 0 && idx < state.options.length; idx += step) {
+      if (!state.options[idx].disabled) return idx;
+    }
+    return state.activeIdx;
+  };
   const onKey = (e) => {
     // IME composition guard (CLAUDE.md §8): the popover keydown listener
     // is on `document`, so a Chinese / Japanese / Korean composition in an
@@ -1802,15 +1868,22 @@ function _aiSelectMount(el, config) {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { close(); e.preventDefault(); }
     else if (e.key === 'ArrowDown') {
-      state.activeIdx = Math.min(state.options.length - 1, state.activeIdx + 1);
+      state.activeIdx = nextEnabledIndex(state.activeIdx + 1, 1);
       renderPopover();
       e.preventDefault();
     } else if (e.key === 'ArrowUp') {
-      state.activeIdx = Math.max(0, state.activeIdx - 1);
+      state.activeIdx = nextEnabledIndex(
+        state.activeIdx < 0 ? state.options.length - 1 : state.activeIdx - 1,
+        -1,
+      );
       renderPopover();
       e.preventDefault();
     } else if (e.key === 'Enter') {
-      if (state.activeIdx >= 0 && state.activeIdx < state.options.length) {
+      if (
+        state.activeIdx >= 0
+        && state.activeIdx < state.options.length
+        && !state.options[state.activeIdx].disabled
+      ) {
         _aiSelectPick(api, state.options[state.activeIdx].value);
         e.preventDefault();
       }
@@ -1823,16 +1896,32 @@ function _aiSelectMount(el, config) {
     el,
     state,
     setOptions(options, { value, placeholder } = {}) {
-      state.options = options || [];
+      state.options = _aiSelectNormalizeOptions(options);
       if (typeof value === 'string') state.value = value;
       if (typeof placeholder === 'string') state.placeholder = placeholder;
       // Normalize value if not in options
-      if (state.value && !state.options.some(o => o.value === state.value)) state.value = '';
+      if (state.value && !state.options.some(
+        option => option.value === state.value && !option.disabled,
+      )) state.value = '';
+      if (
+        state.activeIdx >= state.options.length
+        || state.options[state.activeIdx]?.disabled
+      ) {
+        state.activeIdx = state.options.findIndex(option => !option.disabled);
+      }
       renderTrigger();
       if (state.open) renderPopover();
     },
     setValue(value) {
-      state.value = value || '';
+      state.value = typeof value === 'string' && state.options.some(
+        option => option.value === value && !option.disabled,
+      )
+        ? value
+        : '';
+      renderTrigger();
+    },
+    setAriaLabel(value) {
+      state.ariaLabel = value === null || value === undefined ? '' : String(value);
       renderTrigger();
     },
     getValue() { return state.value; },
@@ -1845,6 +1934,8 @@ function _aiSelectMount(el, config) {
 }
 
 function _aiSelectPick(api, value) {
+  const next = api.state.options.find(option => option.value === value);
+  if (!next || next.disabled) return;
   const prev = api.state.value;
   api.state.value = value || '';
   api.el.dataset.value = api.state.value;
@@ -1886,6 +1977,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _chatVideoNativeControlsHit,
     escapeHtml,
     sanitizeHtml,
+    _sanitizeHtmlWithoutPurifier,
     sanitizeSvgIconHtml,
     _safeHref,
     _SAFE_URI_RE,
@@ -1895,5 +1987,6 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _parseDashboardSpec,
     sanitizeMathExpressionForMathJax,
     _aiSelectNextZIndex,
+    _aiSelectNormalizeOptions,
   };
 }

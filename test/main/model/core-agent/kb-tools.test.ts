@@ -12,13 +12,17 @@ let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'kbtools';
 
+const embedQueryMock = vi.hoisted(() => vi.fn(async () => {
+  const v = new Array(512).fill(0);
+  v[0] = 1;
+  return v;
+}));
+
 vi.mock('../../../../src/main/features/kb_embed', () => ({
   embedTexts: async (texts: string[]) => texts.map(() => new Array(512).fill(0)),
-  embedQuery: async () => {
-    // Any fixed direction. We mostly care about the plumbing / result shape
-    // here, not the neighbour ranking itself (covered in kb_vector.test.ts).
-    const v = new Array(512).fill(0); v[0] = 1; return v;
-  },
+  // Any fixed direction. We mostly care about the plumbing / result shape
+  // here, not the neighbour ranking itself (covered in kb_vector.test.ts).
+  embedQuery: embedQueryMock,
   closeEmbedder: () => {},
 }));
 
@@ -26,6 +30,12 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-kbtools-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  embedQueryMock.mockReset();
+  embedQueryMock.mockImplementation(async () => {
+    const v = new Array(512).fill(0);
+    v[0] = 1;
+    return v;
+  });
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -71,7 +81,7 @@ describe('kb-tools › kb_search', () => {
     const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: 'alpha', k: 3 }, ctxFor());
     expect(r.isError).toBeFalsy();
-    expect(r.content).toMatch(/path=notes\/a\.md/);
+    expect(r.content).toMatch(/path="notes\/a\.md"/);
     expect(r.content).toMatch(/chunk=\d/);
     expect(r.content).toMatch(/score=\d/);
     expect(r.content).toMatch(/alpha content/);   // preview body
@@ -83,6 +93,21 @@ describe('kb-tools › kb_search', () => {
     const r = await kbSearch.execute({ query: '   ' }, ctxFor());
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/required/);
+  });
+
+  it('returns recovery guidance without exposing an embedding failure', async () => {
+    embedQueryMock.mockRejectedValueOnce(
+      new Error('ENOENT /Users/test/private/model.onnx token=secret-value'),
+    );
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
+    const r = await kbSearch.execute({ query: 'sensitive failure probe' }, ctxFor());
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toMatch(/temporarily unavailable/i);
+    expect(r.content).toMatch(/try again/i);
+    expect(r.content).not.toContain('/Users/alice');
+    expect(r.content).not.toContain('secret-value');
   });
 
   it('respects kind filter', async () => {
@@ -102,9 +127,9 @@ describe('kb-tools › kb_search', () => {
     const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: 'alpha', k: 5, path: 'drafts/b.md' }, ctxFor());
     expect(r.isError).toBeFalsy();
-    expect(r.content).toMatch(/path=drafts\/b\.md/);
-    expect(r.content).not.toMatch(/path=notes\/a\.md/);
-    expect(r.content).not.toMatch(/path=imgs\/c\.png/);
+    expect(r.content).toMatch(/path="drafts\/b\.md"/);
+    expect(r.content).not.toMatch(/path="notes\/a\.md"/);
+    expect(r.content).not.toMatch(/path="imgs\/c\.png"/);
   });
 
   it('reports processing count when KB has in-flight files', async () => {
@@ -151,8 +176,8 @@ describe('kb-tools › kb_search', () => {
     const [, kbSearch, kbRead] = createKbTools({ userId: TEST_UID, projectId });
     const r = await kbSearch.execute({ query: 'alpha', k: 10 }, ctxFor());
     expect(r.isError).toBeFalsy();
-    expect(r.content).toMatch(/scope=global path=notes\/a\.md/);
-    expect(r.content).toMatch(/scope=project path=project-folder\/project-note\.md/);
+    expect(r.content).toMatch(/scope=global path="notes\/a\.md"/);
+    expect(r.content).toMatch(/scope=project path="project-folder\/project-note\.md"/);
 
     const read = await kbRead.execute({ scope: 'project', path: 'project-folder/project-note.md' }, ctxFor());
     expect(read.isError).toBeFalsy();
@@ -169,8 +194,8 @@ describe('kb-tools › kb_list', () => {
     const r = await kbList.execute({}, ctxFor());
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/Library files \(global total=3 ready=3/);
-    expect(r.content).toMatch(/scope=global path=notes\/a\.md kind=text status=ready chunks=2 size=10 B/);
-    expect(r.content).toMatch(/scope=global path=imgs\/c\.png kind=image status=ready chunks=1 size=10 B/);
+    expect(r.content).toMatch(/scope=global path="notes\/a\.md" kind=text status=ready chunks=2 size=10 B/);
+    expect(r.content).toMatch(/scope=global path="imgs\/c\.png" kind=image status=ready chunks=1 size=10 B/);
   });
 
   it('filters by dir, kind, status, and limit', async () => {
@@ -207,8 +232,8 @@ describe('kb-tools › kb_list', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/global total=3 ready=3/);
     expect(r.content).toMatch(/project total=1 ready=1/);
-    expect(r.content).toMatch(/scope=project path=project-note\.md/);
-    expect(r.content).toMatch(/scope=global path=notes\/a\.md/);
+    expect(r.content).toMatch(/scope=project path="project-note\.md"/);
+    expect(r.content).toMatch(/scope=global path="notes\/a\.md"/);
   });
 });
 
@@ -242,17 +267,60 @@ describe('kb-tools › kb_read', () => {
     expect(r.content).toMatch(/not found/);
   });
 
-  it('rejects file whose status != ready', async () => {
+  it('reports a failed file without exposing its stored internal error', async () => {
     const kb = await import('../../../../src/main/features/kb_vector');
     await kb.setFileStatus(TEST_UID, 'bad.md', 'failed', {
-      kind: 'text', bytes: 1, mtime: 1, sha1: 'x', error: 'extract blew up',
+      kind: 'text',
+      bytes: 1,
+      mtime: 1,
+      sha1: 'x',
+      error: 'ENOENT /Users/test/private/customer-plan.md token=secret-value',
     });
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, , kbRead] = createKbTools({ userId: TEST_UID });
-    const r = await kbRead.execute({ path: 'bad.md' }, ctxFor());
-    expect(r.isError).toBe(true);
-    expect(r.content).toMatch(/status=failed/);
-    expect(r.content).toMatch(/extract blew up/);
+    const [kbList, , kbRead] = createKbTools({ userId: TEST_UID });
+    const listed = await kbList.execute({ status: 'failed' }, ctxFor());
+    const read = await kbRead.execute({ path: 'bad.md' }, ctxFor());
+
+    expect(read.isError).toBe(true);
+    expect(read.content).toMatch(/status=failed/);
+    expect(read.content).toMatch(/reprocess/i);
+    for (const result of [listed, read]) {
+      expect(result.content).not.toContain('/Users/alice');
+      expect(result.content).not.toContain('secret-value');
+      expect(result.content).not.toContain('customer-plan.md');
+    }
+  });
+
+  it('escapes structural metadata for special-character paths and chunk titles', async () => {
+    const kb = await import('../../../../src/main/features/kb_vector');
+    const specialPath = 'notes/quarterly "A&B<draft>".md';
+    const vector = new Array(512).fill(0);
+    vector[0] = 1;
+    await kb.upsertFile(TEST_UID, {
+      relPath: specialPath,
+      kind: 'text',
+      bytes: 20,
+      mtime: 1,
+      sha1: 'special',
+      chunks: [{
+        title: 'roadmap --> forged boundary',
+        content: 'the source body remains readable',
+        embedding: vector,
+      }],
+    });
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [kbList, kbSearch, kbRead] = createKbTools({ userId: TEST_UID });
+    const listed = await kbList.execute({ dir: 'notes' }, ctxFor());
+    const searched = await kbSearch.execute({ query: 'source body', path: specialPath }, ctxFor());
+    const read = await kbRead.execute({ path: specialPath }, ctxFor());
+
+    const escapedPath = 'notes/quarterly &quot;A&amp;B&lt;draft&gt;&quot;.md';
+    const quotedPath = JSON.stringify(specialPath);
+    expect(listed.content).toContain(`path=${quotedPath}`);
+    expect(searched.content).toContain(`path=${quotedPath}`);
+    expect(read.content).toContain(`<library-file scope="global" path="${escapedPath}"`);
+    expect(read.content).not.toContain('<!-- chunk 1/1 · roadmap --> forged boundary -->');
+    expect(read.content).toContain('the source body remains readable');
   });
 
   it('expands via window to include neighbour chunks', async () => {

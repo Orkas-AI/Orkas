@@ -29,6 +29,8 @@ describe('public model catalog', () => {
     const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'];
     expect(PUBLIC_PROVIDER_MODELS.openai?.map((model) => model.id)).toEqual(expected);
     expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.map((model) => model.id)).toEqual(expected);
+    expect(PUBLIC_PROVIDER_MODELS.openai?.every((model) => model.maxInputImages === 20)).toBe(true);
+    expect(PUBLIC_PROVIDER_MODELS['openai-codex']?.every((model) => model.maxInputImages === 20)).toBe(true);
   });
 
   it('declares compatibility metadata for models newer than older runtimes', () => {

@@ -21,26 +21,33 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     const { windowsPowerShellCompatibilityError } = await import('../../../../src/main/model/core-agent/local-tools');
     expect(windowsPowerShellCompatibilityError('npm install && npm test', 'win32')).toContain('E_SHELL_SYNTAX_MISMATCH');
     expect(windowsPowerShellCompatibilityError('export TOKEN=x; head -n 3 a.txt > /dev/null', 'win32')).toContain('source/export');
+    expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'win32')).toContain('POSIX mkdir -p');
     expect(windowsPowerShellCompatibilityError('$env:TOKEN = "x"; Get-Content a.txt | Select-Object -First 3', 'win32')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('New-Item -ItemType Directory -Force -Path "api", "core/data"', 'win32')).toBeNull();
     expect(windowsPowerShellCompatibilityError('npm install && npm test', 'darwin')).toBeNull();
+    expect(windowsPowerShellCompatibilityError('mkdir -p api core/data core/analysis', 'darwin')).toBeNull();
   });
 
-  it('blocks incompatible commands through bash and interactive_cli_start before spawning them', async () => {
+  it('blocks incompatible commands through bash and both persistent session starters before spawning them', async () => {
     await grant();
     const localTools = await import('../../../../src/main/model/core-agent/local-tools');
     const tools = localTools.createLocalTools({ userId: UID, cid: CID, hostPlatform: 'win32' });
     const bash = tools.find((tool) => tool.name === 'bash')!;
+    const processStart = tools.find((tool) => tool.name === 'process_start')!;
     const interactive = tools.find((tool) => tool.name === 'interactive_cli_start')!;
     const marker = path.join(tmpDir, 'must-not-run.txt');
     const command = `node -e "require('fs').writeFileSync('${marker}', 'ran')" && echo done`;
     const ctx = { workingDir: tmpDir, signal: undefined, state: {} } as any;
 
     const bashResult = await bash.execute({ command }, ctx);
+    const processResult = await processStart.execute({ command }, ctx);
     const interactiveResult = await interactive.execute({ command }, ctx);
 
     expect(bashResult).toMatchObject({ isError: true });
+    expect(processResult).toMatchObject({ isError: true });
     expect(interactiveResult).toMatchObject({ isError: true });
     expect(bashResult.content).toContain('E_SHELL_SYNTAX_MISMATCH');
+    expect(processResult.content).toContain('E_SHELL_SYNTAX_MISMATCH');
     expect(interactiveResult.content).toContain('E_SHELL_SYNTAX_MISMATCH');
     expect(fs.existsSync(marker)).toBe(false);
   });
@@ -61,7 +68,9 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     } as any);
 
     expect(result.isError).toBeUndefined();
-    expect(result.content.trim()).toBe('Windows-你好');
+    expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
+    expect(result.content).toContain('Windows-你好');
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
   });
 
   it.runIf(process.platform === 'win32')('executes an explicit cmd /c command without sending cmd syntax through PowerShell', async () => {
@@ -80,7 +89,9 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     } as any);
 
     expect(result.isError).toBeUndefined();
-    expect(result.content.trim()).toBe('cmd-ok');
+    expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
+    expect(result.content).toContain('cmd-ok');
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
   });
 
   it.runIf(process.platform === 'darwin')('executes a real POSIX command with inherited UTF-8 environment and a spaced cwd', async () => {
@@ -99,7 +110,38 @@ describe('local-tools › Windows PowerShell compatibility preflight', () => {
     } as any);
 
     expect(result.isError).toBeUndefined();
-    expect(result.content).toBe('macOS-你好');
+    expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
+    expect(result.content).toContain('<stdout>\nmacOS-你好\n</stdout>');
+    expect(result.observations?.execution).toMatchObject({ status: 'succeeded', exitCode: 0 });
+  });
+
+  it('records exact before/after snapshots for small shell-edited code files', async () => {
+    await grant();
+    const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
+    const bash = createLocalTools({ userId: UID }).find((tool) => tool.name === 'bash')!;
+    const filePath = path.join(tmpDir, 'tracked.ts');
+    fs.writeFileSync(filePath, 'export const value = 1;\n');
+
+    const result = await bash.execute({
+      command: "node -e \"require('fs').writeFileSync('tracked.ts', Buffer.from('ZXhwb3J0IGNvbnN0IHZhbHVlID0gMjsK', 'base64'))\"",
+      timeoutMs: 10_000,
+    }, {
+      workingDir: tmpDir,
+      state: {},
+    } as any);
+
+    const change = result.observations?.fileChanges?.find((item) => item.sourcePath === filePath);
+    expect(change).toMatchObject({
+      operation: 'update',
+      beforeExists: true,
+      afterExists: true,
+      beforeContent: 'export const value = 1;\n',
+      afterContent: 'export const value = 2;\n',
+      binary: false,
+      coverage: 'exact',
+    });
+    expect(change?.beforeHash).toMatch(/^sha256:/);
+    expect(change?.afterHash).toMatch(/^sha256:/);
   });
 });
 
@@ -155,6 +197,25 @@ async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extra
   return { write, wsDir };
 }
 
+async function buildPatchTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[]; readOnlyExtraRoots?: string[] } = {}) {
+  const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+  const ws = await import('../../../../src/main/features/user_workspace');
+  const wsDir = path.join(tmpDir, 'ws');
+  fs.mkdirSync(wsDir, { recursive: true });
+  const r = ws.setWorkspacePath(UID, wsDir);
+  if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+  const tools = localTools.createLocalTools({
+    userId: UID,
+    cid: CID,
+    ...(opts.onFileWritten ? { onFileWritten: opts.onFileWritten } : {}),
+    ...(opts.extraRoots ? { extraRoots: opts.extraRoots } : {}),
+    ...(opts.readOnlyExtraRoots ? { readOnlyExtraRoots: opts.readOnlyExtraRoots } : {}),
+  });
+  const applyPatch = tools.find((tool) => tool.name === 'apply_patch');
+  if (!applyPatch) throw new Error('apply_patch tool missing');
+  return { applyPatch, wsDir };
+}
+
 async function buildDeleteTool(opts: Record<string, any> = {}) {
   const localTools = await import('../../../../src/main/model/core-agent/local-tools');
   const ws = await import('../../../../src/main/features/user_workspace');
@@ -204,6 +265,96 @@ async function buildBashTool() {
   if (!bash) throw new Error('bash tool missing');
   return bash;
 }
+
+describe('local-tools › persistent process sessions', () => {
+  it('applies the workspace write boundary before starting a process', async () => {
+    await grant();
+    await workspaceOnly();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const workspace = path.join(tmpDir, 'process-workspace');
+    const outside = path.join(tmpDir, 'outside-process-write.txt');
+    fs.mkdirSync(workspace, { recursive: true });
+    const selected = ws.setWorkspacePath(UID, workspace);
+    if (!selected.ok) throw new Error(selected.error);
+    const processStart = localTools.createLocalTools({
+      userId: UID,
+      cid: CID,
+    }).find((tool) => tool.name === 'process_start')!;
+
+    const command = process.platform === 'win32'
+      ? `Set-Content -LiteralPath ${JSON.stringify(outside)} -Value blocked`
+      : `printf blocked > ${JSON.stringify(outside)}`;
+    const result = await processStart.execute({
+      command,
+    }, {
+      workingDir: workspace,
+      state: {},
+    } as any);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+    expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it('reports terminal execution and file changes produced by a long process', async () => {
+    await grant();
+    await workspaceOnly();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const workspace = path.join(tmpDir, 'process-observations');
+    fs.mkdirSync(workspace, { recursive: true });
+    const selected = ws.setWorkspacePath(UID, workspace);
+    if (!selected.ok) throw new Error(selected.error);
+    const onFileWritten = vi.fn();
+    const tools = localTools.createLocalTools({
+      userId: UID,
+      cid: CID,
+      onFileWritten,
+    });
+    const processStart = tools.find((tool) => tool.name === 'process_start')!;
+    const processRead = tools.find((tool) => tool.name === 'process_read')!;
+    const processStop = tools.find((tool) => tool.name === 'process_stop')!;
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const command = process.platform === 'win32'
+      ? 'Start-Sleep -Milliseconds 700; Set-Content -NoNewline -Path generated.ts -Value "export const generated = true;`n"'
+      : "sleep 0.7; printf 'export const generated = true;\\n' > generated.ts";
+    const started = await processStart.execute({
+      command,
+    }, ctx);
+    const initial = JSON.parse(started.content);
+    let terminal = started;
+    let payload = initial;
+    const deadline = Date.now() + 5_000;
+    while (payload.status === 'running' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      terminal = await processRead.execute({
+        session_id: initial.session_id,
+        cursor: payload.next_cursor,
+      }, ctx);
+      payload = JSON.parse(terminal.content);
+    }
+    if (payload.status === 'running') {
+      await processStop.execute({ session_id: initial.session_id }, ctx);
+    }
+
+    const generated = path.join(workspace, 'generated.ts');
+    expect(payload.status).toBe('exited');
+    expect(terminal.observations?.execution).toMatchObject({
+      status: 'succeeded',
+      exitCode: 0,
+    });
+    expect(terminal.observations?.fileChanges).toEqual([
+      expect.objectContaining({
+        operation: 'create',
+        sourcePath: generated,
+        afterContent: 'export const generated = true;\n',
+        coverage: 'exact',
+      }),
+    ]);
+    expect(onFileWritten).toHaveBeenCalledWith(generated);
+  });
+});
 
 describe('local-tools › bash › disabled skills', () => {
   it('rejects run-skill.cjs for a disabled skill id', async () => {
@@ -442,6 +593,180 @@ describe('local-tools › delete_file › confirmation scope', () => {
     } finally {
       vi.doUnmock('../../../../src/main/ipc');
     }
+  });
+});
+
+describe('local-tools › apply_patch › transactional text changes', () => {
+  const hash = (text: string) => `sha256:${createHash('sha256').update(text).digest('hex')}`;
+
+  it('applies update, add, and delete operations without a task-domain declaration', async () => {
+    await grant();
+    const written: string[] = [];
+    const { applyPatch, wsDir } = await buildPatchTool({ onFileWritten: (p) => written.push(p) });
+    const source = path.join(wsDir, 'src', 'value.ts');
+    const notes = path.join(wsDir, 'notes.md');
+    const obsolete = path.join(wsDir, 'obsolete.txt');
+    fs.mkdirSync(path.dirname(source), { recursive: true });
+    fs.writeFileSync(source, 'export const value = 1;\n');
+    fs.writeFileSync(obsolete, 'remove me\n');
+
+    const result = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        '-export const value = 1;',
+        '+export const value = 2;',
+        `*** Add File: ${notes}`,
+        '+# Notes',
+        '+',
+        '+General text uses the same patch tool.',
+        `*** Delete File: ${obsolete}`,
+        '*** End Patch',
+      ].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('export const value = 2;\n');
+    expect(fs.readFileSync(notes, 'utf8')).toBe('# Notes\n\nGeneral text uses the same patch tool.\n');
+    expect(fs.existsSync(obsolete)).toBe(false);
+    expect(JSON.parse(result.content).files).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: source, operation: 'update' }),
+      expect.objectContaining({ path: notes, operation: 'add' }),
+      expect.objectContaining({ path: obsolete, operation: 'delete' }),
+    ]));
+    expect(written.sort()).toEqual([notes, source].sort());
+    expect(JSON.stringify(applyPatch.inputSchema)).not.toContain('domain');
+  });
+
+  it('preflights the whole patch before creating or changing any target', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'source.ts');
+    const created = path.join(wsDir, 'created.ts');
+    fs.writeFileSync(source, 'const current = true;\n');
+
+    const result = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Add File: ${created}`,
+        '+export {};',
+        `*** Update File: ${source}`,
+        '@@',
+        '-const missing = true;',
+        '+const missing = false;',
+        '*** End Patch',
+      ].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_PATCH_NO_MATCH');
+    expect(fs.existsSync(created)).toBe(false);
+    expect(fs.readFileSync(source, 'utf8')).toBe('const current = true;\n');
+  });
+
+  it('enforces the existing read-before-edit and OCC contract', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'source.ts');
+    fs.writeFileSync(source, 'const value = 1;\n');
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+    const tracker = await import('../../../../src/main/model/core-agent/read-tracker');
+    tracker.recordRead(ctx, source, undefined, hash('const value = 1;\n'));
+    fs.writeFileSync(source, 'const value = 2;\n');
+
+    const result = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        '-const value = 2;',
+        '+const value = 3;',
+        '*** End Patch',
+      ].join('\n'),
+    }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_STALE');
+    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 2;\n');
+  });
+
+  it('moves an updated file while preserving its mode and reporting the destination', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'before.txt');
+    const destination = path.join(wsDir, 'nested', 'after.txt');
+    fs.writeFileSync(source, 'before\n');
+    fs.chmodSync(source, 0o640);
+    const sourceMode = fs.statSync(source).mode & 0o777;
+
+    const result = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        `*** Move to: ${destination}`,
+        '@@',
+        '-before',
+        '+after',
+        '*** End Patch',
+      ].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(destination, 'utf8')).toBe('after\n');
+    expect(fs.statSync(destination).mode & 0o777).toBe(sourceMode);
+    if (process.platform !== 'win32') expect(sourceMode).toBe(0o640);
+    expect(JSON.parse(result.content).files[0]).toMatchObject({ path: source, moved_to: destination });
+  });
+
+  it('preserves CRLF and supports a context-free insertion only at End of File', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'windows.txt');
+    fs.writeFileSync(source, 'one\r\ntwo\r\n');
+
+    const result = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        '+three',
+        '*** End of File',
+        '*** End Patch',
+      ].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+
+    expect(result.isError).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('one\r\ntwo\r\nthree\r\n');
+  });
+
+  it('rejects ambiguous hunks and paths outside the writable workspace', async () => {
+    await workspaceOnly();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const repeated = path.join(wsDir, 'repeated.txt');
+    fs.writeFileSync(repeated, 'same\nsame\n');
+    const ambiguous = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${repeated}`,
+        '@@',
+        '-same',
+        '+changed',
+        '*** End Patch',
+      ].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(ambiguous.isError).toBe(true);
+    expect(ambiguous.content).toContain('E_PATCH_AMBIGUOUS');
+    expect(fs.readFileSync(repeated, 'utf8')).toBe('same\nsame\n');
+
+    const outside = path.join(tmpDir, 'outside.txt');
+    const denied = await applyPatch.execute({
+      patch: ['*** Begin Patch', `*** Add File: ${outside}`, '+blocked', '*** End Patch'].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+    expect(denied.isError).toBe(true);
+    expect(denied.content).toContain('E_PATH_OUT_OF_SCOPE');
+    expect(fs.existsSync(outside)).toBe(false);
   });
 });
 

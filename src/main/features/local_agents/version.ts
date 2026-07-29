@@ -20,8 +20,11 @@ import { buildCliSpawnEnv, resolveCliCommand } from './spawn-command.js';
 export const MIN_VERSIONS: Record<string, string> = {
   // claude --output-format stream-json + --print are stable from 2.x.
   claude: '2.0.0',
-  // codex `app-server --listen stdio://` was added in 0.100.0.
-  codex: '0.100.0',
+  // Orkas talks to Codex through the app-server JSON-RPC contract. Keep this
+  // floor pinned to the oldest protocol version validated by Orkas; the model
+  // catalog in Settings is a separate concern and must not determine CLI
+  // compatibility.
+  codex: '0.145.0',
 };
 
 const VERSION_RE = /v?(\d+)\.(\d+)\.(\d+)/;
@@ -67,29 +70,33 @@ export function checkMinVersion(cli: string, detected: string | null): string | 
   return null;
 }
 
+export type VersionProbeResult =
+  | { status: 'success'; version: string }
+  | { status: 'timeout' | 'failed'; version: null };
+
 /**
- * Run the configured version probe, return the parsed version string (the
- * raw line we matched, not just the semver), or null on any failure.
- *
- * Timeout is 5s — a version probe should be sub-100ms; anything longer is
- * a hung/wrong binary.
+ * Run the configured version probe and preserve whether a missing version was
+ * caused specifically by the process deadline. Other failures (spawn error,
+ * non-zero exit, empty/unparseable output, or excessive output) remain
+ * intentionally grouped as `failed`; callers only need a distinct timeout
+ * state for accurate user-facing recovery copy.
  */
-export async function detectVersion(
+export async function detectVersionResult(
   binPath: string,
   timeoutMs = 5000,
   versionArgs: readonly string[] = ['--version'],
-): Promise<string | null> {
+): Promise<VersionProbeResult> {
   return new Promise(resolve => {
     let settled = false;
     let outputBytes = 0;
     let timer: NodeJS.Timeout | null = null;
     const maxOutputBytes = 64 * 1024;
-    const finish = (v: string | null) => {
+    const finish = (result: VersionProbeResult) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       timer = null;
-      resolve(v);
+      resolve(result);
     };
 
     let stdout = '';
@@ -105,7 +112,7 @@ export async function detectVersion(
         detached: process.platform !== 'win32',
       });
     } catch {
-      finish(null);
+      finish({ status: 'failed', version: null });
       return;
     }
 
@@ -115,7 +122,7 @@ export async function detectVersion(
       outputBytes += data.length;
       if (outputBytes > maxOutputBytes) {
         killProcessTree(child, 'SIGKILL');
-        finish(null);
+        finish({ status: 'failed', version: null });
         return;
       }
       if (target === 'stdout') stdout += data.toString('utf8');
@@ -129,23 +136,36 @@ export async function detectVersion(
       // command-shell parent leaves the real CLI (and any probe descendants)
       // running after discovery has already returned.
       killProcessTree(child, 'SIGTERM');
-      finish(null);
+      finish({ status: 'timeout', version: null });
     }, timeoutMs);
     timer.unref?.();
 
-    child.on('error', () => finish(null));
+    child.on('error', () => finish({ status: 'failed', version: null }));
     child.on('close', (code) => {
-      if (code !== 0) return finish(null);
+      if (code !== 0) return finish({ status: 'failed', version: null });
       // Some wrappers print a banner to stdout and the actual version to
       // stderr. Inspect both streams instead of letting non-empty stdout
       // hide a valid stderr version.
       const text = `${stdout}\n${stderr}`.trim();
-      if (!text) return finish(null);
+      if (!text) return finish({ status: 'failed', version: null });
       const sv = parseSemver(text);
-      if (!sv) return finish(null);
+      if (!sv) return finish({ status: 'failed', version: null });
       // Return the matched semver string so callers store a clean value
       // (the raw line may carry product names / notes we don't want).
-      finish(`${sv.major}.${sv.minor}.${sv.patch}`);
+      finish({
+        status: 'success',
+        version: `${sv.major}.${sv.minor}.${sv.patch}`,
+      });
     });
   });
+}
+
+/** Backward-compatible version-only view used by callers that do not need to
+ * distinguish timeout from other probe failures. */
+export async function detectVersion(
+  binPath: string,
+  timeoutMs = 5000,
+  versionArgs: readonly string[] = ['--version'],
+): Promise<string | null> {
+  return (await detectVersionResult(binPath, timeoutMs, versionArgs)).version;
 }

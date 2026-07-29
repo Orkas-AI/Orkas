@@ -24,7 +24,7 @@ import {
   sessionLock, globalSlots,
   type Releaser,
 } from '../../util/locks';
-import type { AgentRunTimings, AgentTool } from '#core-agent';
+import type { AgentRunConvergenceSignal, AgentRunTimings, AgentTool } from '#core-agent';
 import { createLogger } from '../../logger';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
 
@@ -34,6 +34,7 @@ import type { ChatOptions, ChatResult, StreamEvent } from '../client';
 
 import { buildRunner, type ToolDefSnapshot } from './runner';
 import { mapCoreAgentEvents } from './event-mapper';
+import { getSessionForUser as _getCachedSessionForUser } from './session-store';
 import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as fs from 'node:fs';
@@ -204,24 +205,40 @@ type ActiveSessionAbort = {
 
 const activeSessionAborts = new Map<string, Set<ActiveSessionAbort>>();
 
-function addActiveSessionAbort(sessionId: string, entry: ActiveSessionAbort): void {
-  let set = activeSessionAborts.get(sessionId);
+function activeSessionAbortKey(userId: string, sessionId: string): string {
+  return `${userId}\0${sessionId}`;
+}
+
+function sessionIdFromActiveAbortKey(key: string): string {
+  const separator = key.indexOf('\0');
+  return separator >= 0 ? key.slice(separator + 1) : key;
+}
+
+function userIdFromActiveAbortKey(key: string): string {
+  const separator = key.indexOf('\0');
+  return separator >= 0 ? key.slice(0, separator) : '';
+}
+
+function addActiveSessionAbort(userId: string, sessionId: string, entry: ActiveSessionAbort): void {
+  const key = activeSessionAbortKey(userId, sessionId);
+  let set = activeSessionAborts.get(key);
   if (!set) {
     set = new Set();
-    activeSessionAborts.set(sessionId, set);
+    activeSessionAborts.set(key, set);
   }
   set.add(entry);
 }
 
-function removeActiveSessionAbort(sessionId: string, entry: ActiveSessionAbort): void {
-  const set = activeSessionAborts.get(sessionId);
+function removeActiveSessionAbort(userId: string, sessionId: string, entry: ActiveSessionAbort): void {
+  const key = activeSessionAbortKey(userId, sessionId);
+  const set = activeSessionAborts.get(key);
   if (!set) return;
   set.delete(entry);
-  if (set.size === 0) activeSessionAborts.delete(sessionId);
+  if (set.size === 0) activeSessionAborts.delete(key);
 }
 
-export function abortActiveSession(sessionId: string): number {
-  const set = activeSessionAborts.get(sessionId);
+function abortActiveSessionByKey(key: string): number {
+  const set = activeSessionAborts.get(key);
   if (!set || set.size === 0) return 0;
   let count = 0;
   for (const entry of Array.from(set)) {
@@ -233,7 +250,19 @@ export function abortActiveSession(sessionId: string): number {
   return count;
 }
 
-export function abortActiveSessionsForConversation(cid: string): number {
+export function abortActiveSession(sessionId: string, userId?: string): number {
+  if (userId) return abortActiveSessionByKey(activeSessionAbortKey(userId, sessionId));
+
+  let count = 0;
+  for (const key of Array.from(activeSessionAborts.keys())) {
+    if (sessionIdFromActiveAbortKey(key) === sessionId) {
+      count += abortActiveSessionByKey(key);
+    }
+  }
+  return count;
+}
+
+export function abortActiveSessionsForConversation(cid: string, userId?: string): number {
   if (!cid) return 0;
   let count = 0;
   const commanderSession = `gconv-${cid}`;
@@ -244,9 +273,11 @@ export function abortActiveSessionsForConversation(cid: string): number {
   // this by-cid fallback is the safety net for exactly that — include the
   // worker prefix so a Stop also kills any in-flight anonymous worker call.
   const workerPrefix = `gworker-${cid}-`;
-  for (const sessionId of Array.from(activeSessionAborts.keys())) {
+  for (const key of Array.from(activeSessionAborts.keys())) {
+    if (userId && userIdFromActiveAbortKey(key) !== userId) continue;
+    const sessionId = sessionIdFromActiveAbortKey(key);
     if (sessionId === commanderSession || sessionId.startsWith(memberPrefix) || sessionId.startsWith(workerPrefix)) {
-      count += abortActiveSession(sessionId);
+      count += abortActiveSessionByKey(key);
     }
   }
   return count;
@@ -372,6 +403,12 @@ export interface ModelRunLogDiagnostics {
   toolEnds: number;
   toolErrors: number;
   firstRawEventMs?: number;
+  /** First model-produced event (text or tool-call construction), excluding
+   * host retry/fallback/context bookkeeping. */
+  firstModelEventMs?: number;
+  /** First usable model content (text or tool call). A terminal empty `done`
+   * does not satisfy this. */
+  firstContentMs?: number;
   firstClientEventMs?: number;
   firstTextDeltaMs?: number;
   firstToolMs?: number;
@@ -391,6 +428,11 @@ export interface ModelRunLogDiagnostics {
   lastCompactionTokensBefore?: number;
   lastCompactionTokensAfter?: number;
   retryKinds: Record<string, number>;
+  providerFallbackCount: number;
+  providerFallbackAuthCount: number;
+  providerFallbackTimeoutCount: number;
+  providerCandidateCount: number;
+  lastFallbackCandidateIndex: number;
   toolCounts: Record<string, ToolRunLogCounter>;
   toolTimeline: ToolTimelineLogEntry[];
   toolTimelineTruncated: number;
@@ -452,6 +494,11 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     toolEnds: 0,
     toolErrors: 0,
     retryKinds: {},
+    providerFallbackCount: 0,
+    providerFallbackAuthCount: 0,
+    providerFallbackTimeoutCount: 0,
+    providerCandidateCount: 0,
+    lastFallbackCandidateIndex: 0,
     toolCounts: {},
     toolTimeline: [],
     toolTimelineTruncated: 0,
@@ -571,6 +618,8 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.textDeltaEvents += 1;
       stats.textDeltaChars += typeof e.text === 'string' ? e.text.length : 0;
       noteElapsedOnce(stats, 'firstTextDeltaMs', nowMs);
+      noteElapsedOnce(stats, 'firstModelEventMs', nowMs);
+      noteElapsedOnce(stats, 'firstContentMs', nowMs);
       if (!stats.rawTextTimelineRecorded) {
         stats.rawTextTimelineRecorded = true;
         noteRunTimelineForLog(stats, 'raw_text_delta', nowMs, `chars=${typeof e.text === 'string' ? e.text.length : 0}`);
@@ -579,6 +628,8 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
     }
     case 'tool_delta': {
       stats.toolDeltaCount += 1;
+      noteElapsedOnce(stats, 'firstModelEventMs', nowMs);
+      noteElapsedOnce(stats, 'firstContentMs', nowMs);
       const rawId = String(e.id || '');
       const key = rawId || `unknown-${stats.toolDeltaCount}`;
       if (!stats.seenToolDeltaIds[key]) {
@@ -603,6 +654,8 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       noteToolTimelineForLog(stats, e, 'start', nowMs);
       noteRunTimelineForLog(stats, 'tool_start', nowMs, `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)}`);
       noteElapsedOnce(stats, 'firstToolMs', nowMs);
+      noteElapsedOnce(stats, 'firstModelEventMs', nowMs);
+      noteElapsedOnce(stats, 'firstContentMs', nowMs);
       break;
     }
     case 'tool_progress': {
@@ -637,6 +690,30 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       noteRunTimelineForLog(stats, 'retry', nowMs, `kind=${kind}${attempt !== undefined ? ` attempt=${attempt}` : ''}`);
       break;
     }
+    case 'provider_fallback': {
+      stats.providerFallbackCount += 1;
+      if (e.reason === 'auth') stats.providerFallbackAuthCount += 1;
+      if (e.reason === 'no_first_event_timeout') stats.providerFallbackTimeoutCount += 1;
+      stats.providerCandidateCount = Math.max(
+        stats.providerCandidateCount,
+        Math.max(0, Math.round(finiteNumber(e.candidateCount) || 0)),
+      );
+      stats.lastFallbackCandidateIndex = Math.max(
+        stats.lastFallbackCandidateIndex,
+        Math.max(0, Math.round(finiteNumber(e.candidateIndex) || 0)),
+      );
+      noteRunTimelineForLog(
+        stats,
+        'provider_fallback',
+        nowMs,
+        [
+          `reason=${String(e.reason || 'unknown').slice(0, 64)}`,
+          stats.lastFallbackCandidateIndex ? `candidate=${stats.lastFallbackCandidateIndex}` : '',
+          stats.providerCandidateCount ? `of=${stats.providerCandidateCount}` : '',
+        ].filter(Boolean).join(' '),
+      );
+      break;
+    }
     case 'compaction': {
       stats.compactionCount += 1;
       stats.lastCompactionTokensBefore = finiteNumber(e.tokensBefore) ?? stats.lastCompactionTokensBefore;
@@ -667,6 +744,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       break;
     }
     case 'done': {
+      noteElapsedOnce(stats, 'firstModelEventMs', nowMs);
       noteElapsedOnce(stats, 'doneRawEventMs', nowMs);
       const result = e.result as { meta?: Record<string, unknown> } | undefined;
       const meta = result?.meta || {};
@@ -685,6 +763,9 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.resultContentBlocks = Array.isArray((e.result as { content?: unknown } | undefined)?.content)
         ? ((e.result as { content: unknown[] }).content.length)
         : stats.resultContentBlocks;
+      if ((stats.resultTextChars || 0) > 0 || (stats.resultContentBlocks || 0) > 0) {
+        noteElapsedOnce(stats, 'firstContentMs', nowMs);
+      }
       const err = meta.error as Record<string, unknown> | undefined;
       stats.errorKind = typeof err?.kind === 'string' ? err.kind : stats.errorKind;
       noteRunTimelineForLog(
@@ -767,6 +848,8 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     toolTimeline: stats.toolTimeline.map(formatToolTimelineEntryForLog),
     toolTimelineTruncated: stats.toolTimelineTruncated,
     firstRawEventMs: stats.firstRawEventMs,
+    firstModelEventMs: stats.firstModelEventMs,
+    firstContentMs: stats.firstContentMs,
     firstClientEventMs: stats.firstClientEventMs,
     firstTextDeltaMs: stats.firstTextDeltaMs,
     firstToolMs: stats.firstToolMs,
@@ -786,6 +869,11 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     lastCompactionTokensBefore: stats.lastCompactionTokensBefore,
     lastCompactionTokensAfter: stats.lastCompactionTokensAfter,
     retryKinds: stats.retryKinds,
+    providerFallbackCount: stats.providerFallbackCount,
+    providerFallbackAuthCount: stats.providerFallbackAuthCount,
+    providerFallbackTimeoutCount: stats.providerFallbackTimeoutCount,
+    providerCandidateCount: stats.providerCandidateCount,
+    lastFallbackCandidateIndex: stats.lastFallbackCandidateIndex,
     runTimeline: stats.runTimeline.map(formatRunTimelineEntryForLog),
     runTimelineTruncated: stats.runTimelineTruncated,
   };
@@ -899,6 +987,7 @@ export function modelTurnContextForLog(input: {
   userId?: string;
   sessionId?: string;
   cid?: string;
+  turnId?: string;
   agentId?: string;
   projectId?: string;
   workingDir?: string;
@@ -941,6 +1030,7 @@ export function modelTurnContextForLog(input: {
     session_id: maskId(input.sessionId),
     session_kind: sessionKindForLog(input.sessionId),
     cid: maskId(input.cid),
+    turn_id: maskId(input.turnId),
     agent_id: maskId(input.agentId),
     project_id: maskId(input.projectId),
     provider: input.providerId || undefined,
@@ -990,6 +1080,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   const {
     userId, message,
     sessionId = `anon-${genConversationId().slice(0, 8)}`,
+    conversationHistory,
     resumeActiveTurn = false,
     systemPrompt,
     agentName,
@@ -1029,6 +1120,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     userId,
     sessionId,
     cid,
+    turnId,
     agentId,
     projectId,
     workingDir,
@@ -1068,6 +1160,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let _slotRelease: Releaser | undefined;
   let sessionReleased = false;
   let slotReleased = false;
+  let sessionLockWaitMs = 0;
+  let globalSlotWaitMs = 0;
+  let runnerBuildMs = 0;
 
   const releaseSessionOnce = (reason: string): void => {
     if (sessionReleased) return;
@@ -1082,9 +1177,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     try { _slotRelease?.(); } catch (err) { log.warn('release global-slot failed', { error: logErrorRef(err) }); }
   };
 
-  const lockWaitStartedAt = Date.now();
   log.info('model turn queued', turnLogContext);
-  _releaseSession = await sessionLock(sessionId).acquire();
+  const sessionLockWaitStartedAt = Date.now();
+  _releaseSession = await sessionLock(`${userId}\0${sessionId}`).acquire();
+  sessionLockWaitMs = Math.max(0, Date.now() - sessionLockWaitStartedAt);
   if (nested) {
     // G8d nested sub-run: do NOT take a global slot — the parent turn already
     // holds one, and acquiring another here would deadlock when the slot pool
@@ -1093,12 +1189,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // released so every slot-release path (abort / idle / finally) is a no-op.
     slotReleased = true;
   } else {
+    const globalSlotWaitStartedAt = Date.now();
     const [, slotRelease] = await globalSlots.acquire();
+    globalSlotWaitMs = Math.max(0, Date.now() - globalSlotWaitStartedAt);
     _slotRelease = slotRelease;
   }
   log.info('model turn locks acquired', {
     ...turnLogContext,
-    lock_wait_ms: Date.now() - lockWaitStartedAt,
+    lock_wait_ms: sessionLockWaitMs + globalSlotWaitMs,
+    session_lock_wait_ms: sessionLockWaitMs,
+    global_slot_wait_ms: globalSlotWaitMs,
     global_slot_acquired: !nested,
   });
 
@@ -1146,7 +1246,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       releaseSessionOnce('session-abort');
     },
   };
-  addActiveSessionAbort(sessionId, activeAbortEntry);
+  addActiveSessionAbort(userId, sessionId, activeAbortEntry);
 
   const resetIdle = () => {
     if (controller.signal.aborted) return;
@@ -1215,12 +1315,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       systemPrompt,
       userId,
       agentId,
+      ...(conversationHistory ? { conversationHistory } : {}),
+      ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
       ...(turnId ? { turnId } : {}),
       ...(message ? { userMessage: message } : {}),
+      ...(attachmentMetadata ? { attachmentMetadata } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       ...(forceOpenSkillRefs && forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
@@ -1251,6 +1354,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       onCandidateChosen: (info) => {
         recorder.setActiveCandidate(info);
       },
+    }).finally(() => {
+      runnerBuildMs = Math.max(0, Date.now() - buildStartedAt);
     });
     const { runner, providerId, modelId, resolvedSystemPrompt, turnEphemeral, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
     activeProviderId = providerId || '';
@@ -1260,6 +1365,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       userId,
       sessionId,
       cid,
+      turnId,
       agentId,
       projectId,
       workingDir,
@@ -1289,7 +1395,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       entryId,
       resolvedSystemPrompt,
       toolDefs,
-      buildDurationMs: Date.now() - buildStartedAt,
+      buildDurationMs: runnerBuildMs,
     });
     log.info('model turn ready', turnLogContext);
 
@@ -1511,7 +1617,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield errorEvent;
     }
   } finally {
-    removeActiveSessionAbort(sessionId, activeAbortEntry);
+    removeActiveSessionAbort(userId, sessionId, activeAbortEntry);
     if (idleTimer) clearTimeout(idleTimer);
     if (abortSignal) abortSignal.removeEventListener?.('abort', onExternalAbort);
     // Heal orphan tool_use in the cached session before releasing the
@@ -1525,7 +1631,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // a no-op on healthy sessions, so running it unconditionally every
     // turn is safe.
     try {
-      const cached = await _getCachedSession(sessionId);
+      const cached = await _getCachedSessionForUser(userId, sessionId);
       if (cached && typeof (cached as { healAndPersist?: () => boolean }).healAndPersist === 'function') {
         if (cached.healAndPersist()) {
           const report = typeof (cached as { getLastToolProtocolRepairReport?: () => unknown }).getLastToolProtocolRepairReport === 'function'

@@ -7,6 +7,7 @@ import {
   compareSemver,
   checkMinVersion,
   detectVersion,
+  detectVersionResult,
   MIN_VERSIONS,
 } from '../../../../src/main/features/local_agents/version';
 
@@ -70,6 +71,7 @@ describe('local_agents/version › checkMinVersion', () => {
     expect(checkMinVersion('claude', MIN_VERSIONS.claude)).toBeNull();
     expect(checkMinVersion('claude', '2.5.0')).toBeNull();
     expect(checkMinVersion('claude', '3.0.0')).toBeNull();
+    expect(checkMinVersion('codex', '0.145.0-alpha.18')).toBeNull();
   });
 
   it('returns an explanatory string when detected is below minimum', () => {
@@ -77,6 +79,7 @@ describe('local_agents/version › checkMinVersion', () => {
     expect(msg).toMatch(/below required minimum/);
     expect(msg).toContain('claude');
     expect(msg).toContain('1.99.0');
+    expect(checkMinVersion('codex', '0.139.0')).toContain('0.145.0');
   });
 
   it('returns null when detected is missing or unparsable (do not gate on noise)', () => {
@@ -135,6 +138,30 @@ describe('local_agents/version › detectVersion', () => {
   it('returns null when output has no semver', async () => {
     const binPath = writeVersionCli(tmpDir, 'noisy-cli', 'no version here');
     expect(await detectVersion(binPath)).toBeNull();
+    expect(await detectVersionResult(binPath)).toEqual({
+      status: 'failed',
+      version: null,
+    });
+  });
+
+  it('distinguishes a version-probe timeout from other failures', async () => {
+    const script = path.join(tmpDir, 'hanging-version.js');
+    fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+    const launcher = path.join(tmpDir, isWindows ? 'hanging-version.cmd' : 'hanging-version');
+    if (isWindows) {
+      fs.writeFileSync(launcher, `@echo off\r\n"${TEST_NODE}" "${script}"\r\n`);
+    } else {
+      fs.writeFileSync(
+        launcher,
+        `#!/bin/sh\nexec ${JSON.stringify(TEST_NODE)} ${JSON.stringify(script)}\n`,
+      );
+      fs.chmodSync(launcher, 0o755);
+    }
+
+    expect(await detectVersionResult(launcher, 100)).toEqual({
+      status: 'timeout',
+      version: null,
+    });
   });
 
   it('bounds output from a broken version command', async () => {

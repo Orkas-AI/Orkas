@@ -21,6 +21,7 @@ from html import unescape
 import http.client
 import json
 import os
+from pathlib import Path
 import re
 import socket
 import ssl
@@ -29,6 +30,7 @@ import time
 import zlib
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.request import getproxies
 
 from url_safety import (
     URLSafetyError, assert_proxy_target_safe, parse_and_check_scheme,
@@ -94,7 +96,7 @@ def _charset_from_content_type(ct: str) -> str | None:
 
 def _no_proxy_match(host: str, no_proxy: str) -> bool:
     host = host.lower()
-    for entry in (no_proxy or "").split(","):
+    for entry in re.split(r"[,;]", no_proxy or ""):
         e = entry.strip().lower().lstrip("*").lstrip(".")
         if e and (host == e or host.endswith("." + e) or host.endswith(e)):
             return True
@@ -105,11 +107,18 @@ def _proxy_for(scheme: str, host: str):
     """System HTTP(S) proxy for (scheme, host), honoring NO_PROXY. Returns
     (proxy_host, proxy_port) or None. Lets the crawler work where DNS is
     fake-ip'd (Clash/Surge) — the proxy resolves the real target."""
-    no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    system_proxies = getproxies()
+    no_proxy = (
+        os.environ.get("NO_PROXY")
+        or os.environ.get("no_proxy")
+        or system_proxies.get("no")
+        or ""
+    )
     if _no_proxy_match(host, no_proxy):
         return None
     raw = (os.environ.get(scheme.upper() + "_PROXY") or os.environ.get(scheme + "_proxy")
-           or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy"))
+           or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+           or system_proxies.get(scheme) or system_proxies.get("all"))
     if not raw:
         return None
     pr = urlsplit(raw if "://" in raw else "http://" + raw)
@@ -437,6 +446,48 @@ def _first_sentence(text: str, limit: int = 320) -> str:
     return t[:limit]
 
 
+_REPRESENTATIVE_PATH_HINTS = (
+    ("pricing", "plans"),
+    ("compare", "comparison", "versus", "vs"),
+    ("use", "use-case", "use-cases", "solutions"),
+    ("docs", "documentation", "help", "guide", "guides"),
+    ("blog", "news", "resources"),
+    ("security", "trust", "privacy"),
+    ("marketplace", "integrations", "templates"),
+)
+
+
+def representative_internal_links(links: list[str], limit: int = 12) -> list[str]:
+    """Return a compact, section-diverse link sample for bounded site audits.
+
+    The full crawl JSON retains every capped internal link. This projection is
+    deliberately small enough for the CLI summary so an agent need not read a
+    large single-line crawl artifact merely to choose representative pages.
+    """
+    if limit <= 0:
+        return []
+    candidates = []
+    for link in links or []:
+        if isinstance(link, str) and link and link not in candidates:
+            candidates.append(link)
+
+    selected = []
+    for hints in _REPRESENTATIVE_PATH_HINTS:
+        for link in candidates:
+            segments = [segment for segment in urlsplit(link).path.lower().split("/") if segment]
+            if link not in selected and any(hint in segments for hint in hints):
+                selected.append(link)
+                break
+        if len(selected) >= limit:
+            return selected
+    for link in candidates:
+        if link not in selected:
+            selected.append(link)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Site-level context (robots.txt) + CLI entry
 # ─────────────────────────────────────────────────────────────────────────
@@ -502,14 +553,17 @@ def main(argv):
                          with_robots=not args.no_robots)
     result = {"ok": True, "data": data}
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as fh:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", encoding="utf-8") as fh:
             json.dump(result, fh, ensure_ascii=False)
         pg = data["pages"][0]
         return {"ok": True, "out": args.out, "summary": {
             "url": pg["url"], "status_code": pg["status_code"], "title": pg["title"],
             "word_count": pg["word_count"], "is_indexable": pg["is_indexable"],
             "structured_data_types": pg["structured_data_types"],
-            "internal_link_count": pg["internal_link_count"]}}
+            "internal_link_count": pg["internal_link_count"],
+            "representative_internal_links": representative_internal_links(pg["internal_links"])}}
     return result
 
 

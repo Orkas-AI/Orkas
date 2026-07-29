@@ -49,6 +49,7 @@ import {
   recordSyncRev,
 } from '../util/record_sync_fields';
 import { limitNameDisplayText } from '../util/name-limit';
+import { versionChatMediaLocalUrlsInText } from '../util/chat-media-url';
 
 const log = createLogger('chats');
 // A boot-time stale-state sweep may run twice: once before the first window
@@ -159,6 +160,14 @@ export interface Conversation {
 /** Persisted record on `<cid>.jsonl`. Aliased for legacy callers; the new
  *  canonical type is `GroupMessage` from `group_chat/visibility`. */
 export type MessageRecord = GroupMessage;
+
+function _messageForDisplay(message: MessageRecord): MessageRecord {
+  if (message.from === 'user' || !String(message.text || '').includes('chat-media://local/')) {
+    return message;
+  }
+  const text = versionChatMediaLocalUrlsInText(message.text);
+  return text === message.text ? message : { ...message, text };
+}
 
 // ── CRUD ─────────────────────────────────────────────────────────────────
 
@@ -1910,7 +1919,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
   const msgFile = conversationMessageFile(userId, cid, removed?.project_id ?? null);
   try { await fsp.unlink(msgFile); } catch { /* ignore missing */ }
   invalidateLineCount(msgFile);
-  search.dropChatConversation(userId, cid);
+  await search.dropChatConversation(userId, cid);
 
   // Purge commander session + every per-agent member session.
   purgeSession(userId, removed?.session_id || buildConversationSessionId(cid));
@@ -2019,7 +2028,7 @@ export async function getMessagesPage(
     if (page.nextCursor === null) break;
     cursor = page.nextCursor;
   }
-  return { history, nextCursor };
+  return { history: history.map(_messageForDisplay), nextCursor };
 }
 
 /** Load from the fixed-size page containing a search hit through the newest
@@ -2048,7 +2057,7 @@ export async function getMessagesPageAtIndex(
     .map((message, offset) => ({ message, index: pageStart + offset }))
     .filter(({ message }) => !message.deleted_at);
   return {
-    history: visible.map(({ message }) => message),
+    history: visible.map(({ message }) => _messageForDisplay(message)),
     // Keep the source JSONL indexes aligned with `history`. The renderer uses
     // this as the final navigation identity for old records that predate
     // stable message ids/timestamps; filtering a tombstone must not shift the
@@ -2222,6 +2231,11 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       candidates.push(...await _conversationStateCandidates(uid));
     }
   }
+  // The common clean-start path has no running conversations. Loading bus.ts
+  // here would eagerly pull Group Chat, prompts, skills, marketplace, and
+  // model-runtime dependencies before the first BrowserWindow even though
+  // there is no stale state to inspect.
+  if (candidates.length === 0) return { swept: 0 };
   // Loaded lazily to avoid the chats ↔ bus module cycle during startup. The
   // CJS path deliberately shares the same in-memory runtime map as send().
   const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
@@ -2264,7 +2278,8 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
         model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
       };
       const layout = conversationLayout(uid, cid);
-      await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage);
+      const { msgIndex } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage);
+      await search.indexChatMessage(uid, cid, msgIndex, interruptedMessage);
       await appendVisible(uid, cid, interruptedMessage, [...new Set([...memberIds, senderId, 'commander'])]);
       const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
         || (senderId === 'commander' ? 'commander' : 'agent');

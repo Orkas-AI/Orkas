@@ -141,6 +141,9 @@ export interface RouteResolution {
   to: string[];
   /** Tokens that didn't resolve to any known actor. UI may surface these. */
   unknown: string[];
+  /** True when routing came from an explicit @ mention rather than the
+   *  sender-default route / conversation floor. */
+  hadExplicitMention: boolean;
 }
 
 export interface ResolveOpts {
@@ -245,7 +248,7 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
 
   if (resolved.length) {
     // De-dupe (someone might @ the same actor twice).
-    return { to: Array.from(new Set(resolved)), unknown };
+    return { to: Array.from(new Set(resolved)), unknown, hadExplicitMention: true };
   }
 
   // Tokens were present but none resolved synchronously — return empty
@@ -254,7 +257,7 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   // to add BOTH the default recipient AND the async-resolved agent into
   // `to`, ending up with mixed routing like `to=['user', '<agent>']`.
   if (tokens.length > 0) {
-    return { to: [], unknown };
+    return { to: [], unknown, hadExplicitMention: true };
   }
 
   // No `@` mentions at all → default route based on sender role.
@@ -277,7 +280,7 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   } else {
     def = USER_ID;
   }
-  return { to: [def], unknown };
+  return { to: [def], unknown, hadExplicitMention: false };
 }
 
 // ── Form payload + agent-container parsers (moved here so bus can apply
@@ -380,10 +383,10 @@ export function extractFormFromFinal(text: string, defaultAgentId?: string): Ext
   return { cleanText, form: { agent_id: agentId, fields } };
 }
 
-// Hand-back marker: an agent holding the conversation floor (after the commander
-// handed off to it) emits `<handback />` to return control to the commander —
-// when its task is done or the user's ask is out of its scope. Display-only
-// markup; stripped from the visible bubble. Tolerant of attributes /
+// Hand-back marker: an agent emits `<handback />` to return control to the
+// commander after an interactive handoff completes or when a directly addressed
+// task crosses its capability boundary. Display-only markup; stripped from the
+// visible bubble. Tolerant of attributes /
 // self-closing vs paired form, same as the plan-interaction marker.
 const HANDBACK_RE =
   /<handback\b[^>]*\/>|<handback\b[^>]*>\s*<\/handback>/gi;
@@ -391,8 +394,8 @@ const HANDBACK_RE =
 export interface ExtractHandbackResult { cleanText: string; handback?: true }
 
 /** Strip a `<handback />` marker from an agent's visible text and report
- *  whether it was present. The caller resets the floor to the commander only
- *  when the emitting agent actually holds it. */
+ *  whether it was present. The caller owns floor reset and any guarded
+ *  commander continuation. */
 export function extractHandbackFromFinal(text: string): ExtractHandbackResult {
   if (!text || typeof text !== 'string') return { cleanText: text || '' };
   if (!text.toLowerCase().includes('<handback')) return { cleanText: text };
@@ -440,9 +443,14 @@ export function extractActorResultFromFinal(text: string): ExtractActorResultRes
   let status: ActorResultStatus | undefined;
   const cleanText = text.replace(ACTOR_RESULT_RE, (_full, attrs1 = '', attrs2 = '') => {
     const attrs = String(attrs1 || attrs2 || '');
-    const m = /\bstatus\s*=\s*["'](success|failure)["']/i.exec(attrs);
+    // JSON-only replies must encode the telemetry marker's quotes as \". The
+    // marker is still runtime metadata in that representation, not business
+    // evidence, so recognize and remove both plain and JSON-escaped forms.
+    const m = /\bstatus\s*=\s*\\?["'](success|failure)\\?["']/i.exec(attrs);
     if (m) status = m[1].toLowerCase() as ActorResultStatus;
-    return '\n';
+    // A literal newline would invalidate JSON when the marker occupied an
+    // array string; removing it entirely keeps the surrounding JSON parseable.
+    return '';
   }).replace(/\n{3,}/g, '\n\n').trim();
 
   return status ? { cleanText, status } : { cleanText };

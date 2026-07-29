@@ -8,6 +8,7 @@
  */
 
 import * as crypto from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
@@ -32,19 +33,27 @@ import {
   CompositionManifestSchema,
   reconcileCompositionHtml,
   retimeCompositionManifestForNarration,
+  validateCompositionManifestSemantics,
   type CompositionManifest,
 } from '../../features/video_studio_contract';
 import {
   evaluateVideoProductionOperation,
   readVideoProductionState,
+  recordVideoProductionCandidate,
   recordVideoProductionTransition,
   summarizeVideoProductionState,
   updateVideoProductionState,
   type VideoProductionArtifactState,
+  type VideoProductionCandidateLocators,
+  type VideoProductionCandidateRevision,
+  type VideoProductionCandidateSnapshot,
   type VideoProductionGateEntry,
   type VideoProductionNarrationFit,
   type VideoProductionNarrationRepairAuthorization,
+  type VideoProductionNarrationTransaction,
   type VideoProductionPlanApproval,
+  type VideoProductionPlanFileRecord,
+  type VideoProductionPlanFiles,
   type VideoProductionPolicyFacts,
   type VideoProductionStateV1,
   type VideoProductionVisualQaCycle,
@@ -52,6 +61,8 @@ import {
   type VideoProductionVisualQaAttempt,
 } from '../../features/video_studio_state';
 import {
+  assertVideoStudioDesignQualityVerdict,
+  compileVideoStudioDesignQualityScorecard,
   isEnvironmentalDraftFailure,
   VIDEO_STUDIO_INSPECTOR_VERSION,
 } from '../../features/video_studio_qa';
@@ -65,6 +76,8 @@ import {
   videoProductionControlSummary,
   type VideoProductionPlanIdentity,
 } from '../../features/video_production_control';
+import { projectVideoApprovalIntent } from '../../features/video_approval_identity';
+import { canonicalizeManifestSourceShotReferences } from '../../features/video_studio_source_alignment';
 import {
   assessEstimatedNarrationFit,
   configuredTtsBackendId,
@@ -95,8 +108,34 @@ const NARRATION_REPAIR_MAX_EDIT_RATIO = 0.15;
 const NARRATION_REPAIR_MAX_CHECKS = 2;
 const VISUAL_QA_MAX_REPAIR_PASSES = 2;
 
-export type VideoStudioApprovalGate = 'plan' | 'generation' | 'preview' | 'draft';
+export type VideoStudioApprovalGate = 'plan' | 'generation' | 'narration_retry' | 'preview' | 'draft';
 export type VideoStudioApprovalDecision = 'approve' | 'reject' | 'unknown';
+export type VideoStudioDecisionEvidence = {
+  source: 'user_message';
+  gate: VideoStudioApprovalGate;
+  decision: 'approve' | 'revise' | 'reject';
+  /** Verbatim excerpt from the current real user turn. The host verifies
+   * provenance only; semantic interpretation belongs to the model. */
+  quote: string;
+};
+
+export type VideoStudioResolvedDecision = {
+  decision: 'approve' | 'revise' | 'reject' | 'unknown';
+  source: 'form' | 'model_interpreted_user_message' | 'none';
+  evidence_status: 'not_provided' | 'valid' | 'invalid';
+  /** Structured Preview/Final forms bind their opaque option value to the
+   * exact artifact signature they displayed. Natural-language replies target
+   * the current artifact semantically and therefore omit this field. */
+  artifact_signature?: string;
+  evidence_format?: 'object' | 'json_string';
+  evidence_issue?:
+  | 'expected_object'
+  | 'source_invalid'
+  | 'gate_mismatch'
+  | 'decision_invalid'
+  | 'quote_missing'
+  | 'quote_not_in_current_turn';
+};
 
 const APPROVAL_FIELD_RE = /(?:^|_)(?:approval|approve|decision|action|confirm|confirmation|reconfirm)(?:_|$)/i;
 const APPROVAL_VALUES = new Set([
@@ -132,19 +171,64 @@ function approvalKeyGateHints(key: string): Set<VideoStudioApprovalGate> {
   const hints = new Set<VideoStudioApprovalGate>();
   if (/(?:^|_)(?:gate_?b|plan|script|shotlist|storyboard|edl)(?:_|$)/i.test(key)) hints.add('plan');
   if (/(?:^|_)(?:gate_?c|billing|billable|generation|cost)(?:_|$)/i.test(key)) hints.add('generation');
+  if (/(?:^|_)(?:narration_?retry|tts_?retry|speech_?retry)(?:_|$)/i.test(key)) hints.add('narration_retry');
   if (/(?:^|_)(?:html_?preview|preview)(?:_|$)/i.test(key)) hints.add('preview');
   if (/(?:^|_)(?:gate_?d|draft|export|final)(?:_|$)/i.test(key)) hints.add('draft');
   return hints;
 }
 
-function structuredApprovalValue(value: unknown): VideoStudioApprovalDecision {
-  if (value === true) return 'approve';
-  if (value === false) return 'reject';
-  if (typeof value !== 'string') return 'unknown';
-  const normalized = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
-  if (APPROVAL_VALUES.has(normalized)) return 'approve';
-  if (REJECTION_VALUES.has(normalized)) return 'reject';
-  return 'unknown';
+function structuredApproval(value: unknown): {
+  decision: VideoStudioApprovalDecision;
+  artifact_signature?: string;
+} {
+  if (value === true) return { decision: 'approve' };
+  if (value === false) return { decision: 'reject' };
+  if (typeof value !== 'string') return { decision: 'unknown' };
+  const raw = value.trim();
+  const bound = raw.match(/^([^:]+)::([a-f0-9]{64})$/i);
+  const decisionText = bound?.[1] || raw;
+  const normalized = decisionText.toLowerCase().replace(/[\s-]+/g, '_');
+  const decision = APPROVAL_VALUES.has(normalized)
+    ? 'approve'
+    : REJECTION_VALUES.has(normalized)
+      ? 'reject'
+      : 'unknown';
+  return {
+    decision,
+    ...(bound && decision !== 'unknown'
+      ? { artifact_signature: bound[2].toLowerCase() }
+      : {}),
+  };
+}
+
+function structuredVideoStudioGateDecision(
+  message: string | undefined,
+  gate: VideoStudioApprovalGate,
+  expectedAgentId = VIDEO_STUDIO_AGENT_ID,
+): {
+  decision: VideoStudioApprovalDecision;
+  artifact_signature?: string;
+} {
+  const payload = currentUserTurnPayload(message);
+  if (!payload) return { decision: 'unknown' };
+
+  const hasSubmissionTag = /<agent-input-submission\b/i.test(payload);
+  const submission = decodeSubmission(payload);
+  if (!hasSubmissionTag || !submission || submission.agent_id !== expectedAgentId) {
+    return { decision: 'unknown' };
+  }
+  let approved: { artifact_signature?: string } | undefined;
+  let rejected: { artifact_signature?: string } | undefined;
+  for (const [key, value] of Object.entries(submission.values)) {
+    if (!APPROVAL_FIELD_RE.test(key)) continue;
+    const hints = approvalKeyGateHints(key);
+    if (hints.size !== 1 || !hints.has(gate)) continue;
+    const parsed = structuredApproval(value);
+    if (parsed.decision === 'approve') approved = parsed;
+    if (parsed.decision === 'reject') rejected = parsed;
+  }
+  if (rejected) return { decision: 'reject', ...rejected };
+  return approved ? { decision: 'approve', ...approved } : { decision: 'unknown' };
 }
 
 /**
@@ -157,48 +241,155 @@ export function explicitVideoStudioGateDecision(
   gate: VideoStudioApprovalGate,
   expectedAgentId = VIDEO_STUDIO_AGENT_ID,
 ): VideoStudioApprovalDecision {
-  const payload = currentUserTurnPayload(message);
-  if (!payload) return 'unknown';
+  return structuredVideoStudioGateDecision(message, gate, expectedAgentId).decision;
+}
 
-  const hasSubmissionTag = /<agent-input-submission\b/i.test(payload);
-  const submission = decodeSubmission(payload);
-  if (hasSubmissionTag) {
-    if (!submission || submission.agent_id !== expectedAgentId) return 'unknown';
-    let approved = false;
-    let rejected = false;
-    for (const [key, value] of Object.entries(submission.values)) {
-      if (!APPROVAL_FIELD_RE.test(key)) continue;
-      const hints = approvalKeyGateHints(key);
-      // A generic `decision=approve` is not enough: it could belong to Gate A,
-      // billing consent, or another production gate in the same conversation.
-      if (hints.size !== 1 || !hints.has(gate)) continue;
-      const decision = structuredApprovalValue(value);
-      if (decision === 'approve') approved = true;
-      if (decision === 'reject') rejected = true;
-    }
-    if (rejected) return 'reject';
-    return approved ? 'approve' : 'unknown';
-  }
-
-  const text = payload
-    .split(/\r?\n/)
-    .filter((line) => !/^\s*@[^\s]+\s*$/.test(line))
-    .join(' ')
+function normalizedDecisionText(value: string): string {
+  return value
     .replace(/<[^>]+>/g, ' ')
+    .replace(/@\S+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (!text || text.length > 300 || /[?？]/.test(text)) return 'unknown';
-  if (/(?:不同意|不批准|不确认|不继续|先别|不要|拒绝|取消|返回|暂停|停止|修改|调整|重做|有问题|revise|reject|deny|cancel|stop|pause|change\s+direction)/i.test(text)) {
-    return 'reject';
+}
+
+/**
+ * Forms remain deterministic structured input. Natural-language replies are
+ * interpreted by the model and supplied as structured evidence. The host only
+ * verifies that the quoted evidence came from the current real user turn and
+ * that it targets the operation's gate; it intentionally has no keyword or
+ * locale-specific intent rules.
+ */
+export function resolveVideoStudioCurrentTurnDecision(
+  message: string | undefined,
+  gate: VideoStudioApprovalGate,
+  evidence: unknown,
+  expectedAgentId = VIDEO_STUDIO_AGENT_ID,
+): VideoStudioResolvedDecision {
+  const structured = structuredVideoStudioGateDecision(message, gate, expectedAgentId);
+  if (structured.decision !== 'unknown') {
+    return {
+      decision: structured.decision === 'approve' ? 'approve' : 'reject',
+      source: 'form',
+      evidence_status: 'not_provided',
+      ...(structured.artifact_signature
+        ? { artifact_signature: structured.artifact_signature }
+        : {}),
+    };
   }
-  if (gate === 'generation'
-    && !/(?:gate\s*c|付费|计费|扣费|生成(?:镜头|图片|视频)|billable|billing|paid\s+generation|generate\s+(?:the\s+)?(?:image|video|shot))/i.test(text)) {
-    return 'unknown';
+  if (evidence === undefined || evidence === null) {
+    return { decision: 'unknown', source: 'none', evidence_status: 'not_provided' };
   }
-  if (/^(?:我(?:已|明确)?\s*)?(?:同意|批准|确认|通过)(?:$|[\s，,。.!！]|当前|以上|该|此|并|继续|执行|批准|付费|计费|扣费|生成)/i.test(text)) return 'approve';
-  if (/^(?:可以|继续|按(?:这个|此)方案(?:继续|执行)?)[。！!\s]*$/i.test(text)) return 'approve';
-  if (/^(?:i\s+)?(?:approve|approved|confirm|confirmed|accept|accepted|yes|continue|looks good)[.!\s]*$/i.test(text)) return 'approve';
-  return 'unknown';
+  let normalizedEvidence = evidence;
+  let evidenceFormat: 'object' | 'json_string' = 'object';
+  if (typeof normalizedEvidence === 'string') {
+    evidenceFormat = 'json_string';
+    try {
+      normalizedEvidence = JSON.parse(normalizedEvidence);
+    } catch {
+      return {
+        decision: 'unknown',
+        source: 'none',
+        evidence_status: 'invalid',
+        evidence_format: evidenceFormat,
+        evidence_issue: 'expected_object',
+      };
+    }
+  }
+  if (!normalizedEvidence
+    || typeof normalizedEvidence !== 'object'
+    || Array.isArray(normalizedEvidence)) {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'expected_object',
+    };
+  }
+  const record = normalizedEvidence as Record<string, unknown>;
+  if (record.source !== 'user_message') {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'source_invalid',
+    };
+  }
+  if (record.gate !== gate) {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'gate_mismatch',
+    };
+  }
+  if (!['approve', 'revise', 'reject'].includes(String(record.decision || ''))) {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'decision_invalid',
+    };
+  }
+  const payload = normalizedDecisionText(currentUserTurnPayload(message));
+  const quote = normalizedDecisionText(String(record.quote || ''));
+  if (!quote || quote.length > 500) {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'quote_missing',
+    };
+  }
+  if (!payload || !payload.includes(quote)) {
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'invalid',
+      evidence_format: evidenceFormat,
+      evidence_issue: 'quote_not_in_current_turn',
+    };
+  }
+  return {
+    decision: record.decision as 'approve' | 'revise' | 'reject',
+    source: 'model_interpreted_user_message',
+    evidence_status: 'valid',
+    evidence_format: evidenceFormat,
+  };
+}
+
+function invalidDecisionEvidenceResult(
+  op: VideoStudioOp,
+  gate: VideoStudioApprovalGate,
+  decision: VideoStudioResolvedDecision,
+): Record<string, unknown> | undefined {
+  if (decision.evidence_status !== 'invalid') return undefined;
+  return {
+    ok: false,
+    op,
+    errorCode: 'E_DECISION_EVIDENCE_INVALID',
+    message: 'The current user reply is still available, but decision_evidence was not a valid structured object for this operation. Re-interpret the same current reply and retry this operation now with a native object; do not ask the user to confirm again.',
+    decision_evidence_valid: false,
+    decision_evidence_issue: decision.evidence_issue || 'expected_object',
+    decision_evidence_format: decision.evidence_format || 'object',
+    current_user_message_available: true,
+    requires_user_decision: false,
+    user_reconfirmation_required: false,
+    automatic_recovery_expected: true,
+    billable_request_sent: false,
+    expected_decision_evidence: {
+      source: 'user_message',
+      gate,
+      decision: ['approve', 'revise', 'reject'],
+      quote: 'verbatim excerpt from the current real user message',
+    },
+    allowed_recovery_ops: [op],
+    next_action: 'retry_same_operation_with_structured_decision_evidence',
+  };
 }
 
 export function explicitVideoStudioVisualRecoveryDecision(
@@ -238,16 +429,7 @@ export function explicitVideoStudioVisualRevisionDecision(
     }
     return 'unknown';
   }
-  const text = payload
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/@\S+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!text || text.length > 2_000) return 'unknown';
-  if (/^(?:取消|暂停|停止|算了|cancel|pause|stop)[。！!\s]*$/i.test(text)) return 'unknown';
-  return /(?:修改|调整|改成|换成|替换|删除|移除|去掉|增加|添加|重做|重新做|继续修改|\b(?:revise|change|modify|remove|delete|add|replace|redo|update)\b)/i.test(text)
-    ? 'revise'
-    : 'unknown';
+  return 'unknown';
 }
 
 const DENY_MESSAGE =
@@ -468,7 +650,14 @@ type VideoStudioGateEntry = VideoProductionGateEntry;
 
 type VideoStudioGateCheck =
   | { ok: true; entry: VideoStudioGateEntry }
-  | { ok: false; errorCode: string; message: string };
+  | {
+    ok: false;
+    errorCode: string;
+    message: string;
+    submitted_artifact_signature?: string | null;
+    current_artifact_signature?: string;
+    submitted_decision_status?: 'superseded' | 'unbound_after_revision';
+  };
 
 function isRuntimeGeneratedCompositionPath(rel: string, isDirectory: boolean): boolean {
   const normalized = rel.replace(/\\/g, '/');
@@ -497,9 +686,30 @@ function isRuntimeGeneratedCompositionPathV3(rel: string, isDirectory: boolean):
   return /^(?:draft|final|export)-qa(?:-[^.]+)?\.json$/i.test(normalized);
 }
 
+function isRuntimeGeneratedCompositionPathV4(rel: string, isDirectory: boolean): boolean {
+  if (isRuntimeGeneratedCompositionPathV3(rel, isDirectory)) return true;
+  if (!isDirectory) return false;
+  const topLevel = rel.replace(/\\/g, '/').split('/')[0]?.toLowerCase() || '';
+  return topLevel === 'previews' || topLevel === 'drafts' || topLevel === 'reports';
+}
+
+function isRuntimeGeneratedCompositionPathV5(rel: string, isDirectory: boolean): boolean {
+  if (isRuntimeGeneratedCompositionPathV4(rel, isDirectory)) return true;
+  if (!isDirectory) return false;
+  const topLevel = rel.replace(/\\/g, '/').split('/')[0]?.toLowerCase() || '';
+  return topLevel === 'outputs';
+}
+
+function isWithinDirectory(candidatePath: string, directoryPath: string): boolean {
+  const relative = path.relative(path.resolve(directoryPath), path.resolve(candidatePath));
+  return relative === '' || (!relative.startsWith(`..${path.sep}`)
+    && relative !== '..'
+    && !path.isAbsolute(relative));
+}
+
 async function compositionFiles(
   compositionDirAbs: string,
-  signatureVersion: 1 | 2 | 3 = 3,
+  signatureVersion: 1 | 2 | 3 | 4 | 5 = 5,
 ): Promise<string[]> {
   const out: string[] = [];
   const hasCanonicalManifest = !!(await fs.stat(path.join(compositionDirAbs, 'composition-manifest.json')).catch(() => null));
@@ -510,12 +720,16 @@ async function compositionFiles(
       const rel = path.relative(compositionDirAbs, abs).replace(/\\/g, '/');
       if (entry.isDirectory()) {
         if (rel === 'qa' || rel === 'preview' || rel.startsWith('qa/') || rel.startsWith('preview/')) continue;
-        if (signatureVersion >= 3 && isRuntimeGeneratedCompositionPathV3(rel, true)) continue;
+        if (signatureVersion >= 5 && isRuntimeGeneratedCompositionPathV5(rel, true)) continue;
+        if (signatureVersion === 4 && isRuntimeGeneratedCompositionPathV4(rel, true)) continue;
+        if (signatureVersion === 3 && isRuntimeGeneratedCompositionPathV3(rel, true)) continue;
         if (signatureVersion === 2 && isRuntimeGeneratedCompositionPath(rel, true)) continue;
         await visit(abs);
       } else if (entry.isFile()) {
         if (hasCanonicalManifest && (rel === 'design-contract.json' || rel === 'scene-map.json')) continue;
-        if (signatureVersion >= 3 && isRuntimeGeneratedCompositionPathV3(rel, false)) continue;
+        if (signatureVersion >= 5 && isRuntimeGeneratedCompositionPathV5(rel, false)) continue;
+        if (signatureVersion === 4 && isRuntimeGeneratedCompositionPathV4(rel, false)) continue;
+        if (signatureVersion === 3 && isRuntimeGeneratedCompositionPathV3(rel, false)) continue;
         if (signatureVersion === 2 && isRuntimeGeneratedCompositionPath(rel, false)) continue;
         out.push(abs);
       }
@@ -527,7 +741,7 @@ async function compositionFiles(
 
 export async function videoStudioCompositionSignature(
   compositionDirAbs: string,
-  signatureVersion: 2 | 3 = 3,
+  signatureVersion: 2 | 3 | 4 | 5 = 5,
 ): Promise<string> {
   const hash = crypto.createHash('sha256');
   for (const abs of await compositionFiles(compositionDirAbs, signatureVersion)) {
@@ -556,7 +770,9 @@ async function videoStudioGateSignature(
   compositionDirAbs: string,
   entry: VideoProductionGateEntry,
 ): Promise<string> {
-  if (entry.validation_version >= 3) return videoStudioCompositionSignature(compositionDirAbs, 3);
+  if (entry.validation_version >= 5) return videoStudioCompositionSignature(compositionDirAbs, 5);
+  if (entry.validation_version === 4) return videoStudioCompositionSignature(compositionDirAbs, 4);
+  if (entry.validation_version === 3) return videoStudioCompositionSignature(compositionDirAbs, 3);
   if (entry.validation_version === 2) return videoStudioCompositionSignature(compositionDirAbs, 2);
   return legacyVideoStudioCompositionSignature(compositionDirAbs);
 }
@@ -564,44 +780,46 @@ async function videoStudioGateSignature(
 async function checkVideoStudioGateSignature(
   compositionDirAbs: string,
   entry: VideoProductionGateEntry,
-): Promise<{ matches: boolean; upgradeToV3: boolean }> {
-  if (entry.validation_version !== 2) {
+): Promise<{ matches: boolean; upgradeToV5: boolean }> {
+  if (entry.validation_version === 5 || entry.validation_version === 1) {
     return {
       matches: entry.signature === await videoStudioGateSignature(compositionDirAbs, entry),
-      upgradeToV3: false,
+      upgradeToV5: false,
     };
   }
-  const [v2Signature, v3Signature] = await Promise.all([
-    videoStudioCompositionSignature(compositionDirAbs, 2),
-    videoStudioCompositionSignature(compositionDirAbs, 3),
+  const [legacySignature, v5Signature] = await Promise.all([
+    videoStudioCompositionSignature(compositionDirAbs, entry.validation_version),
+    videoStudioCompositionSignature(compositionDirAbs, 5),
   ]);
   return {
-    matches: entry.signature === v2Signature || entry.signature === v3Signature,
-    upgradeToV3: entry.signature === v3Signature,
+    matches: entry.signature === legacySignature || entry.signature === v5Signature,
+    upgradeToV5: entry.signature === legacySignature || entry.signature === v5Signature,
   };
 }
 
-async function migrateVideoStudioGateSignatureV3(
+async function migrateVideoStudioGateSignatureV5(
   statePath: string,
   kind: 'preview' | 'draft',
   compositionDirAbs: string,
   state: VideoProductionStateV1,
 ): Promise<VideoProductionStateV1> {
   const entry = state[kind];
-  if (!entry || entry.validation_version !== 2) return state;
+  if (!entry || entry.validation_version === 1 || entry.validation_version === 5) return state;
   const check = await checkVideoStudioGateSignature(compositionDirAbs, entry);
-  // Migrate only when the stored signature already proves an exact match with
-  // the current v3 inputs. Filesystem mtimes are not authorization evidence:
-  // they can be preserved, rounded, or deliberately backdated.
-  if (!check.matches || !check.upgradeToV3) return state;
+  // Upgrade only when the stored signature still exactly matches the current
+  // tree under either its original rules or v5. The old exact match proves
+  // that no authored input changed while runtime-only paths are reclassified.
+  if (!check.matches || !check.upgradeToV5) return state;
   const artifacts = await videoProductionArtifacts(compositionDirAbs);
   try {
     return await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
       const nextEntry = next[kind];
-      if (!nextEntry || nextEntry.validation_version !== 2 || nextEntry.signature !== entry.signature) {
+      if (!nextEntry
+        || nextEntry.validation_version !== entry.validation_version
+        || nextEntry.signature !== entry.signature) {
         throw new Error('E_VIDEO_PRODUCTION_STATE_CONFLICT: gate changed while its signature was being migrated.');
       }
-      nextEntry.validation_version = 3;
+      nextEntry.validation_version = 5;
       nextEntry.signature = artifacts.composition_signature || entry.signature;
       next.artifacts = { ...next.artifacts, ...artifacts };
     }, { expectedRevision: state.revision });
@@ -624,6 +842,568 @@ async function videoProductionArtifacts(compositionDirAbs: string): Promise<Vide
     ...(manifestSha ? { manifest_sha256: manifestSha } : {}),
     ...(htmlSha ? { html_sha256: htmlSha } : {}),
   };
+}
+
+function videoStudioRuntimeFingerprint(): string {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,
+    electron: process.versions.electron || '',
+    chrome: process.versions.chrome || '',
+    node: process.versions.node,
+    platform: process.platform,
+    arch: process.arch,
+  })).digest('hex');
+}
+
+async function existingCandidateFile(value: unknown): Promise<string | undefined> {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const resolved = path.resolve(value);
+  const stat = await fs.stat(resolved).catch(() => null);
+  return stat?.isFile() ? resolved : undefined;
+}
+
+type CandidateSnapshotFileRecord = {
+  relative_path: string;
+  sha256: string;
+  size_bytes: number;
+  snapshot_path: string;
+};
+
+type CandidateSnapshotManifest = {
+  schema_version: 1;
+  revision_id: string;
+  content_hash: string;
+  runtime_fingerprint: string;
+  canonical_locators: VideoProductionCandidateLocators;
+  frozen_locators: VideoProductionCandidateLocators;
+  source_files: CandidateSnapshotFileRecord[];
+  created_at: string;
+  updated_at: string;
+};
+
+async function sha256FileStream(absPath: string): Promise<{ sha256: string; sizeBytes: number }> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    let sizeBytes = 0;
+    const stream = createReadStream(absPath);
+    stream.on('data', (chunk: Buffer) => {
+      sizeBytes += chunk.length;
+      hash.update(chunk);
+    });
+    stream.on('error', reject);
+    stream.on('end', () => resolve({
+      sha256: hash.digest('hex'),
+      sizeBytes,
+    }));
+  });
+}
+
+async function ensureCandidateBlob(
+  videoStudioRoot: string,
+  sourcePath: string,
+): Promise<{ blobPath: string; sha256: string; sizeBytes: number }> {
+  const { sha256, sizeBytes } = await sha256FileStream(sourcePath);
+  const blobPath = path.join(videoStudioRoot, 'candidate-blobs', sha256.slice(0, 2), sha256);
+  if (!(await fs.stat(blobPath).catch(() => null))) {
+    await fs.mkdir(path.dirname(blobPath), { recursive: true });
+    const tempPath = `${blobPath}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.copyFile(sourcePath, tempPath);
+      await fs.rename(tempPath, blobPath);
+    } finally {
+      await fs.unlink(tempPath).catch(() => undefined);
+    }
+  }
+  return { blobPath, sha256, sizeBytes };
+}
+
+async function materializeCandidateBlob(blobPath: string, snapshotPath: string): Promise<string> {
+  if (await fs.stat(snapshotPath).catch(() => null)) return snapshotPath;
+  await fs.mkdir(path.dirname(snapshotPath), { recursive: true });
+  try {
+    await fs.link(blobPath, snapshotPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return snapshotPath;
+    await fs.copyFile(blobPath, snapshotPath);
+  }
+  return snapshotPath;
+}
+
+function hashedEvidenceName(sourcePath: string, sha256: string, index?: number): string {
+  const parsed = path.parse(sourcePath);
+  const prefix = typeof index === 'number' ? `${String(index).padStart(3, '0')}-` : '';
+  return `${prefix}${parsed.name}-${sha256.slice(0, 12)}${parsed.ext}`;
+}
+
+async function freezeCandidateFile(input: {
+  videoStudioRoot: string;
+  sourcePath: string;
+  snapshotPath: string;
+  relativePath: string;
+}): Promise<CandidateSnapshotFileRecord> {
+  const blob = await ensureCandidateBlob(input.videoStudioRoot, input.sourcePath);
+  const snapshotPath = await materializeCandidateBlob(blob.blobPath, input.snapshotPath);
+  return {
+    relative_path: input.relativePath,
+    sha256: blob.sha256,
+    size_bytes: blob.sizeBytes,
+    snapshot_path: snapshotPath,
+  };
+}
+
+function snapshotLocatorsFromManifest(value: unknown): VideoProductionCandidateLocators {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const locators = value as VideoProductionCandidateLocators;
+  return {
+    ...(typeof locators.html_path === 'string' ? { html_path: locators.html_path } : {}),
+    ...(typeof locators.manifest_path === 'string' ? { manifest_path: locators.manifest_path } : {}),
+    ...(typeof locators.preview_path === 'string' ? { preview_path: locators.preview_path } : {}),
+    ...(Array.isArray(locators.frame_paths)
+      ? { frame_paths: locators.frame_paths.filter((entry): entry is string => typeof entry === 'string') }
+      : {}),
+    ...(typeof locators.draft_path === 'string' ? { draft_path: locators.draft_path } : {}),
+    ...(typeof locators.report_path === 'string' ? { report_path: locators.report_path } : {}),
+    ...(typeof locators.findings_path === 'string' ? { findings_path: locators.findings_path } : {}),
+  };
+}
+
+function mergeCandidateSnapshotLocators(
+  current: VideoProductionCandidateLocators,
+  incoming: VideoProductionCandidateLocators,
+): VideoProductionCandidateLocators {
+  const framePaths = [...new Set([
+    ...(current.frame_paths || []),
+    ...(incoming.frame_paths || []),
+  ])];
+  return {
+    ...current,
+    ...incoming,
+    ...(framePaths.length ? { frame_paths: framePaths } : {}),
+  };
+}
+
+async function materializeVideoProductionCandidateSnapshot(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  contentHash: string;
+  runtimeFingerprint: string;
+  canonicalLocators: VideoProductionCandidateLocators;
+}): Promise<VideoProductionCandidateSnapshot> {
+  const stateKey = path.basename(input.statePath, path.extname(input.statePath));
+  const videoStudioRoot = path.dirname(path.dirname(input.statePath));
+  const rootPath = path.join(videoStudioRoot, 'candidates', stateKey, input.contentHash);
+  const manifestPath = path.join(rootPath, 'candidate.json');
+  const now = new Date().toISOString();
+  const prior = await fs.readFile(manifestPath, 'utf8')
+    .then((raw) => JSON.parse(raw) as CandidateSnapshotManifest)
+    .catch(() => undefined);
+
+  let sourceFiles = prior?.content_hash === input.contentHash && Array.isArray(prior.source_files)
+    ? prior.source_files
+    : [];
+  if (!sourceFiles.length) {
+    sourceFiles = [];
+    for (const sourcePath of await compositionFiles(input.compositionDirAbs, 5)) {
+      const relativePath = path.relative(input.compositionDirAbs, sourcePath).replace(/\\/g, '/');
+      sourceFiles.push(await freezeCandidateFile({
+        videoStudioRoot,
+        sourcePath,
+        snapshotPath: path.join(rootPath, 'source', ...relativePath.split('/')),
+        relativePath,
+      }));
+    }
+  }
+
+  const sourceByRelativePath = new Map<string, CandidateSnapshotFileRecord>(
+    sourceFiles.map((entry) => [entry.relative_path, entry] as const),
+  );
+  const frozenLocators = mergeCandidateSnapshotLocators(
+    snapshotLocatorsFromManifest(prior?.frozen_locators),
+    {
+      ...(sourceByRelativePath.get('index.html')
+        ? { html_path: sourceByRelativePath.get('index.html')!.snapshot_path }
+        : {}),
+      ...(sourceByRelativePath.get('composition-manifest.json')
+        ? { manifest_path: sourceByRelativePath.get('composition-manifest.json')!.snapshot_path }
+        : {}),
+    },
+  );
+
+  const freezeEvidence = async (
+    kind: 'preview' | 'draft' | 'report' | 'findings',
+    sourcePath: string | undefined,
+  ): Promise<string | undefined> => {
+    if (!sourcePath) return undefined;
+    const blob = await ensureCandidateBlob(videoStudioRoot, sourcePath);
+    return materializeCandidateBlob(
+      blob.blobPath,
+      path.join(rootPath, 'evidence', kind, hashedEvidenceName(sourcePath, blob.sha256)),
+    );
+  };
+  const [previewPath, draftPath, reportPath, findingsPath] = await Promise.all([
+    freezeEvidence('preview', input.canonicalLocators.preview_path),
+    freezeEvidence('draft', input.canonicalLocators.draft_path),
+    freezeEvidence('report', input.canonicalLocators.report_path),
+    freezeEvidence('findings', input.canonicalLocators.findings_path),
+  ]);
+  const framePaths = (await Promise.all(
+    (input.canonicalLocators.frame_paths || []).map(async (sourcePath, index) => {
+      const blob = await ensureCandidateBlob(videoStudioRoot, sourcePath);
+      return materializeCandidateBlob(
+        blob.blobPath,
+        path.join(rootPath, 'evidence', 'frames', hashedEvidenceName(sourcePath, blob.sha256, index)),
+      );
+    }),
+  ));
+  const mergedFrozenLocators = mergeCandidateSnapshotLocators(frozenLocators, {
+    ...(previewPath ? { preview_path: previewPath } : {}),
+    ...(framePaths.length ? { frame_paths: framePaths } : {}),
+    ...(draftPath ? { draft_path: draftPath } : {}),
+    ...(reportPath ? { report_path: reportPath } : {}),
+    ...(findingsPath ? { findings_path: findingsPath } : {}),
+  });
+  const canonicalLocators = mergeCandidateSnapshotLocators(
+    snapshotLocatorsFromManifest(prior?.canonical_locators),
+    input.canonicalLocators,
+  );
+  const snapshotManifest: CandidateSnapshotManifest = {
+    schema_version: 1,
+    revision_id: `candidate-${input.contentHash.slice(0, 16)}`,
+    content_hash: input.contentHash,
+    runtime_fingerprint: input.runtimeFingerprint,
+    canonical_locators: canonicalLocators,
+    frozen_locators: mergedFrozenLocators,
+    source_files: sourceFiles,
+    created_at: prior?.created_at || now,
+    updated_at: now,
+  };
+  await fs.mkdir(rootPath, { recursive: true });
+  const tempManifestPath = `${manifestPath}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempManifestPath, JSON.stringify(snapshotManifest, null, 2), 'utf8');
+  await fs.rename(tempManifestPath, manifestPath);
+  return {
+    root_path: rootPath,
+    manifest_path: manifestPath,
+    source_file_count: sourceFiles.length,
+    source_total_bytes: sourceFiles.reduce((sum, entry) => sum + entry.size_bytes, 0),
+    locators: mergedFrozenLocators,
+    updated_at: now,
+  };
+}
+
+async function recordCurrentVideoProductionCandidate(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  op: string;
+  result: Record<string, unknown>;
+}): Promise<VideoProductionStateV1> {
+  const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
+  const [htmlPath, manifestPath, previewPath, draftPath, reportPath, findingsPath] = await Promise.all([
+    existingCandidateFile(path.join(input.compositionDirAbs, 'index.html')),
+    existingCandidateFile(path.join(input.compositionDirAbs, 'composition-manifest.json')),
+    existingCandidateFile(input.result.contact_sheet || input.result.contact_sheet_path),
+    existingCandidateFile(
+      input.op === 'composition.draft' || input.op === 'composition.export'
+        ? input.result.path
+        : undefined,
+    ),
+    existingCandidateFile(input.result.report_path),
+    existingCandidateFile(input.result.findings_path),
+  ]);
+  const framePaths = (await Promise.all(
+    (Array.isArray(input.result.frame_paths) ? input.result.frame_paths : [])
+      .map((value) => existingCandidateFile(value)),
+  )).filter((value): value is string => !!value);
+  const locators: VideoProductionCandidateLocators = {
+    ...(htmlPath ? { html_path: htmlPath } : {}),
+    ...(manifestPath ? { manifest_path: manifestPath } : {}),
+    ...(previewPath ? { preview_path: previewPath } : {}),
+    ...(framePaths.length ? { frame_paths: framePaths } : {}),
+    ...(draftPath ? { draft_path: draftPath } : {}),
+    ...(reportPath ? { report_path: reportPath } : {}),
+    ...(findingsPath ? { findings_path: findingsPath } : {}),
+  };
+  const runtimeFingerprint = videoStudioRuntimeFingerprint();
+  const snapshot = artifacts.composition_signature
+    ? await materializeVideoProductionCandidateSnapshot({
+      statePath: input.statePath,
+      compositionDirAbs: input.compositionDirAbs,
+      contentHash: artifacts.composition_signature,
+      runtimeFingerprint,
+      canonicalLocators: locators,
+    }).catch((err) => {
+      // Candidate identity and recovery state remain useful if private
+      // snapshot storage is temporarily unavailable (for example, disk
+      // pressure). Do not turn an inspect/render result into a new blocker.
+      log.warn(`candidate snapshot failed: ${(err as Error).message}`);
+      return undefined;
+    })
+    : undefined;
+  return updateVideoProductionState(input.statePath, input.compositionDirAbs, (state) => {
+    recordVideoProductionCandidate(state, {
+      contentHash: artifacts.composition_signature || '',
+      artifacts,
+      locators,
+      ...(snapshot ? { snapshot } : {}),
+      runtimeFingerprint,
+      op: input.op,
+      ok: input.result.ok === true,
+      ...(typeof input.result.errorCode === 'string'
+        ? { errorCode: input.result.errorCode }
+        : {}),
+      ...(Number.isFinite(Number(input.result.blocking_error_count))
+        ? { blockingErrorCount: Number(input.result.blocking_error_count) }
+        : {}),
+    });
+  });
+}
+
+function candidateRegisteredPaths(candidate: VideoProductionCandidateRevision | undefined): string[] {
+  if (!candidate) return [];
+  const frozen = candidate.snapshot?.locators;
+  return [
+    candidate.locators.html_path,
+    candidate.locators.manifest_path,
+    candidate.locators.preview_path,
+    candidate.locators.frame_paths,
+    candidate.locators.draft_path,
+    candidate.locators.report_path,
+    candidate.locators.findings_path,
+    candidate.snapshot?.manifest_path,
+    frozen?.preview_path,
+    frozen?.frame_paths,
+    frozen?.draft_path,
+    frozen?.report_path,
+    frozen?.findings_path,
+  ].flat().filter((value): value is string => typeof value === 'string' && !!value);
+}
+
+type VideoStudioReviewArtifact = {
+  role: 'draft' | 'preview' | 'frame' | 'html' | 'manifest' | 'findings' | 'report'
+  | 'script' | 'shotlist' | 'plan_manifest';
+  path: string;
+  source: 'candidate_snapshot' | 'candidate_canonical' | 'plan_evidence';
+  review_status: 'current_approved' | 'current_unapproved' | 'current_input';
+};
+
+type VideoStudioReviewPackage = {
+  presentation_required: true;
+  status: 'current_approved' | 'current_unapproved';
+  conclusion: {
+    outcome: 'quality_not_accepted' | 'blocked';
+    error_code: string;
+    summary: string;
+    next_action: string;
+    requires_user_decision: boolean;
+    next_step_owner: 'agent' | 'user';
+    automatic_recovery_expected: boolean;
+  };
+  continuation: {
+    recoverable: true;
+    terminal: false;
+    user_action_required: boolean;
+    system_action: string;
+    user_options: Array<{
+      id: string;
+      label: string;
+      effect: string;
+    }>;
+  };
+  primary_artifact?: VideoStudioReviewArtifact;
+  artifacts: VideoStudioReviewArtifact[];
+  visible_artifact_paths: string[];
+};
+
+function currentReviewPackage(input: {
+  state: VideoProductionStateV1;
+  result: Record<string, unknown>;
+  planEvidence?: VideoProductionPlanEvidence;
+}): VideoStudioReviewPackage {
+  const candidate = input.state.current_candidate;
+  const frozenLocators = candidate?.snapshot?.locators;
+  // A snapshot may have been created before later evidence (for example the
+  // contact sheet) was attached to the same content-addressed candidate.
+  // Prefer frozen copies where present, but do not hide newer canonical
+  // evidence merely because an earlier partial snapshot exists.
+  const locators = {
+    ...(candidate?.locators || {}),
+    ...(frozenLocators || {}),
+  };
+  const candidateSource = frozenLocators ? 'candidate_snapshot' : 'candidate_canonical';
+  const previewApprovalMatchesCandidate = input.state.preview?.status === 'approved'
+    && !!candidate?.content_hash
+    && input.state.preview.signature === candidate.content_hash;
+  const draftApprovalMatchesCandidate = input.state.draft?.status === 'approved'
+    && !!candidate?.content_hash
+    && input.state.draft.signature === candidate.content_hash;
+  const previewReviewStatus: VideoStudioReviewArtifact['review_status'] =
+    previewApprovalMatchesCandidate ? 'current_approved' : 'current_unapproved';
+  const draftReviewStatus: VideoStudioReviewArtifact['review_status'] =
+    draftApprovalMatchesCandidate ? 'current_approved' : 'current_unapproved';
+  const evidenceReviewStatus = locators.draft_path ? draftReviewStatus : previewReviewStatus;
+  const artifacts: VideoStudioReviewArtifact[] = [];
+  const seen = new Set<string>();
+  const add = (
+    role: VideoStudioReviewArtifact['role'],
+    value: unknown,
+    source: VideoStudioReviewArtifact['source'],
+    reviewStatus: VideoStudioReviewArtifact['review_status'],
+  ) => {
+    if (typeof value !== 'string' || !value) return;
+    const normalized = path.resolve(value);
+    const key = `${role}:${normalized}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    artifacts.push({
+      role,
+      path: normalized,
+      source,
+      review_status: reviewStatus,
+    });
+  };
+  add('draft', locators.draft_path, candidateSource, draftReviewStatus);
+  add('preview', locators.preview_path, candidateSource, previewReviewStatus);
+  for (const framePath of locators.frame_paths || []) {
+    add('frame', framePath, candidateSource, previewReviewStatus);
+  }
+  add('html', locators.html_path, candidateSource, previewReviewStatus);
+  add('manifest', locators.manifest_path, candidateSource, previewReviewStatus);
+  add('findings', locators.findings_path, candidateSource, evidenceReviewStatus);
+  add('report', locators.report_path, candidateSource, evidenceReviewStatus);
+
+  const observations = input.planEvidence?.observations.filter((item) => item.status !== 'missing') || [];
+  if (observations.length) {
+    for (const observation of observations) {
+      add(
+        observation.role === 'manifest' ? 'plan_manifest' : observation.role,
+        observation.path,
+        'plan_evidence',
+        'current_input',
+      );
+    }
+  } else if (input.state.plan_approval?.artifact_records) {
+    const records = input.state.plan_approval.artifact_records;
+    add('script', records.script.path, 'plan_evidence', 'current_input');
+    add('shotlist', records.shotlist.path, 'plan_evidence', 'current_input');
+    add('plan_manifest', records.manifest.path, 'plan_evidence', 'current_input');
+  }
+
+  const errorCode = typeof input.result.errorCode === 'string'
+    ? input.result.errorCode
+    : typeof input.result.conclusion_code === 'string'
+      ? input.result.conclusion_code
+      : '';
+  const planRelated = /(?:GATE_B|PLAN|NARRATION_FIT)/.test(errorCode);
+  const primaryArtifact = planRelated
+    ? artifacts.find((item) => item.role === 'script')
+      || artifacts.find((item) => item.source === 'plan_evidence')
+    : artifacts.find((item) => item.role === 'draft')
+      || artifacts.find((item) => item.role === 'preview')
+      || artifacts.find((item) => item.role === 'frame')
+      || artifacts.find((item) => item.role === 'html')
+      || artifacts.find((item) => item.source === 'plan_evidence');
+  const diagnosticPaths = artifacts
+    .filter((item) => item.role === 'findings' || item.role === 'report')
+    .map((item) => item.path);
+  const planPaths = planRelated
+    ? artifacts.filter((item) => item.source === 'plan_evidence').map((item) => item.path)
+    : [];
+  const visibleArtifactPaths = [...new Set([
+    primaryArtifact?.path,
+    ...diagnosticPaths,
+    ...planPaths,
+  ].filter((value): value is string => !!value))];
+  const requestedNextAction = typeof input.result.next_action === 'string'
+    ? input.result.next_action
+    : Array.isArray(input.result.next_allowed_ops)
+      ? input.result.next_allowed_ops.map(String).join(' → ')
+      : Array.isArray(input.result.allowed_recovery_ops)
+        ? input.result.allowed_recovery_ops.map(String).join(' → ')
+        : '';
+  const nextAction = requestedNextAction || (planRelated
+    ? 'inspect_plan_evidence_and_repair_current_artifacts'
+    : 'inspect_current_candidate_and_continue_recovery');
+  const packageStatus = primaryArtifact?.review_status === 'current_approved'
+    ? 'current_approved'
+    : 'current_unapproved';
+  const requiresUserDecision = input.result.requires_user_decision === true;
+  const resultOptions = Array.isArray(input.result.user_options)
+    ? input.result.user_options.flatMap((item, index) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
+      const option = item as Record<string, unknown>;
+      if (typeof option.label !== 'string' || typeof option.effect !== 'string') return [];
+      return [{
+        id: typeof option.id === 'string' ? option.id : `option_${index + 1}`,
+        label: option.label,
+        effect: option.effect,
+      }];
+    })
+    : [];
+  return {
+    presentation_required: true,
+    status: packageStatus,
+    conclusion: {
+      outcome: /(?:QA|QUALITY|INSPECT|REPAIR|REVIEW|RENDER|PREFLIGHT|DRAFT)/.test(errorCode)
+        ? 'quality_not_accepted'
+        : 'blocked',
+      error_code: errorCode,
+      summary: typeof input.result.message === 'string' ? input.result.message : 'The current result is not accepted.',
+      next_action: nextAction,
+      requires_user_decision: requiresUserDecision,
+      next_step_owner: requiresUserDecision ? 'user' : 'agent',
+      automatic_recovery_expected: !requiresUserDecision,
+    },
+    continuation: {
+      recoverable: true,
+      terminal: false,
+      user_action_required: requiresUserDecision,
+      system_action: requiresUserDecision
+        ? 'Present the current artifact and the concrete choices below; continue from the user’s natural-language decision.'
+        : `Run ${nextAction} and continue recovery in the same turn; do not end with a diagnosis-only response.`,
+      user_options: requiresUserDecision
+        ? resultOptions.length
+          ? resultOptions
+          : [{
+            id: 'describe_change',
+            label: 'Tell me what you want changed',
+            effect: 'The current artifacts stay preserved while the requested change is applied.',
+          }]
+        : [],
+    },
+    ...(primaryArtifact ? { primary_artifact: primaryArtifact } : {}),
+    artifacts,
+    visible_artifact_paths: visibleArtifactPaths,
+  };
+}
+
+async function deliverReviewPackage(input: {
+  opts: VideoStudioToolOpts;
+  state: VideoProductionStateV1;
+  result: Record<string, unknown>;
+  planEvidence?: VideoProductionPlanEvidence;
+}): Promise<VideoStudioReviewPackage> {
+  const reviewPackage = currentReviewPackage(input);
+  await notifyWritten(input.opts, candidateRegisteredPaths(input.state.current_candidate));
+  await publishVisibleOutputs(input.opts, reviewPackage.visible_artifact_paths);
+  return reviewPackage;
+}
+
+async function reviewToolResult(input: {
+  opts: VideoStudioToolOpts;
+  state: VideoProductionStateV1;
+  result: Record<string, unknown>;
+  planEvidence?: VideoProductionPlanEvidence;
+  isError?: boolean;
+}): Promise<ToolResult> {
+  const reviewPackage = await deliverReviewPackage(input);
+  return {
+    content: resultContent({
+      ...input.result,
+      review_package: reviewPackage,
+    }),
+    isError: input.isError ?? input.result.ok === false,
+  } as ToolResult;
 }
 
 function sameVideoProductionArtifacts(
@@ -663,18 +1443,39 @@ function setCurrentPlanApproval(
     .slice(-MAX_PRESERVED_PLAN_APPROVALS);
 }
 
-function reconcileCurrentPlanApproval(state: VideoProductionStateV1, signature: string): boolean {
-  if (state.plan_approval?.signature === signature) return true;
-  if (state.plan_approval) {
-    preservePlanApproval(state, state.plan_approval);
-    delete state.plan_approval;
+function planApprovalMatchesIdentity(
+  approval: VideoProductionPlanApproval | undefined,
+  identity: VideoProductionPlanIdentityResult,
+): boolean {
+  if (!approval) return false;
+  if (approval.signature === identity.signature) return true;
+  // Re-project stored snapshots through the current approval contract. This
+  // migrates legacy runtime/catalog metadata without reopening Gate B while
+  // retaining fail-closed behavior for unknown or creative fields.
+  if (approval.intent_snapshot && identity.intentPayload) {
+    if (stableJson(canonicalApprovedPlanIntentSnapshot(approval.intent_snapshot))
+      === stableJson(canonicalApprovedPlanIntentSnapshot(identity.intentPayload))) {
+      return true;
+    }
   }
-  const restored = [...(state.plan_approval_history || [])]
-    .reverse()
-    .find((entry) => entry.signature === signature);
-  if (!restored) return false;
-  setCurrentPlanApproval(state, restored);
-  return true;
+  return approval.identity_kind !== 'approved_intent_sha256'
+    && !!identity.legacySignature
+    && approval.signature === identity.legacySignature;
+}
+
+function contentAddressedPlanApproval(
+  approval: VideoProductionPlanApproval,
+  identity: VideoProductionPlanIdentityResult,
+): VideoProductionPlanApproval {
+  return {
+    ...approval,
+    signature: identity.signature,
+    identity_kind: 'approved_intent_sha256',
+    ...(identity.intentPayload ? { intent_snapshot: identity.intentPayload } : {}),
+    ...(identity.artifactRecords ? { artifact_records: identity.artifactRecords } : {}),
+    artifact_paths: identity.artifactPaths,
+    validation_version: 3,
+  };
 }
 
 async function enforceNarrationProductionInvariant(input: {
@@ -692,13 +1493,11 @@ async function enforceNarrationProductionInvariant(input: {
   const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const alreadyRecorded = input.state.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED'
     && sameVideoProductionArtifacts(input.state.blocked_operation.artifacts, artifacts)
-    && !input.state.preview
     && !input.state.draft;
   if (alreadyRecorded) return input.state;
   const hasScaffold = !!(await fs.stat(path.join(input.compositionDirAbs, 'index.html')).catch(() => null));
   try {
     return await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
-      delete next.preview;
       delete next.draft;
       // `stage` is retained only as a compatibility projection for older
       // clients. Runtime admission below is based on canonical facts.
@@ -706,7 +1505,7 @@ async function enforceNarrationProductionInvariant(input: {
       next.blocked_operation = {
         op: 'composition.materialize_narration',
         error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED',
-        message: 'Required standalone narration is missing. Existing preview and draft evidence was invalidated without requesting production plan confirmation again; authored visuals and their QA history were preserved.',
+        message: 'Required standalone narration is missing. Draft/final completion remains unavailable until narration is recovered, but visual preview, editing, and visual QA evidence remain available without another production-plan confirmation.',
         artifacts,
         created_at: new Date().toISOString(),
       };
@@ -874,12 +1673,33 @@ async function guardVisualQaAttempt(input: {
           ? 'composition.snapshot'
           : previewStatus === 'approved' ? 'composition.draft' : 'composition.approve_preview',
         visual_repair_cycle: visualQaRepairSummary(cycle),
+        ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
         production_state: summarizeVideoProductionState(state),
       }),
       isError: false,
     };
   }
   const failedSignatures = cycle.failed_signatures;
+  if (cycle.status === 'exhausted' || failedSignatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1) {
+    return {
+      content: resultContent({
+        ok: false,
+        op: input.op,
+        errorCode: 'E_VISUAL_REPAIR_BUDGET_EXCEEDED',
+        message: `The previous visual repair strategies did not resolve the QA findings after ${VISUAL_QA_MAX_REPAIR_PASSES} distinct repair passes. Preserve the approved plan and narration, start a new internal visual-repair cycle, choose a materially different fix from the recorded evidence, and continue QA without asking the user for a technical recovery confirmation.`,
+        visual_revision_recovery_available: true,
+        recovery_action: 'composition.begin_visual_revision',
+        recovery_requires_new_user_revision: false,
+        requires_user_decision: false,
+        allowed_recovery_ops: ['composition.begin_visual_revision', 'composition.reconcile'],
+        next_action: 'composition.begin_visual_revision',
+        preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
+        visual_repair_cycle: visualQaRepairSummary(cycle),
+        ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
+      }),
+      isError: true,
+    };
+  }
   if (failedSignatures.includes(signature)) {
     const code = input.op === 'composition.inspect'
       ? 'E_INSPECT_RETRY_NO_CHANGE'
@@ -890,24 +1710,13 @@ async function guardVisualQaAttempt(input: {
         op: input.op,
         errorCode: code,
         message: `${input.op} already failed for this exact composition input signature. Edit the canonical manifest or visual HTML, then run composition.lint and retry; do not repeat the unchanged probe.`,
+        blocked_operation: input.op,
+        same_input_retry_allowed: false,
+        requires_user_decision: false,
+        allowed_recovery_ops: ['composition.reconcile', 'composition.lint', 'composition.inspect'],
+        next_action: 'repair_visuals_then_composition.reconcile',
         visual_repair_cycle: visualQaRepairSummary(cycle),
-      }),
-      isError: true,
-    };
-  }
-  if (cycle.status === 'exhausted' || failedSignatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1) {
-    return {
-      content: resultContent({
-        ok: false,
-        op: input.op,
-        errorCode: 'E_VISUAL_REPAIR_BUDGET_EXCEEDED',
-        message: `Automatic visual repair reached the limit for this QA cycle after the initial attempt plus ${VISUAL_QA_MAX_REPAIR_PASSES} distinct repair passes. Preserve the approved plan and narration; do not edit again until the user starts a new visual revision.`,
-        visual_revision_recovery_available: true,
-        recovery_action: 'composition.begin_visual_revision',
-        recovery_requires_new_user_revision: true,
-        next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
-        preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
-        visual_repair_cycle: visualQaRepairSummary(cycle),
+        ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
       }),
       isError: true,
     };
@@ -960,7 +1769,20 @@ async function recordVisualQaAttempt(input: {
   });
 }
 
-function canonicalPlanPayload(manifest: CompositionManifest, targetDuration?: number): Record<string, unknown> {
+function canonicalPlanText(value: string): string {
+  return value
+    .normalize('NFKC')
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\s+/g, ' '))
+    .filter((line, index, lines) => line || (index > 0 && !!lines[index - 1]))
+    .join('\n')
+    .trim();
+}
+
+function canonicalLegacyManifestPlanPayload(
+  manifest: CompositionManifest,
+  targetDuration?: number,
+): Record<string, unknown> {
   return {
     schema_version: manifest.schema_version,
     composition: {
@@ -984,30 +1806,329 @@ function canonicalPlanPayload(manifest: CompositionManifest, targetDuration?: nu
   };
 }
 
-async function videoProductionPlanIdentity(compositionDirAbs: string): Promise<{
+/**
+ * Catalog display names are presentation metadata. Stable route/voice
+ * references, language, and speed are the user-approved synthesis intent.
+ */
+function canonicalNarrationIntentForApproval(
+  intent: CompositionManifest['audio']['narration_intent'],
+): Record<string, unknown> | null {
+  if (!intent) return null;
+  return projectVideoApprovalIntent(intent) as Record<string, unknown>;
+}
+
+function canonicalApprovedShotlistIntentPayload(
+  shotlist: Record<string, unknown>,
+): Record<string, unknown> {
+  return projectVideoApprovalIntent(shotlist, {
+    // These describe the artifact/implementation contract. Unknown fields stay
+    // signed, and visual_provenance remains signed as a production constraint.
+    excludeRootKeys: ['schema_version', 'art_direction'],
+  }) as Record<string, unknown>;
+}
+
+function canonicalApprovedManifestIntentPayload(
+  manifest: CompositionManifest,
+  targetDuration?: number,
+): Record<string, unknown> {
+  const legacy = canonicalLegacyManifestPlanPayload(manifest, targetDuration);
+  const { schema_version: _schemaVersion, ...approvedIntent } = legacy;
+  return {
+    ...approvedIntent,
+    audio: {
+      narration_intent: canonicalNarrationIntentForApproval(manifest.audio.narration_intent),
+    },
+  };
+}
+
+function canonicalApprovedPlanIntentSnapshot(
+  snapshot: Record<string, unknown>,
+): Record<string, unknown> {
+  const shotlist = snapshot.shotlist;
+  const manifest = snapshot.manifest;
+  const shotlistIntent = canonicalApprovedShotlistIntentPayload(
+    shotlist && typeof shotlist === 'object' && !Array.isArray(shotlist)
+      ? shotlist as Record<string, unknown>
+      : {},
+  );
+  const manifestIntent = projectVideoApprovalIntent(
+    manifest && typeof manifest === 'object' && !Array.isArray(manifest)
+      ? manifest
+      : {},
+    { excludeRootKeys: ['schema_version', 'art_direction'] },
+  );
+  return {
+    script: canonicalPlanText(typeof snapshot.script === 'string' ? snapshot.script : ''),
+    shotlist: shotlistIntent,
+    manifest: canonicalizeManifestSourceShotReferences(
+      manifestIntent,
+      shotlistIntent,
+    ),
+  };
+}
+
+function canonicalPlanPayload(
+  script: string,
+  shotlist: Record<string, unknown>,
+  manifest: CompositionManifest,
+  targetDuration?: number,
+): Record<string, unknown> {
+  return canonicalApprovedPlanIntentSnapshot({
+    script: canonicalPlanText(script),
+    shotlist: canonicalApprovedShotlistIntentPayload(shotlist),
+    manifest: canonicalApprovedManifestIntentPayload(manifest, targetDuration),
+  });
+}
+
+type VideoProductionPlanArtifactRole = keyof VideoProductionPlanFiles;
+
+type VideoProductionPlanEvidence = {
+  observations: Array<{
+    role: VideoProductionPlanArtifactRole;
+    status: 'matched' | 'relocated' | 'missing' | 'changed' | 'candidate';
+    path: string;
+    sha256?: string;
+  }>;
+  conflicts: Array<{
+    code: string;
+    message: string;
+    paths?: string[];
+  }>;
+  intent_changes?: Array<{
+    path: string;
+    before: unknown;
+    after: unknown;
+  }>;
+  protected_constraints: string[];
+};
+
+type VideoProductionPlanArtifactIssue = {
+  role: VideoProductionPlanArtifactRole;
+  code: 'empty_file' | 'invalid_json' | 'invalid_object' | 'invalid_manifest';
+  path: string;
+  message: string;
+  details?: Array<{
+    path: string;
+    message: string;
+  }>;
+};
+
+type VideoProductionPlanIdentityResult = {
   applicable: boolean;
   complete: boolean;
+  /** SHA-256 of the normalized, user-approved intent projection. */
   signature: string;
+  /** Pre-content-addressing signature retained only to migrate approvals
+   * written by older clients without reopening Gate B. */
+  legacySignature?: string;
+  intentPayload?: Record<string, unknown>;
   artifactPaths: string[];
+  artifactRecords?: VideoProductionPlanFiles;
   requirementIssues: string[];
-}> {
-  const projectDir = path.resolve(compositionDirAbs, '..');
-  const localScriptPath = path.join(compositionDirAbs, 'script.md');
-  const localShotlistPath = path.join(compositionDirAbs, 'shotlist.json');
-  const parentScriptPath = path.join(projectDir, 'script.md');
-  const parentShotlistPath = path.join(projectDir, 'shotlist.json');
-  const localArtifacts = !!await fs.stat(localScriptPath).catch(() => null)
-    || !!await fs.stat(localShotlistPath).catch(() => null);
-  const scriptPath = localArtifacts ? localScriptPath : parentScriptPath;
-  const shotlistPath = localArtifacts ? localShotlistPath : parentShotlistPath;
-  const manifestPath = path.join(compositionDirAbs, 'composition-manifest.json');
+  artifactIssues?: VideoProductionPlanArtifactIssue[];
+  evidence: VideoProductionPlanEvidence;
+};
+
+const PLAN_DISCOVERY_SKIP_DIRS = new Set([
+  '.git',
+  '.hg',
+  '.svn',
+  'node_modules',
+  'dist',
+  'build',
+  'coverage',
+  'render',
+  'renders',
+  'outputs',
+]);
+
+function emptyPlanEvidence(): VideoProductionPlanEvidence {
+  return {
+    observations: [],
+    conflicts: [],
+    protected_constraints: [
+      'approved_plan_content_must_not_change_without_user_approval',
+      'paid_narration_artifacts_must_not_be_overwritten_or_regenerated',
+    ],
+  };
+}
+
+function boundedPlanValidationDetails(error: unknown): Array<{ path: string; message: string }> {
+  const issues = error && typeof error === 'object' && Array.isArray(
+    (error as { issues?: unknown }).issues,
+  )
+    ? (error as {
+      issues: Array<{ path?: unknown; message?: unknown }>;
+    }).issues
+    : [];
+  if (issues.length > 0) {
+    return issues.slice(0, 12).map((issue) => ({
+      path: Array.isArray(issue.path) && issue.path.length > 0
+        ? issue.path.map(String).join('.')
+        : '$',
+      message: String(issue.message || 'Invalid value').slice(0, 240),
+    }));
+  }
+  const message = error instanceof Error ? error.message : String(error || 'Invalid content');
+  return [{ path: '$', message: message.slice(0, 240) }];
+}
+
+function planSearchRoots(roots: string[]): string[] {
+  const unique = [...new Set(roots.map((value) => path.resolve(value)))];
+  return unique.filter((candidate) => !unique.some((other) => (
+    other !== candidate && isWithinDirectory(candidate, other)
+  )));
+}
+
+async function discoverPlanBundleDirectories(roots: string[]): Promise<string[]> {
+  const directories = new Set<string>();
+  let inspected = 0;
+  const visit = async (dirAbs: string): Promise<void> => {
+    if (inspected >= 5_000) return;
+    const entries = await fs.readdir(dirAbs, { withFileTypes: true }).catch(() => []);
+    const names = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+    if (names.has('script.md') && names.has('shotlist.json')) directories.add(dirAbs);
+    for (const entry of entries) {
+      inspected += 1;
+      if (inspected >= 5_000) break;
+      if (!entry.isDirectory() || PLAN_DISCOVERY_SKIP_DIRS.has(entry.name)) continue;
+      await visit(path.join(dirAbs, entry.name));
+    }
+  };
+  for (const root of planSearchRoots(roots)) {
+    await visit(root);
+  }
+  return [...directories];
+}
+
+async function findRecordedPlanFile(
+  role: VideoProductionPlanArtifactRole,
+  record: VideoProductionPlanFileRecord,
+  roots: string[],
+): Promise<string | undefined> {
+  const wantedExtension = role === 'script' ? '.md' : '.json';
+  const matches: string[] = [];
+  let inspected = 0;
+  const visit = async (dirAbs: string): Promise<void> => {
+    if (inspected >= 5_000) return;
+    const entries = await fs.readdir(dirAbs, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      inspected += 1;
+      if (inspected >= 5_000) break;
+      const abs = path.join(dirAbs, entry.name);
+      if (entry.isDirectory()) {
+        if (!PLAN_DISCOVERY_SKIP_DIRS.has(entry.name)) await visit(abs);
+        continue;
+      }
+      if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== wantedExtension) continue;
+      const stat = await fs.stat(abs).catch(() => null);
+      if (!stat?.isFile() || stat.size > 20 * 1024 * 1024) continue;
+      if (await sha256File(abs) === record.sha256) matches.push(abs);
+    }
+  };
+  for (const root of planSearchRoots(roots)) {
+    await visit(root);
+  }
+  if (matches.length === 0) return undefined;
+  matches.sort((a, b) => {
+    const aDistance = path.relative(path.dirname(record.path), a).split(path.sep).length;
+    const bDistance = path.relative(path.dirname(record.path), b).split(path.sep).length;
+    return aDistance - bDistance || a.localeCompare(b);
+  });
+  return matches[0];
+}
+
+async function resolveRecordedPlanFiles(input: {
+  records: VideoProductionPlanFiles;
+  roots: string[];
+}): Promise<{ records?: VideoProductionPlanFiles; evidence: VideoProductionPlanEvidence }> {
+  const evidence = emptyPlanEvidence();
+  const resolved = {} as Partial<VideoProductionPlanFiles>;
+  for (const role of ['script', 'shotlist', 'manifest'] as const) {
+    const record = input.records[role];
+    const currentSha = await sha256File(record.path);
+    if (currentSha === record.sha256) {
+      resolved[role] = record;
+      evidence.observations.push({
+        role,
+        status: 'matched',
+        path: record.path,
+        sha256: record.sha256,
+      });
+      continue;
+    }
+    if (currentSha) {
+      // Raw file hashes identify concrete artifacts and concurrent edits. They
+      // are not the Gate B identity: parse the changed candidate below and
+      // compare its canonical approved-intent hash before deciding whether the
+      // user's approval still applies.
+      resolved[role] = { path: record.path, sha256: currentSha };
+      evidence.observations.push({
+        role,
+        status: 'changed',
+        path: record.path,
+        sha256: currentSha,
+      });
+      continue;
+    }
+    const relocated = role === 'manifest'
+      ? undefined
+      : await findRecordedPlanFile(role, record, input.roots);
+    if (!relocated) {
+      evidence.observations.push({ role, status: 'missing', path: record.path });
+      evidence.conflicts.push({
+        code: 'recorded_artifact_missing',
+        message: `The approved ${role} file could not be found by its recorded content hash.`,
+        paths: [record.path],
+      });
+      continue;
+    }
+    resolved[role] = { path: relocated, sha256: record.sha256 };
+    evidence.observations.push({
+      role,
+      status: 'relocated',
+      path: relocated,
+      sha256: record.sha256,
+    });
+  }
+  if (!resolved.script || !resolved.shotlist || !resolved.manifest) return { evidence };
+  return { records: resolved as VideoProductionPlanFiles, evidence };
+}
+
+async function buildVideoProductionPlanIdentity(
+  records: VideoProductionPlanFiles,
+  evidence: VideoProductionPlanEvidence,
+): Promise<VideoProductionPlanIdentityResult> {
+  const scriptPath = records.script.path;
+  const shotlistPath = records.shotlist.path;
+  const manifestPath = records.manifest.path;
   const [script, shotlistRaw, manifestRaw] = await Promise.all([
     fs.readFile(scriptPath).catch(() => null),
     fs.readFile(shotlistPath).catch(() => null),
     fs.readFile(manifestPath, 'utf8').catch(() => ''),
   ]);
   const applicable = !!script || !!shotlistRaw;
-  if (!applicable) return { applicable: false, complete: false, signature: '', artifactPaths: [], requirementIssues: [] };
+  if (!applicable) {
+    return {
+      applicable: false,
+      complete: false,
+      signature: '',
+      artifactPaths: [],
+      requirementIssues: [],
+      artifactIssues: [],
+      evidence,
+    };
+  }
+  const artifactIssues: VideoProductionPlanArtifactIssue[] = [];
+  const scriptValid = !!script && script.toString('utf8').trim().length > 0;
+  if (script && !scriptValid) {
+    artifactIssues.push({
+      role: 'script',
+      code: 'empty_file',
+      path: scriptPath,
+      message: 'script.md is empty.',
+    });
+  }
   let shotlist: Record<string, unknown> = {};
   let shotlistValid = false;
   try {
@@ -1015,8 +2136,23 @@ async function videoProductionPlanIdentity(compositionDirAbs: string): Promise<{
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
       shotlist = parsed;
       shotlistValid = true;
+    } else if (shotlistRaw) {
+      artifactIssues.push({
+        role: 'shotlist',
+        code: 'invalid_object',
+        path: shotlistPath,
+        message: 'shotlist.json must contain one JSON object.',
+      });
     }
-  } catch { /* reported as an incomplete Gate B artifact below */ }
+  } catch (error) {
+    artifactIssues.push({
+      role: 'shotlist',
+      code: 'invalid_json',
+      path: shotlistPath,
+      message: 'shotlist.json is not valid JSON.',
+      details: boundedPlanValidationDetails(error),
+    });
+  }
   const targetDuration = Number(shotlist.target_duration_seconds);
   const requirementIssues = [
     ...(Number.isFinite(targetDuration) && targetDuration > 0 ? [] : ['shotlist.target_duration_seconds']),
@@ -1026,34 +2162,244 @@ async function videoProductionPlanIdentity(compositionDirAbs: string): Promise<{
     ...(typeof shotlist.music_mode === 'string' && shotlist.music_mode.trim() ? [] : ['shotlist.music_mode']),
   ];
   let planPayload = '';
+  let intentPayload: Record<string, unknown> | undefined;
+  let legacyManifestPayload = '';
   let manifestValid = false;
   try {
     const manifest = CompositionManifestSchema.parse(JSON.parse(manifestRaw));
     manifestValid = true;
+    requirementIssues.push(...validateCompositionManifestSemantics(manifest)
+      .filter((issue) => issue.severity === 'error')
+      .map((issue) => issue.code));
     requirementIssues.push(...videoProductionNarrationAlignmentIssues({
       script: script?.toString('utf8') || '',
       shotlist,
       manifest,
     }));
-    planPayload = JSON.stringify(canonicalPlanPayload(
+    intentPayload = canonicalPlanPayload(
+      script?.toString('utf8') || '',
+      shotlist,
+      manifest,
+      Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : undefined,
+    );
+    planPayload = stableJson(intentPayload);
+    legacyManifestPayload = JSON.stringify(canonicalLegacyManifestPlanPayload(
       manifest,
       Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : undefined,
     ));
-  } catch {
+  } catch (error) {
     planPayload = manifestRaw;
+    legacyManifestPayload = manifestRaw;
+    artifactIssues.push({
+      role: 'manifest',
+      code: 'invalid_manifest',
+      path: manifestPath,
+      message: 'composition-manifest.json does not match the required video-plan structure.',
+      details: boundedPlanValidationDetails(error),
+    });
   }
-  const hash = crypto.createHash('sha256');
-  hash.update(script || Buffer.alloc(0));
-  hash.update('\0');
-  hash.update(shotlistRaw || Buffer.alloc(0));
-  hash.update('\0');
-  hash.update(planPayload);
+  const legacyHash = crypto.createHash('sha256');
+  legacyHash.update(script || Buffer.alloc(0));
+  legacyHash.update('\0');
+  legacyHash.update(shotlistRaw || Buffer.alloc(0));
+  legacyHash.update('\0');
+  legacyHash.update(legacyManifestPayload);
+  const semanticHash = crypto.createHash('sha256').update(planPayload);
   return {
     applicable,
-    complete: !!script && !!shotlistRaw && shotlistValid && manifestValid,
-    signature: hash.digest('hex'),
+    complete: scriptValid && !!shotlistRaw && shotlistValid && manifestValid,
+    signature: semanticHash.digest('hex'),
+    legacySignature: legacyHash.digest('hex'),
+    ...(intentPayload ? { intentPayload } : {}),
     artifactPaths: [scriptPath, shotlistPath, manifestPath],
+    artifactRecords: records,
     requirementIssues,
+    artifactIssues,
+    evidence,
+  };
+}
+
+async function candidatePlanIdentity(
+  directory: string,
+  manifestPath: string,
+): Promise<VideoProductionPlanIdentityResult | undefined> {
+  const scriptPath = path.join(directory, 'script.md');
+  const shotlistPath = path.join(directory, 'shotlist.json');
+  const [scriptSha, shotlistSha, manifestSha] = await Promise.all([
+    sha256File(scriptPath),
+    sha256File(shotlistPath),
+    sha256File(manifestPath),
+  ]);
+  if (!scriptSha && !shotlistSha) return undefined;
+  const evidence = emptyPlanEvidence();
+  evidence.observations.push(
+    {
+      role: 'script',
+      status: scriptSha ? 'candidate' : 'missing',
+      path: scriptPath,
+      ...(scriptSha ? { sha256: scriptSha } : {}),
+    },
+    {
+      role: 'shotlist',
+      status: shotlistSha ? 'candidate' : 'missing',
+      path: shotlistPath,
+      ...(shotlistSha ? { sha256: shotlistSha } : {}),
+    },
+    {
+      role: 'manifest',
+      status: manifestSha ? 'candidate' : 'missing',
+      path: manifestPath,
+      ...(manifestSha ? { sha256: manifestSha } : {}),
+    },
+  );
+  if (!scriptSha || !shotlistSha || !manifestSha) {
+    return {
+      applicable: true,
+      complete: false,
+      signature: '',
+      artifactPaths: [scriptPath, shotlistPath, manifestPath],
+      requirementIssues: [],
+      evidence,
+    };
+  }
+  return buildVideoProductionPlanIdentity({
+    script: { path: scriptPath, sha256: scriptSha },
+    shotlist: { path: shotlistPath, sha256: shotlistSha },
+    manifest: { path: manifestPath, sha256: manifestSha },
+  }, evidence);
+}
+
+async function videoProductionPlanIdentity(
+  compositionDirAbs: string,
+  input: {
+    approval?: VideoProductionPlanApproval;
+    roots?: string[];
+    preferLocal?: boolean;
+  } = {},
+): Promise<VideoProductionPlanIdentityResult> {
+  const manifestPath = path.join(compositionDirAbs, 'composition-manifest.json');
+  const roots = input.roots?.length ? input.roots : [path.resolve(compositionDirAbs, '..')];
+  const localDir = path.resolve(compositionDirAbs);
+  const parentDir = path.resolve(compositionDirAbs, '..');
+  if (input.approval?.artifact_records) {
+    const resolved = await resolveRecordedPlanFiles({
+      records: input.approval.artifact_records,
+      roots,
+    });
+    if (resolved.records) return buildVideoProductionPlanIdentity(resolved.records, resolved.evidence);
+
+    // A plan bundle may be moved and reformatted in the same edit. In that
+    // case neither its old path nor its old raw file hash can locate it. Search
+    // complete bundles, then bind the one whose normalized approved intent
+    // still matches the approval content address.
+    const recoveryDirectories = [...new Set([
+      localDir,
+      parentDir,
+      ...await discoverPlanBundleDirectories(roots),
+    ])];
+    const recoveryCandidates = (await Promise.all(
+      recoveryDirectories.map((directory) => candidatePlanIdentity(directory, manifestPath)),
+    )).filter((value): value is VideoProductionPlanIdentityResult => !!value?.complete);
+    const matchingCandidates = recoveryCandidates
+      .filter((candidate) => planApprovalMatchesIdentity(input.approval, candidate))
+      .sort((a, b) => a.artifactPaths[0].localeCompare(b.artifactPaths[0]));
+    if (matchingCandidates.length > 0) {
+      const recovered = matchingCandidates[0];
+      const recoveredRecords = recovered.artifactRecords!;
+      const evidence = emptyPlanEvidence();
+      for (const role of ['script', 'shotlist', 'manifest'] as const) {
+        const prior = input.approval.artifact_records[role];
+        const current = recoveredRecords[role];
+        evidence.observations.push({
+          role,
+          status: current.path !== prior.path
+            ? 'relocated'
+            : current.sha256 !== prior.sha256 ? 'changed' : 'matched',
+          path: current.path,
+          sha256: current.sha256,
+        });
+      }
+      return { ...recovered, evidence };
+    }
+    if (recoveryCandidates.length === 1) {
+      // Return the only coherent current candidate so the caller can report a
+      // semantic intent diff, rather than a misleading path/hash failure.
+      return recoveryCandidates[0];
+    }
+    return {
+      applicable: true,
+      complete: false,
+      signature: '',
+      artifactPaths: input.approval.artifact_paths,
+      requirementIssues: [],
+      evidence: resolved.evidence,
+    };
+  }
+
+  const direct = (await Promise.all([
+    candidatePlanIdentity(localDir, manifestPath),
+    candidatePlanIdentity(parentDir, manifestPath),
+  ])).filter((value): value is VideoProductionPlanIdentityResult => !!value);
+  const completeDirect = direct.filter((value) => value.complete);
+  if (input.preferLocal) {
+    const local = completeDirect.find((value) => path.dirname(value.artifactPaths[0]) === localDir);
+    if (local) return local;
+  }
+  if (completeDirect.length === 1) return completeDirect[0];
+  if (completeDirect.length > 1) {
+    const signatures = new Set(completeDirect.map((value) => value.signature));
+    if (signatures.size === 1) return completeDirect[0];
+    const evidence = emptyPlanEvidence();
+    evidence.observations.push(...completeDirect.flatMap((value) => value.evidence.observations));
+    evidence.conflicts.push({
+      code: 'multiple_plan_bundles',
+      message: 'Multiple complete script/shotlist bundles disagree. Bind one coherent bundle before approval.',
+      paths: completeDirect.flatMap((value) => value.artifactPaths.slice(0, 2)),
+    });
+    return {
+      applicable: true,
+      complete: false,
+      signature: '',
+      artifactPaths: [],
+      requirementIssues: [],
+      evidence,
+    };
+  }
+
+  const discoveredDirs = await discoverPlanBundleDirectories(roots);
+  const discovered = (await Promise.all(discoveredDirs
+    .filter((directory) => directory !== localDir && directory !== parentDir)
+    .map((directory) => candidatePlanIdentity(directory, manifestPath))))
+    .filter((value): value is VideoProductionPlanIdentityResult => !!value?.complete);
+  if (discovered.length === 1) return discovered[0];
+  if (discovered.length > 1) {
+    const signatures = new Set(discovered.map((value) => value.signature));
+    if (signatures.size === 1) return discovered
+      .sort((a, b) => a.artifactPaths[0].localeCompare(b.artifactPaths[0]))[0];
+    const evidence = emptyPlanEvidence();
+    evidence.observations.push(...discovered.flatMap((value) => value.evidence.observations));
+    evidence.conflicts.push({
+      code: 'multiple_plan_bundles',
+      message: 'More than one complete plan bundle was found and their approved content differs.',
+      paths: discovered.flatMap((value) => value.artifactPaths.slice(0, 2)),
+    });
+    return {
+      applicable: true,
+      complete: false,
+      signature: '',
+      artifactPaths: [],
+      requirementIssues: [],
+      evidence,
+    };
+  }
+  const partial = direct[0];
+  return partial || {
+    applicable: false,
+    complete: false,
+    signature: '',
+    artifactPaths: [],
+    requirementIssues: [],
+    evidence: emptyPlanEvidence(),
   };
 }
 
@@ -1167,6 +2513,50 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
+function boundedIntentEvidenceValue(value: unknown): unknown {
+  if (typeof value === 'string' && value.length > 240) return `${value.slice(0, 237)}...`;
+  return typeof value === 'undefined' ? null : value;
+}
+
+function approvedIntentChanges(
+  before: unknown,
+  after: unknown,
+  pathPrefix = '',
+  changes: NonNullable<VideoProductionPlanEvidence['intent_changes']> = [],
+): NonNullable<VideoProductionPlanEvidence['intent_changes']> {
+  if (changes.length >= 50 || stableJson(before) === stableJson(after)) return changes;
+  if (Array.isArray(before) && Array.isArray(after)) {
+    const count = Math.max(before.length, after.length);
+    for (let index = 0; index < count && changes.length < 50; index += 1) {
+      approvedIntentChanges(before[index], after[index], `${pathPrefix}[${index}]`, changes);
+    }
+    return changes;
+  }
+  if (before && after
+    && typeof before === 'object' && !Array.isArray(before)
+    && typeof after === 'object' && !Array.isArray(after)) {
+    const beforeRecord = before as Record<string, unknown>;
+    const afterRecord = after as Record<string, unknown>;
+    const keys = [...new Set([...Object.keys(beforeRecord), ...Object.keys(afterRecord)])].sort();
+    for (const key of keys) {
+      if (changes.length >= 50) break;
+      approvedIntentChanges(
+        beforeRecord[key],
+        afterRecord[key],
+        pathPrefix ? `${pathPrefix}.${key}` : key,
+        changes,
+      );
+    }
+    return changes;
+  }
+  changes.push({
+    path: pathPrefix || '$',
+    before: boundedIntentEvidenceValue(before),
+    after: boundedIntentEvidenceValue(after),
+  });
+  return changes;
+}
+
 function normalizedRepairText(value: string): string {
   return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
 }
@@ -1266,13 +2656,14 @@ function narrationTokenEditRatio(before: string[], after: string[]): number {
  * redacted only when it exactly duplicates that scene's narration.
  */
 async function videoProductionNarrationRepairIdentity(
-  compositionDirAbs: string,
+  planIdentity: VideoProductionPlanIdentityResult,
 ): Promise<NarrationRepairIdentity | undefined> {
-  const projectDir = path.resolve(compositionDirAbs, '..');
+  const records = planIdentity.artifactRecords;
+  if (!records) return undefined;
   const [script, shotlistRaw, manifestRaw] = await Promise.all([
-    fs.readFile(path.join(projectDir, 'script.md'), 'utf8').catch(() => ''),
-    fs.readFile(path.join(projectDir, 'shotlist.json'), 'utf8').catch(() => ''),
-    fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8').catch(() => ''),
+    fs.readFile(records.script.path, 'utf8').catch(() => ''),
+    fs.readFile(records.shotlist.path, 'utf8').catch(() => ''),
+    fs.readFile(records.manifest.path, 'utf8').catch(() => ''),
   ]);
   if (!script || !shotlistRaw || !manifestRaw) return undefined;
 
@@ -1355,9 +2746,6 @@ function assessNarrationRepair(input: {
   const authorization = input.authorization;
   if (!authorization) return { status: 'none', reason: 'no_measured_repair_authorization' };
   const checksUsed = authorization.checks_used + 1;
-  if (checksUsed > authorization.max_checks) {
-    return { status: 'rejected', reason: 'repair_check_budget_exhausted', checksUsed };
-  }
   if (!input.identity || input.identity.structureSignature !== authorization.structure_signature) {
     return { status: 'rejected', reason: 'approved_structure_changed', checksUsed };
   }
@@ -1380,19 +2768,25 @@ function assessNarrationRepair(input: {
   }
   return {
     status: input.fit.status === 'fits' ? 'inheritable' : 'pending',
-    reason: input.fit.status === 'fits' ? 'measured_narration_fit_repaired' : 'repair_still_outside_delivery_band',
+    reason: input.fit.status === 'fits'
+      ? 'measured_narration_fit_repaired'
+      : checksUsed > authorization.max_checks
+        ? 'repair_strategy_review_required'
+        : 'repair_still_outside_delivery_band',
     editRatio,
     checksUsed,
   };
 }
 
 async function approvedTargetDurationSec(
-  compositionDirAbs: string,
   manifest: CompositionManifest,
+  planIdentity?: VideoProductionPlanIdentityResult,
 ): Promise<number> {
   if (typeof manifest.composition.target_duration === 'number') return manifest.composition.target_duration;
   try {
-    const shotlist = JSON.parse(await fs.readFile(path.join(compositionDirAbs, '..', 'shotlist.json'), 'utf8')) as Record<string, unknown>;
+    const shotlistPath = planIdentity?.artifactRecords?.shotlist.path;
+    if (!shotlistPath) return manifest.composition.duration;
+    const shotlist = JSON.parse(await fs.readFile(shotlistPath, 'utf8')) as Record<string, unknown>;
     const target = Number(shotlist.target_duration_seconds);
     if (Number.isFinite(target) && target > 0 && target <= 600) return target;
   } catch { /* Gate B validation reports malformed/missing shotlists. */ }
@@ -1447,13 +2841,8 @@ async function resolveCompositionNarrationSelection(input: {
       ...(input.signal ? { signal: input.signal } : {}),
     });
     if (resolved.ok === false) return resolved;
-    if (resolved.selection.displayName !== intent.display_name) {
-      return {
-        ok: false,
-        errorCode: 'E_TTS_INTENT_LABEL_MISMATCH',
-        message: 'The confirmed narration display name no longer matches the active capability catalog. Refresh speech.capabilities and request production plan confirmation again.',
-      };
-    }
+    // display_name is mutable capability-catalog metadata. Stable route_ref,
+    // voice_ref, language, and speed identify the approved synthesis request.
     return { ok: true, selection: resolved.selection, speed: intent.speed, legacy: false };
   }
 
@@ -1594,13 +2983,7 @@ async function validateEdlNarrationSelection(planPath: string, signal?: AbortSig
     }
     const resolved = await resolveTtsSelection({ routeRef, voiceRef, language, ...(signal ? { signal } : {}) });
     if (resolved.ok === false) return resolved;
-    if (resolved.selection.displayName !== displayName) {
-      return {
-        ok: false,
-        errorCode: 'E_TTS_INTENT_LABEL_MISMATCH',
-        message: 'tracks.narration.synthesis.display_name no longer matches speech.capabilities. Refresh the plan before production plan confirmation.',
-      };
-    }
+    // Catalog label changes are presentation refreshes, not plan amendments.
     return { ok: true, selection: resolved.selection, speed, legacy: false };
   }
   const legacyVoice = String(nar.voice || '').trim();
@@ -1650,23 +3033,53 @@ async function archiveStaleNarrationAudio(input: {
 async function validatePlanApproval(
   statePath: string,
   compositionDirAbs: string,
-): Promise<{ ok: true } | { ok: false; errorCode: string; message: string }> {
-  const identity = await videoProductionPlanIdentity(compositionDirAbs);
+  roots: string[],
+): Promise<
+  | { ok: true }
+  | { ok: false; errorCode: string; message: string; evidence?: VideoProductionPlanEvidence }
+> {
+  const state = await readVideoProductionState(statePath, compositionDirAbs);
+  const identity = await videoProductionPlanIdentity(compositionDirAbs, {
+    approval: state.plan_approval,
+    roots,
+  });
   if (!identity.complete) {
     return {
       ok: false,
-      errorCode: 'E_GATE_B_ARTIFACTS_INCOMPLETE',
-      message: 'Production plan confirmation requires project/script.md, project/shotlist.json, and a valid composition manifest before prepare.',
+      errorCode: identity.evidence.conflicts.length > 0
+        ? 'E_GATE_B_ARTIFACT_CONFLICT'
+        : 'E_GATE_B_ARTIFACTS_INCOMPLETE',
+      message: identity.evidence.conflicts[0]?.message
+        || 'Production plan confirmation requires one coherent script, shotlist, and valid composition manifest before prepare.',
+      evidence: identity.evidence,
     };
   }
-  const state = await readVideoProductionState(statePath, compositionDirAbs);
-  if (state.plan_approval?.signature === identity.signature) return { ok: true };
+  if (identity.requirementIssues.length > 0) {
+    return {
+      ok: false,
+      errorCode: 'E_GATE_B_ARTIFACTS_INCOMPLETE',
+      message: `The current candidate no longer faithfully projects the approved intent: ${identity.requirementIssues.join(', ')}. Repair the candidate files without requesting another approval.`,
+      evidence: identity.evidence,
+    };
+  }
+  if (planApprovalMatchesIdentity(state.plan_approval, identity)) {
+    if (state.plan_approval
+      && (state.plan_approval.signature !== identity.signature
+        || state.plan_approval.identity_kind !== 'approved_intent_sha256'
+        || stableJson(state.plan_approval.artifact_records) !== stableJson(identity.artifactRecords))) {
+      await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
+        if (!planApprovalMatchesIdentity(next.plan_approval, identity) || !next.plan_approval) return;
+        next.plan_approval = contentAddressedPlanApproval(next.plan_approval, identity);
+      });
+    }
+    return { ok: true };
+  }
   const restorable = [...(state.plan_approval_history || [])]
     .reverse()
-    .find((entry) => entry.signature === identity.signature);
+    .find((entry) => planApprovalMatchesIdentity(entry, identity));
   if (restorable) {
     await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
-      setCurrentPlanApproval(next, restorable);
+      setCurrentPlanApproval(next, contentAddressedPlanApproval(restorable, identity));
     });
     return { ok: true };
   }
@@ -1678,8 +3091,6 @@ async function validatePlanApproval(
     };
   }
   await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
-    preservePlanApproval(next);
-    delete next.plan_approval;
     delete next.preview;
     delete next.draft;
     next.stage = 'manifest_ready';
@@ -1693,7 +3104,24 @@ async function validatePlanApproval(
   return {
     ok: false,
     errorCode: 'E_GATE_B_ARTIFACT_CHANGED',
-    message: 'The confirmed script, shotlist, or narration payload changed. Request production plan confirmation again for the new plan.',
+    message: 'The normalized user-intent content changed. Show the semantic difference and use the current user message as evidence when it explicitly requests the change; implementation-only artifact edits must not reopen approval.',
+    evidence: {
+      ...identity.evidence,
+      ...(state.plan_approval.intent_snapshot && identity.intentPayload ? {
+        intent_changes: approvedIntentChanges(
+          state.plan_approval.intent_snapshot,
+          identity.intentPayload,
+        ),
+      } : {}),
+      conflicts: [
+        ...identity.evidence.conflicts,
+        {
+          code: 'approved_intent_content_changed',
+          message: 'The current canonical user-intent hash differs from the approved content address.',
+          paths: identity.artifactPaths,
+        },
+      ],
+    },
   };
 }
 
@@ -1717,6 +3145,7 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
   audioSha?: string;
   duration?: number;
   narrationMapMatches: boolean;
+  materializationReceiptMatches: boolean;
   htmlTrackMatches: boolean;
   materialized: boolean;
 }> {
@@ -1725,7 +3154,13 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
       await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
     ));
     if (!parsed.success) {
-      return { required: false, narrationMapMatches: false, htmlTrackMatches: false, materialized: false };
+      return {
+        required: false,
+        narrationMapMatches: false,
+        materializationReceiptMatches: false,
+        htmlTrackMatches: false,
+        materialized: false,
+      };
     }
     const text = compositionNarrationText(parsed.data);
     const required = !!text && parsed.data.audio.owner !== 'assembler';
@@ -1741,6 +3176,27 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
     const narrationMapMatches = !!narrationMap
       && narrationMap.narration_text_sha256 === textSha
       && narrationMap.narration_audio_sha256 === audioSha;
+    const alignmentMethod = narrationMap?.alignment_method === 'forced_alignment'
+      ? 'forced_alignment'
+      : narrationMap?.alignment_method === 'scene_estimate_scaled'
+        ? 'scene_estimate_scaled'
+        : undefined;
+    const expectedReceipt = alignmentMethod && textSha && audioSha
+      ? buildCompositionNarrationMap(parsed.data, {
+        textSha256: textSha,
+        audioSha256: audioSha,
+        method: alignmentMethod,
+      })
+      : undefined;
+    // narration-map.json is the durable materialization receipt written only
+    // after measured audio, the retimed manifest, and their content hashes
+    // agree. It is safe to restore a lost ledger binding from that receipt,
+    // but not from a matching filename or a pair of hashes alone.
+    const materializationReceiptMatches = narrationMapMatches
+      && narrationMap?.schema_version === 1
+      && narrationMap?.source === 'composition.materialize_narration'
+      && !!expectedReceipt
+      && stableJson(narrationMap) === stableJson(expectedReceipt);
     const html = await fs.readFile(path.join(compositionDirAbs, 'index.html'), 'utf8').catch(() => '');
     const htmlTrackMatches = (html.match(/<audio\b[^>]*>/gi) || []).some((tag) => {
       const srcMatch = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
@@ -1753,13 +3209,20 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
       ...(audioSha ? { audioSha } : {}),
       ...(track ? { duration: track.duration } : {}),
       narrationMapMatches,
+      materializationReceiptMatches,
       htmlTrackMatches,
       materialized: parsed.data.audio.owner === 'composition'
         && track?.src === 'assets/narration.mp3'
         && !!audioSha,
     };
   } catch {
-    return { required: false, narrationMapMatches: false, htmlTrackMatches: false, materialized: false };
+    return {
+      required: false,
+      narrationMapMatches: false,
+      materializationReceiptMatches: false,
+      htmlTrackMatches: false,
+      materialized: false,
+    };
   }
 }
 
@@ -1804,6 +3267,7 @@ async function recordVideoStudioOperationState(input: {
   ok: boolean;
   stage?: VideoProductionStateV1['stage'];
   errorCode?: string;
+  consumesSameInputAttempt?: boolean;
 }): Promise<VideoProductionStateV1> {
   const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const narration = input.ok && input.op === 'composition.prepare'
@@ -1844,6 +3308,29 @@ async function recordVideoStudioOperationState(input: {
     } else if (state.artifacts.scaffold_html_sha256) {
       artifacts.scaffold_html_sha256 = state.artifacts.scaffold_html_sha256;
     }
+    const activeOperation = state.active_operation?.op === input.op
+      ? state.active_operation
+      : undefined;
+    if (activeOperation) {
+      const journal = state.operation_journal || [];
+      const index = journal.findIndex(
+        (entry) => entry.operation_id === activeOperation.operation_id,
+      );
+      if (index >= 0) {
+        journal[index] = {
+          ...journal[index],
+          status: input.errorCode === 'E_VIDEO_PRODUCTION_OPERATION_INTERRUPTED'
+            ? 'interrupted'
+            : input.ok ? 'passed' : 'failed',
+          ...(input.errorCode ? { error_code: input.errorCode } : {}),
+          ...(typeof input.consumesSameInputAttempt === 'boolean'
+            ? { consumes_same_input_attempt: input.consumesSameInputAttempt }
+            : {}),
+          finished_at: new Date().toISOString(),
+        };
+        state.operation_journal = journal.slice(-100);
+      }
+    }
     recordVideoProductionTransition(state, {
       op: input.op,
       status: input.ok ? 'passed' : 'failed',
@@ -1864,11 +3351,16 @@ async function startVideoStudioOperationState(input: {
   reportPath?: string;
   findingsPath?: string;
 }): Promise<VideoProductionStateV1> {
+  const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
+  const operationId = crypto.randomUUID();
   return updateVideoProductionState(input.statePath, input.compositionDirAbs, (state) => {
     const startedAt = new Date().toISOString();
     state.active_operation = {
-      operation_id: crypto.randomUUID(),
+      operation_id: operationId,
       op: input.op,
+      ...(artifacts.composition_signature
+        ? { input_hash: artifacts.composition_signature }
+        : {}),
       stage: state.stage,
       revision: state.revision + 1,
       ...(input.turnId ? { turn_id: input.turnId } : {}),
@@ -1877,6 +3369,22 @@ async function startVideoStudioOperationState(input: {
       ...(input.findingsPath ? { findings_path: input.findingsPath } : {}),
       started_at: startedAt,
     };
+    state.operation_journal = [
+      ...(state.operation_journal || []),
+      {
+        operation_id: operationId,
+        op: input.op,
+        ...(artifacts.composition_signature
+          ? { input_hash: artifacts.composition_signature }
+          : {}),
+        status: 'started' as const,
+        ...(input.turnId ? { turn_id: input.turnId } : {}),
+        ...(input.outputPath ? { output_path: input.outputPath } : {}),
+        ...(input.reportPath ? { report_path: input.reportPath } : {}),
+        ...(input.findingsPath ? { findings_path: input.findingsPath } : {}),
+        started_at: startedAt,
+      },
+    ].slice(-100);
     recordVideoProductionTransition(state, {
       op: input.op,
       status: 'started',
@@ -1917,7 +3425,7 @@ export async function recordVideoStudioGate(
       turn_id: turnId,
       created_at: new Date().toISOString(),
       status: 'ready',
-      validation_version: 3,
+      validation_version: 5,
       ...(kind === 'preview' && typeof result.contact_sheet === 'string' && result.contact_sheet
         ? { path: result.contact_sheet }
         : typeof result.path === 'string' && result.path ? { path: result.path } : {}),
@@ -1948,6 +3456,23 @@ export async function recordVideoStudioGate(
     } else {
       state.stage = 'draft_ready';
     }
+    const activeOperation = state.active_operation?.op === (
+      kind === 'preview' ? 'composition.snapshot' : 'composition.draft'
+    ) ? state.active_operation : undefined;
+    if (activeOperation) {
+      const journal = state.operation_journal || [];
+      const index = journal.findIndex(
+        (entry) => entry.operation_id === activeOperation.operation_id,
+      );
+      if (index >= 0) {
+        journal[index] = {
+          ...journal[index],
+          status: 'passed',
+          finished_at: new Date().toISOString(),
+        };
+        state.operation_journal = journal.slice(-100);
+      }
+    }
     recordVideoProductionTransition(state, {
       op: kind === 'preview' ? 'composition.snapshot' : 'composition.draft',
       status: 'passed',
@@ -1977,9 +3502,11 @@ export async function approveVideoStudioGate(
   compositionDirAbs: string,
   currentTurnId: string,
   explicitlyApproved: boolean,
+  decisionSource: VideoStudioResolvedDecision['source'] = 'none',
+  submittedArtifactSignature?: string,
 ): Promise<VideoStudioGateCheck> {
   let state = await readVideoProductionState(statePath, compositionDirAbs);
-  state = await migrateVideoStudioGateSignatureV3(statePath, kind, compositionDirAbs, state);
+  state = await migrateVideoStudioGateSignatureV5(statePath, kind, compositionDirAbs, state);
   const entry = state[kind];
   if (!entry) {
     return kind === 'preview'
@@ -1996,6 +3523,28 @@ export async function approveVideoStudioGate(
     return kind === 'preview'
       ? { ok: false, errorCode: 'E_HTML_PREVIEW_APPROVAL_REQUIRED', message: 'Preview approval must come from a later explicit user turn.' }
       : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'Final video confirmation must come from a later explicit user turn.' };
+  }
+  if (decisionSource === 'form') {
+    if (submittedArtifactSignature && submittedArtifactSignature !== entry.signature) {
+      return {
+        ok: false,
+        errorCode: 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED',
+        message: 'The submitted form belongs to an older review artifact. It was received but cannot approve the current artifact. Show the current artifact and keep its review pending without opening a duplicate form.',
+        submitted_artifact_signature: submittedArtifactSignature,
+        current_artifact_signature: entry.signature,
+        submitted_decision_status: 'superseded',
+      };
+    }
+    if (!submittedArtifactSignature && (state.candidate_history?.length || 0) > 0) {
+      return {
+        ok: false,
+        errorCode: 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED',
+        message: 'This legacy form did not identify its review artifact and the project has since produced another candidate. It was received but cannot approve the current artifact. Show the current artifact and keep its review pending without opening a duplicate form.',
+        submitted_artifact_signature: null,
+        current_artifact_signature: entry.signature,
+        submitted_decision_status: 'unbound_after_revision',
+      };
+    }
   }
   if (kind === 'preview' && entry.design_review?.required && entry.design_review.status !== 'passed') {
     return {
@@ -2052,7 +3601,7 @@ export async function validateVideoStudioGate(
   _currentTurnId: string,
 ): Promise<VideoStudioGateCheck> {
   let state = await readVideoProductionState(statePath, compositionDirAbs);
-  state = await migrateVideoStudioGateSignatureV3(statePath, kind, compositionDirAbs, state);
+  state = await migrateVideoStudioGateSignatureV5(statePath, kind, compositionDirAbs, state);
   const entry = state[kind];
   if (!entry) {
     return kind === 'preview'
@@ -2132,6 +3681,39 @@ async function videoStudioDesignReviewRequired(
     ? inspect.draft_disposition as Record<string, unknown>
     : {};
   return Number(disposition.advisory_count || 0) > 0;
+}
+
+async function videoStudioReferenceReviewRequirement(compositionDirAbs: string): Promise<{
+  required: boolean;
+  minimumScore: number;
+}> {
+  try {
+    const manifest = CompositionManifestSchema.parse(JSON.parse(
+      await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
+    ));
+    const artDirection = manifest.art_direction && typeof manifest.art_direction === 'object'
+      && !Array.isArray(manifest.art_direction)
+      ? manifest.art_direction as Record<string, unknown>
+      : {};
+    const references = Array.isArray(artDirection.references) ? artDirection.references : [];
+    const fidelity = artDirection.reference_fidelity && typeof artDirection.reference_fidelity === 'object'
+      && !Array.isArray(artDirection.reference_fidelity)
+      ? artDirection.reference_fidelity as Record<string, unknown>
+      : {};
+    const verification = fidelity.verification && typeof fidelity.verification === 'object'
+      && !Array.isArray(fidelity.verification)
+      ? fidelity.verification as Record<string, unknown>
+      : {};
+    const required = Object.keys(fidelity).length > 0 || references.length > 0;
+    const declaredMinimum = Number(verification.minimum_score);
+    const mode = String(fidelity.mode || '').trim().toLowerCase();
+    const minimumScore = Number.isFinite(declaredMinimum)
+      ? Math.min(100, Math.max(70, declaredMinimum))
+      : mode === 'exact' ? 85 : 70;
+    return { required, minimumScore };
+  } catch {
+    return { required: false, minimumScore: 70 };
+  }
 }
 
 async function ensureInputFile(absPath: string): Promise<string | null> {
@@ -2302,6 +3884,7 @@ async function recordCompositionDoctorResult(
 async function reconcileVideoProduction(input: {
   compositionDirAbs: string;
   statePath: string;
+  roots: string[];
   turnId?: string;
 }): Promise<Record<string, unknown>> {
   const manifestPath = path.join(input.compositionDirAbs, 'composition-manifest.json');
@@ -2347,6 +3930,10 @@ async function reconcileVideoProduction(input: {
       errorCode: 'E_COMPOSITION_RECONCILE_BLOCKED',
       message: reconciled.issues[0]?.message || 'Protected composition structure could not be reconciled.',
       issues: reconciled.issues,
+      blocked_operation: 'composition.reconcile',
+      requires_user_decision: false,
+      allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.lint'],
+      next_action: 'repair_protected_binding_then_composition.reconcile',
     };
   }
   if (reconciled.changed) {
@@ -2361,7 +3948,10 @@ async function reconcileVideoProduction(input: {
       ? checkVideoStudioGateSignature(input.compositionDirAbs, currentState.draft)
       : Promise.resolve(undefined),
     currentNarrationIdentity(input.compositionDirAbs),
-    videoProductionPlanIdentity(input.compositionDirAbs),
+    videoProductionPlanIdentity(input.compositionDirAbs, {
+      approval: currentState.plan_approval,
+      roots: input.roots,
+    }),
   ]);
   const visualAuthored = (!!currentState.artifacts.scaffold_html_sha256
       && originalHtmlSha !== currentState.artifacts.scaffold_html_sha256)
@@ -2372,7 +3962,8 @@ async function reconcileVideoProduction(input: {
     || (!!currentState.narration_transaction
       && currentState.narration_transaction.text_sha256 === narrationIdentity.textSha
       && (!currentState.narration_transaction.audio_sha256
-        || currentState.narration_transaction.audio_sha256 === narrationIdentity.audioSha));
+        || currentState.narration_transaction.audio_sha256 === narrationIdentity.audioSha))
+    || narrationIdentity.materializationReceiptMatches;
   const narrationRecovered = narrationProvenanceMatches
     && narrationIdentity.materialized
     && narrationIdentity.narrationMapMatches
@@ -2382,53 +3973,91 @@ async function reconcileVideoProduction(input: {
     && typeof narrationIdentity.duration === 'number';
   const state = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     if (next.active_operation) {
+      const active = next.active_operation;
+      const journal = next.operation_journal || [];
+      const index = journal.findIndex((entry) => entry.operation_id === active.operation_id);
+      if (index >= 0) {
+        journal[index] = {
+          ...journal[index],
+          status: 'interrupted',
+          error_code: 'E_VIDEO_PRODUCTION_OPERATION_INTERRUPTED',
+          consumes_same_input_attempt: false,
+          finished_at: new Date().toISOString(),
+        };
+        next.operation_journal = journal.slice(-100);
+      }
       recordVideoProductionTransition(next, {
-        op: next.active_operation.op,
+        op: active.op,
         status: 'failed',
         errorCode: 'E_VIDEO_PRODUCTION_OPERATION_INTERRUPTED',
         stage: next.stage,
       });
     }
-    if (planIdentity.applicable) reconcileCurrentPlanApproval(next, planIdentity.signature);
+    if (planIdentity.complete) {
+      if (planApprovalMatchesIdentity(next.plan_approval, planIdentity) && next.plan_approval) {
+        next.plan_approval = contentAddressedPlanApproval(next.plan_approval, planIdentity);
+      } else {
+        const restorable = [...(next.plan_approval_history || [])]
+          .reverse()
+          .find((entry) => planApprovalMatchesIdentity(entry, planIdentity));
+        if (restorable) setCurrentPlanApproval(next, contentAddressedPlanApproval(restorable, planIdentity));
+      }
+    }
     const narrationPending = narrationIdentity.required && !narrationRecovered;
-    const previewValid = !narrationPending && !!next.preview && previewGateCheck?.matches === true;
+    const previewValid = !!next.preview && previewGateCheck?.matches === true;
     const draftValid = !narrationPending && !!next.draft && draftGateCheck?.matches === true;
     if (narrationPending) {
-      delete next.preview;
       delete next.draft;
-      delete next.visual_qa;
       next.blocked_operation = {
         op: 'composition.materialize_narration',
         error_code: 'E_NARRATION_MATERIALIZATION_REQUIRED',
-        message: 'Required standalone narration is missing. Downstream gates remain invalid until composition.materialize_narration succeeds.',
+        message: 'Required standalone narration is missing. Visual preview and repair may continue; draft approval and final export remain unavailable until composition.materialize_narration succeeds.',
         artifacts,
         created_at: new Date().toISOString(),
       };
+    } else if (next.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED') {
+      delete next.blocked_operation;
     }
     if (!previewValid) delete next.preview;
-    else if (next.preview && previewGateCheck?.upgradeToV3) {
-      next.preview.validation_version = 3;
+    else if (next.preview && previewGateCheck?.upgradeToV5) {
+      next.preview.validation_version = 5;
       next.preview.signature = artifacts.composition_signature || next.preview.signature;
     }
     if (!draftValid) delete next.draft;
-    else if (next.draft && draftGateCheck?.upgradeToV3) {
-      next.draft.validation_version = 3;
+    else if (next.draft && draftGateCheck?.upgradeToV5) {
+      next.draft.validation_version = 5;
       next.draft.signature = artifacts.composition_signature || next.draft.signature;
     }
     if (narrationRecovered) {
       const previous = next.narration;
+      const narrationIntent = manifest.schema_version === 2
+        ? manifest.audio.narration_intent
+        : undefined;
       next.narration = {
         status: 'materialized',
         text_sha256: narrationIdentity.textSha!,
         audio_sha256: narrationIdentity.audioSha!,
         path: path.join(input.compositionDirAbs, 'assets', 'narration.mp3'),
         measured_duration_sec: narrationIdentity.duration!,
-        backend: previous?.backend || next.narration_transaction?.backend || 'recovered',
-        ...(previous?.voice ? { voice: previous.voice } : {}),
-        ...(typeof previous?.speed === 'number' ? { speed: previous.speed } : {}),
+        backend: previous?.backend
+          || next.narration_transaction?.backend
+          || (narrationIdentity.materializationReceiptMatches
+            ? 'materialization_receipt'
+            : 'recovered'),
+        ...(narrationIntent ? {
+          route_ref: narrationIntent.route_ref,
+          voice_ref: narrationIntent.voice_ref,
+          language: narrationIntent.language,
+          voice: narrationIntent.voice_ref,
+          speed: narrationIntent.speed,
+        } : {
+          ...(previous?.voice ? { voice: previous.voice } : {}),
+          ...(typeof previous?.speed === 'number' ? { speed: previous.speed } : {}),
+        }),
         materialized_at: previous?.materialized_at || new Date().toISOString(),
       };
       delete next.narration_transaction;
+      delete next.narration_retry_authorization;
     } else if (next.narration && !narrationAudioMatchesState(next, narrationIdentity)) {
       delete next.narration;
     }
@@ -2463,9 +4092,149 @@ async function reconcileVideoProduction(input: {
     op: 'composition.reconcile',
     status: 'reconciled',
     changed: reconciled.changed,
+    plan_record_refreshed: planIdentity.evidence.observations
+      .some((observation) => observation.status === 'relocated'),
+    plan_evidence: planIdentity.evidence,
     html_path: htmlPath,
     issues: reconciled.issues,
     production_state: summarizeVideoProductionState(state),
+  };
+}
+
+/**
+ * One initial request plus one explicitly authorized retry is the maximum
+ * uncertainty we allow for an unchanged narration request. This is an episode
+ * boundary derived from the transaction ledger, not a workflow stage: changing
+ * the stable narration intent creates a different request signature, while
+ * file moves, catalog labels, and provider implementation labels do not.
+ */
+const MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT = 2;
+
+function narrationRetryEpisodeTransactions(
+  state: VideoProductionStateV1,
+  requestSignature: string,
+): VideoProductionNarrationTransaction[] {
+  const unique = new Map<string, VideoProductionNarrationTransaction>();
+  for (const transaction of [
+    ...(state.narration_transaction_history || []),
+    ...(state.narration_transaction ? [state.narration_transaction] : []),
+  ]) {
+    if (transaction.request_signature !== requestSignature
+      || transaction.status !== 'failed'
+      || transaction.request_disposition !== 'sent'
+      || (transaction.charge_status !== 'unknown' && transaction.charge_status !== 'charged')) {
+      continue;
+    }
+    unique.set(transaction.transaction_id, transaction);
+  }
+  return [...unique.values()];
+}
+
+type NarrationRetryDecisionResolution = {
+  decision: VideoStudioResolvedDecision;
+  protocol: 'narration_retry_form' | 'legacy_gate_c_form' | 'model_interpreted_user_message' | 'none';
+};
+
+function resolveNarrationRetryDecision(
+  userMessage: string | undefined,
+  evidence: unknown,
+): NarrationRetryDecisionResolution {
+  let decision = resolveVideoStudioCurrentTurnDecision(
+    userMessage,
+    'narration_retry',
+    evidence,
+  );
+  let protocol: NarrationRetryDecisionResolution['protocol'] = decision.source === 'form'
+    ? 'narration_retry_form'
+    : decision.source === 'model_interpreted_user_message'
+      ? 'model_interpreted_user_message'
+      : 'none';
+
+  // A narration retry form opened by VideoStudio <=1.1.29 used the Gate C
+  // field id. Consume that already-visible structured decision only while
+  // reconciling a matching failed narration transaction; new forms use
+  // narration_retry_decision and natural-language replies stay model
+  // interpreted.
+  if (decision.decision === 'unknown') {
+    const legacyDecision = explicitVideoStudioGateDecision(
+      userMessage,
+      'generation',
+    );
+    if (legacyDecision !== 'unknown') {
+      decision = {
+        decision: legacyDecision === 'approve' ? 'approve' : 'reject',
+        source: 'form',
+        evidence_status: 'not_provided',
+      };
+      protocol = 'legacy_gate_c_form';
+    }
+  }
+  return { decision, protocol };
+}
+
+function exhaustedNarrationRetryResult(input: {
+  state: VideoProductionStateV1;
+  requestSignature: string;
+  billableRequestSent: boolean;
+  providerErrorCode?: string;
+  submittedDecision?: NarrationRetryDecisionResolution;
+}): Record<string, unknown> {
+  const attempts = narrationRetryEpisodeTransactions(input.state, input.requestSignature);
+  const latest = attempts.at(-1);
+  const submittedDecision = input.submittedDecision?.decision.decision !== 'unknown'
+    ? input.submittedDecision
+    : undefined;
+  return {
+    ok: false,
+    op: 'composition.materialize_narration',
+    errorCode: 'E_TTS_RETRY_EPISODE_EXHAUSTED',
+    message: submittedDecision
+      ? 'Your reply was received, but before sending anything the current transaction ledger showed that this unchanged narration plan already has two provider requests with no usable audio and charged or uncertain billing. The older retry proposal is no longer actionable and has been closed without sending or charging a new request. The approved visual candidate remains available; continue after provider reconciliation, or revise the narration voice/content before starting a new request episode.'
+      : 'Narration stopped after two provider requests returned no usable audio while billing was charged or could not be confirmed. No further request will be sent for this unchanged narration plan. The approved visual candidate remains available; continue after provider reconciliation, or revise the narration voice/content before starting a new request episode.',
+    ...(input.providerErrorCode ? { provider_error_code: input.providerErrorCode } : {}),
+    billable_request_sent: input.billableRequestSent,
+    request_disposition: input.billableRequestSent ? 'sent' : 'not_sent',
+    charge_status: latest?.charge_status || 'unknown',
+    retry_policy: 'episode_exhausted',
+    requires_user_decision: false,
+    user_reconfirmation_required: false,
+    automatic_recovery_expected: true,
+    recovery_status: 'completed_with_preserved_visual_candidate',
+    blocked_scope: 'narration_and_complete_delivery_only',
+    candidate_completeness: 'visual_only',
+    ...(submittedDecision ? {
+      decision_acknowledged: true,
+      decision_applied: false,
+      decision_reuse_allowed: false,
+      submitted_decision: submittedDecision.decision.decision,
+      submitted_decision_source: submittedDecision.decision.source,
+      submitted_decision_protocol: submittedDecision.protocol,
+      submitted_decision_status: 'superseded_by_current_transaction_ledger',
+      retry_proposal_status: 'superseded',
+      compatibility_status: 'stale_retry_decision_resolved_safely',
+    } : {}),
+    narration_retry_episode: {
+      status: 'exhausted',
+      request_signature: input.requestSignature,
+      failed_request_count: attempts.length,
+      max_failed_requests: MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT,
+      reset_condition: 'provider_outcome_reconciled_or_stable_narration_intent_changed',
+      transactions: attempts.map((transaction) => ({
+        transaction_id: transaction.transaction_id,
+        charge_status: transaction.charge_status,
+        error_code: transaction.error_code,
+      })),
+    },
+    allowed_recovery_ops: [
+      'composition.status',
+      'composition.reconcile',
+      'composition.lint',
+      'composition.inspect',
+      'composition.snapshot',
+    ],
+    next_action: submittedDecision
+      ? 'acknowledge_superseded_confirmation_show_current_visual_candidate_and_recovery_options'
+      : 'show_current_visual_candidate_and_recovery_options',
   };
 }
 
@@ -2474,6 +4243,7 @@ async function materializeCompositionNarration(input: {
   statePath: string;
   voice?: string;
   speed?: number;
+  decisionEvidence?: unknown;
   opts: VideoStudioToolOpts;
   ctx: ToolContext;
 }): Promise<Record<string, unknown>> {
@@ -2547,7 +4317,7 @@ async function materializeCompositionNarration(input: {
     };
   }
 
-  const state = await readVideoProductionState(input.statePath, input.compositionDirAbs);
+  let state = await readVideoProductionState(input.statePath, input.compositionDirAbs);
   const narrationInvariantRecovery = state.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED';
   const textSha = crypto.createHash('sha256').update(text).digest('hex');
   const requestSignature = crypto.createHash('sha256').update(JSON.stringify({
@@ -2555,14 +4325,58 @@ async function materializeCompositionNarration(input: {
     route_ref: routeRef,
     voice_ref: voiceRef,
     language,
-    model: narrationSelection.selection.model,
     speed: effectiveSpeed,
     format: 'mp3',
   })).digest('hex');
+  const legacyTransactionMatchesStableRequest = (
+    transaction: VideoProductionNarrationTransaction | undefined,
+  ): boolean => !!transaction
+    && manifest.schema_version === 2
+    && transaction.text_sha256 === textSha
+    && transaction.route_ref === routeRef
+    && transaction.voice_ref === voiceRef
+    && transaction.language === language
+    && Math.abs((transaction.speed ?? 1) - effectiveSpeed) <= 0.0001
+    && path.resolve(transaction.path) === path.resolve(
+      path.join(input.compositionDirAbs, 'assets', 'narration.mp3'),
+    );
+  const requestIdentityMigrationRequired = [
+    ...(state.narration_transaction_history || []),
+    ...(state.narration_transaction ? [state.narration_transaction] : []),
+  ].some((transaction) => legacyTransactionMatchesStableRequest(transaction)
+    && transaction.request_signature !== requestSignature);
+  if (requestIdentityMigrationRequired) {
+    state = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      for (const transaction of next.narration_transaction_history || []) {
+        if (legacyTransactionMatchesStableRequest(transaction)) {
+          transaction.request_signature = requestSignature;
+        }
+      }
+      if (legacyTransactionMatchesStableRequest(next.narration_transaction)) {
+        next.narration_transaction!.request_signature = requestSignature;
+      }
+      if (next.narration_retry_authorization
+        && next.narration_retry_authorization.failed_transaction_id
+        === next.narration_transaction?.transaction_id) {
+        next.narration_retry_authorization.request_signature = requestSignature;
+      }
+    });
+  }
+  if (state.narration_retry_authorization
+    && (state.narration_retry_authorization.request_signature !== requestSignature
+      || state.narration_retry_authorization.failed_transaction_id
+      !== state.narration_transaction?.transaction_id)) {
+    state = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      delete next.narration_retry_authorization;
+    });
+  }
   const outputAbsPath = path.join(input.compositionDirAbs, 'assets', 'narration.mp3');
   const existingOutput = await fs.stat(outputAbsPath).catch(() => null);
   const existingAudioSha = existingOutput?.isFile() ? await sha256File(outputAbsPath) : undefined;
   const narrationTrack = manifest.audio.tracks.find((track) => track.kind === 'narration');
+  const existingIdentity = existingOutput?.isFile()
+    ? await currentNarrationIdentity(input.compositionDirAbs)
+    : undefined;
   const trackedNarrationIsCurrent = state.narration?.text_sha256 === textSha
     && (manifest.schema_version === 1
       || (state.narration.route_ref === routeRef && state.narration.voice_ref === voiceRef
@@ -2573,10 +4387,15 @@ async function materializeCompositionNarration(input: {
     && manifest.audio.owner === 'composition'
     && narrationTrack?.src === 'assets/narration.mp3'
     && Math.abs((narrationTrack?.duration || 0) - state.narration.measured_duration_sec) <= 0.01;
-  if (trackedNarrationIsCurrent) {
-    const existingIdentity = await currentNarrationIdentity(input.compositionDirAbs);
+  const receiptNarrationIsCurrent = !trackedNarrationIsCurrent
+    && !!existingIdentity?.materializationReceiptMatches
+    && existingIdentity.materialized
+    && existingIdentity.textSha === textSha
+    && existingIdentity.audioSha === existingAudioSha
+    && typeof existingIdentity.duration === 'number';
+  if (trackedNarrationIsCurrent || receiptNarrationIsCurrent) {
     const narrationMapPath = path.join(input.compositionDirAbs, 'narration-map.json');
-    if (!existingIdentity.narrationMapMatches) {
+    if (!existingIdentity?.narrationMapMatches) {
       await writeJsonAtomic(narrationMapPath, buildCompositionNarrationMap(manifest, {
         textSha256: textSha,
         audioSha256: existingAudioSha!,
@@ -2585,7 +4404,7 @@ async function materializeCompositionNarration(input: {
     }
     const htmlPath = path.join(input.compositionDirAbs, 'index.html');
     const existingHtml = await fs.readFile(htmlPath, 'utf8').catch(() => '');
-    if (!existingIdentity.htmlTrackMatches) {
+    if (!existingIdentity?.htmlTrackMatches) {
       const reconciledHtml = reconcileCompositionHtml(existingHtml, manifest);
       if (!reconciledHtml.ok) {
         return {
@@ -2596,11 +4415,33 @@ async function materializeCompositionNarration(input: {
           issues: reconciledHtml.issues,
           path: outputAbsPath,
           billable_request_sent: false,
+          blocked_operation: 'composition.materialize_narration',
+          requires_user_decision: false,
+          preserved_artifacts: ['narration_audio', 'narration_transaction', 'composition_manifest', 'authored_visuals'],
+          allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.lint'],
+          next_action: 'repair_protected_binding_then_composition.reconcile',
         };
       }
       if (reconciledHtml.changed) await writeTextAtomic(htmlPath, reconciledHtml.html);
     }
-    const metadataRecovered = !existingIdentity.narrationMapMatches || !existingIdentity.htmlTrackMatches;
+    const measuredDurationSec = state.narration?.measured_duration_sec
+      ?? existingIdentity?.duration;
+    if (typeof measuredDurationSec !== 'number') {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_RECEIPT_DURATION_MISSING',
+        message: 'The existing narration receipt matches the current audio and text, but its measured duration is missing. Preserve the audio and repair the receipt before retrying.',
+        path: outputAbsPath,
+        billable_request_sent: false,
+        requires_user_decision: false,
+        allowed_recovery_ops: ['composition.status', 'composition.reconcile'],
+        next_action: 'repair_narration_receipt_then_composition.reconcile',
+      };
+    }
+    const metadataRecovered = receiptNarrationIsCurrent
+      || !existingIdentity?.narrationMapMatches
+      || !existingIdentity?.htmlTrackMatches;
     const authoredVisualsRecovered = narrationInvariantRecovery
       && ((!existingHtml.includes('ORKAS-GENERATED-SCAFFOLD'))
         || (!!state.artifacts.scaffold_html_sha256
@@ -2608,6 +4449,29 @@ async function materializeCompositionNarration(input: {
     const finalArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
     const reusedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
       next.stage = authoredVisualsRecovered ? 'visuals_ready' : 'narration_ready';
+      next.narration = {
+        status: 'materialized',
+        text_sha256: textSha,
+        audio_sha256: existingAudioSha!,
+        path: outputAbsPath,
+        measured_duration_sec: measuredDurationSec,
+        backend: state.narration?.backend
+          || state.narration_transaction?.backend
+          || 'materialization_receipt',
+        ...(manifest.schema_version === 2 ? {
+          route_ref: routeRef,
+          voice_ref: voiceRef,
+          language,
+          voice: voiceRef,
+          speed: effectiveSpeed,
+        } : {
+          ...(state.narration?.voice ? { voice: state.narration.voice } : {}),
+          ...(typeof state.narration?.speed === 'number' ? { speed: state.narration.speed } : {}),
+        }),
+        materialized_at: state.narration?.materialized_at || new Date().toISOString(),
+      };
+      delete next.narration_transaction;
+      delete next.narration_retry_authorization;
       delete next.blocked_operation;
       next.artifacts = {
         ...finalArtifacts,
@@ -2628,50 +4492,339 @@ async function materializeCompositionNarration(input: {
       op: 'composition.materialize_narration',
       status: metadataRecovered ? 'recovered' : 'reused',
       path: outputAbsPath,
-      measured_duration_sec: state.narration.measured_duration_sec,
+      measured_duration_sec: measuredDurationSec,
       narration_text_sha256: textSha,
       narration_map_path: narrationMapPath,
       html_path: htmlPath,
       visuals_preserved: authoredVisualsRecovered,
+      ...(receiptNarrationIsCurrent ? {
+        recovery_source: 'materialization_receipt',
+        ledger_binding_restored: true,
+      } : {}),
       billable_request_sent: false,
       production_state: await summarizeCompositionProductionState(reusedState, input.compositionDirAbs),
     };
   }
-  const transactionMatches = !!state.narration_transaction
+  let transactionMatches = !!state.narration_transaction
     && state.narration_transaction.text_sha256 === textSha
     && path.resolve(state.narration_transaction.path) === path.resolve(outputAbsPath)
     && (state.narration_transaction.request_signature === requestSignature
       || (manifest.schema_version === 1 && !state.narration_transaction.request_signature));
+  const narrationRetryOffer = (transactionId: string, attemptNumber: number) => ({
+    offer_id: crypto.createHash('sha256').update(JSON.stringify({
+      request_signature: requestSignature,
+      failed_transaction_id: transactionId,
+      next_attempt_number: attemptNumber + 1,
+    })).digest('hex'),
+    previous_request_outcome: 'unknown',
+    new_billable_request_count: 1,
+    narration_text_sha256: textSha,
+    route_ref: routeRef,
+    voice_ref: voiceRef,
+    language,
+    speed: effectiveSpeed,
+    ...(state.current_candidate?.revision_id
+      ? { current_candidate_revision_id: state.current_candidate.revision_id }
+      : {}),
+  });
+  const failNarrationArtifactAfterDispatch = async (failure: {
+    transactionId: string;
+    attemptNumber: number;
+    errorCode: 'E_TTS_AUDIO_MISSING';
+    message: string;
+    billableRequestSent: boolean;
+    backend?: string;
+  }): Promise<Record<string, unknown>> => {
+    const failedState = await updateVideoProductionState(
+      input.statePath,
+      input.compositionDirAbs,
+      (next) => {
+        const transaction = next.narration_transaction;
+        if (!transaction || transaction.transaction_id !== failure.transactionId) return;
+        transaction.status = 'failed';
+        transaction.error_code = failure.errorCode;
+        if (failure.backend) transaction.backend = failure.backend;
+        // A durable pending record is written immediately before dispatch.
+        // If execution stops after that boundary, `not_sent` is not proof that
+        // the provider never received the request. Fail closed against a
+        // duplicate paid request and require one explicit retry decision.
+        transaction.request_disposition = 'sent';
+        transaction.charge_status = narrationSelection.selection.provider === 'orkas-voice'
+          ? 'charged'
+          : transaction.charge_status || 'unknown';
+        transaction.retry_policy = 'requires_user_action';
+        transaction.updated_at = new Date().toISOString();
+      },
+    );
+    if (narrationRetryEpisodeTransactions(failedState, requestSignature).length
+      >= MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT) {
+      return exhaustedNarrationRetryResult({
+        state: failedState,
+        requestSignature,
+        billableRequestSent: failure.billableRequestSent,
+        providerErrorCode: failure.errorCode,
+      });
+    }
+    return {
+      ok: false,
+      op: 'composition.materialize_narration',
+      errorCode: failure.errorCode,
+      message: failure.message,
+      billable_request_sent: failure.billableRequestSent,
+      request_disposition: 'sent',
+      charge_status: failedState.narration_transaction?.charge_status || 'unknown',
+      retry_policy: 'requires_user_action',
+      requires_user_decision: true,
+      blocked_scope: 'narration_and_complete_delivery_only',
+      candidate_completeness: 'visual_only',
+      narration_retry_offer: narrationRetryOffer(
+        failure.transactionId,
+        failure.attemptNumber,
+      ),
+      allowed_recovery_ops: [
+        'composition.status',
+        'composition.reconcile',
+        'composition.lint',
+        'composition.inspect',
+        'composition.snapshot',
+      ],
+      next_action: 'continue_visual_preview_then_request_narration_retry_decision',
+    };
+  };
+  let retryAuthorization: {
+    authorizationId: string;
+    failedTransactionId: string;
+    attemptNumber: number;
+    turnId: string;
+    source: 'form' | 'model_interpreted_user_message';
+  } | undefined;
   if (!existingOutput && transactionMatches && state.narration_transaction?.status === 'failed') {
     const transaction = state.narration_transaction;
     const safeAfterPlanFix = transaction.retry_policy === 'safe_after_plan_fix'
       || transaction.charge_status === 'not_charged'
       || transaction.request_disposition === 'rejected_preflight';
-    return {
-      ok: false,
-      op: 'composition.materialize_narration',
-      errorCode: safeAfterPlanFix ? 'E_TTS_PLAN_REVISION_REQUIRED' : 'E_TTS_RETRY_REQUIRES_USER_ACTION',
-      message: safeAfterPlanFix
-        ? 'The matching narration request was rejected without a charge. Refresh speech.capabilities, revise the confirmed narration intent, and request production plan confirmation again before retrying.'
-        : 'The matching narration request may have reached the provider and its charge state is not safely retryable. Do not resend automatically; require explicit user direction and a new signed request.',
-      billable_request_sent: transaction.request_disposition === 'sent',
-      request_disposition: transaction.request_disposition || 'sent',
-      charge_status: transaction.charge_status || 'unknown',
-      retry_policy: transaction.retry_policy || 'requires_user_action',
-    };
+    const attemptNumber = transaction.attempt_number || 1;
+    const retryOffer = narrationRetryOffer(transaction.transaction_id, attemptNumber);
+    const currentDecision = resolveNarrationRetryDecision(
+      input.opts.userMessage,
+      input.decisionEvidence,
+    );
+    if (!safeAfterPlanFix
+      && narrationRetryEpisodeTransactions(state, requestSignature).length
+      >= MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT) {
+      return exhaustedNarrationRetryResult({
+        state,
+        requestSignature,
+        billableRequestSent: false,
+        ...(transaction.error_code ? { providerErrorCode: transaction.error_code } : {}),
+        submittedDecision: currentDecision,
+      });
+    }
+    const persistedAuthorization = state.narration_retry_authorization;
+    if (!safeAfterPlanFix
+      && persistedAuthorization?.request_signature === requestSignature
+      && persistedAuthorization.failed_transaction_id === transaction.transaction_id
+      && persistedAuthorization.consumed_new_requests === 0) {
+      retryAuthorization = {
+        authorizationId: persistedAuthorization.authorization_id,
+        failedTransactionId: transaction.transaction_id,
+        attemptNumber,
+        turnId: persistedAuthorization.authorized_turn_id,
+        source: persistedAuthorization.authorization_source,
+      };
+      transactionMatches = false;
+    }
+    if (!safeAfterPlanFix && !retryAuthorization) {
+      const decision = currentDecision.decision;
+      const invalidEvidence = invalidDecisionEvidenceResult(
+        'composition.materialize_narration',
+        'narration_retry',
+        decision,
+      );
+      if (invalidEvidence) {
+        return {
+          ...invalidEvidence,
+          blocked_scope: 'narration_and_complete_delivery_only',
+          candidate_completeness: 'visual_only',
+          narration_retry_offer: retryOffer,
+          request_disposition: transaction.request_disposition || 'sent',
+          charge_status: transaction.charge_status || 'unknown',
+        };
+      }
+      if (decision.decision === 'approve') {
+        if (!input.opts.turnId || transaction.authorized_turn_id === input.opts.turnId) {
+          return {
+            ok: false,
+            op: 'composition.materialize_narration',
+            errorCode: 'E_TTS_RETRY_DECISION_ALREADY_CONSUMED',
+            message: 'This reply already authorized one new narration request, and that attempt also ended without a conclusive provider result. It will not be sent again from the same reply.',
+            billable_request_sent: transaction.request_disposition === 'sent',
+            request_disposition: transaction.request_disposition || 'sent',
+            charge_status: transaction.charge_status || 'unknown',
+            retry_policy: transaction.retry_policy || 'requires_user_action',
+            requires_user_decision: true,
+            decision_source: decision.source,
+            approval_consumed: true,
+            blocked_scope: 'narration_and_complete_delivery_only',
+            candidate_completeness: 'visual_only',
+            narration_retry_offer: retryOffer,
+            allowed_recovery_ops: [
+              'composition.status',
+              'composition.reconcile',
+              'composition.lint',
+              'composition.inspect',
+              'composition.snapshot',
+            ],
+            next_action: 'show_current_visual_candidate_then_request_a_new_narration_retry_decision',
+          };
+        }
+        retryAuthorization = {
+          authorizationId: retryOffer.offer_id,
+          failedTransactionId: transaction.transaction_id,
+          attemptNumber,
+          turnId: input.opts.turnId,
+          source: decision.source === 'form' ? 'form' : 'model_interpreted_user_message',
+        };
+        await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+          if (next.narration_transaction?.transaction_id !== transaction.transaction_id
+            || next.narration_transaction.status !== 'failed') {
+            throw new Error('E_TTS_RETRY_STATE_CHANGED: narration retry state changed before authorization could be recorded.');
+          }
+          next.narration_retry_authorization = {
+            authorization_id: retryOffer.offer_id,
+            request_signature: requestSignature,
+            failed_transaction_id: transaction.transaction_id,
+            authorized_turn_id: input.opts.turnId!,
+            authorization_source: retryAuthorization!.source,
+            max_new_requests: 1,
+            consumed_new_requests: 0,
+            authorized_at: new Date().toISOString(),
+            validation_version: 1,
+          };
+        });
+        // The current content/voice signature is intentionally unchanged. A
+        // persisted real user decision authorizes exactly one new transaction,
+        // even if a non-billable local repair is needed before dispatch.
+        transactionMatches = false;
+      } else if (decision.decision === 'revise' || decision.decision === 'reject') {
+        await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+          if (next.narration_retry_authorization?.failed_transaction_id === transaction.transaction_id) {
+            delete next.narration_retry_authorization;
+          }
+        });
+        return {
+          ok: false,
+          op: 'composition.materialize_narration',
+          errorCode: 'E_TTS_RETRY_NOT_AUTHORIZED',
+          message: 'No new narration request was sent. The current visual candidate and prior request record remain available while the narration plan is revised or left disabled.',
+          billable_request_sent: false,
+          requires_user_decision: false,
+          decision_source: decision.source,
+          blocked_scope: 'narration_and_complete_delivery_only',
+          candidate_completeness: 'visual_only',
+          next_action: decision.decision === 'revise'
+            ? 'revise_narration_plan_then_composition.check_narration_fit'
+            : 'continue_with_current_visual_candidate_without_resending_narration',
+        };
+      } else {
+        return {
+          ok: false,
+          op: 'composition.materialize_narration',
+          errorCode: 'E_TTS_RETRY_REQUIRES_USER_ACTION',
+          message: 'The previous narration request may have reached the provider, but no usable audio was returned. The current visual work is safe. To finish with narration, show the current preview and ask whether to send exactly one new narration request.',
+          billable_request_sent: transaction.request_disposition === 'sent',
+          request_disposition: transaction.request_disposition || 'sent',
+          charge_status: transaction.charge_status || 'unknown',
+          retry_policy: transaction.retry_policy || 'requires_user_action',
+          requires_user_decision: true,
+          blocked_scope: 'narration_and_complete_delivery_only',
+          candidate_completeness: 'visual_only',
+          narration_retry_offer: retryOffer,
+          allowed_recovery_ops: [
+            'composition.status',
+            'composition.reconcile',
+            'composition.lint',
+            'composition.inspect',
+            'composition.snapshot',
+          ],
+          next_action: 'continue_visual_preview_then_request_narration_retry_decision',
+        };
+      }
+    }
+    if (!retryAuthorization) {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_TTS_PLAN_REVISION_REQUIRED',
+        message: 'The narration request was rejected before billing. Refresh speech capabilities, revise the confirmed narration intent, and check narration fit before trying again.',
+        billable_request_sent: transaction.request_disposition === 'sent',
+        request_disposition: transaction.request_disposition || 'sent',
+        charge_status: transaction.charge_status || 'unknown',
+        retry_policy: transaction.retry_policy || 'requires_user_action',
+        requires_user_decision: false,
+        blocked_scope: 'narration_and_complete_delivery_only',
+        candidate_completeness: 'visual_only',
+        allowed_recovery_ops: [
+          'composition.status',
+          'composition.reconcile',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ],
+        next_action: 'repair_narration_plan_while_continuing_visual_preview',
+      };
+    }
   }
   if (existingOutput && !transactionMatches) {
     return {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_NARRATION_OUTPUT_CONFLICT',
-      message: 'assets/narration.mp3 exists but its text/audio hashes or transaction do not match production state. Preserve it and run composition.reconcile instead of overwriting a potentially billable artifact.',
+      message: 'The saved narration cannot be proven to belong to the current confirmed script. It has been preserved and no new speech request was sent.',
+      recoverable: true,
+      terminal: false,
+      retry_same_operation: false,
+      billable_request_sent: false,
+      requires_user_decision: true,
+      blocked_scope: 'narration_and_complete_delivery_only',
+      candidate_completeness: 'visual_only',
+      preserved_artifacts: [
+        'current_visual_candidate',
+        'approved_preview',
+        'existing_narration_audio',
+        'approved_plan',
+      ],
+      allowed_recovery_ops: [
+        'composition.status',
+        'composition.reconcile',
+        'composition.lint',
+        'composition.inspect',
+        'composition.snapshot',
+      ],
+      next_action: 'show_current_candidate_and_request_narration_conflict_resolution',
+      user_options: [
+        {
+          id: 'regenerate_current_narration',
+          label: 'Regenerate from the current confirmed script',
+          effect: 'Preserve the existing audio, then create one new narration request after explicit confirmation that it may incur a charge.',
+        },
+        {
+          id: 'revise_narration',
+          label: 'Change the narration or voice first',
+          effect: 'Keep the current preview and existing audio while the narration plan is revised.',
+        },
+        {
+          id: 'pause_with_visuals',
+          label: 'Pause and keep the current visuals',
+          effect: 'Make no speech request and keep all current artifacts available.',
+        },
+      ],
     };
   }
   const currentArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const htmlPath = path.join(input.compositionDirAbs, 'index.html');
   const html = await fs.readFile(htmlPath, 'utf8').catch(() => '');
-  const authoredVisualsPresent = narrationInvariantRecovery
+  const authoredVisualsPresent = (narrationInvariantRecovery || !!retryAuthorization)
     && ((!html.includes('ORKAS-GENERATED-SCAFFOLD'))
       || (!!state.artifacts.scaffold_html_sha256
         && currentArtifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
@@ -2686,7 +4839,10 @@ async function materializeCompositionNarration(input: {
       message: 'The manifest changed after composition.prepare, or the HTML cannot be proven to be a prepared scaffold or an authored-visual recovery. Reconcile the current files before narration materialization.',
     };
   }
-  if (!html.includes('ORKAS-GENERATED-SCAFFOLD') && !transactionMatches && !narrationInvariantRecovery) {
+  if (!html.includes('ORKAS-GENERATED-SCAFFOLD')
+    && !transactionMatches
+    && !narrationInvariantRecovery
+    && !retryAuthorization) {
     return {
       ok: false,
       op: 'composition.materialize_narration',
@@ -2703,10 +4859,11 @@ async function materializeCompositionNarration(input: {
     };
   }
 
-  const [targetDurationSec, planIdentity] = await Promise.all([
-    approvedTargetDurationSec(input.compositionDirAbs, manifest),
-    videoProductionPlanIdentity(input.compositionDirAbs),
-  ]);
+  const planIdentity = await videoProductionPlanIdentity(input.compositionDirAbs, {
+    approval: state.plan_approval,
+    roots: allowedRoots(input.opts),
+  });
+  const targetDurationSec = await approvedTargetDurationSec(manifest, planIdentity);
   const estimate = estimateNarrationDuration(text, effectiveSpeed);
   const fit = compositionNarrationFit({
     text,
@@ -2749,9 +4906,43 @@ async function materializeCompositionNarration(input: {
   let bytes = existingOutput?.size || 0;
   let billableRequestSent = false;
   let recovered = !!existingOutput;
+  if (!existingOutput
+    && transactionMatches
+    && state.narration_transaction
+    && (state.narration_transaction.status === 'pending'
+      || state.narration_transaction.status === 'synthesized')) {
+    return failNarrationArtifactAfterDispatch({
+      transactionId,
+      attemptNumber: state.narration_transaction.attempt_number || 1,
+      errorCode: 'E_TTS_AUDIO_MISSING',
+      message: 'The previous narration operation stopped after its provider-dispatch boundary, but no readable audio was recorded. Its billing outcome is treated as uncertain, so it will not be sent again automatically. The current visual candidate remains available.',
+      billableRequestSent: false,
+      ...(state.narration_transaction.backend
+        ? { backend: state.narration_transaction.backend }
+        : {}),
+    });
+  }
   if (!existingOutput) {
     const now = new Date().toISOString();
     await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      if (retryAuthorization) {
+        if (next.narration_transaction?.transaction_id !== retryAuthorization.failedTransactionId) {
+          throw new Error('E_TTS_RETRY_STATE_CHANGED: narration retry state changed before the authorized request could start.');
+        }
+        const persisted = next.narration_retry_authorization;
+        if (!persisted
+          || persisted.authorization_id !== retryAuthorization.authorizationId
+          || persisted.request_signature !== requestSignature
+          || persisted.consumed_new_requests !== 0) {
+          throw new Error('E_TTS_RETRY_AUTHORIZATION_CHANGED: the one-request narration authorization is no longer available.');
+        }
+        next.narration_transaction_history = [
+          ...(next.narration_transaction_history || []),
+          next.narration_transaction,
+        ].slice(-20);
+        persisted.consumed_new_requests = 1;
+        persisted.consumed_at = now;
+      }
       next.narration_transaction = {
         transaction_id: transactionId,
         status: 'pending',
@@ -2770,9 +4961,18 @@ async function materializeCompositionNarration(input: {
         narration_unit: estimate.unit,
         narration_units: estimate.units,
         scene_weights: plannedSceneWeights,
+        ...(retryAuthorization ? {
+          retry_of_transaction_id: retryAuthorization.failedTransactionId,
+          authorized_turn_id: retryAuthorization.turnId,
+          authorization_source: retryAuthorization.source,
+          attempt_number: retryAuthorization.attemptNumber + 1,
+        } : {
+          attempt_number: 1,
+        }),
         started_at: now,
         updated_at: now,
       };
+      if (retryAuthorization) delete next.narration_retry_authorization;
       recordVideoProductionTransition(next, {
         op: 'composition.materialize_narration',
         status: 'started',
@@ -2780,20 +4980,37 @@ async function materializeCompositionNarration(input: {
         stage: next.stage,
       });
     });
-    const speech = await generateSpeech({
-      text,
-      outputAbsPath,
-      routeRef,
-      voiceRef,
-      language,
-      speed: effectiveSpeed,
-      format: 'mp3',
-      ...(input.ctx.signal ? { signal: input.ctx.signal } : {}),
-      onProgress: (event) => input.ctx.emitProgress?.({ phase: event.phase, message: event.message }),
-    });
+    let speech: Awaited<ReturnType<typeof generateSpeech>>;
+    try {
+      speech = await generateSpeech({
+        text,
+        outputAbsPath,
+        routeRef,
+        voiceRef,
+        language,
+        speed: effectiveSpeed,
+        format: 'mp3',
+        ...(input.ctx.signal ? { signal: input.ctx.signal } : {}),
+        onProgress: (event) => input.ctx.emitProgress?.({ phase: event.phase, message: event.message }),
+      });
+    } catch (err) {
+      return failNarrationArtifactAfterDispatch({
+        transactionId,
+        attemptNumber: retryAuthorization
+          ? retryAuthorization.attemptNumber + 1
+          : 1,
+        errorCode: 'E_TTS_AUDIO_MISSING',
+        message: `The narration provider operation ended without a durable result (${(err as Error).message}). It may already have been billed, so it will not be sent again automatically. The current visual candidate remains available.`,
+        billableRequestSent: true,
+        backend: routeRef,
+      });
+    }
     if (speech.ok === false) {
       billableRequestSent = speech.requestDisposition === 'sent';
-      await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+      const safeAfterPlanFix = speech.retryPolicy === 'safe_after_plan_fix'
+        || speech.chargeStatus === 'not_charged'
+        || speech.requestDisposition === 'rejected_preflight';
+      const failedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
         if (next.narration_transaction?.transaction_id === transactionId) {
           next.narration_transaction.status = 'failed';
           next.narration_transaction.error_code = speech.errorCode;
@@ -2803,6 +5020,16 @@ async function materializeCompositionNarration(input: {
           next.narration_transaction.updated_at = new Date().toISOString();
         }
       });
+      if (!safeAfterPlanFix
+        && narrationRetryEpisodeTransactions(failedState, requestSignature).length
+        >= MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT) {
+        return exhaustedNarrationRetryResult({
+          state: failedState,
+          requestSignature,
+          billableRequestSent,
+          providerErrorCode: speech.providerErrorCode || speech.errorCode,
+        });
+      }
       return {
         ok: false,
         op: 'composition.materialize_narration',
@@ -2812,6 +5039,25 @@ async function materializeCompositionNarration(input: {
         request_disposition: speech.requestDisposition || 'sent',
         charge_status: speech.chargeStatus || 'unknown',
         retry_policy: speech.retryPolicy || 'unknown',
+        requires_user_decision: !safeAfterPlanFix,
+        blocked_scope: 'narration_and_complete_delivery_only',
+        candidate_completeness: 'visual_only',
+        allowed_recovery_ops: [
+          'composition.status',
+          'composition.reconcile',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ],
+        next_action: safeAfterPlanFix
+          ? 'repair_narration_plan_while_continuing_visual_preview'
+          : 'continue_visual_preview_then_request_narration_retry_decision',
+        ...(!safeAfterPlanFix ? {
+          narration_retry_offer: narrationRetryOffer(
+            transactionId,
+            retryAuthorization ? retryAuthorization.attemptNumber + 1 : 1,
+          ),
+        } : {}),
         ...(speech.providerErrorCode ? { provider_error_code: speech.providerErrorCode } : {}),
       };
     }
@@ -2820,6 +5066,36 @@ async function materializeCompositionNarration(input: {
     bytes = speech.bytes;
     recovered = false;
   }
+  const audioSha = await sha256File(outputAbsPath);
+  if (!audioSha) {
+    return failNarrationArtifactAfterDispatch({
+      transactionId,
+      attemptNumber: retryAuthorization
+        ? retryAuthorization.attemptNumber + 1
+        : state.narration_transaction?.attempt_number || 1,
+      errorCode: 'E_TTS_AUDIO_MISSING',
+      message: 'The narration provider returned, but no readable audio artifact was recorded. The request may already have been billed, so it will not be sent again automatically. The current visual candidate remains available.',
+      billableRequestSent,
+      backend,
+    });
+  }
+  // Persist successful provider output before media probing or manifest/HTML
+  // reconciliation. Those local steps may fail or the process may stop, but a
+  // later call must recover this paid artifact instead of dispatching again.
+  await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+    const transaction = next.narration_transaction;
+    if (!transaction || transaction.transaction_id !== transactionId) return;
+    transaction.status = 'synthesized';
+    transaction.backend = backend;
+    transaction.request_disposition = transaction.request_disposition === 'not_sent'
+      ? 'sent'
+      : transaction.request_disposition;
+    transaction.charge_status = narrationSelection.selection.provider === 'orkas-voice'
+      ? 'charged'
+      : transaction.charge_status || 'unknown';
+    transaction.audio_sha256 = audioSha;
+    transaction.updated_at = new Date().toISOString();
+  });
   const measuredDurationSec = state.narration_transaction?.measured_duration_sec
     || await probeMediaDurationSec(outputAbsPath, input.ctx.signal);
   if (!(typeof measuredDurationSec === 'number' && measuredDurationSec > 0)) {
@@ -2830,22 +5106,26 @@ async function materializeCompositionNarration(input: {
       message: 'Narration audio exists, but its measured duration is unavailable. The transaction remains recoverable; repair media probing and call materialize_narration again without deleting the audio.',
       path: outputAbsPath,
       billable_request_sent: billableRequestSent,
-    };
-  }
-  const audioSha = await sha256File(outputAbsPath);
-  if (!audioSha) {
-    return {
-      ok: false,
-      op: 'composition.materialize_narration',
-      errorCode: 'E_TTS_AUDIO_MISSING',
-      message: 'Narration transaction has no readable audio artifact.',
-      billable_request_sent: billableRequestSent,
+      request_disposition: 'sent',
+      requires_user_decision: false,
+      user_reconfirmation_required: false,
+      automatic_recovery_expected: true,
+      blocked_scope: 'narration_and_complete_delivery_only',
+      candidate_completeness: 'visual_only',
+      allowed_recovery_ops: [
+        'composition.status',
+        'composition.reconcile',
+        'composition.lint',
+        'composition.inspect',
+        'composition.snapshot',
+      ],
+      next_action: 'repair_media_probe_then_resume_same_narration_transaction',
     };
   }
   const measuredDurationMismatch = measuredDurationSec > targetDurationSec + 0.15
     || measuredDurationSec < targetDurationSec * 0.9;
   const repairIdentity = measuredDurationMismatch
-    ? await videoProductionNarrationRepairIdentity(input.compositionDirAbs)
+    ? await videoProductionNarrationRepairIdentity(planIdentity)
     : undefined;
   const updatedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     const transaction = next.narration_transaction;
@@ -2903,7 +5183,8 @@ async function materializeCompositionNarration(input: {
       });
       if (measuredDurationMismatch
         && repairIdentity
-        && next.plan_approval?.signature === planIdentity.signature) {
+        && planApprovalMatchesIdentity(next.plan_approval, planIdentity)
+        && next.plan_approval) {
         next.narration_repair = {
           source: 'measured_duration_mismatch',
           approval_signature: next.plan_approval.signature,
@@ -2934,6 +5215,17 @@ async function materializeCompositionNarration(input: {
     const repairAuthorizationPreserved = !!updatedState.narration_repair
       && updatedState.narration_repair.approval_signature === planIdentity.signature;
     if (!repairAuthorizationPreserved) {
+      const evidence: VideoProductionPlanEvidence = {
+        ...planIdentity.evidence,
+        conflicts: [
+          ...planIdentity.evidence.conflicts,
+          {
+            code: 'narration_repair_identity_unavailable',
+            message: 'The synthesized narration transaction is present, but its approved plan files could not produce a safe timing-repair identity.',
+            paths: planIdentity.artifactPaths,
+          },
+        ],
+      };
       return {
         ok: false,
         op: 'composition.materialize_narration',
@@ -2943,6 +5235,12 @@ async function materializeCompositionNarration(input: {
         measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
         target_duration_sec: targetDurationSec,
         billable_request_sent: billableRequestSent,
+        evidence,
+        blocked_operation: 'composition.materialize_narration',
+        requires_user_decision: false,
+        preserved_artifacts: ['narration_audio', 'narration_transaction', 'approved_plan'],
+        allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.check_narration_fit'],
+        next_action: 'repair_narration_plan_alignment_then_resume',
       };
     }
     return {
@@ -3007,6 +5305,11 @@ async function materializeCompositionNarration(input: {
         issues: reconciledHtml.issues,
         path: outputAbsPath,
         billable_request_sent: billableRequestSent,
+        blocked_operation: 'composition.materialize_narration',
+        requires_user_decision: false,
+        preserved_artifacts: ['narration_audio', 'narration_transaction', 'composition_manifest', 'authored_visuals'],
+        allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.lint'],
+        next_action: 'repair_protected_binding_then_composition.reconcile',
       };
     }
     await writeTextAtomic(htmlPath, reconciledHtml.html);
@@ -3098,9 +5401,20 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition production-plan inheritance.' },
         segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition production-plan inheritance.' },
         composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
+        decision_evidence: {
+          type: 'object',
+          description: 'For a natural-language user reply, pass a native object (never a quoted JSON string or bare reply) containing the model semantic decision and a verbatim excerpt from the current user turn. Do not send this for structured forms. The host verifies provenance, gate scope, version, and safety but does not classify user language with keyword rules. A safely parseable JSON-object string is accepted only as transport recovery; any other malformed value returns a same-turn self-correction result without consuming approval or sending a billable request.',
+          properties: {
+            source: { type: 'string', enum: ['user_message'] },
+            gate: { type: 'string', enum: ['plan', 'generation', 'narration_retry', 'preview', 'draft'] },
+            decision: { type: 'string', enum: ['approve', 'revise', 'reject'] },
+            quote: { type: 'string' },
+          },
+          required: ['source', 'gate', 'decision', 'quote'],
+        },
         expected_plan_change: { type: 'boolean', description: 'Set true only when composition.approve_plan consumes an approved production-plan amendment. The operation then fails closed unless the signed script, shotlist, or manifest signature actually changed; it never converts that mismatch into a recovery form.' },
-        output_path: { type: 'string', description: 'Output video path for composition.draft/export, or snapshot path for composition.snapshot.' },
-        report_path: { type: 'string', description: 'Optional JSON QA report path for composition.draft/export.' },
+        output_path: { type: 'string', description: 'Output video path for composition.draft/export, or snapshot path for composition.snapshot. Draft/export output must be outside composition_dir; use project/render.' },
+        report_path: { type: 'string', description: 'Optional JSON QA report path for composition.draft/export. It must be outside composition_dir; use project/render.' },
         findings_path: { type: 'string', description: 'Optional findings JSON path for composition.inspect/snapshot/draft.' },
         quality: { type: 'string', enum: ['draft', 'standard', 'high'], description: 'Render quality; draft uses lower fps/CRF.' },
         fps: { type: 'number', description: 'Frames per second, capped at 60.' },
@@ -3114,6 +5428,20 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Structured design-review verdict for composition.submit_design_review.' },
         review_scope: { type: 'string', description: 'What the design review inspected (contact sheet, sampled frames, hierarchy, typography, rhythm).' },
         review_findings: { type: 'array', items: { type: 'string' }, description: 'Concise visual findings or required repairs.' },
+        quality_scores: {
+          type: 'object',
+          description: 'Evidence-based 0-100 design scores. cover_communication is always required; reference_fidelity is additionally required for concrete visual references.',
+          properties: {
+            content_alignment: { type: 'number' },
+            cover_communication: { type: 'number' },
+            hierarchy: { type: 'number' },
+            text_legibility: { type: 'number' },
+            motion_readiness: { type: 'number' },
+            specificity: { type: 'number' },
+            reference_fidelity: { type: 'number' },
+          },
+          required: ['content_alignment', 'cover_communication', 'hierarchy', 'text_legibility', 'motion_readiness', 'specificity'],
+        },
         reviewed_frame_paths: { type: 'array', items: { type: 'string' }, description: 'Every returned snapshot frame path actually inspected during a preview design review. Required to cover the complete current preview frame set before the preview can be shown.' },
         input_path: { type: 'string', description: 'Input audio/video path for speech.transcribe.' },
         transcript_path: { type: 'string', description: 'Optional transcript JSON output path for speech.transcribe.' },
@@ -3208,7 +5536,16 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             return { content: 'E_VIDEO_PRODUCTION_APPROVAL_TURN_REQUIRED: approval must be recorded in the current user turn.', isError: true } as ToolResult;
           }
           if (op === 'production.approve_plan') {
-            if (explicitVideoStudioGateDecision(opts.userMessage, 'plan') !== 'approve') {
+            const resolvedDecision = resolveVideoStudioCurrentTurnDecision(
+              opts.userMessage,
+              'plan',
+              input.decision_evidence,
+            );
+            const invalidEvidence = invalidDecisionEvidenceResult(op, 'plan', resolvedDecision);
+            if (invalidEvidence) {
+              return { content: resultContent(invalidEvidence), isError: true } as ToolResult;
+            }
+            if (resolvedDecision.decision !== 'approve') {
               return { content: 'E_VIDEO_PRODUCTION_GATE_B_EXPLICIT_APPROVAL_REQUIRED: the current real user turn must explicitly approve the displayed EDL.', isError: true } as ToolResult;
             }
             const narrationSelection = await validateEdlNarrationSelection(planAbs, ctx.signal);
@@ -3237,7 +5574,16 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               isError: false,
             } as ToolResult;
           }
-          if (explicitVideoStudioGateDecision(opts.userMessage, 'generation') !== 'approve') {
+          const resolvedDecision = resolveVideoStudioCurrentTurnDecision(
+            opts.userMessage,
+            'generation',
+            input.decision_evidence,
+          );
+          const invalidEvidence = invalidDecisionEvidenceResult(op, 'generation', resolvedDecision);
+          if (invalidEvidence) {
+            return { content: resultContent(invalidEvidence), isError: true } as ToolResult;
+          }
+          if (resolvedDecision.decision !== 'approve') {
             return { content: 'E_VIDEO_PRODUCTION_GATE_C_EXPLICIT_APPROVAL_REQUIRED: the current real user turn must explicitly approve the displayed generation count.', isError: true } as ToolResult;
           }
           await validateVideoProductionPlanApproval({ statePath, planPath: planAbs });
@@ -3286,6 +5632,18 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (!isPathAllowed(requestedOutput, roots)) {
             return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${requestedOutput}`, isError: true } as ToolResult;
           }
+          if (isWithinDirectory(requestedOutput, compositionDirAbs)) {
+            return {
+              content: resultContent({
+                ok: false,
+                op,
+                errorCode: 'E_COMPOSITION_RUNTIME_OUTPUT_IN_SOURCE',
+                message: 'Draft and export output_path must be outside composition_dir so rendered artifacts cannot invalidate authored-input approvals. Use project/render/<name>.',
+                next_action: 'retry_with_project_render_output',
+              }),
+              isError: true,
+            } as ToolResult;
+          }
           const isMine = opts.hasProducedPath ? (p: string) => opts.hasProducedPath!(p) : () => false;
           const unique = await uniquifyPath(requestedOutput, isMine);
           outputAbsPath = unique.finalPath;
@@ -3304,6 +5662,20 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           : undefined;
         if (reportAbsPath && !isPathAllowed(reportAbsPath, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: report_path is outside scope: ${reportAbsPath}`, isError: true } as ToolResult;
+        }
+        if ((op === 'composition.draft' || op === 'composition.export')
+          && reportAbsPath
+          && isWithinDirectory(reportAbsPath, compositionDirAbs)) {
+          return {
+            content: resultContent({
+              ok: false,
+              op,
+              errorCode: 'E_COMPOSITION_RUNTIME_OUTPUT_IN_SOURCE',
+              message: 'Draft and export report_path must be outside composition_dir so runtime reports cannot invalidate authored-input approvals. Use project/render/<name>-report.json.',
+              next_action: 'retry_with_project_render_report',
+            }),
+            isError: true,
+          } as ToolResult;
         }
         const findingsAbsPath = typeof input.findings_path === 'string' && input.findings_path.trim()
           ? resolvePath(ctx, opts, input.findings_path, roots)
@@ -3329,42 +5701,131 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           identity: narrationIdentityBefore,
           turnId: opts.turnId,
         });
+        stateBefore = await migrateVideoStudioGateSignatureV5(
+          gateStatePath,
+          'preview',
+          compositionDirAbs,
+          stateBefore,
+        );
+        stateBefore = await migrateVideoStudioGateSignatureV5(
+          gateStatePath,
+          'draft',
+          compositionDirAbs,
+          stateBefore,
+        );
         const policyFactsBefore = narrationPolicyFacts(stateBefore, narrationIdentityBefore);
         const misroutedGateBApproval = op === 'composition.begin_visual_revision'
-          && /<agent-input-submission\b/i.test(currentUserTurnPayload(opts.userMessage))
-          && explicitVideoStudioGateDecision(opts.userMessage, 'plan') === 'approve';
+          && resolveVideoStudioCurrentTurnDecision(
+            opts.userMessage,
+            'plan',
+            input.decision_evidence,
+          ).decision === 'approve';
         if (PLAN_APPROVAL_REQUIRED_OPS.has(op) && !misroutedGateBApproval) {
           const planApproval = await validatePlanApproval(
             gateStatePath,
             compositionDirAbs,
+            roots,
           );
           if (planApproval.ok === false) {
-            return { content: `${planApproval.errorCode}: ${planApproval.message}`, isError: true } as ToolResult;
+            const blockedResult = {
+              ok: false,
+              op,
+              errorCode: planApproval.errorCode,
+              message: planApproval.message,
+              ...(planApproval.evidence ? { evidence: planApproval.evidence } : {}),
+              billable_request_sent: false,
+              ...(stateBefore.current_candidate
+                ? { current_candidate: stateBefore.current_candidate }
+                : {}),
+            };
+            const reviewPackage = await deliverReviewPackage({
+              opts,
+              state: stateBefore,
+              result: blockedResult,
+              ...(planApproval.evidence ? { planEvidence: planApproval.evidence } : {}),
+            });
+            return {
+              content: resultContent({
+                ...blockedResult,
+                review_package: reviewPackage,
+              }),
+              isError: true,
+            } as ToolResult;
           }
         }
         const admission = evaluateVideoProductionOperation(stateBefore, op, policyFactsBefore);
         if (!misroutedGateBApproval && admission.ok === false) {
+          const blockedResult = {
+            ok: false,
+            op,
+            errorCode: admission.errorCode,
+            message: admission.message,
+            gate_b_required: admission.errorCode === 'E_GATE_B_APPROVAL_REQUIRED',
+            ...(admission.nextAction ? { next_action: admission.nextAction } : {}),
+            ...(stateBefore.current_candidate
+              ? { current_candidate: stateBefore.current_candidate }
+              : {}),
+            production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
+          };
+          const reviewPackage = await deliverReviewPackage({
+            opts,
+            state: stateBefore,
+            result: blockedResult,
+          });
           return {
             content: resultContent({
-              ok: false,
-              op,
-              errorCode: admission.errorCode,
-              message: admission.message,
-              gate_b_required: admission.errorCode === 'E_GATE_B_APPROVAL_REQUIRED',
-              ...(admission.nextAction ? { next_action: admission.nextAction } : {}),
-              production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
+              ...blockedResult,
+              review_package: reviewPackage,
             }),
             isError: true,
           } as ToolResult;
         }
         if (op === 'composition.status') {
           const [planIdentity, currentArtifacts, repairState] = await Promise.all([
-            videoProductionPlanIdentity(compositionDirAbs),
+            videoProductionPlanIdentity(compositionDirAbs, {
+              approval: stateBefore.plan_approval,
+              roots,
+            }),
             videoProductionArtifacts(compositionDirAbs),
             videoStudioRepairSummary(opts, compositionDirAbs),
           ]);
           const artifactDrift = !!stateBefore.artifacts.composition_signature
             && stateBefore.artifacts.composition_signature !== currentArtifacts.composition_signature;
+          const planRecordRefreshRequired = planIdentity.evidence.observations
+            .some((observation) => (
+              observation.status === 'relocated'
+              || (observation.status === 'changed'
+                && planApprovalMatchesIdentity(stateBefore.plan_approval, planIdentity))
+            ));
+          const planApprovalCurrent = planApprovalMatchesIdentity(
+            stateBefore.plan_approval,
+            planIdentity,
+          );
+          const planIdentityMigrated = planApprovalCurrent
+            && planIdentity.complete
+            && !!stateBefore.plan_approval
+            && (
+              stateBefore.plan_approval.signature !== planIdentity.signature
+              || stateBefore.plan_approval.identity_kind !== 'approved_intent_sha256'
+            );
+          if (planIdentityMigrated && stateBefore.plan_approval) {
+            stateBefore = await updateVideoProductionState(
+              gateStatePath,
+              compositionDirAbs,
+              (next) => {
+                if (!next.plan_approval
+                  || !planApprovalMatchesIdentity(next.plan_approval, planIdentity)) return;
+                next.plan_approval = contentAddressedPlanApproval(
+                  next.plan_approval,
+                  planIdentity,
+                );
+              },
+            );
+          }
+          const planArtifactConflict = planIdentity.evidence.conflicts.length > 0
+            || (!!stateBefore.plan_approval
+              && planIdentity.complete
+              && !planApprovalCurrent);
           return {
             content: resultContent({
               ok: true,
@@ -3372,13 +5833,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               status: 'reported',
               artifact_drift: artifactDrift,
               reconciliation_required: artifactDrift
+                || planRecordRefreshRequired
+                || planArtifactConflict
                 || !!stateBefore.narration_transaction
                 || !!stateBefore.active_operation,
+              plan_record_refresh_required: planRecordRefreshRequired,
+              plan_identity_migrated: planIdentityMigrated,
+              plan_artifact_conflict: planArtifactConflict,
               plan_artifacts_present: planIdentity.applicable,
               plan_artifacts_complete: planIdentity.complete,
               plan_requirement_issues: planIdentity.requirementIssues,
-              plan_approval_current: !!stateBefore.plan_approval
-                && stateBefore.plan_approval.signature === planIdentity.signature,
+              plan_evidence: planIdentity.evidence,
+              approved_intent_hash: planApprovalCurrent
+                ? planIdentity.signature
+                : stateBefore.plan_approval?.signature || null,
+              candidate_intent_hash: planIdentity.signature || null,
+              plan_approval_current: planApprovalCurrent,
               inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,
               visual_qa_cycle_stale: !!legacyVisualQaCycle(stateBefore.visual_qa)
                 && !currentVisualQaCycle(stateBefore.visual_qa),
@@ -3403,13 +5873,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               isError: true,
             } as ToolResult;
           }
-          const revisionAuthorized = explicitVideoStudioVisualRevisionDecision(opts.userMessage) === 'revise';
-          const legacyRecoveryAuthorized = explicitVideoStudioVisualRecoveryDecision(opts.userMessage) === 'new_visual_revision';
-          const explicitlyAuthorized = !!opts.turnId
-            && (revisionAuthorized || legacyRecoveryAuthorized);
           const existingCycle = currentVisualQaCycle(stateBefore.visual_qa);
-          if (explicitlyAuthorized
-            && existingCycle?.started_by_turn_id === opts.turnId
+          if (existingCycle?.started_by_turn_id === opts.turnId
             && existingCycle.failed_signatures.length === 0) {
             return {
               content: resultContent({
@@ -3434,20 +5899,6 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 visual_revision_recovery_available: false,
                 next_action: 'continue_current_cycle_without_recovery',
                 visual_repair_cycle: visualQaRepairSummary(legacyVisualQaCycle(stateBefore.visual_qa)),
-              }),
-              isError: true,
-            } as ToolResult;
-          }
-          if (!explicitlyAuthorized) {
-            return {
-              content: resultContent({
-                ok: false,
-                op,
-                errorCode: 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED',
-                message: 'The exhausted visual QA cycle can restart only in a real user turn that submits a visual-preview or final-video revision decision. That revision decision is sufficient; do not ask for a separate recovery confirmation.',
-                visual_revision_recovery_available: true,
-                recovery_requires_new_user_revision: true,
-                next_action: 'report_visual_qa_blocker_or_wait_for_user_revision',
               }),
               isError: true,
             } as ToolResult;
@@ -3491,6 +5942,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               status: 'started',
               visual_revision: visualRevision,
               inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,
+              recovery_started_automatically: true,
+              requires_user_decision: false,
               preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
               invalidated_artifacts: ['preview', 'draft'],
               next_action: 'composition.lint',
@@ -3515,10 +5968,26 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const result = await reconcileVideoProduction({
             compositionDirAbs,
             statePath: gateStatePath,
+            roots,
             turnId: opts.turnId,
           });
           if (result.ok) await notifyWritten(opts, [result.html_path]);
-          const reconciledState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+          let reconciledState = await recordCurrentVideoProductionCandidate({
+            statePath: gateStatePath,
+            compositionDirAbs,
+            op,
+            result,
+          });
+          if (result.ok !== true) {
+            result.review_package = await deliverReviewPackage({
+              opts,
+              state: reconciledState,
+              result,
+            });
+          }
+          if (reconciledState.current_candidate) {
+            result.current_candidate = reconciledState.current_candidate;
+          }
           result.production_state = await summarizeCompositionProductionState(reconciledState, compositionDirAbs);
           return { content: resultContent(result), isError: result.ok !== true } as ToolResult;
         }
@@ -3530,18 +5999,54 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               isError: true,
             } as ToolResult;
           }
-          const identity = await videoProductionPlanIdentity(compositionDirAbs);
+          const identity = await videoProductionPlanIdentity(compositionDirAbs, {
+            approval: stateBefore.plan_approval,
+            roots,
+          });
           if (!identity.complete) {
-            return {
-              content: 'E_NARRATION_FIT_ARTIFACTS_INCOMPLETE: write project/script.md, project/shotlist.json, and the candidate composition-manifest.json before checking narration fit.',
-              isError: true,
-            } as ToolResult;
+            const artifactInvalid = (identity.artifactIssues?.length || 0) > 0;
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: identity.evidence.conflicts.length > 0
+                  ? 'E_NARRATION_FIT_ARTIFACT_CONFLICT'
+                  : artifactInvalid
+                    ? 'E_NARRATION_FIT_ARTIFACT_INVALID'
+                    : 'E_NARRATION_FIT_ARTIFACTS_INCOMPLETE',
+                message: identity.evidence.conflicts[0]?.message
+                  || (artifactInvalid
+                    ? 'The current plan files are present, but one or more files could not be parsed or validated. Repair the listed file fields without changing the approved meaning, then retry this free check in the same turn.'
+                    : 'One or more current plan files are missing. Restore the listed script, shotlist, or manifest before checking narration fit.'),
+                evidence: identity.evidence,
+                artifact_issues: identity.artifactIssues || [],
+                billable_request_sent: false,
+                requires_user_decision: false,
+                next_action: artifactInvalid
+                  ? 'repair_invalid_plan_artifacts_then_recheck_narration_fit'
+                  : 'restore_missing_plan_artifacts_then_recheck_narration_fit',
+              },
+            });
           }
           if (identity.requirementIssues.length > 0) {
-            return {
-              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
-              isError: true,
-            } as ToolResult;
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_GATE_B_REQUIREMENTS_INCOMPLETE',
+                message: `Resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
+                evidence: identity.evidence,
+                requirement_issues: identity.requirementIssues,
+                requires_user_decision: false,
+                next_action: 'repair_current_plan_artifacts_then_recheck_narration_fit',
+              },
+            });
           }
           let manifest: CompositionManifest;
           try {
@@ -3549,17 +6054,37 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
             ));
           } catch (err) {
-            return {
-              content: `E_COMPOSITION_MANIFEST_INVALID: ${(err as Error).message}`,
-              isError: true,
-            } as ToolResult;
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_COMPOSITION_MANIFEST_INVALID',
+                message: (err as Error).message,
+                evidence: identity.evidence,
+                requires_user_decision: false,
+                next_action: 'repair_current_manifest_then_recheck_narration_fit',
+              },
+            });
           }
           const text = compositionNarrationText(manifest);
           if (!text) {
-            return {
-              content: 'E_NARRATION_TEXT_MISSING: add the complete candidate narration_text to manifest scenes before checking production-plan narration fit.',
-              isError: true,
-            } as ToolResult;
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_NARRATION_TEXT_MISSING',
+                message: 'Add the complete candidate narration_text to manifest scenes before checking production-plan narration fit.',
+                evidence: identity.evidence,
+                requires_user_decision: false,
+                next_action: 'repair_current_script_and_manifest_then_recheck_narration_fit',
+              },
+            });
           }
           const narrationSelection = await resolveCompositionNarrationSelection({
             manifest,
@@ -3575,7 +6100,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           }
           const fit = compositionNarrationFit({
             text,
-            targetDurationSec: await approvedTargetDurationSec(compositionDirAbs, manifest),
+            targetDurationSec: await approvedTargetDurationSec(manifest, identity),
             planSignature: identity.signature,
             state: stateBefore,
             ...(narrationSelection.legacy
@@ -3587,8 +6112,33 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               }),
             speed: narrationSelection.speed,
           });
+          const repeatedMeasuredRepairInput = !!stateBefore.narration_repair
+            && stateBefore.narration_fit?.source === 'measured_calibration'
+            && stateBefore.narration_fit.text_sha256 === fit.text_sha256
+            && stateBefore.narration_fit.status !== 'fits';
+          if (repeatedMeasuredRepairInput) {
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_NARRATION_FIT_RETRY_NO_CHANGE',
+                message: 'This exact narration text already failed the measured timing check. Keep the approved voice, target, and structure; make a timing-focused text change before checking again. No new speech request or user confirmation is required.',
+                blocked_operation: op,
+                same_input_retry_allowed: false,
+                requires_user_decision: false,
+                billable_request_sent: false,
+                allowed_recovery_ops: ['composition.check_narration_fit', 'composition.status'],
+                next_action: 'revise_narration_then_composition.check_narration_fit',
+                narration_fit: fit,
+                production_state: await summarizeCompositionProductionState(stateBefore, compositionDirAbs),
+              },
+            });
+          }
           const repairIdentity = stateBefore.narration_repair
-            ? await videoProductionNarrationRepairIdentity(compositionDirAbs)
+            ? await videoProductionNarrationRepairIdentity(identity)
             : undefined;
           const repairAssessment = assessNarrationRepair({
             authorization: stateBefore.narration_repair,
@@ -3597,10 +6147,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             state: stateBefore,
           });
           const approvalInherited = repairAssessment.status === 'inheritable';
-          const repairBudgetExhausted = repairAssessment.reason === 'repair_check_budget_exhausted';
-          const planApprovalCurrent = stateBefore.plan_approval?.signature === identity.signature;
+          const planApprovalCurrent = planApprovalMatchesIdentity(stateBefore.plan_approval, identity);
           const gateBRequired = !planApprovalCurrent && (repairAssessment.status === 'none'
-            || (repairAssessment.status === 'rejected' && !repairBudgetExhausted));
+            || repairAssessment.status === 'rejected');
           const archivedNarrationPath = approvalInherited
             ? await archiveStaleNarrationAudio({
               state: stateBefore,
@@ -3616,13 +6165,16 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               setCurrentPlanApproval(next, {
                 gate: 'B',
                 signature: identity.signature,
+                identity_kind: 'approved_intent_sha256',
+                ...(identity.intentPayload ? { intent_snapshot: identity.intentPayload } : {}),
                 turn_id: authorization.approval_turn_id,
                 approved_at: authorization.approval_at,
+                ...(identity.artifactRecords ? { artifact_records: identity.artifactRecords } : {}),
                 artifact_paths: identity.artifactPaths,
                 inherited_from_signature: authorization.approval_signature,
                 inherited_at: new Date().toISOString(),
                 inheritance_reason: 'measured_narration_fit_repair',
-                validation_version: 1,
+                validation_version: 3,
               });
               delete next.narration;
               delete next.narration_transaction;
@@ -3649,9 +6201,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             : planApprovalCurrent && fit.status === 'fits'
               ? `${narrationFitMessage(fit)} The current production plan confirmation already covers this unchanged narration plan. Do not request it again; follow the current native narration operation.`
             : repairAssessment.status === 'pending'
-              ? `${narrationFitMessage(fit)} This remains an authorized internal timing repair. Revise once more and recheck without requesting production plan confirmation.`
-              : repairBudgetExhausted
-                ? `${narrationFitMessage(fit)} The bounded timing-repair check budget is exhausted. Report this deterministic blocker instead of requesting production plan confirmation again or sending another speech request.`
+              ? repairAssessment.reason === 'repair_strategy_review_required'
+                ? `${narrationFitMessage(fit)} The prior timing edits did not converge. Keep the existing approval and measured voice profile, diagnose the remaining difference, make a materially different timing-focused revision, and recheck without asking the user or sending another speech request.`
+                : `${narrationFitMessage(fit)} This remains an authorized internal timing repair. Revise once more and recheck without requesting production plan confirmation.`
                 : repairAssessment.status === 'rejected'
                   ? `${narrationFitMessage(fit)} The change is outside the timing-only repair authorization (${repairAssessment.reason}); a new production plan confirmation is required for the changed plan.`
                   : narrationFitMessage(fit);
@@ -3674,11 +6226,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   ? preparedHtmlPresent ? 'composition.materialize_narration' : 'composition.prepare'
                 : repairAssessment.status === 'pending'
                   ? 'revise_narration_then_composition.check_narration_fit'
-                  : repairBudgetExhausted
-                    ? 'report_narration_fit_blocker'
                     : fit.status === 'fits'
                       ? 'open_gate_b'
                       : 'revise_narration_then_composition.check_narration_fit',
+              requires_user_decision: gateBRequired,
+              allowed_recovery_ops: repairAssessment.status === 'pending'
+                ? ['composition.check_narration_fit', 'composition.status']
+                : [],
               message,
               billable_request_sent: false,
               narration_selection: {
@@ -3697,22 +6251,76 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as ToolResult;
         }
         if (op === 'composition.approve_plan') {
-          const identity = await videoProductionPlanIdentity(compositionDirAbs);
-          const planChanged = stateBefore.plan_approval?.signature !== identity.signature;
-          if (!identity.complete) {
-            return {
-              content: 'E_GATE_B_ARTIFACTS_INCOMPLETE: production plan confirmation requires project/script.md, project/shotlist.json, and composition/composition-manifest.json.',
-              isError: true,
-            } as ToolResult;
-          }
-          if (identity.requirementIssues.length > 0) {
-            return {
-              content: `E_GATE_B_REQUIREMENTS_INCOMPLETE: resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
-              isError: true,
-            } as ToolResult;
-          }
           const parentPlanRaw = String(input.plan_path || '').trim();
           const parentSegmentId = String(input.segment_id || '').trim();
+          const resolvedPlanDecision = resolveVideoStudioCurrentTurnDecision(
+            opts.userMessage,
+            'plan',
+            input.decision_evidence,
+          );
+          if (!parentPlanRaw && !parentSegmentId) {
+            const invalidEvidence = invalidDecisionEvidenceResult(op, 'plan', resolvedPlanDecision);
+            if (invalidEvidence) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                result: invalidEvidence,
+              });
+            }
+          }
+          const identity = await videoProductionPlanIdentity(compositionDirAbs, {
+            roots,
+            preferLocal: !!parentPlanRaw || !!parentSegmentId,
+          });
+          const planChanged = !planApprovalMatchesIdentity(stateBefore.plan_approval, identity);
+          if (!identity.complete) {
+            const artifactInvalid = (identity.artifactIssues?.length || 0) > 0;
+            const approvalReceived = resolvedPlanDecision.decision === 'approve';
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: identity.evidence.conflicts.length > 0
+                  ? 'E_GATE_B_ARTIFACT_CONFLICT'
+                  : artifactInvalid
+                    ? 'E_GATE_B_ARTIFACT_INVALID'
+                    : 'E_GATE_B_ARTIFACTS_INCOMPLETE',
+                message: identity.evidence.conflicts[0]?.message
+                  || (artifactInvalid
+                    ? `${approvalReceived ? 'Your confirmation is still valid. ' : ''}The current plan files are present, but one or more files could not be parsed or validated. Repair only the listed structure or fields without changing the confirmed plan, then retry approval validation in this same turn.`
+                    : `${approvalReceived ? 'Your confirmation was received. ' : ''}One or more current plan files are missing. Restore the listed script, shotlist, or manifest, then retry approval validation in this same turn.`),
+                evidence: identity.evidence,
+                artifact_issues: identity.artifactIssues || [],
+                billable_request_sent: false,
+                requires_user_decision: false,
+                approval_received: approvalReceived,
+                user_reconfirmation_required: !approvalReceived,
+                next_action: artifactInvalid
+                  ? 'repair_invalid_plan_artifacts_then_retry_composition.approve_plan'
+                  : 'restore_missing_plan_artifacts_then_retry_composition.approve_plan',
+              },
+            });
+          }
+          if (identity.requirementIssues.length > 0) {
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_GATE_B_REQUIREMENTS_INCOMPLETE',
+                message: `Resolve the production-plan metadata or narration-alignment issues before confirmation: ${identity.requirementIssues.join(', ')}.`,
+                evidence: identity.evidence,
+                requirement_issues: identity.requirementIssues,
+                requires_user_decision: false,
+                next_action: 'repair_current_plan_artifacts_before_confirmation',
+              },
+            });
+          }
           let inheritedParent: {
             signature: string;
             turnId: string;
@@ -3763,10 +6371,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 isError: true,
               } as ToolResult;
             }
-            if (explicitVideoStudioGateDecision(
-              opts.userMessage,
-              'plan',
-            ) !== 'approve') {
+            if (resolvedPlanDecision.decision !== 'approve') {
               return {
                 content: 'E_GATE_B_EXPLICIT_APPROVAL_REQUIRED: composition.approve_plan is allowed only when the current real user message explicitly approves the displayed script and shotlist.',
                 isError: true,
@@ -3774,8 +6379,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             }
           }
           if (input.expected_plan_change === true && !planChanged) {
-            return {
-              content: resultContent({
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
                 ok: false,
                 op,
                 errorCode: 'E_GATE_B_AMENDMENT_NOT_APPLIED',
@@ -3784,9 +6392,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 plan_changed: false,
                 visual_revision_recovery_available: false,
                 next_action: 'apply_approved_amendment_then_composition.approve_plan',
-              }),
-              isError: true,
-            } as ToolResult;
+                requires_user_decision: false,
+              },
+            });
           }
           const manifest = CompositionManifestSchema.parse(JSON.parse(
             await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
@@ -3822,7 +6430,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const approvedNarrationFit = approvedNarrationText
             ? checkedNarrationFit || compositionNarrationFit({
               text: approvedNarrationText,
-              targetDurationSec: await approvedTargetDurationSec(compositionDirAbs, manifest),
+              targetDurationSec: await approvedTargetDurationSec(manifest, identity),
               planSignature: identity.signature,
               state: stateBefore,
               ...(approvedNarrationSelection?.ok === true
@@ -3841,8 +6449,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             })
             : undefined;
           if (approvedNarrationFit && approvedNarrationFit.status !== 'fits') {
-            return {
-              content: resultContent({
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              planEvidence: identity.evidence,
+              result: {
                 ok: false,
                 op,
                 errorCode: 'E_GATE_B_NARRATION_FIT_REQUIRED',
@@ -3850,9 +6461,10 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 gate_b_ready: false,
                 billable_request_sent: false,
                 narration_fit: approvedNarrationFit,
-              }),
-              isError: true,
-            } as ToolResult;
+                requires_user_decision: false,
+                next_action: 'revise_narration_then_composition.check_narration_fit',
+              },
+            });
           }
           const currentNarrationTextSha = await currentPlanNarrationTextSha(compositionDirAbs);
           const trackedNarrationTextSha = stateBefore.narration?.text_sha256
@@ -3877,8 +6489,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             setCurrentPlanApproval(next, {
               gate: 'B',
               signature: identity.signature,
+              identity_kind: 'approved_intent_sha256',
+              ...(identity.intentPayload ? { intent_snapshot: identity.intentPayload } : {}),
               turn_id: inheritedParent?.turnId || opts.turnId!,
               approved_at: inheritedParent?.approvedAt || new Date().toISOString(),
+              ...(identity.artifactRecords ? { artifact_records: identity.artifactRecords } : {}),
               artifact_paths: identity.artifactPaths,
               ...(inheritedParent ? {
                 inherited_from_signature: inheritedParent.signature,
@@ -3887,7 +6502,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 parent_plan_path: inheritedParent.planPath,
                 parent_segment_id: inheritedParent.segmentId,
               } : {}),
-              validation_version: 1,
+              validation_version: 3,
             });
             if (approvedNarrationFit) next.narration_fit = approvedNarrationFit;
             else delete next.narration_fit;
@@ -3899,6 +6514,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               if (!narrationTextStillCurrent || !narrationSelectionStillCurrent) {
                 delete next.narration;
                 delete next.narration_transaction;
+                delete next.narration_retry_authorization;
               }
               delete next.capability_check;
               next.stage = 'manifest_ready';
@@ -3920,6 +6536,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               status: 'approved',
               gate: 'B',
               plan_signature: identity.signature,
+              approved_intent_hash: identity.signature,
+              plan_identity_kind: 'approved_intent_sha256',
               plan_changed: planChanged,
               visual_qa_reset: visualQaReset,
               approval_inherited: !!inheritedParent,
@@ -4044,6 +6662,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               } as ToolResult;
             }
           }
+          const referenceRequirement = await videoStudioReferenceReviewRequirement(compositionDirAbs);
+          let qualityScorecard;
+          try {
+            qualityScorecard = compileVideoStudioDesignQualityScorecard(
+              input.quality_scores,
+              referenceRequirement.required,
+            );
+            assertVideoStudioDesignQualityVerdict(
+              verdict,
+              findings,
+              qualityScorecard,
+              referenceRequirement.minimumScore,
+            );
+          } catch (err) {
+            return { content: (err as Error).message, isError: true } as ToolResult;
+          }
           const signature = reviewEntry.signature;
           let reviewed: VideoProductionStateV1;
           try {
@@ -4061,6 +6695,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 verdict,
                 scope,
                 findings,
+                quality_scorecard: qualityScorecard,
                 ...(reviewedFramePaths.length ? { reviewed_frame_paths: reviewedFramePaths } : {}),
               };
               recordVideoProductionTransition(next, {
@@ -4076,43 +6711,98 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (reviewKind === 'preview' && verdict === 'passed') {
             await publishVisibleOutputs(opts, [reviewEntry.path]);
           }
-          return {
-            content: resultContent({
-              ok: true,
-              op,
-              status: verdict,
-              review_target: reviewKind,
-              reviewed_frame_count: reviewedFramePaths.length,
-              expected_frame_count: expectedFramePaths.length,
-              ...(reviewKind === 'preview' ? {
-                preview_gate_ready: verdict === 'passed',
-                contact_sheet: reviewEntry.path || '',
-                frame_paths: expectedFramePaths,
-              } : {
-                gate_d_ready: verdict === 'passed',
-              }),
-              next_action: verdict === 'passed'
-                ? reviewKind === 'preview' ? 'show_preview_then_wait_for_user_approval' : 'composition.approve_draft'
-                : 'repair_visuals_then_composition.reconcile',
-              production_state: summarizeVideoProductionState(reviewed),
+          const reviewResult: Record<string, unknown> = {
+            ok: true,
+            op,
+            status: verdict,
+            review_target: reviewKind,
+            reviewed_frame_count: reviewedFramePaths.length,
+            expected_frame_count: expectedFramePaths.length,
+            quality_scorecard: qualityScorecard,
+            ...(reviewKind === 'preview' ? {
+              preview_gate_ready: verdict === 'passed',
+              contact_sheet: reviewEntry.path || '',
+              frame_paths: expectedFramePaths,
+            } : {
+              gate_d_ready: verdict === 'passed',
             }),
+            ...(verdict !== 'passed' ? {
+              conclusion_code: reviewKind === 'preview'
+                ? 'E_PREVIEW_DESIGN_REVIEW_NOT_ACCEPTED'
+                : 'E_DRAFT_DESIGN_REVIEW_NOT_ACCEPTED',
+              message: findings.length
+                ? `The current ${reviewKind} was not accepted: ${findings.join('; ')}`
+                : `The current ${reviewKind} was not accepted by design review.`,
+              requires_user_decision: false,
+            } : {}),
+            next_action: verdict === 'passed'
+              ? reviewKind === 'preview' ? 'show_preview_then_wait_for_user_approval' : 'composition.approve_draft'
+              : 'repair_visuals_then_composition.reconcile',
+            ...(reviewed.current_candidate ? { current_candidate: reviewed.current_candidate } : {}),
+            production_state: summarizeVideoProductionState(reviewed),
+          };
+          if (verdict !== 'passed') {
+            return reviewToolResult({
+              opts,
+              state: reviewed,
+              result: reviewResult,
+              isError: false,
+            });
+          }
+          return {
+            content: resultContent(reviewResult),
             isError: false,
           } as ToolResult;
         }
         if (op === 'composition.approve_preview' || op === 'composition.approve_draft') {
           const kind = op === 'composition.approve_preview' ? 'preview' : 'draft';
-          const explicitlyApproved = explicitVideoStudioGateDecision(
+          const resolvedDecision = resolveVideoStudioCurrentTurnDecision(
             opts.userMessage,
             kind,
-          ) === 'approve';
+            input.decision_evidence,
+          );
+          const invalidEvidence = invalidDecisionEvidenceResult(op, kind, resolvedDecision);
+          if (invalidEvidence) {
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              result: invalidEvidence,
+            });
+          }
+          const explicitlyApproved = resolvedDecision.decision === 'approve';
           const approval = await approveVideoStudioGate(
             gateStatePath,
             kind,
             compositionDirAbs,
             opts.turnId || '',
             explicitlyApproved,
+            resolvedDecision.source,
+            resolvedDecision.artifact_signature,
           );
           if (approval.ok === false) {
+            if (approval.errorCode === 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED') {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                result: {
+                  ok: false,
+                  op,
+                  errorCode: approval.errorCode,
+                  message: approval.message,
+                  submitted_decision_status: approval.submitted_decision_status,
+                  submitted_artifact_signature: approval.submitted_artifact_signature,
+                  current_artifact_signature: approval.current_artifact_signature,
+                  current_review_status: 'pending',
+                  requires_user_decision: true,
+                  user_reconfirmation_required: false,
+                  billable_request_sent: false,
+                  next_action: 'show_current_artifact_and_keep_existing_review_pending',
+                  ...(stateBefore.current_candidate
+                    ? { current_candidate: stateBefore.current_candidate }
+                    : {}),
+                },
+              });
+            }
             return { content: `${approval.errorCode}: ${approval.message}`, isError: true } as ToolResult;
           }
           return {
@@ -4123,6 +6813,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               stage: kind === 'preview' ? 'preview_approval' : 'draft_approval',
               artifact_signature: approval.entry.signature,
               approved_at: approval.entry.approved_at,
+              decision_source: resolvedDecision.source,
               next_allowed_ops: kind === 'preview' ? ['composition.draft'] : ['composition.export'],
               production_state: summarizeVideoProductionState(
                 await readVideoProductionState(gateStatePath, compositionDirAbs),
@@ -4137,11 +6828,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             statePath: gateStatePath,
             ...(typeof input.voice === 'string' && input.voice.trim() ? { voice: input.voice.trim() } : {}),
             ...(typeof input.speed === 'number' ? { speed: input.speed } : {}),
+            decisionEvidence: input.decision_evidence,
             opts,
             ctx,
           });
+          let narrationState: VideoProductionStateV1;
           if (narrationResult.ok !== true) {
-            const failedState = await recordVideoStudioOperationState({
+            narrationState = await recordVideoStudioOperationState({
               statePath: gateStatePath,
               compositionDirAbs,
               op,
@@ -4149,7 +6842,6 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ok: false,
               errorCode: typeof narrationResult.errorCode === 'string' ? narrationResult.errorCode : undefined,
             });
-            narrationResult.production_state = await summarizeCompositionProductionState(failedState, compositionDirAbs);
           } else {
             await notifyWritten(opts, [
               narrationResult.path,
@@ -4157,19 +6849,84 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               narrationResult.html_path,
               narrationResult.narration_map_path,
             ]);
+            narrationState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+          }
+          narrationState = await recordCurrentVideoProductionCandidate({
+            statePath: gateStatePath,
+            compositionDirAbs,
+            op,
+            result: narrationResult,
+          });
+          if (narrationState.current_candidate) {
+            narrationResult.current_candidate = narrationState.current_candidate;
+          }
+          narrationResult.production_state = await summarizeCompositionProductionState(
+            narrationState,
+            compositionDirAbs,
+          );
+          if (narrationResult.ok !== true) {
+            narrationResult.review_package = await deliverReviewPackage({
+              opts,
+              state: narrationState,
+              result: narrationResult,
+            });
           }
           return { content: resultContent(narrationResult), isError: narrationResult.ok !== true } as ToolResult;
         }
         if (op === 'composition.draft' && await videoStudioPreviewRequired(compositionDirAbs)) {
           const gate = await validateVideoStudioGate(gateStatePath, 'preview', compositionDirAbs, opts.turnId || '');
           if (gate.ok === false) {
-            return { content: `${gate.errorCode}: ${gate.message}`, isError: true } as ToolResult;
+            const currentState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+            const blockedResult = {
+              ok: false,
+              op,
+              errorCode: gate.errorCode,
+              message: gate.message,
+              ...(currentState.current_candidate
+                ? { current_candidate: currentState.current_candidate }
+                : {}),
+              production_state: await summarizeCompositionProductionState(currentState, compositionDirAbs),
+            };
+            const reviewPackage = await deliverReviewPackage({
+              opts,
+              state: currentState,
+              result: blockedResult,
+            });
+            return {
+              content: resultContent({
+                ...blockedResult,
+                review_package: reviewPackage,
+              }),
+              isError: true,
+            } as ToolResult;
           }
         }
         if (op === 'composition.export') {
           const gate = await validateVideoStudioGate(gateStatePath, 'draft', compositionDirAbs, opts.turnId || '');
           if (gate.ok === false) {
-            return { content: `${gate.errorCode}: ${gate.message}`, isError: true } as ToolResult;
+            const currentState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+            const blockedResult = {
+              ok: false,
+              op,
+              errorCode: gate.errorCode,
+              message: gate.message,
+              ...(currentState.current_candidate
+                ? { current_candidate: currentState.current_candidate }
+                : {}),
+              production_state: await summarizeCompositionProductionState(currentState, compositionDirAbs),
+            };
+            const reviewPackage = await deliverReviewPackage({
+              opts,
+              state: currentState,
+              result: blockedResult,
+            });
+            return {
+              content: resultContent({
+                ...blockedResult,
+                review_package: reviewPackage,
+              }),
+              isError: true,
+            } as ToolResult;
           }
         }
         if (op === 'composition.inspect' || op === 'composition.snapshot') {
@@ -4178,17 +6935,64 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             compositionDirAbs,
             op,
           });
-          if (guarded) return guarded;
+          if (guarded) {
+            const guardedState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+            const guardedResult = JSON.parse(guarded.content) as Record<string, unknown>;
+            const reviewPackage = await deliverReviewPackage({
+              opts,
+              state: guardedState,
+              result: guardedResult,
+            });
+            return {
+              ...guarded,
+              content: resultContent({
+                ...guardedResult,
+                review_package: reviewPackage,
+              }),
+            };
+          }
         }
-        const renderBudgetKey = `video_studio:full_render_count:${compositionDirAbs}`;
-        const runScopedLedger = ctx.state.runScopedLedger instanceof Map
-          ? ctx.state.runScopedLedger as Map<string, unknown>
-          : new Map<string, unknown>();
-        if (!(ctx.state.runScopedLedger instanceof Map)) ctx.state.runScopedLedger = runScopedLedger;
-        const fullRenderCount = Number(runScopedLedger.get(renderBudgetKey) || 0);
-        if ((op === 'composition.draft' || op === 'composition.export') && fullRenderCount >= 2) {
+        const renderInputSignature = (op === 'composition.draft' || op === 'composition.export')
+          ? (await videoProductionArtifacts(compositionDirAbs)).composition_signature || 'missing-signature'
+          : '';
+        const identicalRenderAttempts = stateBefore.operation_journal?.filter(
+          (entry) => entry.op === op
+            && entry.input_hash === renderInputSignature
+            && entry.status === 'failed'
+            && entry.consumes_same_input_attempt === true,
+        ).length || 0;
+        if ((op === 'composition.draft' || op === 'composition.export') && identicalRenderAttempts >= 2) {
+          const blockedResult = {
+            ok: false,
+            op,
+            errorCode: 'E_FULL_RENDER_RETRY_NO_CHANGE',
+            message: 'Two full render attempts already ran for this exact composition input. Do not repeat the unchanged render; inspect the recorded failure, edit the relevant canonical input, and retry with the new input signature. No user confirmation is required.',
+            blocked_operation: op,
+            input_signature: renderInputSignature,
+            same_input_retry_allowed: false,
+            requires_user_decision: false,
+            allowed_recovery_ops: ['composition.status', 'composition.reconcile', 'composition.lint', 'composition.inspect'],
+            next_action: 'repair_inputs_then_retry_render',
+            operation_journal_evidence: {
+              input_hash: renderInputSignature,
+              same_input_attempts: identicalRenderAttempts,
+              durable: true,
+            },
+            ...(stateBefore.current_candidate
+              ? { current_candidate: stateBefore.current_candidate }
+              : {}),
+            production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
+          };
+          const reviewPackage = await deliverReviewPackage({
+            opts,
+            state: stateBefore,
+            result: blockedResult,
+          });
           return {
-            content: 'E_FULL_RENDER_TURN_BUDGET_EXCEEDED: Two full render attempts already ran in this turn. Stop and report the blocker or wait for explicit user direction instead of rendering again.',
+            content: resultContent({
+              ...blockedResult,
+              review_package: reviewPackage,
+            }),
             isError: true,
           } as ToolResult;
         }
@@ -4242,7 +7046,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const errorCode = interrupted
             ? 'E_VIDEO_PRODUCTION_OPERATION_INTERRUPTED'
             : 'E_VIDEO_PRODUCTION_OPERATION_FAILED';
-          const failedState = await recordVideoStudioOperationState({
+          let failedState = await recordVideoStudioOperationState({
             statePath: gateStatePath,
             compositionDirAbs,
             op,
@@ -4250,16 +7054,37 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             ok: false,
             errorCode,
           });
+          const failedResult = {
+            ok: false,
+            op,
+            errorCode,
+            message: interrupted
+              ? 'The operation was interrupted. Its durable state was preserved; resume with composition.status and composition.reconcile instead of requesting production plan confirmation again or blindly rerunning.'
+              : `The operation failed before a normal tool result: ${(err as Error).message || String(err)}`,
+          };
+          failedState = await recordCurrentVideoProductionCandidate({
+            statePath: gateStatePath,
+            compositionDirAbs,
+            op,
+            result: failedResult,
+          });
+          const failedPayload = {
+            ...failedResult,
+            ...(failedState.current_candidate
+              ? { current_candidate: failedState.current_candidate }
+              : {}),
+            recovery: ['composition.status', 'composition.reconcile'],
+            production_state: await summarizeCompositionProductionState(failedState, compositionDirAbs),
+          };
+          const reviewPackage = await deliverReviewPackage({
+            opts,
+            state: failedState,
+            result: failedPayload,
+          });
           return {
             content: resultContent({
-              ok: false,
-              op,
-              errorCode,
-              message: interrupted
-                ? 'The operation was interrupted. Its durable state was preserved; resume with composition.status and composition.reconcile instead of requesting production plan confirmation again or blindly rerunning.'
-                : `The operation failed before a normal tool result: ${(err as Error).message || String(err)}`,
-              recovery: ['composition.status', 'composition.reconcile'],
-              production_state: await summarizeCompositionProductionState(failedState, compositionDirAbs),
+              ...failedPayload,
+              review_package: reviewPackage,
             }),
             isError: true,
           } as ToolResult;
@@ -4294,9 +7119,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as typeof result;
         }
 
-        if ((op === 'composition.draft' || op === 'composition.export') && resultConsumesFullRenderTurnBudget(result)) {
-          runScopedLedger.set(renderBudgetKey, fullRenderCount + 1);
-        }
+        const consumesFullRenderAttempt = (op === 'composition.draft' || op === 'composition.export')
+          && resultConsumesFullRenderTurnBudget(result);
 
         if (result.ok && op === 'composition.snapshot' && opts.turnId) {
           const recorded = await recordVideoStudioGate(gateStatePath, 'preview', compositionDirAbs, opts.turnId, result);
@@ -4349,6 +7173,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as typeof result;
         }
 
+        if (findingsAbsPath && await existingCandidateFile(findingsAbsPath)) {
+          result = { ...result, findings_path: findingsAbsPath } as typeof result;
+        }
+        if (reportAbsPath && await existingCandidateFile(reportAbsPath)) {
+          result = { ...result, report_path: reportAbsPath } as typeof result;
+        }
+
         let productionState: VideoProductionStateV1;
         const gateRecorded = result.ok
           && !!opts.turnId
@@ -4373,20 +7204,48 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             ok: result.ok,
             ...(nextStage ? { stage: nextStage } : {}),
             ...(result.ok === false && typeof result.errorCode === 'string' ? { errorCode: result.errorCode } : {}),
+            ...(consumesFullRenderAttempt ? { consumesSameInputAttempt: true } : {}),
           });
         }
+        productionState = await recordCurrentVideoProductionCandidate({
+          statePath: gateStatePath,
+          compositionDirAbs,
+          op,
+          result: result as Record<string, unknown>,
+        });
         const productionStateSummary = await summarizeCompositionProductionState(productionState, compositionDirAbs);
+        const nativeAllowedRecoveryOps = result.ok === false && Array.isArray(result.next_allowed_ops)
+          ? result.next_allowed_ops
+          : result.ok === false && Array.isArray((result as Record<string, unknown>).allowed_recovery_ops)
+            ? (result as Record<string, unknown>).allowed_recovery_ops as unknown[]
+            : undefined;
         result = {
           ...result,
+          ...(productionState.current_candidate
+            ? { current_candidate: productionState.current_candidate }
+            : {}),
           production_state: productionStateSummary,
-          next_allowed_ops: Array.isArray(productionStateSummary.next_allowed_ops)
-            ? productionStateSummary.next_allowed_ops
-            : [],
+          next_allowed_ops: nativeAllowedRecoveryOps
+            ?? (Array.isArray(productionStateSummary.next_allowed_ops)
+              ? productionStateSummary.next_allowed_ops
+              : []),
         } as typeof result;
 
+        if (result.ok === false) {
+          const reviewPackage = await deliverReviewPackage({
+            opts,
+            state: productionState,
+            result: result as Record<string, unknown>,
+          });
+          result = {
+            ...result,
+            review_package: reviewPackage,
+          } as typeof result;
+        }
         if (result.ok) {
           await notifyWritten(opts, [
             result.path,
+            result.cover_path,
             result.first_frame,
             result.report_path,
             result.findings_path,
@@ -4399,6 +7258,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (op === 'composition.draft' || op === 'composition.export') {
             await publishVisibleOutputs(opts, [
               result.path,
+              result.cover_path,
             ]);
           }
         }

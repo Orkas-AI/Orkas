@@ -8,6 +8,7 @@
  * `vs.openVecStore(dbDir)` directly — no uid / `getActiveUserId` ceremony.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { userKbVectorDbPath } from '../paths';
@@ -88,6 +89,15 @@ export function deleteFile(uid: string, relPath: string): Promise<boolean> {
 // ── Search / read ──────────────────────────────────────────────────────
 
 export function search(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
+  return storeForUid(uid).search(queryVec, opts);
+}
+
+/** Query an already-built Library index without creating an empty vector
+ * store. Interactive global search calls this on every settled query, so a
+ * user with no Library must stay a read-only no-op. Index creation and source
+ * reconciliation remain owned by the Library indexing lifecycle. */
+export function searchExisting(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
+  if (!fs.existsSync(userKbVectorDbPath(uid))) return [];
   return storeForUid(uid).search(queryVec, opts);
 }
 

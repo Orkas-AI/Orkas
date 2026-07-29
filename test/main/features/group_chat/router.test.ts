@@ -113,6 +113,7 @@ describe('group_chat router › resolveRecipients', () => {
       activeRecipient: 'writer',
     });
     expect(r.to).toEqual(['writer']);
+    expect(r.hadExplicitMention).toBe(false);
   });
 
   it('user explicit @commander overrides the floor (routes to commander)', () => {
@@ -130,6 +131,7 @@ describe('group_chat router › resolveRecipients', () => {
       activeRecipient: 'writer',
     });
     expect(r.to).toEqual(['coder']);
+    expect(r.hadExplicitMention).toBe(true);
   });
 
   it('floor agent no longer on the roster → falls back to [commander]', () => {
@@ -370,6 +372,21 @@ describe('group_chat router › form encoding', () => {
     expect(r.status).toBe('success');
     expect(r.cleanText).toBe('我会交给 @分析师 处理。');
     expect(r.cleanText).not.toContain('commander-result');
+  });
+
+  it('extractActorResultFromFinal strips JSON-escaped markers without breaking JSON', () => {
+    const text = JSON.stringify({
+      calls: ['video_studio(op=composition.approve_preview)'],
+      do_not_do: ['不要执行付费操作', '<agent-result status="success" />'],
+    });
+    const r = extractActorResultFromFinal(text);
+
+    expect(r.status).toBe('success');
+    expect(r.cleanText).not.toContain('agent-result');
+    expect(JSON.parse(r.cleanText)).toEqual({
+      calls: ['video_studio(op=composition.approve_preview)'],
+      do_not_do: ['不要执行付费操作', ''],
+    });
   });
 
   it('extractActorResultFromFinal strips invalid markers without accepting the status', () => {

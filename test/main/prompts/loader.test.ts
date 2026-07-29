@@ -185,6 +185,12 @@ describe('prompts › chat_shared_rules PDF toolchain invariants', () => {
     // markdown bold form ("**do not** fall back") the prompt now uses.
     expect(body).toMatch(/do not\W+fall back/i);
   });
+
+  it('uses a bounded visual fallback for failed OCR instead of shell repair', () => {
+    const body = load();
+    expect(body).toMatch(/local OCR returns `E_OCR_\*`[\s\S]*fall back once with `pdf_render`/i);
+    expect(body).toMatch(/Never install or repair OCR\/PDF packages with `bash`, `pip`, or `uv`/i);
+  });
 });
 
 describe('prompts › chat_shared_rules ordinary reply structure', () => {
@@ -198,5 +204,18 @@ describe('prompts › chat_shared_rules ordinary reply structure', () => {
     expect(body).toMatch(/most important section first/i);
     expect(body).toMatch(/structured data, metrics, comparisons, timelines, and status snapshots in `:::dashboard` by default/i);
     expect(body).toMatch(/full reports, or playbooks/i);
+  });
+});
+
+describe('prompts › user-intent integrity', () => {
+  it('preserves explicit constraints and keeps open preferences out of closed selects', () => {
+    const body = prompts.load('chat_user_intent_rules', {});
+    expect(body).toMatch(/explicit user requirements as the primary execution constraints/i);
+    expect(body).toMatch(/Optional preferences are not blockers/i);
+    expect(body).toMatch(/Do not re-ask a resolved field/i);
+    expect(body).toMatch(/select.*multiselect.*genuinely closed domain/is);
+    expect(body).toMatch(/open preferences.*text.*textarea/is);
+    expect(body).toMatch(/suggestions may be optional examples, never an exhaustive list/i);
+    expect(body).toMatch(/approve them or revise them with free text/i);
   });
 });

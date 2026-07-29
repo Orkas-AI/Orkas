@@ -10,9 +10,9 @@
  *
  * Four categories (see Common/docs/plans/agent-bash-risk-prompt.md §1):
  *   - network_egress  — UPLOAD / exfil shapes only; plain downloads pass.
- *   - destructive     — shell delete commands (`rm`, `rmdir`, `unlink`), plus
- *                       dd / mkfs / writes to raw devices / fork bombs.
- *   - priv_esc        — sudo / su / doas / pkexec.
+ *   - destructive     — shell delete commands (`rm`, `Remove-Item`, `del`),
+ *                       plus dd / mkfs / disk tools / fork bombs.
+ *   - priv_esc        — sudo / su / doas / pkexec / Windows elevation.
  *   - sensitive_path  — credential & key files (any access), persistence /
  *                       autostart locations (writes), /etc writes. Excludes
  *                       `.env`, broad `~/.config`, /etc reads, and the macOS
@@ -64,12 +64,44 @@ function tokenize(input: string): Tok[] {
     if (c === '"') {
       let j = i + 1; let buf = '';
       while (j < n && input[j] !== '"') {
-        if (input[j] === '\\' && j + 1 < n) { buf += input[j + 1]; j += 2; continue; }
+        if (input[j] === '\\' && j + 1 < n) {
+          const next = input[j + 1];
+          if (next === '"' || next === '\\' || next === '$' || next === '`') {
+            buf += next;
+            j += 2;
+            continue;
+          }
+          // In double-quoted POSIX shell text, backslash before an ordinary
+          // letter stays literal. Preserving it is also essential for
+          // Windows paths such as "C:\Users\test\.ssh\id_rsa".
+          buf += '\\';
+          j++;
+          continue;
+        }
         buf += input[j]; j++;
       }
       cur += buf; hasCur = true; i = (j < n ? j + 1 : n); continue;
     }
-    if (c === '\\') { if (i + 1 < n) { cur += input[i + 1]; hasCur = true; i += 2; } else { i++; } continue; }
+    if (c === '\\') {
+      if (i + 1 < n) {
+        const next = input[i + 1];
+        if (next === ' ' || next === '\t' || next === '\r' || next === '\n'
+          || next === '"' || next === "'" || next === '\\' || ONE_CHAR_OPS.has(next)) {
+          cur += next;
+          hasCur = true;
+          i += 2;
+        } else {
+          cur += '\\';
+          hasCur = true;
+          i++;
+        }
+      } else {
+        cur += '\\';
+        hasCur = true;
+        i++;
+      }
+      continue;
+    }
     if (c === ' ' || c === '\t' || c === '\r') { flush(); i++; continue; }
 
     const two = input.slice(i, i + 2);
@@ -189,6 +221,33 @@ function effectiveCommand(words: string[]): { cmd: string; args: string[] } | nu
   return { cmd, args: w.slice(1) };
 }
 
+const POWERSHELL_CMDS = new Set(['powershell', 'powershell.exe', 'pwsh', 'pwsh.exe']);
+const CMD_SHELL_CMDS = new Set(['cmd', 'cmd.exe']);
+
+function unwrapWindowsShell(
+  cmd: string,
+  args: string[],
+): { command: string; opaque: boolean } | null {
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (POWERSHELL_CMDS.has(cmd)) {
+    if (lower.some((arg) => arg === '-encodedcommand' || arg === '-enc' || arg === '-e')) {
+      return { command: '', opaque: true };
+    }
+    const marker = lower.findIndex((arg) => arg === '-command' || arg === '-c');
+    if (marker >= 0 && marker + 1 < args.length) {
+      return { command: args.slice(marker + 1).join(' '), opaque: false };
+    }
+    return null;
+  }
+  if (CMD_SHELL_CMDS.has(cmd)) {
+    const marker = lower.findIndex((arg) => arg === '/c' || arg === '/k');
+    if (marker >= 0 && marker + 1 < args.length) {
+      return { command: args.slice(marker + 1).join(' '), opaque: false };
+    }
+  }
+  return null;
+}
+
 function isFlag(w: string): boolean { return w.startsWith('-'); }
 
 function commandOperands(args: string[]): string[] {
@@ -205,6 +264,7 @@ function commandOperands(args: string[]): string[] {
 // ── Category matchers ────────────────────────────────────────────────────────
 
 const PRIV_ESC_CMDS = new Set(['sudo', 'su', 'doas', 'pkexec']);
+const WINDOWS_PRIV_ESC_CMDS = new Set(['runas', 'runas.exe', 'gsudo', 'gsudo.exe']);
 
 const NET_DOWNLOADERS = new Set(['curl', 'wget']);
 const RAW_SOCKET_CMDS = new Set(['nc', 'ncat', 'netcat', 'telnet', 'socat']);
@@ -218,6 +278,8 @@ const CURL_UPLOAD_FLAGS = new Set([
   '-d', '--data', '--data-binary', '--data-raw', '--data-urlencode',
   '-F', '--form', '-T', '--upload-file', '--post-file', '--post-data',
 ]);
+const POWERSHELL_WEB_CMDS = new Set(['invoke-webrequest', 'iwr', 'invoke-restmethod', 'irm']);
+const POWERSHELL_EXEC_CMDS = new Set(['invoke-expression', 'iex']);
 
 function looksRemote(arg: string): boolean {
   // user@host:path or host:path, but not a url scheme (http://) or windows
@@ -242,6 +304,15 @@ function matchNetwork(cmd: string, args: string[], seg: Segment): boolean {
     // command substitution in a downloader segment ⇒ likely URL exfil
     if (seg.hasSubstitution) return true;
   }
+  if (POWERSHELL_WEB_CMDS.has(cmd)) {
+    const lower = args.map((arg) => arg.toLowerCase());
+    for (let i = 0; i < lower.length; i++) {
+      const arg = lower[i];
+      if (arg === '-body' || arg === '-infile' || arg === '-form') return true;
+      if (arg === '-method' && /^(post|put|patch|delete)$/.test(lower[i + 1] || '')) return true;
+      if (/^-method:(post|put|patch|delete)$/.test(arg)) return true;
+    }
+  }
   return false;
 }
 
@@ -251,8 +322,10 @@ function matchPipeToShell(seg: Segment): boolean {
   for (const stage of seg.stages) {
     const eff = effectiveCommand(stage.words);
     if (!eff) continue;
-    if (sawDownloader && (SHELL_INTERPRETERS.has(eff.cmd))) return true;
-    if (NET_DOWNLOADERS.has(eff.cmd) || eff.cmd === 'fetch') sawDownloader = true;
+    if (sawDownloader && (SHELL_INTERPRETERS.has(eff.cmd) || POWERSHELL_EXEC_CMDS.has(eff.cmd))) return true;
+    if (NET_DOWNLOADERS.has(eff.cmd) || POWERSHELL_WEB_CMDS.has(eff.cmd) || eff.cmd === 'fetch') {
+      sawDownloader = true;
+    }
   }
   return false;
 }
@@ -277,6 +350,14 @@ function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
   if (cmd === 'dd') return true;
   if (/^mkfs/.test(cmd)) return true;
   if (cmd === 'shred' || cmd === 'fdisk' || cmd === 'parted' || cmd === 'sgdisk') return true;
+  if (cmd === 'remove-item' || cmd === 'del' || cmd === 'erase' || cmd === 'rd' || cmd === 'clear-content') {
+    if (args.some((arg) => arg === '-?' || arg === '/?' || arg === '--help')) return false;
+    // PowerShell accepts pipeline input, so `Get-ChildItem | Remove-Item`
+    // remains destructive even when this stage has no explicit operand.
+    return true;
+  }
+  if (cmd === 'clear-disk' || cmd === 'format-volume' || cmd === 'initialize-disk'
+    || cmd === 'remove-partition' || cmd === 'diskpart' || cmd === 'format') return true;
   // redirect / dd into a raw device
   if (seg.redirectTargets.some((t) => RAW_DEVICE_RE.test(t))) return true;
   if (cmd === 'tee' && args.some((t) => RAW_DEVICE_RE.test(t))) return true;
@@ -309,10 +390,13 @@ const PERSIST_PATH_RES: RegExp[] = [
   /(^|\/)\.config\/systemd/i,
   /\/etc\/systemd/i,
   /(^|\/)\.config\/autostart/i,
-  /\\Start Menu\\Programs\\Startup/i,
+  /\/Start Menu\/Programs\/Startup/i,
 ];
 
-const WRITE_CMDS = new Set(['tee', 'cp', 'mv', 'ln', 'install', 'rsync', 'dd']);
+const WRITE_CMDS = new Set([
+  'tee', 'cp', 'mv', 'ln', 'install', 'rsync', 'dd',
+  'set-content', 'add-content', 'out-file', 'new-item', 'copy-item', 'move-item',
+]);
 
 function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: string[]): boolean {
   // macOS keychain dumping tool
@@ -321,19 +405,58 @@ function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: str
   }
   // crontab install (-, or a file arg) ⇒ persistence
   if (cmd === 'crontab' && (args.includes('-') || args.some((a) => !isFlag(a)))) return true;
+  if ((cmd === 'cmdkey' || cmd === 'cmdkey.exe') && args.some((arg) => /^\/list/i.test(arg))) return true;
+  if ((cmd === 'vaultcmd' || cmd === 'vaultcmd.exe') && args.some((arg) => /^\/listcreds/i.test(arg))) return true;
 
   // credential/key material: any token referencing it
   for (const w of allWords) {
-    if (CRED_PATH_RES.some((re) => re.test(w))) return true;
+    const normalized = w.replace(/\\/g, '/');
+    if (CRED_PATH_RES.some((re) => re.test(normalized))) return true;
   }
 
   // persistence/autostart + /etc: only when this segment WRITES.
   const writes = seg.redirectTargets.length > 0 || WRITE_CMDS.has(cmd);
   if (writes) {
-    const writeTargets = [...seg.redirectTargets, ...args.filter((a) => !isFlag(a))];
+    const writeTargets = [...seg.redirectTargets, ...args.filter((a) => !isFlag(a))]
+      .map((target) => target.replace(/\\/g, '/'));
     for (const t of writeTargets) {
       if (PERSIST_PATH_RES.some((re) => re.test(t))) return true;
       if (/^\/etc\//.test(t)) return true; // write under /etc (reads are not flagged)
+    }
+  }
+  const normalizedArgs = args.join(' ').replace(/\\/g, '/');
+  if (cmd === 'reg' || cmd === 'reg.exe') {
+    if (args[0]?.toLowerCase() === 'add'
+      && /\/CurrentVersion\/Run(?:Once)?(?:[\/\s]|$)/i.test(normalizedArgs)) return true;
+  }
+  if ((cmd === 'schtasks' || cmd === 'schtasks.exe') && args.some((arg) => arg.toLowerCase() === '/create')) {
+    return true;
+  }
+  if (cmd === 'register-scheduledtask' || cmd === 'new-scheduledtask'
+    || cmd === 'set-scheduledtask') return true;
+  if ((cmd === 'set-itemproperty' || cmd === 'new-itemproperty')
+    && /\/CurrentVersion\/Run(?:Once)?(?:[\/\s]|$)/i.test(normalizedArgs)) return true;
+  return false;
+}
+
+function matchPrivilegeEscalation(cmd: string, args: string[]): boolean {
+  if (PRIV_ESC_CMDS.has(cmd) || WINDOWS_PRIV_ESC_CMDS.has(cmd)) return true;
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (cmd === 'start-process') {
+    return lower.some((arg, index) => (
+      (arg === '-verb' && lower[index + 1] === 'runas') || arg === '-verb:runas'
+    ));
+  }
+  if (cmd === 'set-executionpolicy') {
+    return lower.some((arg) => arg === 'bypass' || arg === 'unrestricted');
+  }
+  if (cmd === 'add-mppreference') {
+    return lower.some((arg) => arg.startsWith('-exclusion'));
+  }
+  if (cmd === 'net' || cmd === 'net.exe') {
+    if (lower[0] === 'user') return lower.some((arg) => arg === '/add' || arg === '/delete' || arg.startsWith('/active:'));
+    if (lower[0] === 'localgroup' && lower[1] === 'administrators') {
+      return lower.some((arg) => arg === '/add' || arg === '/delete');
     }
   }
   return false;
@@ -343,7 +466,7 @@ function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: str
 
 /** Classify a bash command. Returns the set of risk categories it trips
  *  (deduped); `risky` is true when any category fires. */
-export function classifyBashCommand(command: string): RiskResult {
+function classifyBashCommandInternal(command: string, depth: number): RiskResult {
   const reasons = new Set<RiskCategory>();
   const cmd = String(command ?? '');
   if (!cmd.trim()) return { risky: false, reasons: [] };
@@ -364,18 +487,31 @@ export function classifyBashCommand(command: string): RiskResult {
       if (!eff) continue;
       let { cmd: c, args } = eff;
 
-      if (PRIV_ESC_CMDS.has(c)) {
+      if (matchPrivilegeEscalation(c, args)) {
         reasons.add('priv_esc');
         // inspect the inner command too: `sudo rm -rf /`
-        const inner = effectiveCommand(args);
-        if (inner) { c = inner.cmd; args = inner.args; }
+        if (PRIV_ESC_CMDS.has(c)) {
+          const inner = effectiveCommand(args);
+          if (inner) { c = inner.cmd; args = inner.args; }
+        }
       }
 
       if (matchNetwork(c, args, seg)) reasons.add('network_egress');
       if (matchDestructive(c, args, seg)) reasons.add('destructive');
       if (matchSensitive(c, args, seg, allWords)) reasons.add('sensitive_path');
+
+      const wrapped = unwrapWindowsShell(c, args);
+      if (wrapped?.opaque) reasons.add('destructive');
+      if (wrapped?.command && depth < 4) {
+        const nested = classifyBashCommandInternal(wrapped.command, depth + 1);
+        for (const reason of nested.reasons) reasons.add(reason);
+      }
     }
   }
 
   return { risky: reasons.size > 0, reasons: [...reasons] };
+}
+
+export function classifyBashCommand(command: string): RiskResult {
+  return classifyBashCommandInternal(command, 0);
 }

@@ -18,7 +18,8 @@
  *                `friendlyRetryReason`
  *   provider_fallback → non-blocking credential warning; the run continues
  *                       on the next configured candidate
- *   context_status → {type:'progress', text: '<message>'}
+ *   context_status → {type:'event', event:{stream:'context', data:{phase,...}}}
+ *                    — semantic only; renderer localizes the phase
  *   compaction → {type:'progress', text: 'compacted <before>→<after> tokens'}
  *   done (ok)  → {type:'final', text} then {type:'done'}
  *   done (err) → {type:'error', text: meta.error.message} then {type:'done'}
@@ -34,6 +35,10 @@ import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { userAgentsDir, userMarketplaceAgentsDir, userSystemSkillsDir } from '../../paths';
 import { providerLabel } from '../provider_catalog';
 import * as path from 'node:path';
+import {
+  classifyTransientNetworkError,
+  isStorageFullError,
+} from '../../../core-agent/src/shared/errors';
 
 const log = createLogger('model');
 
@@ -64,6 +69,7 @@ export interface AgentReadEventMetadata {
 
 type AgentErrorMeta = {
   kind: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
+  message: string;
   code?: string;
 };
 
@@ -71,12 +77,19 @@ function modelFailureDetails(
   error: AgentErrorMeta,
   hasVisibleText: boolean,
 ): Pick<StreamEvent, 'failureKind' | 'failureCode' | 'failurePhase'> {
-  const code = String(error.code || '').trim().toUpperCase();
+  const rawCode = String(error.code || '').trim();
+  const code = rawCode.toUpperCase();
+  const transientKind = classifyTransientNetworkError(error);
   let failureCode = 'provider_error';
   let failurePhase: NonNullable<StreamEvent['failurePhase']> = hasVisibleText ? 'model_text' : 'provider_wait';
 
-  if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
-  else if (code === 'PROVIDER_NETWORK_EXHAUSTED' || /^(ECONN|ENET|EAI_|ETIMEDOUT|UND_ERR_)/.test(code)) failureCode = 'provider_network';
+  if (isStorageFullError(error)) failureCode = 'storage_full';
+  else if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
+  else if (code === 'PROVIDER_EMPTY_RESPONSE') failureCode = 'empty_response';
+  else if (code === 'PROVIDER_NETWORK_EXHAUSTED') failureCode = 'provider_network';
+  else if (transientKind === 'timeout') failureCode = 'provider_timeout';
+  else if (transientKind === 'connection_dropped' || transientKind === 'network') failureCode = 'provider_network';
+  else if (/^(ECONN|ENET|EAI_|ETIMEDOUT|UND_ERR_)/.test(code)) failureCode = 'provider_network';
   else if (code === 'NO_PROVIDER') failureCode = 'provider_not_configured';
   else if (error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED') failureCode = 'provider_auth';
   else if (error.kind === 'rate_limit' || code === 'PROVIDER_RATE_LIMIT_EXHAUSTED') failureCode = 'provider_rate_limit';
@@ -176,13 +189,30 @@ export function friendlyRetryReason(reason: string): string {
   return t('errors.network');
 }
 
-function localizeKnownRunnerText(text: string): string {
+function localizeKnownRunnerText(text: string, code?: string): string {
   const trimmed = String(text || '').trim();
+  if (isStorageFullError({ message: trimmed, code })) return t('errors.storage_full');
+  if (String(code || '').trim().toUpperCase() === 'PROVIDER_EMPTY_RESPONSE') return t('model.empty_response');
   if (trimmed === '(Tool loop limit reached)') return t('model.tool_loop_limit_reached');
   if (trimmed === 'Run aborted') return t('model.run_aborted');
   if (trimmed === 'Max retries exceeded') return t('model.max_retries_exceeded');
   if (trimmed === 'empty response') return t('model.empty_response');
   return text;
+}
+
+function localizeKnownRunnerError(error: AgentErrorMeta): string {
+  const raw = error.message || 'unknown error';
+  const known = localizeKnownRunnerText(raw, error.code);
+  if (known !== raw) return known;
+  const transientKind = classifyTransientNetworkError(error);
+  if (
+    transientKind === 'connection_dropped'
+    || transientKind === 'timeout'
+    || transientKind === 'network'
+  ) {
+    return t('errors.model_network_unavailable');
+  }
+  return raw;
 }
 
 function toolInputPath(input: unknown): string {
@@ -528,7 +558,17 @@ export async function* mapCoreAgentEvents(
           ),
           event: {
             stream: 'provider',
-            data: { phase: 'fallback', reason: ev.reason, provider_id: ev.providerId },
+            data: {
+              phase: 'fallback',
+              reason: ev.reason,
+              provider_id: ev.providerId,
+              ...(ev.candidateIndex !== undefined
+                ? { candidate_index: Math.max(1, Math.round(ev.candidateIndex)) }
+                : {}),
+              ...(ev.candidateCount !== undefined
+                ? { candidate_count: Math.max(1, Math.round(ev.candidateCount)) }
+                : {}),
+            },
           },
         };
         break;
@@ -536,8 +576,7 @@ export async function* mapCoreAgentEvents(
 
       case 'context_status': {
         yield {
-          type: 'progress',
-          text: ev.message,
+          type: 'event',
           event: { stream: 'context', data: { phase: ev.phase, ...(ev.data || {}) } },
         };
         break;
@@ -576,7 +615,7 @@ export async function* mapCoreAgentEvents(
           };
         }
         if (result.meta.error) {
-          error = localizeKnownRunnerText(result.meta.error.message || 'unknown error');
+          error = localizeKnownRunnerError(result.meta.error);
           failureDetails = modelFailureDetails(result.meta.error, finalText.length > 0);
           // meta.error is `{kind, message}` — cause/stack live on the
           // ProviderError that runner.ts already logged via `log.warn(...)`
@@ -584,6 +623,8 @@ export async function* mapCoreAgentEvents(
           log.warn('core-agent done with error', {
             error_chars: error.length,
             kind: result.meta.error.kind,
+            error_code: result.meta.error.code,
+            failure_code: failureDetails.failureCode,
             model: result.meta.model,
             provider: result.meta.provider,
             durationMs: result.meta.durationMs,

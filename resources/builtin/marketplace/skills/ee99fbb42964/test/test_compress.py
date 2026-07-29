@@ -43,6 +43,13 @@ class TokenizeAndScore(unittest.TestCase):
     def test_score_empty_query(self):
         self.assertEqual(_score(set(), tokenize("anything at all")), (0.0, 0.0))
 
+    def test_tokenize_cjk_uses_bigrams(self):
+        terms = set(tokenize("中文压缩预算是否严格"))
+        self.assertIn("中文", terms)
+        self.assertIn("压缩", terms)
+        self.assertIn("预算", terms)
+        self.assertNotIn("是否", terms)
+
 
 class Chunking(unittest.TestCase):
     def test_paragraph_split_respects_cap(self):
@@ -173,8 +180,40 @@ class CompressIntegration(unittest.TestCase):
 
     def test_no_query_skips_scoring(self):
         out = compress.compress({"query": "", "sources": _payload()["sources"]})
-        self.assertTrue(out["stats"]["skipped_compression"])
+        self.assertFalse(out["stats"]["skipped_compression"])
+        self.assertTrue(out["stats"]["skipped_scoring"])
         self.assertTrue(all(k["score"] is None for k in out["kept"]))
+        self.assertLessEqual(out["stats"]["chars_out"], out["budget_chars"])
+
+    def test_cjk_large_input_is_ranked_and_hard_bounded(self):
+        relevant = "本研究分析中文压缩预算，要求所有输出严格遵守字符上限并保留关键证据。" * 80
+        noise = "餐厅今天准备了面包、咖啡和水果，厨师随后整理了厨房。" * 80
+        out = compress.compress({
+            "query": "中文压缩预算如何严格执行",
+            "max_chars": 1200,
+            "sources": [
+                {"id": "relevant", "text": relevant},
+                {"id": "noise", "text": noise},
+            ],
+        })
+        self.assertFalse(out["stats"]["skipped_compression"])
+        self.assertTrue(out["kept"])
+        self.assertEqual(out["kept"][0]["source"], "relevant")
+        self.assertLessEqual(out["stats"]["chars_out"], 1200)
+
+    def test_output_is_self_contained_without_host_rerank_candidates(self):
+        out = compress.compress(_payload())
+        self.assertNotIn("candidates", out)
+        self.assertNotIn("semantic_candidates", out["stats"])
+        self.assertTrue(out["kept"])
+
+    def test_first_chunk_never_overruns_tiny_budget(self):
+        out = compress.compress({
+            "query": QUERY,
+            "max_chars": 40,
+            "sources": [{"id": "s1", "text": RELEVANT * 4}],
+        })
+        self.assertLessEqual(out["stats"]["chars_out"], 40)
 
     def test_dedup_counted_across_sources(self):
         p = _payload()

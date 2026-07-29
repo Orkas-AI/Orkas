@@ -54,7 +54,9 @@ Routing: agent-specific lessons -> agent; user identity/style/preferences -> use
 
 LANGUAGE: Write in the current UI/response language. Preserve proper nouns, commands, file paths, URLs, and exact quoted wording.
 
-Actions: add, replace (by old_text substring), remove (by old_text substring), list.`;
+Actions: add, replace, remove, list. For replace/remove, a complete old_text entry is preferred;
+substring shorthand is accepted only when it matches exactly one entry. Ambiguous matches are
+rejected without changing memory, so list or ask the user for the exact entry instead of guessing.`;
 
 /** Project-session description: four tiers, routed by where a fact belongs
  *  ("would it still hold in another project?") rather than where it was said. */
@@ -77,7 +79,9 @@ Routing — ask "would this still hold in another project?":
 - Yes, but only this agent benefits (its own working lessons) -> agent.
 Write in the user's current language while preserving code, paths, commands, URLs, and exact quoted wording when needed.
 
-Actions: add, replace (by old_text substring), remove (by old_text substring), list.`;
+Actions: add, replace, remove, list. For replace/remove, a complete old_text entry is preferred;
+substring shorthand is accepted only when it matches exactly one entry. Ambiguous matches are
+rejected without changing memory, so list or ask the user for the exact entry instead of guessing.`;
 
 /** Appended for sub-agents: they may read project memory but not write it. */
 const PROJECT_READONLY_NOTE = `
@@ -125,7 +129,7 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         },
         old_text: {
           type: 'string',
-          description: 'Substring to match the existing entry (required for "replace" and "remove").',
+          description: 'Existing entry text for "replace" and "remove". An exact entry is preferred; a substring must match exactly one entry.',
         },
       },
       required: ['action'],

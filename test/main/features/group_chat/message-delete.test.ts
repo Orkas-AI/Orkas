@@ -34,7 +34,7 @@ describe('group_chat message deletion', () => {
     fs.mkdirSync(path.dirname(layout.messageFile), { recursive: true });
     fs.writeFileSync(layout.messageFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
     fs.mkdirSync(layout.visibilityDir, { recursive: true });
-    fs.writeFileSync(layout.visibilityFile('commander'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    fs.writeFileSync(layout.visibilityFile('agent-a'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
     const attachmentDir = layoutModule.chatAttachmentDirForConversation(UID, CID);
     fs.mkdirSync(attachmentDir, { recursive: true });
     const retainedAttachment = path.join(attachmentDir, 'retained.txt');
@@ -44,7 +44,7 @@ describe('group_chat message deletion', () => {
 
     expect(result).toMatchObject({ ok: true, deleted: ['delete-msg'] });
     const mainRows = fs.readFileSync(layout.messageFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
-    const sliceRows = fs.readFileSync(layout.visibilityFile('commander'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const sliceRows = fs.readFileSync(layout.visibilityFile('agent-a'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(mainRows.find((row) => row.id === 'delete-msg')).toMatchObject({
       text: '', deleted_by_user: true, _v: 1,
     });

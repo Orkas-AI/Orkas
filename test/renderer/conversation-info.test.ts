@@ -218,6 +218,55 @@ describe('ConversationInfo files tab', () => {
     expect(html).not.toContain('old.txt');
   });
 
+  it('keeps an expanded directory open while the live file list refreshes', async () => {
+    const snapshot = {
+      history: [] as any[],
+      files: {
+        root: '/tmp/workspace',
+        rootExists: true,
+        truncated: false,
+        count: 1,
+        items: [
+          {
+            path: '/tmp/workspace/project/old.txt',
+            relPath: 'project/old.txt',
+            name: 'old.txt',
+            bytes: 4,
+            mtime: 1700000000000,
+          },
+        ],
+      },
+    };
+    const html = await renderFilesHtml(snapshot, async (context) => {
+      const body = context.document.getElementById('conversation-info-body');
+      body.querySelectorAll = (selector: string) => selector === '.conversation-info-dir[data-directory-key]'
+        ? [{ open: true, dataset: { directoryKey: '/tmp/workspace/project' } }]
+        : [];
+      snapshot.files = {
+        root: '/tmp/workspace',
+        rootExists: true,
+        truncated: false,
+        count: 1,
+        items: [
+          {
+            path: '/tmp/workspace/project/new.txt',
+            relPath: 'project/new.txt',
+            name: 'new.txt',
+            bytes: 8,
+            mtime: 1700000001000,
+          },
+        ],
+      };
+      await context.window.ConversationInfo.refreshFiles('c1', { silent: true });
+    });
+
+    expect(html).toContain('new.txt');
+    expect(html).not.toContain('old.txt');
+    expect(html).toMatch(
+      /<details[^>]*data-directory-key="\/tmp\/workspace\/project"[^>]*\sopen(?:\s|>)/,
+    );
+  });
+
   it('clears file loading when a silent refresh supersedes a visible refresh', async () => {
     const snapshot = {
       history: [] as any[],

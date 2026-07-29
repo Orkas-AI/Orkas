@@ -4,6 +4,10 @@ import * as path from 'node:path';
 import type { NativeImage as ElectronNativeImage } from 'electron';
 
 import { parseHtmlStructure } from './video_studio_html_check';
+import {
+  approvedShotReferenceIndex,
+  resolveApprovedShotReference,
+} from './video_studio_source_alignment';
 
 export type Issue = {
   code: string;
@@ -21,7 +25,7 @@ export type Issue = {
   evidence?: Record<string, unknown>;
 };
 
-export const VIDEO_STUDIO_INSPECTOR_VERSION = 2;
+export const VIDEO_STUDIO_INSPECTOR_VERSION = 3;
 
 export type AudioTrack = {
   absPath: string;
@@ -104,10 +108,23 @@ export type FrameSampleEvidence = {
   visible_scene_ids?: string[];
   visible_roles?: string[];
   visible_text?: string;
+  visible_elements?: VisibleSemanticElementEvidence[];
   capture_source_width?: number;
   capture_source_height?: number;
   capture_scale_factor?: number;
   capture_retry_count?: number;
+};
+
+export type VisibleSemanticElementEvidence = {
+  scene_id?: string;
+  role?: string;
+  text?: string;
+  text_transform?: string;
+  cover_signal?: string;
+  cover_hero?: boolean;
+  width_ratio?: number;
+  height_ratio?: number;
+  area_ratio?: number;
 };
 
 export type FrameEvidence = {
@@ -115,6 +132,28 @@ export type FrameEvidence = {
   contact_sheet: string;
   frame_paths: string[];
   samples: FrameSampleEvidence[];
+};
+
+export type VideoStudioDesignQualityScorecard = {
+  content_alignment: number;
+  cover_communication: number;
+  hierarchy: number;
+  text_legibility: number;
+  motion_readiness: number;
+  specificity: number;
+  reference_fidelity?: number;
+  overall: number;
+  pass_threshold: number;
+  dimension_floor: number;
+};
+
+export type VideoFrameQaOptions = {
+  sceneCount?: number;
+  expectedSceneIds?: string[];
+  requireSemanticCoverage?: boolean;
+  minimumSamples?: number;
+  designContract?: unknown;
+  sceneMap?: unknown;
 };
 
 /**
@@ -189,6 +228,7 @@ const DRAFT_VISUAL_ADVISORY_CODES = new Set([
 const DESIGN_CONTRACT_SECTIONS = [
   'aesthetic',
   'visual_direction',
+  'cover',
   'layout_boxes',
   'typography_tokens',
   'color_tokens',
@@ -213,6 +253,40 @@ const VISUAL_DIRECTION_FIELDS = [
   'rhythm_pattern',
 ];
 
+const COVER_CONTRACT_FIELDS = [
+  'scene_id',
+  'headline',
+  'content_signals',
+  'hero_visual',
+  'composition_strategy',
+  'frame_time_sec',
+];
+
+const REFERENCE_MEDIA_TYPES = new Set(['image', 'video']);
+const REFERENCE_INTENTS = new Set(['reproduce', 'edit', 'guide']);
+const REFERENCE_INTENT_BASES = new Set(['user', 'inferred']);
+const REFERENCE_ROLES = new Set([
+  'content',
+  'identity',
+  'composition',
+  'structure',
+  'style',
+  'motion',
+  'timing',
+  'audio',
+]);
+
+const DESIGN_QUALITY_SCORE_KEYS = [
+  'content_alignment',
+  'cover_communication',
+  'hierarchy',
+  'text_legibility',
+  'motion_readiness',
+  'specificity',
+] as const;
+const DESIGN_QUALITY_PASS_THRESHOLD = 80;
+const DESIGN_QUALITY_DIMENSION_FLOOR = 70;
+
 const GENERIC_AESTHETIC_RE = /\b(?:modern tech|clean modern|sleek|premium|minimalist|minimal|futuristic|dynamic|engaging|professional|high[- ]end|beautiful|polished)\b/i;
 const HARD_PREVIEW_DESIGN_CODES = new Set([
   'AESTHETIC_THESIS_INCOMPLETE',
@@ -225,6 +299,7 @@ const HARD_PREVIEW_DESIGN_CODES = new Set([
 const PREVIEW_REQUIRED_DESIGN_SECTIONS = new Set([
   'aesthetic',
   'visual_direction',
+  'cover',
   'motion_budget',
   'scene_variation',
 ]);
@@ -236,6 +311,74 @@ function designSeverity(code: string, hard = true): Issue['severity'] {
 
 function round2(n: number): number {
   return Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
+}
+
+export function compileVideoStudioDesignQualityScorecard(
+  value: unknown,
+  requireReferenceFidelity = false,
+): VideoStudioDesignQualityScorecard {
+  if (!isRecord(value)) {
+    throw new Error('E_DESIGN_REVIEW_SCORES_REQUIRED: quality_scores must be an object.');
+  }
+  const scores: Record<string, number> = {};
+  for (const key of DESIGN_QUALITY_SCORE_KEYS) {
+    const score = Number(value[key]);
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
+      throw new Error(`E_DESIGN_REVIEW_SCORE_INVALID: quality_scores.${key} must be from 0 to 100.`);
+    }
+    scores[key] = Math.round(score * 10) / 10;
+  }
+  if (requireReferenceFidelity) {
+    const score = Number(value.reference_fidelity);
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
+      throw new Error('E_DESIGN_REVIEW_SCORE_INVALID: quality_scores.reference_fidelity must be from 0 to 100 when a concrete visual reference is present.');
+    }
+    scores.reference_fidelity = Math.round(score * 10) / 10;
+  }
+  const values = Object.values(scores);
+  const overall = Math.round((values.reduce((sum, score) => sum + score, 0) / values.length) * 10) / 10;
+  return {
+    content_alignment: scores.content_alignment,
+    cover_communication: scores.cover_communication,
+    hierarchy: scores.hierarchy,
+    text_legibility: scores.text_legibility,
+    motion_readiness: scores.motion_readiness,
+    specificity: scores.specificity,
+    ...(scores.reference_fidelity !== undefined ? { reference_fidelity: scores.reference_fidelity } : {}),
+    overall,
+    pass_threshold: DESIGN_QUALITY_PASS_THRESHOLD,
+    dimension_floor: DESIGN_QUALITY_DIMENSION_FLOOR,
+  };
+}
+
+export function assertVideoStudioDesignQualityVerdict(
+  verdict: 'passed' | 'repair' | 'blocked',
+  findings: string[],
+  scorecard: VideoStudioDesignQualityScorecard,
+  minimumReferenceFidelity = DESIGN_QUALITY_DIMENSION_FLOOR,
+): void {
+  const scoredDimensions = [
+    scorecard.content_alignment,
+    scorecard.cover_communication,
+    scorecard.hierarchy,
+    scorecard.text_legibility,
+    scorecard.motion_readiness,
+    scorecard.specificity,
+    ...(scorecard.reference_fidelity === undefined ? [] : [scorecard.reference_fidelity]),
+  ];
+  if (verdict === 'passed' && findings.some((item) => item.trim())) {
+    throw new Error('E_DESIGN_REVIEW_PASS_FINDINGS: a passing review cannot retain blocker or fix findings.');
+  }
+  if (verdict === 'passed'
+    && (scorecard.overall < DESIGN_QUALITY_PASS_THRESHOLD
+      || scoredDimensions.some((score) => score < DESIGN_QUALITY_DIMENSION_FLOOR))) {
+    throw new Error(`E_DESIGN_REVIEW_SCORE_BELOW_FLOOR: passed requires overall >= ${DESIGN_QUALITY_PASS_THRESHOLD} and every dimension >= ${DESIGN_QUALITY_DIMENSION_FLOOR}.`);
+  }
+  if (verdict === 'passed'
+    && scorecard.reference_fidelity !== undefined
+    && scorecard.reference_fidelity < minimumReferenceFidelity) {
+    throw new Error(`E_REFERENCE_FIDELITY_BELOW_FLOOR: passed requires reference_fidelity >= ${minimumReferenceFidelity} for the declared reference contract.`);
+  }
 }
 
 function shortText(value: unknown, max = 220): string {
@@ -252,6 +395,18 @@ function hasContent(value: unknown): boolean {
   if (Array.isArray(value)) return value.length > 0;
   if (isRecord(value)) return Object.values(value).some(hasContent);
   return value !== null && value !== undefined && value !== false;
+}
+
+function hasCoverContractValue(key: string, value: unknown): boolean {
+  // Scene ids and approved headlines are identifiers/copy, not prose budgets;
+  // short but non-empty values such as "s1" or "AI" are legitimate.
+  if (key === 'scene_id' || key === 'headline') {
+    return typeof value === 'string' && value.trim().length > 0;
+  }
+  if (key === 'frame_time_sec') {
+    return Number.isFinite(Number(value));
+  }
+  return hasContent(value);
 }
 
 function textFrom(value: unknown): string {
@@ -579,6 +734,71 @@ function addDesignContractAdvisories(
     });
   }
 
+  const cover = isRecord(contract.cover) ? contract.cover : {};
+  const missingCoverFields = COVER_CONTRACT_FIELDS.filter((key) => !hasCoverContractValue(key, cover[key]));
+  if (missingCoverFields.length) {
+    issues.push({
+      code: 'COVER_CONTRACT_INCOMPLETE',
+      severity: 'error',
+      selector: `${sourceSelector}.cover`,
+      message: `The dedicated cover contract is incomplete: ${missingCoverFields.join(', ')} missing.`,
+      fixHint: 'Bind frame 0 to the first canonical scene, an approved headline, at least two content signals, one hero visual, and a thumbnail composition strategy.',
+      source: 'orkas-native-design-contract',
+    });
+  } else {
+    const canonicalScenes = extractScenes(sceneMap).length ? extractScenes(sceneMap) : extractScenes(contract);
+    const coverSceneId = String(cover.scene_id || '').trim();
+    const firstScene = canonicalScenes[0];
+    const matchedScene = canonicalScenes.find((scene) => sceneId(scene) === coverSceneId);
+    if (!matchedScene || (firstScene && sceneId(firstScene) !== coverSceneId)) {
+      issues.push({
+        code: 'COVER_SCENE_NOT_FRAME_ZERO',
+        severity: 'error',
+        selector: `${sourceSelector}.cover.scene_id`,
+        message: `Cover scene "${coverSceneId}" must be the first canonical scene so the exported frame-0 cover matches the video.`,
+        fixHint: 'Use the first canonical scene id for cover.scene_id and design its exact 0s state as the cover.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+    if (Number(cover.frame_time_sec) !== 0) {
+      issues.push({
+        code: 'COVER_FRAME_TIME_INVALID',
+        severity: 'error',
+        selector: `${sourceSelector}.cover.frame_time_sec`,
+        message: 'Cover frame_time_sec must be 0 because VideoStudio exports the exact first frame as the cover artifact.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+    const contentSignals = Array.isArray(cover.content_signals)
+      ? cover.content_signals.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    if (contentSignals.length < 2) {
+      issues.push({
+        code: 'COVER_CONTENT_SIGNALS_THIN',
+        severity: 'error',
+        selector: `${sourceSelector}.cover.content_signals`,
+        message: 'The cover needs at least two concrete content signals so it communicates the video topic instead of only showing a generic title treatment.',
+        fixHint: 'Name two visible topic-specific signals such as the product/object, result, diagram, person, place, or before/after state.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+    if (matchedScene) {
+      const approvedText = normalizeForSearch(textFrom(matchedScene.approved_copy));
+      const headline = normalizeForSearch(cover.headline);
+      if (headline && approvedText && !approvedText.includes(headline)) {
+        issues.push({
+          code: 'COVER_HEADLINE_NOT_APPROVED',
+          severity: 'error',
+          selector: `${sourceSelector}.cover.headline`,
+          sceneId: coverSceneId,
+          message: 'The cover headline is not present in the approved copy of its canonical scene.',
+          fixHint: 'Use approved scene copy for the cover headline, or revise the production plan before authoring it.',
+          source: 'orkas-native-design-contract',
+        });
+      }
+    }
+  }
+
   const aesthetic = isRecord(contract.aesthetic) ? contract.aesthetic : {};
   const aestheticForChecks: Record<string, unknown> = {
     ...aesthetic,
@@ -704,6 +924,225 @@ function addDesignContractAdvisories(
       fixHint: 'Keep brand colors, but add purposeful neutral/supporting accents for hierarchy, data meaning, or scene variation.',
       source: 'orkas-native-design-contract',
     });
+  }
+}
+
+function concreteReferenceFidelityRequirement(contract: unknown): {
+  required: boolean;
+  minimumScore: number;
+} {
+  if (!isRecord(contract)) return { required: false, minimumScore: DESIGN_QUALITY_DIMENSION_FLOOR };
+  const referenceFidelity = isRecord(contract.reference_fidelity) ? contract.reference_fidelity : {};
+  const references = Array.isArray(contract.references) ? contract.references : [];
+  const required = hasContent(referenceFidelity) || references.length > 0;
+  const verification = isRecord(referenceFidelity.verification) ? referenceFidelity.verification : {};
+  const declared = Number(verification.minimum_score);
+  return {
+    required,
+    minimumScore: Number.isFinite(declared) && declared >= DESIGN_QUALITY_DIMENSION_FLOOR && declared <= 100
+      ? declared
+      : DESIGN_QUALITY_DIMENSION_FLOOR,
+  };
+}
+
+async function addReferenceFidelityIssues(
+  issues: Issue[],
+  contract: unknown,
+  compositionDirAbs: string,
+  sourceSelector = 'composition-manifest.json#art_direction',
+): Promise<void> {
+  const requirement = concreteReferenceFidelityRequirement(contract);
+  if (!requirement.required || !isRecord(contract)) return;
+  const fidelity = isRecord(contract.reference_fidelity) ? contract.reference_fidelity : {};
+  const selector = `${sourceSelector}.reference_fidelity`;
+  const mode = String(fidelity.mode || '').trim().toLowerCase();
+  const references = Array.isArray(contract.references) ? contract.references : [];
+  const preserve = Array.isArray(fidelity.preserve)
+    ? fidelity.preserve.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  const mayChange = Array.isArray(fidelity.may_change)
+    ? fidelity.may_change.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  const anchors = Array.isArray(fidelity.layout_anchors) ? fidelity.layout_anchors.filter(isRecord) : [];
+  const verification = isRecord(fidelity.verification) ? fidelity.verification : {};
+  const missing: string[] = [];
+  if (!['exact', 'close', 'adapt'].includes(mode)) missing.push('mode');
+  if (!references.length) missing.push('references');
+  if (!preserve.length) missing.push('preserve');
+  if (!Array.isArray(fidelity.may_change)) missing.push('may_change');
+  const minimumScore = Number(verification.minimum_score);
+  if (!Number.isFinite(minimumScore) || minimumScore < DESIGN_QUALITY_DIMENSION_FLOOR || minimumScore > 100) {
+    missing.push('verification.minimum_score');
+  }
+  if (missing.length) {
+    issues.push({
+      code: 'REFERENCE_FIDELITY_CONTRACT_INCOMPLETE',
+      severity: 'error',
+      selector,
+      message: `Concrete visual references need an executable fidelity contract: ${missing.join(', ')} missing or invalid.`,
+      fixHint: 'Declare image/video references, exact/close/adapt fidelity, preserve/may-change rules, any layout or temporal anchors, and a scored review threshold.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+  if (mode === 'exact' && preserve.length < 3) {
+    issues.push({
+      code: 'REFERENCE_EXACT_PRESERVE_THIN',
+      severity: 'error',
+      selector: `${selector}.preserve`,
+      message: 'Exact fidelity must explicitly preserve at least three visual axes such as composition, typography, palette, geometry, imagery, or spacing.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+  if (mode === 'exact' && Number.isFinite(minimumScore) && minimumScore < 85) {
+    issues.push({
+      code: 'REFERENCE_EXACT_SCORE_FLOOR_LOW',
+      severity: 'error',
+      selector: `${selector}.verification.minimum_score`,
+      message: 'Exact fidelity requires a reference_fidelity review threshold of at least 85.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+  if (mayChange.some((item) => preserve.includes(item))) {
+    issues.push({
+      code: 'REFERENCE_FIDELITY_RULE_CONFLICT',
+      severity: 'error',
+      selector,
+      message: 'The same visual axis cannot appear in both preserve and may_change.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+  const canonicalSceneIds = new Set(extractScenes(contract).map(sceneId).filter(Boolean));
+  const needsLayoutAnchors = mode === 'exact' || references.some((item) => {
+    if (!isRecord(item) || !Array.isArray(item.roles)) return false;
+    return item.roles.some((role) => role === 'composition' || role === 'structure');
+  });
+  if (needsLayoutAnchors && !anchors.length) {
+    issues.push({
+      code: 'REFERENCE_LAYOUT_ANCHORS_REQUIRED',
+      severity: 'error',
+      selector: `${selector}.layout_anchors`,
+      message: 'Exact, composition, and structure references require normalized layout anchors.',
+      source: 'orkas-native-design-contract',
+    });
+  }
+  for (const [index, rawReference] of references.entries()) {
+    const referenceSelector = `${sourceSelector}.references.${index}`;
+    if (!isRecord(rawReference)) {
+      issues.push({
+        code: 'REFERENCE_MEDIA_CONTRACT_INVALID',
+        severity: 'error',
+        selector: referenceSelector,
+        message: 'Each reference must be an object describing its media, intent, roles, and preservation boundary.',
+        source: 'orkas-native-design-contract',
+      });
+      continue;
+    }
+    const id = String(rawReference.id || '').trim();
+    const mediaType = String(rawReference.media_type || '').trim().toLowerCase();
+    const intent = rawReference.intent === undefined
+      ? 'guide'
+      : String(rawReference.intent || '').trim().toLowerCase();
+    const intentBasis = rawReference.intent_basis === undefined
+      ? 'inferred'
+      : String(rawReference.intent_basis || '').trim().toLowerCase();
+    const ref = String(rawReference.path || '').trim();
+    const roles = Array.isArray(rawReference.roles)
+      ? rawReference.roles.map((item) => String(item).trim().toLowerCase()).filter(Boolean)
+      : [];
+    const referencePreserve = Array.isArray(rawReference.preserve)
+      ? rawReference.preserve.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    const referenceMayChange = Array.isArray(rawReference.may_change)
+      ? rawReference.may_change.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    const targetSceneIds = Array.isArray(rawReference.target_scene_ids)
+      ? rawReference.target_scene_ids.map((item) => String(item).trim()).filter(Boolean)
+      : [];
+    const invalidFields: string[] = [];
+    if (!id) invalidFields.push('id');
+    if (!REFERENCE_MEDIA_TYPES.has(mediaType)) invalidFields.push('media_type');
+    if (!REFERENCE_INTENTS.has(intent)) invalidFields.push('intent');
+    if (!REFERENCE_INTENT_BASES.has(intentBasis)) invalidFields.push('intent_basis');
+    if (!ref) invalidFields.push('path');
+    if (!roles.length || roles.some((role) => !REFERENCE_ROLES.has(role))) invalidFields.push('roles');
+    if (!referencePreserve.length) invalidFields.push('preserve');
+    if (!Array.isArray(rawReference.may_change)) invalidFields.push('may_change');
+    if (!targetSceneIds.length) invalidFields.push('target_scene_ids');
+    if ((intent === 'reproduce' || intent === 'edit') && rawReference.required !== true) invalidFields.push('required');
+    if (intent === 'edit' && !referenceMayChange.length) invalidFields.push('may_change');
+    if (referenceMayChange.some((item) => referencePreserve.includes(item))) invalidFields.push('preserve/may_change conflict');
+    if (invalidFields.length) {
+      issues.push({
+        code: 'REFERENCE_MEDIA_CONTRACT_INVALID',
+        severity: 'error',
+        selector: referenceSelector,
+        message: `Reference media contract is incomplete or invalid: ${invalidFields.join(', ')}.`,
+        fixHint: 'Describe the media itself, the requested reproduce/edit/guide intent, exact roles, protected attributes, allowed changes, and target scenes.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+    for (const targetSceneId of targetSceneIds) {
+      if (canonicalSceneIds.size && !canonicalSceneIds.has(targetSceneId)) {
+        issues.push({
+          code: 'REFERENCE_TARGET_SCENE_UNKNOWN',
+          severity: 'error',
+          selector: `${referenceSelector}.target_scene_ids`,
+          message: `Reference "${id || index}" targets unknown scene "${targetSceneId}".`,
+          source: 'orkas-native-design-contract',
+        });
+      }
+    }
+    const temporalAnchors = Array.isArray(rawReference.temporal_anchors)
+      ? rawReference.temporal_anchors.filter(isRecord)
+      : [];
+    const requiresTemporalAnchors = mediaType === 'video'
+      && (intent === 'reproduce' || intent === 'edit' || roles.includes('motion') || roles.includes('timing'));
+    if (requiresTemporalAnchors && !temporalAnchors.length) {
+      issues.push({
+        code: 'REFERENCE_VIDEO_TEMPORAL_ANCHORS_REQUIRED',
+        severity: 'error',
+        selector: `${referenceSelector}.temporal_anchors`,
+        message: 'Video references used for reproduction, editing, motion, or timing require source-time to target-scene anchors.',
+        source: 'orkas-native-design-contract',
+      });
+    }
+    for (const [anchorIndex, anchor] of temporalAnchors.entries()) {
+      const start = Number(anchor.source_start_sec);
+      const end = Number(anchor.source_end_sec);
+      const targetSceneId = String(anchor.target_scene_id || '').trim();
+      if (!Number.isFinite(start) || start < 0 || !Number.isFinite(end) || end <= start
+        || !targetSceneId || (canonicalSceneIds.size > 0 && !canonicalSceneIds.has(targetSceneId))) {
+        issues.push({
+          code: 'REFERENCE_VIDEO_TEMPORAL_ANCHOR_INVALID',
+          severity: 'error',
+          selector: `${referenceSelector}.temporal_anchors.${anchorIndex}`,
+          message: 'A temporal anchor needs a valid source_start_sec/source_end_sec and an existing target_scene_id.',
+          source: 'orkas-native-design-contract',
+        });
+      }
+    }
+    const local = safeResolveLocalRef(compositionDirAbs, ref);
+    if (!local || path.isAbsolute(ref) || isRemoteRef(ref)) {
+      issues.push({
+        code: 'REFERENCE_FIDELITY_PATH_INVALID',
+        severity: 'error',
+        selector: `${referenceSelector}.path`,
+        message: `Reference fidelity inputs must be composition-local relative files: ${ref}`,
+        fixHint: 'Copy the inspected reference into assets/references/ and record that local path in the manifest.',
+        source: 'orkas-native-design-contract',
+      });
+      continue;
+    }
+    const st = await fs.stat(local).catch(() => null);
+    if (!st?.isFile()) {
+      issues.push({
+        code: 'REFERENCE_FIDELITY_ASSET_MISSING',
+        severity: 'error',
+        selector: `${referenceSelector}.path`,
+        message: `Reference fidelity asset is missing: ${ref}`,
+        source: 'orkas-native-design-contract',
+      });
+    }
   }
 }
 
@@ -1083,7 +1522,7 @@ export async function runContractHtmlQa(
   metaIssues: Issue[],
   contractLoad: JsonLoad,
   sceneMapLoad: JsonLoad,
-  _compositionDirAbs: string,
+  compositionDirAbs: string,
 ): Promise<Record<string, unknown>> {
   const issues: Issue[] = metaIssues.map((issue) => ({
     ...issue,
@@ -1174,6 +1613,12 @@ export async function runContractHtmlQa(
     issues,
     contract,
     sceneMap,
+    contractSelector === 'composition-manifest.json' ? 'composition-manifest.json#art_direction' : contractSelector,
+  );
+  await addReferenceFidelityIssues(
+    issues,
+    contract,
+    compositionDirAbs,
     contractSelector === 'composition-manifest.json' ? 'composition-manifest.json#art_direction' : contractSelector,
   );
 
@@ -1353,14 +1798,34 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
     ? sceneMapLoad.value.source_alignment
     : {};
   const mergeReason = typeof alignment.merge_reason === 'string' && alignment.merge_reason.trim();
-  const mappedShotCount = new Set<string>();
+  const referenceIndex = approvedShotReferenceIndex(shotlistLoad.value);
+  const mappedShotIds = new Set<string>();
+  const mappedSourceRefs = new Set<string>();
+  const resolvedAliases = new Map<string, string>();
+  const unknownShotRefs = new Set<string>();
+  const ambiguousShotRefs = new Map<string, string[]>();
   for (const scene of scenes) {
     const refs = Array.isArray(scene.source_shots) ? scene.source_shots : [];
-    refs.forEach((ref) => mappedShotCount.add(String(ref)));
+    refs.forEach((ref) => {
+      const sourceRef = String(ref).trim();
+      if (!sourceRef) return;
+      mappedSourceRefs.add(sourceRef);
+      const resolution = resolveApprovedShotReference(sourceRef, referenceIndex);
+      if (resolution.status === 'direct') mappedShotIds.add(resolution.shotId);
+      if (resolution.status === 'alias') {
+        mappedShotIds.add(resolution.shotId);
+        resolvedAliases.set(sourceRef, resolution.shotId);
+      }
+      if (resolution.status === 'unknown' && referenceIndex.shotIds.size > 0) {
+        unknownShotRefs.add(sourceRef);
+      }
+      if (resolution.status === 'ambiguous') {
+        ambiguousShotRefs.set(sourceRef, resolution.owners);
+      }
+    });
   }
-  const shotIds = new Set(shots.map((shot) => String(shot.id || shot.shot_id || shot.scene_id || '').trim()).filter(Boolean));
-  const unknownShotRefs = [...mappedShotCount].filter((ref) => shotIds.size > 0 && !shotIds.has(ref));
-  if (shotIds.size > 0 && mappedShotCount.size === 0) {
+  const shotIds = referenceIndex.shotIds;
+  if (shotIds.size > 0 && mappedSourceRefs.size === 0) {
     issues.push({
       code: 'SOURCE_SHOT_MAPPING_EMPTY',
       severity: 'error',
@@ -1369,16 +1834,28 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
       source: 'orkas-native-source-alignment',
     });
   }
-  if (unknownShotRefs.length) {
+  if (unknownShotRefs.size) {
     issues.push({
       code: 'SOURCE_SHOT_REFERENCE_UNKNOWN',
       severity: 'error',
       selector: timelineSelector,
-      message: `Manifest source_shots reference unknown approved shot ids: ${unknownShotRefs.slice(0, 8).join(', ')}.`,
+      message: `Manifest source_shots reference neither an approved shot id nor a uniquely owned source alias: ${[...unknownShotRefs].slice(0, 8).join(', ')}.`,
       source: 'orkas-native-source-alignment',
     });
   }
-  if (shots.length > scenes.length && !mergeReason && mappedShotCount.size < shots.length) {
+  if (ambiguousShotRefs.size) {
+    issues.push({
+      code: 'SOURCE_SHOT_REFERENCE_AMBIGUOUS',
+      severity: 'error',
+      selector: timelineSelector,
+      message: `Manifest source_shots contain aliases owned by multiple approved shots: ${[...ambiguousShotRefs]
+        .slice(0, 8)
+        .map(([alias, owners]) => `${alias} -> ${owners.join('|')}`)
+        .join(', ')}.`,
+      source: 'orkas-native-source-alignment',
+    });
+  }
+  if (shots.length > scenes.length && !mergeReason && mappedShotIds.size < shots.length) {
     issues.push({
       code: 'SHOTLIST_SCENE_MAP_MISMATCH',
       severity: 'error',
@@ -1387,7 +1864,7 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
       source: 'orkas-native-source-alignment',
     });
   }
-  const missingShotIds = [...shotIds].filter((id) => !mappedShotCount.has(id));
+  const missingShotIds = [...shotIds].filter((id) => !mappedShotIds.has(id));
   if (missingShotIds.length > 0 && !mergeReason) {
     issues.push({
       code: 'SOURCE_SHOT_COVERAGE_INCOMPLETE',
@@ -1403,7 +1880,10 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
     skipped: false,
     shot_count: shots.length,
     scene_count: scenes.length,
-    mapped_source_shot_count: mappedShotCount.size,
+    mapped_source_ref_count: mappedSourceRefs.size,
+    mapped_source_shot_count: mappedShotIds.size,
+    resolved_source_alias_count: resolvedAliases.size,
+    resolved_source_aliases: Object.fromEntries(resolvedAliases),
     error_count: errorCount,
     issue_count: issues.length,
     issues,
@@ -2053,9 +2533,24 @@ export async function writeFrameContactSheet(evidenceDirAbs: string, samples: Fr
     return `<image href="${href}" x="${x}" y="${y}" width="${thumbW}" height="${thumbH}" preserveAspectRatio="xMidYMid meet"/><text x="${x}" y="${y + thumbH + 24}" fill="#111" font-family="system-ui, sans-serif" font-size="16">${label}</text>`;
   }));
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#fff"/>\n${items.join('\n')}\n</svg>\n`;
-  const out = path.join(evidenceDirAbs, 'contact-sheet.svg');
-  await fs.writeFile(out, svg, 'utf8');
-  return out;
+  const svgPath = path.join(evidenceDirAbs, 'contact-sheet.svg');
+  const pngPath = path.join(evidenceDirAbs, 'contact-sheet.png');
+  await fs.writeFile(svgPath, svg, 'utf8');
+
+  // Keep the self-contained SVG as inspectable evidence, but publish a raster
+  // contact sheet as the primary preview. Conversation attachments render PNG
+  // consistently, whereas an SVG attachment may be shown as a file chip and
+  // leave the separately published first frame looking like the whole preview.
+  const sharpModule = await import('sharp');
+  const sharp = sharpModule.default;
+  await sharp(Buffer.from(svg), {
+    density: 96,
+    failOn: 'error',
+    // librsvg reports density-adjusted pixels (96/72 on some builds), so keep
+    // a bounded margin above the declared sheet geometry.
+    limitInputPixels: Math.max(1, Math.min(100_000_000, width * height * 4)),
+  }).png().toFile(pngPath);
+  return pngPath;
 }
 
 export async function writeVisualBaseline(baselineAbsPath: string, frameEvidence: FrameEvidence): Promise<string> {
@@ -2226,12 +2721,294 @@ export function buildDesignReviewInputs(opts: DesignReviewInputOptions): Record<
   };
 }
 
+const PRIMARY_ENGLISH_TEXT_ROLES = new Set(['title', 'body', 'caption', 'subtitle', 'cta']);
+const UPPERCASE_ACCENT_ROLES = new Set(['label', 'eyebrow', 'metadata', 'code']);
+const COVER_HERO_MIN_AXIS_RATIO = 0.2;
+const COVER_HERO_MIN_AREA_RATIO = 0.015;
+
+function normalizeVisibleCopy(value: unknown): string {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function isEnglishAllCaps(value: string): boolean {
+  const letters = value.match(/[A-Za-z]/g) || [];
+  return letters.length >= 2 && /[A-Z]/.test(value) && !/[a-z]/.test(value);
+}
+
+function isShortAcronymOrCode(value: string): boolean {
+  const text = normalizeVisibleCopy(value);
+  return /^[A-Z]{2,4}$/.test(text)
+    || (/^[A-Z0-9][A-Z0-9._/+:-]{1,7}$/.test(text) && /[0-9._/+:-]/.test(text));
+}
+
+function isBoundedUppercaseAccent(value: string): boolean {
+  const text = normalizeVisibleCopy(value);
+  return text.length <= 24
+    && text.split(/\s+/).filter(Boolean).length <= 3
+    && isEnglishAllCaps(text);
+}
+
+function approvedCopyByScene(sceneMap: unknown): Map<string, string[]> {
+  const out = new Map<string, string[]>();
+  for (const scene of extractScenes(sceneMap)) {
+    const id = sceneId(scene);
+    if (!id) continue;
+    const copy = Array.isArray(scene.approved_copy)
+      ? scene.approved_copy.map(normalizeVisibleCopy).filter(Boolean)
+      : [];
+    out.set(id, copy);
+  }
+  return out;
+}
+
+function videoLanguageFromSceneMap(sceneMap: unknown): string {
+  if (!isRecord(sceneMap)) return '';
+  const canvas = isRecord(sceneMap.canvas) ? sceneMap.canvas : {};
+  return String(
+    canvas.language
+    || sceneMap.video_language
+    || sceneMap.language
+    || '',
+  ).trim();
+}
+
+function addCoverFrameContractIssues(
+  issues: Issue[],
+  seen: Set<string>,
+  firstFrame: FrameSampleEvidence | undefined,
+  designContract: unknown,
+): void {
+  if (!firstFrame || !isRecord(designContract) || !isRecord(designContract.cover)) return;
+  const cover = designContract.cover;
+  const elements = firstFrame.visible_elements;
+  if (!Array.isArray(elements)) {
+    const key = 'COVER_SEMANTIC_EVIDENCE_MISSING';
+    if (!seen.has(key)) {
+      seen.add(key);
+      issues.push({
+        code: key,
+        severity: 'error',
+        sceneId: firstFrame.expected_scene_id,
+        sampleTimeSec: firstFrame.time_seconds,
+        message: 'Frame-0 evidence does not include visible cover elements, so the declared cover cannot be verified.',
+        fixHint: 'Capture the current composition again with native semantic evidence before requesting preview approval.',
+        source: 'orkas-native-video-qa',
+      });
+    }
+    return;
+  }
+
+  const expectedHeadline = normalizeVisibleCopy(cover.headline);
+  const visibleTitles = elements
+    .filter((element) => String(element.role || '').toLowerCase() === 'title')
+    .map((element) => normalizeVisibleCopy(element.text))
+    .filter(Boolean);
+  if (expectedHeadline && !visibleTitles.some((text) => normalizeForSearch(text).includes(normalizeForSearch(expectedHeadline)))) {
+    const key = 'COVER_HEADLINE_NOT_VISIBLE';
+    if (!seen.has(key)) {
+      seen.add(key);
+      issues.push({
+        code: key,
+        severity: 'error',
+        sceneId: String(cover.scene_id || firstFrame.expected_scene_id || ''),
+        role: 'title',
+        sampleTimeSec: firstFrame.time_seconds,
+        message: 'The approved cover headline is not visibly rendered in the frame-0 title.',
+        fixHint: 'Render the approved headline at 0s inside a visible data-role="title" element.',
+        source: 'orkas-native-video-qa',
+      });
+    }
+  }
+
+  const expectedSignals = Array.isArray(cover.content_signals)
+    ? cover.content_signals.map((signal) => normalizeVisibleCopy(signal)).filter(Boolean)
+    : [];
+  const visibleSignals = new Set(
+    elements
+      .map((element) => normalizeForSearch(element.cover_signal))
+      .filter(Boolean),
+  );
+  const matchedSignals = expectedSignals.filter((signal) => visibleSignals.has(normalizeForSearch(signal)));
+  if (expectedSignals.length >= 2 && new Set(matchedSignals.map(normalizeForSearch)).size < 2) {
+    const key = 'COVER_CONTENT_SIGNALS_NOT_VISIBLE';
+    if (!seen.has(key)) {
+      seen.add(key);
+      issues.push({
+        code: key,
+        severity: 'error',
+        sceneId: String(cover.scene_id || firstFrame.expected_scene_id || ''),
+        sampleTimeSec: firstFrame.time_seconds,
+        message: `Frame 0 visibly maps ${new Set(matchedSignals.map(normalizeForSearch)).size} of ${expectedSignals.length} declared cover content signals; at least two are required.`,
+        fixHint: 'Mark two visible topic-specific frame-0 elements with data-cover-signal values copied exactly from art_direction.cover.content_signals.',
+        source: 'orkas-native-video-qa',
+        evidence: {
+          expected_signals: expectedSignals,
+          visible_signals: [...visibleSignals],
+        },
+      });
+    }
+  }
+
+  const heroes = elements.filter((element) => element.cover_hero === true);
+  const dominantVisual = heroes.find((element) => {
+    const role = String(element.role || '').toLowerCase();
+    const widthRatio = Number(element.width_ratio || 0);
+    const heightRatio = Number(element.height_ratio || 0);
+    const areaRatio = Number(element.area_ratio || 0);
+    return role === 'visual'
+      && Math.max(widthRatio, heightRatio) >= COVER_HERO_MIN_AXIS_RATIO
+      && areaRatio >= COVER_HERO_MIN_AREA_RATIO;
+  });
+  if (!dominantVisual) {
+    const key = 'COVER_HERO_NOT_VISIBLE';
+    if (!seen.has(key)) {
+      seen.add(key);
+      issues.push({
+        code: key,
+        severity: 'error',
+        sceneId: String(cover.scene_id || firstFrame.expected_scene_id || ''),
+        role: 'visual',
+        sampleTimeSec: firstFrame.time_seconds,
+        message: 'Frame 0 does not contain a visible, video-scale cover hero.',
+        fixHint: 'Mark the topic-specific dominant visual with data-role="visual" and data-cover-hero; its visible bounds must occupy meaningful frame area.',
+        source: 'orkas-native-video-qa',
+        evidence: {
+          minimum_axis_ratio: COVER_HERO_MIN_AXIS_RATIO,
+          minimum_area_ratio: COVER_HERO_MIN_AREA_RATIO,
+          heroes,
+        },
+      });
+    }
+  }
+}
+
+function addEnglishCasingIssues(
+  issues: Issue[],
+  seen: Set<string>,
+  samples: FrameSampleEvidence[],
+  sceneMap: unknown,
+): void {
+  if (!/^en(?:-|$)/i.test(videoLanguageFromSceneMap(sceneMap))) return;
+  const approvedByScene = approvedCopyByScene(sceneMap);
+  for (const sample of samples) {
+    const elements = Array.isArray(sample.visible_elements) ? sample.visible_elements : [];
+    const validUppercaseItemsByScene = new Map<string, number>();
+    for (const element of elements) {
+      const role = String(element.role || '').trim().toLowerCase();
+      const text = normalizeVisibleCopy(element.text);
+      if (!role || !text || !/[A-Za-z]/.test(text)) continue;
+      const sceneIdValue = String(element.scene_id || sample.expected_scene_id || '').trim();
+      const approved = approvedByScene.get(sceneIdValue) || [];
+      const approvedMatch = approved.find((copy) => normalizeForSearch(copy) === normalizeForSearch(text));
+      const exactApprovedMatch = approvedMatch === text;
+      const textTransform = String(element.text_transform || '').trim().toLowerCase();
+      const allCaps = isEnglishAllCaps(text);
+
+      let issue: Issue | null = null;
+      if (PRIMARY_ENGLISH_TEXT_ROLES.has(role)) {
+        if (textTransform === 'uppercase') {
+          issue = {
+            code: 'UPPERCASE_TRANSFORM_FORBIDDEN',
+            severity: 'error',
+            sceneId: sceneIdValue || undefined,
+            role,
+            sampleTimeSec: sample.time_seconds,
+            message: `Visible ${role} copy uses computed text-transform: uppercase.`,
+            fixHint: 'Remove the uppercase transform and build hierarchy with type family, width, weight, scale, color, or spacing.',
+            source: 'orkas-native-video-qa',
+            evidence: { text },
+          };
+        } else if (approvedMatch && !exactApprovedMatch) {
+          issue = {
+            code: 'APPROVED_COPY_CASING_CHANGED',
+            severity: 'error',
+            sceneId: sceneIdValue || undefined,
+            role,
+            sampleTimeSec: sample.time_seconds,
+            message: `Visible ${role} copy changes the casing of approved English text.`,
+            fixHint: 'Restore the exact approved casing in the rendered HTML.',
+            source: 'orkas-native-video-qa',
+            evidence: { approved: approvedMatch, visible: text },
+          };
+        } else if (allCaps && !isShortAcronymOrCode(text)) {
+          issue = {
+            code: 'PRIMARY_COPY_ALL_CAPS',
+            severity: 'error',
+            sceneId: sceneIdValue || undefined,
+            role,
+            sampleTimeSec: sample.time_seconds,
+            message: `Visible ${role} copy is rendered as all caps instead of natural English casing.`,
+            fixHint: 'Use sentence case or natural title case; reserve all caps for one short approved metadata label, acronym, or code.',
+            source: 'orkas-native-video-qa',
+            evidence: { text },
+          };
+        } else if (allCaps) {
+          validUppercaseItemsByScene.set(
+            sceneIdValue,
+            (validUppercaseItemsByScene.get(sceneIdValue) || 0) + 1,
+          );
+        }
+      } else if (UPPERCASE_ACCENT_ROLES.has(role) && (allCaps || textTransform === 'uppercase')) {
+        const authorized = exactApprovedMatch && isBoundedUppercaseAccent(text) && textTransform !== 'uppercase';
+        if (!authorized) {
+          issue = {
+            code: 'UNAUTHORIZED_ALL_CAPS_ACCENT',
+            severity: 'error',
+            sceneId: sceneIdValue || undefined,
+            role,
+            sampleTimeSec: sample.time_seconds,
+            message: `Uppercase ${role} copy is not an exact, short, approved metadata label, acronym, or code.`,
+            fixHint: 'Restore approved natural casing or explicitly approve one short uppercase accent in the canonical scene copy.',
+            source: 'orkas-native-video-qa',
+            evidence: { approved_copy: approved, visible: text, text_transform: textTransform },
+          };
+        } else {
+          validUppercaseItemsByScene.set(
+            sceneIdValue,
+            (validUppercaseItemsByScene.get(sceneIdValue) || 0) + 1,
+          );
+        }
+      }
+
+      if (issue) {
+        const key = [
+          issue.code,
+          issue.sceneId || '',
+          issue.role || '',
+          normalizeForSearch(text),
+        ].join('|');
+        if (!seen.has(key)) {
+          seen.add(key);
+          issues.push(issue);
+        }
+      }
+    }
+
+    for (const [sceneIdValue, count] of validUppercaseItemsByScene) {
+      if (count <= 1) continue;
+      const key = `ALL_CAPS_ACCENT_OVERUSED|${sceneIdValue}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      issues.push({
+        code: 'ALL_CAPS_ACCENT_OVERUSED',
+        severity: 'error',
+        sceneId: sceneIdValue || undefined,
+        sampleTimeSec: sample.time_seconds,
+        message: `Scene "${sceneIdValue}" visibly uses ${count} uppercase text items; only one short approved label, acronym, or code is allowed.`,
+        fixHint: 'Keep one short approved uppercase label/acronym/code and restore natural casing for the remaining text roles.',
+        source: 'orkas-native-video-qa',
+      });
+    }
+  }
+}
+
 export function summarizeVideoFrameQa(
   frameEvidence: FrameEvidence | null,
   durationSec: number,
-  opts: { sceneCount?: number; expectedSceneIds?: string[]; requireSemanticCoverage?: boolean; minimumSamples?: number } = {},
+  opts: VideoFrameQaOptions = {},
 ): Record<string, unknown> {
   const issues: Issue[] = [];
+  const seenSemanticIssues = new Set<string>();
   const samples = frameEvidence?.samples || [];
   if (!samples.length) {
     issues.push({
@@ -2296,6 +3073,15 @@ export function summarizeVideoFrameQa(
         });
       }
     }
+  }
+  if (opts.requireSemanticCoverage) {
+    addCoverFrameContractIssues(
+      issues,
+      seenSemanticIssues,
+      samples.find((sample) => sample.label === 'first-frame'),
+      opts.designContract,
+    );
+    addEnglishCasingIssues(issues, seenSemanticIssues, samples, opts.sceneMap);
   }
   for (let i = 1; i < samples.length; i += 1) {
     if (!isSuspiciousCrossSceneDuplicate(samples[i - 1], samples[i])

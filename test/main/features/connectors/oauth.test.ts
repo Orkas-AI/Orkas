@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const oauthProgress = vi.fn();
+
 function mockElectron() {
   vi.doMock('electron', () => ({
     app: {
@@ -25,6 +27,9 @@ beforeEach(() => {
   vi.doMock('../../../../src/main/features/config', () => ({
     getLanguage: () => 'en',
   }));
+  vi.doMock('../../../../src/main/features/connectors/oauth-events', () => ({
+    broadcastOAuthConnectProgress: oauthProgress,
+  }));
 });
 
 afterEach(() => {
@@ -32,6 +37,7 @@ afterEach(() => {
   vi.doUnmock('electron');
   vi.doUnmock('../../../../src/main/features/connectors/_server_bridge');
   vi.doUnmock('../../../../src/main/features/config');
+  vi.doUnmock('../../../../src/main/features/connectors/oauth-events');
 });
 
 describe('features/connectors/oauth', () => {

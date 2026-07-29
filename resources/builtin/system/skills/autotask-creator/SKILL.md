@@ -26,7 +26,8 @@ Rules for automation CRUD from the group-chat commander. The commander does not 
 - **Top-level raw block.** Containers must not be fenced, quoted, or wrapped in markdown lists.
 - **One task per container.** Use multiple containers only when the user explicitly asks to change multiple automations.
 - **Keep content clean.** `<content>` stores the user-facing instruction only; do not include `@agent` text, skill-use prefixes, or connector-use prefixes. Use `<recipient>`, `<skill>`, and `<connector>` fields instead.
-- **Visible prose stays brief.** Do not repeat the full JSON in prose. After container(s), a short summary is enough.
+- **Container first; visible prose stays brief and non-authoritative.** Emit the raw container(s) before any optional summary. Do not repeat the full JSON in prose, and do not use past-completion wording such as "已按要求改好", "created", "updated", or "deleted" before the host applies the container. If a summary is useful, use pending wording such as "将把时间改为周五 10:00"; the host appends the authoritative success or failure result.
+- **Keep internal ids out of clarification copy.** Use titles, schedule times, project names, or content snippets to distinguish candidates. Show a `task_id` only when the user explicitly supplied or requested it.
 
 ## Existing task lookup
 
@@ -123,5 +124,5 @@ Rules:
 ## Failure handling
 
 - If the user's create request lacks the content or schedule, ask one concise question.
-- If the user's edit/delete target is not uniquely identifiable from `auto_tasks_list`, ask which task to change.
+- If the user's edit/delete target is not uniquely identifiable from `auto_tasks_list`, ask which task to change using meaningful visible details rather than internal task ids.
 - If an action is irreversible (`delete`), do it only when the user clearly asked to delete/remove. Do not treat "pause" as delete; use `disable`.

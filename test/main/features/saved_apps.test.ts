@@ -27,7 +27,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -106,7 +107,7 @@ describe('saved_apps › saveFromPath', () => {
     expect(fs.existsSync(path.join(dir, 'node_modules', 'skip', 'big.js'))).toBe(false);
     const meta = JSON.parse(fs.readFileSync(path.join(dir, '__orkas-meta.json'), 'utf8'));
     expect(meta.title).toBe('Snake');
-    expect(meta.sourcePath).toBe(root);
+    expect(meta).not.toHaveProperty('sourcePath');
   });
 
   it('copies supported static resources and skips hidden, symlinked, excluded, and unsupported files', async () => {
@@ -429,6 +430,29 @@ describe('saved_apps › rename / delete', () => {
     // Bad id is refused.
     expect(savedApps.deleteSavedApp(UID, '../boom').ok).toBe(false);
   });
+
+  it('does not rename metadata through a symlinked saved-app directory', async () => {
+    const outside = path.join(tmpDir, 'outside-rename-app');
+    fs.mkdirSync(outside, { recursive: true });
+    const outsideMeta = path.join(outside, '__orkas-meta.json');
+    fs.writeFileSync(outsideMeta, JSON.stringify({
+      title: 'Outside original',
+      sourceCid: '',
+      sourceArtifactId: '',
+      savedAt: new Date().toISOString(),
+    }));
+    fs.writeFileSync(path.join(outside, 'index.html'), '<!doctype html>');
+    const linkedId = 'SymlinkRename01';
+    fs.symlinkSync(
+      outside,
+      path.join(APPS_ROOT(), linkedId),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+
+    const { savedApps } = await mods();
+    expect(savedApps.renameSavedApp(UID, linkedId, 'Changed outside').ok).toBe(false);
+    expect(JSON.parse(fs.readFileSync(outsideMeta, 'utf8')).title).toBe('Outside original');
+  });
 });
 
 describe('saved_apps › listSavedApps', () => {
@@ -459,6 +483,51 @@ describe('saved_apps › listSavedApps', () => {
     // saved_apps/ — remove it to exercise the missing-dir branch.
     fs.rmSync(APPS_ROOT(), { recursive: true, force: true });
     expect(savedApps.listSavedApps(UID)).toEqual([]);
+  });
+
+  it('does not list a symlinked app directory outside the saved-app pool', async () => {
+    const outside = path.join(tmpDir, 'outside-app');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'index.html'), '<!doctype html><title>Outside secret</title>');
+    fs.writeFileSync(path.join(outside, '__orkas-meta.json'), JSON.stringify({
+      title: 'Outside secret',
+      sourceCid: '',
+      sourceArtifactId: '',
+      savedAt: new Date().toISOString(),
+    }));
+    const linkedId = 'SymlinkApp01';
+    fs.symlinkSync(
+      outside,
+      path.join(APPS_ROOT(), linkedId),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+
+    const { savedApps } = await mods();
+    expect(savedApps.listSavedApps(UID).map((app) => app.id)).not.toContain(linkedId);
+  });
+
+  it('does not read or rewrite metadata through a symlinked meta file', async () => {
+    const aid = await makeArtifact('Local app');
+    const { savedApps } = await mods();
+    const saved = savedApps.saveFromArtifact(UID, CID, aid);
+    if (!saved.ok) throw new Error('save failed');
+
+    const outsideMeta = path.join(tmpDir, 'outside-meta.json');
+    fs.writeFileSync(outsideMeta, JSON.stringify({
+      title: 'Private outside title',
+      sourceCid: 'outside-conversation',
+      sourceArtifactId: '',
+      savedAt: new Date().toISOString(),
+    }));
+    const metaPath = path.join(APPS_ROOT(), saved.id, '__orkas-meta.json');
+    fs.rmSync(metaPath);
+    fs.symlinkSync(outsideMeta, metaPath, 'file');
+
+    const listed = savedApps.listSavedApps(UID).find((app) => app.id === saved.id);
+    expect(listed?.title).toBe('Interactive app');
+    expect(listed?.sourceCid).toBe('');
+    expect(savedApps.renameSavedApp(UID, saved.id, 'Changed outside').ok).toBe(false);
+    expect(JSON.parse(fs.readFileSync(outsideMeta, 'utf8')).title).toBe('Private outside title');
   });
 });
 
@@ -501,6 +570,48 @@ describe('saved_apps › openForEditing', () => {
     const before = (await chats.listConversations(UID)).length;
     expect((await savedApps.openForEditing(UID, '../evil')).ok).toBe(false);
     expect((await savedApps.openForEditing(UID, 'Zm9vYmFyAA')).ok).toBe(false); // well-formed id, no such app
+    expect((await chats.listConversations(UID)).length).toBe(before);
+  });
+
+  it('rolls back the new conversation when the source attachment cannot be created', async () => {
+    const { savedApps } = await mods();
+    const chats = await import('../../../src/main/features/chats');
+    const chatAttachments = await import('../../../src/main/features/chat_attachments');
+    const aid = await makeArtifact('Attachment failure');
+    const saved = savedApps.saveFromArtifact(UID, CID, aid);
+    if (!saved.ok) throw new Error('save failed');
+    vi.spyOn(chatAttachments, 'uploadAttachment').mockResolvedValue({
+      ok: false,
+      error: 'injected attachment failure',
+    });
+
+    const before = (await chats.listConversations(UID)).length;
+    const result = await savedApps.openForEditing(UID, saved.id);
+    expect(result).toEqual({ ok: false, error: 'injected attachment failure' });
+    expect((await chats.listConversations(UID)).length).toBe(before);
+  });
+
+  it('does not bundle files through a symlinked saved-app directory', async () => {
+    const outside = path.join(tmpDir, 'outside-edit-app');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'index.html'), '<!doctype html><h1>private outside content</h1>');
+    fs.writeFileSync(path.join(outside, '__orkas-meta.json'), JSON.stringify({
+      title: 'Outside edit',
+      sourceCid: '',
+      sourceArtifactId: '',
+      savedAt: new Date().toISOString(),
+    }));
+    const linkedId = 'SymlinkEdit01';
+    fs.symlinkSync(
+      outside,
+      path.join(APPS_ROOT(), linkedId),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+
+    const { savedApps } = await mods();
+    const chats = await import('../../../src/main/features/chats');
+    const before = (await chats.listConversations(UID)).length;
+    expect((await savedApps.openForEditing(UID, linkedId)).ok).toBe(false);
     expect((await chats.listConversations(UID)).length).toBe(before);
   });
 });

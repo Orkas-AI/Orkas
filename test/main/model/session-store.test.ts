@@ -132,6 +132,36 @@ describe('session-store.sessionFileFor', () => {
     expect(() => sessionFileFor(''))
       .toThrow(/invalid session id/);
   });
+
+  it('deduplicates concurrent first loads and cannot reuse a late old-account session after a user switch', async () => {
+    const sessions = await import('../../../src/main/model/core-agent/session-store');
+    const users = await import('../../../src/main/features/users');
+    const nextUid = '12155734';
+    const sessionId = 'gconv-cache-race';
+
+    sessions._evictAll();
+    users.activateUser(uid);
+
+    // Both calls pause on the same first dynamic constructor import. Switching
+    // accounts in that window clears the cache before either constructor
+    // resumes, which probes both promise deduplication and late cache writes.
+    const firstLoad = sessions.getSession(sessionId);
+    const duplicateLoad = sessions.getSession(sessionId);
+    users.activateUser(nextUid);
+
+    try {
+      const [first, duplicate] = await Promise.all([firstLoad, duplicateLoad]);
+      const current = await sessions.getSession(sessionId);
+
+      expect(first).toBe(duplicate);
+      expect(first.getSessionFile()).toContain(`${path.sep}${uid}${path.sep}`);
+      expect(current).not.toBe(first);
+      expect(current.getSessionFile()).toContain(`${path.sep}${nextUid}${path.sep}`);
+    } finally {
+      users.activateUser(uid);
+      sessions._evictAll();
+    }
+  });
 });
 
 // Per-agent cross-session-memory eligibility (pure helpers — no workspace/IO).

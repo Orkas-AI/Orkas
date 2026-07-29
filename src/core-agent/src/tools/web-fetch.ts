@@ -5,58 +5,101 @@
  * No external dependencies — uses Node's built-in fetch() + regex-based
  * HTML tag stripping.
  */
-import { defineTool, type AgentTool } from "./base.js";
+import { defineTool, type AgentTool, type ToolResult } from "./base.js";
+import { createLogger } from "../shared/logger.js";
+import {
+  compactGitHubSnapshotReplay,
+  fetchGitHubRepositorySnapshot,
+  identifyGitHubRepositoryResource,
+} from "./github-repository-fetch.js";
+import {
+  DEFAULT_WEB_FETCH_TIMEOUT_MS,
+  readWebFetchResponse,
+  WEB_FETCH_USER_AGENT,
+  webFetchAcceptLanguage,
+} from "./web-fetch-http.js";
 
-const DEFAULT_TIMEOUT_MS = 60_000;
-/** Network/body safety bound, separate from the 8K model-context policy. The
- * complete decoded/extracted result below this limit reaches the host Result
- * Store; responses above it fail explicitly instead of returning a silent,
- * misleading prefix as if it were the full page. */
-export const MAX_WEB_FETCH_RESPONSE_BYTES = 16 * 1024 * 1024;
-const USER_AGENT =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+export {
+  decodeBytes,
+  MAX_WEB_FETCH_RESPONSE_BYTES,
+  resolveCharset,
+} from "./web-fetch-http.js";
 
-function acceptLanguage(): string {
-  return process.env.ORKAS_ACCEPT_LANGUAGE || "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7";
-}
+const log = createLogger("web-fetch");
 
-/**
- * Pick the charset for decoding raw response bytes.
- *
- *   1. HTTP `Content-Type: text/html; charset=...` header — authoritative
- *      when present.
- *   2. `<meta charset="...">` or `<meta http-equiv="Content-Type"
- *      content="text/html; charset=...">` in the first ~2 KB of the body.
- *      We peek at the bytes as latin1 because ASCII-range tags (`<meta`)
- *      survive that decoding regardless of the actual document encoding.
- *   3. Default to `utf-8`.
- *
- * Returned value is lowercased and passed directly to `TextDecoder` — the
- * WHATWG Encoding standard accepts aliases like `gbk`, `gb2312`, `gb18030`,
- * `big5`, `shift_jis`, `windows-1252`, etc.
- */
-export function resolveCharset(contentType: string, headBytes: Buffer): string {
-  const headerMatch = contentType.match(/charset\s*=\s*["']?([A-Za-z0-9._\-]+)/i);
-  if (headerMatch) return headerMatch[1].toLowerCase();
+type WebFetchCacheEntry = {
+  epoch: number;
+  result: Promise<ToolResult>;
+};
 
-  const head = headBytes.subarray(0, Math.min(headBytes.byteLength, 2048)).toString("latin1");
-  const metaMatch = head.match(/<meta[^>]*charset\s*=\s*["']?([A-Za-z0-9._\-]+)/i);
-  if (metaMatch) return metaMatch[1].toLowerCase();
+const fetchCacheByRunState = new WeakMap<object, Map<string, WebFetchCacheEntry>>();
+const WEB_FETCH_RUN_CACHE_KEY = "webFetchCache";
 
-  return "utf-8";
-}
-
-/**
- * Decode bytes with the given charset label. If the label is unknown or
- * unsupported by the runtime's TextDecoder, fall back to UTF-8 — replacement
- * characters are preferable to throwing on the caller.
- */
-export function decodeBytes(buf: Buffer, charset: string): string {
-  try {
-    return new TextDecoder(charset, { fatal: false }).decode(buf);
-  } catch {
-    return new TextDecoder("utf-8", { fatal: false }).decode(buf);
+function fetchCacheForState(state: Record<string, unknown>): Map<string, WebFetchCacheEntry> {
+  // AgentRunner rebuilds ToolContext.state after every model round and context
+  // compaction, but injects the same runScopedLedger Map by reference. Keep the
+  // fetch cache there so a compacted model cannot cause the same successful URL
+  // to hit the network again. The WeakMap is retained for direct/tool tests and
+  // other callers that do not provide the runner ledger.
+  const runScopedLedger = state.runScopedLedger;
+  if (runScopedLedger instanceof Map) {
+    const cached = runScopedLedger.get(WEB_FETCH_RUN_CACHE_KEY);
+    if (cached instanceof Map) return cached as Map<string, WebFetchCacheEntry>;
+    const created = new Map<string, WebFetchCacheEntry>();
+    runScopedLedger.set(WEB_FETCH_RUN_CACHE_KEY, created);
+    return created;
   }
+
+  let fallback = fetchCacheByRunState.get(state);
+  if (!fallback) {
+    fallback = new Map<string, WebFetchCacheEntry>();
+    fetchCacheByRunState.set(state, fallback);
+  }
+  return fallback;
+}
+
+function contextEpoch(state: Record<string, unknown>): number {
+  const ledger = state.toolResultReadLedger;
+  if (!ledger || typeof ledger !== "object") return 0;
+  const epoch = Number((ledger as { epoch?: unknown }).epoch);
+  return Number.isFinite(epoch) && epoch >= 0 ? Math.trunc(epoch) : 0;
+}
+
+function normalizedFetchUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return rawUrl;
+  }
+}
+
+function applyExplicitCharacterLimit(result: ToolResult, maxChars: number | null): ToolResult {
+  if (maxChars === null || result.content.length <= maxChars) return result;
+  return {
+    ...result,
+    content:
+      result.content.slice(0, maxChars)
+      + "\n...(truncated at the explicitly requested maxChars)",
+  };
+}
+
+function compactCacheReplay(result: ToolResult): ToolResult {
+  const reusableHeader = result.content
+    .split("\n")
+    .filter((line) =>
+      /^(?:Title|URL|Accessed at|HTTP Last-Modified|Embedded document dates \(newest first\)):/i.test(line),
+    )
+    .slice(0, 5)
+    .join("\n");
+  return {
+    content: [
+      "WEB_FETCH_RUN_CACHE_HIT: this normalized URL already succeeded earlier in this run; no network request was made.",
+      reusableHeader,
+      "The full page is intentionally not re-injected after context compaction. Use the durable evidence/file ledger and saved exact quotes. Do not request this URL again merely to recover compacted context.",
+    ].filter(Boolean).join("\n"),
+  };
 }
 
 /**
@@ -116,6 +159,19 @@ function extractTitle(html: string): string | undefined {
   return m ? htmlToText(m[1]).trim() : undefined;
 }
 
+/** Extract machine-readable dates already embedded in HTML (for example,
+ * GitHub's <relative-time datetime="..."> values). This adds research
+ * freshness context without another network request. */
+export function extractEmbeddedDocumentDates(html: string): string[] {
+  const values = new Set<string>();
+  const pattern = /<(?:time|relative-time)\b[^>]*\bdatetime\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  for (const match of html.matchAll(pattern)) {
+    const timestamp = Date.parse(match[1]);
+    if (Number.isFinite(timestamp)) values.add(new Date(timestamp).toISOString());
+  }
+  return [...values].sort((a, b) => b.localeCompare(a)).slice(0, 5);
+}
+
 export type FetchContentIssue = {
   code: "WAF_OR_BOT_CHECK" | "PAGE_NOT_FOUND" | "JS_OR_NAV_SHELL";
   message: string;
@@ -164,13 +220,85 @@ export function classifyFetchContent(url: string, title: string | undefined, raw
   return null;
 }
 
+async function fetchGeneralUrl(url: string): Promise<ToolResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DEFAULT_WEB_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": WEB_FETCH_USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": webFetchAcceptLanguage(),
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    const body = await readWebFetchResponse(response);
+    if ("error" in body) {
+      return {
+        content: body.error.startsWith("HTTP") ? `${body.error} for ${url}` : body.error,
+        isError: true,
+      };
+    }
+
+    if (body.contentType.includes("json")) {
+      try {
+        return { content: JSON.stringify(JSON.parse(body.raw), null, 2) };
+      } catch {
+        return { content: body.raw };
+      }
+    }
+    if (body.contentType.includes("text/plain")) {
+      return { content: body.raw };
+    }
+
+    const title = extractTitle(body.raw);
+    const text = htmlToText(body.raw);
+    const issue = classifyFetchContent(url, title, body.raw, text);
+    const lastModified = response.headers.get("last-modified");
+    const embeddedDates = extractEmbeddedDocumentDates(body.raw);
+    const header = [
+      ...(title ? [`Title: ${title}`] : []),
+      `URL: ${response.url || url}`,
+      `Accessed at: ${new Date().toISOString()}`,
+      ...(lastModified ? [`HTTP Last-Modified: ${lastModified}`] : []),
+      ...(embeddedDates.length
+        ? [`Embedded document dates (newest first): ${embeddedDates.join(", ")}`]
+        : []),
+      "",
+      "",
+    ].join("\n");
+    if (issue) {
+      return {
+        content: `${header}${issue.code}: ${issue.message}\n\nExtracted text preview:\n${text}`,
+        isError: true,
+      };
+    }
+    return { content: header + text };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("abort")) {
+      return {
+        content: `Timeout fetching ${url} (${DEFAULT_WEB_FETCH_TIMEOUT_MS}ms)`,
+        isError: true,
+      };
+    }
+    return { content: `Error fetching ${url}: ${message}`, isError: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export const webFetchTool: AgentTool = defineTool({
   name: "web_fetch",
   executionMode: "parallel",
   description:
     "Fetch a web page by URL and return its content as readable text. " +
     "Use this to read articles, documentation, or any web page content. " +
-    "Returns the page title and extracted text.",
+    "Returns the page title and extracted text. A GitHub repository root is " +
+    "resolved to a structured metadata + official README snapshot, so do not " +
+    "make follow-up requests to its API or raw README aliases.",
   inputSchema: {
     type: "object",
     properties: {
@@ -182,16 +310,12 @@ export const webFetchTool: AgentTool = defineTool({
     },
     required: ["url"],
   },
-  async execute(input) {
+  async execute(input, ctx) {
     const url = (input.url as string).trim();
     const requestedMaxChars = Number(input.maxChars);
     const maxChars = Number.isFinite(requestedMaxChars) && requestedMaxChars > 0
       ? Math.trunc(requestedMaxChars)
       : null;
-    const applyExplicitLimit = (text: string): string =>
-      maxChars !== null && text.length > maxChars
-        ? text.slice(0, maxChars) + "\n...(truncated at the explicitly requested maxChars)"
-        : text;
 
     if (!url) {
       return { content: "Error: url is required", isError: true };
@@ -200,106 +324,44 @@ export const webFetchTool: AgentTool = defineTool({
       return { content: "Error: only http:// and https:// URLs are supported", isError: true };
     }
 
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-      let resp: Response;
-      try {
-        resp = await fetch(url, {
-          method: "GET",
-          headers: {
-            "User-Agent": USER_AGENT,
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": acceptLanguage(),
-          },
-          signal: controller.signal,
-          redirect: "follow",
-        });
-
-        if (!resp.ok) {
-          return {
-            content: `HTTP ${resp.status} ${resp.statusText} for ${url}`,
-            isError: true,
-          };
-        }
-
-        const contentType = resp.headers.get("content-type") ?? "";
-        const declaredLength = Number(resp.headers.get("content-length"));
-        if (Number.isFinite(declaredLength) && declaredLength > MAX_WEB_FETCH_RESPONSE_BYTES) {
-          await resp.body?.cancel().catch(() => undefined);
-          return {
-            content:
-              `E_FETCH_RESPONSE_TOO_LARGE: response declares ${declaredLength} bytes; ` +
-              `hard safety limit is ${MAX_WEB_FETCH_RESPONSE_BYTES} bytes. No partial page was returned.`,
-            isError: true,
-          };
-        }
-
-        // Read response body with size limit. Keep the timeout active until
-        // the body is consumed; slow pages often send headers quickly and then
-        // stall during the read.
-        const reader = resp.body?.getReader();
-        if (!reader) {
-          return { content: "Error: empty response body", isError: true };
-        }
-
-        const chunks: Uint8Array[] = [];
-        let totalBytes = 0;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          totalBytes += value.byteLength;
-          if (totalBytes > MAX_WEB_FETCH_RESPONSE_BYTES) {
-            await reader.cancel().catch(() => undefined);
-            return {
-              content:
-                `E_FETCH_RESPONSE_TOO_LARGE: response exceeded ${MAX_WEB_FETCH_RESPONSE_BYTES} bytes while streaming. ` +
-                `No partial page was returned.`,
-              isError: true,
-            };
-          }
-          chunks.push(value);
-        }
-
-        const buf = Buffer.concat(chunks);
-        const charset = resolveCharset(contentType, buf);
-        const raw = decodeBytes(buf, charset);
-
-        // JSON responses: return as-is (pretty-printed if possible)
-        if (contentType.includes("json")) {
-          try {
-            const pretty = JSON.stringify(JSON.parse(raw), null, 2);
-            return { content: applyExplicitLimit(pretty) };
-          } catch {
-            return { content: applyExplicitLimit(raw) };
-          }
-        }
-
-        // Plain text: return as-is
-        if (contentType.includes("text/plain")) {
-          return { content: applyExplicitLimit(raw) };
-        }
-
-        // HTML: extract text
-        const title = extractTitle(raw);
-        let text = htmlToText(raw);
-        const issue = classifyFetchContent(url, title, raw, text);
-        text = applyExplicitLimit(text);
-
-        const header = title ? `Title: ${title}\nURL: ${url}\n\n` : `URL: ${url}\n\n`;
-        if (issue) {
-          return { content: `${header}${issue.code}: ${issue.message}\n\nExtracted text preview:\n${text}`, isError: true };
-        }
-        return { content: header + text };
-      } finally {
-        clearTimeout(timer);
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("abort")) {
-        return { content: `Timeout fetching ${url} (${DEFAULT_TIMEOUT_MS}ms)`, isError: true };
-      }
-      return { content: `Error fetching ${url}: ${msg}`, isError: true };
+    const fetchCache = fetchCacheForState(ctx.state);
+    const githubResource = identifyGitHubRepositoryResource(url);
+    const requestKey = githubResource?.kind === "repository"
+      ? `github:${githubResource.key}`
+      : normalizedFetchUrl(url);
+    const epoch = contextEpoch(ctx.state);
+    const cached = fetchCache.get(requestKey);
+    if (cached) {
+      log.info("run cache hit; skipped network request", {
+        maxChars: maxChars ?? "complete",
+        compactReplay: epoch > cached.epoch,
+      });
+      const result = await cached.result;
+      return epoch > cached.epoch
+        ? compactCacheReplay(result)
+        : applyExplicitCharacterLimit(result, maxChars);
     }
+
+    const priorGitHubSnapshot = githubResource
+      ? fetchCache.get(`github:${githubResource.key}`)
+      : undefined;
+    if (githubResource && githubResource.kind !== "repository" && priorGitHubSnapshot) {
+      log.info("github repository alias cache hit; skipped network request", {
+        repository: githubResource.key,
+        requestedKind: githubResource.kind,
+      });
+      return compactGitHubSnapshotReplay(githubResource);
+    }
+
+    const request = githubResource?.kind === "repository"
+      ? fetchGitHubRepositorySnapshot(githubResource)
+      : fetchGeneralUrl(url);
+    const cacheEntry = { epoch, result: request };
+    fetchCache.set(requestKey, cacheEntry);
+    const result = await request;
+    if (result.isError) {
+      fetchCache.delete(requestKey);
+    }
+    return applyExplicitCharacterLimit(result, maxChars);
   },
 });

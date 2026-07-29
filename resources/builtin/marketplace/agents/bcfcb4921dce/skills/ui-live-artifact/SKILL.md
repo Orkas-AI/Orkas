@@ -63,7 +63,7 @@ The preview must still be a good UIDesigner artifact:
 - Show refresh status, last updated time, data freshness, and empty/error states.
 - Include source/provenance cues only where they help trust; do not clutter the main workflow.
 - Separate UI actions from data refresh actions.
-- Implement visible, reachable stale, partial, loading, failed-refresh, empty, and last-updated states in DOM/rendering logic; a prose inventory is not sufficient.
+- Implement visible, reachable stale, partial, loading, failed-refresh, empty, and last-updated states in DOM/rendering logic; a prose inventory is not sufficient. Keep those canonical state names directly inspectable in the HTML/JS (for example `data-live-state="loading|empty|failed-refresh|stale|partial"` and `<time data-field="lastUpdated">`) even when the visible labels are localized.
 - Use `ui-design-executor` for baseline visual quality. Add a contract, reference, system, or deep renderer skill only when its specialist trigger is present.
 
 ## Connector Boundaries

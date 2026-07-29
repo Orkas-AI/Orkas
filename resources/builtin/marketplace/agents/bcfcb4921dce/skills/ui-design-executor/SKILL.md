@@ -16,6 +16,15 @@ Pair it with:
 - `ui-design-source` when an inspectable screenshot, Figma export, PDF, design JSON, existing HTML, or other fidelity source exists.
 - One specialist skill only when its trigger below materially changes the work.
 
+## Completion Router
+
+Resolve these gates before asking a question or choosing the HTML fast path:
+
+1. **Explicit final format wins immediately.** If the user explicitly requests SVG, PDF, React, Vue, PNG, Markdown, or another final format and the subject plus deliverable are clear, build that format now. For a standalone icon/SVG request, a missing product name or exact icon list is a low-risk creative detail rather than a material blocker: choose a neutral working identity and a coherent default set. Infer other low-risk visual details; do not open a preference form or ask about style, palette, icon count, or packaging merely because those choices could be customized. A standalone SVG delivery is the editable SVG entry plus `artifact.json`, with HTML intentionally absent.
+2. **Inaccessible exact source offers two honest paths.** When an exact/1:1 Figma request has only an inaccessible URL and no Figma connector/export, do not use a general web fetch as substitute access. Keep exact work blocked and put both paths in the visible reply before any question or form: **Exact** waits for inspectable evidence; **Adaptive (optional)** is a provisional non-fidelity scaffold, explicitly not 1:1, and starts only if the user chooses it. Do not silently start that scaffold.
+3. **Unapproved raster work stays a handoff, not a substitute.** If the brief requires an original raster asset but the current turn has no approved/direct raster invocation, retain the UI, write a ratio-consistent asset brief, and prewire the future relative raster path with an honest pending fallback. The artifact itself must retain a compact machine-checkable brief (for example `<template class="asset-brief">`) that names composition/aspect, matching pixel dimensions, at least two palette colors, opaque/transparent background treatment, and the exact `assets/...` save path. Keep a not-yet-created asset inert, for example `data-raster-src="assets/hero.webp"` beside an actual local/data fallback; do not create a broken active `src`. Do not call a billable generation tool, claim the raster exists, or replace the requested raster with an inline SVG final.
+4. **A revision is incomplete without available preview evidence.** When `html_preview` is available, a standalone HTML revision must validate the package and capture desktop plus mobile preview evidence before the one manifest increment and publication. Do not treat the source-only validator as responsive or rendered evidence.
+
 ## Minimal Routing
 
 Use the fast path for a clear single screen, component, local redesign, or small repo UI change:
@@ -87,7 +96,24 @@ For interactive standalone HTML:
 - Keep meaningful primary content in static HTML before scripts run.
 - Use `addEventListener`, delegation, or data-action hooks; do not nest inline handlers inside generated HTML strings.
 - Keep cached element references immutable. Build complex state in a fragment/detached container and commit once.
-- Guard the real initialization callback so a failure leaves the static shell visible and shows an actionable fallback.
+- Guard the real initialization callback so a failure leaves the static shell visible and shows an actionable fallback. Use one named guarded entry point, not an outer `try/catch` around callback registration:
+
+```js
+function safeInit() {
+  try {
+    init();
+  } catch (error) {
+    runtimeStatus.hidden = false;
+    runtimeStatus.textContent = "This view could not initialize. Retry or reload.";
+  }
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", safeInit, { once: true });
+} else {
+  safeInit();
+}
+```
 
 ## Fast Gate
 
@@ -99,9 +125,9 @@ For a standalone HTML artifact, run the bundled validator when Node and shell ex
   <artifact-directory>
 ```
 
-It checks strict `artifact.json`, entry/file inventory, safe relative paths, critical HTML structure, meaningful static content, inline JavaScript syntax, fragile generated inline handlers, and local references in one call. Fix every reported error. Treat warnings as review prompts, not automatic failures.
+It checks strict `artifact.json`, entry/file inventory, safe relative paths, critical HTML structure, meaningful static content, inline JavaScript syntax, fragile generated inline handlers, guarded initialization when an initializer exists (`runtime-guarded-init`), and local references in one call. Fix every reported error. Treat warnings as review prompts, not automatic failures.
 
-For an in-place revision, validate the changed entry before incrementing the manifest when practical, then run the final package check after the single revision increment. Also smoke-check the requested change, non-blank first render, primary workflow, responsive behavior, and local asset/reference resolution.
+For an in-place revision, use this order: read the baseline; patch the entry; validate before incrementing; run `html_preview` at desktop and mobile when available; check the requested change, non-blank first render, primary workflow, responsive behavior, and local asset/reference resolution; increment the manifest exactly once; run the final package check; publish. A validator-only run is not rendered or responsive evidence.
 
 Use embedded preview, DOM inspection, screenshots, interaction playback, or accessibility tooling only when already available and proportionate to the task. Do not open an external browser or install dependencies by default.
 

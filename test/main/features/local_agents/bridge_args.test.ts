@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildClaudeArgs } from '../../../../src/main/features/local_agents/backends/claude';
-import { buildCodexBridgeOverrides, codexDeveloperInstructions } from '../../../../src/main/features/local_agents/backends/codex';
+import {
+  buildCodexBridgeOverrides,
+  codexDeveloperInstructions,
+  codexThreadDeveloperInstructionParams,
+} from '../../../../src/main/features/local_agents/backends/codex';
 
 const BASE = {
   binPath: '/codex', prompt: 'hi', cwd: '/proj',
@@ -14,6 +18,7 @@ const BASE = {
 describe('claude bridge args', () => {
   it('adds --mcp-config and --append-system-prompt before customArgs', () => {
     const args = buildClaudeArgs({
+      systemPrompt: 'Durable Orkas CLI protocol.',
       bridge: {
         mcpConfigPath: '/runs/r1/orkas-mcp-config.json',
         server: { command: '/node', args: ['/bridge.cjs'], env: {} },
@@ -25,7 +30,9 @@ describe('claude bridge args', () => {
     expect(mcpIdx).toBeGreaterThan(-1);
     expect(args[mcpIdx + 1]).toBe('/runs/r1/orkas-mcp-config.json');
     const sysIdx = args.indexOf('--append-system-prompt');
+    expect(args[sysIdx + 1]).toContain('Durable Orkas CLI protocol.');
     expect(args[sysIdx + 1]).toContain('Orkas');
+    expect(args.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
     // User flags still trail so they can override.
     expect(args.indexOf('--some-user-flag')).toBeGreaterThan(sysIdx);
     // No strict mode — the user's own MCP servers must keep working.
@@ -36,6 +43,21 @@ describe('claude bridge args', () => {
     const args = buildClaudeArgs({});
     expect(args).not.toContain('--mcp-config');
     expect(args).not.toContain('--append-system-prompt');
+  });
+
+  it('repeats invocation-scoped durable instructions when resuming Claude', () => {
+    const args = buildClaudeArgs({
+      resumeSessionId: 'existing-claude-session',
+      systemPrompt: 'Durable Orkas CLI protocol.',
+    });
+
+    const resumeIdx = args.indexOf('--resume');
+    const systemIdx = args.indexOf('--append-system-prompt');
+    expect(resumeIdx).toBeGreaterThan(-1);
+    expect(args[resumeIdx + 1]).toBe('existing-claude-session');
+    expect(systemIdx).toBeGreaterThan(-1);
+    expect(args[systemIdx + 1]).toBe('Durable Orkas CLI protocol.');
+    expect(args.filter((arg) => arg === '--append-system-prompt')).toHaveLength(1);
   });
 });
 
@@ -80,15 +102,34 @@ describe('codex bridge overrides', () => {
     expect(overrides).toContain('mcp_servers.orkas.env.ORKAS_PC_DIR="C:\\\\Program Files\\\\Orkas"');
   });
 
-  it('carries the bridge prompt as developerInstructions, null otherwise', () => {
+  it('combines durable context and the bridge prompt as developerInstructions', () => {
     expect(codexDeveloperInstructions({ ...BASE })).toBeNull();
-    expect(codexDeveloperInstructions({
+    const instructions = codexDeveloperInstructions({
       ...BASE,
+      systemPrompt: 'Durable Orkas CLI protocol.',
       bridge: {
         mcpConfigPath: '/cfg.json',
         server: { command: '/node', args: ['/b.cjs'], env: {} },
         appendSystemPrompt: 'You are running inside Orkas.',
       },
-    })).toContain('Orkas');
+    });
+    expect(instructions).toContain('Durable Orkas CLI protocol.');
+    expect(instructions).toContain('You are running inside Orkas.');
+    expect(instructions).toBe(
+      'Durable Orkas CLI protocol.\n\nYou are running inside Orkas.',
+    );
+  });
+
+  it('omits unchanged instructions only on resume and restores them for a fresh fallback', () => {
+    const opts = {
+      ...BASE,
+      systemPrompt: 'Durable Orkas CLI protocol.',
+      reuseSessionInstructions: true,
+    };
+
+    expect(codexThreadDeveloperInstructionParams(opts, true)).toEqual({});
+    expect(codexThreadDeveloperInstructionParams(opts, false)).toEqual({
+      developerInstructions: 'Durable Orkas CLI protocol.',
+    });
   });
 });

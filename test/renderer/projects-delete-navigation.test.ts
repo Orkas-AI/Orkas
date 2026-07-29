@@ -7,6 +7,9 @@ function loadProjectsRenderer(options: {
   afterProjects: any[];
   afterConversations: any[];
   createdProject?: any;
+  createProjectResult?: Promise<any>;
+  listProjectsError?: Error;
+  listProjectResults?: Array<Promise<any>>;
 }) {
   const setViewCalls: any[] = [];
   const refreshAutoProjectCalls: string[] = [];
@@ -41,6 +44,7 @@ function loadProjectsRenderer(options: {
     document: {
       addEventListener() {},
       getElementById: () => null,
+      querySelector: () => null,
       querySelectorAll: () => [],
     },
     window: {
@@ -51,8 +55,16 @@ function loadProjectsRenderer(options: {
         invoke: async (channel: string) => {
           if (channel === 'autoTasks.list') return { tasks: [] };
           if (channel === 'projects.delete') return { ok: true };
-          if (channel === 'projects.create') return { ok: true, project: options.createdProject };
-          if (channel === 'projects.list') return { ok: true, projects: options.afterProjects };
+          if (channel === 'projects.create') {
+            return options.createProjectResult
+              ? await options.createProjectResult
+              : { ok: true, project: options.createdProject };
+          }
+          if (channel === 'projects.list') {
+            if (options.listProjectsError) throw options.listProjectsError;
+            if (options.listProjectResults?.length) return await options.listProjectResults.shift();
+            return { ok: true, projects: options.afterProjects };
+          }
           throw new Error(`unexpected invoke: ${channel}`);
         },
       },
@@ -134,6 +146,51 @@ describe('project delete navigation', () => {
 });
 
 describe('project create navigation', () => {
+  it('keeps the last successful project list when a background refresh fails', async () => {
+    const cached = [{ project_id: 'p-existing', name: 'Alpha', conv_count: 0 }];
+    const context = loadProjectsRenderer({
+      afterProjects: [],
+      afterConversations: [],
+      listProjectsError: new Error('temporary IPC failure'),
+    });
+    context.__setProjectsCache(cached);
+
+    await expect(context.loadProjects(true)).resolves.toEqual(cached);
+    expect(vm.runInContext('_projectsCache', context)).toEqual(cached);
+  });
+
+  it('does not let an older project-list response replace a newer refresh', async () => {
+    let resolveOlder!: (result: any) => void;
+    let resolveNewer!: (result: any) => void;
+    const older = new Promise<any>((resolve) => { resolveOlder = resolve; });
+    const newer = new Promise<any>((resolve) => { resolveNewer = resolve; });
+    const context = loadProjectsRenderer({
+      afterProjects: [],
+      afterConversations: [],
+      listProjectResults: [older, newer],
+    });
+    context.__setProjectsCache([
+      { project_id: 'p-initial', name: 'Initial', conv_count: 0 },
+    ]);
+
+    const olderRefresh = context.loadProjects(true);
+    const newerRefresh = context.loadProjects(true);
+    resolveNewer({
+      ok: true,
+      projects: [{ project_id: 'p-newer', name: 'Newer', conv_count: 0 }],
+    });
+    await newerRefresh;
+    resolveOlder({
+      ok: true,
+      projects: [{ project_id: 'p-older', name: 'Older', conv_count: 0 }],
+    });
+    await olderRefresh;
+
+    expect(vm.runInContext('_projectsCache', context)).toEqual([
+      { project_id: 'p-newer', name: 'Newer', conv_count: 0 },
+    ]);
+  });
+
   it('selects the new project and opens its detail page after creation', async () => {
     const createdProject = { project_id: 'p-new', name: 'Alpha', conv_count: 0 };
     const context = loadProjectsRenderer({
@@ -143,6 +200,7 @@ describe('project create navigation', () => {
     });
     context.currentView = 'new-chat';
     context._projectDetailPid = '';
+    context._startProjectInlineCreate();
 
     const listeners = new Map<string, (...args: any[]) => any>();
     const input = {
@@ -164,5 +222,81 @@ describe('project create navigation', () => {
     ]);
     expect(context.currentView).toBe('project');
     expect(context._projectDetailPid).toBe('p-new');
+  });
+
+  it('keeps the create draft and duplicate error across a background rerender', async () => {
+    let resolveCreate!: (result: any) => void;
+    const createProjectResult = new Promise<any>((resolve) => {
+      resolveCreate = resolve;
+    });
+    const context = loadProjectsRenderer({
+      afterProjects: [{ project_id: 'p-existing', name: 'Alpha', conv_count: 0 }],
+      afterConversations: [],
+      createProjectResult,
+    });
+    context._startProjectInlineCreate();
+
+    const listeners = new Map<string, (...args: any[]) => any>();
+    const input = {
+      value: 'Alpha',
+      disabled: false,
+      addEventListener(type: string, listener: (...args: any[]) => any) {
+        listeners.set(type, listener);
+      },
+    };
+    context._bindInlineCreateInput(input);
+    const pendingCreate = listeners.get('blur')?.();
+
+    context.renderProjectsSection();
+    resolveCreate({ ok: false, error: 'name_dup' });
+    await pendingCreate;
+
+    const html = context._renderInlineCreateRow();
+    expect(html).toContain('value="Alpha"');
+    expect(html).toContain('project-rename-input is-error');
+    expect(html).toContain('project-inline-error');
+    expect(html).toContain('project.name_dup_inline');
+  });
+
+  it('freezes an in-flight create and does not discard its result by starting a rename', async () => {
+    let resolveCreate!: (result: any) => void;
+    const createProjectResult = new Promise<any>((resolve) => {
+      resolveCreate = resolve;
+    });
+    const createdProject = { project_id: 'p-new', name: 'Alpha', conv_count: 0 };
+    const context = loadProjectsRenderer({
+      afterProjects: [createdProject],
+      afterConversations: [],
+      createdProject,
+      createProjectResult,
+    });
+    context._startProjectInlineCreate();
+
+    const listeners = new Map<string, (...args: any[]) => any>();
+    const input = {
+      value: 'Alpha',
+      disabled: false,
+      addEventListener(type: string, listener: (...args: any[]) => any) {
+        listeners.set(type, listener);
+      },
+    };
+    context._bindInlineCreateInput(input);
+    const pendingCreate = listeners.get('blur')?.();
+
+    expect(input.disabled).toBe(true);
+    expect(context._renderInlineCreateRow()).toContain('disabled');
+    context._startProjectInlineRename('p-existing');
+    expect(vm.runInContext('_projectsInlineCreate', context)).toBe(true);
+    expect(vm.runInContext('_projectsInlineRenamePid', context)).toBeNull();
+
+    resolveCreate({ ok: true, project: createdProject });
+    await pendingCreate;
+    expect(context.__setViewCalls).toEqual([
+      {
+        view: 'project',
+        id: 'p-new',
+        opts: { entryPoint: 'project_create' },
+      },
+    ]);
   });
 });

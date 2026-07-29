@@ -20,12 +20,12 @@ const utils = require('../../src/renderer/modules/utils.js');
 const {
   _safeHref,
   inlineFormat,
-  sanitizeHtml,
+  _sanitizeHtmlWithoutPurifier,
   sanitizeSvgIconHtml,
 } = utils as {
   _safeHref: (url: string) => string;
   inlineFormat: (text: string) => string;
-  sanitizeHtml: (html: string) => string;
+  _sanitizeHtmlWithoutPurifier: (html: string) => string;
   sanitizeSvgIconHtml: (svg: string) => string;
 };
 
@@ -121,14 +121,16 @@ describe('inlineFormat — markdown link XSS hardening', () => {
   });
 });
 
-describe('sanitizeHtml — Node fallback (no DOM/DOMPurify)', () => {
-  it('returns the input unchanged when DOMPurify is unavailable', () => {
-    // In the Node test env there is no window/DOMPurify, so sanitizeHtml is a
-    // passthrough — this pins that it does not throw and does not corrupt the
-    // markdown renderer output that other Node tests assert on.
-    const s = '<div class="markdown-body"><p>hi</p></div>';
-    expect(sanitizeHtml(s)).toBe(s);
-    expect(sanitizeHtml(null as unknown as string)).toBe('');
+describe('sanitizeHtml — missing-runtime containment', () => {
+  it('escapes an untrusted HTML snippet when the renderer sanitizer is unavailable', () => {
+    const dirty = '<img src=x onerror="window.pwned=1"><script>alert(1)</script>';
+    const safe = _sanitizeHtmlWithoutPurifier(dirty);
+
+    expect(safe).toContain('&lt;img');
+    expect(safe).toContain('&lt;script&gt;');
+    expect(safe).not.toContain('<img');
+    expect(safe).not.toContain('<script>');
+    expect(_sanitizeHtmlWithoutPurifier(null as unknown as string)).toBe('');
   });
 });
 

@@ -7,12 +7,12 @@ import { toCompressedGrayJpeg } from '../util/image-transform';
 
 const log = createLogger('library_image_describer');
 
-// Per-image cap for KB / project-library vision summaries. This is not an
-// interactive chat turn, but slow model routing can exceed two minutes; 5min
-// avoids premature fallback while keeping a bad image from stalling a whole
-// indexing batch for too long.
-const IMAGE_DESCRIBE_TIMEOUT_MS = 5 * 60 * 1000;
-const IMAGE_DESCRIBE_IDLE_TIMEOUT_SEC = Math.ceil(IMAGE_DESCRIBE_TIMEOUT_MS / 1000);
+// Per-image cap for KB / project-library vision summaries. The owning
+// indexers enforce a 5min extraction deadline that starts before image
+// preprocessing, so vision must settle earlier to leave time for fallback,
+// chunking, embedding, and persistence.
+const DEFAULT_IMAGE_DESCRIBE_TIMEOUT_MS = 4 * 60 * 1000;
+const MAX_SOURCE_NAME_CHARS = 160;
 
 interface VisionResult {
   ok: boolean;
@@ -33,14 +33,22 @@ export async function describeLibraryImage(
   try {
     compressed = await toCompressedGrayJpeg(raw, { maxDim: 1024, quality: 70, grayscale: true });
   } catch (err) {
-    log.warn(`prepare ${cleanName}: ${(err as Error).message}; using fallback`);
+    logFallback('prepare', cleanName, 'image_prepare_failed');
     return fallbackDescription(cleanName);
   }
 
   const controller = new AbortController();
   let timer: NodeJS.Timeout | null = null;
-  const sessionId = `${sessionPrefix}-${crypto.randomBytes(4).toString('hex')}`;
-  const message = prompts.load('contexts_extract_image', { source_name: cleanName });
+  const timeoutMs = imageDescribeTimeoutMs();
+  const safeSessionPrefix = String(sessionPrefix || 'extract-img')
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'extract-img';
+  const sessionId = `${safeSessionPrefix}-${crypto.randomBytes(4).toString('hex')}`;
+  const message = prompts.load('contexts_extract_image', {
+    source_name_json: JSON.stringify(cleanName),
+  });
 
   const modelCall: Promise<VisionResult> = chatWithModel({
     userId,
@@ -48,7 +56,7 @@ export async function describeLibraryImage(
     message,
     images: [{ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' }],
     skillList: [],
-    idleTimeout: IMAGE_DESCRIBE_IDLE_TIMEOUT_SEC,
+    idleTimeout: Math.ceil(timeoutMs / 1000),
     abortSignal: controller.signal,
   }).catch((err) => ({
     ok: false,
@@ -63,30 +71,52 @@ export async function describeLibraryImage(
       resolve({
         ok: false,
         text: '',
-        error: `vision timeout after ${Math.round(IMAGE_DESCRIBE_TIMEOUT_MS / 1000)}s`,
+        error: 'vision timeout',
         aborted: true,
       });
-    }, IMAGE_DESCRIBE_TIMEOUT_MS);
+    }, timeoutMs);
   });
 
   const result = await Promise.race([modelCall, timeoutCall]);
   if (timer) clearTimeout(timer);
 
   if (!result.ok) {
-    log.warn(`describe ${cleanName}: ${result.error || 'unknown error'}; using fallback`);
+    logFallback(
+      'describe',
+      cleanName,
+      result.aborted ? 'image_describe_timeout' : 'image_describe_failed',
+    );
     return fallbackDescription(cleanName);
   }
   const text = (result.text || '').trim();
   if (!text) {
-    log.warn(`describe ${cleanName}: empty response; using fallback`);
+    logFallback('describe', cleanName, 'image_describe_empty');
     return fallbackDescription(cleanName);
   }
   return text;
 }
 
 function cleanSourceName(sourceName: string): string {
-  const s = String(sourceName || '').replace(/[\r\n]+/g, ' ').trim();
-  return s || 'image';
+  const flattened = String(sourceName || '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .trim();
+  const basename = flattened.split(/[\\/]/).filter(Boolean).pop() || '';
+  return basename.slice(0, MAX_SOURCE_NAME_CHARS).trim() || 'image';
+}
+
+function imageDescribeTimeoutMs(): number {
+  const configured = Math.round(Number(process.env.ORKAS_LIBRARY_IMAGE_DESCRIBE_TIMEOUT_MS));
+  if (!Number.isFinite(configured) || configured < 50) return DEFAULT_IMAGE_DESCRIBE_TIMEOUT_MS;
+  return Math.min(configured, DEFAULT_IMAGE_DESCRIBE_TIMEOUT_MS);
+}
+
+function logFallback(stage: 'prepare' | 'describe', sourceName: string, errorCode: string): void {
+  const sourceRef = crypto.createHash('sha256').update(sourceName).digest('hex').slice(0, 12);
+  log.warn('library image description fallback', {
+    stage,
+    source_ref: sourceRef,
+    error_code: errorCode,
+  });
 }
 
 function fallbackDescription(sourceName: string): string {

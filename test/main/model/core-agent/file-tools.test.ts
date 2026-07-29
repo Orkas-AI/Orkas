@@ -48,14 +48,14 @@ function attachmentDir(): string {
   return path.join(tmpDir, UID, 'cloud', 'chat_attachments', CID);
 }
 
-async function buildTools() {
+async function buildTools(options: { includeOcrFile?: boolean; visionFallbackAvailable?: boolean } = {}) {
   const mod = await import('../../../../src/main/model/core-agent/file-tools');
   const ws = await import('../../../../src/main/features/user_workspace');
   const wsDir = path.join(tmpDir, 'ws');
   fs.mkdirSync(wsDir, { recursive: true });
   const r = ws.setWorkspacePath(UID, wsDir);
   if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
-  const tools = mod.createFileTools({ userId: UID, cid: CID });
+  const tools = mod.createFileTools({ userId: UID, cid: CID, ...options });
   fs.mkdirSync(attachmentDir(), { recursive: true });
   return { tools, wsDir, attDir: attachmentDir() };
 }
@@ -136,6 +136,31 @@ describe('file-tools › read_file (text)', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="2-7"');
     expect(r.content).toContain('cdefg');
+  });
+
+  it('reads a 1-based inclusive line range and records the exact observation', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'range.ts');
+    fs.writeFileSync(p, 'one\ntwo\nthree\nfour\nfive\n');
+    const r = await run(getTool(tools, 'read_file'), { path: p, lineStart: 2, lineEnd: 4 });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('lines="2-4"');
+    expect(r.content).toContain('2\ttwo\n3\tthree\n4\tfour');
+    expect(r.content).not.toContain('1\tone');
+    expect(r.content).not.toContain('5\tfive');
+    expect(r.observations?.fileReads?.[0]).toMatchObject({
+      path: p,
+      lineRange: [2, 4],
+    });
+  });
+
+  it('rejects mixed line and character addressing', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'range.txt');
+    fs.writeFileSync(p, 'one\ntwo\n');
+    const r = await run(getTool(tools, 'read_file'), { path: p, lineStart: 1, charStart: 0 });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_BAD_INPUT');
   });
 
   it('clamps charEnd past total_chars without error', async () => {
@@ -249,6 +274,14 @@ describe('file-tools › read_file (image)', () => {
 });
 
 describe('file-tools › ocr_file', () => {
+  it('is omitted by default and available only when explicitly enabled', async () => {
+    const defaultTools = await buildTools();
+    expect(defaultTools.tools.some((tool) => tool.name === 'ocr_file')).toBe(false);
+
+    const enabledTools = await buildTools({ includeOcrFile: true });
+    expect(enabledTools.tools.some((tool) => tool.name === 'ocr_file')).toBe(true);
+  });
+
   it('runs local OCR for images and returns OCR markdown', async () => {
     const mockOcr = vi.fn(async () => ({
       ok: true,
@@ -258,7 +291,7 @@ describe('file-tools › ocr_file', () => {
       engine: 'local:rapidocr-onnxruntime',
     }));
     vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
-    const { tools, wsDir } = await buildTools();
+    const { tools, wsDir } = await buildTools({ includeOcrFile: true });
     const p = path.join(wsDir, 'scan.png');
     const { Jimp } = await import('jimp' as any);
     const img: any = new Jimp({ width: 20, height: 20, color: 0xFFFFFFFF });
@@ -283,7 +316,7 @@ describe('file-tools › ocr_file', () => {
       engine: 'local:rapidocr-onnxruntime',
     }));
     vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
-    const { tools, wsDir } = await buildTools();
+    const { tools, wsDir } = await buildTools({ includeOcrFile: true });
     const p = path.join(wsDir, 'scan.pdf');
     fs.writeFileSync(p, makeMinimalPdf(['']));
 
@@ -306,7 +339,10 @@ describe('file-tools › ocr_file', () => {
         ],
       })),
     }));
-    const { tools, wsDir } = await buildTools();
+    const { tools, wsDir } = await buildTools({
+      includeOcrFile: true,
+      visionFallbackAvailable: true,
+    });
     const p = path.join(wsDir, 'scan.pdf');
     fs.writeFileSync(p, makeMinimalPdf(['']));
 
@@ -317,12 +353,67 @@ describe('file-tools › ocr_file', () => {
     expect(r.content).toContain('Local OCR runtime install failed');
     expect(r.content).toContain('<ocr-process>');
     expect(r.content).toContain('Downloading and installing local OCR packages');
+    expect(r.content).toContain('<ocr-vision-fallback action="pdf_render"');
+    expect(r.content).toContain('Do not retry ocr_file');
+  });
+
+  it('automatically returns the image to a vision model when local OCR fails', async () => {
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({
+      ocrFile: vi.fn(async () => ({
+        ok: false,
+        errorCode: 'E_OCR_INSTALL_FAILED',
+        message: 'Local OCR runtime install failed.',
+        processLog: [],
+      })),
+    }));
+    const { tools, wsDir } = await buildTools({
+      includeOcrFile: true,
+      visionFallbackAvailable: true,
+    });
+    const p = path.join(wsDir, 'scan.png');
+    const { Jimp } = await import('jimp' as any);
+    const img: any = new Jimp({ width: 20, height: 20, color: 0xFFFFFFFF });
+    fs.writeFileSync(p, await img.getBuffer('image/png'));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('<ocr-vision-fallback');
+    expect(r.content).toContain('action="inspect_attached_image"');
+    expect(r.images).toHaveLength(1);
+    expect(r.images[0].mediaType).toBe('image/jpeg');
+  });
+
+  it('reports the OCR failure without claiming a visual fallback on a text-only model', async () => {
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({
+      ocrFile: vi.fn(async () => ({
+        ok: false,
+        errorCode: 'E_OCR_INSTALL_FAILED',
+        message: 'Local OCR runtime install failed.',
+        processLog: [],
+      })),
+    }));
+    const { tools, wsDir } = await buildTools({
+      includeOcrFile: true,
+      visionFallbackAvailable: false,
+    });
+    const p = path.join(wsDir, 'scan.png');
+    const { Jimp } = await import('jimp' as any);
+    const img: any = new Jimp({ width: 20, height: 20, color: 0xFFFFFFFF });
+    fs.writeFileSync(p, await img.getBuffer('image/png'));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p });
+
+    expect(r.isError).toBe(true);
+    expect(r.images).toBeUndefined();
+    expect(r.content).toContain('E_OCR_INSTALL_FAILED');
+    expect(r.content).not.toContain('<ocr-vision-fallback');
   });
 
   it('rejects unsupported file kinds before invoking OCR runtime', async () => {
     const mockOcr = vi.fn();
     vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
-    const { tools, wsDir } = await buildTools();
+    const { tools, wsDir } = await buildTools({ includeOcrFile: true });
     const p = path.join(wsDir, 'notes.docx');
     fs.writeFileSync(p, makeMinimalDocx({ paragraphs: ['not visual'] }));
 
@@ -514,6 +605,41 @@ describe('file-tools › read_file scope guards', () => {
   });
 });
 
+describe('file-tools › read_files', () => {
+  it('reads related slices together and keeps partial successes usable', async () => {
+    const { tools, wsDir } = await buildTools();
+    const first = path.join(wsDir, 'first.ts');
+    const second = path.join(wsDir, 'second.ts');
+    const missing = path.join(wsDir, 'missing.ts');
+    fs.writeFileSync(first, 'export const first = 1;\n');
+    fs.writeFileSync(second, 'export const second = 2;\n');
+
+    const r = await run(getTool(tools, 'read_files'), {
+      files: [
+        { path: first },
+        { path: second, charStart: 7, charEnd: 19 },
+        { path: missing },
+      ],
+    });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('<read-files count="3" errors="1"');
+    expect(r.content).toContain('export const first = 1');
+    expect(r.content).toContain('const second');
+    expect(r.content).toContain('E_NOT_FOUND');
+  });
+
+  it('bounds omitted ranges to a 24K-character slice', async () => {
+    const { tools, wsDir } = await buildTools();
+    const large = path.join(wsDir, 'large.txt');
+    fs.writeFileSync(large, 'x'.repeat(30_000));
+    const r = await run(getTool(tools, 'read_files'), { files: [{ path: large }] });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('covered="0-24000"');
+    expect(r.content.length).toBeLessThan(30_000);
+  });
+});
+
 describe('file-tools › stat_file', () => {
   it('returns total_chars for text without extra extraction work', async () => {
     const { tools, wsDir } = await buildTools();
@@ -580,6 +706,26 @@ describe('file-tools › stat_file', () => {
 });
 
 describe('file-tools › search_files', () => {
+  it('respects repository ignore files while retaining tracked-style hidden source paths', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.mkdirSync(path.join(wsDir, '.git'), { recursive: true });
+    fs.mkdirSync(path.join(wsDir, 'ignored'), { recursive: true });
+    fs.mkdirSync(path.join(wsDir, '.github', 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(wsDir, '.gitignore'), 'ignored/\n');
+    fs.writeFileSync(path.join(wsDir, 'ignored', 'hidden-source.ts'), 'ignored needle\n');
+    fs.writeFileSync(path.join(wsDir, '.github', 'workflows', 'check.yml'), 'name: check\n');
+
+    const ignored = await run(getTool(tools, 'search_files'), { query: 'hidden-source' });
+    expect(ignored.content).toContain('No matches');
+    const hidden = await run(getTool(tools, 'search_files'), { query: 'check.yml' });
+    expect(hidden.content).toContain(path.join('.github', 'workflows', 'check.yml'));
+    const explicit = await run(getTool(tools, 'search_files'), {
+      query: 'hidden-source',
+      include_ignored: true,
+    });
+    expect(explicit.content).toContain('hidden-source.ts');
+  });
+
   it('finds by substring across workspace + attachment dir', async () => {
     const { tools, wsDir, attDir } = await buildTools();
     fs.writeFileSync(path.join(wsDir, 'contract_v2.md'), 'x');
@@ -770,5 +916,28 @@ describe('file-tools › grep_files', () => {
     const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', glob: '*.nope' });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('No files matched glob');
+  });
+
+  it('supports include/exclude globs, case sensitivity, line columns, and context', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.mkdirSync(path.join(wsDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(wsDir, 'vendor'), { recursive: true });
+    fs.writeFileSync(path.join(wsDir, 'src', 'main.ts'), 'before\nNeedle here\nafter\nneedle lower\n');
+    fs.writeFileSync(path.join(wsDir, 'vendor', 'skip.ts'), 'Needle vendor\n');
+    const r = await run(getTool(tools, 'grep_files'), {
+      pattern: 'Needle',
+      case_sensitive: true,
+      include_glob: ['**/*.ts'],
+      exclude_glob: ['vendor/**'],
+      context_lines: 1,
+      max_results: 1,
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain(`${path.join('src', 'main.ts')}:2:1`);
+    expect(r.content).toContain('before');
+    expect(r.content).toContain('after');
+    expect(r.content).not.toContain('needle lower');
+    expect(r.content).not.toContain('vendor');
+    expect(r.content).toContain('capped at 1');
   });
 });

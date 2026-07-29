@@ -156,6 +156,31 @@ function pruneCanvasPackages(nodeModules, targetPlatform, targetArch) {
   }
 }
 
+function targetSharpPackages(targetPlatform, targetArch) {
+  if (targetPlatform === 'darwin' && (targetArch === 'arm64' || targetArch === 'x64')) {
+    return {
+      binding: `sharp-darwin-${targetArch}`,
+      libvips: `sharp-libvips-darwin-${targetArch}`,
+    };
+  }
+  if (targetPlatform === 'win32' && targetArch === 'x64') {
+    return { binding: 'sharp-win32-x64', libvips: null };
+  }
+  return { binding: null, libvips: null };
+}
+
+function pruneSharpPackages(nodeModules, targetPlatform, targetArch) {
+  const target = targetSharpPackages(targetPlatform, targetArch);
+  const imgDir = path.join(nodeModules, '@img');
+  for (const dirName of listDirs(imgDir)) {
+    const isBinding = /^sharp-(darwin|linux|win32)-/i.test(dirName);
+    const isLibvips = /^sharp-libvips-/i.test(dirName);
+    if ((isBinding && dirName !== target.binding) || (isLibvips && dirName !== target.libvips)) {
+      removeIfExists(path.join(imgDir, dirName));
+    }
+  }
+}
+
 function targetTokenizersPackage(targetPlatform, targetArch) {
   if (targetPlatform === 'darwin') return 'tokenizers-darwin-universal';
   if (targetPlatform === 'win32' && targetArch === 'x64') return 'tokenizers-win32-x64-msvc';
@@ -284,7 +309,12 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
   const sqlitePackage = targetSqliteVecPackage(targetPlatform, targetArch);
   const canvasPackage = targetCanvasPackage(targetPlatform, targetArch);
   const tokenizersPackage = targetTokenizersPackage(targetPlatform, targetArch);
+  const sharpPackages = targetSharpPackages(targetPlatform, targetArch);
   const lock = readPackageLock();
+  const sharpVersion = lock.packages[`node_modules/@img/${sharpPackages.binding}`]?.version;
+  if (!sharpVersion) {
+    throw new Error(`[native-deps-gate] package-lock missing @img/${sharpPackages.binding}`);
+  }
   const verified = [];
 
   requireOnlyPackages(path.join(nodeModules, '@esbuild'), /^.+$/, [esbuildPackage]);
@@ -294,6 +324,8 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
   requireOnlyPackages(path.join(nodeModules, '@napi-rs', 'canvas', 'node_modules', '@napi-rs'), /^canvas-/i, [canvasPackage]);
   requireOnlyPackages(path.join(nodeModules, '@anush008'), /^tokenizers-/i, [tokenizersPackage]);
   requireOnlyPackages(path.join(nodeModules, '@anush008', 'tokenizers', 'node_modules', '@anush008'), /^tokenizers-/i, [tokenizersPackage]);
+  requireOnlyPackages(path.join(nodeModules, '@img'), /^sharp-(darwin|linux|win32)-/i, [sharpPackages.binding]);
+  requireOnlyPackages(path.join(nodeModules, '@img'), /^sharp-libvips-/i, [sharpPackages.libvips]);
 
   if (targetPlatform !== 'darwin' && fs.existsSync(path.join(nodeModules, 'fsevents'))) {
     throw new Error('[native-deps-gate] fsevents must not be included in non-macOS packages');
@@ -316,6 +348,14 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
       `${tokenizersPackage} binary`,
       path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.darwin-universal.node'),
     );
+    requiredFile(
+      `${sharpPackages.binding} binding`,
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', `sharp-darwin-${targetArch}-${sharpVersion}.node`),
+    );
+    requiredFile(
+      `${sharpPackages.libvips} runtime`,
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.libvips}`), 'lib', 'libvips-cpp.8.18.3.dylib'),
+    );
   } else if (targetPlatform === 'win32') {
     requiredFile(
       `${esbuildPackage} binary`,
@@ -333,6 +373,18 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
       `${tokenizersPackage} binary`,
       path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.win32-x64-msvc.node'),
     );
+    requiredFile(
+      `${sharpPackages.binding} binding`,
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', `sharp-win32-x64-${sharpVersion}.node`),
+    );
+    requiredFile(
+      `${sharpPackages.binding} libvips C++ runtime`,
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-cpp-8.18.3.dll'),
+    );
+    requiredFile(
+      `${sharpPackages.binding} libvips runtime`,
+      path.join(packageDir(nodeModules, `@img/${sharpPackages.binding}`), 'lib', 'libvips-42.dll'),
+    );
   }
 
   requiredFile(
@@ -344,6 +396,8 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
   verifyPackageVersionAtDir(sqliteVecPackageDir(nodeModules, sqlitePackage), lock, sqlitePackage, verified);
   verifyPackageVersionAtDir(canvasPackageDir(nodeModules, canvasPackage), lock, `@napi-rs/${canvasPackage}`, verified);
   verifyPackageVersionAtDir(tokenizersPackageDir(nodeModules, tokenizersPackage), lock, `@anush008/${tokenizersPackage}`, verified);
+  verifyPackageVersion(nodeModules, lock, `@img/${sharpPackages.binding}`, verified);
+  if (sharpPackages.libvips) verifyPackageVersion(nodeModules, lock, `@img/${sharpPackages.libvips}`, verified);
   verifyPackageVersion(nodeModules, lock, 'better-sqlite3', verified);
   for (const pkgDir of [
     path.join(nodeModules, 'onnxruntime-node'),
@@ -523,6 +577,7 @@ function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) 
   pruneEsbuildPackage(nodeModules, targetPlatform, targetArch);
   pruneSqliteVecPackages(nodeModules, targetPlatform, targetArch);
   pruneCanvasPackages(nodeModules, targetPlatform, targetArch);
+  pruneSharpPackages(nodeModules, targetPlatform, targetArch);
   pruneTokenizersPackages(nodeModules, targetPlatform, targetArch);
   pruneBetterSqlite3BuildArtifacts(nodeModules);
   if (targetPlatform !== 'darwin') {

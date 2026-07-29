@@ -10,16 +10,18 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withWindowsGitOnPath } from './test-runtime-env.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require_ = createRequire(import.meta.url);
 const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
+const testEnvironment = withWindowsGitOnPath(process.env);
 
 const child = spawn(electronBin, [vitestBin, ...process.argv.slice(2)], {
   stdio: 'inherit',
   env: {
-    ...process.env,
+    ...testEnvironment,
     ELECTRON_RUN_AS_NODE: '1',
     // Test files that need to launch standalone JS helpers must not reuse
     // Electron's process.execPath: if they replace the child environment and

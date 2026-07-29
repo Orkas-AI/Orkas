@@ -101,6 +101,10 @@ export interface SendInput {
   userId: string;
   cid: string;
   text: string;
+  /** User-visible first-message text used only for automatic task titles.
+   *  Callers that inject transport routing such as `@Agent` into `text`
+   *  should pass the pre-routing text here. */
+  title_text?: string;
   model_text?: string;
   attachments?: string[];
   use_selections?: ChatUseSelection[];
@@ -231,9 +235,12 @@ async function _resolveMessageReferences(
 export async function send(
   input: SendInput,
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
-  const { userId, cid, text, model_text, attachments, use_selections, references } = input;
+  const {
+    userId, cid, text, title_text, model_text, attachments, use_selections, references,
+  } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
+  const titleText = typeof title_text === 'string' ? title_text.trim() : '';
   await seedReservedActors(userId, cid);
   // Auto-title: the first real user message in a fresh / unnamed
   // conversation overwrites the placeholder title so the sidebar item
@@ -245,7 +252,7 @@ export async function send(
       await chats.updateConversation(
         userId,
         cid,
-        { title: chats.autoTitle(text) },
+        { title: chats.autoTitle(titleText || text) },
         conv.project_id || null,
       );
     }
@@ -284,29 +291,87 @@ export interface RetryFailedTurnInput {
 export interface ResolvedFailedTurnRetry {
   mode: FailedTurnRetryMode;
   enqueue: Parameters<typeof enqueue>[0];
+  recovery: FailedTurnRecoveryEvidence;
+}
+
+export interface FailedTurnRecoveryEvidence {
+  active_turn: boolean;
+  plan_pending_steps: number;
+  plan_completed_steps: number;
+  completed_work_count: number;
+  succeeded_work_count: number;
+  resource_count: number;
+  produced_count: number;
+  uncertain_operation_count: number;
+  /** Bounded tool names only; never arguments, results, paths, or content. */
+  uncertain_operations: string[];
 }
 
 const RETRY_RESUME_MODEL_TEXT = [
   '<task-retry mode="resume">',
-  'Continue the unfinished task from the durable state in this same session.',
+  'Continue the unfinished task from the durable state available to this retry.',
   'Read the authoritative execution plan, completed-work ledger, prior tool results, and history resources before acting.',
   'Do not repeat work already verified as successful. If an external, paid, destructive, or otherwise non-idempotent operation was interrupted with an uncertain outcome, verify its current state before deciding whether to run it again.',
   'Respect every existing confirmation and permission gate. Complete the remaining work or report the smallest blocker that still requires the user.',
   '</task-retry>',
 ].join('\n');
 
-function _processHasCompletedOrStartedTool(msg: GroupMessage): boolean {
-  return (msg.process || []).some((item) => {
-    const event = item && typeof item === 'object' && 'event' in item ? item.event : undefined;
-    if (!event || event.stream !== 'tool') return false;
-    const data = event.data && typeof event.data === 'object'
-      ? event.data as Record<string, unknown>
-      : {};
-    return /^(?:start|running|request|call|begin|end|result)$/.test(String(data.phase || data.status || '').toLowerCase());
+function _retryProcessToolEvidence(messages: readonly GroupMessage[]): {
+  observed: boolean;
+  uncertainOperations: string[];
+} {
+  const pending = new Map<string, string>();
+  let observed = false;
+  for (const msg of messages) {
+    for (const item of msg.process || []) {
+      const event = item && typeof item === 'object' && 'event' in item ? item.event : undefined;
+      if (!event) continue;
+      const data = event.data && typeof event.data === 'object'
+        ? event.data as Record<string, unknown>
+        : {};
+      const inProcessTool = event.stream === 'tool';
+      const cliTool = event.stream === 'cli'
+        && String(data.type || '').toLowerCase() === 'tool-event';
+      if (!inProcessTool && !cliTool) continue;
+      const phase = String(data.phase || data.status || '').trim().toLowerCase();
+      if (!/^(?:use|start|running|request|call|begin|end|result|complete|completed|success|succeeded|error|failed|abort|aborted|cancel|cancelled)$/.test(phase)) {
+        continue;
+      }
+      observed = true;
+      const name = String(data.tool || data.name || data.tool_name || 'unknown_tool')
+        .trim()
+        .replace(/[^a-zA-Z0-9_.:-]+/g, '_')
+        .slice(0, 80) || 'unknown_tool';
+      const rawCallId = String(data.call_id || data.callId || data.id || '').trim().slice(0, 128);
+      const key = rawCallId
+        ? `${event.stream}:id:${rawCallId}`
+        : `${event.stream}:name:${name}`;
+      if (/^(?:use|start|running|request|call|begin)$/.test(phase)) {
+        pending.set(key, name);
+      } else {
+        pending.delete(key);
+      }
+    }
+  }
+  return {
+    observed,
+    uncertainOperations: Array.from(new Set(pending.values())).slice(0, 20),
+  };
+}
+
+function _isInterruptedAssistantReply(message: GroupMessage): boolean {
+  if (message.system_kind === 'reply_interrupted') return true;
+  return (message.process || []).some((item) => {
+    const data = item?.type === 'event' && item.event?.data;
+    return item?.type === 'event'
+      && item.event?.stream === 'runtime'
+      && !!data
+      && typeof data === 'object'
+      && (data as Record<string, unknown>).aborted === true;
   });
 }
 
-/** Resolve one failed-bubble retry without mutating conversation state. The
+/** Resolve one failed or interrupted bubble retry without mutating conversation state. The
  * main process owns this decision so the renderer cannot guess from localized
  * text or stale DOM. */
 export async function resolveFailedTurnRetry(
@@ -324,15 +389,28 @@ export async function resolveFailedTurnRetry(
   if (!failed.from || failed.from === USER_ID || failed.dispatch) {
     return { ok: false, error: 'retry target is not an assistant reply' };
   }
-  if (!failed.failure_kind && !failed.failure_code) {
+  const interrupted = _isInterruptedAssistantReply(failed);
+  if (!failed.failure_kind && !failed.failure_code && !interrupted) {
     return { ok: false, error: 'retry target is not a failed assistant reply' };
   }
 
-  let sourceIndex = failedIndex - 1;
-  while (sourceIndex >= 0) {
-    const row = rows[sourceIndex];
-    if (!row.deleted_at && !row.dispatch && row.from === USER_ID && String(row.text || '').trim()) break;
-    sourceIndex -= 1;
+  const linkedSourceMessageId = String(failed.source_message_id || '').trim();
+  let sourceIndex = linkedSourceMessageId
+    ? rows.slice(0, failedIndex).findIndex((row) =>
+        row.id === linkedSourceMessageId
+        && !row.deleted_at
+        && !!String(row.text || '').trim(),
+      )
+    : failedIndex - 1;
+  // Legacy terminal replies predate source_message_id. Preserve their
+  // chronological fallback, but never fall through from an explicit broken
+  // link to an unrelated newer request.
+  if (!linkedSourceMessageId) {
+    while (sourceIndex >= 0) {
+      const row = rows[sourceIndex];
+      if (!row.deleted_at && !row.dispatch && row.from === USER_ID && String(row.text || '').trim()) break;
+      sourceIndex -= 1;
+    }
   }
   if (sourceIndex < 0) return { ok: false, error: 'retry source message not found' };
   const source = rows[sourceIndex];
@@ -344,18 +422,49 @@ export async function resolveFailedTurnRetry(
     return { ok: false, error: 'retry actor is unavailable' };
   }
 
+  let cliRuntime: string | null = null;
+  if (actor.kind === 'agent') {
+    try {
+      const agents = await import('../agents');
+      const agent = await agents.getAgent(actor.id);
+      cliRuntime = agent?.runtime?.kind === 'cli' ? agent.runtime.cli : null;
+    } catch (err) {
+      log.warn('retry CLI runtime inspection failed', { error: logErrorRef(err) });
+    }
+  }
+
   let context: {
     activeTurn?: { id: number };
     completedTurns?: Array<{ id: number }>;
-    executionPlan?: { updatedTurnId: number; objectiveTurnId: number };
-    completedWork?: Array<{ turnId: number }>;
+    executionPlan?: {
+      updatedTurnId: number;
+      objectiveTurnId: number;
+      steps?: Array<{ status?: string }>;
+    };
+    completedWork?: Array<{ turnId: number; tool?: string; status?: string }>;
     resources?: Array<{ sourceTurnId?: number }>;
   } | null = null;
-  try {
-    const { getSession } = await import('../../model/core-agent/session-store');
-    context = (await getSession(actorSessionId(cid, actor))).getSerializedContextState();
-  } catch (err) {
-    log.warn('retry context inspection failed', { error: logErrorRef(err) });
+  if (!cliRuntime) {
+    try {
+      const { getSession } = await import('../../model/core-agent/session-store');
+      context = (await getSession(actorSessionId(cid, actor))).getSerializedContextState();
+    } catch (err) {
+      log.warn('retry context inspection failed', { error: logErrorRef(err) });
+    }
+  }
+
+  let cliBindingBelongsToAttempt = false;
+  if (cliRuntime) {
+    try {
+      const { localCliResumeStrategy } = await import('../local_agents/registry');
+      if (localCliResumeStrategy(cliRuntime) !== 'none') {
+        const cliSessions = await import('../local_agents/sessions');
+        const binding = await cliSessions.getBinding(userId, cid, actor.id, cliRuntime);
+        cliBindingBelongsToAttempt = binding?.sourceMessageId === source.id;
+      }
+    } catch (err) {
+      log.warn('retry CLI binding inspection failed', { error: logErrorRef(err) });
+    }
   }
 
   const activeTurnId = context?.activeTurn?.id;
@@ -384,12 +493,47 @@ export async function resolveFailedTurnRetry(
     && !row.dispatch
     && (row.from === USER_ID || row.from === failed.from),
   );
-  const hasProduced = attemptRows.some((row) => Array.isArray(row.produced) && row.produced.length > 0);
-  const hasToolState = attemptRows.some(_processHasCompletedOrStartedTool);
+  const producedCount = attemptRows.reduce(
+    (count, row) => count + (Array.isArray(row.produced) ? row.produced.length : 0),
+    0,
+  );
+  const hasProduced = producedCount > 0;
+  const processToolEvidence = _retryProcessToolEvidence(attemptRows);
+  const hasToolState = processToolEvidence.observed;
+  const attemptCompletedWork = attemptTurnId
+    ? (context?.completedWork || []).filter((entry) => entry.turnId === attemptTurnId)
+    : [];
+  const uncertainLedgerTools = attemptCompletedWork
+    .filter((entry) => /^(?:aborted|stalled)$/.test(String(entry.status || '').toLowerCase()))
+    .map((entry) => String(entry.tool || 'unknown_tool').trim().slice(0, 80) || 'unknown_tool');
+  const uncertainOperations = Array.from(new Set([
+    ...processToolEvidence.uncertainOperations,
+    ...uncertainLedgerTools,
+  ])).slice(0, 20);
+  const planSteps = planBelongsToAttempt && Array.isArray(context?.executionPlan?.steps)
+    ? context.executionPlan.steps
+    : [];
+  const recovery: FailedTurnRecoveryEvidence = {
+    active_turn: !!activeTurnId,
+    plan_pending_steps: planSteps.filter((step) =>
+      /^(?:pending|in_progress)$/.test(String(step.status || '').toLowerCase())).length,
+    plan_completed_steps: planSteps.filter((step) =>
+      String(step.status || '').toLowerCase() === 'completed').length,
+    completed_work_count: attemptCompletedWork.length,
+    succeeded_work_count: attemptCompletedWork.filter((entry) =>
+      String(entry.status || '').toLowerCase() === 'succeeded').length,
+    resource_count: attemptTurnId
+      ? (context?.resources || []).filter((resource) => resource.sourceTurnId === attemptTurnId).length
+      : 0,
+    produced_count: producedCount,
+    uncertain_operation_count: uncertainOperations.length,
+    uncertain_operations: uncertainOperations,
+  };
   const hasDurableState = !!activeTurnId
     || planBelongsToAttempt
     || completedWorkBelongsToAttempt
     || resourceBelongsToAttempt
+    || cliBindingBelongsToAttempt
     || hasProduced
     || hasToolState;
   // Configuration/dependency failures normally happen before the runner
@@ -400,21 +544,44 @@ export async function resolveFailedTurnRetry(
   const mode: FailedTurnRetryMode = hasDurableState && !failedBeforeExecution && !newerAttemptExists
     ? 'resume'
     : 'restart';
+  log.info('failed-turn retry resolved', {
+    mode,
+    cli: cliRuntime || undefined,
+    has_active_turn: !!activeTurnId,
+    has_cli_binding: cliBindingBelongsToAttempt,
+    has_produced: hasProduced,
+    has_tool_state: hasToolState,
+    recovery,
+    newer_attempt: newerAttemptExists,
+    failed_before_execution: failedBeforeExecution,
+    interrupted,
+  });
   const originalModelText = String(source.model_text || source.text || '');
 
   return {
     ok: true,
     value: {
       mode,
+      recovery,
       enqueue: {
         uid: userId,
         cid,
         fromActorId: USER_ID,
         text: visibleText,
         model_text: mode === 'resume'
-          ? `${RETRY_RESUME_MODEL_TEXT}\n\nOriginal user request (quoted for objective continuity):\n${JSON.stringify(originalModelText)}`
+          ? [
+              RETRY_RESUME_MODEL_TEXT,
+              '<recovery-evidence>',
+              JSON.stringify(recovery),
+              '</recovery-evidence>',
+              'Original user request (quoted for objective continuity):',
+              JSON.stringify(originalModelText),
+            ].join('\n\n')
           : originalModelText,
         forceTo: [actor.id],
+        failedTurnRetryMode: mode,
+        retrySourceMessageId: source.id,
+        retryUncertainOperationCount: recovery.uncertain_operation_count,
         ...(mode === 'resume' ? { resumeActiveTurn: true } : {}),
         ...(source.use_selections?.length ? { use_selections: source.use_selections.slice() } : {}),
         ...(mode === 'restart' && source.attachments?.length ? { attachments: source.attachments.slice() } : {}),
@@ -735,26 +902,6 @@ function _encodeMarketplaceInstallResult(
   ].join('\n');
 }
 
-async function _rewriteMarketplaceRequestInFile(
-  file: string,
-  msgId: string,
-  requestId: string,
-  patch: Partial<MarketplaceInstallRequest>,
-): Promise<void> {
-  if (!fs.existsSync(file)) return;
-  const rows = await readJsonl<GroupMessage>(file, 100_000);
-  const idx = rows.findIndex((m) => m.id === msgId);
-  if (idx < 0) return;
-  await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
-    if (!rec || rec.id !== msgId || !Array.isArray(rec.marketplace_requests)) return null;
-    const reqIdx = rec.marketplace_requests.findIndex((r) => r.request_id === requestId);
-    if (reqIdx < 0) return null;
-    const nextReqs = rec.marketplace_requests.slice();
-    nextReqs[reqIdx] = { ...nextReqs[reqIdx], ...patch };
-    return { ...rec, marketplace_requests: nextReqs };
-  });
-}
-
 async function _patchMarketplaceRequest(
   userId: string,
   cid: string,
@@ -783,18 +930,6 @@ async function _patchMarketplaceRequest(
   });
   if (r.ok === false || !updatedReq) return { ok: false, error: r.ok === false ? r.error : 'request update failed' };
 
-  // Keep the commander's replay slice in sync; other actors do not need the
-  // card state for reasoning, and the main jsonl is the renderer source.
-  try {
-    await _rewriteMarketplaceRequestInFile(
-      conversationLayout(userId, cid).visibilityFile(target.from),
-      msgId,
-      requestId,
-      patch,
-    );
-  } catch (err) {
-    log.warn(`marketplace request slice update failed user=${userId} cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
-  }
   return { ok: true, request: updatedReq, message: r.record };
 }
 
@@ -969,7 +1104,8 @@ async function _tombstoneMessagesInFile(file: string, ids: ReadonlySet<string>, 
 
 /** Delete visible messages as versioned tombstones in the main log and all
  * actor slices. Persistent model sessions are purged so the next turn is
- * rebuilt from the filtered slices rather than retaining deleted context. */
+ * rebuilt from the filtered canonical log (Commander) or Agent slice rather
+ * than retaining deleted context. */
 export async function deleteMessages(
   userId: string,
   cid: string,

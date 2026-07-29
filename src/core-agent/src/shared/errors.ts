@@ -53,6 +53,13 @@ export class ProviderError extends CoreAgentError {
   }
 }
 
+export class StorageFullError extends CoreAgentError {
+  constructor(message: string, cause?: Error) {
+    super(message, "STORAGE_FULL", cause);
+    this.name = "StorageFullError";
+  }
+}
+
 export class TimeoutError extends CoreAgentError {
   constructor(message: string, cause?: Error) {
     super(message, "TIMEOUT", cause);
@@ -148,12 +155,12 @@ const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
 
 const DEFAULT_PERMANENT_MESSAGE_PATTERNS = [
   /^(?:http\s*)?(?:400|401|402|403|404|405|406|410|411|413|414|415|422)\b|messages?\s+with\s+role\s+['"]?tool['"]?\s+must\s+be\s+a\s+response\s+to\s+a\s+preceding\s+message\s+with\s+['"]?tool_calls/i.source,
-  /orkas_(llm|points|credits)_quota_exceeded|insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|积分不足|out of credits|credit[_\s-]?exhausted/i.source,
+  /insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|积分不足|out of credits|credit[_\s-]?exhausted/i.source,
   /invalid[_\s-]?api[_\s-]?key|incorrect[_\s-]?api[_\s-]?key|authentication[_\s-]?error|\bunauthorized\b|invalidated[_\s-]+oauth[_\s-]+token|oauth[_\s-]+token.{0,80}\b(invalid|invalidated|expired|revoked)\b|\bforbidden\b|permission[_\s-]?denied|permission[_\s-]?error|access[_\s-]?denied|not[_\s-]?logged[_\s-]?in|sign[_\s-]?in required|session expired|invalid[_\s-]?request(?:[_\s-]?error)?|bad[_\s-]?request|invalid[_\s-]?(argument|parameter|schema|tool)|schema[_\s-]?(validation|error|mismatch)|unsupported[_\s-]?model|model[_\s-]?not[_\s-]?found|no model found|context[_\s-]?(length|overflow|too[_\s-]?long)|prompt (is )?too long|request (entity )?too large|content[_\s-]?policy|content[_\s-]?filter|safety[_\s-]?(violation|policy)|blocked by policy|user (abort|aborted|cancelled|canceled|declined|denied)|request (?:was )?(abort|aborted|cancelled|canceled)|operation (?:was )?(abort|aborted|cancelled|canceled)|aborted by user|abort[_\s-]?error|cancel(?:led|ed)|confirmation required|permission required|tool execution access|path outside|e_path_out_of_scope/i.source,
 ];
 
 const DEFAULT_PERMANENT_CODE_PATTERNS = [
-  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|CONTENT_POLICY|CONTENT_FILTER|SAFETY|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
+  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
 ];
 
 export const DEFAULT_RETRY_ERROR_POLICY: RetryErrorPolicyConfig = Object.freeze({
@@ -291,6 +298,77 @@ function errorCauseOf(err: unknown): unknown {
   return null;
 }
 
+const PROVIDER_SAFETY_CODE_RE =
+  /^(?:CONTENT[_\s-]?(?:FILTER|POLICY(?:[_\s-]?VIOLATION)?)|SAFETY(?:[_\s-]?VIOLATION)?|RESPONSIBLE[_\s-]?AI[_\s-]?POLICY[_\s-]?VIOLATION|RESPONSIBLEAIPOLICYVIOLATION|PROHIBITED[_\s-]?CONTENT|PROMPT[_\s-]?(?:FILTER|BLOCKED)|MODERATION[_\s-]?(?:BLOCKED|REJECTED)|BLOCKED[_\s-]?BY[_\s-]?POLICY|BLOCKLIST|IMAGE[_\s-]?SAFETY)$/i;
+
+const PROVIDER_SAFETY_MESSAGE_RE =
+  /content[_\s-]?(?:policy|filter|moderation)|content management policy|responsible[_\s-]?ai[_\s-]?policy|prohibited[_\s-]?content|(?:prompt|request|response|candidate).{0,100}(?:blocked|filtered).{0,100}(?:safety|policy|moderation)|(?:prompt|request|response|candidate).{0,100}rejected.{0,100}(?:safety (?:policy|filter|reason)|content (?:policy|filter)|moderation)|(?:safety|moderation) (?:policy|filter).{0,100}(?:blocked|filtered|rejected|violation)|safety[_\s-]?violation|blocked (?:by|due to|for|because of).{0,40}(?:safety|content) (?:policy|filter|reasons?)/i;
+
+/**
+ * Detect a model/provider safety decision independently from the mutable
+ * retry-policy blacklist.
+ *
+ * A deployment may replace that blacklist at runtime, but it must never turn
+ * a provider refusal into a transient network failure and retry or rotate to
+ * another model. Provider SDKs are inconsistent about whether they preserve
+ * status, code, message, or a nested `error`, so inspect all of those shapes.
+ */
+export function isProviderSafetyError(err: unknown): boolean {
+  const pending: unknown[] = [err];
+  const seen = new Set<unknown>();
+  let inspected = 0;
+
+  while (pending.length > 0 && inspected < 16) {
+    const cur = pending.shift();
+    if (cur == null || seen.has(cur)) continue;
+    seen.add(cur);
+    inspected++;
+
+    const code = errorCodeOf(cur);
+    if (code && PROVIDER_SAFETY_CODE_RE.test(code)) return true;
+
+    const message = errorMessageOf(cur);
+    if (message && (PROVIDER_SAFETY_CODE_RE.test(message.trim()) || PROVIDER_SAFETY_MESSAGE_RE.test(message))) {
+      return true;
+    }
+
+    if (cur && typeof cur === "object") {
+      const rec = cur as Record<string, unknown>;
+      if (rec.cause != null) pending.push(rec.cause);
+      if (rec.error != null && rec.error !== rec.cause) pending.push(rec.error);
+    }
+  }
+
+  return false;
+}
+
+const STORAGE_FULL_CODE_RE = /^(?:ENOSPC|SQLITE_FULL|STORAGE_FULL|E_STORAGE_FULL|ERR_FILE_NO_SPACE)$/i;
+const STORAGE_FULL_MESSAGE_RE =
+  /\bno space left on device\b|\bdatabase or disk is full\b|\bnot enough space on the disk\b|\bdisk is full\b|\bstorage is full\b|\bERR_FILE_NO_SPACE\b/i;
+
+/** Detect an exhausted-storage failure through wrappers and cause chains.
+ *
+ * This is intentionally a hard runtime rule rather than part of the
+ * server-configurable retry policy: retrying or switching model candidates
+ * cannot restore writable space and only adds latency and duplicate spend. */
+export function isStorageFullError(err: unknown): boolean {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur && depth < 8) {
+    if (errorStatusOf(cur) === 507) return true;
+
+    const code = errorCodeOf(cur);
+    if (code && STORAGE_FULL_CODE_RE.test(code)) return true;
+
+    const message = errorMessageOf(cur);
+    if (message && STORAGE_FULL_MESSAGE_RE.test(message)) return true;
+
+    cur = errorCauseOf(cur);
+    depth++;
+  }
+  return false;
+}
+
 function retryKindForStatusChain(err: unknown): RetryableErrorKind | null {
   let cur: unknown = err;
   let depth = 0;
@@ -314,10 +392,11 @@ function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknow
     if (msg && policy.permanentMessagePatterns.some((pattern) => pattern.test(msg))) return true;
 
     const code = errorCodeOf(cur);
-    // The rotating provider already exhausted its safe candidates/retries.
-    // Retrying at AgentRunner level would repeat the whole set and multiply
-    // the wait, regardless of server-supplied policy overrides.
-    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
+    // The rotating provider already reached a terminal pre-commit outcome:
+    // either it exhausted its safe candidates/retries or deliberately stopped
+    // on an ambiguous empty response. Retrying at AgentRunner level would
+    // repeat that decision regardless of server-supplied policy overrides.
+    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
     if (code && policy.permanentCodePatterns.some((pattern) => pattern.test(code))) return true;
 
     cur = errorCauseOf(cur);
@@ -344,7 +423,7 @@ export function classifyTransientNetworkErrorWithPolicy(
     }
     const code = errorCodeOf(cur);
     if (code && TRANSIENT_CODE_RE.test(code)) {
-      if (/TIMEOUT/i.test(code)) return "timeout";
+      if (/TIMED?OUT/i.test(code)) return "timeout";
       if (/ECONNREFUSED|ENETUNREACH|ENETDOWN|EAI_AGAIN/i.test(code)) return "network";
       return "connection_dropped";
     }
@@ -364,7 +443,16 @@ export function classifyRetryableErrorWithPolicy(
 ): RetryableErrorKind | null {
   const policy = config ? compileRetryErrorPolicy(config) : activeRetryErrorPolicy;
   if (err == null) return null;
-  if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError) return null;
+  if (err instanceof AuthError || err instanceof ContextOverflowError || err instanceof OutputLimitError || err instanceof StorageFullError) return null;
+
+  // Provider safety decisions are never retryable. This is a hard product
+  // invariant rather than a server-configurable policy entry: retrying or
+  // rotating could bypass the selected provider's safeguard.
+  if (isProviderSafetyError(err)) return null;
+
+  // Storage exhaustion is never retryable, even when a runtime policy
+  // replaces the ordinary permanent-status/message/code blacklists.
+  if (isStorageFullError(err)) return null;
 
   // Hard permanent signals should win even if a wrapper adds generic text
   // like "fetch failed" outside the real provider error.

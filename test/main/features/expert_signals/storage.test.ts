@@ -12,7 +12,11 @@ fs.writeFileSync(path.join(TMP, 'users.json'),
 import { activateUser } from '../../../../src/main/features/users';
 activateUser('99999999');
 
-import { emitSignal, querySignals } from '../../../../src/main/features/expert_signals';
+import {
+  emitSignal,
+  querySignals,
+  querySignalsForUser,
+} from '../../../../src/main/features/expert_signals';
 import type { SignalInput } from '../../../../src/main/features/expert_signals/types';
 
 function makeInput(type: SignalInput['type'], over: Partial<SignalInput> = {}): SignalInput {
@@ -68,5 +72,25 @@ describe('expert_signals.storage', () => {
     await new Promise((r) => setTimeout(r, 50));
     const sigs = await querySignals({ types: ['skip'], limit: 2 });
     expect(sigs.length).toBe(2);
+  });
+
+  it('does not redirect an explicit background query when the active account changes', async () => {
+    const firstUid = '11111111';
+    const secondUid = '22222222';
+    emitSignal(firstUid, makeInput('correction', { cid: 'account-one-only' }));
+    emitSignal(secondUid, makeInput('correction', { cid: 'account-two-only' }));
+    await new Promise((r) => setTimeout(r, 50));
+
+    activateUser(secondUid);
+    try {
+      const first = await querySignalsForUser(firstUid, { types: ['correction'] });
+      const activeSecond = await querySignals({ types: ['correction'] });
+      expect(first.map((signal) => signal.cid)).toContain('account-one-only');
+      expect(first.map((signal) => signal.cid)).not.toContain('account-two-only');
+      expect(activeSecond.map((signal) => signal.cid)).toContain('account-two-only');
+      expect(activeSecond.map((signal) => signal.cid)).not.toContain('account-one-only');
+    } finally {
+      activateUser('99999999');
+    }
   });
 });

@@ -19,14 +19,15 @@
  *   - weekly:   { weekday, hour, minute }
  *   - monthly:  { day, hour, minute }      day=31 → last day of shorter months
  *
- * Scheduler: one in-process `setInterval(TICK_MS)` (30s) started by
- * `startScheduler()` after `activateUser()`. Missed boundaries while the
- * app was closed do NOT back-fire.
+ * Scheduler: per-task timers started by `startScheduler()` after
+ * `activateUser()`. Missed boundaries while the app was closed or suspended
+ * do NOT back-fire.
  *
  * Fire-time seed text composition mirrors the commander composer:
  *   - new UI tasks render ordered `message_parts` into localized inline text;
  *   - legacy tasks wrap clean `content` with their single skill / connector;
- *   - agent recipients still prepend `@<agent.name> ` after either path.
+ *   - agent recipients prepend the Agent's current `@<name> ` after either
+ *     path, resolving the stable stored id at fire time so renames stay valid.
  *
  * Content is stored clean (no renderer token metadata). `message_parts` is
  * plain JSON so multiple resource chips retain their original positions.
@@ -52,11 +53,17 @@ import {
 import { readJson, writeJson, nowIso, safeId } from '../storage';
 import { createLogger } from '../logger';
 import { t as translate } from '../i18n';
-import { getCurrentDevice } from '../util/device';
+import {
+  getCurrentDevice as getLegacyDeviceFingerprint,
+  getLegacyDeviceIds,
+  type DeviceFingerprint,
+} from '../util/device';
 import { limitNameDisplayText } from '../util/name-limit';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
-export { getCurrentDevice };
+import { getDeviceId as getPersistentDeviceId } from './machine_device_id';
 import { getActiveUserId, hasActiveUser } from './users';
+import { registerUserSwitchHook } from './user-switch-hooks';
+import * as agents from './agents';
 import * as chats from './chats';
 import * as groupChat from './group_chat';
 
@@ -69,6 +76,18 @@ const MAX_MESSAGE_PARTS = 256;
 // runaway count can't be allowed to push a tick past TICK_MS.
 const MAX_TASKS_PER_USER = 200;
 const AUTO_TASK_CLAIMS_DIR = 'auto_task_claims';
+const LEGACY_MAC_DEVICE_ID_RE = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
+const MAX_LEGACY_CLAIMS_TO_CHECK = 32;
+
+/** Stable automation identity plus a user-facing hostname. The id comes from
+ * machine-global `device.json`, so NIC, VPN, private-MAC, and reboot changes
+ * cannot move tasks away from this installation. */
+export function getCurrentDevice(): DeviceFingerprint {
+  return {
+    id: getPersistentDeviceId(),
+    name: getLegacyDeviceFingerprint().name,
+  };
+}
 
 export type ScheduleOneTime = { type: 'one_time'; at: string };
 export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
@@ -102,10 +121,9 @@ export interface AutoTask {
   attachments?: string[];                // file names under <task_dir>/attachments/
   /** Device the task is bound to — only this machine fires the schedule.
    *  Every device can still read / edit the config (the file cloud-syncs).
-   *  `device_id` is the MAC address of the bound device's first non-internal
-   *  NIC; `device_name` is its hostname at bind time (display only). New
-   *  tasks bind to their creator, and an explicit edit can rebind them to
-   *  the device performing the update. */
+   *  `device_id` is the persistent installation id from machine-global
+   *  `device.json`; legacy releases stored a NIC MAC and migrate it only with
+   *  local ownership evidence. `device_name` is display-only. */
   device_id?: string;
   device_name?: string;
   created_at: string;
@@ -342,6 +360,64 @@ function _relFilesUnder(uid: string, dir: string, fallback: string): string[] {
   return out.length ? out : [fallback];
 }
 
+function _hasMatchingLocalLegacyClaim(uid: string, task: AutoTask): boolean {
+  const assignedId = String(task.device_id || '').toLowerCase();
+  if (!LEGACY_MAC_DEVICE_ID_RE.test(assignedId)) return false;
+  const dir = path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, task.id);
+  if (!fs.existsSync(dir)) return false;
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir)
+      .filter((name) => name.endsWith('.json'))
+      .sort((a, b) => b.localeCompare(a))
+      .slice(0, MAX_LEGACY_CLAIMS_TO_CHECK);
+  } catch {
+    return false;
+  }
+  for (const name of names) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      if (raw?.task_id === task.id
+          && String(raw?.device_id || '').toLowerCase() === assignedId) return true;
+    } catch {
+      // Ignore malformed local claim evidence. It must never transfer a task.
+    }
+  }
+  return false;
+}
+
+async function _migrateLegacyDeviceBindingIfOwned(
+  uid: string,
+  task: AutoTask,
+): Promise<AutoTask> {
+  const assignedId = String(task.device_id || '').toLowerCase();
+  const current = getCurrentDevice();
+  if (!assignedId || !current.id || task.device_id === current.id
+      || !LEGACY_MAC_DEVICE_ID_RE.test(assignedId)) return task;
+  const currentLegacyIds = new Set(getLegacyDeviceIds().map((id) => id.toLowerCase()));
+  const locallyOwned = currentLegacyIds.has(assignedId)
+    || _hasMatchingLocalLegacyClaim(uid, task);
+  if (!locallyOwned) return task;
+  const migrated: AutoTask = {
+    ...task,
+    device_id: current.id,
+    device_name: current.name,
+    updated_at: nowIso(),
+  };
+  await _writeOne(uid, migrated);
+  log.info('legacy auto-task device binding migrated to persistent installation id');
+  return migrated;
+}
+
+async function _migrateLegacyDeviceBindingsIfOwned(
+  uid: string,
+  tasks: AutoTask[],
+): Promise<AutoTask[]> {
+  const out: AutoTask[] = [];
+  for (const task of tasks) out.push(await _migrateLegacyDeviceBindingIfOwned(uid, task));
+  return out;
+}
+
 async function _readAll(uid: string): Promise<AutoTask[]> {
   const out: AutoTask[] = [];
   for (const loc of listAutoTaskLocations(uid)) {
@@ -448,21 +524,29 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
   };
 }
 
-async function _projectAllowsRecipientAgent(uid: string, fields: NormalisedFields): Promise<boolean> {
+async function _validateProjectScope(
+  uid: string,
+  fields: NormalisedFields,
+): Promise<'invalid_project' | 'invalid_recipient' | null> {
   const projectId = fields.project_id;
   const recipient = fields.recipient;
-  if (!projectId || !recipient || recipient.kind !== 'agent') return true;
-  if (!fs.existsSync(projectMetaFile(uid, projectId))) return true;
+  if (!projectId) return null;
+  // A syntactically safe id is not proof that the project exists. In
+  // particular, Commander-generated containers can contain a hallucinated
+  // but path-safe id. Reject it before _writeOne creates a project-shaped
+  // orphan directory that no real Project view can surface.
+  if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
+  if (!recipient || recipient.kind !== 'agent') return null;
   const raw: any = await readJson(projectBindingsFile(uid, projectId));
   const allowed = Array.isArray(raw?.agents)
     ? raw.agents.filter((id: any) => typeof id === 'string' && id)
     : [];
-  return allowed.includes(recipient.id);
+  return allowed.includes(recipient.id) ? null : 'invalid_recipient';
 }
 
 export async function listTasks(uid: string, opts?: { projectId?: string | null }): Promise<AutoTask[]> {
   return _runExclusive(uid, async () => {
-    const all = await _readAll(uid);
+    const all = await _migrateLegacyDeviceBindingsIfOwned(uid, await _readAll(uid));
     if (!opts) return all;
     if (opts.projectId === null) return all.filter((t) => !t.project_id);
     if (typeof opts.projectId === 'string' && opts.projectId) {
@@ -475,7 +559,10 @@ export async function listTasks(uid: string, opts?: { projectId?: string | null 
 
 export async function getTask(uid: string, taskId: string): Promise<AutoTask | null> {
   if (!_isValidTaskId(taskId)) return null;
-  return _runExclusive(uid, () => _readOne(uid, taskId));
+  return _runExclusive(uid, async () => {
+    const task = await _readOne(uid, taskId);
+    return task ? _migrateLegacyDeviceBindingIfOwned(uid, task) : null;
+  });
 }
 
 export async function createTask(
@@ -497,9 +584,8 @@ export async function createTask(
       log.warn(`task create id collision uid=${uid} id=${desiredId}`);
       return { ok: false as const, error: 'too_many_tasks' as const };
     }
-    if (!await _projectAllowsRecipientAgent(uid, norm.fields)) {
-      return { ok: false as const, error: 'invalid_recipient' as const };
-    }
+    const scopeError = await _validateProjectScope(uid, norm.fields);
+    if (scopeError) return { ok: false as const, error: scopeError };
     const now = nowIso();
     const device = getCurrentDevice();
     const task: AutoTask = {
@@ -522,8 +608,9 @@ export async function updateTask(
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
   return _runExclusive(uid, async () => {
-    const cur = await _readOne(uid, taskId);
-    if (!cur) return { ok: false as const, error: 'not_found' as const };
+    const stored = await _readOne(uid, taskId);
+    if (!stored) return { ok: false as const, error: 'not_found' as const };
+    const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
     const legacyMessageChanged = patch.content !== undefined
       || patch.skill !== undefined
       || patch.connector !== undefined;
@@ -550,9 +637,8 @@ export async function updateTask(
     };
     const norm = _normaliseDraft(merged);
     if (!norm.ok) return { ok: false as const, error: (norm as { error: TaskError }).error };
-    if (!await _projectAllowsRecipientAgent(uid, norm.fields)) {
-      return { ok: false as const, error: 'invalid_recipient' as const };
-    }
+    const scopeError = await _validateProjectScope(uid, norm.fields);
+    if (scopeError) return { ok: false as const, error: scopeError };
     const next: AutoTask = {
       ...cur,
       ...norm.fields,
@@ -592,7 +678,7 @@ export async function deleteTask(uid: string, taskId: string): Promise<{ ok: boo
       fs.rmSync(loc.dir, { recursive: true, force: true });
       for (const relPath of relPaths) _notifyDeleted(relPath);
       log.info(`task deleted uid=${uid} id=${taskId}`);
-      _cancelTimer(taskId);
+      _onTaskMutated(uid, null, taskId);
       return { ok: true };
     } catch (err) {
       log.warn(`task delete failed uid=${uid} id=${taskId}: ${(err as Error).message}`);
@@ -1078,6 +1164,24 @@ export function _buildSeedTextForTest(task: AutoTask): string {
   return _buildSeedText(task);
 }
 
+async function _buildFireSeedText(task: AutoTask): Promise<string> {
+  const recipient = task.recipient;
+  if (!recipient || recipient.kind !== 'agent') return _buildSeedText(task);
+  try {
+    const current = await agents.getAgent(recipient.id);
+    const currentName = current?.name?.trim();
+    if (currentName && currentName !== recipient.name) {
+      return _buildSeedText({
+        ...task,
+        recipient: { ...recipient, name: currentName },
+      });
+    }
+  } catch (err) {
+    log.warn(`fire recipient lookup failed id=${task.id} agent=${recipient.id}: ${(err as Error).message}`);
+  }
+  return _buildSeedText(task);
+}
+
 function _buildFireTitle(task: AutoTask): string {
   // No glyph prefix — the renderer reads `conv.origin_auto_task_id` and
   // renders the clock UI icon next to the title (same icon as the sidebar
@@ -1087,13 +1191,18 @@ function _buildFireTitle(task: AutoTask): string {
   return firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
 }
 
-async function _fireTask(uid: string, task: AutoTask): Promise<void> {
+type FireTaskResult =
+  | { ok: true; cid: string }
+  | { ok: false; error: 'conv_create_failed' | 'send_not_ok' | 'send_threw' };
+
+async function _fireTask(uid: string, task: AutoTask): Promise<FireTaskResult> {
   const startedAt = Date.now();
   const title = _buildFireTitle(task);
   let cid = '';
   const emitFailure = (errorCode: string): void => {
     _emitFire({
       type: 'fire_failed',
+      user_id: uid,
       task_id: task.id,
       ...(cid ? { cid } : {}),
       error_code: errorCode,
@@ -1111,13 +1220,13 @@ async function _fireTask(uid: string, task: AutoTask): Promise<void> {
   } catch (err) {
     log.error(`fire conv-create failed uid=${uid} id=${task.id}: ${(err as Error).message}`);
     emitFailure('conv_create_failed');
-    return;
+    return { ok: false, error: 'conv_create_failed' };
   }
   // Copy attachments into the new conversation's chat_attachments dir
   // BEFORE dispatch. The originals stay under the task's attachments/ so
   // recurring schedules re-use them next fire.
   const attachmentNames = await _copyAttachmentsForFire(uid, task, cid);
-  const text = _buildSeedText(task);
+  const text = await _buildFireSeedText(task);
   const rollbackEmptyConv = async (reason: string): Promise<void> => {
     try { await chats.deleteConversation(uid, cid, task.project_id || null); }
     catch (e) { log.warn(`fire rollback failed uid=${uid} id=${task.id} cid=${cid} reason=${reason}: ${(e as Error).message}`); }
@@ -1131,20 +1240,36 @@ async function _fireTask(uid: string, task: AutoTask): Promise<void> {
       log.warn(`fire send failed uid=${uid} id=${task.id} cid=${cid}: ${res.error || 'unknown'}`);
       await rollbackEmptyConv('send_not_ok');
       emitFailure('send_not_ok');
-      return;
+      return { ok: false, error: 'send_not_ok' };
     }
     log.info(`fired uid=${uid} id=${task.id} cid=${cid} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
     _emitFire({
       type: 'conv_created',
+      user_id: uid,
       cid,
       task_id: task.id,
       duration_ms: Math.max(0, Date.now() - startedAt),
     });
+    return { ok: true, cid };
   } catch (err) {
     log.error(`fire send threw uid=${uid} id=${task.id} cid=${cid}: ${(err as Error).message}`);
     await rollbackEmptyConv('send_threw');
     emitFailure('send_threw');
+    return { ok: false, error: 'send_threw' };
   }
+}
+
+/** Explicit user-triggered execution. This intentionally bypasses schedule
+ *  eligibility, device binding, boundary claims, and `_markRan`: a manual run
+ *  creates execution history but must not move or disable the scheduled run. */
+export async function runTaskNow(
+  uid: string,
+  taskId: string,
+): Promise<FireTaskResult | { ok: false; error: 'invalid_id' | 'not_found' }> {
+  if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  const task = await getTask(uid, taskId);
+  if (!task) return { ok: false, error: 'not_found' };
+  return _fireTask(uid, task);
 }
 
 async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string): Promise<string[]> {
@@ -1176,12 +1301,14 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
 export type AutoFireEvent =
   | {
       type: 'conv_created';
+      user_id: string;
       cid: string;
       task_id: string;
       duration_ms?: number;
     }
   | {
       type: 'fire_failed';
+      user_id: string;
       task_id: string;
       cid?: string;
       error_code: string;
@@ -1194,6 +1321,12 @@ const _fireListeners = new Set<FireListener>();
 export function subscribeFires(fn: FireListener): () => void {
   _fireListeners.add(fn);
   return () => { _fireListeners.delete(fn); };
+}
+
+export function subscribeFiresForUser(uid: string, fn: FireListener): () => void {
+  return subscribeFires((ev) => {
+    if (ev.user_id === uid) fn(ev);
+  });
 }
 
 function _emitFire(ev: AutoFireEvent): void {
@@ -1214,21 +1347,58 @@ function _emitFire(ev: AutoFireEvent): void {
 // cancel + re-register the affected task's timer so changes apply
 // immediately without waiting for any tick.
 //
-// Sleep/wake: Node `setTimeout` measures elapsed AWAKE time (uv_now)
-// rather than wall clock, so a 1h timer registered before sleep would
-// fire 1h AFTER resume even though the wall-clock target is in the past.
-// The MAX_TIMEOUT_MS cap bounds that drift; on resume we additionally
-// listen for `powerMonitor.on('resume', ...)` and reschedule every
-// timer so any past-due task fires immediately.
+// A timer can become runnable during a macOS DarkWake maintenance window.
+// Suspend cancels every armed timer and resume restores them without backfill;
+// the fire-time lock check remains a second guard for locked wake states.
 
 /** Max single-step delay (1h). Lets sleep/wake re-evaluate against wall
  *  clock within an hour even without the powerMonitor hook firing. Node's
  *  int32 setTimeout limit is ~24.85d; this is well below. */
 const MAX_TIMEOUT_MS = 60 * 60 * 1000;
 
-const _timers = new Map<string, NodeJS.Timeout>();
-let _resumeListenerAttached = false;
+type ArmedTimer = {
+  handle: NodeJS.Timeout;
+  /** Actual schedule boundary, not the capped one-hour wake-up time. */
+  dueAtMs: number;
+};
+
+type SchedulerPowerMonitor = {
+  on: (event: 'suspend' | 'resume', listener: () => void) => unknown;
+  removeListener: (event: 'suspend' | 'resume', listener: () => void) => unknown;
+};
+
+const _timers = new Map<string, ArmedTimer>();
 let _started = false;
+let _schedulerSuspended = false;
+let _schedulerPowerMonitor: SchedulerPowerMonitor | null = null;
+let _schedulerEpoch = 0;
+
+function schedulerEpochIsCurrent(schedulerEpoch?: number): boolean {
+  if (schedulerEpoch === undefined) return true;
+  return schedulerEpoch === _schedulerEpoch;
+}
+
+function isActiveUser(uid: string): boolean {
+  if (!hasActiveUser()) return false;
+  try {
+    return getActiveUserId() === uid;
+  } catch {
+    return false;
+  }
+}
+
+async function _isComputerSleeping(): Promise<boolean> {
+  try {
+    const { powerMonitor } = await import('electron');
+    if (!powerMonitor || typeof powerMonitor.getSystemIdleState !== 'function') return false;
+    // The threshold is required by Electron but does not affect the `locked`
+    // result. DarkWake is locked; ordinary active or idle use is not blocked.
+    return powerMonitor.getSystemIdleState(1) === 'locked';
+  } catch (err) {
+    log.warn(`system sleep check failed: ${(err as Error).message}`);
+    return false;
+  }
+}
 
 function _scheduleBaseline(task: AutoTask): Date | null {
   if (task.last_run_at) {
@@ -1321,37 +1491,74 @@ function _monthsForwardAt(from: Date, monthsForward: number, day: number, h: num
 function _cancelTimer(taskId: string): void {
   const prev = _timers.get(taskId);
   if (prev) {
-    clearTimeout(prev);
+    clearTimeout(prev.handle);
     _timers.delete(taskId);
   }
+}
+
+function _cancelAllTimers(): void {
+  for (const id of Array.from(_timers.keys())) _cancelTimer(id);
+}
+
+/** Arm one capped wait toward an already-computed schedule boundary. */
+function _armTimerAt(uid: string, taskId: string, dueAtMs: number): void {
+  if (_schedulerSuspended) return;
+  const now = new Date();
+  const wait = dueAtMs - now.getTime();
+  const delay = Math.max(0, Math.min(wait, MAX_TIMEOUT_MS));
+  const schedulerEpoch = _schedulerEpoch;
+  let handle: NodeJS.Timeout;
+  handle = setTimeout(() => {
+    // A CRUD or sync reschedule may replace this timer after its callback is
+    // already queued. Only the currently armed handle may advance the task.
+    if (_timers.get(taskId)?.handle !== handle) return;
+    _onTimerFire(uid, taskId, dueAtMs, _isComputerSleeping, schedulerEpoch)
+      .catch((err) => log.warn(`timer fire threw id=${taskId}: ${(err as Error).message}`));
+  }, delay);
+  if (typeof (handle as any).unref === 'function') (handle as any).unref();
+  _timers.set(taskId, { handle, dueAtMs });
 }
 
 /** Register / refresh the timer for a single task. Idempotent: existing
  *  timer is cancelled first. Sync — safe to call inside `_runExclusive`. */
 function _scheduleTask(uid: string, task: AutoTask, baselineOverride?: Date | null): void {
+  // CRUD and sync work can finish after an account switch. While the live
+  // scheduler is running, only the active account may touch the process-wide
+  // timer map. Different accounts may legitimately contain the same task id.
+  if (_started && !isActiveUser(uid)) return;
   _cancelTimer(task.id);
+  if (_schedulerSuspended) return;
   if (!task.enabled) return;
   if (task.device_id && task.device_id !== getCurrentDevice().id) return;
   const now = new Date();
   const lastRun = baselineOverride === undefined ? _scheduleBaseline(task) : baselineOverride;
   const nextDue = _nextDueAt(task, now, lastRun);
   if (!nextDue) return;
-  const wait = nextDue.getTime() - now.getTime();
-  const delay = Math.max(0, Math.min(wait, MAX_TIMEOUT_MS));
-  const handle = setTimeout(() => {
-    _onTimerFire(uid, task.id).catch((err) => log.warn(`timer fire threw id=${task.id}: ${(err as Error).message}`));
-  }, delay);
-  if (typeof (handle as any).unref === 'function') (handle as any).unref();
-  _timers.set(task.id, handle);
+  _armTimerAt(uid, task.id, nextDue.getTime());
 }
 
 /** Fire handler: re-read the task (may have been edited since scheduled),
  *  real-clock due-check, fire if due, then reschedule for the next due. */
-async function _onTimerFire(uid: string, taskId: string): Promise<void> {
+async function _onTimerFire(
+  uid: string,
+  taskId: string,
+  expectedDueAtMs?: number,
+  isComputerSleeping: () => Promise<boolean> = _isComputerSleeping,
+  schedulerEpoch?: number,
+): Promise<void> {
   _timers.delete(taskId);
-  const task = await _readOne(uid, taskId);
-  if (!task) return;
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
   const now = new Date();
+  if (expectedDueAtMs !== undefined && now.getTime() < expectedDueAtMs) {
+    // MAX_TIMEOUT_MS is only a checkpoint for long waits. Keep the original
+    // schedule boundary intact and do not re-run due logic against persisted
+    // last_run_at, which may intentionally predate a skipped occurrence.
+    _armTimerAt(uid, taskId, expectedDueAtMs);
+    return;
+  }
+  const task = await _readOne(uid, taskId);
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  if (!task) return;
   const lastRun = _scheduleBaseline(task);
   const dueBoundary = _dueBoundary(task, now, lastRun);
   let claimedElsewhereBoundary: Date | null = null;
@@ -1359,6 +1566,15 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
     && (!task.device_id || task.device_id === getCurrentDevice().id)
     && dueBoundary !== null;
   if (canFireHere) {
+    if (_schedulerSuspended || await isComputerSleeping()) {
+      if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+      // Do not create a conversation and do not mutate task state. Treat this
+      // in-memory boundary as consumed so only the next occurrence is armed.
+      log.info(`fire ignored because computer is sleeping uid=${uid} id=${taskId}`);
+      _scheduleTask(uid, task, now);
+      return;
+    }
+    if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
     if (!_tryClaimFireBoundary(uid, task, dueBoundary, now)) {
       claimedElsewhereBoundary = dueBoundary;
       log.info(`fire skipped duplicate uid=${uid} id=${taskId} boundary=${dueBoundary.toISOString()}`);
@@ -1367,6 +1583,7 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
         // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
         // can't get re-picked by a future re-schedule.
         await _markRan(uid, taskId, now.toISOString(), task.schedule.type === 'one_time');
+        if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
       } catch (err) {
         _releaseFireBoundaryClaim(uid, task, dueBoundary);
         log.warn(`fire mark failed id=${taskId}: ${(err as Error).message}`);
@@ -1389,19 +1606,66 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
   if (fresh) _scheduleTask(uid, fresh, claimedElsewhereBoundary || undefined);
 }
 
-export function _onTimerFireForTest(uid: string, taskId: string): Promise<void> {
-  return _onTimerFire(uid, taskId);
+export function _onTimerFireForTest(uid: string, taskId: string, sleeping?: boolean): Promise<void> {
+  return sleeping === undefined
+    ? _onTimerFire(uid, taskId)
+    : _onTimerFire(uid, taskId, undefined, async () => sleeping);
 }
 
-/** Cancel + re-register every timer. Called on system resume so any
- *  task that became due during sleep fires within ms instead of waiting
- *  out the (capped, but possibly hour-long) pre-sleep timer. */
-async function _rescheduleAll(uid: string): Promise<void> {
-  // Cancel everything in one pass.
-  for (const id of Array.from(_timers.keys())) _cancelTimer(id);
+function _baselineWithoutBackfill(task: AutoTask, now: Date): Date | null {
+  const baseline = _scheduleBaseline(task);
+  return _dueBoundary(task, now, baseline) ? now : baseline;
+}
+
+export function nextDueAfterRestoreForTest(task: AutoTask, now: Date): Date | null {
+  const baseline = _baselineWithoutBackfill(task, now);
+  return _nextDueAt(task, now, baseline);
+}
+
+/** Cancel + re-register every timer.
+ *
+ * On bootstrap, past-due boundaries are used only as an in-memory scheduling
+ * baseline. Nothing is persisted and overdue conversations are not created. */
+type RescheduleMode = 'restore' | 'live_sync';
+
+async function _rescheduleAll(
+  uid: string,
+  mode: RescheduleMode = 'restore',
+  schedulerEpoch?: number,
+): Promise<void> {
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  // A live sync can land after an armed boundary but before its timer callback
+  // runs. Preserve only that already-armed occurrence; newly synced overdue
+  // tasks still use restore semantics and never backfill.
+  const armedDueAt = mode === 'live_sync'
+    ? new Map(Array.from(_timers, ([id, timer]) => [id, timer.dueAtMs]))
+    : new Map<string, number>();
+  _cancelAllTimers();
   const tasks = await listTasks(uid);
-  for (const t of tasks) _scheduleTask(uid, t);
+  if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+  const now = new Date();
+  for (const t of tasks) {
+    if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
+    const priorDueAt = armedDueAt.get(t.id);
+    const preserveArmedBoundary = priorDueAt !== undefined && priorDueAt <= now.getTime();
+    const baseline = preserveArmedBoundary
+      ? _scheduleBaseline(t)
+      : _baselineWithoutBackfill(t, now);
+    _scheduleTask(uid, t, baseline);
+  }
   log.info(`rescheduler ran timers=${_timers.size}`);
+}
+
+export function rescheduleAllForTest(uid: string): Promise<void> {
+  return _rescheduleAll(uid);
+}
+
+export function rescheduleAllAfterSyncForTest(uid: string): Promise<void> {
+  return _rescheduleAll(uid, 'live_sync');
+}
+
+export function armedDueAtForTest(taskId: string): number | null {
+  return _timers.get(taskId)?.dueAtMs ?? null;
 }
 
 export function nextDueAtForTest(task: AutoTask, now: Date): Date | null {
@@ -1410,8 +1674,72 @@ export function nextDueAtForTest(task: AutoTask, now: Date): Date | null {
 
 /** Public CRUD hook — call after any task mutation lands on disk. */
 function _onTaskMutated(uid: string, task: AutoTask | null, taskId?: string): void {
-  if (task) _scheduleTask(uid, task);
+  if (_started && !isActiveUser(uid)) return;
+  if (task) _scheduleTask(uid, task, _baselineWithoutBackfill(task, new Date()));
   else if (taskId) _cancelTimer(taskId);
+}
+
+function _suspendScheduler(): void {
+  // Invalidate a callback that has already left the timer queue and is
+  // awaiting disk or sleep-state IO.
+  _schedulerEpoch += 1;
+  _schedulerSuspended = true;
+  _cancelAllTimers();
+  log.info('scheduler suspended');
+}
+
+async function _resumeScheduler(uid: string): Promise<void> {
+  _schedulerSuspended = false;
+  const schedulerEpoch = _schedulerEpoch;
+  if (!isActiveUser(uid)) return;
+  await _rescheduleAll(uid, 'restore', schedulerEpoch);
+  log.info('scheduler resumed');
+}
+
+const _onSystemSuspend = (): void => {
+  if (!_started) return;
+  _suspendScheduler();
+};
+
+const _onSystemResume = (): void => {
+  if (!_started) return;
+  if (!hasActiveUser()) {
+    _schedulerSuspended = false;
+    return;
+  }
+  _resumeScheduler(getActiveUserId())
+    .catch((err) => log.warn(`resume failed: ${(err as Error).message}`));
+};
+
+async function _attachSchedulerPowerMonitor(): Promise<void> {
+  if (_schedulerPowerMonitor) return;
+  try {
+    const { powerMonitor } = await import('electron');
+    if (_schedulerPowerMonitor || !_started || !powerMonitor
+        || typeof powerMonitor.on !== 'function'
+        || typeof powerMonitor.removeListener !== 'function') return;
+    _schedulerPowerMonitor = powerMonitor as unknown as SchedulerPowerMonitor;
+    _schedulerPowerMonitor.on('suspend', _onSystemSuspend);
+    _schedulerPowerMonitor.on('resume', _onSystemResume);
+  } catch (err) {
+    log.warn(`power monitor registration failed: ${(err as Error).message}`);
+  }
+}
+
+function _detachSchedulerPowerMonitor(): void {
+  const monitor = _schedulerPowerMonitor;
+  _schedulerPowerMonitor = null;
+  if (!monitor) return;
+  monitor.removeListener('suspend', _onSystemSuspend);
+  monitor.removeListener('resume', _onSystemResume);
+}
+
+export function suspendSchedulerForTest(): void {
+  _suspendScheduler();
+}
+
+export function resumeSchedulerForTest(uid: string): Promise<void> {
+  return _resumeScheduler(uid);
 }
 
 /** Initial bootstrap — list every task and register a timer for each
@@ -1421,24 +1749,13 @@ function _onTaskMutated(uid: string, task: AutoTask | null, taskId?: string): vo
 export function startScheduler(): void {
   if (_started) return;
   _started = true;
-  // System sleep/wake → rebuild timers on resume so any task that was due
-  // during sleep fires immediately on wake (Node's setTimeout uses
-  // awake-time, not wall-clock).
-  (async () => {
-    try {
-      const { powerMonitor } = await import('electron');
-      if (powerMonitor && !_resumeListenerAttached) {
-        _resumeListenerAttached = true;
-        powerMonitor.on('resume', () => {
-          if (!hasActiveUser()) return;
-          _rescheduleAll(getActiveUserId()).catch((err) => log.warn(`resume reschedule failed: ${(err as Error).message}`));
-        });
-      }
-    } catch (_) { /* non-electron host (tests) — no power-monitor hook */ }
-  })();
+  _schedulerSuspended = false;
+  void _attachSchedulerPowerMonitor();
   if (!hasActiveUser()) return;
   const uid = getActiveUserId();
-  _rescheduleAll(uid).catch((err) => log.warn(`bootstrap failed uid=${uid}: ${(err as Error).message}`));
+  const schedulerEpoch = _schedulerEpoch;
+  _rescheduleAll(uid, 'restore', schedulerEpoch)
+    .catch((err) => log.warn(`bootstrap failed uid=${uid}: ${(err as Error).message}`));
 }
 
 /** Re-read task configs after sync writes directly into cloud/auto_tasks.
@@ -1446,11 +1763,31 @@ export function startScheduler(): void {
  *  hooks while materializing files from another device. */
 export async function rescheduleAllForActiveUser(): Promise<void> {
   if (!hasActiveUser()) return;
-  await _rescheduleAll(getActiveUserId());
+  const uid = getActiveUserId();
+  const schedulerEpoch = _schedulerEpoch;
+  await _rescheduleAll(uid, 'live_sync', schedulerEpoch);
 }
 
 export function stopScheduler(): void {
-  for (const id of Array.from(_timers.keys())) _cancelTimer(id);
+  _schedulerEpoch += 1;
+  _cancelAllTimers();
+  _detachSchedulerPowerMonitor();
+  _schedulerSuspended = false;
   _started = false;
   log.info('scheduler stopped');
 }
+
+registerUserSwitchHook('auto-tasks-scheduler', (_previousUid, nextUid) => {
+  // Invalidate callbacks before users.activateUser swaps filesystem and
+  // credential roots. clearTimeout alone is insufficient when a callback has
+  // already left the timer queue and is awaiting disk or sleep-state IO.
+  _schedulerEpoch += 1;
+  const switchEpoch = _schedulerEpoch;
+  _cancelAllTimers();
+  if (!_started) return;
+  queueMicrotask(() => {
+    if (!_started || !schedulerEpochIsCurrent(switchEpoch) || !isActiveUser(nextUid)) return;
+    _rescheduleAll(nextUid, 'restore', switchEpoch)
+      .catch((err) => log.warn(`account-switch reschedule failed uid=${nextUid}: ${(err as Error).message}`));
+  });
+});

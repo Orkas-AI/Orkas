@@ -407,6 +407,12 @@ describe('PC core regression unit coverage', () => {
 
   it('[PC-AUTO-001][PC-AUTO-002][PC-AUTO-003][PC-AUTO-004] persists automation CRUD, attachments, project scope, and disabled state', async () => {
     const auto = await import('../../src/main/features/auto_tasks');
+    const projects = await import('../../src/main/features/projects');
+    const projectResult = await projects.createProject(TEST_UID, 'Automation regression project');
+    expect(projectResult.ok).toBe(true);
+    if (!projectResult.ok) return;
+    const projectId = projectResult.project.project_id;
+    await projects.addAgentBinding(TEST_UID, projectId, 'agent_a');
     const taskId = auto.allocateDraftTaskId();
 
     expect((await auto.uploadAttachment(TEST_UID, taskId, 'seed.md', Buffer.from('# seed'))).ok).toBe(true);
@@ -416,7 +422,7 @@ describe('PC core regression unit coverage', () => {
       id: taskId,
       title: 'Regression automation',
       content: 'Run the regression report',
-      project_id: 'p_auto_regression',
+      project_id: projectId,
       attachments: ['seed.md'],
       recipient: { kind: 'agent', id: 'agent_a', name: 'Agent A' },
       skill: { id: 'skill_a', name: 'Skill A' },
@@ -435,13 +441,13 @@ describe('PC core regression unit coverage', () => {
       schedule: { type: 'daily', hour: 25, minute: 0 },
     })).ok).toBe(false);
 
-    const configFile = userPath('cloud', 'auto_tasks', taskId, 'config.json');
+    const configFile = userPath('cloud', 'projects', projectId, 'auto_tasks', taskId, 'config.json');
     const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
-    expect(config.project_id).toBe('p_auto_regression');
+    expect(config.project_id).toBe(projectId);
     expect(config.attachments).toEqual(['seed.md']);
     expect(config.schedule).toEqual({ type: 'weekly', weekday: 5, hour: 9, minute: 30 });
 
-    expect((await auto.listTasks(TEST_UID, { projectId: 'p_auto_regression' })).map((task) => task.id)).toEqual([taskId]);
+    expect((await auto.listTasks(TEST_UID, { projectId })).map((task) => task.id)).toEqual([taskId]);
     expect(await auto.listTasks(TEST_UID, { projectId: null })).toEqual([]);
 
     const updated = await auto.updateTask(TEST_UID, taskId, {

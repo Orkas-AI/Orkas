@@ -602,8 +602,9 @@ export async function resolveProjectFileAbsPath(
   try { abs = resolveUnder(root, safeName); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
-  try { st = fs.statSync(abs); }
+  try { st = fs.lstatSync(abs); }
   catch { return { ok: false, error: 'not_found' }; }
+  if (st.isSymbolicLink()) return { ok: false, error: 'symlink_not_supported' };
   if (!st.isFile()) return { ok: false, error: 'not_found' };
   return { ok: true, absPath: abs, kind: kindOfName(safeName) };
 }
@@ -658,6 +659,15 @@ function validateProjectCopySource(sourceAbs: string): Result<{ fileCount: numbe
     const ext = path.extname(current).toLowerCase();
     if (!ALLOWED_EXTENSIONS.has(ext) || st.size > maxBytesFor(current)) {
       return { ok: false, error: 'unsupported_destination' };
+    }
+    if (TEXT_EXTS.has(ext)) {
+      let buf: Buffer;
+      try { buf = fs.readFileSync(current); }
+      catch { return { ok: false, error: 'read_failed' }; }
+      const text = buf.toString('utf8');
+      if (Buffer.byteLength(text, 'utf8') !== buf.length) {
+        return { ok: false, error: 'unsupported_destination' };
+      }
     }
     fileCount += 1;
     bytes += st.size;

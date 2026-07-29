@@ -1,23 +1,15 @@
 #!/usr/bin/env node
 
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(import.meta.dirname, '..', '..');
-const skipDirs = new Set([
-  '.git',
-  '.cache',
-  'build',
-  'data',
-  'dist',
-  'node_modules',
-  'out',
-  'venv',
-  'workspace',
-  'userWorkSpace',
-]);
+const defaultRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const textExts = new Set([
+  '.bat',
   '.cjs',
+  '.cmd',
   '.conf',
   '.css',
   '.html',
@@ -26,6 +18,7 @@ const textExts = new Set([
   '.jsx',
   '.md',
   '.mjs',
+  '.ps1',
   '.py',
   '.sh',
   '.ts',
@@ -39,59 +32,123 @@ const textNames = new Set([
   '.gitattributes',
   '.gitignore',
 ]);
+const GIT_DISCOVERY_TIMEOUT_MS = 30_000;
 
-function isTextFile(name) {
+export function isTextFile(name) {
   return textNames.has(name) || textExts.has(path.extname(name).toLowerCase());
 }
 
-function shouldSkipDir(name) {
-  return skipDirs.has(name);
-}
-
-function shouldSkipPath(dir) {
-  const rel = path.relative(root, dir).split(path.sep).join('/');
-  return rel === 'PC/product/package';
-}
-
-function scanFile(file) {
-  const bytes = fs.readFileSync(file);
-  let lf = 0;
+export function classifyLineEndings(bytes) {
+  let bareCr = 0;
+  let bareLf = 0;
   let crlf = 0;
-  for (let i = 0; i < bytes.length; i += 1) {
-    if (bytes[i] !== 10) continue;
-    lf += 1;
-    if (i > 0 && bytes[i - 1] === 13) crlf += 1;
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 13) {
+      if (bytes[index + 1] === 10) {
+        crlf += 1;
+        index += 1;
+      } else {
+        bareCr += 1;
+      }
+    } else if (bytes[index] === 10) {
+      bareLf += 1;
+    }
   }
-  if (lf === 0) return null;
-  const bareLf = lf - crlf;
-  if (crlf > 0 && bareLf > 0) {
-    return { file, crlf, bareLf };
-  }
-  return null;
+  const styles = [bareCr, bareLf, crlf].filter((count) => count > 0).length;
+  return {
+    bareCr,
+    bareLf,
+    crlf,
+    invalid: bareCr > 0 || styles > 1,
+  };
 }
 
-function walk(dir, out) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) {
-      const next = path.join(dir, entry.name);
-      if (!shouldSkipDir(entry.name) && !shouldSkipPath(next)) walk(next, out);
+export function listRepositoryTextFiles(root = defaultRoot, {
+  fileSystem = fs,
+  spawn = spawnSync,
+} = {}) {
+  const result = spawn(
+    'git',
+    ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    {
+      cwd: root,
+      encoding: 'buffer',
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: GIT_DISCOVERY_TIMEOUT_MS,
+    },
+  );
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`git ls-files failed with exit ${result.status}`);
+  }
+
+  const entries = Buffer.from(result.stdout || Buffer.alloc(0))
+    .toString('utf8')
+    .split('\0')
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b, 'en'));
+  const prefix = `${path.resolve(root)}${path.sep}`;
+  const files = [];
+  for (const relative of entries) {
+    if (!isTextFile(path.basename(relative))) continue;
+    const file = path.resolve(root, relative);
+    if (!file.startsWith(prefix)) continue;
+    let stat;
+    try {
+      stat = fileSystem.lstatSync(file);
+    } catch {
       continue;
     }
-    if (!entry.isFile() || !isTextFile(entry.name)) continue;
-    const result = scanFile(path.join(dir, entry.name));
-    if (result) out.push(result);
+    // Do not follow a repository symlink into a user or system path.
+    if (stat.isFile()) files.push(file);
   }
+  return files;
 }
 
-const mixed = [];
-walk(root, mixed);
-
-if (mixed.length) {
-  console.error('Mixed line endings found:');
-  for (const item of mixed) {
-    console.error(`- ${path.relative(root, item.file)} (CRLF=${item.crlf}, LF=${item.bareLf})`);
-  }
-  process.exit(1);
+export function scanLineEndingFile(file, { fileSystem = fs } = {}) {
+  const result = classifyLineEndings(fileSystem.readFileSync(file));
+  return result.invalid ? { file, ...result } : null;
 }
 
-console.log('No mixed line endings found.');
+function diagnosticPath(root, file) {
+  return path.relative(root, file).split(path.sep).join('/');
+}
+
+export function checkRepositoryLineEndings({
+  fileSystem = fs,
+  print = console.log,
+  printError = console.error,
+  root = defaultRoot,
+  spawn = spawnSync,
+} = {}) {
+  let files;
+  try {
+    files = listRepositoryTextFiles(root, { fileSystem, spawn });
+  } catch (err) {
+    printError(`Line-ending file discovery failed: ${err.message}`);
+    return { code: 2, files: 0, invalid: [] };
+  }
+
+  const invalid = [];
+  for (const file of files) {
+    const result = scanLineEndingFile(file, { fileSystem });
+    if (result) invalid.push(result);
+  }
+  if (invalid.length) {
+    printError('Invalid or mixed line endings found:');
+    for (const item of invalid) {
+      printError(
+        `- ${diagnosticPath(root, item.file)} `
+        + `(CRLF=${item.crlf}, LF=${item.bareLf}, bare-CR=${item.bareCr})`,
+      );
+    }
+    return { code: 1, files: files.length, invalid };
+  }
+
+  print(`Line endings valid in ${files.length} repository text files.`);
+  return { code: 0, files: files.length, invalid };
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  process.exitCode = checkRepositoryLineEndings().code;
+}

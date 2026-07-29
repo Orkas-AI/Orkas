@@ -9,7 +9,7 @@ category: creation
 
 # stage-plan
 
-How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans more than one production line. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler then walks deterministically. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / silence / ocr / scenes / quality / extract_frame via `bin/run-skill.cjs`) plus the built-in `video_studio` transcription op, this skill provides the plan validator script, and the producers handle compose / generate / edit.
+How to turn "here is my material + here's the video I want" into a single, inspectable plan that spans reference images, reference videos, deterministic editing, semantic editing, generation, and composition. The output is `project/plan.json` — a cross-modal Edit Decision List (EDL) — which the assembler walks. Host-neutral: ingest evidence comes from `stage-edit` skill scripts (probe / silence / ocr / scenes / quality / extract_frame) plus `video_studio` transcription; this skill provides the plan validator, and line producers execute the signed decisions.
 
 **Where the material comes from.** User-uploaded clips arrive as chat attachments marked `model_readable="false"` with a `path` (see the attachment list). That flag means "not vision input", NOT "unusable" — it is source material to ingest with the scripts below. Copy each into `raw/` (or pass its attachment path as `--input`) before probing; never skip a `model_readable="false"` clip or plan around material you have not actually ingested.
 
@@ -65,6 +65,8 @@ You cannot plan against material you have not looked at. For EVERY supplied clip
    - **Usability heuristics:** video > 10 s → hero footage; > 3 s → b-roll; has speech → dialogue source; audio-only → narration/music source, production must supply the visuals; image-only → motion must come from animation or generation.
    - **Quality risks to flag:** width < 720 / height < 480 (will look soft), clip < 3 s (limited use), mono audio, a still where the brief wants motion. A flagged risk the plan ignores is a planning bug — resolve it during direction confirmation.
 
+For every supplied image or video that constrains the result, also lock its requested relationship as `reproduce`, `edit`, or `guide`. Do not infer this from file origin. Copy or retain the exact media source and record its roles, protected attributes, allowed changes, and target segments. Video reproduction/editing or motion/timing guidance requires source-time-to-target-segment anchors.
+
 ## Step 2 — Choose the delivery promise
 
 Pick ONE `delivery_promise.type` and make the whole plan keep it:
@@ -83,6 +85,32 @@ Write `project/plan.json`. Every segment declares HOW it is produced (`source`) 
 - `source`: **edit** (trim a real clip — needs `input_id` + `in_sec`/`out_sec`), **generate** (billable AI media — needs `prompt`, explicit `media_kind:image|video`, and the exact settings the provider call will use, including operation plus every reference path/URL; for video the approved defaults are plan aspect, clamped 4-15s target duration, 720p, balanced, audio on), **compose** (designed HTML — needs `kind` plus a complete `composition_plan.scenes` binding with each scene's id, approved_copy, narration_text, and semantic roles), **provided** (use a supplied asset as-is — needs `asset_id` and mandatory `kind:image|video`; unknown kind counts as neither footage nor motion).
 - `layer`: **primary** (the main timeline), **overlay** (sits over a primary via `over: <segment id>` — captions, lower-thirds, title cards), **bg** (behind).
 - `role`: MUST be exactly one of hook / body / proof / cta / transition — the schema rejects any other value (E_SEG_ROLE) and the plan fails validation. Narrative BEAT names from the arc ("payoff", "establishing", "climax", …) are NOT roles: map a payoff / closing / CTA beat to `cta`, an establishing / evidence beat to `proof`. Front-load the hook.
+
+Top-level `references` uses one format for both images and videos: `{id,media_type:"image|video",source,intent?:"reproduce|edit|guide",intent_basis?:"user|inferred",roles,required,preserve,may_change,target_segment_ids,temporal_anchors?}`. This declaration is mandatory for every user/source media item used by an edit, provided segment, or generation reference: a segment's `spec.input_id`, `edit_strategy`, or prose note does not replace it. When the plan uses no reference media at all, omit the top-level `references` field; never emit `"references":[]`, because an empty array is invalid when the field is present. Every reference `roles` entry MUST be exactly one of `content|identity|composition|structure|style|motion|timing|audio`; descriptive aliases such as `primary_source`, `speaker_identity`, `sync_reference`, or `semantic_edit_reference` are rejected by the EDL schema. Explicit user requirements always win and use `intent_basis:"user"`; only an unspecified reference may omit intent and safely default to guide/inferred. Image composition/structure may use spatial regions in downstream COMPOSE. A video reproduce/edit/motion/timing reference needs one valid `{source_start_sec,source_end_sec,target_segment_id}` temporal anchor for every id in `target_segment_ids`; one aggregate source/target time range with no `target_segment_id` is invalid.
+
+References remain live plan facts after initial ingestion. When the user adds,
+replaces, removes, relocates, or changes the declared role of a reference,
+compare the new declaration with the current signed plan before editing:
+
+- a source, identity, content, timing, audio, or signed fidelity-contract
+  change is a bounded plan amendment;
+- an implementation-only relocation with equivalent bytes refreshes the
+  locator and does not reopen approval;
+- a non-signed visual styling change may stay `visual_only` when it changes no
+  approved copy, semantic role, source mapping, identity, timing, or delivery
+  field;
+- a missing or unreadable reference blocks only segments that declare it
+  required. Preserve completed unaffected segments, show the current review
+  artifact, name the exact missing reference, and never fabricate its content.
+
+Keep the prior reference declaration and produced outputs as immutable
+history. Revalidate the complete EDL, invalidate only dependent segment
+outputs plus downstream assembly/review approval, and stop at the one next
+review artifact. If multiple references conflict, the current explicit user
+instruction outranks inferred defaults; do not blend mutually exclusive
+requirements silently.
+
+When VideoStudio chooses or transforms content intelligently, add `edit_strategy:{mode,objectives,decision_signals,preserve,may_change}`. Use `deterministic` for evidence-driven cuts/cleanup, `semantic` for AI pixel edits, and `mixed` for both. A semantic video edit remains an EDIT/AUTO workflow but is encoded as a billable `source:"generate"` segment with `media_kind:"video"`, `operation:"edit"`, and its declared original in `reference_video_paths` or `reference_video_urls`. The validator blocks semantic edits without a matching top-level edit reference, temporal anchor, edit strategy, and Gate-C count.
 
 Tracks are separate from the visual timeline. The top-level `tracks` container is always required and must be an object, even when the video has no active tracks: use `"tracks": {}` (or object members set to `null`), never `"tracks": null`. Before authoring an active narration track, call `video_studio` `speech.capabilities` and copy one returned selection into `tracks.narration.synthesis:{route_ref,voice_ref,display_name,language,speed}`; `language` is the deliverable's BCP-47 narration language and the selected voice must list it in `supported_locales`. Prefer a matching `native_locale`, then a verified non-native locale; never use `language_confidence:"candidate"` for non-native production and never invent a provider voice id. Add at least one timed line `{text, start_sec, target_sec}`; each line gets a `produced_path` once synthesized, so one line can be re-voiced alone. `tracks.music` holds a real `path` + ducking, and `tracks.captions` holds `{ from?, style?, lines:[{text, start_sec, target_sec}] }` as DATA, not burned pixels. A disabled track must be omitted or set to `null`; never emit empty placeholders. Legacy raw `voice` plans are recovery-only and receive a validator warning. Put the billable-generation count in `cost_estimate` — gate C reads it.
 
@@ -106,6 +134,19 @@ Fit narration in the plan before any TTS call: use natural cadence (about 2.2-2.
     { "id": "s2_cap", "order": 3, "role": "body", "layer": "overlay", "over": "s2_body",
       "source": "compose", "target_sec": 3, "spec": { "kind": "lower-third" } }
   ],
+  "references": [
+    {
+      "id": "clip-a-source", "media_type": "video", "source": "raw/clipA.mp4",
+      "intent": "edit", "intent_basis": "user", "roles": ["content", "timing", "audio"],
+      "required": true,
+      "preserve": ["approved content", "original audio sync"],
+      "may_change": ["signed timeline cuts"],
+      "target_segment_ids": ["s1_hook"],
+      "temporal_anchors": [
+        { "source_start_sec": 12, "source_end_sec": 18, "target_segment_id": "s1_hook" }
+      ]
+    }
+  ],
   "tracks": {
     "narration": { "synthesis": {
         "route_ref": "<copy exactly from speech.capabilities>",
@@ -127,7 +168,10 @@ Field gotchas the validator enforces (these are the common breakers):
 - Every segment needs `order` + `layer` + `spec`; use `target_sec` (not `target_duration_sec`/`duration`). At least one segment must be `layer:"primary"`.
 - Every compose segment's `composition_plan.scenes` is user-approved child content, not runtime metadata. The child manifest must reproduce those scene ids/copy/narration/roles exactly or native Gate B inheritance fails.
 - Every billable image, video, portrait, or generated keyframe is its own `source:"generate"` segment. Do not hide auxiliary generation outside the EDL or reuse one segment id for multiple provider calls.
+- Every edit/provided source and every generation reference has a matching top-level `references[]` declaration. `spec.input_id` proves where bytes come from, but it does not prove user intent, preserve/may-change boundaries, or target ownership.
+- For video reproduce/edit/motion/timing references, every `target_segment_ids` entry has its own temporal anchor with that exact `target_segment_id` and a valid source range. Never emit one aggregate anchor without a target id.
 - For a generated video, the signed provider fields are exactly `operation:"generate"|"edit"`, `generation_duration_sec`, `resolution`, `quality`, `generate_audio`, plus the documented reference arrays. Never write provider-family aliases such as `operation:"text_to_video"`, `duration_sec`, or `audio`; they are rejected because the host would otherwise execute different defaults. The aspect ratio comes from top-level `aspect` (a duplicate `spec.aspect` may not conflict). An image segment has no `operation`.
+- `operation:"edit"` requires at least one reference video and `edit_strategy.mode:"semantic"|"mixed"`; it is not an unconstrained variation. Every referenced source must match a top-level video reference with `intent:"edit"` targeting that segment.
 - `tracks` is a required **object** `{narration, music, captions}` — NOT an array and never top-level `null`. With no active tracks, write `"tracks": {}`. Otherwise include only active tracks; omit or use `null` for disabled members.
 - `delivery_promise` must MATCH this deliverable (Step 2) — do NOT copy the example's `hybrid`/`source_required:true`/`0.6`. A designed-HTML explainer is `type:"compose_led"`, `source_required:false`, `motion_min_ratio:0`; set `source_required:true` ONLY when the user's real footage must star. For other promise types, `motion_min_ratio` is the real-footage/generated-video floor you are actually committing to.
 
@@ -155,8 +199,9 @@ The craft of weaving ONE good video across sources, on top of the shared craft (
 
 ## Rules
 
-- The plan is the single source of truth and the resumable state. Segments carry `status` + `produced_path` as they complete; do not re-produce a segment already marked done.
+- The plan is the single source of production intent and its segments may carry the legacy execution facts `status` + `produced_path` as they complete; do not re-produce a segment already marked done. Native Gate B signs the normalized intent projection rather than the whole JSON container: stable content, references, language, timing, provider settings, and voice refs remain signed, while those execution facts and catalog display labels do not. Put new diagnostics in durable production state instead of inventing plan fields, because unknown plan fields intentionally remain approval-bearing.
 - Reference real `input_id`s from `ingest.json`; never cite a clip you have not probed.
+- Reference media by requested reproduce/edit/guide intent, never by which product created it. Preserve and may-change boundaries must not overlap.
 - `cost_estimate.billable_generations` must exactly equal the number of `source:"generate"` segments, including consistency portraits/keyframes; validation blocks a mismatch because Gate C depends on the count.
 
 ## Boundary / non-goals

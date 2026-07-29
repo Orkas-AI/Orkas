@@ -38,6 +38,7 @@ import {
 } from '../paths';
 import { nowIso, genUserId, safeId, readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
+import { notifyUserSwitch } from './user-switch-hooks';
 import { sweepToolResults } from '../util/tool-result-cap';
 import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateChatsGhostCleanup } from '../util/migrate-chats-ghost-cleanup';
@@ -288,8 +289,14 @@ export function migrateLegacyLoggedInLocalIdToAccountLocalId(): LegacyAccountLoc
  *
  * Callers are typically `boot` and account login/logout transitions.
  */
-export function activateUser(uid: string): void {
+function activateUserInternal(uid: string, switchCleanupComplete: boolean): void {
   if (!safeId(uid)) throw new Error(`invalid user id: ${String(uid)}`);
+
+  const previousUid = ACTIVE_UID;
+  if (!switchCleanupComplete && previousUid && previousUid !== uid) {
+    // Fail closed before changing any user-scoped paths or credentials.
+    notifyUserSwitch(previousUid, uid);
+  }
 
   ensureUserLayout(uid);
 
@@ -374,6 +381,10 @@ export function activateUser(uid: string): void {
   log.info('active user changed', { userId: maskId(uid) });
 }
 
+export function activateUser(uid: string): void {
+  activateUserInternal(uid, false);
+}
+
 /**
  * Boot-time entrypoint — read users.json and activate this environment's
  * current-user pointer. If none exists, activate `defaultLocalId` (hosted:
@@ -402,6 +413,12 @@ export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
 export function switchToAccountLocalId(accountUserId: string): UserRecord {
   const localId = accountUserIdToLocalId(accountUserId);
   const current = ACTIVE_UID;
+  if (current === localId) return recordForLocalId(localId);
+  if (current) {
+    // Cleanup must succeed before the anonymous root is renamed or secrets
+    // are rekeyed for another local profile.
+    notifyUserSwitch(current, localId);
+  }
   if (current && current !== localId && isAnonymousLocalId(current) && !localIdRootExists(localId)) {
     const reg = readRegistry();
     const fromRoot = localRoot(current);
@@ -421,7 +438,7 @@ export function switchToAccountLocalId(accountUserId: string): UserRecord {
       });
     }
   }
-  activateUser(localId);
+  activateUserInternal(localId, true);
   return recordForLocalId(localId);
 }
 
@@ -429,6 +446,9 @@ export function switchToAnonymousLocalId(): UserRecord {
   const current = ACTIVE_UID;
   if (current === ANONYMOUS_LOCAL_ID) return recordForLocalId(ANONYMOUS_LOCAL_ID);
   if (current && current !== ANONYMOUS_LOCAL_ID) {
+    // Do not wipe a pre-existing anonymous workspace unless every old-account
+    // runtime has first confirmed synchronous cleanup.
+    notifyUserSwitch(current, ANONYMOUS_LOCAL_ID);
     const anonymousRoot = localRoot(ANONYMOUS_LOCAL_ID);
     try {
       fs.rmSync(anonymousRoot, {
@@ -444,7 +464,7 @@ export function switchToAnonymousLocalId(): UserRecord {
       });
     }
   }
-  activateUser(ANONYMOUS_LOCAL_ID);
+  activateUserInternal(ANONYMOUS_LOCAL_ID, true);
   return recordForLocalId(ANONYMOUS_LOCAL_ID);
 }
 

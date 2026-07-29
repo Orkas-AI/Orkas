@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Per-platform fetch primitives shared by `fetch.py`.
 
-Self-contained: depends only on `requests` and (optionally) `browser_cookie3`
-plus external CLIs (`xreach`, `yt-dlp`) and the local Xiaohongshu proxy.
+Pinned Python dependencies are bootstrapped by `run-skill.cjs` from the
+skill-root requirements.fetch.txt. Twitter uses an installed `xreach` binary
+when available, otherwise the bundled Node/npm runtime downloads the pinned
+CLI through npx. Xiaohongshu still requires its separate local proxy.
 """
 import hashlib, json, os, re, shutil, subprocess, sys, time, urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -145,7 +147,33 @@ def add_diag(diag, **kwargs):
             diag[k] = v
 
 
+_XREACH_NPX_PACKAGE = 'xreach-cli@0.3.3'
+
+
+def _npx_cmd():
+    """Return a cross-platform npx command backed by Orkas' bundled Node."""
+    node = os.environ.get('ORKAS_BUNDLED_NODE', '').strip()
+    if node:
+        node_dir = os.path.dirname(node)
+        candidates = (
+            os.path.join(node_dir, 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+            os.path.join(node_dir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js'),
+        )
+        for cli in candidates:
+            cli = os.path.abspath(cli)
+            if os.path.isfile(cli):
+                return [node, cli]
+    npx = shutil.which('npx')
+    return [npx] if npx else []
+
+
 def xreach_cmd(keyword, count=30):
+    installed = shutil.which('xreach')
+    if installed:
+        return [installed, 'search', keyword, '--json', '-n', str(count)]
+    npx = _npx_cmd()
+    if npx:
+        return [*npx, '--yes', _XREACH_NPX_PACKAGE, 'search', keyword, '--json', '-n', str(count)]
     return ['xreach', 'search', keyword, '--json', '-n', str(count)]
 
 

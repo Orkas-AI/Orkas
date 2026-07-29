@@ -1,0 +1,27 @@
+{
+  "version": "1.0.35",
+  "updated_at": "2026-07-29T08:04:00.000Z",
+  "min_app_version": "1.7.0",
+  "reseed_if_deleted_before": "2026-07-29T08:04:00Z",
+  "category": "creation",
+  "descriptions": {
+    "zh": "规划、研究、起草、改写、自然化、适配和审核编辑内容：可从一句目标直接完成社媒成稿，也支持文章、博客、newsletter、教程、案例、观点稿和资料型改写，并保留来源边界与作者声音。",
+    "en": "Plan, research, draft, revise, humanize, adapt, and audit social and long-form editorial content with channel-aware structure, evidence boundaries, voice preservation, and publication-readiness gates."
+  },
+  "routing": {
+    "applicable_domain": [
+      "individual social posts, long-form articles, blogs, newsletters, explainers, tutorials, case studies, opinion pieces, and research-backed reports",
+      "outlining, source-grounded drafting, structural revision, voice-preserving humanization, citation review, and pre-publish content audit"
+    ],
+    "negative_examples": [
+      "operate a publishing platform, browser CMS, or social media account",
+      "create a social calendar, operate a social account, or execute a multi-post campaign",
+      "provide final professional legal, medical, or financial advice",
+      "certify human authorship or guarantee bypass of AI-detection systems"
+    ],
+    "prerequisites": [
+      "a topic, content request, source pack, outline, or draft is available",
+      "current or externally checkable claims can be verified when strict publication readiness is requested"
+    ]
+  }
+}

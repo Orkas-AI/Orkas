@@ -8,6 +8,9 @@
 // skill / connector tokens stay in `content`; legacy rows may still carry
 // `use`, which is expanded at dispatch time for compatibility.
 
+const _queueDispatching = new Set();
+const _draftSaveTimers = new Map();
+
 function _loadQueueFromStorage(cid) {
   if (!cid) return [];
   try {
@@ -35,6 +38,8 @@ function _getQueue(cid) {
 function _forgetConvLocal(cid) {
   if (!cid) return;
   messageQueues.delete(cid);
+  _queueDispatching.delete(cid);
+  _cancelDraftSave(cid);
   try {
     localStorage.removeItem(_QUEUE_KEY(cid));
     localStorage.removeItem(_DRAFT_KEY(cid));
@@ -118,6 +123,10 @@ function _dispatchNextQueued(cid) {
   const q = _getQueue(cid);
   if (!q.length) return;
   if (isConvPending(cid)) return;
+  // The controller may spend time in an async preflight before onStarted.
+  // Coalesce repeated history/settlement drains during that window so the
+  // durable queue head cannot be submitted twice.
+  if (_queueDispatching.has(cid)) return;
   // Only auto-dispatch for the currently-viewed conversation so the user sees
   // messages go out in order. Queues on other cids stay parked until the user
   // switches back (then on render we'll also kick the next item).
@@ -168,6 +177,10 @@ function _dispatchNextQueued(cid) {
     if (selections.length) extra.use_selections = selections;
   }
   const removeStartedItem = () => {
+    // Once onStarted fires, isConvPending(cid) becomes the execution lock.
+    // Release the preflight lock before terminal settlement synchronously
+    // drains the next queue item.
+    _queueDispatching.delete(cid);
     const liveQueue = _getQueue(cid);
     const idx = liveQueue.findIndex((item) => item && item.id === next.id);
     if (idx < 0) return;
@@ -177,14 +190,25 @@ function _dispatchNextQueued(cid) {
     if (cid === currentCid) renderMessageQueue(cid);
   };
   // Fire-and-forget: the send path owns stream failures and final cleanup.
-  // `onStarted` runs synchronously before the request begins, so a second
-  // drain cannot overtake this item; if preflight refuses the send, it stays
-  // at the head of the persisted queue.
-  Promise.resolve(sendInCurrentConversation(
-    content,
-    Object.keys(extra).length ? extra : undefined,
-    { from_queue: true, source_view: 'conversation', onStarted: removeStartedItem },
-  )).catch(() => {});
+  // Keep the queue head durable until onStarted. A synchronous throw or an
+  // async preflight refusal releases only the dispatch lock so a later
+  // recovery trigger can retry the same item.
+  _queueDispatching.add(cid);
+  let sendPromise;
+  try {
+    sendPromise = sendInCurrentConversation(
+      content,
+      Object.keys(extra).length ? extra : undefined,
+      { from_queue: true, source_view: 'conversation', onStarted: removeStartedItem },
+    );
+  } catch (_) {
+    _queueDispatching.delete(cid);
+    return;
+  }
+  Promise.resolve(sendPromise).then(
+    () => { _queueDispatching.delete(cid); },
+    () => { _queueDispatching.delete(cid); },
+  );
 }
 
 function renderMessageQueue(cid) {
@@ -323,7 +347,12 @@ function _startQueueItemEdit(cid, row) {
 // switches, panel navigation, and reloads. Inline skill / connector chips live
 // inside the text itself; old saved `use` fields are restored as inline tokens.
 
-let _draftSaveTimer = null;
+function _cancelDraftSave(cid) {
+  const timer = _draftSaveTimers.get(cid);
+  if (timer == null) return;
+  clearTimeout(timer);
+  _draftSaveTimers.delete(cid);
+}
 
 function _readDraftData(cid) {
   try {
@@ -363,18 +392,24 @@ function _persistQuoteDraft(cid) {
 
 function _saveDraft(cid) {
   if (!cid) return;
-  if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
-  _draftSaveTimer = setTimeout(() => {
-    const input = document.getElementById('chat-input');
-    const text = input ? input.value : '';
-    const references = typeof _getQuotes === 'function' ? _getQuotes(cid) : [];
+  // Snapshot before the debounce. Reading the shared textarea later can
+  // capture another conversation after a fast sidebar switch and write that
+  // text under the old cid.
+  const input = document.getElementById('chat-input');
+  const text = input ? input.value : '';
+  const references = typeof _getQuotes === 'function' ? _getQuotes(cid) : [];
+  _cancelDraftSave(cid);
+  const timer = setTimeout(() => {
+    if (_draftSaveTimers.get(cid) !== timer) return;
+    _draftSaveTimers.delete(cid);
     _writeDraftData(cid, text, references);
   }, 180);
+  _draftSaveTimers.set(cid, timer);
 }
 
 function _clearDraft(cid) {
   if (!cid) return;
-  if (_draftSaveTimer) { clearTimeout(_draftSaveTimer); _draftSaveTimer = null; }
+  _cancelDraftSave(cid);
   try { localStorage.removeItem(_DRAFT_KEY(cid)); } catch (_) {}
 }
 

@@ -29,8 +29,9 @@ export type VideoProductionGateEntry = {
   report_path?: string;
   /** v1 signatures included runtime outputs; v2 excludes the original
    * runtime-output set; v3 also excludes runtime QA reports whose names are
-   * chosen by the caller. */
-  validation_version: 1 | 2 | 3;
+   * chosen by the caller; v4 excludes reserved runtime output directories;
+   * v5 also reserves the legacy outputs directory. */
+  validation_version: 1 | 2 | 3 | 4 | 5;
   design_review?: {
     required: boolean;
     status: 'pending' | 'passed' | 'repair' | 'blocked';
@@ -38,6 +39,18 @@ export type VideoProductionGateEntry = {
     verdict?: string;
     scope?: string;
     findings?: string[];
+    quality_scorecard?: {
+      content_alignment: number;
+      cover_communication: number;
+      hierarchy: number;
+      text_legibility: number;
+      motion_readiness: number;
+      specificity: number;
+      reference_fidelity?: number;
+      overall: number;
+      pass_threshold: number;
+      dimension_floor: number;
+    };
     reviewed_frame_paths?: string[];
   };
 };
@@ -81,8 +94,32 @@ export type VideoProductionNarrationTransaction = {
   request_disposition?: 'not_sent' | 'rejected_preflight' | 'sent';
   charge_status?: 'not_charged' | 'charged' | 'unknown';
   retry_policy?: 'safe_after_plan_fix' | 'requires_user_action' | 'unknown';
+  /** Present only when this transaction is the one new provider request
+   * authorized after an earlier request ended with an uncertain outcome. */
+  retry_of_transaction_id?: string;
+  authorized_turn_id?: string;
+  authorization_source?: 'form' | 'model_interpreted_user_message';
+  attempt_number?: number;
   started_at: string;
   updated_at: string;
+};
+
+/**
+ * One real user decision may authorize one fresh provider request. Persist it
+ * separately from the request transaction so non-billable local repair
+ * between approval and dispatch does not require the same confirmation again.
+ */
+export type VideoProductionNarrationRetryAuthorization = {
+  authorization_id: string;
+  request_signature: string;
+  failed_transaction_id: string;
+  authorized_turn_id: string;
+  authorization_source: 'form' | 'model_interpreted_user_message';
+  max_new_requests: 1;
+  consumed_new_requests: 0 | 1;
+  authorized_at: string;
+  consumed_at?: string;
+  validation_version: 1;
 };
 
 export type VideoProductionNarrationCalibration = {
@@ -122,18 +159,40 @@ export type VideoProductionNarrationFit = {
   validation_version: 1;
 };
 
+export type VideoProductionPlanFileRecord = {
+  path: string;
+  sha256: string;
+};
+
+export type VideoProductionPlanFiles = {
+  script: VideoProductionPlanFileRecord;
+  shotlist: VideoProductionPlanFileRecord;
+  manifest: VideoProductionPlanFileRecord;
+};
+
 export type VideoProductionPlanApproval = {
   gate: 'B';
+  /** Content address of the canonical user-approved intent. Raw artifact
+   * hashes below are locators/concurrency evidence, not approval identity. */
   signature: string;
+  identity_kind?: 'legacy_artifact_bundle_sha256' | 'approved_intent_sha256';
+  /** Immutable normalized payload whose SHA-256 is `signature`. It lets
+   * recovery report exact intent differences instead of only two hashes. */
+  intent_snapshot?: Record<string, unknown>;
   turn_id: string;
   approved_at: string;
+  /** Current role-to-file evidence. Paths are locators and raw hashes detect
+   * relocation/concurrent edits; a raw hash change does not itself invalidate
+   * the approved intent. */
+  artifact_records?: VideoProductionPlanFiles;
+  /** Legacy flat list retained for backward compatibility and audit output. */
   artifact_paths: string[];
   inherited_from_signature?: string;
   inherited_at?: string;
   inheritance_reason?: 'measured_narration_fit_repair' | 'parent_edl_segment';
   parent_plan_path?: string;
   parent_segment_id?: string;
-  validation_version: 1;
+  validation_version: 1 | 2 | 3;
 };
 
 export type VideoProductionNarrationRepairAuthorization = {
@@ -175,6 +234,54 @@ export type VideoProductionArtifactState = {
   scaffold_html_sha256?: string;
 };
 
+export type VideoProductionCandidateLocators = {
+  html_path?: string;
+  manifest_path?: string;
+  preview_path?: string;
+  frame_paths?: string[];
+  draft_path?: string;
+  report_path?: string;
+  findings_path?: string;
+};
+
+export type VideoProductionCandidateSnapshot = {
+  /** Private content-addressed storage. Canonical source files may live
+   * anywhere in the allowed workspace; this is not an authoring-directory
+   * requirement. */
+  root_path: string;
+  manifest_path: string;
+  source_file_count: number;
+  source_total_bytes: number;
+  /** Stable copies used to inspect this exact revision after canonical files
+   * have changed. */
+  locators: VideoProductionCandidateLocators;
+  updated_at: string;
+};
+
+/**
+ * A content-addressed candidate revision. The authored content identity and
+ * parent link never change; later probes may only add evidence locators and a
+ * newer observation. This is a version record, not a workflow stage.
+ */
+export type VideoProductionCandidateRevision = {
+  revision_id: string;
+  parent_revision_id?: string;
+  content_hash: string;
+  artifacts: VideoProductionArtifactState;
+  locators: VideoProductionCandidateLocators;
+  snapshot?: VideoProductionCandidateSnapshot;
+  runtime_fingerprint: string;
+  created_at: string;
+  last_observed_at: string;
+  last_observed_op: string;
+  last_quality_result?: {
+    ok: boolean;
+    error_code?: string;
+    blocking_error_count?: number;
+    observed_at: string;
+  };
+};
+
 export type VideoProductionTransition = {
   revision: number;
   op: string;
@@ -189,6 +296,7 @@ export type VideoProductionTransition = {
 export type VideoProductionActiveOperation = {
   operation_id: string;
   op: string;
+  input_hash?: string;
   stage: VideoProductionStage;
   revision: number;
   turn_id?: string;
@@ -196,6 +304,23 @@ export type VideoProductionActiveOperation = {
   report_path?: string;
   findings_path?: string;
   started_at: string;
+};
+
+export type VideoProductionOperationJournalEntry = {
+  operation_id: string;
+  op: string;
+  input_hash?: string;
+  status: 'started' | 'passed' | 'failed' | 'interrupted';
+  turn_id?: string;
+  output_path?: string;
+  report_path?: string;
+  findings_path?: string;
+  error_code?: string;
+  /** Quality/content failures consume a same-input attempt; environment and
+   * interruption failures remain retryable without changing authored input. */
+  consumes_same_input_attempt?: boolean;
+  started_at: string;
+  finished_at?: string;
 };
 
 export type VideoProductionBlockedOperation = {
@@ -265,6 +390,13 @@ export type VideoProductionStateV1 = {
   capability_check?: VideoProductionCapabilityCheck;
   narration?: VideoProductionNarration;
   narration_transaction?: VideoProductionNarrationTransaction;
+  /** Bounded audit history for superseded narration attempts. The active
+   * transaction remains singular so crash recovery never has to guess which
+   * provider request owns the canonical output. */
+  narration_transaction_history?: VideoProductionNarrationTransaction[];
+  /** Pending only between a retry decision and atomic provider dispatch.
+   * Mutable display labels and file locators cannot invalidate it. */
+  narration_retry_authorization?: VideoProductionNarrationRetryAuthorization;
   /** Survives narration text revisions; applied only to the same requested
    * voice/speed profile. */
   narration_calibration?: VideoProductionNarrationCalibration;
@@ -276,8 +408,12 @@ export type VideoProductionStateV1 = {
   preview?: VideoProductionGateEntry;
   draft?: VideoProductionGateEntry;
   active_operation?: VideoProductionActiveOperation;
+  operation_journal?: VideoProductionOperationJournalEntry[];
   blocked_operation?: VideoProductionBlockedOperation;
   visual_qa?: VideoProductionVisualQaState;
+  /** Current authored candidate plus bounded content-addressed history. */
+  current_candidate?: VideoProductionCandidateRevision;
+  candidate_history?: VideoProductionCandidateRevision[];
   last_operation?: VideoProductionTransition;
   history: VideoProductionTransition[];
   created_at: string;
@@ -357,6 +493,61 @@ function stageFromLegacy(value: LegacyGateState): VideoProductionStage {
   return 'initialized';
 }
 
+function normalizedVideoProductionState(
+  value: unknown,
+  compositionDir: string,
+): VideoProductionStateV1 | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.schema_version === 1) {
+    if (typeof record.revision !== 'number' || !isVideoProductionStage(record.stage)) {
+      return undefined;
+    }
+    const loaded = record as VideoProductionStateV1;
+    return {
+      ...initialState(compositionDir),
+      ...loaded,
+      composition_dir: compositionDir,
+      artifacts: loaded.artifacts && typeof loaded.artifacts === 'object' ? loaded.artifacts : {},
+      plan_approval_history: Array.isArray(loaded.plan_approval_history)
+        ? loaded.plan_approval_history.slice(-10)
+        : [],
+      candidate_history: Array.isArray(loaded.candidate_history)
+        ? loaded.candidate_history.slice(-20)
+        : [],
+      operation_journal: Array.isArray(loaded.operation_journal)
+        ? loaded.operation_journal.slice(-100)
+        : [],
+      narration_transaction_history: Array.isArray(loaded.narration_transaction_history)
+        ? loaded.narration_transaction_history.slice(-20)
+        : [],
+      history: Array.isArray(loaded.history) ? loaded.history.slice(-50) : [],
+    };
+  }
+  if (record.schema_version !== undefined) return undefined;
+  const legacy = record as LegacyGateState;
+  return {
+    ...initialState(compositionDir),
+    stage: stageFromLegacy(legacy),
+    ...(legacy.preview ? { preview: legacy.preview } : {}),
+    ...(legacy.draft ? { draft: legacy.draft } : {}),
+  };
+}
+
+async function readVideoProductionStateFile(
+  candidatePath: string,
+  compositionDir: string,
+): Promise<VideoProductionStateV1 | undefined> {
+  try {
+    return normalizedVideoProductionState(
+      JSON.parse(await fs.readFile(candidatePath, 'utf8')),
+      compositionDir,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 const PLAN_APPROVAL_REQUIRED_OPS = new Set([
   'composition.prepare',
   'composition.materialize_narration',
@@ -376,9 +567,6 @@ const PLAN_APPROVAL_REQUIRED_OPS = new Set([
  * available while narration is missing so an orthogonal task cannot strand
  * another one. */
 const NARRATION_COMPLETE_REQUIRED_OPS = new Set([
-  'composition.snapshot',
-  'composition.approve_preview',
-  'composition.submit_design_review',
   'composition.draft',
   'composition.approve_draft',
   'composition.export',
@@ -429,12 +617,14 @@ export function nextVideoProductionOps(
     return ['composition.approve_plan', ...recoveryOps];
   }
   const narrationPending = facts?.narrationRequired && !facts.narrationMaterialized;
-  const evidenceOps = narrationPending ? [] : [
+  const visualEvidenceOps = [
     'composition.snapshot',
-    'composition.draft',
     ...(state.preview?.design_review?.required && state.preview.design_review.status !== 'passed'
       ? ['composition.submit_design_review']
       : state.preview?.status === 'ready' ? ['composition.approve_preview'] : []),
+  ];
+  const completionOps = narrationPending ? [] : [
+    'composition.draft',
     ...(state.draft?.design_review?.required && state.draft.design_review.status !== 'passed'
       ? ['composition.submit_design_review']
       : state.draft?.status === 'ready' ? ['composition.approve_draft'] : []),
@@ -447,7 +637,8 @@ export function nextVideoProductionOps(
     'composition.lint',
     'composition.inspect',
     ...(state.visual_qa?.cycle?.status === 'exhausted' ? ['composition.begin_visual_revision'] : []),
-    ...evidenceOps,
+    ...visualEvidenceOps,
+    ...completionOps,
     ...recoveryOps,
   ])];
   return candidates.filter((op) => evaluateVideoProductionOperation(state, op, facts).ok);
@@ -467,31 +658,12 @@ export async function readVideoProductionState(
   statePath: string,
   compositionDir: string,
 ): Promise<VideoProductionStateV1> {
-  let value: unknown;
-  try { value = JSON.parse(await fs.readFile(statePath, 'utf8')); }
-  catch { return initialState(compositionDir); }
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return initialState(compositionDir);
-  const record = value as Record<string, unknown>;
-  if (record.schema_version === 1 && typeof record.revision === 'number' && isVideoProductionStage(record.stage)) {
-    const loaded = record as VideoProductionStateV1;
-    return {
-      ...initialState(compositionDir),
-      ...loaded,
-      composition_dir: compositionDir,
-      artifacts: loaded.artifacts && typeof loaded.artifacts === 'object' ? loaded.artifacts : {},
-      plan_approval_history: Array.isArray(loaded.plan_approval_history)
-        ? loaded.plan_approval_history.slice(-10)
-        : [],
-      history: Array.isArray(loaded.history) ? loaded.history.slice(-50) : [],
-    };
-  }
-  const legacy = record as LegacyGateState;
-  return {
-    ...initialState(compositionDir),
-    stage: stageFromLegacy(legacy),
-    ...(legacy.preview ? { preview: legacy.preview } : {}),
-    ...(legacy.draft ? { draft: legacy.draft } : {}),
-  };
+  const [primary, mirror] = await Promise.all([
+    readVideoProductionStateFile(statePath, compositionDir),
+    readVideoProductionStateFile(`${statePath}.bak`, compositionDir),
+  ]);
+  if (primary && mirror) return mirror.revision > primary.revision ? mirror : primary;
+  return primary || mirror || initialState(compositionDir);
 }
 
 export async function writeVideoProductionState(
@@ -499,9 +671,27 @@ export async function writeVideoProductionState(
   state: VideoProductionStateV1,
 ): Promise<void> {
   await fs.mkdir(path.dirname(statePath), { recursive: true });
-  const tempPath = `${statePath}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, JSON.stringify(state, null, 2), 'utf8');
-  await fs.rename(tempPath, statePath);
+  const serialized = JSON.stringify(state, null, 2);
+  const id = crypto.randomUUID();
+  const tempPath = `${statePath}.${id}.tmp`;
+  const mirrorPath = `${statePath}.bak`;
+  const mirrorTempPath = `${mirrorPath}.${id}.tmp`;
+  try {
+    await Promise.all([
+      fs.writeFile(tempPath, serialized, 'utf8'),
+      fs.writeFile(mirrorTempPath, serialized, 'utf8'),
+    ]);
+    // Publish the mirror first. Readers compare revisions across both files,
+    // so interruption between renames still exposes the newest complete
+    // record.
+    await fs.rename(mirrorTempPath, mirrorPath);
+    await fs.rename(tempPath, statePath);
+  } finally {
+    await Promise.all([
+      fs.rm(tempPath, { force: true }),
+      fs.rm(mirrorTempPath, { force: true }),
+    ]);
+  }
 }
 
 export async function updateVideoProductionState(
@@ -555,6 +745,91 @@ export function recordVideoProductionTransition(
   state.history = [...state.history, transition].slice(-50);
 }
 
+function mergeCandidateLocators(
+  current: VideoProductionCandidateLocators,
+  incoming: VideoProductionCandidateLocators,
+): VideoProductionCandidateLocators {
+  const framePaths = [...new Set([
+    ...(current.frame_paths || []),
+    ...(incoming.frame_paths || []),
+  ])];
+  return {
+    ...current,
+    ...incoming,
+    ...(framePaths.length ? { frame_paths: framePaths } : {}),
+  };
+}
+
+/**
+ * Records an immutable content revision while allowing evidence produced for
+ * that exact revision to accumulate. A changed content hash creates a child
+ * revision and preserves the previous candidate for comparison or rollback.
+ */
+export function recordVideoProductionCandidate(
+  state: VideoProductionStateV1,
+  input: {
+    contentHash: string;
+    artifacts: VideoProductionArtifactState;
+    locators?: VideoProductionCandidateLocators;
+    snapshot?: VideoProductionCandidateSnapshot;
+    runtimeFingerprint: string;
+    op: string;
+    ok?: boolean;
+    errorCode?: string;
+    blockingErrorCount?: number;
+    observedAt?: string;
+  },
+): VideoProductionCandidateRevision | undefined {
+  if (!input.contentHash) return state.current_candidate;
+  const observedAt = input.observedAt || new Date().toISOString();
+  const quality = typeof input.ok === 'boolean'
+    ? {
+      ok: input.ok,
+      ...(input.errorCode ? { error_code: input.errorCode } : {}),
+      ...(typeof input.blockingErrorCount === 'number'
+        ? { blocking_error_count: input.blockingErrorCount }
+        : {}),
+      observed_at: observedAt,
+    }
+    : undefined;
+  const current = state.current_candidate;
+  if (current?.content_hash === input.contentHash) {
+    state.current_candidate = {
+      ...current,
+      artifacts: { ...current.artifacts, ...input.artifacts },
+      locators: mergeCandidateLocators(current.locators, input.locators || {}),
+      ...(input.snapshot ? { snapshot: input.snapshot } : {}),
+      runtime_fingerprint: input.runtimeFingerprint,
+      last_observed_at: observedAt,
+      last_observed_op: input.op,
+      ...(quality ? { last_quality_result: quality } : {}),
+    };
+    return state.current_candidate;
+  }
+  if (current) {
+    state.candidate_history = [
+      ...(state.candidate_history || []).filter(
+        (candidate) => candidate.content_hash !== current.content_hash,
+      ),
+      current,
+    ].slice(-20);
+  }
+  state.current_candidate = {
+    revision_id: `candidate-${input.contentHash.slice(0, 16)}`,
+    ...(current ? { parent_revision_id: current.revision_id } : {}),
+    content_hash: input.contentHash,
+    artifacts: { ...input.artifacts },
+    locators: { ...(input.locators || {}) },
+    ...(input.snapshot ? { snapshot: input.snapshot } : {}),
+    runtime_fingerprint: input.runtimeFingerprint,
+    created_at: observedAt,
+    last_observed_at: observedAt,
+    last_observed_op: input.op,
+    ...(quality ? { last_quality_result: quality } : {}),
+  };
+  return state.current_candidate;
+}
+
 export function summarizeVideoProductionState(
   state: VideoProductionStateV1,
   facts?: VideoProductionPolicyFacts,
@@ -569,12 +844,20 @@ export function summarizeVideoProductionState(
     capability_check: state.capability_check || null,
     ...(state.narration ? { narration: state.narration } : {}),
     ...(state.narration_transaction ? { narration_transaction: state.narration_transaction } : {}),
+    narration_transaction_history: state.narration_transaction_history || [],
+    ...(state.narration_retry_authorization
+      ? { narration_retry_authorization: state.narration_retry_authorization }
+      : {}),
     ...(state.narration_calibration ? { narration_calibration: state.narration_calibration } : {}),
     ...(state.narration_fit ? { narration_fit: state.narration_fit } : {}),
     ...(state.narration_repair ? { narration_repair: state.narration_repair } : {}),
     ...(state.active_operation ? { active_operation: state.active_operation } : {}),
+    operation_journal: state.operation_journal || [],
     ...(state.blocked_operation ? { blocked_operation: state.blocked_operation } : {}),
     ...(state.visual_qa ? { visual_qa: state.visual_qa } : {}),
+    ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
+    candidate_history: state.candidate_history || [],
+    candidate_history_count: state.candidate_history?.length || 0,
     ...(state.last_operation ? { last_operation: state.last_operation } : {}),
     preview_status: state.preview?.status || 'missing',
     preview_design_review: state.preview?.design_review || null,

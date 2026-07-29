@@ -28,6 +28,22 @@ Render an audit into the deliverable: a dashboard spec the chat can show inline,
 
 ## How to call
 
+For a bounded end-to-end diagnosis, first run `seo-crawl --out` so its compact
+summary supplies representative links, then call this orchestrator once:
+
+```
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" seo-report diagnose -- --crawl .orkas-seo-audit/crawl.json --out-dir .orkas-seo-audit [--sample-url <url> ...] [--include-cwv]
+```
+
+It runs root tech/content/schema/GEO/opportunity analysis, audits at most five
+explicit sample URLs once each, writes `multi-summary.json` and `report.json`,
+and returns the dashboard, `action_plan_md`, page matrix, and optional CWV
+failure in one envelope. A failed sample is recorded and not retried. The
+workspace-relative output directory rejects absolute and parent-traversal
+paths. Use `write_file` for the returned `action_plan_md`.
+
+For report-only assembly from existing inputs:
+
 ```
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" seo-report report -- --audit <audit.json> [--crawl <crawl.json>] [--opportunities <opportunities.json>] [--geo-probe <geo-probe.json>] [--plan <ACTION-PLAN.md>] [--out <dashboard.json>]
 ```
@@ -62,6 +78,17 @@ The `dashboard` object is validated against the directive schema before printing
 :::
 ````
 
-2. Write `action_plan_md` to `ACTION-PLAN.md` (use `write_file`).
+2. Write `action_plan_md` to `ACTION-PLAN.md` (use `write_file`). Preserve every P0/P1 item's Evidence, concrete action, Leading indicator, and Failure criterion exactly enough to remain testable; do not replace the generated plan with a generic checklist. If tools are unavailable, present these four fields as the required executor contract instead of inventing findings.
+
+3. Make a strategy answer usable without opening the artifact. After the
+dashboard, inline:
+   - a compact intent-to-page table for the sampled core pages, with owner URL,
+     primary question, answer-ready passage/block, evidence or trust block, and
+     recommended matching schema;
+   - entity-clarity, authoritative-citation, author/reviewer, and visible
+     updated-date requirements; and
+   - every P0/P1 item's Evidence, action, Leading indicator, and Failure
+     criterion.
+Do not replace these details with only an `ACTION-PLAN.md` link.
 
 Do not hand-edit the JSON — regenerate via this skill if the audit changes.

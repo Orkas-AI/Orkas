@@ -47,6 +47,10 @@ const log = createLogger('search');
 import { tokenize, isCJK } from './tokenize';
 import type { Index, Doc } from './storage';
 import * as indexer from './indexer';
+import {
+  isRelevantLibraryContentHit,
+  libraryContentDisplayScore,
+} from './library_content_ranking';
 
 export {
   upsertContext, dropContext,
@@ -57,8 +61,16 @@ export {
   flushAll,
 } from './indexer';
 
-const MAX_PER_KIND = 30;
+const DEFAULT_PER_KIND = 30;
+const MAX_PER_KIND = 200;
 const SNIPPET_RADIUS = 60;
+const LIBRARY_EMBED_CACHE_MAX = 32;
+const RESERVED_RECONCILE_DIRS = new Set([
+  // Current machine-global data roots.
+  'logs', 'venv',
+  // Legacy/shared layouts that may remain after upgrades or manual repair.
+  'users', 'shared', 'search', 'openclaw', 'local',
+]);
 
 interface ChatDisplayCatalog {
   titles: Map<string, string>;
@@ -130,12 +142,76 @@ export interface SearchResult {
   [extra: string]: unknown;
 }
 
+interface LibraryVectorHit {
+  rel_path: string;
+  chunk_idx: number;
+  title?: string | null;
+  content: string;
+  score: number;
+}
+
+interface LibraryContentSearchProvider {
+  embedQuery(query: string): Promise<number[]>;
+  searchGlobal(userId: string, queryVec: number[], limit: number): LibraryVectorHit[];
+  listProjects(userId: string): Promise<Array<{ project_id: string; name: string }>>;
+  searchProject(userId: string, projectId: string, queryVec: number[], limit: number): LibraryVectorHit[];
+}
+
+let _libraryContentSearchProviderForTests: LibraryContentSearchProvider | null = null;
+const _libraryQueryEmbeddingCache = new Map<string, Promise<number[]>>();
+
+function _boundedSearchLimit(limit: unknown, fallback = DEFAULT_PER_KIND): number {
+  const parsed = Number(limit);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(MAX_PER_KIND, Math.max(1, Math.floor(parsed)));
+}
+
+async function _libraryContentSearchProvider(): Promise<LibraryContentSearchProvider> {
+  if (_libraryContentSearchProviderForTests) return _libraryContentSearchProviderForTests;
+  const [kbEmbed, kbVector, projectLibrary, projects] = await Promise.all([
+    import('../kb_embed'),
+    import('../kb_vector'),
+    import('../project_library_indexer'),
+    import('../projects'),
+  ]);
+  return {
+    embedQuery: (query) => kbEmbed.embedQuery(query),
+    searchGlobal: (userId, queryVec, limit) => kbVector.searchExisting(userId, queryVec, { k: limit }),
+    listProjects: (userId) => projects.listProjectNameRows(userId),
+    searchProject: (userId, projectId, queryVec, limit) => (
+      projectLibrary.searchExisting(userId, projectId, queryVec, { k: limit })
+    ),
+  };
+}
+
+function _queryEmbedding(
+  query: string,
+  provider: LibraryContentSearchProvider,
+): Promise<number[]> {
+  const key = query.trim().toLocaleLowerCase();
+  const cached = _libraryQueryEmbeddingCache.get(key);
+  if (cached) return cached;
+  const pending = provider.embedQuery(query);
+  _libraryQueryEmbeddingCache.set(key, pending);
+  while (_libraryQueryEmbeddingCache.size > LIBRARY_EMBED_CACHE_MAX) {
+    const oldest = _libraryQueryEmbeddingCache.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    _libraryQueryEmbeddingCache.delete(oldest);
+  }
+  void pending.catch(() => {
+    if (_libraryQueryEmbeddingCache.get(key) === pending) {
+      _libraryQueryEmbeddingCache.delete(key);
+    }
+  });
+  return pending;
+}
+
 // ── Source readers ──────────────────────────────────────────────────────
 
 interface ChatSourceMessage { id?: unknown; content?: unknown; text?: unknown }
 
-// Search returns at most 30 chat hits. Read only their source records, group
-// hits by conversation, and cap the number of simultaneously-open JSONLs so a
+// Search reads only the bounded result window requested by the caller. Group
+// hits by conversation and cap the number of simultaneously-open JSONLs so a
 // broad query cannot turn into a disk burst. readline's async iterator yields
 // between chunks instead of synchronously reading/splitting an entire long
 // history on Electron's main event loop.
@@ -203,6 +279,15 @@ export const __searchTestHooks = {
     _chatRepairTasks.get(userId)?.cancel();
     _chatRepairTasks.delete(userId);
   },
+  setLibraryContentSearchProvider: (provider: LibraryContentSearchProvider | null): void => {
+    _libraryContentSearchProviderForTests = provider;
+    _libraryQueryEmbeddingCache.clear();
+  },
+  limitSearchResults: (
+    results: SearchResult[],
+    limit: number,
+    scope: SearchAllOptions['scope'] = 'all',
+  ): SearchResult[] => _limitSearchResults(results, _boundedSearchLimit(limit), scope),
 };
 
 function _makeSnippet(text: string, query: string): string {
@@ -309,7 +394,11 @@ function _topN<R extends { score: number }>(
 
 // ── Per-kind queries ─────────────────────────────────────────────────────
 
-export async function searchContexts(query: string, userId?: string): Promise<SearchResult[]> {
+export async function searchContexts(
+  query: string,
+  userId?: string,
+  limit = DEFAULT_PER_KIND,
+): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
   const uid = userId || getActiveUserId();
@@ -322,21 +411,32 @@ export async function searchContexts(query: string, userId?: string): Promise<Se
   const entry = await indexer.getEntry(userContextsIndexPath(uid), 'context');
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
-  return _topN<SearchResult>(scores, MAX_PER_KIND, (docId, score) => {
+  return _topN<SearchResult>(scores, _boundedSearchLimit(limit), (docId, score) => {
     const doc = entry.idx.docs[docId] as Doc & { path?: string; title?: string };
     if (!doc) return null;
     const rel = String(doc.path || '');
+    const relLower = rel.toLowerCase();
+    const qLower = q.toLowerCase();
+    let rankedScore = score;
+    if (relLower === qLower) rankedScore = Math.max(rankedScore, 95);
+    else if (relLower.startsWith(qLower)) rankedScore = Math.max(rankedScore, 60);
+    else if (relLower.includes(qLower)) rankedScore = Math.max(rankedScore, 35);
     return {
       kind: 'context',
       path: doc.path,
       title: doc.title || rel,
       snippet: rel,
-      score,
+      score: rankedScore,
     };
   });
 }
 
-export async function searchProjectContexts(userId: string, projectId: string, query: string): Promise<SearchResult[]> {
+export async function searchProjectContexts(
+  userId: string,
+  projectId: string,
+  query: string,
+  limit = DEFAULT_PER_KIND,
+): Promise<SearchResult[]> {
   const q = (query || '').trim();
   const pid = (projectId || '').trim();
   if (!q || !pid) return [];
@@ -373,11 +473,128 @@ export async function searchProjectContexts(userId: string, projectId: string, q
       });
     }
     scored.sort((a, b) => b.score - a.score || String(a.path || '').localeCompare(String(b.path || '')));
-    return scored.slice(0, MAX_PER_KIND);
+    return scored.slice(0, _boundedSearchLimit(limit));
   } catch (err) {
     log.warn(`project contexts search failed user=${userId} pid=${pid}: ${(err as Error).message}`);
     return [];
   }
+}
+
+async function _searchAllProjectContextPaths(
+  userId: string,
+  query: string,
+  limit: number,
+): Promise<SearchResult[]> {
+  try {
+    const { listProjectNameRows } = await import('../projects');
+    const projects = await listProjectNameRows(userId);
+    const rows = await Promise.all(projects.map((project) => (
+      searchProjectContexts(userId, project.project_id, query, limit)
+    )));
+    return rows.flat().sort((a, b) => b.score - a.score).slice(0, limit);
+  } catch {
+    log.warn('all-project path search unavailable');
+    return [];
+  }
+}
+
+function _libraryContentResult(
+  hit: LibraryVectorHit,
+  query: string,
+  project?: { project_id: string; name: string },
+): SearchResult | null {
+  const relPath = String(hit.rel_path || '').trim();
+  const content = String(hit.content || '').trim();
+  if (!relPath || !content || !isRelevantLibraryContentHit(query, {
+    score: hit.score,
+    path: relPath,
+    title: hit.title,
+    content,
+  })) return null;
+  const title = String(hit.title || '').trim() || path.basename(relPath);
+  return {
+    kind: 'context',
+    path: relPath,
+    title,
+    snippet: _makeSnippet(content, query),
+    score: libraryContentDisplayScore(hit.score),
+    match_source: 'content',
+    chunk_idx: hit.chunk_idx,
+    library_scope: project ? 'project' : 'global',
+    ...(project ? {
+      project_id: project.project_id,
+      project_name: project.name,
+    } : {}),
+  };
+}
+
+/** Search the extracted Library bodies already stored in the vector indexes.
+ * This never parses source files, creates missing project stores, or performs
+ * a source reconcile on the typeahead path. */
+export async function searchLibraryContents(
+  userId: string,
+  query: string,
+  options: { projectId?: string; limit?: number } = {},
+): Promise<SearchResult[]> {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  const limit = _boundedSearchLimit(options.limit);
+  let provider: LibraryContentSearchProvider;
+  let queryVec: number[];
+  try {
+    provider = await _libraryContentSearchProvider();
+    queryVec = await _queryEmbedding(q, provider);
+  } catch {
+    log.warn('library content query embedding unavailable', { query_chars: q.length });
+    return [];
+  }
+
+  const byFile = new Map<string, SearchResult>();
+  const keepBest = (result: SearchResult | null): void => {
+    if (!result) return;
+    const key = result.library_scope === 'project'
+      ? `project:${String(result.project_id || '')}:${String(result.path || '')}`
+      : `global:${String(result.path || '')}`;
+    const current = byFile.get(key);
+    if (!current || result.score > current.score) byFile.set(key, result);
+  };
+
+  try {
+    for (const hit of provider.searchGlobal(userId, queryVec, limit)) {
+      keepBest(_libraryContentResult(hit, q));
+    }
+  } catch {
+    log.warn('global Library content search unavailable');
+  }
+
+  let projects: Array<{ project_id: string; name: string }> = [];
+  try {
+    projects = await provider.listProjects(userId);
+  } catch {
+    log.warn('project catalog unavailable for Library content search');
+  }
+  const selectedProjects = options.projectId
+    ? projects.filter((project) => project.project_id === options.projectId)
+    : projects;
+  // Keep an explicitly selected valid project searchable even if its display
+  // catalog is momentarily stale; the storage helper still refuses a missing
+  // vector store and the result simply omits a project name until refresh.
+  if (options.projectId && !selectedProjects.length) {
+    selectedProjects.push({ project_id: options.projectId, name: '' });
+  }
+  for (const project of selectedProjects) {
+    try {
+      for (const hit of provider.searchProject(userId, project.project_id, queryVec, limit)) {
+        keepBest(_libraryContentResult(hit, q, project));
+      }
+    } catch {
+      log.warn('one project Library content search unavailable');
+    }
+  }
+
+  return Array.from(byFile.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
 }
 
 export interface SearchChatsOptions {
@@ -387,6 +604,8 @@ export interface SearchChatsOptions {
   scope?: 'project' | 'all';
   /** Exclude a conversation whose history is already present in the caller's context. */
   excludeCid?: string;
+  /** Maximum candidate rows returned to the caller. */
+  limit?: number;
 }
 
 export async function searchChats(
@@ -416,38 +635,42 @@ export async function searchChats(
     sourceFile: string;
     sourceIndex: number;
   }
-  const candidates = _topN<ChatCandidate>(scores, MAX_PER_KIND, (docId, score) => {
-    const doc = entry.idx.docs[docId] as Doc & { cid?: string; msg_index?: number; role?: string; time?: string };
-    if (!doc) return null;
-    const cid = String(doc.cid);
-    const msgIndex = Number(doc.msg_index);
-    if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
-    const pid = displayCatalog.cidToPid.get(cid) || '';
-    if (options.excludeCid && cid === options.excludeCid) return null;
-    if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
-    // The catalog above already resolved project membership. Supplying it
-    // avoids `conversationMessageReadFile` re-scanning every project index
-    // once per search result.
-    const file = conversationMessageReadFile(userId, cid, pid || undefined);
-    const result: ChatCandidate = {
-      kind: 'chat',
-      cid: doc.cid,
-      msg_index: doc.msg_index,
-      conv_title: displayCatalog.titles.get(cid) || t('chat.default_title'),
-      role: doc.role,
-      time: doc.time,
-      snippet: '',
-      score,
-      sourceFile: file,
-      sourceIndex: msgIndex,
-    };
-    if (pid) {
-      (result as any).project_id = pid;
-      const name = displayCatalog.pidToName.get(pid);
-      if (name) (result as any).project_name = name;
-    }
-    return result;
-  });
+  const candidates = _topN<ChatCandidate>(
+    scores,
+    _boundedSearchLimit(options.limit),
+    (docId, score) => {
+      const doc = entry.idx.docs[docId] as Doc & { cid?: string; msg_index?: number; role?: string; time?: string };
+      if (!doc) return null;
+      const cid = String(doc.cid);
+      const msgIndex = Number(doc.msg_index);
+      if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
+      const pid = displayCatalog.cidToPid.get(cid) || '';
+      if (options.excludeCid && cid === options.excludeCid) return null;
+      if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
+      // The catalog above already resolved project membership. Supplying it
+      // avoids `conversationMessageReadFile` re-scanning every project index
+      // once per search result.
+      const file = conversationMessageReadFile(userId, cid, pid || undefined);
+      const result: ChatCandidate = {
+        kind: 'chat',
+        cid: doc.cid,
+        msg_index: doc.msg_index,
+        conv_title: displayCatalog.titles.get(cid) || t('chat.default_title'),
+        role: doc.role,
+        time: doc.time,
+        snippet: '',
+        score,
+        sourceFile: file,
+        sourceIndex: msgIndex,
+      };
+      if (pid) {
+        (result as any).project_id = pid;
+        const name = displayCatalog.pidToName.get(pid);
+        if (name) (result as any).project_name = name;
+      }
+      return result;
+    },
+  );
 
   const byFile = new Map<string, Set<number>>();
   for (const candidate of candidates) {
@@ -519,7 +742,11 @@ function _pickDesc(item: { description_zh?: string; description_en?: string }, l
   return fallback || '';
 }
 
-export async function searchAgents(_userId: string, query: string): Promise<SearchResult[]> {
+export async function searchAgents(
+  _userId: string,
+  query: string,
+  limit = DEFAULT_PER_KIND,
+): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
   const qLower = q.toLowerCase();
@@ -543,10 +770,14 @@ export async function searchAgents(_userId: string, query: string): Promise<Sear
   }
   scored.sort((a, b) =>
     b.score - a.score || String(a.name).localeCompare(String(b.name)));
-  return scored.slice(0, MAX_PER_KIND);
+  return scored.slice(0, _boundedSearchLimit(limit));
 }
 
-export async function searchSkills(_userId: string, query: string): Promise<SearchResult[]> {
+export async function searchSkills(
+  _userId: string,
+  query: string,
+  limit = DEFAULT_PER_KIND,
+): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
   const qLower = q.toLowerCase();
@@ -570,7 +801,7 @@ export async function searchSkills(_userId: string, query: string): Promise<Sear
   }
   scored.sort((a, b) =>
     b.score - a.score || String(a.name).localeCompare(String(b.name)));
-  return scored.slice(0, MAX_PER_KIND);
+  return scored.slice(0, _boundedSearchLimit(limit));
 }
 
 async function _hasPersistedIndex(file: string): Promise<boolean> {
@@ -637,8 +868,7 @@ export async function reconcileAll(): Promise<void> {
     for (const ent of fs.readdirSync(WS_ROOT, { withFileTypes: true })) {
       if (!ent.isDirectory()) continue;
       const uid = ent.name;
-      // Skip top-level non-user dirs.
-      if (uid === 'logs') continue;
+      if (RESERVED_RECONCILE_DIRS.has(uid)) continue;
       tasks.push(_reconcileUser(uid, false).then(() => undefined));
     }
   }
@@ -660,21 +890,93 @@ async function _unlinkLegacyIndexes(uid: string): Promise<void> {
 
 export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'agent' | 'skill'; projectId?: string }
 
+function _dedupeSearchResults(results: SearchResult[]): SearchResult[] {
+  const out: SearchResult[] = [];
+  const contextBySource = new Map<string, number>();
+  for (const result of results) {
+    if (result.kind !== 'context') {
+      out.push(result);
+      continue;
+    }
+    const key = result.library_scope === 'project'
+      ? `project:${String(result.project_id || '')}:${String(result.path || '')}`
+      : `global:${String(result.path || '')}`;
+    const existingIndex = contextBySource.get(key);
+    if (existingIndex === undefined) {
+      contextBySource.set(key, out.length);
+      out.push(result);
+      continue;
+    }
+    if (result.score > out[existingIndex].score) out[existingIndex] = result;
+  }
+  return out;
+}
+
+function _limitSearchResults(
+  results: SearchResult[],
+  limit: number,
+  scope: SearchAllOptions['scope'],
+): SearchResult[] {
+  const ranked = results.slice().sort((a, b) => b.score - a.score);
+  if (scope !== 'all') return ranked.slice(0, limit);
+
+  // A single large Library or chat bucket must not erase every other result
+  // kind before the renderer can build its tabs. Reserve an equal first pass,
+  // then fill unused capacity by relevance from all remaining rows.
+  const kinds: SearchResult['kind'][] = ['chat', 'agent', 'skill', 'context'];
+  const quota = Math.floor(limit / kinds.length);
+  const selected = new Set<SearchResult>();
+  const out: SearchResult[] = [];
+  if (quota > 0) {
+    for (const kind of kinds) {
+      for (const result of ranked.filter((row) => row.kind === kind).slice(0, quota)) {
+        selected.add(result);
+        out.push(result);
+      }
+    }
+  }
+  for (const result of ranked) {
+    if (out.length >= limit) break;
+    if (selected.has(result)) continue;
+    selected.add(result);
+    out.push(result);
+  }
+  return out.sort((a, b) => b.score - a.score);
+}
+
 export async function searchAll(
   userId: string, query: string, { limit = 30, scope = 'all', projectId }: SearchAllOptions = {},
 ): Promise<{ results: SearchResult[]; total?: number }> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
+  const requestedLimit = _boundedSearchLimit(limit);
   const buckets: SearchResult[] = [];
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') {
-    tasks.push(searchContexts(q).then((r) => { buckets.push(...r); }));
-    if (projectId) tasks.push(searchProjectContexts(userId, projectId, q).then((r) => { buckets.push(...r); }));
+    tasks.push(searchContexts(q, userId, requestedLimit).then((r) => { buckets.push(...r); }));
+    tasks.push((
+      projectId
+        ? searchProjectContexts(userId, projectId, q, requestedLimit)
+        : _searchAllProjectContextPaths(userId, q, requestedLimit)
+    ).then((r) => { buckets.push(...r); }));
+    tasks.push(searchLibraryContents(userId, q, {
+      ...(projectId ? { projectId } : {}),
+      limit: requestedLimit,
+    }).then((r) => { buckets.push(...r); }));
   }
-  if (scope === 'all' || scope === 'chat')    tasks.push(searchChats(userId, q).then((r) => { buckets.push(...r); }));
-  if (scope === 'all' || scope === 'agent')   tasks.push(searchAgents(userId, q).then((r) => { buckets.push(...r); }));
-  if (scope === 'all' || scope === 'skill')   tasks.push(searchSkills(userId, q).then((r) => { buckets.push(...r); }));
+  if (scope === 'all' || scope === 'chat') {
+    tasks.push(searchChats(userId, q, { limit: requestedLimit }).then((r) => { buckets.push(...r); }));
+  }
+  if (scope === 'all' || scope === 'agent') {
+    tasks.push(searchAgents(userId, q, requestedLimit).then((r) => { buckets.push(...r); }));
+  }
+  if (scope === 'all' || scope === 'skill') {
+    tasks.push(searchSkills(userId, q, requestedLimit).then((r) => { buckets.push(...r); }));
+  }
   await Promise.all(tasks);
-  buckets.sort((a, b) => b.score - a.score);
-  return { results: buckets.slice(0, limit), total: buckets.length };
+  const merged = _dedupeSearchResults(buckets);
+  return {
+    results: _limitSearchResults(merged, requestedLimit, scope),
+    total: merged.length,
+  };
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -30,6 +30,21 @@ function deferred<T>() {
 }
 
 describe('conversation polling cancellation', () => {
+  it('clears a valid zero-valued timer handle instead of leaving polling active', () => {
+    const clearInterval = vi.fn();
+    const context: any = {
+      pollTimers: new Map([['c0', 0]]),
+      clearInterval,
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction('stopPolling'), context);
+
+    context.stopPolling('c0');
+
+    expect(clearInterval).toHaveBeenCalledWith(0);
+    expect(context.pollTimers.has('c0')).toBe(false);
+  });
+
   it('discards an in-flight history response after the live stream stops polling', async () => {
     const fetchResult = deferred<any>();
     const callbacks = new Map<number, () => Promise<void>>();

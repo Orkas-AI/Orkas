@@ -30,6 +30,8 @@ const _BOOT_TOTAL_WARN_MS = 3000;
 const _SIDEBAR_NAV_BOOT_WARM_MS = 3500;
 let _sidebarVersionBaseLabel = '';
 let _sidebarNavWarmUntil = 0;
+let _bootUserNavigated = false;
+let _bootRestoreComplete = false;
 const _sidebarNavTimers = new Map();
 const _sidebarNavTokens = new Map();
 
@@ -41,6 +43,15 @@ function _reportBootUserActivity() {
   if (now - _lastBootActivityReportAt < 1000) return;
   _lastBootActivityReportAt = now;
   try { window.orkas?.reportUserActivity?.(); } catch (_) {}
+}
+
+function _markBootUserNavigation() {
+  if (!_bootRestoreComplete) _bootUserNavigated = true;
+}
+
+function _markBootReady() {
+  document.documentElement.dataset.orkasBootReady = 'true';
+  window.dispatchEvent(new Event('orkas:boot-ready'));
 }
 for (const eventName of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
   window.addEventListener(eventName, _reportBootUserActivity, { capture: true, passive: true });
@@ -132,6 +143,7 @@ async function bootApp() {
   if (typeof _consumePendingTaskNotificationConversation === 'function') {
     _consumePendingTaskNotificationConversation();
   }
+  _markBootReady();
   if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
   // Inline `delete_file` confirm-card subscription is attached here (NOT in
   // Stage C) so a tool call fired within the first 2.5 s of boot still has
@@ -317,6 +329,13 @@ function _showLazyFeatureError(feature, view, err, run) {
 }
 
 function _restoreLastView() {
+  // The static shell is interactive while Stage A/B are still running. If
+  // the user already chose a destination, that explicit navigation wins
+  // over startup restoration.
+  if (_bootUserNavigated) {
+    _bootRestoreComplete = true;
+    return;
+  }
   // Restart policy: only `conversation` view is remembered across launches.
   // Every other tab (agents / skills / contexts / connectors / apps / settings
   // / project detail / marketplace / devtools) intentionally falls back to
@@ -334,9 +353,11 @@ function _restoreLastView() {
 
   if (view === 'conversation' && cid && conversations.some(c => c.conversation_id === cid)) {
     setView('conversation', cid);
+    _bootRestoreComplete = true;
     return;
   }
-  setView('new-chat');
+  setView('new-chat', null, { forceEnter: true, entryPoint: 'startup' });
+  _bootRestoreComplete = true;
 }
 
 async function initUser() {
@@ -358,7 +379,7 @@ async function initUser() {
 // ─── View routing ───
 
 function setView(view, cid, opts = {}) {
-  if (currentView !== view || (view === 'conversation' && currentCid !== cid)) {
+  if (opts.forceEnter || currentView !== view || (view === 'conversation' && currentCid !== cid)) {
     _bootLog.info('view change', { view, cid: cid || undefined });
   }
   currentView = view;

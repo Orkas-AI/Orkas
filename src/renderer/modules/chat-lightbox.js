@@ -55,7 +55,9 @@ function _absPathFromChatMediaLocalUrl(src) {
   try { url = new URL(String(src)); }
   catch (_) { return ''; }
   if (url.protocol !== 'chat-media:' || url.hostname !== 'local') return '';
-  let p = decodeURIComponent(url.pathname || '');
+  let p;
+  try { p = decodeURIComponent(url.pathname || ''); }
+  catch (_) { return ''; }
   if (!p) return '';
   if (/^\/[A-Za-z]:\//.test(p)) return p.slice(1);
   if (/^\/\/[^/]/.test(p)) p = p.replace(/^\/+/, '/');

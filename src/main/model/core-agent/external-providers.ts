@@ -38,7 +38,10 @@
 
 import type { LLMProvider } from '#core-agent';
 import type { Model } from '@earendil-works/pi-ai';
-import { curatedModelsFor } from '../provider_catalog';
+import {
+  curatedModelsFor,
+  type CustomOpenAICompatibleRuntimeConfig,
+} from '../provider_catalog';
 
 // core-agent is an ESM package and the Orkas main process is CJS, so
 // **static import is not allowed**. Reuse the dynamic-import + lazy cache
@@ -364,5 +367,52 @@ export async function createDoubaoProvider(config: CreateDoubaoProviderConfig): 
     provider: 'doubao',
     apiKey: config.apiKey,
     customModel: model,
+  });
+}
+
+// ── User-configured OpenAI-compatible endpoint ──────────────────────────
+
+export interface CreateCustomOpenAICompatibleProviderConfig
+  extends CustomOpenAICompatibleRuntimeConfig {
+  apiKey: string;
+  modelId: string;
+}
+
+export function buildCustomOpenAICompatibleModel(
+  modelId: string,
+  config: CustomOpenAICompatibleRuntimeConfig,
+): Model<'openai-completions'> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: 'openai-completions',
+    provider: 'custom' as any,
+    baseUrl: config.baseUrl,
+    reasoning: false,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: config.contextWindow,
+    maxTokens: config.maxTokens,
+    compat: {
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      supportsReasoningEffort: false,
+      supportsStrictMode: false,
+      maxTokensField: 'max_tokens',
+    },
+  };
+}
+
+export async function createCustomOpenAICompatibleProvider(
+  config: CreateCustomOpenAICompatibleProviderConfig,
+): Promise<LLMProvider> {
+  if (!config.apiKey) throw new Error('custom: apiKey required');
+  if (!config.modelId) throw new Error('custom: modelId required');
+  if (!config.baseUrl) throw new Error('custom: baseUrl required');
+  const mod = await ca();
+  return mod.createPiProvider({
+    provider: 'custom',
+    apiKey: config.apiKey,
+    customModel: buildCustomOpenAICompatibleModel(config.modelId, config),
   });
 }

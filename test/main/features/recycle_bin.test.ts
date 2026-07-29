@@ -353,6 +353,62 @@ describe('global recycle bin', () => {
     ]);
   });
 
+  it.each(['Agent', 'Skill'] as const)(
+    'fails an incomplete %s recycle snapshot instead of allowing an unrecoverable delete',
+    async (kind) => {
+      const paths = await import('../../../src/main/paths');
+      const {
+        createAppRecycleBatchForAgent,
+        createAppRecycleBatchForSkill,
+        listRecycleBatches,
+      } = await import('../../../src/main/features/recycle_bin');
+
+      const id = kind === 'Agent' ? 'keep-safe-agent' : 'keep-safe-skill';
+      const resourceDir = kind === 'Agent'
+        ? path.join(paths.userAgentsDir(UID), id)
+        : path.join(paths.userSkillsDir(UID), id);
+      const requiredFile = path.join(resourceDir, kind === 'Agent' ? 'agent.json' : 'SKILL.md');
+      const protectedFile = path.join(resourceDir, 'references', 'locked.md');
+      await fsp.mkdir(path.dirname(protectedFile), { recursive: true });
+      await fsp.writeFile(requiredFile, kind === 'Agent'
+        ? JSON.stringify({
+            agent_id: id,
+            name: id,
+            description: 'Must remain recoverable',
+            workflow: 'Protect user data.',
+          })
+        : [
+            '---',
+            `name: "${id}"`,
+            'description: "Must remain recoverable"',
+            '---',
+            '',
+            '# Workflow',
+          ].join('\n'));
+      await fsp.writeFile(protectedFile, 'must stay recoverable');
+      const lockChild = process.platform === 'win32'
+        ? await acquireExclusiveWindowsLock(protectedFile)
+        : null;
+      if (!lockChild) await fsp.chmod(protectedFile, 0o000);
+
+      try {
+        const createSnapshot = kind === 'Agent'
+          ? createAppRecycleBatchForAgent
+          : createAppRecycleBatchForSkill;
+        await expect(createSnapshot(UID, id)).rejects.toMatchObject({
+          code: 'recycle_archive_failed',
+        });
+        expect(await listRecycleBatches(UID)).toEqual([]);
+        expect(await fsp.readFile(requiredFile, 'utf8')).toContain(
+          kind === 'Agent' ? 'Protect user data.' : '# Workflow',
+        );
+      } finally {
+        if (lockChild) await releaseExclusiveWindowsLock(lockChild);
+        else await fsp.chmod(protectedFile, 0o600).catch(() => {});
+      }
+    },
+  );
+
   it('labels cloud-sync recycle batches with deleted object titles, not file counts', async () => {
     const paths = await import('../../../src/main/paths');
     const {
@@ -507,6 +563,41 @@ describe('global recycle bin', () => {
     await expect(createRecycleBatch(UID, [unsafePath])).resolves.toBeNull();
     await expect(createAppRecycleBatch(UID, [unsafePath], { kind: 'other' })).resolves.toBeNull();
     expect(await listRecycleBatches(UID)).toEqual([]);
+  });
+
+  it('does not recreate an empty project when every archived file is missing', async () => {
+    const paths = await import('../../../src/main/paths');
+    const projects = await import('../../../src/main/features/projects');
+    const {
+      createAppRecycleBatchForProject,
+      restoreRecycleBatch,
+    } = await import('../../../src/main/features/recycle_bin');
+
+    const created = await projects.createProject(UID, 'Corrupt Recovery Project');
+    if (!created.ok) throw new Error('project create failed');
+    const projectId = created.project.project_id;
+    const batch = await createAppRecycleBatchForProject(UID, projectId);
+    if (!batch) throw new Error('recycle snapshot failed');
+    const deleted = await projects.deleteProject(UID, projectId);
+    expect(deleted.ok).toBe(true);
+
+    for (const item of batch.items) {
+      const archived = path.join(
+        paths.userRecycleDir(UID),
+        batch.id,
+        'files',
+        ...item.path.slice('cloud/'.length).split('/'),
+      );
+      await fsp.rm(archived, { recursive: true, force: true });
+    }
+
+    const restored = await restoreRecycleBatch(UID, batch.id);
+
+    expect(restored.restored_paths).toEqual([]);
+    expect(restored.skipped_paths).toEqual([]);
+    expect(restored.failed_paths.sort()).toEqual(batch.items.map((item) => item.path).sort());
+    expect(restored.reactivated_paths).toEqual([]);
+    expect(await projects.listProjects(UID)).toEqual([]);
   });
 
   it('restores a project delete cascade while showing only the project in the recycle bin', async () => {

@@ -1,0 +1,6 @@
+# Pinned fetch.py dependencies. run-skill.cjs installs these once into a
+# workspace-local, content-addressed venv before the first fetch.
+requests==2.34.2
+curl-cffi==0.15.0
+yt-dlp==2026.7.4
+browser-cookie3==0.20.1

@@ -22,9 +22,9 @@ import { buildCliSpawnEnv, resolveCliCommand } from '../spawn-command.js';
 type KillableChild = Pick<ChildProcessWithoutNullStreams, 'kill' | 'pid'>;
 type SpawnFn = typeof spawn;
 
-/** All event types a backend can emit. The runner persists these to
- *  `events.jsonl` verbatim and forwards them to the renderer through
- *  the existing group-chat stream. */
+/** All event types a backend can emit. The runner removes private fields,
+ *  persists the normalized event to `events.jsonl`, and forwards that same
+ *  normalized shape through the existing group-chat stream. */
 export type LocalEventType =
   | 'process-info'
   | 'text-delta'
@@ -44,8 +44,8 @@ export interface LocalEvent {
   /** Free-form payload — exact keys vary per type. Documented inline at
    *  each emit site; a minimal index:
    *    process-info:       { pid, cwd, cmd, args, sessionId? }
-   *    text-delta:         { text }
-   *    thinking:           { text }
+   *    text-delta:         { text, phase?: 'commentary'|'final_answer', itemId? }
+   *    thinking:           { text } backend-side; { chars } after the runner boundary
    *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputPath? }
    *    stderr-line:        { line }
    *    status:             { status, usage? }   // usage carried for status:'usage' running counters
@@ -62,14 +62,28 @@ export interface LocalEvent {
 
 export interface BackendRunOptions {
   binPath: string;
+  /** Current-turn user input. Durable agent/project/protocol guidance belongs
+   * in `systemPrompt` and must not be appended as another user message. */
   prompt: string;
+  /** Low-churn Orkas instructions for adapters with a native instruction
+   * channel (Claude `--append-system-prompt`, Codex
+   * `developerInstructions`). */
+  systemPrompt?: string;
+  /** Fresh-session payload used only when a requested native resume is
+   * rejected before the turn begins. It contains bounded recovery context
+   * plus the current turn, never the old unbounded transcript. */
+  resumeFallbackPrompt?: string;
+  /** The capability registry says this native session owns the same durable
+   * instructions. Session-scoped adapters may omit the instruction override
+   * on resume, but must restore it if resume falls back to a fresh session. */
+  reuseSessionInstructions?: boolean;
   cwd: string;
   model?: string;
   customArgs?: string[];
   /** When set, ask the CLI to resume a prior session by id (claude:
-   *  `--resume <id>`). Backends that don't support resume ignore the
-   *  field; the runner's session-bookkeeping treats that as "no
-   *  optimisation possible — fall back to slice replay". */
+   *  `--resume <id>`). The group-chat caller consults the registry's resume
+   *  capability first, so backends without resume support receive no stale
+   *  handle and get a visibility-slice history bridge instead. */
   resumeSessionId?: string;
   /** Cancellation; backend wires this to SIGTERM (10s) → SIGKILL. */
   signal: AbortSignal;
@@ -109,6 +123,19 @@ export interface BackendRunOptions {
 
 export interface LocalBackend {
   run(opts: BackendRunOptions): Promise<void>;
+}
+
+/** Remove terminal ANSI/OSC control sequences before diagnostics are
+ * persisted or rendered. CLI stderr is presentation text, not a terminal;
+ * retaining escapes produces visible fragments such as `[31mERROR`. */
+export function stripAnsi(s: string): string {
+  if (!s) return s;
+  // OSC: ESC ] ... BEL or ESC \
+  // eslint-disable-next-line no-control-regex
+  const withoutOsc = s.replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '');
+  // CSI: ESC [ parameters/intermediates final-byte
+  // eslint-disable-next-line no-control-regex
+  return withoutOsc.replace(/\x1B\[[0-?]*[ -\/]*[@-~]/g, '');
 }
 
 /** Bounded stderr collector. ringBytes overrides the default 64 KB cap. */

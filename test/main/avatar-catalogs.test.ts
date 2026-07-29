@@ -41,6 +41,10 @@ function validateCatalog(label: string, relPath: string, catalog: any): void {
     expect(typeof color?.label, `${label}.colors contains invalid entry: ${relPath}`).toBe('string');
     expect(typeof color?.bg, `${label}.colors contains invalid entry: ${relPath}`).toBe('string');
     expect(typeof color?.fg, `${label}.colors contains invalid entry: ${relPath}`).toBe('string');
+    expect(color.bg, `${label}.colors has unsafe bg for ${color?.id}: ${relPath}`)
+      .toMatch(/^#[0-9a-f]{6}$/i);
+    expect(color.fg, `${label}.colors has unsafe fg for ${color?.id}: ${relPath}`)
+      .toMatch(/^#[0-9a-f]{6}$/i);
     expect(colorIds.has(color.id), `${label}.colors duplicate id "${color.id}": ${relPath}`).toBe(false);
     colorIds.add(color.id);
   }

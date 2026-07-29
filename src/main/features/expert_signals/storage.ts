@@ -53,7 +53,17 @@ export function appendSignal(uid: string, input: SignalInput): void {
  *  date range [since, until); without those bounds it falls back to "today
  *  only" to keep memory bounded. */
 export async function querySignals(filter: SignalFilter = {}): Promise<Signal[]> {
-  const uid = getActiveUserId();
+  return querySignalsForUser(getActiveUserId(), filter);
+}
+
+/** Read signals for an explicit account.
+ *
+ * Background consumers must use this form so an account switch cannot
+ * redirect a still-unwinding query to the newly active user's files. */
+export async function querySignalsForUser(
+  uid: string,
+  filter: SignalFilter = {},
+): Promise<Signal[]> {
   const limit = Math.min(filter.limit || QUERY_DEFAULT_LIMIT, QUERY_HARD_CAP);
   const dates = _datesInRange(filter.since, filter.until);
   const out: Signal[] = [];

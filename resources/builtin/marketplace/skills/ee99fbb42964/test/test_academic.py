@@ -10,6 +10,7 @@ hosts) per the repo's text-processing test rule.
 
 import os
 import sys
+import threading
 import unittest
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -20,7 +21,7 @@ import academic  # noqa: E402
 from academic import (  # noqa: E402
     _AllowlistRedirect, _crossref_date, _dedup_key, _http_get, _norm_doi,
     _openalex_abstract, _rec, parse_arxiv, parse_crossref, parse_openalex,
-    parse_semanticscholar, search,
+    parse_pubmed, parse_semanticscholar, search,
 )
 
 ARXIV_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -69,6 +70,33 @@ S2 = {"data": [
     {"paperId": "def", "title": "No Abstract", "year": None, "abstract": None,
      "externalIds": {}, "authors": []},
 ]}
+
+PUBMED_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>12345678</PMID>
+      <Article>
+        <ArticleTitle>Auditable <i>clinical</i> research agents</ArticleTitle>
+        <Abstract>
+          <AbstractText Label="BACKGROUND">Audit trails improve review.</AbstractText>
+          <AbstractText Label="RESULTS">The effect was reproducible.</AbstractText>
+        </Abstract>
+        <AuthorList>
+          <Author><ForeName>Ada</ForeName><LastName>Lovelace</LastName></Author>
+          <Author><CollectiveName>Research Agent Group</CollectiveName></Author>
+        </AuthorList>
+        <Journal><JournalIssue><PubDate><Year>2024</Year><Month>Jun</Month><Day>7</Day></PubDate></JournalIssue></Journal>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="pubmed">12345678</ArticleId>
+        <ArticleId IdType="doi">10.1234/PUBMED.1</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
 
 
 class ArxivParse(unittest.TestCase):
@@ -142,6 +170,27 @@ class SemanticScholarParse(unittest.TestCase):
         self.assertIsNone(recs[1]["doi"])
 
 
+class PubMedParse(unittest.TestCase):
+    def test_parse_nested_title_structured_abstract_and_metadata(self):
+        recs = parse_pubmed(PUBMED_XML)
+        self.assertEqual(len(recs), 1)
+        record = recs[0]
+        self.assertEqual(record["id"], "12345678")
+        self.assertEqual(record["title"], "Auditable clinical research agents")
+        self.assertEqual(
+            record["text"],
+            "BACKGROUND: Audit trails improve review. RESULTS: The effect was reproducible.",
+        )
+        self.assertEqual(record["authors"], ["Ada Lovelace", "Research Agent Group"])
+        self.assertEqual(record["date"], "2024-06-07")
+        self.assertEqual(record["doi"], "10.1234/pubmed.1")
+        self.assertEqual(record["pmid"], "12345678")
+        self.assertEqual(record["url"], "https://pubmed.ncbi.nlm.nih.gov/12345678/")
+
+    def test_empty_pubmed_set(self):
+        self.assertEqual(parse_pubmed("<PubmedArticleSet />"), [])
+
+
 class Normalization(unittest.TestCase):
     def test_norm_doi(self):
         self.assertEqual(_norm_doi("https://doi.org/10.1/AB"), "10.1/ab")
@@ -172,6 +221,33 @@ class HostGuard(unittest.TestCase):
         req = academic.urllib.request.Request("https://export.arxiv.org/api/query")
         with self.assertRaises(urllib.error.HTTPError):
             h.redirect_request(req, None, 302, "Found", {}, "https://evil.example.com/x")
+
+    def test_pubmed_eutils_host_is_allowlisted(self):
+        self.assertIn("eutils.ncbi.nlm.nih.gov", academic.ALLOWED_HOSTS)
+
+    def test_oversized_response_is_rejected_not_silently_truncated(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, size):
+                self.requested = size
+                return b"x" * size
+
+        class FakeOpener:
+            def open(self, req, timeout):
+                return FakeResponse()
+
+        original = academic._OPENER
+        academic._OPENER = FakeOpener()
+        try:
+            with self.assertRaisesRegex(ValueError, "response exceeds"):
+                _http_get("https://api.openalex.org/works", "application/json", 5)
+        finally:
+            academic._OPENER = original
 
 
 class SearchIntegration(unittest.TestCase):
@@ -206,6 +282,40 @@ class SearchIntegration(unittest.TestCase):
     def test_dedup_key_prefers_doi_then_title(self):
         self.assertEqual(_dedup_key({"doi": "10.1/x", "title": "T"}), "doi:10.1/x")
         self.assertEqual(_dedup_key({"doi": None, "title": "Some Title"}), "title:some title")
+
+    def test_duplicate_provider_is_scheduled_once(self):
+        calls = []
+
+        def fake(q, l, t):
+            calls.append(q)
+            return [_rec("pubmed", "One", "", [], "2024", "10.1/one", "https://p", "p1")]
+
+        academic.FETCHERS = {"pubmed": fake}
+        out = search("q", ["pubmed", "pubmed"], 5, 1)
+        self.assertEqual(calls, ["q"])
+        self.assertEqual(out["sources_queried"], ["pubmed"])
+        self.assertEqual(out["count"], 1)
+
+    def test_independent_providers_start_concurrently_and_merge_in_request_order(self):
+        a_started = threading.Event()
+        b_started = threading.Event()
+
+        def fake_a(q, l, t):
+            a_started.set()
+            if not b_started.wait(1):
+                raise RuntimeError("provider b did not start concurrently")
+            return [_rec("a", "A", "", [], "2024", "10.1/a", "https://a", "a")]
+
+        def fake_b(q, l, t):
+            b_started.set()
+            if not a_started.wait(1):
+                raise RuntimeError("provider a did not start concurrently")
+            return [_rec("b", "B", "", [], "2024", "10.1/b", "https://b", "b")]
+
+        academic.FETCHERS = {"a": fake_a, "b": fake_b}
+        out = search("q", ["a", "b"], 5, 1)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual([record["source"] for record in out["results"]], ["a", "b"])
 
 
 if __name__ == "__main__":

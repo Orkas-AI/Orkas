@@ -64,7 +64,7 @@ let _viewerDirty = false;
 let _viewerDiscardConfirmPending = false;
 let _viewerRenderSeq = 0;
 let _viewerBlobUrl = null;
-let _viewerCompositionResizeHandler = null;
+let _viewerHtmlCanvasResizeHandler = null;
 
 const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
@@ -328,9 +328,9 @@ function _teardownViewerContent() {
   _viewerEditController = null;
   _viewerDirty = false;
   _viewerLibraryProjectScoped = false;
-  if (_viewerCompositionResizeHandler && typeof window !== 'undefined') {
-    window.removeEventListener('resize', _viewerCompositionResizeHandler);
-    _viewerCompositionResizeHandler = null;
+  if (_viewerHtmlCanvasResizeHandler && typeof window !== 'undefined') {
+    window.removeEventListener('resize', _viewerHtmlCanvasResizeHandler);
+    _viewerHtmlCanvasResizeHandler = null;
   }
   if (_viewerBlobUrl) {
     try {
@@ -343,7 +343,7 @@ function _teardownViewerContent() {
   }
   if (_viewerBody) _viewerBody.innerHTML = '';
   if (_viewerMdActions) _viewerMdActions.innerHTML = '';
-  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office', 'is-office-fit', 'is-video-composition');
+  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office', 'is-office-fit', 'is-html-canvas');
 }
 
 function _typesetViewerMarkdown() {
@@ -556,35 +556,37 @@ async function _renderPdfBody(absPath, displayName, cid, projectId) {
   _viewerBody.innerHTML = `<iframe class="chat-file-viewer-pdf" src="${url}#toolbar=1&navpanes=0" title="${escapeHtml(displayName || '')}"></iframe>`;
 }
 
-function _videoCompositionDimensions(html) {
-  const rootTag = String(html || '').match(/<[^>]*\bdata-composition-id\s*=\s*["'][^"']+["'][^>]*>/i)?.[0] || '';
-  if (!rootTag) return null;
-  const attrNumber = (name) => {
-    const match = rootTag.match(new RegExp(`\\b${name}\\s*=\\s*["'](\\d+(?:\\.\\d+)?)["']`, 'i'));
-    return match ? Number(match[1]) : 0;
-  };
-  const width = attrNumber('data-width');
-  const height = attrNumber('data-height');
-  if (!Number.isFinite(width) || !Number.isFinite(height)
-      || width < 16 || height < 16 || width > 7680 || height > 4320) return null;
+function _htmlCanvasDimensions(layout) {
+  if (!layout || layout.kind !== 'fixed-canvas') return null;
+  const width = Number(layout.width);
+  const height = Number(layout.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height)
+      || width < 16 || height < 16 || width > 7680 || height > 7680
+      || width * height > 16777216) return null;
   return { width, height };
 }
 
-function _fitVideoCompositionFrame() {
+function _htmlCanvasWidthFit(canvasWidth, canvasHeight, viewportWidth) {
+  const width = Number(canvasWidth);
+  const height = Number(canvasHeight);
+  const availableWidth = Number(viewportWidth);
+  if (!(width > 0 && height > 0 && availableWidth > 0)) return null;
+  const scale = Math.min(1, Math.max(0.01, availableWidth / width));
+  return { scale, renderedHeight: Math.ceil(height * scale) };
+}
+
+function _fitHtmlCanvasFrame() {
   if (!_viewerBody) return;
-  const wrap = _viewerBody.querySelector('.chat-file-viewer-composition-wrap');
+  const wrap = _viewerBody.querySelector('.chat-file-viewer-html-canvas-wrap');
   if (!wrap) return;
   const width = Number(wrap.dataset.width || 0);
   const height = Number(wrap.dataset.height || 0);
-  if (!(width > 0 && height > 0)) return;
-  const scale = Math.min(
-    1,
-    Math.max(0.01, _viewerBody.clientWidth / width),
-    Math.max(0.01, _viewerBody.clientHeight / height),
-  );
-  wrap.style.setProperty('--composition-width', `${width}px`);
-  wrap.style.setProperty('--composition-height', `${height}px`);
-  wrap.style.setProperty('--composition-scale', String(scale));
+  const fit = _htmlCanvasWidthFit(width, height, _viewerBody.clientWidth);
+  if (!fit) return;
+  wrap.style.setProperty('--html-canvas-width', `${width}px`);
+  wrap.style.setProperty('--html-canvas-height', `${height}px`);
+  wrap.style.setProperty('--html-canvas-scale', String(fit.scale));
+  wrap.style.setProperty('--html-canvas-rendered-height', `${fit.renderedHeight}px`);
 }
 
 async function _renderHtmlBody(absPath, displayName, cid, projectId) {
@@ -598,28 +600,34 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   // redirects). Self-contained LLM-generated HTML still runs its inline
   // scripts and styles.
   const sandbox = 'allow-scripts';
-  let composition = null;
+  let canvas = null;
   try {
-    // Ask main to scan for the small composition root tag without copying the
-    // HTML body across IPC. The iframe itself still streams the complete file.
-    const payload = { path: absPath, compositionRootOnly: true };
+    // Ask main for a normalized preview layout without copying the HTML body
+    // across IPC. Responsive pages need no metadata; fixed-canvas artifacts
+    // from any producer use this same width-fit contract.
+    const payload = { path: absPath, htmlPreviewLayoutOnly: true };
     if (cid) payload.cid = cid;
     if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('produced.readText', payload);
     if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
-    if (res && res.ok) composition = _videoCompositionDimensions(String(res.text || ''));
+    if (res && res.ok) canvas = _htmlCanvasDimensions(res.layout);
   } catch (err) {
-    _viewerLog.warn('composition dimension probe failed', { path: absPath, error: String(err && err.message || err) });
+    _viewerLog.warn('HTML preview layout probe failed', { path: absPath, error: String(err && err.message || err) });
   }
-  if (!composition) {
+  if (!canvas) {
     _viewerBody.innerHTML = `<iframe class="chat-file-viewer-html" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe>`;
     return;
   }
-  _viewerEl.classList.add('is-video-composition');
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-composition-wrap" data-width="${composition.width}" data-height="${composition.height}"><iframe class="chat-file-viewer-html chat-file-viewer-composition-frame" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe></div>`;
-  _viewerCompositionResizeHandler = () => _fitVideoCompositionFrame();
-  window.addEventListener('resize', _viewerCompositionResizeHandler);
-  requestAnimationFrame(_fitVideoCompositionFrame);
+  _viewerEl.classList.add('is-html-canvas');
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-html-canvas-wrap" data-width="${canvas.width}" data-height="${canvas.height}"><iframe class="chat-file-viewer-html chat-file-viewer-html-canvas-frame" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe></div>`;
+  _viewerHtmlCanvasResizeHandler = () => _fitHtmlCanvasFrame();
+  window.addEventListener('resize', _viewerHtmlCanvasResizeHandler);
+  requestAnimationFrame(() => {
+    _fitHtmlCanvasFrame();
+    // A tall canvas can introduce a vertical scrollbar and reduce clientWidth.
+    // Refit once after layout so the right edge remains fully visible.
+    requestAnimationFrame(_fitHtmlCanvasFrame);
+  });
 }
 
 async function _renderOfficeBody(absPath, displayName, cid, projectId) {
@@ -973,5 +981,5 @@ async function openChatFileViewer(absPath, displayName, opts) {
 
 // CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _videoCompositionDimensions };
+  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget, _htmlCanvasDimensions, _htmlCanvasWidthFit };
 }

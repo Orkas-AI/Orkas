@@ -298,6 +298,27 @@ function futureCatalogInstance() {
   };
 }
 
+function customAccountInstance(owner: string) {
+  const now = new Date().toISOString();
+  return {
+    id: 'custom-shared',
+    display_name: 'Shared Custom MCP',
+    origin: 'custom' as const,
+    transport: {
+      kind: 'stdio' as const,
+      command: 'node',
+      args: ['server.js'],
+      env: { TEST_CONNECTOR_OWNER: owner },
+    },
+    enabled_subtools: null,
+    tools_cache: [{ name: 'read_owner', description: '', input_schema: {} }],
+    tools_cached_at: Date.now(),
+    status: { kind: 'connected' as const, since: Date.now() },
+    created_at: now,
+    updated_at: now,
+  };
+}
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-connectors-manager-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -391,6 +412,59 @@ describe('features/connectors/manager authorization recovery', () => {
       'github_search_repositories',
       { query: 'orkas' },
     );
+  });
+
+  it('revokes the previous account connection before the same connector id is used by another account', async () => {
+    const secondUid = 'u-connectors-second';
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const users = await import('../../../../src/main/features/users');
+    await registry.upsert(TEST_UID, customAccountInstance('account-a'));
+    await registry.upsert(secondUid, customAccountInstance('account-b'));
+    mocks.mcp.callTool = vi.fn(async function ownerResult(this: any) {
+      return { owner: this.__transport.env.TEST_CONNECTOR_OWNER };
+    });
+
+    await expect(manager.callTool(TEST_UID, 'custom-shared', 'read_owner', {}))
+      .resolves.toEqual({ owner: 'account-a' });
+
+    users.activateUser(secondUid);
+    await vi.waitFor(() => expect(mocks.mcp.close).toHaveBeenCalledTimes(1));
+
+    await expect(manager.callTool(secondUid, 'custom-shared', 'read_owner', {}))
+      .resolves.toEqual({ owner: 'account-b' });
+    expect(mocks.mcp.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it('discards a previous account connection that finishes after the account switch', async () => {
+    const secondUid = 'u-connectors-race';
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const users = await import('../../../../src/main/features/users');
+    await registry.upsert(TEST_UID, customAccountInstance('account-a'));
+    await registry.upsert(secondUid, customAccountInstance('account-b'));
+    let releaseFirstConnect!: () => void;
+    const firstConnect = new Promise<void>((resolve) => { releaseFirstConnect = resolve; });
+    mocks.mcp.connect = vi.fn(async function connectByOwner(this: any) {
+      if (this.__transport.env.TEST_CONNECTOR_OWNER === 'account-a') {
+        await firstConnect;
+      }
+    });
+    mocks.mcp.callTool = vi.fn(async function ownerResult(this: any) {
+      return { owner: this.__transport.env.TEST_CONNECTOR_OWNER };
+    });
+
+    const staleCall = manager.callTool(TEST_UID, 'custom-shared', 'read_owner', {});
+    await vi.waitFor(() => expect(mocks.mcp.connect).toHaveBeenCalledTimes(1));
+    users.activateUser(secondUid);
+    releaseFirstConnect();
+
+    await expect(staleCall).rejects.toMatchObject({
+      code: 'E_CONNECTOR_ACCOUNT_CHANGED',
+    });
+    await expect(manager.callTool(secondUid, 'custom-shared', 'read_owner', {}))
+      .resolves.toEqual({ owner: 'account-b' });
+    expect(mocks.mcp.callTool).toHaveBeenCalledTimes(1);
   });
 
   it('invalidates and degrades a live connection after a tool-call timeout', async () => {

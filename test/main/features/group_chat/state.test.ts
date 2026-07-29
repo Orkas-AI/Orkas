@@ -69,6 +69,31 @@ describe('group_chat state › addMember + ensureAgentMember', () => {
   });
 });
 
+describe('group_chat state › active recipient provenance', () => {
+  it('preserves the source across same-Agent follow-ups and clears it with the floor', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+
+    let floor = await s.setActiveRecipient(
+      TEST_UID,
+      TEST_CID,
+      'agent-a',
+      'commander_handoff',
+    );
+    expect(floor.active_recipient).toBe('agent-a');
+    expect(floor.active_recipient_source).toBe('commander_handoff');
+
+    floor = await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-a');
+    expect(floor.active_recipient_source).toBe('commander_handoff');
+
+    floor = await s.setActiveRecipient(TEST_UID, TEST_CID, 'agent-a', 'user_selection');
+    expect(floor.active_recipient_source).toBe('user_selection');
+
+    floor = await s.setActiveRecipient(TEST_UID, TEST_CID, 'commander');
+    expect(floor.active_recipient).toBeUndefined();
+    expect(floor.active_recipient_source).toBeUndefined();
+  });
+});
+
 describe('group_chat state › renameAgentInMembers', () => {
   // Drive the rename sweep through a seeded `_index.json` + a couple of
   // pre-populated members.json files. The bug this guards: members.name is a

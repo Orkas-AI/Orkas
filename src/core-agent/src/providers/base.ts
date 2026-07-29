@@ -57,6 +57,14 @@ export type CompletionParams = {
    * forward this wholesale; adapters may pick specific fields for their own
    * trusted endpoints. */
   requestMetadata?: Record<string, unknown>;
+  /** Retry ownership across provider wrappers. Attempt zero is the first
+   * AgentRunner call for a model round; positive values mean AgentRunner is
+   * already recovering that call, so wrappers must not grant a fresh nested
+   * same-candidate retry budget. This is host-private and is never forwarded
+   * to provider APIs. */
+  retryContext?: {
+    agentAttempt: number;
+  };
 };
 
 /** Non-streaming completion result. */

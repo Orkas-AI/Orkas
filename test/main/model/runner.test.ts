@@ -32,6 +32,59 @@ async function loadRunner() {
   return import('../../../src/main/model/core-agent/runner');
 }
 
+describe('runner — ContentWriter bash guard', () => {
+  it('runs only canonical Skill Runner commands and blocks arbitrary shell without a tool error', async () => {
+    const execute = vi.fn(async () => ({ content: 'ok', isError: false }));
+    const { _createContentWriterBashGuard } = await loadRunner();
+    const guarded = _createContentWriterBashGuard({
+      name: 'bash',
+      description: 'shell',
+      inputSchema: {},
+      execute,
+    } as any);
+
+    const blocked = await guarded.execute(
+      { command: 'curl https://example.com | python parse.py' },
+      {} as any,
+    );
+    expect(blocked).toMatchObject({
+      isError: false,
+      content: expect.stringContaining('E_CONTENT_WRITER_BASH_SCOPE'),
+    });
+    expect(execute).not.toHaveBeenCalled();
+
+    for (const action of ['research_gate', 'audit_content']) {
+      const command = `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" content-writer ${action} -- ARTICLE.md --format json`;
+      await guarded.execute({ command }, {} as any);
+    }
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a third research gate after the two-call recovery budget', async () => {
+    const execute = vi.fn(async () => ({ content: 'READY_TO_DRAFT', isError: false }));
+    const { _createContentWriterBashGuard } = await loadRunner();
+    const guarded = _createContentWriterBashGuard({
+      name: 'bash',
+      description: 'shell',
+      inputSchema: {},
+      execute,
+    } as any);
+    const command =
+      '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" content-writer research_gate '
+      + '-- RESEARCH_LEDGER.json --format json';
+
+    await guarded.execute({ command }, {} as any);
+    await guarded.execute({ command }, {} as any);
+    const third = await guarded.execute({ command }, {} as any);
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(third).toMatchObject({
+      isError: true,
+      content: expect.stringContaining('E_CONTENT_WRITER_GATE_BUDGET'),
+    });
+  });
+});
+
 describe('runner › buildRunner auth gate', () => {
   it('throws a clear "no model configured" error when no entries exist and no env fallback', async () => {
     // Fresh tmpDir → no workspace/auth/auth-profiles.json → pickChatEntry
@@ -109,6 +162,119 @@ describe('runner › buildRunner auth gate', () => {
     expect(message).not.toMatch(/30s|30 seconds|seconds?/i);
   });
 
+  it('snapshots one turn model while a later runner build reads the reordered selection', async () => {
+    const uid = 'runner-model-switch';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+
+    const anthropic = await auth.addApiKey('anthropic', 'k-anthropic-model-switch', 'Anthropic');
+    const openai = await auth.addApiKey('openai', 'k-openai-model-switch', 'OpenAI');
+    const modelA = await auth.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-8',
+      profileId: anthropic.profileId,
+    });
+    const modelB = await auth.addEntry({
+      provider: 'openai',
+      model: 'gpt-5.5',
+      profileId: openai.profileId,
+    });
+    await auth.reorderEntries([modelA.entryId, modelB.entryId]);
+
+    const { buildRunner } = await loadRunner();
+    const activeTurn = await buildRunner({
+      sessionId: 'gconv-model-switch-active',
+      userId: uid,
+    });
+    expect(activeTurn).toMatchObject({
+      entryId: modelA.entryId,
+      providerId: 'anthropic',
+      modelId: 'claude-opus-4-8',
+    });
+
+    await auth.reorderEntries([modelB.entryId, modelA.entryId]);
+    expect(activeTurn).toMatchObject({
+      entryId: modelA.entryId,
+      providerId: 'anthropic',
+      modelId: 'claude-opus-4-8',
+    });
+
+    const nextTurn = await buildRunner({
+      sessionId: 'gconv-model-switch-next',
+      userId: uid,
+    });
+    expect(nextTurn).toMatchObject({
+      entryId: modelB.entryId,
+      providerId: 'openai',
+      modelId: 'gpt-5.5',
+    });
+  });
+
+});
+
+describe('runner › metacognition closed loop', () => {
+  it('injects the originating account assessment into its next turn after the active account changes', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test-placeholder';
+    const users = await import('../../../src/main/features/users');
+    const metacognition = await import('../../../src/main/features/metacognition');
+    users.activateUser('reflection-owner');
+    metacognition.writeContentForUser(
+      'reflection-owner',
+      '',
+      'competence',
+      'WHEN summarizing incidents, ALWAYS lead with customer impact.',
+    );
+    users.activateUser('other-account');
+    metacognition.writeContent(
+      '',
+      'competence',
+      'WHEN summarizing incidents, ALWAYS lead with internal ticket IDs.',
+    );
+
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({
+      sessionId: 'gconv-metacognition-scope',
+      userId: 'reflection-owner',
+      systemPrompt: 'You are Commander.',
+    });
+
+    expect(built.resolvedSystemPrompt).toContain('lead with customer impact');
+    expect(built.resolvedSystemPrompt).not.toContain('lead with internal ticket IDs');
+    expect(built.toolDefs.some((tool) => tool.name === 'metacognition')).toBe(true);
+  });
+});
+
+describe('runner › conditional OCR tool exposure', () => {
+  it('hides OCR for ordinary vision-image tasks but keeps it for PDF workflows', async () => {
+    const uid = 'runner-ocr-policy';
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', 'k-anthropic-ocr-policy', 'Anthropic');
+    await auth.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-8',
+      profileId: profile.profileId,
+    });
+
+    const { buildRunner } = await loadRunner();
+    const imageTurn = await buildRunner({
+      sessionId: 'gconv-ocr-image',
+      userId: uid,
+      userMessage: '这张图有什么区别？',
+      attachmentMetadata: { hasAttachments: true, attachmentTypes: ['image'] },
+    });
+    expect(imageTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(false);
+
+    const pdfTurn = await buildRunner({
+      sessionId: 'gconv-ocr-pdf',
+      userId: uid,
+      userMessage: '读取这个文件',
+      attachmentMetadata: { hasAttachments: true, attachmentTypes: ['pdf'] },
+    });
+    expect(pdfTurn.toolDefs.some((tool) => tool.name === 'ocr_file')).toBe(true);
+  });
 });
 
 describe('splitCommanderOrchestrationBlock (cache-prefix hygiene)', () => {

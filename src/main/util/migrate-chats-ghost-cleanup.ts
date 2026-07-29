@@ -16,6 +16,7 @@ import { userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile
 import { listProjectIds } from './project-layout';
 import { nowIso, safeId, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('migrate');
 
@@ -94,7 +95,10 @@ export function migrateChatsGhostCleanup(uid: string, nowMs = Date.now()): Chats
       parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch (err) {
       stats.warnings += 1;
-      log.warn(`chat ghost cleanup read/parse failed uid=${uid}: ${(err as Error).message}`);
+      log.warn('chat ghost cleanup read/parse failed', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
       continue;
     }
     if (!Array.isArray(parsed)) continue;
@@ -136,16 +140,22 @@ export function migrateChatsGhostCleanup(uid: string, nowMs = Date.now()): Chats
     if (changed) {
       try {
         writeJsonSync(file, parsed);
-        log.info(`chat ghost cleanup uid=${uid} tombstoned=${stats.tombstoned}`);
+        log.info('chat ghost cleanup completed', {
+          userId: maskId(uid),
+          tombstoned: stats.tombstoned,
+        });
       } catch (err) {
         stats.warnings += 1;
-        log.warn(`chat ghost cleanup write failed uid=${uid}: ${(err as Error).message}`);
+        log.warn('chat ghost cleanup write failed', {
+          userId: maskId(uid),
+          error: logErrorSummary(err),
+        });
       }
     }
   }
   // A first launch can precede the initial cloud pull. Do not consume this
   // one-shot migration until at least one physical index existed, otherwise a
   // later sync can restore the exact ghost rows this pass was meant to clean.
-  if (foundIndex) stamp(uid);
+  if (foundIndex && stats.warnings === 0) stamp(uid);
   return stats;
 }

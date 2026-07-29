@@ -17,6 +17,17 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+
+const electronRuntime = vi.hoisted(() => ({
+  idleState: 'active' as 'active' | 'idle' | 'locked' | 'unknown',
+}));
+
+vi.mock('electron', () => ({
+  powerMonitor: {
+    getSystemIdleState: vi.fn(() => electronRuntime.idleState),
+  },
+}));
+
 import {
   autoTaskAttachmentsDir,
   autoTaskDir,
@@ -31,6 +42,7 @@ import {
   userRoot,
 } from '../../../src/main/paths';
 import {
+  armedDueAtForTest,
   createTask,
   deleteAttachment,
   applyAutoTaskContainerFromCommander,
@@ -40,9 +52,16 @@ import {
   isDue,
   listAttachments,
   listTasks,
+  nextDueAfterRestoreForTest,
   nextDueAtForTest,
+  rescheduleAllAfterSyncForTest,
+  rescheduleAllForTest,
+  resumeSchedulerForTest,
+  runTaskNow,
   stopScheduler,
   subscribeFires,
+  subscribeFiresForUser,
+  suspendSchedulerForTest,
   updateTask,
   uploadAttachment,
   _buildSeedTextForTest,
@@ -58,6 +77,7 @@ const autoRuntime = vi.hoisted(() => ({
   createConversation: vi.fn(),
   deleteConversation: vi.fn(),
   send: vi.fn(),
+  getAgent: vi.fn(),
 }));
 
 vi.mock('../../../src/main/features/chats', () => ({
@@ -67,6 +87,10 @@ vi.mock('../../../src/main/features/chats', () => ({
 
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: autoRuntime.send,
+}));
+
+vi.mock('../../../src/main/features/agents', () => ({
+  getAgent: autoRuntime.getAgent,
 }));
 
 const TEST_UID = 'auto-unit-user';
@@ -101,6 +125,8 @@ function writeProject(uid: string, projectId: string, agentIds: string[] = []) {
 
 beforeEach(() => {
   stopScheduler();
+  _setDeviceFingerprintForTests(null);
+  electronRuntime.idleState = 'active';
   _setMarkRanFailureForTest(null);
   vi.useRealTimers();
   fs.rmSync(userRoot(TEST_UID), { recursive: true, force: true });
@@ -110,10 +136,12 @@ beforeEach(() => {
   autoRuntime.createConversation.mockResolvedValue({ conversation_id: 'cid_auto' });
   autoRuntime.deleteConversation.mockResolvedValue(true);
   autoRuntime.send.mockResolvedValue({ ok: true });
+  autoRuntime.getAgent.mockResolvedValue(null);
 });
 
 afterEach(() => {
   stopScheduler();
+  _setDeviceFingerprintForTests(null);
   _setMarkRanFailureForTest(null);
   vi.useRealTimers();
   setCurrentLang('en');
@@ -164,6 +192,7 @@ describe('seed text composition', () => {
 
 describe('task CRUD normalization', () => {
   it('normalizes drafts and clears optional fields on update', async () => {
+    writeProject(TEST_UID, 'p_auto_project', ['agent_a']);
     const created = await createTask(TEST_UID, {
       id: 'at_11111111',
       title: '  Project report  ',
@@ -201,6 +230,41 @@ describe('task CRUD normalization', () => {
     expect(updated.task.connector).toBeUndefined();
     expect(updated.task.schedule).toEqual({ type: 'monthly', day: 31, hour: 10, minute: 30 });
     expect(await listTasks(TEST_UID, { projectId: null })).toHaveLength(1);
+    expect(fs.existsSync(autoTaskConfigFile(TEST_UID, 'at_11111111'))).toBe(true);
+    expect(fs.existsSync(
+      projectAutoTaskConfigFile(TEST_UID, 'p_auto_project', 'at_11111111'),
+    )).toBe(false);
+    expect((await getTask(TEST_UID, 'at_11111111'))?.project_id).toBeUndefined();
+  });
+
+  it('rejects nonexistent project scopes without creating an orphan task directory', async () => {
+    const missingProjectId = 'p_missing_project';
+    const taskId = 'at_10101010';
+    const rejected = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run inside a project that does not exist',
+      project_id: missingProjectId,
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+
+    expect(rejected).toEqual({ ok: false, error: 'invalid_project' });
+    expect(fs.existsSync(projectAutoTaskConfigFile(TEST_UID, missingProjectId, taskId))).toBe(false);
+    expect(await listTasks(TEST_UID)).toEqual([]);
+
+    const global = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'start as a valid global task',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(global.ok).toBe(true);
+
+    const moved = await updateTask(TEST_UID, taskId, { project_id: missingProjectId });
+    expect(moved).toEqual({ ok: false, error: 'invalid_project' });
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      id: taskId,
+      content: 'start as a valid global task',
+    });
+    expect(fs.existsSync(projectAutoTaskConfigFile(TEST_UID, missingProjectId, taskId))).toBe(false);
   });
 
   it('persists ordered message parts and derives clean legacy content', async () => {
@@ -268,7 +332,7 @@ describe('task CRUD normalization', () => {
     expect((await getTask(TEST_UID, remoteTask.id))?.device_name).toBe(current.name);
   });
 
-  it('does not clear an existing device binding when the current device has no stable id', async () => {
+  it('uses the persistent installation id when no network fingerprint is available', async () => {
     _setDeviceFingerprintForTests({ id: '', name: 'No stable NIC' });
     try {
       const created = await createTask(TEST_UID, {
@@ -278,6 +342,8 @@ describe('task CRUD normalization', () => {
       });
       expect(created.ok).toBe(true);
       if (!created.ok) return;
+      expect(created.task.device_id).toMatch(/^[0-9a-f]{32}$/i);
+      expect(created.task.device_name).toBe('No stable NIC');
 
       const remoteTask = {
         ...created.task,
@@ -289,11 +355,85 @@ describe('task CRUD normalization', () => {
       const rebound = await updateTask(TEST_UID, remoteTask.id, { run_on_current_device: true });
       expect(rebound.ok).toBe(true);
       if (!rebound.ok) return;
-      expect(rebound.task.device_id).toBe(remoteTask.device_id);
-      expect(rebound.task.device_name).toBe(remoteTask.device_name);
+      expect(rebound.task.device_id).toBe(created.task.device_id);
+      expect(rebound.task.device_name).toBe('No stable NIC');
     } finally {
       _setDeviceFingerprintForTests(null);
     }
+  });
+
+  it('migrates a locally claimed legacy MAC binding after the adapter changes', async () => {
+    _setDeviceFingerprintForTests({
+      id: 'aa:bb:cc:dd:ee:ff',
+      name: 'Test workstation',
+    });
+    const taskId = 'at_18181818';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'keep running after adapter changes',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const persistentId = created.task.device_id;
+    expect(persistentId).toBeTruthy();
+    expect(persistentId).not.toBe('11:22:33:44:55:66');
+
+    const legacyTask = {
+      ...created.task,
+      device_id: '11:22:33:44:55:66',
+      device_name: 'Test workstation',
+    };
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify(legacyTask));
+    const claimDir = path.join(userLocalRoot(TEST_UID), 'auto_task_claims', taskId);
+    fs.mkdirSync(claimDir, { recursive: true });
+    fs.writeFileSync(path.join(claimDir, '1.json'), JSON.stringify({
+      task_id: taskId,
+      device_id: legacyTask.device_id,
+    }));
+    stopScheduler();
+    _setDeviceFingerprintForTests({
+      id: '66:55:44:33:22:11',
+      name: 'Test workstation',
+    });
+
+    await rescheduleAllForTest(TEST_UID);
+
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      device_id: persistentId,
+      device_name: 'Test workstation',
+    });
+    expect(armedDueAtForTest(taskId)).not.toBeNull();
+  });
+
+  it('does not migrate a remote legacy MAC binding without local evidence', async () => {
+    _setDeviceFingerprintForTests({
+      id: 'aa:bb:cc:dd:ee:ff',
+      name: 'Local workstation',
+    });
+    const taskId = 'at_19191919';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'stay on the remote device',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    const remoteTask = {
+      ...created.task,
+      device_id: '11:22:33:44:55:66',
+      device_name: 'Remote workstation',
+    };
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify(remoteTask));
+    stopScheduler();
+
+    await rescheduleAllForTest(TEST_UID);
+
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      device_id: remoteTask.device_id,
+      device_name: remoteTask.device_name,
+    });
+    expect(armedDueAtForTest(taskId)).toBeNull();
   });
 
   it('continues to read legacy configs without message parts', async () => {
@@ -523,6 +663,224 @@ describe('attachments', () => {
 });
 
 describe('scheduler dispatch', () => {
+  it('skips a boundary crossed while the process is suspended and never back-fills it on resume', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_59595959';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'skip the sleeping boundary',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    suspendSchedulerForTest();
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({ enabled: true });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+  });
+
+  it('preserves an already-armed due boundary when live sync rebuilds timers before its callback', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_58585858';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run the armed occurrence',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    // setSystemTime moves the wall clock without first draining the 09:00
+    // timer, reproducing sync winning the event-loop race after the boundary.
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 1));
+    await rescheduleAllAfterSyncForTest(TEST_UID);
+    expect(armedDueAtForTest(taskId)).toBe(new Date(2026, 4, 22, 9, 0, 1).getTime());
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(2026, 4, 22, 9, 0, 1).toISOString());
+  });
+
+  it('ignores a due task when the computer is sleeping without mutating it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_60606060';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run after the computer wakes',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    electronRuntime.idleState = 'locked';
+    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      enabled: true,
+    });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+  });
+
+  it('fires normally when the computer is idle but not locked', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_62626262';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'idle is still awake',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    electronRuntime.idleState = 'idle';
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(2026, 4, 22, 9, 0, 0).toISOString());
+  });
+
+  it('does not persist state or create a conversation for an overdue restored task', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    const taskId = 'at_61616161';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'do not catch this up',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    await rescheduleAllForTest(TEST_UID);
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({ enabled: true });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+  });
+
+  it('does not mistake the one-hour cap wake-up for the restored task due time', async () => {
+    vi.useFakeTimers();
+    const restoredAt = new Date(2026, 4, 22, 18, 57, 59);
+    vi.setSystemTime(restoredAt);
+    const taskId = 'at_64646464';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run at seven tomorrow',
+      schedule: { type: 'daily', hour: 7, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const priorRunAt = new Date(2026, 4, 19, 7, 0, 0).toISOString();
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify({
+      ...created.task,
+      last_run_at: priorRunAt,
+    }));
+    await rescheduleAllForTest(TEST_UID);
+
+    const actualDueAt = new Date(2026, 4, 23, 7, 0, 0);
+    expect(armedDueAtForTest(taskId)).toBe(actualDueAt.getTime());
+
+    await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(priorRunAt);
+    expect(armedDueAtForTest(taskId)).toBe(actualDueAt.getTime());
+  });
+
+  it('does not disable or mutate an expired one-time task during restore', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-22T08:30:00.000Z'));
+    const taskId = 'at_63636363';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'do not restore this occurrence',
+      schedule: { type: 'one_time', at: '2026-05-22T09:00:00.000Z' },
+    });
+    expect(created.ok).toBe(true);
+
+    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
+    vi.setSystemTime(new Date('2026-05-22T10:00:00.000Z'));
+    await rescheduleAllForTest(TEST_UID);
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({ enabled: true });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+  });
+
+  it('runs manually without changing schedule state, enabled state, device binding, or last run', async () => {
+    const events: any[] = [];
+    const unsubscribe = subscribeFires((ev) => events.push(ev));
+    const taskId = 'at_65656565';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run on demand',
+      enabled: false,
+      schedule: { type: 'one_time', at: '2099-05-22T09:00:00.000Z' },
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const persisted = {
+      ...created.task,
+      device_id: '11:22:33:44:55:66',
+      device_name: 'Remote workstation',
+      last_run_at: '2026-05-21T09:00:00.000Z',
+    };
+    fs.writeFileSync(autoTaskConfigFile(TEST_UID, taskId), JSON.stringify(persisted));
+    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
+
+    const result = await runTaskNow(TEST_UID, taskId);
+    unsubscribe();
+
+    expect(result).toEqual({ ok: true, cid: 'cid_auto' });
+    expect(autoRuntime.createConversation).toHaveBeenCalledWith(TEST_UID, {
+      kind: 'normal',
+      title: 'run on demand',
+      originAutoTaskId: taskId,
+    });
+    expect(autoRuntime.send).toHaveBeenCalledWith({
+      userId: TEST_UID,
+      cid: 'cid_auto',
+      text: 'run on demand',
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'conv_created',
+      user_id: TEST_UID,
+      cid: 'cid_auto',
+      task_id: taskId,
+    });
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      enabled: false,
+      device_id: '11:22:33:44:55:66',
+      last_run_at: '2026-05-21T09:00:00.000Z',
+      schedule: { type: 'one_time', at: '2099-05-22T09:00:00.000Z' },
+    });
+  });
+
   it('fires a due one-time task, copies attachments, emits an event, and disables the task', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-22T09:00:00.000Z'));
@@ -561,13 +919,45 @@ describe('scheduler dispatch', () => {
     });
     expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ type: 'conv_created', cid: 'cid_auto', task_id: taskId });
+    expect(events[0]).toMatchObject({
+      type: 'conv_created',
+      user_id: TEST_UID,
+      cid: 'cid_auto',
+      task_id: taskId,
+    });
     expect(events[0].duration_ms).toEqual(expect.any(Number));
     expect(fs.readFileSync(path.join(projectChatAttachmentDir(TEST_UID, 'p_auto_project', 'cid_auto'), 'brief.md'), 'utf8')).toBe('brief');
 
     const task = await getTask(TEST_UID, taskId);
     expect(task?.enabled).toBe(false);
     expect(task?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
+  });
+
+  it('resolves the current Agent name by stable id when a scheduled task fires after a rename', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-22T09:00:00.000Z'));
+    autoRuntime.getAgent.mockResolvedValue({
+      agent_id: 'agent_codex',
+      name: 'Codex Renamed',
+    });
+
+    const taskId = 'at_67676767';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'send the renamed-agent report',
+      recipient: { kind: 'agent', id: 'agent_codex', name: 'Old Codex Name' },
+      schedule: { type: 'one_time', at: '2026-05-22T08:59:00.000Z' },
+    });
+    expect(created.ok).toBe(true);
+
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.getAgent).toHaveBeenCalledWith('agent_codex');
+    expect(autoRuntime.send).toHaveBeenCalledWith({
+      userId: TEST_UID,
+      cid: 'cid_auto',
+      text: '@Codex Renamed send the renamed-agent report',
+    });
   });
 
   it('rolls back the empty conversation and emits a failure fire event when dispatch fails', async () => {
@@ -593,6 +983,7 @@ describe('scheduler dispatch', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'fire_failed',
+      user_id: TEST_UID,
       cid: 'cid_auto',
       task_id: taskId,
       error_code: 'send_not_ok',
@@ -601,6 +992,35 @@ describe('scheduler dispatch', () => {
     const task = await getTask(TEST_UID, taskId);
     expect(task?.enabled).toBe(false);
     expect(task?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
+  });
+
+  it('delivers fire events only to listeners for the owning account', async () => {
+    const ownEvents: any[] = [];
+    const foreignEvents: any[] = [];
+    const unsubscribeOwn = subscribeFiresForUser(TEST_UID, (ev) => ownEvents.push(ev));
+    const unsubscribeForeign = subscribeFiresForUser('another-account', (ev) => foreignEvents.push(ev));
+    const taskId = 'at_78787878';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'account scoped delivery',
+      enabled: false,
+      schedule: { type: 'one_time', at: '2099-05-22T09:00:00.000Z' },
+    });
+    expect(created.ok).toBe(true);
+
+    await runTaskNow(TEST_UID, taskId);
+    unsubscribeOwn();
+    unsubscribeForeign();
+
+    expect(ownEvents).toEqual([
+      expect.objectContaining({
+        type: 'conv_created',
+        user_id: TEST_UID,
+        task_id: taskId,
+        cid: 'cid_auto',
+      }),
+    ]);
+    expect(foreignEvents).toEqual([]);
   });
 
   it('claims a due boundary so concurrent schedulers cannot double-fire it', async () => {
@@ -815,6 +1235,43 @@ describe('scheduler next due: recurring creation baseline', () => {
     expect(next?.getMonth()).toBe(1);
     expect(next?.getDate()).toBe(28);
     expect(next?.getHours()).toBe(9);
+  });
+});
+
+describe('scheduler restore skips missed boundaries', () => {
+  it('schedules the next day instead of back-filling a missed daily task', () => {
+    const now = new Date(2026, 4, 27, 10, 30, 0);
+    const next = nextDueAfterRestoreForTest(
+      makeTask(
+        { type: 'daily', hour: 9, minute: 0 },
+        { last_run_at: new Date(2026, 4, 26, 9, 0, 0).toISOString() },
+      ),
+      now,
+    );
+
+    expect(next?.getDate()).toBe(28);
+    expect(next?.getHours()).toBe(9);
+    expect(next?.getMinutes()).toBe(0);
+  });
+
+  it('keeps a future same-day boundary when the app opens before it', () => {
+    const now = new Date(2026, 4, 27, 8, 30, 0);
+    const next = nextDueAfterRestoreForTest(
+      makeTask({ type: 'daily', hour: 9, minute: 0 }),
+      now,
+    );
+
+    expect(next?.getDate()).toBe(27);
+    expect(next?.getHours()).toBe(9);
+    expect(next?.getMinutes()).toBe(0);
+  });
+
+  it('does not back-fill an expired one-time task', () => {
+    const now = new Date(2026, 4, 27, 10, 30, 0);
+    expect(nextDueAfterRestoreForTest(
+      makeTask({ type: 'one_time', at: new Date(2026, 4, 27, 9, 0, 0).toISOString() }),
+      now,
+    )).toBeNull();
   });
 });
 

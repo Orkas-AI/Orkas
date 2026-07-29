@@ -29,6 +29,11 @@ function readLockPackage(lockFile, name) {
 }
 
 function readElectronVersion(pcDir) {
+  const installed = packageVersion(pcDir, 'electron');
+  if (/^\d+\.\d+\.\d+$/.test(installed)) return installed;
+  const locked = readJson(path.join(pcDir, 'package-lock.json'))
+    ?.packages?.['node_modules/electron']?.version;
+  if (/^\d+\.\d+\.\d+$/.test(String(locked || ''))) return String(locked);
   const pkg = readJson(path.join(pcDir, 'package.json'));
   const spec = String(pkg?.devDependencies?.electron || '');
   const match = spec.match(/\d+(?:\.\d+){0,2}/);
@@ -100,6 +105,7 @@ function writeMarker(pcDir, state) {
 
 function readPeMachine(file) {
   if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return null;
+  const fileSize = fs.statSync(file).size;
   const fd = fs.openSync(file, 'r');
   try {
     const dos = Buffer.alloc(64);
@@ -107,9 +113,11 @@ function readPeMachine(file) {
       return null;
     }
     const peOffset = dos.readUInt32LE(0x3c);
-    const header = Buffer.alloc(6);
+    const header = Buffer.alloc(24);
     if (fs.readSync(fd, header, 0, header.length, peOffset) < header.length) return null;
     if (header.toString('ascii', 0, 4) !== 'PE\0\0') return null;
+    const optionalHeaderSize = header.readUInt16LE(20);
+    if (peOffset + header.length + optionalHeaderSize > fileSize) return null;
     return header.readUInt16LE(4);
   } finally {
     fs.closeSync(fd);
@@ -123,25 +131,31 @@ function isPeX64(file) {
 function machCpuTypes(file) {
   if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return [];
   const data = fs.readFileSync(file);
-  if (data.length < 8) return [];
+  if (data.length < 28) return [];
 
   const magicBE = data.readUInt32BE(0);
-  if (magicBE === 0xcafebabe || magicBE === 0xcafebabf) {
-    const count = data.readUInt32BE(4);
+  const fatBigEndian = magicBE === 0xcafebabe || magicBE === 0xcafebabf;
+  const fatLittleEndian = magicBE === 0xbebafeca || magicBE === 0xbfbafeca;
+  if (fatBigEndian || fatLittleEndian) {
+    const count = fatBigEndian ? data.readUInt32BE(4) : data.readUInt32LE(4);
     const out = [];
-    const archSize = magicBE === 0xcafebabf ? 32 : 20;
+    const fat64 = magicBE === 0xcafebabf || magicBE === 0xbfbafeca;
+    const archSize = fat64 ? 32 : 20;
+    if (count <= 0 || count > 64 || 8 + count * archSize > data.length) return [];
     for (let i = 0; i < count; i += 1) {
       const offset = 8 + i * archSize;
-      if (offset + 4 <= data.length) out.push(data.readUInt32BE(offset));
+      out.push(fatBigEndian ? data.readUInt32BE(offset) : data.readUInt32LE(offset));
     }
     return out;
   }
 
   const magicLE = data.readUInt32LE(0);
   if (magicLE === 0xfeedface || magicLE === 0xfeedfacf) {
+    if (data.length < (magicLE === 0xfeedfacf ? 32 : 28)) return [];
     return [data.readUInt32LE(4)];
   }
   if (magicBE === 0xfeedface || magicBE === 0xfeedfacf) {
+    if (data.length < (magicBE === 0xfeedfacf ? 32 : 28)) return [];
     return [data.readUInt32BE(4)];
   }
   return [];

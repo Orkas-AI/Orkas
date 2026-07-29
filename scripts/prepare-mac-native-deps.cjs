@@ -20,8 +20,8 @@ const LOCK_FILE = path.join(PC_DIR, 'package-lock.json');
 const CACHE_HELPER = path.join(__dirname, 'native-prepare-cache.cjs');
 const TARGET_PLATFORM = 'darwin';
 
-function npmCmd() {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+function npmCmd(platform = process.platform) {
+  return platform === 'win32' ? 'npm.cmd' : 'npm';
 }
 
 function run(cwd, command, args, options = {}) {
@@ -76,7 +76,14 @@ function ensurePackageFromRegistry(packageName, requiredFiles = []) {
     const tarball = npmPack(tmpDir, `${packageName}@${version}`);
     fs.rmSync(targetDir, { recursive: true, force: true });
     fs.mkdirSync(targetDir, { recursive: true });
-    run(targetDir, 'tar', ['-xzf', tarball, '--strip-components=1']);
+    const archiveName = path.basename(tarball);
+    const localTarball = path.join(targetDir, archiveName);
+    fs.copyFileSync(tarball, localTarball);
+    try {
+      run(targetDir, 'tar', ['-xzf', archiveName, '--strip-components=1']);
+    } finally {
+      fs.rmSync(localTarball, { force: true });
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -106,6 +113,8 @@ function expectedState(targetArch) {
       [`@esbuild/darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@esbuild/darwin-${targetArch}`),
       [`sqlite-vec-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `sqlite-vec-darwin-${targetArch}`),
       [`@napi-rs/canvas-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@napi-rs/canvas-darwin-${targetArch}`),
+      [`@img/sharp-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@img/sharp-darwin-${targetArch}`),
+      [`@img/sharp-libvips-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@img/sharp-libvips-darwin-${targetArch}`),
     },
   };
 }
@@ -124,13 +133,17 @@ function main() {
   }
 
   fs.mkdirSync(path.join(PC_DIR, 'node_modules', '@esbuild'), { recursive: true });
+  fs.mkdirSync(path.join(PC_DIR, 'node_modules', '@img'), { recursive: true });
 
+  const state = expectedState(targetArch);
+  const sharpVersion = state.packages[`@img/sharp-darwin-${targetArch}`];
   const required = {
     esbuild: path.join(PC_DIR, 'node_modules', '@esbuild', `darwin-${targetArch}`, 'bin', 'esbuild'),
     sqliteVec: path.join(PC_DIR, 'node_modules', `sqlite-vec-darwin-${targetArch}`, 'vec0.dylib'),
     canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', `canvas-darwin-${targetArch}`, `skia.darwin-${targetArch}.node`),
+    sharp: path.join(PC_DIR, 'node_modules', '@img', `sharp-darwin-${targetArch}`, 'lib', `sharp-darwin-${targetArch}-${sharpVersion}.node`),
+    sharpVips: path.join(PC_DIR, 'node_modules', '@img', `sharp-libvips-darwin-${targetArch}`, 'lib', 'libvips-cpp.8.18.3.dylib'),
   };
-  const state = expectedState(targetArch);
   const requiredFiles = Object.values(required);
   const targetFilesMatch = () => requiredFiles.every((file) => isMachArch(file, targetArch));
   if (markerMatches(PC_DIR, state, requiredFiles, targetFilesMatch)) {
@@ -141,12 +154,18 @@ function main() {
   ensureEsbuildPackage(`darwin-${targetArch}`);
   ensurePackageFromRegistry(`sqlite-vec-darwin-${targetArch}`, [required.sqliteVec]);
   ensurePackageFromRegistry(`@napi-rs/canvas-darwin-${targetArch}`, [required.canvas]);
+  ensurePackageFromRegistry(`@img/sharp-darwin-${targetArch}`, [required.sharp]);
+  ensurePackageFromRegistry(`@img/sharp-libvips-darwin-${targetArch}`, [required.sharpVips]);
 
   console.log(`[prepare-mac-native-deps] pruning non-${targetArch} native runtime packages`);
   removeDirectories(path.join(PC_DIR, 'node_modules', '@esbuild'), (name) => name !== `darwin-${targetArch}`);
   removeDirectories(path.join(PC_DIR, 'node_modules'), (name) => /^sqlite-vec-(?!darwin-)/i.test(name) || (/^sqlite-vec-darwin-/i.test(name) && name !== `sqlite-vec-darwin-${targetArch}`));
   removeDirectories(path.join(PC_DIR, 'node_modules', '@napi-rs'), (name) => /^canvas-/i.test(name) && name !== `canvas-darwin-${targetArch}`);
   removeDirectories(path.join(PC_DIR, 'node_modules', '@anush008'), (name) => /^tokenizers-/i.test(name) && name !== 'tokenizers-darwin-universal');
+  removeDirectories(path.join(PC_DIR, 'node_modules', '@img'), (name) => (
+    (/^sharp-(darwin|linux|win32)-/i.test(name) && name !== `sharp-darwin-${targetArch}`)
+    || (/^sharp-libvips-/i.test(name) && name !== `sharp-libvips-darwin-${targetArch}`)
+  ));
 
   assertMachArch(
     `macOS ${targetArch} esbuild runtime binary`,
@@ -163,7 +182,23 @@ function main() {
     required.canvas,
     targetArch,
   );
+  assertMachArch(
+    `macOS ${targetArch} sharp runtime binding`,
+    required.sharp,
+    targetArch,
+  );
+  assertMachArch(
+    `macOS ${targetArch} sharp libvips runtime`,
+    required.sharpVips,
+    targetArch,
+  );
   writeMarker(PC_DIR, state);
 }
 
-main();
+module.exports = {
+  allFilesExist,
+  npmCmd,
+  removeDirectories,
+};
+
+if (require.main === module) main();

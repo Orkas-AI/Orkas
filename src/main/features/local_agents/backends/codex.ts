@@ -34,10 +34,16 @@ import {
   type LocalEvent,
   StderrTail,
   spawnCli,
+  killProcessTree,
   bindAbort,
   armKillWatchdog,
   LineSplitter,
+  stripAnsi,
 } from './base.js';
+import {
+  normalizeLocalTextPhase,
+  type LocalTextPhase,
+} from '../text-phase.js';
 
 /** codex notifications that are pure metadata noise — we keep them
  *  visible only at level=debug. Everything outside this list AND
@@ -51,11 +57,86 @@ const CODEX_DROP_TO_DEBUG = new Set<string>([
   'mcpServer/startupStatus/updated',
 ]);
 
+/** App-server host metadata is unrelated to the active task and may contain
+ *  machine-private installation ids or host names. Never surface it in the
+ *  process rail, logs, or task-turn samples. */
+const CODEX_IGNORED_NOTIFICATIONS = new Set<string>([
+  'remoteControl/status/changed',
+]);
+
 const log = createLogger('local-agents:codex');
 
 const TRUSTED_LOCAL_APPROVAL_POLICY = 'never';
 const TRUSTED_LOCAL_SANDBOX_MODE = 'danger-full-access';
 const TRUSTED_LOCAL_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const;
+
+/** Tracks the phase and streamed body of Codex `agentMessage` items. Delta
+ * notifications carry only itemId + text, while the phase lives on the
+ * matching item/started or item/completed payload. Keeping this as a small
+ * pure accumulator makes version-skew fallbacks deterministic and testable. */
+export class CodexAgentMessageAccumulator {
+  private readonly phases = new Map<string, LocalTextPhase>();
+  private readonly streamedByItem = new Map<string, string>();
+  private allText = '';
+  private finalAnswerText = '';
+
+  rememberItem(raw: unknown): void {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage') return;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    const phase = normalizeLocalTextPhase(item.phase);
+    if (itemId && phase) this.phases.set(itemId, phase);
+  }
+
+  appendDelta(raw: unknown): { text: string; itemId?: string; phase?: LocalTextPhase } | null {
+    const params = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    const text = typeof params.delta === 'string' ? params.delta : '';
+    if (!text) return null;
+    const itemId = typeof params.itemId === 'string' ? params.itemId : '';
+    return this.append(text, itemId, normalizeLocalTextPhase(params.phase) || this.phases.get(itemId));
+  }
+
+  appendCompletedFallback(raw: unknown): { text: string; itemId?: string; phase?: LocalTextPhase } | null {
+    const item = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+    if (item.type !== 'agentMessage') return null;
+    this.rememberItem(item);
+    const text = typeof item.text === 'string' ? item.text : '';
+    if (!text) return null;
+    const itemId = typeof item.id === 'string' ? item.id : '';
+    const streamed = itemId ? (this.streamedByItem.get(itemId) || '') : '';
+    if (streamed === text) return null;
+    // Some Codex builds omit the last delta but include the complete item on
+    // completion. Emit only the missing suffix. If the bodies disagree, keep
+    // the live stream authoritative rather than duplicating the whole item.
+    if (streamed && !text.startsWith(streamed)) return null;
+    const suffix = streamed ? text.slice(streamed.length) : text;
+    const phase = this.phases.get(itemId) || normalizeLocalTextPhase(item.phase);
+    return suffix ? this.append(suffix, itemId, phase) : null;
+  }
+
+  output(): string {
+    return this.finalAnswerText || this.allText;
+  }
+
+  hasText(): boolean {
+    return this.allText.length > 0;
+  }
+
+  private append(
+    text: string,
+    itemId: string,
+    phase?: LocalTextPhase,
+  ): { text: string; itemId?: string; phase?: LocalTextPhase } {
+    this.allText += text;
+    if (phase === 'final_answer') this.finalAnswerText += text;
+    if (itemId) this.streamedByItem.set(itemId, (this.streamedByItem.get(itemId) || '') + text);
+    return {
+      text,
+      ...(itemId ? { itemId } : {}),
+      ...(phase ? { phase } : {}),
+    };
+  }
+}
 
 export const codexBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
@@ -92,7 +173,7 @@ export const codexBackend: LocalBackend = {
     let turnAborted = false;
     let turnCompleted = false;
     const seenTurnIds = new Set<string>();
-    let collectedText = '';
+    const agentMessages = new CodexAgentMessageAccumulator();
     let turnError: string | undefined;
     // Latest usage snapshot from `thread/tokenUsage/updated` —
     // each notification is a cumulative state (not an increment),
@@ -157,16 +238,16 @@ export const codexBackend: LocalBackend = {
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
-      tail.push(chunk);
-      for (const line of chunk.split(/\r?\n/)) {
+      const clean = stripAnsi(chunk);
+      tail.push(clean);
+      for (const line of clean.split(/\r?\n/)) {
         if (line) opts.onEvent({ type: 'stderr-line', line });
       }
     });
 
-    function emitTextDelta(text: string) {
-      if (!text) return;
-      collectedText += text;
-      opts.onEvent({ type: 'text-delta', text });
+    function emitTextDelta(chunk: { text: string; itemId?: string; phase?: LocalTextPhase } | null) {
+      if (!chunk?.text) return;
+      opts.onEvent({ type: 'text-delta', ...chunk });
     }
 
     // Codex 0.125+ uses fine-grained notifications:
@@ -181,13 +262,13 @@ export const codexBackend: LocalBackend = {
     // best-effort handler for that shape too in case older codex builds
     // are encountered.
     function handleNotification(method: string, params: Record<string, any>) {
+      if (CODEX_IGNORED_NOTIFICATIONS.has(method)) return;
       const eventThreadId = typeof params.threadId === 'string' ? params.threadId : '';
       if (threadId && eventThreadId && eventThreadId !== threadId) return;
 
       // ── Streaming agent text (the important one) ─────────────────
       if (method === 'item/agentMessage/delta') {
-        const delta = typeof params.delta === 'string' ? params.delta : '';
-        if (delta) emitTextDelta(delta);
+        emitTextDelta(agentMessages.appendDelta(params));
         return;
       }
 
@@ -215,6 +296,7 @@ export const codexBackend: LocalBackend = {
       // ── item/* — surface tool-equivalent events; fallback final text ──
       if (method === 'item/started') {
         const item = params.item || {};
+        agentMessages.rememberItem(item);
         if (item.type === 'commandExecution') {
           opts.onEvent({
             type: 'tool-event',
@@ -241,6 +323,7 @@ export const codexBackend: LocalBackend = {
       }
       if (method === 'item/completed') {
         const item = params.item || {};
+        agentMessages.rememberItem(item);
         if (item.type === 'commandExecution') {
           opts.onEvent({
             type: 'tool-event',
@@ -257,11 +340,7 @@ export const codexBackend: LocalBackend = {
             phase: 'result',
           });
         } else if (item.type === 'agentMessage') {
-          // Fallback when delta-streaming didn't fire: emit the final
-          // text once. We compare against what we already collected
-          // to avoid duplication.
-          const text = typeof item.text === 'string' ? item.text : '';
-          if (text && !collectedText.includes(text)) emitTextDelta(text);
+          emitTextDelta(agentMessages.appendCompletedFallback(item));
         }
         return;
       }
@@ -341,13 +420,13 @@ export const codexBackend: LocalBackend = {
           return;
         case 'agent_message': {
           const text = typeof ev.message === 'string' ? ev.message : '';
-          emitTextDelta(text);
+          emitTextDelta(agentMessages.appendDelta({ delta: text }));
           return;
         }
         case 'agent_message_delta': {
           const text = typeof ev.delta === 'string' ? ev.delta
                      : (typeof ev.message === 'string' ? ev.message : '');
-          emitTextDelta(text);
+          emitTextDelta(agentMessages.appendDelta({ delta: text }));
           return;
         }
         case 'exec_command_begin':
@@ -405,21 +484,36 @@ export const codexBackend: LocalBackend = {
       resolveOuter();
     }
 
+    function failProtocol(error: string) {
+      // A JSON-RPC setup failure resolves before the normal close-driven
+      // lifecycle. Explicitly terminate the detached process group so a CLI
+      // that keeps its event loop alive cannot outlive the failed dispatch.
+      // No turn has started, so a short hard-kill fallback is safer than
+      // leaving an uncooperative bootstrap process in the background.
+      const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 250);
+      if (typeof hardKill.unref === 'function') hardKill.unref();
+      child.once('close', () => clearTimeout(hardKill));
+      try { child.stdin.end(); } catch { /* already closed */ }
+      killProcessTree(child, 'SIGTERM');
+      finish('failed', { error, stderrTail: tail.toString() });
+    }
+
     child.on('error', err => {
       log.warn('codex spawn error', { error: logErrorSummary(err) });
       finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
     });
     child.on('close', code => {
-      if (opts.signal.aborted) return finish('cancelled', { output: collectedText });
-      if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: collectedText, stderrTail: tail.toString() });
-      if (turnAborted) return finish('cancelled', { output: collectedText });
-      if (turnError) return finish('failed', { error: turnError, output: collectedText, stderrTail: tail.toString() });
-      if (code === 0 && (turnCompleted || collectedText)) {
-        return finish('completed', { output: collectedText });
+      const output = agentMessages.output();
+      if (opts.signal.aborted) return finish('cancelled', { output });
+      if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output, stderrTail: tail.toString() });
+      if (turnAborted) return finish('cancelled', { output });
+      if (turnError) return finish('failed', { error: turnError, output, stderrTail: tail.toString() });
+      if (code === 0 && (turnCompleted || agentMessages.hasText())) {
+        return finish('completed', { output });
       }
       finish('failed', {
         error: `codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'),
-        output: collectedText,
+        output,
         stderrTail: tail.toString(),
       });
     });
@@ -433,15 +527,19 @@ export const codexBackend: LocalBackend = {
         });
         notify('initialized');
 
-        threadId = await startOrResumeThread(opts);
+        const prepared = await startOrResumeThread(opts);
+        threadId = prepared.threadId;
         if (!threadId) {
-          finish('failed', { error: 'codex thread/start returned no thread id', stderrTail: tail.toString() });
+          failProtocol('codex thread/start returned no thread id');
           return;
         }
 
         await rpc('turn/start', {
           threadId,
-          input: [{ type: 'text', text: opts.prompt }],
+          input: [{
+            type: 'text',
+            text: selectCodexTurnPrompt(opts, prepared.resumed),
+          }],
           ...buildCodexTurnPermissionOverrides(opts.cwd),
         });
         // After turn/start succeeds we wait passively — turn end is
@@ -451,12 +549,13 @@ export const codexBackend: LocalBackend = {
       } catch (err) {
         const msg = (err as Error).message || String(err);
         log.warn('codex protocol error', { error: logErrorSummary(err) });
-        if (!exited) finish('failed', { error: msg, stderrTail: tail.toString() });
+        if (!exited) failProtocol(msg);
       }
     })();
 
-    async function startOrResumeThread(o: BackendRunOptions): Promise<string | undefined> {
-      const developerInstructions = codexDeveloperInstructions(o);
+    async function startOrResumeThread(
+      o: BackendRunOptions,
+    ): Promise<{ threadId?: string; resumed: boolean }> {
       if (o.resumeSessionId) {
         try {
           const r = await rpc('thread/resume', {
@@ -464,10 +563,10 @@ export const codexBackend: LocalBackend = {
             cwd: o.cwd,
             model: o.model || null,
             ...buildCodexThreadPermissionOverrides(),
-            developerInstructions,
+            ...codexThreadDeveloperInstructionParams(o, true),
           });
           const tid = extractThreadId(r);
-          if (tid) return tid;
+          if (tid) return { threadId: tid, resumed: true };
           log.warn('codex thread/resume returned no thread id; falling back to thread/start');
         } catch (err) {
           log.warn('codex thread/resume failed; falling back to thread/start', { error: logErrorSummary(err) });
@@ -481,13 +580,13 @@ export const codexBackend: LocalBackend = {
         ...buildCodexThreadPermissionOverrides(),
         config: null,
         baseInstructions: null,
-        developerInstructions,
+        ...codexThreadDeveloperInstructionParams(o, false),
         compactPrompt: null,
         includeApplyPatchTool: null,
         experimentalRawEvents: false,
         persistExtendedHistory: true,
       });
-      return extractThreadId(r);
+      return { threadId: extractThreadId(r), resumed: false };
     }
 
     return outerPromise;
@@ -501,11 +600,43 @@ export const codexBackend: LocalBackend = {
  * preferred over writing an AGENTS.md into cwd (no file pollution, no
  * cleanup-on-crash, never clobbers the user's own AGENTS.md). The bridge
  * config injection (`-c mcp_servers.orkas.*`) already connects the server;
- * this makes the agent reach for it. Returns null when no bridge is live.
- * Exported for tests.
+ * this makes the agent reach for it. Orkas durable CLI instructions share
+ * this native field; null means neither source supplied content. Exported for
+ * tests.
  */
 export function codexDeveloperInstructions(opts: BackendRunOptions): string | null {
-  return opts.bridge?.appendSystemPrompt || null;
+  const value = [
+    opts.systemPrompt,
+    opts.bridge?.appendSystemPrompt,
+  ].map((part) => String(part || '').trim()).filter(Boolean).join('\n\n');
+  return value || null;
+}
+
+/**
+ * Codex persists developer instructions in its native thread. Once the stored
+ * Orkas hash matches, omit the resume override entirely; `null` would clear it.
+ * A resume fallback still calls thread/start and therefore restores the full
+ * current instruction bundle.
+ */
+export function codexThreadDeveloperInstructionParams(
+  opts: BackendRunOptions,
+  resumed: boolean,
+): { developerInstructions?: string | null } {
+  if (resumed && opts.reuseSessionInstructions) return {};
+  return { developerInstructions: codexDeveloperInstructions(opts) };
+}
+
+/**
+ * A rejected resume must never run a delta-only turn on the replacement
+ * thread. Keep this decision pure so the recovery boundary is deterministic
+ * and independently covered without starting Codex.
+ */
+export function selectCodexTurnPrompt(
+  opts: Pick<BackendRunOptions, 'prompt' | 'resumeSessionId' | 'resumeFallbackPrompt'>,
+  resumed: boolean,
+): string {
+  if (resumed || !opts.resumeSessionId) return opts.prompt;
+  return opts.resumeFallbackPrompt || opts.prompt;
 }
 
 function buildCodexArgs(opts: BackendRunOptions): string[] {

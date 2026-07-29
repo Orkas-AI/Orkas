@@ -142,4 +142,105 @@ describe('project to-do controls', () => {
     expect(events).toEqual([]);
     expect(button.disabled).toBe(false);
   });
+
+  it('keeps the project task title text separate from an injected @Agent route', async () => {
+    const input = { value: 'Draft the project brief' };
+    const button = { disabled: false };
+    const sent: Array<{ content: string; extra: Record<string, unknown> }> = [];
+    const context = vm.createContext({
+      console,
+      performance,
+      createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById(id: string) {
+          if (id === 'project-chat-input') return input;
+          if (id === 'project-chat-send-btn') return button;
+          if (id === 'chat-input') return { value: '' };
+          return null;
+        },
+      },
+      window: { addEventListener() {} },
+      conversations: [],
+      t: (key: string) => key,
+      ensureModelConfigured: () => true,
+      _getQuotes: () => [],
+      _referenceSnapshotsForQuotes: () => [],
+      consumeChatUseSelections: () => [],
+      getChatRecipient: () => ({ kind: 'agent', id: 'agent-title', name: 'TitleAgent' }),
+      transformWithChatUse: (value: string) => value,
+      transformChatUseTokens: (value: string) => value,
+      applyRecipientPrefix: (value: string) => `@TitleAgent ${value}`,
+      _autoTitle: (value: string) => value,
+      apiFetch: async () => ({
+        json: async () => ({
+          ok: true,
+          conversation: { conversation_id: 'c_project_title', title: 'New task' },
+        }),
+      }),
+      renderConversationList() {},
+      loadProjects() {},
+      _chatAttachList: () => [],
+      _clearQuotes() {},
+      autoGrow() {},
+      setView() {},
+      setChatRecipient() {},
+      async sendInCurrentConversation(content: string, extra: Record<string, unknown>) {
+        sent.push({ content, extra });
+      },
+      setTimeout,
+      clearTimeout,
+    });
+    vm.runInContext(source, context, { filename: 'project-detail.js' });
+    vm.runInContext("_projectDetailPid = 'p_test'", context);
+
+    await context._submitProjectChat();
+
+    expect(sent).toEqual([{
+      content: '@TitleAgent Draft the project brief',
+      extra: { title_text: 'Draft the project brief' },
+    }]);
+    expect(context.conversations[0].title).toBe('Draft the project brief');
+  });
+
+  it('blocks project chat when no model is configured without telemetry', async () => {
+    const events: any[] = [];
+    const clicks: any[] = [];
+    const input = { value: 'project question' };
+    const Monitor = {
+      click(name: string, payload: any) { clicks.push({ name, payload }); },
+      event(name: string, payload: any) { events.push({ name, payload }); },
+    };
+    const apiFetch = async () => {
+      throw new Error('conversation creation must not run while blocked');
+    };
+    const context = vm.createContext({
+      console,
+      performance,
+      createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: {
+        readyState: 'loading',
+        addEventListener() {},
+        getElementById(id: string) {
+          return id === 'project-chat-input' ? input : null;
+        },
+      },
+      window: { addEventListener() {}, Monitor: true },
+      Monitor,
+      t: (key: string) => key,
+      ensureModelConfigured: () => false,
+      _getQuotes: () => [],
+      apiFetch,
+      setTimeout,
+      clearTimeout,
+    });
+    vm.runInContext(source, context, { filename: 'project-detail.js' });
+    vm.runInContext("_projectDetailPid = 'p_test'", context);
+
+    await context._submitProjectChat();
+
+    expect(clicks).toEqual([]);
+    expect(events).toEqual([]);
+  });
 });

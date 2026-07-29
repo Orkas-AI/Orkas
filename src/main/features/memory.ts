@@ -245,6 +245,36 @@ function buildAgentResult(userId: string, agentId: string, ok: boolean, error?: 
   };
 }
 
+type MemoryEntryMatch = { ok: true; index: number } | { ok: false; error: string };
+
+/**
+ * Resolve a human/model-supplied selector without guessing which durable
+ * record the user meant. A complete entry is authoritative even when it is a
+ * substring of another entry; shorthand remains supported only when it
+ * identifies exactly one record.
+ */
+export function resolveMemoryEntryMatch(entries: readonly string[], oldText: string): MemoryEntryMatch {
+  const needle = String(oldText || '').trim();
+  if (!needle) return { ok: false, error: 'old_text is required' };
+
+  const exact = entries
+    .map((text, index) => ({ text, index }))
+    .filter(({ text }) => text === needle);
+  if (exact.length === 1) return { ok: true, index: exact[0].index };
+  if (exact.length > 1) {
+    return { ok: false, error: 'old_text is ambiguous; provide the complete unique entry text' };
+  }
+
+  const partial = entries
+    .map((text, index) => ({ text, index }))
+    .filter(({ text }) => text.includes(needle));
+  if (partial.length === 0) return { ok: false, error: 'old_text not found' };
+  if (partial.length > 1) {
+    return { ok: false, error: 'old_text is ambiguous; provide the complete unique entry text' };
+  }
+  return { ok: true, index: partial[0].index };
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 export function addEntry(userId: string, target: MemoryScope, content: string): MemoryOpResult {
@@ -286,10 +316,10 @@ export function replaceEntry(userId: string, target: MemoryScope, oldText: strin
   const limit = limitForTarget(target);
   const entryLimit = entryLimitForTarget(target);
   const entries = loadEntries(filePath);
-  const idx = entries.findIndex(e => e.text.includes(oldText));
-  if (idx === -1) return buildResult(userId, target, false, 'old_text not found');
+  const match = resolveMemoryEntryMatch(entries.map(e => e.text), oldText);
+  if (match.ok === false) return buildResult(userId, target, false, match.error);
 
-  entries[idx] = { text: trimmed };
+  entries[match.index] = { text: trimmed };
   saveEntries(filePath, entries, limit, entryLimit);
   notifyMemoryDirty(target);
   return buildResult(userId, target, true);
@@ -305,48 +335,40 @@ export function replaceAgentEntry(userId: string, agentId: string, oldText: stri
     return buildAgentResult(userId, agentId, false, `blocked: suspicious content (${threat})`);
   }
 
-  let changed = false;
   migrateLegacyAgentMemoryOnce(userId, agentId);
   const canonicalPath = agentMemoryFile(userId, agentId);
   const canonicalEntries = loadEntries(canonicalPath);
-  const canonicalIdx = canonicalEntries.findIndex(e => e.text.includes(oldText));
-  if (canonicalIdx !== -1) {
-    canonicalEntries[canonicalIdx] = { text: trimmed };
-    saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
-    notifyMemoryDirty({ agent: agentId });
-    changed = true;
-  }
-
-  return buildAgentResult(userId, agentId, changed, changed ? undefined : 'old_text not found');
+  const match = resolveMemoryEntryMatch(canonicalEntries.map(e => e.text), oldText);
+  if (match.ok === false) return buildAgentResult(userId, agentId, false, match.error);
+  canonicalEntries[match.index] = { text: trimmed };
+  saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+  notifyMemoryDirty({ agent: agentId });
+  return buildAgentResult(userId, agentId, true);
 }
 
 export function removeEntry(userId: string, target: MemoryScope, oldText: string): MemoryOpResult {
   const filePath = fileForTarget(userId, target);
   const limit = limitForTarget(target);
   const entries = loadEntries(filePath);
-  const idx = entries.findIndex(e => e.text.includes(oldText));
-  if (idx === -1) return buildResult(userId, target, false, 'old_text not found');
+  const match = resolveMemoryEntryMatch(entries.map(e => e.text), oldText);
+  if (match.ok === false) return buildResult(userId, target, false, match.error);
 
-  entries.splice(idx, 1);
+  entries.splice(match.index, 1);
   saveEntries(filePath, entries, limit, entryLimitForTarget(target));
   notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
 export function removeAgentEntry(userId: string, agentId: string, oldText: string): MemoryOpResult {
-  let changed = false;
   migrateLegacyAgentMemoryOnce(userId, agentId);
   const canonicalPath = agentMemoryFile(userId, agentId);
   const canonicalEntries = loadEntries(canonicalPath);
-  const canonicalIdx = canonicalEntries.findIndex(e => e.text.includes(oldText));
-  if (canonicalIdx !== -1) {
-    canonicalEntries.splice(canonicalIdx, 1);
-    saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
-    notifyMemoryDirty({ agent: agentId });
-    changed = true;
-  }
-
-  return buildAgentResult(userId, agentId, changed, changed ? undefined : 'old_text not found');
+  const match = resolveMemoryEntryMatch(canonicalEntries.map(e => e.text), oldText);
+  if (match.ok === false) return buildAgentResult(userId, agentId, false, match.error);
+  canonicalEntries.splice(match.index, 1);
+  saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+  notifyMemoryDirty({ agent: agentId });
+  return buildAgentResult(userId, agentId, true);
 }
 
 export function listEntries(userId: string, target: MemoryScope): MemoryOpResult {

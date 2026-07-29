@@ -14,7 +14,7 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { qualitySkillReportFile, qualityAgentReportFile } from '../paths';
-import { writeJson, readJson } from '../storage';
+import { safeId, writeJson } from '../storage';
 import { createLogger } from '../logger';
 
 import { ValidationReport } from './types';
@@ -26,14 +26,39 @@ const pendingReportWrites = new Set<Promise<void>>();
 export type SpecKind = 'skill' | 'agent';
 
 function _reportFile(uid: string, kind: SpecKind, id: string): string {
+  if (!safeId(uid)) throw new Error('invalid quality report user id');
+  if (!safeId(id)) throw new Error('invalid quality report id');
   return kind === 'skill'
     ? qualitySkillReportFile(uid, id)
     : qualityAgentReportFile(uid, id);
 }
 
+function isValidationReport(value: unknown): value is ValidationReport {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const report = value as Partial<ValidationReport>;
+  if (
+    typeof report.ok !== 'boolean'
+    || typeof report.validated_at !== 'string'
+    || typeof report.validator_version !== 'string'
+    || !Array.isArray(report.violations)
+  ) return false;
+  const violationsValid = report.violations.every((violation) => (
+    !!violation
+    && typeof violation === 'object'
+    && ['EXTREME', 'MEDIUM', 'LOW'].includes(violation.level)
+    && typeof violation.rule === 'string'
+    && typeof violation.field === 'string'
+    && typeof violation.snippet === 'string'
+    && typeof violation.suggested_fix === 'string'
+  ));
+  if (!violationsValid) return false;
+  return report.ok === !report.violations.some((violation) => violation.level === 'EXTREME');
+}
+
 /**
  * Write the latest report for a spec. Best-effort: a write failure is logged
  * but does not throw — persistence is informational, not load-bearing.
+ * Invalid account/spec identifiers are rejected before any write is queued.
  */
 function enqueueReportMutation(file: string, mutation: () => Promise<void>): Promise<void> {
   const previous = reportWriteTails.get(file) || Promise.resolve();
@@ -48,7 +73,7 @@ function enqueueReportMutation(file: string, mutation: () => Promise<void>): Pro
   return tracked;
 }
 
-export function persistReport(args: {
+export async function persistReport(args: {
   uid: string;
   kind: SpecKind;
   id: string;
@@ -86,7 +111,12 @@ export async function readReport(args: {
   await reportWriteTails.get(file)?.catch(() => undefined);
   if (!fs.existsSync(file)) return null;
   try {
-    return await readJson<ValidationReport>(file);
+    const parsed = JSON.parse(await fsp.readFile(file, 'utf8')) as unknown;
+    if (!isValidationReport(parsed)) {
+      log.warn(`read ${args.kind} report id=${args.id} ignored invalid payload`);
+      return null;
+    }
+    return parsed;
   } catch (err) {
     log.warn(`read ${args.kind} report id=${args.id} failed: ${(err as Error).message}`);
     return null;

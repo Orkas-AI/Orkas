@@ -35,6 +35,10 @@ Build a one-diagnosis keyword/GEO opportunity pool. This skill is deterministic 
 
 All optional inputs are skipped if missing or unreadable. Results are a snapshot for this run only.
 
+## Strategy-map contract
+
+Translate the opportunity pool into an intent-to-page architecture, not a flat keyword list. For each material theme record the intent/stage, query or topic cluster, owning page type and URL, primary question, answer-first or quotable content block, evidence/trust block, and cannibalization owner. Cover core product, use case, comparison, pricing, and trust/docs/security pages when relevant. If measured search data is missing, label the map `Estimated` and present it as a hypothesis to validate rather than omitting the architecture.
+
 ## Expected output
 
 ```json

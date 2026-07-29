@@ -274,6 +274,10 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
 
     await ctx._runConnect({ id: 'notion', display_name: 'Notion' });
     expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
+    ctx.__emitPush('connectors:oauth-callback', {
+      attempt_id: 'attempt-notion',
+      catalog_id: 'notion',
+    });
     ctx.__emitPush('connectors:oauth-result', {
       attempt_id: 'attempt-notion',
       catalog_id: 'notion',
@@ -314,6 +318,48 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx.__alerts).toEqual([]);
   });
 
+  it('shows loading only after the browser returns and clears it on the matching result', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: true, started: true, attempt_id: 'attempt-loading' };
+      }
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [] };
+      if (channel === 'connectors.list') return { ok: true, instances: [] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+    const entry = { id: 'github', display_name: 'GitHub' };
+
+    await ctx._runConnect(entry);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+
+    ctx.__emitPush('connectors:oauth-callback', {
+      attempt_id: 'attempt-loading',
+      catalog_id: 'github',
+    });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('connectors.action.connecting');
+
+    // A stale terminal event must not clear the active callback's feedback.
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'older-attempt',
+      catalog_id: 'github',
+      result: 'cancelled',
+      code: 'superseded',
+      duration_ms: 1,
+    });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-loading',
+      catalog_id: 'github',
+      result: 'success',
+      duration_ms: 18,
+    });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+    expect(ctx.__events).toEqual([]);
+  });
+
   it('reports an asynchronous user cancellation without an error or alert', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'connectors.start_oauth') {
@@ -340,6 +386,22 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx.__alerts).toEqual([]);
   });
 
+  it('keeps a cancellation silent when the IPC wrapper only preserves E_UNKNOWN', async () => {
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return { ok: false, code: 'E_UNKNOWN', error: 'connector flow cancelled' };
+      }
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+
+    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    expect(ctx.__alerts).toEqual([]);
+  });
+
   it('accepts the browser launch without fabricating a timeout result when no callback arrives', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'connectors.start_oauth') {
@@ -352,6 +414,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
 
     expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
+    expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_request_result')).toEqual([]);
     expect(ctx.__errors).toEqual([]);
     expect(ctx.__alerts).toEqual([]);
   });

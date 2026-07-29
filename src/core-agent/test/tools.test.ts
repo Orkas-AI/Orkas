@@ -5,6 +5,7 @@ import os from "node:os";
 import { createExecutionPlanTool, defineTool, toToolDefinition, getBuiltinTools } from "../src/tools/index.js";
 import { Session } from "../src/agent/session.js";
 import { DEFAULT_BASH_TIMEOUT_MS, normalizeBashTimeoutMs } from "../src/tools/builtin.js";
+import { compactGitHubReadme } from "../src/tools/github-repository-fetch.js";
 import { MAX_WEB_FETCH_RESPONSE_BYTES } from "../src/tools/web-fetch.js";
 import type { ToolContext } from "../src/tools/index.js";
 
@@ -281,8 +282,14 @@ describe("Tools", () => {
 
       const names = tools.map((t) => t.name);
       expect(names).toContain("read_file");
+      expect(names).toContain("read_files");
       expect(names).toContain("write_file");
+      expect(names).toContain("apply_patch");
       expect(names).toContain("bash");
+      expect(names).toContain("process_start");
+      expect(names).toContain("process_read");
+      expect(names).toContain("process_write");
+      expect(names).toContain("process_stop");
       expect(names).toContain("list_files");
     });
   });
@@ -354,6 +361,28 @@ describe("Tools", () => {
   });
 
   describe("web_fetch tool", () => {
+    it("preserves decision-relevant README sections beyond a long prefix", () => {
+      const readme = [
+        "# Example",
+        "Local-first desktop assistant.",
+        "",
+        "## Community",
+        "x".repeat(12_000),
+        "",
+        "## Installation",
+        "Install with the signed desktop package.",
+        "",
+        "## License",
+        "Licensed under Apache-2.0.",
+      ].join("\n");
+      const compacted = compactGitHubReadme(readme);
+      expect(compacted.length).toBeLessThan(readme.length);
+      expect(compacted).toContain("Local-first desktop assistant.");
+      expect(compacted).toContain("Install with the signed desktop package.");
+      expect(compacted).toContain("Licensed under Apache-2.0.");
+      expect(compacted).toContain("other sections omitted");
+    });
+
     it("does not apply the former 50K default truncation before Result Store handling", async () => {
       const body = "x".repeat(60_000);
       vi.stubGlobal("fetch", vi.fn(async () => new Response(body, {
@@ -382,6 +411,230 @@ describe("Tools", () => {
         );
         expect(result.content).toContain("abc");
         expect(result.content).toContain("explicitly requested maxChars");
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("adds access and embedded document dates to HTML without another request", async () => {
+      const fetchMock = vi.fn(async () => new Response(
+        '<html><head><title>Project</title></head><body>'
+        + '<relative-time datetime="2026-07-27T10:30:00Z">yesterday</relative-time>'
+        + '<time datetime="2026-07-20T09:00:00Z">last week</time>'
+        + "</body></html>",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "last-modified": "Mon, 27 Jul 2026 10:30:00 GMT",
+          },
+        },
+      ));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const result = await webFetch.execute({ url: "https://example.test/project" }, { state: {} });
+        expect(result.content).toContain("Title: Project");
+        expect(result.content).toMatch(/Accessed at: \d{4}-\d{2}-\d{2}T/);
+        expect(result.content).toContain("HTTP Last-Modified: Mon, 27 Jul 2026 10:30:00 GMT");
+        expect(result.content).toContain(
+          "Embedded document dates (newest first): "
+          + "2026-07-27T10:30:00.000Z, 2026-07-20T09:00:00.000Z",
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("reuses a successful identical fetch within one run state", async () => {
+      const fetchMock = vi.fn(async () => new Response("stable body", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const ctx: ToolContext = { state: {} };
+        const [first, second] = await Promise.all([
+          webFetch.execute({ url: "https://example.test/cached", maxChars: 8_000 }, ctx),
+          webFetch.execute({ url: "https://example.test/cached", maxChars: 8_000 }, ctx),
+        ]);
+        expect(first.content).toBe("stable body");
+        expect(second.content).toBe("stable body");
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("reuses the complete response when only maxChars changes", async () => {
+      const fetchMock = vi.fn(async () => new Response("abcdefghij", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const ctx: ToolContext = { state: {} };
+        const short = await webFetch.execute(
+          { url: "https://example.test/variable-limit", maxChars: 3 },
+          ctx,
+        );
+        const longer = await webFetch.execute(
+          { url: "https://example.test/variable-limit", maxChars: 8 },
+          ctx,
+        );
+        expect(short.content).toContain("abc");
+        expect(short.content).not.toContain("defgh");
+        expect(longer.content).toContain("abcdefgh");
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("returns a structured GitHub repository snapshot and caches its URL aliases", async () => {
+      const metadata = {
+        full_name: "example/project",
+        description: "Example local-first project",
+        homepage: "https://example.test",
+        default_branch: "main",
+        created_at: "2024-01-01T00:00:00Z",
+        updated_at: "2026-07-27T10:00:00Z",
+        pushed_at: "2026-07-27T09:30:00Z",
+        archived: false,
+        fork: false,
+        stargazers_count: 123,
+        forks_count: 7,
+        open_issues_count: 4,
+        topics: ["local-first", "desktop"],
+        license: {
+          name: "Apache License 2.0",
+          spdx_id: "Apache-2.0",
+          url: "https://api.github.com/licenses/apache-2.0",
+        },
+      };
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const requestUrl = typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+        if (requestUrl.endsWith("/readme")) {
+          return new Response("# Project\nRuns locally on Windows, macOS, and Linux.", {
+            status: 200,
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          });
+        }
+        if (requestUrl === "https://api.github.com/repos/example/project") {
+          return new Response(JSON.stringify(metadata), {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
+        }
+        throw new Error(`unexpected request: ${requestUrl}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const runScopedLedger = new Map<string, unknown>();
+        const ctx: ToolContext = { state: { runScopedLedger } };
+        const snapshot = await webFetch.execute(
+          { url: "https://github.com/example/project", maxChars: 20_000 },
+          ctx,
+        );
+        const readmeAlias = await webFetch.execute(
+          { url: "https://raw.githubusercontent.com/example/project/main/README.md" },
+          ctx,
+        );
+        const metadataAlias = await webFetch.execute(
+          { url: "https://api.github.com/repos/example/project" },
+          ctx,
+        );
+
+        expect(snapshot.isError).toBeUndefined();
+        expect(snapshot.content).toContain("Source type: structured GitHub repository snapshot");
+        expect(snapshot.content).toContain("- License SPDX ID: Apache-2.0");
+        expect(snapshot.content).toContain("- Pushed at: 2026-07-27T09:30:00Z");
+        expect(snapshot.content).not.toContain("Decision evidence candidates");
+        expect(snapshot.content).not.toContain("field=os");
+        expect(snapshot.content).toContain("Runs locally on Windows, macOS, and Linux.");
+        expect(readmeAlias.content).toContain("GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT");
+        expect(metadataAlias.content).toContain("GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT");
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(fetchMock).not.toHaveBeenCalledWith(
+          "https://github.com/example/project",
+          expect.anything(),
+        );
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("reuses a successful fetch after ToolContext state is rebuilt", async () => {
+      const fetchMock = vi.fn(async () => new Response("stable across compaction", {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const runScopedLedger = new Map<string, unknown>();
+        const first = await webFetch.execute(
+          { url: "https://example.test/compacted", maxChars: 8_000 },
+          { state: { runScopedLedger } },
+        );
+        const second = await webFetch.execute(
+          { url: "https://example.test/compacted", maxChars: 8_000 },
+          { state: { runScopedLedger } },
+        );
+        expect(first.content).toBe("stable across compaction");
+        expect(second.content).toBe("stable across compaction");
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("does not re-inject the full cached page after context compaction", async () => {
+      const body = `Title-sized recovery text\n${"page body ".repeat(1_000)}`;
+      const fetchMock = vi.fn(async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const runScopedLedger = new Map<string, unknown>();
+        const first = await webFetch.execute(
+          { url: "https://example.test/compacted-replay", maxChars: 20_000 },
+          { state: { runScopedLedger, toolResultReadLedger: { epoch: 0 } } },
+        );
+        const second = await webFetch.execute(
+          { url: "https://example.test/compacted-replay#after-checkpoint", maxChars: 12_000 },
+          { state: { runScopedLedger, toolResultReadLedger: { epoch: 1 } } },
+        );
+        expect(first.content).toBe(body);
+        expect(second.content).toContain("WEB_FETCH_RUN_CACHE_HIT");
+        expect(second.content).toContain("normalized URL already succeeded");
+        expect(second.content).toContain("full page is intentionally not re-injected");
+        expect(second.content).not.toContain("page body page body");
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("does not cache failed fetches", async () => {
+      const fetchMock = vi.fn(async () => new Response("unavailable", { status: 503 }));
+      vi.stubGlobal("fetch", fetchMock);
+      try {
+        const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+        const ctx: ToolContext = { state: {} };
+        await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
+        await webFetch.execute({ url: "https://example.test/retryable" }, ctx);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
       } finally {
         vi.unstubAllGlobals();
       }
@@ -508,7 +761,13 @@ describe("Tools", () => {
 
       const ctx: ToolContext = { state: {} };
       const result = await bash.execute({ command: "echo hello" }, ctx);
-      expect(result.content.trim()).toBe("hello");
+      expect(result.content).toContain('<command-result status="succeeded" exit_code="0"');
+      expect(result.content).toContain("<stdout>\nhello");
+      expect(result.observations?.execution).toMatchObject({
+        status: "succeeded",
+        exitCode: 0,
+        timedOut: false,
+      });
     });
 
     it("returns error for failing command", async () => {
@@ -540,7 +799,8 @@ describe("Tools", () => {
         },
         ctx,
       );
-      expect(result.content.trim()).toBe("propagated-abc123");
+      expect(result.content).toContain("<stdout>\npropagated-abc123\n</stdout>");
+      expect(result.observations?.execution?.stdout.bytes).toBe(17);
       expect(result.isError).toBeUndefined();
     });
 
@@ -561,8 +821,15 @@ describe("Tools", () => {
 
         expect(result.isError).toBeUndefined();
         expect(result.content).toContain("full output streamed to Result Store");
-        expect(result.streamedOutput).toMatchObject({ size: outputBytes });
-        await expect(fs.stat(result.streamedOutput!.path)).resolves.toMatchObject({ size: outputBytes });
+        expect(result.streamedOutput!.size).toBeGreaterThan(outputBytes);
+        const persisted = await fs.readFile(result.streamedOutput!.path, "utf8");
+        expect(persisted).toContain("--- stdout ---");
+        expect(persisted).toContain("x".repeat(1024));
+        expect(result.observations?.execution).toMatchObject({
+          status: "succeeded",
+          exitCode: 0,
+          stdout: { bytes: outputBytes },
+        });
       } finally {
         await fs.rm(tmpDir, { recursive: true, force: true });
       }

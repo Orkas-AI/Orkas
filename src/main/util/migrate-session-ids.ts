@@ -34,6 +34,7 @@ import {
   userChatsDir,
 } from '../paths';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('migrate');
 
@@ -84,15 +85,18 @@ interface MigrationStats {
   fieldsRewritten: number;
 }
 
-function migrateOneDir(dir: string, stats: MigrationStats): void {
-  if (!fs.existsSync(dir)) return;
+function migrateOneDir(dir: string, stats: MigrationStats): boolean {
+  if (!fs.existsSync(dir)) return true;
   let entries: string[];
   try {
     entries = fs.readdirSync(dir);
   } catch (err) {
-    log.warn(`readdir failed ${dir}: ${(err as Error).message}`);
-    return;
+    log.warn('session migration directory scan failed', {
+      error: logErrorSummary(err),
+    });
+    return false;
   }
+  let completed = true;
   for (const name of entries) {
     if (!name.endsWith('.jsonl')) continue;
     stats.scanned += 1;
@@ -105,7 +109,7 @@ function migrateOneDir(dir: string, stats: MigrationStats): void {
     const src = path.join(dir, name);
     const dst = path.join(dir, newName);
     if (fs.existsSync(dst)) {
-      log.warn(`migration conflict: ${newName} already exists at ${dir}, preserving ${name} for triage`);
+      log.warn('session migration preserved a same-name conflict');
       stats.conflicts += 1;
       continue;
     }
@@ -113,9 +117,13 @@ function migrateOneDir(dir: string, stats: MigrationStats): void {
       fs.renameSync(src, dst);
       stats.renamed += 1;
     } catch (err) {
-      log.warn(`rename failed ${src} → ${dst}: ${(err as Error).message}`);
+      log.warn('session migration rename failed', {
+        error: logErrorSummary(err),
+      });
+      completed = false;
     }
   }
+  return completed;
 }
 
 /** Strip any uid/brand prefix from a session_id string. Returns the input unchanged when no
@@ -127,16 +135,26 @@ function _stripSidPrefix(sid: unknown): { sid: string; changed: boolean } | null
 }
 
 /** Rewrite session_id fields inside `cloud/chats/_index.json` (array of conv records). */
-function migrateChatsIndex(uid: string, stats: MigrationStats): void {
+function migrateChatsIndex(uid: string, stats: MigrationStats): boolean {
   const file = path.join(userChatsDir(uid), '_index.json');
-  if (!fs.existsSync(file)) return;
+  if (!fs.existsSync(file)) return true;
   let raw: string;
   try { raw = fs.readFileSync(file, 'utf8'); }
-  catch (err) { log.warn(`read _index.json: ${(err as Error).message}`); return; }
+  catch (err) {
+    log.warn('session migration could not read the conversation index', {
+      error: logErrorSummary(err),
+    });
+    return false;
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
-  catch (err) { log.warn(`parse _index.json: ${(err as Error).message}`); return; }
-  if (!Array.isArray(parsed)) return;
+  catch (err) {
+    log.warn('session migration could not parse the conversation index', {
+      error: logErrorSummary(err),
+    });
+    return false;
+  }
+  if (!Array.isArray(parsed)) return true;
   let touched = 0;
   for (const row of parsed) {
     if (!row || typeof row !== 'object') continue;
@@ -147,51 +165,77 @@ function migrateChatsIndex(uid: string, stats: MigrationStats): void {
       touched += 1;
     }
   }
-  if (touched === 0) return;
+  if (touched === 0) return true;
   try {
     fs.writeFileSync(file, JSON.stringify(parsed, null, 2), 'utf8');
     stats.fieldsRewritten += touched;
   } catch (err) {
-    log.warn(`write _index.json: ${(err as Error).message}`);
+    log.warn('session migration could not write the conversation index', {
+      error: logErrorSummary(err),
+    });
+    return false;
   }
+  return true;
 }
 
 /** Rewrite session_id field inside a `chat.json` (per-agent or per-skill edit chat meta). */
-function migrateChatMeta(file: string, stats: MigrationStats): void {
-  if (!fs.existsSync(file)) return;
+function migrateChatMeta(file: string, stats: MigrationStats): boolean {
+  if (!fs.existsSync(file)) return true;
   let raw: string;
   try { raw = fs.readFileSync(file, 'utf8'); }
-  catch (err) { log.warn(`read ${file}: ${(err as Error).message}`); return; }
+  catch (err) {
+    log.warn('session migration could not read an edit-chat record', {
+      error: logErrorSummary(err),
+    });
+    return false;
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); }
-  catch (err) { log.warn(`parse ${file}: ${(err as Error).message}`); return; }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+  catch (err) {
+    log.warn('session migration could not parse an edit-chat record', {
+      error: logErrorSummary(err),
+    });
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return true;
   const obj = parsed as Record<string, unknown>;
   const result = _stripSidPrefix(obj.session_id);
-  if (!result?.changed) return;
+  if (!result?.changed) return true;
   obj.session_id = result.sid;
   try {
     fs.writeFileSync(file, JSON.stringify(parsed, null, 2), 'utf8');
     stats.fieldsRewritten += 1;
   } catch (err) {
-    log.warn(`write ${file}: ${(err as Error).message}`);
+    log.warn('session migration could not write an edit-chat record', {
+      error: logErrorSummary(err),
+    });
+    return false;
   }
+  return true;
 }
 
 /** Walk `cloud/chats/{agent,skill}/<id>/chat.json` and rewrite the session_id field in each. */
-function migrateAgentSkillChatMetas(uid: string, stats: MigrationStats): void {
+function migrateAgentSkillChatMetas(uid: string, stats: MigrationStats): boolean {
   const chatsRoot = userChatsDir(uid);
+  let completed = true;
   for (const sub of ['agent', 'skill']) {
     const root = path.join(chatsRoot, sub);
     if (!fs.existsSync(root)) continue;
     let entries: string[];
     try { entries = fs.readdirSync(root); }
-    catch (err) { log.warn(`readdir ${root}: ${(err as Error).message}`); continue; }
+    catch (err) {
+      log.warn('session migration edit-chat scan failed', {
+        error: logErrorSummary(err),
+      });
+      completed = false;
+      continue;
+    }
     for (const id of entries) {
       const meta = path.join(root, id, 'chat.json');
-      migrateChatMeta(meta, stats);
+      if (!migrateChatMeta(meta, stats)) completed = false;
     }
   }
+  return completed;
 }
 
 /**
@@ -205,19 +249,26 @@ export function migrateLegacySessionIds(uid: string): MigrationStats {
   }
 
   // Files first — rename jsonls before we touch the indexes that reference them.
-  migrateOneDir(userSessionsDir(uid), stats);
-  migrateOneDir(userLocalSessionsDir(uid), stats);
+  const cloudSessionsComplete = migrateOneDir(userSessionsDir(uid), stats);
+  const localSessionsComplete = migrateOneDir(userLocalSessionsDir(uid), stats);
   // Then rewrite the stored session_id references so reads don't reanimate the old shape.
-  migrateChatsIndex(uid, stats);
-  migrateAgentSkillChatMetas(uid, stats);
+  const chatIndexComplete = migrateChatsIndex(uid, stats);
+  const editChatsComplete = migrateAgentSkillChatMetas(uid, stats);
+  const completed = cloudSessionsComplete
+    && localSessionsComplete
+    && chatIndexComplete
+    && editChatsComplete;
 
-  stamp(uid);
+  if (completed) stamp(uid);
   if (stats.renamed || stats.conflicts || stats.fieldsRewritten) {
-    log.info(
-      `session id migration done uid=${uid} renamed=${stats.renamed} ` +
-      `fieldsRewritten=${stats.fieldsRewritten} conflicts=${stats.conflicts} ` +
-      `alreadyMigrated=${stats.alreadyMigrated}`,
-    );
+    log.info('session id migration completed', {
+      userId: maskId(uid),
+      renamed: stats.renamed,
+      fieldsRewritten: stats.fieldsRewritten,
+      conflicts: stats.conflicts,
+      alreadyMigrated: stats.alreadyMigrated,
+      retryRequired: !completed,
+    });
   }
   return stats;
 }

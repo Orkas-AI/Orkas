@@ -13,7 +13,10 @@ const _rendererFeatureManifest = Object.freeze({
   marketplace: [
     { src: './modules/marketplace.js' },
   ],
-  agents: [],
+  agents: [
+    // Direct-entry Agent views use the shared marketplace category registry.
+    { src: './modules/marketplace.js' },
+  ],
   project: [
     { src: './modules/library-transfer.js' },
     { src: './modules/project-detail.js' },
@@ -33,6 +36,7 @@ const _rendererFeatureManifest = Object.freeze({
     { src: './modules/saved-apps.js' },
   ],
   skills: [
+    { src: './modules/marketplace.js' },
     { src: './modules/skills.js' },
     { src: './modules/skills-bindings.js' },
   ],

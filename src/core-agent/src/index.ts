@@ -15,6 +15,7 @@ export {
   ContextOverflowError,
   OutputLimitError,
   ProviderError,
+  StorageFullError,
   TimeoutError,
   DEFAULT_RETRY_ERROR_POLICY,
   configureRetryErrorPolicy,
@@ -25,6 +26,7 @@ export {
   classifyRetryableErrorWithPolicy,
   classifyTransientNetworkError,
   classifyTransientNetworkErrorWithPolicy,
+  isStorageFullError,
 } from "./shared/errors.js";
 export type { RetryableErrorKind, RetryErrorPolicyConfig } from "./shared/errors.js";
 export { createLogger } from "./shared/logger.js";
@@ -38,8 +40,10 @@ export { ProviderRegistry } from "./providers/index.js";
 
 // Agent Harness
 export { AgentRunner } from "./agent/index.js";
+export type { ReflectionModelCallEvent } from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
+export { discoverRepositoryInstructions, repositoryInstructionsText } from "./agent/index.js";
 export type { ToolProtocolRepairReport } from "./agent/index.js";
 export type {
   CompletedWorkEntry,
@@ -52,12 +56,62 @@ export type {
   ExecutionPlanUpdate,
   HistoryResource,
   HistoryResourceKind,
+  RepositoryInstructionFile,
+  RepositoryInstructions,
+  WorkspaceDiffRequest,
+  WorkspaceCompactedState,
+  WorkspaceObservationEntry,
+  WorkspaceObservationState,
 } from "./agent/index.js";
-export type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunTimings, AgentRunEvent } from "./agent/index.js";
+export type {
+  AgentRunParams,
+  AgentRunResult,
+  AgentRunMeta,
+  AgentRunTimings,
+  AgentRunConvergenceSignal,
+  AgentRunEvent,
+} from "./agent/index.js";
 
 // Tools
-export type { AgentTool, ToolContext, ToolResult, ToolResultImage } from "./tools/index.js";
-export { defineTool, toToolDefinition, getBuiltinTools, createExecutionPlanTool, runBuiltinWebSearch, WEB_SEARCH_DEFAULT_COUNT, WEB_SEARCH_MAX_COUNT } from "./tools/index.js";
+export type {
+  AgentTool,
+  ToolContext,
+  ToolResult,
+  ToolResultImage,
+  ToolObservations,
+  FileReadObservation,
+  FileChangeObservation,
+  CommandExecutionObservation,
+  CommandStreamObservation,
+} from "./tools/index.js";
+export {
+  applyPatchTool,
+  createApplyPatchTool,
+  getProcessSessionTools,
+  processReadTool,
+  processStartTool,
+  processStopTool,
+  processWriteTool,
+  workspaceDiffTool,
+  WORKSPACE_DIFF_PROVIDER_STATE_KEY,
+  defineTool,
+  toToolDefinition,
+  getBuiltinTools,
+  createExecutionPlanTool,
+  runBuiltinWebSearch,
+  WEB_SEARCH_DEFAULT_COUNT,
+  WEB_SEARCH_MAX_COUNT,
+} from "./tools/index.js";
+export type {
+  ApplyPatchCommittedFile,
+  ApplyPatchContentCheck,
+  ApplyPatchOperation,
+  ApplyPatchPathCheck,
+  ApplyPatchPathRole,
+  ApplyPatchSnapshot,
+  ApplyPatchToolHooks,
+  ProcessSessionStatus,
+} from "./tools/index.js";
 
 // Sandbox
 export { SandboxExecutor } from "./sandbox/index.js";
@@ -108,7 +162,13 @@ export {
 // Evolution (self-improvement)
 export { SkillStore, createSkillManageTool } from "./evolution/index.js";
 export type { Skill, SkillSummary, SkillFrontmatter } from "./evolution/index.js";
-export { detectUserCorrection, emptyRunMetrics, shouldReflect, buildReviewPrompt } from "./evolution/index.js";
+export {
+  detectUserCorrection,
+  emptyRunMetrics,
+  shouldReflect,
+  buildReviewPrompt,
+  REFLECTION_SYSTEM_PROMPT,
+} from "./evolution/index.js";
 export type { MetacognitionConfig, RunMetrics, TriggerSignal, MetacognitiveReflection } from "./evolution/index.js";
 
 // CLI

@@ -1,18 +1,19 @@
+import * as fsSync from 'node:fs';
 import * as fs from 'node:fs/promises';
+import { isIP } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { accountApiBase, tokenStore } from './connectors/_server_bridge';
 import { prepareFeedbackUploadImage } from '../util/image-transform';
 import { fetchWithTimeout, throwIfAborted } from '../util/abort';
 import { logPathRef } from '../util/log-redact';
 import { createLogger } from '../logger';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
+import { getDeviceId } from './machine_device_id';
 
 const log = createLogger('generation-reference-assets');
 
-const TEMP_REFERENCE_URL_EXPIRES = 6 * 60 * 60;
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 12 * 1024 * 1024;
 const VIDEO_COMPRESS_TRIGGER_BYTES = 8 * 1024 * 1024;
@@ -20,7 +21,13 @@ const REFERENCE_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const VIDEO_COMPRESS_TIMEOUT_MS = 10 * 60 * 1000;
 const PROGRESS_HEARTBEAT_MS = 15 * 1000;
 
-const generatedMediaUrls = new Map<string, string>();
+interface GeneratedMediaUrlEntry {
+  url: string;
+  ownerId: string;
+  fileIdentity: string;
+}
+
+const generatedMediaUrls = new Map<string, GeneratedMediaUrlEntry>();
 
 export type GenerationReferenceKind = 'image' | 'video';
 
@@ -41,13 +48,37 @@ export type GenerationReferenceProgressReporter = (event: {
 
 export function registerGeneratedMediaUrl(absPath: string, url?: string): void {
   const cleanPath = normalizePath(absPath);
-  const cleanUrl = normalizeUrl(url);
-  if (!cleanPath || !cleanUrl) return;
-  generatedMediaUrls.set(cleanPath, cleanUrl);
+  let cleanUrl = '';
+  try {
+    cleanUrl = normalizeUrl(url);
+  } catch {
+    // Provider responses are validated by their owning adapter. A URL that is
+    // unsuitable for later reference reuse must not turn a completed
+    // generation into a failure; simply make the local file take the upload
+    // path next time.
+    return;
+  }
+  const fileIdentity = localFileIdentity(cleanPath);
+  if (!cleanPath || !cleanUrl || !fileIdentity) return;
+  generatedMediaUrls.set(cleanPath, {
+    url: cleanUrl,
+    ownerId: currentReferenceOwnerId(),
+    fileIdentity,
+  });
 }
 
 export function generatedMediaUrlForPath(absPath: string): string {
-  return generatedMediaUrls.get(normalizePath(absPath)) || '';
+  const cleanPath = normalizePath(absPath);
+  const entry = generatedMediaUrls.get(cleanPath);
+  if (!entry) return '';
+  if (
+    entry.ownerId !== currentReferenceOwnerId()
+    || entry.fileIdentity !== localFileIdentity(cleanPath)
+  ) {
+    generatedMediaUrls.delete(cleanPath);
+    return '';
+  }
+  return entry.url;
 }
 
 export async function prepareReferenceUrls(input: PrepareReferenceUrlsInput): Promise<string[]> {
@@ -149,11 +180,6 @@ async function compressAndUploadReference(
     total: number;
   },
 ): Promise<string> {
-  const headers = tokenStore.authHeaders();
-  if (!headers.user_id || !headers.session_id) {
-    throw new Error(`Orkas sign-in required to upload local reference ${kind}s to COS temp`);
-  }
-
   throwIfAborted(opts.signal);
   emitProgress(opts.onProgress, 'reference_prepare', `Preparing reference ${kind} ${opts.index}/${opts.total}`, {
     kind,
@@ -169,37 +195,10 @@ async function compressAndUploadReference(
   }
 
   throwIfAborted(opts.signal);
-  emitProgress(opts.onProgress, 'reference_upload', `Uploading reference ${kind} ${opts.index}/${opts.total}`, {
-    kind,
-    index: opts.index,
-    total: opts.total,
-    bytes: prepared.buf.length,
-  });
-  const form = new FormData();
-  form.append('type', 'temp');
-  form.append('file_dir', kind);
-  form.append('signed_url', 'true');
-  form.append('signed_url_expires', String(TEMP_REFERENCE_URL_EXPIRES));
-  form.append('file', new Blob([new Uint8Array(prepared.buf)], { type: prepared.mimeType }), prepared.fileName);
-
-  const res = await fetchWithTimeout(
-    `${accountApiBase()}/file/upload`,
-    { method: 'POST', headers, body: form },
-    REFERENCE_UPLOAD_TIMEOUT_MS,
-    opts.signal,
-    `COS temp ${kind} upload timed out after ${Math.round(REFERENCE_UPLOAD_TIMEOUT_MS / 1000)}s`,
+  throw new Error(
+    `E_REFERENCE_PUBLIC_URL_REQUIRED: local reference ${kind}s cannot be uploaded by the open build; `
+    + 'provide a public HTTPS URL or reuse a generated output that exposes one',
   );
-  let json: any = {};
-  try { json = await res.json(); } catch { /* non-JSON response */ }
-  if (!res.ok || json?.code !== 0 || !json?.signed_url) {
-    throw new Error(json?.msg || `COS temp ${kind} upload failed: HTTP ${res.status}`);
-  }
-  emitProgress(opts.onProgress, 'reference_uploaded', `Reference ${kind} ${opts.index}/${opts.total} uploaded`, {
-    kind,
-    index: opts.index,
-    total: opts.total,
-  });
-  return String(json.signed_url);
 }
 
 async function prepareImage(
@@ -409,8 +408,73 @@ function normalizePath(value?: string): string {
 function normalizeUrl(value?: string): string {
   const s = String(value || '').trim();
   if (!s) return '';
-  if (/^(https?:|asset:)/i.test(s)) return s;
-  return '';
+  if (/^asset:\/\//i.test(s)) {
+    try {
+      const parsed = new URL(s);
+      if (parsed.protocol === 'asset:' && !parsed.username && !parsed.password && parsed.hostname) return s;
+    } catch { /* rejected below */ }
+    throw new Error('reference URL must be an HTTPS public URL or asset:// provider URL');
+  }
+  try {
+    const parsed = new URL(s);
+    if (
+      parsed.protocol === 'https:'
+      && !parsed.username
+      && !parsed.password
+      && !isPrivateReferenceHost(parsed.hostname)
+    ) {
+      return s;
+    }
+  } catch { /* rejected below */ }
+  throw new Error('reference URL must be an HTTPS public URL or asset:// provider URL');
+}
+
+function localFileIdentity(absPath: string): string {
+  if (!absPath) return '';
+  try {
+    const stat = fsSync.statSync(absPath, { bigint: true });
+    if (!stat.isFile()) return '';
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch {
+    return '';
+  }
+}
+
+function currentReferenceOwnerId(): string {
+  return getDeviceId();
+}
+
+function isPrivateReferenceHost(hostname: string): boolean {
+  const host = hostname.trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (!host) return true;
+  if (
+    host === 'localhost'
+    || host.endsWith('.localhost')
+    || host.endsWith('.local')
+    || host.endsWith('.internal')
+  ) return true;
+
+  const ipVersion = isIP(host);
+  if (ipVersion === 4) {
+    const octets = host.split('.').map(Number);
+    const [a, b] = octets;
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || a >= 224;
+  }
+  if (ipVersion === 6) {
+    return host === '::'
+      || host === '::1'
+      || host.startsWith('fc')
+      || host.startsWith('fd')
+      || /^fe[89ab]/.test(host)
+      || /^::ffff:(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host);
+  }
+  return false;
 }
 
 function detectImageMime(buf: Buffer, fileName = ''): 'image/png' | 'image/jpeg' | 'image/webp' | null {

@@ -161,5 +161,7 @@ describe('fetch-ffmpeg host dependency repair', () => {
     expect(fs.existsSync(path.join(packageDir, 'stale'))).toBe(false);
     expect(fs.readFileSync(path.join(packageDir, 'ffprobe'), 'utf8')).toBe('repaired');
     expect(spawnSync).toHaveBeenCalledOnce();
+    expect(spawnSync.mock.calls[0]?.[1]?.[1]).toBe('package.tgz');
+    expect(spawnSync.mock.calls[0]?.[2]?.cwd).toEqual(expect.any(String));
   });
 });

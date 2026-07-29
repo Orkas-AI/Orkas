@@ -5,7 +5,7 @@
  * and piped to `officecli batch <file>` over stdin (one open/save cycle).
  *
  * Op shapes are exactly what `officecli` consumes (verified via `dump` and live
- * runs against v1.0.131):
+ * runs against the checksum-pinned v1.0.139):
  *   - docx / pptx body content → `add` ops: {command,parent,type,props}
  *   - xlsx cells               → `set` ops: {command,path,props}
  */
@@ -14,6 +14,19 @@ export type OfficeBatchOp =
   | { command: 'add'; parent: string; type: string; props: Record<string, string> }
   | { command: 'set'; path: string; props: Record<string, string> }
   | { command: 'remove'; path: string };
+
+/**
+ * Serialize batch commands as ASCII-only JSON. On Windows, hidden console
+ * processes can receive a truncated UTF-8 stdin payload through Node's child
+ * process pipe. JSON `\uXXXX` escapes preserve the exact Unicode content while
+ * keeping the transport byte-for-byte ASCII and avoiding that runtime bug.
+ */
+export function serializeOfficeBatch(operations: readonly unknown[]): string {
+  return JSON.stringify(operations).replace(
+    /[\u007f-\uffff]/g,
+    (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
 
 /**
  * Copy every key of `src` not in `skip` into `props`, coercing the value to
@@ -228,31 +241,58 @@ export function buildXlsxBatch(sheet: string, rows: readonly (readonly XlsxCell[
  *  extra key is passed through to `add column`. */
 export type XlsxColumnSpec = { name?: string; width?: string | number; hidden?: boolean; [key: string]: unknown };
 
-/** One worksheet: a tab `name`, its cell `rows`, and optional `columns` widths. */
+/**
+ * One native Excel chart. `type` is normalized to OfficeCLI's `chartType`;
+ * every other key is forwarded to `add chart`. Charts should normally bind to
+ * worksheet cells with `dataRange` plus an optional `categories` range so the
+ * resulting object stays editable and updates with the source cells.
+ */
+export type XlsxChartSpec = {
+  type?: string;
+  dataRange?: string;
+  categories?: string;
+  data?: string;
+  title?: string;
+  anchor?: string;
+  [key: string]: unknown;
+};
+
+const XLSX_CHART_STRUCTURAL = new Set(['type', 'chartType']);
+// OfficeCLI 1.0.139 accepts axismin/axismax while adding a chart but does not
+// persist those scaling nodes at add-time. Re-applying them to the newly
+// created chart does persist <c:min>/<c:max>, so emit a targeted post-add set.
+const XLSX_CHART_POST_ADD_PROPS = ['axismin', 'axismax'] as const;
+
+/** One worksheet: a tab `name`, its cell `rows`, optional columns, and native charts. */
 export type XlsxSheetSpec = {
   name?: string;
   rows?: readonly (readonly XlsxCell[])[];
   columns?: readonly XlsxColumnSpec[];
+  charts?: readonly XlsxChartSpec[];
 };
 
 /**
  * Build the `batch` ops for a multi-sheet workbook. A freshly created xlsx has
  * exactly one sheet, `Sheet1`; the first spec reuses it (renamed via `set` when
- * its `name` differs), and each later spec is `add`ed. Per sheet: column widths
- * first (`add column`), then cells (delegated to `buildXlsxBatch`, which targets
- * `/<name>/A1`). Renames are emitted before any write so the new tab name
- * resolves.
+ * its `name` differs), and each later spec is `add`ed. This is deliberately
+ * three-pass: create every sheet first so dashboard formulas may reference
+ * later sheets, populate every sheet next, then add charts after all referenced
+ * source cells exist.
  */
 export function buildXlsxWorkbookBatch(sheets: readonly XlsxSheetSpec[]): OfficeBatchOp[] {
   const ops: OfficeBatchOp[] = [];
+  const normalized: Array<{ sheet: XlsxSheetSpec; name: string }> = [];
   sheets.forEach((sheet, idx) => {
     if (!sheet || typeof sheet !== 'object') return;
     const name = typeof sheet.name === 'string' && sheet.name ? sheet.name : (idx === 0 ? 'Sheet1' : `Sheet${idx + 1}`);
+    normalized.push({ sheet, name });
     if (idx === 0) {
       if (name !== 'Sheet1') ops.push({ command: 'set', path: '/Sheet1', props: { name } });
     } else {
       ops.push({ command: 'add', parent: '/', type: 'sheet', props: { name } });
     }
+  });
+  for (const { sheet, name } of normalized) {
     if (Array.isArray(sheet.columns)) {
       for (const col of sheet.columns) {
         if (!col || typeof col !== 'object') continue;
@@ -263,7 +303,30 @@ export function buildXlsxWorkbookBatch(sheets: readonly XlsxSheetSpec[]): Office
       }
     }
     if (Array.isArray(sheet.rows)) ops.push(...buildXlsxBatch(name, sheet.rows));
-  });
+  }
+  for (const { sheet, name } of normalized) {
+    if (Array.isArray(sheet.charts)) {
+      let chartIndex = 0;
+      for (const chart of sheet.charts) {
+        if (!chart || typeof chart !== 'object') continue;
+        const chartType = typeof chart.type === 'string' && chart.type
+          ? chart.type
+          : (typeof chart.chartType === 'string' ? chart.chartType : '');
+        if (!chartType) continue;
+        const chartProps: Record<string, string> = { chartType };
+        addPassthrough(chartProps, chart, XLSX_CHART_STRUCTURAL);
+        ops.push({ command: 'add', parent: `/${name}`, type: 'chart', props: chartProps });
+        chartIndex += 1;
+        const postAddProps: Record<string, string> = {};
+        for (const key of XLSX_CHART_POST_ADD_PROPS) {
+          if (key in chartProps) postAddProps[key] = chartProps[key];
+        }
+        if (Object.keys(postAddProps).length) {
+          ops.push({ command: 'set', path: `/${name}/chart[${chartIndex}]`, props: postAddProps });
+        }
+      }
+    }
+  }
   return ops;
 }
 
@@ -394,10 +457,11 @@ export function buildPptxBatch(slides: readonly PptxSlideSpec[]): OfficeBatchOp[
   return ops;
 }
 
-// ── In-place edit (any format) ──────────────────────────────────────────────
+// ── Existing-file edit operations (any format) ─────────────────────────────
 
-/** A single in-place edit on an existing document. `set`/`remove` target an
- *  element by `path` (from `office_read`); `add` inserts under `parent`. */
+/** A single edit on an existing document. The tool layer applies these to a
+ *  validated temporary/working copy. `set`/`remove` target an element by
+ *  `path` (from `office_read`); `add` inserts under `parent`. */
 export type EditOp =
   | { action: 'set'; path: string; props?: Record<string, unknown> }
   | { action: 'add'; parent: string; type: string; props?: Record<string, unknown> }

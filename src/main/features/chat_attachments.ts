@@ -95,6 +95,10 @@ const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
 
 const MAX_FILENAME_LEN = 200;
 const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
+/** Composer boundary: one unsent message may reference at most this many
+ * distinct attachments. Enforced in the storage layer so IPC, drag/drop and
+ * any future callers cannot bypass the UI. */
+export const MAX_PENDING_ATTACHMENTS_PER_MESSAGE = 20;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -257,14 +261,19 @@ function notifyAttachmentDeletedIfSyncable(userId: string, cid: string, name: st
 }
 
 function uniqueTarget(dir: string, name: string): string {
-  let target = path.join(dir, name);
+  const target = path.join(dir, name);
   if (!fs.existsSync(target)) return target;
   const ext = path.extname(name);
   const stem = name.slice(0, name.length - ext.length);
   const now = new Date();
   const pad = (v: number) => String(v).padStart(2, '0');
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return path.join(dir, `${stem}-${stamp}${ext}`);
+  const stamped = path.join(dir, `${stem}-${stamp}${ext}`);
+  if (!fs.existsSync(stamped)) return stamped;
+  for (let copy = 2; ; copy += 1) {
+    const candidate = path.join(dir, `${stem}-${stamp}-${copy}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
 }
 
 const attachmentWriteLocks = new Map<string, Promise<void>>();
@@ -323,6 +332,7 @@ async function findDuplicateByHash(
   dir: string,
   bytes: number,
   sha256: string,
+  allowedNames?: ReadonlySet<string>,
 ): Promise<AttachmentInfo | null> {
   let items: fs.Dirent[];
   try { items = fs.readdirSync(dir, { withFileTypes: true }); }
@@ -330,6 +340,7 @@ async function findDuplicateByHash(
   items.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   for (const e of items) {
     if (!e.isFile() || e.name.startsWith('.')) continue;
+    if (allowedNames && !allowedNames.has(e.name)) continue;
     const ext = path.extname(e.name).toLowerCase();
     if (!ALLOWED_EXTENSIONS.has(ext)) continue;
     const abs = path.join(dir, e.name);
@@ -377,10 +388,21 @@ export async function uploadAttachment(
   const dir = ensureDir(userId, safeConvId);
   const incomingHash = hashBuffer(buf);
   return withAttachmentWriteLock(userId, safeConvId, async () => {
-    const duplicate = await findDuplicateByHash(dir, buf.length, incomingHash);
+    // Reuse only files that are still pending. Reusing a file already
+    // referenced by history would make this new selection indistinguishable
+    // from the old send, so listPendingAttachments would drop it on restart.
+    const pending = listPendingAttachments(userId, safeConvId);
+    const pendingNames = new Set(pending.map((item) => item.name));
+    const duplicate = await findDuplicateByHash(dir, buf.length, incomingHash, pendingNames);
     if (duplicate) {
       log.info(`upload dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
       return { ok: true, info: duplicate, reused: true };
+    }
+    if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
+      return {
+        ok: false,
+        error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+      };
     }
 
     const target = uniqueTarget(dir, safeName);
@@ -457,10 +479,20 @@ export async function importAttachmentFromPath(
     try { incomingHash = await hashFile(absSource); }
     catch (err) { return { ok: false, error: (err as Error).message }; }
 
-    const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash);
+    // Match uploadAttachment: a historical file needs a new pool entry so
+    // the newly-selected pending item can be reconstructed after restart.
+    const pending = listPendingAttachments(userId, safeConvId);
+    const pendingNames = new Set(pending.map((item) => item.name));
+    const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash, pendingNames);
     if (duplicate) {
       log.info(`import dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
       return { ok: true, info: duplicate, reused: true };
+    }
+    if (pending.length >= MAX_PENDING_ATTACHMENTS_PER_MESSAGE) {
+      return {
+        ok: false,
+        error: t('errors.too_many_attachments', { max: MAX_PENDING_ATTACHMENTS_PER_MESSAGE }),
+      };
     }
 
     const target = uniqueTarget(dir, safeName);
@@ -850,7 +882,7 @@ export function adoptDraftAttachments(
   userId: string,
   fromCid: string,
   toCid: string,
-): Result<{ count: number }> {
+): Result<{ count: number; items: Array<{ sourceName: string; targetName: string }> }> {
   let srcSafe: string;
   let dstSafe: string;
   try { srcSafe = safeCid(fromCid); dstSafe = safeCid(toCid); }
@@ -858,25 +890,25 @@ export function adoptDraftAttachments(
   if (srcSafe === dstSafe) return { ok: false, error: 'same cid' };
 
   const src = attachmentDirForCid(userId, srcSafe);
-  if (!fs.existsSync(src)) return { ok: true, count: 0 };
+  if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
   const dst = chatAttachmentDirForConversation(userId, dstSafe);
-  let movedNames: string[] = [];
-  try { movedNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
+  let sourceNames: string[] = [];
+  try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
   catch { /* ignore */ }
+  let movedNames: Array<{ source: string; target: string }> = [];
 
   try {
     if (!fs.existsSync(dst)) {
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.renameSync(src, dst);
+      movedNames = sourceNames.map((name) => ({ source: name, target: name }));
     } else {
       for (const name of fs.readdirSync(src)) {
         const from = path.join(src, name);
-        const to = path.join(dst, name);
-        try { fs.renameSync(from, to); }
-        catch {
-          // Cross-device or already-exists → fall back to copy+unlink.
-          fs.copyFileSync(from, to);
-          try { fs.unlinkSync(from); } catch { /* best-effort */ }
+        const target = uniqueTarget(dst, name);
+        _moveFileBestEffort(from, target);
+        if (!name.startsWith('.')) {
+          movedNames.push({ source: name, target: path.basename(target) });
         }
       }
       try { fs.rmdirSync(src); } catch { /* best-effort */ }
@@ -885,15 +917,20 @@ export function adoptDraftAttachments(
     return { ok: false, error: (err as Error).message };
   }
 
-  let count = 0;
-  try { count = fs.readdirSync(dst).filter((n) => !n.startsWith('.')).length; }
-  catch { /* ignore */ }
   for (const name of movedNames) {
-    notifyAttachmentDeletedIfSyncable(userId, srcSafe, name);
-    notifyAttachmentDirty(userId, dstSafe, name);
+    notifyAttachmentDeletedIfSyncable(userId, srcSafe, name.source);
+    notifyAttachmentDirty(userId, dstSafe, name.target);
   }
+  const count = movedNames.length;
   log.info(`adopt user=${userId} ${srcSafe} → ${dstSafe} count=${count}`);
-  return { ok: true, count };
+  return {
+    ok: true,
+    count,
+    items: movedNames.map((name) => ({
+      sourceName: name.source,
+      targetName: name.target,
+    })),
+  };
 }
 
 /** Remove the entire `<cid>/` attachment dir + drop all file_cache entries
@@ -932,7 +969,7 @@ export interface AttachmentManifest {
   /** Compressed gray JPEG images formatted for `ChatOptions.images` (pi-ai
    *  ImageContent). Produced in real time on each call — no cache. */
   images: Array<{ data: string; mediaType: ImageMimeType }>;
-  /** Names of attachments we couldn't pack (missing / too big / load error). */
+  /** Names of attachments we couldn't use (missing / too big / load error). */
   skipped: Array<{ name: string; reason: string }>;
   /** Current-turn attachment metadata for Orkas-managed server routing. */
   metadata: AttachmentRequestMetadata;
@@ -944,7 +981,9 @@ export interface AttachmentRequestMetadata {
 }
 
 export interface BuildManifestOpts {
-  /** Max number of images attached to a single message. Default 5. */
+  /** Max number of images eagerly prepared for model delivery. Remaining
+   * images stay in the manifest as path-addressable deferred attachments.
+   * Defaults to the composer attachment limit (20). */
   maxImages?: number;
 }
 
@@ -970,7 +1009,7 @@ export interface BuildConversationAttachmentIndexOpts {
  *   - image           → compressed grayscale JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
- *   - video/audio     → skipped entirely (display-only).
+ *   - video/audio     → listed by path for media tools, without inline bytes.
  */
 export async function buildAttachmentManifest(
   userId: string,
@@ -978,7 +1017,10 @@ export async function buildAttachmentManifest(
   names: string[],
   opts: BuildManifestOpts = {},
 ): Promise<AttachmentManifest> {
-  const maxImages = opts.maxImages ?? 5;
+  const requestedMaxImages = opts.maxImages ?? MAX_PENDING_ATTACHMENTS_PER_MESSAGE;
+  const maxImages = Number.isFinite(requestedMaxImages)
+    ? Math.max(0, Math.min(MAX_PENDING_ATTACHMENTS_PER_MESSAGE, Math.trunc(requestedMaxImages)))
+    : MAX_PENDING_ATTACHMENTS_PER_MESSAGE;
   const skipped: Array<{ name: string; reason: string }> = [];
   const entries: string[] = [];
   const images: Array<{ data: string; mediaType: ImageMimeType }> = [];
@@ -1014,17 +1056,18 @@ export async function buildAttachmentManifest(
     if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: t('attachments.skipped.missing') }); continue; }
 
     if (kind === 'image') {
-      if (images.length >= maxImages) { skipped.push({ name: nm, reason: t('attachments.skipped.too_many_images', { max: maxImages }) }); continue; }
+      if (images.length >= maxImages) {
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="deferred"/>`);
+        continue;
+      }
       try {
         const buf = fs.readFileSync(abs);
         const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
-        // Also list the image in the manifest so the LLM has a text-side
-        // hint (filename + abs path) tying its inline-attached vision input
-        // to the user's intent ("this image is 证书.jpg"). `attached="inline"`
-        // tells the LLM bytes are already on this turn — see chat_commander.md
-        // attachments section — so it doesn't waste a read_file round-trip.
-        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="inline"/>`);
+        // Candidate providers enforce their own N-image request limit after
+        // this manifest is built. `image_order` preserves a deterministic
+        // name/path ↔ image-block mapping for whichever prefix is delivered.
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="model-bounded" image_order="${images.length}"/>`);
       } catch (err) {
         skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
       }
@@ -1072,8 +1115,12 @@ export async function buildAttachmentManifest(
   const mediaNote = hasMedia
     ? '\n<!-- video/audio are not vision input; read their content with media tools (probe / transcribe / extract frames) via the path — do not treat them as unreadable -->'
     : '';
+  const hasImages = entries.some((e) => e.includes('kind="image"'));
+  const imageNote = hasImages
+    ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_file(path=...) for that image, one at a time; listing a path alone is not visual processing. -->'
+    : '';
   const manifest = entries.length
-    ? `<attachments>${mediaNote}\n${entries.join('\n')}\n</attachments>`
+    ? `<attachments>${mediaNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
     : '';
   return { manifest, images, skipped, metadata: metadata() };
 }

@@ -72,7 +72,6 @@ export interface SavedAppMeta {
   title: string;
   sourceCid: string;
   sourceArtifactId: string;
-  sourcePath?: string;
   entry?: string;
   savedAt: string; // ISO
 }
@@ -121,6 +120,22 @@ function sanitiseTitle(t: unknown): string {
 
 function writeMeta(dir: string, meta: SavedAppMeta): void {
   fs.writeFileSync(path.join(dir, META_FILENAME), Buffer.from(JSON.stringify(meta, null, 2), 'utf8'));
+}
+
+function isRealSavedAppDirectory(dir: string): boolean {
+  try {
+    const st = fs.lstatSync(dir);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function readMeta(dir: string): Partial<SavedAppMeta> {
+  const metaPath = path.join(dir, META_FILENAME);
+  const st = fs.lstatSync(metaPath);
+  if (!st.isFile() || st.isSymbolicLink()) throw new Error('invalid app metadata');
+  return JSON.parse(fs.readFileSync(metaPath, 'utf8')) || {};
 }
 
 function savedAppRelPath(appId: string, rel = ''): string {
@@ -464,7 +479,7 @@ export function saveFromPath(
       entry: inspected.entry,
       savedAt: new Date().toISOString(),
     };
-    writeMeta(tmpDir, { ...meta, sourcePath: inspected.rootDir });
+    writeMeta(tmpDir, meta);
     fs.mkdirSync(path.dirname(destDir), { recursive: true });
     fs.renameSync(tmpDir, destDir);
     log.info('saveFromPath completed', {
@@ -501,9 +516,9 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
     let appId: string;
     try { appId = safeAppId(name); } catch { continue; }
     const dir = savedAppDir(userId, appId);
-    try { if (!fs.statSync(dir).isDirectory()) continue; } catch { continue; }
+    if (!isRealSavedAppDirectory(dir)) continue;
     let meta: Partial<SavedAppMeta> = {};
-    try { meta = JSON.parse(fs.readFileSync(path.join(dir, META_FILENAME), 'utf8')) || {}; }
+    try { meta = readMeta(dir); }
     catch (err) {
       log.warn('listSavedApps bad meta skipped', {
         user_id: maskId(userId),
@@ -533,23 +548,18 @@ export function resolveSavedAppIndex(
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
   const root = path.resolve(savedAppDir(userId, safeId));
+  if (!isRealSavedAppDirectory(root)) {
+    return { ok: false, code: 'not_found', error: 'app not found' };
+  }
   let entry = 'index.html';
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(root, META_FILENAME), 'utf8')) || {};
+    const meta = readMeta(root);
     entry = normaliseEntryRel(meta.entry);
   } catch { /* old apps or corrupt meta fall back to index.html */ }
   const abs = path.resolve(root, entry);
   const rel = path.relative(root, abs);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     return { ok: false, code: 'bad_input', error: 'path traversal blocked' };
-  }
-  try {
-    const rootStat = fs.lstatSync(root);
-    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-      return { ok: false, code: 'not_found', error: 'app not found' };
-    }
-  } catch {
-    return { ok: false, code: 'not_found', error: 'app not found' };
   }
   if (!isPathAllowed(abs, [root])) {
     return { ok: false, code: 'not_found', error: 'app not found' };
@@ -572,9 +582,12 @@ export function resolveSavedAppFilePath(
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
   const root = path.resolve(savedAppDir(userId, safeId));
+  if (!isRealSavedAppDirectory(root)) {
+    return { ok: false, code: 'not_found', error: 'not found' };
+  }
   let entry = 'index.html';
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(root, META_FILENAME), 'utf8')) || {};
+    const meta = readMeta(root);
     entry = normaliseEntryRel(meta.entry);
   } catch { /* old apps or corrupt meta fall back to index.html */ }
 
@@ -598,14 +611,6 @@ export function resolveSavedAppFilePath(
   if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     return { ok: false, code: 'forbidden', error: 'path traversal blocked' };
   }
-  try {
-    const rootStat = fs.lstatSync(root);
-    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
-      return { ok: false, code: 'not_found', error: 'not found' };
-    }
-  } catch {
-    return { ok: false, code: 'not_found', error: 'not found' };
-  }
   if (!isPathAllowed(abs, [root])) {
     return { ok: false, code: 'forbidden', error: 'symlink escape blocked' };
   }
@@ -623,8 +628,9 @@ export function renameSavedApp(userId: string, appId: string, title: unknown): R
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (typeof title !== 'string' || !title.trim()) return { ok: false, error: 'title required' };
   const dir = savedAppDir(userId, safeId);
+  if (!isRealSavedAppDirectory(dir)) return { ok: false, error: 'app not found' };
   let meta: SavedAppMeta;
-  try { meta = JSON.parse(fs.readFileSync(path.join(dir, META_FILENAME), 'utf8')); }
+  try { meta = readMeta(dir) as SavedAppMeta; }
   catch (err) { return { ok: false, error: `app not found: ${(err as Error).message}` }; }
   meta.title = sanitiseTitle(title);
   try { writeMeta(dir, meta); }
@@ -640,9 +646,15 @@ export function deleteSavedApp(userId: string, appId: string): Result {
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const dir = savedAppDir(userId, safeId);
-  const deleted = fs.existsSync(dir) ? listAppFilesRel(dir) : [];
+  let exists = false;
   try {
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    const st = fs.lstatSync(dir);
+    exists = true;
+    if (!st.isDirectory() || st.isSymbolicLink()) return { ok: false, error: 'app not found' };
+  } catch { /* idempotent missing delete */ }
+  const deleted = exists ? listAppFilesRel(dir) : [];
+  try {
+    if (exists) fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
     log.warn('deleteSavedApp failed', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorRef(err) });
     return { ok: false, error: `failed to delete: ${(err as Error).message}` };
@@ -680,7 +692,7 @@ function buildSourceBundle(dir: string, title: string): string {
   const files = listAppFilesRel(dir).filter((rel) => rel !== META_FILENAME);
   let entry = 'index.html';
   try {
-    const meta = JSON.parse(fs.readFileSync(path.join(dir, META_FILENAME), 'utf8')) || {};
+    const meta = readMeta(dir);
     entry = normaliseEntryRel(meta.entry);
   } catch { /* old apps */ }
   const lines: string[] = [
@@ -725,16 +737,14 @@ export async function openForEditing(
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const dir = savedAppDir(userId, safeId);
-  try { if (!fs.statSync(dir).isDirectory()) throw new Error('not a directory'); }
-  catch { return { ok: false, error: 'app not found' }; }
+  if (!isRealSavedAppDirectory(dir)) return { ok: false, error: 'app not found' };
   let title = DEFAULT_TITLE;
-  let entry = 'index.html';
   try {
-    const m = JSON.parse(fs.readFileSync(path.join(dir, META_FILENAME), 'utf8'));
+    const m = readMeta(dir);
     if (m && typeof m.title === 'string' && m.title.trim()) title = m.title;
-    entry = normaliseEntryRel(m?.entry);
   } catch { /* fallback */ }
-  if (!fs.existsSync(path.join(dir, entry))) return { ok: false, error: 'app is missing its HTML entry' };
+  const resolvedEntry = resolveSavedAppIndex(userId, safeId);
+  if (!resolvedEntry.ok) return { ok: false, error: 'app is missing its HTML entry' };
 
   const bundle = buildSourceBundle(dir, title);
 

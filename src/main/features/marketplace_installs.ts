@@ -49,6 +49,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import { userMarketplaceInstallsFile, userMarketplaceDirCloud } from '../paths';
+import { safeId } from '../storage';
 import { createLogger } from '../logger';
 import { isExpiredMsTombstone } from '../util/tombstone_retention';
 import { minAppVersionFrom, type MinAppVersionSource } from '../util/app-version-compat';
@@ -196,6 +197,7 @@ export async function writeInstalls(uid: string, manifest: InstallsManifest): Pr
 }
 
 export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'installed_at'> & { installed_at?: number }): Promise<void> {
+  _assertSafeMarketplaceId(row.id);
   await _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.agents.findIndex((a) => a.id === row.id);
@@ -216,6 +218,7 @@ export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'inst
 }
 
 export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'installed_at'> & { installed_at?: number }): Promise<void> {
+  _assertSafeMarketplaceId(row.id);
   await _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.skills.findIndex((s) => s.id === row.id);
@@ -236,6 +239,7 @@ export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'inst
 }
 
 export async function removeAgentInstall(uid: string, id: string): Promise<boolean> {
+  _assertSafeMarketplaceId(id);
   return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const before = manifest.agents.length;
@@ -249,6 +253,7 @@ export async function removeAgentInstall(uid: string, id: string): Promise<boole
 }
 
 export async function removeSkillInstall(uid: string, id: string): Promise<boolean> {
+  _assertSafeMarketplaceId(id);
   return _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const before = manifest.skills.length;
@@ -275,7 +280,7 @@ function _isAgentRow(x: unknown): x is AgentInstall {
   if (!x || typeof x !== 'object') return false;
   const r = x as Record<string, unknown>;
   // `create_uid` is intentionally not required — older rows pre-date the field.
-  return typeof r.id === 'string' && typeof r.version === 'string'
+  return safeId(r.id) && typeof r.version === 'string'
     && typeof r.published_at === 'number' && typeof r.agent_json_url === 'string'
     && typeof r.installed_at === 'number';
 }
@@ -283,7 +288,7 @@ function _isAgentRow(x: unknown): x is AgentInstall {
 function _isSkillRow(x: unknown): x is SkillInstall {
   if (!x || typeof x !== 'object') return false;
   const r = x as Record<string, unknown>;
-  return typeof r.id === 'string' && typeof r.version === 'string'
+  return safeId(r.id) && typeof r.version === 'string'
     && typeof r.published_at === 'number' && typeof r.bundle_url === 'string'
     && typeof r.installed_at === 'number';
 }
@@ -331,11 +336,15 @@ function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown 
     for (const [id, value] of Object.entries(bucket as Record<string, unknown>)) {
       const n = Number(value);
       if (isExpiredMsTombstone(n)) continue;
-      if (id && Number.isFinite(n) && n > 0) clean[id] = n;
+      if (safeId(id) && Number.isFinite(n) && n > 0) clean[id] = n;
     }
     if (Object.keys(clean).length > 0) out[kind] = clean;
   }
   return Object.keys(out).length > 0 ? out : null;
+}
+
+function _assertSafeMarketplaceId(id: string): void {
+  if (!safeId(id)) throw new Error('invalid marketplace id');
 }
 
 function _markDeleted(manifest: InstallsManifest, kind: 'agents' | 'skills', id: string): void {

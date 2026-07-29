@@ -1,19 +1,16 @@
 """deep-research compress — deterministic context compression / de-noising.
 
-GPT-Researcher compresses fetched context with a langchain EmbeddingsFilter
-before it hits the model, so a long page does not blow the token budget. We do
-the same job WITHOUT langchain and WITHOUT embeddings (embedding/vector rerank is
-a separate Phase-3 core-agent tool a stdlib subprocess cannot reach): chunk each
-fetched source, drop duplicate/boilerplate passages, score the rest against the
-sub-question by lexical overlap, and keep the most relevant chunks within a char
-budget. Calls no model, so the same input always yields the same selection.
+Chunk each fetched source, drop duplicate/boilerplate passages, score the rest
+against the sub-question by multilingual lexical overlap, and return the most
+relevant chunks within a hard character budget. The complete selection path
+lives in this stdlib-only script: it has no host-only tool, embedding, model, or
+network dependency, so the same input always yields the same result.
 
 Small-content shortcut (mirrors GPT-R skipping embedding for small inputs): when
 the total fetched text already fits the budget there is nothing to compress —
 sources pass through de-duplicated, unscored.
 
-stdlib only. Tokenization is English-centric (whitespace/word based); CJK text is
-treated coarsely — fine for the academic/web sources this engine targets.
+stdlib only. Latin-script words and CJK bigrams are both indexed.
 """
 
 from __future__ import annotations
@@ -34,11 +31,14 @@ MAX_SOURCE_CHARS = 100000     # cap a single fetched source before chunking
 MAX_TOTAL_INPUT_CHARS = 500000
 NEAR_DEDUP_SHINGLE_TOKENS = 8
 NEAR_DEDUP_BUCKET_STEP = 4
-
 _WORD_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z'\-]*", re.UNICODE)
+_CJK_RUN_RE = re.compile(
+    r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+",
+    re.UNICODE,
+)
 _WS_RE = re.compile(r"\s+")
 _PARA_RE = re.compile(r"\n\s*\n")
-_SENT_RE = re.compile(r"(?<=[.!?])\s+")
+_SENT_RE = re.compile(r"(?<=[.!?。！？；])\s*")
 
 _STOP = {
     "the", "and", "for", "with", "your", "you", "our", "are", "that", "this",
@@ -48,6 +48,10 @@ _STOP = {
     "than", "then", "there", "here", "when", "where", "about", "over", "more",
     "most", "some", "also", "may", "might", "been", "being", "does", "did",
     "a", "an", "of", "to", "in", "is", "it", "on", "by", "or", "be", "as", "at",
+}
+_CJK_STOP = {
+    "什么", "如何", "是否", "哪些", "这个", "那个", "可以", "需要", "以及",
+    "对于", "进行", "一个", "一种", "我们", "他们", "其中", "相关",
 }
 
 
@@ -59,21 +63,40 @@ def _norm(s: str) -> str:
 
 
 def tokenize(s: str) -> list:
-    """Content tokens: lowercased words, length >= 2, stopwords removed."""
-    return [w for w in (m.group(0).lower() for m in _WORD_RE.finditer(s or ""))
-            if len(w) >= 2 and w not in _STOP]
+    """Multilingual content tokens.
+
+    Latin-script terms keep their word shape; contiguous CJK text becomes
+    overlapping bigrams so queries such as ``中文压缩预算`` can match a source
+    without requiring whitespace segmentation or a third-party tokenizer.
+    """
+    normalized = unicodedata.normalize("NFKC", s or "")
+    terms = [
+        w for w in (m.group(0).lower() for m in _WORD_RE.finditer(normalized))
+        if len(w) >= 2 and w not in _STOP
+    ]
+    for match in _CJK_RUN_RE.finditer(normalized):
+        run = match.group(0)
+        if len(run) == 1:
+            terms.append(run)
+            continue
+        terms.extend(
+            token for token in (run[i:i + 2] for i in range(len(run) - 1))
+            if token not in _CJK_STOP
+        )
+    return terms
 
 
-def chunk_text(text: str) -> list:
+def chunk_text(text: str, max_chunk_chars: int = MAX_CHUNK_CHARS) -> list:
     """Split into passages: by blank-line paragraphs, further split by sentence
-    when a paragraph exceeds MAX_CHUNK_CHARS. Fragments below MIN_CHUNK_CHARS are
+    when a paragraph exceeds max_chunk_chars. Fragments below MIN_CHUNK_CHARS are
     dropped."""
+    max_chunk_chars = max(MIN_CHUNK_CHARS, min(int(max_chunk_chars), MAX_CHUNK_CHARS))
     chunks = []
     for para in _PARA_RE.split(text or ""):
         para = _WS_RE.sub(" ", para).strip()
         if not para:
             continue
-        if len(para) <= MAX_CHUNK_CHARS:
+        if len(para) <= max_chunk_chars:
             if len(para) >= MIN_CHUNK_CHARS:
                 chunks.append(para)
             continue
@@ -83,16 +106,16 @@ def chunk_text(text: str) -> list:
             sent = sent.strip()
             if not sent:
                 continue
-            if buf and len(buf) + 1 + len(sent) > MAX_CHUNK_CHARS:
+            if buf and len(buf) + 1 + len(sent) > max_chunk_chars:
                 if len(buf) >= MIN_CHUNK_CHARS:
                     chunks.append(buf)
                 buf = sent
             else:
                 buf = (buf + " " + sent) if buf else sent
             # A single sentence longer than the cap is hard-split on width.
-            while len(buf) > MAX_CHUNK_CHARS:
-                chunks.append(buf[:MAX_CHUNK_CHARS])
-                buf = buf[MAX_CHUNK_CHARS:]
+            while len(buf) > max_chunk_chars:
+                chunks.append(buf[:max_chunk_chars])
+                buf = buf[max_chunk_chars:]
         if len(buf) >= MIN_CHUNK_CHARS:
             chunks.append(buf)
     return chunks
@@ -181,6 +204,35 @@ def _text_of(src: dict) -> str:
     return value if isinstance(value, str) else str(value)
 
 
+def _bounded_int(value, default: int, lower: int, upper: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lower, min(parsed, upper))
+
+
+def _select_with_budget(records: list, budget: int, max_per_source=None) -> list:
+    """Select whole records without ever crossing the hard output budget."""
+    kept = []
+    used = 0
+    per_source = {}
+    source_cap = None if max_per_source is None else max(0, int(max_per_source))
+    for record in records:
+        source = record.get("source")
+        if source_cap is not None and per_source.get(source, 0) >= source_cap:
+            continue
+        size = len(record.get("chunk") or record.get("text") or "")
+        if size <= 0 or used + size > budget:
+            continue
+        kept.append(record)
+        used += size
+        per_source[source] = per_source.get(source, 0) + 1
+    return kept
+
+
 def _limit_sources(sources: list) -> tuple:
     """Return capped source copies plus stats about discarded input."""
     valid = 0
@@ -234,23 +286,25 @@ def compress(payload: dict) -> dict:
     query = payload.get("query") or ""
     original_sources = payload.get("sources") or []
     sources, source_stats = _limit_sources(original_sources)
-    budget = int(payload.get("max_chars") or DEFAULT_MAX_CHARS)
+    budget = _bounded_int(payload.get("max_chars"), DEFAULT_MAX_CHARS, 0, MAX_TOTAL_INPUT_CHARS)
     max_per_source = payload.get("max_per_source")
     min_score = float(payload.get("min_score") or 0.0)
 
     chars_in = sum(len(_text_of(s)) for s in sources if isinstance(s, dict))
     query_terms = set(tokenize(query))
 
-    # Small-content / no-query shortcut: nothing to gain from scoring, just emit
-    # whole sources (de-duplicated) so the caller still gets clean, keyed context.
-    skip = chars_in <= SMALL_CONTENT_CHARS or not query_terms
+    # Only bypass chunking when the whole input already fits BOTH the small-input
+    # threshold and the caller's hard output budget. An empty/CJK query must never
+    # bypass the budget.
+    skip = chars_in <= SMALL_CONTENT_CHARS and chars_in <= budget
     records = []
     for s in sources:
         if not isinstance(s, dict):
             continue
         text = _text_of(s)
         meta = {"source": s.get("id"), "url": s.get("url"), "title": s.get("title")}
-        pieces = [text.strip()] if skip else chunk_text(text)
+        chunk_cap = max(MIN_CHUNK_CHARS, min(MAX_CHUNK_CHARS, budget or MAX_CHUNK_CHARS))
+        pieces = [text.strip()] if skip else chunk_text(text, chunk_cap)
         for i, piece in enumerate(pieces):
             if not piece:
                 continue
@@ -259,46 +313,57 @@ def compress(payload: dict) -> dict:
     records, deduped = _dedup(records)
 
     if skip:
-        kept = [{**r, "score": None} for r in records]
+        kept = [{**r, "score": None} for r in _select_with_budget(records, budget, max_per_source)]
         chars_out = sum(len(r["chunk"]) for r in kept)
         return _envelope(query, kept, sources, records, deduped, chars_in, chars_out,
                          budget, dropped_low=0, skipped=True, source_stats=source_stats)
 
-    # Score, drop zero/low-relevance noise, then rank for budget selection.
-    # Default threshold 0.0 keeps any chunk that shares >=1 content term and
-    # drops pure noise (coverage 0); a positive min_score raises the bar.
-    scored = []
+    if not query_terms:
+        # No lexical query is available, so preserve stable source order but
+        # still chunk and enforce the hard budget. Calling this "skipped
+        # compression" would be incorrect: large input was bounded here.
+        selected = _select_with_budget(records, budget, max_per_source)
+        kept = [{**r, "score": None} for r in selected]
+        chars_out = sum(len(r["chunk"]) for r in kept)
+        return _envelope(
+            query, kept, sources, records, deduped, chars_in, chars_out,
+            budget, dropped_low=0, skipped=False, source_stats=source_stats,
+            skipped_scoring=True)
+
+    # Score every record before applying the relevance threshold.
+    scored_all = []
     for r in records:
         cov, dens = _score(query_terms, tokenize(r["chunk"]))
-        if cov <= min_score:
-            continue
-        scored.append({**r, "score": cov, "_density": dens})
+        scored_all.append({**r, "score": cov, "_density": dens})
+    scored_all.sort(
+        key=lambda r: (-r["score"], -r["_density"], str(r["source"]), r["chunk_index"]))
+
+    # Drop zero/low-relevance noise, then select under budget.
+    # Default threshold 0.0 keeps any chunk that shares >=1 content term and
+    # drops pure noise (coverage 0); a positive min_score raises the bar.
+    scored = [r for r in scored_all if r["score"] > min_score]
     dropped_low = len(records) - len(scored)
 
-    # Stable ranking: relevance first, then original source/chunk order.
-    scored.sort(key=lambda r: (-r["score"], -r["_density"], str(r["source"]), r["chunk_index"]))
-
-    kept = []
-    used = 0
-    per_source = {}
-    for r in scored:
-        if max_per_source is not None:
-            c = per_source.get(r["source"], 0)
-            if c >= int(max_per_source):
-                continue
-        if used + len(r["chunk"]) > budget and kept:
-            continue          # over budget — skip, but keep scanning smaller chunks
-        used += len(r["chunk"])
-        per_source[r["source"]] = per_source.get(r["source"], 0) + 1
-        kept.append({"source": r["source"], "url": r["url"], "title": r["title"],
-                     "chunk": r["chunk"], "chunk_index": r["chunk_index"], "score": r["score"]})
+    selected = _select_with_budget(scored, budget, max_per_source)
+    kept = [
+        {
+            "source": r["source"],
+            "url": r["url"],
+            "title": r["title"],
+            "chunk": r["chunk"],
+            "chunk_index": r["chunk_index"],
+            "score": r["score"],
+        }
+        for r in selected
+    ]
+    used = sum(len(r["chunk"]) for r in kept)
 
     return _envelope(query, kept, sources, records, deduped, chars_in, used,
                      budget, dropped_low=dropped_low, skipped=False, source_stats=source_stats)
 
 
 def _envelope(query, kept, sources, records, deduped, chars_in, chars_out,
-              budget, dropped_low, skipped, source_stats=None) -> dict:
+              budget, dropped_low, skipped, source_stats=None, skipped_scoring=False) -> dict:
     source_stats = source_stats or {}
     return {
         "query": query,
@@ -320,6 +385,7 @@ def _envelope(query, kept, sources, records, deduped, chars_in, chars_out,
             "deduped": deduped,
             "input_capped": source_stats.get("input_capped", False),
             "skipped_compression": skipped,
+            "skipped_scoring": skipped_scoring,
         },
     }
 

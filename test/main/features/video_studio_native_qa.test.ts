@@ -16,6 +16,7 @@ import {
   isCompositionRequestUrlAllowed,
   isWindowsNativeRuntimeIncompatible,
   lintComposition,
+  materializeVideoCover,
   preflightComposition,
   prepareComposition,
   previewArtifactPaths,
@@ -28,6 +29,7 @@ import {
   selectSafeFinalRenderFps,
   shouldNormalizeLoudness,
   transcribeSpeech,
+  videoCoverArtifactPath,
   withVideoStudioTimeout,
 } from '../../../src/main/features/video_studio';
 import {
@@ -50,6 +52,7 @@ import {
   buildInspectFrameSamplePlan,
   buildPreviewFrameSamplePlan,
   compareVisualBaseline,
+  compileVideoStudioDesignQualityScorecard,
   dedupeInspectIssues,
   isEnvironmentalDraftFailure,
   isSuspiciousCrossSceneDuplicate,
@@ -60,6 +63,7 @@ import {
   runContractHtmlQa,
   runAudioTimingQa,
   runSourceAlignmentQa,
+  assertVideoStudioDesignQualityVerdict,
   summarizeDraftInspectDisposition,
   summarizeVideoFrameQa,
   writeFrameContactSheet,
@@ -137,6 +141,7 @@ function writeSceneMap(compositionDir: string, overrides: Record<string, unknown
 }
 
 function completeArtDirection(sceneIds: string[] = ['cover']): Record<string, unknown> {
+  const sceneDuration = 10 / Math.max(sceneIds.length, 1);
   return {
     aesthetic: {
       subject_world: 'editorial launch surface with measured signal marks',
@@ -153,8 +158,18 @@ function completeArtDirection(sceneIds: string[] = ['cover']): Record<string, un
       motion_verb_rule: ['draw', 'align', 'resolve'],
       rhythm_pattern: 'quick hook, measured hold, clear payoff',
     },
-    scenes: sceneIds.map((id) => ({
+    cover: {
+      scene_id: sceneIds[0] || 'cover',
+      headline: 'Launch',
+      content_signals: ['launch subject', 'measured signal path'],
+      hero_visual: 'the launch subject locked to a measured signal path',
+      composition_strategy: 'large approved promise plus topic-specific hero in one readable thumbnail frame',
+      frame_time_sec: 0,
+    },
+    scenes: sceneIds.map((id, index) => ({
       id,
+      start: index * sceneDuration,
+      duration: sceneDuration,
       scene_world: 'editorial signal field',
       hero_visual: 'large readable title anchored by a measured signal path',
       depth_layers: ['quiet field', 'signal/title layer', 'measurement accents'],
@@ -166,6 +181,105 @@ function completeArtDirection(sceneIds: string[] = ['cover']): Record<string, un
     motion_budget: { rule: 'resolved frame first, then purposeful entrance motion' },
     scene_variation: { rule: 'vary focal mass and framing when multiple scenes exist' },
   };
+}
+
+const coverQaHeadline = 'Execution is cheap. Attention is not.';
+const coverQaSignals = ['compression queues', 'attention bottleneck'];
+
+function summarizeCoverHardGateFixture(options: {
+  headlineText?: string;
+  headlineRole?: string;
+  signals?: string[];
+  hero?: Record<string, unknown> | null;
+  extraElements?: Array<Record<string, unknown>>;
+  includeVisibleElements?: boolean;
+  language?: string;
+  approvedCopy?: string[];
+} = {}) {
+  const {
+    headlineText = coverQaHeadline,
+    headlineRole = 'title',
+    signals = coverQaSignals,
+    hero = {
+      role: 'visual',
+      cover_hero: true,
+      width_ratio: 0.4,
+      height_ratio: 0.3,
+      area_ratio: 0.12,
+    },
+    extraElements = [],
+    includeVisibleElements = true,
+    language = 'en',
+    approvedCopy = [coverQaHeadline, 'BETA'],
+  } = options;
+  const visibleElements: Array<Record<string, unknown>> = [
+    {
+      role: headlineRole,
+      text: headlineText,
+    },
+    ...signals.map((signal) => ({
+      role: 'visual',
+      cover_signal: signal,
+      width_ratio: 0.3,
+      height_ratio: 0.1,
+      area_ratio: 0.03,
+    })),
+    ...(hero ? [hero] : []),
+    ...extraElements,
+  ];
+
+  return summarizeVideoFrameQa({
+    evidence_dir: '/tmp/evidence',
+    contact_sheet: '/tmp/contact-sheet.svg',
+    frame_paths: ['/tmp/cover.png'],
+    samples: [
+      {
+        label: 'first-frame',
+        time_seconds: 0,
+        frame_index: 0,
+        path: '/tmp/cover.png',
+        hash: 'cover-hash',
+        brightness: 64,
+        contrast: 24,
+        width: 1920,
+        height: 1080,
+        expected_scene_id: 'cover',
+        visible_scene_ids: ['cover'],
+        visible_roles: ['title', 'visual'],
+        visible_text: headlineText,
+        ...(includeVisibleElements
+          ? {
+              visible_elements: visibleElements,
+            }
+          : {}),
+      },
+    ],
+  }, 10, {
+    sceneCount: 1,
+    expectedSceneIds: ['cover'],
+    requireSemanticCoverage: true,
+    designContract: {
+      cover: {
+        scene_id: 'cover',
+        headline: coverQaHeadline,
+        content_signals: coverQaSignals,
+        hero_visual: 'a flow resolving around the attention bottleneck',
+        composition_strategy: 'large promise plus explanatory flow',
+        frame_time_sec: 0,
+      },
+    },
+    sceneMap: {
+      canvas: {
+        language,
+      },
+      scenes: [
+        {
+          id: 'cover',
+          approved_copy: approvedCopy,
+        },
+      ],
+    },
+  });
 }
 
 function writeManifest(compositionDir: string, overrides: Record<string, unknown> = {}) {
@@ -284,12 +398,16 @@ describe('native VideoStudio draft QA parity', () => {
     expect(pendingOps).toContain('composition.materialize_narration');
     expect(pendingOps).toContain('composition.lint');
     expect(pendingOps).toContain('composition.inspect');
-    expect(pendingOps).not.toContain('composition.snapshot');
+    expect(pendingOps).toContain('composition.snapshot');
     expect(pendingOps).not.toContain('composition.draft');
     expect(pendingOps).not.toContain('composition.begin_visual_revision');
     expect(nextVideoProductionOps(state)).toContain('composition.materialize_narration');
     state.stage = 'draft_approved';
     expect(isVideoProductionOpAllowed(state, 'composition.inspect', {
+      narrationRequired: true,
+      narrationMaterialized: false,
+    })).toBe(true);
+    expect(isVideoProductionOpAllowed(state, 'composition.snapshot', {
       narrationRequired: true,
       narrationMaterialized: false,
     })).toBe(true);
@@ -554,7 +672,7 @@ describe('native VideoStudio draft QA parity', () => {
     expect((await readVideoProductionState(gatePath, p.compositionDir)).preview?.validation_version).toBe(2);
   });
 
-  it('migrates a legacy-tagged approval whose signature exactly matches current v3 inputs', async () => {
+  it('migrates a legacy-tagged approval whose signature exactly matches current authored inputs', async () => {
     const p = tmpProject('gate-v3-exact-signature-migration');
     writeHtml(p.compositionDir, 'Approved source', { duration: 60 });
     const gatePath = path.join(p.root, 'private-gate.json');
@@ -573,11 +691,48 @@ describe('native VideoStudio draft QA parity', () => {
     });
 
     await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
-      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 3 } });
+      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 5 } });
     expect((await readVideoProductionState(gatePath, p.compositionDir)).preview).toMatchObject({
       signature,
-      validation_version: 3,
+      validation_version: 5,
     });
+  });
+
+  it('migrates a current v4 preview before legacy outputs change during draft rendering', async () => {
+    const p = tmpProject('gate-v5-legacy-outputs-migration');
+    writeHtml(p.compositionDir, 'Approved source', { duration: 60 });
+    const outputsDir = path.join(p.compositionDir, 'outputs');
+    fs.mkdirSync(outputsDir, { recursive: true });
+    fs.writeFileSync(path.join(outputsDir, 'draft.mp4'), 'old runtime output', 'utf8');
+    const gatePath = path.join(p.root, 'private-gate.json');
+    const v4Signature = await videoStudioCompositionSignature(p.compositionDir, 4);
+    const v5Signature = await videoStudioCompositionSignature(p.compositionDir, 5);
+    expect(v4Signature).not.toBe(v5Signature);
+    await updateVideoProductionState(gatePath, p.compositionDir, (state) => {
+      state.stage = 'preview_approved';
+      state.preview = {
+        signature: v4Signature,
+        turn_id: 'turn-preview',
+        created_at: new Date().toISOString(),
+        status: 'approved',
+        approved_turn_id: 'turn-approve',
+        approved_at: new Date().toISOString(),
+        validation_version: 4,
+      };
+    });
+
+    await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
+      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 5 } });
+    expect((await readVideoProductionState(gatePath, p.compositionDir)).preview).toMatchObject({
+      signature: v5Signature,
+      validation_version: 5,
+    });
+
+    fs.writeFileSync(path.join(outputsDir, 'draft.mp4'), 'new runtime output', 'utf8');
+    fs.mkdirSync(path.join(outputsDir, 'draft-evidence'), { recursive: true });
+    fs.writeFileSync(path.join(outputsDir, 'draft-evidence', '01-first-frame.png'), 'frame');
+    await expect(validateVideoStudioGate(gatePath, 'preview', p.compositionDir, 'turn-draft'))
+      .resolves.toMatchObject({ ok: true, entry: { status: 'approved', validation_version: 5 } });
   });
 
   it('normalizes legacy start_s/duration_s once into the canonical manifest', async () => {
@@ -652,6 +807,173 @@ describe('native VideoStudio draft QA parity', () => {
       expect.objectContaining({ code: 'COMPOSITION_MANIFEST_SCENE_GAP' }),
       expect.objectContaining({ code: 'COMPOSITION_MANIFEST_AUDIO_PATH_INVALID' }),
     ]));
+  });
+
+  it('rejects English all-caps primary copy before plan approval while preserving one bounded metadata accent', async () => {
+    const rejectedProject = tmpProject('manifest-uppercase-primary');
+    writeManifest(rejectedProject.compositionDir, {
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: ['EXECUTION IS CHEAP. ATTENTION IS NOT.'],
+        narration_refs: [],
+        source_shots: [],
+        roles: ['title', 'visual'],
+      }],
+    });
+
+    const rejected = await ensureCompositionManifest(rejectedProject.compositionDir);
+
+    expect(rejected).toMatchObject({ ok: false, source: 'manifest', manifest: null });
+    expect(rejected.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'COMPOSITION_MANIFEST_PRIMARY_COPY_ALL_CAPS',
+        sceneId: 'cover',
+      }),
+    ]));
+
+    const acceptedProject = tmpProject('manifest-uppercase-accent');
+    writeManifest(acceptedProject.compositionDir, {
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: ['Execution is cheap. Attention is not.', 'BETA'],
+        narration_refs: [],
+        source_shots: [],
+        roles: ['title', 'label', 'visual'],
+      }],
+    });
+
+    await expect(ensureCompositionManifest(acceptedProject.compositionDir))
+      .resolves.toMatchObject({ ok: true, source: 'manifest' });
+  });
+
+  it.each([
+    {
+      name: 'single-word primary headline',
+      language: 'en',
+      approvedCopy: ['WRITE'],
+      roles: ['title', 'visual'],
+    },
+    {
+      name: 'multiple uppercase accents',
+      language: 'en',
+      approvedCopy: ['Execution is cheap. Attention is not.', 'BETA', 'ALPHA'],
+      roles: ['title', 'label', 'visual'],
+    },
+    {
+      name: 'regional English language code',
+      language: 'en-US',
+      approvedCopy: ['EXECUTION IS CHEAP. ATTENTION IS NOT.'],
+      roles: ['title', 'visual'],
+    },
+  ])('rejects $name in the canonical English manifest', async ({
+    name,
+    language,
+    approvedCopy,
+    roles,
+  }) => {
+    const project = tmpProject(`manifest-casing-reject-${name.replace(/\W+/g, '-')}`);
+    writeManifest(project.compositionDir, {
+      composition: {
+        id: 'main',
+        width: 1920,
+        height: 1080,
+        duration: 10,
+        fps: 30,
+        language,
+      },
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: approvedCopy,
+        narration_refs: [],
+        source_shots: [],
+        roles,
+      }],
+    });
+
+    const result = await ensureCompositionManifest(project.compositionDir);
+
+    expect(result).toMatchObject({
+      ok: false,
+      source: 'manifest',
+      manifest: null,
+    });
+    expect(result.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'COMPOSITION_MANIFEST_PRIMARY_COPY_ALL_CAPS',
+        sceneId: 'cover',
+      }),
+    ]));
+  });
+
+  it.each([
+    {
+      name: 'natural sentence case',
+      language: 'en',
+      approvedCopy: ['Execution is cheap. Attention is not.'],
+      roles: ['title', 'visual'],
+    },
+    {
+      name: 'short acronym in a primary role',
+      language: 'en',
+      approvedCopy: ['AI'],
+      roles: ['title', 'visual'],
+    },
+    {
+      name: 'short code in a primary role',
+      language: 'en',
+      approvedCopy: ['GPT-5'],
+      roles: ['title', 'visual'],
+    },
+    {
+      name: 'one bounded metadata accent',
+      language: 'en',
+      approvedCopy: ['Execution is cheap. Attention is not.', 'BETA'],
+      roles: ['title', 'label', 'visual'],
+    },
+    {
+      name: 'non-English copy containing a Latin acronym',
+      language: 'zh-CN',
+      approvedCopy: ['AI 驱动工作流'],
+      roles: ['title', 'visual'],
+    },
+  ])('preserves the allowed casing boundary for $name', async ({
+    name,
+    language,
+    approvedCopy,
+    roles,
+  }) => {
+    const project = tmpProject(`manifest-casing-accept-${name.replace(/\W+/g, '-')}`);
+    writeManifest(project.compositionDir, {
+      composition: {
+        id: 'main',
+        width: 1920,
+        height: 1080,
+        duration: 10,
+        fps: 30,
+        language,
+      },
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: approvedCopy,
+        narration_refs: [],
+        source_shots: [],
+        roles,
+      }],
+    });
+
+    await expect(ensureCompositionManifest(project.compositionDir))
+      .resolves.toMatchObject({
+        ok: true,
+        source: 'manifest',
+      });
   });
 
   it('creates the protected seekable scaffold and prepares the local GSAP vendor', async () => {
@@ -819,8 +1141,12 @@ describe('native VideoStudio draft QA parity', () => {
       height: 1,
     }]);
 
-    const svg = fs.readFileSync(out, 'utf8');
-    expect(out).toBe(path.join(evidenceDir, 'contact-sheet.svg'));
+    const svgPath = path.join(evidenceDir, 'contact-sheet.svg');
+    const svg = fs.readFileSync(svgPath, 'utf8');
+    expect(out).toBe(path.join(evidenceDir, 'contact-sheet.png'));
+    expect(fs.readFileSync(out).subarray(0, 8)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
     expect(svg).toContain('href="data:image/png;base64,');
     expect(svg).not.toContain('href="01-first-frame.png"');
   });
@@ -876,7 +1202,19 @@ describe('native VideoStudio draft QA parity', () => {
       errorCode: 'E_PREFLIGHT_BLOCKED',
       repair_budget: expect.objectContaining({ budget_exhausted: true, repair_passes_used: 2 }),
     });
-    expect(attempts[3]).toMatchObject({ ok: false, errorCode: 'E_REPAIR_BUDGET_EXCEEDED' });
+    expect(attempts[3]).toMatchObject({
+      ok: false,
+      errorCode: 'E_REPAIR_BUDGET_EXCEEDED',
+      blocked_operation: 'composition.draft',
+      same_input_retry_allowed: false,
+      requires_user_decision: false,
+      next_action: 'repair_inputs_then_retry_draft',
+      allowed_recovery_ops: expect.arrayContaining([
+        'composition.reconcile',
+        'composition.lint',
+        'composition.inspect',
+      ]),
+    });
     expect(fs.existsSync(path.join(p.compositionDir, 'qa', 'draft-repair-state.json'))).toBe(true);
   });
 
@@ -929,7 +1267,13 @@ describe('native VideoStudio draft QA parity', () => {
       outputAbsPath: p.outputPath,
       reportAbsPath: p.reportPath,
     });
-    expect(blocked).toMatchObject({ ok: false, errorCode: 'E_REPAIR_BUDGET_EXCEEDED' });
+    expect(blocked).toMatchObject({
+      ok: false,
+      errorCode: 'E_REPAIR_BUDGET_EXCEEDED',
+      requires_user_decision: false,
+      same_input_retry_allowed: false,
+      next_action: 'repair_inputs_then_retry_draft',
+    });
 
     // The user edits the composition — its source signature changes, so the
     // prior failures are stale and the budget must reset instead of staying
@@ -1173,6 +1517,14 @@ describe('native VideoStudio draft QA parity', () => {
         motion_verb_rule: ['gather', 'align', 'resolve'],
         rhythm_pattern: 'quick evidence gather, measured hold, final resolve',
       },
+      cover: {
+        scene_id: 'cover',
+        headline: 'Launch',
+        content_signals: ['launch subject', 'amber signal path'],
+        hero_visual: 'launch subject held against the signal path',
+        composition_strategy: 'approved headline and launch hero share one dominant frame',
+        frame_time_sec: 0,
+      },
       scenes: [{
         id: 'cover',
         start: 0,
@@ -1211,6 +1563,235 @@ describe('native VideoStudio draft QA parity', () => {
     expect(qa.issues).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'AESTHETIC_THESIS_INCOMPLETE' }),
     ]));
+  });
+
+  it('S3 blocks a composition whose frame-zero cover was never designed as a content contract', async () => {
+    const p = tmpProject('cover-contract');
+    writeHtml(p.compositionDir, 'Launch');
+    const art = completeArtDirection();
+    delete art.cover;
+    writeContract(p.compositionDir, art);
+    const qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      },
+      [],
+      await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null },
+      p.compositionDir,
+    );
+    expect(qa).toMatchObject({ ok: false });
+    expect(qa.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'COVER_CONTRACT_INCOMPLETE', severity: 'error' }),
+    ]));
+  });
+
+  it('S3 requires reference images to remain local, intent-bound, anchored, and scored', async () => {
+    const p = tmpProject('reference-fidelity-contract');
+    writeHtml(p.compositionDir, 'Launch');
+    const art = completeArtDirection();
+    art.references = [{
+      id: 'source-image',
+      media_type: 'image',
+      path: 'assets/references/source.png',
+      intent: 'reproduce',
+      intent_basis: 'user',
+      roles: ['composition', 'content', 'style'],
+      required: true,
+      preserve: ['composition', 'typography', 'palette', 'geometry'],
+      may_change: ['copy', 'timing'],
+      target_scene_ids: ['cover'],
+    }];
+    writeContract(p.compositionDir, art);
+    let qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'REFERENCE_FIDELITY_CONTRACT_INCOMPLETE', severity: 'error' }),
+    ]));
+
+    fs.mkdirSync(path.join(p.compositionDir, 'assets', 'references'), { recursive: true });
+    fs.writeFileSync(path.join(p.compositionDir, 'assets', 'references', 'source.png'), 'reference');
+    art.reference_fidelity = {
+      mode: 'exact',
+      preserve: ['composition', 'typography', 'palette', 'geometry'],
+      may_change: ['copy', 'timing'],
+      layout_anchors: [{ id: 'hero', role: 'hero', bounds: { x: 0.08, y: 0.12, width: 0.5, height: 0.7 } }],
+      verification: { minimum_score: 90, compare_frames: ['first-frame'] },
+    };
+    writeContract(p.compositionDir, art);
+    qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa).toMatchObject({ ok: true, error_count: 0 });
+    expect(qa.issues).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'REFERENCE_FIDELITY_CONTRACT_INCOMPLETE' }),
+      expect.objectContaining({ code: 'REFERENCE_FIDELITY_ASSET_MISSING' }),
+    ]));
+  });
+
+  it('S3 defaults an unspecified reference intent to guide and validates any declared basis', async () => {
+    const p = tmpProject('reference-intent-default');
+    writeHtml(p.compositionDir, 'Launch');
+    fs.mkdirSync(path.join(p.compositionDir, 'assets', 'references'), { recursive: true });
+    fs.writeFileSync(path.join(p.compositionDir, 'assets', 'references', 'look.png'), 'reference');
+    const art = completeArtDirection();
+    art.references = [{
+      id: 'look',
+      media_type: 'image',
+      path: 'assets/references/look.png',
+      roles: ['style'],
+      required: false,
+      preserve: ['palette'],
+      may_change: ['content', 'layout'],
+      target_scene_ids: ['cover'],
+    }];
+    art.reference_fidelity = {
+      mode: 'close',
+      preserve: ['palette'],
+      may_change: ['content', 'layout'],
+      layout_anchors: [],
+      verification: { minimum_score: 75, compare_frames: ['first-frame'] },
+    };
+    writeContract(p.compositionDir, art);
+    let qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa).toMatchObject({ ok: true, error_count: 0 });
+
+    (art.references as Array<Record<string, unknown>>)[0].intent_basis = 'file-origin';
+    writeContract(p.compositionDir, art);
+    qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'REFERENCE_MEDIA_CONTRACT_INVALID', severity: 'error' }),
+    ]));
+  });
+
+  it('S3 gives reference video the same contract plus temporal anchors', async () => {
+    const p = tmpProject('reference-video-contract');
+    writeHtml(p.compositionDir, 'Launch');
+    fs.mkdirSync(path.join(p.compositionDir, 'assets', 'references'), { recursive: true });
+    fs.writeFileSync(path.join(p.compositionDir, 'assets', 'references', 'source.mp4'), 'reference-video');
+    const art = completeArtDirection();
+    art.references = [{
+      id: 'source-video',
+      media_type: 'video',
+      path: 'assets/references/source.mp4',
+      intent: 'edit',
+      intent_basis: 'user',
+      roles: ['content', 'motion', 'timing'],
+      required: true,
+      preserve: ['subject', 'camera path', 'beat timing'],
+      may_change: ['copy'],
+      target_scene_ids: ['cover'],
+    }];
+    art.reference_fidelity = {
+      mode: 'close',
+      preserve: ['subject', 'camera path', 'beat timing'],
+      may_change: ['copy'],
+      layout_anchors: [],
+      verification: { minimum_score: 82, compare_frames: ['first-frame', 'payoff'] },
+    };
+    writeContract(p.compositionDir, art);
+    let qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: 'REFERENCE_VIDEO_TEMPORAL_ANCHORS_REQUIRED', severity: 'error' }),
+    ]));
+
+    (art.references as Array<Record<string, unknown>>)[0].temporal_anchors = [{
+      source_start_sec: 0,
+      source_end_sec: 4,
+      target_scene_id: 'cover',
+    }];
+    writeContract(p.compositionDir, art);
+    qa = await runContractHtmlQa(
+      {
+        htmlPath: path.join(p.compositionDir, 'index.html'),
+        html: fs.readFileSync(path.join(p.compositionDir, 'index.html'), 'utf8'),
+        rootAttrs: {}, id: 'main', width: 1920, height: 1080, durationSec: 10, audioTracks: [],
+      }, [], await loadDesignContract(p.compositionDir),
+      { path: path.join(p.compositionDir, 'scene-map.json'), exists: false, value: null }, p.compositionDir,
+    );
+    expect(qa).toMatchObject({ ok: true, error_count: 0 });
+  });
+
+  it('scores cover communication and enforces the declared reference-fidelity floor', () => {
+    const scores = compileVideoStudioDesignQualityScorecard({
+      content_alignment: 92,
+      cover_communication: 90,
+      hierarchy: 88,
+      text_legibility: 94,
+      motion_readiness: 86,
+      specificity: 87,
+      reference_fidelity: 82,
+    }, true);
+    expect(scores).toMatchObject({ cover_communication: 90, reference_fidelity: 82 });
+    expect(() => assertVideoStudioDesignQualityVerdict('passed', [], scores, 90))
+      .toThrow('E_REFERENCE_FIDELITY_BELOW_FLOOR');
+    expect(() => assertVideoStudioDesignQualityVerdict('passed', [], { ...scores, reference_fidelity: 92 }, 90))
+      .not.toThrow();
+  });
+
+  it('derives a stable dedicated cover path beside the rendered video', () => {
+    expect(videoCoverArtifactPath('/tmp/project/final.mp4')).toBe(path.resolve('/tmp/project/final-cover.png'));
+    expect(videoCoverArtifactPath('/tmp/project/final')).toBe(path.resolve('/tmp/project/final-cover.png'));
+  });
+
+  it('materializes the QA-approved first frame as the dedicated cover artifact', async () => {
+    const p = tmpProject('cover-artifact');
+    const renderedVideo = path.join(p.renderDir, 'final.mp4');
+    const firstFrame = path.join(p.renderDir, 'evidence', 'first-frame.png');
+    fs.mkdirSync(path.dirname(firstFrame), { recursive: true });
+    fs.writeFileSync(firstFrame, 'approved-cover-frame');
+    const cover = await materializeVideoCover(renderedVideo, {
+      evidence_dir: path.dirname(firstFrame),
+      contact_sheet: '',
+      frame_paths: [firstFrame],
+      samples: [{
+        label: 'first-frame',
+        time_seconds: 0,
+        frame_index: 0,
+        path: firstFrame,
+        hash: 'frame-hash',
+        brightness: 0.5,
+        contrast: 0.5,
+        width: 1920,
+        height: 1080,
+      }],
+    });
+    expect(cover).toMatchObject({ path: videoCoverArtifactPath(renderedVideo), source_frame: firstFrame, label: 'first-frame' });
+    expect(fs.readFileSync(cover.path, 'utf8')).toBe('approved-cover-frame');
   });
 
   it('S3 reads scene art direction when scenes are keyed by id', async () => {
@@ -1771,6 +2352,85 @@ describe('native VideoStudio draft QA parity', () => {
     });
   });
 
+  it('S2 resolves uniquely owned source aliases to their approved semantic shot ids', async () => {
+    const result = await runSourceAlignmentQa({
+      path: '/tmp/composition-manifest.json',
+      exists: true,
+      value: {
+        scenes: [
+          { id: 'hook', source_shots: ['s01'] },
+          { id: 'payoff', source_shots: ['s02'] },
+        ],
+      },
+    }, {
+      path: '/tmp/shotlist.json',
+      exists: true,
+      value: {
+        shots: [
+          { id: 'hook', source_shots: ['s01'] },
+          { id: 'payoff', source_shots: ['s02'] },
+        ],
+        source_shots: [
+          { id: 's01', provenance: 'self-authored HTML/CSS/SVG' },
+          { id: 's02', provenance: 'self-authored HTML/CSS/SVG' },
+        ],
+      },
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      mapped_source_ref_count: 2,
+      mapped_source_shot_count: 2,
+      resolved_source_alias_count: 2,
+      resolved_source_aliases: {
+        s01: 'hook',
+        s02: 'payoff',
+      },
+      error_count: 0,
+    });
+  });
+
+  it('S2 rejects source aliases that are unknown or owned by multiple approved shots', async () => {
+    const shotlist = {
+      path: '/tmp/shotlist.json',
+      exists: true,
+      value: {
+        shots: [
+          { id: 'hook', source_shots: ['shared'] },
+          { id: 'payoff', source_shots: ['shared'] },
+        ],
+      },
+    };
+    const ambiguous = await runSourceAlignmentQa({
+      path: '/tmp/composition-manifest.json',
+      exists: true,
+      value: { scenes: [{ id: 'hook', source_shots: ['shared'] }] },
+    }, shotlist);
+    expect(ambiguous).toMatchObject({
+      ok: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'SOURCE_SHOT_REFERENCE_AMBIGUOUS',
+          message: expect.stringContaining('shared -> hook|payoff'),
+        }),
+      ]),
+    });
+
+    const unknown = await runSourceAlignmentQa({
+      path: '/tmp/composition-manifest.json',
+      exists: true,
+      value: { scenes: [{ id: 'hook', source_shots: ['missing-alias'] }] },
+    }, shotlist);
+    expect(unknown).toMatchObject({
+      ok: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'SOURCE_SHOT_REFERENCE_UNKNOWN',
+          message: expect.stringContaining('missing-alias'),
+        }),
+      ]),
+    });
+  });
+
   it('S1/S2 blocks declared composition narration that would render silent', async () => {
     const p = tmpProject('silent-narration');
     writeHtml(p.compositionDir, 'Launch');
@@ -1811,6 +2471,53 @@ describe('native VideoStudio draft QA parity', () => {
       }],
       audio: { owner: 'none', tracks: [] },
     });
+    fs.writeFileSync(path.join(p.compositionDir, '..', 'shotlist.json'), JSON.stringify({
+      target_duration_seconds: 10,
+      video_language: 'en',
+      audio_mode: 'narration',
+      caption_mode: 'none',
+      music_mode: 'none',
+      shots: [],
+    }), 'utf8');
+
+    const visualPreflight = await preflightComposition(
+      { compositionDirAbs: p.compositionDir },
+      'visual-preview',
+    );
+    expect(visualPreflight).toMatchObject({
+      ok: true,
+      report: {
+        status: 'passed',
+        profile: 'visual-preview',
+        completeness: 'visual_only',
+        blocking_error_count: 0,
+        deferred_delivery_error_count: 2,
+        next_allowed_ops: expect.arrayContaining([
+          'composition.inspect',
+          'composition.snapshot',
+          'composition.materialize_narration',
+        ]),
+      },
+      issues: expect.arrayContaining([expect.objectContaining({
+        code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED',
+        severity: 'warning',
+      }), expect.objectContaining({
+        code: 'DELIVERY_NARRATION_MISSING',
+        severity: 'warning',
+      })]),
+    });
+    const lint = await lintComposition({ compositionDirAbs: p.compositionDir });
+    expect(lint).toMatchObject({
+      ok: true,
+      preview_completeness: 'visual_only',
+      narration_pending: true,
+      next_allowed_ops: expect.arrayContaining([
+        'composition.inspect',
+        'composition.snapshot',
+        'composition.materialize_narration',
+      ]),
+    });
+    expect(lint.next_allowed_ops).not.toContain('composition.draft');
 
     const res = await draftComposition({
       compositionDirAbs: p.compositionDir,
@@ -1822,13 +2529,81 @@ describe('native VideoStudio draft QA parity', () => {
       ok: false,
       errorCode: 'E_PREFLIGHT_BLOCKED',
       preflight: expect.objectContaining({
+        completeness: 'visual_only',
+        next_allowed_ops: expect.arrayContaining([
+          'composition.materialize_narration',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ]),
         issues: expect.arrayContaining([expect.objectContaining({
           code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED',
           severity: 'error',
+        }), expect.objectContaining({
+          code: 'DELIVERY_NARRATION_MISSING',
+          severity: 'error',
         })]),
       }),
+      next_allowed_ops: expect.arrayContaining([
+        'composition.materialize_narration',
+        'composition.lint',
+        'composition.inspect',
+        'composition.snapshot',
+      ]),
     });
     expect(fs.existsSync(p.outputPath)).toBe(false);
+  });
+
+  it('keeps non-audio structural defects blocking in the visual-preview profile', async () => {
+    const p = tmpProject('pending-narration-with-missing-copy');
+    writeHtml(p.compositionDir, 'Wrong visible copy');
+    writeManifest(p.compositionDir, {
+      scenes: [{
+        id: 'cover',
+        start: 0,
+        duration: 10,
+        approved_copy: ['Launch'],
+        narration_refs: ['n1'],
+        narration_text: 'Launch narration.',
+        source_shots: [],
+        roles: ['title', 'visual'],
+      }],
+      audio: { owner: 'none', tracks: [] },
+    });
+
+    const visualPreflight = await preflightComposition(
+      { compositionDirAbs: p.compositionDir },
+      'visual-preview',
+    );
+    expect(visualPreflight).toMatchObject({
+      ok: false,
+      report: {
+        status: 'failed',
+        profile: 'visual-preview',
+        blocking_error_count: 1,
+        completeness: 'visual_only',
+      },
+      issues: expect.arrayContaining([
+        expect.objectContaining({
+          code: 'NARRATION_REQUIRED_BUT_NOT_MATERIALIZED',
+          severity: 'warning',
+        }),
+        expect.objectContaining({
+          code: 'HTML_MISSING_SCENE_COPY',
+          severity: 'error',
+        }),
+      ]),
+    });
+    const lint = await lintComposition({ compositionDirAbs: p.compositionDir });
+    expect(lint).toMatchObject({
+      ok: false,
+      errorCode: 'E_PREFLIGHT_BLOCKED',
+      blocking_error_count: 1,
+      next_allowed_ops: expect.arrayContaining([
+        'composition.prepare',
+        'composition.materialize_narration',
+      ]),
+    });
   });
 
   it('keeps explicitly silent compositions eligible for visual QA', async () => {

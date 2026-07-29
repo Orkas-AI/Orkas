@@ -91,7 +91,7 @@ describe('task completion notifications', () => {
     expect(clickListener).toBeTypeOf('function');
     clickListener!();
     expect(setBadgeCount).toHaveBeenLastCalledWith(0);
-    expect(openConversation).toHaveBeenCalledWith('c1', status);
+    expect(openConversation).toHaveBeenCalledWith('c1', status, 'u1');
   });
 
   it('suppresses disabled, foreground, unsupported, cancelled, and other-user events', () => {
@@ -128,6 +128,18 @@ describe('task completion notifications', () => {
     clickListener!();
 
     expect(openConversation).not.toHaveBeenCalled();
+    expect(setBadgeCount).toHaveBeenLastCalledWith(1);
+  });
+
+  it('rolls back the badge when the native notification cannot be created', () => {
+    createNotification.mockImplementationOnce(() => {
+      throw new Error('native notification unavailable');
+    });
+
+    expect(() => listener(terminal('completed'))).not.toThrow();
+    expect(setBadgeCount.mock.calls.map(([count]) => count)).toEqual([0, 1, 0]);
+
+    listener({ ...terminal('failed'), run_id: 'run-2' });
     expect(setBadgeCount).toHaveBeenLastCalledWith(1);
   });
 

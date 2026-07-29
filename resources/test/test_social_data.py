@@ -145,6 +145,26 @@ def test_command_helpers_and_external_failures_are_fail_closed(monkeypatch):
         assert fetch_core._youtube_fetch_comments("https://example.test") == []
 
 
+def test_xreach_uses_pinned_npx_fallback_when_cli_is_not_installed(monkeypatch):
+    monkeypatch.delenv("ORKAS_BUNDLED_NODE", raising=False)
+    monkeypatch.setattr(
+        fetch_core.shutil,
+        "which",
+        lambda name: "/runtime/bin/npx" if name == "npx" else None,
+    )
+
+    assert fetch_core.xreach_cmd("topic", 3) == [
+        "/runtime/bin/npx",
+        "--yes",
+        "xreach-cli@0.3.3",
+        "search",
+        "topic",
+        "--json",
+        "-n",
+        "3",
+    ]
+
+
 def test_diagnostics_accumulate_errors_and_details():
     diag = fetch_core.make_diag("Test")
     fetch_core.add_diag(diag, status="error", errors="first", detail={"attempt": 1})

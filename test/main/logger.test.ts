@@ -67,6 +67,7 @@ describe('logger › redact', () => {
       relPath: 'cloud/contexts/private/customer-plan.md',
       user_id: 'ABCDEF1234567890',
       session_id: 'session-secret-value',
+      cid: 'conversation-secret-value',
     }) as any;
     expect(out.url).toBe('https://example.test/oauth/callback?code=***&state=***&ok=1');
     expect(out.note).toBe('contact a***@example.com phone 138****8000');
@@ -76,6 +77,7 @@ describe('logger › redact', () => {
     expect(JSON.stringify(out)).not.toContain('customer-plan.md');
     expect(out.user_id).toBe('ABCD...7890');
     expect(out.session_id).toBe('***REDACTED***');
+    expect(out.cid).toBe('***REDACTED***');
   });
 
   it('masks PII field names (phone / mobile / email / username) but leaves name passthrough', async () => {
@@ -212,5 +214,26 @@ describe('logger › createLogger / logFromRenderer', () => {
     expect(() => logFromRenderer({} as any)).not.toThrow();
     expect(() => logFromRenderer({ level: 'bogus', module: 'x', message: 'hi' } as any)).not.toThrow();
     expect(() => logFromRenderer(undefined as any)).not.toThrow();
+  });
+});
+
+describe('logger › console pipe safety', () => {
+  it('swallows EPIPE and disables further console transport writes', async () => {
+    const { writeConsoleSafely } = await import('../../src/main/logger');
+    const disable = vi.fn();
+    const brokenWrite = vi.fn(() => {
+      throw Object.assign(new Error('broken pipe'), { code: 'EPIPE' });
+    });
+
+    expect(() => writeConsoleSafely(brokenWrite, ['message'], disable)).not.toThrow();
+    expect(brokenWrite).toHaveBeenCalledWith('message');
+    expect(disable).toHaveBeenCalledOnce();
+  });
+
+  it('does not hide non-EPIPE console failures', async () => {
+    const { writeConsoleSafely } = await import('../../src/main/logger');
+    const failure = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+
+    expect(() => writeConsoleSafely(() => { throw failure; }, [])).toThrow(failure);
   });
 });

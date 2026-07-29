@@ -55,7 +55,7 @@ describe('open-source VideoStudio resources', () => {
     expect(gateControl).toMatch(/One user decision may produce at most one follow-up authorization form/i);
     expect(standards).toMatch(/read gate-control and run its bundled transition resolver/i);
     expect(standards).toMatch(/single authorization source across COMPOSE, AUTO, GENERATE, and EDIT/i);
-    expect(standards).toMatch(/composition\.begin_visual_revision is internal and may run only when the resolver returns it/i);
+    expect(standards).toMatch(/composition\.begin_visual_revision runs internally when the resolver reports recovery available/i);
   });
 
   it('resolves post-gate authorization traces without duplicate recovery forms', () => {

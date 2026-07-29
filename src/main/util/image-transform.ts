@@ -61,6 +61,19 @@ function loadJimp(): Promise<any> {
   return _jimpPromise;
 }
 
+function flattenAlphaOnWhite(Jimp: any, img: any): { image: any; flattened: boolean } {
+  if (typeof img.hasAlpha !== 'function' || !img.hasAlpha()) {
+    return { image: img, flattened: false };
+  }
+  const background: any = new Jimp({
+    width: img.bitmap.width,
+    height: img.bitmap.height,
+    color: 0xFFFFFFFF,
+  });
+  background.composite(img, 0, 0);
+  return { image: background, flattened: true };
+}
+
 export async function toCompressedGrayJpeg(
   buf: Buffer,
   opts: ImageTransformOpts = {},
@@ -73,7 +86,13 @@ export async function toCompressedGrayJpeg(
   const grayscale = opts.grayscale !== false;
 
   const Jimp: any = await loadJimp();
-  const img: any = await Jimp.read(buf);
+  let img: any = await Jimp.read(buf);
+
+  // JPEG has no alpha channel. Encoding a transparent PNG/WebP directly lets
+  // the codec replace transparent pixels with black, which can hide the common
+  // case of black text drawn on a transparent canvas. Flatten onto white first
+  // so the model sees the same document-like image users see in the UI.
+  img = flattenAlphaOnWhite(Jimp, img).image;
 
   // Only downscale if either dim exceeds maxDim. scaleToFit preserves aspect.
   if (img.bitmap.width > maxDim || img.bitmap.height > maxDim) {
@@ -87,6 +106,33 @@ export async function toCompressedGrayJpeg(
     mimeType: 'image/jpeg',
     width: img.bitmap.width,
     height: img.bitmap.height,
+  };
+}
+
+/**
+ * OCR engines commonly discard an alpha channel without compositing it,
+ * turning transparent black-text documents into solid black images. Return a
+ * white-backed JPEG only when the source actually contains transparency;
+ * opaque inputs return null so callers avoid an unnecessary re-encode.
+ */
+export async function flattenTransparentImageToJpeg(
+  buf: Buffer,
+  opts: Pick<ImageTransformOpts, 'quality'> = {},
+): Promise<ImageTransformResult | null> {
+  if (!buf || !(buf instanceof Buffer) || buf.length === 0) {
+    throw new Error('flattenTransparentImageToJpeg: empty or invalid buffer');
+  }
+  const quality = Math.min(100, Math.max(1, opts.quality ?? 90));
+  const Jimp: any = await loadJimp();
+  const source: any = await Jimp.read(buf);
+  const flattened = flattenAlphaOnWhite(Jimp, source);
+  if (!flattened.flattened) return null;
+  const out: Buffer = await flattened.image.getBuffer('image/jpeg', { quality });
+  return {
+    buf: out,
+    mimeType: 'image/jpeg',
+    width: flattened.image.bitmap.width,
+    height: flattened.image.bitmap.height,
   };
 }
 

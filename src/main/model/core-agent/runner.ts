@@ -17,7 +17,9 @@
  * to the SDK's default-provider + env-var auth path.
  */
 
-import type { AgentTool, HistoryResource, LLMProvider, ToolContext, ToolResult } from '#core-agent';
+import type { AgentTool, HistoryResource, LLMProvider, Message, ToolContext, ToolResult } from '#core-agent';
+import type { Api, Model } from '@earendil-works/pi-ai';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
@@ -33,7 +35,13 @@ import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
-import { getSession, memoryScopeForSession, sessionKindOf, toolResultsDirForSession } from './session-store';
+import {
+  getSession,
+  getSessionForUser,
+  memoryScopeForSession,
+  sessionKindOf,
+  toolResultsDirForSession,
+} from './session-store';
 import {
   addEntry,
   replaceEntry,
@@ -45,7 +53,8 @@ import {
 import {
   formatProjectContextPolicyForSystemPrompt,
   formatProjectInstructionsForSystemPrompt,
-  writeProjectInstructions,
+  readProjectInstructions,
+  writeProjectInstructionsIfUnchanged,
 } from '../../features/projects';
 import * as projectTasks from '../../features/project_tasks';
 import * as metacognition from '../../features/metacognition';
@@ -53,13 +62,15 @@ import { appendAgentSkill, listAgents } from '../../features/agents';
 const log = createLogger('model/runner');
 import { createLocalTools, createFileTools } from './local-tools';
 import { createOfficeTools } from './office-tools';
+import { createPdfTools } from './pdf-tools';
 import { officeCliAvailable } from '../../features/office/office_engine';
 import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createVideoStudioTool } from './video-studio-tool';
-import { createResearchRerankTool } from './research-rerank-tool';
+import { createImageStudioTool } from './image-studio-tool';
 import { isToolVisibleToAgent } from './tool-catalog';
+import { shouldExposeOcrFileTool } from './ocr-tool-policy';
 import { createWebSearchOverrideTool } from './search-tools';
 import {
   agentEvolvedSkillsDir,
@@ -67,7 +78,7 @@ import {
   userMarketplaceAgentSkillsDir,
   userSystemSkillsDir,
 } from '../../paths';
-import { artifactDirForConversation } from '../../util/project-layout';
+import { artifactDirForConversation, chatAttachmentDirForConversation } from '../../util/project-layout';
 import {
   capToolResult,
   DEFAULT_INLINE_RESULT_TOKENS,
@@ -80,10 +91,16 @@ import {
   createMoonshotProvider,
   createDeepSeekProvider,
   createDoubaoProvider,
+  buildCustomOpenAICompatibleModel,
+  createCustomOpenAICompatibleProvider,
 } from './external-providers';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
-import { EXTERNAL_API_PROVIDERS, resolveConfiguredPiModel } from '../provider_catalog';
+import {
+  EXTERNAL_API_PROVIDERS,
+  resolveConfiguredPiModel,
+  modelInputImageLimit,
+} from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
 import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-tools';
 import { hasAnySearchProfile } from '../../features/search_auth';
@@ -94,12 +111,69 @@ import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-too
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
 
 const runnerLog = createLogger('runner');
+const CONTENT_WRITER_AGENT_ID = '173d4235a431';
+const CONTENT_WRITER_GATE_BUDGET_CODE = 'E_CONTENT_WRITER_GATE_BUDGET';
+const CONTENT_WRITER_BASH_SCOPE_CODE = 'E_CONTENT_WRITER_BASH_SCOPE';
+
+function contentWriterRunnerKind(command: string): 'research_gate' | 'audit_content' | null {
+  const trimmed = command.trim();
+  if (
+    !trimmed
+    || /(?:&&|\|\||[;|`]|\r|\n)/.test(trimmed)
+  ) {
+    return null;
+  }
+  const match = trimmed.match(
+    /^["']?\$ORKAS_NODE["']?\s+["']?\$ORKAS_PC_DIR[/\\]bin[/\\]run-skill\.cjs["']?\s+content-writer\s+(research_gate|audit_content)(?:\s|$)/i,
+  );
+  return match?.[1]?.toLowerCase() as 'research_gate' | 'audit_content' | undefined ?? null;
+}
+
+export function _createContentWriterBashGuard(bashTool: AgentTool): AgentTool {
+  let researchGateRuns = 0;
+  return {
+    ...bashTool,
+    description:
+      'ContentWriter deterministic runner only. Use exactly one documented '
+      + '`"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" content-writer '
+      + 'research_gate|audit_content ...` command. Arbitrary shell, retrieval, '
+      + 'parsing, inspection, and command chaining are unavailable.',
+    async execute(input, context) {
+      const command = String((input as any)?.command || (input as any)?.cmd || '');
+      const runnerKind = contentWriterRunnerKind(command);
+      if (!runnerKind) {
+        return {
+          content:
+            `${CONTENT_WRITER_BASH_SCOPE_CODE}: ContentWriter bash is limited to the documented `
+            + 'research_gate and audit_content Skill Runner commands. Do not retry or use shell '
+            + 'for retrieval, parsing, inspection, or recovery; continue with the available '
+            + 'evidence and deliver the visible result now.',
+          isError: false,
+        };
+      }
+      if (runnerKind === 'research_gate' && researchGateRuns >= 2) {
+        return {
+          content:
+            `${CONTENT_WRITER_GATE_BUDGET_CODE}: the two allowed ContentWriter research gates have already run. `
+            + 'Use the last gate result and deliver explicit gaps/HOLD when incomplete.',
+          isError: true,
+        };
+      }
+      if (runnerKind === 'research_gate') researchGateRuns += 1;
+      return bashTool.execute(input, context);
+    },
+  };
+}
 
 function isNativeSearchEnabled(): boolean {
   return true;
 }
 
-function buildExternalProviderModel(providerId: string, modelId: string): { contextWindow?: number; maxTokens?: number } | null {
+function buildExternalProviderModel(
+  providerId: string,
+  modelId: string,
+  customConfig?: ChatEntryChoice['customConfig'],
+): Model<Api> | null {
   switch (providerId) {
     case 'moonshot':
       return buildMoonshotModel(modelId);
@@ -107,6 +181,8 @@ function buildExternalProviderModel(providerId: string, modelId: string): { cont
       return buildDeepSeekModel(modelId);
     case 'doubao':
       return buildDoubaoModel(modelId);
+    case 'custom':
+      return customConfig ? buildCustomOpenAICompatibleModel(modelId, customConfig) : null;
     default:
       return null;
   }
@@ -164,6 +240,17 @@ export interface BuildRunnerParams {
   sessionId: string;
   systemPrompt?: string;
   userId?: string;
+  /** Host-authoritative completed dialogue. Replaces the execution session's
+   * completed raw messages before a normal new turn. */
+  conversationHistory?: {
+    source: string;
+    messages: Message[];
+    replaceFromTurnId?: number;
+    checkpoint?: string;
+  };
+  /** Preserve a verified active execution turn verbatim instead of rebasing
+   * it from canonical completed dialogue. */
+  resumeActiveTurn?: boolean;
   /** Conversation id. Used by file-tools to scope read_file / search_file
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
@@ -174,6 +261,9 @@ export interface BuildRunnerParams {
   /** Current real user text, used by tools that must bind an approval action
    * to explicit user intent rather than merely to the existence of a turn. */
   userMessage?: string;
+  /** Current-turn attachment kinds. Tool exposure uses this metadata without
+   * inspecting attachment contents or eagerly running extraction. */
+  attachmentMetadata?: { hasAttachments?: boolean; attachmentTypes?: readonly string[] };
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Resolved once at
@@ -263,6 +353,32 @@ export interface NativeSearchInjectedInfo {
   model: string;
   api: string;
   tool: string;
+}
+
+function inputImageLimitForChoice(mod: CA, choice: ChatEntryChoice | undefined): number {
+  const providerId = choice?.provider || 'anthropic';
+  const modelId = choice?.model || 'claude-opus-4-8';
+  const model = EXTERNAL_API_PROVIDERS.includes(providerId)
+    ? buildExternalProviderModel(providerId, modelId, choice?.customConfig)
+    : resolveConfiguredPiModel(mod, providerId, modelId)?.model;
+  return modelInputImageLimit(providerId, modelId, model);
+}
+
+function conversationAttachmentNames(
+  userId: string,
+  cid: string | undefined,
+  projectId: string | undefined,
+): string[] {
+  if (!cid) return [];
+  try {
+    return fs.readdirSync(
+      chatAttachmentDirForConversation(userId, cid, projectId),
+      { withFileTypes: true },
+    ).filter((entry) => entry.isFile() && !entry.name.startsWith('.'))
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 /** Tool definition snapshot persisted to the dev-only LLM archive so the
@@ -411,7 +527,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const openSkillSourcesVisible = openSkillSourcesExposureFromSessionId(params.sessionId);
   const [mod, session, systemSkillsBlock, skillsBlock] = await Promise.all([
     ca(),
-    getSession(params.sessionId),
+    earlyUid ? getSessionForUser(earlyUid, params.sessionId) : getSession(params.sessionId),
     systemSkillsVisible ? getSystemSkillsPromptBlock(earlyUid || undefined) : Promise.resolve(''),
     getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
@@ -429,6 +545,23 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   const providerId = primary?.provider || 'anthropic';
   const modelId    = primary?.model    || 'claude-opus-4-8';
+
+  const preservingActiveTurn = !!params.resumeActiveTurn
+    && !!session.getSerializedContextState()?.activeTurn;
+  if (params.conversationHistory && !preservingActiveTurn) {
+    session.replaceConversationHistory(
+      params.conversationHistory.messages,
+      params.conversationHistory.source,
+      {
+        ...(params.conversationHistory.replaceFromTurnId !== undefined
+          ? { replaceFromTurnId: params.conversationHistory.replaceFromTurnId }
+          : {}),
+        ...(params.conversationHistory.checkpoint
+          ? { checkpoint: params.conversationHistory.checkpoint }
+          : {}),
+      },
+    );
+  }
 
   // Build tools array: memory tool + metacognition tool. Assembly stays
   // above the system-prompt build because finalToolNames is still snapshotted
@@ -560,20 +693,38 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // tool. Injected for the commander only, so there is no other write path.
     if (isCommander) {
       const { createProjectInstructionsTool } = await import('../../../core-agent/src/tools/project-instructions-tool');
+      const initialInstructions = await readProjectInstructions(uid, pid);
+      let expectedInstructions = initialInstructions.ok ? initialInstructions.content : null;
       injectedTools.push(createProjectInstructionsTool({
         set: async (instructions: string) => {
-          const r = await writeProjectInstructions(uid, pid, instructions);
-          return r.ok ? { ok: true } : { ok: false, error: (r as { error: string }).error };
+          if (expectedInstructions === null) return { ok: false, error: 'not_found' };
+          const r = await writeProjectInstructionsIfUnchanged(
+            uid,
+            pid,
+            expectedInstructions,
+            instructions,
+          );
+          if (r.ok) {
+            expectedInstructions = instructions;
+            return { ok: true };
+          }
+          const writeError = 'error' in r ? r.error : 'write_failed';
+          const error = writeError === 'conflict'
+            ? 'conflict: project instructions changed after this turn started; retry in a new turn with the latest content'
+            : writeError;
+          return { ok: false, error };
         },
       }));
     }
   }
 
-  // Metacognition tool (per-agent, only if enabled via env var)
-  if (isMetacognitionEnabled()) {
+  // Metacognition tool (per-agent/account, only if enabled for the turn's
+  // owner). Never resolve this through the active-user singleton: a queued
+  // turn or background reflection may overlap an account switch.
+  if (uid && metacognition.isFeatureEnabledForUser(uid)) {
     const metaHandler: MetacognitionToolHandler = {
-      read: (target) => metacognition.readContent(agentId, target),
-      write: (target, content) => metacognition.writeContent(agentId, target, content),
+      read: (target) => metacognition.readContentForUser(uid, agentId, target),
+      write: (target, content) => metacognition.writeContentForUser(uid, agentId, target, content),
     };
     const { createMetacognitionTool } = await import('../../../core-agent/src/tools/metacognition-tool');
     injectedTools.push(createMetacognitionTool(metaHandler, {
@@ -601,6 +752,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...agentPrivateSkillReadRoots,
   ];
   const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
+  const visionFallbackAvailable = inputImageLimitForChoice(mod, primary) > 0;
+  const includeOcrFile = !!uid && shouldExposeOcrFileTool({
+    agentId,
+    userMessage: params.userMessage,
+    attachmentTypes: params.attachmentMetadata?.attachmentTypes,
+    conversationAttachmentNames: conversationAttachmentNames(uid, params.cid, params.projectId),
+    visionAvailable: visionFallbackAvailable,
+  });
   const localReadOnlyDenyRoots = [
     ...fileReadOnlyExtraRoots,
     ...(toolResultsDir ? [toolResultsDir] : []),
@@ -634,6 +793,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const fileTools = uid
     ? createFileTools({
         userId: uid,
+        includeOcrFile,
+        visionFallbackAvailable,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(agentId ? { agentId } : {}),
         ...(agentName ? { agentName } : {}),
@@ -705,13 +866,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       })]
     : [];
 
-  // Deep-research-owned tools (ownerAgent gate). Pure local compute (embedding
-  // + ranking), so no uid / workspace scope and no Tool Execution Access needed;
-  // hidden from the commander and every other actor via isToolVisibleToAgent.
-  const deepResearchTools: AgentTool[] = [];
-  if (isToolVisibleToAgent('research_rerank', agentId)) {
-    deepResearchTools.push(createResearchRerankTool());
-  }
+  const imageStudioTools: AgentTool[] = uid
+    ? [createImageStudioTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
 
   // Office document tools (bundled OfficeCLI engine). Permission-gated like
   // local-tools (writing a docx/xlsx/pptx is the same blast radius as
@@ -719,6 +885,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // workspace + attachment scope to sandbox output paths.
   const officeTools: AgentTool[] = uid && officeCliAvailable()
     ? createOfficeTools({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })
+    : [];
+
+  // Guaranteed local PDF editing/rendering. Unlike the retired nano-pdf
+  // skill, this path has no user-installed CLI or paid model-key dependency.
+  const pdfTools: AgentTool[] = uid
+    ? createPdfTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
@@ -779,6 +958,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       )
     : [];
 
+  const builtinTools = mod.getBuiltinTools();
+  const contentWriterTurnGuards: AgentTool[] = [];
+  if (agentId === CONTENT_WRITER_AGENT_ID) {
+    const bashTool = localTools.find((tool) => tool.name === 'bash');
+    if (bashTool) {
+      contentWriterTurnGuards.push(_createContentWriterBashGuard(bashTool));
+    }
+  }
+
   // Merge injected tools with extra tools from caller
   const allTools = [
     ...injectedTools,
@@ -788,12 +976,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...chatHistoryTools,
     ...imageGenTools,
     ...videoStudioTools,
-    ...deepResearchTools,
+    ...imageStudioTools,
     ...officeTools,
+    ...pdfTools,
     ...searchOverrideTools,
     ...toolResultTools,
     ...(params.extraTools || []),
     ...connectorMetaTools,
+    ...contentWriterTurnGuards,
   ];
 
   // Authoritative owner-scoped visibility gate: drop any tool whose catalog
@@ -804,7 +994,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // catalog, so `isToolVisibleToAgent` returns true for them (unaffected).
   const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
   const visibleToolNameSet = new Set(visibleTools.map((tool) => tool.name));
-  const builtinTools = mod.getBuiltinTools();
 
   // Apply one simple 8K per-result policy at AgentRunner's FINAL result
   // boundary. Keeping this as a result transformer (instead of pre-wrapping
@@ -909,6 +1098,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Project sessions additionally render the project's own notes section.
   const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope, params.projectId) : '';
   if (memoryBlock) parts.push(memoryBlock);
+  // Reflection only improves future behavior if its persisted assessment is
+  // present on the next eligible turn. Keep it beside cross-session memory:
+  // both are user-scoped, low-volume, and re-read every turn. The empty
+  // agentId intentionally maps commander conversations to `_default`.
+  const metacognitionBlock = (
+    uid
+    && memoryAgentScope
+    && metacognition.isFeatureEnabledForUser(uid)
+  ) ? metacognition.formatForSystemPromptForUser(uid, agentId) : '';
+  if (metacognitionBlock) parts.push(metacognitionBlock);
   const resolvedSystemPrompt = parts.join('\n\n');
   // P2: the truly per-turn-volatile blocks — the orchestration ledger (~7-9K
   // JSON that changes every commander turn) and the datetime tail — do NOT go
@@ -964,7 +1163,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   for (const choice of group) {
     if (modelCatalog[choice.model]) continue;
     const model = EXTERNAL_API_PROVIDERS.includes(choice.provider)
-      ? buildExternalProviderModel(choice.provider, choice.model)
+      ? buildExternalProviderModel(choice.provider, choice.model, choice.customConfig)
       : resolveConfiguredPiModel(mod, choice.provider, choice.model)?.model;
     const entry = modelCatalogEntryFromModel(model);
     if (entry) modelCatalog[choice.model] = { provider: choice.provider, model: choice.model, ...entry };
@@ -1045,6 +1244,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(visibleTools.length ? { tools: visibleTools } : {}),
     ...(transformToolResult ? { transformToolResult } : {}),
     ...(toolResultsDir ? { toolContextState: { toolResultSpoolDir: toolResultsDir } } : {}),
+    ...(agentId === CONTENT_WRITER_AGENT_ID
+      ? { disabledToolNames: ['manage_execution_plan'] }
+      : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
     ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
@@ -1119,7 +1321,8 @@ export function openSkillSourcesExposureFromSessionId(sessionId: string): boolea
  * Extend the switch when a new id is added to `EXTERNAL_API_PROVIDERS`.
  * Async because the underlying factories await core-agent dynamic import.
  */
-async function buildExternalProvider(providerId: string, apiKey: string, modelId: string): Promise<LLMProvider> {
+async function buildExternalProvider(choice: ChatEntryChoice): Promise<LLMProvider> {
+  const { provider: providerId, apiKey, model: modelId } = choice;
   switch (providerId) {
     case 'moonshot':
       return await createMoonshotProvider({ apiKey, modelId });
@@ -1127,6 +1330,13 @@ async function buildExternalProvider(providerId: string, apiKey: string, modelId
       return await createDeepSeekProvider({ apiKey, modelId });
     case 'doubao':
       return await createDoubaoProvider({ apiKey, modelId });
+    case 'custom':
+      if (!choice.customConfig) throw new Error('custom model configuration is incomplete');
+      return await createCustomOpenAICompatibleProvider({
+        apiKey,
+        modelId,
+        ...choice.customConfig,
+      });
     default:
       throw new Error(`no external provider factory for "${providerId}"`);
   }
@@ -1164,15 +1374,28 @@ async function buildRotatingProvider(
     const candProviderId = choice.provider;
     const candModelId = choice.model;
     const isExternal = EXTERNAL_API_PROVIDERS.includes(candProviderId);
+    const resolvedModel = isExternal
+      ? null
+      : resolveConfiguredPiModel(mod, candProviderId, candModelId);
+    const candidateModel = isExternal
+      ? buildExternalProviderModel(candProviderId, candModelId, choice.customConfig)
+      : resolvedModel?.model;
+    const candidateMaxTokens = candidateModel?.maxTokens;
+    const maxInputImages = modelInputImageLimit(candProviderId, candModelId, candidateModel);
     return {
       profileId: choice.profileId,
       providerId: candProviderId,
       modelId: candModelId,
+      maxInputImages,
+      ...(typeof candidateMaxTokens === 'number'
+        && Number.isFinite(candidateMaxTokens)
+        && candidateMaxTokens > 0
+        ? { maxTokens: Math.trunc(candidateMaxTokens) }
+        : {}),
       build: async () => {
         if (isExternal) {
-          return buildExternalProvider(candProviderId, choice.apiKey, candModelId);
+          return buildExternalProvider(choice);
         }
-        const resolvedModel = resolveConfiguredPiModel(mod, candProviderId, candModelId);
         if (resolvedModel?.isConfiguredFallback) {
           log.info('using configured model fallback', {
             provider: candProviderId,

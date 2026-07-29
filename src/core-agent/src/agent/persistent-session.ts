@@ -6,16 +6,19 @@ import type {
   ToolResultContent,
   ToolUseContent,
 } from "../shared/types.js";
+import type { ToolObservations } from "../tools/base.js";
 import { createLogger } from "../shared/logger.js";
 import {
   Session,
   type CompletedWorkEntry,
   type CompletedWorkInput,
+  type ConversationHistoryReplaceOptions,
   type ExecutionPlanState,
   type ExecutionPlanUpdate,
   type HistoryResource,
   type SerializedSessionContextState,
 } from "./session.js";
+import type { WorkspaceObservationEntry } from "./workspace-state.js";
 
 const log = createLogger("persistent-session");
 
@@ -66,6 +69,13 @@ export class PersistentSession extends Session {
   private readonly sessionFile: string;
   private readonly contextFile: string;
   private lastToolProtocolRepairReport = emptyToolProtocolRepairReport();
+  private contextMutationDepth = 0;
+  private contextWriteDirty = false;
+  /** Byte position of each in-memory message's JSONL line. This makes a
+   * canonical history tail replacement proportional to the changed tail
+   * instead of rewriting every retained turn. */
+  private messageStartOffsets: number[] = [];
+  private sessionFileSize = 0;
 
   constructor(opts: {
     /** Absolute path to the jsonl file that backs this session. */
@@ -99,20 +109,25 @@ export class PersistentSession extends Session {
    */
   loadFromDisk(): void {
     super.clear();
+    this.messageStartOffsets = [];
+    this.sessionFileSize = 0;
     if (!fs.existsSync(this.sessionFile)) return;
 
-    let raw: string;
+    let raw: Buffer;
     try {
-      raw = fs.readFileSync(this.sessionFile, "utf-8");
+      raw = fs.readFileSync(this.sessionFile);
+      this.sessionFileSize = raw.length;
     } catch (err) {
       console.warn(`[persistent-session] failed to read ${this.sessionFile}: ${(err as Error).message}`);
       return;
     }
 
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+    let lineStart = 0;
+    const loadLine = (lineEnd: number) => {
+      const trimmed = raw.subarray(lineStart, lineEnd).toString("utf-8").trim();
+      const recordStart = lineStart;
+      lineStart = lineEnd + 1;
+      if (!trimmed) return;
       try {
         const obj = JSON.parse(trimmed) as { role?: string; content?: unknown; turnId?: unknown };
         if (
@@ -126,11 +141,18 @@ export class PersistentSession extends Session {
               ? obj.turnId as number
               : undefined,
           );
+          const dropped = Math.max(0, this.messageStartOffsets.length + 1 - this.length);
+          if (dropped) this.messageStartOffsets.splice(0, dropped);
+          this.messageStartOffsets.push(recordStart);
         }
       } catch {
         // Skip corrupt line — keep going rather than throwing away everything.
       }
+    };
+    for (let index = 0; index < raw.length; index++) {
+      if (raw[index] === 0x0a) loadLine(index);
     }
+    if (lineStart < raw.length) loadLine(raw.length);
 
     // Heal orphan `tool_use` entries — see `healOrphanToolUses` for why.
     // Runs after all lines parse so it operates on the full, loaded history
@@ -403,60 +425,89 @@ export class PersistentSession extends Session {
   /** Override: in-memory add + atomic append to disk. */
   override addMessage(role: Message["role"], content: MessageContent[], turnId?: number): Message {
     const message = super.addMessage(role, content, turnId);
+    this.alignOffsetsAfterAppend();
     this.appendToDisk(message);
-    this.writeContextToDisk();
+    this.requestContextWrite();
     return message;
   }
 
   /** Override: start a tracked UI turn + atomic append to disk. */
   override beginUserTurn(content: MessageContent[]): number {
     const id = super.beginUserTurn(content);
+    this.alignOffsetsAfterAppend();
     this.appendToDisk({ role: "user", content, turnId: id });
-    this.writeContextToDisk();
+    this.requestContextWrite();
     return id;
+  }
+
+  override replaceConversationHistory(
+    messages: readonly Message[],
+    source: string,
+    options: ConversationHistoryReplaceOptions = {},
+  ): number | null {
+    const changedFrom = super.replaceConversationHistory(messages, source, options);
+    if (changedFrom !== null) this.rewriteTailToDisk(changedFrom);
+    this.requestContextWrite();
+    return changedFrom;
   }
 
   override completeActiveTurn(outcome?: string): void {
     super.completeActiveTurn(outcome);
-    this.writeContextToDisk();
+    this.requestContextWrite();
   }
 
   override addHistoryResource(resource: HistoryResource): void {
     super.addHistoryResource(resource);
-    this.writeContextToDisk();
+    this.requestContextWrite();
   }
 
   override recordCompletedWork(input: CompletedWorkInput): CompletedWorkEntry | undefined {
     const entry = super.recordCompletedWork(input);
-    if (entry) this.writeContextToDisk();
+    if (entry) this.requestContextWrite();
+    return entry;
+  }
+
+  override recordToolObservations(input: {
+    toolCallId?: string;
+    tool: string;
+    observations?: ToolObservations;
+  }): WorkspaceObservationEntry | undefined {
+    const entry = super.recordToolObservations(input);
+    if (entry) this.requestContextWrite();
+    return entry;
+  }
+
+  override reconcileWorkspaceObservations(): WorkspaceObservationEntry | undefined {
+    const entry = super.reconcileWorkspaceObservations();
+    if (entry) this.requestContextWrite();
     return entry;
   }
 
   override updateExecutionPlan(update: ExecutionPlanUpdate): ExecutionPlanState {
     const plan = super.updateExecutionPlan(update);
-    this.writeContextToDisk();
+    this.requestContextWrite();
     return plan;
   }
 
   override ensureExecutionPlanAnchor(): ExecutionPlanState {
     const plan = super.ensureExecutionPlanAnchor();
-    this.writeContextToDisk();
+    this.requestContextWrite();
     return plan;
   }
 
   override clearExecutionPlan(): void {
     super.clearExecutionPlan();
-    this.writeContextToDisk();
+    this.requestContextWrite();
   }
 
   override applyHistorySummary(summary: string, turnIds: readonly number[]): void {
     super.applyHistorySummary(summary, turnIds);
-    this.writeContextToDisk();
+    this.requestContextWrite();
   }
 
   override applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): string {
     const appliedSummary = super.applyActiveCheckpointSummary(summary, checkpointThroughMessageIndex);
-    this.writeContextToDisk();
+    this.requestContextWrite();
     return appliedSummary;
   }
 
@@ -467,12 +518,28 @@ export class PersistentSession extends Session {
   override compact(summary: string): void {
     super.compact(summary);
     this.flushToDisk();
-    this.writeContextToDisk();
+    this.requestContextWrite();
+  }
+
+  override withContextMutationBatch<T>(mutate: () => T): T {
+    this.contextMutationDepth++;
+    try {
+      return mutate();
+    } finally {
+      this.contextMutationDepth--;
+      if (this.contextMutationDepth === 0 && this.contextWriteDirty) {
+        this.contextWriteDirty = false;
+        this.writeContextToDisk();
+      }
+    }
   }
 
   /** Truncate the on-disk history to match an empty in-memory session. */
   override clear(): void {
     super.clear();
+    this.messageStartOffsets = [];
+    this.sessionFileSize = 0;
+    this.contextWriteDirty = false;
     try {
       if (fs.existsSync(this.sessionFile)) fs.truncateSync(this.sessionFile, 0);
       if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
@@ -482,6 +549,14 @@ export class PersistentSession extends Session {
   }
 
   // ── Disk writes ────────────────────────────────────────────────────────
+
+  private requestContextWrite(): void {
+    if (this.contextMutationDepth > 0) {
+      this.contextWriteDirty = true;
+      return;
+    }
+    this.writeContextToDisk();
+  }
 
   /**
    * Append a single record to the jsonl file. `fs.appendFileSync` with
@@ -493,9 +568,83 @@ export class PersistentSession extends Session {
     this.ensureDir();
     const line = JSON.stringify({ ...record, ts: Date.now() }) + "\n";
     try {
+      const start = this.sessionFileSize;
       fs.appendFileSync(this.sessionFile, line, "utf-8");
+      this.messageStartOffsets.push(start);
+      this.sessionFileSize += Buffer.byteLength(line, "utf-8");
     } catch (err) {
       console.warn(`[persistent-session] append failed ${this.sessionFile}: ${(err as Error).message}`);
+    }
+  }
+
+  /** Account for Session's legacy in-memory head trim before recording the
+   * newly appended line offset. The append-only JSONL intentionally retains
+   * that older prefix; only the in-memory offset index moves forward. */
+  private alignOffsetsAfterAppend(): void {
+    const dropped = Math.max(0, this.messageStartOffsets.length + 1 - this.length);
+    if (dropped) this.messageStartOffsets.splice(0, dropped);
+  }
+
+  /** Replace only the changed suffix. Canonical group history is recoverable
+   * from the main conversation log, so an interrupted suffix write is repaired
+   * by the next full/incremental rebase; fsync still closes the normal crash
+   * window before the new active turn starts. */
+  private rewriteTailToDisk(changedFrom: number): void {
+    let onDiskSize = -1;
+    try {
+      onDiskSize = fs.existsSync(this.sessionFile)
+        ? fs.statSync(this.sessionFile).size
+        : -1;
+    } catch { /* full rewrite below */ }
+    if (
+      changedFrom <= 0
+      || changedFrom > this.messageStartOffsets.length
+      || onDiskSize !== this.sessionFileSize
+    ) {
+      this.flushToDisk();
+      return;
+    }
+
+    const oldLength = this.messageStartOffsets.length;
+    const offset = changedFrom < oldLength
+      ? this.messageStartOffsets[changedFrom]
+      : this.sessionFileSize;
+    const tail = this.getMessages().slice(changedFrom);
+    const lines = tail.map((message) => JSON.stringify({
+      role: message.role,
+      content: message.content,
+      ...(message.turnId ? { turnId: message.turnId } : {}),
+      ts: Date.now(),
+    }) + "\n");
+    const payload = Buffer.from(lines.join(""), "utf-8");
+
+    this.ensureDir();
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(this.sessionFile, "r+");
+      fs.ftruncateSync(fd, offset);
+      if (payload.length) fs.writeSync(fd, payload, 0, payload.length, offset);
+      fs.fsyncSync(fd);
+
+      const nextOffsets = this.messageStartOffsets.slice(0, changedFrom);
+      let position = offset;
+      for (const line of lines) {
+        nextOffsets.push(position);
+        position += Buffer.byteLength(line, "utf-8");
+      }
+      this.messageStartOffsets = nextOffsets;
+      this.sessionFileSize = position;
+    } catch (err) {
+      console.warn(`[persistent-session] tail rewrite failed ${this.sessionFile}: ${(err as Error).message}`);
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+        fd = undefined;
+      }
+      this.flushToDisk();
+    } finally {
+      if (fd !== undefined) {
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -507,16 +656,23 @@ export class PersistentSession extends Session {
     this.ensureDir();
     const tmp = `${this.sessionFile}.tmp`;
     try {
-      const lines = this.getMessages()
+      const records = this.getMessages()
         .map((m) => JSON.stringify({
           role: m.role,
           content: m.content,
           ...(m.turnId ? { turnId: m.turnId } : {}),
           ts: Date.now(),
-        }))
-        .join("\n");
-      fs.writeFileSync(tmp, lines ? lines + "\n" : "", "utf-8");
+        }) + "\n");
+      const lines = records.join("");
+      fs.writeFileSync(tmp, lines, "utf-8");
       fs.renameSync(tmp, this.sessionFile);
+      this.messageStartOffsets = [];
+      let position = 0;
+      for (const record of records) {
+        this.messageStartOffsets.push(position);
+        position += Buffer.byteLength(record, "utf-8");
+      }
+      this.sessionFileSize = position;
     } catch (err) {
       console.warn(`[persistent-session] flush failed ${this.sessionFile}: ${(err as Error).message}`);
       try { fs.unlinkSync(tmp); } catch { /* ignore */ }
@@ -560,7 +716,7 @@ export class PersistentSession extends Session {
       }
       this.ensureDir();
       const tmp = `${this.contextFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+      fs.writeFileSync(tmp, JSON.stringify(state) + "\n", "utf-8");
       fs.renameSync(tmp, this.contextFile);
     } catch (err) {
       console.warn(`[persistent-session] context write failed ${this.contextFile}: ${(err as Error).message}`);

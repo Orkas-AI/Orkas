@@ -31,13 +31,6 @@ const TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
 const MARKETPLACE_CATEGORIES_TIMEOUT_MS = 60_000;
 export const DEFAULT_MARKETPLACE_CATEGORY_CODE = 'general';
 
-// In-memory mirror of `marketplace.json::categories`. Populated on first read from disk; refreshed
-// on every successful server fetch. Skips the fs + JSON.parse round-trip when the IPC handler is
-// called rapidly (renderer can hit `getMarketplaceCategories` every time it opens the marketplace
-// panel; without this we'd re-read the file each time even though TTL is 24h).
-let _memCache: { fetched_at: number; list: MarketplaceCategory[] } | null = null;
-let _memCacheUid: string | null = null;  // invalidated on uid switch
-
 export interface MarketplaceCategory {
   code: string;
   name_zh: string;
@@ -81,21 +74,82 @@ interface PersistedBiz {
   };
 }
 
-async function _readPersisted(): Promise<PersistedBiz> {
-  const file = marketplaceBizFile(getActiveUserId());
+type CategoryCacheEntry = NonNullable<PersistedBiz['categories']>;
+type CategoryMemCache = CategoryCacheEntry & { uid: string };
+
+// Keep the uid and payload in one object so overlapping account requests
+// cannot leave a new uid paired with an old uid's list.
+let _memCache: CategoryMemCache | null = null;
+
+function _errorCode(err: unknown): string {
+  return String((err as NodeJS.ErrnoException)?.code || 'unknown');
+}
+
+function _normalizeCategoryList(value: unknown): MarketplaceCategory[] {
+  if (!Array.isArray(value)) return [];
+  const byCode = new Map<string, MarketplaceCategory>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const row = raw as Record<string, unknown>;
+    const code = normalizeMarketplaceCategoryCode(String(row.code || ''), '');
+    if (!code || byCode.has(code)) continue;
+    const sortOrder = typeof row.sort_order === 'number' && Number.isFinite(row.sort_order)
+      ? row.sort_order
+      : 0;
+    byCode.set(code, {
+      code,
+      name_zh: String(row.name_zh || '').trim() || code,
+      name_en: String(row.name_en || '').trim() || code,
+      name_ja: String(row.name_ja || '').trim(),
+      name_pt: String(row.name_pt || '').trim(),
+      sort_order: sortOrder,
+    });
+  }
+  return Array.from(byCode.values());
+}
+
+function _isFresh(entry: CategoryCacheEntry, now: number): boolean {
+  return Number.isFinite(entry.fetched_at)
+    && entry.fetched_at > 0
+    && entry.fetched_at <= now
+    && (now - entry.fetched_at) <= TTL_MS;
+}
+
+function _cacheForActiveUser(uid: string, entry: CategoryCacheEntry): void {
+  try {
+    if (getActiveUserId() !== uid) return;
+  } catch {
+    return;
+  }
+  _memCache = { uid, fetched_at: entry.fetched_at, list: entry.list };
+}
+
+async function _readPersisted(uid: string): Promise<PersistedBiz> {
+  const file = marketplaceBizFile(uid);
   if (!fs.existsSync(file)) return {};
   try {
-    return JSON.parse(await fsp.readFile(file, 'utf8')) as PersistedBiz;
+    const raw = JSON.parse(await fsp.readFile(file, 'utf8')) as unknown;
+    const parsed = raw && typeof raw === 'object' ? raw as PersistedBiz : {};
+    const list = _normalizeCategoryList(parsed.categories?.list);
+    if (!list.length) return { ...parsed, categories: undefined };
+    const fetchedAt = Number(parsed.categories?.fetched_at);
+    return {
+      ...parsed,
+      categories: {
+        fetched_at: Number.isFinite(fetchedAt) ? fetchedAt : 0,
+        list,
+      },
+    };
   } catch (err) {
-    log.warn(`read ${file} failed: ${(err as Error).message}`);
+    log.warn(`persisted categories read failed code=${_errorCode(err)}`);
     return {};
   }
 }
 
-async function _writePersisted(data: PersistedBiz): Promise<void> {
-  const dir = userLocalBizDir(getActiveUserId());
+async function _writePersisted(uid: string, data: PersistedBiz): Promise<void> {
+  const dir = userLocalBizDir(uid);
   await fsp.mkdir(dir, { recursive: true });
-  const file = marketplaceBizFile(getActiveUserId());
+  const file = marketplaceBizFile(uid);
   await fsp.writeFile(file, JSON.stringify(data, null, 2), 'utf8');
 }
 
@@ -110,19 +164,9 @@ async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json() as { code: number; msg?: string; list?: unknown };
   if (data.code !== 0) throw new Error(data.msg || `code=${data.code}`);
-  const list = Array.isArray(data.list) ? data.list : [];
-  // Normalize: keep only the fields PC needs; tolerate any drift on the server side.
-  return list
-    .filter((x): x is Record<string, unknown> => x !== null && typeof x === 'object')
-    .map((row) => ({
-      code: String(row.code || ''),
-      name_zh: String(row.name_zh || ''),
-      name_en: String(row.name_en || ''),
-      name_ja: String(row.name_ja || ''),
-      name_pt: String(row.name_pt || ''),
-      sort_order: typeof row.sort_order === 'number' ? row.sort_order : 0,
-    }))
-    .filter((c) => c.code);
+  // Keep only safe, canonical fields. A malformed registry row must not create
+  // duplicate/unsafe filter values in the renderer or poison the disk cache.
+  return _normalizeCategoryList(data.list);
 }
 
 /** Return the active category list. Reads from in-memory cache first, falls back to the
@@ -133,27 +177,29 @@ export async function getMarketplaceCategories(
   opts: { localOnly?: boolean; forceRefresh?: boolean } = {},
 ): Promise<MarketplaceCategory[]> {
   const uid = getActiveUserId();
-  if (_memCacheUid !== uid) { _memCache = null; _memCacheUid = uid; }   // uid switch invalidates
   const now = Date.now();
   const forceRefresh = opts.forceRefresh && !opts.localOnly;
 
   // Fast path: in-memory hit within TTL. Local-only callers also accept stale data because the
   // category registry is config-like and they are optimizing for immediate dialog paint.
-  if (!forceRefresh && _memCache && (opts.localOnly || (now - _memCache.fetched_at) <= TTL_MS)) {
+  if (!forceRefresh
+      && _memCache?.uid === uid
+      && _memCache.list.length > 0
+      && (opts.localOnly || _isFresh(_memCache, now))) {
     return _sort(_memCache.list);
   }
 
   // Cold or expired — try persisted file first (cheap), then server.
-  const persisted = await _readPersisted();
+  const persisted = await _readPersisted(uid);
   const cached = persisted.categories;
-  if (!forceRefresh && cached && (opts.localOnly || (now - cached.fetched_at) <= TTL_MS)) {
-    _memCache = cached;
+  if (!forceRefresh && cached && (opts.localOnly || _isFresh(cached, now))) {
+    _cacheForActiveUser(uid, cached);
     return _sort(cached.list);
   }
 
   if (opts.localOnly) {
     const fallback = [...FALLBACK_CATEGORIES] as MarketplaceCategory[];
-    _memCache = { fetched_at: 0, list: fallback };
+    _cacheForActiveUser(uid, { fetched_at: 0, list: fallback });
     return _sort(fallback);
   }
 
@@ -161,18 +207,28 @@ export async function getMarketplaceCategories(
     const fresh = await _fetchFromServer();
     if (fresh.length > 0) {
       const entry = { fetched_at: now, list: fresh };
-      _memCache = entry;
-      await _writePersisted({ ...persisted, categories: entry });
+      _cacheForActiveUser(uid, entry);
+      try {
+        await _writePersisted(uid, { ...persisted, categories: entry });
+      } catch (err) {
+        // This is a disposable offline cache. A read-only/full local disk must
+        // not hide a valid Server registry from the current Marketplace view.
+        log.warn(`persisted categories write failed code=${_errorCode(err)}`);
+      }
       return _sort(fresh);
     }
     log.warn('server returned empty categories; keeping cached/fallback');
   } catch (err) {
-    log.warn(`fetch categories failed: ${(err as Error).message}`);
+    log.warn(`fetch categories failed code=${_errorCode(err)}`);
   }
 
-  if (cached && cached.list.length > 0) { _memCache = cached; return _sort(cached.list); }
+  if (cached && cached.list.length > 0) {
+    _cacheForActiveUser(uid, cached);
+    return _sort(cached.list);
+  }
   const fallback = [...FALLBACK_CATEGORIES] as MarketplaceCategory[];
-  _memCache = { fetched_at: 0, list: fallback };  // fetched_at=0 so it expires immediately
+  // fetched_at=0 means the next non-local call retries the Server immediately.
+  _cacheForActiveUser(uid, { fetched_at: 0, list: fallback });
   return _sort(fallback);
 }
 

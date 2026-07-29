@@ -78,7 +78,13 @@ export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence
 export type StreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "retry"; attempt: number; reason: string }
-  | { type: "provider_fallback"; reason: "auth" | "no_first_event_timeout"; providerId: string }
+  | {
+      type: "provider_fallback";
+      reason: "auth" | "no_first_event_timeout";
+      providerId: string;
+      candidateIndex?: number;
+      candidateCount?: number;
+    }
   | { type: "tool_use_start"; id: string; name: string }
   | { type: "tool_use_delta"; id: string; input: string }
   | { type: "tool_use_end"; id: string }

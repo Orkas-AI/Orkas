@@ -21,12 +21,15 @@
  *   stripped once at startup by `util/migrate-session-ids.ts` and should not appear
  *   here at runtime.
  *
- * session jsonl carries the raw resumable LLM-turn history (tool_use /
- * tool_result pairs included). `Session.getMessagesForModel()` applies a
- * transient model-facing view: completed history is projected to summary +
- * bounded user/final-assistant I/O, while the active turn keeps recent tool
- * process messages. The raw JSONL remains separate from
- * `<uid>/cloud/chats/<cid>.jsonl` (the UI-facing view).
+ * Session jsonl carries resumable execution state (tool_use / tool_result pairs
+ * included). `Session.getMessagesForModel()` applies a transient model-facing
+ * view: completed history is projected to summary + bounded user/final-
+ * assistant I/O, while the active turn keeps recent tool process messages.
+ * For group-chat Commander, the host synchronizes completed dialogue from
+ * `<uid>/cloud/chats/<cid>.jsonl` before each normal turn so Agent replies in
+ * the canonical conversation are ordinary history. A persisted checkpoint
+ * replaces only the newest mutable tail after the first/full recovery pass;
+ * Agent sessions remain scoped to their authorized slices.
  */
 
 import * as path from 'node:path';
@@ -136,15 +139,20 @@ export function toolResultsDirForSession(userId: string, sessionId: string): str
 }
 
 /**
- * Lazy cache of loaded `PersistentSession` instances keyed by session_id.
- * Two concurrent calls with the same session_id get the same instance so
- * the in-memory history stays consistent — the per-session Mutex in
- * `util/locks.sessionLock` serializes them upstream anyway.
+ * Lazy cache of loaded `PersistentSession` instances keyed by uid + session id.
+ * Concurrent first loads share one promise, so the in-memory history stays
+ * consistent even before the upstream per-session mutex is acquired.
  */
 type PersistentSessionCtor = typeof import('#core-agent').PersistentSession;
 type PersistentSessionInstance = InstanceType<PersistentSessionCtor>;
 
 const cache = new Map<string, PersistentSessionInstance>();
+const pending = new Map<string, Promise<PersistentSessionInstance>>();
+let cacheGeneration = 0;
+
+function cacheKey(userId: string, sessionId: string): string {
+  return `${userId}\0${sessionId}`;
+}
 
 let _ctorPromise: Promise<PersistentSessionCtor> | null = null;
 async function getCtor(): Promise<PersistentSessionCtor> {
@@ -158,25 +166,54 @@ async function getCtor(): Promise<PersistentSessionCtor> {
  * Load (or reuse a cached) PersistentSession for a session id. The
  * constructor transparently reads any prior jsonl lines into memory.
  */
-export async function getSession(sessionId: string): Promise<PersistentSessionInstance> {
-  const cached = cache.get(sessionId);
+export async function getSessionForUser(
+  userId: string,
+  sessionId: string,
+): Promise<PersistentSessionInstance> {
+  const key = cacheKey(userId, sessionId);
+  const cached = cache.get(key);
   if (cached) return cached;
 
-  const userId = getActiveUserId();
-  const file = resolveSessionPath(userId, sessionId);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const loading = pending.get(key);
+  if (loading) return loading;
 
-  const Ctor = await getCtor();
-  const session = new Ctor({
-    sessionFile: file,
-  });
-  cache.set(sessionId, session);
-  return session;
+  const generation = cacheGeneration;
+  const load = (async () => {
+    const file = resolveSessionPath(userId, sessionId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const Ctor = await getCtor();
+    const session = new Ctor({
+      sessionFile: file,
+    });
+    // An account switch or explicit eviction may happen while the dynamic
+    // constructor import is pending. The original caller may still finish
+    // against its captured path, but the late instance must not repopulate a
+    // cache that now belongs to a different lifecycle.
+    if (generation === cacheGeneration && getActiveUserId() === userId) {
+      cache.set(key, session);
+    }
+    return session;
+  })();
+  pending.set(key, load);
+  try {
+    return await load;
+  } finally {
+    if (pending.get(key) === load) pending.delete(key);
+  }
+}
+
+/** Active-account compatibility wrapper. Runtime turns should use the
+ * explicit-user form so a mid-flight account switch cannot redirect IO. */
+export async function getSession(sessionId: string): Promise<PersistentSessionInstance> {
+  return getSessionForUser(getActiveUserId(), sessionId);
 }
 
 /** Drop a cached session — used when the underlying conversation is deleted. */
 export function evictSession(sessionId: string): void {
-  cache.delete(sessionId);
+  const key = cacheKey(getActiveUserId(), sessionId);
+  cacheGeneration += 1;
+  cache.delete(key);
+  pending.delete(key);
 }
 
 /** Delete the on-disk jsonl. Caller is responsible for also evicting. */
@@ -246,7 +283,9 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
 
 /** Flush all cached sessions — called by `features/users.activateUser()` on uid switch. */
 export function _evictAll(): void {
+  cacheGeneration += 1;
   cache.clear();
+  pending.clear();
 }
 
 /** For diagnostics / tests. */

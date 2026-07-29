@@ -48,10 +48,12 @@ Do not start `index.html` until the composition has a usable visual identity in 
 - `aesthetic.signature_device`
 - `aesthetic.aesthetic_risk`
 - `aesthetic.anti_template_check` (or legacy `anti_template`)
+- `cover` with first-scene id, approved headline, two or more content signals, hero visual, composition strategy, and `frame_time_sec:0`
 - role-based `typography_tokens`
 - baseline `color_tokens`
 - `visual_direction` with a design tradition, lazy-default rejections, video-scale rule, depth-layer rule, motion-verb rule, and rhythm pattern
 - a scene-level plan with `hero_visual`, `depth_layers`, `opening_state`, and `resolved_state`
+- for every concrete reference image or video, executable `references` + `reference_fidelity` contracts from `design-system-importer`, based on reproduce/edit/guide intent rather than origin
 
 If the first concrete visual move is a generic grid, circles connected by lines, a centered title card, emoji-as-icon, or a web-dashboard layout, the visual identity is not ready. Revise the art direction first; do not compensate with more glows or animation.
 
@@ -125,6 +127,7 @@ Treat the composition as designed video frames, not a web page inside a video ca
 - Start from a frame grammar: full-bleed visual system, split focal/annotation, diagram build, editorial title wall, data mark, product surface, map/flow, or quote/argument. Pick one because it matches the brief, then vary it across scenes.
 - Avoid default centered-card scenes, generic gradient backgrounds, floating bento panels, pill badges, and dashboard fragments unless the subject itself is an app/dashboard and the UI is the point.
 - The first frame must be a composed thumbnail: readable promise, subject-specific visual signal, and no blank/slow intro. Never tween the whole opening scene from `opacity: 0` at 0s. Motion may begin at 0s, but the exact still frame at 0s must already say what the video is about.
+- Treat that first frame as a dedicated cover design. It needs one dominant hero plus at least two visible content signals from the actual video; a generic branded/title treatment that could front an unrelated topic does not pass. Bind it to `art_direction.cover`, not only to an aesthetic paragraph. Mark the topic-specific dominant visual with `data-role="visual" data-cover-hero`, and mark at least two visible frame-0 elements with `data-cover-signal="<exact content_signals value>"`; do not put either marker on a generic background, decorative accent, or the title itself. Native QA verifies these rendered hooks and meaningful hero bounds before exposing a preview.
 - Build every designed frame in three semantic depth layers: a topic-derived background field, a dominant midground message/diagram, and foreground accents or metadata. Do not add arbitrary decoration; every layer should reinforce subject, hierarchy, scale, direction, or continuity.
 - Use video scale, not web scale: for 1920x1080, headlines usually need 72-140px, body/supporting text 28-42px, labels 18-26px, borders 2-4px, safe padding 60-140px, and atmospheric decoratives 12-25% opacity. Anything under 24px or under 10% opacity needs a reason.
 - Use a visible hierarchy system: one dominant focal element, one supporting focal/text zone, and optional labels. A designed explainer's meaningful visual material should usually occupy most of the safe canvas rather than clustering in one corner. If a scene needs more than two text zones, split the beat or convert detail into a diagram.
@@ -159,6 +162,8 @@ Add an `aesthetic` object under `art_direction` in `project/composition/composit
 The rest of `manifest.art_direction` must make the thesis executable:
 
 - `visual_direction`: the `VisualDirectionV1` object: design tradition, composition behavior, rejected lazy defaults, video scale, depth-layer rule, motion-verb rule, typography register, and rhythm pattern.
+- `cover`: the frame-0 communication contract: first canonical `scene_id`, approved `headline`, concrete `content_signals`, `hero_visual`, thumbnail `composition_strategy`, and `frame_time_sec:0`.
+- `references` + `reference_fidelity`: when concrete media exists, its image/video type, reproduce/edit/guide intent, user/inferred intent basis, roles, local path, preserve/may-change axes, target scenes, layout/temporal anchors, and scored verification floor supplied by `design-system-importer`. Explicit user constraints override inferred defaults.
 - `typography_tokens`: role-based, not just sizes. Include display, body, data/label, and caption roles when needed.
 - `color_tokens`: named baseline values with rationale. Include neutrals, primary accent, and any purposeful supporting accents needed for brand, hierarchy, data meaning, or scene variation.
 - `layout_boxes`: describe visual hierarchy, not only coordinates. Name the focal zone, supporting zone, depth layers, and intended meaningful canvas coverage.
@@ -185,12 +190,12 @@ When writing `index.html`:
 
 ## Build Loop
 
-1. Draft the thesis and `manifest.art_direction`.
+1. Draft the thesis, dedicated cover, any concrete reference-fidelity contract, and the rest of `manifest.art_direction`.
 2. Self-critique the art direction: name the most generic choice and replace it.
 3. Run the internal pre-code art-direction pass: choose `VisualDirectionV1`, scene grammar, hero visual, three depth layers, motion verbs, typography register, rhythm pattern, opening/resolved states, and cross-scene continuity. Keep it inside the generation turn; no new user confirmation.
 4. Write HTML/SVG from the manifest art direction using adapted visual primitives and worked examples as references, not fixed templates.
-5. Run the draft QA command. If `draft_disposition.blocking_error_count` or structural/video/audio QA fails, repair `manifest.art_direction` or the canonical scene structure first; do not only nudge CSS numbers. Missing preview-required art direction is a blocking manifest error, not a cosmetic note: complete the aesthetic thesis, VisualDirectionV1, motion budget, scene variation budget, per-scene depth layers, and per-scene motion verbs before preview or draft. Treat visual/readability findings as draft notes unless they make the approved message unreadable. Low-cost native warnings for contrast, safe area, density, repeated layout, or palette narrowness are feedback for the next localized edit; they do not by themselves justify expensive rerender loops.
-6. For preview, judge the returned keyframe contact sheet rather than only frame 0. After a rendered draft, use `design_review_inputs` plus the first frame, scene mids, and payoff frame for: clear focal point, subject-specific visual language, readable type, and motion with purpose.
+5. Run the draft QA command. If `draft_disposition.blocking_error_count` or structural/video/audio QA fails, repair `manifest.art_direction` or the canonical scene structure first; do not only nudge CSS numbers. Missing preview-required art direction is a blocking manifest error, not a cosmetic note: complete the aesthetic thesis, dedicated cover, VisualDirectionV1, motion budget, scene variation budget, per-scene depth layers, and per-scene motion verbs before preview or draft. Treat visual/readability findings as draft notes unless they make the approved message unreadable. Low-cost native warnings for contrast, safe area, density, repeated layout, or palette narrowness are feedback for the next localized edit; they do not by themselves justify expensive rerender loops.
+6. For preview, judge the returned keyframe contact sheet rather than only frame 0. Score whether frame 0 communicates the actual video as a cover. When reference images exist, compare spatial anchors and declared axes side-by-side. When reference videos exist, compare the declared source time ranges against their target scene frames and motion/timing intent. Score the requested reproduce/edit/guide outcome, never the reference's origin. After a rendered draft, use `design_review_inputs` plus the first frame, scene mids, and payoff frame for: clear focal point, subject-specific visual language, readable type, reference fidelity, and motion with purpose.
 
 ## Output Standard
 

@@ -74,17 +74,17 @@ function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): s
   // description (shouldn't happen for shipped connectors).
   //
   // `resolveVisibleConnectors` routes `connected` AND `degraded` (the latter so a tool call can
-  // heal it), so a line is NOT implicitly healthy — a degraded one must say so. Without this the
-  // model reads a clean list, calls a connector that has been unable to reach its backend for
-  // days, gets one opaque failure, and silently downgrades its conclusions instead of telling the
-  // user the data source was never readable. Disconnected / errored / connecting instances remain
-  // hidden entirely — see tools-adapter.ts for the filter + rationale.
+  // heal it), so a line is NOT implicitly healthy — a degraded one must say so. Keep the warning
+  // host-authored: status.message may contain arbitrary remote/provider text and this block is
+  // injected into the system prompt. The actual call can return its error as ordinary tool data.
+  // Disconnected / errored / connecting instances remain hidden entirely — see tools-adapter.ts
+  // for the filter + rationale.
   const catalog = findCatalogEntry(instance.id);
   const descKey = `description_${lang}` as 'description_zh' | 'description_en';
   const desc = catalog ? (catalog[descKey] || '') : '';
   const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
   const warn = instance.status.kind === 'degraded'
-    ? ` — ⚠️ UNVERIFIED: the last connection attempt failed (${instance.status.message}). Calls may fail; if one does, report this to the user rather than working around it.`
+    ? ' — ⚠️ UNVERIFIED: the last connection attempt failed. Calls may fail; if one does, report the connector error to the user rather than working around it.'
     : '';
   return desc
     ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}${warn}`

@@ -8,6 +8,7 @@ function loadShim(
   invokeImpl: (...args: any[]) => Promise<any> = vi.fn(),
 ) {
   const monitorError = vi.fn();
+  const loggerWarn = vi.fn();
   const sandbox: any = {
     console,
     URL,
@@ -18,7 +19,7 @@ function loadShim(
     ReadableStream,
     btoa,
     fetch: vi.fn(),
-    createLogger: () => ({ warn() {}, info() {}, error() {} }),
+    createLogger: () => ({ warn: loggerWarn, info() {}, error() {} }),
     window: {
       Monitor: { error: monitorError },
       orkas: {
@@ -32,7 +33,7 @@ function loadShim(
   vm.createContext(sandbox);
   const source = readFileSync(resolve(__dirname, '../../src/renderer/modules/ipc-shim.js'), 'utf8');
   vm.runInContext(source, sandbox, { filename: 'ipc-shim.js' });
-  return { apiFetch: sandbox.apiFetch as Function, monitorError };
+  return { apiFetch: sandbox.apiFetch as Function, monitorError, loggerWarn };
 }
 
 describe('ipc-shim streams', () => {
@@ -59,7 +60,7 @@ describe('ipc-shim streams', () => {
     expect(monitorError).not.toHaveBeenCalled();
   });
 
-  it('still reports unexpected stream failures', async () => {
+  it('surfaces unexpected stream failures without exposing raw bridge errors', async () => {
     const boom = new Error('boom');
     const { apiFetch, monitorError } = loadShim(() => ({
       promise: Promise.reject(boom),
@@ -69,7 +70,7 @@ describe('ipc-shim streams', () => {
     const res = await apiFetch('/api/conversations/c1/events/stream', { method: 'POST' });
     const reader = res.body.getReader();
 
-    await expect(reader.read()).rejects.toThrow('boom');
+    await expect(reader.read()).rejects.toThrow('ipc stream failed');
     expect(monitorError).not.toHaveBeenCalled();
   });
 });

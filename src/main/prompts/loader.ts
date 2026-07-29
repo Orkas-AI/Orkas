@@ -19,25 +19,16 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { createLogger } from '../logger';
+import {
+  safeSubstitute,
+  type TemplateArgs,
+} from './template';
+
+export { safeSubstitute, type TemplateArgs } from './template';
 
 const log = createLogger('prompts');
 
 const DEFAULT_TEMPLATES_DIR = __dirname;
-
-const TEMPLATE_RE = /\$(\$|\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g;
-
-export type TemplateArgs = Record<string, string | number | boolean>;
-
-export function safeSubstitute(body: string, args: TemplateArgs): string {
-  return body.replace(TEMPLATE_RE, (match, _g1, braced: string | undefined, named: string | undefined) => {
-    if (match === '$$') return '$';
-    const key = braced || named;
-    if (key && Object.prototype.hasOwnProperty.call(args, key)) {
-      return String(args[key]);
-    }
-    return match; // unknown → literal
-  });
-}
 
 interface CacheEntry { mtime: number; body: string }
 

@@ -8,10 +8,10 @@ function read(rel: string) {
   return fs.readFileSync(path.join(root, rel), 'utf8');
 }
 
-function newChatScenarioOrder(html: string) {
-  const row = html.match(/<div class="new-chat-scenarios" id="new-chat-scenarios">([\s\S]*?)<\/div>/);
-  expect(row?.[1]).toBeTruthy();
-  return [...row![1].matchAll(/data-scenario="([^"]+)"/g)].map((m) => m[1]);
+function quickStartOrder(source: string, declaration: string) {
+  const block = source.match(new RegExp(`const ${declaration}[^=]*= \\[([\\s\\S]*?)\\n\\];`));
+  expect(block?.[1]).toBeTruthy();
+  return [...block![1].matchAll(/\{\s*id:\s*'([^']+)'/g)].map((match) => match[1]);
 }
 
 describe('new chat home surface', () => {
@@ -24,19 +24,42 @@ describe('new chat home surface', () => {
     expect(html).not.toContain('data-ui-icon="mic"');
   });
 
+  it('opens the homepage external-agent flow in place and restores composer focus on cancel', () => {
+    const state = read('src/renderer/modules/state.js');
+    const agents = read('src/renderer/modules/agents.js');
+    const handler = state.slice(
+      state.indexOf("document.getElementById('new-chat-external-agent-btn')"),
+      state.indexOf("document.getElementById('create-agent-btn')"),
+    );
+
+    expect(handler).toContain("initialTab: 'external'");
+    expect(handler).toContain('externalOnly: true');
+    expect(handler).toContain("returnFocusId: 'new-chat-input'");
+    expect(handler).not.toContain("setView('agents'");
+    expect(agents).toContain('if (tabBar) tabBar.hidden = externalOnly;');
+    expect(agents).toContain('closeAgentModal({ restoreFocus: true });');
+  });
+
   it('uses the synced homepage shortcut set and order', () => {
     const html = read('src/renderer/index.html');
-
-    expect(newChatScenarioOrder(html)).toEqual([
+    const renderer = read('src/renderer/modules/conversation.js');
+    const clientConfig = read('src/main/features/client_config.ts');
+    const expected = [
       'data',
       'video',
+      'image',
       'ui_design',
-      'seo_geo',
       'office',
+      'creation',
       'rnd',
-    ]);
-    expect(html).not.toContain('data-scenario="ecommerce"');
-    expect(html).not.toContain('data-scenario="creation"');
+      'seo_geo',
+    ];
+
+    expect(html).toContain('class="new-chat-scenarios quick-panel" id="new-chat-scenarios"');
+    expect(html).toContain('class="quick-grid" id="new-chat-scenario-grid"');
+    expect(html).not.toContain('data-scenario=');
+    expect(quickStartOrder(renderer, '_DEFAULT_QUICK_START_ITEMS')).toEqual(expected);
+    expect(quickStartOrder(clientConfig, 'DEFAULT_QUICK_START_CONFIG')).toEqual(expected);
   });
 
   it('exposes Library-aware picker copy and accessible skill chip removal', () => {

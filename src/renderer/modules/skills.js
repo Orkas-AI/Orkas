@@ -939,9 +939,11 @@ async function _flipOpenSkillEnabled(id) {
  *  and the detail-page enable/disable button). On failure, alerts and does
  *  not mutate UI state; on success, refreshes the grid + detail page. */
 async function _flipSkillEnabled(skillId, nextEnabled) {
+  const trackResult = _createSkillManageTracker('toggle');
   try {
     const res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: nextEnabled });
     if (!res || !res.ok) {
+      trackResult('failure', 'update_failed');
       await uiAlert(t('component.toggle_failed'));
       return false;
     }
@@ -951,11 +953,32 @@ async function _flipSkillEnabled(skillId, nextEnabled) {
     if (_selectedSkill?.id === skillId) {
       _renderSkillEnabledButton({ id: skillId, enabled: nextEnabled });
     }
+    trackResult('success');
     return true;
   } catch (err) {
+    trackResult('failure', 'invoke_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
+}
+
+function _createSkillManageTracker(action) {
+  const startedAt = Date.now();
+  let done = false;
+  return (result, errorCode = '') => {
+    if (done) return;
+    done = true;
+    try {
+      if (!window.Monitor) return;
+      const payload = {
+        result,
+        action,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      Monitor.event('skill_manage_result', payload);
+    } catch (_) {}
+  };
 }
 
 // ─── View switching: grid ↔ detail ─────────────────────────────────────
@@ -2823,11 +2846,13 @@ async function deleteSelectedSkill() {
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
+  const trackResult = _createSkillManageTracker('delete');
   try {
     const result = _isSkillPlatformSource(src)
       ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
       : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
+      trackResult('failure', 'delete_failed');
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;
     }
@@ -2838,7 +2863,9 @@ async function deleteSelectedSkill() {
     // Snap back to grid view (detail panel is for whole skills, the one
     // we just deleted no longer exists).
     _showSkillsGridView();
+    trackResult('success');
   } catch (e) {
+    trackResult('failure', 'request_failed');
     await uiAlert(t('skills.delete_failed_with', { reason: e.message || e }));
   }
 }

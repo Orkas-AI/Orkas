@@ -42,6 +42,29 @@ const RETAIN_DAYS     = 7;
 const FILE_MAX_BYTES  = 10 * 1024 * 1024;   // 10 MB per file
 const TOTAL_MAX_BYTES = 100 * 1024 * 1024;  // 100 MB across the logs dir
 
+type ConsoleWrite = (...args: any[]) => void;
+
+export function isBrokenPipeError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === 'EPIPE';
+}
+
+/**
+ * Console output is diagnostic-only and must never take down the Electron
+ * main process after its launcher/terminal closes the inherited pipe.
+ */
+export function writeConsoleSafely(
+  write: ConsoleWrite,
+  args: any[],
+  onBrokenPipe?: () => void,
+): void {
+  try {
+    write(...args);
+  } catch (error) {
+    if (!isBrokenPipeError(error)) throw error;
+    onBrokenPipe?.();
+  }
+}
+
 // ── Date helpers ─────────────────────────────────────────────────────────
 
 function dateKey(d: Date = new Date()): string {
@@ -73,6 +96,7 @@ const REDACT_KEYS = new Set([
   'token', 'accesstoken', 'refreshtoken', 'access_token', 'refresh_token',
   'idtoken', 'id_token',
   'sessionid', 'session_id', 'sid',
+  'cid', 'conversationid', 'conversation_id',
   'secret', 'clientsecret', 'client_secret',
   'password', 'passwd', 'pwd',
   'authorization',
@@ -243,6 +267,15 @@ export function initLogger(): void {
   // gets verbose console by default so you see activity while coding.
   const fileLevel = (process.env.ORKAS_LOG_LEVEL as any) || 'info';
   const consoleLevel = process.env.ORKAS_DEVTOOLS ? 'debug' : (process.env.ORKAS_LOG_LEVEL as any) || 'info';
+  const originalConsole = {
+    error: console.error.bind(console),
+    warn: console.warn.bind(console),
+    info: console.info.bind(console),
+    debug: console.debug.bind(console),
+  };
+  const disableConsoleTransport = () => {
+    log.transports.console.level = false;
+  };
 
   log.transports.file.level    = fileLevel;
   log.transports.console.level = consoleLevel;
@@ -258,6 +291,27 @@ export function initLogger(): void {
 
   log.transports.file.format    = '[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] [{scope}] {text}';
   log.transports.console.format = '[{h}:{i}:{s}.{ms}] [{level}] [{scope}] {text}';
+  log.transports.console.writeFn = ({ message }) => {
+    const write = message.level === 'error'
+      ? originalConsole.error
+      : message.level === 'warn'
+        ? originalConsole.warn
+        : message.level === 'debug' || message.level === 'silly'
+          ? originalConsole.debug
+          : originalConsole.info;
+    writeConsoleSafely(write, message.data, disableConsoleTransport);
+  };
+
+  // A closed pipe can surface asynchronously as a stream `error`, outside the
+  // transport's try/catch. Once that happens, stop console logging and retain
+  // the file transport; non-EPIPE stream failures keep their normal fatal
+  // semantics.
+  const handleOutputError = (error: Error & { code?: string }) => {
+    if (!isBrokenPipeError(error)) throw error;
+    disableConsoleTransport();
+  };
+  process.stdout?.on('error', handleOutputError);
+  process.stderr?.on('error', handleOutputError);
 
   // Redaction hook — runs for every record before formatting. Walk the
   // `data` array (the arguments passed to log.info(...) etc.) and mask
@@ -276,18 +330,13 @@ export function initLogger(): void {
   // `shared/logger.ts`, which `pi-provider.ts` uses) actually land in
   // `data/logs/`. Without this, core-agent stream errors only print to
   // stderr and disappear when the dev terminal is closed — making "fetch
-  // failed" impossible to retro-diagnose. We keep the original console
-  // intact so dev-mode terminal output is unchanged.
+  // failed" impossible to retro-diagnose. The console transport writes each
+  // bridged record once through the original methods captured above.
   try {
     const consoleScope = log.scope('console');
-    const orig = {
-      info: console.info.bind(console),
-      warn: console.warn.bind(console),
-      error: console.error.bind(console),
-    };
-    console.info = (...args: any[]) => { try { consoleScope.info(...args); } catch { /* noop */ } orig.info(...args); };
-    console.warn = (...args: any[]) => { try { consoleScope.warn(...args); } catch { /* noop */ } orig.warn(...args); };
-    console.error = (...args: any[]) => { try { consoleScope.error(...args); } catch { /* noop */ } orig.error(...args); };
+    console.info = (...args: any[]) => { try { consoleScope.info(...args); } catch { /* noop */ } };
+    console.warn = (...args: any[]) => { try { consoleScope.warn(...args); } catch { /* noop */ } };
+    console.error = (...args: any[]) => { try { consoleScope.error(...args); } catch { /* noop */ } };
   } catch { /* noop */ }
 
   // One-shot retention sweep. Log the outcome via the newly-initialized

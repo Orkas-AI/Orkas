@@ -18,7 +18,8 @@
  *   - Idempotent at startup: stamps `<uid>/local/.migrations` with
  *     `agent-as-directory-v1` to prevent re-runs.
  *   - When the old `<aid>.json` coexists with the new `<aid>/agent.json`
- *     (last run was interrupted), the new format wins.
+ *     (last run was interrupted), identical content is deduplicated and
+ *     divergent content is preserved under `migration_conflicts/`.
  *   - A missing meta sub-directory for an agent emits log.warn but does not
  *     block the migration.
  *   - Per-item failures don't block the rest; the stamp is only written
@@ -27,9 +28,11 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { userAgentsDir, userCloudRoot, userLocalConfigDir } from '../paths';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('migrate');
 
@@ -70,6 +73,52 @@ interface MigrationOptions {
   force?: boolean;
 }
 
+function shortDigest(contents: Buffer): string {
+  return createHash('sha256').update(contents).digest('hex').slice(0, 12);
+}
+
+function uniqueConflictPath(base: string, contents: Buffer): string {
+  if (!fs.existsSync(base)) return base;
+  try {
+    if (fs.readFileSync(base).equals(contents)) return base;
+  } catch { /* choose a unique path below */ }
+  for (let index = 1; index < 1_000; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!fs.existsSync(candidate)) return candidate;
+    try {
+      if (fs.readFileSync(candidate).equals(contents)) return candidate;
+    } catch { /* keep searching */ }
+  }
+  return `${base}-${Date.now()}`;
+}
+
+function preserveConflictFile(
+  source: string,
+  current: string,
+  conflictDir: string,
+  label: string,
+): 'deduplicated' | 'preserved' {
+  const sourceContents = fs.readFileSync(source);
+  const currentContents = fs.readFileSync(current);
+  if (sourceContents.equals(currentContents)) {
+    fs.unlinkSync(source);
+    return 'deduplicated';
+  }
+  fs.mkdirSync(conflictDir, { recursive: true });
+  const extension = path.extname(label);
+  const baseName = extension ? label.slice(0, -extension.length) : label;
+  const destination = uniqueConflictPath(
+    path.join(
+      conflictDir,
+      `${baseName}.legacy-${shortDigest(sourceContents)}${extension}`,
+    ),
+    sourceContents,
+  );
+  if (fs.existsSync(destination)) fs.unlinkSync(source);
+  else fs.renameSync(source, destination);
+  return 'preserved';
+}
+
 /**
  * Migrate one user's agent layout in place. Idempotent — already-stamped uids
  * return zero stats without touching disk. Safe to call on every boot.
@@ -78,6 +127,7 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
   const stats: MigrationStats = { agentsConverted: 0, metaMoved: 0, warnings: 0 };
   const applied = alreadyApplied(uid);
   if (applied && !opts.force) return stats;
+  let retryRequired = false;
 
   const agentsRoot = userAgentsDir(uid);
   const oldMetaRoot = path.join(userCloudRoot(uid), 'meta');
@@ -88,7 +138,11 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
     try {
       entries = fs.readdirSync(agentsRoot, { withFileTypes: true });
     } catch (err) {
-      log.warn(`readdir failed ${agentsRoot}: ${(err as Error).message}`);
+      log.warn('agent-layout migration scan failed', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
+      retryRequired = true;
     }
     for (const e of entries) {
       if (!e.isFile() || !e.name.endsWith('.json') || e.name.startsWith('.')) continue;
@@ -97,14 +151,28 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
       const newDir = path.join(agentsRoot, aid);
       const newFile = path.join(newDir, 'agent.json');
       if (fs.existsSync(newFile)) {
-        // Previous run was interrupted, or the user hand-created the new
-        // format → keep the new format, drop the old flat file.
         try {
-          fs.unlinkSync(oldFile);
-          log.info(`migrate: dropped redundant flat ${oldFile} (new agent.json already exists)`);
+          const outcome = preserveConflictFile(
+            oldFile,
+            newFile,
+            path.join(newDir, 'migration_conflicts'),
+            'agent.json',
+          );
+          if (outcome === 'preserved') {
+            stats.warnings += 1;
+            log.warn('agent-layout migration preserved a divergent flat agent', {
+              userId: maskId(uid),
+              agentId: maskId(aid),
+            });
+          }
         } catch (err) {
-          log.warn(`migrate: unlink redundant ${oldFile} failed: ${(err as Error).message}`);
+          log.warn('agent-layout migration could not reconcile a flat agent', {
+            userId: maskId(uid),
+            agentId: maskId(aid),
+            error: logErrorSummary(err),
+          });
           stats.warnings += 1;
+          retryRequired = true;
         }
         continue;
       }
@@ -113,8 +181,13 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
         fs.renameSync(oldFile, newFile);
         stats.agentsConverted += 1;
       } catch (err) {
-        log.warn(`migrate: agent ${aid} flat→dir failed: ${(err as Error).message}`);
+        log.warn('agent-layout migration could not move a flat agent', {
+          userId: maskId(uid),
+          agentId: maskId(aid),
+          error: logErrorSummary(err),
+        });
         stats.warnings += 1;
+        retryRequired = true;
       }
     }
   }
@@ -126,7 +199,11 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
     try {
       entries = fs.readdirSync(oldMetaRoot, { withFileTypes: true });
     } catch (err) {
-      log.warn(`readdir failed ${oldMetaRoot}: ${(err as Error).message}`);
+      log.warn('agent-layout legacy metadata scan failed', {
+        userId: maskId(uid),
+        error: logErrorSummary(err),
+      });
+      retryRequired = true;
     }
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
@@ -139,8 +216,19 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
           const src = path.join(srcDir, f);
           const dst = path.join(targetDir, f);
           if (fs.existsSync(dst)) {
-            log.warn(`migrate: meta target exists, skipping ${dst}`);
-            stats.warnings += 1;
+            const outcome = preserveConflictFile(
+              src,
+              dst,
+              path.join(agentsRoot, aid, 'migration_conflicts', 'meta'),
+              f,
+            );
+            if (outcome === 'preserved') {
+              stats.warnings += 1;
+              log.warn('agent-layout migration preserved divergent metadata', {
+                userId: maskId(uid),
+                agentId: maskId(aid),
+              });
+            }
             continue;
           }
           fs.renameSync(src, dst);
@@ -150,8 +238,13 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
         try { fs.rmdirSync(srcDir); }
         catch { /* leave the leftover for the next run to clean up */ }
       } catch (err) {
-        log.warn(`migrate: meta agent ${aid} failed: ${(err as Error).message}`);
+        log.warn('agent-layout metadata migration failed', {
+          userId: maskId(uid),
+          agentId: maskId(aid),
+          error: logErrorSummary(err),
+        });
         stats.warnings += 1;
+        retryRequired = true;
       }
     }
     // Remove the top-level meta/ directory wholesale (rmdirSync only succeeds
@@ -160,11 +253,15 @@ export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): Mi
     catch { /* keep */ }
   }
 
-  if (!applied) stamp(uid);
+  if (!applied && !retryRequired) stamp(uid);
   if (stats.agentsConverted || stats.metaMoved || stats.warnings) {
-    log.info(
-      `agent-layout migration done uid=${uid} agents=${stats.agentsConverted} meta=${stats.metaMoved} warnings=${stats.warnings}`,
-    );
+    log.info('agent-layout migration completed', {
+      userId: maskId(uid),
+      agents: stats.agentsConverted,
+      metadata: stats.metaMoved,
+      warnings: stats.warnings,
+      retryRequired,
+    });
   }
   return stats;
 }

@@ -48,6 +48,7 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
 
 vi.mock('../../../../src/main/model/core-agent/session-store', () => ({
   getSession: async () => null,
+  getSessionForUser: async () => null,
 }));
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -216,5 +217,82 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     h.lastBuildRunnerParams = null;
     await drain({});
     expect(h.lastBuildRunnerParams?.maxToolLoops).toBeUndefined();
+  }, 8000);
+
+  it('forwards attachment metadata used by conditional OCR tool exposure', async () => {
+    h.makeStream = () => (async function* () { yield { type: 'text_delta', text: 'ok' }; })();
+    h.lastBuildRunnerParams = null;
+
+    await drain({
+      attachmentMetadata: {
+        hasAttachments: true,
+        attachmentTypes: ['image'],
+      },
+    });
+
+    expect(h.lastBuildRunnerParams?.attachmentMetadata).toEqual({
+      hasAttachments: true,
+      attachmentTypes: ['image'],
+    });
+  }, 8000);
+
+  it('does not serialize identical session ids that belong to different accounts', async () => {
+    const bothStarted = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let starts = 0;
+    h.makeStream = () =>
+      (async function* () {
+        starts += 1;
+        if (starts === 2) bothStarted.resolve();
+        await release.promise;
+        yield { type: 'text_delta', text: 'ok' };
+      })();
+
+    const first = drain({ userId: 'account-a', sessionId: 'gconv-shared-lock' });
+    const second = drain({ userId: 'account-b', sessionId: 'gconv-shared-lock' });
+    let startError: Error | null = null;
+    try {
+      await Promise.race([
+        bothStarted.promise,
+        delay(500).then(() => { throw new Error('second account was blocked by the first account session lock'); }),
+      ]);
+    } catch (error) {
+      startError = error as Error;
+    } finally {
+      release.resolve();
+    }
+    await Promise.all([first, second]);
+
+    if (startError) throw startError;
+    expect(starts).toBe(2);
+  }, 8000);
+
+  it('aborts only the requested account when two accounts have the same conversation id', async () => {
+    const bothStarted = Promise.withResolvers<void>();
+    let starts = 0;
+    h.makeStream = () =>
+      (async function* () {
+        starts += 1;
+        if (starts === 2) bothStarted.resolve();
+        await new Promise(() => {});
+      })();
+
+    const first = drain({ userId: 'account-a', sessionId: 'gconv-shared-abort', cid: 'shared-abort' });
+    let secondSettled = false;
+    const second = drain({ userId: 'account-b', sessionId: 'gconv-shared-abort', cid: 'shared-abort' })
+      .finally(() => { secondSettled = true; });
+    await bothStarted.promise;
+
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const firstAbortCount = client.abortActiveSessionsForConversation('shared-abort', 'account-a');
+    await first;
+    await delay(20);
+    const secondWasStillRunning = !secondSettled;
+    const secondAbortCount = client.abortActiveSessionsForConversation('shared-abort', 'account-b');
+    await second;
+
+    expect(firstAbortCount).toBe(1);
+    expect(secondWasStillRunning).toBe(true);
+    expect(secondAbortCount).toBe(1);
   }, 8000);
 });

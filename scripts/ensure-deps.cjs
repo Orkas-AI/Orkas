@@ -5,6 +5,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
@@ -13,6 +14,122 @@ const PKG = path.join(PC_DIR, 'package.json');
 const LOCK = path.join(PC_DIR, 'package-lock.json');
 const NODE_MODULES = path.join(PC_DIR, 'node_modules');
 const STAMP = path.join(NODE_MODULES, '.orkas-deps-hash');
+const DEPENDENCY_LOCK = path.join(
+  os.tmpdir(),
+  `orkas-ensure-deps-${crypto.createHash('sha256').update(PC_DIR).digest('hex').slice(0, 16)}.lock`,
+);
+const DEPENDENCY_LOCK_TIMEOUT_MS = 20 * 60 * 1000;
+const DEPENDENCY_LOCK_MAX_AGE_MS = 30 * 60 * 1000;
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function processIsAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err && err.code !== 'ESRCH';
+  }
+}
+
+function readDependencyLock(lockFile) {
+  try {
+    const raw = fs.readFileSync(lockFile, 'utf8');
+    const stat = fs.statSync(lockFile);
+    let owner = null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (
+        Number.isSafeInteger(parsed?.pid)
+        && parsed.pid > 0
+        && typeof parsed?.token === 'string'
+        && parsed.token
+      ) {
+        owner = parsed;
+      }
+    } catch {
+      owner = null;
+    }
+    return { raw, owner, mtimeMs: stat.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function removeObservedDependencyLock(lockFile, observed) {
+  if (!observed) return false;
+  try {
+    if (fs.readFileSync(lockFile, 'utf8') !== observed.raw) return false;
+    fs.unlinkSync(lockFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function acquireDependencyLock(options = {}) {
+  const lockFile = options.lockFile || DEPENDENCY_LOCK;
+  const timeoutMs = options.timeoutMs ?? DEPENDENCY_LOCK_TIMEOUT_MS;
+  const pollMs = options.pollMs ?? 250;
+  const isProcessAlive = options.isProcessAlive || processIsAlive;
+  const logWait = options.logWait !== false;
+  const startedAt = Date.now();
+  const token = `${process.pid}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+  const contents = JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }) + '\n';
+  let loggedWait = false;
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockFile, 'wx');
+      let wroteOwner = false;
+      try {
+        fs.writeFileSync(fd, contents, 'utf8');
+        wroteOwner = true;
+      } finally {
+        fs.closeSync(fd);
+        if (!wroteOwner) {
+          try { fs.unlinkSync(lockFile); } catch { /* leave recovery to stale-lock handling */ }
+        }
+      }
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        const observed = readDependencyLock(lockFile);
+        if (observed?.owner?.token === token) removeObservedDependencyLock(lockFile, observed);
+      };
+    } catch (err) {
+      if (!err || err.code !== 'EEXIST') throw err;
+    }
+
+    const observed = readDependencyLock(lockFile);
+    const ageMs = observed ? Math.max(0, Date.now() - observed.mtimeMs) : 0;
+    const ownerDead = Boolean(observed?.owner) && !isProcessAlive(observed.owner.pid);
+    const ownerMissingAndExpired = Boolean(observed)
+      && !observed.owner
+      && ageMs > DEPENDENCY_LOCK_MAX_AGE_MS;
+    if (
+      (ownerDead || ownerMissingAndExpired)
+      && removeObservedDependencyLock(lockFile, observed)
+    ) {
+      continue;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      const owner = observed?.owner?.pid ? ` (owner pid ${observed.owner.pid})` : '';
+      throw new Error(`Timed out waiting for dependency preparation lock${owner}`);
+    }
+    if (logWait && !loggedWait) {
+      const owner = observed?.owner?.pid ? ` by pid ${observed.owner.pid}` : ' in another process';
+      console.log(`[Orkas] Dependency preparation is already running${owner}; waiting...`);
+      loggedWait = true;
+    }
+    sleepSync(Math.max(1, pollMs));
+  }
+}
 
 function missingDeclaredDependencyPackages(options = {}) {
   const packageFile = options.packageFile || PKG;
@@ -102,7 +219,7 @@ function writeStamp(hash) {
   fs.writeFileSync(STAMP, hash + '\n', 'utf8');
 }
 
-function npmInstallInvocation() {
+function npmInvocation(args, actionLabel) {
   let packageManager = '';
   try {
     const pkg = JSON.parse(fs.readFileSync(PKG, 'utf8'));
@@ -121,30 +238,30 @@ function npmInstallInvocation() {
     if (!corepackProbe.error) {
       return {
         cmd: corepackCmd,
-        args: ['npm', 'install'],
+        args: ['npm', ...args],
         shell: process.platform === 'win32',
-        label: `corepack npm install (${packageManager})`,
+        label: `corepack npm ${actionLabel} (${packageManager})`,
       };
     }
-    console.warn(`[Orkas] corepack unavailable (${corepackProbe.error.message}); falling back to npm install.`);
+    console.warn(`[Orkas] corepack unavailable (${corepackProbe.error.message}); falling back to npm ${actionLabel}.`);
     return {
       cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-      args: ['install'],
+      args,
       shell: process.platform === 'win32',
-      label: `npm install (fallback for ${packageManager})`,
+      label: `npm ${actionLabel} (fallback for ${packageManager})`,
     };
   }
 
   return {
     cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-    args: ['install'],
+    args,
     shell: process.platform === 'win32',
-    label: 'npm install',
+    label: `npm ${actionLabel}`,
   };
 }
 
 function runNpmInstall() {
-  const invocation = npmInstallInvocation();
+  const invocation = npmInvocation(['install'], 'install');
   console.log(`[Orkas] Installing dependencies with ${invocation.label}...`);
   const res = spawnSync(invocation.cmd, invocation.args, {
     cwd: PC_DIR,
@@ -191,7 +308,23 @@ const ELECTRON_DIR = path.join(NODE_MODULES, 'electron');
 const ELECTRON_INSTALL = path.join(ELECTRON_DIR, 'install.js');
 const ELECTRON_PATH_TXT = path.join(ELECTRON_DIR, 'path.txt');
 
-function electronExpectedVersion() {
+function lockedPackageVersion(options = {}) {
+  const lockFile = options.lockFile || LOCK;
+  const packageName = options.packageName || '';
+  if (!packageName) return '';
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+    return String(lock?.packages?.[`node_modules/${packageName}`]?.version || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function electronLockedVersion() {
+  return lockedPackageVersion({ lockFile: LOCK, packageName: 'electron' });
+}
+
+function electronInstalledVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(ELECTRON_DIR, 'package.json'), 'utf8'));
     return String(pkg.version || '').trim();
@@ -210,62 +343,204 @@ function electronBinaryPath() {
   }
 }
 
-function electronPlatformPath() {
-  switch (process.platform) {
-    case 'darwin':
-      return 'Electron.app/Contents/MacOS/Electron';
-    case 'win32':
-      return 'electron.exe';
-    default:
-      return 'electron';
-  }
-}
-
-function electronDarwinAppRoot(bin) {
-  const marker = `${path.sep}Contents${path.sep}MacOS${path.sep}Electron`;
-  if (!bin.endsWith(marker)) return '';
-  return bin.slice(0, -marker.length);
-}
-
-function electronDistReady(distDir, relPath, expected) {
-  const bin = path.join(distDir, relPath);
-  if (!bin || !fs.existsSync(bin)) return false;
-
+function electronBinaryVersion() {
   try {
-    const actual = fs.readFileSync(path.join(distDir, 'version'), 'utf8').trim().replace(/^v/, '');
-    if (actual !== expected) return false;
+    return fs.readFileSync(path.join(ELECTRON_DIR, 'dist', 'version'), 'utf8').trim().replace(/^v/, '');
   } catch {
-    return false;
+    return '';
   }
+}
 
-  if (process.platform === 'darwin') {
-    const appRoot = electronDarwinAppRoot(bin);
-    if (!appRoot) return false;
-    const framework = path.join(
-      appRoot,
-      'Contents',
-      'Frameworks',
-      'Electron Framework.framework',
-      'Versions',
-      'A',
-      'Electron Framework',
-    );
-    if (!fs.existsSync(framework)) return false;
-  }
+function electronDependencyState({ lockedVersion, installedVersion, binaryVersion, binaryExists }) {
+  if (!lockedVersion) return 'lockfile_version_missing';
+  if (installedVersion !== lockedVersion) return 'package_version_mismatch';
+  if (!binaryExists) return 'binary_missing';
+  if (binaryVersion !== lockedVersion) return 'binary_version_mismatch';
+  return '';
+}
 
-  return true;
+function currentElectronDependencyState() {
+  const bin = electronBinaryPath();
+  return electronDependencyState({
+    lockedVersion: electronLockedVersion(),
+    installedVersion: electronInstalledVersion(),
+    binaryVersion: electronBinaryVersion(),
+    binaryExists: Boolean(bin && fs.existsSync(bin)),
+  });
 }
 
 function electronReady() {
-  const expected = electronExpectedVersion();
-  if (!expected) return false;
+  return currentElectronDependencyState() === '';
+}
+
+function pathExistsNoFollow(target) {
   try {
-    const rel = fs.readFileSync(ELECTRON_PATH_TXT, 'utf8').trim();
-    if (!rel) return false;
-    return electronDistReady(path.join(ELECTRON_DIR, 'dist'), rel, expected);
+    fs.lstatSync(target);
+    return true;
   } catch {
     return false;
   }
+}
+
+function packageVersionAt(packageDir) {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, 'package.json'), 'utf8'));
+    return String(pkg.version || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function replaceElectronPackageFromSource(options) {
+  const sourceDir = options.sourceDir;
+  const electronDir = options.electronDir || ELECTRON_DIR;
+  const expectedVersion = options.expectedVersion;
+  const nodeModulesDir = path.dirname(electronDir);
+  const suffix = `${process.pid}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  const stagedDir = path.join(nodeModulesDir, `.orkas-electron-staging-${suffix}`);
+  const backupDir = path.join(nodeModulesDir, `.orkas-electron-backup-${suffix}`);
+  let movedExisting = false;
+
+  if (packageVersionAt(sourceDir) !== expectedVersion) {
+    throw new Error(`Electron package source does not match locked version ${expectedVersion}`);
+  }
+
+  try {
+    fs.cpSync(sourceDir, stagedDir, {
+      recursive: true,
+      filter(source) {
+        const relative = path.relative(sourceDir, source);
+        return relative !== 'path.txt'
+          && relative !== 'dist'
+          && !relative.startsWith(`dist${path.sep}`);
+      },
+    });
+    if (packageVersionAt(stagedDir) !== expectedVersion) {
+      throw new Error(`Staged Electron package does not match locked version ${expectedVersion}`);
+    }
+
+    if (pathExistsNoFollow(electronDir)) {
+      fs.renameSync(electronDir, backupDir);
+      movedExisting = true;
+    }
+    fs.renameSync(stagedDir, electronDir);
+  } catch (err) {
+    if (!pathExistsNoFollow(electronDir) && movedExisting && pathExistsNoFollow(backupDir)) {
+      try { fs.renameSync(backupDir, electronDir); } catch { /* keep the original error */ }
+    }
+    try { fs.rmSync(stagedDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+
+  if (movedExisting) {
+    try {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    } catch {
+      console.warn('[Orkas] Could not remove the previous Electron package backup; continuing with the verified replacement.');
+    }
+  }
+}
+
+function fetchLockedElectronPackageSource(version) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `orkas-electron-${version}-`));
+  const args = [
+    'install',
+    '--prefix', tempDir,
+    '--ignore-scripts',
+    '--no-save',
+    '--package-lock=false',
+    `electron@${version}`,
+  ];
+  const invocation = npmInvocation(args, `install isolated electron@${version}`);
+  console.log(`[Orkas] Fetching the locked Electron ${version} npm wrapper in isolation...`);
+  const res = spawnSync(invocation.cmd, invocation.args, {
+    cwd: PC_DIR,
+    stdio: 'inherit',
+    shell: invocation.shell,
+  });
+  if (res.error || res.status !== 0) {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    const detail = res.error?.message || `exit ${res.status}`;
+    throw new Error(`${invocation.label} failed: ${detail}`);
+  }
+  return {
+    sourceDir: path.join(tempDir, 'node_modules', 'electron'),
+    cleanup() {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    },
+  };
+}
+
+function restoreLockedElectronPackage(lockedVersion) {
+  const ignoredDir = path.join(NODE_MODULES, '.ignored', 'electron');
+  let sourceDir = ignoredDir;
+  let cleanup = () => {};
+  if (packageVersionAt(sourceDir) !== lockedVersion) {
+    const fetched = fetchLockedElectronPackageSource(lockedVersion);
+    sourceDir = fetched.sourceDir;
+    cleanup = fetched.cleanup;
+  } else {
+    console.log(`[Orkas] Reusing the cached Electron ${lockedVersion} npm wrapper from node_modules/.ignored.`);
+  }
+
+  try {
+    replaceElectronPackageFromSource({
+      sourceDir,
+      electronDir: ELECTRON_DIR,
+      expectedVersion: lockedVersion,
+    });
+  } finally {
+    cleanup();
+  }
+}
+
+function ensureElectronPackageMatchesLock() {
+  const lockedVersion = electronLockedVersion();
+  if (!lockedVersion) {
+    console.error('[Orkas] package-lock.json does not contain a locked Electron version.');
+    console.error('[Orkas] Refusing to run an installed Electron repair script without a lockfile authority.');
+    process.exit(1);
+  }
+
+  const installedVersion = electronInstalledVersion();
+  if (installedVersion === lockedVersion) return;
+
+  console.log(
+    `[Orkas] Electron package ${installedVersion || '<missing>'} does not match package-lock.json `
+    + `(${lockedVersion}); restoring only the locked Electron wrapper first...`,
+  );
+  try {
+    restoreLockedElectronPackage(lockedVersion);
+  } catch (err) {
+    console.error('[Orkas] Failed to restore the locked Electron npm wrapper:', err.message);
+    process.exit(1);
+  }
+
+  const restoredVersion = electronInstalledVersion();
+  if (restoredVersion !== lockedVersion) {
+    console.error(
+      `[Orkas] Electron wrapper restore left Electron at ${restoredVersion || '<missing>'}; `
+      + `package-lock.json requires ${lockedVersion}.`,
+    );
+    process.exit(1);
+  }
+}
+
+function describeElectronRepairReason(fallback) {
+  const lockedVersion = electronLockedVersion();
+  const installedVersion = electronInstalledVersion();
+  const binaryVersion = electronBinaryVersion();
+  const state = currentElectronDependencyState();
+  if (state === 'package_version_mismatch') {
+    return `package ${installedVersion || '<missing>'} does not match locked ${lockedVersion}`;
+  }
+  if (state === 'binary_version_mismatch') {
+    return `binary ${binaryVersion || '<missing>'} does not match locked ${lockedVersion}`;
+  }
+  if (state === 'binary_missing') {
+    return `locked ${lockedVersion} binary is missing`;
+  }
+  return fallback;
 }
 
 function runElectronInstall(reason) {
@@ -275,7 +550,7 @@ function runElectronInstall(reason) {
     process.exit(1);
   }
 
-  console.log(`[Orkas] Electron binary is not ready (${reason}); repairing Electron install...`);
+  console.log(`[Orkas] Electron binary is not ready (${reason}); repairing locked Electron install...`);
   const res = spawnSync(process.execPath, [ELECTRON_INSTALL], {
     cwd: PC_DIR,
     stdio: 'inherit',
@@ -319,7 +594,7 @@ function powershellQuote(value) {
 function repairWindowsElectronFromCache() {
   if (process.platform !== 'win32') return false;
 
-  const version = electronExpectedVersion();
+  const version = electronLockedVersion();
   const archiveName = `electron-v${version}-win32-${process.arch}.zip`;
   let expectedSha = '';
   try {
@@ -365,9 +640,10 @@ function repairWindowsElectronFromCache() {
 }
 
 function ensureElectronReady(reason = 'missing binary') {
+  ensureElectronPackageMatchesLock();
   if (electronReady()) return;
 
-  runElectronInstall(reason);
+  runElectronInstall(describeElectronRepairReason(reason));
   if (electronReady()) return;
   if (repairWindowsElectronFromCache()) return;
 
@@ -468,10 +744,22 @@ function main() {
     missingPackages,
   });
 
+  // Restore a drifted Electron wrapper to the lockfile version before any path
+  // can run the wrong install.js. This isolated restore does not download
+  // unrelated dependencies such as ffmpeg.
+  if (nodeModulesExists && electronInstalledVersion()) {
+    ensureElectronPackageMatchesLock();
+  }
+
   if (!installReason) {
-    // 依赖已同步；但模型文件可能被误删，单独校验一次。
+    // A matching fingerprint does not prove the installed package versions;
+    // another package manager may have linked an Electron wrapper that differs
+    // from package-lock.json.
+    ensureElectronPackageMatchesLock();
+    // Dependencies are synchronized, but the embedding model may have been
+    // deleted independently. Verify it before continuing.
     if (!modelReady()) {
-      console.log('[Orkas] 知识库 embedding 模型缺失，补下载（约 90MB）...');
+      console.log('[Orkas] The knowledge-base embedding model is missing; downloading it now (about 90 MB)...');
       runModelFetch();
     }
     ensureElectronReady('dependency stamp is current but Electron files are incomplete');
@@ -481,11 +769,11 @@ function main() {
   }
 
   if (installReason === 'node_modules_missing') {
-    console.log('[Orkas] 首次运行：安装依赖 + 下载嵌入模型（约 5～10 分钟）...');
+    console.log('[Orkas] First run: installing dependencies and downloading the embedding model (about 5-10 minutes)...');
   } else if (installReason === 'packages_incomplete') {
     console.log(`[Orkas] Installed npm packages are incomplete (${summarizePackages(missingPackages)}); repairing...`);
   } else {
-    console.log('[Orkas] 依赖与 package.json / lockfile 不一致，执行 npm install...');
+    console.log('[Orkas] Dependencies do not match package.json/package-lock.json; running npm install...');
   }
 
   runNpmInstall();
@@ -494,32 +782,57 @@ function main() {
     console.error(`[Orkas] npm install completed but required packages are still incomplete: ${summarizePackages(missingAfterInstall)}`);
     process.exit(1);
   }
+  ensureElectronPackageMatchesLock();
   ensureElectronReady('npm install finished without a complete Electron binary');
 
-  // 双保险：npm install 的 postinstall 已跑 fetch-embedding-model，若因 npm
-  // 的 postinstall 被 --ignore-scripts / CI 配置跳过，这里再兜底补一次。
+  // npm install normally fetches the embedding model from postinstall. Check
+  // once more in case CI or --ignore-scripts skipped lifecycle scripts.
   if (!modelReady()) {
-    console.log('[Orkas] 嵌入模型尚未就绪，补下载...');
+    console.log('[Orkas] The embedding model is still missing; downloading it now...');
     runModelFetch();
   }
 
-  // npm install 重新落地的 Electron 会带回 "Electron" 字样的 Info.plist —
-  // 必须紧接着再 patch 一遍，否则 Dock 又会显示 Electron。
+  // npm install restores the Electron app bundle with its default name. Patch
+  // it immediately so the Dock continues to display Orkas.
   patchElectronAppName();
   ensureElectronReady('Electron app-name patch left Electron files incomplete');
 
-  // 安装后重新算一次（postinstall 钩子不会改 package.json/lockfile，但保险起见）
+  // Postinstall should not change package metadata, but record the final state.
   const finalHash = depFingerprint();
   try {
     writeStamp(finalHash);
-  } catch (err) {
-    console.warn('[Orkas] 警告：写入依赖 stamp 失败（不影响启动）：', err.message);
+  } catch {
+    console.warn('[Orkas] Could not write the dependency stamp; startup can continue.');
   }
 }
 
-if (require.main === module) main();
+function runMainWithDependencyLock() {
+  let release;
+  try {
+    release = acquireDependencyLock();
+  } catch (err) {
+    console.error('[Orkas] Failed to acquire dependency preparation lock:', err.message);
+    process.exit(1);
+  }
+
+  const releaseOnExit = () => release();
+  process.once('exit', releaseOnExit);
+  try {
+    main();
+  } finally {
+    process.removeListener('exit', releaseOnExit);
+    release();
+  }
+}
+
+if (require.main === module) runMainWithDependencyLock();
 
 module.exports = {
+  acquireDependencyLock,
+  depFingerprint,
   dependencyInstallReason,
+  electronDependencyState,
+  lockedPackageVersion,
   missingDeclaredDependencyPackages,
+  replaceElectronPackageFromSource,
 };

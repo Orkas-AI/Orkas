@@ -43,6 +43,7 @@ import {
   spawnCli,
   bindAbort,
   armKillWatchdog,
+  stripAnsi,
 } from './base.js';
 
 const log = createLogger('local-agents:openclaw');
@@ -179,14 +180,6 @@ export function buildOpenclawArgs(opts: Pick<BackendRunOptions, 'model' | 'resum
 
 function hasOpenclawTimeoutArg(args: string[] | undefined): boolean {
   return (args || []).some((arg) => arg === '--timeout' || arg.startsWith('--timeout='));
-}
-
-/** Strip ANSI color escape sequences. openclaw's `[skills]` /
- *  `[tools]` log lines are colorized; without this every stderr-line
- *  shows up in the UI with raw ESC[36m noise. */
-function stripAnsi(s: string): string {
-  // eslint-disable-next-line no-control-regex
-  return s.replace(/\[[0-9;]*m/g, '');
 }
 
 /**

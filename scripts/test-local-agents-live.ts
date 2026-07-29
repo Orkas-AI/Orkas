@@ -8,19 +8,24 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   LOCAL_AGENT_ENV_KEYS,
+  localAgentBenchmarkScenariosFor,
   classifyLiveFailure,
   ensureRequestedAgents,
   installerPlan,
   managedBinaryCandidates,
   parseLiveArgs,
+  scoreLocalAgentBenchmarkScenario,
   summarizeLiveFailure,
+  validateLocalAgentBenchmarkInventory,
 } from './local-agent-live-support.mjs';
+import { resolveCliCommand } from '../src/main/features/local_agents/spawn-command.js';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const pcRoot = path.resolve(scriptDir, '..');
@@ -36,6 +41,9 @@ function usage(): string {
     '  --agents claude,codex,...  Agents to verify; default: all five',
     '  --no-install               Fail instead of installing a missing CLI',
     '  --install-only             Install and version-check, skip model calls',
+    '  --benchmark                Run the objective model-quality suite',
+    '  --k N                      Benchmark rollouts per scenario; default: 3',
+    '  --no-save                  Print benchmark scorecard without saving it',
     '  -h, --help                 Show this help',
   ].join('\n');
 }
@@ -51,12 +59,14 @@ async function runProcess(
 ): Promise<void> {
   process.stdout.write(`\n[local-agent-live] $ ${printableCommand(command, args)}\n`);
   await new Promise<void>((resolve, reject) => {
-    const child = spawn(command, args, {
+    const env = { ...process.env, ...options.env };
+    const launch = resolveCliCommand(command, args, process.platform, env);
+    const child = spawn(launch.command, launch.args, {
       cwd: pcRoot,
-      env: { ...process.env, ...options.env },
+      env,
       stdio: 'inherit',
       windowsHide: true,
-      shell: false,
+      windowsVerbatimArguments: launch.windowsVerbatimArguments,
     });
     const timeoutMs = options.timeoutMs ?? Number(process.env.ORKAS_LOCAL_AGENT_INSTALL_TIMEOUT_MS || 15 * 60_000);
     const timer = setTimeout(() => {
@@ -126,6 +136,165 @@ async function installAgent(type: string): Promise<void> {
   }
 }
 
+type QualityRun = {
+  agent: string;
+  scenario: string;
+  rollout: number;
+  passed: boolean;
+  status: string;
+  wallMs: number;
+  checks: Array<{ name: string; pass: boolean; detail: string }>;
+  outputSha256: string;
+  failureKind: string | null;
+};
+
+function outputFingerprint(text: string): string {
+  return text
+    ? createHash('sha256').update(text.replace(/\r\n/g, '\n').trim()).digest('hex')
+    : '';
+}
+
+function scorecardFileTimestamp(iso: string): string {
+  return iso.replace(/[:.]/g, '-');
+}
+
+function listWorkspaceFiles(root: string, relativeDir = ''): string[] {
+  const absoluteDir = path.join(root, relativeDir);
+  const files: string[] = [];
+  for (const entry of fs.readdirSync(absoluteDir, { withFileTypes: true })) {
+    const relativePath = path.join(relativeDir, entry.name);
+    if (entry.isDirectory()) files.push(...listWorkspaceFiles(root, relativePath));
+    else files.push(relativePath.split(path.sep).join('/'));
+  }
+  return files.sort();
+}
+
+async function runQualityBenchmark(
+  entries: Array<{ type: string; version?: string | null }>,
+  run: (options: any) => Promise<any>,
+  uid: string,
+  testDataRoot: string,
+  options: { k: number; noSave: boolean },
+): Promise<void> {
+  const inventoryErrors = validateLocalAgentBenchmarkInventory();
+  if (inventoryErrors.length) {
+    throw new Error(`invalid local-agent benchmark inventory:\n${inventoryErrors.map(error => `- ${error}`).join('\n')}`);
+  }
+  const startedAt = new Date().toISOString();
+  const results: QualityRun[] = [];
+
+  for (const entry of entries) {
+    for (const scenario of localAgentBenchmarkScenariosFor(entry.type)) {
+      for (let rollout = 1; rollout <= options.k; rollout += 1) {
+        const cwd = path.join(testDataRoot, 'benchmark', entry.type, scenario.id, `rollout-${rollout}`);
+        fs.mkdirSync(cwd, { recursive: true });
+        for (const [relPath, content] of Object.entries(scenario.seedFiles)) {
+          const absPath = path.join(cwd, relPath);
+          fs.mkdirSync(path.dirname(absPath), { recursive: true });
+          fs.writeFileSync(absPath, String(content), 'utf8');
+        }
+
+        let terminalEvent: any = null;
+        const t0 = Date.now();
+        const result = await run({
+          uid,
+          cid: `c-bench-${entry.type}-${rollout}`,
+          agentId: `a-bench-${entry.type}`,
+          agentName: `Benchmark ${entry.type}`,
+          cli: entry.type,
+          prompt: scenario.prompt,
+          cwd,
+          signal: new AbortController().signal,
+          onEvent: (event: any) => {
+            if (event?.type === 'done') terminalEvent = event;
+          },
+        });
+        const files: Record<string, string | null> = {};
+        for (const relPath of scenario.observedFiles) {
+          try { files[relPath] = fs.readFileSync(path.join(cwd, relPath), 'utf8'); }
+          catch { files[relPath] = null; }
+        }
+        const output = String(result.output || '');
+        const checks = scoreLocalAgentBenchmarkScenario(scenario, {
+          status: result.status,
+          output,
+          files,
+          workspaceFiles: listWorkspaceFiles(cwd),
+        });
+        const passed = checks.every(check => check.pass);
+        const failureKind = passed
+          ? null
+          : classifyLiveFailure({
+              ...result,
+              stderrTail: typeof terminalEvent?.stderrTail === 'string' ? terminalEvent.stderrTail : '',
+            });
+        results.push({
+          agent: entry.type,
+          scenario: scenario.id,
+          rollout,
+          passed,
+          status: String(result.status || 'unknown'),
+          wallMs: Date.now() - t0,
+          checks,
+          outputSha256: outputFingerprint(output),
+          failureKind,
+        });
+        const failedChecks = checks.filter(check => !check.pass).map(check => check.name);
+        process.stdout.write(
+          `  ${passed ? '✓' : '✗'} ${entry.type}/${scenario.id} rollout ${rollout}/${options.k}`
+          + `${failedChecks.length ? ` failed=${failedChecks.join(',')}` : ''}\n`,
+        );
+      }
+    }
+  }
+
+  const robustGroups = new Map<string, boolean>();
+  for (const result of results) {
+    const key = `${result.agent}/${result.scenario}`;
+    robustGroups.set(key, (robustGroups.get(key) ?? true) && result.passed);
+  }
+  const passedRollouts = results.filter(result => result.passed).length;
+  const robustPassed = [...robustGroups.values()].filter(Boolean).length;
+  const scorecard = {
+    kind: 'local-agent-quality',
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    k: options.k,
+    environment: {
+      platform: process.platform,
+      arch: process.arch,
+      node: process.version,
+      agents: entries.map(entry => ({ type: entry.type, version: entry.version || null })),
+    },
+    aggregate: {
+      rollouts: results.length,
+      passed: passedRollouts,
+      passRate: results.length ? passedRollouts / results.length : 0,
+      scenarioGroups: robustGroups.size,
+      robustPassed,
+    },
+    results,
+  };
+
+  if (!options.noSave) {
+    const resultsDir = path.join(pcRoot, 'eval', 'local-agents', 'results');
+    fs.mkdirSync(resultsDir, { recursive: true });
+    const fileName = `local-agent-quality-${scorecardFileTimestamp(startedAt)}-${process.pid}.json`;
+    const outputPath = path.join(resultsDir, fileName);
+    fs.writeFileSync(outputPath, `${JSON.stringify(scorecard, null, 2)}\n`, 'utf8');
+    process.stdout.write(`[local-agent-benchmark] scorecard: ${path.relative(pcRoot, outputPath)}\n`);
+  } else {
+    process.stdout.write('[local-agent-benchmark] scorecard not saved (--no-save)\n');
+  }
+  process.stdout.write(`${JSON.stringify(scorecard, null, 2)}\n`);
+  if (passedRollouts !== results.length) {
+    throw new Error(
+      `local-agent quality benchmark failed: ${passedRollouts}/${results.length} rollouts passed,`
+      + ` ${robustPassed}/${robustGroups.size} scenario groups robust`,
+    );
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseLiveArgs(process.argv.slice(2));
   if (args.help) {
@@ -161,6 +330,11 @@ async function main(): Promise<void> {
     ]);
     const uid = 'u-local-agent-live';
     activateUser(uid);
+    if (args.benchmark) {
+      process.stdout.write(`\n[local-agent-benchmark] running pass@${args.k}...\n`);
+      await runQualityBenchmark(entries, run, uid, testDataRoot, { k: args.k, noSave: args.noSave });
+      return;
+    }
     const failures: string[] = [];
 
     for (const entry of entries) {

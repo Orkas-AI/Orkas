@@ -24,6 +24,10 @@ For every scene, internally answer:
 
 Put compact answers in the existing design contract scene fields when they help HTML execution. Do not create a separate approval artifact.
 
+Before coding the first scene, resolve the dedicated cover contract separately: approved headline, dominant hero, at least two concrete signals of the video's real content, and a composition that still communicates at thumbnail size. Frame 0 is the exported cover, so it cannot be a generic title treatment or an incomplete tween state.
+
+When reference media exists, place each copied image or sampled video anchor beside its planned target frame. Convert declared layout anchors into explicit HTML/CSS/SVG regions and map video temporal anchors to their target scene/timeline positions before styling details. If safe owned layers or assets happen to be available, they may help execute the same contract, but they do not change the reproduce/edit/guide intent. Write motion around preserved geometry and timing; do not let animation become an excuse for drift.
+
 ## Compose a frame, not a page
 
 A good video frame remains intentional when paused:
@@ -92,6 +96,8 @@ Replace these before coding:
 Before saving `index.html`, verify from the source itself:
 
 - frame 0 contains the promise and a subject-specific visual signal;
+- frame 0 satisfies every `art_direction.cover.content_signals` item and reads as the actual video's cover;
+- reference images and videos satisfy their reproduce/edit/guide intent, protected axes, allowed changes, and layout/temporal anchors;
 - every scene has background, midground, and foreground intent;
 - each scene has a large, recognizable hero visual;
 - the spatial sequence varies without losing the shared visual system;

@@ -8,14 +8,21 @@
  * contract.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { buildSandboxEnv, decodeProcessOutput, killProcessTree } from '../../../core-agent/src/sandbox/executor';
+import {
+  buildSandboxEnv,
+  buildShellInvocation,
+  decodeProcessOutput,
+  defaultShellForPlatform,
+  killProcessTree,
+} from '../../../core-agent/src/sandbox/executor';
 import { createLogger } from '../../logger';
 import { logErrorRef, maskId } from '../../util/log-redact';
+import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 
 const log = createLogger('interactive-cli');
 
@@ -99,7 +106,7 @@ export function _setInteractiveCliBroadcastForTest(fn: ((channel: string, payloa
 
 export function _resetInteractiveCliSessionsForTest(): void {
   for (const s of _sessions.values()) {
-    try { killProcessTree(s.child, 'SIGKILL'); } catch { /* best effort */ }
+    killInteractiveProcessTree(s.child, 'SIGKILL');
     clearTimers(s);
   }
   _sessions.clear();
@@ -187,16 +194,17 @@ function detectPrompt(text: string): { kind: InteractiveCliPromptKind; sensitive
   return null;
 }
 
-function broadcast(payload: Record<string, unknown>): void {
+function broadcast(s: Session, payload: Record<string, unknown>): void {
+  const scopedPayload = { ...payload, user_id: s.uid };
   if (_broadcastOverride) {
-    _broadcastOverride('interactive-cli:event', payload);
+    _broadcastOverride('interactive-cli:event', scopedPayload);
     return;
   }
   try {
     // Lazy lookup avoids a static model -> ipc import cycle.
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
-    ipc.broadcastToRenderer?.('interactive-cli:event', payload);
+    ipc.broadcastToRenderer?.('interactive-cli:event', scopedPayload);
   } catch { /* headless tests / early boot: session still works via tools */ }
 }
 
@@ -253,7 +261,7 @@ function appendOutput(s: Session, stream: InteractiveCliStream, raw: Buffer | st
     ensureUserActionLifetime(s);
   }
   touch(s);
-  broadcast({
+  broadcast(s, {
     type: 'output',
     session_id: s.id,
     stream,
@@ -264,7 +272,7 @@ function appendOutput(s: Session, stream: InteractiveCliStream, raw: Buffer | st
     status: s.status,
   });
   if (prompt) {
-    broadcast({
+    broadcast(s, {
       type: 'waiting_input',
       session_id: s.id,
       prompt_kind: prompt.kind,
@@ -307,7 +315,7 @@ function finishSession(
   clearTimeout(s.lifetimeTimer);
   if (s.killTimer) clearTimeout(s.killTimer);
   scheduleCleanup(s);
-  broadcast({
+  broadcast(s, {
     type: status,
     session_id: s.id,
     status: s.status,
@@ -319,12 +327,32 @@ function finishSession(
 }
 
 function killSession(s: Session, signal: NodeJS.Signals = 'SIGTERM'): void {
-  try { killProcessTree(s.child, signal); } catch { /* best effort */ }
+  killInteractiveProcessTree(s.child, signal);
   if (s.killTimer) clearTimeout(s.killTimer);
   s.killTimer = setTimeout(() => {
-    try { killProcessTree(s.child, 'SIGKILL'); } catch { /* best effort */ }
+    killInteractiveProcessTree(s.child, 'SIGKILL');
   }, 5000);
   if (typeof s.killTimer.unref === 'function') s.killTimer.unref();
+}
+
+function killInteractiveProcessTree(
+  child: ChildProcessWithoutNullStreams,
+  signal: NodeJS.Signals,
+): void {
+  if (process.platform !== 'win32' || !child.pid) {
+    try { killProcessTree(child, signal); } catch { /* best effort */ }
+    return;
+  }
+  const windowsRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+  try {
+    const result = spawnSync(
+      path.win32.join(windowsRoot, 'System32', 'taskkill.exe'),
+      ['/pid', String(child.pid), '/t', '/f'],
+      { stdio: 'ignore', windowsHide: true },
+    );
+    if (!result.error && result.status === 0) return;
+  } catch { /* fall through to the direct child */ }
+  try { child.kill(signal); } catch { /* process may already be dead */ }
 }
 
 function assertOwnSession(uid: string, sessionId: string): Session {
@@ -360,11 +388,13 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
   const cwd = path.resolve(String(opts.cwd || process.cwd()));
   try { fs.mkdirSync(cwd, { recursive: true }); } catch { /* spawn will report */ }
   const env = buildSandboxEnv(opts.sandboxEnv ?? {});
-  const shell = process.platform === 'win32' ? true : (process.env.SHELL || '/bin/bash');
-  const child = spawn(command, {
+  const shell = process.platform === 'win32'
+    ? defaultShellForPlatform()
+    : (process.env.SHELL || defaultShellForPlatform());
+  const invocation = buildShellInvocation(shell, command);
+  const child = spawn(invocation.command, invocation.args, {
     cwd,
     env,
-    shell,
     detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
@@ -421,7 +451,7 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
     });
   });
 
-  broadcast({
+  broadcast(session, {
     type: 'started',
     session_id: id,
     ...(session.purpose ? { purpose: session.purpose } : {}),
@@ -473,7 +503,7 @@ export function sendInteractiveCliInput(
     throw new Error(`failed to write stdin: ${(err as Error).message}`);
   }
   touch(s);
-  broadcast({
+  broadcast(s, {
     type: 'input_sent',
     session_id: s.id,
     status: s.status,
@@ -498,3 +528,19 @@ export function closeInteractiveCliSession(uid: string, sessionId: string): Inte
   }
   return viewOf(s);
 }
+
+export function closeInteractiveCliSessionsForUser(uid: string): number {
+  const owner = String(uid || '');
+  let closed = 0;
+  for (const s of _sessions.values()) {
+    if (s.uid !== owner || s.status !== 'running') continue;
+    killSession(s, 'SIGKILL');
+    finishSession(s, 'closed', { signal: 'account_switch' });
+    closed++;
+  }
+  return closed;
+}
+
+registerUserSwitchHook('interactive-cli-sessions', (previousUid) => {
+  closeInteractiveCliSessionsForUser(previousUid);
+});

@@ -80,6 +80,7 @@ export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 // Dev builds use dev_current_user_id so they do not overwrite the packaged
 // active profile pointer in the shared install-container users.json.
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
+export const DEVICE_FILE       = path.join(WS_ROOT, 'device.json');
 export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');

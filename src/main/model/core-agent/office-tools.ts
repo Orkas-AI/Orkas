@@ -21,9 +21,10 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
+import { fileEditLock } from '../../util/locks';
 import { officeCliAvailable, runOfficeCli, closeOfficeFile, OfficeCliError } from '../../features/office/office_engine';
 import {
-  buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch,
+  buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, serializeOfficeBatch,
   type DocxParagraphSpec, type DocxTableSpec, type DocxImageSpec,
   type XlsxCell, type XlsxSheetSpec, type PptxSlideSpec, type PptxImageSpec,
   type EditOp, type OfficeBatchOp,
@@ -109,6 +110,109 @@ function resolveImagePath(opts: OfficeToolsOpts, ctx: ToolContext, rawSrc: unkno
   return { abs };
 }
 
+const LOCAL_FILE_PROP = /^(?:src|source|file|filename|filepath|path|template|templatepath|image(?:src|path|file)|media(?:src|path|file)|ole(?:src|path|file)|embeddedobject(?:src|path|file))$/i;
+const LINK_PROP = /^(?:url|uri|href|link|hyperlink)$/i;
+const UNSAFE_LINK_SCHEME = /^(?:data|file|javascript|vbscript):/i;
+
+function uriScheme(value: string): string {
+  if (/^[A-Za-z]:[\\/]/.test(value)) return '';
+  return value.match(/^([A-Za-z][A-Za-z0-9+.-]*):/)?.[1]?.toLowerCase() || '';
+}
+
+/**
+ * Validate and normalize model-controlled edit properties before they reach
+ * OfficeCLI. Properties that make the engine read a local file are resolved
+ * against the conversation sandbox. Link-like properties may embed ordinary
+ * web links, but active/local schemes are rejected. Walk nested values too so
+ * a future richer operation schema cannot accidentally bypass this boundary.
+ */
+function normalizeEditProps(
+  opts: OfficeToolsOpts,
+  ctx: ToolContext,
+  raw: unknown,
+  key = '',
+): { value: unknown } | { error: string } {
+  if (Array.isArray(raw)) {
+    const out: unknown[] = [];
+    for (const item of raw) {
+      const normalized = normalizeEditProps(opts, ctx, item, key);
+      if ('error' in normalized) return normalized;
+      out.push(normalized.value);
+    }
+    return { value: out };
+  }
+  if (raw && typeof raw === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [childKey, childValue] of Object.entries(raw as Record<string, unknown>)) {
+      const normalized = normalizeEditProps(opts, ctx, childValue, childKey.replace(/[^A-Za-z]/g, ''));
+      if ('error' in normalized) return normalized;
+      out[childKey] = normalized.value;
+    }
+    return { value: out };
+  }
+  if (typeof raw !== 'string') return { value: raw };
+
+  const value = raw.trim();
+  if (LOCAL_FILE_PROP.test(key)) {
+    if (!value) return { error: `file-bearing property \`${key}\` requires a path` };
+    if (uriScheme(value)) {
+      return { error: `file-bearing property \`${key}\` does not accept URI references` };
+    }
+    const abs = path.resolve(ctx.workingDir ?? '.', value);
+    const scopeErr = guardPath(opts, abs, 'readable');
+    if (scopeErr) return { error: scopeErr.replace(/^E_[A-Z_]+:\s*/, '') };
+    let stat: fs.Stats;
+    try { stat = fs.statSync(abs); }
+    catch { return { error: `referenced file not found: ${abs}` }; }
+    if (!stat.isFile()) return { error: `referenced path is not a file: ${abs}` };
+    return { value: abs };
+  }
+  if (LINK_PROP.test(key) && UNSAFE_LINK_SCHEME.test(value)) {
+    return { error: `link property \`${key}\` uses an unsafe URI scheme` };
+  }
+  return { value: raw };
+}
+
+function normalizeEditOperations(
+  opts: OfficeToolsOpts,
+  ctx: ToolContext,
+  raw: unknown,
+): { operations: EditOp[] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: '`operations` must be an array' };
+  const operations: EditOp[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const operation = item as Record<string, unknown>;
+    const normalizedProps = normalizeEditProps(opts, ctx, operation.props);
+    if ('error' in normalizedProps) return normalizedProps;
+    operations.push({
+      ...operation,
+      ...(operation.props !== undefined ? { props: normalizedProps.value } : {}),
+    } as EditOp);
+  }
+  return { operations };
+}
+
+function editedCopyPath(source: string): string {
+  const ext = path.extname(source);
+  return path.join(path.dirname(source), `${path.basename(source, ext)}-edited${ext}`);
+}
+
+async function acquireFileLocks(absPaths: readonly string[]): Promise<() => void> {
+  const releases: Array<() => void> = [];
+  try {
+    for (const abs of [...new Set(absPaths.map((item) => path.resolve(item)))].sort()) {
+      releases.push(await fileEditLock(abs).acquire());
+    }
+  } catch (err) {
+    for (const release of releases.reverse()) release();
+    throw err;
+  }
+  return () => {
+    for (const release of releases.reverse()) release();
+  };
+}
+
 /** Render one page to a PNG and return it as a tool-result image. Best-effort
  *  for the create-preview path; the caller decides whether a null is fatal. */
 async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal): Promise<ToolResultImage | null> {
@@ -149,28 +253,55 @@ async function runCreate(
   let finalPath = args.inputAbs;
   let cwd = path.dirname(finalPath);
   let renamed = false;
+  let tempDir = '';
+  let workPath = '';
+  let releaseLocks: (() => void) | null = null;
   try {
     ({ finalPath, renamed } = await uniquifyPath(args.inputAbs, isMineFor(opts)));
     cwd = path.dirname(finalPath);
     fs.mkdirSync(cwd, { recursive: true });
+    releaseLocks = await acquireFileLocks([finalPath]);
+    tempDir = fs.mkdtempSync(path.join(cwd, '.orkas-office-create-'));
+    workPath = path.join(tempDir, path.basename(finalPath));
 
-    const created = await runOfficeCli(['create', finalPath, ...args.createFlags], {
-      cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+    const created = await runOfficeCli(['create', workPath, ...args.createFlags], {
+      cwd: tempDir, ...(ctx.signal ? { signal: ctx.signal } : {}),
     });
     if (created.code !== 0) {
       return errResult('E_OFFICE_CREATE_FAILED', created.stderr || created.stdout || `exit ${created.code}`);
     }
 
     if (args.ops.length) {
-      const batched = await runOfficeCli(['batch', finalPath], {
-        cwd, stdin: JSON.stringify(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
+      const batched = await runOfficeCli(['batch', workPath], {
+        cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
       if (batched.code !== 0) {
         return errResult('E_OFFICE_BATCH_FAILED', batched.stderr || batched.stdout || `exit ${batched.code}`);
       }
     }
 
-    const preview = args.wantPreview ? await renderToImage(finalPath, cwd, '1', ctx.signal) : null;
+    const preview = args.wantPreview ? await renderToImage(workPath, tempDir, '1', ctx.signal) : null;
+    await closeOfficeFile(workPath, tempDir);
+
+    // Promote only a fully created/batched file. Failed creation therefore
+    // leaves neither a half-built artifact nor a collision that forces the
+    // model's retry onto `-2.xlsx`. Preserve an owned prior version until the
+    // replacement has reached its final path so retries cannot destroy it.
+    let backupPath = '';
+    if (fs.existsSync(finalPath)) {
+      await closeOfficeFile(finalPath, cwd);
+      backupPath = path.join(tempDir, `.previous-${path.basename(finalPath)}`);
+      fs.renameSync(finalPath, backupPath);
+    }
+    try {
+      fs.renameSync(workPath, finalPath);
+    } catch (err) {
+      if (backupPath && fs.existsSync(backupPath) && !fs.existsSync(finalPath)) {
+        fs.renameSync(backupPath, finalPath);
+      }
+      throw err;
+    }
+    if (backupPath) fs.rmSync(backupPath, { force: true });
 
     if (opts.onFileWritten) {
       try { await opts.onFileWritten(finalPath); }
@@ -185,7 +316,12 @@ async function runCreate(
     const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CREATE_FAILED';
     return errResult(code, (err as Error).message);
   } finally {
-    await closeOfficeFile(finalPath, cwd);
+    if (workPath && tempDir) await closeOfficeFile(workPath, tempDir);
+    if (fs.existsSync(finalPath)) await closeOfficeFile(finalPath, cwd);
+    if (releaseLocks) releaseLocks();
+    if (tempDir) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 }
 
@@ -312,10 +448,85 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
 }
 
 function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
+  const chartSchema = {
+    type: 'object',
+    description:
+      'A native editable Excel chart bound to worksheet cells. Prefer dataRange/categories over inline data so updates remain traceable.',
+    properties: {
+      type: {
+        type: 'string',
+        enum: [
+          'bar', 'column', 'line', 'pie', 'doughnut', 'area', 'scatter', 'bubble', 'radar',
+          'stock', 'combo', 'waterfall', 'funnel', 'treemap', 'sunburst', 'boxWhisker',
+          'histogram', 'pareto',
+        ],
+        description: 'Native chart type. Use line for time trends and bar/column for category comparisons.',
+      },
+      dataRange: {
+        type: 'string',
+        description: 'Worksheet source range, e.g. "Trend!B1:C32". Header cells become series names.',
+      },
+      categories: {
+        type: 'string',
+        description: 'Category-label range, e.g. "Trend!A2:A32".',
+      },
+      data: {
+        type: 'string',
+        description: 'Inline fallback such as "Sales:10,20,30"; prefer cell ranges for auditable workbooks.',
+      },
+      title: { type: 'string', description: 'Chart title.' },
+      anchor: { type: 'string', description: 'Cell anchor rectangle, e.g. "D2:L18".' },
+      legend: {
+        type: 'string',
+        enum: ['true', 'false', 'none', 'top', 'bottom', 'left', 'right', 'topRight'],
+        description: 'Legend visibility or position.',
+      },
+      dataLabels: {
+        type: 'string',
+        description: 'Labels such as "value", "percent", "value,percent", "outsideEnd", or "none".',
+      },
+      catTitle: { type: 'string', description: 'Category-axis title.' },
+      axistitle: { type: 'string', description: 'Value-axis title.' },
+      axismin: { type: 'number', description: 'Value-axis minimum. Bar/column charts normally use 0.' },
+      axismax: { type: 'number', description: 'Optional value-axis maximum.' },
+      axisnumfmt: { type: 'string', description: 'Value-axis number format, e.g. "#,##0" or "0.0%".' },
+      gridlines: { type: ['boolean', 'string'], description: 'Major gridlines or a line style such as "E0E0E0:0.5".' },
+      colors: { type: 'string', description: 'Comma-separated series colors, e.g. "4472C4,ED7D31".' },
+      preset: {
+        type: 'string',
+        enum: ['minimal', 'dark', 'corporate', 'magazine', 'dashboard', 'colorful', 'monochrome'],
+        description: 'Named chart style preset.',
+      },
+      style: { type: 'number', description: 'Built-in Excel chart style id (1-48).' },
+      labelrotation: { type: 'number', description: 'Axis label rotation in degrees (-90 to 90).' },
+      width: { type: 'string', description: 'Chart width with unit; ignored when anchor is set.' },
+      height: { type: 'string', description: 'Chart height with unit; ignored when anchor is set.' },
+      smooth: { type: 'boolean', description: 'Smooth line/scatter series.' },
+      marker: { type: 'string', description: 'Line/scatter marker, e.g. "circle:6" or "none".' },
+      linewidth: { type: 'number', description: 'Series line width in points.' },
+      gapwidth: { type: 'number', description: 'Bar/column gap width from 0 to 500.' },
+      overlap: { type: 'number', description: 'Bar/column overlap from -100 to 100.' },
+      varyColors: { type: 'boolean', description: 'Vary colors by point for a single-series chart.' },
+      secondaryaxis: {
+        type: 'string',
+        description: 'Comma-separated 1-based series indices placed on the secondary value axis, e.g. "2".',
+      },
+      combotypes: {
+        type: 'string',
+        description: 'Per-series types for a combo chart, e.g. "column,line".',
+      },
+      combosplit: { type: 'number', description: 'Combo split: first N series use the primary chart type.' },
+      referenceline: {
+        type: 'string',
+        description: 'Target line as "value:color:label:dash", e.g. "100:FF0000:目标:dash".',
+      },
+    },
+    required: ['type'],
+  };
   return {
     name: 'create_xlsx',
     description:
-      'Create a .xlsx workbook with path plus rows or sheets. rows is [[cell]], where cell is string/number or {value, formula?, format?, bold?, fill?, font.color?, font.size?, merge?}; formulas omit the leading "=". sheets: [{name, rows, columns?}]. Returns saved path/preview; collisions return <file-renamed>.',
+      'Create one .xlsx workbook with rows/sheets and native editable charts. rows is [[cell]]; a cell is a value or {value, formula?, format?, bold?, fill?, font.color?, merge?}. formulas omit "=". sheets: [{name, rows, columns?, charts?}]. Charts bind dataRange/categories with type/title/anchor/axis/legend. Refine the returned path with edit_office instead of calling create_xlsx again. Returns path/preview; collisions return <file-renamed>.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -366,9 +577,14 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
             required: ['name'],
           },
         },
+        charts: {
+          type: 'array',
+          description: 'Native editable charts for the default sheet. Chart ranges may reference any sheet in this workbook.',
+          items: chartSchema,
+        },
         sheets: {
           type: 'array',
-          description: 'Multiple worksheets (use instead of top-level `sheet`/`rows`/`columns`). The first sheet reuses the default tab.',
+          description: 'Multiple worksheets (use instead of top-level `sheet`/`rows`/`columns`/`charts`). The first sheet reuses the default tab.',
           items: {
             type: 'object',
             properties: {
@@ -387,6 +603,11 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
                   required: ['name'],
                 },
               },
+              charts: {
+                type: 'array',
+                description: 'Native editable charts placed on this sheet.',
+                items: chartSchema,
+              },
             },
           },
         },
@@ -403,6 +624,7 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
             name: typeof input.sheet === 'string' && input.sheet ? input.sheet : 'Sheet1',
             rows: Array.isArray(input.rows) ? (input.rows as XlsxCell[][]) : [],
             ...(Array.isArray(input.columns) ? { columns: input.columns as XlsxSheetSpec['columns'] } : {}),
+            ...(Array.isArray(input.charts) ? { charts: input.charts as XlsxSheetSpec['charts'] } : {}),
           }];
       return runCreate(opts, ctx, {
         inputAbs: prep.abs,
@@ -571,6 +793,71 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
   };
 }
 
+function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
+  return {
+    name: 'office_check',
+    description:
+      'Check an existing Word/Excel/PowerPoint file before delivery with the built-in Office engine. Runs OpenXML ' +
+      'validation plus the engine issue scan and returns structured results. Use after create_docx/create_xlsx/' +
+      'create_pptx or edit_office. Invalid OpenXML is a fatal tool error; non-fatal issue findings remain structured QA output.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Path to an existing .docx/.xlsx/.pptx (absolute or workspace-relative).' },
+      },
+      required: ['path'],
+    },
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+      if (!officeCliAvailable()) {
+        return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
+      }
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return errResult('E_BAD_INPUT', '`path` is required');
+      const abs = path.resolve(ctx.workingDir ?? '.', rawPath);
+      if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
+        return errResult('E_BAD_INPUT', 'office_check supports .docx/.xlsx/.pptx only');
+      }
+      const scopeErr = guardPath(opts, abs, 'readable');
+      if (scopeErr) return { content: scopeErr, isError: true };
+      if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
+
+      const cwd = path.dirname(abs);
+      const normalizeOutput = (stdout: string, stderr: string): unknown => {
+        const raw = (stdout || stderr || '').trim();
+        if (!raw) return null;
+        try { return JSON.parse(raw); } catch { return raw; }
+      };
+      try {
+        const validate = await runOfficeCli(['validate', abs, '--json'], {
+          cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        const issues = await runOfficeCli(['view', abs, 'issues', '--json'], {
+          cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        const payload = {
+          path: abs,
+          valid: validate.code === 0,
+          validation_exit_code: validate.code,
+          validation: normalizeOutput(validate.stdout, validate.stderr),
+          issue_scan_ok: issues.code === 0,
+          issue_scan_exit_code: issues.code,
+          issues: normalizeOutput(issues.stdout, issues.stderr),
+        };
+        return {
+          content: JSON.stringify(payload),
+          ...(payload.valid ? {} : { isError: true }),
+        };
+      } catch (err) {
+        const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CHECK_FAILED';
+        return errResult(code, (err as Error).message);
+      } finally {
+        await closeOfficeFile(abs, cwd);
+      }
+    },
+  };
+}
+
 /**
  * Validate a model-controlled value before it becomes an OfficeCLI argv token.
  *
@@ -605,11 +892,10 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'office_read',
     description:
-      'Read an existing Word/Excel/PowerPoint file WITH element paths, using the built-in Office engine — so you can ' +
-      'target an in-place edit afterwards. Modes: "text" (default; each line prefixed with its [/element/path], e.g. ' +
-      '[/body/p[3]] …, [/Sheet1/A1] …), "outline" (document structure), "get" (one node by `target` path as JSON), ' +
-      '"query" (CSS-like `target` selector as JSON). Typical flow: office_read to find the path, then edit_office to ' +
-      'change it. (For plain text without paths, read_file also works and needs no tool-execution permission.)',
+      'Read an existing DOCX/XLSX/PPTX with element paths before a precise edit. Modes: "text" (default, path-prefixed ' +
+      'content such as [/body/p[3]] or [/Sheet1/A1]), "outline" (structure), "get" (one `target` path as JSON), and ' +
+      '"query" (CSS-like `target` selector as JSON). Use `office_read` to discover a stable path, then `edit_office`; ' +
+      'use `read_file` instead when plain text without element paths is enough.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -660,18 +946,21 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'edit_office',
     description:
-      'Edit an existing Word/Excel/PowerPoint file IN PLACE (preserving its formatting), using the built-in Office ' +
-      'engine. Provide `path` and `operations`, applied in order. Each operation is one of:\n' +
-      '  - {action:"set", path, props} — change an element. props.text for a paragraph/run; props.value or ' +
-      'props.formula (no leading "=") for an xlsx cell; props.style / props.align for a paragraph; etc.\n' +
-      '  - {action:"add", parent, type, props} — insert a new element under `parent` (e.g. parent "/body" type "p").\n' +
-      '  - {action:"remove", path} — delete the element at `path`.\n' +
-      'Discover element paths with office_read first (e.g. /body/p[3], /Sheet1/B2, /slide[2]). Stops at the first ' +
-      'failing operation and reports it. Returns the saved path and a first-page PNG preview.',
+      'Safely edit DOCX/XLSX/PPTX. Provide source `path`, optional `output_path`, and `operations`: ' +
+      'only {action:"set",path,props}, {action:"add",parent,type,props}, or {action:"remove",path}. ' +
+      'For targeted text replacement use {action:"set",path:"/body/p[2]",props:{find:"old",replace:"new"}}; ' +
+      'there is no replace action or edits field. A pre-existing source becomes a ' +
+      '`-edited` copy and is never overwritten; a conversation-produced file may be refined in place. ' +
+      'Use `office_read` for stable element paths. File-bearing props such as `src` must be sandboxed. The batch is ' +
+      'validated before atomic commit; returns the saved path and preview.',
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Path to an existing .docx/.xlsx/.pptx (absolute or workspace-relative).' },
+        path: { type: 'string', description: 'Source .docx/.xlsx/.pptx path (absolute or workspace-relative).' },
+        output_path: {
+          type: 'string',
+          description: 'Optional output path with the same extension. Required only when a specific working-copy path is desired.',
+        },
         operations: {
           type: 'array',
           description: 'Edit operations, applied in order.',
@@ -698,33 +987,99 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
       }
       const rawPath = String(input.path ?? '');
       if (!rawPath) return errResult('E_BAD_INPUT', '`path` is required');
-      const abs = path.resolve(ctx.workingDir ?? '.', rawPath);
-      if (!['.docx', '.xlsx', '.pptx'].includes(path.extname(abs).toLowerCase())) {
+      const sourceAbs = path.resolve(ctx.workingDir ?? '.', rawPath);
+      const sourceExt = path.extname(sourceAbs).toLowerCase();
+      if (!['.docx', '.xlsx', '.pptx'].includes(sourceExt)) {
         return errResult('E_BAD_INPUT', 'edit_office supports .docx/.xlsx/.pptx only');
       }
-      const scopeErr = guardPath(opts, abs, 'writable');
-      if (scopeErr) return { content: scopeErr, isError: true };
-      if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
+      const sourceScopeErr = guardPath(opts, sourceAbs, 'readable');
+      if (sourceScopeErr) return { content: sourceScopeErr, isError: true };
+      if (!fs.existsSync(sourceAbs)) return errResult('E_NOT_FOUND', `${sourceAbs}: file not found`);
 
-      const ops = buildEditBatch(Array.isArray(input.operations) ? (input.operations as EditOp[]) : []);
+      const normalized = normalizeEditOperations(opts, ctx, input.operations);
+      if ('error' in normalized) return errResult('E_BAD_INPUT', normalized.error);
+      const ops = buildEditBatch(normalized.operations);
       if (!ops.length) return errResult('E_BAD_INPUT', '`operations` must contain at least one valid {action,…} entry');
 
-      const cwd = path.dirname(abs);
+      const sourceWasProduced = !!opts.hasProducedPath?.(sourceAbs);
+      const rawOutputPath = typeof input.output_path === 'string' ? input.output_path.trim() : '';
+      let requestedOutput = rawOutputPath
+        ? path.resolve(ctx.workingDir ?? '.', rawOutputPath)
+        : (sourceWasProduced ? sourceAbs : editedCopyPath(sourceAbs));
+      if (path.extname(requestedOutput).toLowerCase() !== sourceExt) {
+        return errResult('E_BAD_INPUT', '`output_path` must use the same Office extension as `path`');
+      }
+      const outputScopeErr = guardPath(opts, requestedOutput, 'writable');
+      if (outputScopeErr) return { content: outputScopeErr, isError: true };
+      if (path.resolve(requestedOutput) === path.resolve(sourceAbs) && !sourceWasProduced) {
+        return errResult('E_SOURCE_OVERWRITE', 'output_path must differ from a pre-existing source; omit it for an automatic working copy');
+      }
+
+      let finalPath = requestedOutput;
+      let renamed = false;
+      let tempDir = '';
+      let workPath = '';
+      let workCwd = '';
+      let finalCwd = path.dirname(finalPath);
+      let releaseLocks: (() => void) | null = null;
       try {
-        const r = await runOfficeCli(['batch', abs, '--stop-on-error'], {
-          cwd, stdin: JSON.stringify(ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
+        if (path.resolve(requestedOutput) !== path.resolve(sourceAbs)) {
+          ({ finalPath, renamed } = await uniquifyPath(requestedOutput, () => false));
+        }
+        finalCwd = path.dirname(finalPath);
+        fs.mkdirSync(finalCwd, { recursive: true });
+        tempDir = fs.mkdtempSync(path.join(finalCwd, '.orkas-office-edit-'));
+        workPath = path.join(tempDir, path.basename(finalPath));
+        workCwd = path.dirname(workPath);
+        releaseLocks = await acquireFileLocks([sourceAbs, finalPath]);
+        fs.copyFileSync(sourceAbs, workPath);
+        const r = await runOfficeCli(['batch', workPath, '--stop-on-error'], {
+          cwd: workCwd, stdin: serializeOfficeBatch(ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
         if (r.code !== 0) {
           return errResult('E_OFFICE_EDIT_FAILED', r.stderr || r.stdout || `exit ${r.code}`);
         }
-        const preview = input.preview !== false ? await renderToImage(abs, cwd, '1', ctx.signal) : null;
-        if (opts.onFileWritten) {
-          try { await opts.onFileWritten(abs); }
-          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
+        const validation = await runOfficeCli(['validate', workPath, '--json'], {
+          cwd: workCwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+        if (validation.code !== 0) {
+          return errResult(
+            'E_OFFICE_VALIDATION_FAILED',
+            validation.stderr || validation.stdout || `exit ${validation.code}`,
+          );
         }
-        return { content: `Edited ${abs} (${ops.length} operation${ops.length === 1 ? '' : 's'})`, ...(preview ? { images: [preview] } : {}) };
+        await closeOfficeFile(workPath, workCwd);
+        fs.renameSync(workPath, finalPath);
+
+        const preview = input.preview !== false ? await renderToImage(finalPath, finalCwd, '1', ctx.signal) : null;
+        if (opts.onFileWritten) {
+          try { await opts.onFileWritten(finalPath); }
+          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
+        }
+        const sourceNote = sourceWasProduced && finalPath === sourceAbs
+          ? ''
+          : `; source preserved: ${sourceAbs}`;
+        const renameSignal = renamed ? renderRenameSignal(requestedOutput, finalPath) : '';
+        return {
+          content: `Edited ${finalPath} (${ops.length} operation${ops.length === 1 ? '' : 's'})${sourceNote}${renameSignal}`,
+          ...(preview ? { images: [preview] } : {}),
+        };
+      } catch (err) {
+        const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_EDIT_FAILED';
+        return errResult(code, (err as Error).message || String(err));
       } finally {
-        await closeOfficeFile(abs, cwd);
+        if (workPath && workCwd) {
+          try { await closeOfficeFile(workPath, workCwd); }
+          catch (err) { log.warn('close edited working copy failed', { error: logErrorRef(err) }); }
+        }
+        if (finalPath && finalCwd && finalPath !== workPath) {
+          try { await closeOfficeFile(finalPath, finalCwd); }
+          catch (err) { log.warn('close edited output failed', { error: logErrorRef(err) }); }
+        }
+        if (releaseLocks) releaseLocks();
+        if (tempDir) {
+          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best effort */ }
+        }
       }
     },
   };
@@ -740,6 +1095,7 @@ export function createOfficeTools(opts: OfficeToolsOpts = {}): AgentTool[] {
     createPptxTool(opts),
     createOfficeReadTool(opts),
     createEditOfficeTool(opts),
+    createOfficeCheckTool(opts),
     createOfficeRenderTool(opts),
   ];
 }

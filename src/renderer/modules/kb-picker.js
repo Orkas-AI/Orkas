@@ -8,8 +8,8 @@
 //     → Promise<{ path: string } | null>  // null = user cancelled
 //
 // Persistence: the last-selected directory is remembered in localStorage so
-// the next archive starts where the user left off. Keyed globally since the
-// app currently has a single active uid.
+// the next archive starts where the user left off. It is account- and
+// scope-specific because Electron localStorage survives account switches.
 const _kbPickerLog = createLogger('kb-picker');
 const KB_PICKER_LAST_DIR_KEY = 'kb-picker.last-dir';
 
@@ -40,10 +40,9 @@ async function pickKbLocation(opts = {}) {
   _kbPickerScope = _kbPickerNormalizeScope(opts.scope || opts.targetScope);
   await _kbPickerLoadTree(_kbPickerScope);
 
-  const lastDirKey = _kbPickerLastDirKey(_kbPickerScope);
   const defaultDir = opts.defaultDir != null
     ? String(opts.defaultDir)
-    : (localStorage.getItem(lastDirKey) || '');
+    : _kbPickerReadLastDir(_kbPickerScope);
   _kbPickerCurrentDir = _kbPickerDirExists(defaultDir) ? defaultDir : '';
 
   // Expand the path down to the default dir so the user sees the selection.
@@ -77,10 +76,41 @@ function _kbPickerNormalizeScope(scope) {
 }
 
 function _kbPickerLastDirKey(scope) {
+  const lexicalUid = (typeof currentUserId === 'string') ? currentUserId.trim() : '';
+  const globalUid = (typeof globalThis.currentUserId === 'string')
+    ? globalThis.currentUserId.trim()
+    : '';
+  const uid = lexicalUid || globalUid || 'anonymous';
+  if (scope && scope.type === 'project' && scope.projectId) {
+    return `${KB_PICKER_LAST_DIR_KEY}:${uid}.project.${scope.projectId}`;
+  }
+  return `${KB_PICKER_LAST_DIR_KEY}:${uid}`;
+}
+
+function _kbPickerLegacyLastDirKey(scope) {
   if (scope && scope.type === 'project' && scope.projectId) {
     return `${KB_PICKER_LAST_DIR_KEY}.project.${scope.projectId}`;
   }
   return KB_PICKER_LAST_DIR_KEY;
+}
+
+function _kbPickerReadLastDir(scope) {
+  try {
+    const scopedKey = _kbPickerLastDirKey(scope);
+    const scoped = localStorage.getItem(scopedKey);
+    if (scoped != null) return scoped;
+
+    // Assign the old shared preference to the first active account that opens
+    // this scope, then remove it so later accounts cannot inherit the path.
+    const legacyKey = _kbPickerLegacyLastDirKey(scope);
+    const legacy = localStorage.getItem(legacyKey);
+    if (legacy == null) return '';
+    localStorage.setItem(scopedKey, legacy);
+    localStorage.removeItem(legacyKey);
+    return legacy;
+  } catch {
+    return '';
+  }
 }
 
 function _kbPickerBasename(rel) {

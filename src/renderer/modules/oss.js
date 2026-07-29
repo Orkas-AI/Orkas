@@ -1,16 +1,25 @@
-// Open-source-driven · ① new-chat capability strip + shared helpers for the
+// Open-source-driven · ① new-chat tool-enhancement rail + shared helpers for the
 // marketplace「开源项目」专区 (②).
 //
 // Data is the curated catalog served by `marketplace.listProjects` (config-as-
 // code on the Server — see PC/docs/plans/oss-driven.md). ① and ② share the
 // same cache layer, keyed by home/category/search options.
 //
-// Clicking any card PREFILLS the Commander composer with a user-language task
-// and focuses it — it does NOT auto-send (same contract as the scenario chips).
-// The Commander then "installs-then-runs" the project; no new frontend logic,
-// it reuses the existing CLI / MCP / skill mechanisms.
+// Clicking a home card PREFILLS a complete install request and focuses the
+// Commander composer — it does NOT auto-send. The home subset intentionally
+// excludes capabilities already covered by Quick start agents.
 
 const _ossLog = createLogger('oss');
+
+function _ossTrackClick(action, data) {
+  void action;
+  void data;
+}
+
+function _ossTrackEvent(action, data) {
+  void action;
+  void data;
+}
 
 // category code → centralized ui-icon name (icons.js). We deliberately do NOT
 // render the unicode project glyph as an icon (CLAUDE.md: icons go through the
@@ -37,13 +46,14 @@ const OSS_MARKETPLACE_PAGE_SIZE = 100;
 // Bump this when the built-in OSS catalog shape changes. The renderer hydrates
 // disk cache before asking main/server, so old project keys can otherwise keep
 // the home strip pinned to a pre-release catalog after an app restart.
-const OSS_CATALOG_CACHE_VERSION = 2;
+const OSS_CATALOG_CACHE_VERSION = 5;
 let _ossCatalogHydrated = false;
 let _ossCatalogHydratePromise = null;
 const _ossCatalogCache = new Map();
 const _ossCatalogInflight = new Map();
 const _ossCatalogNextRefreshAt = new Map();
 const _ossCatalogColdRefreshChecked = new Set();
+let _ossHomeLoadTelemetrySent = false;
 
 function _ossNormalizeCatalogOpts(forceOrOpts) {
   if (typeof forceOrOpts === 'boolean') return { force: forceOrOpts };
@@ -81,6 +91,7 @@ function _ossCacheEntryFromListings(v) {
     categories: Array.isArray(v.categories) ? v.categories : [],
     total: typeof v.total === 'number' ? v.total : v.items.length,
     ts: v.ts,
+    sourceType: 'cache',
   };
 }
 
@@ -128,11 +139,15 @@ function _ossCatalogPayload(opts) {
 
 function _ossEntryFromCatalogResponse(res) {
   const bundledFallback = !!(res && (res.source === 'bundled' || res.stale === true));
+  const reportedSource = String((res && res.source) || '').trim();
   return {
     projects: Array.isArray(res && res.list) ? res.list : [],
     categories: Array.isArray(res && res.categories) ? res.categories : [],
     total: typeof (res && res.total) === 'number' ? res.total : (Array.isArray(res && res.list) ? res.list.length : 0),
     ts: bundledFallback ? 0 : Date.now(),
+    sourceType: /^(?:server|bundled|cache)$/.test(reportedSource)
+      ? reportedSource
+      : (bundledFallback ? 'bundled' : 'server'),
   };
 }
 
@@ -327,15 +342,36 @@ function ossOpenRepo(p) {
 // ③ behavior — prefill the Commander composer, focus, NO send. The caret lands
 // on the first `[...]` placeholder (the blank task slot) when present, so the
 // user types their specific task over it; otherwise it goes to the end.
-function prefillCommander(text) {
+function _setOssCommanderAttribution(input, raw) {
+  if (!input || !input.dataset || !raw || typeof raw !== 'object') return;
+  if (typeof window.setCommanderTemplateAttribution === 'function') {
+    window.setCommanderTemplateAttribution(input, raw);
+    return;
+  }
+  const resourceId = String(raw.resource_id || '').trim();
+  const position = Math.round(Number(raw.position) || 0);
+  input.dataset.commanderEntryPoint = 'oss_tool';
+  if (/^[A-Za-z0-9._-]{1,64}$/.test(resourceId)) input.dataset.commanderResourceId = resourceId;
+  input.dataset.commanderSource = 'commander_home';
+  input.dataset.commanderRecipientType = 'commander';
+  if (position > 0 && position <= 100) input.dataset.commanderPosition = String(position);
+}
+
+function prefillCommander(text, attribution, opts = {}) {
   const value = String(text || '');
-  if (!value) return;
+  if (!value) return false;
   if (typeof setView === 'function') setView('new-chat');
   if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
   const input = document.getElementById('new-chat-input');
-  if (!input) return;
+  if (!input) {
+    _ossLog.warn('Commander OSS prefill failed: composer missing', {
+      resource_id: String((attribution && attribution.resource_id) || ''),
+    });
+    return false;
+  }
   input.value = value;
-  const m = value.match(/\[[^\]]*\]/);
+  if (attribution) _setOssCommanderAttribution(input, attribution);
+  const m = opts.trackPlaceholder === false ? null : value.match(/\[[^\]]*\]/);
   if (m) input.dataset.ossTemplatePlaceholder = m[0];
   else delete input.dataset.ossTemplatePlaceholder;
   input.focus();
@@ -346,6 +382,7 @@ function prefillCommander(text) {
   input.dispatchEvent(new Event('input', { bubbles: true })); // triggers autoGrow + chip state
   input.classList.add('is-prefilled');
   setTimeout(() => input.classList.remove('is-prefilled'), 1200);
+  return true;
 }
 
 /**
@@ -368,21 +405,79 @@ function unresolvedOssTemplatePlaceholder(input) {
   return marker;
 }
 
+// Shared helper retained for tool-specific task prompts outside the home rail.
+// It preserves a manual or Quick start draft and avoids nesting OSS wrappers.
+function _ossPromptForComposer(p, input) {
+  const prompt = ossPromptFor(p);
+  const existing = String((input && input.value) || '').trim();
+  const existingEntryPoint = String((input && input.dataset && input.dataset.commanderEntryPoint) || '');
+  if (!existing || existingEntryPoint === 'oss_tool') return prompt;
+  if (/\[[^\]]*\]/.test(prompt)) return prompt.replace(/\[[^\]]*\]/, () => existing);
+  return `${prompt}\n\n${existing}`;
+}
+
+// Desktop users naturally reach for the vertical mouse wheel even though this
+// strip scrolls horizontally. Keep wheel gestures inside the strip, amplify
+// vertical movement so one mouse-wheel notch advances roughly one card, and
+// preserve direct horizontal trackpad movement.
+function _bindOssWheelScroll(grid) {
+  if (!grid || grid._ossWheelScrollBound || typeof grid.addEventListener !== 'function') return;
+  grid._ossWheelScrollBound = true;
+  grid.addEventListener('wheel', (event) => {
+    if (event?.ctrlKey) return;
+    const deltaY = Number(event?.deltaY || 0);
+    const deltaX = Number(event?.deltaX || 0);
+    if (!deltaY && !deltaX) return;
+
+    const clientWidth = Math.max(0, Number(grid.clientWidth || 0));
+    const maxScrollLeft = Math.max(0, Number(grid.scrollWidth || 0) - clientWidth);
+    if (!maxScrollLeft) return;
+
+    const deltaMode = Number(event?.deltaMode || 0);
+    const scale = deltaMode === 1 ? 16 : deltaMode === 2 ? Math.max(1, clientWidth) : 1;
+    const delta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY * 2 : deltaX;
+    const current = Math.max(0, Math.min(maxScrollLeft, Number(grid.scrollLeft || 0)));
+    const next = Math.max(0, Math.min(maxScrollLeft, current + delta * scale));
+
+    grid.scrollLeft = next;
+    event.preventDefault();
+  }, { passive: false });
+}
+
 // ① entry — render the task cards into #oss-entry-grid + bind clicks. Called on
 // every new-chat view enter (and on i18n-change, since task text is localized).
+function _openOssMarketplace() {
+  _ossTrackClick('commander_oss_more', { source_view: 'new_chat' });
+  const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+  if (typeof load !== 'function') {
+    _ossLog.warn('Commander OSS more failed: marketplace loader unavailable');
+    return;
+  }
+  load('marketplace').then(() => openMarketplace('oss')).catch((err) => {
+    _ossLog.warn('Commander OSS more failed to load marketplace', {
+      error: err && err.message ? err.message : String(err || ''),
+    });
+  });
+}
+
+function _resetOssScrollForProjectChange(grid, projects) {
+  if (!grid) return;
+  const renderKey = JSON.stringify((projects || []).map((p) => String((p && p.id) || '')));
+  const previousRenderKey = String((grid.dataset && grid.dataset.ossProjectRenderKey) || '');
+  if (grid.dataset) grid.dataset.ossProjectRenderKey = renderKey;
+  if (previousRenderKey !== renderKey) grid.scrollLeft = 0;
+}
+
 async function initOssEntry(opts = {}) {
   const entry = document.getElementById('oss-entry');
   const grid = document.getElementById('oss-entry-grid');
   if (!entry || !grid) return;
+  _bindOssWheelScroll(grid);
 
-  // Bind the "更多能力 →" header link once.
+  // Bind the compact “更多” header link once.
   const more = document.getElementById('oss-entry-more');
   if (more && !more.dataset.bound) {
-    more.addEventListener('click', () => {
-      const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
-      if (typeof load !== 'function') return;
-      load('marketplace').then(() => openMarketplace('oss')).catch(() => {});
-    });
+    more.addEventListener('click', _openOssMarketplace);
     more.dataset.bound = '1';
   }
 
@@ -393,32 +488,86 @@ async function initOssEntry(opts = {}) {
       revalidate: opts.revalidate === false ? false : 'cold-start',
     });
   }
-  catch (err) { _ossLog.warn('oss entry load failed', { error: err && err.message }); entry.style.display = 'none'; return; }
+  catch (err) {
+    _ossLog.warn('oss entry load failed', { error: err && err.message });
+    if (!_ossHomeLoadTelemetrySent) {
+      _ossHomeLoadTelemetrySent = true;
+      _ossTrackEvent('commander_oss_load_result', {
+        result: 'failure',
+        reason: 'catalog_load_failed',
+        item_count: 0,
+      });
+    }
+    entry.style.display = 'none';
+    return;
+  }
 
   // ① receives the curated home subset from the Server. The Server config
   // controls how many rows are returned; the client renders whatever it gets.
   const projects = data.projects || [];
+  if (!_ossHomeLoadTelemetrySent) {
+    _ossHomeLoadTelemetrySent = true;
+    _ossTrackEvent('commander_oss_load_result', {
+      result: 'success',
+      source: String(data.sourceType || 'cache'),
+      item_count: projects.length,
+    });
+  }
   if (!projects.length) { entry.style.display = 'none'; return; }
   entry.style.display = '';
 
-  grid.innerHTML = projects.map((p) => {
+  const toolCards = projects.map((p) => {
     const task = escapeHtml(ossTaskFor(p));
-    const by = escapeHtml(p.by || p.name || '');
+    const name = escapeHtml(p.name || p.id || '');
+    const category = escapeHtml(ossCatLabel(p.category, data.categories));
     const icon = uiIconHtml(ossIconFor(p.category), 'oss-card-icon');
-    const byLine = (typeof t === 'function') ? t('oss.driven_by').replace('{name}', by) : by;
+    const addLabel = (typeof t === 'function') ? t('oss.add_to_task') : 'Add';
     return `
       <button type="button" class="oss-card" data-oss-id="${escapeHtml(p.id)}">
-        <span class="oss-card-top">
-          <span class="oss-card-glyph" style="--oss-c:${escapeHtml(p.color || 'var(--primary)')}">${icon}</span>
-          <span class="oss-card-task">${task}</span>
+        <span class="oss-card-glyph" style="--oss-c:${escapeHtml(p.color || 'var(--primary)')}" aria-hidden="true">${icon}</span>
+        <span class="oss-card-copy">
+          <span class="oss-card-name-row">
+            <strong class="oss-card-name">${name}</strong>
+            <span class="oss-card-category">${category}</span>
+          </span>
+          <span class="oss-card-fit">${task}</span>
         </span>
-        <span class="oss-card-by">${byLine}</span>
+        <span class="oss-card-add">
+          <span>${escapeHtml(addLabel)}</span>
+        </span>
       </button>`;
   }).join('');
+  grid.innerHTML = toolCards;
+  _resetOssScrollForProjectChange(grid, projects);
 
-  grid.querySelectorAll('.oss-card').forEach((btn) => {
+  grid.querySelectorAll('.oss-card[data-oss-id]').forEach((btn, index) => {
     const p = projects.find((x) => x.id === btn.dataset.ossId);
-    btn.addEventListener('click', () => { if (p) prefillCommander(ossPromptFor(p)); });
+    btn.addEventListener('click', () => {
+      if (!p) return;
+      const telemetry = {
+        resource_id: String(p.id || ''),
+        position: index + 1,
+        source: 'commander_home',
+      };
+      _ossTrackClick('commander_oss_task', telemetry);
+      const input = document.getElementById('new-chat-input');
+      const hadDraft = !!String((input && input.value) || '').trim();
+      const applied = prefillCommander(
+        ossInstallPromptFor(p),
+        {
+          entry_point: 'oss_tool',
+          recipient_type: 'commander',
+          ...telemetry,
+        },
+        { trackPlaceholder: false },
+      );
+      _ossTrackEvent('commander_oss_prefill_result', {
+        ...telemetry,
+        result: applied ? 'success' : 'failure',
+        had_draft: hadDraft,
+        ...(applied ? {} : { reason: 'composer_missing' }),
+      });
+    });
   });
 }
 

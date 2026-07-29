@@ -64,12 +64,12 @@ async function loadContexts() {
   return import('../../../src/main/features/contexts');
 }
 
-function ctxRoot(): string {
-  return path.join(tmpDir, TEST_UID, 'cloud', 'contexts');
+function ctxRoot(userId = TEST_UID): string {
+  return path.join(tmpDir, userId, 'cloud', 'contexts');
 }
 
-function writeFile(rel: string, body: string | Buffer): void {
-  const full = path.join(ctxRoot(), rel);
+function writeFile(rel: string, body: string | Buffer, userId = TEST_UID): void {
+  const full = path.join(ctxRoot(userId), rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, body);
 }
@@ -313,6 +313,20 @@ describe('contexts › uploadContextFile', () => {
 
     expect(result).toMatchObject({ ok: false, code: 'E_IMPORT_TARGET_SYMLINK' });
     expect(fs.existsSync(path.join(outside, 'escape.md'))).toBe(false);
+  });
+
+  it('does not overwrite a same-name Library file with different imported content', async () => {
+    const source = path.join(tmpDir, 'note.md');
+    fs.writeFileSync(source, 'new picked content', 'utf8');
+    const c = await loadContexts();
+    expect(c.writeContextFile('note.md', 'existing Library content').ok).toBe(true);
+
+    const result = await c.importContextFileFromPath('note.md', source);
+
+    expect(result).toMatchObject({ ok: false, code: 'E_IMPORT_TARGET_EXISTS' });
+    expect(fs.readFileSync(path.join(ctxRoot(), 'note.md'), 'utf8'))
+      .toBe('existing Library content');
+    expect(fs.readFileSync(source, 'utf8')).toBe('new picked content');
   });
 
   it('accepts pdf bytes', async () => {
@@ -597,6 +611,21 @@ describe('contexts › rebuildIndex', () => {
     const c = await loadContexts();
     const entries = await c.getContextIndexEntries();
     expect(entries.map((e) => e.path).sort()).toEqual(['a.md', 'sub/b.md', 'sub/c.pdf']);
+  });
+
+  it('keeps the in-memory index isolated when the active account changes', async () => {
+    writeFile('account-a.md', '# Account A');
+    const c = await loadContexts();
+    expect((await c.getContextIndexEntries()).map((entry) => entry.path)).toEqual(['account-a.md']);
+
+    writeFile('account-b.md', '# Account B', 'u2');
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('u2');
+    expect((await c.getContextIndexEntries()).map((entry) => entry.path)).toEqual(['account-b.md']);
+
+    const inactiveRebuild = c.rebuildIndex(TEST_UID);
+    expect(inactiveRebuild.entries.map((entry) => entry.path)).toEqual(['account-a.md']);
+    expect((await c.getContextIndexEntries()).map((entry) => entry.path)).toEqual(['account-b.md']);
   });
 
 });

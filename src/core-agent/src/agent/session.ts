@@ -1,11 +1,28 @@
 import type { ImageContent, Message, MessageContent, Usage } from "../shared/types.js";
-import type { ToolResultImage } from "../tools/base.js";
+import type { ToolObservations, ToolResultImage } from "../tools/base.js";
+import {
+  appendWorkspaceObservations,
+  cloneWorkspaceObservationState,
+  emptyWorkspaceObservationState,
+  normalizeWorkspaceObservationState,
+  reconcileWorkspaceObservations,
+  renderWorkspaceContext,
+  renderWorkspaceDiff,
+  type WorkspaceDiffRequest,
+  type WorkspaceObservationEntry,
+  type WorkspaceObservationState,
+} from "./workspace-state.js";
 
 export const HISTORY_RAW_TRIGGER_TOKENS = 12_000;
 export const HISTORY_RAW_RETAIN_TURNS_AFTER_SUMMARY = 2;
 export const HISTORY_RAW_RETAIN_TOKEN_BUDGET = 3_000;
 export const HISTORY_RAW_RETAIN_SINGLE_TURN_MAX_TOKENS = 2_000;
 export const HISTORY_SUMMARY_MAX_TOKENS = 2_048;
+export const HISTORY_EXACT_FACTS_HEADING =
+  "Exact facts and identifiers required across turns (cumulative):";
+export const HISTORY_EXACT_FACTS_MAX_ITEMS = 128;
+export const HISTORY_EXACT_FACT_MAX_CHARS = 1_000;
+export const HISTORY_EXACT_FACTS_MAX_CHARS = 24_000;
 
 export const ACTIVE_PROCESS_TRIGGER_TOKENS = 18_000;
 export const ACTIVE_RETAIN_TOOL_STEPS = 2;
@@ -149,7 +166,15 @@ type ActiveTurnRecord = {
 export type SerializedSessionContextState = {
   version: 1;
   nextTurnId: number;
+  /** Host-owned semantic history currently mirrored into this execution
+   * session. When present, the host may replace raw completed dialogue from
+   * its canonical record while retaining compatible rolling summaries. */
+  conversationHistorySource?: string;
+  /** Opaque host-owned cursor for incrementally refreshing the canonical
+   * dialogue. Session persists it but never interprets its contents. */
+  conversationHistoryCheckpoint?: string;
   historySummary?: string;
+  historyExactFacts?: string[];
   summaryVersion?: number;
   summaryThroughTurnId?: number;
   completedTurns?: CompletedTurnRecord[];
@@ -159,6 +184,7 @@ export type SerializedSessionContextState = {
   completedWork?: CompletedWorkEntry[];
   nextWorkLedgerId?: number;
   executionPlanAudit?: ExecutionPlanAuditRecord[];
+  workspaceObservations?: WorkspaceObservationState;
 };
 
 export type HistoryArchiveCandidate = {
@@ -185,7 +211,10 @@ export type ActiveCheckpointCandidate = {
 type TurnTrackingState = Required<
   Pick<SerializedSessionContextState, "version" | "nextTurnId" | "summaryVersion">
 > & {
+  conversationHistorySource?: string;
+  conversationHistoryCheckpoint?: string;
   historySummary: string;
+  historyExactFacts: string[];
   summaryThroughTurnId?: number;
   completedTurns: CompletedTurnRecord[];
   activeTurn?: ActiveTurnRecord;
@@ -194,23 +223,33 @@ type TurnTrackingState = Required<
   completedWork: CompletedWorkEntry[];
   nextWorkLedgerId: number;
   executionPlanAudit: ExecutionPlanAuditRecord[];
+  workspaceObservations: WorkspaceObservationState;
 };
 
-type CheckpointExactFactSection = {
+export type ConversationHistoryReplaceOptions = {
+  /** Replace only messages whose stable turn id is at or after this boundary.
+   * The host must fall back to a full snapshot when the source changes or the
+   * boundary has already been folded into the rolling summary. */
+  replaceFromTurnId?: number;
+  /** Opaque synchronization cursor owned by the host. */
+  checkpoint?: string;
+};
+
+type ExactFactSection = {
   lines: string[];
   headingIndex: number;
   endIndex: number;
   items: string[];
 };
 
-function checkpointExactFactSection(summary: string): CheckpointExactFactSection | null {
+function exactFactSection(summary: string, heading: string): ExactFactSection | null {
   const lines = summary.split(/\r?\n/);
   const headingIndex = lines.findIndex(
     (line) => line
       .trim()
       .replace(/^#{1,6}\s+/, "")
       .replace(/^(?:\*\*|__)(.*)(?:\*\*|__)$/, "$1")
-      .trim() === ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
+      .trim() === heading,
   );
   if (headingIndex < 0) return null;
 
@@ -227,6 +266,65 @@ function checkpointExactFactSection(summary: string): CheckpointExactFactSection
     endIndex++;
   }
   return { lines, headingIndex, endIndex, items };
+}
+
+function checkpointExactFactSection(summary: string): ExactFactSection | null {
+  return exactFactSection(summary, ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING);
+}
+
+function historyExactFactSection(summary: string): ExactFactSection | null {
+  return exactFactSection(summary, HISTORY_EXACT_FACTS_HEADING);
+}
+
+function normalizeHistoryExactFact(value: string): string {
+  const normalized = value
+    .trim()
+    .replace(/^[-*]\s+/, "");
+  if (!normalized || /^none$/i.test(normalized)) return "";
+  return normalized.slice(0, HISTORY_EXACT_FACT_MAX_CHARS);
+}
+
+function mergeHistoryExactFacts(
+  previous: readonly string[] | undefined,
+  next: readonly string[] | undefined,
+): string[] {
+  const newestFirst: string[] = [];
+  const seen = new Set<string>();
+  let chars = 0;
+  const combined = [...(previous ?? []), ...(next ?? [])];
+  for (let index = combined.length - 1; index >= 0; index--) {
+    const raw = combined[index];
+    const item = normalizeHistoryExactFact(raw);
+    if (!item || seen.has(item)) continue;
+    const addedChars = item.length + (newestFirst.length ? 1 : 0);
+    if (
+      newestFirst.length >= HISTORY_EXACT_FACTS_MAX_ITEMS
+      || chars + addedChars > HISTORY_EXACT_FACTS_MAX_CHARS
+    ) {
+      break;
+    }
+    seen.add(item);
+    newestFirst.push(item);
+    chars += addedChars;
+  }
+  return newestFirst.reverse();
+}
+
+function stripExactFactSection(summary: string, section: ExactFactSection): string {
+  const lines = [
+    ...section.lines.slice(0, section.headingIndex),
+    ...section.lines.slice(section.endIndex),
+  ];
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function splitHistorySummary(summary: string): { summary: string; exactFacts: string[] } {
+  const section = historyExactFactSection(summary);
+  if (!section) return { summary: summary.trim(), exactFacts: [] };
+  return {
+    summary: stripExactFactSection(summary, section),
+    exactFacts: section.items.map(normalizeHistoryExactFact).filter(Boolean),
+  };
 }
 
 /**
@@ -315,6 +413,13 @@ export class Session {
     this.addMessage("user", [{ type: "text", text }]);
   }
 
+  /** Group several synchronous context mutations into one durability unit.
+   * In-memory sessions execute directly; persistent sessions coalesce their
+   * sidecar rewrite until the callback completes. */
+  withContextMutationBatch<T>(mutate: () => T): T {
+    return mutate();
+  }
+
   /** Add an assistant message from LLM response content. */
   addAssistantMessage(content: MessageContent[]): void {
     this.addMessage("assistant", content);
@@ -325,6 +430,14 @@ export class Session {
     const state = this.turnState;
     const active = state?.activeTurn;
     if (!state || !active) return;
+
+    const checkpointFacts = active.checkpointSummary
+      ? checkpointExactFactSection(active.checkpointSummary)?.items
+      : undefined;
+    state.historyExactFacts = mergeHistoryExactFacts(
+      state.historyExactFacts,
+      checkpointFacts,
+    );
 
     const endIndex = Math.max(active.startIndex, this.messages.length - 1);
     let finalAssistantMessageIndex: number | undefined;
@@ -415,6 +528,46 @@ export class Session {
   /** Defensive copy of the durable completed-work audit ledger. */
   getCompletedWorkLedger(): CompletedWorkEntry[] {
     return (this.turnState?.completedWork ?? []).map(cloneCompletedWorkEntry);
+  }
+
+  /** Record structured file/command facts after a real tool call completes.
+   * This is an append-only observation ledger, not a workflow state machine. */
+  recordToolObservations(input: {
+    toolCallId?: string;
+    tool: string;
+    observations?: ToolObservations;
+  }): WorkspaceObservationEntry | undefined {
+    if (!input.observations) return undefined;
+    const state = this.ensureTurnTracking();
+    const active = state.activeTurn;
+    if (!active) return undefined;
+    return appendWorkspaceObservations(state.workspaceObservations, {
+      turnId: active.id,
+      ...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
+      tool: input.tool,
+      observations: input.observations,
+    });
+  }
+
+  getWorkspaceObservations(): WorkspaceObservationState {
+    return cloneWorkspaceObservationState(this.turnState?.workspaceObservations);
+  }
+
+  /** Detect out-of-band changes to files already observed by this session. */
+  reconcileWorkspaceObservations(): WorkspaceObservationEntry | undefined {
+    const state = this.turnState;
+    const active = state?.activeTurn;
+    if (!state || !active) return undefined;
+    return reconcileWorkspaceObservations(state.workspaceObservations, {
+      turnId: active.id,
+    });
+  }
+
+  renderWorkspaceDiff(request: WorkspaceDiffRequest, workingDir?: string): string {
+    return renderWorkspaceDiff(this.turnState?.workspaceObservations, request, {
+      activeTurnId: this.turnState?.activeTurn?.id,
+      workingDir,
+    });
   }
 
   /** Defensive copy of bounded plan revisions/tombstones retained in sidecar. */
@@ -596,6 +749,166 @@ export class Session {
   }
 
   /**
+   * Rebase completed dialogue onto a host-owned canonical conversation.
+   *
+   * Persistent agent sessions remain useful for execution state (active tool
+   * protocol, plans, resources, observations), but they are not necessarily
+   * the semantic transcript. Group chat, for example, records replies from
+   * several actors in one canonical log. Before a normal new turn the host can
+   * project that log into provider-valid user/assistant pairs and replace the
+   * raw completed dialogue here.
+   *
+   * A matching source preserves rolling history compaction; stable turn ids in
+   * `messages` keep the existing summary boundary aligned while newer canonical
+   * turns remain exact. A source change resets only the old dialogue summary,
+   * because it may describe a different/incomplete transcript. Durable
+   * execution state and resource ledgers are retained in both cases.
+   */
+  replaceConversationHistory(
+    messages: readonly Message[],
+    source: string,
+    options: ConversationHistoryReplaceOptions = {},
+  ): number | null {
+    const normalizedSource = source.trim();
+    if (!normalizedSource) {
+      throw new Error("conversation history source is required");
+    }
+
+    const previous = this.turnState;
+    const sameSource = previous?.conversationHistorySource === normalizedSource;
+    const replaceFromTurnId = options.replaceFromTurnId;
+    let changedFrom = 0;
+    if (replaceFromTurnId !== undefined) {
+      if (!isPositiveInteger(replaceFromTurnId)) {
+        throw new Error("conversation history tail boundary must be a positive turn id");
+      }
+      if (!this.canReplaceConversationHistoryTail(normalizedSource, replaceFromTurnId)) {
+        if (!sameSource) {
+          throw new Error("conversation history tail replacement requires a matching source");
+        }
+        if (
+          previous.summaryThroughTurnId !== undefined
+          && replaceFromTurnId <= previous.summaryThroughTurnId
+        ) {
+          throw new Error("conversation history tail boundary is already summarized");
+        }
+        throw new Error("conversation history tail boundary is not retained");
+      }
+      for (const message of messages) {
+        if (!isPositiveInteger(message.turnId) || message.turnId < replaceFromTurnId) {
+          throw new Error("conversation history tail contains a message before its boundary");
+        }
+      }
+      const firstReplaced = this.messages.findIndex(
+        (message) => isPositiveInteger(message.turnId) && message.turnId >= replaceFromTurnId,
+      );
+      changedFrom = firstReplaced >= 0 ? firstReplaced : this.messages.length;
+      const canonicalTail = messages.map(cloneStoredMessage);
+      this.messages.splice(
+        changedFrom,
+        this.messages.length - changedFrom,
+        ...canonicalTail,
+      );
+      const state = previous!;
+      while (
+        state.completedTurns.length
+        && state.completedTurns[state.completedTurns.length - 1].endIndex >= changedFrom
+      ) {
+        state.completedTurns.pop();
+      }
+      state.activeTurn = undefined;
+
+      let turnStart = -1;
+      let turnId = 0;
+      const finishTailTurn = (endExclusive: number) => {
+        if (turnStart < changedFrom || !isPositiveInteger(turnId)) return;
+        let finalAssistantMessageIndex: number | undefined;
+        for (let index = endExclusive - 1; index > turnStart; index--) {
+          if (this.messages[index]?.role === "assistant") {
+            finalAssistantMessageIndex = index;
+            break;
+          }
+        }
+        if (finalAssistantMessageIndex !== undefined) {
+          state.completedTurns.push({
+            id: turnId,
+            userMessageIndex: turnStart,
+            finalAssistantMessageIndex,
+            startIndex: turnStart,
+            endIndex: Math.max(turnStart, endExclusive - 1),
+            archived: false,
+          });
+        }
+      };
+      for (let index = changedFrom; index < this.messages.length; index++) {
+        const message = this.messages[index];
+        if (!isUserTurnStarter(message) || !isPositiveInteger(message.turnId)) continue;
+        finishTailTurn(index);
+        turnStart = index;
+        turnId = message.turnId;
+      }
+      finishTailTurn(this.messages.length);
+      const maxTailTurnId = Math.max(
+        replaceFromTurnId,
+        ...canonicalTail
+          .map((message) => message.turnId)
+          .filter((id): id is number => isPositiveInteger(id)),
+      );
+      state.nextTurnId = Math.max(state.nextTurnId, maxTailTurnId + 1);
+      state.conversationHistoryCheckpoint = options.checkpoint;
+      return changedFrom;
+    } else {
+      this.messages = messages.map(cloneStoredMessage);
+    }
+    this.turnState = this.rebuildTurnStateFromMessages({
+      ...(sameSource ? {
+        historySummary: previous.historySummary,
+        historyExactFacts: previous.historyExactFacts,
+        summaryVersion: previous.summaryVersion,
+        summaryThroughTurnId: previous.summaryThroughTurnId,
+        nextTurnId: previous.nextTurnId,
+      } : {}),
+      conversationHistorySource: normalizedSource,
+      conversationHistoryCheckpoint: options.checkpoint,
+      resources: previous?.resources,
+      executionPlan: previous?.executionPlan,
+      completedWork: previous?.completedWork,
+      nextWorkLedgerId: previous?.nextWorkLedgerId,
+      executionPlanAudit: previous?.executionPlanAudit,
+      workspaceObservations: previous?.workspaceObservations,
+    });
+    return changedFrom;
+  }
+
+  /** Return the host cursor only when it belongs to the requested canonical
+   * source. Callers treat an absent/malformed cursor as a full-rebuild signal. */
+  getConversationHistoryCheckpoint(source: string): string | undefined {
+    const state = this.turnState;
+    if (!state || state.conversationHistorySource !== source.trim()) return undefined;
+    return state.conversationHistoryCheckpoint;
+  }
+
+  /** A tail rebase is safe only while the previous mutable boundary is still
+   * represented in memory and has not been archived into summary prose. A
+   * process restart that repaired/truncated raw indexes therefore forces the
+   * host back to one full canonical rebuild. */
+  canReplaceConversationHistoryTail(source: string, replaceFromTurnId: number): boolean {
+    const state = this.turnState;
+    if (
+      !state
+      || state.conversationHistorySource !== source.trim()
+      || !isPositiveInteger(replaceFromTurnId)
+      || (
+        state.summaryThroughTurnId !== undefined
+        && replaceFromTurnId <= state.summaryThroughTurnId
+      )
+    ) {
+      return false;
+    }
+    return this.messages.some((message) => message.turnId === replaceFromTurnId);
+  }
+
+  /**
    * Get the LLM-facing view of the session.
    *
    * When turn tracking is enabled, completed history is projected as:
@@ -680,6 +993,10 @@ export class Session {
       // on every model loop. Both live outside raw message history, so a
       // probabilistic checkpoint cannot omit completed calls or the objective.
       if (opts?.includeExecutionPlan !== false) {
+        const workspaceLedger = renderWorkspaceContext(state.workspaceObservations, active.id);
+        if (workspaceLedger) {
+          result.push({ role: "user", content: [{ type: "text", text: workspaceLedger }] });
+        }
         const workLedger = this.completedWorkContextText(active.id);
         if (workLedger) {
           result.push({ role: "user", content: [{ type: "text", text: workLedger }] });
@@ -775,7 +1092,10 @@ export class Session {
       tokenById.set(turn.id, tokens);
       rawTokens += tokens;
     }
-    const summaryTokens = estimateTextTokens(state.historySummary);
+    const summaryTokens = estimateTextTokens([
+      state.historySummary,
+      this.historyExactFactsText(),
+    ].filter(Boolean).join("\n\n"));
     if (rawTokens + summaryTokens < HISTORY_RAW_TRIGGER_TOKENS) {
       return null;
     }
@@ -814,7 +1134,12 @@ export class Session {
     for (const turn of state.completedTurns) {
       if (archived.has(turn.id)) turn.archived = true;
     }
-    state.historySummary = summary;
+    const split = splitHistorySummary(summary);
+    state.historySummary = split.summary;
+    state.historyExactFacts = mergeHistoryExactFacts(
+      state.historyExactFacts,
+      split.exactFacts,
+    );
     state.summaryVersion += 1;
     state.summaryThroughTurnId = Math.max(
       state.summaryThroughTurnId ?? 0,
@@ -829,6 +1154,7 @@ export class Session {
     if (!state) return this.estimateModelTokens();
     const previous = {
       historySummary: state.historySummary,
+      historyExactFacts: [...state.historyExactFacts],
       summaryVersion: state.summaryVersion,
       summaryThroughTurnId: state.summaryThroughTurnId,
       archived: state.completedTurns.map((turn) => turn.archived),
@@ -838,12 +1164,18 @@ export class Session {
       for (const turn of state.completedTurns) {
         if (archived.has(turn.id)) turn.archived = true;
       }
-      state.historySummary = summary;
+      const split = splitHistorySummary(summary);
+      state.historySummary = split.summary;
+      state.historyExactFacts = mergeHistoryExactFacts(
+        state.historyExactFacts,
+        split.exactFacts,
+      );
       state.summaryVersion += 1;
       state.summaryThroughTurnId = Math.max(state.summaryThroughTurnId ?? 0, ...turnIds);
       return this.estimateModelTokens();
     } finally {
       state.historySummary = previous.historySummary;
+      state.historyExactFacts = previous.historyExactFacts;
       state.summaryVersion = previous.summaryVersion;
       state.summaryThroughTurnId = previous.summaryThroughTurnId;
       state.completedTurns.forEach((turn, index) => { turn.archived = previous.archived[index]; });
@@ -1000,7 +1332,12 @@ export class Session {
     return {
       version: 1,
       nextTurnId: state.nextTurnId,
+      conversationHistorySource: state.conversationHistorySource,
+      conversationHistoryCheckpoint: state.conversationHistoryCheckpoint,
       historySummary: state.historySummary || undefined,
+      historyExactFacts: state.historyExactFacts.length
+        ? [...state.historyExactFacts]
+        : undefined,
       summaryVersion: state.summaryVersion || undefined,
       summaryThroughTurnId: state.summaryThroughTurnId,
       completedTurns: state.completedTurns.map((t) => ({ ...t })),
@@ -1010,6 +1347,7 @@ export class Session {
       completedWork: state.completedWork.map(cloneCompletedWorkEntry),
       nextWorkLedgerId: state.nextWorkLedgerId,
       executionPlanAudit: state.executionPlanAudit.map(cloneExecutionPlanAuditRecord),
+      workspaceObservations: cloneWorkspaceObservationState(state.workspaceObservations),
     };
   }
 
@@ -1018,10 +1356,24 @@ export class Session {
       this.turnState = null;
       return false;
     }
+    const restoredHistory = splitHistorySummary(raw.historySummary || "");
     const restored: TurnTrackingState = {
       version: 1,
       nextTurnId: Number.isFinite(raw.nextTurnId) && raw.nextTurnId > 0 ? raw.nextTurnId : 1,
-      historySummary: raw.historySummary || "",
+      conversationHistorySource: typeof raw.conversationHistorySource === "string"
+        && raw.conversationHistorySource.trim()
+        ? raw.conversationHistorySource.trim()
+        : undefined,
+      conversationHistoryCheckpoint:
+        typeof raw.conversationHistoryCheckpoint === "string"
+        && raw.conversationHistoryCheckpoint
+          ? raw.conversationHistoryCheckpoint
+          : undefined,
+      historySummary: restoredHistory.summary,
+      historyExactFacts: mergeHistoryExactFacts(
+        Array.isArray(raw.historyExactFacts) ? raw.historyExactFacts : [],
+        restoredHistory.exactFacts,
+      ),
       summaryVersion: raw.summaryVersion || 0,
       summaryThroughTurnId: raw.summaryThroughTurnId,
       completedTurns: Array.isArray(raw.completedTurns)
@@ -1039,6 +1391,7 @@ export class Session {
       completedWork: normalizeSerializedCompletedWork(raw.completedWork),
       nextWorkLedgerId: 1,
       executionPlanAudit: normalizeSerializedExecutionPlanAudit(raw.executionPlanAudit),
+      workspaceObservations: normalizeWorkspaceObservationState(raw.workspaceObservations),
     };
     restored.nextWorkLedgerId = normalizeNextWorkLedgerId(
       raw.nextWorkLedgerId,
@@ -1049,8 +1402,13 @@ export class Session {
 
     this.turnState = this.rebuildTurnStateFromMessages({
       historySummary: restored.historySummary,
+      historyExactFacts: restored.historyExactFacts,
       summaryVersion: restored.summaryVersion,
       summaryThroughTurnId: restored.summaryThroughTurnId,
+      conversationHistorySource: restored.conversationHistorySource,
+      // Invalid message indexes mean the persisted raw prefix was repaired or
+      // trimmed during reload. Keep semantic compression, but invalidate the
+      // opaque host cursor so the next turn performs one canonical full rebase.
       resources: restored.resources,
       nextTurnId: restored.nextTurnId,
       preferActiveTail: !!restored.activeTurn,
@@ -1060,6 +1418,7 @@ export class Session {
       completedWork: restored.completedWork,
       nextWorkLedgerId: restored.nextWorkLedgerId,
       executionPlanAudit: restored.executionPlanAudit,
+      workspaceObservations: restored.workspaceObservations,
     });
     return true;
   }
@@ -1125,22 +1484,29 @@ export class Session {
     this.turnState = prev
       ? this.rebuildTurnStateFromMessages({
           historySummary: prev.historySummary,
+          historyExactFacts: prev.historyExactFacts,
           summaryVersion: prev.summaryVersion,
           summaryThroughTurnId: prev.summaryThroughTurnId,
+          conversationHistorySource: prev.conversationHistorySource,
+          conversationHistoryCheckpoint: prev.conversationHistoryCheckpoint,
           resources: prev.resources,
           nextTurnId: prev.nextTurnId,
           executionPlan: prev.executionPlan,
           completedWork: prev.completedWork,
           nextWorkLedgerId: prev.nextWorkLedgerId,
           executionPlanAudit: prev.executionPlanAudit,
+          workspaceObservations: prev.workspaceObservations,
         })
       : null;
   }
 
   private rebuildTurnStateFromMessages(preserve?: {
     historySummary?: string;
+    historyExactFacts?: string[];
     summaryVersion?: number;
     summaryThroughTurnId?: number;
+    conversationHistorySource?: string;
+    conversationHistoryCheckpoint?: string;
     resources?: HistoryResource[];
     nextTurnId?: number;
     preferActiveTail?: boolean;
@@ -1150,11 +1516,15 @@ export class Session {
     completedWork?: CompletedWorkEntry[];
     nextWorkLedgerId?: number;
     executionPlanAudit?: ExecutionPlanAuditRecord[];
+    workspaceObservations?: WorkspaceObservationState;
   }): TurnTrackingState {
     const state: TurnTrackingState = {
       version: 1,
       nextTurnId: 1,
+      conversationHistorySource: preserve?.conversationHistorySource,
+      conversationHistoryCheckpoint: preserve?.conversationHistoryCheckpoint,
       historySummary: preserve?.historySummary || "",
+      historyExactFacts: mergeHistoryExactFacts([], preserve?.historyExactFacts),
       summaryVersion: preserve?.summaryVersion || 0,
       summaryThroughTurnId: preserve?.summaryThroughTurnId,
       completedTurns: [],
@@ -1166,6 +1536,7 @@ export class Session {
         preserve?.completedWork || [],
       ),
       executionPlanAudit: (preserve?.executionPlanAudit || []).map(cloneExecutionPlanAuditRecord),
+      workspaceObservations: cloneWorkspaceObservationState(preserve?.workspaceObservations),
     };
     let currentUserIndex: number | null = null;
     let currentTurnId: number | null = null;
@@ -1440,6 +1811,7 @@ export class Session {
     const lines = [
       "[Completed work ledger — deterministic host state, not a summary]",
       "These calls already ran for the current objective. Do not repeat an exact successful call merely to regain compacted context; use its result ref, a narrow read, or the recorded outcome. A later file change or explicit verification need may justify a repeat.",
+      "A tool-call ID such as call_... is not a result ref. Use tool_result_search/tool_result_read_chunk only when an entry explicitly contains ref=...",
     ];
     const selected: string[] = [];
     let chars = lines.join("\n").length;
@@ -1473,9 +1845,21 @@ export class Session {
         state.historySummary,
       );
     }
+    const exactFacts = this.historyExactFactsText();
+    if (exactFacts) parts.push(exactFacts);
     const resources = this.historyResourcesText();
     if (resources) parts.push(resources);
     return parts.join("\n\n");
+  }
+
+  private historyExactFactsText(): string {
+    const facts = this.turnState?.historyExactFacts || [];
+    if (!facts.length) return "";
+    return [
+      "[History retained facts — host-persisted model extraction]",
+      "These values were extracted by prior model checkpoints and retained outside summary prose. Verify them against newer user messages or tool evidence before relying on details that may have changed.",
+      ...facts.map((fact) => `- ${fact}`),
+    ].join("\n");
   }
 
   private historyResourcesText(): string {
@@ -1549,6 +1933,8 @@ export class Session {
     if (state?.historySummary) {
       lines.push("\n[Existing history summary]\n" + state.historySummary);
     }
+    const exactFacts = this.historyExactFactsText();
+    if (exactFacts) lines.push("\n" + exactFacts);
     const resources = this.historyResourcesText();
     if (resources) lines.push("\n" + resources);
     for (const turn of turns) {
@@ -2191,6 +2577,14 @@ function isInterruptSteerMessage(msg: Message): boolean {
 
 function cloneMessage(msg: Message): Message {
   return { role: msg.role, content: [...msg.content] };
+}
+
+function cloneStoredMessage(msg: Message): Message {
+  return {
+    role: msg.role,
+    content: msg.content.map((content) => ({ ...content })),
+    ...(isPositiveInteger(msg.turnId) ? { turnId: msg.turnId } : {}),
+  };
 }
 
 function userFacingUserContent(content: MessageContent[]): MessageContent[] {

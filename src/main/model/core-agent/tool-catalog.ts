@@ -69,26 +69,15 @@ export interface ToolCatalogEntry {
  * Within each group the order is "most frequently used first", kept stable
  * to keep the rendered KV-cache prefix stable.
  */
-/**
- * Agent ids that share the deep-research engine, so its `research_rerank` tool
- * is visible to the platform DeepResearcher and hosted data/research agents
- * that can hand work into the research flow:
- * DeepResearcher / KnowledgeManager / SocialResearcher / BrandResearcher.
- * Referenced by opaque marketplace id (as skill_list does), not by name.
- */
-export const DEEP_RESEARCH_AGENT_IDS = [
-  '78900d8758bc', // DeepResearcher
-  '5dd962efb425', // KnowledgeManager
-  '17c0a2e95df3', // SocialResearcher
-  '7083ff63b398', // BrandResearcher
-];
-
 export const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
+export const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 
 export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // Files / workspace
   { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/modern Office text or image as multimodal).' },
+  { name: 'read_files',    group: 'fs', summary: 'Read several related workspace/attachment file slices in one bounded parallel call.' },
   { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
+  { name: 'apply_patch',   group: 'fs', permission: 'localExec', summary: 'Apply one validated, transactional multi-file text patch using Add/Update/Move/Delete operations.' },
   { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
   { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file. Files inside the current workspace/attachment/editor scope are deleted immediately; files outside that scope use an inline confirmation card with a token, and multiple out-of-scope deletes from the same turn are grouped when possible. Use instead of `bash rm` for removals.' },
   { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
@@ -96,13 +85,19 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'ocr_file',      group: 'fs', summary: 'Run local OCR on PDF pages or image files when visual text is not available through read_file/stat_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched); optional `glob` scope + `output_mode` files/count.' },
+  { name: 'workspace_diff', group: 'fs', summary: 'Read the bounded net file changes observed from agent tools for the current turn or session.' },
   { name: 'tool_result_search', group: 'fs', summary: 'Search a persisted oversized tool result by opaque ref and return bounded matching excerpts.' },
   { name: 'tool_result_read_chunk', group: 'fs', summary: 'Read one bounded cursor chunk from a persisted oversized tool result by opaque ref.' },
   { name: 'publish_outputs', group: 'fs', summary: 'Declare the complete set of current-turn files that should appear as final deliverables in the message footer.' },
   { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
+  { name: 'html_preview', group: 'fs', permission: 'localExec', summary: 'Render a local HTML entry at desktop and mobile viewports; returns inline screenshots plus runtime, resource, overflow, image, Tab-key focus, and safe local form/link/download evidence. Network and browser host permissions are blocked.' },
 
   // Shell
   { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
+  { name: 'process_start', group: 'shell', permission: 'localExec', summary: 'Start a persistent long-running build, test, watcher, server, or stdin-driven process session.' },
+  { name: 'process_read',  group: 'shell', permission: 'localExec', summary: 'Read bounded incremental output and status from a persistent process session using a cursor.' },
+  { name: 'process_write', group: 'shell', permission: 'localExec', summary: 'Write known non-secret stdin characters to a running persistent process session.' },
+  { name: 'process_stop',  group: 'shell', permission: 'localExec', summary: 'Stop a persistent process session and its process tree.' },
   { name: 'interactive_cli_start', group: 'shell', permission: 'localExec', summary: 'Start a live stdin/stdout session for any local CLI command expected to wait for user input.' },
   { name: 'interactive_cli_read',  group: 'shell', permission: 'localExec', summary: 'Read status and recent output from an interactive CLI session.' },
   { name: 'interactive_cli_send',  group: 'shell', permission: 'localExec', summary: 'Send non-secret stdin to an interactive CLI session; user secrets must go through the UI panel.' },
@@ -111,20 +106,22 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // PDF
   { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'Markdown → PDF (CJK-friendly, zero external dependency).' },
   { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF (same renderer).' },
+  { name: 'edit_pdf',        group: 'pdf', permission: 'localExec', summary: 'Edit PDF pages, order, rotation, overlays, watermarks, images, and form values with a bundled cross-platform engine.' },
+  { name: 'pdf_render',      group: 'pdf', permission: 'localExec', summary: 'Render a selected PDF page to an inline PNG for visual quality review.' },
 
   // Office documents (bundled OfficeCLI engine — no MS Office needed)
   { name: 'create_docx',   group: 'office', permission: 'localExec', summary: 'Create a Word (.docx) document from paragraphs (styles + inline bold/font/size/color), plus tables and images; CJK-ready, first-page PNG preview; built-in engine, no MS Office required.' },
-  { name: 'create_xlsx',   group: 'office', permission: 'localExec', summary: 'Create an Excel (.xlsx) workbook from rows (values + formulas + number formats + cell fill/font/align/border), with multiple sheets and column widths; CJK-ready, PNG preview.' },
+  { name: 'create_xlsx',   group: 'office', permission: 'localExec', summary: 'Create one Excel (.xlsx) workbook from rows (values + formulas + number formats + cell styling), multiple sheets, column widths, and native editable charts bound to cell ranges; CJK-ready, PNG preview.' },
   { name: 'create_pptx',   group: 'office', permission: 'localExec', summary: 'Create a PowerPoint (.pptx) deck (title/body/layout, slide background/transition, free-positioned styled shapes, plus images and tables for designed slides); CJK-ready, first-slide PNG preview.' },
   { name: 'office_read',   group: 'office', permission: 'localExec', summary: 'Read an existing .docx/.xlsx/.pptx with element paths (text/outline/get/query) so edits can target them; pairs with edit_office.' },
-  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Edit an existing .docx/.xlsx/.pptx in place (set/add/remove on element paths), preserving formatting; returns a PNG preview.' },
+  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Safely edit an existing .docx/.xlsx/.pptx (set/add/remove on element paths): pre-existing sources become validated working copies, while conversation-produced outputs can be refined in place; returns a PNG preview.' },
+  { name: 'office_check',  group: 'office', permission: 'localExec', summary: 'Validate an existing .docx/.xlsx/.pptx against OpenXML and scan for formatting/content/structure issues before delivery; invalid OpenXML is a fatal result.' },
   { name: 'office_render', group: 'office', permission: 'localExec', summary: 'Render a page of an existing .docx/.xlsx/.pptx to a PNG image to inspect layout / fonts / CJK glyphs.' },
 
   // Library
   { name: 'kb_list',       group: 'kb', summary: 'List Library files and indexing status before choosing what to search or read.' },
   { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s Library.' },
   { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a Library file that kb_search has hit.' },
-  { name: 'research_rerank', group: 'kb', ownerAgent: DEEP_RESEARCH_AGENT_IDS, summary: 'Semantically rerank candidate research passages against a sub-question by local embedding similarity — the second stage after the deep-research compress skill\'s lexical filter, surfacing on-topic passages that share no keywords. Read-only, local, no Tool Execution Access. Owned by the deep-research + data-research agents (hidden from the commander).' },
 
   // Conversation history
   { name: 'chat_search',   group: 'chat', summary: 'Search prior messages for missing continuity context; project conversations default to same-project history.' },
@@ -132,6 +129,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
 
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
+  { name: 'image_studio', group: 'image', permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned security kernel for project inspection, local snapshot review, configured workflow dispatch, and approved image export.' },
   { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML preview, QA-gated draft/export, and speech transcription fallback orchestration.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)

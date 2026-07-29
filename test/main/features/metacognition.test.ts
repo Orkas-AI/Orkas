@@ -9,8 +9,8 @@ const TEST_UID = 'u1';
 
 // Metacognition files live at `<uid>/cloud/agents/<agent_id>/meta/*.md`
 // (agent 目录形态;详见 docs/plans/agent-as-directory.md)。
-function metaDir(agentId: string): string {
-  return path.join(tmpDir, TEST_UID, 'cloud', 'agents', agentId, 'meta');
+function metaDir(agentId: string, uid = TEST_UID): string {
+  return path.join(tmpDir, uid, 'cloud', 'agents', agentId, 'meta');
 }
 
 beforeEach(async () => {
@@ -186,6 +186,28 @@ describe('metacognition › agent isolation', () => {
     // Verify it's stored under _default on disk
     const defaultFile = path.join(metaDir('_default'), 'COMPETENCE.md');
     expect(fs.existsSync(defaultFile)).toBe(true);
+  });
+});
+
+// ── Account isolation ──────────────────────────────────────────────────
+
+describe('metacognition › account isolation', () => {
+  it('keeps an in-flight model turn bound to its originating account after an account switch', async () => {
+    const mod = await loadModule();
+    const users = await import('../../../src/main/features/users');
+
+    mod.writeContentForUser(TEST_UID, 'agent-shared', 'competence', 'u1 private assessment');
+    users.activateUser('u2');
+    mod.writeContent('agent-shared', 'competence', 'u2 private assessment');
+
+    expect(mod.readContentForUser(TEST_UID, 'agent-shared', 'competence').content)
+      .toBe('u1 private assessment');
+    expect(mod.readContentForUser('u2', 'agent-shared', 'competence').content)
+      .toBe('u2 private assessment');
+    expect(fs.readFileSync(path.join(metaDir('agent-shared', TEST_UID), 'COMPETENCE.md'), 'utf8'))
+      .toBe('u1 private assessment');
+    expect(fs.readFileSync(path.join(metaDir('agent-shared', 'u2'), 'COMPETENCE.md'), 'utf8'))
+      .toBe('u2 private assessment');
   });
 });
 

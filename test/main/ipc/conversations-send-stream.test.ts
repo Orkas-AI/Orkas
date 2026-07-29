@@ -104,6 +104,35 @@ async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void>
 }
 
 describe('ipc › conversations.sendStream', () => {
+  it('passes the pre-routing title text separately from the routed message', async () => {
+    if (!streamStartHandler) throw new Error('stream handler not registered');
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const run = streamStartHandler(
+      { sender },
+      {
+        requestId: 'title-text',
+        channel: 'conversations.sendStream',
+        payload: {
+          cid: 'c123abc',
+          content: '@VideoStudio Draft the launch video',
+          title_text: 'Draft the launch video',
+        },
+      },
+    );
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      text: '@VideoStudio Draft the launch video',
+      title_text: 'Draft the launch video',
+    }]);
+
+    groupChatMock.quiescent = true;
+    groupChatMock.releaseSend?.();
+    await run;
+  });
+
   it('routes a failed-message retry to the smart retry path instead of a normal send', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });

@@ -9,7 +9,7 @@
  * the parsing is a one-trick pony for signal attribution; no other caller
  * needs it. Keeping it next to its consumer avoids over-abstracting.
  *
- * **No FS access**: pure path-string comparison against the three root
+ * **No FS access**: pure path-string comparison against the supported root
  * helpers from `paths.ts`. Reading the SKILL.md body would violate
  * PC/CLAUDE.md §3 (model layer doesn't read business data) and is
  * unnecessary — the system label is derivable from the absolute path
@@ -23,6 +23,7 @@ import * as path from 'node:path';
 import {
   userSkillsDir,
   userMarketplaceSkillsDir,
+  userMarketplaceAgentsDir,
   userAgentsDir,
 } from '../../paths';
 
@@ -32,18 +33,18 @@ export interface ParsedSkillPath {
   system: SkillSystem;
   /** Directory name of the skill (last segment before `SKILL.md`). */
   skill_id: string;
-  /** Owning agent id — only set for System B (`<uid>/cloud/agents/<aid>/skills/<sid>/SKILL.md`). */
+  /** Owning agent id — only set for System B (`<agents-root>/<aid>/skills/<sid>/SKILL.md`). */
   agent_id?: string;
 }
 
 /** Returns true iff the absolute path resolves to a SKILL.md inside one of
- *  the three skill roots for the given uid. */
+ *  the supported skill roots for the given uid. */
 export function isSkillMdPath(absPath: string, uid: string): boolean {
   return parseSkillPath(absPath, uid) !== null;
 }
 
 /** Parse a SKILL.md absolute path into `{ system, skill_id, agent_id? }`.
- *  Returns `null` if the path is not under any of the three roots, doesn't
+ *  Returns `null` if the path is not under a supported root, doesn't
  *  end in SKILL.md, or has an unexpected segment count. */
 export function parseSkillPath(absPath: string, uid: string): ParsedSkillPath | null {
   if (!absPath || !uid) return null;
@@ -56,10 +57,15 @@ export function parseSkillPath(absPath: string, uid: string): ParsedSkillPath | 
   const p = _tryUnderRoot(abs, userMarketplaceSkillsDir(uid), 1);
   if (p) return { system: 'A.platform', skill_id: p.segments[0] };
 
-  // System B: `<uid>/cloud/agents/<aid>/skills/<sid>/SKILL.md`
-  const b = _tryUnderRoot(abs, userAgentsDir(uid), 3);
-  if (b && b.segments[1] === 'skills') {
-    return { system: 'B', skill_id: b.segments[2], agent_id: b.segments[0] };
+  // System B can be owned by either a user Agent or an installed
+  // marketplace Agent. Both use `<agents-root>/<aid>/skills/<sid>/SKILL.md`.
+  // Keeping the two roots explicit prevents installed Agent skills from
+  // silently disappearing from skill_invoked telemetry.
+  for (const root of [userAgentsDir(uid), userMarketplaceAgentsDir(uid)]) {
+    const b = _tryUnderRoot(abs, root, 3);
+    if (b && b.segments[1] === 'skills') {
+      return { system: 'B', skill_id: b.segments[2], agent_id: b.segments[0] };
+    }
   }
 
   return null;

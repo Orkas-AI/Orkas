@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 async function loadMarketplace() {
@@ -11,6 +13,27 @@ describe('marketplace projects catalog', () => {
     vi.unstubAllGlobals();
     vi.resetModules();
     delete process.env.ORKAS_API_BASE_URL;
+  });
+
+  it('keeps the bundled fallback catalog self-consistent', () => {
+    const bundled = JSON.parse(fs.readFileSync(
+      path.join(__dirname, '../../../src/main/data/oss-projects.json'),
+      'utf8',
+    ));
+    const categoryCodes = bundled.categories.map((category: any) => category.code);
+    const projectIds = bundled.projects.map((project: any) => project.id);
+
+    expect(new Set(categoryCodes).size).toBe(categoryCodes.length);
+    expect(new Set(projectIds).size).toBe(projectIds.length);
+    expect(bundled.categories.every((category: any) =>
+      category.name_zh && category.name_en && Number.isFinite(category.sort_order)))
+      .toBe(true);
+    expect(bundled.projects.every((project: any) =>
+      categoryCodes.includes(project.category)
+      && project.repo
+      && project.description_zh
+      && project.description_en))
+      .toBe(true);
   });
 
   it('falls back to bundled projects when the Server catalog is unavailable', async () => {

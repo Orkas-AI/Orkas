@@ -66,6 +66,8 @@ export type TtsResult =
     providerErrorCode?: string;
   };
 
+type TtsFailure = Extract<TtsResult, { ok: false }>;
+
 /** Whether a synthesized narration fits a target clip duration, with a concrete
  *  remedy (word count / speed derived from the OBSERVED speaking rate). The
  *  upstream check that the shipped pipeline lacked: a 16 s narration silently
@@ -263,6 +265,92 @@ interface TtsBackend {
   synthesize(p: TtsParams): Promise<TtsResult>;
 }
 
+function isClearlyNonAudioResponse(resp: Response): boolean {
+  const contentType = String(resp.headers.get('content-type') || '')
+    .split(';', 1)[0]
+    .trim()
+    .toLowerCase();
+  return contentType === 'application/json'
+    || contentType === 'application/problem+json'
+    || contentType === 'application/xml'
+    || contentType === 'text/xml'
+    || contentType === 'text/html'
+    || contentType === 'text/plain';
+}
+
+function sentFailure(
+  errorCode: string,
+  message: string,
+  retryPolicy: TtsFailure['retryPolicy'] = 'unknown',
+  chargeStatus: TtsFailure['chargeStatus'] = 'unknown',
+  providerErrorCode?: string,
+): TtsFailure {
+  return {
+    ok: false,
+    errorCode,
+    message,
+    requestDisposition: 'sent',
+    chargeStatus,
+    retryPolicy,
+    ...(providerErrorCode ? { providerErrorCode } : {}),
+  };
+}
+
+function invalidAudioResponse(): TtsFailure {
+  return sentFailure(
+    'E_TTS_INVALID_AUDIO',
+    'The speech provider returned a non-audio response. No audio file was saved.',
+  );
+}
+
+function providerHttpFailure(provider: string, status: number): TtsFailure {
+  if (status === 401 || status === 403) {
+    return sentFailure(
+      'E_TTS_API_ERROR',
+      `${provider} rejected the configured credentials. Update the speech provider settings before retrying.`,
+      'requires_user_action',
+    );
+  }
+  if (status === 400 || status === 404 || status === 422) {
+    return sentFailure(
+      'E_TTS_API_ERROR',
+      `${provider} rejected the speech request. Verify the selected model, voice, language, and format before retrying.`,
+      'requires_user_action',
+    );
+  }
+  if (status === 429) {
+    return sentFailure(
+      'E_TTS_API_ERROR',
+      `${provider} is rate limited. Wait before starting a new retry.`,
+    );
+  }
+  return sentFailure(
+    'E_TTS_API_ERROR',
+    status >= 500
+      ? `${provider} is temporarily unavailable.`
+      : `${provider} could not complete the speech request.`,
+  );
+}
+
+async function persistSynthesizedAudio(
+  backend: string,
+  outputAbsPath: string,
+  buf: Buffer,
+): Promise<TtsResult> {
+  try {
+    await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
+    await fs.writeFile(outputAbsPath, buf);
+  } catch (err) {
+    log.warn(`persist synthesized audio: ${redactPaths((err as Error).message)}`);
+    return sentFailure(
+      'E_TTS_WRITE',
+      'Speech was generated but could not be saved. Free storage or choose a writable output path before retrying; the provider may already have charged for this request.',
+      'requires_user_action',
+    );
+  }
+  return { ok: true, path: outputAbsPath, bytes: buf.length, backend };
+}
+
 /** Default request timeout for a synthesis call. Speech of a sentence is quick;
  *  generous enough for a paragraph without hanging forever. */
 const TTS_TIMEOUT_MS = 120_000;
@@ -304,22 +392,30 @@ class OpenAICompatibleTtsBackend implements TtsBackend {
       const aborted = p.signal?.aborted;
       // Don't echo the raw fetch error (it can embed the configured endpoint URL).
       if (!aborted) log.warn(`tts request failed: ${redactPaths((err as Error).message)}`);
-      return { ok: false, errorCode: aborted ? 'E_TTS_ABORTED' : 'E_TTS_NETWORK', message: aborted ? 'TTS aborted.' : 'TTS request failed (network/endpoint error).' };
+      return sentFailure(
+        aborted ? 'E_TTS_ABORTED' : 'E_TTS_NETWORK',
+        aborted
+          ? 'TTS was aborted after dispatch; the provider charge status is unknown.'
+          : 'TTS request failed (network/endpoint error).',
+      );
     }
     if (!resp.ok) {
-      const detail = (await resp.text().catch(() => '')).slice(0, 400);
-      return { ok: false, errorCode: 'E_TTS_API_ERROR', message: `TTS API ${resp.status}: ${detail || resp.statusText}` };
+      await resp.body?.cancel().catch(() => {});
+      return providerHttpFailure('The speech provider', resp.status);
+    }
+    if (isClearlyNonAudioResponse(resp)) {
+      await resp.body?.cancel().catch(() => {});
+      return invalidAudioResponse();
     }
     const declared = Number(resp.headers.get('content-length') || 0);
     if (declared > MAX_TTS_BYTES) {
-      return { ok: false, errorCode: 'E_TTS_TOO_LARGE', message: `TTS response too large (${declared} bytes).` };
+      await resp.body?.cancel().catch(() => {});
+      return sentFailure('E_TTS_TOO_LARGE', 'The speech response was too large and was not saved.');
     }
     const buf = Buffer.from(await resp.arrayBuffer());
-    if (buf.length > MAX_TTS_BYTES) return { ok: false, errorCode: 'E_TTS_TOO_LARGE', message: `TTS response too large (${buf.length} bytes).` };
-    if (!buf.length) return { ok: false, errorCode: 'E_TTS_EMPTY', message: 'TTS API returned empty audio.' };
-    await fs.mkdir(path.dirname(p.outputAbsPath), { recursive: true }).catch(() => {});
-    await fs.writeFile(p.outputAbsPath, buf);
-    return { ok: true, path: p.outputAbsPath, bytes: buf.length, backend: this.id };
+    if (buf.length > MAX_TTS_BYTES) return sentFailure('E_TTS_TOO_LARGE', 'The speech response was too large and was not saved.');
+    if (!buf.length) return sentFailure('E_TTS_EMPTY', 'The speech provider returned empty audio.');
+    return persistSynthesizedAudio(this.id, p.outputAbsPath, buf);
   }
 }
 
@@ -446,23 +542,31 @@ class DoubaoTtsBackend implements TtsBackend {
     } catch (err) {
       const aborted = p.signal?.aborted;
       if (!aborted) log.warn(`doubao tts request failed: ${redactPaths((err as Error).message)}`);
-      return { ok: false, errorCode: aborted ? 'E_TTS_ABORTED' : 'E_TTS_NETWORK', message: aborted ? 'TTS aborted.' : 'TTS request failed (network/endpoint error).' };
+      return sentFailure(
+        aborted ? 'E_TTS_ABORTED' : 'E_TTS_NETWORK',
+        aborted
+          ? 'TTS was aborted after dispatch; the provider charge status is unknown.'
+          : 'TTS request failed (network/endpoint error).',
+      );
     }
     if (!resp.ok) {
-      const detail = (await resp.text().catch(() => '')).slice(0, 400);
-      return { ok: false, errorCode: 'E_TTS_API_ERROR', message: `TTS API ${resp.status}: ${detail || resp.statusText}` };
+      await resp.body?.cancel().catch(() => {});
+      return providerHttpFailure('Doubao TTS', resp.status);
     }
     const raw = await resp.text();
     // base64 inflates ~1.33×; a 50MB audio cap is ~67MB of NDJSON text.
-    if (raw.length > MAX_TTS_BYTES * 2) return { ok: false, errorCode: 'E_TTS_TOO_LARGE', message: 'TTS response too large.' };
+    if (raw.length > MAX_TTS_BYTES * 2) return sentFailure('E_TTS_TOO_LARGE', 'The speech response was too large and was not saved.');
     const parsed = parseDoubaoV3Ndjson(raw);
-    if (parsed.ok === false) return { ok: false, errorCode: 'E_TTS_API_ERROR', message: parsed.message };
+    if (parsed.ok === false) {
+      return sentFailure(
+        'E_TTS_API_ERROR',
+        'Doubao TTS returned an invalid or rejected audio stream.',
+      );
+    }
     const buf = format === 'wav' ? wrapPcm16MonoWav(parsed.audio) : parsed.audio;
-    if (buf.length > MAX_TTS_BYTES) return { ok: false, errorCode: 'E_TTS_TOO_LARGE', message: `TTS response too large (${buf.length} bytes).` };
-    if (!buf.length) return { ok: false, errorCode: 'E_TTS_EMPTY', message: 'TTS API returned empty audio.' };
-    await fs.mkdir(path.dirname(p.outputAbsPath), { recursive: true }).catch(() => {});
-    await fs.writeFile(p.outputAbsPath, buf);
-    return { ok: true, path: p.outputAbsPath, bytes: buf.length, backend: this.id };
+    if (buf.length > MAX_TTS_BYTES) return sentFailure('E_TTS_TOO_LARGE', 'The speech response was too large and was not saved.');
+    if (!buf.length) return sentFailure('E_TTS_EMPTY', 'Doubao TTS returned empty audio.');
+    return persistSynthesizedAudio(this.id, p.outputAbsPath, buf);
   }
 }
 
@@ -540,7 +644,18 @@ export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
       retryPolicy: 'safe_after_plan_fix',
     };
   }
-  const res = await resolveTtsBackend(resolved.selection.routeRef).synthesize({
+  if (p.signal?.aborted) {
+    return {
+      ok: false,
+      errorCode: 'E_TTS_ABORTED',
+      message: 'TTS was aborted before the provider request.',
+      requestDisposition: 'not_sent',
+      chargeStatus: 'not_charged',
+      retryPolicy: 'unknown',
+    };
+  }
+  const backend = resolveTtsBackend(resolved.selection.routeRef);
+  const res = await backend.synthesize({
     ...p,
     routeRef: resolved.selection.routeRef,
     voiceRef: resolved.selection.voiceRef,

@@ -44,6 +44,11 @@ import { hardenedWebPreferences, installExternalNavigationGuard } from './util/w
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
+const E2E_USER_DATA_DIR = !app.isPackaged
+  ? String(process.env.ORKAS_E2E_USER_DATA_DIR || '').trim()
+  : '';
+const E2E_HIDE_WINDOW = !app.isPackaged
+  && String(process.env.ORKAS_E2E_HIDE_WINDOW || '').trim() === '1';
 const WINDOWS_TASK_BADGE_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAPklEQVR4nGNgoAX4jwNQpJkoQ2CK3ru4YMV4DSGkGa8hxGrGacioAVQwgOJopEpCQjcEF8CrmZAhRGkmFQAAcdLnkJb3ml4AAAAASUVORK5CYII=';
 const PACKAGED_LAUNCH_SMOKE_FILE = app.isPackaged
   ? String(process.env.ORKAS_PACKAGED_LAUNCH_SMOKE_FILE || '').trim()
@@ -60,6 +65,10 @@ app.setName('Orkas');
 try {
   if (IS_PACKAGED_LAUNCH_SMOKE) {
     app.setPath('userData', path.join(path.dirname(PACKAGED_LAUNCH_SMOKE_FILE), 'user-data'));
+  } else if (E2E_USER_DATA_DIR) {
+    // Keep unpackaged E2E state and its single-instance lock away from the
+    // developer's normal Orkas profile. Packaged launches ignore this hook.
+    app.setPath('userData', path.resolve(E2E_USER_DATA_DIR));
   }
 } catch {
   /* userData may be unavailable in unusual test hosts; the default is fine. */
@@ -126,6 +135,7 @@ import { getBootDeviceProfile } from './util/boot-device-profile';
 
 import * as storage from './storage';
 import { initLogger, createLogger } from './logger';
+import { logErrorSummary } from './util/log-redact';
 initLogger();
 const log = createLogger('orkas');
 const marketplaceBootLog = createLogger('marketplace_boot');
@@ -214,7 +224,7 @@ function createWindow(): BrowserWindow {
     height: 800,
     ...restored.bounds,
     title: '',
-    show: !IS_PACKAGED_LAUNCH_SMOKE,
+    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW,
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
     webPreferences: hardenedWebPreferences({
@@ -277,9 +287,10 @@ function createWindow(): BrowserWindow {
 function openConversationFromTaskNotification(
   conversationId: string,
   status: import('./features/group_chat/bus').TaskTerminalStatus,
+  userId: string,
 ): void {
-  if (!storage.safeId(conversationId)) {
-    log.warn('task notification carried invalid conversation id');
+  if (!storage.safeId(conversationId) || !storage.safeId(userId)) {
+    log.warn('task notification carried invalid navigation scope');
     return;
   }
 
@@ -293,6 +304,7 @@ function openConversationFromTaskNotification(
     win.webContents.send('conversations:open-from-notification', {
       conversation_id: conversationId,
       terminal_status: status,
+      user_id: userId,
     });
   };
   if (win.webContents.isLoading()) win.webContents.once('did-finish-load', send);
@@ -319,6 +331,10 @@ function registerIpc(): void {
       if (readyState !== 'interactive' && readyState !== 'complete') {
         throw new Error(`launch smoke renderer is not ready: ${readyState || '(missing)'}`);
       }
+      const launchStartedAtMs = Number(process.env.ORKAS_PACKAGED_LAUNCH_STARTED_AT_MS);
+      if (!Number.isFinite(launchStartedAtMs) || launchStartedAtMs <= 0) {
+        throw new Error('launch smoke start timestamp is missing');
+      }
       const appAsar = path.join(process.resourcesPath, 'app.asar');
       // Electron's patched `fs` exposes an ASAR as a virtual directory, so
       // stat().isFile() is false even for a healthy physical archive. Prove
@@ -339,6 +355,7 @@ function registerIpc(): void {
         version: app.getVersion(),
         platform: process.platform,
         arch: process.arch,
+        readyElapsedMs: Math.max(0, Date.now() - launchStartedAtMs),
         readyAt: new Date().toISOString(),
       };
       const marker = path.resolve(PACKAGED_LAUNCH_SMOKE_FILE);
@@ -363,6 +380,7 @@ function registerIpc(): void {
       platform,
       osVersion: systemVersion,
       arch: process.arch,
+      isE2E: false,
     };
   });
 
@@ -405,7 +423,7 @@ function registerIpc(): void {
       const lang = appConfig.getLanguage();
       event.returnValue = { ok: true, lang, tables: getRendererBootTables(lang) };
     } catch (err) {
-      log.warn('bootI18n failed', { error: (err as Error)?.message });
+      log.warn('bootI18n failed', { error: logErrorSummary(err) });
       event.returnValue = { ok: false };
     }
   });
@@ -496,14 +514,24 @@ async function runBootSelfCheck(): Promise<void> {
   } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
 
   // Stage 2: clear stale processing=true conversations from a previous crash.
-  try { await chatsFeature.sweepStaleProcessing(users.getActiveUserId()); }
+  try {
+    const { swept } = await chatsFeature.sweepStaleProcessing(users.getActiveUserId());
+    // Emit once per boot, including zero, so dashboards can measure both the
+    // recovered task volume and the share of boots affected by interruption.
+    if (swept > 0) log.info('recovered stale conversations', { swept });
+  }
   catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
 
 }
 
 async function runBootMaintenanceSweeps(): Promise<void> {
   // Full cross-user/unindexed recovery stays out of the pre-window self-check.
-  try { await chatsFeature.sweepStaleProcessing(); }
+  try {
+    const { swept } = await chatsFeature.sweepStaleProcessing();
+    // This full scan is a fallback for inactive/unindexed state. Zero adds no
+    // information beyond the active-user boot event, so keep it silent.
+    if (swept > 0) log.info('recovered stale conversations during maintenance', { swept });
+  }
   catch (err) { log.warn('full chats sweep failed', { error: (err as Error).message }); }
 
   // file_cache orphan sweep — stat-based maintenance, not needed before the

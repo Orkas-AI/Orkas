@@ -56,7 +56,7 @@ export interface UserPreferences {
 }
 
 // Avatar tokens reuse the same catalog (src/main/data/avatars.json).
-import { isKnownIcon, isKnownColor } from './avatars';
+import { getCatalog, isKnownIcon, isKnownColor } from './avatars';
 
 function preferencesFile(): string {
   return userPreferencesFile(getActiveUserId());
@@ -70,6 +70,10 @@ function systemLanguage(): Lang {
 
 export function readPreferences(): UserPreferences {
   return readJsonSync<UserPreferences>(preferencesFile());
+}
+
+function readPreferencesForUser(userId: string): UserPreferences {
+  return readJsonSync<UserPreferences>(userPreferencesFile(userId));
 }
 
 /** Merge `partial` into the on-disk preferences and atomically rewrite. */
@@ -109,15 +113,18 @@ export type AppConfig = UserPreferences;
 // ── Language ─────────────────────────────────────────────────────────────
 
 export function getLanguage(): Lang {
-  const v = readPreferences().language;
-  const lang = isLang(v) ? v : systemLanguage();
-  setCurrentLang(lang);
-  return lang;
+  return getLanguageForUser(getActiveUserId());
 }
 
+/** Read one user's language without changing process-wide i18n state. */
+export function resolveLanguageForUser(uid: string): Lang {
+  const v = readPreferencesForUser(uid).language;
+  return isLang(v) ? v : systemLanguage();
+}
+
+/** Resolve one user's language and make it the active process language. */
 export function getLanguageForUser(uid: string): Lang {
-  const v = readJsonSync<UserPreferences>(userPreferencesFile(uid)).language;
-  const lang = isLang(v) ? v : systemLanguage();
+  const lang = resolveLanguageForUser(uid);
   setCurrentLang(lang);
   return lang;
 }
@@ -158,20 +165,29 @@ export function initLanguage(systemLocale: string): Lang {
 
 // ── Commander avatar ─────────────────────────────────────────────────────
 
+function commanderDefaultIcon(): string {
+  return getCatalog().commander_default.icon;
+}
+
 export function getCommanderAvatar(): CommanderAvatar | null {
   const v = readPreferences().commander_avatar;
   if (!v || typeof v !== 'object') return null;
-  const icon = (v as CommanderAvatar).icon;
   const color = (v as CommanderAvatar).color;
-  if (!isKnownIcon(icon) || !isKnownColor(color)) return null;
-  return { icon, color };
+  if (!isKnownColor(color)) return null;
+  // Commander has a fixed visual identity in the renderer. Normalize older
+  // preferences that allowed another catalog icon while retaining the user's
+  // chosen color.
+  return { icon: commanderDefaultIcon(), color };
 }
 
 export function setCommanderAvatar(avatar: CommanderAvatar): CommanderAvatar {
-  if (!isKnownIcon(avatar?.icon) || !isKnownColor(avatar?.color)) {
+  const icon = avatar?.icon;
+  if (!isKnownIcon(icon)
+      || icon !== commanderDefaultIcon()
+      || !isKnownColor(avatar?.color)) {
     throw new Error('invalid avatar tokens');
   }
-  const next: CommanderAvatar = { icon: avatar.icon, color: avatar.color };
+  const next: CommanderAvatar = { icon, color: avatar.color };
   writePreferences({ commander_avatar: next });
   return next;
 }
@@ -183,7 +199,15 @@ export function setCommanderAvatar(avatar: CommanderAvatar): CommanderAvatar {
 // layers the env `ORKAS_METACOGNITION='0'` kill switch on top.
 
 export function getMetacognitionEnabled(): boolean {
-  const v = readPreferences().metacognition_enabled;
+  return getMetacognitionEnabledForUser(getActiveUserId());
+}
+
+/** Resolve the metacognition preference for a specific account.
+ *
+ * Background work must not use the active-user wrapper: an account switch
+ * can happen while an asynchronous reflection cycle is still unwinding. */
+export function getMetacognitionEnabledForUser(userId: string): boolean {
+  const v = readPreferencesForUser(userId).metacognition_enabled;
   return v !== false;
 }
 

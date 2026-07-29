@@ -521,6 +521,28 @@ export interface AppUpdatePolicyConfig {
   min_version: string;
 }
 
+export type QuickStartScenarioId =
+  | 'data'
+  | 'video'
+  | 'image'
+  | 'ui_design'
+  | 'office'
+  | 'creation'
+  | 'rnd'
+  | 'seo_geo';
+
+export interface QuickStartConfigEntry {
+  id: QuickStartScenarioId;
+  agent_id: string;
+}
+
+export type QuickStartConfigSource = 'pc_default' | 'server_config';
+
+export interface QuickStartConfigState {
+  items: QuickStartConfigEntry[];
+  source: QuickStartConfigSource;
+}
+
 interface ModelCatalogConfig {
   providers: Record<string, ProviderModelEntry[]>;
   imageGeneration: Record<string, ImageGenCapability>;
@@ -535,6 +557,51 @@ export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapa
   google: { model: 'gemini-3.1-flash-image-preview', api: 'gemini', supportsEdit: true },
   doubao: { model: 'doubao-seedream-4-5-251128', api: 'doubao', supportsEdit: true },
 };
+
+/**
+ * First-paint fallback for the Commander home page. The Server may replace
+ * this ordered list through `commander.quick_start`, but it deliberately does
+ * not publish that key yet. Every referenced agent is either bundled with the
+ * desktop app or marked `default_install` in the marketplace.
+ */
+export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = [
+  { id: 'data', agent_id: '78900d8758bc' },
+  { id: 'video', agent_id: '79df9cc89f5f' },
+  { id: 'image', agent_id: '814b61b027f0' },
+  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
+  { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'creation', agent_id: '173d4235a431' },
+  { id: 'rnd', agent_id: 'a316881746f9' },
+  { id: 'seo_geo', agent_id: 'e064dca9e1bd' },
+];
+
+const QUICK_START_SCENARIO_IDS = new Set<QuickStartScenarioId>(
+  DEFAULT_QUICK_START_CONFIG.map((entry) => entry.id),
+);
+let lastInvalidQuickStartConfigHash = '';
+
+function normalizeQuickStartConfig(raw: unknown): QuickStartConfigEntry[] | null {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > QUICK_START_SCENARIO_IDS.size) return null;
+  const out: QuickStartConfigEntry[] = [];
+  const seen = new Set<QuickStartScenarioId>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const record = item as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() as QuickStartScenarioId : '' as QuickStartScenarioId;
+    const agentId = typeof record.agent_id === 'string' ? record.agent_id.trim() : '';
+    if (!QUICK_START_SCENARIO_IDS.has(id) || seen.has(id) || !/^[A-Za-z0-9_-]{3,64}$/.test(agentId)) return null;
+    seen.add(id);
+    out.push({ id, agent_id: agentId });
+  }
+  return out;
+}
+
+function mergeQuickStartConfig(baseRaw: unknown, overrideRaw: unknown): QuickStartConfigEntry[] {
+  const base = normalizeQuickStartConfig(baseRaw)
+    || DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry }));
+  const override = normalizeQuickStartConfig(overrideRaw);
+  return (override || base).map((entry) => ({ ...entry }));
+}
 
 function emptyModelCatalog(): ModelCatalogConfig {
   return { providers: {}, imageGeneration: {} };
@@ -552,12 +619,14 @@ function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
     const template = typeof r.template === 'string' && r.template.trim() ? r.template.trim() : undefined;
     const contextWindow = normalizePositiveInteger(r.contextWindow);
     const maxTokens = normalizePositiveInteger(r.maxTokens);
+    const maxInputImages = normalizeNonNegativeInteger(r.maxInputImages);
     out.push({
       id,
       name,
       ...(template ? { template } : {}),
       ...(contextWindow ? { contextWindow } : {}),
       ...(maxTokens ? { maxTokens } : {}),
+      ...(maxInputImages !== undefined ? { maxInputImages } : {}),
     });
   }
   return out;
@@ -567,6 +636,12 @@ function normalizePositiveInteger(value: unknown): number | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
   const n = Math.floor(value);
   return n > 0 ? n : undefined;
+}
+
+function normalizeNonNegativeInteger(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  const n = Math.floor(value);
+  return n >= 0 ? n : undefined;
 }
 
 function normalizeImageGenCapability(value: unknown): ImageGenCapability | null {
@@ -710,6 +785,15 @@ clientConfig.registerDefault<string>('app_update.min_version', '', {
   effect: 'immediate',
 });
 
+clientConfig.registerDefault<QuickStartConfigEntry[]>(
+  'commander.quick_start',
+  DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry })),
+  {
+  effect: 'immediate',
+  merge: mergeQuickStartConfig,
+  },
+);
+
 function loadModelCatalog(): ModelCatalogConfig {
   return normalizeModelCatalogConfig(clientConfig.get('model_catalog', DEFAULT_MODEL_CATALOG));
 }
@@ -750,4 +834,34 @@ export function getMinimumAppVersion(): string {
     clientConfig.get('app_update', { min_version: '' }),
   );
   return policy.min_version.trim();
+}
+
+export function getQuickStartConfig(): QuickStartConfigEntry[] {
+  return getQuickStartConfigState().items;
+}
+
+export function getQuickStartConfigState(): QuickStartConfigState {
+  const raw = clientConfig.getServerValue('commander.quick_start');
+  if (raw !== undefined) {
+    const serverItems = normalizeQuickStartConfig(raw);
+    if (serverItems) {
+      lastInvalidQuickStartConfigHash = '';
+      return {
+        items: serverItems.map((entry) => ({ ...entry })),
+        source: 'server_config',
+      };
+    }
+    const cache = clientConfig.readCache();
+    const configHash = String(cache.config_hash || 'server-config-without-hash');
+    if (lastInvalidQuickStartConfigHash !== configHash) {
+      lastInvalidQuickStartConfigHash = configHash;
+      log.warn('invalid Commander quick-start config; using open defaults', {
+        config_hash: cache.config_hash || '',
+      });
+    }
+  }
+  return {
+    items: DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry })),
+    source: 'pc_default',
+  };
 }

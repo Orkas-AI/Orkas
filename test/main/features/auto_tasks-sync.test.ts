@@ -66,4 +66,41 @@ describe('auto tasks sync dirty notifications', () => {
     ]);
     expect(deleted).toEqual(['cloud/auto_tasks/at_abcdef12/attachments/brief.txt']);
   });
+
+  it('marks an owned legacy device-binding migration dirty', async () => {
+    const autoTasks = await import('../../../src/main/features/auto_tasks');
+    const device = await import('../../../src/main/util/device');
+    const paths = await import('../../../src/main/paths');
+    device._setDeviceFingerprintForTests({
+      id: '11:22:33:44:55:66',
+      name: 'Legacy workstation',
+    });
+    try {
+      const created = await autoTasks.createTask(UID, {
+        id: 'at_1357ace0',
+        content: 'migrate this task',
+        schedule: { type: 'daily', hour: 9, minute: 0 },
+      });
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const configFile = paths.autoTaskConfigFile(UID, created.task.id);
+      fs.writeFileSync(configFile, JSON.stringify({
+        ...created.task,
+        device_id: '11:22:33:44:55:66',
+      }));
+      dirty = [];
+      autoTasks._setSyncDirtyNotifierForTest((domain, relPath) => dirty.push({ domain, relPath }));
+
+      const tasks = await autoTasks.listTasks(UID);
+
+      expect(tasks[0].device_id).toBe(created.task.device_id);
+      expect(dirty).toEqual([{
+        domain: 'auto_tasks',
+        relPath: 'cloud/auto_tasks/at_1357ace0/config.json',
+      }]);
+    } finally {
+      device._setDeviceFingerprintForTests(null);
+      autoTasks.stopScheduler();
+    }
+  });
 });

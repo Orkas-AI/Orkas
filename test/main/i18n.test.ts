@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import {
   t, setCurrentLang, getCurrentLang,
   acceptLanguageHeader, detectSystemLang, descriptionLang, getRendererBootTables,
-  isLang, _resetCacheForTests,
+  fallbackChain, isLang, _resetCacheForTests,
 } from '../../src/main/i18n';
 
 beforeEach(() => {
@@ -61,15 +61,11 @@ describe('i18n › t() lookup', () => {
     expect(t('errors.not_utf8')).toBe('Os arquivos de texto devem ser codificados em UTF-8');
   });
 
-  it('falls back to en when key missing in current lang', () => {
-    // Seed only-in-en by monkey-patching loaded table isn't supported; instead
-    // we rely on the shipped table where `errors.not_utf8` exists in both.
-    // This test covers the en-fallback path by picking a real key and
-    // temporarily pretending the zh side is empty via cache reset + one-shot
-    // override: simpler to just verify the final chain with a known-missing
-    // key (returns raw key).
-    setCurrentLang('zh');
-    expect(t('nope.definitely.missing.key')).toBe('nope.definitely.missing.key');
+  it('uses English as the only fallback for every non-English UI language', () => {
+    expect(fallbackChain('zh')).toEqual(['zh', 'en']);
+    expect(fallbackChain('ja')).toEqual(['ja', 'en']);
+    expect(fallbackChain('pt')).toEqual(['pt', 'en']);
+    expect(fallbackChain('en')).toEqual(['en']);
   });
 
   it('returns raw key when missing in both langs', () => {
@@ -98,6 +94,8 @@ describe('i18n › t() lookup', () => {
       .toContain('长时间没有响应');
     expect(t('cli_agent.session_expired_detail', { name: 'Claude Code' }))
       .toContain('外接会话已失效');
+    expect(t('cli_agent.upgrade_required_detail', { name: 'Codex', cli: 'codex' }))
+      .toContain('需要更高版本');
   });
 
   it('leaves unknown placeholders untouched', () => {

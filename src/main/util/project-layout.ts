@@ -366,5 +366,10 @@ export function autoTaskLocationForTask(uid: string, taskId: string, projectId?:
   if (projectId && projectExistsForLayout(uid, projectId)) {
     return projectAutoTaskLocation(uid, projectId, taskId);
   }
-  return findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
+  // This helper receives the task's desired persisted scope, not a lookup
+  // hint. Falling back to its old location when projectId is cleared leaves a
+  // project-less config under the old project directory; _readOne then
+  // reconstructs that directory's project id and the user's edit reverts on
+  // the next read/relaunch.
+  return globalAutoTaskLocation(uid, taskId);
 }

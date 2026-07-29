@@ -28,6 +28,7 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
       params: { sessionId: 's', update: { kind: 'agent_message_chunk', content: { text: 'hello' } } },
     }, h);
     expect(h.onTextDelta).toHaveBeenCalledWith('hello');
+    expect(h.onThinking).not.toHaveBeenCalled();
   });
 
   it('routes session/update agent_message_chunk via sessionUpdate field (Hermes wire format)', () => {
@@ -37,6 +38,7 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
       params: { sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: { text: 'hi' } } },
     }, h);
     expect(h.onTextDelta).toHaveBeenCalledWith('hi');
+    expect(h.onThinking).not.toHaveBeenCalled();
   });
 
   it('routes agent_thought_chunk to onThinking', () => {
@@ -46,6 +48,7 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
       params: { update: { sessionUpdate: 'agent_thought_chunk', content: { text: '(◔_◔) mulling' } } },
     }, h);
     expect(h.onThinking).toHaveBeenCalledWith('(◔_◔) mulling');
+    expect(h.onTextDelta).not.toHaveBeenCalled();
   });
 
   it('available_commands_update goes to onUnknown (not pretending to be a tool)', () => {

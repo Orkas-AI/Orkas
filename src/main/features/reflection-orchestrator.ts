@@ -28,12 +28,14 @@ import { listAgents } from './agents';
 import { listConversations, type Conversation } from './chats';
 import * as metacognition from './metacognition';
 import { buildTranscript, listAgentGmemberFiles } from './reflection-transcript';
-import { querySignals } from './expert_signals';
+import { querySignalsForUser } from './expert_signals';
 import { buildRunner } from '../model/core-agent/runner';
 import { cloudSessionFileFor } from '../util/project-layout';
-import { getLanguage } from './config';
+import { resolveLanguageForUser } from './config';
 import { getLocaleMeta } from '../i18n';
 import { scheduleBootBackground, type ScheduledBootBackgroundTask } from '../util/boot_init';
+import { registerUserSwitchHook } from './user-switch-hooks';
+import { getActiveUserId } from './users';
 
 const log = createLogger('reflection-orchestrator');
 
@@ -150,7 +152,7 @@ export async function isAgentDirty(uid: string, agentId: string, sinceMs: number
 
   // (1) signals.jsonl probe
   try {
-    const sigs = await querySignals({
+    const sigs = await querySignalsForUser(uid, {
       since: new Date(sinceMs).toISOString(),
       aid: isDefault ? null : agentId,
       limit: 1,
@@ -198,12 +200,22 @@ function _sessionNewerThan(uid: string, sessionId: string, sinceMs: number): boo
 
 // ── Reflection invocation ────────────────────────────────────────────────
 
-export type ReflectFn = (uid: string, agentId: string, sinceMs: number) => Promise<void>;
+export type ReflectFn = (
+  uid: string,
+  agentId: string,
+  sinceMs: number,
+  signal?: AbortSignal,
+) => Promise<void>;
 
 /** Build the reflection prompt for one agent and run it. Throws on failure
  *  so the caller can decide whether to stamp `lastReflectedAt` (success)
  *  or leave it (retry next cycle). */
-async function realReflectForAgent(uid: string, agentId: string, sinceMs: number): Promise<void> {
+async function realReflectForAgent(
+  uid: string,
+  agentId: string,
+  sinceMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
   const runnerAgentId = agentId === DEFAULT_AGENT_ID ? '' : agentId;
 
   // Ephemeral session — runReflection uses an in-memory session (not the
@@ -212,8 +224,10 @@ async function realReflectForAgent(uid: string, agentId: string, sinceMs: number
   const sessionId = `reflect-${tail}`;
 
   const { runner } = await buildRunner({ sessionId, userId: uid, agentId: runnerAgentId });
+  if (signal?.aborted) throw new Error('reflection cancelled');
 
   const transcriptResult = await buildTranscript(uid, agentId, sinceMs);
+  if (signal?.aborted) throw new Error('reflection cancelled');
   if (!transcriptResult.text) {
     // Dirty gate said yes but transcript came back empty (race / sweep / etc.).
     // Skip without stamping — next cycle's dirty check decides again.
@@ -222,14 +236,14 @@ async function realReflectForAgent(uid: string, agentId: string, sinceMs: number
   }
 
   const ca = await import('#core-agent');
-  const comp = metacognition.readContent(agentId, 'competence');
-  const strat = metacognition.readContent(agentId, 'strategies');
-  const languageName = getLocaleMeta(getLanguage()).llmName;
+  const comp = metacognition.readContentForUser(uid, agentId, 'competence');
+  const strat = metacognition.readContentForUser(uid, agentId, 'strategies');
+  const languageName = getLocaleMeta(resolveLanguageForUser(uid)).llmName;
   const prompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', transcriptResult.text, languageName);
 
   // `runReflection` swallows provider/LLM/loop errors and returns ''; an
   // empty response is treated as a failed reflection (cooldown not stamped).
-  const responseText = await runner.runReflection(prompt);
+  const responseText = await runner.runReflection(prompt, signal);
   if (!responseText || !responseText.trim()) {
     throw new Error('reflection returned empty (provider/LLM error or max loops; see core-agent log)');
   }
@@ -259,7 +273,7 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
     log.debug('no active uid, skipping cycle');
     return 0;
   }
-  if (!metacognition.isFeatureEnabled()) {
+  if (!metacognition.isFeatureEnabledForUser(uid)) {
     log.debug('metacognition disabled, skipping cycle');
     return 0;
   }
@@ -272,6 +286,7 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   let agents: Awaited<ReturnType<typeof listAgents>> = [];
   try { agents = await listAgents(); }
   catch (err) { log.warn(`listAgents failed: ${(err as Error).message}`); }
+  if (opts.signal?.aborted) return 0;
 
   // `_default` first so the most common bucket gets attention even if a
   // long agent list later in the loop hits issues.
@@ -289,7 +304,11 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   for (const { agentId, sinceMs, reason } of eligible) {
     if (opts.signal?.aborted) break;
     try {
-      await reflect(uid, agentId, sinceMs);
+      await reflect(uid, agentId, sinceMs, opts.signal);
+      // Account switching cancels the old cycle. A provider/tool may resolve
+      // after observing cancellation, but that stale work must never earn a
+      // cooldown stamp or suppress the new account's next reflection.
+      if (opts.signal?.aborted) break;
       // Stamp success — read fresh state in case another writer touched it.
       const next = readReflectionState(uid);
       next.lastReflectedAt[agentId] = new Date(now).toISOString();
@@ -307,15 +326,13 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
 // ── Loop control ─────────────────────────────────────────────────────────
 
 export interface LoopHandle {
-  /** Cancel the next scheduled cycle. Any in-flight cycle continues to
-   *  completion (no preemption). */
+  /** Cancel scheduled work and abort any in-flight cycle cooperatively. */
   stop(): void;
 }
 
-/** Start the reflection loop: run one cycle now, then every
- *  `CYCLE_INTERVAL_MS` until stopped. The boot path itself is offset beyond
- *  startup by util/boot_init.ts before it calls this function. */
-export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopHandle {
+/** Create a raw per-account reflection loop. Lifecycle ownership lives in
+ * `startReflectionLoop`, which replaces it when the active account changes. */
+function createReflectionLoop(uid: string, opts: RunCycleOpts): LoopHandle {
   let scheduled: ScheduledBootBackgroundTask | null = null;
   let stopped = false;
 
@@ -347,3 +364,73 @@ export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopH
     },
   };
 }
+
+interface ManagedLoop {
+  uid: string;
+  pendingUid: string | null;
+  switchEpoch: number;
+  opts: RunCycleOpts;
+  raw: LoopHandle;
+  stopped: boolean;
+}
+
+let activeLoop: ManagedLoop | null = null;
+
+/** Start the reflection loop: run one cycle now, then every
+ * `CYCLE_INTERVAL_MS` until stopped. Starting again replaces the previous
+ * loop. Account switches abort the old account's work and immediately arm a
+ * loop for the new account with the same options. */
+export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopHandle {
+  if (activeLoop) {
+    activeLoop.stopped = true;
+    activeLoop.raw.stop();
+  }
+
+  const managed: ManagedLoop = {
+    uid,
+    pendingUid: null,
+    switchEpoch: 0,
+    opts,
+    raw: { stop() { /* replaced immediately below */ } },
+    stopped: false,
+  };
+  managed.raw = createReflectionLoop(uid, opts);
+  activeLoop = managed;
+
+  return {
+    stop() {
+      if (managed.stopped) return;
+      managed.stopped = true;
+      managed.switchEpoch += 1;
+      managed.pendingUid = null;
+      managed.raw.stop();
+      if (activeLoop === managed) activeLoop = null;
+    },
+  };
+}
+
+registerUserSwitchHook('reflection-orchestrator', (previousUid, nextUid) => {
+  const managed = activeLoop;
+  if (!managed
+      || managed.stopped
+      || (managed.uid !== previousUid && managed.pendingUid !== previousUid)) return;
+  managed.raw.stop();
+  managed.pendingUid = nextUid;
+  managed.switchEpoch += 1;
+  const switchEpoch = managed.switchEpoch;
+  // Account activation can still be rejected by another safety hook. Arm the
+  // next loop only after the synchronous switch commits; the epoch also
+  // collapses rapid A→B→C switches into the final active account.
+  queueMicrotask(() => {
+    if (activeLoop !== managed
+        || managed.stopped
+        || managed.switchEpoch !== switchEpoch
+        || managed.pendingUid !== nextUid) return;
+    let activeUid = '';
+    try { activeUid = getActiveUserId(); } catch { return; }
+    if (activeUid !== nextUid) return;
+    managed.uid = nextUid;
+    managed.pendingUid = null;
+    managed.raw = createReflectionLoop(nextUid, managed.opts);
+  });
+});

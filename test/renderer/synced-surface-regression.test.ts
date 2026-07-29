@@ -76,13 +76,13 @@ describe('synced PC surface regressions', () => {
     expect(css).toContain('.agents-grid-subtitle');
   });
 
-  it('keeps the external-agent entry copy aligned with Orkas AI coding tools wording', () => {
+  it('keeps the external-agent entry copy aligned with the current AI tools wording', () => {
     const html = read('src/renderer/index.html');
     const en = read('src/renderer/locales/en.json');
     const zh = read('src/renderer/locales/zh.json');
 
-    expect(html).toContain('other AI coding tools');
-    expect(en).toContain('other AI coding tools');
+    expect(html).toContain('other AI tools');
+    expect(en).toContain('other AI tools');
     expect(zh).toContain('等 AI 编程工具');
     expect(zh).not.toContain('外部智能体');
   });

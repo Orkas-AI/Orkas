@@ -177,6 +177,25 @@ describe('memory › replaceEntry', () => {
     expect(result.error).toMatch(/not found/);
   });
 
+  it('prefers an exact entry and rejects an ambiguous substring without changing memory', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'memory', 'release owner is Alice');
+    mem.addEntry('u1', 'memory', 'release');
+
+    const exact = mem.replaceEntry('u1', 'memory', 'release', 'release cadence is weekly');
+    expect(exact).toMatchObject({
+      ok: true,
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
+
+    const ambiguous = mem.replaceEntry('u1', 'memory', 'release', 'unsafe overwrite');
+    expect(ambiguous).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
+  });
+
   it('rejects empty content', async () => {
     const mem = await loadMemory();
     mem.addEntry('u1', 'memory', 'note A');
@@ -202,6 +221,23 @@ describe('memory › removeEntry', () => {
     const result = mem.removeEntry('u1', 'memory', 'nothing here');
     expect(result.ok).toBe(false);
     expect(result.error).toMatch(/not found/);
+  });
+
+  it('rejects empty or ambiguous selectors and preserves every entry', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'memory', 'release owner is Alice');
+    mem.addEntry('u1', 'memory', 'release cadence is weekly');
+
+    expect(mem.removeEntry('u1', 'memory', '')).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/old_text.*required/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
+    expect(mem.removeEntry('u1', 'memory', 'release')).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
   });
 });
 
@@ -572,6 +608,23 @@ describe('memory › formatForSystemPrompt assembly', () => {
     expect(removed.ok).toBe(true);
     expect(removed.entries).toEqual([]);
     expect(mem.formatForSystemPrompt('u1', 'video-studio')).toBe('');
+  });
+
+  it('does not guess which agent-memory entry to change when a substring matches several', async () => {
+    const mem = await loadMemory();
+    mem.addAgentEntry('u1', 'video-studio', 'release owner is Alice');
+    mem.addAgentEntry('u1', 'video-studio', 'release cadence is weekly');
+
+    expect(mem.replaceAgentEntry('u1', 'video-studio', 'release', 'unsafe overwrite')).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
+    expect(mem.removeAgentEntry('u1', 'video-studio', 'release')).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/ambiguous/),
+      entries: ['release owner is Alice', 'release cadence is weekly'],
+    });
   });
 
   it('no agentId (e.g. commander with empty scope) → user + shared only', async () => {

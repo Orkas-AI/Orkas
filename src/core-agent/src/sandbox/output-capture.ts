@@ -80,7 +80,20 @@ export class ProcessOutputCapture {
     if (accepted.length) {
       if (this.fd != null) {
         try {
-          fs.writeSync(this.fd, accepted);
+          let offset = 0;
+          while (offset < accepted.length) {
+            const written = fs.writeSync(
+              this.fd,
+              accepted,
+              offset,
+              accepted.length - offset,
+              null,
+            );
+            if (!Number.isInteger(written) || written <= 0) {
+              throw new Error("process output spool made no write progress");
+            }
+            offset += written;
+          }
         } catch {
           // Once streaming fails, the already-buffered prefix is the only safe
           // output we can promise. Switch to explicit truncation and let the

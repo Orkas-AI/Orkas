@@ -1,0 +1,23 @@
+{
+  "version": "1.0.1",
+  "updated_at": "2026-07-28T13:32:31.000Z",
+  "min_app_version": "1.6.2",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "descriptions": {
+    "zh": "用于将 PRD、用户故事或功能切片转成带稳定编号的 Given/When/Then 产品验收场景、边界、错误恢复和非功能通过条件。",
+    "en": "Use to turn a PRD, user story, or feature slice into stable-ID Given/When/Then acceptance scenarios, boundaries, recovery behavior, and non-functional pass/fail conditions."
+  },
+  "routing": {
+    "applicable_domain": "product-level acceptance behavior for a specific story, feature slice, or user workflow",
+    "negative_examples": [
+      "implement or modify source code",
+      "write a full engineering test suite or automation code",
+      "discover an undefined product direction or write a complete PRD"
+    ],
+    "prerequisites": [
+      "a story, PRD section, feature slice, or behavior description exists",
+      "the user-visible scope is specific enough to describe observable outcomes"
+    ]
+  }
+}

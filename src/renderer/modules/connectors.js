@@ -11,9 +11,9 @@
 //
 // OAuth flow UX: clicking Connect asks main to open the system browser, then the IPC returns
 // immediately. The custom-scheme callback finishes exchange + provisioning independently and
-// pushes `connectors:oauth-result` back here. **The card itself does NOT stay busy while the user
-// is in the browser** — no authorizing badge, no disabled button. Closing/ignoring the browser is
-// abandonment, not a connector failure; a second click simply supersedes the earlier flow.
+// pushes `connectors:oauth-callback` when the user returns and `connectors:oauth-result` when the
+// network work finishes. **The card does NOT stay busy while the user is in the browser**. It shows
+// loading only after the callback, while exchange + provisioning is actually running.
 
 const _connectorsLog = createLogger('connectors');
 const _CONNECTORS_RENDER_CACHE_VERSION = 2;
@@ -73,14 +73,18 @@ let _connectorsState = {
   catalog: [],
   instances: [],
   loading: false,
-  /** Per-card launch flag. It lasts only until main accepts the OAuth request; browser consent,
-   *  callback exchange, and MCP startup continue asynchronously. */
+  /** Per-card busy flag for in-app retry operations. OAuth callback finalization is tracked
+   *  separately by `_oauthCallbackAttempts`. */
   connecting: new Set(),
 };
-// Correlates the accepted start with a later push so the terminal metric retains click metadata
-// and wall duration. Entries intentionally remain when no callback arrives: that is an abandoned
-// browser flow, so there is no fabricated terminal result to report.
+// Correlates an accepted start with the later callback/result push. Entries
+// intentionally remain when no callback arrives so a foreign result cannot
+// mutate the card state.
 const _pendingConnectAttempts = new Map();
+// `catalog_id → attempt_id` only while a provider callback is being exchanged/provisioned.
+// Keeping the attempt id prevents a late result from an older superseded flow from clearing a
+// newer callback's spinner on the same card.
+const _oauthCallbackAttempts = new Map();
 let _connectorsLoadSeq = 0;
 
 function _connectorsRenderCacheKey() {
@@ -501,18 +505,15 @@ function _renderCatalogCard(entry, instance) {
     : '';
 
   // Bottom-row action:
-  //   - connecting (this card is in `_connectorsState.connecting`): show spinner — overrides
-  //     every other state. Without this, a bundle finishes its 5-member install in ~0.7s
-  //     of stdio MCP handshakes; the card flips from "available" to "connected" section
-  //     before `_runConnect`'s `finally` clears the connecting flag, and the user sees
-  //     the spinner vanish "the moment they return from the browser" even though the
-  //     IPC chain (loadConnectors + grid re-render) is still finishing.
+  //   - connecting: show a spinner only for an in-app retry or after an OAuth deep-link callback
+  //     returns to the app. The initial Connect click and time spent in the browser stay unchanged.
   //   - connected: use in the Commander composer; enable / disable lives in the ⋯ menu
   //   - errored:   disconnect (recover from a stuck error state)
   //   - oauth_pending: disabled unavailable button
   //   - default (uninstalled): connect (start OAuth)
   let action = '';
-  const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
+  const isConnecting = (_connectorsState.connecting && _connectorsState.connecting.has(e.id))
+    || _oauthCallbackAttempts.has(e.id);
   if (isConnecting) {
     action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect">${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (isOAuthPending) {
@@ -807,10 +808,6 @@ async function _runConnect(entry) {
   const payload = _connectorTrackPayload(entry, null);
   const startedAt = performance.now();
   _connectorsTrackClick('connector_connect', payload);
-  // Show a spinner only while main validates and accepts the launch. The renderer must not hold
-  // the card in a ten-minute "connecting" state while the user is in an external browser.
-  _connectorsState.connecting.add(entry.id);
-  _renderConnectorsGrid();
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
     if (res && res.ok && res.started && typeof res.attempt_id === 'string' && res.attempt_id) {
@@ -822,14 +819,24 @@ async function _runConnect(entry) {
     }
   } catch (err) {
     _handleConnectFailure(payload, startedAt, err);
-  } finally {
-    _connectorsState.connecting.delete(entry.id);
-    _renderConnectorsGrid();
   }
+}
+
+function _handleOAuthCallback(info) {
+  if (!info || typeof info.attempt_id !== 'string' || typeof info.catalog_id !== 'string') return;
+  // Ignore stale or foreign callbacks. Every renderer-initiated flow records its attempt as soon as
+  // main accepts the launch, before an external browser can return to this process.
+  if (!_pendingConnectAttempts.has(info.attempt_id)) return;
+  _oauthCallbackAttempts.set(info.catalog_id, info.attempt_id);
+  _renderConnectorsGrid();
 }
 
 function _handleOAuthConnectResult(info) {
   if (!info || typeof info.attempt_id !== 'string' || typeof info.catalog_id !== 'string') return;
+  if (_oauthCallbackAttempts.get(info.catalog_id) === info.attempt_id) {
+    _oauthCallbackAttempts.delete(info.catalog_id);
+    _renderConnectorsGrid();
+  }
   const pending = _pendingConnectAttempts.get(info.attempt_id) || null;
   if (pending) _pendingConnectAttempts.delete(info.attempt_id);
   const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
@@ -1116,6 +1123,7 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('connectors:changed', () => {
       if (currentView === 'connectors') loadConnectors();
     });
+    window.orkas.onPushEvent('connectors:oauth-callback', _handleOAuthCallback);
     window.orkas.onPushEvent('connectors:oauth-result', _handleOAuthConnectResult);
     window.orkas.onPushEvent('client-config:changed', () => {
       if (currentView === 'connectors') loadConnectors();

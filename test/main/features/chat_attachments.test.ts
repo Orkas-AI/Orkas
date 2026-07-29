@@ -23,6 +23,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -70,6 +71,45 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.existsSync(path.join(draftAttDir('main_chat'), 'draft.txt'))).toBe(true);
     expect(fs.existsSync(path.join(cloudAttDir('main_chat'), 'draft.txt'))).toBe(false);
     expect(m.listPendingAttachments(UID, 'main_chat').map((i) => i.name)).toEqual(['draft.txt']);
+  });
+
+  it('caps distinct pending attachments per message and still reuses duplicates', async () => {
+    const m = await loadMod();
+    for (let i = 0; i < m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE; i++) {
+      const uploaded = await m.uploadAttachment(
+        UID,
+        CID,
+        `file-${i}.txt`,
+        Buffer.from(`body-${i}`, 'utf8'),
+      );
+      expect(uploaded.ok).toBe(true);
+    }
+
+    const overflow = await m.uploadAttachment(
+      UID,
+      CID,
+      'overflow.txt',
+      Buffer.from('overflow', 'utf8'),
+    );
+    expect(overflow).toMatchObject({ ok: false });
+    if (!overflow.ok) expect(overflow.error).toMatch(/20/);
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
+
+    const duplicate = await m.uploadAttachment(
+      UID,
+      CID,
+      'duplicate-name.txt',
+      Buffer.from('body-0', 'utf8'),
+    );
+    expect(duplicate).toMatchObject({ ok: true, reused: true });
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
+
+    const importedSource = path.join(tmpDir, 'overflow-import.txt');
+    fs.writeFileSync(importedSource, 'unique imported overflow', 'utf8');
+    const importedOverflow = await m.importAttachmentFromPath(UID, CID, importedSource);
+    expect(importedOverflow).toMatchObject({ ok: false });
+    if (!importedOverflow.ok) expect(importedOverflow.error).toMatch(/20/);
+    expect(m.listPendingAttachments(UID, CID)).toHaveLength(m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE);
   });
 
   it('stores PDF without pre-extracting (no sibling cache files)', async () => {
@@ -156,9 +196,12 @@ describe('chat_attachments › uploadAttachment', () => {
     const exts = ['.mp4', '.webm', '.mov', '.m4v', '.ogv'];
     for (const ext of exts) {
       const name = `v${ext.replace('.', '_')}${ext}`;
-      const r = await m.uploadAttachment(UID, CID, name, Buffer.from('x'));
+      const r = await m.uploadAttachment(UID, CID, name, Buffer.from(`video-${ext}`));
       expect(r.ok, `expected ${ext} to be accepted`).toBe(true);
-      if (r.ok) expect(r.info.kind).toBe('video');
+      if (r.ok) {
+        expect(r.info.name).toBe(name);
+        expect(r.info.kind).toBe('video');
+      }
     }
   });
 
@@ -208,6 +251,24 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r2.info.name.endsWith('.txt')).toBe(true);
   });
 
+  it('preserves every file across three same-name uploads within one timestamp', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-24T11:00:00.000Z'));
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('first'));
+    const r2 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('second'));
+    const r3 = await m.uploadAttachment(UID, CID, 'rapid.txt', Buffer.from('third'));
+
+    expect(r1.ok && r2.ok && r3.ok).toBe(true);
+    if (!(r1.ok && r2.ok && r3.ok)) return;
+    expect(new Set([r1.info.name, r2.info.name, r3.info.name]).size).toBe(3);
+    const storedBodies = fs.readdirSync(attDir())
+      .filter((name) => !name.startsWith('.'))
+      .map((name) => fs.readFileSync(path.join(attDir(), name), 'utf8'))
+      .sort();
+    expect(storedBodies).toEqual(['first', 'second', 'third']);
+  });
+
   it('reuses an existing attachment when upload content hash matches', async () => {
     const m = await loadMod();
     const r1 = await m.uploadAttachment(UID, CID, 'first.txt', Buffer.from('same bytes'));
@@ -218,6 +279,29 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r2.info.name).toBe(r1.info.name);
     expect(r2.reused).toBe(true);
     expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['first.txt']);
+  });
+
+  it('keeps a re-selected copy pending when its bytes match a previously sent attachment', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('send these bytes again');
+    const sent = await m.uploadAttachment(UID, CID, 'sent.txt', body);
+    expect(sent.ok).toBe(true);
+    if (!sent.ok) return;
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${JSON.stringify({ role: 'user', content: 'first send', attachments: [sent.info.name] })}\n`,
+    );
+
+    const selectedAgain = await m.uploadAttachment(UID, CID, 'selected-again.txt', body);
+
+    expect(selectedAgain.ok).toBe(true);
+    if (!selectedAgain.ok) return;
+    expect(selectedAgain.info.name).not.toBe(sent.info.name);
+    expect(m.listPendingAttachments(UID, CID).map((item) => item.name))
+      .toEqual([selectedAgain.info.name]);
   });
 
   it('reuses a single attachment when matching uploads arrive concurrently', async () => {
@@ -262,6 +346,31 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r2.info.name).toBe('kept.md');
     expect(r2.reused).toBe(true);
     expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['kept.md']);
+  });
+
+  it('keeps an imported copy pending when it matches a previously sent attachment', async () => {
+    const m = await loadMod();
+    const body = Buffer.from('workspace file selected again');
+    const sent = await m.uploadAttachment(UID, CID, 'sent.md', body);
+    expect(sent.ok).toBe(true);
+    if (!sent.ok) return;
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${JSON.stringify({ role: 'user', content: 'first send', attachments: [sent.info.name] })}\n`,
+    );
+    const source = path.join(tmpDir, 'workspace-copy.md');
+    fs.writeFileSync(source, body);
+
+    const selectedAgain = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(selectedAgain.ok).toBe(true);
+    if (!selectedAgain.ok) return;
+    expect(selectedAgain.info.name).not.toBe(sent.info.name);
+    expect(m.listPendingAttachments(UID, CID).map((item) => item.name))
+      .toEqual([selectedAgain.info.name]);
   });
 
   it('reuses a single attachment when matching imports arrive concurrently', async () => {
@@ -431,6 +540,30 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     if (!r.ok) return;
     expect(fs.existsSync(path.join(cloudAttDir(CID), 'kept.txt'))).toBe(true);
     expect(fs.existsSync(path.join(cloudAttDir(CID), 'new.txt'))).toBe(true);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
+  it('preserves both files when a draft name collides with the target conversation', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'same-name.txt', Buffer.from('existing conversation file'));
+    await m.uploadAttachment(UID, DRAFT, 'same-name.txt', Buffer.from('new draft file'));
+
+    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.count).toBe(1);
+    expect(r.items).toHaveLength(1);
+    expect(r.items[0].sourceName).toBe('same-name.txt');
+    expect(r.items[0].targetName).not.toBe('same-name.txt');
+    const names = fs.readdirSync(cloudAttDir(CID)).filter((name) => !name.startsWith('.'));
+    expect(names).toHaveLength(2);
+    expect(fs.readFileSync(path.join(cloudAttDir(CID), 'same-name.txt'), 'utf8'))
+      .toBe('existing conversation file');
+    expect(fs.readFileSync(path.join(cloudAttDir(CID), r.items[0].targetName), 'utf8'))
+      .toBe('new draft file');
+    expect(names.map((name) => fs.readFileSync(path.join(cloudAttDir(CID), name), 'utf8')).sort())
+      .toEqual(['existing conversation file', 'new draft file']);
     expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
   });
 
@@ -921,7 +1054,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['audio'] });
   });
 
-  it('packs images into images[] as real-time compressed JPEG AND lists them in the manifest with attached="inline"', async () => {
+  it('packs images into images[] and marks model-bounded delivery with a stable order', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'chart.png', await makePng());
     const r = await m.buildAttachmentManifest(UID, CID, ['chart.png']);
@@ -930,8 +1063,10 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toMatch(/<attachments>/);
     expect(r.manifest).toMatch(/name="chart\.png"/);
     expect(r.manifest).toMatch(/kind="image"/);
-    expect(r.manifest).toMatch(/attached="inline"/);
-    // Look-alike negative: an image is inline vision input and must NOT be
+    expect(r.manifest).toMatch(/attached="model-bounded"/);
+    expect(r.manifest).toMatch(/image_order="1"/);
+    expect(r.manifest).toContain('image delivery is bounded by the active model');
+    // Look-alike negative: an image is candidate vision input and must NOT be
     // marked model_readable="false" like a video/audio file.
     expect(r.manifest).not.toContain('model_readable');
     // Bytes — fed to vision via ChatOptions.images on the same user turn.
@@ -941,7 +1076,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
   });
 
-  it('caps images per message: inlined ones appear in manifest, over-cap ones go to skipped[] only', async () => {
+  it('keeps over-cap images path-addressable as deferred instead of reporting them as skipped', async () => {
     const m = await loadMod();
     for (let i = 0; i < 7; i++) {
       await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng(0x11223300 + i));
@@ -952,13 +1087,12 @@ describe('chat_attachments › buildAttachmentManifest', () => {
       { maxImages: 3 },
     );
     expect(r.images).toHaveLength(3);
-    // Exactly 3 image entries in the manifest — over-cap images are dropped
-    // from BOTH images[] and entries[], surfaced only via skipped[].
-    expect(r.manifest.match(/<file [^>]*kind="image"/g)?.length).toBe(3);
+    expect(r.manifest.match(/<file [^>]*kind="image"/g)?.length).toBe(7);
+    expect(r.manifest.match(/attached="model-bounded"/g)?.length).toBe(3);
+    expect(r.manifest.match(/attached="deferred"/g)?.length).toBe(4);
     expect(r.manifest).toMatch(/name="img0\.png"/);
-    expect(r.manifest).not.toMatch(/name="img6\.png"/);
-    expect(r.skipped.length).toBe(4);
-    expect(r.skipped.every((s) => /image cap|图片上限/.test(s.reason))).toBe(true);
+    expect(r.manifest).toMatch(/name="img6\.png"/);
+    expect(r.skipped).toEqual([]);
     expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
   });
 
@@ -968,6 +1102,22 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toBe('');
     expect(r.skipped.length).toBe(1);
     expect(r.skipped[0].reason).toMatch(/no longer exists|不存在/);
+  });
+
+  it('keeps valid files usable when a mixed turn contains a corrupt image', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'usable.md', Buffer.from('# usable attachment\n'));
+    await m.uploadAttachment(UID, CID, 'broken.png', Buffer.from('not an image'));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['usable.md', 'broken.png']);
+
+    expect(r.manifest).toContain('name="usable.md"');
+    expect(r.manifest).not.toContain('name="broken.png"');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0]).toMatchObject({ name: 'broken.png' });
+    expect(r.skipped[0].reason).toMatch(/compression failed|图片压缩失败/i);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['text', 'image'] });
   });
 });
 

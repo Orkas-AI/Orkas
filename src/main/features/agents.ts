@@ -23,7 +23,7 @@ import * as path from 'node:path';
 import type { AgentTool } from '#core-agent';
 
 import {
-  userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
+  userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile,
   agentDir, agentDefinitionFile, agentRuntimeStatsFile,
   userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
   userAgentRuntimeConfigFile, userMemoryDir, userAgentCatalogCacheFile,
@@ -43,6 +43,7 @@ import {
   type AgentRuntimeStatsBucket,
 } from './agent_runtime_stats';
 import { getCurrentDevice } from '../util/device';
+import { localCliCapabilities } from './local_agents/registry';
 
 const log = createLogger('agents');
 
@@ -498,17 +499,32 @@ function assertAgentNameCharsetValid(name: string): void {
  *  entry — IPC create / IPC update / LLM-driven create+edit — so neither
  *  the UI form nor the LLM can land a duplicate. */
 async function assertAgentNameUnique(
-  name: string, excludeAgentId?: string,
+  name: string, excludeAgentId?: string, userId = getActiveUserId(),
 ): Promise<void> {
   const key = _agentNameKey(name);
   if (!key) return;
-  const all = await listAgents();
-  for (const a of all) {
-    if (excludeAgentId && a.agent_id === excludeAgentId) continue;
-    if (_agentNameKey(a.name || '') === key) {
-      const err: any = new Error(`agent name "${name}" is already in use`);
-      err.code = 'E_AGENT_NAME_TAKEN';
-      throw err;
+  for (const [source, baseDir] of [
+    ['marketplace', userMarketplaceAgentsDir(userId)],
+    ['custom', userAgentsDir(userId)],
+  ] as const) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const raw = await readJson<AgentRaw>(path.join(baseDir, entry.name, 'agent.json'));
+        const agent = normalizeAgent(raw, source);
+        if (!agent) continue;
+        if (excludeAgentId && agent.agent_id === excludeAgentId) continue;
+        if (_agentNameKey(agent.name || '') === key) {
+          const err: any = new Error(`agent name "${name}" is already in use`);
+          err.code = 'E_AGENT_NAME_TAKEN';
+          throw err;
+        }
+      } catch (err) {
+        if ((err as { code?: string }).code === 'E_AGENT_NAME_TAKEN') throw err;
+      }
     }
   }
 }
@@ -955,14 +971,13 @@ function _normalizeRuntime(raw: unknown): AgentRuntime | null {
   return out;
 }
 
-/** True when this CLI is a coding agent (claude code / codex). Coding
+/** True when this CLI is a coding agent (Claude Code / Codex). Coding
  *  agents are dispatched with a per-conversation project directory as
  *  cwd instead of the user workspace; the chip in the conversation
  *  surface lets the user set it. Single source of truth for both UI
  *  visibility and dispatch routing. */
-export const CODING_CLIS = new Set<string>(['claude', 'codex']);
 export function cliIsCodingAgent(cli: string | undefined): boolean {
-  return !!cli && CODING_CLIS.has(cli);
+  return localCliCapabilities(cli).codingProjectDirectory;
 }
 
 /** True when this agent runs via a local CLI rather than in-process
@@ -1118,8 +1133,8 @@ interface AgentEnrichedCache { specs: Agent[]; uid: string; expiresAt: number; d
 let _agentListCache: AgentListCache | null = null;
 let _agentEnrichedCache: AgentEnrichedCache | null = null;
 
-function _agentCatalogCacheFile(): string {
-  return userAgentCatalogCacheFile(getActiveUserId());
+function _agentCatalogCacheFile(userId = getActiveUserId()): string {
+  return userAgentCatalogCacheFile(userId);
 }
 
 function _readPersistedAgentCatalog(stamp: string): Agent[] | null {
@@ -1144,10 +1159,11 @@ function _writePersistedAgentCatalog(stamp: string, data: Agent[]): void {
   }
 }
 
-function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
+function _invalidateAgentListCache(opts: { markDirty?: boolean; userId?: string } = {}): void {
+  const userId = opts.userId || getActiveUserId();
   _agentListCache = null;
   _agentEnrichedCache = null;
-  try { fs.rmSync(_agentCatalogCacheFile(), { force: true }); } catch { /* cache is best-effort */ }
+  try { fs.rmSync(_agentCatalogCacheFile(userId), { force: true }); } catch { /* cache is best-effort */ }
   if (opts.markDirty === false) return;
   // Notify the sync engine (lazy-require — stripped in the open-source build builds). Every cache-invalidate
   // is also a disk-mutation point, so co-locating the dirty signal here covers all the
@@ -1435,18 +1451,18 @@ function resolveBilingualDescription(
   };
 }
 
-async function _skillSpecsForDisplay(): Promise<SkillAllowlistRef[]> {
-  try { return await listSkillSpecsForAgentMetadata(getActiveUserId()); }
+async function _skillSpecsForDisplay(userId = getActiveUserId()): Promise<SkillAllowlistRef[]> {
+  try { return await listSkillSpecsForAgentMetadata(userId); }
   catch (err) {
     log.warn(`skill display-name map unavailable: ${(err as Error).message}`);
     return [];
   }
 }
 
-async function _normalizeWorkflowSkillIds(workflow: string): Promise<string> {
+async function _normalizeWorkflowSkillIds(workflow: string, userId = getActiveUserId()): Promise<string> {
   const text = String(workflow || '');
   if (!text) return text;
-  return normalizeKnownSkillRefsForDisplay(text, await _skillSpecsForDisplay());
+  return normalizeKnownSkillRefsForDisplay(text, await _skillSpecsForDisplay(userId));
 }
 
 function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent {
@@ -1534,17 +1550,18 @@ function bumpAgentSpecRevision(data: AgentRaw): void {
 export async function createCustomAgent(
   { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
+  const userId = getActiveUserId();
   assertAgentNameAllowed(name);
-  await assertAgentNameUnique(String(name || '').trim());
-  fs.mkdirSync(CUSTOM_AGENTS_DIR(), { recursive: true });
+  await assertAgentNameUnique(String(name || '').trim(), undefined, userId);
+  fs.mkdirSync(userAgentsDir(userId), { recursive: true });
   let agentId: string;
   do { agentId = genAgentId(); }
-  while (fs.existsSync(_platformAgentSpecFile(agentId))
-      || fs.existsSync(customAgentFile(agentId)));
+  while (fs.existsSync(path.join(userMarketplaceAgentDir(userId, agentId), 'agent.json'))
+      || fs.existsSync(agentDefinitionFile(userId, agentId)));
   // mkdir <aid>/ first so writeJson on agent.json has a parent.
-  fs.mkdirSync(agentDir(getActiveUserId(), agentId), { recursive: true });
+  fs.mkdirSync(agentDir(userId, agentId), { recursive: true });
   const desc = resolveBilingualDescription(description, description_zh, description_en);
-  const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''));
+  const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''), userId);
   const data: AgentRaw = {
     agent_id: agentId,
     name: String(name || '').trim() || t('agent.default_name'),
@@ -1597,18 +1614,18 @@ export async function createCustomAgent(
   // so the latest report on disk always matches the most recent intent.
   const report = validateAgentSpec({ agentJson: data });
   void persistQualityReport({
-    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+    uid: userId, kind: 'agent', id: agentId, report,
   });
   if (!report.ok) {
     // Roll back the freshly-mkdir'd directory so a rejected create doesn't
     // leave behind an empty <aid>/ that would later confuse `listAgents`.
-    try { fs.rmSync(agentDir(getActiveUserId(), agentId), { recursive: true, force: true }); }
+    try { fs.rmSync(agentDir(userId, agentId), { recursive: true, force: true }); }
     catch { /* tolerate cleanup failure */ }
     throw new Error(_validationErrorMessage(report));
   }
 
-  await writeJson(customAgentFile(agentId), data);
-  _invalidateAgentListCache();
+  await writeJson(agentDefinitionFile(userId, agentId), data);
+  _invalidateAgentListCache({ userId });
   log.info(`created id=${agentId} name=${data.name}`);
   return normalizeAgent(data, 'custom');
 }
@@ -1704,25 +1721,26 @@ export async function updateCustomAgent(
   agentId: string, updates: UpdateAgentFields,
 ): Promise<Agent | null> {
   if (!agentId) return null;
-  const f = customAgentFile(agentId);
+  const userId = getActiveUserId();
+  const f = agentDefinitionFile(userId, agentId);
   if (!fs.existsSync(f)) return null;
   const data = await readJson<AgentRaw>(f);
   const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
-  await _applyAgentUpdates(data, agentId, updates);
+  await _applyAgentUpdates(data, agentId, updates, userId);
 
   // Quality gate (same policy as createCustomAgent): EXTREME blocks the
   // write so the on-disk spec doesn't regress; MEDIUM persists but writes
   // through.
   const report = validateAgentSpec({ agentJson: data });
   void persistQualityReport({
-    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+    uid: userId, kind: 'agent', id: agentId, report,
   });
   if (!report.ok) {
     throw new Error(_validationErrorMessage(report));
   }
 
   await writeJson(f, data);
-  _invalidateAgentListCache();
+  _invalidateAgentListCache({ userId });
   log.info(`updated id=${agentId}`);
   // Propagate a name change into every conversation roster that already
   // lists this agent. members.json snapshots the name at join time and the
@@ -1730,7 +1748,7 @@ export async function updateCustomAgent(
   // would keep matching in old chats.
   const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
   if (newName && newName !== oldName) {
-    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
+    try { await renameAgentInMembers(userId, agentId, newName); }
     catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
   }
   return normalizeAgent(data, 'custom');
@@ -1788,13 +1806,13 @@ function _applyLegacyProfileUpdate(data: AgentRaw, value: AgentProfile | null | 
 }
 
 async function _applyAgentUpdates(
-  data: AgentRaw, agentId: string, updates: UpdateAgentFields,
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields, userId = getActiveUserId(),
 ): Promise<void> {
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     const incomingName = typeof updates.name === 'string' ? updates.name : '';
     assertAgentNameAllowed(incomingName);
     const trimmed = incomingName.trim();
-    if (trimmed) await assertAgentNameUnique(trimmed, agentId);
+    if (trimmed) await assertAgentNameUnique(trimmed, agentId, userId);
   }
   // CLI-backed agents have no authored workflow / skill_list — the
   // edit prompt forbids the LLM from emitting those tags, but if it
@@ -1818,7 +1836,7 @@ async function _applyAgentUpdates(
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
       const v = (updates as any)[k];
       const next = typeof v === 'string' ? v : '';
-      (data as any)[k] = k === 'workflow' ? await _normalizeWorkflowSkillIds(next) : next;
+      (data as any)[k] = k === 'workflow' ? await _normalizeWorkflowSkillIds(next, userId) : next;
     }
   }
   // First migrate any persisted legacy `description` into the bilingual pair
@@ -1871,7 +1889,7 @@ async function _applyAgentUpdates(
       // Scope metadata to this agent while preserving enabled external-package
       // refs, so another agent's private (`ownerAgent`) skill resolves as
       // unknown and gets dropped.
-      const specs = await listSkillSpecsForAgentMetadata(getActiveUserId(), { forAgentId: agentId });
+      const specs = await listSkillSpecsForAgentMetadata(userId, { forAgentId: agentId });
       const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
         log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
@@ -2067,33 +2085,8 @@ export async function removeCustomAgentMemory(agentId: string, oldText: string) 
   const fileRes = removeAgentEntry(getActiveUserId(), agentId, oldText);
   if (fileRes.ok) {
     _invalidateAgentListCache();
-    return fileRes;
   }
-  if (target.source !== 'custom') return fileRes;
-
-  const data = target.data;
-  const profile = normalizeAgentProfile(data);
-  const memory = profile?.memory || [];
-  const needle = String(oldText || '').trim();
-  const nextMemory = memory.filter((entry) => {
-    const text = `${entry.title || ''}\n${entry.description || ''}`.trim();
-    return !needle || !text.includes(needle);
-  });
-  if (nextMemory.length === memory.length) return fileRes;
-
-  const rawProfile = _plainObj((data as any).profile) || {};
-  if (nextMemory.length) {
-    (data as any).profile = { ...rawProfile, memory: nextMemory };
-  } else {
-    const { memory: _removed, ...rest } = rawProfile;
-    if (Object.keys(rest).length) (data as any).profile = rest;
-    else delete (data as any).profile;
-  }
-  bumpAgentSpecRevision(data);
-  data.updated_at = nowIso();
-  await writeJson(target.file, data);
-  _invalidateAgentListCache();
-  return listAgentEntries(getActiveUserId(), agentId);
+  return fileRes;
 }
 
 export async function updateCustomAgentMemory(agentId: string, oldText: string, content: string) {
@@ -2124,43 +2117,45 @@ export async function recordAgentRuntimeStats(
 }
 
 export async function deleteCustomAgent(agentId: string): Promise<boolean> {
-  if (!agentId) return false;
-  const dir = agentDir(getActiveUserId(), agentId);
+  if (!agentId || !safeId(agentId)) return false;
+  const userId = getActiveUserId();
+  const dir = agentDir(userId, agentId);
   if (!fs.existsSync(dir)) return false;
   // Wipe the whole `agents/<aid>/` directory in one shot — agent.json,
   // meta/, and skills/ all live inside it, so we no longer need separate
   // cascades for metacognition.purgeAgent / SkillStore.delete.
   try { await fsp.rm(dir, { recursive: true, force: true }); }
   catch (err) { log.warn(`rm failed ${dir}: ${(err as Error).message}`); return false; }
-  _invalidateAgentListCache();
+  _invalidateAgentListCache({ userId });
 
-  // Drop each user's per-agent edit chat directory + the matching
+  // Drop this account's per-agent memory, edit chat, session, and local
+  // runtime override. Another account may own a distinct Agent with the
+  // same id, so cleanup must never walk the whole workspace.
+  const memoryDir = path.join(userMemoryDir(userId), 'agents', agentId);
+  try { await fsp.rm(memoryDir, { recursive: true, force: true }); }
+  catch (err) { log.warn(`memory rm failed user=${userId} agent=${agentId}: ${(err as Error).message}`); }
+
+  // Drop this account's per-agent edit chat directory + the matching
   // core-agent session jsonl. Without the session purge, recreating an
   // agent with the same name would reload the deleted agent's transcript
   // and the LLM would appear to "remember" the previous attempt.
-  if (fs.existsSync(WS_ROOT)) {
-    for (const uidEntry of await fsp.readdir(WS_ROOT, { withFileTypes: true })) {
-      if (!uidEntry.isDirectory()) continue;
-      const uid = uidEntry.name;
-      const chatDir = userAgentChatDir(uid, agentId);
-      if (fs.existsSync(chatDir)) {
-        try { await fsp.rm(chatDir, { recursive: true, force: true }); }
-        catch (err) { log.warn(`rm failed user=${uid} agent=${agentId}: ${(err as Error).message}`); }
-        invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-      }
-      const sessionId = defaultAgentEditSessionId(agentId);
-      try { evictSession(sessionId); } catch { /* cache may not hold it */ }
-      const sessionJsonl = userSessionFile(uid, sessionId);
-      try { await fsp.unlink(sessionJsonl); }
-      catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          log.warn(`session unlink user=${uid} agent=${agentId}: ${(err as Error).message}`);
-        }
-      }
-      try { _deleteAgentRuntimeConfigEntry(uid, agentId); }
-      catch (err) { log.warn(`runtime config cleanup user=${uid} agent=${agentId}: ${(err as Error).message}`); }
+  const chatDir = userAgentChatDir(userId, agentId);
+  if (fs.existsSync(chatDir)) {
+    try { await fsp.rm(chatDir, { recursive: true, force: true }); }
+    catch (err) { log.warn(`rm failed user=${userId} agent=${agentId}: ${(err as Error).message}`); }
+    invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
+  }
+  const sessionId = defaultAgentEditSessionId(agentId);
+  try { evictSession(sessionId); } catch { /* cache may not hold it */ }
+  const sessionJsonl = userSessionFile(userId, sessionId);
+  try { await fsp.unlink(sessionJsonl); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} agent=${agentId}: ${(err as Error).message}`);
     }
   }
+  try { _deleteAgentRuntimeConfigEntry(userId, agentId); }
+  catch (err) { log.warn(`runtime config cleanup user=${userId} agent=${agentId}: ${(err as Error).message}`); }
 
   // Metacognition + evolved skills are already wiped by the
   // `rm -rf agents/<aid>/` above — meta / skills sub-directories live

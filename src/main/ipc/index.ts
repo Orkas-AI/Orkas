@@ -53,6 +53,7 @@ import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import * as commanderProfile from '../features/commander_profile';
 import * as commanderRuntimeStats from '../features/commander_runtime_stats';
+import { getQuickStartConfigState } from '../features/client_config';
 import { getRendererTables, isLang, t } from '../i18n';
 import { isPathAllowed } from '../util/path-sandbox';
 import * as userWorkspace from '../features/user_workspace';
@@ -98,6 +99,11 @@ function conversationProjectHint(args: Record<string, any>): string | null | und
   if (raw === '') return null;
   if (!safeId(raw)) throw new Error('invalid project id');
   return raw;
+}
+
+function requireMarketplaceId(id: unknown): string {
+  if (!safeId(id)) throw new Error('invalid marketplace id');
+  return id as string;
 }
 
 interface IpcContext {
@@ -522,26 +528,78 @@ async function _isAllowedFileActionPath(userId: string, payload: any, absPath: s
   return typeof cid === 'string' && !!cid && await _isConversationRecordedFile(userId, cid, absPath);
 }
 
-// Scan an HTML file with constant memory and return only the authored
-// composition root tag. The file may be any size; only this small tag crosses
-// IPC, while the complete HTML continues to stream through chat-media://.
-async function _readHtmlCompositionRootTag(absPath: string): Promise<string> {
+type HtmlPreviewLayout = {
+  kind: 'fixed-canvas';
+  width: number;
+  height: number;
+};
+
+const HTML_PREVIEW_LAYOUT_MANIFEST_MAX_BYTES = 256 * 1024;
+const HTML_PREVIEW_LAYOUT_MAX_AREA = 16_777_216;
+
+function _validHtmlPreviewLayout(width: unknown, height: unknown): HtmlPreviewLayout | null {
+  const parsedWidth = Number(width);
+  const parsedHeight = Number(height);
+  if (!Number.isInteger(parsedWidth) || !Number.isInteger(parsedHeight)
+      || parsedWidth < 16 || parsedWidth > 7680
+      || parsedHeight < 16 || parsedHeight > 7680
+      || parsedWidth * parsedHeight > HTML_PREVIEW_LAYOUT_MAX_AREA) return null;
+  return { kind: 'fixed-canvas', width: parsedWidth, height: parsedHeight };
+}
+
+// Compatibility adapter for ImageStudio projects authored before the shared
+// HTML preview contract was added. The renderer does not know about
+// ImageStudio: this function translates the existing project manifest into
+// the same fixed-canvas layout object used by any authored HTML metadata.
+async function _readAdjacentHtmlPreviewLayout(absPath: string): Promise<HtmlPreviewLayout | null> {
+  const projectDir = path.dirname(absPath);
+  const manifestPath = path.join(projectDir, 'image-manifest.json');
+  try {
+    const st = await fs.promises.lstat(manifestPath);
+    if (!st.isFile() || st.isSymbolicLink() || st.size > HTML_PREVIEW_LAYOUT_MANIFEST_MAX_BYTES) return null;
+    const manifest = JSON.parse(await fs.promises.readFile(manifestPath, 'utf8')) as Record<string, any>;
+    const entry = typeof manifest.entry === 'string' && manifest.entry.trim()
+      ? manifest.entry.trim()
+      : 'index.html';
+    const entryAbs = path.resolve(projectDir, entry);
+    if (!isPathAllowed(entryAbs, [projectDir]) || entryAbs !== path.resolve(absPath)) return null;
+    return _validHtmlPreviewLayout(manifest.canvas?.width, manifest.canvas?.height);
+  } catch {
+    return null;
+  }
+}
+
+// Scan an HTML file with constant memory for an authored fixed-canvas
+// contract. The renderer receives only normalized dimensions, never product-
+// specific metadata or a synthetic HTML tag. Responsive HTML has no contract
+// and stays on the normal full-width iframe path.
+async function _readHtmlPreviewLayout(absPath: string): Promise<HtmlPreviewLayout | null> {
   const stream = fs.createReadStream(absPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
-  const rootPattern = /<[^>]*\bdata-composition-id\s*=\s*["'][^"']+["'][^>]*>/i;
+  const rootPattern = /<[^>]*\b(?:data-preview-layout\s*=\s*["']fixed-canvas["']|data-composition-id\s*=\s*["'][^"']+["'])[^>]*>/i;
   const MAX_TAG_CARRY_CHARS = 64 * 1024;
   let carry = '';
+  let layout: HtmlPreviewLayout | null = null;
   try {
     for await (const chunk of stream) {
       const combined = carry + String(chunk);
       const match = combined.match(rootPattern);
-      if (match) return match[0];
+      if (match) {
+        const attrNumber = (name: string): number => {
+          const attr = match[0].match(new RegExp(`\\b${name}\\s*=\\s*["'](\\d+(?:\\.\\d+)?)["']`, 'i'));
+          return attr ? Number(attr[1]) : 0;
+        };
+        layout = _validHtmlPreviewLayout(
+          attrNumber('data-preview-width') || attrNumber('data-width'),
+          attrNumber('data-preview-height') || attrNumber('data-height'),
+        );
+        break;
+      }
       const lastOpen = combined.lastIndexOf('<');
       carry = lastOpen >= 0 ? combined.slice(lastOpen) : '';
       // A normal HTML opening tag is tiny. Drop pathological unterminated
       // markup instead of letting a malformed file grow the scan buffer.
       if (carry.length > MAX_TAG_CARRY_CHARS) carry = '';
     }
-    return '';
   } finally {
     // `destroy()` schedules the underlying file-handle close. Await the close
     // edge before returning so callers can immediately move/delete the file
@@ -553,6 +611,7 @@ async function _readHtmlCompositionRootTag(absPath: string): Promise<string> {
       });
     }
   }
+  return layout || _readAdjacentHtmlPreviewLayout(absPath);
 }
 
 function _contextTreeHasPath(nodes: contexts.ContextNode[], relPath: string): boolean {
@@ -732,6 +791,7 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
 
 const invokeHandlers: Record<string, InvokeHandler> = {
+  'clientConfig.getQuickStart': async () => getQuickStartConfigState(),
   'user.init': async () => {
     const user = await users.getOrCreateSelfUser();
     return user;
@@ -916,8 +976,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { project };
   },
 
-  // User-authored per-project instructions (ORKAS.md). User-owned: edited only
-  // here via the project settings UI; agents read it from the system prompt.
+  // User-managed per-project instructions (ORKAS.md). The settings UI writes
+  // through this unconditional path; Commander uses a separate conditional
+  // replacement path so a stale model turn cannot overwrite a newer UI edit.
   'projects.instructions.get': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     const result = await projects.readProjectInstructions(ctx.userId, projectId);
@@ -1229,9 +1290,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { id: autoTasks.allocateDraftTaskId() };
   },
 
-  // Current device fingerprint — { id: <MAC>, name: <hostname> }. Renderer
-  // uses this to decide which task rows are "本机" (matches MAC) vs. show
-  // the device_name from the task as-is (other devices).
+  // Current device identity — { id: <persistent installation id>,
+  // name: <hostname> }. Renderer uses it to distinguish this installation
+  // from tasks assigned to another device.
   'autoTasks.currentDevice': async () => {
     const d = autoTasks.getCurrentDevice();
     return { device: { id: d.id, name: d.name } };
@@ -1372,16 +1433,25 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { task: result.task };
   },
 
+  'autoTasks.runNow': async ({ taskId }, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const result = await autoTasks.runTaskNow(ctx.userId, taskId);
+    if (result.ok === false) throw new Error(result.error);
+    return { cid: result.cid };
+  },
+
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
-  'groupChat.send': async ({ cid, content, attachments, use_selections, references }, ctx) => {
+  'groupChat.send': async ({ cid, content, title_text, attachments, use_selections, references }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
+    const titleText = typeof title_text === 'string' ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
     const refs = Array.isArray(references) ? references : [];
     return groupChat.send({
       userId: ctx.userId, cid, text,
+      ...(titleText ? { title_text: titleText } : {}),
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(refs.length ? { references: refs } : {}),
@@ -1898,7 +1968,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // full content. Caller passes the list-row's (version, freshness timestamp) so we can short-circuit
   // on a hot cache. Sweep is invoked once per openMarketplace at the entry point.
   'marketplace.detailAgent': async ({ id, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
@@ -1915,7 +1985,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'marketplace.detailSkill': async ({ id, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
@@ -1932,7 +2002,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'marketplace.installAgent': async ({ id, name, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion, force }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
@@ -1949,7 +2019,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'marketplace.installSkill': async ({ id, name, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion, force }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
@@ -1968,12 +2038,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Uninstall is non-dev: wipes the local install copy + manifest entry. Does NOT touch the
   // server row (`marketplace_dev.deleteMarketplace*` does that, dev-only).
   'marketplace.uninstallAgent': async ({ id }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     return marketplace.uninstallMarketplaceAgent(id);
   },
 
   'marketplace.uninstallSkill': async ({ id }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     return marketplace.uninstallMarketplaceSkill(id);
   },
 
@@ -2005,12 +2075,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // Detail-page file viewer (skill kind only — agent payload is fully in the detail response).
   'marketplace.cacheSkillFiles': async ({ id }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     return { list: await marketplaceCache.listSkillCacheFiles(id) };
   },
 
   'marketplace.cacheSkillRead': async ({ id, file }) => {
-    if (!id || typeof id !== 'string') throw new Error('id required');
+    id = requireMarketplaceId(id);
     if (!file || typeof file !== 'string') throw new Error('file required');
     const content = await marketplaceCache.readSkillCacheFile(id, file);
     return { content: content || '' };
@@ -2046,14 +2116,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Cache (clearable umbrella under `<uid>/local/cache/<bucket>/`) ──
-  'cache.listClearable': async () => ({ list: await cacheClearable.listClearableBuckets() }),
+  'cache.listClearable': async (_payload, ctx) => ({
+    list: await cacheClearable.listClearableBuckets(ctx.userId),
+  }),
 
-  'cache.clearBucket': async ({ name }) => {
+  'cache.clearBucket': async ({ name }, ctx) => {
     if (!name || typeof name !== 'string') throw new Error('name required');
-    return { bytes_freed: await cacheClearable.clearBucket(name) };
+    return { bytes_freed: await cacheClearable.clearBucket(ctx.userId, name) };
   },
 
-  'cache.clearAll': async () => ({ bytes_freed: await cacheClearable.clearAllClearable() }),
+  'cache.clearAll': async (_payload, ctx) => ({
+    bytes_freed: await cacheClearable.clearAllClearable(ctx.userId),
+  }),
 
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──
   'contexts.tree': async () => ({ tree: contexts.listContextsTree() }),
@@ -2250,13 +2324,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     envForcedOff: process.env.ORKAS_METACOGNITION === '0',
   }),
   'prefs.setMetacognition': async ({ enabled }) => {
-    return { enabled: appConfig.setMetacognitionEnabled(!!enabled) };
+    const next = appConfig.setMetacognitionEnabled(!!enabled);
+    markPreferencesDirty();
+    return { enabled: next };
   },
 
   // ── Auth / model config (settings page) ──
   'auth.listProviders': async () => auth.listProviders(),
   'auth.listModels': async ({ provider }) => auth.listModels(provider),
   'auth.addApiKey': async ({ provider, apiKey, label }) => auth.addApiKey(provider, apiKey, label),
+  'auth.addApiKeyEntry': async ({ provider, model, apiKey, label }) => (
+    auth.addApiKeyEntry(provider, model, apiKey, label)
+  ),
+  'auth.addCustomModelEntry': async ({ label, baseUrl, model, apiKey, contextWindow, maxTokens }) => (
+    auth.addCustomModelEntry({ label, baseUrl, model, apiKey, contextWindow, maxTokens })
+  ),
   // Legacy alias; renderer migrated to auth.addApiKey.
   'auth.saveApiKey': async ({ provider, apiKey, label }) => auth.saveApiKey(provider, apiKey, label),
   'auth.renameProfile': async ({ profileId, label }) => auth.renameProfile(profileId, label),
@@ -2285,12 +2367,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // renderer never sees the full key (parity with chat entries' `profileMasked`).
   'imageAuth.list':     async () => ({
     ok: true,
+    providers: imageAuth.flattenImageProviderOptions(imageAuth.listImageProviderOptions()),
     profiles: imageAuth.listImageProfiles().map((p) => ({
-      id: p.id, provider: p.provider, label: p.label, createdAt: p.createdAt,
+      id: p.id,
+      provider: p.provider,
+      model: p.model || imageAuth.listImageModelOptions(p.provider)[0]?.id || '',
+      label: p.label,
+      createdAt: p.createdAt,
       apiKeyMasked: auth.maskKey(p.apiKey),
     })),
   }),
-  'imageAuth.add':      async ({ provider, apiKey, label }) => imageAuth.addImageProfile({ provider, apiKey, label }),
+  'imageAuth.add':      async ({ provider, model, apiKey, label }) => imageAuth.addImageProfile({ provider, model, apiKey, label }),
   'imageAuth.remove':   async ({ id }) => imageAuth.removeImageProfile(id),
   'imageAuth.reorder':  async ({ orderedIds }) => imageAuth.reorderImageProfiles(orderedIds || []),
   'imageAuth.test':     async ({ id }) => imageAuth.testImageProfile(id),
@@ -2298,9 +2385,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Video-generation API key (independent from chat/image entries) ──
   'videoAuth.list':     async () => ({
     ok: true,
-    providers: videoAuth.listVideoProviderOptions(),
+    providers: videoAuth.flattenVideoProviderOptions(videoAuth.listVideoProviderOptions()),
     profiles: videoAuth.listVideoProfiles().map((p) => ({
-      id: p.id, provider: p.provider, label: p.label, createdAt: p.createdAt,
+      id: p.id, provider: p.provider, model: p.model, label: p.label, createdAt: p.createdAt,
       apiKeyMasked: auth.maskKey(p.apiKey),
     })),
   }),
@@ -2650,8 +2737,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // instead). Same scope as the file actions above: active workspace ∪ the
   // attachment dir of the current cid ∪ exact recorded produced files. Full
   // reads keep the 2 MB cap because their contents cross IPC. The HTML viewer
-  // uses `compositionRootOnly` to scan files of any size while returning only
-  // the small composition tag; the HTML body itself never crosses this IPC.
+  // uses `htmlPreviewLayoutOnly` to scan files of any size while returning
+  // only a normalized fixed-canvas layout; the HTML body never crosses IPC.
   'produced.readText': async (payload, ctx) => {
     const target = payload?.path;
     if (typeof target !== 'string' || !target) {
@@ -2666,16 +2753,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     catch { return { ok: false, error: 'not_found' }; }
     if (!st.isFile()) return { ok: false, error: 'not_found' };
     const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-    const compositionRootOnly = payload?.compositionRootOnly === true;
-    if (!compositionRootOnly && st.size > MAX_TEXT_BYTES) {
+    const htmlPreviewLayoutOnly = payload?.htmlPreviewLayoutOnly === true;
+    if (!htmlPreviewLayoutOnly && st.size > MAX_TEXT_BYTES) {
       return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
     }
-    let text: string;
-    try {
-      text = compositionRootOnly
-        ? await _readHtmlCompositionRootTag(norm)
-        : fs.readFileSync(norm, 'utf8');
+    if (htmlPreviewLayoutOnly) {
+      try {
+        const layout = await _readHtmlPreviewLayout(norm);
+        return { ok: true, layout, size: st.size };
+      } catch (err) {
+        return { ok: false, error: String((err as Error).message || 'read failed') };
+      }
     }
+    let text: string;
+    try { text = fs.readFileSync(norm, 'utf8'); }
     catch (err) { return { ok: false, error: String((err as Error).message || 'read failed') }; }
     // Strip UTF-8 BOM so markdown / json don't render a leading invisible char.
     if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
@@ -2778,9 +2869,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'devtools.clearArchives': async () => ({ ok: true }),
   'devtools.getNativeSearchEnabled': async () => ({ enabled: true }),
   'devtools.setNativeSearchEnabled': async () => ({ enabled: true }),
-  'devtools.skillMetricsReport': async ({ sinceDays } = {}) => {
+  'devtools.skillMetricsReport': async ({ sinceDays } = {}, ctx) => {
     const { aggregateSkillMetrics } = await import('../features/skill_metrics');
-    return aggregateSkillMetrics({ sinceDays: Number.isFinite(sinceDays) ? Number(sinceDays) : undefined });
+    return aggregateSkillMetrics(ctx.userId, { sinceDays: Number(sinceDays) });
   },
 
   // User-account login (Google OAuth). Stripped from the open-source build.
@@ -2810,7 +2901,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections, references, retry_message_id }, ctx, signal) {
+  'conversations.sendStream': async function* ({ cid, content, title_text, attachments, use_selections, references, retry_message_id }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
@@ -2820,6 +2911,7 @@ const streamHandlers: Record<string, StreamHandler> = {
       yield { type: 'error', text: 'empty message' };
       return;
     }
+    const titleText = typeof title_text === 'string' ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
     const refs = Array.isArray(references) ? references : [];
@@ -2871,6 +2963,7 @@ const streamHandlers: Record<string, StreamHandler> = {
             })
           : await groupChat.send({
               userId: ctx.userId, cid, text,
+              ...(titleText ? { title_text: titleText } : {}),
               ...(atts.length ? { attachments: atts } : {}),
               ...(useSelections.length ? { use_selections: useSelections } : {}),
               ...(refs.length ? { references: refs } : {}),
@@ -2986,13 +3079,13 @@ const streamHandlers: Record<string, StreamHandler> = {
   // auto-task fire produces a `conv_created` event so the sidebar can
   // reload its conv list (manual runs mutate the list locally, but auto
   // fires create the conv from main with no other notification path).
-  'autoTasks.events': async function* (_payload, _ctx, signal) {
+  'autoTasks.events': async function* (_payload, ctx, signal) {
     const buf: autoTasks.AutoFireEvent[] = [];
     let wake: (() => void) | null = null;
     let cancelled = signal.aborted;
     const onAbort = () => { cancelled = true; const w = wake; wake = null; w?.(); };
     if (!cancelled) signal.addEventListener('abort', onAbort, { once: true });
-    const unsub = autoTasks.subscribeFires((ev) => {
+    const unsub = autoTasks.subscribeFiresForUser(ctx.userId, (ev) => {
       buf.push(ev);
       const w = wake; wake = null; w?.();
     });
@@ -3135,10 +3228,21 @@ async function resolveContext(sender: WebContents): Promise<IpcContext> {
 /** Send a push-event to every open renderer. Channel name must match preload's
  *  `PUSH_EVENT_PREFIXES` allow-list. Used by main-initiated status broadcasts
  *  (boot-time reconcile / sync / updater state). */
-export function broadcastToRenderer(channel: string, payload: unknown): void {
+export function broadcastToRenderer(channel: string, payload: unknown): boolean {
+  let delivered = false;
   for (const win of BrowserWindow.getAllWindows()) {
-    if (!win.isDestroyed()) win.webContents.send(channel, payload);
+    if (win.isDestroyed()) continue;
+    try {
+      win.webContents.send(channel, payload);
+      delivered = true;
+    } catch (err) {
+      log.warn('renderer broadcast failed', {
+        channel,
+        error: logErrorRef(err),
+      });
+    }
   }
+  return delivered;
 }
 
 export function register(): void {

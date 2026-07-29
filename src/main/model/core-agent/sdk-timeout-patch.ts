@@ -1,13 +1,14 @@
 /**
- * Monkey-patch @anthropic-ai/sdk and openai default timeouts.
+ * Monkey-patch @anthropic-ai/sdk and openai request ownership defaults.
  *
- * Why: pi-ai (0.68.1) constructs SDK clients with hardcoded options and does
+ * Why: pi-ai constructs SDK clients with hardcoded options and does
  * NOT expose `timeout` as a configurable parameter. Both SDKs default to
  * 600s, which caps long-running reasoning / agent / tool-loop calls too
  * tightly. We subclass each SDK's primary class to inject a larger default
  * timeout, then replace the module-level references so pi-ai's
  * `import Anthropic from "@anthropic-ai/sdk"` (and similar) picks up the
- * wrapped class.
+ * wrapped class. Orkas owns visible retry policy above the SDK, so opaque SDK
+ * retries are disabled unless a caller explicitly opts into them.
  *
  * Must run BEFORE any code path imports pi-ai (which in turn imports these
  * SDKs). Installed from `src/main/index.ts` at boot, ahead of feature
@@ -22,6 +23,16 @@ const log = createLogger('sdk-timeout-patch');
  * guards on LLM calls; every other "timeout" in the app is either a short
  * external-IO failfast or a debounce. */
 const LLM_TIMEOUT_MS = 3_600_000;
+const LLM_SDK_MAX_RETRIES = 0;
+
+export function sdkClientOptionsForOrkas(opts: any = {}): any {
+  const base = opts || {};
+  return {
+    ...base,
+    ...(base.timeout == null ? { timeout: LLM_TIMEOUT_MS } : {}),
+    ...(base.maxRetries == null ? { maxRetries: LLM_SDK_MAX_RETRIES } : {}),
+  };
+}
 
 export function installSdkTimeoutPatch(): void {
   try {
@@ -48,11 +59,7 @@ function patchSdk(moduleName: string): void {
 
   class Wrapped extends Original {
     constructor(opts: any = {}) {
-      const merged =
-        opts && opts.timeout == null
-          ? { ...opts, timeout: LLM_TIMEOUT_MS }
-          : (opts || { timeout: LLM_TIMEOUT_MS });
-      super(merged);
+      super(sdkClientOptionsForOrkas(opts));
     }
   }
   (Wrapped as any).__orkasPatched = true;
@@ -68,5 +75,9 @@ function patchSdk(moduleName: string): void {
       /* getter-only or frozen — skip */
     }
   }
-  log.info('sdk timeout patched', { module: moduleName, timeout_ms: LLM_TIMEOUT_MS });
+  log.info('sdk request defaults patched', {
+    module: moduleName,
+    timeout_ms: LLM_TIMEOUT_MS,
+    max_retries: LLM_SDK_MAX_RETRIES,
+  });
 }

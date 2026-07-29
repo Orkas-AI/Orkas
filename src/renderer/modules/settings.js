@@ -385,6 +385,7 @@ function _settingsBindLanguageOnce() {
   const el = document.getElementById('settings-language-select');
   if (!el) return;
   _settingsLanguageSel = _aiSelectMount(el, {
+    ariaLabel: t('settings.language.title'),
     options: _SETTINGS_LANG_OPTIONS,
     value: (typeof getLang === 'function') ? getLang() : 'en',
   });
@@ -402,7 +403,10 @@ function _settingsBindLanguageOnce() {
 function _settingsSyncLanguageRadio() {
   // Function name kept for caller-side compatibility; semantics is now "sync dropdown value".
   const cur = (typeof getLang === 'function') ? getLang() : 'en';
-  if (_settingsLanguageSel) _settingsLanguageSel.setValue(cur);
+  if (_settingsLanguageSel) {
+    _settingsLanguageSel.setValue(cur);
+    _settingsLanguageSel.setAriaLabel(t('settings.language.title'));
+  }
 }
 
 // Keep the radio in sync if some other code path changes language, and
@@ -441,13 +445,18 @@ async function _settingsGetModels(providerId) {
 
 // ── Picker (provider + model + add button) ──
 
+function _settingsProviderDisplayName(provider) {
+  if (!provider) return '';
+  return provider.labelKey ? t(provider.labelKey) : (provider.label || provider.id || '');
+}
+
 async function _settingsRenderPicker() {
   const providerEl = document.getElementById('settings-picker-provider');
   const modelEl    = document.getElementById('settings-picker-model');
   if (!providerEl || !modelEl) return;
 
   const providerOptions = _settingsState.providers.map((p) => {
-    const baseLabel = p.label || p.id;
+    const baseLabel = _settingsProviderDisplayName(p);
     const label = p.recommended ? `${baseLabel} ${t('settings.picker.recommended_suffix')}` : baseLabel;
     let authHint = '';
     if (p.supportsOAuth && p.supportsApiKey)       authHint = t('settings.oauth.support_api_and_oauth');
@@ -508,7 +517,22 @@ async function _settingsRenderPicker() {
 async function _settingsPopulatePickerModel(providerId, selected) {
   const sel = _settingsState.pickerModelSel;
   if (!sel) return;
+  const provider = _settingsState.providers.find((p) => p.id === providerId);
+  const modelRow = document.getElementById('settings-picker-model-row');
+  const isCustom = !!provider?.customOpenAICompatible;
+  if (modelRow) modelRow.hidden = isCustom;
+  if (isCustom) {
+    sel.setOptions([], {
+      value: '',
+      placeholder: t('settings.picker.custom_config_in_dialog'),
+    });
+    return;
+  }
   const models = await _settingsGetModels(providerId);
+  // Provider changes can overlap network requests. Ignore a late response
+  // from the previously selected provider instead of rendering a model list
+  // that the main-process catalog will reject for the current provider.
+  if ((_settingsState.pickerProviderSel?.getValue() || '') !== providerId) return;
   sel.setOptions(
     models.map((m) => ({ value: m.id, label: m.name || m.id })),
     { value: selected || '', placeholder: providerId ? t('settings.picker.select_model') : t('settings.picker.pick_provider_first') },
@@ -517,12 +541,18 @@ async function _settingsPopulatePickerModel(providerId, selected) {
 
 async function _settingsClickAddEntry() {
   const providerId = _settingsState.pickerProviderSel?.getValue() || '';
-  const modelId    = _settingsState.pickerModelSel?.getValue() || '';
   if (!providerId) { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_provider_needed')); return; }
-  if (!modelId)    { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_model_needed')); return; }
 
   const provider = _settingsState.providers.find((p) => p.id === providerId);
   if (!provider) { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_provider_missing')); return; }
+  if (provider.customOpenAICompatible) {
+    _settingsSetStatus('settings-picker-status', '', '');
+    _settingsShowCustomModelForm(provider);
+    return;
+  }
+
+  const modelId = _settingsState.pickerModelSel?.getValue() || '';
+  if (!modelId) { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_model_needed')); return; }
 
   _settingsSetStatus('settings-picker-status', '', '');
   _settingsChooseAccountMethod(provider, modelId);
@@ -606,7 +636,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
     </div>
     <div class="form-row">
       <label>API Key</label>
-      <input type="text" class="api-key-input form-input" placeholder="sk-…" autocomplete="off" spellcheck="false" />
+      <input type="password" class="api-key-input form-input" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
     </div>
     ${docsHtml}
     <div class="form-msg"></div>
@@ -630,6 +660,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
     const apiKey = (keyInput.value || '').trim();
     if (!apiKey) { msg.textContent = t('settings.paste_key_first'); msg.className = 'form-msg error'; return; }
     saveBtn.disabled = true;
+    const startedAt = Date.now();
     msg.textContent = t('settings.save_loading'); msg.className = 'form-msg';
     _settingsLog.info('add api key', { provider: provider.id, model: modelId, has_label: !!label });
     const addRes = await window.orkas.invoke('auth.addApiKey', {
@@ -644,17 +675,8 @@ function _settingsShowApiKeyForm(provider, modelId) {
       _settingsLog.warn('add api key failed', { provider: provider.id, error: addRes && addRes.error });
       return;
     }
-    const entryRes = await window.orkas.invoke('auth.addEntry', {
-      provider: provider.id,
-      model: modelId,
-      profileId: addRes.profileId,
-    });
+    _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'success');
     saveBtn.disabled = false;
-    if (!entryRes || !entryRes.ok) {
-      msg.textContent = (entryRes && entryRes.error) || t('settings.add_entry_failed');
-      msg.className = 'form-msg error';
-      return;
-    }
     _settingsCloseModal(overlay);
     await _settingsReload();
   };
@@ -665,6 +687,172 @@ function _settingsShowApiKeyForm(provider, modelId) {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') { keyInput.focus(); e.preventDefault(); }
   });
+  keyInput.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter') { save(); e.preventDefault(); }
+  });
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  _settingsOpenModal(overlay);
+  setTimeout(() => labelInput.focus(), 0);
+}
+
+function _settingsCustomModelError(code, fallback) {
+  const key = ({
+    CUSTOM_BASE_URL_REQUIRED: 'settings.custom.error_base_url',
+    CUSTOM_BASE_URL_INVALID: 'settings.custom.error_base_url_invalid',
+    CUSTOM_MODEL_REQUIRED: 'settings.custom.error_model',
+    CUSTOM_API_KEY_REQUIRED: 'settings.custom.error_api_key',
+    CUSTOM_TOKEN_LIMIT_INVALID: 'settings.custom.error_token_limits',
+  })[String(code || '')];
+  return key ? t(key) : (fallback || t('settings.save_failed'));
+}
+
+function _settingsValidateCustomBaseUrl(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return 'CUSTOM_BASE_URL_REQUIRED';
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return 'CUSTOM_BASE_URL_INVALID';
+    if (url.username || url.password || url.search || url.hash) return 'CUSTOM_BASE_URL_INVALID';
+  } catch (_) {
+    return 'CUSTOM_BASE_URL_INVALID';
+  }
+  return '';
+}
+
+function _settingsNormalizeCustomBaseUrl(value) {
+  const raw = String(value || '').trim();
+  try {
+    const url = new URL(raw);
+    const chatPathIndex = url.pathname.search(/\/chat(?:\/|$)/i);
+    if (chatPathIndex >= 0) {
+      url.pathname = url.pathname.slice(0, chatPathIndex).replace(/\/+$/, '') || '/';
+    }
+    return url.toString().replace(/\/+$/, '');
+  } catch (_) {
+    return raw;
+  }
+}
+
+function _settingsBuildCustomModelPayload(values) {
+  return {
+    label: String(values.label || '').trim(),
+    baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl),
+    model: String(values.model || '').trim(),
+    apiKey: String(values.apiKey || '').trim(),
+  };
+}
+
+function _settingsShowCustomModelForm(provider) {
+  const overlay = document.getElementById('add-account-modal');
+  const title = document.getElementById('add-account-title');
+  const body = document.getElementById('add-account-body');
+  const actions = document.getElementById('add-account-actions');
+  if (!overlay || !title || !body || !actions) return;
+
+  title.innerHTML = `
+    <span class="modal-title-text">${escapeHtml(t('settings.custom.title'))}</span>
+    <span class="form-hint custom-model-intro">${escapeHtml(t('settings.custom.compat_hint'))}</span>
+  `;
+  body.innerHTML = `
+    <div class="form-row">
+      <label>${escapeHtml(t('settings.custom.label'))}</label>
+      <input type="text" class="custom-label-input form-input" placeholder="${escapeHtml(t('settings.custom.label_placeholder'))}" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>${escapeHtml(t('settings.custom.base_url'))}</label>
+      <input type="text" class="custom-base-url-input form-input" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>${escapeHtml(t('settings.custom.model_id'))}</label>
+      <input type="text" class="custom-model-input form-input" placeholder="${escapeHtml(t('settings.custom.model_placeholder'))}" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>API Key</label>
+      <input type="password" class="custom-key-input form-input" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
+    </div>
+    <div class="form-msg"></div>
+  `;
+  actions.innerHTML = '';
+
+  const labelInput = body.querySelector('.custom-label-input');
+  const baseUrlInput = body.querySelector('.custom-base-url-input');
+  const modelInput = body.querySelector('.custom-model-input');
+  const keyInput = body.querySelector('.custom-key-input');
+  const msg = body.querySelector('.form-msg');
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn';
+  cancelBtn.textContent = t('common.cancel');
+  cancelBtn.onclick = () => _settingsCloseModal(overlay);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn btn-primary';
+  saveBtn.textContent = t('settings.save');
+  const save = async () => {
+    const payload = _settingsBuildCustomModelPayload({
+      label: labelInput.value,
+      baseUrl: baseUrlInput.value,
+      model: modelInput.value,
+      apiKey: keyInput.value,
+    });
+    const { label, baseUrl, model, apiKey } = payload;
+    let errorCode = _settingsValidateCustomBaseUrl(baseUrl);
+    if (!errorCode && !model) errorCode = 'CUSTOM_MODEL_REQUIRED';
+    if (!errorCode && !apiKey) errorCode = 'CUSTOM_API_KEY_REQUIRED';
+    if (errorCode) {
+      msg.textContent = _settingsCustomModelError(errorCode);
+      msg.className = 'form-msg error';
+      return;
+    }
+
+    saveBtn.disabled = true;
+    const startedAt = Date.now();
+    msg.textContent = t('settings.save_loading');
+    msg.className = 'form-msg';
+    _settingsLog.info('add custom model', { provider: provider.id, model, has_label: !!label });
+    let addRes = null;
+    try {
+      addRes = await window.orkas.invoke('auth.addCustomModelEntry', payload);
+    } catch (_) {
+      addRes = { ok: false, code: 'invoke_failed' };
+    }
+    if (!addRes || !addRes.ok) {
+      saveBtn.disabled = false;
+      msg.textContent = _settingsCustomModelError(addRes && addRes.code, addRes && addRes.error);
+      msg.className = 'form-msg error';
+      _settingsLog.warn('add custom model failed', {
+        provider: provider.id,
+        model,
+        error_code: addRes && addRes.code,
+      });
+      _settingsTrackModelConfigResult(
+        startedAt,
+        'add',
+        'custom',
+        'failure',
+        _settingsResultErrorCode(addRes),
+      );
+      return;
+    }
+    _settingsTrackModelConfigResult(startedAt, 'add', 'custom', 'success');
+    saveBtn.disabled = false;
+    _settingsCloseModal(overlay);
+    await _settingsReload();
+  };
+  saveBtn.onclick = save;
+
+  const focusNextOnEnter = (input, next) => {
+    input.addEventListener('keydown', (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter') { next.focus(); e.preventDefault(); }
+    });
+  };
+  focusNextOnEnter(labelInput, baseUrlInput);
+  focusNextOnEnter(baseUrlInput, modelInput);
+  focusNextOnEnter(modelInput, keyInput);
   keyInput.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') { save(); e.preventDefault(); }
@@ -696,6 +884,7 @@ function _settingsCloseModal(overlay) {
 let _oauthFlowPollTimer = null;
 let _oauthFlowId        = null;
 let _oauthFlowTarget    = null; // { provider, modelId }
+let _oauthFlowTelemetry = null;
 
 async function _settingsStartOAuthFlow(provider, modelId) {
   const overlay   = document.getElementById('oauth-flow-modal');
@@ -710,6 +899,7 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   const aliased = oauthProviderId !== provider.id;
 
   _oauthFlowTarget = { provider, modelId, oauthProviderId };
+  _oauthFlowTelemetry = { startedAt: Date.now(), done: false };
   title.textContent = t('settings.oauth.title_prefix', { provider: provider.label || provider.id });
   const aliasTip = aliased
     ? `<div class="oauth-flow-hint">${escapeHtml(t('settings.oauth.alias_tip', { provider: oauthProviderId }))}</div>`
@@ -717,13 +907,26 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(t('settings.oauth.starting'))}</div>${aliasTip}`;
   overlay.classList.add('open');
 
+  const finishTelemetry = (result, errorCode = '') => {
+    if (!_oauthFlowTelemetry || _oauthFlowTelemetry.done) return;
+    _oauthFlowTelemetry.done = true;
+    _settingsTrackModelConfigResult(
+      _oauthFlowTelemetry.startedAt,
+      'add',
+      'oauth',
+      result,
+      errorCode,
+    );
+  };
   const closeFlow = () => {
+    finishTelemetry('cancelled', 'cancelled');
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     if (_oauthFlowId) {
       window.orkas.invoke('auth.cancelOAuthFlow', { flowId: _oauthFlowId }).catch(() => {});
     }
     _oauthFlowId = null;
     _oauthFlowTarget = null;
+    _oauthFlowTelemetry = null;
     overlay.classList.remove('open');
     document.removeEventListener('keydown', onKey, true);
   };
@@ -862,11 +1065,45 @@ function _oauthFlowRender(provider, status, closeFlow) {
           const hit = supported.find(m => m.id === model);
           if (!hit && supported.length) model = supported[0].id;
         }
-        await window.orkas.invoke('auth.addEntry', {
+        const entryRes = await window.orkas.invoke('auth.addEntry', {
           provider: entryProvider,
           model,
           profileId,
         });
+        if (!entryRes || !entryRes.ok) {
+          // The OAuth profile was created specifically for this flow. If its
+          // model entry cannot be committed, remove it again so a catalog
+          // race or write failure cannot look successful or leave hidden
+          // credential-only state.
+          await window.orkas.invoke('auth.removeCredential', { profileId }).catch(() => {});
+          const message = (entryRes && entryRes.error) || t('settings.add_entry_failed');
+          body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(message)}</div>`;
+          _settingsLog.warn('oauth entry save failed', {
+            provider: entryProvider,
+            model,
+            error: entryRes && entryRes.error,
+          });
+          if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
+            _settingsTrackModelConfigResult(
+              _oauthFlowTelemetry.startedAt,
+              'add',
+              'oauth',
+              'failure',
+              _settingsResultErrorCode(entryRes, 'entry_save_failed'),
+            );
+            _oauthFlowTelemetry.done = true;
+          }
+          return;
+        }
+      }
+      if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
+        _settingsTrackModelConfigResult(
+          _oauthFlowTelemetry.startedAt,
+          'add',
+          'oauth',
+          'success',
+        );
+        _oauthFlowTelemetry.done = true;
       }
       closeFlow();
       await _settingsReload();
@@ -877,6 +1114,16 @@ function _oauthFlowRender(provider, status, closeFlow) {
   if (status.kind === 'error') {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(status.error || t('settings.oauth.auth_failed'))}</div>`;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
+    if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
+      _settingsTrackModelConfigResult(
+        _oauthFlowTelemetry.startedAt,
+        'add',
+        'oauth',
+        'failure',
+        'oauth_failed',
+      );
+      _oauthFlowTelemetry.done = true;
+    }
     return;
   }
 }
@@ -910,6 +1157,16 @@ function _settingsEntryModelState(entry, list) {
   };
 }
 
+function _settingsEntryProblem(entry) {
+  if (entry.profileAvailable === false) {
+    return t('settings.entries.credential_missing');
+  }
+  if (entry.modelAvailable === false) {
+    return t('settings.entries.model_unavailable');
+  }
+  return '';
+}
+
 function _settingsRenderEntryRow(entry, idx) {
   const row = document.createElement('div');
   row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
@@ -925,10 +1182,14 @@ function _settingsRenderEntryRow(entry, idx) {
   main.className = 'entry-main';
   const primary = document.createElement('div');
   primary.className = 'entry-primary';
+  const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
+  const modelControl = entry.modelEditable === false
+    ? `<span class="entry-model-static">${escapeHtml(entry.modelName || entry.model)}</span>`
+    : '<div class="ai-select ai-select-compact entry-model-select"></div>';
   primary.innerHTML = `
-    <span class="entry-provider">${escapeHtml(entry.providerLabel || entry.provider)}</span>
+    <span class="entry-provider">${escapeHtml(providerName)}</span>
     <span class="entry-sep">·</span>
-    <div class="ai-select ai-select-compact entry-model-select"></div>
+    ${modelControl}
     <span class="entry-account-chip" title="${escapeHtml(t('settings.entries.account_title'))}">@ ${escapeHtml(entry.profileLabel || '')}</span>
   `;
   main.appendChild(primary);
@@ -938,33 +1199,34 @@ function _settingsRenderEntryRow(entry, idx) {
   // model that left the catalog remains visible only as a remediation row and
   // is never injected back into these options.
   const modelEl = primary.querySelector('.entry-model-select');
-  const initialModelState = _settingsEntryModelState(entry, []);
-  const modelUnavailable = initialModelState.unavailable;
-  const modelSel = _aiSelectMount(modelEl, {
-    placeholder: initialModelState.placeholder,
-  });
-  // Prevent drag from starting when interacting with the picker.
-  modelEl.addEventListener('mousedown', (e) => e.stopPropagation());
-  modelEl.setAttribute('draggable', 'false');
-  (async () => {
-    const res = await window.orkas.invoke('auth.listModels', { provider: entry.provider });
-    const list = (res && res.ok && Array.isArray(res.models)) ? res.models : [];
-    const modelState = _settingsEntryModelState(entry, list);
-    modelSel.setOptions(modelState.options, {
-      value: modelState.value,
-      placeholder: modelState.placeholder,
+  if (modelEl) {
+    const initialModelState = _settingsEntryModelState(entry, []);
+    const modelSel = _aiSelectMount(modelEl, {
+      placeholder: initialModelState.placeholder,
     });
-    modelSel.onChange(async (val) => {
-      if (!val || val === entry.model) return;
-      const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
-      if (!up || !up.ok) {
-        await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));
-        modelSel.setValue(entry.model);
-        return;
-      }
-      await _settingsReload();
-    });
-  })();
+    // Prevent drag from starting when interacting with the picker.
+    modelEl.addEventListener('mousedown', (e) => e.stopPropagation());
+    modelEl.setAttribute('draggable', 'false');
+    (async () => {
+      const res = await window.orkas.invoke('auth.listModels', { provider: entry.provider });
+      const list = (res && res.ok && Array.isArray(res.models)) ? res.models : [];
+      const modelState = _settingsEntryModelState(entry, list);
+      modelSel.setOptions(modelState.options, {
+        value: modelState.value,
+        placeholder: modelState.placeholder,
+      });
+      modelSel.onChange(async (val) => {
+        if (!val || val === entry.model) return;
+        const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
+        if (!up || !up.ok) {
+          await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));
+          modelSel.setValue(entry.model);
+          return;
+        }
+        await _settingsReload();
+      });
+    })();
+  }
 
   const meta = document.createElement('div');
   meta.className = 'entry-meta';
@@ -991,9 +1253,10 @@ function _settingsRenderEntryRow(entry, idx) {
 
   const status = document.createElement('div');
   status.className = 'entry-status';
-  if (modelUnavailable) {
+  const entryProblem = _settingsEntryProblem(entry);
+  if (entryProblem) {
     status.className += ' error';
-    status.textContent = t('settings.entries.model_unavailable');
+    status.textContent = entryProblem;
   }
   main.appendChild(status);
   row.appendChild(main);
@@ -1109,8 +1372,10 @@ async function _settingsTestEntry(entry, statusEl) {
 }
 
 async function _settingsRemoveEntry(entry) {
-  const title = `${entry.providerLabel || entry.provider} · ${entry.modelName || entry.model} · ${entry.profileLabel}`;
+  const providerName = entry.providerLabelKey ? t(entry.providerLabelKey) : (entry.providerLabel || entry.provider);
+  const title = `${providerName} · ${entry.modelName || entry.model} · ${entry.profileLabel}`;
   if (!(await uiConfirm(t('settings.entries.delete_confirm', { title })))) return;
+  const startedAt = Date.now();
   _settingsLog.info('remove entry', {
     entry_id: entry.entryId,
     provider: entry.provider,
@@ -1119,9 +1384,17 @@ async function _settingsRemoveEntry(entry) {
   const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
   if (!res || !res.ok) {
     _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
+    _settingsTrackModelConfigResult(
+      startedAt,
+      'remove',
+      'existing',
+      'failure',
+      _settingsResultErrorCode(res),
+    );
     await uiAlert((res && res.error) || t('settings.entries.delete_failed'));
     return;
   }
+  _settingsTrackModelConfigResult(startedAt, 'remove', 'existing', 'success');
   await _settingsReload();
 }
 
@@ -1650,6 +1923,16 @@ function _settingsTtsApplyProviderFields(providerId) {
   _settingsTtsSetRowHidden('.tts-row-doubao-res', true);
 }
 
+function _settingsTtsAddFailure(errorLike) {
+  const errorCode = String(errorLike?.code || '').trim();
+  const storageFull = errorCode === 'ENOSPC';
+  return {
+    message: storageFull ? t('settings.storage_full') : t('settings.tts.add_failed'),
+    errorCode: errorCode || 'unknown',
+    errorType: storageFull ? 'storage' : 'operation',
+  };
+}
+
 async function _settingsClickAddTts() {
   const provider = _settingsState.ttsProviderSel?.getValue() || '';
   if (!provider) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_provider_needed')); return; }
@@ -1676,7 +1959,8 @@ async function _settingsClickAddTts() {
   try {
     const res = await window.orkas.invoke('ttsAuth.add', payload);
     if (!res || !res.ok) {
-      _settingsSetStatus('settings-tts-status', 'error', (res && res.error) || t('settings.tts.add_failed'));
+      const failure = _settingsTtsAddFailure(res);
+      _settingsSetStatus('settings-tts-status', 'error', failure.message);
       return;
     }
     const keyInput = document.getElementById('settings-tts-key-input');
@@ -1684,7 +1968,12 @@ async function _settingsClickAddTts() {
     _settingsSetStatus('settings-tts-status', 'ok', t('settings.tts.add_ok'));
     await _settingsRefreshTtsProfiles();
   } catch (err) {
-    _settingsSetStatus('settings-tts-status', 'error', (err && err.message) || String(err));
+    const failure = _settingsTtsAddFailure(err);
+    _settingsSetStatus('settings-tts-status', 'error', failure.message);
+    _settingsLog.warn('add TTS provider failed', {
+      error_type: failure.errorType,
+      error_code: failure.errorCode,
+    });
   }
 }
 

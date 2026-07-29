@@ -67,6 +67,10 @@ function loadOss(opts: LoadOpts = {}) {
       if (key === 'oss.office_prompt') return 'OfficeCLI is built in. Use built-in Office tools for: [describe your task here].';
       if (key === 'oss.install_prompt') return 'Please install the open-source project {name} ({url}) as local external package {id}. Once it is installed, briefly tell me what it can do.';
       if (key === 'oss.office_install_prompt') return 'OfficeCLI is already built in as Office tools. Briefly explain what it can do.';
+      if (key === 'oss.use_for') return 'Good for';
+      if (key === 'oss.add_to_task') return 'Add to task';
+      if (key === 'oss.more_tools') return 'More tools';
+      if (key === 'oss.subtitle') return 'Extend Commander capabilities';
       return key;
     },
     setView: (v: string) => { calls.setView.push(v); },
@@ -95,6 +99,30 @@ function loadOss(opts: LoadOpts = {}) {
 }
 
 describe('oss.js', () => {
+  it('keeps the home rail hierarchy compact without shrinking its content', () => {
+    const html = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
+    const css = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const zh = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/zh.json'), 'utf8'));
+    const header = html.match(/<div class="oss-entry-head">[\s\S]*?<\/button>\s*<\/div>/)?.[0] || '';
+
+    expect(zh['oss.add_to_task']).toBe('+安装');
+    expect(header).not.toContain('oss-entry-badge');
+    expect(header).not.toContain('data-ui-icon="diamond"');
+    expect(header.indexOf('data-i18n="oss.subtitle"'))
+      .toBeLessThan(header.indexOf('data-i18n="oss.optional"'));
+    expect(header).toContain('oss-entry-sub-divider');
+    expect(header).toContain('data-ui-icon="chevron-right"');
+    expect(css).toMatch(/\.oss-entry-title\s*\{[\s\S]*?font-size:\s*13px;[\s\S]*?font-weight:\s*400;/);
+    expect(css).toMatch(/\.oss-entry\s*\{[^}]*margin-top:\s*2px;[^}]*display:\s*flex;/);
+    expect(css).not.toMatch(/\.oss-entry\s*\{[^}]*border-top:/);
+    expect(css).toMatch(/\.oss-card\s*\{[\s\S]*?height:\s*60px;[\s\S]*?padding:\s*5px 8px;/);
+    expect(css).toMatch(/\.oss-card-name\s*\{[\s\S]*?font-size:\s*12px;/);
+    expect(css).toMatch(/\.oss-card-fit\s*\{[\s\S]*?font-size:\s*10px;/);
+    expect(css).toMatch(/\.oss-card-add\s*\{[\s\S]*?margin-right:\s*8px;[\s\S]*?color:\s*var\(--muted\);/);
+    expect(css).toMatch(/\.oss-card:hover \.oss-card-add\s*\{[\s\S]*?color:\s*var\(--primary-text\);/);
+    expect(css).not.toMatch(/\.oss-card-add\s*\{[^}]*(?:background|border|box-shadow):/);
+  });
+
   it('prefillCommander writes the task, focuses, sets the Commander recipient, and does NOT send', () => {
     const { context, el, calls } = loadOss();
     context.prefillCommander('帮我做一段产品开场动画');
@@ -111,6 +139,174 @@ describe('oss.js', () => {
     const { context, calls } = loadOss();
     context.prefillCommander('');
     expect(calls.setView).toEqual([]);
+  });
+
+  it('prefillCommander keeps only structured Commander attribution', () => {
+    const { context, el } = loadOss();
+    const applied = context.prefillCommander('Use X for [task].', {
+      entry_point: 'oss_tool',
+      resource_id: 'project-x',
+      position: 4,
+      source: 'commander_home',
+      recipient_type: 'commander',
+    });
+
+    expect(applied).toBe(true);
+    expect(el('new-chat-input').dataset).toMatchObject({
+      commanderEntryPoint: 'oss_tool',
+      commanderResourceId: 'project-x',
+      commanderPosition: '4',
+      commanderSource: 'commander_home',
+      commanderRecipientType: 'commander',
+    });
+  });
+
+  it('does not treat bracketed content in an existing task as an OSS placeholder', () => {
+    const { context, el } = loadOss();
+    const applied = context.prefillCommander(
+      'Use Project X for this task: keep [sample] in the copy.',
+      { entry_point: 'oss_tool', resource_id: 'project-x' },
+      { trackPlaceholder: false },
+    );
+
+    expect(applied).toBe(true);
+    expect(el('new-chat-input').dataset.ossTemplatePlaceholder).toBeUndefined();
+  });
+
+  it('adds a selected tool to an existing task without nesting another OSS prompt', () => {
+    const { context } = loadOss();
+    const project = {
+      id: 'project-x',
+      name: 'Project X',
+      repo: 'org/project-x',
+    };
+    const quickStartInput = {
+      value: 'Build a landing page with $& in the example copy.',
+      dataset: { commanderEntryPoint: 'quick_start' },
+    };
+    const enhanced = context._ossPromptForComposer(project, quickStartInput);
+    expect(enhanced).toContain('Build a landing page with $& in the example copy.');
+    expect(enhanced).not.toContain('[describe your task here]');
+
+    const existingOssInput = {
+      value: enhanced,
+      dataset: { commanderEntryPoint: 'oss_tool' },
+    };
+    expect(context._ossPromptForComposer(project, existingOssInput))
+      .toContain('[describe your task here]');
+  });
+
+  it('handles OSS row load, task click, prefill, and More without telemetry', async () => {
+    const { context, el } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') return { entries: {} };
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return {
+          source: 'bundled',
+          list: [{
+            id: 'project-x',
+            name: 'Project X',
+            task_zh: '处理任务',
+            task_en: 'Handle task',
+            category: 'anim',
+            repo: 'org/project-x',
+          }],
+          categories: [],
+          total: 1,
+        };
+      },
+    });
+    const clicks: any[] = [];
+    const events: any[] = [];
+    let cardClick: Function | null = null;
+    let moreClick: Function | null = null;
+    const card = {
+      dataset: { ossId: 'project-x' },
+      addEventListener(type: string, fn: Function) { if (type === 'click') cardClick = fn; },
+    };
+    const grid = {
+      innerHTML: '',
+      querySelectorAll: () => [card],
+    };
+    const entry = { style: { display: 'none' } };
+    const more = {
+      dataset: {} as Record<string, string>,
+      addEventListener(type: string, fn: Function) { if (type === 'click') moreClick = fn; },
+    };
+    const baseGetElementById = context.document.getElementById;
+    context.document.getElementById = (id: string) => {
+      if (id === 'oss-entry') return entry;
+      if (id === 'oss-entry-grid') return grid;
+      if (id === 'oss-entry-more') return more;
+      if (id === 'new-chat-input') return el(id);
+      return baseGetElementById(id);
+    };
+    context.Monitor = {
+      click: (name: string, payload: any) => clicks.push({ name, payload }),
+      event: (name: string, payload: any) => events.push({ name, payload }),
+    };
+    context.window.Monitor = true;
+
+    await context.initOssEntry({ revalidate: false });
+    cardClick!();
+    moreClick!();
+
+    expect(entry.style.display).toBe('');
+    expect(clicks).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
+  it('amplifies vertical wheel gestures and keeps them within the horizontal card strip', () => {
+    const { context } = loadOss();
+    let wheel: Function | null = null;
+    const grid = {
+      scrollLeft: 0,
+      scrollWidth: 1000,
+      clientWidth: 400,
+      addEventListener(type: string, fn: Function, options: unknown) {
+        if (type === 'wheel') {
+          expect(options).toEqual({ passive: false });
+          wheel = fn;
+        }
+      },
+    };
+    context._bindOssWheelScroll(grid);
+
+    let prevented = false;
+    wheel!({ deltaY: 120, deltaX: 0, preventDefault: () => { prevented = true; } });
+    expect(grid.scrollLeft).toBe(240);
+    expect(prevented).toBe(true);
+
+    grid.scrollLeft = 600;
+    prevented = false;
+    wheel!({ deltaY: 120, deltaX: 0, preventDefault: () => { prevented = true; } });
+    expect(grid.scrollLeft).toBe(600);
+    expect(prevented).toBe(true);
+
+    grid.scrollLeft = 0;
+    prevented = false;
+    wheel!({ deltaY: -120, deltaX: 0, preventDefault: () => { prevented = true; } });
+    expect(grid.scrollLeft).toBe(0);
+    expect(prevented).toBe(true);
+  });
+
+  it('returns the rail to the first card only when the project list changes', () => {
+    const { context } = loadOss();
+    const grid = {
+      dataset: {} as Record<string, string>,
+      scrollLeft: 999,
+    };
+    const originalProjects = [{ id: 'hyperframes' }, { id: 'ppt-master' }];
+
+    context._resetOssScrollForProjectChange(grid, originalProjects);
+    expect(grid.scrollLeft).toBe(0);
+
+    grid.scrollLeft = 240;
+    context._resetOssScrollForProjectChange(grid, originalProjects);
+    expect(grid.scrollLeft).toBe(240);
+
+    context._resetOssScrollForProjectChange(grid, [...originalProjects, { id: 'OfficeCLI' }]);
+    expect(grid.scrollLeft).toBe(0);
   });
 
   it('loadOssCatalog uses bundled cache first, then refreshes without duplicate calls', async () => {
@@ -151,7 +347,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|5|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -223,7 +419,7 @@ describe('oss.js', () => {
     await context.loadOssCatalog({ homeOnly: true });
 
     const merge = invokeCalls.find((c) => c.channel === 'marketplace.mergeListingsCache');
-    expect(merge?.payload.entries['project|2|home|||'].ts).toBe(0);
+    expect(merge?.payload.entries['project|5|home|||'].ts).toBe(0);
   });
 
   it('loadOssCatalog does not replace real cache with bundled fallback', async () => {
@@ -233,7 +429,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|5|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -267,7 +463,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|5|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -303,7 +499,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|5|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }

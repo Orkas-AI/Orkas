@@ -14,6 +14,19 @@ let _ctxMenuEl = null;
 let _ctxMenuItems = [];
 let _ctxMenuActiveIdx = -1;
 let _ctxMenuOpen = false;
+let _ctxMenuPreviousFocus = null;
+
+function _runContextMenuAction(item) {
+  if (!item || item.disabled) return;
+  try {
+    const result = item.onClick();
+    if (result && typeof result.then === 'function') {
+      Promise.resolve(result).catch(() => _ctxMenuLog.warn('context menu action failed'));
+    }
+  } catch (_) {
+    _ctxMenuLog.warn('context menu action failed');
+  }
+}
 
 function showContextMenu(event, items) {
   closeContextMenu();
@@ -24,14 +37,28 @@ function showContextMenu(event, items) {
   const menu = document.createElement('div');
   menu.className = 'context-menu';
   menu.setAttribute('role', 'menu');
-  menu.innerHTML = _ctxMenuItems.map((it, idx) => {
-    const icon = it.icon && typeof uiIconHtml === 'function'
-      ? `<span class="context-menu-icon">${uiIconHtml(it.icon)}</span>`
-      : '';
-    return `<button type="button" class="context-menu-item${it.disabled ? ' is-disabled' : ''}"`
-    + ` data-context-menu-idx="${idx}" role="menuitem" tabindex="-1"`
-    + ` ${it.disabled ? 'disabled' : ''}>${icon}<span class="context-menu-label">${escapeHtml(it.label)}</span></button>`;
-  }).join('');
+  menu.tabIndex = -1;
+  _ctxMenuItems.forEach((it, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `context-menu-item${it.disabled ? ' is-disabled' : ''}`;
+    btn.dataset.contextMenuIdx = String(idx);
+    btn.setAttribute('role', 'menuitem');
+    btn.setAttribute('tabindex', '-1');
+    btn.disabled = !!it.disabled;
+    if (it.icon && typeof uiIconHtml === 'function') {
+      const icon = document.createElement('span');
+      icon.className = 'context-menu-icon';
+      icon.innerHTML = uiIconHtml(it.icon);
+      btn.appendChild(icon);
+    }
+    const label = document.createElement('span');
+    label.className = 'context-menu-label';
+    label.textContent = it.label;
+    btn.appendChild(label);
+    menu.appendChild(btn);
+  });
+  _ctxMenuPreviousFocus = document.activeElement;
   document.body.appendChild(menu);
   _ctxMenuEl = menu;
   _ctxMenuOpen = true;
@@ -39,13 +66,22 @@ function showContextMenu(event, items) {
 
   // Place at cursor; flip when overflowing viewport. Read offset after
   // appending so the menu has real dimensions.
-  const x = event.clientX || 0;
-  const y = event.clientY || 0;
+  const x = Number.isFinite(event && event.clientX) ? event.clientX : 0;
+  const y = Number.isFinite(event && event.clientY) ? event.clientY : 0;
   const rect = menu.getBoundingClientRect();
   const vw = window.innerWidth;
   const vh = window.innerHeight;
-  const left = x + rect.width > vw - 4 ? Math.max(4, x - rect.width) : x;
-  const top  = y + rect.height > vh - 4 ? Math.max(4, y - rect.height) : y;
+  const margin = 4;
+  const preferredLeft = x + rect.width > vw - margin ? x - rect.width : x;
+  const preferredTop = y + rect.height > vh - margin ? y - rect.height : y;
+  const left = Math.min(
+    Math.max(margin, vw - rect.width - margin),
+    Math.max(margin, preferredLeft),
+  );
+  const top = Math.min(
+    Math.max(margin, vh - rect.height - margin),
+    Math.max(margin, preferredTop),
+  );
   menu.style.left = `${left}px`;
   menu.style.top  = `${top}px`;
 
@@ -56,16 +92,17 @@ function showContextMenu(event, items) {
       const idx = Number(btn.dataset.contextMenuIdx);
       const it = _ctxMenuItems[idx];
       closeContextMenu();
-      if (it && !it.disabled) {
-        try { it.onClick(); }
-        catch (err) { _ctxMenuLog.warn('item onClick threw', err); }
-      }
+      _runContextMenuAction(it);
     });
     btn.addEventListener('mouseenter', () => {
       const idx = Number(btn.dataset.contextMenuIdx);
       _setActiveIdx(idx);
     });
   });
+
+  const firstEnabled = _ctxMenuItems.findIndex((item) => !item.disabled);
+  if (firstEnabled >= 0) _setActiveIdx(firstEnabled);
+  else menu.focus();
 }
 
 function closeContextMenu() {
@@ -75,6 +112,9 @@ function closeContextMenu() {
   if (_ctxMenuEl && _ctxMenuEl.parentNode) _ctxMenuEl.parentNode.removeChild(_ctxMenuEl);
   _ctxMenuEl = null;
   _ctxMenuItems = [];
+  const previousFocus = _ctxMenuPreviousFocus;
+  _ctxMenuPreviousFocus = null;
+  try { previousFocus?.focus?.(); } catch (_) {}
 }
 
 function _setActiveIdx(idx) {
@@ -85,8 +125,24 @@ function _setActiveIdx(idx) {
     _ctxMenuActiveIdx = idx;
   }
   _ctxMenuEl.querySelectorAll('.context-menu-item').forEach((btn, i) => {
-    btn.classList.toggle('is-active', i === _ctxMenuActiveIdx);
+    const active = i === _ctxMenuActiveIdx;
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('tabindex', active ? '0' : '-1');
+    if (active) {
+      try { btn.focus(); } catch (_) {}
+    }
   });
+}
+
+function _findEnabledIdx(from, direction) {
+  const length = _ctxMenuItems.length;
+  if (!length) return -1;
+  const start = from >= 0 ? from : (direction > 0 ? -1 : 0);
+  for (let step = 1; step <= length; step += 1) {
+    const idx = (start + direction * step + length * 2) % length;
+    if (!_ctxMenuItems[idx].disabled) return idx;
+  }
+  return -1;
 }
 
 // ── Dismissers ─────────────────────────────────────────────────────────
@@ -105,16 +161,24 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { e.preventDefault(); closeContextMenu(); return; }
   if (e.key === 'ArrowDown') {
     e.preventDefault();
-    let next = _ctxMenuActiveIdx + 1;
-    while (next < _ctxMenuItems.length && _ctxMenuItems[next].disabled) next += 1;
-    if (next < _ctxMenuItems.length) _setActiveIdx(next);
+    const next = _findEnabledIdx(_ctxMenuActiveIdx, 1);
+    if (next >= 0) _setActiveIdx(next);
     return;
   }
   if (e.key === 'ArrowUp') {
     e.preventDefault();
-    let prev = _ctxMenuActiveIdx - 1;
-    while (prev >= 0 && _ctxMenuItems[prev].disabled) prev -= 1;
+    const prev = _findEnabledIdx(_ctxMenuActiveIdx, -1);
     if (prev >= 0) _setActiveIdx(prev);
+    return;
+  }
+  if (e.key === 'Home' || e.key === 'End') {
+    e.preventDefault();
+    const next = _findEnabledIdx(-1, e.key === 'Home' ? 1 : -1);
+    if (next >= 0) _setActiveIdx(next);
+    return;
+  }
+  if (e.key === 'Tab') {
+    closeContextMenu();
     return;
   }
   if (e.key === 'Enter') {
@@ -123,8 +187,7 @@ document.addEventListener('keydown', (e) => {
     if (!it || it.disabled) return;
     e.preventDefault();
     closeContextMenu();
-    try { it.onClick(); }
-    catch (err) { _ctxMenuLog.warn('item onClick threw on Enter', err); }
+    _runContextMenuAction(it);
   }
 });
 

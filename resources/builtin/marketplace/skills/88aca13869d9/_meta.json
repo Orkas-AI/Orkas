@@ -1,0 +1,26 @@
+{
+  "version": "1.0.1",
+  "updated_at": "2026-07-28T13:32:31.000Z",
+  "min_app_version": "1.6.2",
+  "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
+  "category": "rnd",
+  "descriptions": {
+    "zh": "用于读取 GitHub issue、PR、CI、release 与仓库元数据，并在明确授权后执行对应维护操作。",
+    "en": "Read GitHub issues, pull requests, CI, releases, and repository metadata, and perform maintenance writes only with explicit approval."
+  },
+  "routing": {
+    "applicable_domain": [
+      "live GitHub issues, pull requests, CI runs, releases, branches, and repository settings",
+      "repository maintenance that requires GitHub API state"
+    ],
+    "negative_examples": [
+      "edit local repository source without requiring GitHub state",
+      "infer live issue, pull request, or CI status from stale local text",
+      "perform GitHub writes without explicit user approval"
+    ],
+    "prerequisites": [
+      "a GitHub repository or concrete GitHub object is in scope",
+      "the GitHub connector is available for live operations"
+    ]
+  }
+}

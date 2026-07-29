@@ -14,18 +14,19 @@
 
 import { readReport } from '../quality/report';
 import { getActiveUserId } from '../features/users';
+import { safeId } from '../storage';
 
 type InvokeHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 export const invokeHandlers: Record<string, InvokeHandler> = {
   'quality.readSkillReport': async ({ id }) => {
-    if (typeof id !== 'string' || !id) throw new Error('id required');
+    if (typeof id !== 'string' || !safeId(id)) throw new Error('invalid id');
     const report = await readReport({ uid: getActiveUserId(), kind: 'skill', id });
     return { report };
   },
 
   'quality.readAgentReport': async ({ id }) => {
-    if (typeof id !== 'string' || !id) throw new Error('id required');
+    if (typeof id !== 'string' || !safeId(id)) throw new Error('invalid id');
     const report = await readReport({ uid: getActiveUserId(), kind: 'agent', id });
     return { report };
   },

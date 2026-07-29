@@ -1,11 +1,55 @@
 import { describe, it, expect } from 'vitest';
 import {
+  CodexAgentMessageAccumulator,
   buildCodexThreadPermissionOverrides,
   buildCodexTurnPermissionOverrides,
   extractCodexDiffFiles,
   extractThreadId,
   extractCodexUsage,
+  selectCodexTurnPrompt,
 } from '../../../../src/main/features/local_agents/backends/codex';
+
+describe('local_agents/backends/codex › phased agent messages', () => {
+  it('maps item phases onto deltas and resolves only the final answer', () => {
+    const messages = new CodexAgentMessageAccumulator();
+    messages.rememberItem({ id: 'comment-1', type: 'agentMessage', phase: 'commentary' });
+    expect(messages.appendDelta({ itemId: 'comment-1', delta: 'Checking files…' })).toEqual({
+      itemId: 'comment-1',
+      phase: 'commentary',
+      text: 'Checking files…',
+    });
+
+    messages.rememberItem({ id: 'final-1', type: 'agentMessage', phase: 'final_answer' });
+    expect(messages.appendDelta({ itemId: 'final-1', delta: 'Fixed.' })).toEqual({
+      itemId: 'final-1',
+      phase: 'final_answer',
+      text: 'Fixed.',
+    });
+    expect(messages.output()).toBe('Fixed.');
+  });
+
+  it('emits only a missing completion suffix and keeps its phase', () => {
+    const messages = new CodexAgentMessageAccumulator();
+    messages.rememberItem({ id: 'final-1', type: 'agentMessage', phase: 'final_answer' });
+    messages.appendDelta({ itemId: 'final-1', delta: 'Final ' });
+
+    expect(messages.appendCompletedFallback({
+      id: 'final-1', type: 'agentMessage', phase: 'final_answer', text: 'Final answer',
+    })).toEqual({ itemId: 'final-1', phase: 'final_answer', text: 'answer' });
+    expect(messages.output()).toBe('Final answer');
+  });
+
+  it('preserves legacy unphased and commentary-only output', () => {
+    const legacy = new CodexAgentMessageAccumulator();
+    legacy.appendDelta({ delta: 'legacy body' });
+    expect(legacy.output()).toBe('legacy body');
+
+    const commentaryOnly = new CodexAgentMessageAccumulator();
+    commentaryOnly.rememberItem({ id: 'comment-1', type: 'agentMessage', phase: 'commentary' });
+    commentaryOnly.appendDelta({ itemId: 'comment-1', delta: 'partial work' });
+    expect(commentaryOnly.output()).toBe('partial work');
+  });
+});
 
 describe('local_agents/backends/codex › extractThreadId', () => {
   it('returns top-level threadId when present', () => {
@@ -94,6 +138,29 @@ describe('local_agents/backends/codex › trusted local permissions', () => {
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
     });
+  });
+});
+
+describe('local_agents/backends/codex › resume recovery prompt', () => {
+  const input = {
+    prompt: 'current task only',
+    resumeSessionId: 'thread-old',
+    resumeFallbackPrompt: 'bounded recovery\n\ncurrent task only',
+  };
+
+  it('keeps the current-turn delta when native resume succeeds', () => {
+    expect(selectCodexTurnPrompt(input, true)).toBe('current task only');
+  });
+
+  it('uses bounded recovery when native resume falls back to a fresh thread', () => {
+    expect(selectCodexTurnPrompt(input, false)).toBe('bounded recovery\n\ncurrent task only');
+  });
+
+  it('does not add recovery to an intentionally fresh run', () => {
+    expect(selectCodexTurnPrompt({
+      prompt: 'fresh task',
+      resumeFallbackPrompt: 'unused recovery',
+    }, false)).toBe('fresh task');
   });
 });
 

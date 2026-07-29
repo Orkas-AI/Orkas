@@ -84,6 +84,25 @@ describe('features/users › activateUser', () => {
       .toBe(path.join(tmpDir, 'u2', 'local', 'config'));
   });
 
+  it('stays on the old account when a synchronous safety hook cannot clean up', async () => {
+    const users = await import('../../../src/main/features/users');
+    const hooks = await import('../../../src/main/features/user-switch-hooks');
+    users.activateUser('u1');
+    const oldAuthDir = process.env.CORE_AGENT_AUTH_DIR;
+    hooks.registerUserSwitchHook('users-test-failure', () => {
+      throw new Error('cleanup failed');
+    });
+
+    try {
+      expect(() => users.activateUser('u2')).toThrow(/user switch cleanup failed/);
+      expect(users.getActiveUserId()).toBe('u1');
+      expect(process.env.CORE_AGENT_AUTH_DIR).toBe(oldAuthDir);
+      expect(readUsersJson().current_user_id).toBe('u1');
+    } finally {
+      hooks.registerUserSwitchHook('users-test-failure', () => {});
+    }
+  });
+
   it('writes users.json with current_user_id on first activation', async () => {
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');
@@ -250,6 +269,29 @@ describe('features/users › account uid', () => {
     ]);
   });
 
+  it('does not move anonymous data before login switch cleanup succeeds', async () => {
+    const users = await import('../../../src/main/features/users');
+    const hooks = await import('../../../src/main/features/user-switch-hooks');
+    const accountUid = 'account-cleanup-failure';
+    users.initActiveUser({ defaultLocalId: users.ANONYMOUS_LOCAL_ID });
+    const marker = path.join(tmpDir, 'anonymous', 'local', 'config', 'marker.txt');
+    fs.writeFileSync(marker, 'must stay');
+    hooks.registerUserSwitchHook('users-account-transition-failure', () => {
+      throw new Error('cleanup failed');
+    });
+
+    try {
+      expect(() => users.switchToAccountLocalId(accountUid))
+        .toThrow(/user switch cleanup failed/);
+      expect(users.getActiveUserId()).toBe(users.ANONYMOUS_LOCAL_ID);
+      expect(fs.readFileSync(marker, 'utf8')).toBe('must stay');
+      expect(fs.existsSync(path.join(tmpDir, accountUid))).toBe(false);
+      expect(readUsersJson().current_user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+    } finally {
+      hooks.registerUserSwitchHook('users-account-transition-failure', () => {});
+    }
+  });
+
   it('does not rewrite the dev pointer when prod adopts anonymous on login', async () => {
     writeUsersJson({
       current_user_id: 'anonymous',
@@ -322,6 +364,31 @@ describe('features/users › account uid', () => {
     expect(fs.existsSync(path.join(tmpDir, 'anonymous', 'local', 'config'))).toBe(true);
     expect(fs.existsSync(path.join(tmpDir, 'anonymous', 'cloud', 'chats', 'leftover.jsonl'))).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, 'A0653F11-9F05-4A8B-89CE-0026D809EAFC'))).toBe(true);
+  });
+
+  it('does not reset anonymous data before logout switch cleanup succeeds', async () => {
+    const users = await import('../../../src/main/features/users');
+    const hooks = await import('../../../src/main/features/user-switch-hooks');
+    const accountUid = 'account-before-failed-logout';
+    users.initActiveUser({ defaultLocalId: users.ANONYMOUS_LOCAL_ID });
+    users.switchToAccountLocalId(accountUid);
+    const anonymousDraft = path.join(tmpDir, 'anonymous', 'cloud', 'chats', 'draft.jsonl');
+    fs.mkdirSync(path.dirname(anonymousDraft), { recursive: true });
+    fs.writeFileSync(anonymousDraft, 'must stay');
+    hooks.registerUserSwitchHook('users-account-transition-failure', () => {
+      throw new Error('cleanup failed');
+    });
+
+    try {
+      expect(() => users.switchToAnonymousLocalId())
+        .toThrow(/user switch cleanup failed/);
+      expect(users.getActiveUserId()).toBe(accountUid);
+      expect(fs.readFileSync(anonymousDraft, 'utf8')).toBe('must stay');
+      expect(fs.existsSync(path.join(tmpDir, accountUid))).toBe(true);
+      expect(readUsersJson().current_user_id).toBe(accountUid);
+    } finally {
+      hooks.registerUserSwitchHook('users-account-transition-failure', () => {});
+    }
   });
 
   it('does not wipe anonymous data when already anonymous', async () => {

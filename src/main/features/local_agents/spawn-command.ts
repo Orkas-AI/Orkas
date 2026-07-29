@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 
@@ -8,6 +9,7 @@ export type ResolvedCliCommand = {
 };
 
 const WINDOWS_COMMAND_SCRIPT_RE = /\.(?:cmd|bat)$/i;
+const WINDOWS_CMD_RE = /\.cmd$/i;
 const CMD_META_RE = /([()\][%!^"`<>&|;, *?])/g;
 
 /**
@@ -84,11 +86,61 @@ function escapeCmdArgument(value: string, doubleEscapeMetaChars: boolean): strin
   return escaped;
 }
 
+function resolveNodeExecutable(
+  binPath: string,
+  env: NodeJS.ProcessEnv,
+): string | null {
+  const explicit = env.ORKAS_TEST_NODE;
+  if (explicit && fs.existsSync(explicit)) return explicit;
+
+  const localNode = path.win32.join(path.win32.dirname(binPath), 'node.exe');
+  if (fs.existsSync(localNode)) return localNode;
+
+  const rawPath = env.PATH || env.Path || '';
+  for (const directory of rawPath.split(';').filter(Boolean)) {
+    const candidate = path.win32.join(directory, 'node.exe');
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function resolveNpmNodeShim(
+  binPath: string,
+  powershellShim: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+): ResolvedCliCommand | null {
+  let source = '';
+  try {
+    source = fs.readFileSync(powershellShim, 'utf8');
+  } catch {
+    return null;
+  }
+
+  const basedir = path.win32.dirname(powershellShim);
+  const candidates = Array.from(source.matchAll(/["']\$basedir[\\/]([^"']+)["']/gi))
+    .map((match) => path.win32.resolve(basedir, match[1].replace(/\//g, '\\')));
+  const entry = candidates.find((candidate) => {
+    if (!fs.existsSync(candidate)) return false;
+    if (/\.(?:c?js|mjs)$/i.test(candidate)) return true;
+    try {
+      return /^#![^\r\n]*\bnode(?:\.exe)?\b/i.test(
+        fs.readFileSync(candidate, 'utf8').slice(0, 256),
+      );
+    } catch {
+      return false;
+    }
+  });
+  const node = entry ? resolveNodeExecutable(binPath, env) : null;
+  return entry && node ? { command: node, args: [entry, ...args] } : null;
+}
+
 /**
  * Resolve one CLI launch without enabling Node's generic `shell:true` path.
- * Native executables are returned unchanged. Windows .cmd/.bat shims are
- * safely quoted and passed through ComSpec, which is required for npm-global
- * CLIs such as claude.cmd and codex.cmd.
+ * Native executables are returned unchanged. For a standard npm Windows shim,
+ * resolve the Node entry from its sibling .ps1 and launch it directly so
+ * multiline prompts survive unchanged. Other .cmd/.bat files are safely
+ * quoted and passed through ComSpec.
  */
 export function resolveCliCommand(
   binPath: string,
@@ -101,6 +153,14 @@ export function resolveCliCommand(
   }
 
   const normalized = path.win32.normalize(binPath);
+  const powershellShim = WINDOWS_CMD_RE.test(normalized)
+    ? normalized.replace(WINDOWS_CMD_RE, '.ps1')
+    : '';
+  if (powershellShim && fs.existsSync(powershellShim)) {
+    const npmNodeShim = resolveNpmNodeShim(normalized, powershellShim, args, env);
+    if (npmNodeShim) return npmNodeShim;
+  }
+
   // npm-generated shims re-parse their `%*` payload once more. Cover both
   // project-local node_modules/.bin and the standard global npm directory.
   const doubleEscape = /(?:node_modules[\\/]\.bin|AppData[\\/]Roaming[\\/]npm)[\\/][^\\/]+\.cmd$/i

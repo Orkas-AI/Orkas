@@ -100,8 +100,10 @@ function _iclApplyState(session) {
   const send = session.card.querySelector('[data-icl-send]');
   const stop = session.card.querySelector('[data-icl-stop]');
   const close = session.card.querySelector('[data-icl-close]');
+  const sensitive = session.card.querySelector('[data-icl-sensitive]');
   const form = session.card.querySelector('[data-icl-form]');
   const isRunning = session.status === 'running';
+  const isSending = !!session.sendPromise;
 
   if (title) title.textContent = _iclSessionTitle(session);
   if (status) {
@@ -118,8 +120,9 @@ function _iclApplyState(session) {
     output.scrollTop = output.scrollHeight;
   }
   if (form) form.hidden = !isRunning;
-  if (input) input.disabled = !isRunning;
-  if (send) send.disabled = !isRunning;
+  if (input) input.disabled = !isRunning || isSending;
+  if (send) send.disabled = !isRunning || isSending;
+  if (sensitive) sensitive.disabled = !isRunning || isSending;
   if (stop) stop.disabled = !isRunning;
   if (close) close.disabled = false;
   _iclSetSensitive(session, session.sensitive || session.sensitive_hint);
@@ -197,6 +200,7 @@ function _iclEnsureSession(payload, opts) {
     prompt_kind: '',
     sensitive_hint: false,
     sensitive: false,
+    sendPromise: null,
     dismissTimer: null,
   };
   _interactiveCliSessions.set(id, session);
@@ -246,6 +250,7 @@ function _iclRevealSession(session) {
   const form = card.querySelector('[data-icl-form]');
   const input = card.querySelector('[data-icl-input]');
   const sensitive = card.querySelector('[data-icl-sensitive]');
+  const send = card.querySelector('[data-icl-send]');
   const stop = card.querySelector('[data-icl-stop]');
   const close = card.querySelector('[data-icl-close]');
 
@@ -256,19 +261,7 @@ function _iclRevealSession(session) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       if (!input || input.disabled) return;
-      const value = input.value;
-      try {
-        await window.orkas.invoke('interactiveCli.send', {
-          session_id: session.id,
-          input: value,
-          add_newline: true,
-          sensitive: !!session.sensitive,
-        });
-        input.value = '';
-      } catch (err) {
-        _interactiveCliLog.warn('send input failed', { error: err && err.message });
-        if (typeof uiToast === 'function') uiToast(_iclT('interactive_cli.send_failed', 'Failed to send input'), { variant: 'error' });
-      }
+      await _iclSendInput(session, input, send);
     });
   }
   if (close) {
@@ -290,7 +283,56 @@ function _iclRevealSession(session) {
   _iclApplyState(session);
 }
 
+async function _iclSendInput(session, input, send) {
+  if (session.sendPromise) return session.sendPromise;
+  const value = input.value;
+  const operation = (async () => {
+    try {
+      await window.orkas.invoke('interactiveCli.send', {
+        session_id: session.id,
+        input: value,
+        add_newline: true,
+        sensitive: !!session.sensitive,
+      });
+      input.value = '';
+    } catch (err) {
+      _interactiveCliLog.warn('send input failed', { error: err && err.message });
+      if (typeof uiToast === 'function') {
+        uiToast(_iclT('interactive_cli.send_failed', 'Failed to send input'), { variant: 'error' });
+      }
+    }
+  })();
+  session.sendPromise = operation;
+  input.disabled = true;
+  if (send) send.disabled = true;
+  const sensitive = session.card && session.card.querySelector('[data-icl-sensitive]');
+  if (sensitive) sensitive.disabled = true;
+  try {
+    await operation;
+  } finally {
+    if (session.sendPromise === operation) session.sendPromise = null;
+    if (session.card) {
+      _iclApplyState(session);
+    } else {
+      const isRunning = session.status === 'running';
+      input.disabled = !isRunning;
+      if (send) send.disabled = !isRunning;
+    }
+  }
+}
+
+function _iclActiveUserId() {
+  const lexical = typeof currentUserId === 'string' ? currentUserId.trim() : '';
+  const global = typeof globalThis.currentUserId === 'string'
+    ? globalThis.currentUserId.trim()
+    : '';
+  return lexical || global;
+}
+
 function _iclHandleEvent(payload) {
+  const owner = String(payload && payload.user_id || '').trim();
+  const activeUser = _iclActiveUserId();
+  if (!owner || !activeUser || owner !== activeUser) return;
   const type = String(payload && payload.type || '');
   const session = _iclEnsureSession(payload, { reveal: false });
   if (!session) return;
@@ -325,4 +367,17 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
   } catch (err) {
     _interactiveCliLog.warn('interactive CLI push channel unavailable', { error: err && err.message });
   }
+}
+
+// Focused CommonJS bridge for deterministic renderer-state tests.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    _iclEsc,
+    _iclHandleEvent,
+    _iclLooksLikeInteractiveAuthUrl,
+    _iclOutputAsksForBrowserAction,
+    _iclSendInput,
+    _iclShouldRevealForOutput,
+    _iclSessionCountForTest: () => _interactiveCliSessions.size,
+  };
 }

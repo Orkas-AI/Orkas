@@ -14,6 +14,9 @@ import * as paths from '../../paths';
 import type { CatalogEntry, OAuthGrant, Transport } from './types';
 
 type EnvSynth = (access_token: string) => Record<string, string>;
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+const OBJECT_META_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
 // Cache the Electron-as-Node values once per process — `process.execPath` and PC_ROOT are
 // immutable at runtime. Lazy because `app` is undefined in vitest paths that pull this module
@@ -51,6 +54,16 @@ function _hasElectronAsNodePlaceholder(tpl: { command: string; args: string[] })
   return tpl.args.some((a) => /\$\{ORKAS_NODE\}/.test(a) || /\$\{ORKAS_PC_DIR\}/.test(a));
 }
 
+function _assertMappingKey(
+  value: string,
+  kind: 'environment variable' | 'HTTP header',
+  pattern: RegExp,
+): void {
+  if (!pattern.test(value) || OBJECT_META_KEYS.has(value.toLowerCase())) {
+    throw new Error(`invalid OAuth ${kind} name in transport template`);
+  }
+}
+
 const _SYNTHESIZERS: Record<string, EnvSynth> = {
   // Notion OAuth: the official @notionhq/notion-mcp-server reads `OPENAPI_MCP_HEADERS`, a JSON
   // blob holding the Authorization + Notion-Version headers.
@@ -71,14 +84,20 @@ export function applyTemplate(entry: CatalogEntry, grant: OAuthGrant): Transport
   }
   const tpl = entry.transport_template;
   const token = grant.access_token;
-  if (!token) throw new Error('OAuth grant has no access_token');
+  if (typeof token !== 'string' || !token.trim()) {
+    throw new Error('OAuth grant has no access_token');
+  }
   if (tpl.kind === 'stdio') {
+    if (tpl.env_synthesizer && tpl.oauth_env_key) {
+      throw new Error('OAuth stdio template cannot set both oauth_env_key and env_synthesizer');
+    }
     let env: Record<string, string> = {};
     if (tpl.env_synthesizer) {
       const synth = _SYNTHESIZERS[tpl.env_synthesizer];
       if (!synth) throw new Error(`unknown env_synthesizer: ${tpl.env_synthesizer}`);
       env = { ...synth(token) };
     } else if (tpl.oauth_env_key) {
+      _assertMappingKey(tpl.oauth_env_key, 'environment variable', ENV_KEY_RE);
       env[tpl.oauth_env_key] = token;
     } else {
       throw new Error('OAuth stdio template needs either oauth_env_key or env_synthesizer');
@@ -103,7 +122,10 @@ export function applyTemplate(entry: CatalogEntry, grant: OAuthGrant): Transport
   }
   // streamable-http
   const headers: Record<string, string> = {};
-  const headerName = tpl.oauth_header_key || 'Authorization';
+  const headerName = tpl.oauth_header_key === undefined
+    ? 'Authorization'
+    : tpl.oauth_header_key;
+  _assertMappingKey(headerName, 'HTTP header', HEADER_NAME_RE);
   // Always send `Bearer` per RFC 6750 — `grant.token_type` is descriptive metadata from the
   // provider (Slack returns "bot", Notion sometimes returns "bearer" lowercase), NOT a wire
   // hint for the HTTP Authorization header. Every MCP server we target treats anything but

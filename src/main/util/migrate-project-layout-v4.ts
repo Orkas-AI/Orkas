@@ -27,6 +27,7 @@ import {
 import { readJsonSync, safeId, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 import { listProjectIds, cloudRelForAbs } from './project-layout';
+import { logErrorSummary, maskId } from './log-redact';
 
 const log = createLogger('migrate-project-layout-v4');
 
@@ -580,7 +581,7 @@ export function migrateProjectLayoutV4(
     });
     if (moves.length || stats.warnings.length) {
       log.info('project layout v4 migration complete', {
-        uid,
+        userId: maskId(uid),
         moved_conversations: stats.moved_conversations,
         moved_sessions: stats.moved_sessions,
         moved_attachments: stats.moved_attachments,
@@ -593,7 +594,10 @@ export function migrateProjectLayoutV4(
     }
   } catch (err) {
     stats.warnings.push((err as Error).message);
-    log.warn('project layout v4 migration failed', { uid, error: (err as Error).message });
+    log.warn('project layout v4 migration failed', {
+      userId: maskId(uid),
+      error: logErrorSummary(err),
+    });
   } finally {
     try { stats.move_log_entries += flushMoveJournal(uid); }
     catch (err) { stats.warnings.push(`flush move journal failed: ${(err as Error).message}`); }

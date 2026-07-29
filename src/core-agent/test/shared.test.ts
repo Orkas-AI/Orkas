@@ -5,6 +5,7 @@ import {
   RateLimitError,
   ContextOverflowError,
   ProviderError,
+  StorageFullError,
   TimeoutError,
   configureRetryErrorPolicy,
   classifyRetryableError,
@@ -12,6 +13,7 @@ import {
   classifyTransientNetworkError,
   getRetryErrorPolicy,
   isRetryableError,
+  isStorageFullError,
   isTransientNetworkError,
   formatError,
 } from "../src/shared/errors.js";
@@ -45,6 +47,12 @@ describe("Errors", () => {
     const err = new ProviderError("boom", "anthropic", 500);
     expect(err.provider).toBe("anthropic");
     expect(err.statusCode).toBe(500);
+  });
+
+  it("StorageFullError carries a stable machine-readable code", () => {
+    const err = new StorageFullError("no space left on device");
+    expect(err).toBeInstanceOf(CoreAgentError);
+    expect(err.code).toBe("STORAGE_FULL");
   });
 
   describe("isRetryableError", () => {
@@ -112,6 +120,11 @@ describe("Errors", () => {
       expect(isRetryableError(err)).toBe(true);
       expect(classifyRetryableError(err)).toBe("connection_dropped");
       expect(classifyTransientNetworkError(err)).toBe("connection_dropped");
+    });
+
+    it("does not retry an explicit empty provider terminal", () => {
+      const err = Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_RESPONSE" });
+      expect(isRetryableError(err)).toBe(false);
     });
 
     it("returns true for hosted WebSocket stream drops", () => {
@@ -184,6 +197,64 @@ describe("Errors", () => {
       expect(isRetryableError(wrappedAuth)).toBe(false);
     });
 
+    it("never retries structured provider safety errors even when runtime policy removes every blacklist", () => {
+      const policy = {
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      };
+      const azureSafety = Object.assign(new Error("Request rejected by provider"), {
+        code: "ResponsibleAIPolicyViolation",
+      });
+      const wrappedGoogleSafety = Object.assign(new Error("Provider request failed"), {
+        cause: {
+          code: "PROHIBITED_CONTENT",
+          message: "Candidate unavailable",
+        },
+      });
+
+      expect(classifyRetryableErrorWithPolicy(azureSafety, policy)).toBeNull();
+      expect(classifyRetryableErrorWithPolicy(wrappedGoogleSafety, policy)).toBeNull();
+    });
+
+    it("does not suppress recovery for unrelated safety-service transport failures", () => {
+      expect(classifyRetryableError(
+        new Error("Safety telemetry connection rejected by proxy"),
+      )).toBe("network");
+      expect(classifyRetryableError(
+        Object.assign(new Error("Request failed"), { code: "SAFETY_CHECK_TIMEOUT" }),
+      )).toBe("network");
+    });
+
+    it("never retries exhausted-storage errors", () => {
+      const enospc = Object.assign(new Error("write failed"), { code: "ENOSPC" });
+      const sqliteFull = Object.assign(new Error("database write failed"), { code: "SQLITE_FULL" });
+      const wrapped = Object.assign(new TypeError("fetch failed"), { cause: enospc });
+
+      expect(isStorageFullError(enospc)).toBe(true);
+      expect(isRetryableError(enospc)).toBe(false);
+      expect(isRetryableError(sqliteFull)).toBe(false);
+      expect(isRetryableError(wrapped)).toBe(false);
+      expect(isRetryableError(new ProviderError("ENOSPC: no space left on device, write", "test-provider"))).toBe(false);
+      expect(isRetryableError(new ProviderError("Insufficient Storage", "test-provider", 507))).toBe(false);
+    });
+
+    it("runtime retry policy cannot make storage exhaustion retryable", () => {
+      const policy = {
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      };
+      expect(classifyRetryableErrorWithPolicy(
+        Object.assign(new Error("write failed"), { code: "ENOSPC" }),
+        policy,
+      )).toBeNull();
+      expect(classifyRetryableErrorWithPolicy(
+        new ProviderError("Insufficient Storage", "test-provider", 507),
+        policy,
+      )).toBeNull();
+    });
+
     it("allows runtime retry policy to override the permanent blacklist", () => {
       configureRetryErrorPolicy({
         permanent_statuses: [],
@@ -195,9 +266,10 @@ describe("Errors", () => {
       expect(getRetryErrorPolicy().permanent_statuses).toEqual([]);
     });
 
-    it("never retries a provider set already exhausted by the rotating provider", () => {
+    it("never retries rotating-provider terminal outcomes", () => {
       for (const code of [
         "PROVIDER_NO_FIRST_EVENT_TIMEOUT",
+        "PROVIDER_EMPTY_RESPONSE",
         "PROVIDER_NETWORK_EXHAUSTED",
         "PROVIDER_RATE_LIMIT_EXHAUSTED",
       ]) {
@@ -263,6 +335,8 @@ describe("Errors", () => {
     it("matches via code on direct error", () => {
       expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "ECONNRESET" }))).toBe(true);
       expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "UND_ERR_CONNECT_TIMEOUT" }))).toBe(true);
+      expect(classifyTransientNetworkError(Object.assign(new Error("x"), { code: "ETIMEDOUT" }))).toBe("timeout");
+      expect(classifyTransientNetworkError(Object.assign(new Error("x"), { code: "UND_ERR_HEADERS_TIMEOUT" }))).toBe("timeout");
     });
 
     it("walks cause chain", () => {

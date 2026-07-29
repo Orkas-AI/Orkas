@@ -19,16 +19,17 @@ function dirs(root: string): string[] {
   }
 }
 
-function idSet(root: string): Set<string> {
-  return new Set(dirs(root));
+function idSet(root: string, marker: 'agent.json' | 'SKILL.md'): Set<string> {
+  return new Set(dirs(root).filter((id) => fs.existsSync(path.join(root, id, marker))));
 }
 
 describe('official marketplace Resource registry', () => {
   it('keeps Resource and builtin marketplace ids disjoint per kind', () => {
     const root = repoRoot();
     for (const kind of ['agents', 'skills'] as const) {
-      const resourceIds = idSet(path.join(root, 'Resource', kind));
-      const builtinIds = idSet(path.join(root, 'PC', 'resources', 'builtin', 'marketplace', kind));
+      const marker = kind === 'agents' ? 'agent.json' : 'SKILL.md';
+      const resourceIds = idSet(path.join(root, 'Resource', kind), marker);
+      const builtinIds = idSet(path.join(root, 'PC', 'resources', 'builtin', 'marketplace', kind), marker);
       const overlap = [...resourceIds].filter((id) => builtinIds.has(id)).sort();
       expect(overlap, `${kind} ids exist in both Resource and builtin trees`).toEqual([]);
     }

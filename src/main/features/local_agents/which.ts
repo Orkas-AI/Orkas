@@ -20,13 +20,13 @@ import * as path from 'node:path';
 
 const isWindows = process.platform === 'win32';
 
-/** Scan PATH and return the first absolute path matching `name`, or null. */
-export async function whichBin(name: string, opts: { extraDirs?: string[] } = {}): Promise<string | null> {
-  if (!name) return null;
+/** Scan PATH and return every absolute path matching `name`, in search order. */
+export async function whichBins(name: string, opts: { extraDirs?: string[] } = {}): Promise<string[]> {
+  if (!name) return [];
 
   // Absolute or relative path with separator → caller already resolved.
   if (path.isAbsolute(name) || name.includes(path.sep) || (isWindows && name.includes('/'))) {
-    return (await isExecutableFile(name)) ? path.resolve(name) : null;
+    return (await isExecutableFile(name)) ? [path.resolve(name)] : [];
   }
 
   const pathEnv = process.env.PATH ?? '';
@@ -34,28 +34,41 @@ export async function whichBin(name: string, opts: { extraDirs?: string[] } = {}
     ...pathEnv.split(path.delimiter).filter(Boolean),
     ...(opts.extraDirs ?? []),
   ]);
-  if (dirs.length === 0) return null;
+  if (dirs.length === 0) return [];
 
   const exts = isWindows ? winExtCandidates() : [''];
+  const matches: string[] = [];
 
   for (const dir of dirs) {
     for (const ext of exts) {
       const candidate = path.join(dir, name + ext);
       if (await isExecutableFile(candidate)) {
-        return candidate;
+        matches.push(candidate);
+        // A bare Windows command and its PATHEXT variants represent
+        // alternatives in the same directory. Preserve LookPath semantics
+        // within that directory and continue with the next directory.
+        break;
       }
     }
   }
-  return null;
+  return matches;
+}
+
+/** Scan PATH and return the first absolute path matching `name`, or null. */
+export async function whichBin(name: string, opts: { extraDirs?: string[] } = {}): Promise<string | null> {
+  return (await whichBins(name, opts))[0] ?? null;
 }
 
 function uniqueDirs(dirs: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const dir of dirs) {
-    const trimmed = String(dir || '').trim();
-    if (!trimmed) continue;
-    const resolved = path.resolve(trimmed);
+    let value = String(dir || '').trim();
+    if (isWindows && value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1).trim();
+    }
+    if (!value) continue;
+    const resolved = path.resolve(value);
     const key = isWindows ? resolved.toLowerCase() : resolved;
     if (seen.has(key)) continue;
     seen.add(key);

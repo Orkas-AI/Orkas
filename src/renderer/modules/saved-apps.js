@@ -44,6 +44,19 @@
     try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
   }
 
+  function _trackManageResult(startedAt, action, result, errorCode = '') {
+    try {
+      if (!window.Monitor) return;
+      const payload = {
+        result,
+        action,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      };
+      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      Monitor.event('saved_app_manage_result', payload);
+    } catch (_) {}
+  }
+
   function _esc(s) {
     return String(s == null ? '' : s)
       .replace(/&/g, '&amp;')
@@ -225,13 +238,22 @@
   // (mirrors `agents.js::useAgent`'s create-conv-and-go pattern, but doesn't
   // auto-send — the user completes the request and hits Send).
   async function _editApp(appId) {
+    const startedAt = Date.now();
     let r;
     try {
       r = await window.orkas.invoke('savedApps.openForEditing', { appId: String(appId) });
       if (!r || r.ok === false) throw new Error((r && r.error) || 'open-for-editing failed');
-    } catch (err) { _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err); return; }
+    } catch (err) {
+      _trackManageResult(startedAt, 'edit', 'failure', 'open_failed');
+      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err);
+      return;
+    }
     const conv = r.conversation;
-    if (!conv || !conv.conversation_id) { _fail(_t('apps.edit_failed', 'Could not open an edit conversation')); return; }
+    if (!conv || !conv.conversation_id) {
+      _trackManageResult(startedAt, 'edit', 'failure', 'invalid_response');
+      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
+      return;
+    }
     // Add to the sidebar list. Set last_active_at explicitly — backend
     // create response doesn't include the derived field, so timeBucket
     // would otherwise put this brand-new row in the 'older' bucket.
@@ -261,6 +283,7 @@
       }
       if (typeof _chatAttachRefreshFromServer === 'function') _chatAttachRefreshFromServer(conv.conversation_id);
     } catch (err) { _appsLog.warn('edit post-nav setup failed', err && err.message ? err.message : err); }
+    _trackManageResult(startedAt, 'edit', 'success');
   }
 
   async function _renameApp(appId) {
@@ -272,10 +295,16 @@
     if (next == null) return; // cancelled
     next = String(next).trim();
     if (!next || (cur && next === cur.title)) return;
+    const startedAt = Date.now();
     try {
       const r = await window.orkas.invoke('savedApps.rename', { appId: String(appId), title: next });
       if (!r || r.ok === false) throw new Error((r && r.error) || 'rename failed');
-    } catch (err) { _fail(_t('apps.rename_failed', 'Could not rename'), err); }
+    } catch (err) {
+      _trackManageResult(startedAt, 'rename', 'failure', 'rename_failed');
+      _fail(_t('apps.rename_failed', 'Could not rename'), err);
+      return;
+    }
+    _trackManageResult(startedAt, 'rename', 'success');
     loadSavedApps(true);
   }
 
@@ -294,10 +323,16 @@
       } else { ok = true; }
     } catch (_) { ok = false; }
     if (!ok) return;
+    const startedAt = Date.now();
     try {
       const r = await window.orkas.invoke('savedApps.delete', { appId: String(appId) });
       if (!r || r.ok === false) throw new Error((r && r.error) || 'delete failed');
-    } catch (err) { _fail(_t('apps.delete_failed', 'Could not delete'), err); }
+    } catch (err) {
+      _trackManageResult(startedAt, 'delete', 'failure', 'delete_failed');
+      _fail(_t('apps.delete_failed', 'Could not delete'), err);
+      return;
+    }
+    _trackManageResult(startedAt, 'delete', 'success');
     loadSavedApps(true);
   }
 

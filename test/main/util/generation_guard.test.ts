@@ -27,6 +27,16 @@ describe('noteGeneration', () => {
     expect(noteGeneration(undefined, '/ws/x.mp4')).toBe(1);
     expect(noteGeneration(undefined, '/ws/x.mp4')).toBe(2);
   });
+
+  it('evicts the oldest deliverable after the bounded cache reaches capacity', () => {
+    expect(noteGeneration('old-cid', '/ws/old.png')).toBe(1);
+    for (let index = 0; index < 2_000; index += 1) {
+      expect(noteGeneration(`cid-${index}`, `/ws/${index}.png`)).toBe(1);
+    }
+
+    expect(noteGeneration('old-cid', '/ws/old.png')).toBe(1);
+    expect(noteGeneration('cid-1999', '/ws/1999.png')).toBe(2);
+  });
 });
 
 describe('regenerationWarning', () => {

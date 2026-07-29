@@ -3,7 +3,9 @@
  *
  * Logical channels exposed to the renderer:
  *   - `localAgents.list`             → all known CLI types with availability + version
- *   - `localAgents.detect`           → single-CLI re-probe (bypasses cache)
+ *                                      (`validate:false` does path-only discovery)
+ *   - `localAgents.detect`           → single-CLI re-probe (bypasses cache;
+ *                                      callers may run types concurrently)
  *   - `localAgents.listModels`       → static model catalog for a CLI type
  *   - `localAgents.readToolResult`   → read a spilled CLI tool_result file
  *                                       (renderer click-to-expand)
@@ -17,7 +19,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
+import { detectAll, detectOne, findAllInstalled, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
 import * as bridgePermissions from '../features/local_agents/bridge_permissions.js';
 import * as bashPermissions from '../model/core-agent/bash-permissions.js';
 import {
@@ -67,20 +69,25 @@ function maskUnsupported(entries: LocalCliEntry[]): LocalCliEntry[] {
 
 export const invokeHandlers = {
   /**
-   * List all known CLI types. Default uses the 60s cache; pass
-   * `{ force: true }` to invalidate first (settings page refresh button,
-   * for instance, would want a fresh probe).
+   * List all known CLI types. Default runs version validation and uses the
+   * process-lifetime cache; pass `{ force: true }` to refresh it. The
+   * External-agent create panel first requests `{ validate:false }`, which
+   * performs only executable-path discovery and never starts a CLI process.
    */
-  'localAgents.list': async ({ force = false }: { force?: boolean } = {}) => {
-    const entries = await detectAll({ force: !!force });
+  'localAgents.list': async (
+    { force = false, validate = true }: { force?: boolean; validate?: boolean } = {},
+  ) => {
+    const entries = validate === false
+      ? await findAllInstalled()
+      : await detectAll({ force: !!force });
     return { entries: maskUnsupported(entries) };
   },
 
   /**
    * Re-probe a single CLI without the cache. Used at execute-time by
    * the runner to make sure a recently-uninstalled binary doesn't slip
-   * through, and by the create-modal to refresh after the user changes
-   * the relevant `ORKAS_<TYPE>_PATH` env var.
+   * through, and by the create-modal to progressively render each CLI as its
+   * independent version probe completes.
    */
   'localAgents.detect': async ({ type }: { type?: unknown }) => {
     if (!isLocalCliType(type)) throw new Error('invalid CLI type');

@@ -35,7 +35,7 @@ const CID = 'c0a1b2c3d4e5';
 // (concurrent embed on the shared ONNX session is safe — see header).
 const PARALLEL_ALLOWLIST = [
   'chat_read', 'chat_search',
-  'grep_files', 'kb_list', 'kb_read', 'kb_search', 'list_files', 'read_file', 'search_files',
+  'grep_files', 'kb_list', 'kb_read', 'kb_search', 'list_files', 'read_file', 'read_files', 'search_files',
 ].sort();
 
 let tmpDir: string;

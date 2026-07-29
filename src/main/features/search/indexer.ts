@@ -668,9 +668,17 @@ async function _upsertChatMessageDoc(
   _markDirty(idxPath);
 }
 
-export function indexChatMessage(userId: string, cid: string, msgIndex: number, msg: ChatMessage): void {
-  _upsertChatMessageDoc(userId, cid, msgIndex, msg)
-    .catch((err) => log.warn(`index chat msg failed: ${err.message}`));
+export function indexChatMessage(
+  userId: string,
+  cid: string,
+  msgIndex: number,
+  msg: ChatMessage,
+): Promise<void> {
+  return _upsertChatMessageDoc(userId, cid, msgIndex, msg)
+    .catch((err) => {
+      _currentChatIndexes.delete(userId);
+      log.warn(`index chat msg failed: ${err.message}`);
+    });
 }
 
 async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
@@ -684,8 +692,10 @@ async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
   _markDirty(idxPath);
 }
 
-export function dropChatConversation(userId: string, cid: string): void {
-  _dropChatFile(userId, cid).catch(() => {});
+export function dropChatConversation(userId: string, cid: string): Promise<void> {
+  return _dropChatFile(userId, cid).catch(() => {
+    _currentChatIndexes.delete(userId);
+  });
 }
 
 // ── Internal handle for query-side reads ─────────────────────────────────

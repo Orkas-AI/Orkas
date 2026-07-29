@@ -1176,6 +1176,55 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.workflow).toBe('wf');  // preserved
   });
 
+  it('finishes an in-flight rename against the account that started it', async () => {
+    writeCustomAgent('abc', { name: 'Old' });
+    const otherUid = 'u2';
+    const otherAgentDir = path.join(tmpDir, otherUid, 'cloud', 'agents', 'abc');
+    fs.mkdirSync(otherAgentDir, { recursive: true });
+    fs.writeFileSync(path.join(otherAgentDir, 'agent.json'), JSON.stringify({
+      agent_id: 'abc',
+      name: 'Other',
+      description: 'Other account agent',
+      workflow: '',
+    }));
+    const membersFiles = new Map<string, string>();
+    for (const [uid, name] of [[TEST_UID, 'Old'], [otherUid, 'Other']] as const) {
+      const chatsDir = path.join(tmpDir, uid, 'cloud', 'chats');
+      const cid = `chat-${uid}`;
+      const chatDir = path.join(chatsDir, cid);
+      fs.mkdirSync(chatDir, { recursive: true });
+      fs.writeFileSync(path.join(chatsDir, '_index.json'), JSON.stringify([
+        { conversation_id: cid },
+      ]));
+      const membersFile = path.join(chatDir, 'members.json');
+      fs.writeFileSync(membersFile, JSON.stringify({
+        version: 1,
+        actors: [{
+          kind: 'agent',
+          id: 'abc',
+          name,
+          joined_at: '2026-07-24T00:00:00.000Z',
+        }],
+      }));
+      membersFiles.set(uid, membersFile);
+    }
+
+    const a = await loadAgents();
+    const rename = a.updateCustomAgent('abc', { name: 'Renamed' });
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(otherUid);
+    await rename;
+
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')).name)
+      .toBe('Renamed');
+    expect(JSON.parse(fs.readFileSync(path.join(otherAgentDir, 'agent.json'), 'utf8')).name)
+      .toBe('Other');
+    expect(JSON.parse(fs.readFileSync(membersFiles.get(TEST_UID)!, 'utf8')).actors[0].name)
+      .toBe('Renamed');
+    expect(JSON.parse(fs.readFileSync(membersFiles.get(otherUid)!, 'utf8')).actors[0].name)
+      .toBe('Other');
+  });
+
   it('routes a single description update by current UI language, preserving historical other-language text', async () => {
     const { setLanguage } = await import('../../../src/main/features/config');
     setLanguage('zh');
@@ -1766,6 +1815,17 @@ describe('agents › deleteCustomAgent', () => {
     expect(await a.deleteCustomAgent('ghost')).toBe(false);
   });
 
+  it('rejects traversal ids without deleting sibling cloud resources', async () => {
+    const protectedDir = path.join(tmpDir, TEST_UID, 'cloud', 'skills', 'protected-resource');
+    fs.mkdirSync(protectedDir, { recursive: true });
+    const protectedFile = path.join(protectedDir, 'SKILL.md');
+    fs.writeFileSync(protectedFile, '# must survive');
+    const a = await loadAgents();
+
+    expect(await a.deleteCustomAgent('../skills/protected-resource')).toBe(false);
+    expect(fs.readFileSync(protectedFile, 'utf8')).toBe('# must survive');
+  });
+
   it('drops per-user agent chat dirs on delete', async () => {
     writeCustomAgent('victim');
     const chatDir = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'victim');
@@ -1786,6 +1846,51 @@ describe('agents › deleteCustomAgent', () => {
     const a = await loadAgents();
     await a.deleteCustomAgent('victim');
     expect(fs.existsSync(sessionFile)).toBe(false);
+  });
+
+  it('deletes only the active account Agent-owned state', async () => {
+    writeCustomAgent('victim');
+    const otherUid = 'u2';
+    const currentAgentMemory = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'victim', 'MEMORY.md');
+    const otherAgentMemory = path.join(tmpDir, otherUid, 'cloud', 'memory', 'agents', 'victim', 'MEMORY.md');
+    const currentChat = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'victim');
+    const otherChat = path.join(tmpDir, otherUid, 'cloud', 'chats', 'agent', 'victim');
+    const currentSession = path.join(tmpDir, TEST_UID, 'cloud', 'sessions', 'agent-victim.jsonl');
+    const otherSession = path.join(tmpDir, otherUid, 'cloud', 'sessions', 'agent-victim.jsonl');
+    const currentRuntime = path.join(tmpDir, TEST_UID, 'local', 'config', 'agent-runtime.json');
+    const otherRuntime = path.join(tmpDir, otherUid, 'local', 'config', 'agent-runtime.json');
+    for (const [chat, session, memory, runtime] of [
+      [currentChat, currentSession, currentAgentMemory, currentRuntime],
+      [otherChat, otherSession, otherAgentMemory, otherRuntime],
+    ]) {
+      fs.mkdirSync(chat, { recursive: true });
+      fs.writeFileSync(path.join(chat, 'chat.jsonl'), '{"role":"user"}\n');
+      fs.mkdirSync(path.dirname(session), { recursive: true });
+      fs.writeFileSync(session, '{"role":"user"}\n');
+      fs.mkdirSync(path.dirname(memory), { recursive: true });
+      fs.writeFileSync(memory, 'private preference');
+      fs.mkdirSync(path.dirname(runtime), { recursive: true });
+      fs.writeFileSync(runtime, JSON.stringify({
+        version: 1,
+        project_dirs: {
+          victim: { path: path.join(tmpDir, 'project') },
+          keep: { path: path.join(tmpDir, 'keep') },
+        },
+      }));
+    }
+
+    const a = await loadAgents();
+    expect(await a.deleteCustomAgent('victim')).toBe(true);
+
+    expect(fs.existsSync(currentChat)).toBe(false);
+    expect(fs.existsSync(currentSession)).toBe(false);
+    expect(fs.existsSync(currentAgentMemory)).toBe(false);
+    expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).project_dirs.victim).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).project_dirs.keep).toBeDefined();
+    expect(fs.existsSync(otherChat)).toBe(true);
+    expect(fs.existsSync(otherSession)).toBe(true);
+    expect(fs.existsSync(otherAgentMemory)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(otherRuntime, 'utf8')).project_dirs.victim).toBeDefined();
   });
 
   it('does not delete existing tasks that reference the agent legacy field', async () => {

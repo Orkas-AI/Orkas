@@ -9,6 +9,7 @@
 
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -21,6 +22,7 @@ import {
 } from '../paths';
 import { bundledRuntimeEnv } from '../util/bundled-runtime';
 import { createLogger } from '../logger';
+import { flattenTransparentImageToJpeg } from '../util/image-transform';
 
 const execFileAsync = promisify(execFile);
 const log = createLogger('ocr-runtime');
@@ -29,7 +31,7 @@ export const OCR_RUNTIME_KEY = `ocr-rapidocr-3.9.0-onnxruntime-1.27.0-pypdfium2-
 const RAPIDOCR_VERSION = '3.9.0';
 const ONNXRUNTIME_VERSION = '1.27.0';
 const PYPDFIUM2_VERSION = '5.10.1';
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const OCR_TIMEOUT_MS = 5 * 60 * 1000;
 const INSTALL_TIMEOUT_MS = 10 * 60 * 1000;
 const VERIFY_TIMEOUT_MS = 2 * 60 * 1000;
@@ -210,7 +212,10 @@ async function ensureRuntimeUncached(onProgress?: ProgressFn): Promise<RuntimeRe
       data: { runtimePath: venv },
     });
     await withHeartbeat(
-      execFileAsync(uv, ['venv', '--python', bundledPython, venv], {
+      // Verification already proved this environment is unusable. `--clear`
+      // makes first-use provisioning idempotent when an earlier install left
+      // the directory behind (uv otherwise exits with "already exists").
+      execFileAsync(uv, ['venv', '--clear', '--python', bundledPython, venv], {
         timeout: INSTALL_TIMEOUT_MS,
         env,
         windowsHide: true,
@@ -351,24 +356,64 @@ function cleanPages(pages: string | undefined): string {
   return String(pages || '').replace(/\s+/g, '').trim();
 }
 
-function fileFingerprint(absPath: string): { size: number; mtime: number } {
-  const stat = fs.statSync(absPath);
+async function prepareImageInput(absPath: string): Promise<{ path: string; cleanup: () => void }> {
+  const ext = path.extname(absPath).toLowerCase();
+  if (!['.png', '.webp', '.gif'].includes(ext)) {
+    return { path: absPath, cleanup: () => {} };
+  }
+  try {
+    const flattened = await flattenTransparentImageToJpeg(fs.readFileSync(absPath));
+    if (!flattened) return { path: absPath, cleanup: () => {} };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ocr-input-'));
+    const preparedPath = path.join(dir, 'input.jpg');
+    fs.writeFileSync(preparedPath, flattened.buf);
+    return {
+      path: preparedPath,
+      cleanup: () => {
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      },
+    };
+  } catch (err) {
+    log.warn(`transparent image normalization failed path=${absPath}: ${(err as Error).message}`);
+    return { path: absPath, cleanup: () => {} };
+  }
+}
+
+async function fileFingerprint(
+  absPath: string,
+): Promise<{ size: number; mtime: number; ctime: number; contentSha256: string }> {
+  const stat = await fs.promises.stat(absPath);
   if (!stat.isFile()) throw new Error(`not a file: ${absPath}`);
-  return { size: stat.size, mtime: Math.floor(stat.mtimeMs) };
+  const digest = crypto.createHash('sha256');
+  for await (const chunk of fs.createReadStream(absPath)) digest.update(chunk);
+  // Filesystem timestamps can collide or be deliberately preserved during a same-size
+  // replacement. Content identity keeps those writes from reusing stale OCR.
+  return {
+    size: stat.size,
+    mtime: stat.mtimeMs,
+    ctime: stat.ctimeMs,
+    contentSha256: digest.digest('hex'),
+  };
 }
 
 function hash(s: string): string {
   return crypto.createHash('sha1').update(s).digest('hex');
 }
 
-function cachePaths(userId: string, absPath: string, pages: string): { dir: string; file: string } {
-  const fp = fileFingerprint(absPath);
+async function cachePaths(
+  userId: string,
+  absPath: string,
+  pages: string,
+): Promise<{ dir: string; file: string }> {
+  const fp = await fileFingerprint(absPath);
   const sourceHash = hash(absPath).slice(0, 16);
   const taskHash = hash(JSON.stringify({
     cacheVersion: CACHE_VERSION,
     absPath,
     size: fp.size,
     mtime: fp.mtime,
+    ctime: fp.ctime,
+    contentSha256: fp.contentSha256,
     pages,
     runtime: OCR_RUNTIME_KEY,
   })).slice(0, 16);
@@ -436,7 +481,7 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
   }
 
   let pages = cleanPages(input.pages);
-  const { file: cacheFile, dir: cacheDir } = cachePaths(input.userId, input.absPath, pages);
+  const { file: cacheFile, dir: cacheDir } = await cachePaths(input.userId, input.absPath, pages);
   try {
     if (fs.existsSync(cacheFile)) {
       const content = fs.readFileSync(cacheFile, 'utf8')
@@ -461,15 +506,17 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
   }
 
   emitProgress({ phase: 'ocr_run', message: kind === 'pdf' ? 'Rendering PDF pages and running OCR' : 'Running OCR' });
-  const payload = JSON.stringify({
-    path: input.absPath,
-    kind,
-    pages,
-    scale: 2,
-  });
-
   let stdout = '';
+  const preparedInput = kind === 'image'
+    ? await prepareImageInput(input.absPath)
+    : { path: input.absPath, cleanup: () => {} };
   try {
+    const payload = JSON.stringify({
+      path: preparedInput.path,
+      kind,
+      pages,
+      scale: 2,
+    });
     stdout = await runOcrProcess(runtime.python, payload, emitProgress, input.signal);
   } catch (err) {
     if (!input.signal?.aborted) invalidateRuntimeCache(runtime.python);
@@ -481,6 +528,8 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
       message: `Local OCR failed: ${(err as Error).message}`,
       processLog,
     };
+  } finally {
+    preparedInput.cleanup();
   }
 
   try {
@@ -549,13 +598,16 @@ export async function ocrImageText(input: {
   if (runtime.ok === false) {
     return { ok: false, errorCode: runtime.errorCode, message: runtime.message };
   }
-  const payload = JSON.stringify({ path: input.absPath, kind: 'image', pages: '', scale: 2 });
   let stdout = '';
+  const preparedInput = await prepareImageInput(input.absPath);
   try {
+    const payload = JSON.stringify({ path: preparedInput.path, kind: 'image', pages: '', scale: 2 });
     stdout = await runOcrProcess(runtime.python, payload, input.onProgress, input.signal);
   } catch (err) {
     if (!input.signal?.aborted) invalidateRuntimeCache(runtime.python);
     return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR failed: ${(err as Error).message}` };
+  } finally {
+    preparedInput.cleanup();
   }
   try {
     const parsed = JSON.parse(stdout) as {

@@ -30,6 +30,7 @@ import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
 import { fetchWithTimeout } from '../../util/abort';
+import { broadcastOAuthConnectProgress } from './oauth-events';
 import type { CatalogEntry, DcrClientCredentials, OAuthGrant, Transport } from './types';
 
 const log = createLogger('connectors:oauth-dcr');
@@ -41,6 +42,7 @@ const CLIENT_NAME = 'Orkas';
 
 interface PendingDcrFlow {
   catalogId: string;
+  attemptId?: string;
   state: string;            // CSRF token — match incoming deep link
   codeVerifier: string;     // PKCE
   redirectUri: string;
@@ -254,6 +256,7 @@ function _genPkce(): { verifier: string; challenge: string } {
 export async function startMcpDcrOAuth(
   _uid: string,
   entry: CatalogEntry,
+  opts: { attemptId?: string } = {},
 ): Promise<{ grant: OAuthGrant; client: DcrClientCredentials }> {
   if (!entry.transport_template || entry.transport_template.kind !== 'streamable-http') {
     throw new Error('DCR flow only supports streamable-http transports');
@@ -318,6 +321,7 @@ export async function startMcpDcrOAuth(
     timer.unref?.();
     _pending = {
       catalogId: entry.id,
+      ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       state,
       codeVerifier: pkce.verifier,
       redirectUri,
@@ -352,6 +356,12 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   if (status === 'error') { _cancelPending(`server error: ${reason || 'unknown'}`); return; }
   const exchangeCode = url.searchParams.get('exchange_code');
   if (!exchangeCode) { _cancelPending('missing exchange_code'); return; }
+  if (pending.attemptId) {
+    broadcastOAuthConnectProgress({
+      attempt_id: pending.attemptId,
+      catalog_id: pending.catalogId,
+    });
+  }
 
   // Pull {oauth_code, oauth_state} from Server. Server uses the namespaced keys (not bare
   // `code`/`state`) because `json_response` spreads data flat — a bare `code` key would

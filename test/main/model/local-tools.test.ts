@@ -6,6 +6,14 @@ import * as path from 'node:path';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 const SHELL_SUCCESS_TIMEOUT_MS = process.platform === 'win32' ? 15_000 : 5_000;
 
+function testNodeCommand(script: string): string {
+  if (process.platform === 'win32') {
+    const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+    return `& ${quote(TEST_NODE)} -e ${quote(script)}`;
+  }
+  return `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+}
+
 // ── Electron mock (for html_to_pdf / markdown_to_pdf paths) ─────────────
 
 const printToPDF = vi.fn(async () => Buffer.from('%PDF-1.4 test', 'utf8'));
@@ -114,20 +122,26 @@ function writeFakeCommand(dir: string, name: string, source: string): void {
 // ── Tool identity ─────────────────────────────────────────────────────────
 
 describe('local-tools › identity', () => {
-  it('exposes local shell/file/pdf tools plus interactive CLI session tools', async () => {
+  it('exposes local shell/file/pdf tools plus persistent and interactive session tools', async () => {
     const { lt } = await loadModules();
     const tools = lt.createLocalTools({});
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
+        'apply_patch',
         'bash',
         'delete_file',
         'edit_file',
+        'html_preview',
         'html_to_pdf',
         'interactive_cli_close',
         'interactive_cli_read',
         'interactive_cli_send',
         'interactive_cli_start',
         'markdown_to_pdf',
+        'process_read',
+        'process_start',
+        'process_stop',
+        'process_write',
         'write_file',
       ],
     );
@@ -171,9 +185,10 @@ describe('local-tools › identity', () => {
     expect(wf.description.toLowerCase()).toContain('workspace');
   });
 
-  it('blocks unmanaged QA runtimes only for VideoStudio', async () => {
+  it('blocks unmanaged QA runtimes for the built-in studio agents only', async () => {
     const { lt } = await loadModules();
     const videoBash = lt.createLocalTools({ agentId: '79df9cc89f5f' }).find((t) => t.name === 'bash')!;
+    const imageBash = lt.createLocalTools({ agentId: '814b61b027f0' }).find((t) => t.name === 'bash')!;
     const otherBash = lt.createLocalTools({ agentId: 'another-agent' }).find((t) => t.name === 'bash')!;
 
     const blocked = await videoBash.execute({
@@ -182,6 +197,13 @@ describe('local-tools › identity', () => {
     }, makeCtx());
     expect(blocked.isError).toBe(true);
     expect(blocked.content).toContain('E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
+
+    const imageBlocked = await imageBash.execute({
+      command: 'npx playwright test',
+      timeoutMs: 5000,
+    }, makeCtx());
+    expect(imageBlocked.isError).toBe(true);
+    expect(imageBlocked.content).toContain('E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
 
     const allowed = await otherBash.execute({
       command: 'echo safe',
@@ -564,7 +586,7 @@ describe('local-tools › bash filesystem mutation scope', () => {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const script = `require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'blocked')`;
       const res = await bash.execute({
-        command: `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`,
+        command: testNodeCommand(script),
         timeoutMs: 5000,
       }, makeCtx());
       expect(res.isError).toBe(true);
@@ -596,15 +618,17 @@ describe('local-tools › interactive_cli tools', () => {
     const read = toolByName(tools, 'interactive_cli_read');
     const close = toolByName(tools, 'interactive_cli_close');
     const script = "process.stdout.write('Enter verification code: '); process.stdin.once('data', d => { process.stdout.write('got:' + d.toString().trim()); process.exit(0); });";
-    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+    const command = testNodeCommand(script);
 
-    const started = parseToolJson(await start.execute({
+    const startResult = await start.execute({
       command,
       max_lifetime_ms: 30000,
-    }, makeCtx()));
+    }, makeCtx());
+    const started = parseToolJson(startResult);
     expect(started.session_id).toMatch(/[0-9a-f-]{20,}/i);
     expect(String(started.output)).toContain('verification code');
     expect(started.prompt_kind).toBe('auth_code');
+    expect(startResult.endTurn).toBe(true);
 
     const sent = parseToolJson(await send.execute({
       session_id: started.session_id,
@@ -655,7 +679,7 @@ describe('local-tools › interactive_cli tools', () => {
     const start = toolByName(tools, 'interactive_cli_start');
     const read = toolByName(tools, 'interactive_cli_read');
     const script = "process.stderr.write('Missing provider auth configuration.'); process.exit(2);";
-    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+    const command = testNodeCommand(script);
 
     const started = JSON.parse(String((await start.execute({
       command,
@@ -684,13 +708,14 @@ describe('local-tools › interactive_cli tools', () => {
     const close = toolByName(tools, 'interactive_cli_close');
     const authUrl = 'https://accounts.google.com/o/oauth2/auth?redirect_uri=http%3A%2F%2Flocalhost%3A8085%2F&code_challenge=abc';
     const script = `process.stdout.write('Your browser has been opened to visit:\\n\\n ${authUrl}\\n'); setInterval(() => {}, 1000);`;
-    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+    const command = testNodeCommand(script);
 
-    const started = parseToolJson(await start.execute({
+    const startResult = await start.execute({
       command,
       purpose: 'Authorize in browser',
       max_lifetime_ms: 30000,
-    }, makeCtx()));
+    }, makeCtx());
+    const started = parseToolJson(startResult);
 
     let latest = started;
     for (let i = 0; i < 20 && latest.user_action_required !== true; i++) {
@@ -700,6 +725,7 @@ describe('local-tools › interactive_cli tools', () => {
     expect(latest.user_action_required).toBe(true);
     expect(latest.agent_should_stop).toBe(true);
     expect(latest.user_action_reason).toBe('browser_auth');
+    expect(startResult.endTurn).toBe(true);
     expect(latest.next_step).toContain('Do not call open');
     expect(latest.next_step).toContain('do not restart or close');
     expect(latest.next_step).toContain('do not switch to another OAuth method');
@@ -720,7 +746,7 @@ describe('local-tools › interactive_cli tools', () => {
   it('redacts sensitive UI-provided input if a CLI echoes it', async () => {
     const mgr = await import('../../../src/main/model/core-agent/interactive-cli-sessions');
     const script = "process.stdin.once('data', d => { process.stdout.write('echo:' + d.toString().trim()); process.exit(0); });";
-    const command = `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+    const command = testNodeCommand(script);
     const started = mgr.startInteractiveCliSession({
       uid: 'u1',
       command,
@@ -946,6 +972,29 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     } finally {
       bashPerms._setBroadcastForTest(null);
       fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('prompts for an opaque PowerShell command before attempting to spawn it', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({
+        command: 'powershell -EncodedCommand UwB0AGEAcgB0AC0AUAByAG8AYwBlAHMAcwA=',
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(String(res.content)).not.toMatch(/ENOENT|not found|not recognized/i);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
     }
   });
 
