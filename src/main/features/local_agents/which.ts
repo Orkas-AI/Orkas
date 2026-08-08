@@ -11,8 +11,9 @@
  *
  * Windows: scan PATH (split by ';'), multiply each candidate by
  * `process.env.PATHEXT` (e.g. `.COM;.EXE;.BAT;.CMD`); first stat hit
- * wins. The empty extension is also tried first because some installs
- * drop bare names (PowerShell shims, MinGW, etc.).
+ * wins. The empty extension is tried only as a fallback because npm installs
+ * a POSIX shell shim beside the Windows `.cmd` launcher; selecting that bare
+ * file makes an otherwise valid CLI fail its version probe.
  */
 
 import * as fs from 'node:fs/promises';
@@ -78,8 +79,9 @@ function uniqueDirs(dirs: string[]): string[] {
 }
 
 /**
- * Returns the candidate extensions to try on Windows, with the empty
- * extension first so an exact-name hit (rare but possible) short-circuits.
+ * Returns the candidate extensions to try on Windows. Follow PATHEXT first,
+ * matching normal Windows command resolution, then retain the empty extension
+ * as a fallback for uncommon native/MinGW installs that use a bare filename.
  */
 function winExtCandidates(): string[] {
   const raw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
@@ -87,8 +89,7 @@ function winExtCandidates(): string[] {
     .split(';')
     .map(s => s.trim())
     .filter(Boolean);
-  // Always try the bare name first.
-  return ['', ...exts];
+  return [...exts, ''];
 }
 
 /**
