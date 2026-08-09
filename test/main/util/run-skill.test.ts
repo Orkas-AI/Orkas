@@ -132,6 +132,50 @@ describe('run-skill.cjs', () => {
     expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, argv: 'reddit' });
   });
 
+  it('exits non-zero while preserving a module semantic-failure report', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'module-failure');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: module-failure\ndescription: semantic failure fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'scripts', 'validate.mjs'),
+      'export default async () => ({ ok: false, errors: ["artifact is invalid"] });\n',
+    );
+
+    const r = runSkill('module-failure', 'validate');
+
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      ok: false,
+      errors: ['artifact is invalid'],
+    });
+  });
+
+  it('does not infer failure from module-specific fields without ok false', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'module-result');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: module-result\ndescription: module result fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'scripts', 'inspect.js'),
+      'module.exports = async () => ({ valid: false, reason: "informational result" });\n',
+    );
+
+    const r = runSkill('module-result', 'inspect');
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      valid: false,
+      reason: 'informational result',
+    });
+  });
+
   it('keeps direct internal-id lookup working', () => {
     writeMarketplaceSkill('252af214f470', 'social-fetch', 'fetch');
 

@@ -59,7 +59,9 @@
  *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
  *
  * This file is CommonJS so it can be required directly without import-hook
- * gymnastics. .ts skill scripts use ESM-style default export.
+ * gymnastics. .ts skill scripts use ESM-style default export. Module scripts
+ * may return a top-level `{ ok: false }` result to report a semantic failure;
+ * the runner preserves that JSON on stdout and exits non-zero.
  */
 
 'use strict';
@@ -859,7 +861,15 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
 
   // If the script already printed structured output, respect that and skip
   // appending a duplicate payload. Convention: non-undefined return => we
-  // JSON.stringify it to stdout (trailing newline).
+  // JSON.stringify it to stdout (trailing newline). A top-level `ok: false`
+  // is the module contract for a semantic failure, so callers receive both
+  // the structured report and a failing process status.
+  const exitCode = (
+    result !== null
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && result.ok === false
+  ) ? 1 : 0;
   if (result !== undefined) {
     try {
       process.stdout.write(JSON.stringify(result) + '\n');
@@ -867,7 +877,7 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
       die(73, `failed to serialize result: ${e && e.message}`);
     }
   }
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 async function main() {
