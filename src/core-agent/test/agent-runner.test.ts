@@ -1379,6 +1379,57 @@ describe("AgentRunner", () => {
     expect(attempts).toEqual([0, 1]);
   });
 
+  it("keeps visible retry ordinals monotonic across provider and outer recovery layers", async () => {
+    const agentAttempts: number[] = [];
+    let streamCalls = 0;
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete() { throw new Error("complete not used"); },
+      async *stream(params) {
+        agentAttempts.push(params.retryContext?.agentAttempt ?? -1);
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          // Each provider candidate and auth route owns a local attempt
+          // counter. This mirrors the production timeline that exposed the
+          // visible 3 -> 1 and 3 -> 1 regressions.
+          for (const attempt of [1, 2, 3, 1, 2, 3, 1, 2]) {
+            yield { type: "retry" as const, attempt, reason: "fetch failed" };
+          }
+        }
+        if (streamCalls === 1) throw new RateLimitError("retry immediately", 0);
+        yield { type: "text_delta" as const, text: "recovered" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+          content: [{ type: "text" as const, text: "recovered" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 2 },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [] });
+    const events: AgentRunEvent[] = [];
+
+    for await (const event of runner.runStream({ message: "recover across both layers" })) {
+      events.push(event);
+    }
+
+    expect(events.filter((event) => event.type === "retry").map((event) => event.attempt))
+      .toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(agentAttempts).toEqual([0, 1]);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      result: { text: "recovered", meta: { stopReason: "end_turn" } },
+    });
+  });
+
   it("stops immediately when storage is full", async () => {
     let streamCalls = 0;
     const mockProvider: LLMProvider = {

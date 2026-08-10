@@ -916,6 +916,10 @@ export class AgentRunner {
     const skillsLoadedSet = new Set<string>();
     let transientToolErrors = 0;
     let permanentToolErrors = 0;
+    // Provider wrappers and AgentRunner own separate retry budgets, but the
+    // public stream is one user-visible task. Normalize both sources here so
+    // the process rail never regresses from (for example) retry 3 to retry 1.
+    let visibleRetryAttempt = 0;
     const timings: MutableRunTimings = {
       providerMs: 0,
       toolMs: 0,
@@ -1116,7 +1120,8 @@ export class AgentRunner {
             }
             streamingTool = null;
           } else if (ev.type === "retry") {
-            yield { type: "retry", attempt: ev.attempt, reason: ev.reason };
+            visibleRetryAttempt += 1;
+            yield { type: "retry", attempt: visibleRetryAttempt, reason: ev.reason };
           } else if (ev.type === "provider_fallback") {
             yield {
               type: "provider_fallback",
@@ -2041,7 +2046,8 @@ export class AgentRunner {
           const waitMs = retryDelayMs(err, attempt);
           const reason = formatError(err);
           log.warn(`Retryable ${retryKind} error (attempt ${attempt + 1}/${maxRetries}): ${reason}, waiting ${waitMs}ms`);
-          yield { type: "retry", attempt: attempt + 1, reason, waitMs };
+          visibleRetryAttempt += 1;
+          yield { type: "retry", attempt: visibleRetryAttempt, reason, waitMs };
           const retryWaitStartedAt = Date.now();
           await sleep(waitMs, params.signal);
           timings.retryWaitMs += Math.max(0, Date.now() - retryWaitStartedAt);
