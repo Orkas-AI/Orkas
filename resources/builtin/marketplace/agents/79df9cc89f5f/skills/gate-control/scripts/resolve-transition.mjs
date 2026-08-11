@@ -3,12 +3,16 @@
 const VALID = {
   line: new Set(['unknown', 'compose', 'auto', 'generate', 'edit']),
   artifact: new Set(['unknown', 'composition', 'production']),
-  gate: new Set(['none', 'gate_a', 'gate_b', 'gate_c', 'preview', 'gate_d']),
+  gate: new Set(['none', 'gate_a', 'gate_b', 'gate_c', 'gate_d']),
   decision: new Set(['none', 'approve', 'revise']),
   scope: new Set(['unknown', 'none', 'visual_only', 'gate_b_payload']),
   recovery: new Set(['unknown', 'available', 'not_available']),
   recoveryDecision: new Set(['none', 'new_visual_revision', 'pause']),
   artifactState: new Set(['unknown', 'new', 'unchanged', 'changed']),
+  // Who asked for the change. `user` means the current user turn names it in
+  // their own words; `model` covers a model-initiated change and any reply
+  // that mixes both, because a mixed reply takes the higher bar.
+  origin: new Set(['unknown', 'user', 'model']),
   approvalStatus: new Set(['unknown', 'none', 'pending', 'approved']),
 };
 
@@ -35,7 +39,6 @@ function assertEnum(name, value, allowed) {
 function result({
   nextAction,
   authorities = [],
-  form = null,
   allowedOps = [],
   prohibitedOps = [],
   reason,
@@ -44,14 +47,13 @@ function result({
     policy_version: 1,
     next_action: nextAction,
     authorities,
-    form,
     allowed_ops: allowedOps,
     prohibited_ops: prohibitedOps,
     reason,
   };
 }
 
-const NO_VISUAL_RESET = ['composition.begin_visual_revision'];
+const NO_VISUAL_RESET = ['restart_visual_qa_cycle'];
 
 function lineOperations(line, artifact) {
   if (artifact === 'composition' || (artifact === 'unknown' && line === 'compose')) {
@@ -82,6 +84,7 @@ export function resolveTransition(raw = {}) {
     recovery: raw.recovery || 'unknown',
     recoveryDecision: raw.recoveryDecision || 'none',
     artifactState: raw.artifactState || 'unknown',
+    origin: raw.origin || 'unknown',
     approvalStatus: raw.approvalStatus || 'unknown',
     errorCode: raw.errorCode || '',
   };
@@ -94,11 +97,34 @@ export function resolveTransition(raw = {}) {
   assertEnum('recovery', input.recovery, VALID.recovery);
   assertEnum('recovery-decision', input.recoveryDecision, VALID.recoveryDecision);
   assertEnum('artifact-state', input.artifactState, VALID.artifactState);
+  assertEnum('origin', input.origin, VALID.origin);
   assertEnum('approval-status', input.approvalStatus, VALID.approvalStatus);
   if (input.recoveryDecision !== 'none' && input.decision !== 'none') {
     throw new Error('decision and recovery-decision cannot both describe the current turn; pass only the field submitted by the real user');
   }
   const lineOps = lineOperations(input.line, input.artifact);
+
+  // A signed-payload change the user themselves named needs no confirmation
+  // back to them: they already said what they wanted. Apply exactly that change
+  // and re-sign. The host verifies the quote appears in the current user turn,
+  // so this cannot be claimed for a model-initiated rewrite. A reply that mixes
+  // a user instruction with model suggestions is `model` — high water mark.
+  if (input.decision === 'revise'
+    && input.scope === 'gate_b_payload'
+    && input.origin === 'user') {
+    return result({
+      nextAction: 'apply_user_instruction_then_approve_plan',
+      authorities: ['edit_current_artifact', 'approve_gate_b'],
+      allowedOps: [
+        'edit_current_artifact',
+        input.artifact === 'composition' || (input.artifact === 'unknown' && input.line === 'compose')
+          ? 'composition.approve_plan'
+          : 'production.approve_plan',
+      ],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
+      reason: 'The current user named this exact change. Apply it to the canonical plan artifacts and re-sign with expected_plan_change=true and decision_evidence quoting their instruction; do not ask them to confirm what they just asked for.',
+    });
+  }
 
   // Signed-payload impact always wins over visual recovery/error handling.
   // Its one Gate B amendment creates a fresh signature and QA cycle.
@@ -106,7 +132,6 @@ export function resolveTransition(raw = {}) {
     return result({
       nextAction: 'open_gate_b_amendment',
       authorities: ['edit_current_artifact'],
-      form: { fields: ['gate_b_decision'] },
       prohibitedOps: NO_VISUAL_RESET,
       reason: 'The requested revision changes the signed production-plan payload. Its new approved signature owns a fresh QA cycle, so old-cycle recovery is irrelevant.',
     });
@@ -117,7 +142,7 @@ export function resolveTransition(raw = {}) {
       nextAction: 'edit_current_cycle',
       authorities: ['edit_current_artifact'],
       allowedOps: lineOps.edit,
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
       reason: 'Native state says the current visual QA cycle is not exhausted.',
     });
   }
@@ -125,21 +150,18 @@ export function resolveTransition(raw = {}) {
   if (input.errorCode === 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED') {
     if (input.recovery === 'available') {
       return result({
-        nextAction: 'begin_visual_revision_then_edit',
-        authorities: [
-          ...(input.decision === 'revise' ? ['edit_current_artifact'] : []),
-          'restart_visual_qa_cycle',
-        ],
-        allowedOps: ['composition.begin_visual_revision', ...lineOps.edit],
-        prohibitedOps: ['emit_form'],
-        reason: 'Native QA evidence authorizes the non-billable cycle restart. Begin it immediately without a technical user confirmation.',
+        nextAction: 'present_findings_and_ask_user_direction',
+        authorities: [],
+        allowedOps: [],
+        prohibitedOps: ['edit_files', 'restart_visual_qa_cycle'],
+        reason: 'An exhausted visual QA cycle is not restarted by the agent. Present the current frames and the remaining findings, offer another repair round or skipping the named check, and end the turn; the user reply grants the next cycle.',
       });
     }
     if (input.recovery === 'unknown') {
       return result({
         nextAction: 'query_status',
         allowedOps: [lineOps.status],
-        prohibitedOps: ['emit_form', 'edit_files', 'composition.begin_visual_revision'],
+        prohibitedOps: ['stop_for_user', 'edit_files', 'restart_visual_qa_cycle'],
         reason: 'An authorization error cannot establish recovery availability.',
       });
     }
@@ -148,14 +170,14 @@ export function resolveTransition(raw = {}) {
         nextAction: 'edit_current_cycle',
         authorities: input.decision === 'revise' ? ['edit_current_artifact'] : [],
         allowedOps: input.decision === 'revise' ? lineOps.edit : [],
-        prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+        prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
         reason: 'Native status says no restart is required. A failed reset call is a control-flow error, not a reason to ask the user again.',
       });
     }
     return result({
       nextAction: 'query_status',
       allowedOps: [lineOps.status],
-      prohibitedOps: ['emit_form', 'edit_files', 'composition.begin_visual_revision'],
+      prohibitedOps: ['stop_for_user', 'edit_files', 'restart_visual_qa_cycle'],
       reason: 'The legacy authorization error is not authoritative. Query native status and follow its recovery availability.',
     });
   }
@@ -170,7 +192,7 @@ export function resolveTransition(raw = {}) {
     return result({
       nextAction: 'continue_from_existing_approval',
       authorities: ['consume_existing_approval'],
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
       reason: 'No current decision was submitted and the same artifact signature is already approved.',
     });
   }
@@ -180,17 +202,17 @@ export function resolveTransition(raw = {}) {
       return result({
         nextAction: 'classify_revision_scope',
         authorities: ['inspect_requested_change'],
-        prohibitedOps: ['emit_form', 'composition.begin_visual_revision'],
+        prohibitedOps: ['stop_for_user', 'restart_visual_qa_cycle'],
         reason: 'A revise decision grants edit intent, but signed-payload impact must be classified.',
       });
     }
     if (input.recovery === 'available') {
       return result({
-        nextAction: 'begin_visual_revision_then_edit',
-        authorities: ['edit_current_artifact', 'restart_visual_qa_cycle'],
-        allowedOps: ['composition.begin_visual_revision', ...lineOps.edit],
-        prohibitedOps: ['emit_form'],
-        reason: 'The current revise decision already authorizes the bounded edit. Restart the exhausted internal QA cycle without asking the user again.',
+        nextAction: 'edit_current_cycle',
+        authorities: ['edit_current_artifact'],
+        allowedOps: lineOps.edit,
+        prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
+        reason: 'This revise decision is the user reply that already bought the next QA cycle, so edit now and do not ask again. Choose a strategy the recorded failed evidence has not already tried.',
       });
     }
     if (input.recovery === 'unknown') {
@@ -198,7 +220,7 @@ export function resolveTransition(raw = {}) {
         nextAction: 'query_status',
         authorities: ['edit_current_artifact'],
         allowedOps: [lineOps.status],
-        prohibitedOps: ['emit_form', 'composition.begin_visual_revision'],
+        prohibitedOps: ['stop_for_user', 'restart_visual_qa_cycle'],
         reason: 'Resolve native recovery state before editing or asking another question.',
       });
     }
@@ -206,7 +228,7 @@ export function resolveTransition(raw = {}) {
       nextAction: 'edit_current_cycle',
       authorities: ['edit_current_artifact'],
       allowedOps: lineOps.edit,
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
       reason: 'The user already authorized a bounded revision and native recovery is not required.',
     });
   }
@@ -218,7 +240,6 @@ export function resolveTransition(raw = {}) {
     };
     const compositionApprovals = {
       gate_b: ['approve_plan', 'composition.approve_plan'],
-      preview: ['approve_preview', 'composition.approve_preview'],
       gate_d: ['approve_draft', 'composition.approve_draft'],
     };
     const productionApprovals = {
@@ -236,7 +257,7 @@ export function resolveTransition(raw = {}) {
         nextAction: 'apply_approved_amendment_then_approve_plan',
         authorities: ['edit_current_artifact', 'approve_gate_b'],
         allowedOps: ['edit_current_artifact', mapped[1]],
-        prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+        prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
         reason: 'The current user approved the displayed amendment. Apply that exact patch, call composition.approve_plan with expected_plan_change=true, and continue the fresh QA cycle without visual recovery.',
       });
     }
@@ -244,29 +265,29 @@ export function resolveTransition(raw = {}) {
       nextAction: mapped[0],
       authorities: [`approve_${input.gate}`],
       allowedOps: [mapped[1]],
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
       reason: 'The current real user message explicitly approved the displayed gate artifact.',
     });
   }
 
-  // Backward compatibility for recovery forms emitted by VideoStudio 1.1.5
-  // or older. New policy never emits this form, but an already-visible form
+  // Backward compatibility for recovery requests emitted by VideoStudio 1.1.5
+  // or older. New policy never emits one, but an already-visible request
   // must remain consumable without producing yet another confirmation.
   if (input.recoveryDecision === 'new_visual_revision') {
     if (input.recovery === 'available') {
       return result({
-        nextAction: 'begin_visual_revision',
-        authorities: ['restart_visual_qa_cycle'],
-        allowedOps: ['composition.begin_visual_revision'],
-        prohibitedOps: ['emit_form'],
-        reason: 'Consume the legacy recovery submission once. New turns use the original revise decision directly and never emit this form.',
+        nextAction: 'edit_current_cycle',
+        authorities: ['edit_current_artifact'],
+        allowedOps: lineOps.edit,
+        prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
+        reason: 'The legacy submission is a user reply, so the next cycle was already granted by the host. Consume it by making a materially different edit — never by repeating a strategy the recorded evidence already shows failed.',
       });
     }
     if (input.recovery === 'unknown') {
       return result({
         nextAction: 'query_status',
         allowedOps: [lineOps.status],
-        prohibitedOps: ['emit_form', 'edit_files', 'composition.begin_visual_revision'],
+        prohibitedOps: ['stop_for_user', 'edit_files', 'restart_visual_qa_cycle'],
         reason: 'A legacy recovery submission cannot be consumed until native state is verified.',
       });
     }
@@ -274,24 +295,24 @@ export function resolveTransition(raw = {}) {
       nextAction: 'edit_current_cycle',
       authorities: ['edit_current_artifact'],
       allowedOps: lineOps.edit,
-      prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+      prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
       reason: 'The cycle is not exhausted, so consume the legacy submission by continuing the bounded edit without a reset.',
     });
   }
 
   if (input.recovery === 'available') {
     return result({
-      nextAction: 'begin_visual_revision',
-      authorities: ['restart_visual_qa_cycle'],
-      allowedOps: ['composition.begin_visual_revision'],
-      prohibitedOps: ['emit_form'],
-      reason: 'Native QA evidence authorizes an internal non-billable restart. Begin it without waiting for a user revision request.',
+      nextAction: 'present_findings_and_ask_user_direction',
+      authorities: [],
+      allowedOps: [],
+      prohibitedOps: ['edit_files', 'restart_visual_qa_cycle'],
+      reason: 'The visual QA budget is spent. Show the frames and the remaining findings, offer another repair round or skipping the named check, and end the turn — the user reply is what buys the next cycle.',
     });
   }
 
   return result({
     nextAction: 'follow_native_state',
-    prohibitedOps: ['emit_form', ...NO_VISUAL_RESET],
+    prohibitedOps: ['stop_for_user', ...NO_VISUAL_RESET],
     reason: 'No new authority is required; follow the current native next action.',
   });
 }

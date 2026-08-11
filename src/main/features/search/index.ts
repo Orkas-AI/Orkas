@@ -157,6 +157,18 @@ interface LibraryContentSearchProvider {
   searchProject(userId: string, projectId: string, queryVec: number[], limit: number): LibraryVectorHit[];
 }
 
+export type SearchDegradationCode =
+  | 'library_content_embedding_unavailable'
+  | 'library_global_content_unavailable'
+  | 'library_project_catalog_unavailable'
+  | 'library_project_content_unavailable';
+
+interface SearchLibraryContentsOptions {
+  projectId?: string;
+  limit?: number;
+  onDegraded?: (code: SearchDegradationCode) => void;
+}
+
 let _libraryContentSearchProviderForTests: LibraryContentSearchProvider | null = null;
 const _libraryQueryEmbeddingCache = new Map<string, Promise<number[]>>();
 
@@ -208,7 +220,13 @@ function _queryEmbedding(
 
 // ── Source readers ──────────────────────────────────────────────────────
 
-interface ChatSourceMessage { id?: unknown; content?: unknown; text?: unknown }
+interface ChatSourceMessage {
+  id?: unknown;
+  content?: unknown;
+  text?: unknown;
+  deleted_at?: unknown;
+  dispatch?: unknown;
+}
 
 // Search reads only the bounded result window requested by the caller. Group
 // hits by conversation and cap the number of simultaneously-open JSONLs so a
@@ -534,7 +552,7 @@ function _libraryContentResult(
 export async function searchLibraryContents(
   userId: string,
   query: string,
-  options: { projectId?: string; limit?: number } = {},
+  options: SearchLibraryContentsOptions = {},
 ): Promise<SearchResult[]> {
   const q = String(query || '').trim();
   if (!q) return [];
@@ -546,6 +564,7 @@ export async function searchLibraryContents(
     queryVec = await _queryEmbedding(q, provider);
   } catch {
     log.warn('library content query embedding unavailable', { query_chars: q.length });
+    options.onDegraded?.('library_content_embedding_unavailable');
     return [];
   }
 
@@ -565,6 +584,7 @@ export async function searchLibraryContents(
     }
   } catch {
     log.warn('global Library content search unavailable');
+    options.onDegraded?.('library_global_content_unavailable');
   }
 
   let projects: Array<{ project_id: string; name: string }> = [];
@@ -572,6 +592,7 @@ export async function searchLibraryContents(
     projects = await provider.listProjects(userId);
   } catch {
     log.warn('project catalog unavailable for Library content search');
+    options.onDegraded?.('library_project_catalog_unavailable');
   }
   const selectedProjects = options.projectId
     ? projects.filter((project) => project.project_id === options.projectId)
@@ -589,6 +610,7 @@ export async function searchLibraryContents(
       }
     } catch {
       log.warn('one project Library content search unavailable');
+      options.onDegraded?.('library_project_content_unavailable');
     }
   }
 
@@ -602,6 +624,12 @@ export interface SearchChatsOptions {
   projectId?: string;
   /** Project scope is opt-in at this feature layer; model tools choose it by default in projects. */
   scope?: 'project' | 'all';
+  /** Restrict candidates to one exact conversation before loading source rows. */
+  conversationId?: string;
+  /** Restrict candidates to raw JSONL indexes strictly before this boundary. */
+  beforeMsgIndex?: number;
+  /** Return only user-visible message bodies, excluding tombstones and hidden dispatch rows. */
+  userVisibleOnly?: boolean;
   /** Exclude a conversation whose history is already present in the caller's context. */
   excludeCid?: string;
   /** Maximum candidate rows returned to the caller. */
@@ -645,6 +673,8 @@ export async function searchChats(
       const msgIndex = Number(doc.msg_index);
       if (!cid || !Number.isInteger(msgIndex) || msgIndex < 0) return null;
       const pid = displayCatalog.cidToPid.get(cid) || '';
+      if (options.conversationId && cid !== options.conversationId) return null;
+      if (Number.isInteger(options.beforeMsgIndex) && msgIndex >= Number(options.beforeMsgIndex)) return null;
       if (options.excludeCid && cid === options.excludeCid) return null;
       if (options.scope === 'project' && (!options.projectId || pid !== options.projectId)) return null;
       // The catalog above already resolved project membership. Supplying it
@@ -682,11 +712,22 @@ export async function searchChats(
   await Promise.all(Array.from(byFile, async ([file, indexes]) => {
     sourceRows.set(file, await _readJsonlMessagesAt(file, indexes));
   }));
-  return candidates.map(({ sourceFile, sourceIndex, ...result }) => {
+  return candidates.flatMap(({ sourceFile, sourceIndex, ...result }) => {
     const msg = sourceRows.get(sourceFile)?.get(sourceIndex);
+    if (
+      options.userVisibleOnly
+      && (
+        !msg
+        || !!msg.deleted_at
+        || !!msg.dispatch
+        || !indexer.readMsgText(msg).trim()
+      )
+    ) {
+      return [];
+    }
     result.snippet = _makeSnippet(indexer.readMsgText(msg), q);
     if (typeof msg?.id === 'string' && msg.id) result.msg_id = msg.id;
-    return result;
+    return [result];
   });
 }
 
@@ -946,11 +987,16 @@ function _limitSearchResults(
 
 export async function searchAll(
   userId: string, query: string, { limit = 30, scope = 'all', projectId }: SearchAllOptions = {},
-): Promise<{ results: SearchResult[]; total?: number }> {
+): Promise<{
+  results: SearchResult[];
+  total?: number;
+  degradation_code?: SearchDegradationCode | 'multiple';
+}> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
   const requestedLimit = _boundedSearchLimit(limit);
   const buckets: SearchResult[] = [];
+  const degradations = new Set<SearchDegradationCode>();
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') {
     tasks.push(searchContexts(q, userId, requestedLimit).then((r) => { buckets.push(...r); }));
@@ -962,6 +1008,7 @@ export async function searchAll(
     tasks.push(searchLibraryContents(userId, q, {
       ...(projectId ? { projectId } : {}),
       limit: requestedLimit,
+      onDegraded: (code) => degradations.add(code),
     }).then((r) => { buckets.push(...r); }));
   }
   if (scope === 'all' || scope === 'chat') {
@@ -975,8 +1022,12 @@ export async function searchAll(
   }
   await Promise.all(tasks);
   const merged = _dedupeSearchResults(buckets);
+  const degradationCode = degradations.size > 1
+    ? 'multiple'
+    : degradations.values().next().value;
   return {
     results: _limitSearchResults(merged, requestedLimit, scope),
     total: merged.length,
+    ...(degradationCode ? { degradation_code: degradationCode } : {}),
   };
 }

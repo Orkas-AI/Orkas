@@ -39,7 +39,7 @@ export interface ProjectTasksToolHandler {
   list(): Promise<{ ok: boolean; tasks: ProjectTaskView[]; progress: ProjectTasksProgress }>;
   create(input: {
     title: string; detail?: string; owner?: string; status?: ProjectTaskStatus;
-  }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
+  }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView; alreadyExists?: boolean }>;
   update(taskId: string, patch: {
     title?: string; detail?: string; status?: ProjectTaskStatus; owner?: string; result_ref?: string;
   }): Promise<{ ok: boolean; error?: string; task?: ProjectTaskView }>;
@@ -63,7 +63,7 @@ When origin_cid or result_ref points to a conversation and the current request d
 
 Actions:
 - list: the complete current backlog + progress, including task detail, dependencies, and timestamps.
-- create: add a task (title required; optional detail, status, owner).
+- create: add a task, or reuse the same normalized open title with alreadyExists=true.
 - update: change a task's status/detail/owner/result_ref by task_id.
 - complete: mark a task done by task_id (optional result_ref).`;
 

@@ -138,9 +138,31 @@ describe('shared Library transfer dialog', () => {
       new Error('copy failed at /Users/test/customer-plan.md'),
     );
 
-    expect(payload).toEqual({ error_type: 'exception' });
+    expect(payload).toEqual({ error_code: 'transfer_failed', error_type: 'operation' });
     expect(JSON.stringify(payload)).not.toContain('/Users/private');
     expect(JSON.stringify(payload)).not.toContain('customer-plan.md');
+  });
+
+  it('keeps stable transfer failures queryable without raw backend details', () => {
+    expect(transfer._transferFailureTelemetry({ error: 'target_exists' })).toEqual({
+      error_code: 'target_exists',
+      error_type: 'conflict',
+    });
+    expect(transfer._transferFailureTelemetry({ error: 'invalid_batch' })).toEqual({
+      error_code: 'invalid_batch',
+      error_type: 'validation',
+    });
+    expect(transfer._transferFailureTelemetry('source_delete_failed')).toEqual({
+      error_code: 'source_delete_failed',
+      error_type: 'operation',
+    });
+    expect(transfer._transferFailureTelemetry({
+      code: 'E_IPC_REQUEST',
+      error: 'private backend detail',
+    })).toEqual({
+      error_code: 'E_IPC_REQUEST',
+      error_type: 'operation',
+    });
   });
 
   it('keeps row menus compact with one consolidated transfer action', () => {

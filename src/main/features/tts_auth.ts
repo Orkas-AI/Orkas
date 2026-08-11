@@ -49,6 +49,12 @@ export function listTtsProfiles(): TtsProfile[] {
   return normalized;
 }
 
+/** Open-source profiles are user-owned by definition; managed profiles are
+ * removed during normalization, so every retained profile is usable. */
+export function listUsableTtsProfiles(): TtsProfile[] {
+  return listTtsProfiles();
+}
+
 export interface AddTtsProfileInput {
   baseUrl?: string;
   model?: string;

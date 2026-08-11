@@ -53,6 +53,9 @@ export interface ConnectorMetaToolsOpts {
    *  tool so its confirmation dialog routes to the right conversation.
    *  Omitted for discover-mode (agent-edit) where add is not exposed. */
   cid?: string;
+  /** Keep list/call schemas available for a live run that may gain a
+   * connector after construction. */
+  allowRuntimeRefresh?: boolean;
 }
 
 function errResult(code: string, msg: string): ToolResult {
@@ -344,9 +347,9 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
  *                     "gmail's email-sending feature". `call_connector_tool` is withheld so an
  *                     authoring session can never produce external side effects.).
  *
- *  Returns `[]` when uid is empty OR when the actor has no visible connectors — in that case
- *  the system prompt also doesn't carry the `## Connectors` block, so the tools have nothing
- *  to act on and would only confuse the model. */
+ *  Returns `[]` when uid is empty. Normally an actor with no visible
+ *  connectors receives only the optional add tool; rich active-turn sessions
+ *  may opt into a stable list/call schema whose execution resolves live state. */
 export async function createConnectorMetaTools(
   opts: ConnectorMetaToolsOpts,
   mode: 'full' | 'discover' = 'full',
@@ -362,7 +365,7 @@ export async function createConnectorMetaTools(
     : [];
 
   const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
-  if (!visible.length) return addTool;
+  if (!visible.length && !opts.allowRuntimeRefresh) return addTool;
   if (mode === 'discover') return [createListConnectorToolsTool(opts)];
   return [
     createListConnectorToolsTool(opts),

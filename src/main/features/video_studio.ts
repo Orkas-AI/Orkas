@@ -10,19 +10,26 @@ import type { BrowserWindow as ElectronBrowserWindow, NativeImage as ElectronNat
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../util/bundled-runtime';
 import { versionedChatMediaLocalUrl } from '../util/chat-media-url';
 import { redactPaths } from '../util/redact';
+import { logErrorSummary } from '../util/log-redact';
 import { createLogger } from '../logger';
 import { writeJson } from '../storage';
+import { prepareProducedFileForInput } from './produced_output_hooks';
 import {
+  CompositionManifestSchema,
   compositionNarrationText,
+  decomposeCompositionSceneAttribution,
   ensureCompositionManifest,
   manifestAsDesignContract,
   manifestAsSceneMap,
   prepareCompositionScaffold,
   type CompositionManifest,
+  type SceneAttributionDecomposition,
 } from './video_studio_contract';
 import {
+  designContractReadiness,
   DRAFT_REPAIR_MAX_PASSES,
   analyzeNativeImage,
+  regionContrast,
   buildDesignReviewInputs,
   buildDraftFrameSamplePlan,
   buildInspectFrameSamplePlan,
@@ -56,12 +63,19 @@ import {
   type FrameSamplePlan,
   type Issue,
   type VisibleSemanticElementEvidence,
+  type HiddenSemanticElementEvidence,
+  BLANK_FRAME_MAX_CONTRAST,
 } from './video_studio_qa';
 import { extractCssImports, extractCssUrls, extractHtmlResourceRefs, parseHtmlStructure, type HtmlResourceRef } from './video_studio_html_check';
 import { hardenedWebPreferences } from '../util/window-security';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 
 const log = createLogger('video-studio');
+
+function logOptionalReadFailure(message: string, err: unknown): void {
+  if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') return;
+  log.warn(message, { error: logErrorSummary(err) });
+}
 
 const COMPOSITION_LOAD_TIMEOUT_MS = Number(process.env.ORKAS_VIDEO_STUDIO_LOAD_TIMEOUT_MS) || 30_000;
 const COMPOSITION_READY_TIMEOUT_MS = Number(process.env.ORKAS_VIDEO_STUDIO_READY_TIMEOUT_MS) || 20_000;
@@ -73,6 +87,7 @@ export type VideoStudioOp =
   | 'production.status'
   | 'production.approve_plan'
   | 'production.approve_generation'
+  | 'production.segment_qa'
   | 'composition.status'
   | 'composition.doctor'
   | 'composition.reconcile'
@@ -82,12 +97,10 @@ export type VideoStudioOp =
   | 'composition.materialize_narration'
   | 'composition.lint'
   | 'composition.inspect'
-  | 'composition.begin_visual_revision'
   | 'composition.render'
   | 'composition.draft'
   | 'composition.export'
   | 'composition.snapshot'
-  | 'composition.approve_preview'
   | 'composition.submit_design_review'
   | 'composition.approve_draft'
   | 'speech.capabilities'
@@ -116,6 +129,23 @@ export interface CompositionOptions {
   frameSampleTimes?: Array<{ label: string; timeSec: number; sceneId?: string }>;
   visualBaselineAbsPath?: string;
   updateVisualBaseline?: boolean;
+  /** Whether this composition's frame 0 is the delivered video's first frame.
+   *  Only the owning tool layer knows: a standalone COMPOSE always is, while an
+   *  assembled child is only when it is the first segment of its parent EDL.
+   *  Omitted means yes, so direct callers and tests keep the original rule. */
+  isDeliveredOpening?: boolean;
+  /** QA finding codes the user chose to skip, read from the production state
+   *  by the owning tool layer. Matching design/frame findings report as
+   *  informational; media-integrity QA is never filtered. */
+  waivedQaFindings?: string[];
+  /** Timing-normalized visual identity of the canonical composition inputs,
+   * computed by the owning tool layer. When present, successful renders
+   * persist provenance and later identical-key renders may reuse the prior
+   * video track (audio-only remux). Absent means no reuse is attempted. */
+  visualSignature?: string;
+  /** Machine-private content-addressed store for per-scene rendered segments
+   * (P3c R2). Absent means scene-segment assembly is never attempted. */
+  segmentCacheDirAbs?: string;
   signal?: AbortSignal;
   onProgress?: (event: { phase: string; message: string; data?: Record<string, unknown> }) => void;
 }
@@ -184,7 +214,7 @@ type NativeRenderProfile = {
   degrade_ineffective?: string;
   previous_observed_capture_fps?: number;
   previous_realtime_factor?: number;
-  frame_pipeline?: 'raw_bgra_pipe';
+  frame_pipeline?: 'raw_bgra_pipe' | 'video_track_reuse' | 'scene_segment_assembly';
   capture_pipeline_seconds?: number;
   encoder_finalize_seconds?: number;
   total_render_seconds?: number;
@@ -378,9 +408,43 @@ function findingsJson(issues: Issue[], extra: Record<string, unknown> = {}): str
   }, null, 2);
 }
 
-function qualityFps(quality: RenderQuality | undefined, fps: number | undefined): number {
+/** The composition's own declared frame rate, or undefined when there is no
+ *  manifest to read it from. It lives only in composition-manifest.json — the
+ *  HTML root carries width/height/duration but never fps — so nothing on the
+ *  render path had it. */
+export async function declaredCompositionFps(compositionDirAbs: string): Promise<number | undefined> {
+  try {
+    const raw = await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { composition?: { fps?: unknown } };
+    // A real number, as CompositionManifestSchema requires. Coercing a string
+    // here would let the renderer honour a value the manifest itself rejects.
+    const raw_fps = parsed?.composition?.fps;
+    const declared = typeof raw_fps === 'number' ? raw_fps : Number.NaN;
+    return Number.isFinite(declared) && declared > 0
+      ? Math.max(1, Math.min(MAX_FPS, Math.floor(declared)))
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Explicit request first, then draft's deliberate speed shortcut, then what
+ *  the composition declared, and only then the house default.
+ *
+ *  `declared` used to be missing entirely: the manifest's `fps` reached the
+ *  design contract's canvas and stopped there, so every non-draft render came
+ *  out at 30 whatever the composition asked for — a 24 or 60 fps composition
+ *  was silently re-rated, and the plan summary the user approves reads its fps
+ *  from the same manifest the renderer ignored. Draft keeps 15: that is the
+ *  point of a draft, and it is labelled as one. */
+export function qualityFps(
+  quality: RenderQuality | undefined,
+  fps: number | undefined,
+  declared?: number,
+): number {
   if (isFinitePositive(fps)) return Math.max(1, Math.min(MAX_FPS, Math.floor(fps)));
   if (quality === 'draft') return 15;
+  if (isFinitePositive(declared)) return Math.max(1, Math.min(MAX_FPS, Math.floor(declared)));
   return 30;
 }
 
@@ -452,6 +516,129 @@ async function persistObservedRenderProfile(compositionDirAbs: string, profile: 
   };
   await fs.mkdir(path.dirname(out), { recursive: true });
   await fs.writeFile(out, JSON.stringify(value, null, 2), 'utf8');
+}
+
+/** P3c R0: page-identical whole-track reuse. A successful render persists the
+ * exact inputs its video track depends on; a later render with the same key
+ * reuses that track and remixes only the audio graph. Frame identity rests on
+ * the same seek-determinism the preview snapshot pipeline already stakes on.
+ * The provenance file lives under qa/, which every composition signature walk
+ * excludes, so writing it never perturbs input identity. */
+const RENDER_PROVENANCE_MAX_ENTRIES = 4;
+const VIDEO_TRACK_REMUX_TIMEOUT_MS = 120_000;
+
+export type RenderWindowVector = Array<{ id: string; start: number; duration: number }>;
+
+export type RenderProvenanceEntry = {
+  key: string;
+  visual_signature: string;
+  windows: RenderWindowVector;
+  width: number;
+  height: number;
+  fps: number;
+  quality: string;
+  format: string;
+  video_path: string;
+  video_sha256: string;
+  evidence_dir?: string;
+  contact_sheet?: string;
+  samples?: FrameSampleEvidence[];
+  rendered_at: string;
+};
+
+type PersistedRenderProvenance = { version: 1; entries: RenderProvenanceEntry[] };
+
+function renderProvenancePath(compositionDirAbs: string): string {
+  return path.join(compositionDirAbs, 'qa', 'render-provenance.json');
+}
+
+export function buildRenderReuseKey(input: {
+  visualSignature: string;
+  windows: RenderWindowVector;
+  width: number;
+  height: number;
+  fps: number;
+  quality: string | undefined;
+  format: string | undefined;
+}): string {
+  const canonical = JSON.stringify({
+    v: 1,
+    visual_signature: input.visualSignature,
+    windows: input.windows.map((window) => [window.id, window.start, window.duration]),
+    width: input.width,
+    height: input.height,
+    fps: input.fps,
+    // Undefined quality maps to its own encoder CRF tier; never fold it into
+    // a named tier or two differently encoded requests would share a key.
+    quality: input.quality ?? 'unset',
+    format: input.format ?? 'mp4',
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+export async function readCompositionWindowVector(compositionDirAbs: string): Promise<RenderWindowVector | null> {
+  try {
+    const raw = await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8');
+    const parsed = JSON.parse(raw) as { scenes?: Array<{ id?: unknown; start?: unknown; duration?: unknown }> };
+    if (!Array.isArray(parsed?.scenes) || parsed.scenes.length === 0) return null;
+    const windows: RenderWindowVector = [];
+    for (const scene of parsed.scenes) {
+      const id = typeof scene?.id === 'string' ? scene.id : null;
+      const start = typeof scene?.start === 'number' && Number.isFinite(scene.start) ? scene.start : null;
+      const duration = typeof scene?.duration === 'number' && Number.isFinite(scene.duration) ? scene.duration : null;
+      if (id === null || start === null || duration === null) return null;
+      windows.push({ id, start, duration });
+    }
+    return windows;
+  } catch (err) {
+    logOptionalReadFailure('composition window vector read failed', err);
+    return null;
+  }
+}
+
+async function readRenderProvenance(compositionDirAbs: string): Promise<RenderProvenanceEntry[]> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(renderProvenancePath(compositionDirAbs), 'utf8')) as PersistedRenderProvenance;
+    if (parsed?.version !== 1 || !Array.isArray(parsed.entries)) return [];
+    return parsed.entries.filter((entry) => !!entry && typeof entry.key === 'string' && typeof entry.video_sha256 === 'string');
+  } catch (err) {
+    logOptionalReadFailure('render provenance read failed', err);
+    return [];
+  }
+}
+
+async function upsertRenderProvenance(compositionDirAbs: string, entry: RenderProvenanceEntry): Promise<void> {
+  const existing = await readRenderProvenance(compositionDirAbs);
+  const entries = [entry, ...existing.filter((candidate) => candidate.key !== entry.key)]
+    .slice(0, RENDER_PROVENANCE_MAX_ENTRIES);
+  const out = renderProvenancePath(compositionDirAbs);
+  await fs.mkdir(path.dirname(out), { recursive: true });
+  await fs.writeFile(out, JSON.stringify({ version: 1, entries } satisfies PersistedRenderProvenance, null, 2), 'utf8');
+}
+
+async function sha256File(absPath: string): Promise<string | null> {
+  try {
+    return crypto.createHash('sha256').update(await fs.readFile(absPath)).digest('hex');
+  } catch (err) {
+    logOptionalReadFailure('video checksum read failed', err);
+    return null;
+  }
+}
+
+export function evaluateVideoTrackReuse(input: {
+  entry: RenderProvenanceEntry | null;
+  priorVideoSha256: string | null;
+  evidenceRequired: boolean;
+  priorSamplesPresent: boolean;
+}): { reuse: boolean; reason: 'match' | 'no_provenance' | 'video_missing_or_changed' | 'evidence_missing' } {
+  if (!input.entry) return { reuse: false, reason: 'no_provenance' };
+  if (!input.priorVideoSha256 || input.priorVideoSha256 !== input.entry.video_sha256) {
+    return { reuse: false, reason: 'video_missing_or_changed' };
+  }
+  if (input.evidenceRequired && !input.priorSamplesPresent) {
+    return { reuse: false, reason: 'evidence_missing' };
+  }
+  return { reuse: true, reason: 'match' };
 }
 
 function isConstrainedMachine(totalRamGB: number, observedGpuMode?: 'hardware' | 'software'): boolean {
@@ -625,6 +812,7 @@ async function loadCompositionMeta(compositionDirAbs: string): Promise<{ meta: C
     };
   }
 
+  await prepareProducedFileForInput(htmlPath, { source: 'video_studio.composition_input' });
   const html = await fs.readFile(htmlPath, 'utf8');
   const structure = parseHtmlStructure(html);
   const rootTag = structure.tags.find((tag) => tag.attrs['data-composition-id']);
@@ -919,6 +1107,10 @@ export async function preflightComposition(
     canonicalContractLoad,
     canonicalSceneMapLoad,
     p.compositionDirAbs,
+    {
+      ...(p.isDeliveredOpening === false ? { isDeliveredOpening: false } : {}),
+      ...(p.waivedQaFindings?.length ? { waivedFindings: p.waivedQaFindings } : {}),
+    },
   );
   const sourceAlignment = await runSourceAlignmentQa(canonicalSceneMapLoad, shotlistLoad);
   const deliveryRequirements = deliveryRequirementsForPreflightProfile(await runDeliveryRequirementsQa(
@@ -1044,6 +1236,11 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
     html_path: prepared.html_path,
     scaffold_created: prepared.scaffold_created,
     blocking_error_count: 0,
+    // Judged here, where "before writing HTML" is still before writing HTML.
+    // Prepare stays passing — the contract is authored INTO this manifest
+    // next, so blocking on its absence would deadlock the very step that
+    // fixes it. Inspect keeps the hard gate.
+    design_contract: designContractReadiness(prepared.manifest),
     issues,
     next_allowed_ops: prepared.manifest
       && prepared.manifest.audio.owner !== 'assembler'
@@ -1054,6 +1251,21 @@ export async function prepareComposition(p: CompositionOptions): Promise<VideoSt
   };
 }
 
+/** Persist a findings document when the caller asked for one.
+ *
+ * `findings_path` is a promise that the complete evidence is readable at that
+ * path. lint returned the path in its result but never wrote the file: on
+ * 2026-08-07 the batched QA advertised
+ * `segment-qa-lint-findings.json`, the model read it twice and got E_NOT_FOUND
+ * both times, and — with the batched summary carrying only the first issue —
+ * spent twelve minutes editing manifests blind. Whoever names a findings path
+ * writes it. */
+async function writeFindingsIfRequested(absPath: string | undefined, findings: string): Promise<void> {
+  if (!absPath) return;
+  await fs.mkdir(path.dirname(absPath), { recursive: true });
+  await fs.writeFile(absPath, findings, 'utf8');
+}
+
 export async function lintComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   const preflight = await preflightComposition(p, 'visual-preview');
   const findings = findingsJson(preflight.issues, {
@@ -1062,6 +1274,8 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
     canvas: preflight.meta ? { width: preflight.meta.width, height: preflight.meta.height, durationSec: preflight.meta.durationSec } : null,
     preflight: preflight.report,
   });
+  await writeFindingsIfRequested(p.findingsAbsPath, findings);
+  const findingsPath = p.findingsAbsPath ? { findings_path: p.findingsAbsPath } : {};
   if (!preflight.ok) {
     const narrationPending = narrationPendingInPreflight(preflight);
     return {
@@ -1074,6 +1288,7 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
       blocking_error_count: preflight.issues.filter((issue) => issue.severity === 'error').length,
       preflight: preflight.report,
       findings,
+      ...findingsPath,
       next_allowed_ops: narrationPending
         ? ['composition.prepare', 'composition.materialize_narration']
         : ['composition.prepare'],
@@ -1088,6 +1303,7 @@ export async function lintComposition(p: CompositionOptions): Promise<VideoStudi
     blocking_error_count: 0,
     preflight: preflight.report,
     findings,
+    ...findingsPath,
     preview_completeness: narrationPending ? 'visual_only' : 'complete',
     narration_pending: narrationPending,
     next_allowed_ops: narrationPending
@@ -1317,7 +1533,7 @@ async function withCompositionWindow<T>(
   }
 }
 
-function buildTimelineAdapterScript(meta: CompositionMeta, variables?: Record<string, unknown>): string {
+export function buildTimelineAdapterScript(meta: CompositionMeta, variables?: Record<string, unknown>): string {
   const vars = JSON.stringify(variables || {});
   return `
 (() => {
@@ -1361,8 +1577,24 @@ function buildTimelineAdapterScript(meta: CompositionMeta, variables?: Record<st
     if (!tl) return false;
     try {
       if (typeof tl.pause === 'function') tl.pause();
-      if (typeof tl.seek === 'function') { tl.seek(t, false); return true; }
-      if (typeof tl.time === 'function') { tl.time(t, false); return true; }
+      // GSAP skips rendering when the playhead is already at the requested
+      // time, so a zero-duration set positioned exactly there never applies.
+      // A freshly created paused timeline sits at 0, which makes frame 0 the
+      // permanent victim: tl.set(scene, autoAlpha 1) at position 0 — the
+      // reveal the authoring skill asks for — is never rendered, the
+      // scaffold's .clip opacity:0/visibility:hidden stands, and frame 0
+      // captures blank. Verified against the bundled build: seek(0) leaves
+      // the element untouched while seek(0.5) applies it, and a forced render
+      // fixes 0. Force only when the seek is a no-op, so ordinary frames keep
+      // the normal path.
+      const before = typeof tl.time === 'function' ? Number(tl.time()) : NaN;
+      const forceRender = () => {
+        if (Number.isFinite(before) && Math.abs(before - t) < 1e-6 && typeof tl.render === 'function') {
+          tl.render(t, false, true);
+        }
+      };
+      if (typeof tl.seek === 'function') { tl.seek(t, false); forceRender(); return true; }
+      if (typeof tl.time === 'function') { tl.time(t, false); forceRender(); return true; }
       if (typeof tl.progress === 'function' && typeof tl.duration === 'function') {
         const dur = Number(tl.duration()) || ${meta.durationSec};
         tl.progress(dur > 0 ? Math.max(0, Math.min(1, t / dur)) : 0, false);
@@ -1457,33 +1689,118 @@ new Promise((resolve) => requestAnimationFrame(() => {
   });
 }
 
+/** How many times a capture may be retaken when the pixels contradict the DOM.
+ *  Two settles is already far past the one-frame race; more would be waiting
+ *  on something else. */
+const COMPOSITION_CONTRADICTED_CAPTURE_MAX_RETRIES = 2;
+/** A visible element must cover at least this share of the frame before its
+ *  absence from the pixels counts as a contradiction rather than a rounding
+ *  difference. */
+const CONTRADICTED_CAPTURE_MIN_AREA_RATIO = 0.02;
+
+/** Did this capture come back blank while the page said it had content?
+ *
+ *  `capturePage` returns the last COMPOSITED surface, not the current DOM. The
+ *  render loop's first capture races that compositor: seek(0) applies the
+ *  scene-reveal styles, but nothing has painted since the window loaded with
+ *  every scene scaffold-hidden, so the pixels can be one flat field while the
+ *  DOM already holds the title.
+ *
+ *  2026-08-07: a delivered draft's frame 0 came back at brightness 17.8 /
+ *  contrast 0 — a black cover — while the same sample's semantic evidence
+ *  recorded `visible_scene_ids: ["hook"]` and a `data-role="title"` occupying
+ *  14% of the frame. QA correctly reported EMPTY_HOOK_FRAME and pointed the
+ *  model at the HTML, which was not wrong; the model could never fix it, and
+ *  the run died there. Those two facts cannot both be true, and the host holds
+ *  both — so it decides the capture failed rather than blaming the page.
+ *
+ *  2026-08-08 widened it: the whole-frame test above answers "is this image
+ *  blank", which is not the same question. A page with a gradient background
+ *  and a grid overlay measured contrast 9.03 — comfortably past the blank
+ *  threshold — while its 88px headline was absent from the pixels and the DOM
+ *  reported that same headline visible with text. The same composition rendered
+ *  to video correctly, so the preview the user judges was worse than the video
+ *  they would get. The question has to be asked of the region the element
+ *  occupies, not of the frame.
+ *
+ *  Deliberately narrow, in both forms: it needs real content in the DOM AND
+ *  either a mathematically uniform frame, or a named element whose own region
+ *  is uniform while it claims meaningful area. A dark design is not uniform; an
+ *  intentionally empty frame has nothing in the DOM to contradict; an element
+ *  the probe never located is not judged. */
+export function captureContradictsDom(
+  stats: { brightness: number; contrast: number },
+  evidence: { visible_text?: string; visible_elements?: VisibleSemanticElementEvidence[] },
+  region?: (area: { left: number; top: number; width: number; height: number }) => number,
+): boolean {
+  const substantial = (evidence.visible_elements || []).filter(
+    (element) => Number(element.area_ratio || 0) >= CONTRADICTED_CAPTURE_MIN_AREA_RATIO,
+  );
+  if (stats.contrast < BLANK_FRAME_MAX_CONTRAST) {
+    if (String(evidence.visible_text || '').trim()) return true;
+    return substantial.length > 0;
+  }
+  if (!region) return false;
+  // Only elements the probe placed AND that carry something a viewer would
+  // miss: text, a cover signal, or the hero. A decorative box that renders as
+  // one flat colour is legitimately uniform and must not trigger a re-shoot.
+  return substantial.some((element) => {
+    if (element.left_ratio === undefined || element.top_ratio === undefined) return false;
+    if (!String(element.text || '').trim() && !element.cover_signal && !element.cover_hero) return false;
+    return region({
+      left: element.left_ratio,
+      top: element.top_ratio,
+      width: Number(element.width_ratio || 0),
+      height: Number(element.height_ratio || 0),
+    }) < BLANK_FRAME_MAX_CONTRAST;
+  });
+}
+
 async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
   visible_scene_ids: string[];
   visible_roles: string[];
   visible_text: string;
   visible_elements: VisibleSemanticElementEvidence[];
+  hidden_elements: HiddenSemanticElementEvidence[];
 }> {
   return await withVideoStudioTimeout(win.webContents.executeJavaScript(`
 (() => {
   const viewportWidth = Math.max(1, document.documentElement.clientWidth || window.innerWidth || 1);
   const viewportHeight = Math.max(1, document.documentElement.clientHeight || window.innerHeight || 1);
-  const visible = (el) => {
+  const selectorOf = (el) => {
+    if (!el) return '';
+    if (el.id) return '#' + el.id;
+    const tag = String(el.tagName || '').toLowerCase();
+    const sceneId = el.getAttribute && el.getAttribute('data-scene-id');
+    if (sceneId) return tag + '[data-scene-id="' + sceneId + '"]';
+    const role = el.getAttribute && el.getAttribute('data-role');
+    if (role) return tag + '[data-role="' + role + '"]';
+    const cls = String((el.className && el.className.baseVal) || el.className || '').trim().split(/\\s+/)[0];
+    return cls ? tag + '.' + cls : tag;
+  };
+  // Returns null when the element renders, otherwise the reason it does not.
+  // The walk is identical to the old boolean test — only its answer is richer.
+  const failure = (el) => {
     const rect = el.getBoundingClientRect();
-    if (rect.width <= 1 || rect.height <= 1) return false;
+    if (rect.width <= 1 || rect.height <= 1) return { reason: 'zero_size' };
     const visibleWidth = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
     const visibleHeight = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
-    if (visibleWidth <= 1 || visibleHeight <= 1) return false;
+    if (visibleWidth <= 1 || visibleHeight <= 1) return { reason: 'offscreen' };
     let node = el;
     let opacity = 1;
     while (node && node.nodeType === Node.ELEMENT_NODE) {
       const style = getComputedStyle(node);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (style.display === 'none') return { reason: 'display_none', blocked_by: selectorOf(node) };
+      if (style.visibility === 'hidden') return { reason: 'visibility_hidden', blocked_by: selectorOf(node) };
       opacity *= Number(style.opacity || 1);
-      if (opacity <= 0.1) return false;
+      if (opacity <= 0.1) {
+        return { reason: 'transparent', blocked_by: selectorOf(node), computed_opacity: Number(opacity.toFixed(3)) };
+      }
       node = node.parentElement;
     }
-    return true;
+    return null;
   };
+  const visible = (el) => failure(el) === null;
   const scenes = Array.from(document.querySelectorAll('[data-scene-id]'))
     .filter(visible)
     .map((el) => String(el.getAttribute('data-scene-id') || '').trim())
@@ -1513,6 +1830,8 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
         width_ratio: Number((visibleWidth / viewportWidth).toFixed(4)),
         height_ratio: Number((visibleHeight / viewportHeight).toFixed(4)),
         area_ratio: Number(((visibleWidth * visibleHeight) / (viewportWidth * viewportHeight)).toFixed(4)),
+        left_ratio: Number((Math.max(0, rect.left) / viewportWidth).toFixed(4)),
+        top_ratio: Number((Math.max(0, rect.top) / viewportHeight).toFixed(4)),
       };
     });
   const text = visibleElements
@@ -1521,11 +1840,48 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
     .filter(Boolean)
     .join(' ')
     .slice(0, 1000);
+  // Only the elements QA asks about: scene roots and the cover-bearing roles.
+  // Report the OUTERMOST failing element per subtree: in a 9-scene video eight
+  // scenes are legitimately hidden at any sampled time, and listing each of
+  // their titles and heroes too would bury the one the finding asks about
+  // under expected noise — and could push it past the cap entirely. A hidden
+  // container is the cause; its children are consequences.
+  const candidates = Array.from(document.querySelectorAll('[data-scene-id], [data-role], [data-cover-hero], [data-cover-signal]'));
+  const failingSet = new Set(candidates.filter((el) => failure(el) !== null));
+  const hiddenElements = [];
+  const hiddenSeen = new Set();
+  for (const el of candidates) {
+    if (hiddenElements.length >= 12) break;
+    const why = failure(el);
+    if (!why) continue;
+    let ancestor = el.parentElement;
+    let coveredByAncestor = false;
+    while (ancestor) {
+      if (failingSet.has(ancestor)) { coveredByAncestor = true; break; }
+      ancestor = ancestor.parentElement;
+    }
+    if (coveredByAncestor) continue;
+    const selector = selectorOf(el);
+    if (hiddenSeen.has(selector)) continue;
+    hiddenSeen.add(selector);
+    const sceneOwner = el.closest('[data-scene-id]');
+    const role = String(el.getAttribute('data-role') || '').trim();
+    hiddenElements.push({
+      selector,
+      ...(sceneOwner ? { scene_id: String(sceneOwner.getAttribute('data-scene-id') || '').trim() } : {}),
+      ...(role ? { role } : {}),
+      reason: why.reason,
+      ...(why.blocked_by && why.blocked_by !== selector ? { blocked_by: why.blocked_by } : {}),
+      ...(typeof why.computed_opacity === 'number' ? { computed_opacity: why.computed_opacity } : {}),
+      ...(el.hasAttribute('data-cover-hero') ? { cover_hero: true } : {}),
+    });
+  }
   return {
     visible_scene_ids: [...new Set(scenes)],
     visible_roles: [...new Set(roles)],
     visible_text: text,
     visible_elements: visibleElements,
+    hidden_elements: hiddenElements,
   };
 })()
 `, true) as Promise<{
@@ -1533,6 +1889,7 @@ async function readFrameSemanticEvidence(win: ElectronBrowserWindow): Promise<{
   visible_roles: string[];
   visible_text: string;
   visible_elements: VisibleSemanticElementEvidence[];
+  hidden_elements: HiddenSemanticElementEvidence[];
 }>,
   COMPOSITION_SCRIPT_TIMEOUT_MS,
   'E_SEMANTIC_EVIDENCE_TIMEOUT',
@@ -1600,9 +1957,34 @@ export async function materializeVideoCover(
   return { path: target, source_frame: source, label: sample.label };
 }
 
+/** Does every blocking preflight error live in the manifest's declarative
+ *  art-direction contract?
+ *
+ *  Those fields (`reference_fidelity`, `cover`, the reference/anchor family)
+ *  describe intent for later review; nothing about them changes what the page
+ *  renders. Blocking the runtime probe on them hides the layout findings for a
+ *  whole cycle: on 2026-08-07 an inspect blocked solely by
+ *  REFERENCE_FIDELITY_CONTRACT_INCOMPLETE returned no layout evidence, and the
+ *  13 advisory defects it would have reported only surfaced after the metadata
+ *  was fixed. Anything pointing at `index.html`, timing, narration, or
+ *  resources keeps the probe closed — there the rendered page really is not
+ *  the one under review, and probe output would mislead. */
+function preflightBlockedOnlyByDeclarativeArtDirection(preflight: CompositionPreflightResult): boolean {
+  const blocking = preflight.issues.filter((issue) => issue.severity === 'error');
+  return blocking.length > 0 && blocking.every((issue) => String(issue.selector || '')
+    .startsWith('composition-manifest.json#art_direction'));
+}
+
 export async function inspectComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   const preflight = await preflightComposition(p, 'visual-preview');
-  if (!preflight.ok || !preflight.meta) {
+  // A declarative-only block still runs the probe so its findings arrive with
+  // the metadata repair instead of one cycle later. The verdict below is
+  // unchanged: the operation still fails with E_PREFLIGHT_BLOCKED and still
+  // sends the model back through prepare.
+  const probeDespitePreflight = !preflight.ok
+    && !!preflight.meta
+    && preflightBlockedOnlyByDeclarativeArtDirection(preflight);
+  if ((!preflight.ok && !probeDespitePreflight) || !preflight.meta) {
     const result = {
       ok: false,
       op: 'composition.inspect',
@@ -1623,6 +2005,7 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
   const issues: Issue[] = [...preflight.issues];
   const samplePlans = buildInspectFrameSamplePlan(meta, preflight.sceneMapLoad.value, 30);
   const samples = samplePlans.map((plan) => plan.timeSec);
+  let isolationProbe: SceneIsolationProbeResult | null = null;
   try {
     await withCompositionWindow(meta, p, async (win) => {
       for (const plan of samplePlans) {
@@ -1632,9 +2015,29 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
           COMPOSITION_SCRIPT_TIMEOUT_MS,
           'E_INSPECT_TIMEOUT',
           `composition inspect timed out at ${round2(plan.timeSec)}s.`,
-          () => { try { win.destroy(); } catch { /* best effort */ } },
+          () => {
+            try { win.destroy(); }
+            catch (err) { log.warn('inspect window cleanup failed', { error: logErrorSummary(err) }); }
+          },
         );
         issues.push(...sampleIssues);
+      }
+      if (preflight.manifest) {
+        // Advisory attribution probe: failures leave the record unsupported
+        // but never fail or slow down the inspect verdict itself.
+        isolationProbe = await withVideoStudioTimeout(
+          win.webContents.executeJavaScript(buildSceneIsolationProbeScript(preflight.manifest), true) as Promise<SceneIsolationProbeResult>,
+          COMPOSITION_SCRIPT_TIMEOUT_MS,
+          'E_INSPECT_TIMEOUT',
+          'scene isolation probe timed out.',
+          () => {
+            try { win.destroy(); }
+            catch (err) { log.warn('isolation probe window cleanup failed', { error: logErrorSummary(err) }); }
+          },
+        ).catch((err) => {
+          log.warn('scene isolation probe failed', { error: logErrorSummary(err) });
+          return null;
+        });
       }
     });
   } catch (err) {
@@ -1645,6 +2048,20 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
       message: (err as Error).message,
       source: 'orkas-native',
     });
+  }
+  let sceneIsolation: SceneIsolationRecord | null = null;
+  if (preflight.manifest) {
+    sceneIsolation = summarizeSceneIsolation({
+      htmlSha256: crypto.createHash('sha256').update(meta.html).digest('hex'),
+      decomposition: decomposeCompositionSceneAttribution(meta.html, preflight.manifest),
+      probe: isolationProbe,
+    });
+    const isolationOut = sceneIsolationPath(p.compositionDirAbs);
+    await fs.mkdir(path.dirname(isolationOut), { recursive: true })
+      .then(() => fs.writeFile(isolationOut, JSON.stringify(sceneIsolation, null, 2), 'utf8'))
+      .catch((err) => {
+        log.warn('persist scene isolation record failed', { error: logErrorSummary(err) });
+      });
   }
   const normalizedIssues = dedupeInspectIssues(normalizeDraftInspectIssueSeverities(issues));
   const findings = findingsJson(normalizedIssues, {
@@ -1658,6 +2075,28 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
   const disposition = summarizeDraftInspectDisposition(findings);
   const blockingErrorCount = Number(disposition.blocking_error_count || 0);
   const fatalErrorCount = Number(disposition.fatal_error_count || 0);
+  if (probeDespitePreflight) {
+    // Same verdict as the early return above — the declarative contract still
+    // has to be repaired before anything proceeds — but `findings` now carries
+    // the layout evidence too, so both repairs can be made in one pass.
+    const result = {
+      ok: false,
+      op: 'composition.inspect',
+      errorCode: 'E_PREFLIGHT_BLOCKED',
+      message: preflight.issues.find((issue) => issue.severity === 'error')?.message || 'Composition preflight failed.',
+      status: 'failed',
+      stage: 'runtime_probe',
+      runtime_probe_ran: true,
+      blocking_error_count: preflight.issues.filter((issue) => issue.severity === 'error').length,
+      preflight: preflight.report,
+      preview_completeness: narrationPending ? 'visual_only' : 'complete',
+      narration_pending: narrationPending,
+      findings,
+      next_allowed_ops: ['composition.prepare'],
+    } as VideoStudioResult;
+    await writeJsonIfRequested(p.findingsAbsPath, result);
+    return result;
+  }
   if (fatalErrorCount > 0) {
     const result = {
       ok: false,
@@ -1693,6 +2132,7 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
       narration_pending: narrationPending,
       findings,
       inspect_disposition: disposition,
+      ...(sceneIsolation ? { scene_isolation: sceneIsolationSummary(sceneIsolation) } : {}),
       next_allowed_ops: ['composition.snapshot'],
     } as VideoStudioResult;
     await writeJsonIfRequested(p.findingsAbsPath, result);
@@ -1709,12 +2149,156 @@ export async function inspectComposition(p: CompositionOptions): Promise<VideoSt
     preview_completeness: narrationPending ? 'visual_only' : 'complete',
     narration_pending: narrationPending,
     findings,
+    ...(sceneIsolation ? { scene_isolation: sceneIsolationSummary(sceneIsolation) } : {}),
     next_allowed_ops: narrationPending
       ? ['composition.snapshot', 'composition.materialize_narration']
       : ['composition.snapshot', 'composition.draft'],
   } as VideoStudioResult;
   await writeJsonIfRequested(p.findingsAbsPath, result);
   return result;
+}
+
+function sceneIsolationSummary(record: SceneIsolationRecord): Record<string, unknown> {
+  return {
+    attributable: record.attributable,
+    runtime_supported: record.runtime_supported,
+    isolation: record.isolation,
+    violation_count: record.violations.length,
+  };
+}
+
+/** P3c R1: one-shot runtime probe over the composition timeline. Classifies
+ * every leaf tween by the scene window(s) its global interval fits inside and
+ * verifies its targets live in exactly that scene's section. Contract-owned
+ * visibility setters (targets that ARE scene sections) are exempt. The result
+ * is an advisory attribution fact, never a QA verdict. */
+export function buildSceneIsolationProbeScript(manifest: CompositionManifest): string {
+  const windows = manifest.scenes.map((scene) => ({ id: scene.id, start: scene.start, end: scene.start + scene.duration }));
+  return `
+(() => {
+  const windows = ${JSON.stringify(windows)};
+  const EPSILON = 0.001;
+  const violations = [];
+  const round = (value) => Math.round(Number(value || 0) * 100) / 100;
+  const timelines = window.__timelines || {};
+  const tl = window.__ORKAS_COMPOSITION_TIMELINE__
+    || timelines[${JSON.stringify(manifest.composition.id)}]
+    || timelines.main
+    || timelines.root;
+  if (!tl || typeof tl.getChildren !== 'function') {
+    return { supported: false, isolation: false, violations: [{ reason: 'no_composition_timeline' }] };
+  }
+  const describeTargets = (targets) => targets.slice(0, 3).map((target) => {
+    if (target && target.nodeType === 1) {
+      return (target.tagName || '').toLowerCase() + (target.id ? '#' + target.id : '');
+    }
+    return typeof target;
+  });
+  const record = (violation) => {
+    if (violations.length < 20) violations.push(violation);
+  };
+  const walk = (node, offset) => {
+    const children = node.getChildren(false, true, true) || [];
+    for (const child of children) {
+      const start = offset + child.startTime();
+      const end = offset + (typeof child.endTime === 'function'
+        ? child.endTime(true)
+        : child.startTime() + child.totalDuration());
+      if (typeof child.getChildren === 'function') {
+        walk(child, start);
+        continue;
+      }
+      const targets = typeof child.targets === 'function' ? (child.targets() || []) : [];
+      if (!targets.length) continue;
+      if (targets.every((target) => target && target.nodeType === 1
+        && target.hasAttribute && target.hasAttribute('data-scene-id'))) continue;
+      const candidates = windows.filter((w) => start >= w.start - EPSILON && end <= w.end + EPSILON);
+      if (!candidates.length) {
+        record({ reason: 'tween_spans_scene_windows', start: round(start), end: round(end), targets: describeTargets(targets) });
+        continue;
+      }
+      const targetSceneIds = new Set();
+      let nonElement = false;
+      let outsideScenes = false;
+      for (const target of targets) {
+        const el = target && target.nodeType === 1 ? target : null;
+        if (!el) { nonElement = true; continue; }
+        const scene = el.closest ? el.closest('[data-scene-id]') : null;
+        if (!scene) { outsideScenes = true; continue; }
+        targetSceneIds.add(String(scene.getAttribute('data-scene-id') || ''));
+      }
+      if (nonElement) {
+        record({ reason: 'non_element_target', start: round(start), end: round(end), targets: describeTargets(targets) });
+        continue;
+      }
+      if (outsideScenes) {
+        record({ reason: 'target_outside_scenes', start: round(start), end: round(end), targets: describeTargets(targets) });
+        continue;
+      }
+      if (targetSceneIds.size !== 1) {
+        record({ reason: 'multi_scene_targets', start: round(start), end: round(end), targets: describeTargets(targets) });
+        continue;
+      }
+      const sceneId = [...targetSceneIds][0];
+      if (!candidates.some((w) => w.id === sceneId)) {
+        record({
+          reason: 'target_in_other_scene',
+          expected: candidates.map((w) => w.id),
+          actual: sceneId,
+          start: round(start),
+          end: round(end),
+          targets: describeTargets(targets),
+        });
+      }
+    }
+  };
+  try {
+    walk(tl, 0);
+  } catch (err) {
+    return { supported: false, isolation: false, violations: [{ reason: 'walk_failed', message: String((err && err.message) || err) }] };
+  }
+  return { supported: true, isolation: violations.length === 0, violations };
+})()
+`;
+}
+
+export type SceneIsolationRecord = {
+  version: 1;
+  html_sha256: string;
+  attributable: boolean;
+  attribution_reasons: string[];
+  runtime_supported: boolean;
+  isolation: boolean;
+  violations: Array<Record<string, unknown>>;
+  verified_at: string;
+};
+
+type SceneIsolationProbeResult = {
+  supported?: boolean;
+  isolation?: boolean;
+  violations?: Array<Record<string, unknown>>;
+};
+
+export function summarizeSceneIsolation(input: {
+  htmlSha256: string;
+  decomposition: SceneAttributionDecomposition;
+  probe: SceneIsolationProbeResult | null;
+}): SceneIsolationRecord {
+  const runtimeSupported = input.probe?.supported === true;
+  return {
+    version: 1,
+    html_sha256: input.htmlSha256,
+    attributable: input.decomposition.attributable,
+    attribution_reasons: input.decomposition.reasons,
+    runtime_supported: runtimeSupported,
+    isolation: input.decomposition.attributable && runtimeSupported && input.probe?.isolation === true,
+    violations: Array.isArray(input.probe?.violations) ? input.probe.violations.slice(0, 20) : [],
+    verified_at: new Date().toISOString(),
+  };
+}
+
+function sceneIsolationPath(compositionDirAbs: string): string {
+  return path.join(compositionDirAbs, 'qa', 'scene-isolation.json');
 }
 
 export function buildInspectScript(meta: CompositionMeta, tSec: number, expectedSceneId?: string): string {
@@ -1921,7 +2505,15 @@ export function buildInspectScript(meta: CompositionMeta, tSec: number, expected
 
 export async function snapshotComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   if (!p.snapshotAbsPath) {
-    return { ok: false, op: 'composition.snapshot', errorCode: 'E_OUTPUT_REQUIRED', message: 'snapshot output path is required.' };
+    // The convention is the host's, and the caller cannot infer it: frames
+    // belong under the composition's own preview/ directory, where a snapshot
+    // does not change the composition signature.
+    return {
+      ok: false,
+      op: 'composition.snapshot',
+      errorCode: 'E_OUTPUT_REQUIRED',
+      message: 'snapshot output path is required: pass the frame destination inside this composition, conventionally preview/first-frame.png.',
+    };
   }
   const preflight = await preflightComposition(p, 'visual-preview');
   if (!preflight.ok || !preflight.meta || !preflight.manifest) {
@@ -1989,14 +2581,32 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       await seek(win, plan.timeSec);
       await settleCompositionPaint(win);
       const semanticEvidence = await readFrameSemanticEvidence(win);
-      const capturedImage = await withVideoStudioTimeout(
-        win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
-        COMPOSITION_CAPTURE_TIMEOUT_MS,
-        'E_SNAPSHOT_TIMEOUT',
-        `composition snapshot timed out while capturing preview frame ${index + 1}/${plans.length}.`,
-        () => { try { win.destroy(); } catch { /* best effort */ } },
-      );
-      const normalizedCapture = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+      const captureFrame = async (): Promise<ReturnType<typeof normalizeCapturedFrame>> => {
+        const shot = await withVideoStudioTimeout(
+          win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+          COMPOSITION_CAPTURE_TIMEOUT_MS,
+          'E_SNAPSHOT_TIMEOUT',
+          `composition snapshot timed out while capturing preview frame ${index + 1}/${plans.length}.`,
+          () => { try { win.destroy(); } catch { /* best effort */ } },
+        );
+        return normalizeCapturedFrame(shot, meta.width, meta.height);
+      };
+      let normalizedCapture = await captureFrame();
+      // The preview is what the user approves, so a frame that came back blank
+      // while the page held content must not reach them either.
+      let contradictedRetries = 0;
+      while (
+        contradictedRetries < COMPOSITION_CONTRADICTED_CAPTURE_MAX_RETRIES
+        && captureContradictsDom(
+          analyzeNativeImage(normalizedCapture.image),
+          semanticEvidence,
+          (area) => regionContrast(normalizedCapture.image, area),
+        )
+      ) {
+        contradictedRetries += 1;
+        await settleCompositionPaint(win);
+        normalizedCapture = await captureFrame();
+      }
       const image = normalizedCapture.image;
       const png = image.toPNG();
       if (index === 0) await fs.writeFile(p.snapshotAbsPath!, png);
@@ -2011,7 +2621,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
         capture_source_width: normalizedCapture.sourceWidth,
         capture_source_height: normalizedCapture.sourceHeight,
         capture_scale_factor: normalizedCapture.scaleFactor,
-        ...(retryCount > 0 ? { capture_retry_count: retryCount } : {}),
+        ...(retryCount + contradictedRetries > 0 ? { capture_retry_count: retryCount + contradictedRetries } : {}),
         ...semanticEvidence,
         ...analyzeNativeImage(image),
       };
@@ -2071,7 +2681,12 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
     const previewQa = summarizeVideoFrameQa(frameEvidence, meta.durationSec, {
       sceneCount: manifest.scenes.length,
       expectedSceneIds: manifest.scenes.map((scene) => scene.id),
+      sceneWindows: manifest.scenes.map((scene) => ({
+        id: scene.id, start: scene.start, duration: scene.duration,
+      })),
       requireSemanticCoverage: true,
+      ...(p.isDeliveredOpening === false ? { isDeliveredOpening: false } : {}),
+      ...(p.waivedQaFindings?.length ? { waivedFindings: p.waivedQaFindings } : {}),
       designContract: preflight.contractLoad.value,
       sceneMap: preflight.sceneMapLoad.value,
     });
@@ -2157,7 +2772,7 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
       visual_regression: visualRegression,
       design_review_inputs: designReviewInputs,
       preview_ready: true,
-      next_allowed_ops: ['composition.approve_preview'],
+      next_allowed_ops: ['composition.draft'],
     } as VideoStudioResult;
     await writeJsonIfRequested(p.findingsAbsPath, result);
     return result;
@@ -2173,6 +2788,818 @@ export async function snapshotComposition(p: CompositionOptions): Promise<VideoS
   }
 }
 
+/** R0 fast path: returns a complete render result when the prior video track
+ * is provably identical for this key, or null to fall through to the full
+ * frame-capture render. Every failure inside is a silent fallback, never an
+ * error surface — reuse is an optimization, not a contract. */
+async function attemptVideoTrackReuse(
+  p: CompositionOptions,
+  meta: CompositionMeta,
+  ctx: {
+    fps: number;
+    totalFrames: number;
+    ffmpeg: string;
+    ffprobe: string;
+    renderProfile: NativeRenderProfile;
+  },
+): Promise<VideoStudioResult | null> {
+  if (!p.visualSignature || !p.outputAbsPath) return null;
+  const windows = await readCompositionWindowVector(p.compositionDirAbs);
+  if (!windows) return null;
+  const key = buildRenderReuseKey({
+    visualSignature: p.visualSignature,
+    windows,
+    width: meta.width,
+    height: meta.height,
+    fps: ctx.fps,
+    quality: p.quality,
+    format: p.format,
+  });
+  const entry = (await readRenderProvenance(p.compositionDirAbs)).find((candidate) => candidate.key === key) || null;
+  const priorVideoSha256 = entry ? await sha256File(entry.video_path) : null;
+  const evidenceRequired = !!p.frameEvidenceDirAbs;
+  let priorSamplesPresent = false;
+  if (entry?.samples?.length) {
+    priorSamplesPresent = (await Promise.all(
+      entry.samples.map((sample) => fs.stat(sample.path).then(() => true, () => false)),
+    )).every(Boolean);
+  }
+  const decision = evaluateVideoTrackReuse({ entry, priorVideoSha256, evidenceRequired, priorSamplesPresent });
+  if (!decision.reuse || !entry) return null;
+  const startedAt = Date.now();
+  const outputDir = path.dirname(p.outputAbsPath);
+  const outputExt = path.extname(p.outputAbsPath) || (p.format === 'webm' ? '.webm' : '.mp4');
+  const tempOutputAbsPath = path.join(
+    outputDir,
+    `.${path.basename(p.outputAbsPath, path.extname(p.outputAbsPath))}.remuxing-${crypto.randomUUID()}${outputExt}`,
+  );
+  try {
+    await fs.mkdir(outputDir, { recursive: true });
+    const remux = await runProcess(ctx.ffmpeg, buildVideoTrackRemuxArgs({
+      priorVideoAbsPath: entry.video_path,
+      outputAbsPath: tempOutputAbsPath,
+      durationSec: meta.durationSec,
+      ...(p.format ? { format: p.format } : {}),
+      audioTracks: meta.audioTracks,
+    }), { timeoutMs: VIDEO_TRACK_REMUX_TIMEOUT_MS, ...(p.signal ? { signal: p.signal } : {}) });
+    if (remux.code !== 0) {
+      log.warn('video track remux failed; falling back to full render', { code: remux.code });
+      await fs.rm(tempOutputAbsPath, { force: true }).catch((err) => {
+        log.warn('failed remux cleanup failed', { error: logErrorSummary(err) });
+      });
+      return null;
+    }
+    const probe = await probeMedia(ctx.ffprobe, tempOutputAbsPath, p.signal);
+    if (!probe?.video || probe.duration_seconds === null) {
+      await fs.rm(tempOutputAbsPath, { force: true }).catch((err) => {
+        log.warn('invalid remux cleanup failed', { error: logErrorSummary(err) });
+      });
+      return null;
+    }
+    let frameEvidence: FrameEvidence | undefined;
+    let copiedSamples: FrameSampleEvidence[] = [];
+    if (evidenceRequired && p.frameEvidenceDirAbs && entry.samples?.length) {
+      await fs.mkdir(p.frameEvidenceDirAbs, { recursive: true });
+      for (const sample of entry.samples) {
+        const target = path.join(p.frameEvidenceDirAbs, path.basename(sample.path));
+        if (path.resolve(target) !== path.resolve(sample.path)) {
+          await fs.copyFile(sample.path, target);
+        }
+        copiedSamples.push({ ...sample, path: target, reused_from_prior_render: true });
+      }
+      const contactSheet = await writeFrameContactSheet(p.frameEvidenceDirAbs, copiedSamples);
+      frameEvidence = {
+        evidence_dir: p.frameEvidenceDirAbs,
+        contact_sheet: contactSheet,
+        frame_paths: copiedSamples.map((sample) => sample.path),
+        samples: copiedSamples,
+      };
+    }
+    await fs.rename(tempOutputAbsPath, p.outputAbsPath);
+    const st = await fs.stat(p.outputAbsPath);
+    const outputSha = await sha256File(p.outputAbsPath);
+    if (outputSha) {
+      await upsertRenderProvenance(p.compositionDirAbs, {
+        ...entry,
+        video_path: p.outputAbsPath,
+        video_sha256: outputSha,
+        ...(frameEvidence
+          ? { evidence_dir: frameEvidence.evidence_dir, contact_sheet: frameEvidence.contact_sheet, samples: copiedSamples }
+          : {}),
+        rendered_at: new Date().toISOString(),
+      }).catch((err) => {
+        log.warn('reused render provenance refresh failed', { error: logErrorSummary(err) });
+      });
+    }
+    const totalSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
+    const renderProfile: NativeRenderProfile = {
+      ...ctx.renderProfile,
+      frame_pipeline: 'video_track_reuse',
+      total_render_seconds: round2(totalSeconds),
+      frame_bytes_streamed: 0,
+      temporary_frame_bytes: 0,
+    };
+    p.onProgress?.({
+      phase: 'composition.render',
+      message: 'Visual inputs and scene windows are unchanged; reusing the prior rendered video track and remixing audio only.',
+      data: { framePipeline: 'video_track_reuse', totalFrames: ctx.totalFrames },
+    });
+    return {
+      ok: true,
+      op: 'composition.render',
+      path: p.outputAbsPath,
+      bytes: st.size,
+      media: versionedChatMediaLocalUrl(p.outputAbsPath),
+      probe,
+      engine: 'orkas-native',
+      fps: ctx.fps,
+      frames: ctx.totalFrames,
+      canvas: { width: meta.width, height: meta.height, durationSec: meta.durationSec },
+      render_profile: renderProfile,
+      reused_video_track: true,
+      ...(frameEvidence ? { frame_evidence: frameEvidence } : {}),
+    };
+  } catch (err) {
+    await fs.rm(tempOutputAbsPath, { force: true }).catch((cleanupErr) => {
+      log.warn('remux rollback cleanup failed', { error: logErrorSummary(cleanupErr) });
+    });
+    if (p.signal?.aborted) throw err;
+    log.warn('video track reuse attempt failed; falling back to full render', { error: logErrorSummary(err) });
+    return null;
+  }
+}
+
+/** P3c R2: per-scene segment assembly. The global frame sequence is
+ * partitioned at scene-start boundaries; each partition renders (or reuses)
+ * an independently encoded video-only segment, and the final output is a
+ * lossless concat plus one audio remux. Correctness rests on verified scene
+ * attribution: segments are keyed by scene subtree + motion region + shared
+ * surface + absolute window + frame range + encode params, and the whole
+ * path is eligible only while qa/scene-isolation.json proves isolation for
+ * the exact current HTML bytes. */
+const SEGMENT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const SEGMENT_CACHE_META_VERSION = 1;
+
+type SegmentCacheSample = Omit<FrameSampleEvidence, 'path'> & { cache_relative_path: string };
+
+type SegmentCacheMeta = {
+  version: typeof SEGMENT_CACHE_META_VERSION;
+  scene_id: string;
+  frame_range: [number, number];
+  fps: number;
+  samples: SegmentCacheSample[];
+};
+
+export type SceneFrameRange = {
+  sceneId: string;
+  window: { start: number; duration: number };
+  startFrame: number;
+  endFrame: number;
+};
+
+/** Partition [0, totalFrames) at scene-start boundaries. Uses starts only, so
+ * the partition is total even when manifest windows carry tolerance gaps. */
+export function computeSceneFrameRanges(
+  windows: RenderWindowVector,
+  fps: number,
+  totalFrames: number,
+): SceneFrameRange[] | null {
+  if (!windows.length || !Number.isFinite(fps) || fps <= 0 || totalFrames < 1) return null;
+  const sorted = [...windows].sort((a, b) => a.start - b.start);
+  const boundaries = sorted.map((window, index) => (index === 0
+    ? 0
+    : Math.max(0, Math.min(totalFrames, Math.ceil(window.start * fps - 1e-6)))));
+  const ranges: SceneFrameRange[] = [];
+  for (const [index, window] of sorted.entries()) {
+    const startFrame = boundaries[index];
+    const endFrame = index + 1 < sorted.length ? boundaries[index + 1] : totalFrames;
+    if (endFrame < startFrame) return null;
+    ranges.push({
+      sceneId: window.id,
+      window: { start: window.start, duration: window.duration },
+      startFrame,
+      endFrame,
+    });
+  }
+  return ranges;
+}
+
+export function buildSceneSegmentKey(input: {
+  sceneId: string;
+  window: { start: number; duration: number };
+  frameRange: [number, number];
+  subtreeSha256: string;
+  motionRegionSha256: string;
+  sharedSurfaceSha256: string;
+  sceneAssetsSha256: string;
+  sharedAssetsSha256: string;
+  fps: number;
+  width: number;
+  height: number;
+  quality: string | undefined;
+  format: string | undefined;
+}): string {
+  return crypto.createHash('sha256').update(JSON.stringify({
+    v: 2,
+    scene: input.sceneId,
+    window: [input.window.start, input.window.duration],
+    frames: input.frameRange,
+    subtree: input.subtreeSha256,
+    motion: input.motionRegionSha256,
+    shared: input.sharedSurfaceSha256,
+    scene_assets: input.sceneAssetsSha256,
+    shared_assets: input.sharedAssetsSha256,
+    fps: input.fps,
+    width: input.width,
+    height: input.height,
+    quality: input.quality ?? 'unset',
+    format: input.format ?? 'mp4',
+  })).digest('hex');
+}
+
+function sha256Text(text: string): string {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+const SEGMENT_VISUAL_SIGNATURE_EXCLUDED_AUDIO_RE = /\.(?:mp3|wav|m4a|ogg|aac|flac|opus)$/i;
+
+/** Content identity of the local visual resources referenced by one
+ * attributable HTML surface. The fragment bytes themselves are already part
+ * of the segment key; this projection closes the separate same-path/content-
+ * changed hole without making an unrelated scene inherit the whole
+ * composition signature. */
+export async function videoStudioReferencedVisualAssetSignature(
+  compositionDirAbs: string,
+  htmlFragment: string,
+): Promise<string> {
+  const queue: Array<{ ref: string; baseDirAbs: string }> = extractHtmlResourceRefs(parseHtmlStructure(htmlFragment))
+    .map((item) => ({ ref: item.ref, baseDirAbs: compositionDirAbs }));
+  const visited = new Set<string>();
+  const assets: Array<[string, string]> = [];
+
+  for (let index = 0; index < queue.length; index += 1) {
+    const item = queue[index];
+    const abs = safeResolveLocalRefFromBase(compositionDirAbs, item.baseDirAbs, item.ref);
+    if (!abs || visited.has(abs) || SEGMENT_VISUAL_SIGNATURE_EXCLUDED_AUDIO_RE.test(abs)) continue;
+    visited.add(abs);
+    const bytes = await fs.readFile(abs);
+    const rel = path.relative(compositionDirAbs, abs).replace(/\\/g, '/');
+    assets.push([rel, crypto.createHash('sha256').update(bytes).digest('hex')]);
+    if (path.extname(abs).toLowerCase() !== '.css') continue;
+    const css = bytes.toString('utf8');
+    for (const ref of new Set([...extractCssImports(css), ...extractCssUrls(css)])) {
+      queue.push({ ref, baseDirAbs: path.dirname(abs) });
+    }
+  }
+
+  assets.sort(([left], [right]) => left.localeCompare(right));
+  return sha256Text(JSON.stringify(assets));
+}
+
+async function readSegmentCacheMeta(entryDirAbs: string): Promise<SegmentCacheMeta | null> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(entryDirAbs, 'meta.json'), 'utf8')) as SegmentCacheMeta;
+    if (parsed?.version !== SEGMENT_CACHE_META_VERSION || !Array.isArray(parsed.frame_range)) return null;
+    return parsed;
+  } catch (err) {
+    logOptionalReadFailure('segment cache metadata read failed', err);
+    return null;
+  }
+}
+
+export async function pruneSegmentCache(
+  cacheDirAbs: string,
+  removeEntry: (dirAbs: string) => Promise<void> = (dirAbs) => fs.rm(dirAbs, { recursive: true, force: true }),
+): Promise<void> {
+  try {
+    const entries = await fs.readdir(cacheDirAbs, { withFileTypes: true });
+    const stats: Array<{ dirAbs: string; mtimeMs: number; bytes: number }> = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const dirAbs = path.join(cacheDirAbs, entry.name);
+      let bytes = 0;
+      let mtimeMs = 0;
+      for (const file of await fs.readdir(dirAbs, { recursive: true, withFileTypes: true }).catch((err) => {
+        logOptionalReadFailure('segment cache directory read failed', err);
+        return [];
+      })) {
+        if (!file.isFile()) continue;
+        const st = await fs.stat(path.join(String(file.parentPath || file.path || dirAbs), file.name)).catch((err) => {
+          logOptionalReadFailure('segment cache file stat failed', err);
+          return null;
+        });
+        if (!st) continue;
+        bytes += st.size;
+        mtimeMs = Math.max(mtimeMs, st.mtimeMs);
+      }
+      stats.push({ dirAbs, mtimeMs, bytes });
+    }
+    let total = stats.reduce((sum, item) => sum + item.bytes, 0);
+    if (total <= SEGMENT_CACHE_MAX_BYTES) return;
+    for (const item of stats.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+      if (total <= SEGMENT_CACHE_MAX_BYTES) break;
+      const removed = await removeEntry(item.dirAbs).then(() => true).catch((err) => {
+        log.warn('segment cache eviction failed', { error: logErrorSummary(err) });
+        return false;
+      });
+      if (removed) total -= item.bytes;
+    }
+  } catch (err) {
+    logOptionalReadFailure('segment cache pruning failed', err);
+  }
+}
+
+async function attemptSceneSegmentAssembly(
+  p: CompositionOptions,
+  meta: CompositionMeta,
+  ctx: {
+    fps: number;
+    totalFrames: number;
+    ffmpeg: string;
+    ffprobe: string;
+    renderProfile: NativeRenderProfile;
+  },
+): Promise<VideoStudioResult | null> {
+  if (!p.segmentCacheDirAbs || !p.outputAbsPath || !p.visualSignature) return null;
+  const windows = await readCompositionWindowVector(p.compositionDirAbs);
+  if (!windows || windows.length < 2) return null;
+  const ranges = computeSceneFrameRanges(windows, ctx.fps, ctx.totalFrames);
+  if (!ranges) return null;
+
+  // Isolation must be proven for the exact current HTML bytes.
+  const htmlSha = sha256Text(meta.html);
+  let isolation: SceneIsolationRecord | null = null;
+  try {
+    isolation = JSON.parse(await fs.readFile(sceneIsolationPath(p.compositionDirAbs), 'utf8')) as SceneIsolationRecord;
+  } catch (err) {
+    logOptionalReadFailure('scene isolation record read failed', err);
+    return null;
+  }
+  if (!isolation || isolation.version !== 1 || isolation.isolation !== true || isolation.html_sha256 !== htmlSha) {
+    return null;
+  }
+
+  let manifest: CompositionManifest;
+  try {
+    const parsed = CompositionManifestSchema.safeParse(
+      JSON.parse(await fs.readFile(path.join(p.compositionDirAbs, 'composition-manifest.json'), 'utf8')),
+    );
+    if (!parsed.success) return null;
+    manifest = parsed.data;
+  } catch (err) {
+    logOptionalReadFailure('segment assembly manifest read failed', err);
+    return null;
+  }
+  const decomposition = decomposeCompositionSceneAttribution(meta.html, manifest);
+  if (!decomposition.attributable) return null;
+
+  const sharedSha = sha256Text(decomposition.shared_surface);
+  let segments: Array<{ range: SceneFrameRange; key: string }>;
+  try {
+    const sharedAssetsSha256 = await videoStudioReferencedVisualAssetSignature(
+      p.compositionDirAbs,
+      decomposition.shared_surface,
+    );
+    segments = await Promise.all(ranges.map(async (range) => {
+      const subtree = decomposition.scene_subtrees[range.sceneId] ?? '';
+      const motionRegion = decomposition.scene_motion_regions[range.sceneId] ?? '';
+      return {
+        range,
+        key: buildSceneSegmentKey({
+          sceneId: range.sceneId,
+          window: range.window,
+          frameRange: [range.startFrame, range.endFrame],
+          subtreeSha256: sha256Text(subtree),
+          motionRegionSha256: sha256Text(motionRegion),
+          sharedSurfaceSha256: sharedSha,
+          sceneAssetsSha256: await videoStudioReferencedVisualAssetSignature(
+            p.compositionDirAbs,
+            `${subtree}\n${motionRegion}`,
+          ),
+          sharedAssetsSha256,
+          fps: ctx.fps,
+          width: meta.width,
+          height: meta.height,
+          quality: p.quality,
+          format: p.format,
+        }),
+      };
+    }));
+  } catch (err) {
+    log.warn('scene segment dependency fingerprint failed; falling back to full render', {
+      error: logErrorSummary(err),
+    });
+    return null;
+  }
+
+  const evidenceDirAbs = p.frameEvidenceDirAbs;
+  const requestedSampleTimes = p.frameSampleTimes || [];
+  const samplePlans: FrameSamplePlan[] = evidenceDirAbs
+    ? requestedSampleTimes.map((item) => ({
+      label: samplePlanKey(item.label),
+      timeSec: Math.max(0, Math.min(meta.durationSec - 0.001, item.timeSec)),
+      frameIndex: Math.max(0, Math.min(ctx.totalFrames - 1, Math.floor(Math.max(0, item.timeSec) * ctx.fps))),
+      ...(item.sceneId ? { sceneId: item.sceneId } : {}),
+    }))
+    : [];
+  const planSegmentOf = (plan: FrameSamplePlan) => segments.find(
+    (segment) => plan.frameIndex >= segment.range.startFrame && plan.frameIndex < segment.range.endFrame,
+  );
+
+  type SegmentJob = typeof segments[number] & { entryDirAbs: string; cachedMeta: SegmentCacheMeta | null };
+  const jobs: SegmentJob[] = [];
+  for (const segment of segments) {
+    const entryDirAbs = path.join(p.segmentCacheDirAbs, segment.key);
+    let cachedMeta = await readSegmentCacheMeta(entryDirAbs);
+    if (cachedMeta && !(await fs.stat(path.join(entryDirAbs, 'segment.mp4')).then((st) => st.isFile(), () => false))) {
+      cachedMeta = null;
+    }
+    if (cachedMeta && evidenceDirAbs) {
+      // A cached segment must carry every scene-anchored sample its range owns,
+      // or draft evidence would silently thin out. Missing samples demote the
+      // segment to a fresh render.
+      const owned = samplePlans.filter((plan) => plan.sceneId && planSegmentOf(plan)?.key === segment.key);
+      const labels = new Set(cachedMeta.samples.map((sample) => sample.label));
+      if (!owned.every((plan) => labels.has(plan.label))) cachedMeta = null;
+    }
+    jobs.push({ ...segment, entryDirAbs, cachedMeta });
+  }
+
+  const dirty = jobs.filter((job) => !job.cachedMeta);
+  const globalPlans = samplePlans.filter((plan) => !plan.sceneId);
+  const needsWindow = dirty.length > 0 || globalPlans.length > 0;
+  const startedAt = Date.now();
+  const outputDir = path.dirname(p.outputAbsPath);
+  const workDirAbs = path.join(outputDir, `.segment-assembly-${crypto.randomUUID()}`);
+  const collected = new Map<string, { evidence: FrameSampleEvidence; reused: boolean }>();
+
+  try {
+    await fs.mkdir(outputDir, { recursive: true });
+    await fs.mkdir(workDirAbs, { recursive: true });
+    if (evidenceDirAbs) await fs.mkdir(evidenceDirAbs, { recursive: true });
+
+    if (needsWindow) {
+      await withCompositionWindow(meta, p, async (win) => {
+        for (const job of dirty) {
+          const frameCount = job.range.endFrame - job.range.startFrame;
+          if (frameCount <= 0) continue;
+          const stagingDirAbs = path.join(workDirAbs, `render-${job.key.slice(0, 12)}`);
+          await fs.mkdir(path.join(stagingDirAbs, 'samples'), { recursive: true });
+          const segmentTmpAbs = path.join(stagingDirAbs, 'segment.mp4');
+          const ownedPlans = evidenceDirAbs
+            ? samplePlans.filter((plan) => plan.sceneId && planSegmentOf(plan)?.key === job.key)
+            : [];
+          const planByFrame = new Map<number, FrameSamplePlan>();
+          for (const plan of ownedPlans) {
+            if (!planByFrame.has(plan.frameIndex)) planByFrame.set(plan.frameIndex, plan);
+          }
+          const segmentSamples: SegmentCacheSample[] = [];
+          const encoder = startRawFrameEncoder({
+            ffmpeg: ctx.ffmpeg,
+            outputAbsPath: segmentTmpAbs,
+            width: meta.width,
+            height: meta.height,
+            fps: ctx.fps,
+            format: p.format ?? 'mp4',
+            quality: p.quality,
+            audioTracks: [],
+            durationSec: frameCount / ctx.fps,
+            signal: p.signal,
+          });
+          try {
+            for (let frame = job.range.startFrame; frame < job.range.endFrame; frame += 1) {
+              if (p.signal?.aborted) throw new Error('render aborted');
+              const t = Math.min(frame / ctx.fps, Math.max(0, meta.durationSec - 0.001));
+              await seek(win, t);
+              const plan = planByFrame.get(frame);
+              const semanticEvidence = plan ? await readFrameSemanticEvidence(win) : null;
+              const capturedImage = await withVideoStudioTimeout(
+                win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+                COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+                'E_RENDER_CAPTURE_TIMEOUT',
+                `segment render timed out while capturing frame ${frame + 1}.`,
+                () => {
+                  try { win.destroy(); }
+                  catch (err) { log.warn('segment render window cleanup failed', { error: logErrorSummary(err) }); }
+                },
+              );
+              const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+              await withVideoStudioTimeout(
+                encoder.writeFrame(normalized.image.toBitmap()),
+                COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+                'E_RENDER_PIPE_TIMEOUT',
+                `segment render timed out while streaming frame ${frame + 1}.`,
+                () => encoder.cancel(),
+              );
+              if (plan) {
+                const stats = analyzeNativeImage(normalized.image);
+                const relative = path.join('samples', `${plan.label}.png`);
+                await fs.writeFile(path.join(stagingDirAbs, relative), normalized.image.toPNG());
+                segmentSamples.push({
+                  label: plan.label,
+                  time_seconds: round2(plan.timeSec),
+                  frame_index: frame,
+                  ...(plan.sceneId ? { expected_scene_id: plan.sceneId } : {}),
+                  capture_source_width: normalized.sourceWidth,
+                  capture_source_height: normalized.sourceHeight,
+                  capture_scale_factor: normalized.scaleFactor,
+                  ...(semanticEvidence || {}),
+                  ...stats,
+                  cache_relative_path: relative,
+                });
+              }
+            }
+            const encoded = await encoder.finish();
+            if (encoded.aborted || encoded.timedOut || encoded.code !== 0) {
+              throw new Error(`segment encode failed (code ${encoded.code}).`);
+            }
+          } catch (err) {
+            encoder.cancel();
+            await encoder.wait().catch((waitErr) => {
+              log.warn('segment encoder cleanup failed', { error: logErrorSummary(waitErr) });
+              return null;
+            });
+            throw err;
+          }
+          const segmentProbe = await probeMedia(ctx.ffprobe, segmentTmpAbs, p.signal);
+          if (!segmentProbe?.video) throw new Error('segment media could not be probed.');
+          await fs.writeFile(path.join(stagingDirAbs, 'meta.json'), JSON.stringify({
+            version: SEGMENT_CACHE_META_VERSION,
+            scene_id: job.range.sceneId,
+            frame_range: [job.range.startFrame, job.range.endFrame],
+            fps: ctx.fps,
+            samples: segmentSamples,
+          } satisfies SegmentCacheMeta, null, 2), 'utf8');
+          await fs.rm(job.entryDirAbs, { recursive: true, force: true }).catch((err) => {
+            log.warn('stale segment cache cleanup failed', { error: logErrorSummary(err) });
+          });
+          await fs.mkdir(path.dirname(job.entryDirAbs), { recursive: true });
+          await fs.rename(stagingDirAbs, job.entryDirAbs);
+          job.cachedMeta = await readSegmentCacheMeta(job.entryDirAbs);
+          if (!job.cachedMeta) throw new Error('segment cache entry did not persist.');
+        }
+        if (evidenceDirAbs) {
+          for (const plan of globalPlans) {
+            await seek(win, plan.timeSec);
+            await settleCompositionPaint(win);
+            const semanticEvidence = await readFrameSemanticEvidence(win);
+            const capturedImage = await withVideoStudioTimeout(
+              win.webContents.capturePage({ x: 0, y: 0, width: meta.width, height: meta.height }),
+              COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+              'E_RENDER_CAPTURE_TIMEOUT',
+              `sample capture timed out at ${round2(plan.timeSec)}s.`,
+              () => {
+                try { win.destroy(); }
+                catch (err) { log.warn('sample capture window cleanup failed', { error: logErrorSummary(err) }); }
+              },
+            );
+            const normalized = normalizeCapturedFrame(capturedImage, meta.width, meta.height);
+            const stats = analyzeNativeImage(normalized.image);
+            const evidence: FrameSampleEvidence = {
+              label: plan.label,
+              time_seconds: round2(plan.timeSec),
+              frame_index: plan.frameIndex,
+              path: '',
+              capture_source_width: normalized.sourceWidth,
+              capture_source_height: normalized.sourceHeight,
+              capture_scale_factor: normalized.scaleFactor,
+              ...(semanticEvidence || {}),
+              ...stats,
+            } as FrameSampleEvidence;
+            collected.set(plan.label, {
+              reused: false,
+              evidence: { ...evidence, path: path.join(workDirAbs, `${plan.label}.png`) },
+            });
+            await fs.writeFile(path.join(workDirAbs, `${plan.label}.png`), normalized.image.toPNG());
+          }
+        }
+      });
+    }
+
+    if (evidenceDirAbs) {
+      for (const job of jobs) {
+        if (!job.cachedMeta) throw new Error('segment unexpectedly missing after render.');
+        const wasReused = dirty.every((candidate) => candidate.key !== job.key);
+        for (const sample of job.cachedMeta.samples) {
+          const { cache_relative_path: relative, ...rest } = sample;
+          collected.set(sample.label, {
+            reused: wasReused,
+            evidence: { ...rest, path: path.join(job.entryDirAbs, relative) } as FrameSampleEvidence,
+          });
+        }
+      }
+    }
+
+    const parts = jobs.filter((job) => job.range.endFrame > job.range.startFrame);
+    if (!parts.length) return null;
+    const concatListAbs = path.join(workDirAbs, 'segments.txt');
+    await fs.writeFile(concatListAbs, parts.map((job) => (
+      `file '${path.join(job.entryDirAbs, 'segment.mp4').replace(/'/g, "'\\''")}'`
+    )).join('\n'), 'utf8');
+    const concatVideoAbs = path.join(workDirAbs, `video${p.format === 'webm' ? '.webm' : '.mp4'}`);
+    const concatRun = await runProcess(ctx.ffmpeg, [
+      '-y', '-f', 'concat', '-safe', '0', '-i', concatListAbs, '-c', 'copy', concatVideoAbs,
+    ], { timeoutMs: VIDEO_TRACK_REMUX_TIMEOUT_MS, ...(p.signal ? { signal: p.signal } : {}) });
+    if (concatRun.code !== 0) throw new Error(`segment concat failed (code ${concatRun.code}).`);
+
+    const outputExt = path.extname(p.outputAbsPath) || (p.format === 'webm' ? '.webm' : '.mp4');
+    const tempOutputAbsPath = path.join(
+      outputDir,
+      `.${path.basename(p.outputAbsPath, path.extname(p.outputAbsPath))}.assembling-${crypto.randomUUID()}${outputExt}`,
+    );
+    const remux = await runProcess(ctx.ffmpeg, buildVideoTrackRemuxArgs({
+      priorVideoAbsPath: concatVideoAbs,
+      outputAbsPath: tempOutputAbsPath,
+      durationSec: meta.durationSec,
+      ...(p.format ? { format: p.format } : {}),
+      audioTracks: meta.audioTracks,
+    }), { timeoutMs: VIDEO_TRACK_REMUX_TIMEOUT_MS, ...(p.signal ? { signal: p.signal } : {}) });
+    if (remux.code !== 0) {
+      await fs.rm(tempOutputAbsPath, { force: true }).catch((err) => {
+        log.warn('failed segment remux cleanup failed', { error: logErrorSummary(err) });
+      });
+      throw new Error(`segment assembly remux failed (code ${remux.code}).`);
+    }
+    const probe = await probeMedia(ctx.ffprobe, tempOutputAbsPath, p.signal);
+    if (!probe?.video || probe.duration_seconds === null) {
+      await fs.rm(tempOutputAbsPath, { force: true }).catch((err) => {
+        log.warn('invalid segment remux cleanup failed', { error: logErrorSummary(err) });
+      });
+      throw new Error('assembled media could not be probed.');
+    }
+
+    let frameEvidence: FrameEvidence | undefined;
+    if (evidenceDirAbs) {
+      const ordered: FrameSampleEvidence[] = [];
+      for (const plan of samplePlans) {
+        const item = collected.get(plan.label);
+        if (!item) continue;
+        const target = path.join(evidenceDirAbs, `${String(ordered.length + 1).padStart(2, '0')}-${plan.label}.png`);
+        await fs.copyFile(item.evidence.path, target);
+        ordered.push({
+          ...item.evidence,
+          path: target,
+          ...(item.reused ? { reused_from_prior_render: true } : {}),
+        });
+      }
+      const contactSheet = await writeFrameContactSheet(evidenceDirAbs, ordered);
+      frameEvidence = {
+        evidence_dir: evidenceDirAbs,
+        contact_sheet: contactSheet,
+        frame_paths: ordered.map((sample) => sample.path),
+        samples: ordered,
+      };
+    }
+
+    await fs.rename(tempOutputAbsPath, p.outputAbsPath);
+    const st = await fs.stat(p.outputAbsPath);
+    if (p.visualSignature) {
+      const videoSha = await sha256File(p.outputAbsPath);
+      if (videoSha) {
+        await upsertRenderProvenance(p.compositionDirAbs, {
+          key: buildRenderReuseKey({
+            visualSignature: p.visualSignature,
+            windows,
+            width: meta.width,
+            height: meta.height,
+            fps: ctx.fps,
+            quality: p.quality,
+            format: p.format,
+          }),
+          visual_signature: p.visualSignature,
+          windows,
+          width: meta.width,
+          height: meta.height,
+          fps: ctx.fps,
+          quality: p.quality ?? 'unset',
+          format: p.format ?? 'mp4',
+          video_path: p.outputAbsPath,
+          video_sha256: videoSha,
+          ...(frameEvidence
+            ? {
+              evidence_dir: frameEvidence.evidence_dir,
+              contact_sheet: frameEvidence.contact_sheet,
+              samples: frameEvidence.samples,
+            }
+            : {}),
+          rendered_at: new Date().toISOString(),
+        }).catch((err) => {
+          log.warn('segment render provenance persistence failed', { error: logErrorSummary(err) });
+        });
+      }
+    }
+    await pruneSegmentCache(p.segmentCacheDirAbs);
+    const totalSeconds = Math.max(0.001, (Date.now() - startedAt) / 1000);
+    const renderProfile: NativeRenderProfile = {
+      ...ctx.renderProfile,
+      frame_pipeline: 'scene_segment_assembly',
+      total_render_seconds: round2(totalSeconds),
+    };
+    p.onProgress?.({
+      phase: 'composition.render',
+      message: `Scene attribution verified; rendered ${dirty.length} changed scene segment(s) and reused ${jobs.length - dirty.length} cached segment(s).`,
+      data: { framePipeline: 'scene_segment_assembly', segmentsTotal: jobs.length, segmentsRendered: dirty.length },
+    });
+    return {
+      ok: true,
+      op: 'composition.render',
+      path: p.outputAbsPath,
+      bytes: st.size,
+      media: versionedChatMediaLocalUrl(p.outputAbsPath),
+      probe,
+      engine: 'orkas-native',
+      fps: ctx.fps,
+      frames: ctx.totalFrames,
+      canvas: { width: meta.width, height: meta.height, durationSec: meta.durationSec },
+      render_profile: renderProfile,
+      scene_segments: {
+        total: jobs.length,
+        rendered: dirty.length,
+        reused: jobs.length - dirty.length,
+      },
+      ...(frameEvidence ? { frame_evidence: frameEvidence } : {}),
+    };
+  } catch (err) {
+    if (p.signal?.aborted) throw err;
+    log.warn('scene segment assembly failed; falling back to full render', { error: logErrorSummary(err) });
+    return null;
+  } finally {
+    await fs.rm(workDirAbs, { recursive: true, force: true }).catch((err) => {
+      log.warn('segment assembly workspace cleanup failed', { error: logErrorSummary(err) });
+    });
+  }
+}
+
+/** One image of the whole assembled video, segments in playback order.
+ *
+ * An AUTO production's frames live per child composition, so the keyframe
+ * preview used to arrive as one contact sheet per segment — four links for a
+ * five-segment video on 2026-08-07, with the user's own opening footage absent
+ * because a media segment has no snapshot to publish. The stop exists so the
+ * user can judge the whole video in one look, and only the host can compose
+ * that: it owns every segment's frames and the order they play in.
+ *
+ * A media segment contributes one extracted frame so the footage the user
+ * supplied appears beside the authored scenes. Best effort throughout — a
+ * segment that yields nothing is skipped rather than failing the preview.
+ */
+export async function writeProductionContactSheet(input: {
+  outputDirAbs: string;
+  segments: Array<{
+    segmentId: string;
+    framePaths?: string[];
+    mediaPath?: string;
+  }>;
+  signal?: AbortSignal;
+}): Promise<string> {
+  const bins = bundledFfmpegPaths();
+  await fs.mkdir(input.outputDirAbs, { recursive: true });
+  const samples: FrameSampleEvidence[] = [];
+  for (const segment of input.segments) {
+    for (const framePath of segment.framePaths || []) {
+      if (!(await fs.access(framePath).then(() => true).catch(() => false))) continue;
+      const label = path.basename(framePath).replace(/^\d+-/, '').replace(/\.png$/i, '');
+      samples.push({
+        label: `${segment.segmentId} · ${label}`,
+        time_seconds: 0,
+        frame_index: 0,
+        path: framePath,
+        hash: '',
+        brightness: 0,
+        contrast: 0,
+        width: 0,
+        height: 0,
+      } as FrameSampleEvidence);
+    }
+    if (segment.framePaths?.length || !segment.mediaPath || !bins.ffmpeg) continue;
+    // A cut or generated shot: pull one representative frame so the segment is
+    // visible in the overview instead of silently missing from it.
+    const stillPath = path.join(input.outputDirAbs, `segment-${segment.segmentId}-still.png`);
+    const extracted = await runProcess(bins.ffmpeg, [
+      '-y', '-loglevel', 'error',
+      '-ss', '0.5', '-i', segment.mediaPath,
+      '-frames:v', '1', '-q:v', '3', stillPath,
+    ], { ...(input.signal ? { signal: input.signal } : {}), timeoutMs: 30_000 }).catch(() => null);
+    if (extracted?.code !== 0) continue;
+    if (!(await fs.access(stillPath).then(() => true).catch(() => false))) continue;
+    samples.push({
+      label: `${segment.segmentId} · clip`,
+      time_seconds: 0,
+      frame_index: 0,
+      path: stillPath,
+      hash: '',
+      brightness: 0,
+      contrast: 0,
+      width: 0,
+      height: 0,
+    } as FrameSampleEvidence);
+  }
+  if (!samples.length) return '';
+  // Cells are labelled by segment and frame: across compositions a per-cell
+  // timeline offset means nothing, and "@ 0s" on every cell would be false.
+  return writeFrameContactSheet(input.outputDirAbs, samples, { labelOnly: true });
+}
+
 export async function renderComposition(p: CompositionOptions): Promise<VideoStudioResult> {
   const loaded = await loadCompositionMeta(p.compositionDirAbs);
   if (!loaded.meta) {
@@ -2183,9 +3610,14 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
     return { ok: false, op: 'composition.render', errorCode: 'E_LINT_BLOCKED', message: blocking[0].message, findings: findingsJson(loaded.issues) };
   }
   if (!p.outputAbsPath) {
-    return { ok: false, op: 'composition.render', errorCode: 'E_OUTPUT_REQUIRED', message: 'output path is required.' };
+    return {
+      ok: false,
+      op: 'composition.render',
+      errorCode: 'E_OUTPUT_REQUIRED',
+      message: 'output path is required, and it must sit outside composition_dir so a runtime file cannot invalidate authored-input approvals — conventionally project/render/<name>.mp4.',
+    };
   }
-  const requestedFps = qualityFps(p.quality, p.fps);
+  const requestedFps = qualityFps(p.quality, p.fps, await declaredCompositionFps(p.compositionDirAbs));
   const renderProfile = await resolveNativeRenderProfile(
     p.compositionDirAbs,
     loaded.meta,
@@ -2212,6 +3644,22 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
 
   const fps = renderProfile.render_fps;
   const totalFrames = Math.max(1, Math.ceil(loaded.meta.durationSec * fps));
+  const reused = await attemptVideoTrackReuse(p, loaded.meta, {
+    fps,
+    totalFrames,
+    ffmpeg: bins.ffmpeg,
+    ffprobe: bins.ffprobe,
+    renderProfile,
+  });
+  if (reused) return reused;
+  const assembled = await attemptSceneSegmentAssembly(p, loaded.meta, {
+    fps,
+    totalFrames,
+    ffmpeg: bins.ffmpeg,
+    ffprobe: bins.ffprobe,
+    renderProfile,
+  });
+  if (assembled) return assembled;
   const evidenceDirAbs = p.frameEvidenceDirAbs;
   const requestedSampleTimes: Array<{ label: string; timeSec: number; sceneId?: string }> = p.frameSampleTimes
     || sampleTimes(loaded.meta.durationSec).map((timeSec, index) => ({ label: `sample-${index + 1}`, timeSec }));
@@ -2258,20 +3706,57 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
         if (p.signal?.aborted) throw new Error('render aborted');
         const t = frame / fps;
         await seek(win, Math.min(t, Math.max(0, loaded.meta!.durationSec - 0.001)));
+        if (frame === 0) {
+          // The first capture races the compositor: seek(0) applies the
+          // scene-reveal styles, but capturePage returns the last composited
+          // frame, and nothing has painted since the window loaded with every
+          // scene scaffold-hidden. The snapshot path settles before every
+          // capture and its frame 0 passes; this loop skipped settling for
+          // throughput and its frame 0 captured the pre-reveal state — a
+          // blank opening at background luminance on an HTML whose snapshot
+          // had just passed QA (2026-08-07). Later frames are safe: each
+          // capture composites the previous frame's already-painted state,
+          // one frame apart at most. Only the first needs the explicit wait.
+          await settleCompositionPaint(win);
+        }
         const sample = sampleByFrame.get(frame);
         const semanticEvidence = sample ? await readFrameSemanticEvidence(win) : null;
-        const capturedImage = await withVideoStudioTimeout(
-          win.webContents.capturePage({ x: 0, y: 0, width: loaded.meta!.width, height: loaded.meta!.height }),
-          COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
-          'E_RENDER_CAPTURE_TIMEOUT',
-          `composition render timed out while capturing frame ${frame + 1}/${totalFrames}.`,
-          () => { try { win.destroy(); } catch { /* best effort */ } },
-        );
-        const normalizedCapture = normalizeCapturedFrame(
-          capturedImage,
-          loaded.meta!.width,
-          loaded.meta!.height,
-        );
+        const captureFrame = async (): Promise<ReturnType<typeof normalizeCapturedFrame>> => {
+          const shot = await withVideoStudioTimeout(
+            win.webContents.capturePage({ x: 0, y: 0, width: loaded.meta!.width, height: loaded.meta!.height }),
+            COMPOSITION_RENDER_FRAME_TIMEOUT_MS,
+            'E_RENDER_CAPTURE_TIMEOUT',
+            `composition render timed out while capturing frame ${frame + 1}/${totalFrames}.`,
+            () => { try { win.destroy(); } catch { /* best effort */ } },
+          );
+          return normalizeCapturedFrame(shot, loaded.meta!.width, loaded.meta!.height);
+        };
+        let normalizedCapture = await captureFrame();
+        // Re-shoot BEFORE the frame reaches the encoder: once it is streamed it
+        // is in the video, and every later check is reporting a defect the host
+        // could have prevented here. Only sampled frames carry the DOM evidence
+        // this compares against, and frame 0 — the one that races the
+        // compositor — is always sampled.
+        let captureRetryCount = 0;
+        while (
+          semanticEvidence
+          && captureRetryCount < COMPOSITION_CONTRADICTED_CAPTURE_MAX_RETRIES
+          && captureContradictsDom(
+          analyzeNativeImage(normalizedCapture.image),
+          semanticEvidence,
+          (area) => regionContrast(normalizedCapture.image, area),
+        )
+        ) {
+          captureRetryCount += 1;
+          await settleCompositionPaint(win);
+          normalizedCapture = await captureFrame();
+        }
+        if (captureRetryCount > 0) {
+          log.warn('composition render recaptured a frame whose pixels contradicted the page', {
+            frame,
+            retries: captureRetryCount,
+          });
+        }
         const image = normalizedCapture.image;
         renderProfile.capture_source_width = normalizedCapture.sourceWidth;
         renderProfile.capture_source_height = normalizedCapture.sourceHeight;
@@ -2296,6 +3781,7 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
             ...(sample.sceneId ? { expected_scene_id: sample.sceneId } : {}),
             capture_source_width: normalizedCapture.sourceWidth,
             capture_source_height: normalizedCapture.sourceHeight,
+            ...(captureRetryCount > 0 ? { capture_retry_count: captureRetryCount } : {}),
             capture_scale_factor: normalizedCapture.scaleFactor,
             ...(semanticEvidence || {}),
             ...stats,
@@ -2350,7 +3836,7 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
       };
     }
     await persistObservedRenderProfile(p.compositionDirAbs, renderProfile).catch((err) => {
-      log.warn('persist render profile failed', { message: (err as Error).message });
+      log.warn('persist render profile failed', { error: logErrorSummary(err) });
     });
     const probe = await probeMedia(bins.ffprobe, tempOutputAbsPath, p.signal);
     if (!probe?.video || probe.duration_seconds === null) {
@@ -2365,6 +3851,42 @@ export async function renderComposition(p: CompositionOptions): Promise<VideoStu
     }
     await fs.rename(tempOutputAbsPath, p.outputAbsPath);
     const st = await fs.stat(p.outputAbsPath);
+    if (p.visualSignature) {
+      const windows = await readCompositionWindowVector(p.compositionDirAbs);
+      const videoSha = windows ? await sha256File(p.outputAbsPath) : null;
+      if (windows && videoSha) {
+        await upsertRenderProvenance(p.compositionDirAbs, {
+          key: buildRenderReuseKey({
+            visualSignature: p.visualSignature,
+            windows,
+            width: loaded.meta.width,
+            height: loaded.meta.height,
+            fps,
+            quality: p.quality,
+            format: p.format,
+          }),
+          visual_signature: p.visualSignature,
+          windows,
+          width: loaded.meta.width,
+          height: loaded.meta.height,
+          fps,
+          quality: p.quality ?? 'unset',
+          format: p.format ?? 'mp4',
+          video_path: p.outputAbsPath,
+          video_sha256: videoSha,
+          ...(frameEvidence
+            ? {
+              evidence_dir: frameEvidence.evidence_dir,
+              contact_sheet: frameEvidence.contact_sheet,
+              samples: capturedSamples,
+            }
+            : {}),
+          rendered_at: new Date().toISOString(),
+        }).catch((err) => {
+          log.warn('persist render provenance failed', { error: logErrorSummary(err) });
+        });
+      }
+    }
     return {
       ok: true,
       op: 'composition.render',
@@ -2426,6 +3948,38 @@ type FrameEncoderOptions = {
   signal?: AbortSignal;
 };
 
+/** Audio graph shared by the frame encoder and the video-track remux path.
+ * The video stream is always ffmpeg input 0; audio files follow. */
+function buildAudioMixGraph(audioTracksIn: AudioTrack[], durationSec: number): {
+  tracks: AudioTrack[];
+  inputArgs: string[];
+  filterAndMapArgs: string[];
+} {
+  const tracks = audioTracksIn.filter((track) => fss.existsSync(track.absPath));
+  const inputArgs: string[] = [];
+  for (const track of tracks) inputArgs.push('-i', track.absPath);
+  if (!tracks.length) return { tracks, inputArgs, filterAndMapArgs: [] };
+  const duration = durationSec.toFixed(3);
+  const filters: string[] = [];
+  tracks.forEach((track, index) => {
+    const inputIndex = index + 1;
+    const delayMs = Math.max(0, Math.round((track.startSec || 0) * 1000));
+    const volume = Number.isFinite(track.volume) && track.volume >= 0 ? track.volume : 1;
+    const delay = delayMs > 0 ? `adelay=${delayMs}|${delayMs},` : '';
+    filters.push(`[${inputIndex}:a]volume=${volume},${delay}apad,atrim=0:${duration}[a${index}]`);
+  });
+  if (tracks.length === 1) {
+    filters.push('[a0]anull[aout]');
+  } else {
+    filters.push(`${tracks.map((_track, index) => `[a${index}]`).join('')}amix=inputs=${tracks.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
+  }
+  return {
+    tracks,
+    inputArgs,
+    filterAndMapArgs: ['-filter_complex', filters.join(';'), '-map', '0:v:0', '-map', '[aout]'],
+  };
+}
+
 export function buildFrameEncoderArgs(opts: Omit<FrameEncoderOptions, 'ffmpeg' | 'signal'>): string[] {
   const args = [
     '-y',
@@ -2435,31 +3989,44 @@ export function buildFrameEncoderArgs(opts: Omit<FrameEncoderOptions, 'ffmpeg' |
     '-framerate', String(opts.fps),
     '-i', 'pipe:0',
   ];
-  const audioTracks = opts.audioTracks.filter((track) => fss.existsSync(track.absPath));
-  for (const track of audioTracks) args.push('-i', track.absPath);
-  if (audioTracks.length) {
-    const duration = opts.durationSec.toFixed(3);
-    const filters: string[] = [];
-    audioTracks.forEach((track, index) => {
-      const inputIndex = index + 1;
-      const delayMs = Math.max(0, Math.round((track.startSec || 0) * 1000));
-      const volume = Number.isFinite(track.volume) && track.volume >= 0 ? track.volume : 1;
-      const delay = delayMs > 0 ? `adelay=${delayMs}|${delayMs},` : '';
-      filters.push(`[${inputIndex}:a]volume=${volume},${delay}apad,atrim=0:${duration}[a${index}]`);
-    });
-    if (audioTracks.length === 1) {
-      filters.push('[a0]anull[aout]');
-    } else {
-      filters.push(`${audioTracks.map((_track, index) => `[a${index}]`).join('')}amix=inputs=${audioTracks.length}:duration=longest:normalize=0,atrim=0:${duration}[aout]`);
-    }
-    args.push('-filter_complex', filters.join(';'), '-map', '0:v:0', '-map', '[aout]');
-  }
+  const graph = buildAudioMixGraph(opts.audioTracks, opts.durationSec);
+  const audioTracks = graph.tracks;
+  args.push(...graph.inputArgs);
+  args.push(...graph.filterAndMapArgs);
   if (opts.format === 'webm') {
     args.push('-c:v', 'libvpx-vp9', '-pix_fmt', 'yuv420p', '-b:v', '0', '-crf', String(crfForQuality(opts.quality) + 8));
     if (audioTracks.length) args.push('-c:a', 'libopus');
   } else {
     args.push('-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-preset', 'veryfast', '-crf', String(crfForQuality(opts.quality)), '-movflags', '+faststart');
     if (audioTracks.length) args.push('-c:a', 'aac');
+  }
+  args.push('-t', opts.durationSec.toFixed(3), opts.outputAbsPath);
+  return args;
+}
+
+/** Remux for the R0 reuse path: copy the prior render's video stream
+ * untouched and rebuild only the audio graph from the current tracks. */
+export function buildVideoTrackRemuxArgs(opts: {
+  priorVideoAbsPath: string;
+  outputAbsPath: string;
+  durationSec: number;
+  format?: RenderFormat;
+  audioTracks: AudioTrack[];
+}): string[] {
+  const args = ['-y', '-i', opts.priorVideoAbsPath];
+  const graph = buildAudioMixGraph(opts.audioTracks, opts.durationSec);
+  args.push(...graph.inputArgs);
+  if (graph.tracks.length) {
+    args.push(...graph.filterAndMapArgs);
+  } else {
+    args.push('-map', '0:v:0', '-an');
+  }
+  args.push('-c:v', 'copy');
+  if (opts.format === 'webm') {
+    if (graph.tracks.length) args.push('-c:a', 'libopus');
+  } else {
+    if (graph.tracks.length) args.push('-c:a', 'aac');
+    args.push('-movflags', '+faststart');
   }
   args.push('-t', opts.durationSec.toFixed(3), opts.outputAbsPath);
   return args;
@@ -2997,7 +4564,7 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
 
   const metaForRender = loaded.meta ?? (await loadCompositionMeta(p.compositionDirAbs)).meta;
   const sceneMapForSamples = preflight.sceneMapLoad;
-  const fps = qualityFps(p.quality, p.fps);
+  const fps = qualityFps(p.quality, p.fps, await declaredCompositionFps(p.compositionDirAbs));
   const evidenceDirAbs = p.frameEvidenceDirAbs
     || (p.outputAbsPath ? path.join(path.dirname(p.outputAbsPath), 'draft-evidence') : path.join(p.compositionDirAbs, 'qa', 'draft-evidence'));
   const render = await renderComposition({
@@ -3086,7 +4653,12 @@ export async function draftComposition(p: CompositionOptions): Promise<VideoStud
     const videoQa = summarizeVideoFrameQa(renderedFrameEvidence, metaForRender.durationSec, {
       sceneCount: preflight.manifest.scenes.length,
       expectedSceneIds: preflight.manifest.scenes.map((scene) => scene.id),
+      sceneWindows: preflight.manifest.scenes.map((scene) => ({
+        id: scene.id, start: scene.start, duration: scene.duration,
+      })),
       requireSemanticCoverage: true,
+      ...(p.isDeliveredOpening === false ? { isDeliveredOpening: false } : {}),
+      ...(p.waivedQaFindings?.length ? { waivedFindings: p.waivedQaFindings } : {}),
       designContract: preflight.contractLoad.value,
       sceneMap: preflight.sceneMapLoad.value,
     });
@@ -3330,6 +4902,32 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
   if (!st || !st.isFile()) {
     return { ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_NO_INPUT', message: 'input is not a file' };
   }
+  // A file with no audio track is not a failed extraction — there is nothing
+  // to extract. Asked to transcribe a silent clip, ffmpeg printed its version
+  // banner and the input's whole metadata dump, then one final line saying
+  // the output would hold no stream; the host returned the last 1200
+  // characters of that as the message, so the answer was ~97% banner and the
+  // reason was the tail of it (2026-08-08 run: 2135 chars of stderr, the
+  // cause at offset 2107). The host can see the streams before spending the
+  // run, and the caller's recovery is a different tool, not a retry.
+  const probe = bins.ffprobe
+    ? await probeMedia(bins.ffprobe, p.inputAbsPath, p.signal)
+    : null;
+  if (probe && !probe.audio) {
+    return {
+      ok: false,
+      op: 'speech.transcribe',
+      errorCode: 'E_TRANSCRIBE_NO_AUDIO_TRACK',
+      message: 'This file has no audio track, so there is nothing to transcribe. '
+        + 'To read what it shows, extract frames and read those instead.',
+      next_action: 'read_visual_content_instead_of_transcribing',
+      media: {
+        ...(probe.video ? { video_codec: probe.video.codec } : {}),
+        has_audio: false,
+        ...(typeof probe.duration_seconds === 'number' ? { duration_seconds: probe.duration_seconds } : {}),
+      },
+    };
+  }
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-transcribe-'));
   const wav = path.join(tmp, 'audio.wav');
   const outBase = path.join(tmp, 'transcript');
@@ -3337,7 +4935,20 @@ export async function transcribeSpeech(p: SpeechTranscribeOptions): Promise<Vide
     p.onProgress?.({ phase: 'speech.transcribe.extract', message: 'Extracting mono 16 kHz audio for transcription.' });
     const ex = await runProcess(bins.ffmpeg, ['-y', '-i', p.inputAbsPath, '-vn', '-ac', '1', '-ar', '16000', wav], { signal: p.signal, timeoutMs: 20 * 60 * 1000 });
     if (ex.code !== 0) {
-      return { ok: false, op: 'speech.transcribe', errorCode: 'E_TRANSCRIBE_AUDIO_EXTRACT_FAILED', message: redactPaths(ex.stderr.slice(-1200)) || 'audio extraction failed' };
+      // A real extraction failure: say what happened in the caller's terms and
+      // keep the tool's own words as bounded diagnostic detail, never as the
+      // message. The last lines carry the cause; the banner never does.
+      const stderrTail = redactPaths(ex.stderr.trim().split('\n').slice(-4).join('\n')).slice(-400);
+      return {
+        ok: false,
+        op: 'speech.transcribe',
+        errorCode: 'E_TRANSCRIBE_AUDIO_EXTRACT_FAILED',
+        message: 'The audio in this file could not be decoded for transcription. '
+          + 'It may be corrupt or in an unsupported codec; try a re-encoded copy, '
+          + 'or read the visual content instead.',
+        next_action: 'retry_with_reencoded_media_or_read_visual_content',
+        ...(stderrTail ? { extract_diagnostic: stderrTail } : {}),
+      };
     }
     p.onProgress?.({ phase: 'speech.transcribe.asr', message: 'Running Orkas-native whisper.cpp transcription.' });
     const timestampDetail = p.timestamps === 'word' ? 'word' : 'segment';

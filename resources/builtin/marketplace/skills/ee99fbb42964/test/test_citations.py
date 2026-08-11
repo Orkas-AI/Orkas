@@ -322,13 +322,12 @@ class References(unittest.TestCase):
                 "candidate": "Example",
                 "best_for": "Private desktop use",
                 "os": "Windows, macOS, Linux",
-                "installation": "Not verified",
-                "local_model_path": "Not verified",
-                "privacy": "Data remains on device",
-                "license_open_source": "Not verified",
-                "project_activity": "Pushed recently",
-                "activity_observed_at": "2026-07-28",
-                "hardware_constraints": "Not verified",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "Data remains on device",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
                 "ideal_user": "Everyday user",
                 "evidence_sources": ["repo"],
             }],
@@ -344,7 +343,7 @@ class References(unittest.TestCase):
         ))
         self.assertIn("[E1]", out["evidence_markdown"])
         self.assertIn('"All data remains on your device."', out["evidence_markdown"])
-        self.assertEqual(out["comparison_rows"][0]["evidence"], "E1, E2, E3")
+        self.assertEqual(out["comparison_rows"][0]["evidence"], "E1, E2")
 
     def test_github_snapshot_is_classified_in_research_layer(self):
         source = {
@@ -400,36 +399,159 @@ class References(unittest.TestCase):
         out = verify({
             "sources": [source],
             "claims": [
-                _claim(
-                    "User data remains on the device.",
-                    _cite(source="s1", quote="keep user data on the device"),
-                ),
+                {
+                    "id": "c_privacy",
+                    **_claim(
+                        "User data remains on the device.",
+                        _cite(source="s1", quote="keep user data on the device"),
+                    ),
+                },
             ],
             "comparison": [{
                 "candidate": "Local | Agent",
                 "best_for": "Private chat",
-                "os": "macOS, Windows, Linux",
-                "installation": "Desktop installer",
-                "local_model_path": "Bundled model flow",
-                "privacy": "Local-first",
-                "license_open_source": "Apache-2.0",
-                "project_activity": "Repository page showed current activity",
-                "activity_observed_at": "2026-07-28",
-                "hardware_constraints": "Not benchmarked",
+                "os": "Not verified",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "User data remains on the device",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
                 "ideal_user": "Everyday desktop user",
                 "evidence_sources": ["s1"],
+                "field_claims": {"privacy_data_handling": ["c_privacy"]},
             }],
         })
         table = out["comparison_markdown"]
         self.assertTrue(table.startswith(
-            "| Candidate | Best for | OS | Installation | Local-model path | Privacy | "
-            "License/open source | Project activity (observed date) | Hardware/constraints | "
-            "Ideal user | Evidence |"
+            "| Candidate | Best for | OS | Setup/ease | Model capabilities | Local/offline | "
+            "Privacy/data handling | Pricing/cost | Key limitations | Ideal user | Evidence |"
         ))
         self.assertIn("Local \\| Agent", table)
-        self.assertIn("Repository page showed current activity (observed 2026-07-28)", table)
         self.assertIn("| E1 |", table)
         self.assertEqual(out["comparison_warnings"], [])
+
+    def test_comparison_downgrades_unmapped_factual_cell(self):
+        source = {**SOURCES[0], "accessed_at": "2026-07-28"}
+        out = verify({
+            "sources": [source],
+            "claims": [{
+                "id": "c_privacy",
+                **_claim(
+                    "User data remains on the device.",
+                    _cite(source="s1", quote="keep user data on the device"),
+                ),
+            }],
+            "comparison": [{
+                "candidate": "Unmapped app",
+                "best_for": "Private chat",
+                "os": "Not verified",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "User data remains on the device",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
+                "ideal_user": "Everyday desktop user",
+                "evidence_sources": ["s1"],
+            }],
+        })
+        row = out["comparison_rows"][0]
+        self.assertEqual(row["privacy_data_handling"], "Not verified: Privacy/data handling")
+        self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
+        self.assertIn(
+            "comparison_field_evidence_missing",
+            {warning["issue"] for warning in out["comparison_warnings"]},
+        )
+
+    def test_comparison_rejects_claim_from_another_candidate_source(self):
+        out = verify({
+            "sources": SOURCES,
+            "claims": [{
+                "id": "c_cloud",
+                **_claim(
+                    "Cloud agents stream everything to a server.",
+                    _cite(source="s2", quote="Cloud agents stream everything to a server"),
+                ),
+            }],
+            "comparison": [{
+                "candidate": "Local app",
+                "best_for": "Private chat",
+                "os": "Not verified",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Cloud agents stream everything to a server",
+                "privacy_data_handling": "Not verified",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
+                "ideal_user": "Everyday desktop user",
+                "evidence_sources": ["s1"],
+                "field_claims": {"local_offline": ["c_cloud"]},
+            }],
+        })
+        row = out["comparison_rows"][0]
+        self.assertEqual(row["local_offline"], "Not verified: Local/offline")
+        self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
+
+    def test_comparison_rejects_unproven_field_claim(self):
+        out = verify({
+            "sources": SOURCES,
+            "claims": [{
+                "id": "c_unproven",
+                **_claim(
+                    "The application supports Windows and macOS.",
+                    _cite(source="s1", quote="keep user data on the device"),
+                ),
+            }],
+            "comparison": [{
+                "candidate": "Unsupported app",
+                "best_for": "Desktop use",
+                "os": "Windows and macOS",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "Not verified",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
+                "ideal_user": "Everyday desktop user",
+                "evidence_sources": ["s1"],
+                "field_claims": {"os": ["c_unproven"]},
+            }],
+        })
+        row = out["comparison_rows"][0]
+        self.assertFalse(out["claims"][0]["supported"])
+        self.assertEqual(row["os"], "Not verified: OS")
+        self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
+
+    def test_comparison_rejects_verified_but_unrelated_field_claim(self):
+        out = verify({
+            "sources": SOURCES,
+            "claims": [{
+                "id": "c_privacy",
+                **_claim(
+                    "User data remains on the device.",
+                    _cite(source="s1", quote="keep user data on the device"),
+                ),
+            }],
+            "comparison": [{
+                "candidate": "Misbound app",
+                "best_for": "Desktop use",
+                "os": "Windows and macOS",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "Not verified",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
+                "ideal_user": "Everyday desktop user",
+                "evidence_sources": ["s1"],
+                "field_claims": {"os": ["c_privacy"]},
+            }],
+        })
+        row = out["comparison_rows"][0]
+        self.assertTrue(out["claims"][0]["supported"])
+        self.assertEqual(row["os"], "Not verified: OS")
+        self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
 
     def test_comparison_marks_missing_fields_and_unverified_evidence(self):
         out = verify({
@@ -437,17 +559,15 @@ class References(unittest.TestCase):
             "claims": [],
             "comparison": [{
                 "candidate": "Sparse candidate",
-                "project_activity": "Repository is active",
                 "evidence": "E99",
             }],
         })
         row = out["comparison_rows"][0]
         self.assertEqual(row["os"], "Not verified: OS")
-        self.assertIn("Not verified: observed date", row["project_activity"])
+        self.assertEqual(row["pricing_cost"], "Not verified: Pricing/cost")
         self.assertEqual(row["evidence"], "Not verified: no verified Evidence ID")
         issues = {warning["issue"] for warning in out["comparison_warnings"]}
         self.assertIn("comparison_field_missing", issues)
-        self.assertIn("comparison_activity_date_missing", issues)
         self.assertIn("comparison_evidence_missing", issues)
 
     def test_unproven_or_flagged_citations_are_not_rendered_as_evidence(self):
@@ -552,6 +672,65 @@ class AbstainAndSummary(unittest.TestCase):
         decoded = json.loads(completed.stdout.decode("ascii"))
         self.assertEqual(decoded["data"]["references"][0]["title"], "桌面应用")
         self.assertIn("—", decoded["data"]["evidence_markdown"])
+
+    def test_cli_with_out_persists_full_result_but_prints_only_compact_summary(self):
+        script = os.path.join(os.path.dirname(__file__), "..", "scripts", "citations.py")
+        payload = {
+            "sources": [{
+                "id": "s1",
+                "url": "https://example.com/source",
+                "title": "Official source",
+                "text": "The desktop application keeps private documents on the local device.",
+            }],
+            "claims": [{
+                "id": "c_privacy",
+                "text": "The desktop application keeps private documents on the local device.",
+                "citations": [{
+                    "source": "s1",
+                    "quote": "The desktop application keeps private documents on the local device.",
+                }],
+            }],
+            "comparison": [{
+                "candidate": "Example",
+                "best_for": "Private desktop use",
+                "os": "Not verified",
+                "setup_ease": "Not verified",
+                "model_capabilities": "Not verified",
+                "local_offline": "Not verified",
+                "privacy_data_handling": "The application keeps private documents on the local device",
+                "pricing_cost": "Not verified",
+                "key_limitations": "Not verified",
+                "ideal_user": "Desktop user",
+                "evidence_sources": ["s1"],
+                "field_claims": {"privacy_data_handling": ["c_privacy"]},
+            }],
+        }
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "citations_input.json")
+            output_path = os.path.join(root, "citations_output.json")
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            completed = subprocess.run(
+                [sys.executable, script, "--op", "verify", "--input", input_path,
+                 "--out", output_path],
+                check=True,
+                capture_output=True,
+            )
+            stdout = json.loads(completed.stdout.decode("ascii"))
+            with open(output_path, encoding="utf-8") as fh:
+                persisted = json.load(fh)
+
+        self.assertEqual(stdout["output"], output_path)
+        self.assertEqual(stdout["summary"]["supported"], 1)
+        self.assertEqual(stdout["flags"], 0)
+        self.assertEqual(stdout["comparison_warnings"], 0)
+        self.assertEqual(stdout["comparison_warning_details"], [])
+        self.assertNotIn("data", stdout)
+        self.assertIn("| Candidate |", stdout["comparison_markdown"])
+        self.assertIn("## Evidence used", stdout["evidence_markdown"])
+        self.assertTrue(persisted["data"]["claims"][0]["supported"])
+        self.assertIn("## Evidence used", persisted["data"]["evidence_markdown"])
+        self.assertIn("The desktop application keeps private documents", persisted["data"]["evidence_markdown"])
 
 
 class UrlNormalization(unittest.TestCase):

@@ -20,7 +20,7 @@
 import * as crypto from 'node:crypto';
 
 const SENSITIVE_FIELD =
-  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie)';
+  '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|path|abs_?path|rel_?path|file_?path|file_?name|filename|working_?dir|cwd)';
 
 const SENSITIVE_QUERY_FIELD =
   '(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|conversation_?id|cid|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)';
@@ -40,10 +40,11 @@ const QUERY_SECRET_FIELD_RE = new RegExp(
   'gi',
 );
 
-const CLOUD_PATH_RE = /\bcloud\/[^\s'",)]+/g;
-const FILE_URL_RE = /\bfile:\/\/\/?[^\s'",)]+/gi;
-const POSIX_ABS_PATH_RE = /(^|[\s'",(])((?:\/Users|\/private|\/var|\/tmp|\/Volumes|\/home|\/opt)\/[^\s'",)]+)/g;
-const WINDOWS_ABS_PATH_RE = /\b[A-Za-z]:\\[^\s'",)]+/g;
+const PATH_END = '(?=\\s+(?:then|while|failed|failure|error|at|from|to|for|because|with)\\b|$|[\'",);])';
+const CLOUD_PATH_RE = new RegExp(`\\bcloud\\/[^\\n\\r'",);]+?${PATH_END}`, 'g');
+const FILE_URL_RE = new RegExp(`\\bfile:\\/\\/\\/?[^\\n\\r'",);]+?${PATH_END}`, 'gi');
+const POSIX_ABS_PATH_RE = new RegExp(`(^|[\\s'",(])((?:\\/Users|\\/private|\\/var|\\/tmp|\\/Volumes|\\/home|\\/opt)\\/[^\\n\\r'",);]+?)${PATH_END}`, 'g');
+const WINDOWS_ABS_PATH_RE = new RegExp(`\\b[A-Za-z]:\\\\[^\\n\\r'",);]+?${PATH_END}`, 'g');
 
 function hashForLog(value: unknown): string {
   return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, 12);

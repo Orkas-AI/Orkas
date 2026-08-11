@@ -456,25 +456,37 @@ describe('saved_apps › rename / delete', () => {
 });
 
 describe('saved_apps › listSavedApps', () => {
-  it('lists A→Z by title and tolerates a corrupt meta (fallback title, still listed)', async () => {
+  it('lists newest saves first, uses a stable tie-break, and puts missing times last', async () => {
     const { savedApps } = await mods();
-    const a1 = await makeArtifact('Zebra');
-    const a2 = await makeArtifact('alpha');
-    const s1 = savedApps.saveFromArtifact(UID, CID, a1);
-    const s2 = savedApps.saveFromArtifact(UID, CID, a2);
-    if (!s1.ok || !s2.ok) throw new Error('save failed');
-    // Corrupt one app's meta.
-    fs.writeFileSync(path.join(APPS_ROOT(), s1.id, '__orkas-meta.json'), '{ not json');
+    const saves = await Promise.all(['Older alpha', 'Newest Zebra', 'Tie gamma', 'Tie beta', 'Corrupt'].map(async (title) => {
+      const artifactId = await makeArtifact(title);
+      return savedApps.saveFromArtifact(UID, CID, artifactId);
+    }));
+    if (saves.some((saved) => !saved.ok)) throw new Error('save failed');
+    const [older, newest, tieGamma, tieBeta, corrupt] = saves as Array<{ ok: true; id: string; title: string }>;
+    const setSavedAt = (appId: string, savedAt: string) => {
+      const metaPath = path.join(APPS_ROOT(), appId, '__orkas-meta.json');
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      fs.writeFileSync(metaPath, JSON.stringify({ ...meta, savedAt }));
+    };
+    setSavedAt(older.id, '2026-06-02T10:00:00.000Z');
+    setSavedAt(newest.id, '2026-07-27T10:00:00.000Z');
+    setSavedAt(tieGamma.id, '2026-06-01T10:00:00.000Z');
+    setSavedAt(tieBeta.id, '2026-06-01T10:00:00.000Z');
+    // A damaged legacy record has no trustworthy save time, but remains recoverable.
+    fs.writeFileSync(path.join(APPS_ROOT(), corrupt.id, '__orkas-meta.json'), '{ not json');
     // A non-conforming directory name must be ignored.
     fs.mkdirSync(path.join(APPS_ROOT(), 'has space'), { recursive: true });
 
     const list = savedApps.listSavedApps(UID);
-    expect(list.map((x) => x.id).sort()).toEqual([s1.id, s2.id].sort());
-    // s2 ("alpha") sorts before s1 (corrupt → "Interactive app").
-    expect(list[0].id).toBe(s2.id);
-    expect(list[0].title).toBe('alpha');
-    const corrupt = list.find((x) => x.id === s1.id);
-    expect(corrupt?.title).toBe('Interactive app');
+    expect(list.map((x) => x.id)).toEqual([
+      newest.id,
+      older.id,
+      tieBeta.id,
+      tieGamma.id,
+      corrupt.id,
+    ]);
+    expect(list.at(-1)).toMatchObject({ id: corrupt.id, title: 'Interactive app', savedAt: '' });
   });
 
   it('returns [] when the pool dir does not exist', async () => {

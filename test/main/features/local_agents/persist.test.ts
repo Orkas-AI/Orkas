@@ -32,7 +32,6 @@ describe('local_agents/persist', () => {
       cid: 'conv-1',
       cli: 'claude',
       cliPath: '/fake/claude',
-      model: 'claude-opus-4-7',
       prompt: 'write tests',
     });
 
@@ -65,7 +64,6 @@ describe('local_agents/persist', () => {
       cid: 'conv-1',
       cli: 'claude',
       cliPath: '/fake/claude',
-      model: 'claude-opus-4-7',
       status: 'completed',
       durationMs: 42,
       output: 'complete body',
@@ -73,6 +71,7 @@ describe('local_agents/persist', () => {
     });
     expect(meta.startedAt).toBeTruthy();
     expect(meta.endedAt).toBeTruthy();
+    expect(meta).not.toHaveProperty('model');
   });
 
   it('writes final output when no streamed output exists', async () => {

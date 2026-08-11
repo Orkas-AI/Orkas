@@ -33,6 +33,14 @@ describe('project memory controls', () => {
     expect(source).not.toContain('input.select()');
   });
 
+  it('labels the shared instructions and memory card as context in every locale', () => {
+    expect(html).toContain('data-i18n="project.context.title">Context</span>');
+    expect(locales.en['project.context.title']).toBe('Context');
+    expect(locales.zh['project.context.title']).toBe('上下文');
+    expect(locales.ja['project.context.title']).toBe('コンテキスト');
+    expect(locales.pt['project.context.title']).toBe('Contexto');
+  });
+
   it('keeps live progress out of project-memory guidance in every locale', () => {
     const forbidden: Record<string, RegExp> = {
       en: /\b(progress|update)\b/i,
@@ -55,5 +63,7 @@ describe('project memory controls', () => {
     expect(source).toContain("result: 'success'");
     expect(source).toContain("result: 'failure'");
     expect(source).toContain('duration_ms: Math.max(0, Math.round(performance.now() - startedAt))');
+    expect(source).toContain("input.dataset.projectId = String(_projectDetailPid || '')");
+    expect(source).toContain('if (input.dataset.projectId === projectId) input.dataset.savedValue = content');
   });
 });

@@ -10,8 +10,8 @@ require('./proxy-bootstrap.cjs');
 // (`gmail.googleapis.com`, GA since 2014) has no such gate, so we wrap it ourselves. The
 // catalog entry's transport_template references this script via the `${ORKAS_NODE}` +
 // `${ORKAS_PC_DIR}/bin/gmail-mcp-server.cjs` placeholder pair, which `apply-template.ts`
-// resolves to Electron's binary path running with `ELECTRON_RUN_AS_NODE=1` so we don't
-// require the user to have node on PATH.
+// resolves to Orkas's bundled stock Node so we don't require node on the user's PATH or
+// launch the GUI Electron executable as a headless helper.
 //
 // Tool surface (5 tools, v1):
 //   - search_messages(query, maxResults?)               → list of message ids + snippets + headers

@@ -22,6 +22,14 @@ export interface ImageTransformResult {
   height: number;
 }
 
+/** Canonical Library/KB image-indexing transform. Production extraction and
+ * its live model regression share this object so fidelity cannot drift. */
+export const LIBRARY_IMAGE_TRANSFORM_OPTIONS: Readonly<Required<ImageTransformOpts>> = Object.freeze({
+  maxDim: 1024,
+  quality: 70,
+  grayscale: true,
+});
+
 export interface FeedbackImageTransformOpts {
   fileName?: string;
   mimeType?: string;

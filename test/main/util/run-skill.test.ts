@@ -15,9 +15,12 @@ beforeEach(() => {
   tmpDirs.push(tmpDir);
 });
 
-afterAll(() => {
+afterAll(async () => {
   for (const dir of tmpDirs) {
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
+    // Yield between retries so Windows can release executables that were just
+    // launched from a generated virtualenv. A synchronous retry loop can keep
+    // racing the same antivirus/process teardown handle until it exhausts.
+    await fs.promises.rm(dir, { recursive: true, force: true, maxRetries: 50, retryDelay: 100 });
   }
 });
 
@@ -140,6 +143,137 @@ describe('run-skill.cjs', () => {
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
     expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, argv: 'youtube' });
+  });
+
+  it.each([
+    [
+      'js',
+      'module.exports = async ({ args, skillDir }) => ({ ext: "js", arg: args[0], resource: require("node:fs").readFileSync(require("node:path").join(skillDir, "assets", "fixture.txt"), "utf8").trim() });\n',
+    ],
+    [
+      'mjs',
+      'export default async ({ args, skillDir }) => ({ ext: "mjs", arg: args[0], resource: require("node:fs").readFileSync(require("node:path").join(skillDir, "assets", "fixture.txt"), "utf8").trim() });\n',
+    ],
+    [
+      'ts',
+      'export default async ({ args, skillDir }: { args: string[]; skillDir: string }) => ({ ext: "ts", arg: args[0], resource: require("node:fs").readFileSync(require("node:path").join(skillDir, "assets", "fixture.txt"), "utf8").trim() });\n',
+    ],
+  ])('loads and executes .%s module scripts with bundled resources', (ext, source) => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', `module-${ext}`);
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.mkdirSync(path.join(skillDir, 'assets'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---\nname: module-${ext}\ndescription: ${ext} module fixture\n---\n\nbody\n`,
+    );
+    fs.writeFileSync(path.join(skillDir, 'assets', 'fixture.txt'), `resource-${ext}\n`);
+    fs.writeFileSync(path.join(skillDir, 'scripts', `run.${ext}`), source);
+
+    const r = runSkill(`module-${ext}`, 'run', [`arg-${ext}`]);
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      ext,
+      arg: `arg-${ext}`,
+      resource: `resource-${ext}`,
+    });
+  });
+
+  it('exits non-zero while preserving a module semantic-failure report', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'module-failure');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: module-failure\ndescription: semantic failure fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'scripts', 'validate.mjs'),
+      'export default async () => ({ ok: false, errors: ["artifact is invalid"] });\n',
+    );
+
+    const r = runSkill('module-failure', 'validate');
+
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      ok: false,
+      errors: ['artifact is invalid'],
+    });
+  });
+
+  it('does not infer failure from module-specific fields without ok false', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'module-result');
+    fs.mkdirSync(path.join(skillDir, 'scripts'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: module-result\ndescription: module result fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(
+      path.join(skillDir, 'scripts', 'inspect.js'),
+      'module.exports = async () => ({ valid: false, reason: "informational result" });\n',
+    );
+
+    const r = runSkill('module-result', 'inspect');
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      valid: false,
+      reason: 'informational result',
+    });
+  });
+
+  it('uses an exact internal id to disambiguate same-name Skill scripts', () => {
+    writeMarketplaceSkill('duplicate-first', 'duplicate-name', 'run');
+    writeMarketplaceSkill('duplicate-second', 'duplicate-name', 'run');
+    fs.writeFileSync(
+      path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'duplicate-first', 'scripts', 'run.js'),
+      'module.exports = async () => ({ selected: "first" });\n',
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'duplicate-second', 'scripts', 'run.js'),
+      'module.exports = async () => ({ selected: "second" });\n',
+    );
+
+    const r = runSkill('duplicate-second', 'run');
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({ selected: 'second' });
+  });
+
+  it('rejects path-like Skill refs before filesystem resolution', () => {
+    const r = runSkill('../outside-skill', 'run');
+
+    expect(r.status).toBe(64);
+    expect(r.stdout).toBe('');
+    expect(JSON.parse(r.stderr.trim())).toMatchObject({
+      ok: false,
+      error: 'skill id/name must be one non-path segment',
+    });
+  });
+
+  itOnNonWindows('rejects script symlinks that escape the admitted Skill scripts directory', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'symlink-skill');
+    const scriptsDir = path.join(skillDir, 'scripts');
+    const outsideScript = path.join(tmpDir, 'outside-script.js');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: symlink-skill\ndescription: symlink fixture\n---\n\nbody\n',
+    );
+    fs.writeFileSync(outsideScript, 'module.exports = async () => ({ escaped: true });\n');
+    fs.symlinkSync(outsideScript, path.join(scriptsDir, 'run.js'));
+
+    const r = runSkill('symlink-skill', 'run');
+
+    expect(r.status).toBe(66);
+    expect(r.stdout).toBe('');
+    const error = JSON.parse(r.stderr.trim());
+    expect(error.error).toContain('skill script not found');
+    expect(error.searched).toEqual(expect.arrayContaining(['symlink-skill/scripts/run.js']));
+    expect(r.stderr).not.toContain(tmpDir);
   });
 
   it('resolves current-agent private marketplace scripts from the installed agent directory', () => {

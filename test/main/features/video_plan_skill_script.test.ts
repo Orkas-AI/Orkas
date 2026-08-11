@@ -8,9 +8,7 @@ import { describe, expect, it } from 'vitest';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 function pcDir() {
-  return path.basename(process.cwd()) === 'PC'
-    ? process.cwd()
-    : path.resolve(process.cwd(), 'PC');
+  return process.cwd();
 }
 
 function validPlan() {
@@ -91,9 +89,7 @@ function makeFakeProbeEnv(cwd: string, durations: Record<string, number>) {
 }
 
 function runVideoPlan(cwd: string, args: string[], extraEnv: Record<string, string> = {}) {
-  const appDir = fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
-    ? process.cwd()
-    : path.resolve(process.cwd(), 'PC');
+  const appDir = pcDir();
   const skillDir = path.join(appDir, 'resources', 'builtin', 'marketplace', 'agents', '79df9cc89f5f', 'skills', 'stage-plan');
   return spawnSync(
     TEST_NODE,
@@ -125,6 +121,28 @@ describe('stage-plan video_plan skill script', () => {
     expect(out.ok).toBe(true);
     expect(out.valid).toBe(true);
     expect(out.text).toContain('plan VALID');
+    // `validate` is the last thing the model reads before it decides to show
+    // the plan, and it used to return only the verdict. Twice on 2026-08-08 the
+    // model then wrote its own six-line abstract and asked the user to approve
+    // an EDL they had never seen. The summarize op already produced this text
+    // under this exact instruction; it just was not where the decision gets
+    // made.
+    expect(out.text).toContain('present this to the user in their language');
+    expect(out.summary).toContain('Timeline:');
+    expect(out.summary).toContain('[hook]');
+    expect(out.summary).toContain('[body]');
+  });
+
+  it('says nothing about presenting a plan it just rejected', () => {
+    // Negative control: an invalid plan must not carry a digest inviting the
+    // model to show it — the plan does not exist yet in a presentable form.
+    const plan = validPlan() as any;
+    plan.segments[0].role = 'not-a-role';
+    const res = runVideoPlan(makeProject(plan), ['--op', 'validate', '--plan', 'project/plan.json']);
+    const out = parseJsonOutput(res.stderr || res.stdout);
+    expect(out.valid).toBe(false);
+    expect(out.summary).toBeUndefined();
+    expect(String(out.text)).not.toContain('present this to the user');
   });
 
   it('keeps legacy empty tracks executable and reports them as disabled', () => {

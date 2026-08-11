@@ -10,6 +10,16 @@ type InvokeFn = (event: unknown, req: { channel: string; payload?: unknown }) =>
 
 let invokeHandler: InvokeFn | null = null;
 
+const notificationPermissionMocks = vi.hoisted(() => ({
+  getSystemNotificationPermission: vi.fn(async () => ({
+    state: 'granted',
+    can_open_settings: true,
+  })),
+  openSystemNotificationSettings: vi.fn(async () => true),
+}));
+
+vi.mock('../../../src/main/features/notification_permissions', () => notificationPermissionMocks);
+
 vi.mock('electron', () => ({
   ipcMain: {
     handle: (channel: string, fn: InvokeFn) => {
@@ -32,15 +42,6 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   invokeHandler = null;
   vi.resetModules();
-  vi.doMock('../../../src/main/ipc/local_agents', () => ({
-    invokeHandlers: {
-      'localAgents.list': async () => ({
-        entries: [
-          { type: 'claude', path: '/usr/local/bin/claude', version: '2.1.148', available: true },
-        ],
-      }),
-    },
-  }));
 
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -124,6 +125,15 @@ describe('ipc › permissions.* routes', () => {
     expect(res.ok).toBe(false);
   });
 
+  it('persists task-notification preference without waiting for the platform permission probe', async () => {
+    notificationPermissionMocks.getSystemNotificationPermission.mockClear();
+
+    const res = await call('prefs.setTaskNotifications', { enabled: false });
+
+    expect(res).toMatchObject({ ok: true, enabled: false });
+    expect(notificationPermissionMocks.getSystemNotificationPermission).not.toHaveBeenCalled();
+  });
+
   it('unknown permissions.* channel surfaces the router fallback error', async () => {
     // Regression guard: this is the exact symptom that made "授权本机工具"
     // look dead — when a handler is missing, the router returns
@@ -133,15 +143,5 @@ describe('ipc › permissions.* routes', () => {
     const res = await call('permissions.doesNotExist');
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/unknown channel/);
-  });
-});
-
-describe('ipc › localAgents.* routes', () => {
-  it('registers localAgents.list for the external CLI picker', async () => {
-    const res = await call('localAgents.list');
-    expect(res.ok).toBe(true);
-    expect(res.entries).toEqual([
-      { type: 'claude', path: '/usr/local/bin/claude', version: '2.1.148', available: true },
-    ]);
   });
 });

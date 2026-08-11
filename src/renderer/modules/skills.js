@@ -1,6 +1,56 @@
 const _skillsLog = createLogger('skills');
 // ─── Skills ───
 
+function _skillsTrackError(action, data) {
+  _skillsLog.warn('skill operation failed', { action, ...(data || {}) });
+}
+
+function _skillManageErrorCode(value, fallback = 'operation_failed') {
+  const message = String((value && value.message) || '').trim();
+  const raw = String((value && (value.code || value.error_code))
+    || (/^[A-Za-z0-9_.:-]{1,64}$/.test(message) ? message : '')).trim();
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : fallback;
+}
+
+const _SKILL_AUTOSAVE_FAILURE_DEDUPE_MS = 60_000;
+const _SKILL_AUTOSAVE_FAILURE_MAX_PER_SESSION = 20;
+const _skillAutosaveFailureState = {
+  lastAtByCode: new Map(),
+  uploadCount: 0,
+};
+
+function _skillAutosaveFailureCode(value) {
+  const signal = String([
+    value && value.code,
+    value && value.error_code,
+    value && value.name,
+    value && value.message,
+    value,
+  ].filter(Boolean).join(' ')).toLowerCase();
+  if (/unauthorized|not[_ -]?logged|session[_ -]?expired|auth/.test(signal)) return 'unauthorized';
+  if (/permission|denied|eacces|eperm/.test(signal)) return 'permission_denied';
+  if (/not[_ -]?found|enoent/.test(signal)) return 'not_found';
+  if (/conflict|eexist/.test(signal)) return 'conflict';
+  if (/network|fetch|socket|timeout|timed[_ -]?out/.test(signal)) return 'network_failed';
+  return 'file_save_failed';
+}
+
+function _reportSkillAutosaveFailure(value) {
+  const errorCode = _skillAutosaveFailureCode(value);
+  const now = Date.now();
+  const previousAt = Number(_skillAutosaveFailureState.lastAtByCode.get(errorCode) || 0);
+  if (_skillAutosaveFailureState.uploadCount >= _SKILL_AUTOSAVE_FAILURE_MAX_PER_SESSION) return;
+  if (previousAt && now - previousAt < _SKILL_AUTOSAVE_FAILURE_DEDUPE_MS) return;
+  _skillAutosaveFailureState.lastAtByCode.set(errorCode, now);
+  _skillAutosaveFailureState.uploadCount += 1;
+  _skillsTrackError('skill_manage', {
+    action: 'edit',
+    error_type: 'ipc',
+    error_code: errorCode,
+    error_message: errorCode,
+  });
+}
+
 let _skillsCache = null;
 // Read-only open-tier entries. External packages render as package cards,
 // while machine-global folders still render their individual skills. Package
@@ -10,6 +60,7 @@ let _openSkillsCache = [];
 let _packagesCache = [];
 let _skillsLoadInFlight = null;
 let _selectedSkill = null;    // { source, id }
+let _skillDetailReturnTarget = null; // { view, id? } — page underneath a transient detail
 let _expandedGlobalSkillGroups = new Set();
 const _GLOBAL_SKILL_GROUP_MIN = 2;
 
@@ -699,15 +750,22 @@ function _wireOpenSkillCards(gridEl) {
 }
 
 async function _setOpenSkillEnabled(id, nextEnabled) {
+  const trackResult = _createSkillManageTracker('toggle');
   try {
     const res = await window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled });
-    if (!res || !res.ok) { await uiAlert(t('component.toggle_failed')); return false; }
+    if (!res || !res.ok) {
+      trackResult('failure', _skillManageErrorCode(res, 'update_failed'));
+      await uiAlert(t('component.toggle_failed'));
+      return false;
+    }
     // enable/disable is keyed by id; the same skill can appear under both
     // external and global, so flip every matching row's optimistic state.
     for (const r of _openSkillsCache) if (r.id === id) r.enabled = nextEnabled;
     renderSkillsList(_skillsCache || []);
+    trackResult('success');
     return true;
-  } catch {
+  } catch (error) {
+    trackResult('failure', _skillManageErrorCode(error, 'invoke_failed'));
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
@@ -719,11 +777,13 @@ async function _setGlobalSkillGroupEnabled(key, nextEnabled) {
     .filter((row) => (row.enabled !== false) !== nextEnabled)
     .map((row) => row.id));
   if (!targetIds.size) return true;
+  const trackResult = _createSkillManageTracker('toggle');
   try {
     const results = await Promise.allSettled(Array.from(targetIds).map((id) => (
       window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled })
     )));
     if (results.some((res) => res.status === 'rejected' || !res.value || !res.value.ok)) {
+      trackResult('failure', 'partial_failure');
       await loadSkills(true);
       await uiAlert(t('component.toggle_failed'));
       return false;
@@ -732,8 +792,10 @@ async function _setGlobalSkillGroupEnabled(key, nextEnabled) {
       if (targetIds.has(row.id)) row.enabled = nextEnabled;
     }
     renderSkillsList(_skillsCache || []);
+    trackResult('success');
     return true;
-  } catch {
+  } catch (error) {
+    trackResult('failure', _skillManageErrorCode(error, 'invoke_failed'));
     await loadSkills(true);
     await uiAlert(t('component.toggle_failed'));
     return false;
@@ -871,61 +933,27 @@ async function _runOpenPackageAction(command, packageName, cardEl, packageDispla
   const card = cardEl && cardEl.isConnected ? cardEl : null;
   const displayName = String(packageDisplayName || packageName);
   if (card) _setSkillCardBusy(card, command);
-  const startedAt = Date.now();
-  if (window.Monitor) (() => {})('package_action', { surface: 'skills', command });
   try {
     const res = await window.orkas.invoke('packages.action', { command, name: packageName });
     if (!res || res.ok === false) {
-      const errorMessage = (res && res.error) || t('settings.packages.action_failed');
-      if (window.Monitor) {
-        (() => {})('package_action_result', {
-          surface: 'skills',
-          command,
-          result: 'failure',
-          duration_ms: Date.now() - startedAt,
-        });
-        (() => {})('package_action', {
-          surface: 'skills',
-          command,
-          error_type: 'runtime',
-          error_message: errorMessage,
-        });
-      }
       await uiAlert((res && res.error) || t('settings.packages.action_failed'));
       return;
-    }
-    if (window.Monitor) {
-      (() => {})('package_action_result', {
-        surface: 'skills',
-        command,
-        result: 'success',
-        duration_ms: Date.now() - startedAt,
-      });
     }
     if (command === 'update' && typeof uiToast === 'function') {
       uiToast(t('settings.packages.updated', { name: displayName }), { variant: 'success' });
     }
-    await loadSkills(true);
-  } catch (err) {
-    if (window.Monitor) {
-      (() => {})('package_action_result', {
-        surface: 'skills',
-        command,
-        result: 'failure',
-        duration_ms: Date.now() - startedAt,
-      });
-      (() => {})('package_action', {
-        surface: 'skills',
-        command,
-        error_type: 'ipc',
-        error_message: (err && err.message) || String(err || 'unknown'),
-      });
+    try {
+      await loadSkills(true);
+    } catch (_) {
+      _skillsLog.warn('package action refresh failed', { command, error_code: 'refresh_failed' });
     }
-    _skillsLog.warn('package action failed', err);
+  } catch (err) {
+    _skillsLog.warn('package action failed', {
+      command,
+      error_code: _skillManageErrorCode(err, 'package_action_failed'),
+    });
     await uiAlert(t('settings.packages.action_failed'));
   } finally {
-    // Success re-renders the grid (card replaced), so this only fires on the
-    // failure path where the original card is still mounted.
     if (card && card.isConnected) _clearSkillCardBusy(card);
   }
 }
@@ -940,26 +968,31 @@ async function _flipOpenSkillEnabled(id) {
  *  not mutate UI state; on success, refreshes the grid + detail page. */
 async function _flipSkillEnabled(skillId, nextEnabled) {
   const trackResult = _createSkillManageTracker('toggle');
+  let res;
   try {
-    const res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: nextEnabled });
-    if (!res || !res.ok) {
-      trackResult('failure', 'update_failed');
-      await uiAlert(t('component.toggle_failed'));
-      return false;
-    }
-    const cached = _skillsCache?.find((s) => s.id === skillId);
-    if (cached) cached.enabled = nextEnabled;
-    await loadSkills();
-    if (_selectedSkill?.id === skillId) {
-      _renderSkillEnabledButton({ id: skillId, enabled: nextEnabled });
-    }
-    trackResult('success');
-    return true;
+    res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: nextEnabled });
   } catch (err) {
     trackResult('failure', 'invoke_failed');
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
+  if (!res || !res.ok) {
+    trackResult('failure', 'update_failed');
+    await uiAlert(t('component.toggle_failed'));
+    return false;
+  }
+  trackResult('success');
+  const cached = _skillsCache?.find((s) => s.id === skillId);
+  if (cached) cached.enabled = nextEnabled;
+  try {
+    await loadSkills();
+    if (_selectedSkill?.id === skillId) {
+      _renderSkillEnabledButton({ id: skillId, enabled: nextEnabled });
+    }
+  } catch (_) {
+    _skillsLog.warn('skill toggle refresh failed', { error_code: 'refresh_failed' });
+  }
+  return true;
 }
 
 function _createSkillManageTracker(action) {
@@ -968,16 +1001,13 @@ function _createSkillManageTracker(action) {
   return (result, errorCode = '') => {
     if (done) return;
     done = true;
-    try {
-      if (!window.Monitor) return;
-      const payload = {
-        result,
-        action,
-        duration_ms: Math.max(0, Date.now() - startedAt),
-      };
-      if (result !== 'success') payload.error_code = errorCode || 'unknown';
-      Monitor.event('skill_manage_result', payload);
-    } catch (_) {}
+    const payload = {
+      result,
+      action,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result !== 'success') payload.error_code = errorCode || 'unknown';
+    _skillsLog.info('skill operation result', payload);
   };
 }
 
@@ -1003,12 +1033,42 @@ async function _onSkillsBack() {
       if (r && r.discarded) { _skillsCache = null; await loadSkills(); }
     } catch (_) { /* best effort — a leftover empty draft is non-fatal */ }
   }
-  _showSkillsGridView();
+  _returnFromSkillsDetailView();
+}
+
+function _normalizeSkillDetailReturnTarget(target) {
+  const view = typeof target?.view === 'string' ? target.view.trim() : '';
+  if (!view || view === 'skills') return { view: 'skills' };
+  if (view === 'conversation') {
+    const id = typeof target?.id === 'string' ? target.id.trim() : '';
+    return id ? { view, id } : { view: 'skills' };
+  }
+  if (view === 'project') {
+    const id = typeof target?.id === 'string' ? target.id.trim() : '';
+    return id ? { view, id } : { view: 'skills' };
+  }
+  return { view };
+}
+
+function _captureSkillDetailReturnTarget() {
+  const view = (typeof currentView === 'string' && currentView) ? currentView : 'skills';
+  if (view === 'conversation') {
+    const id = (typeof currentCid === 'string') ? currentCid : '';
+    return _normalizeSkillDetailReturnTarget({ view, id });
+  }
+  if (view === 'project') {
+    const id = (typeof _projectDetailPid !== 'undefined' && typeof _projectDetailPid === 'string')
+      ? _projectDetailPid
+      : '';
+    return _normalizeSkillDetailReturnTarget({ view, id });
+  }
+  return _normalizeSkillDetailReturnTarget({ view });
 }
 
 function _showSkillsGridView() {
   const grid = document.getElementById('skills-grid-view');
   const detail = document.getElementById('skills-detail-view');
+  document.getElementById('panel-skills')?.classList.remove('resource-detail-overlay');
   // Exit edit mode if active so chat panel is hidden too.
   if (_skillEditMode) {
     // Abort any in-flight reply (same reason as toggleSkillEditMode exit
@@ -1032,6 +1092,48 @@ function _showSkillsGridView() {
   if (body) body.style.minHeight = '';
   _selectedSkill = null;
   _closeSkillRowMenu();
+}
+
+async function openSkillDetail(source, id, options = {}) {
+  const hasExplicitReturnTarget = Object.prototype.hasOwnProperty.call(options, 'returnTarget');
+  _skillDetailReturnTarget = hasExplicitReturnTarget
+    ? _normalizeSkillDetailReturnTarget(options.returnTarget)
+    : _captureSkillDetailReturnTarget();
+  const panel = document.getElementById('panel-skills');
+  panel?.classList.toggle('resource-detail-overlay', _skillDetailReturnTarget.view !== 'skills');
+  await _showSkillsDetailView(source, id, options);
+}
+
+function _isSkillDetailReturnTargetCurrent(target) {
+  if (!target || target.view !== currentView) return false;
+  if (target.view === 'conversation') return target.id === currentCid;
+  if (target.view === 'project') {
+    return typeof _projectDetailPid !== 'undefined' && target.id === _projectDetailPid;
+  }
+  return true;
+}
+
+function _returnFromSkillsDetailView() {
+  const target = _normalizeSkillDetailReturnTarget(_skillDetailReturnTarget);
+  const wasOverlay = document.getElementById('panel-skills')?.classList.contains('resource-detail-overlay') === true;
+  _skillDetailReturnTarget = null;
+  _showSkillsGridView();
+  if (wasOverlay && _isSkillDetailReturnTargetCurrent(target)) return;
+  if (target.view === 'skills' || typeof setView !== 'function') return;
+  if (target.view === 'conversation' || target.view === 'project') {
+    setView(target.view, target.id);
+    return;
+  }
+  setView(target.view);
+}
+
+function _resetSkillsDetailForNavigation() {
+  const detail = document.getElementById('skills-detail-view');
+  const panel = document.getElementById('panel-skills');
+  const isOpen = detail && detail.style.display !== 'none';
+  if (!isOpen && !panel?.classList.contains('resource-detail-overlay')) return;
+  _skillDetailReturnTarget = null;
+  _showSkillsGridView();
 }
 
 async function _showSkillsDetailView(source, id, opts = {}) {
@@ -1194,7 +1296,8 @@ function _openSkillRowMenu(anchorBtn, id, source) {
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
   if (canEdit) {
-    items.push(`<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(t('skills.delete'))}</div>`);
+    const removeLabel = _isSkillPlatformSource(source) ? t('skills.uninstall') : t('skills.delete');
+    items.push(`<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(removeLabel)}</div>`);
   }
   menu.innerHTML = items.join('');
   // While menu open, force the source card's ⋯ visible.
@@ -1652,6 +1755,7 @@ function _renderSkillDetailCategory(skill, source) {
   _mountDetailCategorySelect(sourceEl, {
     value: skill?.category || 'general',
     onChange: async (category, api) => {
+      const trackResult = _createSkillManageTracker('edit');
       try {
         const res = await window.orkas.invoke('skills.update', {
           id: skillId,
@@ -1659,10 +1763,12 @@ function _renderSkillDetailCategory(skill, source) {
           skipRename: true,
         });
         if (!res || res.ok === false || !res.skill) {
+          trackResult('failure', _skillManageErrorCode(res, 'update_failed'));
           api.setValue(skill?.category || 'general');
           uiAlert((res && res.error) || t('skills.save_failed'));
           return;
         }
+        trackResult('success');
         skill.category = res.skill.category || category || 'general';
         _skillsCache = null;
         await loadSkills(true);
@@ -1670,6 +1776,7 @@ function _renderSkillDetailCategory(skill, source) {
           await selectSkillFile('custom', skillId, _selectedSkill.filepath || 'SKILL.md', null);
         }
       } catch (err) {
+        trackResult('failure', _skillManageErrorCode(err, 'invoke_failed'));
         api.setValue(skill?.category || 'general');
         uiAlert((err && err.message) || t('skills.save_failed'));
       }
@@ -1783,6 +1890,7 @@ function _renderSkillFileEditor(body, content, _ext) {
         await loadSkills();
       }
     } catch (e) {
+      _reportSkillAutosaveFailure(e);
       setStatus(t('skills.save_failed_with', { reason: e.message || e }), 'err');
     } finally {
       saving = false;
@@ -1940,6 +2048,7 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
       if (!data || data.ok === false) {
         throw new Error(data?.error || 'save failed');
       }
+      trackResult('success');
       if (field === 'name') {
         const nextName = data.skill?.name || newName || currentId;
         _skillsCache = null;
@@ -1974,6 +2083,7 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
     if (!data.ok) {
       throw new Error(data.error || 'save failed');
     }
+    trackResult('success');
     if (validate && field === 'name' && !skipRename) {
       // Directory was renamed — refresh caches + update _selectedSkill.id
       // so subsequent calls (selectSkillFile / chat dir lookup) hit the
@@ -2490,6 +2600,8 @@ function _skillCreateTrackClick(creationMethod, data) {
 }
 
 function _skillCreateTrackResult(tracking, result, data) {
+  if (!tracking || tracking.done) return false;
+  tracking.done = true;
   try {
     const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
     if (monitor && typeof monitor.event === 'function') {
@@ -2499,21 +2611,14 @@ function _skillCreateTrackResult(tracking, result, data) {
       }, data || {})));
     }
   } catch (_) {}
-}
-
-function _skillCreateTrackError(tracking, data) {
-  try {
-    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
-    if (monitor && typeof monitor.error === 'function') {
-      monitor.error('skill_create', _skillCreatePayload(tracking.creationMethod, data || {}));
-    }
-  } catch (_) {}
+  return true;
 }
 
 function _skillCreateTracking(creationMethod, clickData) {
   const tracking = {
     creationMethod,
     startedAt: _skillCreateNow(),
+    done: false,
   };
   _skillCreateTrackClick(creationMethod, clickData);
   return tracking;
@@ -2526,17 +2631,6 @@ function _skillCreateIdFromResponse(data) {
 function _skillCreateCountFromResponse(data) {
   if (Array.isArray(data?.skills)) return data.skills.length;
   return data?.skill ? 1 : 0;
-}
-
-function _skillCreateResourceFromResponse(data, fallbackName = '') {
-  const skill = data?.skill || data?.skills?.[0] || {};
-  const id = String(skill.id || '').trim().slice(0, 128);
-  const name = String(skill.name || fallbackName || id).replace(/\s+/g, ' ').trim().slice(0, 128);
-  return {
-    resource_kind: 'skill',
-    resource_id: id,
-    resource_name: name,
-  };
 }
 
 async function saveSkill() {
@@ -2557,6 +2651,7 @@ async function saveSkill() {
 window.saveSkill = saveSkill;
 
 async function _saveSkillManual({ editId, msgEl }) {
+  const tracking = editId ? null : _skillCreateTracking('manual');
   const rawName = document.getElementById('skill-name').value;
   const name = rawName.trim();
   const description = document.getElementById('skill-description').value.trim();
@@ -2564,21 +2659,23 @@ async function _saveSkillManual({ editId, msgEl }) {
     msgEl.textContent = t('skills.input_name_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-name').focus();
+    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'no_name' });
     return;
   }
   if (!_isValidSkillNameCharset(rawName)) {
     msgEl.textContent = t('skills.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-name').focus();
+    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'name_invalid' });
     return;
   }
   if (!description) {
     msgEl.textContent = t('skills.input_desc_needed');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-description').focus();
+    if (tracking) _skillCreateTrackResult(tracking, 'blocked', { error_code: 'no_desc' });
     return;
   }
-  const tracking = editId ? null : _skillCreateTracking('manual', { category: 'general' });
   try {
     // Create: stamp the marketplace default since the modal has no category picker.
     // Edit: omit category so the on-disk frontmatter value is preserved (LLM-authored
@@ -2601,24 +2698,14 @@ async function _saveSkillManual({ editId, msgEl }) {
       msgEl.className = 'form-msg err';
       if (tracking) {
         _skillCreateTrackResult(tracking, 'failure', {
-          category: 'general',
-          error_code: data.code || '',
-        });
-        _skillCreateTrackError(tracking, {
-          category: 'general',
-          error_type: 'api',
-          error_code: data.code || '',
-          error_message: data.error || 'unknown',
+          error_code: _skillManageErrorCode(data, 'create_failed'),
         });
       }
       return;
     }
     if (tracking) {
       _skillCreateTrackResult(tracking, 'success', {
-        skill_id: _skillCreateIdFromResponse(data),
-        ..._skillCreateResourceFromResponse(data, name),
         skill_count: _skillCreateCountFromResponse(data),
-        category: 'general',
       });
     }
     await _afterSkillCreated(data.skill?.id || editId, !editId, null);
@@ -2626,25 +2713,23 @@ async function _saveSkillManual({ editId, msgEl }) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
     if (tracking) {
-      _skillCreateTrackResult(tracking, 'failure', { category: 'general' });
-      _skillCreateTrackError(tracking, {
-        category: 'general',
-        error_type: 'network',
-        error_message: e && e.message ? e.message : String(e),
-      });
+      if (!_skillCreateTrackResult(tracking, 'failure', { error_code: 'network_failed' })) {
+        _skillsLog.warn('skill post-create refresh failed', { creation_method: 'manual', error_code: 'refresh_failed' });
+      }
     }
   }
 }
 
 async function _saveSkillFromUrl({ msgEl }) {
+  const tracking = _skillCreateTracking('url');
   const url = document.getElementById('skill-url-input').value.trim();
   if (!/^https?:\/\//i.test(url)) {
     msgEl.textContent = t('skill_modal.err_url_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-url-input').focus();
+    _skillCreateTrackResult(tracking, 'blocked', { error_code: 'url_invalid' });
     return;
   }
-  const tracking = _skillCreateTracking('url');
   try {
     msgEl.textContent = t('skills.saving');
     msgEl.className = 'form-msg';
@@ -2661,12 +2746,7 @@ async function _saveSkillFromUrl({ msgEl }) {
       msgEl.className = 'form-msg err';
       _setSkillModalBusy(false);
       _skillCreateTrackResult(tracking, 'failure', {
-        error_code: data.code || '',
-      });
-      _skillCreateTrackError(tracking, {
-        error_type: 'api',
-        error_code: data.code || '',
-        error_message: data.error || 'unknown',
+        error_code: _skillManageErrorCode(data, 'import_failed'),
       });
       return;
     }
@@ -2676,36 +2756,34 @@ async function _saveSkillFromUrl({ msgEl }) {
     // the edit chat authors real content, offer to discard that placeholder.
     _importDraftId = data.skill?.id && _skillAutoSeedHasModelText(autoSeed) ? data.skill.id : null;
     _skillCreateTrackResult(tracking, 'success', {
-      skill_id: createdId,
-      ..._skillCreateResourceFromResponse(data),
       skill_count: _skillCreateCountFromResponse(data),
     });
     await _afterSkillCreated(createdId, true, autoSeed);
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
-    _skillCreateTrackResult(tracking, 'failure');
-    _skillCreateTrackError(tracking, {
-      error_type: 'network',
-      error_message: e && e.message ? e.message : String(e),
-    });
+    if (!_skillCreateTrackResult(tracking, 'failure', { error_code: 'network_failed' })) {
+      _skillsLog.warn('skill post-create refresh failed', { creation_method: 'url', error_code: 'refresh_failed' });
+    }
   } finally {
     _setSkillModalBusy(false);
   }
 }
 
 async function _saveSkillFromDir({ msgEl }) {
+  const tracking = _skillCreateTracking('dir');
   const srcDir = document.getElementById('skill-dir-path').value.trim();
   if (!srcDir) {
     msgEl.textContent = t('skill_modal.err_dir_missing');
     msgEl.className = 'form-msg err';
+    _skillCreateTrackResult(tracking, 'blocked', { error_code: 'dir_missing' });
     return;
   }
   return _saveSkillFromDirWithQuality({
     msgEl,
     srcDir,
     force: false,
-    tracking: _skillCreateTracking('dir', { forced: false }),
+    tracking,
   });
 }
 
@@ -2723,7 +2801,7 @@ function _qualityImportRejectedTitle(name) {
 }
 
 async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) {
-  tracking = tracking || _skillCreateTracking('dir', { forced: !!force });
+  tracking = tracking || _skillCreateTracking('dir');
   try {
     msgEl.textContent = t('skills.saving');
     msgEl.className = 'form-msg';
@@ -2749,13 +2827,7 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) 
         }
         _skillCreateTrackResult(tracking, 'blocked', {
           forced: false,
-          error_code: data.code || 'quality_validation',
-        });
-        _skillCreateTrackError(tracking, {
-          forced: false,
-          error_type: 'validation',
-          error_code: data.code || 'quality_validation',
-          error_message: data.error || 'quality validation failed',
+          error_code: _skillManageErrorCode(data, 'quality_validation'),
         });
         msgEl.textContent = data.error || t('skills.save_failed');
         msgEl.className = 'form-msg err';
@@ -2765,20 +2837,12 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) 
       msgEl.className = 'form-msg err';
       _skillCreateTrackResult(tracking, 'failure', {
         forced: !!force,
-        error_code: data.code || '',
-      });
-      _skillCreateTrackError(tracking, {
-        forced: !!force,
-        error_type: data.report ? 'validation' : 'api',
-        error_code: data.code || '',
-        error_message: data.error || 'unknown',
+        error_code: _skillManageErrorCode(data, data.report ? 'quality_validation' : 'import_failed'),
       });
       return;
     }
     const createdId = _skillCreateIdFromResponse(data);
     _skillCreateTrackResult(tracking, 'success', {
-      skill_id: createdId,
-      ..._skillCreateResourceFromResponse(data),
       skill_count: _skillCreateCountFromResponse(data),
       forced: !!force,
     });
@@ -2786,12 +2850,12 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) 
   } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
-    _skillCreateTrackResult(tracking, 'failure', { forced: !!force });
-    _skillCreateTrackError(tracking, {
+    if (!_skillCreateTrackResult(tracking, 'failure', {
       forced: !!force,
-      error_type: 'network',
-      error_message: e && e.message ? e.message : String(e),
-    });
+      error_code: 'network_failed',
+    })) {
+      _skillsLog.warn('skill post-create refresh failed', { creation_method: 'dir', error_code: 'refresh_failed' });
+    }
   } finally {
     _setSkillModalBusy(false);
   }
@@ -2842,31 +2906,40 @@ function editSelectedSkill() {
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
   const src = _selectedSkill.source;
-  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
+  const isMarketplace = _isSkillPlatformSource(src);
+  if (src !== 'custom') return;
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
-  if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
+  const confirmKey = isMarketplace ? 'skills.uninstall_confirm' : 'skills.delete_confirm';
+  const failedWithKey = isMarketplace ? 'skills.uninstall_failed_with' : 'skills.delete_failed_with';
+  if (!(await uiConfirm(t(confirmKey, { name: cached?.name || sid })))) return;
   const trackResult = _createSkillManageTracker('delete');
+  let result;
   try {
-    const result = _isSkillPlatformSource(src)
+    result = isMarketplace
       ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
       : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
-    if (!result.ok) {
-      trackResult('failure', 'delete_failed');
-      await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
-      return;
-    }
-    _selectedSkill = null;
-    _skillsCache = null;
-    _skillTreeCache.clear();
+  } catch (e) {
+    trackResult('failure', 'request_failed');
+    await uiAlert(t(failedWithKey, { reason: e.message || e }));
+    return;
+  }
+  if (!result || !result.ok) {
+    trackResult('failure', 'delete_failed');
+    await uiAlert(t(failedWithKey, { reason: result?.error || '' }));
+    return;
+  }
+  trackResult('success');
+  _selectedSkill = null;
+  _skillsCache = null;
+  _skillTreeCache.clear();
+  try {
     await loadSkills();
     // Snap back to grid view (detail panel is for whole skills, the one
     // we just deleted no longer exists).
     _showSkillsGridView();
-    trackResult('success');
-  } catch (e) {
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('skills.delete_failed_with', { reason: e.message || e }));
+  } catch (_) {
+    _skillsLog.warn('skill delete refresh failed', { error_code: 'refresh_failed' });
   }
 }
 

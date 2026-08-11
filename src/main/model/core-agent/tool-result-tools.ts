@@ -3,9 +3,10 @@
  *
  * Persisted outputs are addressed by an opaque ref, never by a model-chosen
  * path. Search is the default retrieval path; exact reads require a cursor and
- * are hard-clamped to 2K estimated tokens. A runner-provided per-round ledger
- * enforces a 4K aggregate budget and suppresses duplicate reads within the same
- * compaction epoch.
+ * are hard-clamped to 2K estimated tokens. Both tools accept a bounded batch so
+ * independent retrievals do not require one model round each. A runner-provided
+ * per-round ledger enforces a 4K aggregate budget and suppresses duplicate reads
+ * within the same compaction epoch.
  */
 
 import * as fs from 'node:fs';
@@ -18,7 +19,12 @@ export const TOOL_RESULT_CHUNK_DEFAULT_TOKENS = 1_000;
 export const TOOL_RESULT_CHUNK_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_SEARCH_MAX_TOKENS = 2_000;
 export const TOOL_RESULT_ROUND_MAX_TOKENS = 4_000;
+export const TOOL_RESULT_BATCH_MAX_ITEMS = 8;
+export const TOOL_RESULT_REF_SCHEMA_PATTERN = '^[a-zA-Z0-9_-]{1,48}\\.(?:[a-f0-9]{16}|[a-f0-9]{64})$';
+const TOOL_RESULT_REF_RE = new RegExp(TOOL_RESULT_REF_SCHEMA_PATTERN);
 const TOOL_RESULT_FILE_SCAN_BYTES = 64 * 1024;
+const TOOL_RESULT_REF_DESCRIPTION =
+  'Literal opaque ref from <persisted-output ref="...">. It has tool.hash form; never use a tool-call ID such as call_...';
 
 export type ToolResultReadLedger = {
   epoch: number;
@@ -37,35 +43,39 @@ export function createToolResultTools(opts: ToolResultToolsOpts): AgentTool[] {
 function createSearchTool(opts: ToolResultToolsOpts): AgentTool {
   return {
     name: 'tool_result_search',
-    description: 'Search a persisted oversized tool result by ref. Use before reading exact chunks; returns bounded relevant excerpts, never the whole result.',
+    description: 'Search an oversized tool result only when its prior output literally contained <persisted-output ref="...">. A call_... tool-call ID is never a result ref. Pass `queries` with 1-8 narrow searches in one tool round. All results share the 4K round budget.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        ref: { type: 'string', description: 'Opaque ref from <persisted-output ref="...">.' },
-        query: { type: 'string', description: 'Specific text, symbol, error, field, or topic to find.' },
+        queries: {
+          type: 'array',
+          minItems: 1,
+          maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
+          description: 'Preferred batched searches. Each item contains an opaque ref and a narrow query.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              ref: {
+                type: 'string',
+                pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
+                description: TOOL_RESULT_REF_DESCRIPTION,
+              },
+              query: { type: 'string' },
+            },
+            required: ['ref', 'query'],
+          },
+        },
       },
-      required: ['ref', 'query'],
+      required: ['queries'],
     },
     async execute(input, ctx) {
-      const ref = String(input.ref || '').trim();
-      const query = String(input.query || '').trim();
-      if (!ref || !query) return error('E_BAD_INPUT', '`ref` and `query` are required.');
-      if (estimateToolResultTokens(query) > 256) {
-        return error('E_BAD_INPUT', '`query` must be a narrow search expression under 256 estimated tokens.');
-      }
-      const resolved = resolveToolResultRef(opts.toolResultsDir, ref);
-      if (resolved.ok === false) return error(resolved.code, resolved.message);
-
       const ledger = readLedger(ctx);
-      const key = `${ledger?.epoch ?? 0}:search:${ref}:${normalizeQuery(query)}`;
-      const duplicate = rejectDuplicate(ledger, key);
-      if (duplicate) return duplicate;
-      const budget = availableBudget(ledger, TOOL_RESULT_SEARCH_MAX_TOKENS);
-      if (budget < 128) return budgetError();
-
-      const output = searchResultFile(resolved.path, ref, query, budget);
-      commitRead(ledger, key, estimateToolResultTokens(output));
-      return { content: output };
+      const batch = batchItems(input, 'queries', ['ref', 'query']);
+      if (batch.error) return batch.error;
+      return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
+        executeSearchItem(opts, item, ledger, maxOutputTokens));
     },
   };
 }
@@ -73,81 +83,211 @@ function createSearchTool(opts: ToolResultToolsOpts): AgentTool {
 function createReadChunkTool(opts: ToolResultToolsOpts): AgentTool {
   return {
     name: 'tool_result_read_chunk',
-    description: 'Read one exact bounded chunk from a persisted tool result. Requires a cursor; max 2K tokens. Continue with next_cursor only when exact bytes are necessary.',
+    description: 'Read exact bounded chunks only when prior output literally contained <persisted-output ref="...">. A call_... tool-call ID is never a result ref. Pass `chunks` with 1-8 cursors in one tool round. Each chunk is capped at 2K and all chunks share the 4K round budget.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        ref: { type: 'string', description: 'Opaque ref from <persisted-output ref="...">.' },
-        cursor: { type: 'number', description: '0-based character cursor. Start with 0.' },
-        maxTokens: { type: 'number', description: 'Requested chunk size; clamped to 256-2000 tokens.' },
+        chunks: {
+          type: 'array',
+          minItems: 1,
+          maxItems: TOOL_RESULT_BATCH_MAX_ITEMS,
+          description: 'Preferred batched exact reads. Each item contains ref, cursor, and optional maxTokens.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              ref: {
+                type: 'string',
+                pattern: TOOL_RESULT_REF_SCHEMA_PATTERN,
+                description: TOOL_RESULT_REF_DESCRIPTION,
+              },
+              cursor: { type: 'number' },
+              maxTokens: { type: 'number' },
+            },
+            required: ['ref', 'cursor'],
+          },
+        },
       },
-      required: ['ref', 'cursor'],
+      required: ['chunks'],
     },
     async execute(input, ctx) {
-      const ref = String(input.ref || '').trim();
-      const cursor = Number(input.cursor);
-      if (!ref || !Number.isInteger(cursor) || cursor < 0) {
-        return error('E_BAD_INPUT', '`ref` and a non-negative integer `cursor` are required.');
-      }
-      const resolved = resolveToolResultRef(opts.toolResultsDir, ref);
-      if (resolved.ok === false) return error(resolved.code, resolved.message);
-
       const ledger = readLedger(ctx);
-      const key = `${ledger?.epoch ?? 0}:chunk:${ref}:${cursor}`;
-      const duplicate = rejectDuplicate(ledger, key);
-      if (duplicate) return duplicate;
-      const requested = Number.isFinite(Number(input.maxTokens))
-        ? Math.trunc(Number(input.maxTokens))
-        : TOOL_RESULT_CHUNK_DEFAULT_TOKENS;
-      const perCall = clamp(requested, 256, TOOL_RESULT_CHUNK_MAX_TOKENS);
-      const budget = availableBudget(ledger, perCall);
-      if (budget < 128) return budgetError();
-
-      let candidate = '';
-      let candidateFull = false;
-      const totalChars = scanUtf8File(resolved.path, (text, chunkStart) => {
-        if (candidateFull || chunkStart + text.length <= cursor) return;
-        const localStart = Math.max(0, cursor - chunkStart);
-        const combined = candidate + text.slice(localStart);
-        const bounded = prefixWithinTokenBudget(combined, budget);
-        candidate = bounded;
-        candidateFull = bounded.length < combined.length;
-      });
-      if (cursor > totalChars) {
-        return error('E_RESULT_CURSOR_RANGE', `cursor ${cursor} exceeds total_chars ${totalChars}.`);
-      }
-      const emptyEnvelope =
-        `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${cursor}" next_cursor="done">\n\n` +
-        `</tool-result-chunk>`;
-      const payloadBudget = budget - estimateToolResultTokens(emptyEnvelope);
-      if (payloadBudget < 64) return budgetError();
-      // The cursor/end attributes grow with the selected payload, so reserving
-      // an envelope built with `covered="cursor-cursor"` can be one or two
-      // tokens short once real offsets are inserted. Bound the FINAL envelope,
-      // not only its text payload, so the documented 2K per-read ceiling is a
-      // strict invariant rather than an approximate one.
-      const payloadCandidate = prefixWithinTokenBudget(candidate, payloadBudget);
-      const render = (text: string): string => {
-        const end = cursor + text.length;
-        const next = end < totalChars ? String(end) : 'done';
-        return (
-          `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${end}" next_cursor="${next}">\n` +
-          `${text}\n` +
-          `</tool-result-chunk>`
-        );
-      };
-      let lo = 0;
-      let hi = payloadCandidate.length;
-      while (lo < hi) {
-        const mid = Math.ceil((lo + hi) / 2);
-        if (estimateToolResultTokens(render(payloadCandidate.slice(0, mid))) <= budget) lo = mid;
-        else hi = mid - 1;
-      }
-      const output = render(payloadCandidate.slice(0, lo));
-      commitRead(ledger, key, estimateToolResultTokens(output));
-      return { content: output };
+      const batch = batchItems(input, 'chunks', ['ref', 'cursor']);
+      if (batch.error) return batch.error;
+      return executeBatch(batch.items, ledger, (item, maxOutputTokens) =>
+        executeReadChunkItem(opts, item, ledger, maxOutputTokens));
     },
   };
+}
+
+type RetrievalItemResult = { content: string; isError?: true };
+
+function batchItems(
+  input: Record<string, unknown>,
+  batchKey: 'queries' | 'chunks',
+  legacyRequired: string[],
+): { items: Record<string, unknown>[]; error?: never } | { items?: never; error: RetrievalItemResult } {
+  const rawBatch = input[batchKey];
+  if (rawBatch !== undefined) {
+    if (!Array.isArray(rawBatch) || rawBatch.length < 1 || rawBatch.length > TOOL_RESULT_BATCH_MAX_ITEMS) {
+      return {
+        error: error(
+          'E_BAD_INPUT',
+          `\`${batchKey}\` must contain 1-${TOOL_RESULT_BATCH_MAX_ITEMS} requests.`,
+        ),
+      };
+    }
+    return {
+      items: rawBatch.map((item) =>
+        item && typeof item === 'object' && !Array.isArray(item)
+          ? item as Record<string, unknown>
+          : {}),
+    };
+  }
+  if (!legacyRequired.every((key) => input[key] !== undefined)) {
+    return {
+      error: error(
+        'E_BAD_INPUT',
+        `Provide either \`${batchKey}\` or the legacy ${legacyRequired.map((key) => `\`${key}\``).join(' + ')} fields.`,
+      ),
+    };
+  }
+  return { items: [input] };
+}
+
+function executeBatch(
+  items: Record<string, unknown>[],
+  ledger: ToolResultReadLedger | null,
+  executeItem: (item: Record<string, unknown>, maxOutputTokens: number) => RetrievalItemResult,
+): RetrievalItemResult {
+  const outputs: string[] = [];
+  let successes = 0;
+  let remainingOutputTokens = Math.min(
+    TOOL_RESULT_ROUND_MAX_TOKENS,
+    ledger?.remainingTokens ?? TOOL_RESULT_ROUND_MAX_TOKENS,
+  );
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const separatorTokens = outputs.length ? estimateToolResultTokens('\n') : 0;
+    const remainingItems = items.length - index;
+    // Divide what remains across every pending request. Without this, the
+    // first two 2K chunks can consume the entire 4K allowance and silently
+    // drop the tail of an otherwise valid batch.
+    const itemBudget = Math.max(
+      0,
+      Math.floor((remainingOutputTokens - separatorTokens) / remainingItems),
+    );
+    if (itemBudget < 1) break;
+    const result = executeItem(item, itemBudget);
+    const content = prefixWithinTokenBudget(result.content, itemBudget);
+    outputs.push(content);
+    remainingOutputTokens = Math.max(
+      0,
+      remainingOutputTokens - separatorTokens - estimateToolResultTokens(content),
+    );
+    if (!result.isError) successes++;
+  }
+  if (!outputs.length) return budgetError();
+  return {
+    content: outputs.join('\n'),
+    ...(successes === 0 ? { isError: true as const } : {}),
+  };
+}
+
+function executeSearchItem(
+  opts: ToolResultToolsOpts,
+  input: Record<string, unknown>,
+  ledger: ToolResultReadLedger | null,
+  maxOutputTokens: number,
+): RetrievalItemResult {
+  const ref = String(input.ref || '').trim();
+  const query = String(input.query || '').trim();
+  if (!ref || !query) return error('E_BAD_INPUT', '`ref` and `query` are required.');
+  if (estimateToolResultTokens(query) > 256) {
+    return error('E_BAD_INPUT', '`query` must be a narrow search expression under 256 estimated tokens.');
+  }
+  const resolved = resolveToolResultRef(opts.toolResultsDir, ref);
+  if (resolved.ok === false) return error(resolved.code, resolved.message);
+
+  const key = `${ledger?.epoch ?? 0}:search:${ref}:${canonicalSearchQuery(query)}`;
+  const duplicate = rejectDuplicate(ledger, key);
+  if (duplicate) return duplicate;
+  const budget = availableBudget(ledger, Math.min(TOOL_RESULT_SEARCH_MAX_TOKENS, maxOutputTokens));
+  if (budget < 128) return budgetError();
+
+  const output = searchResultFile(resolved.path, ref, query, budget);
+  commitRead(ledger, key, estimateToolResultTokens(output));
+  return { content: output };
+}
+
+function executeReadChunkItem(
+  opts: ToolResultToolsOpts,
+  input: Record<string, unknown>,
+  ledger: ToolResultReadLedger | null,
+  maxOutputTokens: number,
+): RetrievalItemResult {
+  const ref = String(input.ref || '').trim();
+  const cursor = Number(input.cursor);
+  if (!ref || !Number.isInteger(cursor) || cursor < 0) {
+    return error('E_BAD_INPUT', '`ref` and a non-negative integer `cursor` are required.');
+  }
+  const resolved = resolveToolResultRef(opts.toolResultsDir, ref);
+  if (resolved.ok === false) return error(resolved.code, resolved.message);
+
+  const key = `${ledger?.epoch ?? 0}:chunk:${ref}:${cursor}`;
+  const duplicate = rejectDuplicate(ledger, key);
+  if (duplicate) return duplicate;
+  const requested = Number.isFinite(Number(input.maxTokens))
+    ? Math.trunc(Number(input.maxTokens))
+    : TOOL_RESULT_CHUNK_DEFAULT_TOKENS;
+  const perCall = clamp(requested, 256, TOOL_RESULT_CHUNK_MAX_TOKENS);
+  const budget = availableBudget(ledger, Math.min(perCall, maxOutputTokens));
+  if (budget < 128) return budgetError();
+
+  let candidate = '';
+  let candidateFull = false;
+  const totalChars = scanUtf8File(resolved.path, (text, chunkStart) => {
+    if (candidateFull || chunkStart + text.length <= cursor) return;
+    const localStart = Math.max(0, cursor - chunkStart);
+    const combined = candidate + text.slice(localStart);
+    const bounded = prefixWithinTokenBudget(combined, budget);
+    candidate = bounded;
+    candidateFull = bounded.length < combined.length;
+  });
+  if (cursor > totalChars) {
+    return error('E_RESULT_CURSOR_RANGE', `cursor ${cursor} exceeds total_chars ${totalChars}.`);
+  }
+  const emptyEnvelope =
+    `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${cursor}" next_cursor="done">\n\n` +
+    `</tool-result-chunk>`;
+  const payloadBudget = budget - estimateToolResultTokens(emptyEnvelope);
+  if (payloadBudget < 64) return budgetError();
+  // The cursor/end attributes grow with the selected payload, so reserving
+  // an envelope built with `covered="cursor-cursor"` can be one or two
+  // tokens short once real offsets are inserted. Bound the FINAL envelope,
+  // not only its text payload, so the documented 2K per-read ceiling is a
+  // strict invariant rather than an approximate one.
+  const payloadCandidate = prefixWithinTokenBudget(candidate, payloadBudget);
+  const render = (text: string): string => {
+    const end = cursor + text.length;
+    const next = end < totalChars ? String(end) : 'done';
+    return (
+      `<tool-result-chunk ref="${escapeAttr(ref)}" total_chars="${totalChars}" covered="${cursor}-${end}" next_cursor="${next}">\n` +
+      `${text}\n` +
+      `</tool-result-chunk>`
+    );
+  };
+  let lo = 0;
+  let hi = payloadCandidate.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (estimateToolResultTokens(render(payloadCandidate.slice(0, mid))) <= budget) lo = mid;
+    else hi = mid - 1;
+  }
+  const output = render(payloadCandidate.slice(0, lo));
+  commitRead(ledger, key, estimateToolResultTokens(output));
+  return { content: output };
 }
 
 export function resolveToolResultRef(
@@ -166,7 +306,7 @@ export function resolveToolResultRef(
   // Accept legacy 64-bit refs plus the current full SHA-256 refs. New writes
   // always use 64 hex chars; compatibility here keeps existing conversations
   // and persisted markers readable after upgrade.
-  if (!/^[a-zA-Z0-9_-]{1,48}\.(?:[a-f0-9]{16}|[a-f0-9]{64})$/.test(ref)) {
+  if (!TOOL_RESULT_REF_RE.test(ref)) {
     return { ok: false, code: 'E_RESULT_REF_INVALID', message: 'Invalid tool-result ref.' };
   }
   const root = path.resolve(toolResultsDir);
@@ -353,6 +493,17 @@ function prefixWithinTokenBudget(text: string, maxTokens: number): string {
 
 function normalizeQuery(value: string): string {
   return value.toLocaleLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Search matching already treats whitespace-separated terms as an unordered
+ * OR-set, so the duplicate key should do the same. This prevents a model from
+ * spending another round merely by changing term order/case/spacing. */
+function canonicalSearchQuery(value: string): string {
+  const normalized = normalizeQuery(value);
+  const terms = normalized.match(/[\p{L}\p{N}_-]{2,}/gu);
+  return terms?.length
+    ? Array.from(new Set(terms)).sort().join(' ')
+    : normalized;
 }
 
 function isInside(root: string, candidate: string): boolean {

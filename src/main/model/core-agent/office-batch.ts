@@ -370,9 +370,22 @@ export type PptxTableSpec = {
   [key: string]: unknown;
 };
 
+/** A native, editable PowerPoint chart. `type` is normalized to OfficeCLI's
+ *  `chartType`; data is supplied as `Series:1,2,3;Series 2:4,5,6` and every
+ *  other key (categories, title, colors, legend, dataLabels, axes, position,
+ *  …) passes through to `add chart`. */
+export type PptxChartSpec = {
+  type?: string;
+  chartType?: string;
+  data?: string;
+  categories?: string;
+  [key: string]: unknown;
+};
+
 /** One slide. `title`/`body` auto-emit the title/body placeholder shapes;
- *  `shapes` add free-positioned text boxes; `images`/`tables` add pictures and
- *  grids; `background`/`transition` style the slide itself. */
+ *  `shapes` add free-positioned text boxes; `images`/`charts`/`tables` add
+ *  pictures, native charts, and grids; `background`/`transition` style the
+ *  slide itself. */
 export type PptxSlideSpec = {
   title?: string;
   body?: string;
@@ -381,19 +394,34 @@ export type PptxSlideSpec = {
   transition?: string;
   shapes?: PptxShapeSpec[];
   images?: PptxImageSpec[];
+  charts?: PptxChartSpec[];
   tables?: PptxTableSpec[];
 };
 
 /** `rows` is the grid (not the engine's int `rows` prop) — excluded from a
  *  table's passthrough. */
 const PPTX_TABLE_STRUCTURAL = new Set(['rows']);
+const PPTX_CHART_STRUCTURAL = new Set(['type', 'chartType']);
+const PPTX_SHAPE_FILL_CARRIERS = ['fill', 'gradient', 'pattern'] as const;
+
+/**
+ * OfficeCLI's PPTX `shadow` property is an outer-shadow color/spec, with
+ * `true` selecting its default black shadow. Older Orkas tool metadata called
+ * it a "preset", which taught models to emit the PptxGenJS-style token
+ * `outer`. Preserve that single legacy intent without forwarding an invalid
+ * color token that would make the entire atomic batch fail.
+ */
+function normalizePptxShapeShadow(props: Record<string, string>): void {
+  if (props.shadow?.trim().toLowerCase() === 'outer') props.shadow = 'true';
+}
 
 /**
  * Build `add slide` ops, in order, each optionally followed by `add shape`
- * (text boxes), `add picture`, and `add table` ops. A slide with no fields still
- * produces a blank slide. `body` maps to OfficeCLI's `text` prop (newlines
- * become separate body lines); `background`/`transition` style the slide.
- * Shapes/pictures/tables are added under `/slide[N]` where N is the slide's
+ * (text boxes), `add picture`, `add chart`, and `add table` ops. A slide with no
+ * fields still produces a blank slide. `body` maps to OfficeCLI's `text` prop
+ * (newlines become separate body lines); `background`/`transition` style the
+ * slide. Shapes/pictures/charts/tables are added under `/slide[N]` where N is
+ * the slide's
  * 1-based position (OfficeCLI numbers slides from 1 in add-order). A table emits
  * `add table {rows,cols}` then one `set` per non-empty cell at
  * `/slide[N]/table[K]/tr[i]/tc[j]` (K = 1-based table index on that slide;
@@ -419,6 +447,22 @@ export function buildPptxBatch(slides: readonly PptxSlideSpec[]): OfficeBatchOp[
         if (!shape || typeof shape !== 'object') continue;
         const shapeProps: Record<string, string> = {};
         addPassthrough(shapeProps, shape, PASS_ALL);
+        normalizePptxShapeShadow(shapeProps);
+        // OfficeCLI treats opacity as a modifier of an explicit fill carrier.
+        // Models occasionally add `opacity: 0` to an otherwise unfilled text
+        // box; passing that orphan modifier makes the whole batch fail even
+        // though it has no visual meaning. Drop only the meaningless modifier
+        // and preserve opacity whenever a real fill/gradient/pattern exists.
+        if (
+          'opacity' in shapeProps
+          && !PPTX_SHAPE_FILL_CARRIERS.some((key) => key in shapeProps)
+        ) {
+          delete shapeProps.opacity;
+        }
+        // The outline equivalent has the same carrier relationship.
+        if ('lineOpacity' in shapeProps && !('line' in shapeProps)) {
+          delete shapeProps.lineOpacity;
+        }
         if (!Object.keys(shapeProps).length) continue;
         ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'shape', props: shapeProps });
       }
@@ -431,6 +475,19 @@ export function buildPptxBatch(slides: readonly PptxSlideSpec[]): OfficeBatchOp[
         addPassthrough(picProps, img, PASS_ALL);
         if (!picProps.src) continue; // a picture needs a source path
         ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'picture', props: picProps });
+      }
+    }
+
+    if (Array.isArray(s.charts)) {
+      for (const chart of s.charts) {
+        if (!chart || typeof chart !== 'object') continue;
+        const chartType = typeof chart.type === 'string' && chart.type
+          ? chart.type
+          : (typeof chart.chartType === 'string' ? chart.chartType : '');
+        if (!chartType) continue;
+        const chartProps: Record<string, string> = { chartType };
+        addPassthrough(chartProps, chart, PPTX_CHART_STRUCTURAL);
+        ops.push({ command: 'add', parent: `/slide[${slideNo}]`, type: 'chart', props: chartProps });
       }
     }
 
@@ -467,14 +524,33 @@ export type EditOp =
   | { action: 'add'; parent: string; type: string; props?: Record<string, unknown> }
   | { action: 'remove'; path: string };
 
-/** OfficeCLI props are all strings on the wire. Coerce, dropping null/undefined.
- *  A `formula` value's leading `=` is stripped (OfficeCLI wants it without) so a
- *  model that includes the `=` out of habit still works. */
-function normProps(props?: Record<string, unknown>): Record<string, string> {
+/** Raised when an otherwise well-formed edit operation contains a property
+ *  shape that OfficeCLI cannot represent safely. The tool layer turns this
+ *  into E_BAD_INPUT before it creates or edits a working copy. */
+export class OfficeEditInputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OfficeEditInputError';
+  }
+}
+
+/** OfficeCLI props are scalar strings on the wire. Coerce scalar values and
+ *  drop null/undefined, but never silently flatten arrays/objects: `String()`
+ *  would turn a table grid into a comma string and an object into
+ *  "[object Object]", producing misleading downstream engine errors. */
+function normProps(
+  props?: Record<string, unknown>,
+  skip: ReadonlySet<string> = PASS_ALL,
+): Record<string, string> {
   const out: Record<string, string> = {};
   if (props && typeof props === 'object') {
     for (const [k, v] of Object.entries(props)) {
-      if (v === null || v === undefined) continue;
+      if (skip.has(k) || v === null || v === undefined) continue;
+      if (Array.isArray(v) || typeof v === 'object') {
+        throw new OfficeEditInputError(
+          `property \`${k}\` must be a scalar; nested arrays/objects are unsupported except \`props.rows\` when adding a table`,
+        );
+      }
       const s = String(v);
       out[k] = k === 'formula' ? s.replace(/^=/, '') : s;
     }
@@ -482,11 +558,68 @@ function normProps(props?: Record<string, unknown>): Record<string, string> {
   return out;
 }
 
+const EDIT_TABLE_GRID_STRUCTURAL = new Set(['rows', 'cols', 'data']);
+const EDIT_TABLE_CELL_PROP = /^r\d+c\d+$/i;
+
+/** Convert an add-table `rows: [[cell]]` grid into OfficeCLI's scalar add
+ *  props (`rows`, `cols`, `r1c1`, ...). Seeding cells on the add itself avoids
+ *  guessing the new table's positional index in an existing document and also
+ *  makes multiple table additions in one batch independent. */
+function normAddProps(op: Extract<EditOp, { action: 'add' }>): Record<string, string> {
+  const props = op.props;
+  const rows = props?.rows;
+  if (op.type !== 'table' || !Array.isArray(rows)) return normProps(props);
+  if (!rows.length) {
+    throw new OfficeEditInputError('table `props.rows` must contain at least one row');
+  }
+  if (props && Object.entries(props).some(([key, value]) => (
+    key !== 'rows'
+    && value !== null
+    && value !== undefined
+    && (EDIT_TABLE_GRID_STRUCTURAL.has(key) || EDIT_TABLE_CELL_PROP.test(key))
+  ))) {
+    throw new OfficeEditInputError(
+      'table `props.rows` grid cannot be combined with `cols`, `data`, or `r{row}c{column}` properties',
+    );
+  }
+
+  let colCount = -1;
+  const cells: Array<{ row: number; col: number; value: string }> = [];
+  rows.forEach((row, rowIndex) => {
+    if (!Array.isArray(row) || !row.length) {
+      throw new OfficeEditInputError(`table \`props.rows[${rowIndex}]\` must be a non-empty array`);
+    }
+    if (colCount < 0) colCount = row.length;
+    if (row.length !== colCount) {
+      throw new OfficeEditInputError(
+        `table \`props.rows\` must be rectangular; row ${rowIndex + 1} has ${row.length} cells, expected ${colCount}`,
+      );
+    }
+    row.forEach((cell, colIndex) => {
+      if (cell === null || cell === undefined || cell === '') return;
+      if (Array.isArray(cell) || typeof cell === 'object') {
+        throw new OfficeEditInputError(
+          `table cell at row ${rowIndex + 1}, column ${colIndex + 1} must be a string, number, boolean, or null`,
+        );
+      }
+      cells.push({ row: rowIndex + 1, col: colIndex + 1, value: String(cell) });
+    });
+  });
+
+  const out: Record<string, string> = {
+    rows: String(rows.length),
+    cols: String(colCount),
+    ...normProps(props, EDIT_TABLE_GRID_STRUCTURAL),
+  };
+  for (const cell of cells) out[`r${cell.row}c${cell.col}`] = cell.value;
+  return out;
+}
+
 /**
  * Translate high-level edit operations into OfficeCLI `batch` ops. Malformed
- * entries (missing path/parent/type, unknown action) are dropped so one bad
- * item from the model doesn't abort the whole edit at build time — the caller
- * runs the batch with `--stop-on-error` to surface per-op engine failures.
+ * entries (missing path/parent/type, unknown action) are dropped. Unsupported
+ * property shapes fail explicitly before a working copy is created; the caller
+ * runs accepted batches with `--stop-on-error` for per-op engine failures.
  */
 export function buildEditBatch(ops: readonly EditOp[]): OfficeBatchOp[] {
   const out: OfficeBatchOp[] = [];
@@ -495,7 +628,7 @@ export function buildEditBatch(ops: readonly EditOp[]): OfficeBatchOp[] {
     if (op.action === 'set' && typeof op.path === 'string' && op.path) {
       out.push({ command: 'set', path: op.path, props: normProps(op.props) });
     } else if (op.action === 'add' && typeof op.parent === 'string' && op.parent && typeof op.type === 'string' && op.type) {
-      out.push({ command: 'add', parent: op.parent, type: op.type, props: normProps(op.props) });
+      out.push({ command: 'add', parent: op.parent, type: op.type, props: normAddProps(op) });
     } else if (op.action === 'remove' && typeof op.path === 'string' && op.path) {
       out.push({ command: 'remove', path: op.path });
     }

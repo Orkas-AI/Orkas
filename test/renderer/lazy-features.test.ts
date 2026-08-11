@@ -5,13 +5,26 @@ import * as vm from 'node:vm';
 
 function loadFeatureLoader(onAppend?: (script: any, context: any) => void) {
   const appended: any[] = [];
+  const telemetry = {
+    events: [] as Array<{ action: string; data: Record<string, unknown> }>,
+    errors: [] as Array<{ action: string; data: Record<string, unknown> }>,
+  };
   const context: any = {
     Map,
     Promise,
     Error,
     Object,
     String,
-    window: {},
+    window: {
+      Monitor: {
+        event(action: string, data: Record<string, unknown>) {
+          telemetry.events.push({ action, data });
+        },
+        error(action: string, data: Record<string, unknown>) {
+          telemetry.errors.push({ action, data });
+        },
+      },
+    },
     document: {
       createElement: () => ({ dataset: {} }),
       head: {
@@ -28,12 +41,12 @@ function loadFeatureLoader(onAppend?: (script: any, context: any) => void) {
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/lazy-features.js'), 'utf8');
   vm.runInContext(source, context, { filename: 'lazy-features.js' });
-  return { context, appended };
+  return { context, appended, telemetry };
 }
 
 describe('renderer lazy feature loader', () => {
   it('loads the Settings bundle in declared classic-script order and shares concurrent work', async () => {
-    const { context, appended } = loadFeatureLoader();
+    const { context, appended, telemetry } = loadFeatureLoader();
 
     const first = context.loadRendererFeature('settings');
     const second = context.loadRendererFeature('settings');
@@ -45,30 +58,37 @@ describe('renderer lazy feature loader', () => {
       './modules/memory.js',
     ]);
     expect(appended.every((script) => script.async === false)).toBe(true);
+    expect(telemetry.events).toEqual([]);
+    expect(telemetry.errors).toEqual([]);
   });
 
   it('does not fail marketplace loading when the optional dev enhancer is absent', async () => {
-    const { context, appended } = loadFeatureLoader((script) => {
+    const { context, appended, telemetry } = loadFeatureLoader((script) => {
       if (script.src.endsWith('marketplace_dev.js')) script.onerror();
       else script.onload();
     });
 
     await expect(context.loadRendererFeature('marketplace')).resolves.toBeUndefined();
     expect(appended.map((script) => script.src)).toEqual([
+      './modules/semver.js',
       './modules/marketplace.js',
     ]);
+    expect(telemetry.events).toEqual([]);
+    expect(telemetry.errors).toEqual([]);
   });
 
   it('loads public Agent and Skill surfaces without private publishing modules', async () => {
     const agents = loadFeatureLoader();
     await agents.context.loadRendererFeature('agents');
     expect(agents.appended.map((script) => script.src)).toEqual([
+      './modules/semver.js',
       './modules/marketplace.js',
     ]);
 
     const skills = loadFeatureLoader();
     await skills.context.loadRendererFeature('skills');
     expect(skills.appended.map((script) => script.src)).toEqual([
+      './modules/semver.js',
       './modules/marketplace.js',
       './modules/skills.js',
       './modules/skills-bindings.js',
@@ -85,7 +105,7 @@ describe('renderer lazy feature loader', () => {
 
   it('retries a required script while reusing scripts that already loaded', async () => {
     let contextAttempts = 0;
-    const { context, appended } = loadFeatureLoader((script) => {
+    const { context, appended, telemetry } = loadFeatureLoader((script) => {
       if (script.src.endsWith('contexts.js') && contextAttempts++ === 0) script.onerror();
       else script.onload();
     });
@@ -98,6 +118,17 @@ describe('renderer lazy feature loader', () => {
       './modules/contexts.js',
       './modules/kb-picker.js',
     ]);
+    expect(telemetry.events).toEqual([]);
+    expect(telemetry.errors).toEqual([]);
+  });
+
+  it('collapses unknown feature names before reporting a bounded failure', async () => {
+    const { context, telemetry } = loadFeatureLoader();
+
+    await expect(context.loadRendererFeature('private-feature-name')).rejects.toThrow('unknown renderer feature');
+
+    expect(telemetry.events).toEqual([]);
+    expect(telemetry.errors).toEqual([]);
   });
 
   it('keeps tab-only project, Library, apps, and devtools scripts out of the eager HTML', async () => {
@@ -221,7 +252,7 @@ describe('renderer lazy feature loader', () => {
     const end = source.indexOf('async function refreshSelectedAgentDetail', start);
     const detailOpen = source.slice(start, end);
 
-    expect(detailOpen).toContain('await selectAgent(agentId)');
+    expect(detailOpen).toContain('await selectAgent(agentId, { refreshCliOptions: true })');
     expect(detailOpen).not.toContain('loadAgents(true)');
   });
 
@@ -250,7 +281,7 @@ describe('renderer lazy feature loader', () => {
     const source = fs.readFileSync(
       path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
     const start = source.indexOf('async function _renderAgentDetailRuntime');
-    const end = source.indexOf('async function _renderAgentDetailProjectDir', start);
+    const end = source.indexOf('async function _renderAgentDetailCliSettings', start);
     const runtimeSelector = source.slice(start, end);
 
     expect(runtimeSelector).toContain('loadLocalCliEntries()');
@@ -258,6 +289,19 @@ describe('renderer lazy feature loader', () => {
     expect(runtimeSelector).toContain('const currentEntry = entries.find');
     expect(runtimeSelector).toContain('window.getLocalCliUnavailableHint(currentEntry)');
     expect(runtimeSelector).not.toContain("hint: t('agent.cli_missing')");
+  });
+
+  it('loads Agent-scoped CLI model and thinking settings from main IPC', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
+    const start = source.indexOf('function _loadAgentCliRuntimeOptions');
+    const end = source.indexOf('async function _renderAgentDetailProjectDir', start);
+    const settings = source.slice(start, end);
+
+    expect(settings).toContain("window.orkas.invoke('localAgents.runtimeOptions'");
+    expect(settings).toContain('model_override');
+    expect(settings).toContain('thinking_level');
+    expect(settings).toContain('updates: { runtime: nextRuntime }');
   });
 
 });

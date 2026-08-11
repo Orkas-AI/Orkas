@@ -6,10 +6,10 @@ It spawns a local coding CLI to execute end-to-end; no workflow / skills / tools
 Full authoring rules live in system skill `agent-creator`. **Read it first**:
 
 ```
-read_file <SYSTEM_SKILLS_ROOT>/agent-creator/SKILL.md
+read_file "@skill/agent-creator"
 ```
 
-`<SYSTEM_SKILLS_ROOT>` is shown in the `## System skills` block; its CLI-backed section is canonical.
+Use the exact read ref shown in the `## System skills` block; its CLI-backed section is canonical.
 
 ---
 

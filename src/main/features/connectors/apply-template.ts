@@ -11,6 +11,7 @@
 import { app } from 'electron';
 
 import * as paths from '../../paths';
+import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 import type { CatalogEntry, OAuthGrant, Transport } from './types';
 
 type EnvSynth = (access_token: string) => Record<string, string>;
@@ -18,12 +19,17 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const OBJECT_META_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
-// Cache the Electron-as-Node values once per process — `process.execPath` and PC_ROOT are
-// immutable at runtime. Lazy because `app` is undefined in vitest paths that pull this module
-// without an Electron context.
-let _electronAsNode: { node: string; pcDir: string } | null = null;
-function _electronAsNodeVars(): { node: string; pcDir: string } {
-  if (_electronAsNode) return _electronAsNode;
+// Cache the app-owned adapter runtime once per process. Packaged/dev runtime
+// preparation guarantees bundled Node; on macOS the resolver deliberately
+// refuses to fall back to the GUI Electron executable because every direct
+// Electron helper launch can produce a separate App Data privacy prompt.
+let _adapterRuntime: {
+  node: string;
+  pcDir: string;
+  electronAsNode: boolean;
+} | null = null;
+function _adapterRuntimeVars(): { node: string; pcDir: string; electronAsNode: boolean } {
+  if (_adapterRuntime) return _adapterRuntime;
   const isPackaged = !!app && app.isPackaged;
   // Packaged builds: rewrite `app.asar` → `app.asar.unpacked` so the spawned child can read the
   // adapter script as a real file on disk (asar contents aren't visible to a child process that
@@ -31,8 +37,9 @@ function _electronAsNodeVars(): { node: string; pcDir: string } {
   const pcDir = isPackaged
     ? paths.PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked')
     : paths.PC_ROOT;
-  _electronAsNode = { node: process.execPath, pcDir };
-  return _electronAsNode;
+  const runtime = resolveBackgroundNodeRuntime();
+  _adapterRuntime = { node: runtime.executable, pcDir, electronAsNode: runtime.electronAsNode };
+  return _adapterRuntime;
 }
 
 /** Resolve `${ORKAS_NODE}` / `${ORKAS_PC_DIR}` placeholders inside a stdio template's
@@ -41,7 +48,7 @@ function _electronAsNodeVars(): { node: string; pcDir: string } {
  *  to surface typos at install — silent passthrough would let `${ORKS_NODE}` slip through and
  *  spawn a literal-named binary that doesn't exist. */
 function _resolvePlaceholders(s: string): string {
-  const vars = _electronAsNodeVars();
+  const vars = _adapterRuntimeVars();
   return s.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_m, key) => {
     if (key === 'ORKAS_NODE') return vars.node;
     if (key === 'ORKAS_PC_DIR') return vars.pcDir;
@@ -49,7 +56,7 @@ function _resolvePlaceholders(s: string): string {
   });
 }
 
-function _hasElectronAsNodePlaceholder(tpl: { command: string; args: string[] }): boolean {
+function _hasAppOwnedNodePlaceholder(tpl: { command: string; args: string[] }): boolean {
   if (/\$\{ORKAS_NODE\}/.test(tpl.command)) return true;
   return tpl.args.some((a) => /\$\{ORKAS_NODE\}/.test(a) || /\$\{ORKAS_PC_DIR\}/.test(a));
 }
@@ -102,15 +109,15 @@ export function applyTemplate(entry: CatalogEntry, grant: OAuthGrant): Transport
     } else {
       throw new Error('OAuth stdio template needs either oauth_env_key or env_synthesizer');
     }
-    // Electron-as-Node injection: templates pointing at our own bundled adapter scripts (e.g.
-    // `${ORKAS_NODE}` + `${ORKAS_PC_DIR}/bin/gmail-mcp-server.cjs`) need `ELECTRON_RUN_AS_NODE=1`
-    // in the child env so Electron boots as plain Node. Same pattern as `client.ts::
-    // buildSkillSandboxEnv`. We only inject these when the template actually uses a
-    // placeholder — third-party stdio servers like the legacy `npx @modelcontextprotocol/server-X`
-    // pattern stay env-clean.
-    if (_hasElectronAsNodePlaceholder(tpl)) {
-      const vars = _electronAsNodeVars();
-      env = { ...env, ELECTRON_RUN_AS_NODE: '1', ORKAS_NODE: vars.node, ORKAS_PC_DIR: vars.pcDir };
+    // App-owned adapter templates use the stock bundled Node runtime. Keep
+    // third-party stdio commands env-clean and preserve the Electron marker
+    // only for the non-macOS emergency fallback described by the resolver.
+    if (_hasAppOwnedNodePlaceholder(tpl)) {
+      const vars = _adapterRuntimeVars();
+      env = withBackgroundNodeEnv(
+        { ...env, ORKAS_PC_DIR: vars.pcDir },
+        { executable: vars.node, electronAsNode: vars.electronAsNode },
+      );
     }
     return {
       kind: 'stdio',

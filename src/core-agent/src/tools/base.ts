@@ -30,6 +30,10 @@ export type ToolResultImage = {
   data: string;
   /** e.g. 'image/jpeg', 'image/png'. */
   mediaType: string;
+  /** Optional generic analysis intent for the next model call. The provider
+   * adapter transports this beside the image without depending on the tool
+   * name that produced it. */
+  analysisMode?: "understand" | "quality_review";
 };
 
 /** One explicit file read observed by a tool. Host-only: providers receive
@@ -95,6 +99,10 @@ export type ToolObservations = {
 /** Result returned from a tool execution. */
 export type ToolResult = {
   content: string;
+  /** Host-only label for the concrete service selected by a generic tool.
+   * AgentRunner forwards it to UI events, but only `content` enters model
+   * context. Example: `web_search` can identify the provider that answered. */
+  displayName?: string;
   /** Deterministic host-only facts produced by the tool. AgentRunner records
    * them with the real tool-call/turn identity; providers never receive this
    * object directly. */
@@ -116,6 +124,12 @@ export type ToolResult = {
    *  immediately following the tool_result message (works across providers
    *  even when the provider's tool_result channel doesn't accept images). */
   images?: ToolResultImage[];
+  /** This result is a document the model was instructed to read whole — a
+   *  skill body or its reference. File-tool hosts and core-agent's learned
+   *  skill reader set the same semantic hint, so the host result policy can
+   *  give it a higher inline ceiling than an ordinary tool dump. It is still
+   *  bounded and subject to the per-round ledger. */
+  verbatimDocument?: boolean;
   isError?: boolean;
   /** Terminal tool: end the run after committing this result, WITHOUT a
    *  follow-up inference. The model's text streamed in the same round becomes
@@ -123,6 +137,15 @@ export type ToolResult = {
    *  deliberate last act of a turn — e.g. handing the conversation off to
    *  another agent, where a commander "synthesis" turn would be wasted. */
   endTurn?: boolean;
+  /** User-boundary tool: commit this result, withhold every tool for exactly
+   * one follow-up inference, then end the run with that model-authored reply.
+   *
+   * Use this when the tool has reached an authoritative boundary that needs a
+   * human-readable explanation (for example, a preview that now needs user
+   * input). Unlike `endTurn`, the text written before the tool call is not
+   * treated as the reply. The follow-up cannot call or retry tools, and the
+   * runner accepts it even when a durable execution plan remains open. */
+  synthesizeAndEndTurn?: boolean;
 };
 
 /** A tool that can be called by the agent during an LLM interaction. */

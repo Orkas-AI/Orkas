@@ -4,7 +4,11 @@
  * Provides resource limits, directory restrictions, command filtering,
  * and timeout enforcement. Inspired by OpenClaw's sandbox execution layer.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
@@ -50,6 +54,8 @@ export interface SandboxResult {
   stderr: string;
   /** Exit code (null if killed). */
   exitCode: number | null;
+  /** Whether the host failed to create the shell process. */
+  startFailed: boolean;
   /** Whether the command was killed due to timeout. */
   timedOut: boolean;
   /** Whether the command was killed due to output limit. */
@@ -83,6 +89,15 @@ type SpawnInvocation = {
   command: string;
   args: string[];
 };
+
+export function formatProcessStartFailure(error: unknown): string {
+  const rawCode = error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  const code = /^[A-Z0-9_]+$/.test(rawCode) ? rawCode : "";
+  return `Failed to start shell process${code ? ` (${code})` : ""}. `
+    + "The command was not executed; retry once or use another available tool.";
+}
 
 function windowsSystem32Tool(name: string): string {
   const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
@@ -564,6 +579,7 @@ export class SandboxExecutor {
         stdout: "",
         stderr: `Command blocked by sandbox policy: ${violation}`,
         exitCode: 1,
+        startFailed: false,
         timedOut: false,
         outputLimitExceeded: false,
         stdoutBytes: 0,
@@ -621,13 +637,32 @@ export class SandboxExecutor {
         buildShellInvocation(this.config.shell, command),
         this.config.allowedDirs,
       );
-      const child = spawn(invocation.command, invocation.args, {
-        cwd,
-        env,
-        detached: process.platform !== "win32",
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-      });
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn(invocation.command, invocation.args, {
+          cwd,
+          env,
+          detached: process.platform !== "win32",
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+        }) as ChildProcessWithoutNullStreams;
+      } catch (error) {
+        stdoutCapture?.discard();
+        stderrCapture?.discard();
+        const stderr = formatProcessStartFailure(error);
+        resolve({
+          stdout: "",
+          stderr,
+          exitCode: null,
+          startFailed: true,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdoutBytes: 0,
+          stderrBytes: Buffer.byteLength(stderr),
+          durationMs: Date.now() - startTime,
+        });
+        return;
+      }
 
       const abortSignal = this.config.signal;
       if (abortSignal) {
@@ -691,7 +726,7 @@ export class SandboxExecutor {
         killChild();
       }, this.config.timeoutMs);
 
-      const finish = (code: number | null) => {
+      const finish = (code: number | null, startFailed = false) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeoutId);
@@ -727,6 +762,7 @@ export class SandboxExecutor {
           stdout,
           stderr,
           exitCode: code,
+          startFailed,
           timedOut,
           outputLimitExceeded,
           stdoutBytes,
@@ -754,12 +790,13 @@ export class SandboxExecutor {
 
       child.on("error", (err) => {
         if (settled) return;
-        if (stderrCapture) stderrCapture.append(Buffer.from(err.message));
+        const message = formatProcessStartFailure(err);
+        if (stderrCapture) stderrCapture.append(Buffer.from(message));
         else {
-          stderrChunks.push(Buffer.from(err.message));
-          stderrBytes += Buffer.byteLength(err.message);
+          stderrChunks.push(Buffer.from(message));
+          stderrBytes += Buffer.byteLength(message);
         }
-        finish(1);
+        finish(null, true);
       });
     });
   }

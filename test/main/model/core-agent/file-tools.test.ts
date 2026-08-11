@@ -95,12 +95,57 @@ function getTool(tools: any[], name: string) {
   return t;
 }
 
+describe('file-tools › list_files', () => {
+  it('treats a lazy, not-yet-created conversation cwd as an empty directory', async () => {
+    const { tools, wsDir } = await buildTools();
+    const lazyCwd = path.join(wsDir, 'new-conversation');
+    const result = await getTool(tools, 'list_files').execute(
+      { path: lazyCwd },
+      { workingDir: lazyCwd, signal: undefined } as any,
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toBe('(empty directory)');
+    expect(fs.existsSync(lazyCwd)).toBe(false);
+  });
+
+  it('keeps a missing child path as a real error', async () => {
+    const { tools, wsDir } = await buildTools();
+    const result = await getTool(tools, 'list_files').execute(
+      { path: path.join(wsDir, 'missing-child') },
+      { workingDir: wsDir, signal: undefined } as any,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain('E_LIST_FAILED');
+  });
+});
+
 async function run(tool: any, input: Record<string, any>) {
   const ctx = { workingDir: '.', signal: undefined } as any;
   return await tool.execute(input, ctx);
 }
 
 describe('file-tools › read_file (text)', () => {
+  it('advertises one tagged range object instead of mutually exclusive flat fields', async () => {
+    const { tools } = await buildTools();
+    const schema = getTool(tools, 'read_file').inputSchema as any;
+    expect(schema.properties).not.toHaveProperty('charStart');
+    expect(schema.properties).not.toHaveProperty('charEnd');
+    expect(schema.properties).not.toHaveProperty('lineStart');
+    expect(schema.properties).not.toHaveProperty('lineEnd');
+    expect(schema.properties.range).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['unit', 'start', 'end'],
+      properties: {
+        unit: { type: 'string', enum: ['line', 'char'] },
+        start: { type: 'integer' },
+        end: { type: 'integer' },
+      },
+    });
+  });
+
   it('reads whole file when no range given and reports total_chars + covered + lines', async () => {
     const { tools, wsDir } = await buildTools();
     const body = 'A\nB\nC\nD\nE';
@@ -111,8 +156,31 @@ describe('file-tools › read_file (text)', () => {
     expect(r.content).toContain(`total_chars="${body.length}"`);
     expect(r.content).toContain(`covered="0-${body.length}"`);
     expect(r.content).toContain('lines="1-5"');
+    expect(r.content).toMatch(/revision="file_rev_[A-Za-z0-9_-]{16}"/);
     // Lines are shown with absolute 1-based number + tab prefixes (G5).
     expect(r.content).toContain('1\tA\n2\tB\n3\tC\n4\tD\n5\tE');
+  });
+
+  it('returns one stable revision for parallel reads and a new revision after the file changes', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'parallel-revision.txt');
+    fs.writeFileSync(p, '初始内容🙂\n', 'utf8');
+    const read = getTool(tools, 'read_file');
+    const ctx = { workingDir: wsDir, signal: undefined, state: {} } as any;
+    const [first, second] = await Promise.all([
+      read.execute({ path: p }, ctx),
+      read.execute({ path: p }, ctx),
+    ]);
+    const firstRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(first.content)?.[1];
+    const secondRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(second.content)?.[1];
+    expect(firstRevision).toBeTruthy();
+    expect(secondRevision).toBe(firstRevision);
+
+    fs.appendFileSync(p, '新内容\n', 'utf8');
+    const changed = await read.execute({ path: p }, ctx);
+    const changedRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(changed.content)?.[1];
+    expect(changedRevision).toBeTruthy();
+    expect(changedRevision).not.toBe(firstRevision);
   });
 
   it('numbers lines from the absolute line of a mid-file char slice', async () => {
@@ -154,6 +222,50 @@ describe('file-tools › read_file (text)', () => {
     });
   });
 
+  it('reads line and character slices through the tagged range contract', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'tagged-range.txt');
+    fs.writeFileSync(p, 'one\ntwo\nthree\nfour\n');
+
+    const lines = await run(getTool(tools, 'read_file'), {
+      path: p,
+      range: { unit: 'line', start: 2, end: 3 },
+    });
+    expect(lines.isError).toBeFalsy();
+    expect(lines.content).toContain('2\ttwo\n3\tthree');
+    expect(lines.content).not.toContain('1\tone');
+
+    const chars = await run(getTool(tools, 'read_file'), {
+      path: p,
+      range: { unit: 'char', start: 4, end: 7 },
+    });
+    expect(chars.isError).toBeFalsy();
+    expect(chars.content).toContain('two');
+    expect(chars.content).toContain('covered="4-7"');
+  });
+
+  it('rejects malformed tagged ranges and mixed tagged/legacy addressing', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'invalid-range.txt');
+    fs.writeFileSync(p, 'one\ntwo\n');
+    const read = getTool(tools, 'read_file');
+
+    const malformed = await run(read, {
+      path: p,
+      range: { unit: 'line', start: 2, end: 1 },
+    });
+    expect(malformed.isError).toBe(true);
+    expect(malformed.content).toContain('E_BAD_INPUT');
+
+    const mixed = await run(read, {
+      path: p,
+      range: { unit: 'line', start: 1, end: 1 },
+      charStart: 0,
+    });
+    expect(mixed.isError).toBe(true);
+    expect(mixed.content).toContain('E_BAD_INPUT');
+  });
+
   it('rejects mixed line and character addressing', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'range.txt');
@@ -170,6 +282,74 @@ describe('file-tools › read_file (text)', () => {
     const r = await run(getTool(tools, 'read_file'), { path: p, charEnd: 999 });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-2"');
+  });
+});
+
+describe('file-tools › portable skill documents', () => {
+  it('gives every file-based skill source the same verbatim-document semantics', async () => {
+    process.env.HOME = path.join(tmpDir, 'home');
+    const paths = await import('../../../../src/main/paths');
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const [claudeGlobal, codexGlobal] = paths.globalSkillRoots();
+    const roots = [
+      ['custom', paths.userSkillsDir(UID)],
+      ['marketplace', paths.userMarketplaceSkillsDir(UID)],
+      ['system', paths.userSystemSkillsDir(UID)],
+      ['agent-private', paths.agentPrivateSkillsDir(UID, 'agent-one')],
+      ['agent-evolved', paths.agentEvolvedSkillsDir(UID, 'agent-one')],
+      ['marketplace-agent', paths.userMarketplaceAgentSkillsDir(UID, 'agent-two')],
+      ['package-companion', paths.userPackageSkillsDir(UID)],
+      ['external-package-dot-root', paths.userPackagesDir(UID)],
+      ['external-package-nested-root', path.join(paths.userPackageDir(UID, 'toolkit'), 'skills')],
+      ['global-claude', claudeGlobal],
+      ['global-codex', codexGlobal],
+    ] as const;
+
+    const files = roots.map(([source, root]) => {
+      const skillFile = path.join(root, `skill-${source}`, 'SKILL.md');
+      fs.mkdirSync(path.dirname(skillFile), { recursive: true });
+      fs.writeFileSync(skillFile, `---\nname: ${source}\n---\nFollow the ${source} procedure.\n`);
+      return { source, skillFile };
+    });
+    const tools = mod.createFileTools({
+      userId: UID,
+      readOnlyExtraRoots: roots.map(([, root]) => root),
+    });
+
+    for (const { source, skillFile } of files) {
+      const result = await run(getTool(tools, 'read_file'), { path: skillFile });
+      expect({ source, isError: !!result.isError, verbatimDocument: result.verbatimDocument })
+        .toEqual({ source, isError: false, verbatimDocument: true });
+    }
+  });
+
+  it('covers nested references without promoting sibling or unrelated files', async () => {
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const root = path.join(tmpDir, 'portable-skills');
+    const skillDir = path.join(root, 'design-skill');
+    const skillBody = path.join(skillDir, 'SKILL.md');
+    const nestedReference = path.join(skillDir, 'references', 'design-styles', 'framer.md');
+    const siblingNote = path.join(skillDir, 'notes.md');
+    const script = path.join(skillDir, 'scripts', 'render.ts');
+    const unrelatedReference = path.join(root, 'ordinary', 'references', 'notes.md');
+    for (const [file, body] of [
+      [skillBody, '---\nname: Design skill\n---\nBody'],
+      [nestedReference, 'Nested reference'],
+      [siblingNote, 'Sibling note'],
+      [script, 'console.log("script")'],
+      [unrelatedReference, 'Not a skill reference'],
+    ]) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, body);
+    }
+    const tools = mod.createFileTools({ userId: UID, readOnlyExtraRoots: [root] });
+    const read = (file: string) => run(getTool(tools, 'read_file'), { path: file });
+
+    expect((await read(skillBody)).verbatimDocument).toBe(true);
+    expect((await read(nestedReference)).verbatimDocument).toBe(true);
+    expect((await read(siblingNote)).verbatimDocument).toBeUndefined();
+    expect((await read(script)).verbatimDocument).toBeUndefined();
+    expect((await read(unrelatedReference)).verbatimDocument).toBeUndefined();
   });
 });
 
@@ -559,6 +739,303 @@ describe('file-tools › read_file scope guards', () => {
     expect(r.content).toContain('hi from extra');
   });
 
+  it('observes read-only roots appended after tool construction', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    perm.setLocalExecMode('workspace_approval');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const workspace = ws.setWorkspacePath(UID, wsDir);
+    if (!workspace.ok) throw new Error(`setWorkspacePath failed: ${workspace.error}`);
+
+    const runtimeRoots: string[] = [];
+    const tools = mod.createFileTools({
+      userId: UID,
+      cid: CID,
+      runtimeReadOnlyRoots: runtimeRoots,
+    });
+    const referencedRoot = path.join(tmpDir, 'referenced-conversation');
+    const referencedFile = path.join(referencedRoot, 'evidence.md');
+    fs.mkdirSync(referencedRoot, { recursive: true });
+    fs.writeFileSync(referencedFile, 'runtime reference body');
+
+    const beforeAdmission = await run(getTool(tools, 'read_file'), { path: referencedFile });
+    expect(beforeAdmission.isError).toBe(true);
+    expect(beforeAdmission.content).toContain('E_PATH_OUT_OF_SCOPE');
+
+    runtimeRoots.push(referencedRoot);
+    const afterAdmission = await run(getTool(tools, 'read_file'), { path: referencedFile });
+    expect(afterAdmission.isError).toBeFalsy();
+    expect(afterAdmission.content).toContain('runtime reference body');
+  });
+
+  it('loads a run-scoped Skill entry, references, templates, assets, images, and scripts without rescanning paths', async () => {
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const workspace = ws.setWorkspacePath(UID, wsDir);
+    if (!workspace.ok) throw new Error(`setWorkspacePath failed: ${workspace.error}`);
+
+    const skillRoot = path.join(tmpDir, 'bound-skills', 'deep-research');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    const reference = path.join(skillRoot, 'references', 'workflow.md');
+    const template = path.join(skillRoot, 'templates', 'report.md');
+    const config = path.join(skillRoot, 'assets', 'settings.json');
+    const image = path.join(skillRoot, 'assets', 'badge.png');
+    const script = path.join(skillRoot, 'scripts', 'caps.py');
+    fs.mkdirSync(path.dirname(reference), { recursive: true });
+    fs.mkdirSync(path.dirname(template), { recursive: true });
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(skillEntry, '---\nname: deep-research\n---\nmain workflow');
+    fs.writeFileSync(reference, 'reference workflow');
+    fs.writeFileSync(template, '# Report template\n{{findings}}\n');
+    fs.writeFileSync(config, JSON.stringify({ mode: 'strict', limit: 2 }));
+    const { Jimp } = await import('jimp' as any);
+    const badge: any = new Jimp({ width: 12, height: 12, color: 0x336699FF });
+    fs.writeFileSync(image, await badge.getBuffer('image/png'));
+    fs.writeFileSync(script, 'print("caps")\n');
+    const binding = {
+      id: 'ee99fbb42964',
+      name: 'deep-research',
+      root: skillRoot,
+      entry: skillEntry,
+      source: 'platform',
+    };
+    const invoked: string[] = [];
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([
+        ['deep-research', binding],
+        ['ee99fbb42964', binding],
+      ]),
+      onSkillInvoked: (id) => invoked.push(id),
+    });
+
+    const entryResult = await run(getTool(tools, 'read_file'), { path: '@skill/deep-research' });
+    const referenceResult = await run(getTool(tools, 'read_file'), {
+      path: '@skill/deep-research/references/workflow.md',
+    });
+    const templateResult = await run(getTool(tools, 'read_file'), {
+      path: '@skill/deep-research/templates/report.md',
+    });
+    const configResult = await run(getTool(tools, 'read_file'), {
+      path: '@skill/ee99fbb42964/assets/settings.json',
+    });
+    const imageResult = await run(getTool(tools, 'read_file'), {
+      path: '@skill/deep-research/assets/badge.png',
+    });
+    const scriptResult = await run(getTool(tools, 'read_file'), {
+      path: '@skill/deep-research/scripts/caps.py',
+    });
+
+    expect(entryResult.isError).toBeFalsy();
+    expect(entryResult.content).toContain('path="@skill/deep-research"');
+    expect(entryResult.content).toContain('main workflow');
+    expect(referenceResult.isError).toBeFalsy();
+    expect(referenceResult.content).toContain('reference workflow');
+    expect(referenceResult.verbatimDocument).toBe(true);
+    expect(templateResult.isError).toBeFalsy();
+    expect(templateResult.content).toContain('{{findings}}');
+    expect(configResult.isError).toBeFalsy();
+    expect(configResult.content).toContain('"mode":"strict"');
+    expect(imageResult.isError).toBeFalsy();
+    expect(imageResult.content).toContain('path="@skill/deep-research/assets/badge.png"');
+    expect(imageResult.images).toHaveLength(1);
+    expect(imageResult.images[0].mediaType).toBe('image/jpeg');
+    expect(scriptResult.isError).toBeFalsy();
+    expect(scriptResult.content).toContain('print("caps")');
+    for (const result of [entryResult, referenceResult, templateResult, configResult, imageResult, scriptResult]) {
+      expect(result.content).not.toContain(skillRoot);
+    }
+    expect(invoked).toEqual(['ee99fbb42964']);
+  });
+
+  it('supports logical Skill refs in read_files, stat_file, list_files, search_files, and grep_files', async () => {
+    const skillRoot = path.join(tmpDir, 'bound-skills', 'bundle');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    const reference = path.join(skillRoot, 'references', 'facts.md');
+    fs.mkdirSync(path.dirname(reference), { recursive: true });
+    fs.writeFileSync(skillEntry, '---\nname: bundle\n---\nentry body');
+    fs.writeFileSync(reference, 'needle fact');
+    const binding = { id: 'bundle-id', name: 'bundle', root: skillRoot, entry: skillEntry, source: 'custom' };
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['bundle', binding]]),
+    });
+    const readFilesSchema = getTool(tools, 'read_files').inputSchema as any;
+    expect(readFilesSchema.properties.files.items.properties.path.description).toContain('@skill/<read-ref>');
+
+    const batch = await run(getTool(tools, 'read_files'), {
+      files: [
+        { path: '@skill/bundle' },
+        { path: '@skill/bundle/references/facts.md' },
+      ],
+    });
+    const stat = await run(getTool(tools, 'stat_file'), { path: '@skill/bundle/references/facts.md' });
+    const list = await run(getTool(tools, 'list_files'), { path: '@skill/bundle/references' });
+    const bareList = await run(getTool(tools, 'list_files'), { path: '@skill/bundle' });
+    const search = await run(getTool(tools, 'search_files'), { root: '@skill/bundle/references', query: 'facts' });
+    const bareSearch = await run(getTool(tools, 'search_files'), { root: '@skill/bundle', query: 'facts' });
+    const grepTool = getTool(tools, 'grep_files');
+    const grep = await run(grepTool, { root: '@skill/bundle/references', pattern: 'needle' });
+    const bareGrep = await run(grepTool, { root: '@skill/bundle', pattern: 'needle' });
+    const grepFiles = await run(grepTool, {
+      root: '@skill/bundle/references',
+      pattern: 'needle',
+      output_mode: 'files',
+    });
+    const grepCount = await run(grepTool, {
+      root: '@skill/bundle/references',
+      pattern: 'needle',
+      output_mode: 'count',
+    });
+
+    expect(batch.isError).toBeFalsy();
+    expect(batch.content).toContain('entry body');
+    expect(batch.content).toContain('needle fact');
+    expect(stat.isError).toBeFalsy();
+    expect(stat.content).toContain('path="@skill/bundle/references/facts.md"');
+    expect(list.content).toContain('f facts.md');
+    expect(bareList.isError).toBeFalsy();
+    expect(bareList.content).toContain('f SKILL.md');
+    expect(bareList.content).toContain('d references');
+    expect(search.content).toContain('path=@skill/bundle/references/facts.md');
+    expect(search.content).not.toContain(skillRoot);
+    expect(bareSearch.content).toContain('path=@skill/bundle/references/facts.md');
+    expect(bareSearch.content).not.toContain(skillRoot);
+    for (const result of [grep, bareGrep, grepFiles, grepCount]) {
+      expect(result.content).toContain('@skill/bundle/references/facts.md');
+      expect(result.content).not.toContain(skillRoot);
+    }
+    expect(grep.content).toContain('needle fact');
+  });
+
+  it('keeps logical Skill refs in missing-path and OCR results without leaking installation roots', async () => {
+    const skillRoot = path.join(tmpDir, 'bound-skills', 'private-layout');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    const image = path.join(skillRoot, 'assets', 'scan.png');
+    fs.mkdirSync(path.dirname(image), { recursive: true });
+    fs.writeFileSync(skillEntry, '---\nname: private-layout\n---\nentry body');
+    const { Jimp } = await import('jimp' as any);
+    const scan: any = new Jimp({ width: 12, height: 12, color: 0xFFFFFFFF });
+    fs.writeFileSync(image, await scan.getBuffer('image/png'));
+    const mockOcr = vi.fn(async ({ absPath }: { absPath: string }) => ({
+      ok: true,
+      content: `<ocr-file path="${absPath}" kind="image">recognized</ocr-file>`,
+      pages: [1],
+      cached: false,
+      engine: 'test',
+    }));
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
+    const binding = {
+      id: 'private-layout-id',
+      name: 'private-layout',
+      root: skillRoot,
+      entry: skillEntry,
+      source: 'custom',
+    };
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      includeOcrFile: true,
+      skillRuntimeBindings: new Map([['private-layout', binding]]),
+    });
+
+    const missingFile = await run(getTool(tools, 'read_file'), {
+      path: '@skill/private-layout/assets/missing.json',
+    });
+    const missingStat = await run(getTool(tools, 'stat_file'), {
+      path: '@skill/private-layout/assets/missing.json',
+    });
+    const missingList = await run(getTool(tools, 'list_files'), {
+      path: '@skill/private-layout/missing',
+    });
+    const missingSearch = await run(getTool(tools, 'search_files'), {
+      root: '@skill/private-layout/missing',
+      query: 'anything',
+    });
+    const missingGrep = await run(getTool(tools, 'grep_files'), {
+      root: '@skill/private-layout/missing',
+      pattern: 'anything',
+    });
+    const ocr = await run(getTool(tools, 'ocr_file'), {
+      path: '@skill/private-layout/assets/scan.png',
+    });
+
+    for (const result of [missingFile, missingStat, missingList, missingSearch, missingGrep]) {
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('@skill/private-layout/');
+      expect(result.content).not.toContain(skillRoot);
+    }
+    expect(ocr.isError).toBeFalsy();
+    expect(ocr.content).toContain('path="@skill/private-layout/assets/scan.png"');
+    expect(ocr.content).toContain('recognized');
+    expect(ocr.content).not.toContain(skillRoot);
+    expect(mockOcr).toHaveBeenCalledWith(expect.objectContaining({ absPath: image }));
+  });
+
+  it('rejects unknown, traversal, and symlink-escape Skill refs before reading', async () => {
+    const skillRoot = path.join(tmpDir, 'bound-skills', 'safe-skill');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    const outside = path.join(tmpDir, 'outside-secret.md');
+    fs.mkdirSync(skillRoot, { recursive: true });
+    fs.writeFileSync(skillEntry, 'safe skill');
+    fs.writeFileSync(outside, 'outside secret');
+    let symlinkCreated = true;
+    try { fs.symlinkSync(outside, path.join(skillRoot, 'escape.md')); }
+    catch { symlinkCreated = false; }
+    const binding = { id: 'safe-id', name: 'safe-skill', root: skillRoot, entry: skillEntry, source: 'custom' };
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['safe-skill', binding]]),
+    });
+    const readFile = getTool(tools, 'read_file');
+
+    const unknown = await run(readFile, { path: '@skill/not-bound' });
+    const traversal = await run(readFile, { path: '@skill/safe-skill/../outside-secret.md' });
+    const escaped = symlinkCreated
+      ? await run(readFile, { path: '@skill/safe-skill/escape.md' })
+      : null;
+
+    expect(unknown.content).toContain('E_SKILL_NOT_AVAILABLE');
+    expect(traversal.content).toContain('E_SKILL_REF_INVALID');
+    if (escaped) {
+      expect(escaped.content).toContain('E_SKILL_PATH_OUT_OF_SCOPE');
+      expect(escaped.content).not.toContain('outside secret');
+    }
+  });
+
+  it('re-checks disabled state when a logical Skill ref is read', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const skillRoot = path.join(paths.userSkillsDir(UID), 'disabled-logical');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    fs.mkdirSync(skillRoot, { recursive: true });
+    fs.writeFileSync(skillEntry, 'secret logical workflow');
+    enabled.setSkillEnabled(UID, 'disabled-logical', false);
+    const binding = {
+      id: 'disabled-logical',
+      name: 'disabled-logical',
+      root: skillRoot,
+      entry: skillEntry,
+      source: 'custom',
+    };
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['disabled-logical', binding]]),
+    });
+
+    const result = await run(getTool(tools, 'read_file'), { path: '@skill/disabled-logical' });
+    expect(result.content).toContain('E_SKILL_DISABLED');
+    expect(result.content).not.toContain('secret logical workflow');
+  });
+
   it('blocks read_file from loading a disabled skill SKILL.md', async () => {
     const ws = await import('../../../../src/main/features/user_workspace');
     const paths = await import('../../../../src/main/paths');
@@ -606,6 +1083,28 @@ describe('file-tools › read_file scope guards', () => {
 });
 
 describe('file-tools › read_files', () => {
+  it('advertises and executes the same tagged range contract for every batch item', async () => {
+    const { tools, wsDir } = await buildTools();
+    const readFiles = getTool(tools, 'read_files');
+    const itemSchema = (readFiles.inputSchema as any).properties.files.items;
+    expect(itemSchema.properties).not.toHaveProperty('charStart');
+    expect(itemSchema.properties).not.toHaveProperty('lineStart');
+    expect(itemSchema.properties.range).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+      required: ['unit', 'start', 'end'],
+    });
+
+    const p = path.join(wsDir, 'batch-range.txt');
+    fs.writeFileSync(p, 'one\ntwo\nthree\n');
+    const result = await run(readFiles, {
+      files: [{ path: p, range: { unit: 'line', start: 2, end: 2 } }],
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('2\ttwo');
+    expect(result.content).not.toContain('1\tone');
+  });
+
   it('reads related slices together and keeps partial successes usable', async () => {
     const { tools, wsDir } = await buildTools();
     const first = path.join(wsDir, 'first.ts');
@@ -637,6 +1136,35 @@ describe('file-tools › read_files', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-24000"');
     expect(r.content.length).toBeLessThan(30_000);
+  });
+
+  it('reads skill documents whole and preserves their semantics across batch aggregation', async () => {
+    const { tools, wsDir } = await buildTools();
+    const ordinaryFile = path.join(wsDir, 'ordinary.md');
+    fs.writeFileSync(ordinaryFile, 'ordinary notes\n');
+    const readFiles = getTool(tools, 'read_files');
+    const skillFiles = Array.from({ length: 5 }, (_, index) => {
+      const file = path.join(wsDir, `batch-skill-${index}`, 'SKILL.md');
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, `---\nname: Batch ${index}\n---\n${'x'.repeat(30_000)}\nEND-SKILL-${index}\n`);
+      return file;
+    });
+    const referenceFile = path.join(wsDir, 'reference-skill', 'references', 'nested', 'details.md');
+    fs.mkdirSync(path.dirname(referenceFile), { recursive: true });
+    fs.writeFileSync(path.join(wsDir, 'reference-skill', 'SKILL.md'), '---\nname: Reference skill\n---\nBody\n');
+    fs.writeFileSync(referenceFile, `${'r'.repeat(30_000)}\nEND-NESTED-REFERENCE\n`);
+
+    const withSkill = await run(readFiles, {
+      files: [...skillFiles.map((path) => ({ path })), { path: referenceFile }],
+    });
+    expect(withSkill.verbatimDocument).toBe(true);
+    expect(withSkill.content).toContain('truncated="false"');
+    expect(withSkill.content.length).toBeGreaterThan(160_000);
+    expect(withSkill.content).toContain('END-SKILL-4');
+    expect(withSkill.content).toContain('END-NESTED-REFERENCE');
+
+    const ordinaryOnly = await run(readFiles, { files: [{ path: ordinaryFile }] });
+    expect(ordinaryOnly.verbatimDocument).toBeUndefined();
   });
 });
 

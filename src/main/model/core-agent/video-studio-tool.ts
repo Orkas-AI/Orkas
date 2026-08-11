@@ -13,7 +13,14 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
+import { prepareLosslessModelImage } from '../../features/image_assets';
 import { getLocalExecGranted } from '../../features/permissions';
+import {
+  checkInstalledVideoStudioContract,
+  VIDEO_STUDIO_MIN_COMPATIBLE_AGENT_VERSION,
+  VIDEO_STUDIO_TOOL_CONTRACT,
+  type VideoStudioContractCheck,
+} from '../../features/video_studio_skill_contract';
 import {
   draftComposition,
   inspectComposition,
@@ -21,6 +28,7 @@ import {
   prepareComposition,
   snapshotComposition,
   transcribeSpeech,
+  writeProductionContactSheet,
   type RenderFormat,
   type RenderQuality,
   type VideoStudioOp,
@@ -31,16 +39,20 @@ import {
   buildCompositionScaffold,
   compositionNarrationText,
   CompositionManifestSchema,
+  normalizeCompositionHtmlForVisualIdentity,
   reconcileCompositionHtml,
   retimeCompositionManifestForNarration,
   validateCompositionManifestSemantics,
+  visualProjectionOfCompositionManifest,
   type CompositionManifest,
 } from '../../features/video_studio_contract';
 import {
   evaluateVideoProductionOperation,
+  parentEdlLinkOf,
   readVideoProductionState,
   recordVideoProductionCandidate,
   recordVideoProductionTransition,
+  projectCandidateRevisionForModel,
   summarizeVideoProductionState,
   updateVideoProductionState,
   type VideoProductionArtifactState,
@@ -50,6 +62,7 @@ import {
   type VideoProductionGateEntry,
   type VideoProductionNarrationFit,
   type VideoProductionNarrationRepairAuthorization,
+  type VideoProductionNarrationTimingEpisode,
   type VideoProductionNarrationTransaction,
   type VideoProductionPlanApproval,
   type VideoProductionPlanFileRecord,
@@ -64,19 +77,26 @@ import {
   assertVideoStudioDesignQualityVerdict,
   compileVideoStudioDesignQualityScorecard,
   isEnvironmentalDraftFailure,
+  qaFindingIsWaivable,
   VIDEO_STUDIO_INSPECTOR_VERSION,
 } from '../../features/video_studio_qa';
 import {
   approveVideoProductionGeneration,
   approveVideoProductionPlan,
   readVideoProductionControlState,
+  recordVideoProductionPreviewGoAhead,
   readVideoProductionPlanIdentity,
   validateVideoProductionPlanApproval,
   videoProductionControlStatePath,
   videoProductionControlSummary,
+  videoProductionReviewStatus,
+  videoProductionSegmentIds,
   type VideoProductionPlanIdentity,
+  type VideoProductionSegmentReviewFact,
 } from '../../features/video_production_control';
+import { verifyProductionDelivery } from '../../features/video_studio_delivery';
 import { projectVideoApprovalIntent } from '../../features/video_approval_identity';
+import { redactPaths } from '../../util/redact';
 import { canonicalizeManifestSourceShotReferences } from '../../features/video_studio_source_alignment';
 import {
   assessEstimatedNarrationFit,
@@ -84,9 +104,13 @@ import {
   estimateNarrationDuration,
   generateSpeech,
   hasConfiguredTtsProvider,
+  narrationDurationBand,
+  narrationFitBlocksProduction,
   narrationDurationCalibrationScale,
 } from '../../features/tts';
 import {
+  getTtsAvailabilityDetails,
+  listableTtsVoices,
   listTtsCapabilities,
   publicTtsCapabilities,
   resolveTtsSelection,
@@ -95,20 +119,47 @@ import {
 import { probeMediaDurationSec } from '../../util/media_probe';
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../../util/bundled-runtime';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { chatMediaLocalUrl } from '../../util/chat-media-url';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { decodeSubmission } from '../../features/group_chat/router';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
+import { resolveLocalMediaPath } from '../../features/chat_attachments';
 import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
 import { userLocalRoot } from '../../paths';
+import { recordRead } from './read-tracker';
+import { finalizeProducedFile } from '../../features/produced_output_hooks';
 
 const log = createLogger('video-studio-tool');
 const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
 const NARRATION_REPAIR_MAX_EDIT_RATIO = 0.15;
 const NARRATION_REPAIR_MAX_CHECKS = 2;
 const VISUAL_QA_MAX_REPAIR_PASSES = 2;
+/** Canonical snapshot destination, relative to the composition directory.
+ *  `preview/` is excluded from every composition-signature version, so
+ *  defaulting here cannot perturb an approved plan's identity. */
+const DEFAULT_SNAPSHOT_OUTPUT_RELATIVE_PATH = path.join('preview', 'first-frame.png');
+/**
+ * Where each QA operation's record lands when the caller names no findings_path.
+ *
+ * It used to land nowhere. `findings_path` is optional, so a call that omitted
+ * it produced a result that existed only in that one tool payload — and the
+ * payload is gone once the turn completes. 2026-08-08: a blocked snapshot left
+ * `qa/snapshot.json` holding the PREVIOUS evening's conclusions, which is worse
+ * than an absent file, because anything reading it (the model on a later turn,
+ * anyone doing forensics) gets a confident answer about a run that no longer
+ * exists. `qa/` is outside the composition signature, so rewriting it on every
+ * call costs nothing the preflight will notice. Only the two operations whose
+ * whole output IS a QA verdict get a default; draft and export keep their own
+ * `report_path`.
+ */
+const DEFAULT_QA_FINDINGS_RELATIVE_PATH: Record<string, string> = {
+  'composition.snapshot': path.join('qa', 'snapshot.json'),
+  'composition.inspect': path.join('qa', 'inspect.json'),
+};
 
-export type VideoStudioApprovalGate = 'plan' | 'generation' | 'narration_retry' | 'preview' | 'draft';
+export type VideoStudioApprovalGate = 'plan' | 'generation' | 'narration_retry' | 'preview' | 'draft' | 'qa_waiver';
 export type VideoStudioApprovalDecision = 'approve' | 'reject' | 'unknown';
 export type VideoStudioDecisionEvidence = {
   source: 'user_message';
@@ -123,6 +174,8 @@ export type VideoStudioResolvedDecision = {
   decision: 'approve' | 'revise' | 'reject' | 'unknown';
   source: 'form' | 'model_interpreted_user_message' | 'none';
   evidence_status: 'not_provided' | 'valid' | 'invalid';
+  /** A deterministic form was submitted, but it did not decide this gate. */
+  structured_submission_detected?: boolean;
   /** Structured Preview/Final forms bind their opaque option value to the
    * exact artifact signature they displayed. Natural-language replies target
    * the current artifact semantically and therefore omit this field. */
@@ -165,6 +218,17 @@ function currentUserTurnPayload(message: string | undefined): string {
     if (from === 'user') current = match[2] || '';
   }
   return (sawWrappedMessage ? current : raw).trim();
+}
+
+/**
+ * A gate decision may only come from a real user turn. A commander nested
+ * dispatch wakes the agent with `<msg from="commander" …>`, which carries no
+ * user reply at all — that is a routing fact, not a malformed tool argument,
+ * so it must never be reported as a retryable input error. An unwrapped
+ * message (plain chat, no group envelope) is the user's own turn.
+ */
+function currentUserTurnAvailable(message: string | undefined): boolean {
+  return !!currentUserTurnPayload(message);
 }
 
 function approvalKeyGateHints(key: string): Set<VideoStudioApprovalGate> {
@@ -276,8 +340,16 @@ export function resolveVideoStudioCurrentTurnDecision(
         : {}),
     };
   }
+  const structuredSubmissionDetected = /<agent-input-submission\b/i.test(
+    currentUserTurnPayload(message),
+  );
   if (evidence === undefined || evidence === null) {
-    return { decision: 'unknown', source: 'none', evidence_status: 'not_provided' };
+    return {
+      decision: 'unknown',
+      source: 'none',
+      evidence_status: 'not_provided',
+      ...(structuredSubmissionDetected ? { structured_submission_detected: true } : {}),
+    };
   }
   let normalizedEvidence = evidence;
   let evidenceFormat: 'object' | 'json_string' = 'object';
@@ -362,24 +434,75 @@ export function resolveVideoStudioCurrentTurnDecision(
   };
 }
 
-function invalidDecisionEvidenceResult(
+function decisionEvidenceCorrectionResult(
   op: VideoStudioOp,
   gate: VideoStudioApprovalGate,
   decision: VideoStudioResolvedDecision,
+  options: { correctOmittedEvidence?: boolean } = {},
 ): Record<string, unknown> | undefined {
-  if (decision.evidence_status !== 'invalid') return undefined;
+  if (decision.source === 'form') return undefined;
+  const missing = options.correctOmittedEvidence === true
+    && decision.evidence_status === 'not_provided'
+    && decision.source === 'none'
+    && decision.structured_submission_detected !== true;
+  if (!missing && decision.evidence_status !== 'invalid') return undefined;
+  // A quote that is not in the current user message is a PROVENANCE failure,
+  // not a shape one. Reporting it as "not a valid structured object" and
+  // telling the model to re-interpret and retry is how a fabricated approval
+  // becomes a loop: on 2026-08-10 the model invented `quote: "确认方案"` for a
+  // decision the user never made, was told its object was malformed, retried
+  // the identical object, and the no-progress breaker ended the turn with a
+  // page of English diagnostics in the user's chat. The host knows which of
+  // the two it is — `evidence_issue` has always carried it — so it says so,
+  // and leans to the user: a needless stop costs one reply, a needless retry
+  // costs the turn.
+  if (!missing && decision.evidence_issue === 'quote_not_in_current_turn') {
+    return {
+      ok: false,
+      op,
+      errorCode: 'E_DECISION_EVIDENCE_NOT_FROM_USER',
+      message: 'The quoted text does not appear in the current user message, so nothing here records this decision.'
+        + ' The evidence object itself was well formed — do not reshape it and retry. If the user did decide this gate,'
+        + ' quote their words exactly as they wrote them and retry once. If they did not, they have not answered yet:'
+        + ' present the current review material to them and end the turn.',
+      presentation_required: true,
+      decision_evidence_valid: false,
+      decision_evidence_issue: 'quote_not_in_current_turn',
+      current_user_message_available: true,
+      requires_user_decision: true,
+      user_reconfirmation_required: false,
+      automatic_recovery_expected: false,
+      next_step_owner: 'user',
+      same_turn_continuation_required: false,
+      billable_request_sent: false,
+      expected_decision_evidence: {
+        source: 'user_message',
+        gate,
+        decision: ['approve', 'revise', 'reject'],
+        quote: 'verbatim excerpt from the current real user message',
+      },
+      next_action: 'present_review_material_and_end_turn_unless_the_user_already_decided',
+    };
+  }
   return {
     ok: false,
     op,
-    errorCode: 'E_DECISION_EVIDENCE_INVALID',
-    message: 'The current user reply is still available, but decision_evidence was not a valid structured object for this operation. Re-interpret the same current reply and retry this operation now with a native object; do not ask the user to confirm again.',
+    errorCode: missing ? 'E_DECISION_EVIDENCE_REQUIRED' : 'E_DECISION_EVIDENCE_INVALID',
+    message: missing
+      ? 'This gate operation omitted the model\'s semantic decision for the current user reply. Classify that same reply once: if it decides this gate, retry now with structured decision_evidence; otherwise continue the appropriate non-gate flow. This missing argument is Agent work and must not reopen or display a user confirmation.'
+      : 'The current user reply is still available, but decision_evidence was not a valid structured object for this operation. Re-interpret the same current reply and retry this operation now with a native object; do not ask the user to confirm again.',
+    presentation_required: false,
     decision_evidence_valid: false,
-    decision_evidence_issue: decision.evidence_issue || 'expected_object',
+    decision_evidence_required: true,
+    decision_evidence_issue: missing ? 'not_provided' : decision.evidence_issue || 'expected_object',
     decision_evidence_format: decision.evidence_format || 'object',
     current_user_message_available: true,
     requires_user_decision: false,
     user_reconfirmation_required: false,
     automatic_recovery_expected: true,
+    next_step_owner: 'agent',
+    same_turn_continuation_required: true,
+    interaction_required: false,
     billable_request_sent: false,
     expected_decision_evidence: {
       source: 'user_message',
@@ -387,9 +510,228 @@ function invalidDecisionEvidenceResult(
       decision: ['approve', 'revise', 'reject'],
       quote: 'verbatim excerpt from the current real user message',
     },
-    allowed_recovery_ops: [op],
-    next_action: 'retry_same_operation_with_structured_decision_evidence',
+    ...(!missing ? { allowed_recovery_ops: [op] } : {}),
+    next_action: missing
+      ? 'classify_current_reply_then_retry_with_evidence_or_continue_without_gate'
+      : 'retry_same_operation_with_structured_decision_evidence',
   };
+}
+
+/**
+ * No user reply exists in this turn, so the gate cannot be decided here at all.
+ * The field set mirrors `E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED` because the
+ * required agent behavior is the same: show the current review artifact with a
+ * plain decision prompt and end the turn. Retrying in this turn cannot succeed.
+ */
+function missingUserTurnGateResult(
+  op: VideoStudioOp,
+  gate: VideoStudioApprovalGate,
+): Record<string, unknown> {
+  return {
+    ok: false,
+    op,
+    errorCode: 'E_GATE_USER_TURN_REQUIRED',
+    message: 'This turn was started by another actor and carries no user reply, so it cannot authorize this gate. Show the current review artifact with one plain decision prompt and end the turn; the decision has to arrive in a later real user turn. Do not open a form or retry this operation in the current turn.',
+    gate,
+    current_user_message_available: false,
+    requires_user_decision: true,
+    user_reconfirmation_required: false,
+    automatic_recovery_expected: false,
+    same_turn_continuation_required: false,
+    interaction_required: true,
+    interaction_mode: 'request_gate_decision',
+    form_policy: 'plain_message_no_form',
+    next_step_owner: 'user',
+    billable_request_sent: false,
+    next_action: 'show_current_artifact_and_request_user_decision',
+  };
+}
+
+/**
+ * Ops whose behavior depends on skill-side protocol knowledge (gate decisions,
+ * evidence shapes, review verdicts). A skill generation that predates the host
+ * contract loops on these instead of failing visibly, so they are refused
+ * explicitly on a detected mismatch. Read/QA/render ops keep working — the
+ * degraded mode is "produce and show, but no gate decisions".
+ */
+const CONTRACT_SENSITIVE_OPS = new Set<string>([
+  'composition.approve_plan',
+  'composition.approve_draft',
+  'composition.submit_design_review',
+  'composition.materialize_narration',
+  'production.approve_plan',
+  'production.approve_generation',
+  'production.segment_qa',
+]);
+
+function videoStudioContractMismatchResult(
+  op: string,
+  check: Extract<VideoStudioContractCheck, { compatible: false }>,
+): ToolResult {
+  const skillOutdated = check.direction === 'skill_outdated';
+  return {
+    content: resultContent({
+      ok: false,
+      op,
+      errorCode: skillOutdated ? 'E_VIDEO_STUDIO_SKILL_OUTDATED' : 'E_VIDEO_STUDIO_HOST_OUTDATED',
+      message: skillOutdated
+        ? 'The installed VideoStudio agent predates the video production protocol this app implements, so gate and review operations cannot proceed reliably. Do not retry this operation. Tell the user, in their language, that the video agent component is out of date: restarting the app repairs it automatically, and reinstalling VideoStudio from the marketplace also fixes it. Then end the turn.'
+        : 'The installed VideoStudio agent declares a newer video production protocol than this app implements. Do not retry this operation. Tell the user, in their language, to update the app to use this agent version, then end the turn.',
+      host_contract: VIDEO_STUDIO_TOOL_CONTRACT,
+      declared_contract: check.declared_contract,
+      installed_agent_version: check.installed_version,
+      min_compatible_agent_version: VIDEO_STUDIO_MIN_COMPATIBLE_AGENT_VERSION,
+      requires_user_decision: false,
+      user_reconfirmation_required: false,
+      automatic_recovery_expected: false,
+      same_turn_continuation_required: false,
+      next_step_owner: 'user',
+      interaction_required: true,
+      billable_request_sent: false,
+      next_action: 'inform_user_component_update_needed_and_end_turn',
+    }),
+    isError: true,
+  } as ToolResult;
+}
+
+const VIDEO_STUDIO_REPEATED_FAILURE_LIMIT = 3;
+
+function videoStudioCallArgsHash(input: Record<string, unknown>): string {
+  // Top-level key order normalized; identical args means the model resent the
+  // same call payload.
+  const normalized = JSON.stringify(input, Object.keys(input).sort());
+  return crypto.createHash('sha256').update(normalized).digest('hex');
+}
+
+function videoStudioFailureClass(content: string): {
+  code: string;
+  freshEvidence: boolean;
+  candidateIdentity?: string;
+  billableRequestSent?: boolean;
+  requestDisposition?: unknown;
+  chargeStatus?: unknown;
+} {
+  const text = content.split('\n\n<file-renamed>')[0];
+  const direct = /^([A-Z][A-Z0-9_]+):/.exec(text.trim());
+  if (direct) return { code: direct[1], freshEvidence: false };
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const narrationFit = parsed.narration_fit && typeof parsed.narration_fit === 'object'
+      ? parsed.narration_fit as Record<string, unknown>
+      : undefined;
+    const candidatePayload = {
+      request_signature: parsed.request_signature,
+      text_sha256: parsed.narration_text_sha256 || narrationFit?.text_sha256,
+      plan_signature: parsed.plan_signature || narrationFit?.plan_signature,
+      target_duration_sec: parsed.target_duration_sec || narrationFit?.target_duration_sec,
+      min_duration_sec: parsed.min_duration_sec || narrationFit?.min_duration_sec,
+      max_duration_sec: parsed.max_duration_sec || narrationFit?.max_duration_sec,
+    };
+    const candidateIdentity = Object.values(candidatePayload).some((value) => value !== undefined)
+      ? crypto.createHash('sha256').update(JSON.stringify(candidatePayload)).digest('hex')
+      : undefined;
+    const billableRequestSent = typeof parsed.billable_request_sent === 'boolean'
+      ? parsed.billable_request_sent
+      : undefined;
+    return {
+      code: typeof parsed?.errorCode === 'string' && parsed.errorCode ? parsed.errorCode : 'E_UNCLASSIFIED',
+      // A failure carrying fresh execution evidence means the renderer or
+      // inspector actually ran against current inputs. Those ops govern their
+      // own repetition (signature-aware E_*_RETRY_NO_CHANGE + repair budgets),
+      // and each attempt may follow a real file repair, so the breaker must
+      // not count them. The compacted QA-blocked payload replaces the bulky
+      // report with video_qa/media_qa sections and an evidence_note stamp;
+      // those mark the same executed run.
+      freshEvidence: !!(parsed && (
+        parsed.report || parsed.preview_qa || parsed.video_qa
+        || parsed.media_qa || parsed.findings_path
+        || parsed.frame_evidence || parsed.draft_disposition
+        || parsed.evidence_note || parsed.measured_duration_sec
+        || parsed.narration_fit || billableRequestSent === true
+        || parsed.request_disposition === 'sent'
+      )),
+      ...(candidateIdentity ? { candidateIdentity } : {}),
+      ...(billableRequestSent !== undefined ? { billableRequestSent } : {}),
+      ...(parsed.request_disposition !== undefined
+        ? { requestDisposition: parsed.request_disposition }
+        : {}),
+      ...(parsed.charge_status !== undefined ? { chargeStatus: parsed.charge_status } : {}),
+    };
+  } catch {
+    return { code: 'E_UNCLASSIFIED', freshEvidence: false };
+  }
+}
+
+/**
+ * Host-side circuit breaker: the loops observed in production were the model
+ * resending one failing call unchanged, each failure instructing another
+ * retry. A streak is keyed by (arguments, errorCode) — identical arguments
+ * can still legitimately progress when the model repaired files with other
+ * tools between attempts, and that progress shows up as a different error,
+ * fresh execution evidence, or success. Three failures with the same call AND
+ * the same validation error mean nothing is changing, so the host — not model
+ * obedience — ends the loop and hands the turn to the user. Runs after
+ * execution so a repair-then-identical retry that now succeeds is untouched;
+ * success clears the call's streaks.
+ */
+function applyVideoStudioFailureBreaker(
+  streaks: Map<string, number>,
+  input: Record<string, unknown>,
+  result: ToolResult,
+): ToolResult {
+  const argsHash = videoStudioCallArgsHash(input);
+  const original = typeof result.content === 'string' ? result.content : String(result.content ?? '');
+  if (!result.isError) {
+    for (const key of [...streaks.keys()]) {
+      if (key.startsWith(`${argsHash}::`)) streaks.delete(key);
+    }
+    return result;
+  }
+  const failureClass = videoStudioFailureClass(original);
+  if (failureClass.freshEvidence) return result;
+  const key = `${argsHash}::${failureClass.candidateIdentity || 'no-candidate'}::${failureClass.code}`;
+  const failures = (streaks.get(key) || 0) + 1;
+  streaks.set(key, failures);
+  if (failures < VIDEO_STUDIO_REPEATED_FAILURE_LIMIT) return result;
+  return {
+    content: resultContent({
+      ok: false,
+      op: String(input.op || ''),
+      errorCode: 'E_REPEATED_FAILURE_USER_DECISION_REQUIRED',
+      message: `This exact candidate failed ${failures} times in this turn with identical arguments and the same error, so sending it again cannot make progress. Stop retrying. Summarize the blocker in plain language, show the current artifacts, ask the user how to proceed, and end the turn.`,
+      identical_failed_attempts: failures,
+      original_error_excerpt: original.slice(0, 1500),
+      requires_user_decision: true,
+      user_reconfirmation_required: false,
+      automatic_recovery_expected: false,
+      same_turn_continuation_required: false,
+      next_step_owner: 'user',
+      interaction_required: true,
+      billable_request_sent: failureClass.billableRequestSent ?? false,
+      ...(failureClass.requestDisposition !== undefined
+        ? { request_disposition: failureClass.requestDisposition }
+        : {}),
+      ...(failureClass.chargeStatus !== undefined
+        ? { charge_status: failureClass.chargeStatus }
+        : {}),
+      next_action: 'present_blocker_to_user_and_end_turn',
+    }),
+    isError: true,
+  } as ToolResult;
+}
+
+/** Convert the model-facing VideoStudio outcome into the generic runner
+ * boundary contract. The JSON remains the source of truth for the synthesis;
+ * this host-only bit only prevents another tool round. */
+function applyVideoStudioTurnBoundary(result: ToolResult): ToolResult {
+  try {
+    const payload = JSON.parse(result.content.split(/\n\n<file-renamed\b/i, 1)[0]) as { outcome?: unknown };
+    return payload.outcome === 'need_user'
+      ? { ...result, synthesizeAndEndTurn: true }
+      : result;
+  } catch {
+    return result;
+  }
 }
 
 export function explicitVideoStudioVisualRecoveryDecision(
@@ -438,6 +780,8 @@ const DENY_MESSAGE =
 export interface VideoStudioToolOpts {
   userId: string;
   cid?: string;
+  conversationTitle?: string;
+  conversationTitleUpdatedAt?: number;
   turnId?: string;
   userMessage?: string;
   agentId?: string;
@@ -453,6 +797,7 @@ const OPS = new Set<VideoStudioOp>([
   'production.status',
   'production.approve_plan',
   'production.approve_generation',
+  'production.segment_qa',
   'composition.status',
   'composition.doctor',
   'composition.reconcile',
@@ -462,11 +807,9 @@ const OPS = new Set<VideoStudioOp>([
   'composition.materialize_narration',
   'composition.lint',
   'composition.inspect',
-  'composition.begin_visual_revision',
   'composition.draft',
   'composition.export',
   'composition.snapshot',
-  'composition.approve_preview',
   'composition.submit_design_review',
   'composition.approve_draft',
   'speech.capabilities',
@@ -478,9 +821,7 @@ const PLAN_APPROVAL_REQUIRED_OPS = new Set<VideoStudioOp>([
   'composition.materialize_narration',
   'composition.lint',
   'composition.inspect',
-  'composition.begin_visual_revision',
   'composition.snapshot',
-  'composition.approve_preview',
   'composition.submit_design_review',
   'composition.draft',
   'composition.approve_draft',
@@ -495,14 +836,14 @@ function allowedRoots(opts: VideoStudioToolOpts): string[] {
     if (!roots.includes(resolved)) roots.push(resolved);
   };
   try { push(getWorkspacePath(opts.userId)); }
-  catch (err) { log.warn(`resolve workspace failed: ${(err as Error).message}`); }
+  catch (err) { log.warn('resolve workspace failed', { error: logErrorSummary(err) }); }
   if (opts.projectId) {
     try { push(getWorkspacePath(opts.userId, opts.projectId)); }
-    catch (err) { log.warn(`resolve project workspace failed: ${(err as Error).message}`); }
+    catch (err) { log.warn('resolve project workspace failed', { error: logErrorSummary(err) }); }
   }
   if (opts.cid) {
     try { push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
-    catch (err) { log.warn(`resolve attachment dir failed: ${(err as Error).message}`); }
+    catch (err) { log.warn('resolve attachment dir failed', { error: logErrorSummary(err) }); }
   }
   for (const root of opts.extraRoots || []) push(root);
   return roots;
@@ -556,6 +897,10 @@ function legacyVideoStudioStateKey(opts: VideoStudioToolOpts, compositionDirAbs:
 
 export function videoStudioRepairStatePath(opts: VideoStudioToolOpts, compositionDirAbs: string): string {
   return path.join(userLocalRoot(opts.userId), 'video_studio', 'draft-repair', `${videoStudioStateKey(opts, compositionDirAbs)}.json`);
+}
+
+export function videoStudioSegmentCachePath(opts: VideoStudioToolOpts, compositionDirAbs: string): string {
+  return path.join(userLocalRoot(opts.userId), 'video_studio', 'segment_cache', videoStudioStateKey(opts, compositionDirAbs));
 }
 
 export function videoStudioProductionStatePath(opts: VideoStudioToolOpts, compositionDirAbs: string): string {
@@ -656,7 +1001,7 @@ type VideoStudioGateCheck =
     message: string;
     submitted_artifact_signature?: string | null;
     current_artifact_signature?: string;
-    submitted_decision_status?: 'superseded' | 'unbound_after_revision';
+    submitted_decision_status?: 'superseded' | 'unbound_after_revision' | 'unbound';
   };
 
 function isRuntimeGeneratedCompositionPath(rel: string, isDirectory: boolean): boolean {
@@ -698,6 +1043,22 @@ function isRuntimeGeneratedCompositionPathV5(rel: string, isDirectory: boolean):
   if (!isDirectory) return false;
   const topLevel = rel.replace(/\\/g, '/').split('/')[0]?.toLowerCase() || '';
   return topLevel === 'outputs';
+}
+
+/** True when a runtime artifact would land inside the authored-input
+ *  signature: inside the composition directory but outside the given
+ *  signature-excluded subtree. Writing there makes the operation invalidate
+ *  its own evidence, because the next signature comparison sees a composition
+ *  the operation itself changed. */
+function runtimeArtifactInsideSignature(
+  artifactAbsPath: string,
+  compositionDirAbs: string,
+  excludedSubtree: 'preview' | 'qa',
+): boolean {
+  if (!isWithinDirectory(artifactAbsPath, compositionDirAbs)) return false;
+  const rel = path.relative(path.resolve(compositionDirAbs), path.resolve(artifactAbsPath))
+    .replace(/\\/g, '/');
+  return (rel.split('/')[0] || '').toLowerCase() !== excludedSubtree;
 }
 
 function isWithinDirectory(candidatePath: string, directoryPath: string): boolean {
@@ -752,6 +1113,89 @@ export async function videoStudioCompositionSignature(
     hash.update('\0');
   }
   return hash.digest('hex');
+}
+
+const VISUAL_IDENTITY_EXCLUDED_AUDIO_RE = /\.(?:mp3|wav|m4a|ogg|aac|flac|opus)$/i;
+
+/**
+ * Visual sub-identity: the composition hashed through its visual projection —
+ * audio files and narration-map excluded, the manifest reduced to visual
+ * fields, and the HTML normalized over invisible declarative audio tags.
+ * Scene timing remains part of the identity because it changes sampled
+ * pixels. A narration re-materialization that fits the existing scene windows
+ * leaves this signature unchanged, which lets the preview survive it.
+ */
+export async function videoStudioVisualCompositionSignature(compositionDirAbs: string): Promise<string> {
+  const hash = crypto.createHash('sha256');
+  for (const abs of await compositionFiles(compositionDirAbs, 5)) {
+    const rel = path.relative(compositionDirAbs, abs).replace(/\\/g, '/');
+    if (VISUAL_IDENTITY_EXCLUDED_AUDIO_RE.test(rel)) continue;
+    if (rel === 'narration-map.json') continue;
+    hash.update(rel);
+    hash.update('\0');
+    if (rel === 'composition-manifest.json') {
+      const raw = await fs.readFile(abs, 'utf8').catch((err) => {
+        log.warn('visual manifest signature read failed', { error: logErrorSummary(err) });
+        throw err;
+      });
+      let projected = raw;
+      try {
+        projected = visualProjectionOfCompositionManifest(JSON.parse(raw));
+      } catch (err) {
+        log.warn('visual manifest signature projection failed', { error: logErrorSummary(err) });
+      }
+      hash.update(projected);
+    } else if (rel === 'index.html') {
+      const raw = await fs.readFile(abs, 'utf8').catch((err) => {
+        log.warn('visual HTML signature read failed', { error: logErrorSummary(err) });
+        throw err;
+      });
+      hash.update(normalizeCompositionHtmlForVisualIdentity(raw));
+    } else {
+      hash.update(await fs.readFile(abs));
+    }
+    hash.update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * Single staleness rule for preview entries. Entries carrying a
+ * visual_signature stay current while the visual projection matches — the
+ * approval-inheritance half of the P1 sub-identity split. Older entries do
+ * not prove that sub-identity and therefore fail closed into one new preview.
+ */
+async function previewStillVisuallyCurrent(
+  compositionDirAbs: string,
+  entry: VideoProductionGateEntry,
+): Promise<boolean> {
+  if (!entry.visual_signature) return false;
+  return entry.visual_signature === await videoStudioVisualCompositionSignature(compositionDirAbs);
+}
+
+/**
+ * Remove one stale visual-evidence bundle as a unit. Preview frames, the
+ * user's go-ahead for those frames, and their visual QA record all describe
+ * the same visual identity; retaining only part of that bundle creates the
+ * contradictory "approved but confirm again" state.
+ */
+function invalidateVisualEvidenceUnlessCurrent(
+  state: VideoProductionStateV1,
+  currentVisualSignature: string,
+): boolean {
+  // A go-ahead without the preview identity it authorizes is never usable.
+  // Older prepare paths could leave exactly this orphan behind.
+  if (!state.preview) {
+    const hadOrphan = !!state.preview_go_ahead;
+    delete state.preview_go_ahead;
+    return hadOrphan;
+  }
+  if (state.preview.visual_signature
+    && state.preview.visual_signature === currentVisualSignature) return false;
+  delete state.preview;
+  delete state.preview_go_ahead;
+  delete state.visual_qa;
+  return true;
 }
 
 async function legacyVideoStudioCompositionSignature(compositionDirAbs: string): Promise<string> {
@@ -821,6 +1265,9 @@ async function migrateVideoStudioGateSignatureV5(
       }
       nextEntry.validation_version = 5;
       nextEntry.signature = artifacts.composition_signature || entry.signature;
+      if (kind === 'preview') {
+        nextEntry.visual_signature = artifacts.visual_signature;
+      }
       next.artifacts = { ...next.artifacts, ...artifacts };
     }, { expectedRevision: state.revision });
   } catch (err) {
@@ -835,13 +1282,32 @@ async function sha256File(absPath: string): Promise<string | undefined> {
 }
 
 async function videoProductionArtifacts(compositionDirAbs: string): Promise<VideoProductionArtifactState> {
-  const manifestSha = await sha256File(path.join(compositionDirAbs, 'composition-manifest.json'));
-  const htmlSha = await sha256File(path.join(compositionDirAbs, 'index.html'));
+  const [manifestSha, htmlSha, compositionSignature, visualSignature] = await Promise.all([
+    sha256File(path.join(compositionDirAbs, 'composition-manifest.json')),
+    sha256File(path.join(compositionDirAbs, 'index.html')),
+    videoStudioCompositionSignature(compositionDirAbs),
+    videoStudioVisualCompositionSignature(compositionDirAbs),
+  ]);
   return {
-    composition_signature: await videoStudioCompositionSignature(compositionDirAbs),
+    composition_signature: compositionSignature,
+    visual_signature: visualSignature,
     ...(manifestSha ? { manifest_sha256: manifestSha } : {}),
     ...(htmlSha ? { html_sha256: htmlSha } : {}),
   };
+}
+
+function artifactsShowAuthoredVisuals(
+  baseline: VideoProductionArtifactState,
+  current: VideoProductionArtifactState,
+  currentHtml = '',
+): boolean {
+  if (baseline.scaffold_visual_signature && current.visual_signature) {
+    return baseline.scaffold_visual_signature !== current.visual_signature;
+  }
+  if (baseline.scaffold_html_sha256 && current.html_sha256) {
+    return baseline.scaffold_html_sha256 !== current.html_sha256;
+  }
+  return !!currentHtml && !currentHtml.includes('ORKAS-GENERATED-SCAFFOLD');
 }
 
 function videoStudioRuntimeFingerprint(): string {
@@ -1125,6 +1591,12 @@ async function recordCurrentVideoProductionCandidate(input: {
     ...(findingsPath ? { findings_path: findingsPath } : {}),
   };
   const runtimeFingerprint = videoStudioRuntimeFingerprint();
+  const visualSignature = artifacts.composition_signature
+    ? await videoStudioVisualCompositionSignature(input.compositionDirAbs).catch((err) => {
+      log.warn('candidate visual signature failed', { error: logErrorSummary(err) });
+      return '';
+    })
+    : '';
   const snapshot = artifacts.composition_signature
     ? await materializeVideoProductionCandidateSnapshot({
       statePath: input.statePath,
@@ -1136,13 +1608,14 @@ async function recordCurrentVideoProductionCandidate(input: {
       // Candidate identity and recovery state remain useful if private
       // snapshot storage is temporarily unavailable (for example, disk
       // pressure). Do not turn an inspect/render result into a new blocker.
-      log.warn(`candidate snapshot failed: ${(err as Error).message}`);
+      log.warn('candidate snapshot failed', { error: logErrorSummary(err) });
       return undefined;
     })
     : undefined;
   return updateVideoProductionState(input.statePath, input.compositionDirAbs, (state) => {
     recordVideoProductionCandidate(state, {
       contentHash: artifacts.composition_signature || '',
+      ...(visualSignature ? { visualSignature } : {}),
       artifacts,
       locators,
       ...(snapshot ? { snapshot } : {}),
@@ -1188,7 +1661,7 @@ type VideoStudioReviewArtifact = {
 };
 
 type VideoStudioReviewPackage = {
-  presentation_required: true;
+  presentation_required: boolean;
   status: 'current_approved' | 'current_unapproved';
   conclusion: {
     outcome: 'quality_not_accepted' | 'blocked';
@@ -1196,8 +1669,13 @@ type VideoStudioReviewPackage = {
     summary: string;
     next_action: string;
     requires_user_decision: boolean;
-    next_step_owner: 'agent' | 'user';
+    next_step_owner: 'agent' | 'user' | 'external';
     automatic_recovery_expected: boolean;
+  };
+  user_guidance: {
+    what_happened: string;
+    what_remains_safe: string;
+    what_happens_next: string;
   };
   continuation: {
     recoverable: true;
@@ -1211,14 +1689,111 @@ type VideoStudioReviewPackage = {
     }>;
   };
   primary_artifact?: VideoStudioReviewArtifact;
-  artifacts: VideoStudioReviewArtifact[];
-  visible_artifact_paths: string[];
+  /** Omitted when the package is not presentable — see deliverReviewPackage. */
+  artifacts?: VideoStudioReviewArtifact[];
+  visible_artifact_paths?: string[];
 };
+
+function reviewUserGuidance(input: {
+  errorCode: string;
+  result: Record<string, unknown>;
+  nextAction: string;
+  requiresUserDecision: boolean;
+}): VideoStudioReviewPackage['user_guidance'] {
+  const approvalStillValid = input.result.approval_still_valid === true
+    || (input.result.approval_received === true
+      && input.result.user_reconfirmation_required === false);
+  const preserved = approvalStillValid
+    ? 'The existing production-plan confirmation remains valid, and the current project files are preserved.'
+    : 'The current project files and usable production artifacts are preserved.';
+
+  if (/(?:GATE_B|NARRATION_FIT)_ARTIFACT_INVALID|COMPOSITION_MANIFEST_INVALID/.test(input.errorCode)) {
+    return {
+      what_happened: 'A production-plan file has a formatting or field-validation problem.',
+      what_remains_safe: preserved,
+      what_happens_next: 'I will repair only the listed fields and check the same plan again now.',
+    };
+  }
+  if (/(?:GATE_B|NARRATION_FIT)_ARTIFACTS_INCOMPLETE/.test(input.errorCode)) {
+    return {
+      what_happened: 'One of the production-plan files is missing.',
+      what_remains_safe: preserved,
+      what_happens_next: 'I will restore the missing plan file and check the same plan again now.',
+    };
+  }
+  if (input.errorCode === 'E_GATE_B_REQUIREMENTS_INCOMPLETE') {
+    return {
+      what_happened: 'Some required production-plan details are incomplete or inconsistent.',
+      what_remains_safe: preserved,
+      what_happens_next: 'I will correct the listed plan details and rerun the free check now.',
+    };
+  }
+  if (input.errorCode === 'E_GATE_B_NARRATION_FIT_REQUIRED') {
+    return {
+      what_happened: 'The narration length does not yet match the planned video timing.',
+      what_remains_safe: 'The current script, shot list, voice selection, and visual plan are preserved.',
+      what_happens_next: 'I will adjust the narration timing and check it again before asking for any review.',
+    };
+  }
+  if (input.errorCode === 'E_DECISION_EVIDENCE_INVALID'
+    || input.errorCode === 'E_DECISION_EVIDENCE_REQUIRED') {
+    return {
+      what_happened: 'I need to correct how I recorded the current reply.',
+      what_remains_safe: 'The user reply and the pending review remain available.',
+      what_happens_next: 'I will correct the operation input and retry it now; no new confirmation is needed.',
+    };
+  }
+  if (input.errorCode === 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED') {
+    return {
+      what_happened: 'The submitted reply belongs to an earlier or unbound preview version.',
+      what_remains_safe: 'The latest complete preview and its review state are preserved.',
+      what_happens_next: 'I will show the latest preview and resume its current review choices without advancing production.',
+    };
+  }
+  // Must precede the generic TTS branch: "not ready yet" invites waiting and
+  // retrying, but these speech states require a configuration change first.
+  if (input.errorCode === 'E_TTS_USER_DISABLED') {
+    return {
+      what_happened: 'Orkas · Voice is turned off in Settings, and no other speech provider is available.',
+      what_remains_safe: 'The visuals, script, and captions are preserved, and no speech request was sent.',
+      what_happens_next: 'I will tell the user to open Settings > Models > Text-to-speech services and enable Orkas · Voice or configure another speech provider; retrying before that change cannot help.',
+    };
+  }
+  if (input.errorCode === 'E_TTS_NOT_CONFIGURED') {
+    return {
+      what_happened: 'Speech synthesis is not configured on this server, so no narration audio can be produced.',
+      what_remains_safe: 'The visuals, script, captions, and the chosen voice are preserved, and the video can still be delivered without narration.',
+      what_happens_next: 'I will deliver the current visual result and report that narration needs a server-side speech credential; retrying or changing the voice cannot help.',
+    };
+  }
+  if (/(?:NARRATION_MATERIALIZATION|TTS)/.test(input.errorCode)) {
+    return {
+      what_happened: 'The narration audio is not ready yet.',
+      what_remains_safe: 'The current visuals, script, voice selection, and any usable audio result are preserved.',
+      what_happens_next: input.requiresUserDecision
+        ? 'I will show the available narration choices so the user can choose the next step.'
+        : `I will continue the narration-audio recovery now (${input.nextAction}).`,
+    };
+  }
+  return {
+    what_happened: typeof input.result.message === 'string'
+      ? input.result.message
+      : 'The current production result needs another step.',
+    what_remains_safe: 'The current project files and usable production artifacts are preserved.',
+    what_happens_next: input.requiresUserDecision
+      ? 'I will show the current artifact with concrete choices.'
+      : `I will continue with ${input.nextAction} now.`,
+  };
+}
 
 function currentReviewPackage(input: {
   state: VideoProductionStateV1;
   result: Record<string, unknown>;
   planEvidence?: VideoProductionPlanEvidence;
+  /** False when this composition is not a thing the user reviews — an AUTO
+   *  child segment, whose frames belong to the assembled production's review.
+   *  The presentation payload then has no reader and is omitted. */
+  presentable?: boolean;
 }): VideoStudioReviewPackage {
   const candidate = input.state.current_candidate;
   const frozenLocators = candidate?.snapshot?.locators;
@@ -1231,9 +1806,14 @@ function currentReviewPackage(input: {
     ...(frozenLocators || {}),
   };
   const candidateSource = frozenLocators ? 'candidate_snapshot' : 'candidate_canonical';
+  // Preview approval attests visual content: it also covers a candidate whose
+  // only drift from the approved one is narration/audio (matching visual
+  // signatures). Draft approval stays bound to the exact full content hash.
   const previewApprovalMatchesCandidate = input.state.preview?.status === 'approved'
     && !!candidate?.content_hash
-    && input.state.preview.signature === candidate.content_hash;
+    && (input.state.preview.signature === candidate.content_hash
+      || (!!input.state.preview.visual_signature
+        && input.state.preview.visual_signature === candidate.visual_signature));
   const draftApprovalMatchesCandidate = input.state.draft?.status === 'approved'
     && !!candidate?.content_hash
     && input.state.draft.signature === candidate.content_hash;
@@ -1284,8 +1864,8 @@ function currentReviewPackage(input: {
     }
   } else if (input.state.plan_approval?.artifact_records) {
     const records = input.state.plan_approval.artifact_records;
-    add('script', records.script.path, 'plan_evidence', 'current_input');
-    add('shotlist', records.shotlist.path, 'plan_evidence', 'current_input');
+    if (records.script) add('script', records.script.path, 'plan_evidence', 'current_input');
+    if (records.shotlist) add('shotlist', records.shotlist.path, 'plan_evidence', 'current_input');
     add('plan_manifest', records.manifest.path, 'plan_evidence', 'current_input');
   }
 
@@ -1328,6 +1908,22 @@ function currentReviewPackage(input: {
     ? 'current_approved'
     : 'current_unapproved';
   const requiresUserDecision = input.result.requires_user_decision === true;
+  const explicitNextStepOwner = input.result.next_step_owner === 'agent'
+    || input.result.next_step_owner === 'user'
+    || input.result.next_step_owner === 'external'
+    ? input.result.next_step_owner
+    : undefined;
+  const automaticRecoveryExpected = typeof input.result.automatic_recovery_expected === 'boolean'
+    ? input.result.automatic_recovery_expected
+    : !requiresUserDecision;
+  const nextStepOwner = explicitNextStepOwner
+    || (requiresUserDecision ? 'user' : automaticRecoveryExpected ? 'agent' : 'external');
+  const userGuidance = reviewUserGuidance({
+    errorCode,
+    result: input.result,
+    nextAction,
+    requiresUserDecision,
+  });
   const resultOptions = Array.isArray(input.result.user_options)
     ? input.result.user_options.flatMap((item, index) => {
       if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
@@ -1341,25 +1937,28 @@ function currentReviewPackage(input: {
     })
     : [];
   return {
-    presentation_required: true,
+    presentation_required: input.presentable !== false,
     status: packageStatus,
     conclusion: {
       outcome: /(?:QA|QUALITY|INSPECT|REPAIR|REVIEW|RENDER|PREFLIGHT|DRAFT)/.test(errorCode)
         ? 'quality_not_accepted'
         : 'blocked',
       error_code: errorCode,
-      summary: typeof input.result.message === 'string' ? input.result.message : 'The current result is not accepted.',
+      summary: userGuidance.what_happened,
       next_action: nextAction,
       requires_user_decision: requiresUserDecision,
-      next_step_owner: requiresUserDecision ? 'user' : 'agent',
-      automatic_recovery_expected: !requiresUserDecision,
+      next_step_owner: nextStepOwner,
+      automatic_recovery_expected: nextStepOwner === 'agent' && automaticRecoveryExpected,
     },
+    user_guidance: userGuidance,
     continuation: {
       recoverable: true,
       terminal: false,
       user_action_required: requiresUserDecision,
       system_action: requiresUserDecision
         ? 'Present the current artifact and the concrete choices below; continue from the user’s natural-language decision.'
+        : nextStepOwner === 'external'
+          ? 'Present the preserved artifact and the external-state boundary; do not claim that an automatic retry is running.'
         : `Run ${nextAction} and continue recovery in the same turn; do not end with a diagnosis-only response.`,
       user_options: requiresUserDecision
         ? resultOptions.length
@@ -1382,10 +1981,33 @@ async function deliverReviewPackage(input: {
   state: VideoProductionStateV1;
   result: Record<string, unknown>;
   planEvidence?: VideoProductionPlanEvidence;
+  presentable?: boolean;
 }): Promise<VideoStudioReviewPackage> {
   const reviewPackage = currentReviewPackage(input);
-  await notifyWritten(input.opts, candidateRegisteredPaths(input.state.current_candidate));
-  await publishVisibleOutputs(input.opts, reviewPackage.visible_artifact_paths);
+  const presentationSuppressed = input.result.presentation_required === false;
+  if (!presentationSuppressed) {
+    await notifyWritten(input.opts, candidateRegisteredPaths(input.state.current_candidate));
+    // Publishing is how the frames become visible at all, so it runs even when
+    // the returned package omits the listing: an AUTO child's frames still
+    // belong in the parent's production review.
+    await publishVisibleOutputs(input.opts, reviewPackage.visible_artifact_paths);
+  }
+  if (input.presentable === false || presentationSuppressed) {
+    // The artifact listing exists to be shown, and this composition is not one
+    // the user reviews, so it has no reader and costs the message it rides: on
+    // 2026-08-09 seven E_SEGMENT_HAS_NO_USER_GATE refusals — whose own text is
+    // "do not ask the user about a single segment" — each carried a full
+    // presentation package, 65% of 48,237 characters across one round. All
+    // seven spilled, so the sentence telling the model to keep going arrived
+    // as a search ref.
+    const {
+      primary_artifact: _primaryArtifact,
+      artifacts: _artifacts,
+      visible_artifact_paths: _visibleArtifactPaths,
+      ...withoutPresentation
+    } = reviewPackage;
+    return { ...withoutPresentation, presentation_required: false };
+  }
   return reviewPackage;
 }
 
@@ -1395,11 +2017,39 @@ async function reviewToolResult(input: {
   result: Record<string, unknown>;
   planEvidence?: VideoProductionPlanEvidence;
   isError?: boolean;
+  presentable?: boolean;
 }): Promise<ToolResult> {
   const reviewPackage = await deliverReviewPackage(input);
+  const nextStepOwner = input.result.next_step_owner === 'user'
+    || input.result.next_step_owner === 'agent'
+    || input.result.next_step_owner === 'external'
+    ? input.result.next_step_owner
+    : reviewPackage.conclusion.next_step_owner;
+  const interactionRequired = nextStepOwner === 'user';
+  const approvalStillValid = input.result.approval_still_valid === true
+    || (input.result.approval_received === true
+      && input.result.user_reconfirmation_required === false);
+  const nextAction = typeof input.result.next_action === 'string'
+    ? input.result.next_action
+    : reviewPackage.conclusion.next_action;
   return {
     content: resultContent({
       ...input.result,
+      next_step_owner: nextStepOwner,
+      interaction_required: interactionRequired,
+      automatic_recovery_expected: nextStepOwner === 'agent'
+        && input.result.automatic_recovery_expected !== false,
+      same_turn_continuation_required: nextStepOwner === 'agent',
+      ...(approvalStillValid ? { approval_still_valid: true } : {}),
+      execution: {
+        next_action: nextAction,
+        next_step_owner: nextStepOwner,
+        continue_in_current_turn: nextStepOwner === 'agent',
+        interaction_required: interactionRequired,
+        requires_concrete_mutation_before_retry: nextStepOwner === 'agent'
+          && /(?:repair|restore|revise|edit|apply)/i.test(nextAction),
+      },
+      user_guidance: reviewPackage.user_guidance,
       review_package: reviewPackage,
     }),
     isError: input.isError ?? input.result.ok === false,
@@ -1437,7 +2087,28 @@ function setCurrentPlanApproval(
   if (state.plan_approval && state.plan_approval.signature !== approval.signature) {
     preservePlanApproval(state, state.plan_approval);
   }
+  // Being a segment of a parent EDL is structural identity, not part of any
+  // one approval: a child whose plan approval is re-signed without resolving
+  // the parent again (direct approve_plan, amendment, reconcile restore) is
+  // still the same segment of the same plan. Dropping the linkage here is
+  // what scattered an assembled production into standalone rows in the
+  // review panel (2026-08-06: 4 of 6 segments lost it mid-run). Carry the
+  // structural fields; inherited_from_signature/inherited_at stay with the
+  // approval that actually inherited, so they are deliberately not carried.
+  const prior = state.plan_approval;
+  if (prior?.inheritance_reason === 'parent_edl_segment'
+    && !approval.inheritance_reason
+    && typeof prior.parent_plan_path === 'string'
+    && typeof prior.parent_segment_id === 'string') {
+    approval = {
+      ...approval,
+      inheritance_reason: 'parent_edl_segment',
+      parent_plan_path: prior.parent_plan_path,
+      parent_segment_id: prior.parent_segment_id,
+    };
+  }
   state.plan_approval = approval;
+  delete state.plan_review_candidate;
   state.plan_approval_history = (state.plan_approval_history || [])
     .filter((entry) => entry.signature !== approval.signature)
     .slice(-MAX_PRESERVED_PLAN_APPROVALS);
@@ -1458,9 +2129,12 @@ function planApprovalMatchesIdentity(
       return true;
     }
   }
-  return approval.identity_kind !== 'approved_intent_sha256'
-    && !!identity.legacySignature
-    && approval.signature === identity.legacySignature;
+  // The pre-content-addressing byte hash is gone with the files it hashed:
+  // it was defined over script.md + shotlist.json + the manifest payload, and
+  // two of those three are no longer read. Approvals recorded by clients that
+  // old re-sign once; every approval since carries an intent snapshot, which
+  // the re-projection above migrates for free.
+  return false;
 }
 
 function contentAddressedPlanApproval(
@@ -1510,7 +2184,7 @@ async function enforceNarrationProductionInvariant(input: {
         created_at: new Date().toISOString(),
       };
       recordVideoProductionTransition(next, {
-        op: 'composition.recover_narration_invariant',
+        op: 'recover_narration_invariant',
         status: 'passed',
         turnId: input.turnId,
         stage: next.stage,
@@ -1614,12 +2288,6 @@ function newVisualQaCycle(input: { visualRevision: number; turnId?: string }): V
   };
 }
 
-function visualQaBudgetExhausted(state: VideoProductionVisualQaState | undefined): boolean {
-  const cycle = legacyVisualQaCycle(state);
-  return !!cycle && (cycle.status === 'exhausted'
-    || cycle.failed_signatures.length >= cycle.max_repair_passes + 1);
-}
-
 function visualQaRepairSummary(cycle: VideoProductionVisualQaCycle | undefined): Record<string, unknown> {
   const failedAttempts = cycle?.failed_signatures.length || 0;
   const used = Math.max(0, failedAttempts - 1);
@@ -1636,7 +2304,43 @@ function visualQaRepairSummary(cycle: VideoProductionVisualQaCycle | undefined):
   };
 }
 
+/** How an exhausted segment sits inside the production it belongs to.
+ *
+ * A composition that is one segment of an assembled EDL must not stop the other
+ * segments when its own repair budget runs out. On 2026-08-04 s1 exhausted at
+ * 15:47, the whole video stopped to ask, and the user answered at 17:52 — two
+ * hours in which the six untouched segments could have been finished. The user
+ * still gets the creative fork; it just travels with the one production review
+ * instead of halting production to ask about one scene. */
+export async function exhaustedSegmentProductionContext(input: {
+  opts: VideoStudioToolOpts;
+  state: VideoProductionStateV1;
+}): Promise<Record<string, unknown>> {
+  const approval = input.state.plan_approval;
+  if (!approval
+    || approval.inheritance_reason !== 'parent_edl_segment'
+    || typeof approval.parent_plan_path !== 'string'
+    || typeof approval.parent_segment_id !== 'string'
+    || !approval.parent_segment_id) return {};
+  // This used to also offer "keep the version you already approved for this
+  // scene", built from the last candidate revision that still had frames. It
+  // was removed rather than repaired, because all three of its legs were
+  // broken: no operation restores a segment from a preserved snapshot (the
+  // `snapshot_root` it published had no reader anywhere); a segment of an
+  // assembled production never stops on its own frames, so a version the user
+  // approved for one scene cannot exist; and the option was keyed
+  // `rendered_fallback` at this end and read as `approved_fallback` at the
+  // other through a type assertion, so it was never once offered to anyone.
+  return {
+    production_segment: {
+      plan_path: approval.parent_plan_path,
+      segment_id: approval.parent_segment_id,
+    },
+  };
+}
+
 async function guardVisualQaAttempt(input: {
+  opts: VideoStudioToolOpts;
   statePath: string;
   compositionDirAbs: string;
   op: VisualQaOp;
@@ -1671,7 +2375,7 @@ async function guardVisualQaAttempt(input: {
         } : {}),
         next_action: input.op === 'composition.inspect'
           ? 'composition.snapshot'
-          : previewStatus === 'approved' ? 'composition.draft' : 'composition.approve_preview',
+          : 'composition.draft',
         visual_repair_cycle: visualQaRepairSummary(cycle),
         ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
         production_state: summarizeVideoProductionState(state),
@@ -1680,21 +2384,88 @@ async function guardVisualQaAttempt(input: {
     };
   }
   const failedSignatures = cycle.failed_signatures;
-  if (cycle.status === 'exhausted' || failedSignatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1) {
+  const budgetSpent = cycle.status === 'exhausted'
+    || failedSignatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1;
+  // The model writes its next repair before it can learn the budget is gone —
+  // the check that would tell it runs at the entry of the call it makes to
+  // verify. 2026-08-08: six successful edits, three minutes, then this branch
+  // discarded them unmeasured and asked the user to pick between another round
+  // and skipping a check while nobody knew whether the edits had already
+  // fixed it. Measuring is ~2s of tool time against a user round trip, so an
+  // input this cycle has never seen gets one. Consumed only by a failure: if
+  // the repair is working, letting it continue is the point.
+  const measuresTheFinalRepair = budgetSpent
+    && !cycle.final_repair_measured
+    && !failedSignatures.includes(signature)
+    && cycle.passed_signatures[key] !== signature;
+  if (budgetSpent && !measuresTheFinalRepair) {
+    // P3b: an exhausted repair budget is a creative fork, not a technical
+    // dead end. A production session ground for 17 minutes of invisible
+    // internal restarts before hitting this wall; the user — who can redirect
+    // the visual approach in one sentence — was never consulted. Show the
+    // current candidate evidence and hand them the choice; another internal
+    // cycle remains one of the options, never the silent default.
+    const segmentContext = await exhaustedSegmentProductionContext({ opts: input.opts, state });
+    // Read, not asserted. The removed fallback option survived unreachable for
+    // as long as it did because an `as` cast let this end name a key the other
+    // end never produced, and the compiler had no opinion about it.
+    const rawSegment = segmentContext.production_segment;
+    const segment = rawSegment
+      && typeof rawSegment === 'object'
+      && typeof (rawSegment as { segment_id?: unknown }).segment_id === 'string'
+      ? rawSegment as { segment_id: string }
+      : undefined;
     return {
       content: resultContent({
         ok: false,
         op: input.op,
         errorCode: 'E_VISUAL_REPAIR_BUDGET_EXCEEDED',
-        message: `The previous visual repair strategies did not resolve the QA findings after ${VISUAL_QA_MAX_REPAIR_PASSES} distinct repair passes. Preserve the approved plan and narration, start a new internal visual-repair cycle, choose a materially different fix from the recorded evidence, and continue QA without asking the user for a technical recovery confirmation.`,
-        visual_revision_recovery_available: true,
-        recovery_action: 'composition.begin_visual_revision',
-        recovery_requires_new_user_revision: false,
-        requires_user_decision: false,
-        allowed_recovery_ops: ['composition.begin_visual_revision', 'composition.reconcile'],
-        next_action: 'composition.begin_visual_revision',
-        preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
+        message: `The previous visual repair strategies did not resolve the QA findings after ${VISUAL_QA_MAX_REPAIR_PASSES} distinct repair passes.`
+          + (segment
+            ? ` This is segment "${segment.segment_id}" of an assembled production; every other segment is unaffected and its recorded approvals stand. Keep producing them and raise this with the one production review rather than stopping the whole video for one scene.`
+            : '')
+          + ' Show the current candidate evidence and the remaining findings in plain language, offer another repair round and skipping the named check among the options, and end the turn. The user reply grants the next cycle automatically; there is no operation that restarts one.',
+        visual_revision_recovery_available: false,
+        recovery_requires_new_user_revision: true,
+        requires_user_decision: true,
+        user_reconfirmation_required: false,
+        next_step_owner: 'user',
+        interaction_required: true,
+        automatic_recovery_expected: false,
+        same_turn_continuation_required: false,
+        billable_request_sent: false,
+        user_options: [
+          {
+            id: 'guide_revision',
+            label: 'Describe what to change',
+            effect: 'The user redirects the visual approach in their own words; apply it as a bounded revision and restart QA.',
+          },
+          {
+            id: 'simplify_scene',
+            label: 'Simplify the failing scene',
+            effect: 'Reduce the failing scene to a simpler layout that satisfies the recorded findings, then restart QA.',
+          },
+          {
+            id: 'retry_internal',
+            label: 'Try again with a different approach',
+            effect: 'The user asks for one more repair round. Their reply grants it: the next cycle starts automatically with a fresh budget, and the strategies already recorded as failed must not be repeated.',
+          },
+          {
+            id: 'waive_findings',
+            label: 'Skip the failing check and continue',
+            effect: 'The user waives the named QA findings for this video; pass them as waive_qa_findings with their decision evidence and continue production.',
+          },
+        ],
+        allowed_recovery_ops: ['composition.reconcile'],
+        // Being a segment is what makes "carry on with the others" right; it
+        // never depended on an old revision existing, which is all the removed
+        // `blocks_production` measured.
+        next_action: segment
+          ? 'continue_other_segments_then_present_findings_with_production_review'
+          : 'present_findings_and_ask_user_direction',
+        preserved_artifacts: ['plan_approval', 'composition_manifest', 'narration'],
         visual_repair_cycle: visualQaRepairSummary(cycle),
+        ...segmentContext,
         ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
       }),
       isError: true,
@@ -1730,6 +2501,7 @@ async function recordVisualQaAttempt(input: {
   op: VisualQaOp;
   ok: boolean;
   errorCode?: string;
+  turnId?: string;
 }): Promise<void> {
   const artifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const signature = artifacts.composition_signature || '';
@@ -1758,8 +2530,18 @@ async function recordVisualQaAttempt(input: {
       cycle.status = key === 'snapshot' ? 'passed' : 'active';
       delete cycle.last_error_code;
     } else {
+      const wasSpent = !!previousCycle
+        && (previousCycle.status === 'exhausted'
+          || previousCycle.failed_signatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1);
       delete cycle.passed_signatures[key];
       cycle.status = failedSignatures.length >= VISUAL_QA_MAX_REPAIR_PASSES + 1 ? 'exhausted' : 'active';
+      // Stamp the turn the budget ran out in. The stop is presented in that
+      // turn; only a LATER real user turn is a reply to it, and that reply is
+      // what buys the next cycle.
+      if (cycle.status === 'exhausted' && input.turnId) cycle.exhausted_by_turn_id = input.turnId;
+      if (input.turnId) cycle.last_failure_turn_id = input.turnId;
+      // The one post-budget measurement is spent by a failure, not by progress.
+      if (wasSpent) cycle.final_repair_measured = true;
       if (input.errorCode) cycle.last_error_code = input.errorCode;
     }
     state.visual_qa = {
@@ -1781,7 +2563,6 @@ function canonicalPlanText(value: string): string {
 
 function canonicalLegacyManifestPlanPayload(
   manifest: CompositionManifest,
-  targetDuration?: number,
 ): Record<string, unknown> {
   return {
     schema_version: manifest.schema_version,
@@ -1789,14 +2570,21 @@ function canonicalLegacyManifestPlanPayload(
       id: manifest.composition.id,
       width: manifest.composition.width,
       height: manifest.composition.height,
-      target_duration: manifest.composition.target_duration ?? targetDuration ?? manifest.composition.duration,
+      target_duration: manifest.composition.target_duration ?? manifest.composition.duration,
       language: manifest.composition.language || '',
+      // Emitted only when declared, so a manifest written before captions
+      // moved here projects byte-identically and its approval still matches.
+      ...(manifest.composition.caption_mode
+        ? { caption_mode: manifest.composition.caption_mode }
+        : {}),
     },
     scenes: manifest.scenes.map((scene) => ({
       id: scene.id,
       approved_copy: scene.approved_copy,
       narration_text: scene.narration_text || '',
-      narration_refs: scene.narration_refs,
+      narration_refs: scene.narration_text !== undefined && !scene.narration_text.trim()
+        ? []
+        : scene.narration_refs,
       source_shots: scene.source_shots,
       roles: scene.roles,
     })),
@@ -1817,21 +2605,10 @@ function canonicalNarrationIntentForApproval(
   return projectVideoApprovalIntent(intent) as Record<string, unknown>;
 }
 
-function canonicalApprovedShotlistIntentPayload(
-  shotlist: Record<string, unknown>,
-): Record<string, unknown> {
-  return projectVideoApprovalIntent(shotlist, {
-    // These describe the artifact/implementation contract. Unknown fields stay
-    // signed, and visual_provenance remains signed as a production constraint.
-    excludeRootKeys: ['schema_version', 'art_direction'],
-  }) as Record<string, unknown>;
-}
-
 function canonicalApprovedManifestIntentPayload(
   manifest: CompositionManifest,
-  targetDuration?: number,
 ): Record<string, unknown> {
-  const legacy = canonicalLegacyManifestPlanPayload(manifest, targetDuration);
+  const legacy = canonicalLegacyManifestPlanPayload(manifest);
   const { schema_version: _schemaVersion, ...approvedIntent } = legacy;
   return {
     ...approvedIntent,
@@ -1841,42 +2618,449 @@ function canonicalApprovedManifestIntentPayload(
   };
 }
 
+/** The approved intent IS the manifest.
+ *
+ * A stored snapshot written before script.md and shotlist.json were retired
+ * still carries `script` and `shotlist` keys; both are ignored on both sides
+ * of the comparison, so an approval recorded then still matches the same
+ * manifest today without a re-signature. Dropping the script also stops a
+ * heading, a scene label, or a timing annotation — none of them approved
+ * creative intent — from changing the signature and reopening the plan. */
 function canonicalApprovedPlanIntentSnapshot(
   snapshot: Record<string, unknown>,
 ): Record<string, unknown> {
-  const shotlist = snapshot.shotlist;
   const manifest = snapshot.manifest;
-  const shotlistIntent = canonicalApprovedShotlistIntentPayload(
-    shotlist && typeof shotlist === 'object' && !Array.isArray(shotlist)
-      ? shotlist as Record<string, unknown>
-      : {},
-  );
-  const manifestIntent = projectVideoApprovalIntent(
-    manifest && typeof manifest === 'object' && !Array.isArray(manifest)
-      ? manifest
-      : {},
-    { excludeRootKeys: ['schema_version', 'art_direction'] },
-  );
   return {
-    script: canonicalPlanText(typeof snapshot.script === 'string' ? snapshot.script : ''),
-    shotlist: shotlistIntent,
-    manifest: canonicalizeManifestSourceShotReferences(
-      manifestIntent,
-      shotlistIntent,
-    ),
+    manifest: projectVideoApprovalIntent(
+      manifest && typeof manifest === 'object' && !Array.isArray(manifest)
+        ? manifest
+        : {},
+      { excludeRootKeys: ['schema_version', 'art_direction'] },
+    ) as Record<string, unknown>,
   };
 }
 
-function canonicalPlanPayload(
-  script: string,
-  shotlist: Record<string, unknown>,
-  manifest: CompositionManifest,
-  targetDuration?: number,
-): Record<string, unknown> {
+/**
+ * What the user is being asked to approve, handed back with the refusal.
+ *
+ * Gate B is the one approval that authorizes production, and the refusal used
+ * to be a bare sentence saying the user "must explicitly approve the displayed
+ * EDL" — while checking nothing about whether anything had been displayed and
+ * carrying nothing the model could display. 2026-08-08, measured: the model
+ * showed the user two sentences and a file path, and asked them to approve six
+ * segments, sixty seconds, and a language they never saw. `gate-control` has
+ * always required a locked direction summary plus the plan digest here; this is
+ * the host supplying the material for it instead of hoping.
+ *
+ * Bounded to the fields that decide the video. The full plan stays on disk.
+ */
+/** The production plan rendered as the text the user decides on.
+ *
+ * Host-side twin of the stage-plan skill's `summarizeEdl`: same information
+ * set (line, per-segment timeline with compose copy, narration voice,
+ * captions, cost). It exists because two prose instructions and a ready-made
+ * skill payload all failed to make the model show the plan before asking for
+ * approval — on 2026-08-08 the user confirmed a production whose entire
+ * on-screen description was "制作方案已准备好". The presentation stop returns
+ * THIS text, so what the user judges no longer depends on the model choosing
+ * to relay it. */
+export function renderVideoProductionPlanSummary(plan: Record<string, unknown>): string {
+  const lines: string[] = [];
+  const promise = isIntentRecord(plan.delivery_promise) ? plan.delivery_promise : {};
+  const motionRatio = Number(promise.motion_min_ratio);
+  lines.push(
+    `Plan: ${plan.aspect || '?'} · ~${plan.total_target_sec || '?'}s · ${plan.language || '?'} · promise=${promise.type || '?'}`
+    + (promise.source_required ? ' · source-required' : '')
+    + (promise.type === 'compose_led'
+      ? ' · HTML-motion=native-QA'
+      : Number.isFinite(motionRatio) ? ` · motion≥${Math.round(motionRatio * 100)}%` : ''),
+  );
+  const truncate = (value: string, max: number) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
+  const describe = (segment: Record<string, unknown>): string => {
+    const spec = isIntentRecord(segment.spec) ? segment.spec : {};
+    if (segment.source === 'edit') {
+      const inSec = Number(spec.in_sec);
+      const outSec = Number(spec.out_sec);
+      const range = Number.isFinite(inSec) && Number.isFinite(outSec) ? ` [${inSec}–${outSec}s]` : '';
+      return `edit ${String(spec.input_id ?? '?')}${range}`;
+    }
+    if (segment.source === 'generate') {
+      return `generate-${spec.media_kind === 'image' ? 'image' : 'video'} "${truncate(String(spec.prompt ?? ''), 56)}"`;
+    }
+    if (segment.source === 'compose') {
+      const binding = isIntentRecord(spec.composition_plan) ? spec.composition_plan : {};
+      const scenes = Array.isArray(binding.scenes) ? binding.scenes.filter(isIntentRecord) : [];
+      const copy = scenes.flatMap((scene) => (Array.isArray(scene.approved_copy) ? scene.approved_copy.map(String) : []));
+      return `compose ${String(spec.kind ?? '?')}${copy.length ? ` — "${truncate(copy.join(' / '), 72)}"` : ''}`;
+    }
+    if (segment.source === 'provided') return `provided ${String(spec.asset_id ?? '?')}`;
+    return String(segment.source ?? '?');
+  };
+  const segments = Array.isArray(plan.segments) ? plan.segments.filter(isIntentRecord) : [];
+  const primary = segments
+    .filter((segment) => segment.layer === 'primary')
+    .sort((a, b) => (Number(a.order) || 0) - (Number(b.order) || 0));
+  lines.push('Timeline:');
+  primary.forEach((segment, index) => {
+    lines.push(`  ${index + 1}. [${segment.role}] ${describe(segment)} (~${segment.target_sec ?? '?'}s)`);
+    for (const overlay of segments.filter((other) => other.layer !== 'primary' && other.over === segment.id)) {
+      lines.push(`       └ ${overlay.layer}: ${describe(overlay)}`);
+    }
+  });
+  const tracks = isIntentRecord(plan.tracks) ? plan.tracks : {};
+  const narration = isIntentRecord(tracks.narration) ? tracks.narration : undefined;
+  const narrationLines = narration && Array.isArray(narration.segments) ? narration.segments.length : 0;
+  if (narration && narrationLines) {
+    const synthesis = isIntentRecord(narration.synthesis) ? narration.synthesis : undefined;
+    const voice = synthesis
+      ? `${synthesis.display_name} (${synthesis.route_ref}) · language=${synthesis.language} · speed=${synthesis.speed}`
+      : `legacy:${narration.voice}`;
+    lines.push(`Narration: voice=${voice}, ${narrationLines} line(s)`);
+    // Windows are authored from the visual beat and the copy is written
+    // separately; nothing measures one against the other while the plan is
+    // being written, and the plan validator only checks that windows do not
+    // overlap. On 2026-08-09 a signed plan gave 54.2s of windows to copy that
+    // speaks in 33.5s, and the 20s of slack surfaced only at assembly — where
+    // it was filled by slowing the narration audio, which the user heard as
+    // wrong pacing and spent three rounds correcting. This summary is what the
+    // model reads back and the user approves, so the measurement belongs here,
+    // where it is still cheap to retime a window or lengthen a line. It is
+    // shown, not enforced: slack can be deliberate, and a fill-ratio threshold
+    // cannot tell a padded plan from a sparse one — measured, legitimate short
+    // lines fill 0.28–0.41 of their windows while this incident's ran 0.59–0.78.
+    const speed = synthesis && Number.isFinite(Number(synthesis.speed)) ? Number(synthesis.speed) : 1;
+    const timed = (Array.isArray(narration.segments) ? narration.segments : [])
+      .filter(isIntentRecord)
+      .map((line) => {
+        const text = String(line.text ?? '').trim();
+        const target = Number(line.target_sec);
+        if (!text || !Number.isFinite(target) || target <= 0) return null;
+        return { text, target, speech: estimateNarrationDuration(text, speed).estimatedSec };
+      })
+      .filter((entry): entry is { text: string; target: number; speech: number } => !!entry);
+    if (timed.length) {
+      const windowTotal = timed.reduce((sum, entry) => sum + entry.target, 0);
+      const speechTotal = timed.reduce((sum, entry) => sum + entry.speech, 0);
+      lines.push(`  windows ${windowTotal.toFixed(1)}s · speech ~${speechTotal.toFixed(1)}s`
+        + ` · silence ~${Math.max(0, windowTotal - speechTotal).toFixed(1)}s`);
+      timed.forEach((entry, index) => {
+        if (Math.abs(entry.target - entry.speech) < 1) return;
+        lines.push(`    ${index + 1}. ${entry.target}s window · ~${entry.speech.toFixed(1)}s speech`
+          + ` — ${truncate(entry.text, 24)}`);
+      });
+    }
+  }
+  const music = isIntentRecord(tracks.music) ? tracks.music : undefined;
+  if (music && typeof music.path === 'string' && music.path.trim()) {
+    lines.push(`Music: ${music.path}${music.duck ? ' · ducked under narration' : ''}`);
+  }
+  const captions = isIntentRecord(tracks.captions) ? tracks.captions : undefined;
+  const captionLines = captions && Array.isArray(captions.lines) ? captions.lines.length : 0;
+  if (captions && (captionLines || captions.from)) {
+    lines.push(`Captions: ${captionLines ? `${captionLines} line(s)` : `from=${captions.from || '?'}`}${captions.style ? ` · ${captions.style}` : ''}`);
+  }
+  const cost = isIntentRecord(plan.cost_estimate) ? plan.cost_estimate : {};
+  const billable = Number.isFinite(Number(cost.billable_generations)) ? Number(cost.billable_generations) : 0;
+  lines.push(`Cost: ${billable} billable generation(s)${cost.note ? ` — ${cost.note}` : ''}`);
+  return lines.join('\n');
+}
+
+/** The COMPOSE counterpart of the EDL summary above, rendered from the signed
+ * manifest: canvas and duration, every scene with its window, on-screen copy
+ * and the words it speaks, plus the same narration window-vs-speech accounting.
+ *
+ * COMPOSE reached Gate B with no rendered plan at all. Its approval refusal
+ * said "Show the plan below in their language first — they cannot approve what
+ * they have not seen" and attached a digest, so there was nothing below to
+ * show; `composition.status` returned no plan text either. Every presentation
+ * fix so far landed on the AUTO/EDL path and none of it reached here, which is
+ * why the same failure kept coming back: on 2026-08-09 the agent asked for
+ * approval with "方案已准备好", the user answered "方案展示一下", and it
+ * refused to show anything and asked for approval again — across a whole turn
+ * it never called a single status operation, because none of them would have
+ * handed it the plan. */
+export function renderCompositionPlanSummary(manifest: Record<string, unknown>): string {
+  const composition = isIntentRecord(manifest.composition) ? manifest.composition : {};
+  const audio = isIntentRecord(manifest.audio) ? manifest.audio : {};
+  const intent = isIntentRecord(audio.narration_intent) ? audio.narration_intent : undefined;
+  const scenes = (Array.isArray(manifest.scenes) ? manifest.scenes : []).filter(isIntentRecord);
+  const truncate = (value: string, max: number) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
+  const lines: string[] = [];
+  const width = Number(composition.width);
+  const height = Number(composition.height);
+  lines.push(
+    `Plan: ${Number.isFinite(width) && Number.isFinite(height) ? `${width}x${height}` : '?'}`
+    + ` · ~${composition.duration ?? composition.target_duration ?? '?'}s`
+    + ` · ${composition.language ?? '?'}`
+    + (composition.fps ? ` · ${composition.fps}fps` : ''),
+  );
+  lines.push('Scenes:');
+  scenes.forEach((scene, index) => {
+    const copy = (Array.isArray(scene.approved_copy) ? scene.approved_copy : [])
+      .map((item) => String(item ?? '').trim())
+      .filter(Boolean);
+    lines.push(`  ${index + 1}. [${scene.id ?? '?'}] ${scene.start ?? '?'}–${Number(scene.start ?? 0) + Number(scene.duration ?? 0)}s`
+      + (copy.length ? ` — ${truncate(copy.join(' / '), 72)}` : ''));
+    const narrationText = String(scene.narration_text ?? '').trim();
+    if (narrationText) lines.push(`       narration: ${truncate(narrationText, 72)}`);
+  });
+  if (intent) {
+    lines.push(`Narration: voice=${intent.display_name} (${intent.route_ref})`
+      + ` · language=${intent.language} · speed=${intent.speed}`);
+    // Same accounting the EDL summary carries: the windows are authored from
+    // the scene beats and the copy is written separately, so the slack that
+    // assembly has to fill belongs in front of the person approving it.
+    const speed = Number.isFinite(Number(intent.speed)) ? Number(intent.speed) : 1;
+    const spoken = scenes
+      .map((scene) => {
+        const text = String(scene.narration_text ?? '').trim();
+        const window = Number(scene.duration);
+        if (!text || !Number.isFinite(window) || window <= 0) return null;
+        return { window, speech: estimateNarrationDuration(text, speed).estimatedSec };
+      })
+      .filter((entry): entry is { window: number; speech: number } => !!entry);
+    if (spoken.length) {
+      const windowTotal = spoken.reduce((sum, entry) => sum + entry.window, 0);
+      const speechTotal = spoken.reduce((sum, entry) => sum + entry.speech, 0);
+      lines.push(`  windows ${windowTotal.toFixed(1)}s · speech ~${speechTotal.toFixed(1)}s`
+        + ` · silence ~${Math.max(0, windowTotal - speechTotal).toFixed(1)}s`);
+    }
+  } else if (audio.owner === 'none') {
+    lines.push('Narration: none');
+  }
+  return lines.join('\n');
+}
+
+/** Every EDL narration line whose text cannot be spoken inside its window,
+ * judged with the SAME estimator and tolerance generate_speech applies before
+ * a paid request (estimated > target * 1.05). This runs at Gate B because on
+ * 2026-08-08 all four narrated lines of an approved plan were over budget and
+ * each was discovered one paid-gate refusal at a time, mid-assembly — after
+ * the user had approved a script that never fit its own windows. Free: no
+ * provider is contacted. */
+export function edlNarrationBudgetIssues(plan: Record<string, unknown>): Array<{
+  index: number;
+  target_sec: number;
+  estimated_sec: number;
+  current_units: number;
+  shorten_to_units: number;
+  remove_units: number;
+  unit: string;
+  text_head: string;
+}> {
+  const tracks = isIntentRecord(plan.tracks) ? plan.tracks : {};
+  const narration = isIntentRecord(tracks.narration) ? tracks.narration : undefined;
+  if (!narration) return [];
+  const synthesis = isIntentRecord(narration.synthesis) ? narration.synthesis : undefined;
+  const speed = synthesis && Number.isFinite(Number(synthesis.speed)) ? Number(synthesis.speed) : 1;
+  const segments = Array.isArray(narration.segments) ? narration.segments : [];
+  const issues: Array<{ index: number; target_sec: number; estimated_sec: number; current_units: number; shorten_to_units: number; remove_units: number; unit: string; text_head: string }> = [];
+  segments.forEach((line, index) => {
+    if (!isIntentRecord(line)) return;
+    const text = String(line.text ?? '').trim();
+    const target = Number(line.target_sec);
+    if (!text || !Number.isFinite(target) || target <= 0) return;
+    const estimate = estimateNarrationDuration(text, speed);
+    if (estimate.estimatedSec <= target * 1.05) return;
+    const keepRatio = Math.min(1, target / estimate.estimatedSec);
+    const shortenTo = Math.max(1, Math.floor(estimate.units * keepRatio));
+    issues.push({
+      index,
+      target_sec: target,
+      estimated_sec: estimate.estimatedSec,
+      // Both counts, not just the destination: a mixed CJK/Latin line is
+      // exactly what a model cannot measure by eye, so "shorten to 27" made
+      // it guess its own length and undershoot every line, every round
+      // (2026-08-09: six lines went 12.4s -> 9.9s against an 8s window and
+      // were refused again). The host counted them already.
+      current_units: estimate.units,
+      shorten_to_units: shortenTo,
+      remove_units: Math.max(1, estimate.units - shortenTo),
+      unit: estimate.unit,
+      text_head: text.slice(0, 20),
+    });
+  });
+  return issues;
+}
+
+/** Every segment reports produced bytes, so a final artifact is expected to
+ * exist and the delivery check has something to check. */
+function videoProductionLooksAssembled(plan: Record<string, unknown>): boolean {
+  const segments = Array.isArray(plan.segments) ? plan.segments : [];
+  if (!segments.length) return false;
+  return segments.every((segment) => (
+    !!segment && typeof segment === 'object' && !Array.isArray(segment)
+      && typeof (segment as Record<string, unknown>).produced_path === 'string'
+      && !!String((segment as Record<string, unknown>).produced_path).trim()
+  ));
+}
+
+function videoProductionPlanDigest(plan: unknown): Record<string, unknown> | undefined {
+  if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return undefined;
+  const record = plan as Record<string, unknown>;
+  const segments = Array.isArray(record.segments) ? record.segments : [];
+  const references = Array.isArray(record.references) ? record.references : [];
+  const delivery = isIntentRecord(record.delivery_promise) ? record.delivery_promise : {};
+  const cost = isIntentRecord(record.cost_estimate) ? record.cost_estimate : {};
+  const generateCount = segments.filter((segment) => (
+    isIntentRecord(segment) && segment.source === 'generate'
+  )).length;
+  return {
+    aspect: record.aspect,
+    duration_sec: record.total_target_sec,
+    language: record.language,
+    delivery: delivery.type,
+    ...(delivery.source_required !== undefined ? { source_required: delivery.source_required } : {}),
+    billable_generations: cost.billable_generations ?? generateCount,
+    supplied_references: references.slice(0, 6).map((reference) => (
+      isIntentRecord(reference)
+        ? { id: reference.id, media_type: reference.media_type, roles: reference.roles }
+        : reference
+    )),
+    segments: segments.slice(0, 24).map((segment) => (isIntentRecord(segment)
+      ? {
+        id: segment.id,
+        role: segment.role,
+        source: segment.source,
+        ...(segment.duration_sec !== undefined ? { duration_sec: segment.duration_sec } : {}),
+      }
+      : segment)),
+    ...(segments.length > 24 ? { segments_omitted: segments.length - 24 } : {}),
+  };
+}
+
+/** The composition-line counterpart of `videoProductionPlanDigest`. */
+/** The rendered plan for a composition directory, or undefined when the
+ *  manifest is missing or unreadable. Paired with the digest at every point
+ *  that asks the user to approve: the digest says WHICH plan, this says WHAT. */
+async function compositionPlanSummaryFor(compositionDirAbs: string): Promise<string | undefined> {
+  const raw = await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8')
+    .catch(() => '');
+  if (!raw) return undefined;
+  let manifest: unknown;
+  try { manifest = JSON.parse(raw); } catch { return undefined; }
+  if (!isIntentRecord(manifest)) return undefined;
+  const summary = renderCompositionPlanSummary(manifest).trim();
+  return summary || undefined;
+}
+
+async function compositionManifestApprovalDigest(
+  compositionDirAbs: string,
+): Promise<Record<string, unknown> | undefined> {
+  const raw = await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8')
+    .catch(() => '');
+  if (!raw) return undefined;
+  let manifest: unknown;
+  try { manifest = JSON.parse(raw); } catch { return undefined; }
+  if (!isIntentRecord(manifest)) return undefined;
+  const composition = isIntentRecord(manifest.composition) ? manifest.composition : {};
+  const audio = isIntentRecord(manifest.audio) ? manifest.audio : {};
+  const narration = isIntentRecord(audio.narration_intent) ? audio.narration_intent : undefined;
+  const scenes = Array.isArray(manifest.scenes) ? manifest.scenes : [];
+  return {
+    aspect: composition.width && composition.height
+      ? `${composition.width}x${composition.height}`
+      : undefined,
+    duration_sec: composition.target_duration ?? composition.duration,
+    language: composition.language,
+    audio: narration
+      ? { narrated: true, voice_ref: narration.voice_ref, language: narration.language }
+      : { narrated: false },
+    scenes: scenes.slice(0, 24).map((scene) => (isIntentRecord(scene)
+      ? {
+        id: scene.id,
+        ...(scene.approved_copy !== undefined ? { approved_copy: scene.approved_copy } : {}),
+        ...(scene.narration_text !== undefined ? { narration_text: scene.narration_text } : {}),
+      }
+      : scene)),
+    ...(scenes.length > 24 ? { scenes_omitted: scenes.length - 24 } : {}),
+  };
+}
+
+const APPROVED_INTENT_CHANGES_REPORTED = 12;
+
+function isIntentRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Collect the paths at which two approved-intent projections disagree. */
+function collectIntentChanges(
+  approved: unknown,
+  candidate: unknown,
+  prefix: string,
+  out: string[],
+): void {
+  if (out.length >= APPROVED_INTENT_CHANGES_REPORTED) return;
+  if (Array.isArray(approved) && Array.isArray(candidate)) {
+    // Scenes are addressed by id, not by position: "scenes.cta.narration_text"
+    // survives a reorder, and "scenes.3" tells the model to go count.
+    const keyOf = (value: unknown, index: number): string => (
+      isIntentRecord(value) && typeof value.id === 'string' && value.id ? value.id : String(index)
+    );
+    const approvedByKey = new Map(approved.map((value, index) => [keyOf(value, index), value]));
+    const candidateByKey = new Map(candidate.map((value, index) => [keyOf(value, index), value]));
+    for (const [key, value] of candidateByKey) {
+      if (!approvedByKey.has(key)) out.push(`${prefix}.${key} (added)`);
+      else collectIntentChanges(approvedByKey.get(key), value, `${prefix}.${key}`, out);
+    }
+    for (const key of approvedByKey.keys()) {
+      if (!candidateByKey.has(key)) out.push(`${prefix}.${key} (removed)`);
+    }
+    return;
+  }
+  if (isIntentRecord(approved) && isIntentRecord(candidate)) {
+    for (const key of [...new Set([...Object.keys(approved), ...Object.keys(candidate)])].sort()) {
+      collectIntentChanges(approved[key], candidate[key], prefix ? `${prefix}.${key}` : key, out);
+    }
+    return;
+  }
+  if (stableJson(approved) !== stableJson(candidate)) out.push(prefix);
+}
+
+/**
+ * What changed in the approved intent since the recorded approval.
+ *
+ * `plan_approval_current: false` is a boolean over two snapshots the host is
+ * holding, and reopening a gate is expensive: it costs the user a round trip
+ * and it costs the model a full plan re-presentation, because a bare false
+ * gives it nothing smaller to show. 2026-08-08: the user confirmed, the model
+ * then rewrote the narration text (its fit estimate moved 48.77s -> 51.21s),
+ * that invalidated the approval it had just been given, and it re-presented the
+ * whole plan twice without ever knowing it had caused this itself. The diff
+ * turns that into "the narration text of two scenes changed" — which the model
+ * can either show as a one-line delta or, seeing that it was its own edit,
+ * reconsider.
+ */
+function approvedPlanIntentChanges(
+  approval: VideoProductionPlanApproval | undefined,
+  identity: VideoProductionPlanIdentityResult,
+): string[] {
+  if (!approval?.intent_snapshot || !identity.intentPayload) return [];
+  const out: string[] = [];
+  collectIntentChanges(
+    canonicalApprovedPlanIntentSnapshot(approval.intent_snapshot),
+    canonicalApprovedPlanIntentSnapshot(identity.intentPayload),
+    '',
+    out,
+  );
+  return out;
+}
+
+/** Project the diff into a result, omitting it entirely when there is none. */
+function intentChangesField(changes: string[]): Record<string, unknown> {
+  if (!changes.length) return {};
+  const shown = changes.slice(0, APPROVED_INTENT_CHANGES_REPORTED);
+  return {
+    plan_intent_changes: shown,
+    plan_intent_changes_note: `The recorded confirmation covers a different plan: ${shown.join(', ')}`
+      + (changes.length > shown.length ? `, and ${changes.length - shown.length} more` : '')
+      + '. Confirm only what changed rather than re-presenting the whole plan, and check first whether an edit of your own caused this.',
+  };
+}
+
+function canonicalPlanPayload(manifest: CompositionManifest): Record<string, unknown> {
   return canonicalApprovedPlanIntentSnapshot({
-    script: canonicalPlanText(script),
-    shotlist: canonicalApprovedShotlistIntentPayload(shotlist),
-    manifest: canonicalApprovedManifestIntentPayload(manifest, targetDuration),
+    manifest: canonicalApprovedManifestIntentPayload(manifest),
   });
 }
 
@@ -1918,9 +3102,6 @@ type VideoProductionPlanIdentityResult = {
   complete: boolean;
   /** SHA-256 of the normalized, user-approved intent projection. */
   signature: string;
-  /** Pre-content-addressing signature retained only to migrate approvals
-   * written by older clients without reopening Gate B. */
-  legacySignature?: string;
   intentPayload?: Record<string, unknown>;
   artifactPaths: string[];
   artifactRecords?: VideoProductionPlanFiles;
@@ -1928,19 +3109,6 @@ type VideoProductionPlanIdentityResult = {
   artifactIssues?: VideoProductionPlanArtifactIssue[];
   evidence: VideoProductionPlanEvidence;
 };
-
-const PLAN_DISCOVERY_SKIP_DIRS = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  'node_modules',
-  'dist',
-  'build',
-  'coverage',
-  'render',
-  'renders',
-  'outputs',
-]);
 
 function emptyPlanEvidence(): VideoProductionPlanEvidence {
   return {
@@ -1980,134 +3148,28 @@ function planSearchRoots(roots: string[]): string[] {
   )));
 }
 
-async function discoverPlanBundleDirectories(roots: string[]): Promise<string[]> {
-  const directories = new Set<string>();
-  let inspected = 0;
-  const visit = async (dirAbs: string): Promise<void> => {
-    if (inspected >= 5_000) return;
-    const entries = await fs.readdir(dirAbs, { withFileTypes: true }).catch(() => []);
-    const names = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
-    if (names.has('script.md') && names.has('shotlist.json')) directories.add(dirAbs);
-    for (const entry of entries) {
-      inspected += 1;
-      if (inspected >= 5_000) break;
-      if (!entry.isDirectory() || PLAN_DISCOVERY_SKIP_DIRS.has(entry.name)) continue;
-      await visit(path.join(dirAbs, entry.name));
-    }
-  };
-  for (const root of planSearchRoots(roots)) {
-    await visit(root);
-  }
-  return [...directories];
-}
-
-async function findRecordedPlanFile(
-  role: VideoProductionPlanArtifactRole,
-  record: VideoProductionPlanFileRecord,
-  roots: string[],
-): Promise<string | undefined> {
-  const wantedExtension = role === 'script' ? '.md' : '.json';
-  const matches: string[] = [];
-  let inspected = 0;
-  const visit = async (dirAbs: string): Promise<void> => {
-    if (inspected >= 5_000) return;
-    const entries = await fs.readdir(dirAbs, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      inspected += 1;
-      if (inspected >= 5_000) break;
-      const abs = path.join(dirAbs, entry.name);
-      if (entry.isDirectory()) {
-        if (!PLAN_DISCOVERY_SKIP_DIRS.has(entry.name)) await visit(abs);
-        continue;
-      }
-      if (!entry.isFile() || path.extname(entry.name).toLowerCase() !== wantedExtension) continue;
-      const stat = await fs.stat(abs).catch(() => null);
-      if (!stat?.isFile() || stat.size > 20 * 1024 * 1024) continue;
-      if (await sha256File(abs) === record.sha256) matches.push(abs);
-    }
-  };
-  for (const root of planSearchRoots(roots)) {
-    await visit(root);
-  }
-  if (matches.length === 0) return undefined;
-  matches.sort((a, b) => {
-    const aDistance = path.relative(path.dirname(record.path), a).split(path.sep).length;
-    const bDistance = path.relative(path.dirname(record.path), b).split(path.sep).length;
-    return aDistance - bDistance || a.localeCompare(b);
-  });
-  return matches[0];
-}
-
-async function resolveRecordedPlanFiles(input: {
-  records: VideoProductionPlanFiles;
-  roots: string[];
-}): Promise<{ records?: VideoProductionPlanFiles; evidence: VideoProductionPlanEvidence }> {
-  const evidence = emptyPlanEvidence();
-  const resolved = {} as Partial<VideoProductionPlanFiles>;
-  for (const role of ['script', 'shotlist', 'manifest'] as const) {
-    const record = input.records[role];
-    const currentSha = await sha256File(record.path);
-    if (currentSha === record.sha256) {
-      resolved[role] = record;
-      evidence.observations.push({
-        role,
-        status: 'matched',
-        path: record.path,
-        sha256: record.sha256,
-      });
-      continue;
-    }
-    if (currentSha) {
-      // Raw file hashes identify concrete artifacts and concurrent edits. They
-      // are not the Gate B identity: parse the changed candidate below and
-      // compare its canonical approved-intent hash before deciding whether the
-      // user's approval still applies.
-      resolved[role] = { path: record.path, sha256: currentSha };
-      evidence.observations.push({
-        role,
-        status: 'changed',
-        path: record.path,
-        sha256: currentSha,
-      });
-      continue;
-    }
-    const relocated = role === 'manifest'
-      ? undefined
-      : await findRecordedPlanFile(role, record, input.roots);
-    if (!relocated) {
-      evidence.observations.push({ role, status: 'missing', path: record.path });
-      evidence.conflicts.push({
-        code: 'recorded_artifact_missing',
-        message: `The approved ${role} file could not be found by its recorded content hash.`,
-        paths: [record.path],
-      });
-      continue;
-    }
-    resolved[role] = { path: relocated, sha256: record.sha256 };
-    evidence.observations.push({
-      role,
-      status: 'relocated',
-      path: relocated,
-      sha256: record.sha256,
-    });
-  }
-  if (!resolved.script || !resolved.shotlist || !resolved.manifest) return { evidence };
-  return { records: resolved as VideoProductionPlanFiles, evidence };
+function compositionPlanIntentSignature(manifest: CompositionManifest): string {
+  return crypto.createHash('sha256')
+    .update(stableJson(canonicalPlanPayload(manifest)))
+    .digest('hex');
 }
 
 async function buildVideoProductionPlanIdentity(
   records: VideoProductionPlanFiles,
   evidence: VideoProductionPlanEvidence,
 ): Promise<VideoProductionPlanIdentityResult> {
-  const scriptPath = records.script.path;
-  const shotlistPath = records.shotlist.path;
+  // The manifest is the plan. script.md and shotlist.json are retired as
+  // INPUTS: each carried a second copy of something the manifest already
+  // states, each needed a reconciliation check to police its copy, and those
+  // checks failed twice in one week over differences that were never about
+  // the video. The identity below hashes the normalized approved-intent
+  // projection of the manifest alone; `records.script`/`records.shotlist`
+  // survive only as OPTIONAL fields on `VideoProductionPlanFiles` so
+  // approvals recorded before the retirement still deserialize. Their bytes
+  // are not read — a readable script is RENDERED from the manifest instead.
   const manifestPath = records.manifest.path;
-  const [script, shotlistRaw, manifestRaw] = await Promise.all([
-    fs.readFile(scriptPath).catch(() => null),
-    fs.readFile(shotlistPath).catch(() => null),
-    fs.readFile(manifestPath, 'utf8').catch(() => ''),
-  ]);
-  const applicable = !!script || !!shotlistRaw;
+  const manifestRaw = await fs.readFile(manifestPath, 'utf8').catch(() => '');
+  const applicable = !!manifestRaw.trim();
   if (!applicable) {
     return {
       applicable: false,
@@ -2120,50 +3182,9 @@ async function buildVideoProductionPlanIdentity(
     };
   }
   const artifactIssues: VideoProductionPlanArtifactIssue[] = [];
-  const scriptValid = !!script && script.toString('utf8').trim().length > 0;
-  if (script && !scriptValid) {
-    artifactIssues.push({
-      role: 'script',
-      code: 'empty_file',
-      path: scriptPath,
-      message: 'script.md is empty.',
-    });
-  }
-  let shotlist: Record<string, unknown> = {};
-  let shotlistValid = false;
-  try {
-    const parsed = JSON.parse(shotlistRaw?.toString('utf8') || '');
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      shotlist = parsed;
-      shotlistValid = true;
-    } else if (shotlistRaw) {
-      artifactIssues.push({
-        role: 'shotlist',
-        code: 'invalid_object',
-        path: shotlistPath,
-        message: 'shotlist.json must contain one JSON object.',
-      });
-    }
-  } catch (error) {
-    artifactIssues.push({
-      role: 'shotlist',
-      code: 'invalid_json',
-      path: shotlistPath,
-      message: 'shotlist.json is not valid JSON.',
-      details: boundedPlanValidationDetails(error),
-    });
-  }
-  const targetDuration = Number(shotlist.target_duration_seconds);
-  const requirementIssues = [
-    ...(Number.isFinite(targetDuration) && targetDuration > 0 ? [] : ['shotlist.target_duration_seconds']),
-    ...(typeof shotlist.video_language === 'string' && shotlist.video_language.trim() ? [] : ['shotlist.video_language']),
-    ...(typeof shotlist.audio_mode === 'string' && shotlist.audio_mode.trim() ? [] : ['shotlist.audio_mode']),
-    ...(typeof shotlist.caption_mode === 'string' && shotlist.caption_mode.trim() ? [] : ['shotlist.caption_mode']),
-    ...(typeof shotlist.music_mode === 'string' && shotlist.music_mode.trim() ? [] : ['shotlist.music_mode']),
-  ];
+  const requirementIssues: string[] = [];
   let planPayload = '';
   let intentPayload: Record<string, unknown> | undefined;
-  let legacyManifestPayload = '';
   let manifestValid = false;
   try {
     const manifest = CompositionManifestSchema.parse(JSON.parse(manifestRaw));
@@ -2171,25 +3192,10 @@ async function buildVideoProductionPlanIdentity(
     requirementIssues.push(...validateCompositionManifestSemantics(manifest)
       .filter((issue) => issue.severity === 'error')
       .map((issue) => issue.code));
-    requirementIssues.push(...videoProductionNarrationAlignmentIssues({
-      script: script?.toString('utf8') || '',
-      shotlist,
-      manifest,
-    }));
-    intentPayload = canonicalPlanPayload(
-      script?.toString('utf8') || '',
-      shotlist,
-      manifest,
-      Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : undefined,
-    );
+    intentPayload = canonicalPlanPayload(manifest);
     planPayload = stableJson(intentPayload);
-    legacyManifestPayload = JSON.stringify(canonicalLegacyManifestPlanPayload(
-      manifest,
-      Number.isFinite(targetDuration) && targetDuration > 0 ? targetDuration : undefined,
-    ));
   } catch (error) {
     planPayload = manifestRaw;
-    legacyManifestPayload = manifestRaw;
     artifactIssues.push({
       role: 'manifest',
       code: 'invalid_manifest',
@@ -2198,75 +3204,18 @@ async function buildVideoProductionPlanIdentity(
       details: boundedPlanValidationDetails(error),
     });
   }
-  const legacyHash = crypto.createHash('sha256');
-  legacyHash.update(script || Buffer.alloc(0));
-  legacyHash.update('\0');
-  legacyHash.update(shotlistRaw || Buffer.alloc(0));
-  legacyHash.update('\0');
-  legacyHash.update(legacyManifestPayload);
   const semanticHash = crypto.createHash('sha256').update(planPayload);
   return {
     applicable,
-    complete: scriptValid && !!shotlistRaw && shotlistValid && manifestValid,
+    complete: manifestValid,
     signature: semanticHash.digest('hex'),
-    legacySignature: legacyHash.digest('hex'),
     ...(intentPayload ? { intentPayload } : {}),
-    artifactPaths: [scriptPath, shotlistPath, manifestPath],
+    artifactPaths: [manifestPath],
     artifactRecords: records,
     requirementIssues,
     artifactIssues,
     evidence,
   };
-}
-
-async function candidatePlanIdentity(
-  directory: string,
-  manifestPath: string,
-): Promise<VideoProductionPlanIdentityResult | undefined> {
-  const scriptPath = path.join(directory, 'script.md');
-  const shotlistPath = path.join(directory, 'shotlist.json');
-  const [scriptSha, shotlistSha, manifestSha] = await Promise.all([
-    sha256File(scriptPath),
-    sha256File(shotlistPath),
-    sha256File(manifestPath),
-  ]);
-  if (!scriptSha && !shotlistSha) return undefined;
-  const evidence = emptyPlanEvidence();
-  evidence.observations.push(
-    {
-      role: 'script',
-      status: scriptSha ? 'candidate' : 'missing',
-      path: scriptPath,
-      ...(scriptSha ? { sha256: scriptSha } : {}),
-    },
-    {
-      role: 'shotlist',
-      status: shotlistSha ? 'candidate' : 'missing',
-      path: shotlistPath,
-      ...(shotlistSha ? { sha256: shotlistSha } : {}),
-    },
-    {
-      role: 'manifest',
-      status: manifestSha ? 'candidate' : 'missing',
-      path: manifestPath,
-      ...(manifestSha ? { sha256: manifestSha } : {}),
-    },
-  );
-  if (!scriptSha || !shotlistSha || !manifestSha) {
-    return {
-      applicable: true,
-      complete: false,
-      signature: '',
-      artifactPaths: [scriptPath, shotlistPath, manifestPath],
-      requirementIssues: [],
-      evidence,
-    };
-  }
-  return buildVideoProductionPlanIdentity({
-    script: { path: scriptPath, sha256: scriptSha },
-    shotlist: { path: shotlistPath, sha256: shotlistSha },
-    manifest: { path: manifestPath, sha256: manifestSha },
-  }, evidence);
 }
 
 async function videoProductionPlanIdentity(
@@ -2277,135 +3226,1199 @@ async function videoProductionPlanIdentity(
     preferLocal?: boolean;
   } = {},
 ): Promise<VideoProductionPlanIdentityResult> {
+  // One file, one place. Bundle discovery and relocation existed because the
+  // plan was spread across script.md and shotlist.json, which a reformat could
+  // move or rewrite out from under their recorded hashes — and searching for
+  // them is what bound a sibling conversation's files on 2026-08-06
+  // (E_GATE_B_ARTIFACT_CONFLICT). The manifest lives at a known path inside the
+  // composition it describes, so there is nothing to search for and no second
+  // bundle to disagree with.
   const manifestPath = path.join(compositionDirAbs, 'composition-manifest.json');
-  const roots = input.roots?.length ? input.roots : [path.resolve(compositionDirAbs, '..')];
-  const localDir = path.resolve(compositionDirAbs);
-  const parentDir = path.resolve(compositionDirAbs, '..');
-  if (input.approval?.artifact_records) {
-    const resolved = await resolveRecordedPlanFiles({
-      records: input.approval.artifact_records,
-      roots,
-    });
-    if (resolved.records) return buildVideoProductionPlanIdentity(resolved.records, resolved.evidence);
-
-    // A plan bundle may be moved and reformatted in the same edit. In that
-    // case neither its old path nor its old raw file hash can locate it. Search
-    // complete bundles, then bind the one whose normalized approved intent
-    // still matches the approval content address.
-    const recoveryDirectories = [...new Set([
-      localDir,
-      parentDir,
-      ...await discoverPlanBundleDirectories(roots),
-    ])];
-    const recoveryCandidates = (await Promise.all(
-      recoveryDirectories.map((directory) => candidatePlanIdentity(directory, manifestPath)),
-    )).filter((value): value is VideoProductionPlanIdentityResult => !!value?.complete);
-    const matchingCandidates = recoveryCandidates
-      .filter((candidate) => planApprovalMatchesIdentity(input.approval, candidate))
-      .sort((a, b) => a.artifactPaths[0].localeCompare(b.artifactPaths[0]));
-    if (matchingCandidates.length > 0) {
-      const recovered = matchingCandidates[0];
-      const recoveredRecords = recovered.artifactRecords!;
-      const evidence = emptyPlanEvidence();
-      for (const role of ['script', 'shotlist', 'manifest'] as const) {
-        const prior = input.approval.artifact_records[role];
-        const current = recoveredRecords[role];
-        evidence.observations.push({
-          role,
-          status: current.path !== prior.path
-            ? 'relocated'
-            : current.sha256 !== prior.sha256 ? 'changed' : 'matched',
-          path: current.path,
-          sha256: current.sha256,
-        });
-      }
-      return { ...recovered, evidence };
-    }
-    if (recoveryCandidates.length === 1) {
-      // Return the only coherent current candidate so the caller can report a
-      // semantic intent diff, rather than a misleading path/hash failure.
-      return recoveryCandidates[0];
+  const manifestSha = await sha256File(manifestPath);
+  const evidence = emptyPlanEvidence();
+  const recorded = input.approval?.artifact_records?.manifest;
+  evidence.observations.push({
+    role: 'manifest',
+    status: !manifestSha
+      ? 'missing'
+      : !recorded
+        ? 'candidate'
+        : recorded.sha256 === manifestSha ? 'matched' : 'changed',
+    path: manifestPath,
+    ...(manifestSha ? { sha256: manifestSha } : {}),
+  });
+  if (!manifestSha) {
+    if (recorded) {
+      evidence.conflicts.push({
+        code: 'recorded_artifact_missing',
+        message: 'The approved composition manifest could not be found.',
+        paths: [manifestPath],
+      });
     }
     return {
-      applicable: true,
-      complete: false,
-      signature: '',
-      artifactPaths: input.approval.artifact_paths,
-      requirementIssues: [],
-      evidence: resolved.evidence,
-    };
-  }
-
-  const direct = (await Promise.all([
-    candidatePlanIdentity(localDir, manifestPath),
-    candidatePlanIdentity(parentDir, manifestPath),
-  ])).filter((value): value is VideoProductionPlanIdentityResult => !!value);
-  const completeDirect = direct.filter((value) => value.complete);
-  if (input.preferLocal) {
-    const local = completeDirect.find((value) => path.dirname(value.artifactPaths[0]) === localDir);
-    if (local) return local;
-  }
-  if (completeDirect.length === 1) return completeDirect[0];
-  if (completeDirect.length > 1) {
-    const signatures = new Set(completeDirect.map((value) => value.signature));
-    if (signatures.size === 1) return completeDirect[0];
-    const evidence = emptyPlanEvidence();
-    evidence.observations.push(...completeDirect.flatMap((value) => value.evidence.observations));
-    evidence.conflicts.push({
-      code: 'multiple_plan_bundles',
-      message: 'Multiple complete script/shotlist bundles disagree. Bind one coherent bundle before approval.',
-      paths: completeDirect.flatMap((value) => value.artifactPaths.slice(0, 2)),
-    });
-    return {
-      applicable: true,
+      applicable: false,
       complete: false,
       signature: '',
       artifactPaths: [],
       requirementIssues: [],
+      artifactIssues: [],
       evidence,
     };
   }
-
-  const discoveredDirs = await discoverPlanBundleDirectories(roots);
-  const discovered = (await Promise.all(discoveredDirs
-    .filter((directory) => directory !== localDir && directory !== parentDir)
-    .map((directory) => candidatePlanIdentity(directory, manifestPath))))
-    .filter((value): value is VideoProductionPlanIdentityResult => !!value?.complete);
-  if (discovered.length === 1) return discovered[0];
-  if (discovered.length > 1) {
-    const signatures = new Set(discovered.map((value) => value.signature));
-    if (signatures.size === 1) return discovered
-      .sort((a, b) => a.artifactPaths[0].localeCompare(b.artifactPaths[0]))[0];
-    const evidence = emptyPlanEvidence();
-    evidence.observations.push(...discovered.flatMap((value) => value.evidence.observations));
-    evidence.conflicts.push({
-      code: 'multiple_plan_bundles',
-      message: 'More than one complete plan bundle was found and their approved content differs.',
-      paths: discovered.flatMap((value) => value.artifactPaths.slice(0, 2)),
-    });
-    return {
-      applicable: true,
-      complete: false,
-      signature: '',
-      artifactPaths: [],
-      requirementIssues: [],
-      evidence,
-    };
-  }
-  const partial = direct[0];
-  return partial || {
-    applicable: false,
-    complete: false,
-    signature: '',
-    artifactPaths: [],
-    requirementIssues: [],
-    evidence: emptyPlanEvidence(),
-  };
+  return buildVideoProductionPlanIdentity(
+    { manifest: { path: manifestPath, sha256: manifestSha } },
+    evidence,
+  );
 }
 
 type ParentCompositionBindingCheck =
   | { ok: true; parentSignature: string }
   | { ok: false; errorCode: string; message: string };
+
+/** The one image of the whole video the preview stop leads with.
+ *
+ * Extracted because it used to live only in the full batch path, and the
+ * moment a production becomes ready is exactly the moment that path is not
+ * taken: with every segment captured, the batch's default scope (segments
+ * with no current frames) is empty, so it early-returns "nothing to check,
+ * open the preview review" — and composed no sheet. Measured 2026-08-09: the
+ * host never produced one, and the model hand-built its own contact sheet to
+ * have something to show. Both exits compose it now. */
+async function composeProductionContactSheet(
+  opts: VideoStudioToolOpts,
+  planPathAbs: string,
+  records: Array<{
+    fact: { segment_id: string };
+    mediaPath?: string;
+    statePath?: string;
+    compositionDir?: string;
+  }>,
+): Promise<string> {
+  const orderedFrames = await Promise.all(records.map(async (record) => {
+    if (record.mediaPath) {
+      return { segmentId: record.fact.segment_id, mediaPath: record.mediaPath };
+    }
+    if (!record.statePath || !record.compositionDir) return null;
+    const segmentState = await readVideoProductionState(record.statePath, record.compositionDir)
+      .catch(() => null);
+    const framePaths = segmentState?.preview?.frame_paths || [];
+    return framePaths.length ? { segmentId: record.fact.segment_id, framePaths } : null;
+  }));
+  const sheet = await writeProductionContactSheet({
+    outputDirAbs: path.join(path.dirname(planPathAbs), 'preview'),
+    segments: orderedFrames.filter((entry): entry is NonNullable<typeof entry> => !!entry),
+  }).catch(() => '');
+  if (sheet) await notifyWritten(opts, [sheet]);
+  return sheet;
+}
+
+/** Run one QA phase across an assembled production's segments in a single call.
+ *
+ * The per-composition ops are correct but the model issues six or eight of them
+ * at once, and each returns the whole durable state again. On 2026-08-05 that
+ * fan-out was 1084KB of 1.25MB returned — 87% — and drove six context
+ * compactions plus a convergence nudge inside one run. Batching does not save
+ * wall clock (the calls already go out in the same second); it saves the
+ * context that repeating one production's state N times consumes.
+ *
+ * Concurrency is preserved deliberately: running the phases serially would make
+ * something that currently finishes in one second take N times longer.
+ */
+async function runProductionSegmentQa(input: {
+  opts: VideoStudioToolOpts;
+  ctx: ToolContext;
+  planPathAbs: string;
+  phase: 'lint' | 'inspect' | 'snapshot';
+  requestedSegmentIds: string[];
+  roots: string[];
+  /** Verified user-authorized waiver codes to record on every segment this
+   * batch touches before running its phase. */
+  waiveQaFindings?: string[];
+  waiverQuote?: string;
+  /** Per-turn `<phase>::<segmentId>` -> last failed composition signature.
+   * Lets an unchanged retry be refused before it pays for a full pass. */
+  failedSignatures: Map<string, string>;
+}): Promise<Record<string, unknown>> {
+  const identity = await readVideoProductionPlanIdentity(input.planPathAbs);
+  const statePath = videoProductionControlStatePath({
+    userId: input.opts.userId,
+    ...(input.opts.projectId ? { projectId: input.opts.projectId } : {}),
+    planPath: input.planPathAbs,
+  });
+  const records = await videoProductionSegmentReviewRecords({
+    opts: input.opts,
+    planPathAbs: input.planPathAbs,
+    identity,
+    roots: input.roots,
+  });
+  const review = videoProductionReviewStatus({
+    identity,
+    facts: records.map((record) => record.fact),
+  });
+  // Editing a segment drops it back to uncaptured, so "has no current frames"
+  // already IS the set of work that remains. An explicit list overrides it for
+  // a targeted re-check.
+  const defaultScope = new Set(review.uncaptured_segment_ids);
+  const scope = input.requestedSegmentIds.length
+    ? input.requestedSegmentIds
+    : records.map((record) => record.fact.segment_id).filter((id) => defaultScope.has(id));
+  const byId = new Map(records.map((record) => [record.fact.segment_id, record]));
+  const runnable = scope.filter((id) => !!byId.get(id)?.compositionDir);
+  // A cut or generated clip has no HTML to lint, inspect, or snapshot — it is
+  // already the frames a review shows. Naming one is not an error and does not
+  // mean the segment is missing; saying "author it first" would send the model
+  // to re-produce work that is already done.
+  const mediaBackedIds = scope.filter((id) => !!byId.get(id)?.mediaPath);
+  const unknownIds = scope.filter((id) => {
+    const record = byId.get(id);
+    return !record?.compositionDir && !record?.mediaPath;
+  });
+
+  if (!runnable.length) {
+    // Naming the segments without naming WHERE they go sends the model
+    // hunting: on 2026-08-08 this exact message produced a guessed
+    // composition_dir, two filesystem searches, then hand-built directories
+    // and stub manifests — which the ownership gate then rejected, the same
+    // trap the incident before it hit. The host computes this path itself
+    // everywhere else; it is a convention the caller cannot infer and that
+    // appears in no skill. The derivation instruction rides with it, because
+    // the manifest is not the model's to write for a parent segment.
+    const planDirPosix = path.posix.dirname(input.planPathAbs.split(path.sep).join('/'));
+    const unbound = unknownIds.map((segmentId) => ({
+      segment_id: segmentId,
+      composition_dir: path.posix.join(planDirPosix, 'compositions', segmentId),
+    }));
+    const readySheet = input.phase === 'snapshot' && !unknownIds.length && !review.uncaptured_segment_ids.length
+      ? await composeProductionContactSheet(input.opts, input.planPathAbs, records)
+      : '';
+    return {
+      ok: unknownIds.length === 0,
+      op: 'production.segment_qa',
+      phase: input.phase,
+      nothing_to_check: unknownIds.length === 0,
+      ...(readySheet ? { production_contact_sheet: readySheet } : {}),
+      checked_segment_ids: [],
+      ...(unknownIds.length ? { unknown_segment_ids: unknownIds, unbound_segments: unbound } : {}),
+      ...(mediaBackedIds.length ? { media_backed_segment_ids: mediaBackedIds } : {}),
+      segments: [],
+      production_review: {
+        renderable: review.renderable,
+        uncaptured_segment_ids: review.uncaptured_segment_ids,
+      },
+      message: unknownIds.length
+        ? `No composition is bound to segment(s) ${unknownIds.join(', ')}. For each, call composition.approve_plan with `
+          + `plan_path=${path.posix.basename(planDirPosix)}/plan.json, its segment_id, and the composition_dir listed in `
+          + 'unbound_segments: that inherits the parent Gate B, creates the directory, and derives '
+          + 'composition-manifest.json from the signed parent. Do not create the directory or author the manifest by hand; '
+          + 'author only index.html afterwards.'
+        : mediaBackedIds.length
+          ? `Segment(s) ${mediaBackedIds.join(', ')} are produced media, not compositions: their file is the review evidence and needs no QA phase. Nothing else in scope needs re-checking.`
+          : 'Every segment is already approved for its current bytes; there is nothing to re-check. Take the production review to the user instead of re-running QA.',
+      next_action: unknownIds.length ? 'author_missing_segments' : 'open_production_preview_review',
+    };
+  }
+
+  // Bounded concurrency: snapshot drives a Chromium capture per segment, and
+  // eight at once is a memory risk on an ordinary laptop.
+  const limit = input.phase === 'snapshot' ? 3 : 6;
+  const results = new Map<string, Record<string, unknown>>();
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= runnable.length) return;
+      const segmentId = runnable[index];
+      const record = byId.get(segmentId)!;
+      const compositionDirAbs = record.compositionDir!;
+      try {
+        // The unchanged-probe guard the single-composition path has had all
+        // along (E_INSPECT_RETRY_NO_CHANGE / E_SNAPSHOT_RETRY_NO_CHANGE), now
+        // on the batched path too. The repeated-failure breaker judges AFTER
+        // execution — deliberately, so a repair-then-identical retry still
+        // counts — but that means an unchanged retry pays the full pass
+        // first. On 2026-08-07 three such rounds each ran QA over four
+        // segments before being refused. A segment whose bytes did not move
+        // cannot produce a different verdict, so it is skipped here and its
+        // siblings still run.
+        const signatureKey = `${input.phase}::${segmentId}`;
+        const currentSignature = (await videoProductionArtifacts(compositionDirAbs))
+          .composition_signature || '';
+        if (currentSignature && input.failedSignatures.get(signatureKey) === currentSignature) {
+          results.set(segmentId, {
+            result: {
+              ok: false,
+              op: `composition.${input.phase}`,
+              errorCode: input.phase === 'snapshot'
+                ? 'E_SNAPSHOT_RETRY_NO_CHANGE'
+                : input.phase === 'inspect'
+                  ? 'E_INSPECT_RETRY_NO_CHANGE'
+                  : 'E_LINT_RETRY_NO_CHANGE',
+              message: `${input.phase} already failed for this exact composition input signature. Repair this segment's canonical manifest or visual HTML before re-running the phase; an unchanged probe cannot return a different verdict.`,
+              same_input_retry_allowed: false,
+              blocking_error_count: 0,
+            } as unknown as Record<string, unknown>,
+          });
+          continue;
+        }
+        // Under `qa/`, which the composition signature excludes. At the top
+        // level it did not: every batched phase wrote its findings beside
+        // index.html, so running QA changed the very signature that decides
+        // whether the composition changed. That silently defeated the
+        // unchanged-probe guards and made each pass look like a new candidate.
+        const findingsAbsPath = path.join(
+          compositionDirAbs,
+          'qa',
+          `segment-qa-${input.phase}-findings.json`,
+        );
+        // A waiver is production-wide: the user skipped the check for their
+        // video, so every segment this batch touches records it.
+        const segmentState = input.waiveQaFindings?.length
+          ? await recordQaWaivers({
+            statePath: record.statePath!,
+            compositionDirAbs,
+            codes: input.waiveQaFindings,
+            quote: input.waiverQuote || '',
+            turnId: input.opts.turnId,
+          })
+          : await readVideoProductionState(record.statePath!, compositionDirAbs);
+        const segmentWaivers = (segmentState.qa_waivers || []).map((waiver) => waiver.code);
+        const common = {
+          compositionDirAbs,
+          findingsAbsPath,
+          // The snapshot phase captures frames and therefore needs somewhere to
+          // put them. This path never supplied one, so `snapshotComposition`
+          // returned E_OUTPUT_REQUIRED on its first line for every segment and
+          // the batched snapshot phase could not succeed at all. The model then
+          // did what the comment below already records it doing on 2026-08-07:
+          // gave up on the batch and re-ran every child through
+          // `composition.snapshot` by hand — which is exactly the fan-out
+          // batching exists to remove (87% of the bytes returned on 2026-08-05).
+          // Observed again in production on 2026-08-08, five segments, five
+          // failures, six manual snapshots. Same destination the single-
+          // composition path defaults to, inside signature-excluded `preview/`.
+          ...(input.phase === 'snapshot'
+            ? { snapshotAbsPath: path.join(compositionDirAbs, DEFAULT_SNAPSHOT_OUTPUT_RELATIVE_PATH) }
+            : {}),
+          // Lint and inspect run the shared preflight too, so the opening
+          // determination gates the cover family on every phase.
+          isDeliveredOpening: await compositionIsDeliveredOpening(segmentState),
+          ...(segmentWaivers.length ? { waivedQaFindings: segmentWaivers } : {}),
+          ...(input.ctx.signal ? { signal: input.ctx.signal } : {}),
+        };
+        const result = input.phase === 'lint'
+          ? await lintComposition(common)
+          : input.phase === 'inspect'
+            ? await inspectComposition(common)
+            : await snapshotComposition(common);
+        // A passing batched snapshot records its segment's preview entry, the
+        // same as the single-composition path. Without this the batch produced
+        // frames that no segment fact could see: `captured` stayed false,
+        // `uncaptured_segment_ids` never emptied, and the production could not
+        // reach its preview stop through the batched call the skill tells the
+        // model to prefer. On 2026-08-07 the model gave up on it after three
+        // rounds and re-ran every child through composition.snapshot by hand.
+        if (input.phase === 'snapshot' && result.ok === true && record.statePath && input.opts.turnId) {
+          await recordVideoStudioGate(
+            record.statePath,
+            'preview',
+            compositionDirAbs,
+            input.opts.turnId,
+            result as unknown as Record<string, unknown>,
+          ).catch(() => false);
+        }
+        if (currentSignature) {
+          if (result.ok === true) input.failedSignatures.delete(signatureKey);
+          else input.failedSignatures.set(signatureKey, currentSignature);
+        }
+        results.set(segmentId, { result: result as unknown as Record<string, unknown>, findingsAbsPath });
+      } catch (err) {
+        // One segment throwing is that segment's outcome, never the batch's:
+        // the same rule that keeps a failing segment from stopping the
+        // production keeps it from hiding its siblings' results.
+        results.set(segmentId, {
+          error: (err as Error).message || String(err),
+        });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, runnable.length) }, () => worker()));
+
+  const after = await videoProductionSegmentReviewRecords({
+    opts: input.opts,
+    planPathAbs: input.planPathAbs,
+    identity,
+    roots: input.roots,
+  });
+  const afterReview = videoProductionReviewStatus({
+    identity,
+    facts: after.map((record) => record.fact),
+  });
+  const afterById = new Map(after.map((record) => [record.fact.segment_id, record]));
+
+  const segments = runnable.map((segmentId) => {
+    const entry = results.get(segmentId) || {};
+    const fact = afterById.get(segmentId)?.fact;
+    if (entry.error) {
+      return {
+        segment_id: segmentId,
+        ok: false,
+        error_code: 'E_SEGMENT_QA_FAILED',
+        message: String(entry.error).slice(0, 500),
+      };
+    }
+    const result = (entry.result || {}) as Record<string, unknown>;
+    const ok = result.ok === true;
+    // `findings` arrives as a serialized JSON blob, not an array — the old
+    // Array.isArray test silently discarded it, so a segment failing three
+    // checks reported `error_count: 3` and exactly ONE message: the first
+    // issue's. The model repaired that one, re-ran the phase (~2 min across
+    // four segments), and met the second. Measured on the 2026-08-07 11:09
+    // run: three such rounds, ~8 minutes, to converge on a list the host had
+    // complete on the first call. Every blocking issue now travels with the
+    // failure, bounded and with its fix hint.
+    const parsedFindings = result.findings === undefined
+      ? undefined
+      : compactFindingsPayload(result.findings);
+    const findingsRecord = parsedFindings && typeof parsedFindings === 'object' && !Array.isArray(parsedFindings)
+      ? parsedFindings as Record<string, unknown>
+      : undefined;
+    // Compaction now carries an advisory tail as well, but this row is the
+    // segment's BLOCKER list — an advisory entry here would read as something
+    // that has to be fixed before the segment can proceed.
+    const findingsIssues = (Array.isArray(parsedFindings)
+      ? parsedFindings as Record<string, unknown>[]
+      : Array.isArray(findingsRecord?.issues)
+        ? findingsRecord.issues as Record<string, unknown>[]
+        : []).filter((issue) => issue.severity === 'error');
+    // The snapshot phase does not produce `findings` at all. Its blockers ride
+    // on `inspect_disposition` (already bounded to 12 by the QA layer), so
+    // reading only `findings` left every snapshot failure with a count and
+    // nothing else: the 2026-08-10 AUTO run got `error_count: 14` with zero
+    // issues, then spent a round of partial reads and a grep across five
+    // 35–55KB findings files to recover what this row was holding. lint and
+    // inspect keep using `findings`; whichever the phase wrote, the blockers
+    // travel with the failure.
+    const dispositionIssues = findingsIssues.length ? [] : (() => {
+      const disposition = result.inspect_disposition;
+      const issues = disposition && typeof disposition === 'object' && !Array.isArray(disposition)
+        ? (disposition as Record<string, unknown>).blocking_issues
+        : undefined;
+      return Array.isArray(issues) ? issues as Record<string, unknown>[] : [];
+    })();
+    const blockingIssues = findingsIssues.length ? findingsIssues : dispositionIssues;
+    const errorCount = Number(result.blocking_error_count ?? 0)
+      || Number(findingsRecord?.errorCount ?? 0)
+      || blockingIssues.length;
+    return {
+      segment_id: segmentId,
+      ok,
+      ...(result.errorCode ? { error_code: result.errorCode } : {}),
+      error_count: errorCount,
+      warning_count: Number(findingsRecord?.warningCount ?? 0),
+      ...(fact ? { visual_signature: fact.visual_signature, captured: fact.captured } : {}),
+      // Advertise the findings file only when the phase actually wrote one.
+      // Every writer stamps `findings_path` onto its own result as it writes,
+      // so this is the fact rather than the intent: reporting the intended
+      // path unconditionally is what sent the model to a nonexistent file
+      // twice on 2026-08-07.
+      ...(typeof result.findings_path === 'string' && result.findings_path
+        ? { findings_path: result.findings_path }
+        : {}),
+      // Repair material and the reviewable candidate ride only with a failure.
+      // A passing segment has nothing to repair, and repeating its state is
+      // what filled the context in the first place.
+      ...(ok ? {} : {
+        // An unchanged-probe refusal must say so on the segment itself; the
+        // model reads these rows, not the underlying phase result.
+        ...(result.same_input_retry_allowed === false ? { same_input_retry_allowed: false } : {}),
+        ...(blockingIssues.length ? { blocking_issues: blockingIssues } : {}),
+        // Count only the blockers that did not fit; `issues_omitted` also
+        // covers the advisory tail, which would overstate what is missing.
+        // `errorCount` is the segment's own blocker total whichever carrier
+        // supplied the list, so a truncated snapshot list says so too rather
+        // than reading as complete.
+        ...(Math.max(0, errorCount - blockingIssues.length) > 0
+          ? { blocking_issues_omitted: errorCount - blockingIssues.length }
+          : {}),
+        ...(result.current_candidate ? { current_candidate: result.current_candidate } : {}),
+        ...(result.message ? { message: result.message } : {}),
+      }),
+    };
+  });
+
+  const failed = segments.filter((segment) => !segment.ok).map((segment) => segment.segment_id);
+  // When the last segment is captured, the keyframe preview opens — and its
+  // artifact is ONE image of the whole video. Composing it is the host's job:
+  // only it holds every segment's frames and the order they play in. Without
+  // it the stop arrives as one contact sheet per child composition (four
+  // links for a five-segment video on 2026-08-07) with media segments missing
+  // entirely, which is not something a user can review as a video.
+  let productionContactSheet = '';
+  if (input.phase === 'snapshot' && !failed.length && afterReview.uncaptured_segment_ids.length === 0) {
+    productionContactSheet = await composeProductionContactSheet(input.opts, input.planPathAbs, after);
+  }
+  return {
+    ok: failed.length === 0,
+    op: 'production.segment_qa',
+    phase: input.phase,
+    checked_segment_ids: runnable,
+    ...(productionContactSheet ? { production_contact_sheet: productionContactSheet } : {}),
+    ...(unknownIds.length ? { unknown_segment_ids: unknownIds } : {}),
+    ...(mediaBackedIds.length ? { media_backed_segment_ids: mediaBackedIds } : {}),
+    failed_segment_ids: failed,
+    segments,
+    production_review: {
+      renderable: afterReview.renderable,
+      uncaptured_segment_ids: afterReview.uncaptured_segment_ids,
+    },
+    ...productionSegmentQaOutcome({
+      phase: input.phase,
+      failed,
+      checkedCount: runnable.length,
+      uncaptured: afterReview.uncaptured_segment_ids,
+    }),
+  };
+}
+
+/** What a finished QA batch tells the model to do next, and why.
+ *
+ * Pure, because it is the one place a passing phase can contradict the
+ * production's own readiness. A snapshot batch that passes while a segment
+ * is still unproduced used to answer "snapshot passed" +
+ * `open_production_preview_review`, while the whole-video contact sheet was
+ * withheld — correctly, since it cannot be composed until every segment has
+ * frames. The model opened the stop as instructed and the user got "The
+ * visual preview is ready" with nothing to look at (2026-08-08: five
+ * compositions captured, one edit segment with no produced file). The next
+ * action follows readiness now, and names what is missing. */
+export function productionSegmentQaOutcome(input: {
+  phase: 'lint' | 'inspect' | 'snapshot';
+  failed: string[];
+  checkedCount: number;
+  uncaptured: string[];
+}): { message: string; next_action: string } {
+  if (input.failed.length) {
+    return {
+      message: `${input.phase} failed for ${input.failed.join(', ')}. Repair those segments only; the passing segments keep their results and must not be re-run.`,
+      next_action: 'repair_failed_segments_then_recheck',
+    };
+  }
+  if (input.phase === 'snapshot' && input.uncaptured.length) {
+    return {
+      message: `snapshot passed for all ${input.checkedCount} checked segment(s), but the production is not ready `
+        + `to review: ${input.uncaptured.join(', ')} has no current frames. `
+        + 'Produce it first — a media segment needs its produced_path file, a composition needs this QA '
+        + 'phase — then run this phase again. The whole-video contact sheet the preview stop leads with '
+        + 'is only composed once every segment is captured.',
+      next_action: 'produce_uncaptured_segments_then_recheck',
+    };
+  }
+  return {
+    message: `${input.phase} passed for all ${input.checkedCount} checked segment(s).`,
+    next_action: input.phase === 'snapshot'
+      ? 'open_production_preview_review'
+      // Phrases, never operation-shaped strings: these are next_action hints,
+      // and a `namespace.verb` hint is indistinguishable from a real op — a
+      // caller that takes it literally calls something that does not exist.
+      // The phase is an argument of production.segment_qa, not an op of its own.
+      : input.phase === 'lint' ? 'run_segment_qa_inspect_phase' : 'run_segment_qa_snapshot_phase',
+  };
+}
+
+/** Whether this composition's frame 0 is the delivered video's first frame.
+ *
+ * A standalone COMPOSE always is. An assembled child only is when it leads its
+ * parent EDL: a middle segment's frame 0 plays somewhere inside the finished
+ * video, so the opening-promise rule would be applying whole-video cover
+ * semantics to the middle of a film. Unreadable parent plan means yes, so an
+ * unknown stays on the stricter side. */
+/** Error results the model must repair from, whose full payloads run to
+ * ~100KB (per-frame visible_elements, whole preflight reports). Inlining
+ * that spills the tool result to disk, and the model then burns two extra
+ * round trips (tool_result_search + read_chunk) before it can start the
+ * repair — 2026-08-06: ~5 minutes per QA block on a run the user was
+ * waiting on. The returned payload keeps the actionable repair focus; the
+ * complete evidence is already persisted via findings/report files. */
+const QA_BLOCKED_COMPACT_CODES = new Set([
+  'E_PREFLIGHT_BLOCKED',
+  'E_PREVIEW_QA_BLOCKED',
+  'E_PREVIEW_DESIGN_QA_BLOCKED',
+  'E_VIDEO_QA_BLOCKED',
+  'E_MEDIA_QA_BLOCKED',
+]);
+
+const QA_COMPACT_MAX_ISSUES = 12;
+/** Advisory findings are repair material, not noise. Compaction used to keep
+ *  only `severity:'error'`, so a passing inspect reported `issueCount: 13,
+ *  issues: []` — a count and nothing else. On 2026-08-07 the model then
+ *  rediscovered those layout defects by eye, one frame-review cycle at a
+ *  time. Warnings ride along behind the errors and stay bounded so the result
+ *  still fits inline; the count of what was dropped is still reported. */
+const QA_COMPACT_MAX_ADVISORY = 8;
+
+function compactQaIssueEntries(issues: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(issues)) return [];
+  const entries = issues.filter((issue): issue is Record<string, unknown> => (
+    !!issue && typeof issue === 'object' && !Array.isArray(issue)
+  ));
+  // Errors first: they are what blocks, and a truncated tail must never cost
+  // the model a blocker in exchange for an advisory note.
+  const kept = [
+    ...entries.filter((issue) => issue.severity === 'error').slice(0, QA_COMPACT_MAX_ISSUES),
+    ...entries.filter((issue) => issue.severity === 'warning').slice(0, QA_COMPACT_MAX_ADVISORY),
+  ];
+  return kept.map((issue) => ({
+    code: issue.code,
+    severity: issue.severity,
+    ...(issue.sceneId ? { sceneId: issue.sceneId } : {}),
+    ...(typeof issue.sampleTimeSec === 'number' ? { sampleTimeSec: issue.sampleTimeSec } : {}),
+    ...(issue.selector ? { selector: issue.selector } : {}),
+    message: issue.message,
+    ...(issue.fixHint ? { fixHint: issue.fixHint } : {}),
+  }));
+}
+
+function compactQaSection(section: unknown): Record<string, unknown> | undefined {
+  if (!section || typeof section !== 'object' || Array.isArray(section)) return undefined;
+  const record = section as Record<string, unknown>;
+  const issues = Array.isArray(record.issues) ? record.issues : [];
+  const errors = compactQaIssueEntries(issues);
+  return {
+    ...(record.ok !== undefined ? { ok: record.ok } : {}),
+    ...(record.status !== undefined ? { status: record.status } : {}),
+    ...(record.error_count !== undefined ? { error_count: record.error_count } : {}),
+    ...(record.warning_count !== undefined ? { warning_count: record.warning_count } : {}),
+    ...(record.issue_count !== undefined ? { issue_count: record.issue_count } : {}),
+    issues: errors,
+    ...(issues.length > errors.length ? { issues_omitted: issues.length - errors.length } : {}),
+  };
+}
+
+/** Deep-collect error-severity issue entries from an arbitrary report shape
+ * (preflight reports nest per-section issue arrays). Bounded. */
+/** Walks a preflight payload for blocking findings.
+ *
+ * Deduplicated, because a preflight carries its findings in more than one
+ * place — the result's own `issues` and the same array again under `report`
+ * — and a blind walk emitted every finding twice: a 2026-08-09 run was told
+ * it had six problems when it had three, each repair line printed twice. The
+ * key is what identifies a finding to a reader, not object identity, since
+ * the copies may be structurally equal without being the same object. */
+function collectErrorIssues(
+  value: unknown,
+  out: Record<string, unknown>[],
+  depth = 0,
+  seen: Set<string> = new Set(),
+): void {
+  if (out.length >= QA_COMPACT_MAX_ISSUES || depth > 6) return;
+  if (Array.isArray(value)) {
+    for (const entry of value) collectErrorIssues(entry, out, depth + 1, seen);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const record = value as Record<string, unknown>;
+  if (record.severity === 'error' && typeof record.message === 'string' && record.code) {
+    const key = [record.code, record.selector ?? '', record.sceneId ?? '', record.message].join('\u0000');
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(...compactQaIssueEntries([record]));
+    return;
+  }
+  for (const key of Object.keys(record)) collectErrorIssues(record[key], out, depth + 1, seen);
+}
+
+/** Payload size past which a findings-carrying result is compacted even
+ * without a blocker: anything near the inline cap spills to disk and costs
+ * the model a search round trip to read its own result. */
+const QA_COMPACT_SIZE_THRESHOLD = 24_000;
+
+const QA_SECTION_KEYS = ['findings', 'preview_qa', 'video_qa', 'media_qa', 'inspect_disposition'] as const;
+
+function needsQaCompaction(result: VideoStudioResult): boolean {
+  const record = result as unknown as Record<string, unknown>;
+  if (result.ok === false && QA_BLOCKED_COMPACT_CODES.has(String(result.errorCode))) return true;
+  // A SUCCESS result can carry blockers: composition.inspect returns
+  // ok:true / status:"review_required" with blocking_error_count > 0 and a
+  // ~68KB serialized findings blob. 2026-08-06: the model spent 8 minutes
+  // on six searches and a chunk read hunting the single error inside it.
+  if (Number(record.blocking_error_count || 0) > 0) return true;
+  if (!QA_SECTION_KEYS.some((key) => record[key] !== undefined)) return false;
+  return JSON.stringify(record).length > QA_COMPACT_SIZE_THRESHOLD;
+}
+
+/** The actionable core of a serialized findings blob. `findings` is a
+ * pretty-printed JSON STRING holding every issue plus samples, sample plans
+ * and the preflight report; only its counts and error entries are repair
+ * material. Unparseable input degrades to a length note, never a throw. */
+function compactFindingsPayload(value: unknown): unknown {
+  if (typeof value !== 'string') {
+    if (Array.isArray(value)) return compactQaIssueEntries(value);
+    return value;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return { omitted_chars: value.length, note: 'findings payload was not parseable JSON and was omitted for size.' };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return parsed;
+  const record = parsed as Record<string, unknown>;
+  const issues = Array.isArray(record.issues) ? record.issues : [];
+  const errors = compactQaIssueEntries(issues);
+  return {
+    ...(record.ok !== undefined ? { ok: record.ok } : {}),
+    ...(record.errorCount !== undefined ? { errorCount: record.errorCount } : {}),
+    ...(record.warningCount !== undefined ? { warningCount: record.warningCount } : {}),
+    ...(record.issueCount !== undefined ? { issueCount: record.issueCount } : {}),
+    issues: errors,
+    ...(issues.length > errors.length ? { issues_omitted: issues.length - errors.length } : {}),
+  };
+}
+
+/** Bounded projection of the durable-state sections a result carries.
+ *
+ * These are recoverable on demand — composition.status returns the complete
+ * picture — so a result that has to spill to disk to carry them costs the
+ * model a search round trip for evidence it did not need. The 2026-08-07
+ * QA-blocked draft was 71KB: 36KB production_state (11KB superseded candidate
+ * history, a 10KB duplicate of the candidate already at top level, a 6KB
+ * approved-intent snapshot), 10KB current_candidate (6KB of private
+ * content-store metadata), 11KB review package (8.7KB artifact inventory) —
+ * against 257 bytes of actual QA findings. Measured again on 2026-08-07 over
+ * the case's ordinary ok:true results: lint/status/reconcile each ~43KB with
+ * production_state at 32KB — the same echo on every call, all session long.
+ *
+ * What remains here is the size decision alone. Whether a field is usable at
+ * all belongs to `summarizeVideoProductionState`, which is why the frozen-store
+ * locators and the approved-intent snapshot left from there rather than from
+ * here — status was exempt from this projection by design, so anything applied
+ * only here never reached the largest result of the run.
+ */
+function compactProductionStateSection(
+  value: unknown,
+  opts: { topLevelCandidatePresent: boolean },
+): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = { ...(value as Record<string, unknown>) };
+  // The duplicate of the candidate the result already carries at top level.
+  // Some early-return paths carry the candidate only here — keep it then.
+  if (opts.topLevelCandidatePresent) delete record.current_candidate;
+  if (Array.isArray(record.operation_journal)) {
+    record.operation_journal = record.operation_journal.slice(-6);
+  }
+  if (Array.isArray(record.narration_transaction_history)) {
+    record.narration_transaction_history = record.narration_transaction_history.slice(-3);
+  }
+  if (Array.isArray(record.history)) record.history = record.history.slice(-6);
+  return record;
+}
+
+function compactCandidateSection(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = { ...projectCandidateRevisionForModel(value as Record<string, unknown>) };
+  delete record.artifacts;
+  return record;
+}
+
+function compactReviewPackageSection(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const record = { ...(value as Record<string, unknown>) };
+  const artifacts = record.artifacts;
+  if (Array.isArray(artifacts)) {
+    record.artifacts = artifacts.slice(0, 8);
+    if (artifacts.length > 8) record.artifacts_omitted = artifacts.length - 8;
+  }
+  const visible = record.visible_artifact_paths;
+  if (Array.isArray(visible) && visible.length > 12) {
+    record.visible_artifact_paths = visible.slice(0, 12);
+    record.visible_artifact_paths_omitted = visible.length - 12;
+  }
+  return record;
+}
+
+/** The one model-facing result projection, applied where results serialize.
+ *
+ * Only `composition.status`/`production.status` return the complete durable
+ * state — that is what the operation is FOR. Every other operation answers
+ * "what did this call do", so the durable-state sections it carries travel as
+ * the bounded projection: full echo on every working call was the single
+ * largest token cost in the 2026-08-06 case run (29 native calls, ~43KB each,
+ * >60% repeated state; 14 of 96 tool calls existed only to search spilled
+ * copies of results the model had already been handed). QA-blocked or
+ * findings-heavy results additionally compact their QA payload down to the
+ * error entries that are actual repair material.
+ */
+/** A passing report, projected to what a passing result is FOR: which steps
+ * ran, the QA verdict with any surviving issues, and a pointer at the disk
+ * copy for everything else. Issues are kept verbatim — on a passing report
+ * they are the advisory tail (hundreds of bytes), and they are exactly the
+ * part the model may still act on. */
+function summarizePassingDiskBackedReport(report: Record<string, unknown>): Record<string, unknown> {
+  const steps = report.steps && typeof report.steps === 'object' && !Array.isArray(report.steps)
+    ? report.steps as Record<string, unknown>
+    : {};
+  const stepStatus: Record<string, string> = {};
+  for (const [name, value] of Object.entries(steps)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const step = value as Record<string, unknown>;
+    // Data blocks stored beside steps (design_review_inputs) have no verdict
+    // and are not steps; the top-level result carries them once already.
+    if (step.ok === undefined && step.status === undefined) continue;
+    stepStatus[name] = step.ok === true ? 'ok' : step.ok === false ? 'failed' : String(step.status);
+  }
+  const videoQa = report.video_qa && typeof report.video_qa === 'object' && !Array.isArray(report.video_qa)
+    ? report.video_qa as Record<string, unknown>
+    : undefined;
+  return {
+    ...(Object.keys(stepStatus).length ? { steps: stepStatus } : {}),
+    ...(videoQa ? {
+      video_qa: {
+        ...(videoQa.ok !== undefined ? { ok: videoQa.ok } : {}),
+        ...(videoQa.issue_count !== undefined ? { issue_count: videoQa.issue_count } : {}),
+        ...(videoQa.error_count !== undefined ? { error_count: videoQa.error_count } : {}),
+        ...(videoQa.warning_count !== undefined ? { warning_count: videoQa.warning_count } : {}),
+        sample_count: Array.isArray(videoQa.samples) ? videoQa.samples.length : 0,
+        ...(Array.isArray(videoQa.issues) && videoQa.issues.length ? { issues: videoQa.issues } : {}),
+      },
+    } : {}),
+    // A bare "the rest is at report_path" is an invitation to read the whole
+    // thing. On 2026-08-09 the model did exactly that: 311,495 characters of
+    // draft report pulled back in one read_file, ~78k tokens, spilled again on
+    // the way in — larger than the inline report this projection removed. Say
+    // what the file is for and that a passing draft does not need it.
+    note: 'Every step above passed. The full render/QA detail (per-frame samples, frame evidence, passing findings, preflight)'
+      + ' is on disk at report_path for a later failure to be traced against — reading it whole costs more context than it'
+      + ' carries. Open it only for a specific question, and search or seek to that part rather than loading the file.',
+  };
+}
+
+export function compactQaBlockedVideoStudioResult(result: VideoStudioResult): VideoStudioResult {
+  const record = { ...(result as unknown as Record<string, unknown>) };
+  const op = String(record.op || '');
+  if (op === 'composition.status' || op === 'production.status') return result;
+  const qaCompaction = needsQaCompaction(result);
+  const carriesStateEcho = record.production_state !== undefined
+    || record.current_candidate !== undefined
+    || record.review_package !== undefined
+    || record.evidence !== undefined;
+  // A passing render whose detail is already on disk is projectable on its own
+  // merits. Gating that on a state echo made it accidental: it ran only
+  // because draft/export happen to carry production_state as well.
+  const carriesDiskBackedDetail = result.ok === true
+    && typeof record.report_path === 'string' && !!record.report_path
+    && (record.report !== undefined || record.design_review_inputs !== undefined);
+  if (!qaCompaction && !carriesStateEcho && !carriesDiskBackedDetail) return result;
+  if (record.production_state !== undefined) {
+    record.production_state = compactProductionStateSection(record.production_state, {
+      topLevelCandidatePresent: record.current_candidate !== undefined,
+    });
+  }
+  const evidence = record.evidence;
+  if (evidence && typeof evidence === 'object' && !Array.isArray(evidence)) {
+    const observations = (evidence as Record<string, unknown>).observations;
+    if (Array.isArray(observations) && observations.length > 24) {
+      record.evidence = {
+        ...(evidence as Record<string, unknown>),
+        observations: observations.slice(0, 24),
+        observations_omitted: observations.length - 24,
+      };
+    }
+  }
+  if (record.current_candidate !== undefined) {
+    record.current_candidate = compactCandidateSection(record.current_candidate);
+  }
+  if (record.review_package !== undefined) {
+    record.review_package = compactReviewPackageSection(record.review_package);
+  }
+  // A PASSING draft/export inlined its whole report even though the same
+  // bytes were just written to report_path — per-frame samples, render frame
+  // evidence, passing inspect findings, and video_qa/design_review_inputs a
+  // second time each under steps: ~61K of the ~100K result. Five segments per
+  // batch put every one of those PASSING results over the tool-result cap, so
+  // the model received five search refs where five verdicts should have been,
+  // and the turn compacted three times (2026-08-08 run). The failing paths
+  // were already projected (delete record.report below); the passing path is
+  // now projected too. Guarded on report_path: with no disk copy verified,
+  // the inline report is the only copy and must survive.
+  if (carriesDiskBackedDetail) {
+    if (record.report && typeof record.report === 'object' && !Array.isArray(record.report)) {
+      record.report = summarizePassingDiskBackedReport(record.report as Record<string, unknown>);
+    }
+    // The projection above left the largest block of that same detail inline:
+    // `design_review_inputs` on a passing draft measured 3.9–5.8KB while the
+    // result beside it said `design_review_required: false`, and the disk copy
+    // was already written by the same call. Six segments in one round on
+    // 2026-08-10 came to ~4,095 tokens each against a 7,027 round budget, so
+    // three of the six verdicts reached the model as refs. The deletion below
+    // never ran for them — it sits after the `qaCompaction` return, and a
+    // passing result is not QA-blocked. A review that IS required keeps its
+    // inputs: that is the one caller who has to act on them.
+    if (record.design_review_required !== true && record.design_review_inputs !== undefined) {
+      delete record.design_review_inputs;
+      record.design_review_inputs_note = 'No design review is open, so its inputs were omitted; they are in the report at report_path.';
+    }
+  }
+  if (!qaCompaction) return record as unknown as VideoStudioResult;
+  for (const key of ['preview_qa', 'video_qa', 'media_qa'] as const) {
+    const compact = compactQaSection(record[key]);
+    if (compact) record[key] = compact;
+  }
+  const frameEvidence = record.frame_evidence as Record<string, unknown> | undefined;
+  if (frameEvidence && typeof frameEvidence === 'object') {
+    record.frame_evidence = {
+      ...(frameEvidence.evidence_dir ? { evidence_dir: frameEvidence.evidence_dir } : {}),
+      ...(frameEvidence.contact_sheet ? { contact_sheet: frameEvidence.contact_sheet } : {}),
+      sample_count: Array.isArray(frameEvidence.samples) ? frameEvidence.samples.length : 0,
+    };
+  }
+  if (record.preflight && typeof record.preflight === 'object') {
+    const preflight = record.preflight as Record<string, unknown>;
+    const errorIssues: Record<string, unknown>[] = [];
+    collectErrorIssues(preflight, errorIssues);
+    record.preflight = {
+      ...(preflight.status !== undefined ? { status: preflight.status } : {}),
+      ...(preflight.blocking_error_count !== undefined
+        ? { blocking_error_count: preflight.blocking_error_count }
+        : {}),
+      ...(preflight.fatal_error_count !== undefined
+        ? { fatal_error_count: preflight.fatal_error_count }
+        : {}),
+      error_issues: errorIssues,
+    };
+  }
+  if (record.findings !== undefined) {
+    record.findings = compactFindingsPayload(record.findings);
+  }
+  // inspect already summarizes its own verdict into bounded blocking/advisory
+  // lists — exactly the repair material — so it is kept as-is.
+  delete record.design_review_inputs;
+  delete record.visual_regression;
+  delete record.report;
+  delete record.steps;
+  delete record.samples;
+  delete record.sample_plan;
+  record.evidence_note = 'Repair from the error issues above. Bulk evidence (per-frame elements, sample plans, the full preflight report) was omitted for size; re-run this operation with findings_path to write the complete report to disk.';
+  return record as unknown as VideoStudioResult;
+}
+
+function normalizedQaWaiverCodes(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value.map((code) => String(code || '').trim()).filter(Boolean))]
+    : [];
+}
+
+function qaWaiverQuoteOf(evidence: unknown): string {
+  let record = evidence;
+  if (typeof record === 'string') {
+    try { record = JSON.parse(record); } catch { return ''; }
+  }
+  return record && typeof record === 'object' && !Array.isArray(record)
+    ? String((record as Record<string, unknown>).quote || '').trim()
+    : '';
+}
+
+/** Validate a user-authorized QA waiver request. Returns an error payload to
+ * return as-is, or the verified verbatim quote to record. Waiving a finding
+ * is a user decision: the quote must come from the current real user turn,
+ * and evidence-integrity findings are never waivable. */
+function verifyQaWaiverRequest(
+  op: string,
+  userMessage: string | undefined,
+  codes: string[],
+  evidence: unknown,
+): { error?: Record<string, unknown>; quote?: string } {
+  const nonWaivable = codes.filter((code) => !qaFindingIsWaivable(code));
+  if (nonWaivable.length) {
+    return {
+      error: {
+        ok: false,
+        op,
+        errorCode: 'E_QA_WAIVER_NOT_ALLOWED',
+        message: `These findings mark missing or corrupt QA evidence and cannot be waived: ${nonWaivable.join(', ')}. Repair the evidence path instead; the user may waive judgment findings only.`,
+        non_waivable_findings: nonWaivable,
+      },
+    };
+  }
+  const decision = resolveVideoStudioCurrentTurnDecision(userMessage, 'qa_waiver', evidence);
+  const invalid = decisionEvidenceCorrectionResult(op as VideoStudioOp, 'qa_waiver', decision);
+  if (invalid) return { error: invalid };
+  if (decision.decision !== 'approve' || decision.source !== 'model_interpreted_user_message') {
+    return {
+      error: {
+        ok: false,
+        op,
+        errorCode: 'E_QA_WAIVER_EVIDENCE_REQUIRED',
+        message: 'Waiving a QA finding is a user decision: pass decision_evidence with source user_message, gate "qa_waiver", decision "approve", and the user\'s verbatim words from the current turn.',
+      },
+    };
+  }
+  return { quote: qaWaiverQuoteOf(evidence) };
+}
+
+/** Append accepted waivers to the production state (deduplicated by code)
+ * and return the updated state. Bounded like other audit lists. */
+async function recordQaWaivers(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  codes: string[];
+  quote: string;
+  turnId?: string;
+}): Promise<VideoProductionStateV1> {
+  return updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+    const waivers = next.qa_waivers || [];
+    const known = new Set(waivers.map((waiver) => waiver.code));
+    for (const code of input.codes) {
+      if (known.has(code)) continue;
+      known.add(code);
+      waivers.push({
+        code,
+        quote: input.quote,
+        turn_id: input.turnId || '',
+        created_at: new Date().toISOString(),
+      });
+    }
+    next.qa_waivers = waivers.slice(-40);
+  });
+}
+
+async function compositionIsDeliveredOpening(state: VideoProductionStateV1): Promise<boolean> {
+  // Structural parent linkage, with history fallback: an approval re-signed
+  // without resolving the parent must not turn a mid-film segment back into
+  // "the delivered opening" — that is what held the 2026-08-06 run's middle
+  // segments to poster-frame cover standards.
+  const link = parentEdlLinkOf(state);
+  if (!link.planPath || !link.segmentId) return true;
+  try {
+    const plan = JSON.parse(await fs.readFile(link.planPath, 'utf8')) as { segments?: unknown };
+    const segments = Array.isArray(plan.segments) ? plan.segments : [];
+    // Layer order decides what the viewer sees first: an overlay riding on the
+    // opening primary segment is not itself the delivered opening.
+    const primary = segments.filter((segment): segment is Record<string, unknown> => !!segment
+      && typeof segment === 'object'
+      && !Array.isArray(segment)
+      && (segment as Record<string, unknown>).layer === 'primary');
+    const first = (primary[0] || {}) as Record<string, unknown>;
+    return typeof first.id === 'string' ? first.id === link.segmentId : true;
+  } catch {
+    return true;
+  }
+}
+
+/** Current per-segment review facts for one assembled production.
+ *
+ * A compose segment is authored as its own composition with its own state, and
+ * the link back is the parent reference recorded on its inherited plan
+ * approval — the same one the review panel groups by. Signatures are read from
+ * the composition as it is NOW, so a segment edited after its confirmation
+ * reports a different value and shows up as stale rather than silently
+ * renderable.
+ *
+ * An edit/generate/provided segment has no composition at all: its artifact is
+ * the produced media file, and the panel plays exactly that file. Deriving
+ * every segment from composition state made those segments permanently
+ * uncaptured, which on 2026-08-05 left a nine-segment production — eight
+ * compositions and one cut — unable to reach `renderable` at all. They are
+ * therefore captured by their own bytes rather than by snapshot evidence: HTML
+ * needs rendering before there is anything to look at, a cut is already
+ * pixels. */
+type SegmentReviewRecord = {
+  fact: VideoProductionSegmentReviewFact;
+  /** The gate state file the fact was read from, so the aggregate approval can
+   *  stamp this segment's own preview entry. Absent for a segment with no gate
+   *  ledger yet, and for a media-backed segment, which has none. */
+  statePath?: string;
+  compositionDir?: string;
+  /** The produced media file this segment's fact was read from. Present only
+   *  for a media-backed segment; it is what the review shows. */
+  mediaPath?: string;
+};
+
+/** A composition-manifest read failure, said in the caller's terms.
+ *
+ * Four sites passed the raw fs error straight through as the message, so a
+ * manifest that simply did not exist yet answered as "invalid" with a full
+ * local absolute path inside (`ENOENT ... open '/Users/...'`) — the same
+ * misclassification family as "no audio track is not a failed extraction",
+ * plus a path-hygiene violation. Missing and invalid are different answers:
+ * missing points at the step that creates the file, invalid carries the
+ * parse detail (path-redacted; zod details are field paths and were already
+ * safe). Observed live on 2026-08-09 before the media-segment routing fix
+ * intercepted that run's instance one step earlier. */
+function compositionManifestFailure(err: unknown): { missing: boolean; detail: string } {
+  if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+    return { missing: true, detail: 'composition-manifest.json does not exist here yet' };
+  }
+  return { missing: false, detail: redactPaths(String((err as Error)?.message ?? err)) };
+}
+
+/** Sources whose artifact is produced media rather than an authored composition. */
+const MEDIA_BACKED_SEGMENT_SOURCES = new Set(['edit', 'generate', 'provided']);
+
+/** The reviewable media file of a non-compose segment, or '' when it has none.
+ *
+ * Fail-closed at every step: an unknown source, a missing `produced_path`, a
+ * path outside the agent's scope, an extension or size the panel cannot serve,
+ * and an empty file all yield '' — the segment stays uncaptured, which is the
+ * same answer as before this branch existed. `resolveLocalMediaPath` is the
+ * same resolver `chat-media://local/` serves through, so "captured" means
+ * exactly "the panel can display these bytes". */
+function mediaBackedSegmentPath(input: {
+  segment: Record<string, unknown>;
+  planPathAbs: string;
+  roots: string[];
+}): string {
+  const source = typeof input.segment.source === 'string' ? input.segment.source : '';
+  if (!MEDIA_BACKED_SEGMENT_SOURCES.has(source)) return '';
+  const producedPath = typeof input.segment.produced_path === 'string'
+    ? input.segment.produced_path.trim()
+    : '';
+  if (!producedPath) return '';
+  // The plan lives at `<video>/project/plan.json` and its own paths read
+  // `project/cuts/<id>.mp4`, so a relative produced path is relative to the
+  // video directory, not to the plan's own folder.
+  const abs = path.isAbsolute(producedPath)
+    ? path.resolve(producedPath)
+    : path.resolve(path.dirname(path.dirname(input.planPathAbs)), producedPath);
+  if (!isPathAllowed(abs, input.roots)) return '';
+  const resolved = resolveLocalMediaPath(abs);
+  return resolved.ok ? resolved.absPath : '';
+}
+
+async function videoProductionSegmentReviewRecords(input: {
+  opts: VideoStudioToolOpts;
+  planPathAbs: string;
+  identity: VideoProductionPlanIdentity;
+  roots: string[];
+}): Promise<SegmentReviewRecord[]> {
+  const segmentIds = videoProductionSegmentIds(input.identity);
+  const planSegments = new Map<string, Record<string, unknown>>();
+  for (const segment of Array.isArray(input.identity.plan.segments)
+    ? input.identity.plan.segments
+    : []) {
+    if (!segment || typeof segment !== 'object' || Array.isArray(segment)) continue;
+    const record = segment as Record<string, unknown>;
+    if (typeof record.id === 'string' && record.id) planSegments.set(record.id, record);
+  }
+  const gatesDir = path.join(userLocalRoot(input.opts.userId), 'video_studio', 'gates');
+  const entries = await fs.readdir(gatesDir, { withFileTypes: true }).catch(() => []);
+  const wanted = new Set(segmentIds);
+  const bySegment = new Map<string, {
+    compositionDir: string;
+    statePath: string;
+    state: VideoProductionStateV1;
+    updatedAtMs: number;
+  }>();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const filePath = path.join(gatesDir, entry.name);
+    let state: VideoProductionStateV1;
+    try {
+      state = JSON.parse(await fs.readFile(filePath, 'utf8')) as VideoProductionStateV1;
+    } catch {
+      continue;
+    }
+    const approval = state?.plan_approval;
+    if (!approval
+      || approval.inheritance_reason !== 'parent_edl_segment'
+      || typeof approval.parent_plan_path !== 'string'
+      || path.resolve(approval.parent_plan_path) !== path.resolve(input.planPathAbs)) continue;
+    const segmentId = typeof approval.parent_segment_id === 'string' ? approval.parent_segment_id : '';
+    const compositionDir = typeof state.composition_dir === 'string' ? state.composition_dir : '';
+    if (!segmentId || !wanted.has(segmentId) || !compositionDir) continue;
+    // The same segment can have more than one historical ledger (a resumed task
+    // rekeys them). The freshest record names the composition in use.
+    const updatedAtMs = (await fs.stat(filePath).catch(() => null))?.mtimeMs || 0;
+    const existing = bySegment.get(segmentId);
+    if (!existing || updatedAtMs > existing.updatedAtMs) {
+      bySegment.set(segmentId, { compositionDir, statePath: filePath, state, updatedAtMs });
+    }
+  }
+  return Promise.all(segmentIds.map(async (segmentId) => {
+    const found = bySegment.get(segmentId);
+    if (found) {
+      const visualSignature = await videoStudioVisualCompositionSignature(found.compositionDir)
+        .catch(() => '');
+      // Captured means the user can be shown frames of exactly these bytes: a
+      // snapshot preview entry exists and its visual identity still matches the
+      // files. An authored-but-never-snapshotted segment, or one edited after
+      // its snapshot, has nothing reviewable and must not count.
+      const captured = !!visualSignature
+        && found.state.preview?.visual_signature === visualSignature;
+      return {
+        fact: { segment_id: segmentId, visual_signature: visualSignature, captured },
+        statePath: found.statePath,
+        compositionDir: found.compositionDir,
+      };
+    }
+    // No composition. A media-backed segment is captured by its own bytes; a
+    // compose segment that has not been authored yet is not, and neither is a
+    // compose segment whose plan happens to carry a produced_path — its HTML
+    // still has to be snapshotted before there is anything to review.
+    const planSegment = planSegments.get(segmentId);
+    const mediaPath = planSegment
+      ? mediaBackedSegmentPath({
+        segment: planSegment,
+        planPathAbs: input.planPathAbs,
+        roots: input.roots,
+      })
+      : '';
+    if (!mediaPath) {
+      return { fact: { segment_id: segmentId, visual_signature: '', captured: false } };
+    }
+    const { sha256, sizeBytes } = await sha256FileStream(mediaPath)
+      .catch(() => ({ sha256: '', sizeBytes: 0 }));
+    // The file's own bytes are the signature, so a re-trim to the same path
+    // reports a different value and the segment goes stale exactly like an
+    // edited composition does.
+    if (!sha256 || sizeBytes === 0) {
+      return { fact: { segment_id: segmentId, visual_signature: '', captured: false } };
+    }
+    return {
+      fact: { segment_id: segmentId, visual_signature: sha256, captured: true },
+      mediaPath,
+    };
+  }));
+}
+
+/** Why an assembled child's audio declaration is wrong, or '' when it is fine.
+ *
+ * A silent child that still carries narration text is `owner:"assembler"`, not
+ * `owner:"none"`. The two are not interchangeable: every narration predicate in
+ * the host reads `owner !== 'assembler'` as "this composition owes its own
+ * narration audio", and the manifest schema then demands a signed
+ * `narration_intent`. A child written as `"none"` could not satisfy both
+ * contracts at once — on 2026-08-04 that produced five consecutive
+ * E_GATE_B_ARTIFACT_INVALID, and the escape the model found was to sign a voice
+ * for a segment that must never speak. `"none"` stays correct for a child with
+ * no narration at all. Reads the raw manifest so it can run before the schema.
+ * Pure → unit-tested. */
+export function parentCompositionAudioFault(rawManifest: unknown): string {
+  const manifest = rawManifest && typeof rawManifest === 'object' && !Array.isArray(rawManifest)
+    ? rawManifest as Record<string, unknown>
+    : {};
+  const audio = manifest.audio && typeof manifest.audio === 'object' && !Array.isArray(manifest.audio)
+    ? manifest.audio as Record<string, unknown>
+    : {};
+  const owner = String(audio.owner ?? '');
+  const trackCount = Array.isArray(audio.tracks) ? audio.tracks.length : 0;
+  const hasNarrationText = Array.isArray(manifest.scenes)
+    && manifest.scenes.some((scene) => !!scene
+      && typeof scene === 'object'
+      && !Array.isArray(scene)
+      && typeof (scene as Record<string, unknown>).narration_text === 'string'
+      && !!((scene as Record<string, unknown>).narration_text as string).trim());
+  if (trackCount > 0 || owner === 'composition') {
+    return 'The child carries its own audio. Remove audio.tracks and do not set audio.owner:"composition": the parent assembler mixes one narration for the whole video, so a baked-in child track plays twice.';
+  }
+  if (audio.narration_intent) {
+    return 'The child signs its own audio.narration_intent. Remove it: the voice is selected once on the parent EDL, and a segment that never speaks must not sign one.';
+  }
+  if (hasNarrationText && owner !== 'assembler') {
+    return `The child carries narration text but declares audio.owner:"${owner}". Use audio.owner:"assembler" — it renders silent exactly like "none" while naming the real owner, so the host stops asking this segment for its own narration audio.`;
+  }
+  return '';
+}
 
 async function validateParentCompositionBinding(input: {
   parentIdentity: VideoProductionPlanIdentity;
@@ -2418,11 +4431,25 @@ async function validateParentCompositionBinding(input: {
     ))
     : [];
   const segment = segments.find((candidate) => candidate.id === input.segmentId);
-  if (!segment || segment.source !== 'compose') {
+  if (segment && segment.source !== 'compose') {
+    // A media-backed segment has no composition and never will: its artifact
+    // is the file at produced_path. Answering "no compose segment named X"
+    // reads as a typo and sent a 2026-08-09 run down the composition line for
+    // an `edit` segment — an empty directory created for it, doctor passing
+    // on that empty directory, and reconcile finally failing on a missing
+    // manifest nobody was ever supposed to write. The parent plan says what
+    // this segment is; say it.
+    return {
+      ok: false,
+      errorCode: 'E_PARENT_SEGMENT_NOT_A_COMPOSITION',
+      message: `Segment "${input.segmentId}" is ${/^[aeiou]/i.test(String(segment.source)) ? 'an' : 'a'} ${segment.source} segment, not a composition: its artifact is its produced_path file, so it has no composition-manifest.json and no composition operation applies to it. Produce it on its own line and let the production QA phases pick it up from the file.`,
+    };
+  }
+  if (!segment) {
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_SEGMENT_INVALID',
-      message: `The approved parent EDL has no compose segment named ${input.segmentId}.`,
+      message: `The approved parent EDL has no compose segment named ${input.segmentId}. Its compose segments are: ${segments.filter((candidate) => candidate.source === 'compose').map((candidate) => String(candidate.id)).join(', ') || '(none)'}.`,
     };
   }
   const spec = segment.spec && typeof segment.spec === 'object' && !Array.isArray(segment.spec)
@@ -2439,11 +4466,38 @@ async function validateParentCompositionBinding(input: {
       message: 'AUTO compose inheritance requires spec.composition_plan.scenes in the confirmed parent EDL. Do not request a separate child production plan confirmation; revise and confirm the parent EDL once.',
     };
   }
+  let rawManifest: unknown;
+  try {
+    rawManifest = JSON.parse(
+      await fs.readFile(path.join(input.compositionDirAbs, 'composition-manifest.json'), 'utf8'),
+    );
+  } catch (err) {
+    const failure = compositionManifestFailure(err);
+    return {
+      ok: false,
+      errorCode: 'E_COMPOSITION_MANIFEST_INVALID',
+      message: failure.missing
+        ? 'composition-manifest.json does not exist here yet — approving this segment derives it from the signed parent; retry composition.approve_plan with the same binding.'
+        : failure.detail,
+    };
+  }
+  // Audio ownership is decided before the manifest schema runs, because the
+  // schema's standalone-narration rule assumes a composition that owes its own
+  // voice — which an assembled child never does. Judged in the other order it
+  // reports "sign an audio.narration_intent" at a segment that must stay
+  // silent, and following that advice is what cost the 2026-08-04 run its
+  // fourth user confirmation.
+  const audioFault = parentCompositionAudioFault(rawManifest);
+  if (audioFault) {
+    return {
+      ok: false,
+      errorCode: 'E_PARENT_COMPOSITION_AUDIO_OWNERSHIP',
+      message: `AUTO child compositions must remain silent; the parent assembler owns narration and audio. ${audioFault}`,
+    };
+  }
   let manifest: CompositionManifest;
   try {
-    manifest = CompositionManifestSchema.parse(JSON.parse(
-      await fs.readFile(path.join(input.compositionDirAbs, 'composition-manifest.json'), 'utf8'),
-    ));
+    manifest = CompositionManifestSchema.parse(rawManifest);
   } catch (err) {
     return {
       ok: false,
@@ -2454,27 +4508,23 @@ async function validateParentCompositionBinding(input: {
   const parentLanguage = typeof input.parentIdentity.plan.language === 'string'
     ? input.parentIdentity.plan.language.trim()
     : '';
+  // Every mismatch below names BOTH sides. The host just compared them, and
+  // "does not match" alone makes the caller re-derive what the host already
+  // knows — the largest defect class in this tool's incident history.
   const targetDuration = Number(segment.target_sec);
-  if (!Number.isFinite(targetDuration)
-    || Math.abs((manifest.composition.target_duration ?? manifest.composition.duration) - targetDuration) > 0.01) {
+  const childDuration = manifest.composition.target_duration ?? manifest.composition.duration;
+  if (!Number.isFinite(targetDuration) || Math.abs(childDuration - targetDuration) > 0.01) {
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_DURATION_MISMATCH',
-      message: 'The child composition duration does not match the approved parent EDL segment.',
+      message: `The child composition is ${childDuration}s but the approved parent EDL signs segment "${input.segmentId}" at ${Number.isFinite(targetDuration) ? `${targetDuration}s` : 'no duration at all'}. Set the composition duration to the signed value; changing the segment's length needs a parent EDL amendment.`,
     };
   }
   if (parentLanguage && manifest.composition.language && manifest.composition.language !== parentLanguage) {
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_LANGUAGE_MISMATCH',
-      message: 'The child composition language does not match the approved parent EDL.',
-    };
-  }
-  if (manifest.audio.owner !== 'none' || manifest.audio.tracks.length > 0) {
-    return {
-      ok: false,
-      errorCode: 'E_PARENT_COMPOSITION_AUDIO_OWNERSHIP',
-      message: 'AUTO child compositions must remain silent; the parent assembler owns narration and audio.',
+      message: `The child composition language is "${manifest.composition.language}" but the approved parent EDL signs "${parentLanguage}". Use the signed language.`,
     };
   }
   const normalizeScene = (value: Record<string, unknown>): Record<string, unknown> => ({
@@ -2488,14 +4538,208 @@ async function validateParentCompositionBinding(input: {
     .map(normalizeScene);
   const actualScenes = manifest.scenes.map((scene) => normalizeScene(scene as unknown as Record<string, unknown>));
   if (stableJson(expectedScenes) !== stableJson(actualScenes)) {
+    // Naming the four candidate fields and leaving the caller to find which
+    // one drifted is a search, not an answer: the host holds both sides.
+    const drift: string[] = [];
+    const describe = (value: unknown): string => (Array.isArray(value) ? JSON.stringify(value) : `"${String(value)}"`);
+    for (let index = 0; index < Math.max(expectedScenes.length, actualScenes.length); index += 1) {
+      const expected = expectedScenes[index];
+      const actual = actualScenes[index];
+      if (!expected) { drift.push(`scene ${index} ("${actual?.id}") is not in the signed plan`); continue; }
+      if (!actual) { drift.push(`signed scene "${expected.id}" is missing from the manifest`); continue; }
+      for (const field of ['id', 'approved_copy', 'narration_text', 'roles'] as const) {
+        if (stableJson(expected[field]) === stableJson(actual[field])) continue;
+        drift.push(`scene ${index} ${field}: signed ${describe(expected[field])}, manifest has ${describe(actual[field])}`);
+      }
+    }
     return {
       ok: false,
       errorCode: 'E_PARENT_COMPOSITION_CONTENT_MISMATCH',
-      message: 'The child composition copy, narration, scene ids, or semantic roles differ from the confirmed parent EDL binding.',
+      message: `The child composition no longer reproduces the confirmed parent EDL binding — ${drift.slice(0, 6).join('; ')}${drift.length > 6 ? `; and ${drift.length - 6} more` : ''}. Restore the signed values; changing them needs a parent EDL amendment.`,
     };
   }
   return { ok: true, parentSignature: input.parentIdentity.signature };
 }
+
+/** Write an AUTO child's plan artifacts from the signed parent EDL segment.
+ *
+ * The host already holds the child's complete specification: the parent
+ * binding fixes the scene ids, approved copy, narration text and roles, the
+ * segment fixes the duration, the plan fixes language and aspect, and an
+ * assembled child is silent by rule. Until 2026-08-07 that specification was
+ * used only as a COMPARATOR — the model had to hand-author script.md,
+ * shotlist.json and composition-manifest.json for every child, and the host
+ * graded the result field by field. Measured on the 11:09 run: 4 children x 3
+ * files, and three rounds of E_GATE_B_ARTIFACTS_INCOMPLETE /
+ * E_GATE_B_REQUIREMENTS_INCOMPLETE (`shotlist.target_duration_seconds`,
+ * `video_language`, `audio_mode`, `caption_mode`, `music_mode`,
+ * `shots.missing`) before the same values the parent already carried were
+ * finally typed correctly — about ten minutes of the run, spent restating
+ * signed facts.
+ *
+ * So the same specification generates. Deterministic derivation belongs to
+ * the host; the model authors what needs judgment (the HTML and its art
+ * direction), and those are preserved here untouched. Idempotent: a
+ * conforming file is left alone, so re-deriving never churns the artifact
+ * signature.
+ */
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+async function materializeChildPlanArtifacts(input: {
+  parentIdentity: VideoProductionPlanIdentity;
+  segmentId: string;
+  compositionDirAbs: string;
+}): Promise<{ written: string[] }> {
+  const plan = input.parentIdentity.plan as Record<string, unknown>;
+  const segments = Array.isArray(plan.segments)
+    ? plan.segments.filter((value): value is Record<string, unknown> => (
+      !!value && typeof value === 'object' && !Array.isArray(value)
+    ))
+    : [];
+  const segment = segments.find((candidate) => candidate.id === input.segmentId);
+  if (!segment || segment.source !== 'compose') return { written: [] };
+  const spec = segment.spec && typeof segment.spec === 'object' && !Array.isArray(segment.spec)
+    ? segment.spec as Record<string, unknown>
+    : {};
+  const binding = spec.composition_plan && typeof spec.composition_plan === 'object'
+    && !Array.isArray(spec.composition_plan)
+    ? spec.composition_plan as Record<string, unknown>
+    : null;
+  const boundScenes = Array.isArray(binding?.scenes)
+    ? binding.scenes.filter((value): value is Record<string, unknown> => (
+      !!value && typeof value === 'object' && !Array.isArray(value)
+    ))
+    : [];
+  const targetDuration = Number(segment.target_sec);
+  if (!boundScenes.length || !Number.isFinite(targetDuration) || targetDuration <= 0) return { written: [] };
+
+  const language = typeof plan.language === 'string' && plan.language.trim() ? plan.language.trim() : 'en';
+  const aspect = String(plan.aspect || '16:9').trim();
+  const [width, height] = aspect === '9:16' ? [1080, 1920] : aspect === '1:1' ? [1080, 1080] : [1920, 1080];
+  const written: string[] = [];
+  const writeIfChanged = async (fileName: string, content: string): Promise<void> => {
+    const filePath = path.join(input.compositionDirAbs, fileName);
+    const current = await fs.readFile(filePath, 'utf8').catch(() => null);
+    if (current === content) return;
+    await fs.mkdir(input.compositionDirAbs, { recursive: true });
+    await fs.writeFile(filePath, content, 'utf8');
+    written.push(filePath);
+  };
+
+  // Windows follow the binding's own durations when it declares them, and
+  // otherwise split the signed segment length evenly. Either way the last
+  // scene absorbs the rounding so the child ends exactly on target_sec.
+  const declared = boundScenes.map((scene) => Number(scene.duration));
+  const declaredTotal = declared.reduce((sum, value) => sum + (Number.isFinite(value) && value > 0 ? value : 0), 0);
+  const useDeclared = declared.every((value) => Number.isFinite(value) && value > 0)
+    && Math.abs(declaredTotal - targetDuration) <= 0.01;
+  const evenShare = targetDuration / boundScenes.length;
+  let cursor = 0;
+  const scenes = boundScenes.map((scene, index) => {
+    const last = index === boundScenes.length - 1;
+    const start = round3(cursor);
+    const duration = last
+      ? round3(Math.max(0.001, targetDuration - start))
+      : round3(useDeclared ? declared[index] : evenShare);
+    cursor = start + duration;
+    const id = String(scene.id || `${input.segmentId}_${index + 1}`);
+    return {
+      id,
+      start,
+      duration,
+      approved_copy: Array.isArray(scene.approved_copy) ? scene.approved_copy.map(String) : [],
+      narration_text: typeof scene.narration_text === 'string' ? scene.narration_text : '',
+      source_shots: [id],
+      roles: Array.isArray(scene.roles) ? scene.roles.map(String) : [],
+    };
+  });
+
+  const existingManifest = await fs.readFile(
+    path.join(input.compositionDirAbs, 'composition-manifest.json'), 'utf8',
+  ).then((raw) => JSON.parse(raw) as Record<string, unknown>).catch(() => null);
+  const existingComposition = existingManifest && typeof existingManifest.composition === 'object'
+    && !Array.isArray(existingManifest.composition)
+    ? existingManifest.composition as Record<string, unknown>
+    : {};
+  const fps = Number(existingComposition.fps) > 0 ? Number(existingComposition.fps) : 30;
+  const authoredScenes = Array.isArray(existingManifest?.scenes)
+    ? existingManifest.scenes.filter((value): value is Record<string, unknown> => (
+      !!value && typeof value === 'object' && !Array.isArray(value)
+    ))
+    : [];
+  // Authored scene CONTENT is never overwritten. Copy, narration and roles
+  // can carry a change the user asked for, and silently reverting them to the
+  // parent would erase that instruction without a word — the binding
+  // comparator still reports the mismatch and sends the amendment to the one
+  // parent EDL, which is where a content change belongs. Only the structure
+  // the parent fixes deterministically (windows, canvas, language) is filled
+  // in here, and a missing manifest is derived whole.
+  const manifestScenes = authoredScenes.length
+    ? authoredScenes.map((scene, index) => ({
+      ...scene,
+      ...(scenes[index] ? { start: scenes[index].start, duration: scenes[index].duration } : {}),
+      ...(Array.isArray(scene.source_shots) && scene.source_shots.length
+        ? {}
+        : { source_shots: [String(scene.id || scenes[index]?.id || '')] }),
+    }))
+    : scenes;
+  const manifest: Record<string, unknown> = {
+    // The model's own work — art direction above all — survives derivation.
+    ...(existingManifest || {}),
+    schema_version: 2,
+    composition: {
+      ...existingComposition,
+      id: String(existingComposition.id || input.segmentId),
+      width,
+      height,
+      duration: round3(targetDuration),
+      target_duration: round3(targetDuration),
+      fps,
+      language,
+    },
+    scenes: manifestScenes,
+    // Audio ownership is derived only for a manifest this call creates. An
+    // existing one keeps whatever it declares so the ownership check can name
+    // the mistake instead of it being quietly rewritten.
+    audio: existingManifest?.audio ?? { owner: 'assembler', tracks: [] },
+  };
+  await writeIfChanged('composition-manifest.json', `${JSON.stringify(manifest, null, 2)}\n`);
+  return { written };
+}
+
+/** The plan as prose, rendered from the manifest.
+ *
+ * script.md used to be an authored input carrying a second copy of every
+ * scene's narration, policed by an alignment check — a check that failed on a
+ * script whose only sin was line breaks (2026-08-07) and blocked the run.
+ * The words now have one home. This renders the readable view from that home,
+ * so it is a report, never a source: it cannot drift, and editing it changes
+ * nothing. */
+function renderPlanScript(manifest: CompositionManifest, title: string): string {
+  const round = (value: number): number => Math.round(value * 1000) / 1000;
+  const lines: string[] = [
+    `# ${title}`,
+    '',
+    `<!-- Rendered from composition-manifest.json. Edit the manifest, not this file. -->`,
+    '',
+    `${round(manifest.composition.target_duration ?? manifest.composition.duration)}s · `
+      + `${manifest.composition.width}x${manifest.composition.height}`
+      + (manifest.composition.language ? ` · ${manifest.composition.language}` : ''),
+    '',
+  ];
+  for (const [index, scene] of manifest.scenes.entries()) {
+    const start = round(scene.start);
+    const end = round(scene.start + scene.duration);
+    lines.push(`## ${index + 1}. ${scene.id} (${start}s–${end}s)`, '');
+    for (const copy of scene.approved_copy) lines.push(`- ${copy}`);
+    if (scene.approved_copy.length) lines.push('');
+    if (scene.narration_text?.trim()) lines.push(scene.narration_text.trim(), '');
+  }
+  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
+}
+
 
 type NarrationRepairIdentity = {
   structureSignature: string;
@@ -2561,67 +4805,13 @@ function normalizedRepairText(value: string): string {
   return value.normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
 }
 
-type ShotNarrationProjection = {
-  keys: Array<'narration' | 'narration_text'>;
-  text: string;
-  issue?: 'invalid' | 'conflict';
-};
-
-/** The manifest is the canonical narration source. Shotlist narration fields
- * are optional legacy/review projections; when present they must agree with
- * each other and with the manifest. */
-function shotNarrationProjection(shot: Record<string, unknown>): ShotNarrationProjection {
-  const keys = (['narration', 'narration_text'] as const)
-    .filter((key) => Object.prototype.hasOwnProperty.call(shot, key));
-  if (keys.length === 0) return { keys: [], text: '' };
-  const values: string[] = [];
-  for (const key of keys) {
-    const value = shot[key];
-    if (typeof value !== 'string' || !value.trim()) return { keys, text: '', issue: 'invalid' };
-    values.push(value.trim());
-  }
-  if (values.some((value) => normalizedRepairText(value) !== normalizedRepairText(values[0]))) {
-    return { keys, text: '', issue: 'conflict' };
-  }
-  return { keys, text: values[0] };
-}
-
-function videoProductionNarrationAlignmentIssues(input: {
-  script: string;
-  shotlist: Record<string, unknown>;
-  manifest: CompositionManifest;
-}): string[] {
-  const narratedScenes = input.manifest.scenes.filter((scene) => !!scene.narration_text?.trim());
-  if (narratedScenes.length === 0) return [];
-  const shots = Array.isArray(input.shotlist.shots)
-    ? input.shotlist.shots.filter((value): value is Record<string, unknown> => (
-      !!value && typeof value === 'object' && !Array.isArray(value)
-    ))
-    : [];
-  const shotsById = new Map(shots.map((shot) => [typeof shot.id === 'string' ? shot.id : '', shot]));
-  const issues: string[] = [];
-  let scriptCursor = 0;
-  for (const scene of narratedScenes) {
-    const narration = scene.narration_text!.trim();
-    const scriptIndex = input.script.indexOf(narration, scriptCursor);
-    if (scriptIndex < 0) issues.push(`script.narration_missing(${scene.id})`);
-    else scriptCursor = scriptIndex + narration.length;
-    const shot = shotsById.get(scene.id);
-    if (!shot) {
-      issues.push(`shotlist.shots.missing(${scene.id})`);
-      continue;
-    }
-    const projection = shotNarrationProjection(shot);
-    if (projection.issue) {
-      issues.push(`shotlist.shots.${scene.id}.narration_${projection.issue}`);
-    } else if (projection.text
-      && normalizedRepairText(projection.text) !== normalizedRepairText(narration)) {
-      issues.push(`shotlist.shots.${scene.id}.narration_conflicts_with_manifest`);
-    }
-  }
-  return issues;
-}
-
+/** Every narrated scene's words appear in the script, in playback order.
+ *
+ * The script is the one place the user reads the narration as prose, so it
+ * must not drift from the manifest that speaks it. The shot-binding half of
+ * this check went with shotlist.json: it reconciled two copies of the same
+ * fact and produced `shotlist.shots.missing` — an error about bookkeeping,
+ * not about the video. */
 function narrationRepairTokens(text: string): string[] {
   const normalized = text.normalize('NFKC').toLocaleLowerCase();
   const estimate = estimateNarrationDuration(text);
@@ -2650,64 +4840,33 @@ function narrationTokenEditRatio(before: string[], after: string[]): number {
 
 /**
  * Build a signature for every approved plan field except the narration copy
- * that may be shortened/expanded by the measured-duration repair. The
- * manifest is canonical. Optional shotlist narration/narration_text
- * projections must agree scene-by-scene, and approved on-screen copy is
- * redacted only when it exactly duplicates that scene's narration.
+ * that may be shortened or expanded by the measured-duration repair. The
+ * manifest is the plan, so the structure is the manifest with each scene's
+ * narration replaced by a per-scene marker — and approved on-screen copy
+ * redacted only where it exactly duplicates that narration. Rewording the
+ * spoken line alone leaves this signature unchanged; changing anything else
+ * does not.
  */
 async function videoProductionNarrationRepairIdentity(
   planIdentity: VideoProductionPlanIdentityResult,
 ): Promise<NarrationRepairIdentity | undefined> {
   const records = planIdentity.artifactRecords;
   if (!records) return undefined;
-  const [script, shotlistRaw, manifestRaw] = await Promise.all([
-    fs.readFile(records.script.path, 'utf8').catch(() => ''),
-    fs.readFile(records.shotlist.path, 'utf8').catch(() => ''),
-    fs.readFile(records.manifest.path, 'utf8').catch(() => ''),
-  ]);
-  if (!script || !shotlistRaw || !manifestRaw) return undefined;
+  const manifestRaw = await fs.readFile(records.manifest.path, 'utf8').catch(() => '');
+  if (!manifestRaw) return undefined;
 
-  let shotlist: Record<string, unknown>;
   let manifest: CompositionManifest;
   try {
-    const parsedShotlist = JSON.parse(shotlistRaw) as unknown;
-    if (!parsedShotlist || typeof parsedShotlist !== 'object' || Array.isArray(parsedShotlist)) return undefined;
-    shotlist = parsedShotlist as Record<string, unknown>;
     manifest = CompositionManifestSchema.parse(JSON.parse(manifestRaw));
   } catch {
     return undefined;
   }
-  if (!Array.isArray(shotlist.shots)) return undefined;
 
-  const shotsById = new Map<string, Record<string, unknown>>();
-  for (const value of shotlist.shots) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-    const shot = value as Record<string, unknown>;
-    const id = typeof shot.id === 'string' ? shot.id : '';
-    if (!id || shotsById.has(id)) return undefined;
-    shotsById.set(id, shot);
-  }
-
-  let scriptStructure = script;
-  const sanitizedShots: Record<string, unknown>[] = [];
   const sanitizedScenes: CompositionManifest['scenes'] = [];
   for (const scene of manifest.scenes) {
     const narration = scene.narration_text?.trim() || '';
-    const shot = shotsById.get(scene.id);
-    if (!narration || !shot) {
-      return undefined;
-    }
-    const projection = shotNarrationProjection(shot);
-    if (projection.issue || (projection.text
-      && normalizedRepairText(projection.text) !== normalizedRepairText(narration))) return undefined;
-    const scriptIndex = scriptStructure.indexOf(narration);
-    if (scriptIndex < 0) return undefined;
+    if (!narration) return undefined;
     const marker = `{{ORKAS_NARRATION:${scene.id}}}`;
-    scriptStructure = `${scriptStructure.slice(0, scriptIndex)}${marker}${scriptStructure.slice(scriptIndex + narration.length)}`;
-    const sanitizedShot = { ...shot };
-    delete sanitizedShot.narration;
-    delete sanitizedShot.narration_text;
-    sanitizedShots.push(sanitizedShot);
     sanitizedScenes.push({
       ...scene,
       narration_text: marker,
@@ -2719,13 +4878,10 @@ async function videoProductionNarrationRepairIdentity(
 
   const narrationText = compositionNarrationText(manifest);
   if (!narrationText) return undefined;
-  const structurePayload = {
-    script: scriptStructure,
-    shotlist: { ...shotlist, shots: sanitizedShots },
-    manifest: { ...manifest, scenes: sanitizedScenes },
-  };
   return {
-    structureSignature: crypto.createHash('sha256').update(stableJson(structurePayload)).digest('hex'),
+    structureSignature: crypto.createHash('sha256')
+      .update(stableJson({ manifest: { ...manifest, scenes: sanitizedScenes } }))
+      .digest('hex'),
     narrationTokenHashes: narrationRepairTokens(narrationText),
   };
 }
@@ -2766,9 +4922,10 @@ function assessNarrationRepair(input: {
   if (editRatio > authorization.max_edit_ratio) {
     return { status: 'rejected', reason: 'narration_change_exceeds_authorized_scope', editRatio, checksUsed };
   }
+  const repaired = !narrationFitBlocksProduction(input.fit.status);
   return {
-    status: input.fit.status === 'fits' ? 'inheritable' : 'pending',
-    reason: input.fit.status === 'fits'
+    status: repaired ? 'inheritable' : 'pending',
+    reason: repaired
       ? 'measured_narration_fit_repaired'
       : checksUsed > authorization.max_checks
         ? 'repair_strategy_review_required'
@@ -2911,6 +5068,11 @@ function compositionNarrationFit(input: {
     ...(profile.voice ? { voice: profile.voice } : {}),
     speed: profile.speed,
     target_duration_sec: assessed.targetSec,
+    tolerance_ratio: assessed.toleranceRatio,
+    tolerance_floor_sec: assessed.toleranceFloorSec,
+    tolerance_sec: assessed.toleranceSec,
+    min_duration_sec: assessed.minDurationSec,
+    max_duration_sec: assessed.maxDurationSec,
     generic_estimated_duration_sec: assessed.genericEstimatedSec,
     estimated_duration_sec: assessed.estimatedSec,
     duration_scale: assessed.durationScale,
@@ -2918,7 +5080,7 @@ function compositionNarrationFit(input: {
     narration_units: assessed.units,
     suggested_units: assessed.suggestedUnits,
     checked_at: new Date().toISOString(),
-    validation_version: 1,
+    validation_version: 2,
   };
 }
 
@@ -2927,12 +5089,12 @@ function narrationFitMessage(fit: VideoProductionNarrationFit): string {
     ? 'the persisted measured voice pace'
     : 'the generic natural-pace estimate';
   if (fit.status === 'over') {
-    return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}. Trim it to about ${fit.suggested_units} ${fit.narration_unit}; no speech request was sent.`;
+    return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}, outside the accepted ${fit.min_duration_sec}-${fit.max_duration_sec}s band. Trim it to about ${fit.suggested_units} ${fit.narration_unit}; no speech request was sent.`;
   }
   if (fit.status === 'under') {
-    return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}. Expand it to about ${fit.suggested_units} ${fit.narration_unit}; no speech request was sent.`;
+    return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}, outside the accepted ${fit.min_duration_sec}-${fit.max_duration_sec}s band. Expand it to about ${fit.suggested_units} ${fit.narration_unit}; no speech request was sent.`;
   }
-  return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source} and is ready for production plan confirmation.`;
+  return `Narration is estimated at ${fit.estimated_duration_sec}s for a ${fit.target_duration_sec}s target using ${source}, inside the accepted ${fit.min_duration_sec}-${fit.max_duration_sec}s band, and is ready for production plan confirmation.`;
 }
 
 async function currentPlanNarrationTextSha(compositionDirAbs: string): Promise<string> {
@@ -3034,9 +5196,20 @@ async function validatePlanApproval(
   statePath: string,
   compositionDirAbs: string,
   roots: string[],
+  /** The parent-EDL binding the caller passed (plan_path + segment_id), when
+   *  present. A missing manifest means something different under it: the
+   *  manifest is host-derived by composition.approve_plan, not restored by
+   *  the model. */
+  parentBinding?: { segmentId: string; planPath: string },
 ): Promise<
   | { ok: true }
-  | { ok: false; errorCode: string; message: string; evidence?: VideoProductionPlanEvidence }
+  | {
+    ok: false;
+    errorCode: string;
+    message: string;
+    evidence?: VideoProductionPlanEvidence;
+    artifactIssues?: VideoProductionPlanArtifactIssue[];
+  }
 > {
   const state = await readVideoProductionState(statePath, compositionDirAbs);
   const identity = await videoProductionPlanIdentity(compositionDirAbs, {
@@ -3044,14 +5217,50 @@ async function validatePlanApproval(
     roots,
   });
   if (!identity.complete) {
+    // The host already parsed the manifest, so it knows both WHICH failure
+    // this is and WHICH fields failed — `buildVideoProductionPlanIdentity`
+    // records them as `artifactIssues[].details`. This branch used to collapse
+    // both cases into one sentence and drop the issues, while the sibling
+    // approve_plan / check_narration_fit branches classified them. That cost
+    // ~4 minutes on 2026-08-07: the model could not tell a schema-invalid
+    // manifest from a missing one, the sentence named `script` and `shotlist`
+    // (both retired in 4658470f8), and it re-read gate-control in full
+    // (12.4k tokens) because the wording described a gate problem while
+    // `plan_gate_class` already said artifact_repair.
+    const artifactIssues = identity.artifactIssues ?? [];
+    const artifactInvalid = artifactIssues.length > 0;
+    const details = artifactIssues.flatMap((issue) => (issue.details ?? [])
+      .map((entry) => `${entry.path}: ${entry.message}`));
+    if (!artifactInvalid && identity.evidence.conflicts.length === 0 && parentBinding) {
+      // "Restore the canonical plan manifest" is the wrong instruction for an
+      // AUTO child — the manifest is derived by the host at inheritance. On
+      // 2026-08-08 the model obeyed it literally: five hand-written manifests,
+      // which the ownership gate then rejected five more times for signing a
+      // voice, and a bash pass to unwind — two full failure rounds caused by
+      // this sentence pointing at the wrong actor.
+      return {
+        ok: false,
+        errorCode: 'E_GATE_B_APPROVAL_REQUIRED',
+        message: `composition-manifest.json does not exist here yet, and for segment "${parentBinding.segmentId}" `
+          + `of ${parentBinding.planPath} it is not yours to write: call composition.approve_plan with the same `
+          + 'composition_dir, plan_path, and segment_id — it inherits the parent Gate B and derives the manifest '
+          + 'from the signed parent. Then retry this operation.',
+        evidence: identity.evidence,
+      };
+    }
     return {
       ok: false,
       errorCode: identity.evidence.conflicts.length > 0
         ? 'E_GATE_B_ARTIFACT_CONFLICT'
-        : 'E_GATE_B_ARTIFACTS_INCOMPLETE',
+        : artifactInvalid
+          ? 'E_GATE_B_ARTIFACT_INVALID'
+          : 'E_GATE_B_ARTIFACTS_INCOMPLETE',
       message: identity.evidence.conflicts[0]?.message
-        || 'Production plan confirmation requires one coherent script, shotlist, and valid composition manifest before prepare.',
+        || (artifactInvalid
+          ? `composition-manifest.json does not match the required video-plan structure${details.length ? ` — ${details.slice(0, 6).join('; ')}` : ''}. Repair those fields without changing the confirmed plan, then retry the same operation in this turn.`
+          : 'composition-manifest.json is missing, empty, or unreadable. Restore the canonical plan manifest, then retry the same operation in this turn.'),
       evidence: identity.evidence,
+      ...(artifactInvalid ? { artifactIssues } : {}),
     };
   }
   if (identity.requirementIssues.length > 0) {
@@ -3087,11 +5296,13 @@ async function validatePlanApproval(
     return {
       ok: false,
       errorCode: 'E_GATE_B_APPROVAL_REQUIRED',
-      message: 'Record the explicit script/shotlist approval with composition.approve_plan before prepare.',
+      message: 'Record the explicit plan approval with composition.approve_plan before prepare.',
     };
   }
+  const currentVisualSignature = await videoStudioVisualCompositionSignature(compositionDirAbs)
+    .catch(() => '');
   await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
-    delete next.preview;
+    invalidateVisualEvidenceUnlessCurrent(next, currentVisualSignature);
     delete next.draft;
     next.stage = 'manifest_ready';
     recordVideoProductionTransition(next, {
@@ -3125,18 +5336,38 @@ async function validatePlanApproval(
   };
 }
 
-async function writeJsonAtomic(absPath: string, value: unknown): Promise<void> {
+/** Re-stamp the fs read baseline after a native op rewrites a file the model
+ *  also edits with `edit_file`.
+ *
+ *  `edit_file` enforces read-before-edit through a run-scoped stamp and
+ *  refreshes it after its own write, so consecutive edits need no re-read.
+ *  Native composition writes are another writer in the same run: `rename`
+ *  gives the file a new mtime, the stamp goes stale, and the model's next
+ *  `edit_file` fails `E_STALE` and must spend a `read_file` round trip first.
+ *  On 2026-08-07 that pattern cost ~30 round trips at ~29s each. Re-stamping
+ *  costs nothing and is not a weaker guarantee: `old_string` must still match
+ *  the current bytes exactly, so an edit aimed at a region this write changed
+ *  degrades to `E_NO_MATCH`, which already returns bounded current context and
+ *  a fresh hash for a same-turn retry. */
+function restampReadBaseline(ctx: ToolContext | undefined, absPath: string): void {
+  if (!ctx) return;
+  recordRead(ctx, absPath);
+}
+
+async function writeJsonAtomic(absPath: string, value: unknown, ctx?: ToolContext): Promise<void> {
   await fs.mkdir(path.dirname(absPath), { recursive: true });
   const tempPath = `${absPath}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(value, null, 2), 'utf8');
   await fs.rename(tempPath, absPath);
+  restampReadBaseline(ctx, absPath);
 }
 
-async function writeTextAtomic(absPath: string, value: string): Promise<void> {
+async function writeTextAtomic(absPath: string, value: string, ctx?: ToolContext): Promise<void> {
   await fs.mkdir(path.dirname(absPath), { recursive: true });
   const tempPath = `${absPath}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(tempPath, value, 'utf8');
   await fs.rename(tempPath, absPath);
+  restampReadBaseline(ctx, absPath);
 }
 
 async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
@@ -3146,6 +5377,7 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
   duration?: number;
   narrationMapMatches: boolean;
   materializationReceiptMatches: boolean;
+  legacyMaterializationReceipt?: boolean;
   htmlTrackMatches: boolean;
   materialized: boolean;
 }> {
@@ -3186,17 +5418,55 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
         textSha256: textSha,
         audioSha256: audioSha,
         method: alignmentMethod,
+        ...(typeof narrationMap?.narration_audio_duration === 'number'
+          && typeof track?.duration === 'number'
+          ? { audioDurationSec: track.duration }
+          : {}),
       })
+      : undefined;
+    const legacyExpectedReceipt = alignmentMethod && textSha && audioSha
+      ? {
+        schema_version: 1,
+        source: 'composition.materialize_narration',
+        alignment_method: alignmentMethod,
+        narration_text_sha256: textSha,
+        narration_audio_sha256: audioSha,
+        total_duration: parsed.data.composition.duration,
+        ...(typeof narrationMap?.narration_audio_duration === 'number'
+          && typeof track?.duration === 'number'
+          ? { narration_audio_duration: track.duration }
+          : {}),
+        lines: parsed.data.scenes.flatMap((scene) => {
+          const lineText = scene.narration_text?.trim() || '';
+          if (!lineText) return [];
+          const ids = scene.narration_refs.length
+            ? scene.narration_refs
+            : [`narration-${scene.id}`];
+          return ids.map((id) => ({
+            id,
+            scene_id: scene.id,
+            start: scene.start,
+            duration: scene.duration,
+            text: lineText,
+          }));
+        }),
+      }
       : undefined;
     // narration-map.json is the durable materialization receipt written only
     // after measured audio, the retimed manifest, and their content hashes
     // agree. It is safe to restore a lost ledger binding from that receipt,
     // but not from a matching filename or a pair of hashes alone.
+    const legacyMaterializationReceipt = narrationMapMatches
+      && narrationMap?.schema_version === 1
+      && narrationMap?.source === 'composition.materialize_narration'
+      && !!legacyExpectedReceipt
+      && stableJson(narrationMap) === stableJson(legacyExpectedReceipt);
     const materializationReceiptMatches = narrationMapMatches
       && narrationMap?.schema_version === 1
       && narrationMap?.source === 'composition.materialize_narration'
       && !!expectedReceipt
-      && stableJson(narrationMap) === stableJson(expectedReceipt);
+      && (stableJson(narrationMap) === stableJson(expectedReceipt)
+        || legacyMaterializationReceipt);
     const html = await fs.readFile(path.join(compositionDirAbs, 'index.html'), 'utf8').catch(() => '');
     const htmlTrackMatches = (html.match(/<audio\b[^>]*>/gi) || []).some((tag) => {
       const srcMatch = /\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(tag);
@@ -3210,6 +5480,7 @@ async function currentNarrationIdentity(compositionDirAbs: string): Promise<{
       ...(track ? { duration: track.duration } : {}),
       narrationMapMatches,
       materializationReceiptMatches,
+      ...(legacyMaterializationReceipt ? { legacyMaterializationReceipt: true } : {}),
       htmlTrackMatches,
       materialized: parsed.data.audio.owner === 'composition'
         && track?.src === 'assets/narration.mp3'
@@ -3277,16 +5548,28 @@ async function recordVideoStudioOperationState(input: {
     const narrationIsCurrent = !!narration && narrationIdentityMatchesState(state, narration);
     if (input.stage) {
       const authoredVisuals = input.stage === 'visuals_ready'
-        && !!state.artifacts.scaffold_html_sha256
-        && artifacts.html_sha256 !== state.artifacts.scaffold_html_sha256;
+        && artifactsShowAuthoredVisuals(state.artifacts, artifacts);
       state.stage = input.stage === 'scaffold_ready' && narrationIsCurrent
         ? 'narration_ready'
         : input.stage === 'visuals_ready' && !authoredVisuals
           ? narrationIsCurrent ? 'narration_ready' : 'scaffold_ready'
           : input.stage;
     }
-    if (input.ok && (input.op === 'composition.prepare' || input.op === 'composition.inspect')) {
-      delete state.preview;
+    if (input.ok && input.op === 'composition.prepare') {
+      invalidateVisualEvidenceUnlessCurrent(state, artifacts.visual_signature || '');
+      delete state.draft;
+    }
+    if (input.ok && input.op === 'composition.inspect') {
+      // Inspect normally runs BEFORE the snapshot, on freshly authored
+      // visuals, so dropping an older preview is right. Dropping it
+      // unconditionally also punished the redundant order — snapshot, then
+      // inspect again to double-check — by discarding frames that still match
+      // the bytes, forcing another full Chromium capture and answering the
+      // next draft with "this composition requires a snapshot" (2026-08-09).
+      // The visual signature is the same authority the draft's own staleness
+      // check applies one step later, so a preview it still vouches for is
+      // kept, and the more precise E_HTML_PREVIEW_STALE stays reachable.
+      invalidateVisualEvidenceUnlessCurrent(state, artifacts.visual_signature || '');
       delete state.draft;
     }
     if (input.ok || !sameVideoProductionArtifacts(state.blocked_operation?.artifacts, artifacts)) {
@@ -3305,8 +5588,10 @@ async function recordVideoStudioOperationState(input: {
     }
     if (input.ok && input.op === 'composition.prepare' && !state.artifacts.scaffold_html_sha256) {
       artifacts.scaffold_html_sha256 = artifacts.html_sha256;
+      artifacts.scaffold_visual_signature = artifacts.visual_signature;
     } else if (state.artifacts.scaffold_html_sha256) {
       artifacts.scaffold_html_sha256 = state.artifacts.scaffold_html_sha256;
+      artifacts.scaffold_visual_signature = state.artifacts.scaffold_visual_signature;
     }
     const activeOperation = state.active_operation?.op === input.op
       ? state.active_operation
@@ -3407,10 +5692,20 @@ export async function recordVideoStudioGate(
       && isPassingPreflight(result.preflight)
     : result.draft_ready === true;
   if (!isReady) return false;
-  const [signature, artifacts] = await Promise.all([
+  // A rejected Promise.all returns while its sibling filesystem scans keep
+  // running. On Windows that lets callers begin temp-tree cleanup while those
+  // scans still hold files open. Settle every scan before propagating an error.
+  const [signatureResult, visualSignatureResult, artifactsResult] = await Promise.allSettled([
     videoStudioCompositionSignature(compositionDirAbs),
+    videoStudioVisualCompositionSignature(compositionDirAbs),
     videoProductionArtifacts(compositionDirAbs),
   ]);
+  if (signatureResult.status === 'rejected') throw signatureResult.reason;
+  if (visualSignatureResult.status === 'rejected') throw visualSignatureResult.reason;
+  if (artifactsResult.status === 'rejected') throw artifactsResult.reason;
+  const signature = signatureResult.value;
+  const visualSignature = visualSignatureResult.value;
+  const artifacts = artifactsResult.value;
   const framePaths = Array.isArray(result.frame_paths)
     ? result.frame_paths
       .filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
@@ -3419,6 +5714,10 @@ export async function recordVideoStudioGate(
   await updateVideoProductionState(statePath, compositionDirAbs, (state) => {
     state[kind] = {
       signature,
+      // Preview attests visual content only (it is silent); the visual
+      // sub-identity is what its approval survives narration changes on.
+      // Draft muxes audio and timing, so it stays bound to the full signature.
+      ...(kind === 'preview' ? { visual_signature: visualSignature } : {}),
       ...(kind === 'preview' && typeof result.preview_revision === 'string' && result.preview_revision
         ? { revision_id: result.preview_revision }
         : {}),
@@ -3498,80 +5797,43 @@ function isPassingPreflight(value: unknown): boolean {
 
 export async function approveVideoStudioGate(
   statePath: string,
-  kind: 'preview' | 'draft',
+  kind: 'draft',
   compositionDirAbs: string,
   currentTurnId: string,
   explicitlyApproved: boolean,
-  decisionSource: VideoStudioResolvedDecision['source'] = 'none',
   submittedArtifactSignature?: string,
 ): Promise<VideoStudioGateCheck> {
   let state = await readVideoProductionState(statePath, compositionDirAbs);
   state = await migrateVideoStudioGateSignatureV5(statePath, kind, compositionDirAbs, state);
   const entry = state[kind];
   if (!entry) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_REQUIRED', message: 'Generate a passing composition.snapshot before approving the HTML preview.' }
-      : { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'Generate a passing composition.draft before final video confirmation.' };
+    return { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'Generate a passing composition.draft before final video confirmation.' };
   }
-  const signature = await videoStudioGateSignature(compositionDirAbs, entry);
-  if (entry.signature !== signature) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_STALE', message: 'Composition inputs changed after the preview. Capture a new snapshot.' }
-      : { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the draft. Render a new draft.' };
+  if (submittedArtifactSignature
+    && submittedArtifactSignature.toLowerCase() !== entry.signature.toLowerCase()) {
+    return {
+      ok: false,
+      errorCode: 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED',
+      message: 'This decision belongs to an older rendered draft. It was not applied to the latest draft; keep the latest review open and show that current artifact without rendering or exporting again.',
+      submitted_artifact_signature: submittedArtifactSignature.toLowerCase(),
+      current_artifact_signature: entry.signature,
+      submitted_decision_status: 'superseded',
+    };
+  }
+  if (entry.signature !== await videoStudioGateSignature(compositionDirAbs, entry)) {
+    return { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the draft. Render a new draft.' };
   }
   if (!currentTurnId || entry.turn_id === currentTurnId) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_APPROVAL_REQUIRED', message: 'Preview approval must come from a later explicit user turn.' }
-      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'Final video confirmation must come from a later explicit user turn.' };
+    return { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'Final video confirmation must come from a later explicit user turn.' };
   }
-  if (decisionSource === 'form') {
-    if (submittedArtifactSignature && submittedArtifactSignature !== entry.signature) {
-      return {
-        ok: false,
-        errorCode: 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED',
-        message: 'The submitted form belongs to an older review artifact. It was received but cannot approve the current artifact. Show the current artifact and keep its review pending without opening a duplicate form.',
-        submitted_artifact_signature: submittedArtifactSignature,
-        current_artifact_signature: entry.signature,
-        submitted_decision_status: 'superseded',
-      };
-    }
-    if (!submittedArtifactSignature && (state.candidate_history?.length || 0) > 0) {
-      return {
-        ok: false,
-        errorCode: 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED',
-        message: 'This legacy form did not identify its review artifact and the project has since produced another candidate. It was received but cannot approve the current artifact. Show the current artifact and keep its review pending without opening a duplicate form.',
-        submitted_artifact_signature: null,
-        current_artifact_signature: entry.signature,
-        submitted_decision_status: 'unbound_after_revision',
-      };
-    }
-  }
-  if (kind === 'preview' && entry.design_review?.required && entry.design_review.status !== 'passed') {
-    return {
-      ok: false,
-      errorCode: 'E_PREVIEW_DESIGN_REVIEW_REQUIRED',
-      message: 'Preview approval is unavailable until composition.submit_design_review records a passed review covering every frame from this exact snapshot.',
-    };
-  }
-  if (kind === 'draft' && entry.design_review?.required && entry.design_review.status !== 'passed') {
-    return {
-      ok: false,
-      errorCode: 'E_DESIGN_REVIEW_REQUIRED',
-      message: 'Final video confirmation is unavailable until composition.submit_design_review records a passed review for this exact draft signature.',
-    };
-  }
+  // P3: model-scored design review is advisory and never blocks approval —
+  // including legacy entries recorded with a pending review requirement.
   if (!explicitlyApproved) {
-    return kind === 'preview'
-      ? {
-        ok: false,
-        errorCode: 'E_HTML_PREVIEW_EXPLICIT_APPROVAL_REQUIRED',
-        message: 'The current real user message must explicitly approve the displayed HTML preview before composition.approve_preview can record approval.',
-      }
-      : {
-        ok: false,
-        errorCode: 'E_GATE_D_EXPLICIT_APPROVAL_REQUIRED',
-        message: 'The current real user message must explicitly confirm the displayed draft before composition.approve_draft can record final video approval.',
-      };
+    return {
+      ok: false,
+      errorCode: 'E_GATE_D_EXPLICIT_APPROVAL_REQUIRED',
+      message: 'The current real user message must explicitly confirm the displayed draft before composition.approve_draft can record final video approval.',
+    };
   }
   const artifacts = await videoProductionArtifacts(compositionDirAbs);
   const approvedState = await updateVideoProductionState(statePath, compositionDirAbs, (next) => {
@@ -3582,9 +5844,9 @@ export async function approveVideoStudioGate(
     nextEntry.status = 'approved';
     nextEntry.approved_turn_id = currentTurnId;
     nextEntry.approved_at = new Date().toISOString();
-    next.stage = kind === 'preview' ? 'preview_approved' : 'draft_approved';
+    next.stage = 'draft_approved';
     recordVideoProductionTransition(next, {
-      op: kind === 'preview' ? 'composition.approve_preview' : 'composition.approve_draft',
+      op: 'composition.approve_draft',
       status: 'passed',
       turnId: currentTurnId,
       stage: next.stage,
@@ -3594,9 +5856,41 @@ export async function approveVideoStudioGate(
   return { ok: true, entry: approvedState[kind]! };
 }
 
+/** Does this composition have frames of exactly its current bytes?
+ *
+ * The evidence a draft render needs, with no user decision in it. A snapshot
+ * that was never taken, or one taken before the last edit, means there is
+ * nothing to render from and nothing the user could have seen. */
+export async function validateCompositionFrameEvidence(
+  statePath: string,
+  compositionDirAbs: string,
+): Promise<VideoStudioGateCheck> {
+  let state = await readVideoProductionState(statePath, compositionDirAbs);
+  // Signature-version normalization, not approval logic: an entry recorded
+  // under an older signature scheme covered a different file set, so it has to
+  // be re-proved against the current one before its frames count as current.
+  state = await migrateVideoStudioGateSignatureV5(statePath, 'preview', compositionDirAbs, state);
+  const entry = state.preview;
+  if (!entry) {
+    return {
+      ok: false,
+      errorCode: 'E_HTML_PREVIEW_REQUIRED',
+      message: 'This multi-scene or designed composition requires a passing composition.snapshot before mp4 rendering.',
+    };
+  }
+  if (!(await previewStillVisuallyCurrent(compositionDirAbs, entry))) {
+    return {
+      ok: false,
+      errorCode: 'E_HTML_PREVIEW_STALE',
+      message: 'Composition inputs changed after the snapshot. Capture a new snapshot before rendering.',
+    };
+  }
+  return { ok: true, entry };
+}
+
 export async function validateVideoStudioGate(
   statePath: string,
-  kind: 'preview' | 'draft',
+  kind: 'draft',
   compositionDirAbs: string,
   _currentTurnId: string,
 ): Promise<VideoStudioGateCheck> {
@@ -3604,29 +5898,386 @@ export async function validateVideoStudioGate(
   state = await migrateVideoStudioGateSignatureV5(statePath, kind, compositionDirAbs, state);
   const entry = state[kind];
   if (!entry) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_REQUIRED', message: 'This multi-scene or designed composition requires composition.snapshot and a user preview turn before mp4 rendering.' }
-      : { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'A successful composition.draft with video QA is required before high-quality export.' };
+    return { ok: false, errorCode: 'E_DRAFT_QA_REQUIRED', message: 'A successful composition.draft with video QA is required before high-quality export.' };
   }
-  const signature = await videoStudioGateSignature(compositionDirAbs, entry);
-  if (entry.signature !== signature) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_STALE', message: 'Composition inputs changed after the preview. Capture and show a new snapshot before rendering.' }
-      : { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the approved draft. Run composition.draft again and request final video confirmation.' };
+  if (entry.signature !== await videoStudioGateSignature(compositionDirAbs, entry)) {
+    return { ok: false, errorCode: 'E_DRAFT_FROZEN_INPUT_CHANGED', message: 'Composition inputs changed after the approved draft. Run composition.draft again and request final video confirmation.' };
   }
-  if (kind === 'preview' && entry.design_review?.required && entry.design_review.status !== 'passed') {
-    return {
-      ok: false,
-      errorCode: 'E_PREVIEW_DESIGN_REVIEW_REQUIRED',
-      message: 'The snapshot exists but has not passed a complete preview-frame design review.',
-    };
-  }
+  // P3: design review is advisory; legacy pending entries do not block here.
   if (entry.status !== 'approved' || !entry.approved_turn_id || !entry.approved_at) {
-    return kind === 'preview'
-      ? { ok: false, errorCode: 'E_HTML_PREVIEW_APPROVAL_REQUIRED', message: 'The preview exists but has not been explicitly approved. Call composition.approve_preview only after the user approves it.' }
-      : { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'The draft exists but the final video has not been explicitly confirmed. Call composition.approve_draft only after the user confirms it.' };
+    return { ok: false, errorCode: 'E_GATE_D_APPROVAL_REQUIRED', message: 'The draft exists but the final video has not been explicitly confirmed. Call composition.approve_draft only after the user confirms it.' };
   }
   return { ok: true, entry };
+}
+
+/** Enforce the keyframe preview stop for the delivered composition.
+ *
+ * The property this protects is a control-flow fact — the run stopped on the
+ * frames and the user got a chance to look — not a claim the model can
+ * evidence. Two earlier designs tried to verify it from tool-call-local
+ * evidence and both were routed around: quote provenance was met with a
+ * fabricated quote, and turn ordering was met with a "继续" the user had said
+ * to resume an interrupted run, before the frames existed. Whether the frames
+ * actually reached the user is simply not observable from inside a tool call.
+ *
+ * So the stop is made structural instead of inferred: a render attempted in
+ * the same turn that captured the frames is refused AND ends the turn
+ * (`endTurn`), so the model cannot negotiate, re-word, or loop — the run stops
+ * on the frames, which are published with it. The go-ahead is then just what
+ * it looks like: the user speaking in a later turn. No decision evidence is
+ * required, because a quote never proved the property anyway.
+ */
+/** Record preview authorization only when the model chooses the owning
+ *  operation, `composition.draft`. Read-only/status operations must not turn
+ *  an arbitrary user question into a durable go-ahead. The model owns the
+ *  semantic decision; the host owns temporal and visual-identity validation. */
+async function recordKeyframePreviewGoAhead(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  state: VideoProductionStateV1;
+  opts: VideoStudioToolOpts;
+}): Promise<VideoProductionStateV1> {
+  const entry = input.state.preview;
+  if (!entry) return input.state;
+  const parentLink = parentEdlLinkOf(input.state);
+  const captureTurn = String(entry.turn_id || '');
+  const currentTurn = String(input.opts.turnId || '');
+  if (!captureTurn || !currentTurn || captureTurn === currentTurn) return input.state;
+  if (!currentUserTurnAvailable(input.opts.userMessage)) return input.state;
+  // A segment's reply belongs to the production, not to the segment: the stop
+  // it answered covers every sibling, and the answer has to be somewhere they
+  // can all read it. Recording it in this composition's own state would stop
+  // the next segment too, which is the per-segment stop the protocol forbids.
+  if (parentLink.segmentId) {
+    if (!parentLink.planPath) return input.state;
+    const controlPath = videoProductionControlStatePath({
+      userId: input.opts.userId,
+      planPath: parentLink.planPath,
+    });
+    const control = await readVideoProductionControlState(controlPath, parentLink.planPath)
+      .catch(() => null);
+    const productionSignature = String(control?.plan_approval?.signature || control?.plan_signature || '');
+    if (!productionSignature) return input.state;
+    const productionVisualSignature = await currentProductionPreviewVisualSignature(
+      input.opts,
+      parentLink.planPath,
+    );
+    if (!productionVisualSignature) return input.state;
+    await recordVideoProductionPreviewGoAhead({
+      statePath: controlPath,
+      planPath: parentLink.planPath,
+      planSignature: productionSignature,
+      visualSignature: productionVisualSignature,
+      turnId: currentTurn,
+    });
+    return input.state;
+  }
+  const planSignature = String(input.state.plan_approval?.signature || '');
+  if (!planSignature) return input.state;
+  if (input.state.preview_go_ahead?.plan_signature === planSignature) return input.state;
+  return updateVideoProductionState(input.statePath, input.compositionDirAbs, (state) => {
+    state.preview_go_ahead = {
+      plan_signature: planSignature,
+      turn_id: currentTurn,
+      created_at: new Date().toISOString(),
+    };
+  });
+}
+
+/** Grant the next visual-QA cycle when the user replies to an exhausted one.
+ *
+ *  The per-cycle budget bounds retrying ONE strategy. It used to be reopened by
+ *  `composition.begin_visual_revision`, an operation the model called on its
+ *  own — so the budget bounded a cycle and nothing bounded the cycles. On
+ *  2026-08-07 a CTA scene alternated between "never visible" and "visible in
+ *  every frame" across three self-granted cycles and about twelve minutes,
+ *  never stopping to ask, and the run ended with the model inventing a QA
+ *  waiver it had no authority to grant.
+ *
+ *  The operation is gone. An exhausted cycle ends the turn on the user, and
+ *  their reply is what buys the next one — so the bound is a person, not a
+ *  counter. A reply that asks to skip the check instead reaches
+ *  `waive_qa_findings` and leaves this cycle unused, which costs nothing. The
+ *  failed strategies stay in `visual_qa.history` precisely so the next cycle
+ *  can be told not to repeat them. */
+async function grantVisualQaCycleOnUserTurn(input: {
+  statePath: string;
+  compositionDirAbs: string;
+  state: VideoProductionStateV1;
+  opts: VideoStudioToolOpts;
+}): Promise<VideoProductionStateV1> {
+  if (input.state.draft?.status === 'approved') return input.state;
+  // Read through the legacy shape so an old record is recognised, then hand it
+  // straight back: a cycle recorded in the pre-cycle shape, or by an older
+  // inspector, is invalidated by its own `visual_qa_cycle_stale` path, which
+  // re-proves the composition against the current checks. Granting a fresh
+  // cycle over it would erase that signal before anyone acted on it.
+  const cycle = legacyVisualQaCycle(input.state.visual_qa);
+  if (cycle && !currentVisualQaCycle(input.state.visual_qa)) return input.state;
+  const currentTurn = String(input.opts.turnId || '');
+  // The turn that exhausted the budget is the turn that presents it; only a
+  // LATER real user turn is a reply to that presentation.
+  if (!currentTurn || !cycle) return input.state;
+  if (String(cycle.exhausted_by_turn_id || '') === currentTurn) return input.state;
+  if (!currentUserTurnAvailable(input.opts.userMessage)) return input.state;
+  const drained = cycle.status === 'exhausted'
+    || cycle.failed_signatures.length >= cycle.max_repair_passes + 1;
+  // A partly spent cycle whose last failure came from an earlier turn is an
+  // ABANDONED repair episode. The budget bounds how far the model repairs
+  // WITHOUT the user, so charging an abandoned episode's spend to the run the
+  // user just started is the same as never having consulted them. 2026-08-08:
+  // a cycle opened the previous evening carried 2 of its 2 passes into a fresh
+  // session, the first failure of the new run hit the wall seven minutes in,
+  // and the model told the user it had done "3 repair rounds" — two of them
+  // belonged to a conversation the user was no longer in.
+  //
+  // The stamp is required, not assumed: a cycle recorded before it existed, or
+  // seeded by a caller that does not stamp, cannot be proven abandoned, and
+  // erasing a live episode's failed signatures would lose the record that makes
+  // "try a different strategy" enforceable.
+  const abandoned = !drained
+    && cycle.failed_signatures.length > 0
+    && !!cycle.last_failure_turn_id
+    && cycle.last_failure_turn_id !== currentTurn;
+  if (!drained && !abandoned) return input.state;
+  const visualRevision = nextVisualRevision(input.state.visual_qa);
+  return updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+    next.visual_qa = {
+      cycle: newVisualQaCycle({ visualRevision, turnId: currentTurn }),
+      history: visualQaHistoryWithCurrent(next.visual_qa),
+    };
+    delete next.blocked_operation;
+    recordVideoProductionTransition(next, {
+      op: 'composition.status',
+      status: 'passed',
+      turnId: currentTurn,
+      stage: next.stage,
+    });
+  });
+}
+
+/** Identity of the complete production preview: segment order plus the current
+ * visual bytes of every captured child/media segment. Narration and other
+ * non-visual plan fields are deliberately absent. */
+async function currentProductionPreviewVisualSignature(
+  opts: VideoStudioToolOpts,
+  planPath: string,
+): Promise<string> {
+  const identity = await readVideoProductionPlanIdentity(planPath).catch(() => null);
+  if (!identity) return '';
+  const records = await videoProductionSegmentReviewRecords({
+    opts,
+    planPathAbs: planPath,
+    identity,
+    roots: allowedRoots(opts),
+  }).catch(() => []);
+  const review = videoProductionReviewStatus({
+    identity,
+    facts: records.map((record) => record.fact),
+  });
+  if (!review.renderable) return '';
+  return crypto.createHash('sha256').update(stableJson(review.segments.map((segment) => ({
+    segment_id: segment.segment_id,
+    visual_signature: segment.visual_signature,
+  })))).digest('hex');
+}
+
+/** Has this segment's production already had its current visual preview stop answered? */
+async function productionPreviewGoAheadGranted(
+  opts: VideoStudioToolOpts,
+  state: VideoProductionStateV1,
+): Promise<{ granted: boolean }> {
+  const link = parentEdlLinkOf(state);
+  if (!link.segmentId || !link.planPath) return { granted: false };
+  const control = await readVideoProductionControlState(
+    videoProductionControlStatePath({ userId: opts.userId, planPath: link.planPath }),
+    link.planPath,
+  ).catch(() => null);
+  const goAhead = control?.preview_go_ahead;
+  if (!goAhead) return { granted: false };
+  const signature = String(control?.plan_approval?.signature || control?.plan_signature || '');
+  const visualSignature = await currentProductionPreviewVisualSignature(opts, link.planPath);
+  return {
+    granted: !!signature
+      && !!visualSignature
+      && goAhead.plan_signature === signature
+      && goAhead.visual_signature === visualSignature,
+  };
+}
+
+function keyframePreviewStopBlock(input: {
+  state: VideoProductionStateV1;
+  entry?: VideoProductionGateEntry;
+  opts: VideoStudioToolOpts;
+  /** For a segment: whether the PRODUCTION already has the user's go-ahead. */
+  productionPreviewGoAhead?: boolean;
+}): Record<string, unknown> | undefined {
+  const entry = input.entry || input.state.preview;
+  if (!entry) return undefined;
+  // A segment of an assembled production does not stop on its own frames —
+  // per-segment stops are what the protocol forbids — but it defers to the
+  // production's ONE stop, and for a long time that stop existed only in this
+  // comment: there is no production-level render or export operation to host
+  // it, the assembly is ffmpeg driven by the model, so nothing ever asked.
+  // Measured twice on 2026-08-08 in one run: the first delivery went capture
+  // straight to finished video, and a user-requested frame fix was captured
+  // (16:37:51, 16:38:29) and rendered (16:38:49) inside a single turn — the
+  // change the user asked to see became the final video without being shown.
+  // So the deferral now has to point at something: the first segment to draft
+  // carries the stop until the production records a go-ahead, and every
+  // segment after that renders straight through.
+  const autoChild = !!parentEdlLinkOf(input.state).segmentId;
+  if (autoChild) {
+    if (input.productionPreviewGoAhead) return undefined;
+  } else {
+    // The stop happens once per visual identity. Re-capturing unchanged bytes
+    // does not reopen it; a visible edit invalidates the preview/go-ahead
+    // bundle before capture. A narration-only amendment re-keys the same
+    // visual go-ahead during plan approval.
+    const planSignature = String(input.state.plan_approval?.signature || '');
+    const goAhead = input.state.preview_go_ahead;
+    if (planSignature && goAhead?.plan_signature === planSignature) return undefined;
+  }
+
+  const captureTurn = String(entry.turn_id || '');
+  const currentTurn = String(input.opts.turnId || '');
+  const sameTurnAsCapture = !!captureTurn && captureTurn === currentTurn;
+
+  const framePaths = (entry.frame_paths || []).slice(0, 24);
+  return {
+    ok: false,
+    op: 'composition.draft',
+    errorCode: 'E_PREVIEW_GO_AHEAD_REQUIRED',
+    message: sameTurnAsCapture
+      ? 'These frames were captured in this same turn, so the user has not seen them. Do not retry this call — it cannot succeed until they reply. Write the keyframe preview message NOW: name each frame path below, invite changes in one line, end the turn with the interaction marker, and render on their next reply.'
+      : 'The keyframe preview is still pending a user reply. Do not retry this call. Present the frames below with their paths, invite changes, and end the turn; render after they respond.',
+    contact_sheet: entry.path || '',
+    frame_paths: framePaths,
+    ...(entry.frame_paths && entry.frame_paths.length > framePaths.length
+      ? { frame_paths_omitted: entry.frame_paths.length - framePaths.length }
+      : {}),
+    frames_captured_this_turn: sameTurnAsCapture,
+    requires_user_decision: true,
+    next_step_owner: 'user',
+    interaction_required: true,
+    automatic_recovery_expected: false,
+    same_turn_continuation_required: false,
+    billable_request_sent: false,
+    next_action: 'present_keyframe_preview_and_end_turn',
+  };
+}
+
+/** How the narration retime should divide the target duration across scenes.
+ *
+ * Speech time is reserved: a narrated scene weighs its estimated speech
+ * duration, because a window shorter than its own line cuts the voice off.
+ * Whatever time remains is shared among the SILENT scenes in proportion to the
+ * durations the design gave them — a silent hook, title card or payoff hold is
+ * a deliberate beat, not filler.
+ *
+ * The previous rule weighed a silent scene at 3% of its authored duration,
+ * which did not shorten it so much as delete it: on 2026-08-06 a 5.875s
+ * opening hook was retimed to 0.224s — seven frames — and every sampled frame
+ * around it came back blank, which read as a rendering defect rather than the
+ * timing decision it was. When speech alone already exceeds the target there
+ * is nothing to share, so silent scenes fall back to a floor and the
+ * narration-overflow QA reports the real problem.
+ */
+function narrationSceneWeights(
+  manifest: CompositionManifest,
+  targetDurationSec: number,
+  effectiveSpeed: number,
+): number[] {
+  const MIN_WEIGHT = 0.05;
+  const speech = manifest.scenes.map((scene) => {
+    const text = scene.narration_text?.trim() || '';
+    return text ? Math.max(MIN_WEIGHT, estimateNarrationDuration(text, effectiveSpeed).estimatedSec) : 0;
+  });
+  const authoredSilent = manifest.scenes.map((scene, index) => (
+    speech[index] > 0 ? 0 : Math.max(MIN_WEIGHT, scene.duration)
+  ));
+  const totalSpeech = speech.reduce((sum, value) => sum + value, 0);
+  const totalSilent = authoredSilent.reduce((sum, value) => sum + value, 0);
+  const remaining = Number.isFinite(targetDurationSec) ? targetDurationSec - totalSpeech : 0;
+  if (!(totalSilent > 0) || !(remaining > 0)) {
+    return manifest.scenes.map((_, index) => (
+      speech[index] > 0 ? speech[index] : MIN_WEIGHT
+    ));
+  }
+  return manifest.scenes.map((_, index) => (
+    speech[index] > 0
+      ? speech[index]
+      : Math.max(MIN_WEIGHT, remaining * authoredSilent[index] / totalSilent)
+  ));
+}
+
+function narrationTimingBudget(
+  manifest: CompositionManifest,
+  deliveryTargetDurationSec: number,
+): { targetDurationSec: number; reservedSilentDurationSec: number } {
+  const reservedSilentDurationSec = Math.round(manifest.scenes.reduce((sum, scene) => (
+    scene.narration_text?.trim() ? sum : sum + scene.duration
+  ), 0) * 1000) / 1000;
+  return {
+    targetDurationSec: Math.max(0.5, Math.round(
+      (deliveryTargetDurationSec - reservedSilentDurationSec) * 1000,
+    ) / 1000),
+    reservedSilentDurationSec,
+  };
+}
+
+function interstitialSilentSceneIds(manifest: CompositionManifest): string[] {
+  const narrated = manifest.scenes.flatMap((scene, index) => (
+    scene.narration_text?.trim() ? [index] : []
+  ));
+  if (narrated.length < 2) return [];
+  const first = narrated[0];
+  const last = narrated.at(-1)!;
+  return manifest.scenes
+    .slice(first + 1, last)
+    .filter((scene) => !scene.narration_text?.trim())
+    .map((scene) => scene.id);
+}
+
+/** Test seam for the scene-weight rule: the retime it feeds is only reachable
+ *  through a billable narration call. */
+export const _narrationSceneWeightsForTest = narrationSceneWeights;
+
+/** Whether the ASSEMBLED production this segment belongs to needs a keyframe
+ * preview — judged on the parent EDL, because the promise is per video, not
+ * per segment. The per-segment thresholds exempted every segment of a real
+ * 60s six-segment promo (each under 20s, one scene each), so the production
+ * stop that the segment exemption defers to was never evaluated: on
+ * 2026-08-08 all five segments went snapshot -> draft -> ffmpeg assembly with
+ * `preview_go_ahead: null`, twice in one day, and the user asked twice why no
+ * preview ever appeared. Same thresholds, applied to the whole video: total
+ * target duration, and the scene count summed across compose segments.
+ * Unreadable plans fall back to the segment-level answer instead of inventing
+ * a requirement. */
+async function assembledProductionPreviewRequired(planPathAbs: string): Promise<boolean> {
+  try {
+    const plan = JSON.parse(await fs.readFile(planPathAbs, 'utf8')) as Record<string, unknown>;
+    const totalSec = Number(plan.total_target_sec);
+    if (Number.isFinite(totalSec) && totalSec >= 20) return true;
+    const segments = Array.isArray(plan.segments) ? plan.segments : [];
+    let sceneCount = 0;
+    for (const segment of segments) {
+      if (!segment || typeof segment !== 'object' || Array.isArray(segment)) continue;
+      const record = segment as Record<string, unknown>;
+      if (record.source !== 'compose') continue;
+      const spec = record.spec && typeof record.spec === 'object' && !Array.isArray(record.spec)
+        ? record.spec as Record<string, unknown>
+        : {};
+      const binding = spec.composition_plan && typeof spec.composition_plan === 'object'
+        && !Array.isArray(spec.composition_plan)
+        ? spec.composition_plan as Record<string, unknown>
+        : {};
+      sceneCount += Array.isArray(binding.scenes) ? binding.scenes.length : 0;
+    }
+    return sceneCount >= 3;
+  } catch {
+    return false;
+  }
 }
 
 export async function videoStudioPreviewRequired(compositionDirAbs: string): Promise<boolean> {
@@ -3652,35 +6303,6 @@ export async function videoStudioPreviewRequired(compositionDirAbs: string): Pro
     sceneCount = new Set([...html.matchAll(/\bdata-scene-id\s*=\s*["']([^"']+)["']/gi)].map((match) => match[1])).size;
   }
   return duration >= 20 || sceneCount >= 3;
-}
-
-async function videoStudioDesignReviewRequired(
-  compositionDirAbs: string,
-  draftResult: Record<string, unknown>,
-): Promise<boolean> {
-  if (await videoStudioPreviewRequired(compositionDirAbs)) return true;
-  try {
-    const manifest = CompositionManifestSchema.parse(JSON.parse(
-      await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
-    ));
-    const artDirection = manifest.art_direction;
-    if (artDirection && typeof artDirection === 'object' && !Array.isArray(artDirection)
-      && (artDirection as Record<string, unknown>).style_source) return true;
-  } catch { /* draft QA owns invalid-manifest errors */ }
-  const report = draftResult.report && typeof draftResult.report === 'object' && !Array.isArray(draftResult.report)
-    ? draftResult.report as Record<string, unknown>
-    : {};
-  const steps = report.steps && typeof report.steps === 'object' && !Array.isArray(report.steps)
-    ? report.steps as Record<string, unknown>
-    : {};
-  const inspect = steps.inspect && typeof steps.inspect === 'object' && !Array.isArray(steps.inspect)
-    ? steps.inspect as Record<string, unknown>
-    : {};
-  const disposition = inspect.draft_disposition && typeof inspect.draft_disposition === 'object'
-    && !Array.isArray(inspect.draft_disposition)
-    ? inspect.draft_disposition as Record<string, unknown>
-    : {};
-  return Number(disposition.advisory_count || 0) > 0;
 }
 
 async function videoStudioReferenceReviewRequirement(compositionDirAbs: string): Promise<{
@@ -3716,14 +6338,54 @@ async function videoStudioReferenceReviewRequirement(compositionDirAbs: string):
   }
 }
 
-async function ensureInputFile(absPath: string): Promise<string | null> {
+/** Refusal content when a required path argument does not name a readable
+ *  file, or null when it does. The bare `input is not a file: <path>` this
+ *  replaced carried no error code, no next action, and no argument name — the
+ *  same string answered a missing `plan_path` and a `speech.transcribe`
+ *  `input_path`, so the model could not tell which of its arguments was wrong
+ *  or whether the file was absent or merely a directory (2026-08-09 run). */
+async function ensureInputFile(
+  absPath: string,
+  argument: 'plan_path' | 'input_path' | 'delivered_video_path',
+): Promise<string | null> {
   const st = await fs.stat(absPath).catch(() => null);
-  return st && st.isFile() ? null : `input is not a file: ${absPath}`;
+  if (st?.isFile()) return null;
+  const missing = !st;
+  return resultContent({
+    ok: false,
+    errorCode: missing ? 'E_INPUT_FILE_NOT_FOUND' : 'E_INPUT_NOT_A_FILE',
+    message: missing
+      ? `${argument} does not exist here yet: ${absPath}`
+      : `${argument} names a directory, not a file: ${absPath}`,
+    next_action: 'retry_with_the_path_that_holds_the_file',
+  });
 }
 
-async function ensureInputDir(absPath: string): Promise<string | null> {
+/** Inspection result when composition_dir does not name a usable directory.
+ *  Twin of ensureInputFile above and fixed for the same
+ *  reason: the bare `composition_dir is not a directory: <path>` it replaced
+ *  carried no error code, no next action, and did not separate a directory
+ *  that does not exist yet from a path that is a file. The AUTO-child branch
+ *  below answers its own case. The `exists` fact also lets the read-only
+ *  status operation distinguish a fresh composition from a mistyped file. */
+async function inspectInputDir(absPath: string): Promise<{
+  error: string | null;
+  exists: boolean;
+}> {
   const st = await fs.stat(absPath).catch(() => null);
-  return st && st.isDirectory() ? null : `composition_dir is not a directory: ${absPath}`;
+  if (st?.isDirectory()) return { error: null, exists: true };
+  const missing = !st;
+  return {
+    exists: !missing,
+    error: resultContent({
+      ok: false,
+      errorCode: missing ? 'E_COMPOSITION_DIR_NOT_FOUND' : 'E_COMPOSITION_DIR_NOT_A_DIRECTORY',
+      message: missing
+        ? `composition_dir does not exist yet: ${absPath}. Author composition-manifest.json there first, then call composition.prepare to create the generated index.html scaffold; or pass the directory that already holds the composition.`
+        : `composition_dir names a file, not a directory: ${absPath}.`,
+      next_action: 'retry_with_the_composition_directory',
+    }),
+  };
 }
 
 async function notifyWritten(opts: VideoStudioToolOpts, paths: Array<unknown>): Promise<void> {
@@ -3741,7 +6403,7 @@ async function notifyWritten(opts: VideoStudioToolOpts, paths: Array<unknown>): 
     if (seen.has(abs)) continue;
     seen.add(abs);
     try { await opts.onFileWritten(abs); }
-    catch (err) { log.warn(`onFileWritten failed: ${(err as Error).message}`); }
+    catch (err) { log.warn('onFileWritten failed', { error: logErrorSummary(err) }); }
   }
 }
 
@@ -3764,11 +6426,125 @@ async function publishVisibleOutputs(opts: VideoStudioToolOpts, paths: Array<unk
   }
   if (!out.length) return;
   try { await opts.onOutputsPublished(out); }
-  catch (err) { log.warn(`onOutputsPublished failed: ${(err as Error).message}`); }
+  catch (err) { log.warn('onOutputsPublished failed', { error: logErrorSummary(err) }); }
+}
+
+async function finalizeVideoBeforePublish(
+  opts: VideoStudioToolOpts,
+  op: 'composition.draft' | 'composition.export',
+  outputPath: unknown,
+  coverPath?: unknown,
+): Promise<void> {
+  if (typeof outputPath !== 'string' || !outputPath) return;
+  try {
+    // Both draft and export videos are user-visible deliverables. Finalize them
+    // before returning the tool result so a streamed chat-media link never
+    // exposes the clean render before output policy post-processing completes.
+    await finalizeProducedFile(path.resolve(outputPath), {
+      userId: opts.userId,
+      ...(opts.cid ? { cid: opts.cid } : {}),
+      ...(opts.projectId ? { projectId: opts.projectId } : {}),
+      source: op === 'composition.draft'
+        ? 'video_studio.draft_pre_publish'
+        : 'video_studio.export_pre_publish',
+    });
+    if (typeof coverPath === 'string' && coverPath) {
+      await finalizeProducedFile(path.resolve(coverPath), {
+        userId: opts.userId,
+        ...(opts.cid ? { cid: opts.cid } : {}),
+        ...(opts.projectId ? { projectId: opts.projectId } : {}),
+        source: op === 'composition.draft'
+          ? 'video_studio.draft_cover_pre_publish'
+          : 'video_studio.export_cover_pre_publish',
+      });
+    }
+  } catch (err) {
+    log.warn(`${op} pre-publish finalization failed`, { error: logErrorSummary(err) });
+  }
+}
+
+async function prepareVideoStudioModelVisual(
+  absPath: string,
+): Promise<{ data: string; mediaType: 'image/png' | 'image/webp' } | null> {
+  try {
+    const source = await fs.readFile(absPath);
+    const prepared = await prepareLosslessModelImage(source);
+    return {
+      data: prepared.buf.toString('base64'),
+      mediaType: prepared.mediaType,
+    };
+  } catch (err) {
+    // Native snapshot/draft paths are expected to be valid PNGs. Keep older
+    // mocked/legacy hosts compatible, but never label unreadable bytes as
+    // model-visible evidence.
+    log.warn('video visual evidence attachment skipped', {
+      path: absPath,
+      error: logErrorSummary(err),
+    });
+    return null;
+  }
+}
+
+export function deriveVideoStudioOutcome(
+  result: Record<string, unknown>,
+): 'continue' | 'need_user' | 'stop' {
+  if (result.ok === true) return result.op === 'composition.export' ? 'stop' : 'continue';
+  if (result.next_step_owner === 'user'
+    || result.requires_user_decision === true
+    || result.interaction_required === true) {
+    return 'need_user';
+  }
+  return 'continue';
+}
+
+const VIDEO_STUDIO_ERROR_CLASS_RULES: Array<{ re: RegExp; cls: string }> = [
+  { re: /^E_(?:DECISION_EVIDENCE|DESIGN_REVIEW_(?:SCORES?|VERDICT|SCORE)|PATH_OUT_OF_SCOPE|PARENT_COMPOSITION_BINDING)/, cls: 'input_error' },
+  { re: /^E_(?:GATE_USER_TURN_REQUIRED|REPEATED_FAILURE_USER_DECISION_REQUIRED|VIDEO_REVIEW_SUBMISSION_SUPERSEDED|NARRATION_TIMING_USER_DECISION_REQUIRED)/, cls: 'user_turn_required' },
+  { re: /APPROVAL_REQUIRED|APPROVAL_TURN_REQUIRED|EXPLICIT_APPROVAL/, cls: 'user_turn_required' },
+  { re: /^E_(?:VIDEO_STUDIO_SKILL_OUTDATED|VIDEO_STUDIO_HOST_OUTDATED)/, cls: 'user_turn_required' },
+  { re: /^E_TTS_RETRY_EPISODE_EXHAUSTED|BUDGET_EXCEEDED|RETRY_NO_CHANGE|ALREADY_PASSED/, cls: 'budget' },
+  { re: /^E_(?:TTS_MEASURED_DURATION_MISMATCH|NARRATION_TIMING_REVISION_REQUIRED|NARRATION_TIMING_WAIVER_MATERIALIZATION_REQUIRED)/, cls: 'narration_timing' },
+  { re: /^E_TTS_TEXT_(?:TOO_LONG|TOO_SHORT)/, cls: 'input_error' },
+  { re: /^E_TTS_|PROVIDER|^E_VIDEO_QA_BLOCKED|TIMEOUT/, cls: 'provider_error' },
+];
+
+export function deriveVideoStudioErrorClass(errorCode: unknown): string | undefined {
+  const code = typeof errorCode === 'string' ? errorCode : '';
+  if (!code) return undefined;
+  for (const rule of VIDEO_STUDIO_ERROR_CLASS_RULES) {
+    if (rule.re.test(code)) return rule.cls;
+  }
+  return 'precondition';
+}
+
+export function deriveVideoStudioPlanGateClass(
+  errorCode: unknown,
+): 'artifact_repair' | 'intent_amendment' | undefined {
+  const code = typeof errorCode === 'string' ? errorCode : '';
+  if (!code.startsWith('E_GATE_B_')) return undefined;
+  const needsUser = code === 'E_GATE_B_ARTIFACT_CHANGED'
+    || code === 'E_GATE_B_APPROVAL_REQUIRED'
+    || code === 'E_GATE_B_EXPLICIT_APPROVAL_REQUIRED'
+    || code === 'E_GATE_B_APPROVE_PLAN_REQUIRED';
+  return needsUser ? 'intent_amendment' : 'artifact_repair';
 }
 
 function resultContent(result: Record<string, unknown>, renamedNote = ''): string {
-  return `${JSON.stringify(result, null, 2)}${renamedNote}`;
+  // Every JSON protocol result names the host tool contract so skills can
+  // verify they are reading the protocol generation they were written for.
+  // Serialization is also where the model-facing projection applies, so every
+  // return path — including early gate refusals — carries the same bounded
+  // envelope instead of the full durable-state echo.
+  const compact = compactQaBlockedVideoStudioResult(result as VideoStudioResult) as unknown as Record<string, unknown>;
+  const errorClass = deriveVideoStudioErrorClass(compact.errorCode);
+  const planGateClass = deriveVideoStudioPlanGateClass(compact.errorCode);
+  return `${JSON.stringify({
+    contract_version: VIDEO_STUDIO_TOOL_CONTRACT,
+    outcome: deriveVideoStudioOutcome(compact),
+    ...(errorClass ? { error_class: errorClass } : {}),
+    ...(planGateClass ? { plan_gate_class: planGateClass } : {}),
+    ...compact,
+  }, null, 2)}${renamedNote}`;
 }
 
 export function resultConsumesFullRenderTurnBudget(result: Record<string, unknown>): boolean {
@@ -3804,17 +6580,38 @@ async function compositionDoctor(compositionDirAbs: string): Promise<Record<stri
     const manifest = CompositionManifestSchema.parse(JSON.parse(
       await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
     ));
-    narrationRequested = !!compositionNarrationText(manifest);
+    // Narration readiness belongs to whoever will synthesize the audio. An
+    // assembled child carries the words so its frames can be timed and
+    // captioned, but the parent EDL signs the voice and mixes it. Asking the
+    // child here demanded an `audio.narration_intent` that
+    // `composition.approve_plan` refuses on exactly the same manifest
+    // (`E_PARENT_COMPOSITION_AUDIO_OWNERSHIP`), so a narrated AUTO segment
+    // could satisfy neither check and production stopped with nothing to fix.
+    narrationRequested = !!compositionNarrationText(manifest)
+      && manifest.audio.owner !== 'assembler';
     if (narrationRequested) {
       narrationSelection = await resolveCompositionNarrationSelection({ manifest });
     }
   } catch { /* manifest readiness is reported by prepare */ }
+  const ttsProviderReady = hasConfiguredTtsProvider();
+  const ttsAvailability = ttsProviderReady
+    ? { available: true as const, reason: 'available' as const }
+    : getTtsAvailabilityDetails(false);
   const checks = {
     workspace_write: { ok: writable, required: true },
     ffmpeg: { ok: ffmpegReady, required: true },
     ffprobe: { ok: ffprobeReady, required: true },
     browser_window: { ok: browserWindowAvailable, required: true },
-    tts_provider: { ok: hasConfiguredTtsProvider(), required: narrationRequested },
+    tts_provider: {
+      ok: ttsProviderReady,
+      required: narrationRequested,
+      availability: ttsAvailability.reason,
+      ...(!ttsAvailability.available ? {
+        error_code: ttsAvailability.errorCode,
+        message: ttsAvailability.message,
+        next_action: ttsAvailability.nextAction,
+      } : {}),
+    },
     tts_selection: {
       ok: !narrationRequested || narrationSelection?.ok === true,
       required: narrationRequested,
@@ -3886,6 +6683,7 @@ async function reconcileVideoProduction(input: {
   statePath: string;
   roots: string[];
   turnId?: string;
+  ctx?: ToolContext;
 }): Promise<Record<string, unknown>> {
   const manifestPath = path.join(input.compositionDirAbs, 'composition-manifest.json');
   const htmlPath = path.join(input.compositionDirAbs, 'index.html');
@@ -3893,11 +6691,14 @@ async function reconcileVideoProduction(input: {
   try {
     manifest = CompositionManifestSchema.parse(JSON.parse(await fs.readFile(manifestPath, 'utf8')));
   } catch (err) {
+    const failure = compositionManifestFailure(err);
     return {
       ok: false,
       op: 'composition.reconcile',
       errorCode: 'E_COMPOSITION_MANIFEST_INVALID',
-      message: `Cannot reconcile an invalid composition manifest: ${(err as Error).message}`,
+      message: failure.missing
+        ? 'There is no composition-manifest.json here to reconcile. For an AUTO child, composition.approve_plan with the parent plan_path and segment_id derives it; a standalone composition authors it before composition.prepare.'
+        : `Cannot reconcile an invalid composition manifest: ${failure.detail}`,
     };
   }
   const currentState = await readVideoProductionState(input.statePath, input.compositionDirAbs);
@@ -3921,7 +6722,6 @@ async function reconcileVideoProduction(input: {
       production_state: summarizeVideoProductionState(state),
     };
   }
-  const originalHtmlSha = crypto.createHash('sha256').update(originalHtml).digest('hex');
   const reconciled = reconcileCompositionHtml(originalHtml, manifest);
   if (!reconciled.ok) {
     return {
@@ -3937,13 +6737,10 @@ async function reconcileVideoProduction(input: {
     };
   }
   if (reconciled.changed) {
-    await writeTextAtomic(htmlPath, reconciled.html);
+    await writeTextAtomic(htmlPath, reconciled.html, input.ctx);
   }
-  const [artifacts, previewGateCheck, draftGateCheck, narrationIdentity, planIdentity] = await Promise.all([
+  const [artifacts, draftGateCheck, narrationIdentity, planIdentity] = await Promise.all([
     videoProductionArtifacts(input.compositionDirAbs),
-    currentState.preview
-      ? checkVideoStudioGateSignature(input.compositionDirAbs, currentState.preview)
-      : Promise.resolve(undefined),
     currentState.draft
       ? checkVideoStudioGateSignature(input.compositionDirAbs, currentState.draft)
       : Promise.resolve(undefined),
@@ -3953,9 +6750,11 @@ async function reconcileVideoProduction(input: {
       roots: input.roots,
     }),
   ]);
-  const visualAuthored = (!!currentState.artifacts.scaffold_html_sha256
-      && originalHtmlSha !== currentState.artifacts.scaffold_html_sha256)
-    || !originalHtml.includes('ORKAS-GENERATED-SCAFFOLD');
+  const visualAuthored = artifactsShowAuthoredVisuals(
+    currentState.artifacts,
+    artifacts,
+    originalHtml,
+  );
   const narrationProvenanceMatches = (!!currentState.narration
     && currentState.narration.text_sha256 === narrationIdentity.textSha
     && currentState.narration.audio_sha256 === narrationIdentity.audioSha)
@@ -4004,7 +6803,8 @@ async function reconcileVideoProduction(input: {
       }
     }
     const narrationPending = narrationIdentity.required && !narrationRecovered;
-    const previewValid = !!next.preview && previewGateCheck?.matches === true;
+    const previewValid = !!next.preview?.visual_signature
+      && next.preview.visual_signature === artifacts.visual_signature;
     const draftValid = !narrationPending && !!next.draft && draftGateCheck?.matches === true;
     if (narrationPending) {
       delete next.draft;
@@ -4018,11 +6818,10 @@ async function reconcileVideoProduction(input: {
     } else if (next.blocked_operation?.error_code === 'E_NARRATION_MATERIALIZATION_REQUIRED') {
       delete next.blocked_operation;
     }
-    if (!previewValid) delete next.preview;
-    else if (next.preview && previewGateCheck?.upgradeToV5) {
-      next.preview.validation_version = 5;
-      next.preview.signature = artifacts.composition_signature || next.preview.signature;
-    }
+    // A preview is keyed only by the visual projection. Narration recovery
+    // and other non-visual reconciliation keep the whole evidence bundle;
+    // legacy entries without that sub-identity fail closed.
+    invalidateVisualEvidenceUnlessCurrent(next, artifacts.visual_signature || '');
     if (!draftValid) delete next.draft;
     else if (next.draft && draftGateCheck?.upgradeToV5) {
       next.draft.validation_version = 5;
@@ -4056,6 +6855,7 @@ async function reconcileVideoProduction(input: {
         }),
         materialized_at: previous?.materialized_at || new Date().toISOString(),
       };
+      appendNarrationTransactionHistory(next, next.narration_transaction);
       delete next.narration_transaction;
       delete next.narration_retry_authorization;
     } else if (next.narration && !narrationAudioMatchesState(next, narrationIdentity)) {
@@ -4074,9 +6874,15 @@ async function reconcileVideoProduction(input: {
     next.artifacts = {
       ...artifacts,
       ...(!visualAuthored && artifacts.html_sha256
-        ? { scaffold_html_sha256: artifacts.html_sha256 }
+        ? {
+          scaffold_html_sha256: artifacts.html_sha256,
+          scaffold_visual_signature: artifacts.visual_signature,
+        }
         : currentState.artifacts.scaffold_html_sha256
-          ? { scaffold_html_sha256: currentState.artifacts.scaffold_html_sha256 }
+          ? {
+            scaffold_html_sha256: currentState.artifacts.scaffold_html_sha256,
+            scaffold_visual_signature: currentState.artifacts.scaffold_visual_signature,
+          }
           : {}),
     };
     recordVideoProductionTransition(next, {
@@ -4198,7 +7004,10 @@ function exhaustedNarrationRetryResult(input: {
     retry_policy: 'episode_exhausted',
     requires_user_decision: false,
     user_reconfirmation_required: false,
-    automatic_recovery_expected: true,
+    automatic_recovery_expected: false,
+    next_step_owner: 'external',
+    same_turn_continuation_required: false,
+    interaction_required: false,
     recovery_status: 'completed_with_preserved_visual_candidate',
     blocked_scope: 'narration_and_complete_delivery_only',
     candidate_completeness: 'visual_only',
@@ -4238,6 +7047,97 @@ function exhaustedNarrationRetryResult(input: {
   };
 }
 
+/**
+ * Move a narration artifact that cannot be attributed to the current script out
+ * of the composition, without losing it.
+ *
+ * The audio was very likely paid for, so it is preserved under the
+ * runtime-owned `assets/narration-history/` directory rather than deleted. That
+ * directory is excluded from the composition-file walk, so the artifact stops
+ * participating in the composition identity while remaining on disk for the
+ * user. Preview approval is unaffected either way — it resolves against the
+ * VISUAL signature, which excludes audio.
+ *
+ * The name is content-addressed, so re-preserving the same bytes is idempotent.
+ * Returns the new path, or null when the move failed; a caller that gets null
+ * must keep treating the original as present.
+ */
+async function preserveUnmatchedNarrationAudio(
+  compositionDirAbs: string,
+  audioAbsPath: string,
+): Promise<string | null> {
+  const historyDir = path.join(compositionDirAbs, 'assets', 'narration-history');
+  const sha = await sha256File(audioAbsPath);
+  const target = path.join(historyDir, `unmatched-${(sha || 'unknown').slice(0, 16)}.mp3`);
+  try {
+    await fs.mkdir(historyDir, { recursive: true });
+    await fs.rename(audioAbsPath, target);
+    return target;
+  } catch (err) {
+    log.warn('preserve unmatched narration audio failed', { error: logErrorSummary(err) });
+    return null;
+  }
+}
+
+function appendNarrationTransactionHistory(
+  state: VideoProductionStateV1,
+  transaction: VideoProductionNarrationTransaction | undefined,
+): void {
+  if (!transaction) return;
+  const history = (state.narration_transaction_history || [])
+    .filter((candidate) => candidate.transaction_id !== transaction.transaction_id);
+  state.narration_transaction_history = [...history, transaction].slice(-20);
+}
+
+function narrationTimingDecisionResult(input: {
+  episode: VideoProductionNarrationTimingEpisode;
+  measuredDurationSec: number;
+  billableRequestSent: boolean;
+}): Record<string, unknown> {
+  return {
+    ok: false,
+    op: 'composition.materialize_narration',
+    errorCode: 'E_NARRATION_TIMING_USER_DECISION_REQUIRED',
+    message: `Narration measured ${Math.round(input.measuredDurationSec * 1000) / 1000}s, outside the accepted ${input.episode.min_duration_sec}-${input.episode.max_duration_sec}s range after the one automatic timing retry. No further speech request will be sent automatically. Ask the user whether to revise the narration again or continue production with this complete audio and its actual duration.`,
+    measured_duration_sec: Math.round(input.measuredDurationSec * 1000) / 1000,
+    target_duration_sec: input.episode.target_duration_sec,
+    tolerance_sec: input.episode.tolerance_sec,
+    min_duration_sec: input.episode.min_duration_sec,
+    max_duration_sec: input.episode.max_duration_sec,
+    timing_episode_id: input.episode.episode_id,
+    automatic_retries_used: input.episode.automatic_retries_used,
+    automatic_retry_limit: input.episode.automatic_retry_limit,
+    billable_request_sent: input.billableRequestSent,
+    requires_user_decision: true,
+    user_reconfirmation_required: true,
+    automatic_recovery_expected: false,
+    next_step_owner: 'user',
+    interaction_required: true,
+    blocked_scope: 'narration_and_complete_delivery_only',
+    candidate_completeness: 'visual_only',
+    user_options: [
+      {
+        id: 'continue_narration_revision',
+        label: 'Continue revising narration',
+        effect: 'Authorize exactly one additional speech request after a timing-focused text revision and free fit check.',
+      },
+      {
+        id: 'proceed_with_current_narration',
+        label: 'Continue with the current narration',
+        effect: 'Record a duration waiver and retime the composition to the complete current audio without truncating speech.',
+      },
+    ],
+    allowed_recovery_ops: [
+      'composition.status',
+      'composition.lint',
+      'composition.inspect',
+      'composition.snapshot',
+      'composition.materialize_narration',
+    ],
+    next_action: 'present_narration_timing_decision_and_end_turn',
+  };
+}
+
 async function materializeCompositionNarration(input: {
   compositionDirAbs: string;
   statePath: string;
@@ -4264,7 +7164,7 @@ async function materializeCompositionNarration(input: {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_COMPOSITION_MANIFEST_INVALID',
-      message: `A valid composition-manifest.json is required before narration: ${(err as Error).message}`,
+      message: `A valid composition-manifest.json is required before narration: ${compositionManifestFailure(err).detail}. Run composition.prepare (or AUTO inheritance via composition.approve_plan) first when it does not exist yet.`,
     };
   }
   const parsed = CompositionManifestSchema.safeParse(parsedJson);
@@ -4277,6 +7177,23 @@ async function materializeCompositionNarration(input: {
     };
   }
   const manifest = parsed.data;
+  // Hard boundary, not advice: materializing here would bake a narration track
+  // into a segment whose parent mixes the one real narration — the "two
+  // voices" defect the assembler's silence contract exists to prevent. The v2
+  // schema already blocks this path, but with a message that tells the model to
+  // sign a voice; a v1 manifest plus a legacy voice parameter would sail
+  // through to a paid synthesis.
+  if (manifest.audio.owner === 'assembler') {
+    return {
+      ok: false,
+      op: 'composition.materialize_narration',
+      errorCode: 'E_NARRATION_NOT_OWNED',
+      message: 'This composition declares audio.owner:"assembler": the parent production synthesizes and mixes the one narration for the whole video, and this segment must render silent. No speech request was sent and no credits were consumed. Do not sign an audio.narration_intent here; continue with visual authoring and let the parent assembler own narration.',
+      billable_request_sent: false,
+      requires_user_decision: false,
+      next_action: 'continue_visual_authoring',
+    };
+  }
   const text = compositionNarrationText(manifest);
   if (!text) {
     return {
@@ -4284,6 +7201,19 @@ async function materializeCompositionNarration(input: {
       op: 'composition.materialize_narration',
       errorCode: 'E_NARRATION_TEXT_MISSING',
       message: 'Add approved narration_text to manifest scenes before materializing narration.',
+    };
+  }
+  const unsupportedSilentGaps = interstitialSilentSceneIds(manifest);
+  if (unsupportedSilentGaps.length) {
+    return {
+      ok: false,
+      op: 'composition.materialize_narration',
+      errorCode: 'E_NARRATION_INTERSTITIAL_SILENCE_UNSUPPORTED',
+      message: `Scene(s) ${unsupportedSilentGaps.join(', ')} are silent between narrated scenes, but one continuous narration track cannot pause across those windows without measured per-line audio cuts. Move intentional silence to the opening or ending, or make the pause part of the narrated script before checking fit. No speech request was sent.`,
+      scene_ids: unsupportedSilentGaps,
+      billable_request_sent: false,
+      requires_user_decision: false,
+      next_action: 'repair_narration_timeline_then_composition.check_narration_fit',
     };
   }
   const narrationSelection = await resolveCompositionNarrationSelection({
@@ -4371,7 +7301,9 @@ async function materializeCompositionNarration(input: {
     });
   }
   const outputAbsPath = path.join(input.compositionDirAbs, 'assets', 'narration.mp3');
-  const existingOutput = await fs.stat(outputAbsPath).catch(() => null);
+  // Not const: an unmatched artifact may be preserved out of the way below, and
+  // every later branch must then see the composition as having no narration.
+  let existingOutput = await fs.stat(outputAbsPath).catch(() => null);
   const existingAudioSha = existingOutput?.isFile() ? await sha256File(outputAbsPath) : undefined;
   const narrationTrack = manifest.audio.tracks.find((track) => track.kind === 'narration');
   const existingIdentity = existingOutput?.isFile()
@@ -4394,12 +7326,15 @@ async function materializeCompositionNarration(input: {
     && existingIdentity.audioSha === existingAudioSha
     && typeof existingIdentity.duration === 'number';
   if (trackedNarrationIsCurrent || receiptNarrationIsCurrent) {
+    const measuredDurationSec = state.narration?.measured_duration_sec
+      ?? existingIdentity?.duration;
     const narrationMapPath = path.join(input.compositionDirAbs, 'narration-map.json');
-    if (!existingIdentity?.narrationMapMatches) {
+    if (!existingIdentity?.narrationMapMatches || existingIdentity.legacyMaterializationReceipt) {
       await writeJsonAtomic(narrationMapPath, buildCompositionNarrationMap(manifest, {
         textSha256: textSha,
         audioSha256: existingAudioSha!,
         method: 'scene_estimate_scaled',
+        ...(typeof measuredDurationSec === 'number' ? { audioDurationSec: measuredDurationSec } : {}),
       }));
     }
     const htmlPath = path.join(input.compositionDirAbs, 'index.html');
@@ -4422,10 +7357,8 @@ async function materializeCompositionNarration(input: {
           next_action: 'repair_protected_binding_then_composition.reconcile',
         };
       }
-      if (reconciledHtml.changed) await writeTextAtomic(htmlPath, reconciledHtml.html);
+      if (reconciledHtml.changed) await writeTextAtomic(htmlPath, reconciledHtml.html, input.ctx);
     }
-    const measuredDurationSec = state.narration?.measured_duration_sec
-      ?? existingIdentity?.duration;
     if (typeof measuredDurationSec !== 'number') {
       return {
         ok: false,
@@ -4442,11 +7375,9 @@ async function materializeCompositionNarration(input: {
     const metadataRecovered = receiptNarrationIsCurrent
       || !existingIdentity?.narrationMapMatches
       || !existingIdentity?.htmlTrackMatches;
-    const authoredVisualsRecovered = narrationInvariantRecovery
-      && ((!existingHtml.includes('ORKAS-GENERATED-SCAFFOLD'))
-        || (!!state.artifacts.scaffold_html_sha256
-          && state.artifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
     const finalArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
+    const authoredVisualsRecovered = narrationInvariantRecovery
+      && artifactsShowAuthoredVisuals(state.artifacts, finalArtifacts, existingHtml);
     const reusedState = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
       next.stage = authoredVisualsRecovered ? 'visuals_ready' : 'narration_ready';
       next.narration = {
@@ -4470,6 +7401,7 @@ async function materializeCompositionNarration(input: {
         }),
         materialized_at: state.narration?.materialized_at || new Date().toISOString(),
       };
+      appendNarrationTransactionHistory(next, next.narration_transaction);
       delete next.narration_transaction;
       delete next.narration_retry_authorization;
       delete next.blocked_operation;
@@ -4478,6 +7410,9 @@ async function materializeCompositionNarration(input: {
         scaffold_html_sha256: authoredVisualsRecovered
           ? state.artifacts.scaffold_html_sha256
           : finalArtifacts.html_sha256,
+        scaffold_visual_signature: authoredVisualsRecovered
+          ? state.artifacts.scaffold_visual_signature
+          : finalArtifacts.visual_signature,
       };
       recordVideoProductionTransition(next, {
         op: 'composition.materialize_narration',
@@ -4502,6 +7437,11 @@ async function materializeCompositionNarration(input: {
         ledger_binding_restored: true,
       } : {}),
       billable_request_sent: false,
+      narration_audition: {
+        audio_path: outputAbsPath,
+        duration_sec: measuredDurationSec,
+        action: 'share_audio_with_user_for_audition_now',
+      },
       production_state: await summarizeCompositionProductionState(reusedState, input.compositionDirAbs),
     };
   }
@@ -4636,7 +7576,17 @@ async function materializeCompositionNarration(input: {
     }
     if (!safeAfterPlanFix && !retryAuthorization) {
       const decision = currentDecision.decision;
-      const invalidEvidence = invalidDecisionEvidenceResult(
+      if (!currentUserTurnAvailable(input.opts.userMessage)) {
+        return {
+          ...missingUserTurnGateResult('composition.materialize_narration', 'narration_retry'),
+          blocked_scope: 'narration_and_complete_delivery_only',
+          candidate_completeness: 'visual_only',
+          narration_retry_offer: retryOffer,
+          request_disposition: transaction.request_disposition || 'sent',
+          charge_status: transaction.charge_status || 'unknown',
+        };
+      }
+      const invalidEvidence = decisionEvidenceCorrectionResult(
         'composition.materialize_narration',
         'narration_retry',
         decision,
@@ -4776,58 +7726,84 @@ async function materializeCompositionNarration(input: {
     }
   }
   if (existingOutput && !transactionMatches) {
-    return {
-      ok: false,
-      op: 'composition.materialize_narration',
-      errorCode: 'E_NARRATION_OUTPUT_CONFLICT',
-      message: 'The saved narration cannot be proven to belong to the current confirmed script. It has been preserved and no new speech request was sent.',
-      recoverable: true,
-      terminal: false,
-      retry_same_operation: false,
-      billable_request_sent: false,
-      requires_user_decision: true,
-      blocked_scope: 'narration_and_complete_delivery_only',
-      candidate_completeness: 'visual_only',
-      preserved_artifacts: [
-        'current_visual_candidate',
-        'approved_preview',
-        'existing_narration_audio',
-        'approved_plan',
-      ],
-      allowed_recovery_ops: [
-        'composition.status',
-        'composition.reconcile',
-        'composition.lint',
-        'composition.inspect',
-        'composition.snapshot',
-      ],
-      next_action: 'show_current_candidate_and_request_narration_conflict_resolution',
-      user_options: [
-        {
-          id: 'regenerate_current_narration',
-          label: 'Regenerate from the current confirmed script',
-          effect: 'Preserve the existing audio, then create one new narration request after explicit confirmation that it may incur a charge.',
-        },
-        {
-          id: 'revise_narration',
-          label: 'Change the narration or voice first',
-          effect: 'Keep the current preview and existing audio while the narration plan is revised.',
-        },
-        {
-          id: 'pause_with_visuals',
-          label: 'Pause and keep the current visuals',
-          effect: 'Make no speech request and keep all current artifacts available.',
-        },
-      ],
-    };
+    // Escape hatch for an unattributable artifact. The retry-authorization
+    // block above is gated on `!existingOutput`, so while this file sits here a
+    // user approval can never be recorded OR consumed: every call returns this
+    // same error, and none of the offered options can clear it because no code
+    // path ever removes the audio. Observed 2026-08-04/05: a charged narration
+    // was invalidated by a silent rebind (`audio.owner` -> "none", narration
+    // track dropped), the state record was deleted while the mp3 stayed, and
+    // regeneration was then permanently impossible — the user confirmed a retry
+    // and got the identical refusal back.
+    //
+    // An explicit approval in the CURRENT turn does the one thing that breaks
+    // the loop: preserve the unmatched audio out of the composition, then fall
+    // through to normal materialization. Approval is required because the
+    // continuation dispatches a billable request; without it the refusal below
+    // still stands, and the artifact stays exactly where it is.
+    const conflictDecision = resolveNarrationRetryDecision(
+      input.opts.userMessage,
+      input.decisionEvidence,
+    );
+    const approvedRegeneration = conflictDecision.decision.decision === 'approve'
+      && currentUserTurnAvailable(input.opts.userMessage);
+    const preservedAudioPath = approvedRegeneration
+      ? await preserveUnmatchedNarrationAudio(input.compositionDirAbs, outputAbsPath)
+      : null;
+    if (preservedAudioPath) {
+      existingOutput = null;
+    } else {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_OUTPUT_CONFLICT',
+        message: 'The saved narration cannot be proven to belong to the current confirmed script. It has been preserved and no new speech request was sent. Approving regeneration moves it into assets/narration-history/ and creates exactly one new narration request.',
+        recoverable: true,
+        terminal: false,
+        retry_same_operation: false,
+        billable_request_sent: false,
+        requires_user_decision: true,
+        blocked_scope: 'narration_and_complete_delivery_only',
+        candidate_completeness: 'visual_only',
+        preserved_artifacts: [
+          'current_visual_candidate',
+          'approved_preview',
+          'existing_narration_audio',
+          'approved_plan',
+        ],
+        allowed_recovery_ops: [
+          'composition.status',
+          'composition.reconcile',
+          'composition.lint',
+          'composition.inspect',
+          'composition.snapshot',
+        ],
+        next_action: 'show_current_candidate_and_request_narration_conflict_resolution',
+        user_options: [
+          {
+            id: 'regenerate_current_narration',
+            label: 'Regenerate from the current confirmed script',
+            effect: 'Move the existing audio into assets/narration-history/ so it is kept but no longer bound to this composition, then create exactly one new narration request. This may incur a charge.',
+          },
+          {
+            id: 'revise_narration',
+            label: 'Change the narration or voice first',
+            effect: 'Keep the current preview and existing audio while the narration plan is revised.',
+          },
+          {
+            id: 'pause_with_visuals',
+            label: 'Pause and keep the current visuals',
+            effect: 'Make no speech request and keep all current artifacts available.',
+          },
+        ],
+      };
+    }
   }
   const currentArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const htmlPath = path.join(input.compositionDirAbs, 'index.html');
   const html = await fs.readFile(htmlPath, 'utf8').catch(() => '');
   const authoredVisualsPresent = (narrationInvariantRecovery || !!retryAuthorization)
-    && ((!html.includes('ORKAS-GENERATED-SCAFFOLD'))
-      || (!!state.artifacts.scaffold_html_sha256
-        && currentArtifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
+    && artifactsShowAuthoredVisuals(state.artifacts, currentArtifacts, html);
   if (!transactionMatches && (!state.artifacts.manifest_sha256
     || !state.artifacts.html_sha256
     || state.artifacts.manifest_sha256 !== currentArtifacts.manifest_sha256
@@ -4851,11 +7827,14 @@ async function materializeCompositionNarration(input: {
     };
   }
   if (!existingOutput && !hasConfiguredTtsProvider()) {
+    const availability = getTtsAvailabilityDetails(false);
     return {
       ok: false,
       op: 'composition.materialize_narration',
-      errorCode: 'E_TTS_NO_PROVIDER',
-      message: 'No TTS provider is configured. Configure Orkas Voice or a speech provider, then retry narration materialization.',
+      errorCode: availability.errorCode || 'E_TTS_NO_PROVIDER',
+      message: availability.message || 'No speech provider is available.',
+      availability: availability.reason,
+      next_action: availability.nextAction,
     };
   }
 
@@ -4863,7 +7842,9 @@ async function materializeCompositionNarration(input: {
     approval: state.plan_approval,
     roots: allowedRoots(input.opts),
   });
-  const targetDurationSec = await approvedTargetDurationSec(manifest, planIdentity);
+  const deliveryTargetDurationSec = await approvedTargetDurationSec(manifest, planIdentity);
+  const narrationBudget = narrationTimingBudget(manifest, deliveryTargetDurationSec);
+  const targetDurationSec = narrationBudget.targetDurationSec;
   const estimate = estimateNarrationDuration(text, effectiveSpeed);
   const fit = compositionNarrationFit({
     text,
@@ -4875,14 +7856,14 @@ async function materializeCompositionNarration(input: {
       : { routeRef, voiceRef, language }),
     speed: effectiveSpeed,
   });
-  await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+  state = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     next.narration_fit = fit;
   });
   // A matching on-disk transaction is already paid/recoverable. Never strand
   // it behind a later estimator change; probe the real audio and let the
   // measured policy below decide. The estimate gate applies only before a new
   // provider request can be sent.
-  if (fit.status !== 'fits' && !existingOutput) {
+  if (narrationFitBlocksProduction(fit.status) && !existingOutput) {
     return {
       ok: false,
       op: 'composition.materialize_narration',
@@ -4892,16 +7873,63 @@ async function materializeCompositionNarration(input: {
       narration_fit: fit,
     };
   }
-  const plannedSceneWeights = manifest.scenes.map((scene) => {
-    const sceneText = scene.narration_text?.trim() || '';
-    if (sceneText) return Math.max(0.05, estimateNarrationDuration(sceneText, effectiveSpeed).estimatedSec);
-    return Math.max(0.05, scene.duration * 0.03);
-  });
+  const plannedSceneWeights = narrationSceneWeights(manifest, targetDurationSec, effectiveSpeed);
+
+  const matchingTimingEpisode = state.narration_timing_episode
+    && state.narration_timing_episode.approval_signature === planIdentity.signature
+    && Math.abs(state.narration_timing_episode.target_duration_sec - targetDurationSec) <= 0.001
+    ? state.narration_timing_episode
+    : undefined;
+  let timingAttemptKind: VideoProductionNarrationTransaction['attempt_kind'] = retryAuthorization
+    ? 'provider_retry'
+    : 'initial';
+  if (!existingOutput && !retryAuthorization && matchingTimingEpisode) {
+    if (matchingTimingEpisode.status === 'awaiting_user_decision') {
+      const decision = resolveNarrationRetryDecision(input.opts.userMessage, input.decisionEvidence);
+      const invalidEvidence = decisionEvidenceCorrectionResult(
+        'composition.materialize_narration',
+        'narration_retry',
+        decision.decision,
+      );
+      if (invalidEvidence) return invalidEvidence;
+      if (decision.decision.decision !== 'approve') {
+        return narrationTimingDecisionResult({
+          episode: matchingTimingEpisode,
+          measuredDurationSec: matchingTimingEpisode.latest_measured_duration_sec,
+          billableRequestSent: false,
+        });
+      }
+      state = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
+        const episode = next.narration_timing_episode;
+        if (!episode || episode.episode_id !== matchingTimingEpisode.episode_id
+          || episode.status !== 'awaiting_user_decision') {
+          throw new Error('E_NARRATION_TIMING_DECISION_STATE_CHANGED: timing episode changed before authorization.');
+        }
+        episode.user_authorized_requests += 1;
+        episode.status = 'active';
+        episode.updated_at = new Date().toISOString();
+      });
+      timingAttemptKind = 'user_authorized_timing_retry';
+    } else if (matchingTimingEpisode.user_authorized_requests
+      > matchingTimingEpisode.user_authorization_consumed) {
+      timingAttemptKind = 'user_authorized_timing_retry';
+    } else if (matchingTimingEpisode.automatic_retries_used
+      < matchingTimingEpisode.automatic_retry_limit) {
+      timingAttemptKind = 'automatic_timing_retry';
+    } else {
+      return narrationTimingDecisionResult({
+        episode: matchingTimingEpisode,
+        measuredDurationSec: matchingTimingEpisode.latest_measured_duration_sec,
+        billableRequestSent: false,
+      });
+    }
+  }
 
   await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
   const transactionId = transactionMatches
     ? state.narration_transaction!.transaction_id
     : crypto.randomUUID();
+  const timingEpisodeId = matchingTimingEpisode?.episode_id || crypto.randomUUID();
   let backend = state.narration_transaction?.backend || 'recovered';
   let bytes = existingOutput?.size || 0;
   let billableRequestSent = false;
@@ -4936,12 +7964,30 @@ async function materializeCompositionNarration(input: {
           || persisted.consumed_new_requests !== 0) {
           throw new Error('E_TTS_RETRY_AUTHORIZATION_CHANGED: the one-request narration authorization is no longer available.');
         }
-        next.narration_transaction_history = [
-          ...(next.narration_transaction_history || []),
-          next.narration_transaction,
-        ].slice(-20);
+        appendNarrationTransactionHistory(next, next.narration_transaction);
         persisted.consumed_new_requests = 1;
         persisted.consumed_at = now;
+      }
+      if (!retryAuthorization && next.narration_transaction
+        && next.narration_transaction.transaction_id !== transactionId) {
+        appendNarrationTransactionHistory(next, next.narration_transaction);
+      }
+      if (timingAttemptKind === 'automatic_timing_retry') {
+        const episode = next.narration_timing_episode;
+        if (!episode || episode.episode_id !== timingEpisodeId
+          || episode.automatic_retries_used >= episode.automatic_retry_limit) {
+          throw new Error('E_NARRATION_TIMING_RETRY_STATE_CHANGED: automatic timing retry is no longer available.');
+        }
+        episode.automatic_retries_used = 1;
+        episode.updated_at = now;
+      } else if (timingAttemptKind === 'user_authorized_timing_retry') {
+        const episode = next.narration_timing_episode;
+        if (!episode || episode.episode_id !== timingEpisodeId
+          || episode.user_authorization_consumed >= episode.user_authorized_requests) {
+          throw new Error('E_NARRATION_TIMING_AUTHORIZATION_CHANGED: no user-authorized timing request remains.');
+        }
+        episode.user_authorization_consumed += 1;
+        episode.updated_at = now;
       }
       next.narration_transaction = {
         transaction_id: transactionId,
@@ -4951,6 +7997,8 @@ async function materializeCompositionNarration(input: {
         manifest_sha256: currentArtifacts.manifest_sha256 || '',
         scaffold_html_sha256: currentArtifacts.html_sha256 || '',
         request_signature: requestSignature,
+        timing_episode_id: timingEpisodeId,
+        attempt_kind: timingAttemptKind,
         ...(!narrationSelection.legacy ? { route_ref: routeRef, voice_ref: voiceRef, language } : {}),
         ...(narrationSelection.legacy && input.voice ? { voice: input.voice } : {}),
         speed: effectiveSpeed,
@@ -4979,6 +8027,16 @@ async function materializeCompositionNarration(input: {
         turnId: input.opts.turnId,
         stage: next.stage,
       });
+    });
+    log.info('narration request dispatching', {
+      transaction_id: transactionId,
+      timing_episode_id: timingEpisodeId,
+      attempt_kind: timingAttemptKind,
+      text_sha256: textSha,
+      request_signature: requestSignature,
+      target_duration_sec: targetDurationSec,
+      min_duration_sec: fit.min_duration_sec,
+      max_duration_sec: fit.max_duration_sec,
     });
     let speech: Awaited<ReturnType<typeof generateSpeech>>;
     try {
@@ -5020,6 +8078,54 @@ async function materializeCompositionNarration(input: {
           next.narration_transaction.updated_at = new Date().toISOString();
         }
       });
+      // Disabled, missing, or deployment-disabled speech configuration is
+      // refused before any provider call. `not_charged` would otherwise hand it
+      // to the automatic repair-and-retry path — observed 2026-08-03, where
+      // that path burned two provider attempts and two user confirmations
+      // against an instant 503. Close the episode and identify who can restore
+      // the route instead of presenting it as a transient provider failure.
+      const ttsConfigurationActionRequired = [
+        'E_TTS_USER_DISABLED',
+        'E_TTS_SERVICE_DISABLED',
+        'E_TTS_SIGN_IN_REQUIRED',
+        'E_TTS_NO_PROVIDER',
+        'E_TTS_NOT_CONFIGURED',
+      ].includes(speech.errorCode);
+      if (ttsConfigurationActionRequired) {
+        const userCanResolve = speech.errorCode === 'E_TTS_USER_DISABLED'
+          || speech.errorCode === 'E_TTS_SIGN_IN_REQUIRED'
+          || speech.errorCode === 'E_TTS_NO_PROVIDER';
+        return {
+          ok: false,
+          op: 'composition.materialize_narration',
+          errorCode: speech.errorCode,
+          message: speech.message,
+          ...(speech.providerErrorCode ? { provider_error_code: speech.providerErrorCode } : {}),
+          billable_request_sent: billableRequestSent,
+          request_disposition: speech.requestDisposition || 'sent',
+          charge_status: speech.chargeStatus || 'not_charged',
+          retry_policy: 'requires_user_action',
+          requires_user_decision: userCanResolve,
+          user_reconfirmation_required: false,
+          automatic_recovery_expected: false,
+          next_step_owner: userCanResolve ? 'user' : 'external',
+          same_turn_continuation_required: false,
+          interaction_required: userCanResolve,
+          recovery_status: 'completed_with_preserved_visual_candidate',
+          blocked_scope: 'narration_and_complete_delivery_only',
+          candidate_completeness: 'visual_only',
+          allowed_recovery_ops: [
+            'composition.status',
+            'composition.reconcile',
+            'composition.lint',
+            'composition.inspect',
+            'composition.snapshot',
+          ],
+          next_action: userCanResolve
+            ? (getTtsAvailabilityDetails(false).nextAction || 'ask_user_to_review_voice_settings')
+            : 'deliver_visual_candidate_and_report_speech_unavailable',
+        };
+      }
       if (!safeAfterPlanFix
         && narrationRetryEpisodeTransactions(failedState, requestSignature).length
         >= MAX_UNCERTAIN_NARRATION_REQUESTS_PER_INTENT) {
@@ -5122,8 +8228,49 @@ async function materializeCompositionNarration(input: {
       next_action: 'repair_media_probe_then_resume_same_narration_transaction',
     };
   }
-  const measuredDurationMismatch = measuredDurationSec > targetDurationSec + 0.15
-    || measuredDurationSec < targetDurationSec * 0.9;
+  // COMPOSE keeps estimates and measured audio on one editorial band on
+  // purpose: this composition owns its own length, so delivery expands to a
+  // fitting longer narration below and accepted speech is never truncated
+  // merely to preserve the nominal target. Crossing the band here opens a user
+  // timing decision, so the wide allowance is also what keeps that stop rare.
+  // AUTO cannot do either — its windows are signed at Gate B and the video is
+  // cut to them — so its measured-overrun check reads
+  // `narrationMeasurementOverruns` instead. Do not merge the two.
+  const measuredBand = narrationDurationBand(targetDurationSec);
+  const measuredOutsideBand = measuredDurationSec < measuredBand.minDurationSec
+    || measuredDurationSec > measuredBand.maxDurationSec;
+  const timingDecisionAtMeasurement = matchingTimingEpisode?.status === 'awaiting_user_decision'
+    ? resolveNarrationRetryDecision(input.opts.userMessage, input.decisionEvidence)
+    : undefined;
+  if (timingDecisionAtMeasurement) {
+    const invalidEvidence = decisionEvidenceCorrectionResult(
+      'composition.materialize_narration',
+      'narration_retry',
+      timingDecisionAtMeasurement.decision,
+    );
+    if (invalidEvidence) return invalidEvidence;
+  }
+  const acceptTimingWaiver = measuredOutsideBand
+    && timingDecisionAtMeasurement?.decision.decision === 'reject';
+  const continueTimingRevision = measuredOutsideBand
+    && (timingDecisionAtMeasurement?.decision.decision === 'approve'
+      || timingDecisionAtMeasurement?.decision.decision === 'revise');
+  const measuredDurationMismatch = measuredOutsideBand && !acceptTimingWaiver;
+  log.info('narration duration measured', {
+    transaction_id: transactionId,
+    timing_episode_id: timingEpisodeId,
+    attempt_kind: state.narration_transaction?.attempt_kind || timingAttemptKind,
+    text_sha256: textSha,
+    request_signature: requestSignature,
+    measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+    target_duration_sec: targetDurationSec,
+    min_duration_sec: measuredBand.minDurationSec,
+    max_duration_sec: measuredBand.maxDurationSec,
+    fit_status: measuredOutsideBand
+      ? measuredDurationSec < measuredBand.minDurationSec ? 'under' : 'over'
+      : 'fits',
+    timing_waiver_applied: acceptTimingWaiver,
+  });
   const repairIdentity = measuredDurationMismatch
     ? await videoProductionNarrationRepairIdentity(planIdentity)
     : undefined;
@@ -5137,6 +8284,66 @@ async function materializeCompositionNarration(input: {
     transaction.audio_sha256 = audioSha;
     transaction.measured_duration_sec = Math.round(measuredDurationSec * 1000) / 1000;
     transaction.updated_at = new Date().toISOString();
+    if (measuredOutsideBand) {
+      const previousEpisode = next.narration_timing_episode?.episode_id === timingEpisodeId
+        ? next.narration_timing_episode
+        : undefined;
+      const now = new Date().toISOString();
+      const transactionIds = [...new Set([
+        ...(previousEpisode?.transaction_ids || []),
+        transaction.transaction_id,
+      ])];
+      const episode: VideoProductionNarrationTimingEpisode = previousEpisode
+        ? {
+          ...previousEpisode,
+          transaction_ids: transactionIds,
+          latest_measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+          latest_text_sha256: textSha,
+          updated_at: now,
+        }
+        : {
+          episode_id: timingEpisodeId,
+          approval_signature: planIdentity.signature,
+          target_duration_sec: targetDurationSec,
+          tolerance_ratio: measuredBand.toleranceRatio,
+          tolerance_floor_sec: measuredBand.toleranceFloorSec,
+          tolerance_sec: measuredBand.toleranceSec,
+          min_duration_sec: measuredBand.minDurationSec,
+          max_duration_sec: measuredBand.maxDurationSec,
+          initial_transaction_id: transaction.transaction_id,
+          transaction_ids: transactionIds,
+          automatic_retry_limit: 1,
+          automatic_retries_used: 0,
+          user_authorized_requests: 0,
+          user_authorization_consumed: 0,
+          status: 'active',
+          latest_measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+          latest_text_sha256: textSha,
+          created_at: now,
+          updated_at: now,
+          validation_version: 1,
+        };
+      if (acceptTimingWaiver) {
+        episode.status = 'accepted_by_user_waiver';
+        episode.user_waiver = {
+          quote: currentUserTurnPayload(input.opts.userMessage).slice(0, 500),
+          turn_id: input.opts.turnId || '',
+          created_at: now,
+        };
+      } else if (continueTimingRevision) {
+        episode.user_authorized_requests += 1;
+        episode.status = 'active';
+      } else if (transaction.attempt_kind === 'automatic_timing_retry'
+        || transaction.attempt_kind === 'user_authorized_timing_retry') {
+        episode.status = 'awaiting_user_decision';
+      }
+      next.narration_timing_episode = episode;
+    } else if (next.narration_timing_episode?.episode_id === timingEpisodeId) {
+      next.narration_timing_episode.status = 'accepted';
+      next.narration_timing_episode.latest_measured_duration_sec = Math.round(measuredDurationSec * 1000) / 1000;
+      next.narration_timing_episode.latest_text_sha256 = textSha;
+      next.narration_timing_episode.updated_at = new Date().toISOString();
+    }
     const genericEstimatedSec = transaction.generic_estimated_duration_sec || estimate.estimatedSec;
     const durationScale = narrationDurationCalibrationScale({
       genericEstimatedSec,
@@ -5212,6 +8419,35 @@ async function materializeCompositionNarration(input: {
   });
 
   if (measuredDurationMismatch) {
+    const timingEpisode = updatedState.narration_timing_episode;
+    if (continueTimingRevision && timingEpisode) {
+      return {
+        ok: false,
+        op: 'composition.materialize_narration',
+        errorCode: 'E_NARRATION_TIMING_REVISION_REQUIRED',
+        message: `The user authorized one additional timing-focused narration request. Revise the narration, run composition.check_narration_fit, then call composition.prepare and composition.materialize_narration once. The authorization is durable and no request was sent by this decision call.`,
+        path: outputAbsPath,
+        measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+        target_duration_sec: targetDurationSec,
+        min_duration_sec: measuredBand.minDurationSec,
+        max_duration_sec: measuredBand.maxDurationSec,
+        timing_episode_id: timingEpisode.episode_id,
+        billable_request_sent: false,
+        requires_user_decision: false,
+        user_reconfirmation_required: false,
+        automatic_recovery_expected: true,
+        next_step_owner: 'agent',
+        same_turn_continuation_required: true,
+        next_action: 'revise_narration_then_check_prepare_and_materialize_once',
+      };
+    }
+    if (timingEpisode?.status === 'awaiting_user_decision') {
+      return narrationTimingDecisionResult({
+        episode: timingEpisode,
+        measuredDurationSec,
+        billableRequestSent,
+      });
+    }
     const repairAuthorizationPreserved = !!updatedState.narration_repair
       && updatedState.narration_repair.approval_signature === planIdentity.signature;
     if (!repairAuthorizationPreserved) {
@@ -5247,11 +8483,18 @@ async function materializeCompositionNarration(input: {
       ok: false,
       op: 'composition.materialize_narration',
       errorCode: 'E_TTS_MEASURED_DURATION_MISMATCH',
-      message: `Measured narration is ${Math.round(measuredDurationSec * 1000) / 1000}s and cannot fit the approved ${targetDurationSec}s target (it may be at most 10% shorter, but cannot run longer). The synthesized audio, transaction, measured voice calibration, and bounded timing-repair authorization were preserved. Revise the script, shotlist narration, and manifest narration together to narration_fit.suggested_units, then run composition.check_narration_fit. When it returns approval_inherited=true, continue with composition.prepare without requesting production plan confirmation again.`,
+      message: `Measured narration is ${Math.round(measuredDurationSec * 1000) / 1000}s, outside the approved ${measuredBand.minDurationSec}-${measuredBand.maxDurationSec}s range around the ${targetDurationSec}s target. The synthesized audio, transaction, measured voice calibration, and one automatic timing-repair authorization were preserved. Revise the script and manifest narration together to narration_fit.suggested_units, run composition.check_narration_fit, then composition.prepare and composition.materialize_narration once without requesting production plan confirmation again.`,
       path: outputAbsPath,
       measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
       target_duration_sec: targetDurationSec,
+      tolerance_sec: measuredBand.toleranceSec,
+      min_duration_sec: measuredBand.minDurationSec,
+      max_duration_sec: measuredBand.maxDurationSec,
       billable_request_sent: billableRequestSent,
+      requires_user_decision: false,
+      automatic_timing_retries_remaining: timingEpisode
+        ? Math.max(0, timingEpisode.automatic_retry_limit - timingEpisode.automatic_retries_used)
+        : 1,
       narration_fit: compositionNarrationFit({
         text,
         targetDurationSec,
@@ -5270,7 +8513,7 @@ async function materializeCompositionNarration(input: {
     : plannedSceneWeights;
   const retimed = retimeCompositionManifestForNarration({
     ...manifest,
-    composition: { ...manifest.composition, target_duration: targetDurationSec },
+    composition: { ...manifest.composition, target_duration: deliveryTargetDurationSec },
   }, measuredDurationSec, sceneWeights);
   const retimedValidation = CompositionManifestSchema.safeParse(retimed);
   if (!retimedValidation.success) {
@@ -5283,17 +8526,26 @@ async function materializeCompositionNarration(input: {
       billable_request_sent: billableRequestSent,
     };
   }
-  await writeJsonAtomic(manifestPath, retimedValidation.data);
+  const sceneRetiming = retimedValidation.data.scenes.map((scene, index) => ({
+    id: scene.id,
+    previous_start: manifest.scenes[index]?.start ?? null,
+    previous_duration: manifest.scenes[index]?.duration ?? null,
+    start: scene.start,
+    duration: scene.duration,
+    shifted: Math.abs((manifest.scenes[index]?.start ?? scene.start) - scene.start) > 0.05
+      || Math.abs((manifest.scenes[index]?.duration ?? scene.duration) - scene.duration) > 0.05,
+  }));
+  const scaffoldRetimed = sceneRetiming.some((scene) => scene.shifted);
+  await writeJsonAtomic(manifestPath, retimedValidation.data, input.ctx);
   const narrationMapPath = path.join(input.compositionDirAbs, 'narration-map.json');
   await writeJsonAtomic(narrationMapPath, buildCompositionNarrationMap(retimedValidation.data, {
     textSha256: textSha,
     audioSha256: audioSha,
     method: 'scene_estimate_scaled',
+    audioDurationSec: measuredDurationSec,
   }));
   const authoredVisualsRecovered = narrationInvariantRecovery
-    && ((!html.includes('ORKAS-GENERATED-SCAFFOLD'))
-      || (!!state.artifacts.scaffold_html_sha256
-        && state.artifacts.html_sha256 !== state.artifacts.scaffold_html_sha256));
+    && artifactsShowAuthoredVisuals(state.artifacts, currentArtifacts, html);
   if (authoredVisualsRecovered) {
     const reconciledHtml = reconcileCompositionHtml(html, retimedValidation.data);
     if (!reconciledHtml.ok) {
@@ -5312,10 +8564,15 @@ async function materializeCompositionNarration(input: {
         next_action: 'repair_protected_binding_then_composition.reconcile',
       };
     }
-    await writeTextAtomic(htmlPath, reconciledHtml.html);
+    await writeTextAtomic(htmlPath, reconciledHtml.html, input.ctx);
   } else {
-    await writeTextAtomic(htmlPath, buildCompositionScaffold(retimedValidation.data));
+    await writeTextAtomic(htmlPath, buildCompositionScaffold(retimedValidation.data), input.ctx);
   }
+  // Files are in their final post-narration form now: the visual signature
+  // decides whether the recorded preview (with its approval and design
+  // review) survives. Narration-only changes leave it unchanged; a scaffold
+  // rebuild or authored-visual drift does not.
+  const currentVisualSignature = await videoStudioVisualCompositionSignature(input.compositionDirAbs);
   const finalArtifacts = await videoProductionArtifacts(input.compositionDirAbs);
   const updated = await updateVideoProductionState(input.statePath, input.compositionDirAbs, (next) => {
     next.narration = {
@@ -5335,10 +8592,15 @@ async function materializeCompositionNarration(input: {
       speed: effectiveSpeed,
       materialized_at: new Date().toISOString(),
     };
+    appendNarrationTransactionHistory(next, next.narration_transaction);
     delete next.narration_transaction;
     delete next.narration_repair;
     next.stage = authoredVisualsRecovered ? 'visuals_ready' : 'narration_ready';
-    delete next.preview;
+    // The draft muxes the narration audio, so it is always invalidated. The
+    // preview is silent: it survives while its visual identity still matches
+    // the post-narration tree. Legacy entries without a visual signature keep
+    // the old always-invalidate behavior.
+    invalidateVisualEvidenceUnlessCurrent(next, currentVisualSignature);
     delete next.draft;
     delete next.blocked_operation;
     next.artifacts = {
@@ -5346,6 +8608,9 @@ async function materializeCompositionNarration(input: {
       scaffold_html_sha256: authoredVisualsRecovered
         ? state.artifacts.scaffold_html_sha256
         : finalArtifacts.html_sha256,
+      scaffold_visual_signature: authoredVisualsRecovered
+        ? state.artifacts.scaffold_visual_signature
+        : finalArtifacts.visual_signature,
     };
     recordVideoProductionTransition(next, {
       op: 'composition.materialize_narration',
@@ -5364,13 +8629,25 @@ async function materializeCompositionNarration(input: {
     backend,
     narration_text_sha256: textSha,
     previous_duration_sec: manifest.composition.duration,
-    target_duration_sec: targetDurationSec,
+    target_duration_sec: deliveryTargetDurationSec,
+    narration_target_duration_sec: targetDurationSec,
+    reserved_silent_duration_sec: narrationBudget.reservedSilentDurationSec,
     measured_duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
     manifest_path: manifestPath,
     html_path: htmlPath,
     narration_map_path: narrationMapPath,
     alignment_method: 'scene_estimate_scaled',
-    scaffold_retimed: true,
+    scaffold_retimed: scaffoldRetimed,
+    // Retiming moves every scene window, which silently invalidates the
+    // in-scene motion the model positioned against the OLD windows: on
+    // 2026-08-06 the element entrances of scene 2 stayed at their pre-retime
+    // times, so the scene's sampled midpoint captured its content still at
+    // opacity 0 and QA reported a blank frame instead of a stale tween. The
+    // shifted windows are named here so the repair is obvious.
+    scene_retiming: sceneRetiming,
+    retiming_action: scaffoldRetimed
+      ? 'Scene windows moved. Re-time every in-scene tween to its new window — an entrance still positioned at an old time leaves that scene blank at its sampled midpoint — then rerun composition.inspect and composition.snapshot.'
+      : 'Scene windows did not move. Keep the existing visual authoring and preview; continue with the current narration binding.',
     visuals_preserved: authoredVisualsRecovered,
     billable_request_sent: billableRequestSent,
     narration_selection: {
@@ -5381,12 +8658,27 @@ async function materializeCompositionNarration(input: {
       speed: effectiveSpeed,
       legacy: narrationSelection.legacy,
     },
+    // The narration audio is the user's earliest chance to judge voice and
+    // tone — the visual preview is silent, so without this the first audible
+    // checkpoint is the rendered draft, where narration changes cost the
+    // whole downstream chain.
+    narration_audition: {
+      audio_path: outputAbsPath,
+      duration_sec: Math.round(measuredDurationSec * 1000) / 1000,
+      action: 'share_audio_with_user_for_audition_now',
+    },
     production_state: await summarizeCompositionProductionState(updated, input.compositionDirAbs),
   };
 }
 
 export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
-  return {
+  // Consecutive identical-argument failures in this turn, keyed by the
+  // normalized call payload. See applyVideoStudioFailureBreaker.
+  const failureStreaks = new Map<string, number>();
+  // `<phase>::<segmentId>` -> the composition signature that already failed
+  // that batched QA phase in this turn. See batchedQaNoChangeRefusal.
+  const batchedQaFailedSignatures = new Map<string, string>();
+  const inner: AgentTool = {
     name: 'video_studio',
     description:
       'VideoStudio-native runtime for durable EDL approvals, billable generation authorization, stateful manifest-bounded HTML video production, runtime speech capabilities, and transcription. Use production.* for AUTO/GENERATE control and composition.* for signed HTML production.',
@@ -5396,9 +8688,10 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         op: {
           type: 'string',
           enum: [...OPS],
-          description: 'Operation: production.status, production.approve_plan, production.approve_generation, composition.status, composition.doctor, composition.reconcile, composition.check_narration_fit, composition.approve_plan, composition.prepare, composition.materialize_narration, composition.lint, composition.inspect, composition.begin_visual_revision, composition.snapshot, composition.approve_preview, composition.draft, composition.submit_design_review, composition.approve_draft, composition.export, speech.capabilities, or speech.transcribe. composition.begin_visual_revision is an internal recovery operation for an exhausted visual-QA cycle. A current visual-preview or final-video revision submission authorizes the bounded edit and restart without a second user form; a newly confirmed production-plan signature starts fresh QA without this operation.',
+          description: 'Operation: production.status, production.approve_plan, production.approve_generation, production.segment_qa, composition.status, composition.doctor, composition.reconcile, composition.check_narration_fit, composition.approve_plan, composition.prepare, composition.materialize_narration, composition.lint, composition.inspect, composition.snapshot, composition.draft, composition.submit_design_review, composition.approve_draft, composition.export, speech.capabilities, or speech.transcribe. Segment frames are progress and never create per-segment approval. A required delivered-composition keyframe preview is published and must end the current turn; on a later real user turn, choosing composition.draft records the go-ahead only while that visual identity is current, with no preview-approval operation. Only the production plan, paid generation, and the final video require explicit user decisions. production.status verifies an assembled deliverable when given delivered_video_path, and reports that the check is available once every segment has produced bytes. production.segment_qa runs one QA phase (lint, inspect, or snapshot) across every segment of an assembled production in one call, defaulting to the segments that have no current frames; it returns a per-segment summary with full findings only for failures, and is the AUTO path — the per-composition ops remain for COMPOSE and for re-checking one named segment. An exhausted visual-QA cycle is not restarted by any operation: present the findings, let the user choose another repair round or skipping the check, and their reply grants the next cycle automatically.',
         },
         plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition production-plan inheritance.' },
+        delivered_video_path: { type: 'string', description: 'Assembled final video to verify against the approved plan on production.status — length, canvas, narration placement, loudness, and declared captions. Checks the artifact, not how it was assembled, so a hand-built file is held to the same bar as one produced by the assembly operations.' },
         segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition production-plan inheritance.' },
         composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
         decision_evidence: {
@@ -5406,16 +8699,17 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           description: 'For a natural-language user reply, pass a native object (never a quoted JSON string or bare reply) containing the model semantic decision and a verbatim excerpt from the current user turn. Do not send this for structured forms. The host verifies provenance, gate scope, version, and safety but does not classify user language with keyword rules. A safely parseable JSON-object string is accepted only as transport recovery; any other malformed value returns a same-turn self-correction result without consuming approval or sending a billable request.',
           properties: {
             source: { type: 'string', enum: ['user_message'] },
-            gate: { type: 'string', enum: ['plan', 'generation', 'narration_retry', 'preview', 'draft'] },
+            gate: { type: 'string', enum: ['plan', 'generation', 'narration_retry', 'preview', 'draft', 'qa_waiver'] },
             decision: { type: 'string', enum: ['approve', 'revise', 'reject'] },
             quote: { type: 'string' },
           },
           required: ['source', 'gate', 'decision', 'quote'],
         },
-        expected_plan_change: { type: 'boolean', description: 'Set true only when composition.approve_plan consumes an approved production-plan amendment. The operation then fails closed unless the signed script, shotlist, or manifest signature actually changed; it never converts that mismatch into a recovery form.' },
-        output_path: { type: 'string', description: 'Output video path for composition.draft/export, or snapshot path for composition.snapshot. Draft/export output must be outside composition_dir; use project/render.' },
+        task_title: { type: 'string', description: 'Optional one-line restatement of what the user asked this production to deliver, in the user language, for composition.approve_plan. Display only: review surfaces title the production with it instead of its directory path. It is not part of the approval identity and never reopens a gate.' },
+        expected_plan_change: { type: 'boolean', description: 'Set true only when composition.approve_plan consumes an approved production-plan amendment. The operation then fails closed unless the signed manifest signature actually changed; it never converts that mismatch into a recovery form.' },
+        output_path: { type: 'string', description: 'Output video path for composition.draft/export, or snapshot path for composition.snapshot. Draft/export output is required and must be outside composition_dir; use project/render. Snapshot output is optional and defaults to the composition directory\'s preview/first-frame.png; a snapshot path inside composition_dir but outside preview/ is relocated there, because capturing into the signed composition invalidates its own preview.' },
         report_path: { type: 'string', description: 'Optional JSON QA report path for composition.draft/export. It must be outside composition_dir; use project/render.' },
-        findings_path: { type: 'string', description: 'Optional findings JSON path for composition.inspect/snapshot/draft.' },
+        findings_path: { type: 'string', description: 'Optional findings JSON path for composition.inspect/snapshot/draft. A path inside composition_dir but outside qa/ is relocated there, because runtime evidence written into the signed composition invalidates the next preflight.' },
         quality: { type: 'string', enum: ['draft', 'standard', 'high'], description: 'Render quality; draft uses lower fps/CRF.' },
         fps: { type: 'number', description: 'Frames per second, capped at 60.' },
         strict_render_settings: { type: 'boolean', description: 'Set true only when the user explicitly requires exact fps/render settings. Default false lets final export choose the highest safe fps without another confirmation.' },
@@ -5423,11 +8717,12 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         variables: { type: 'object', description: 'Optional composition variables exposed as window.__ORKAS_VIDEO_VARIABLES__.' },
         visual_baseline_path: { type: 'string', description: 'Optional visual baseline JSON path for advisory preview/draft regression checks.' },
         update_visual_baseline: { type: 'boolean', description: 'Explicitly promote current sampled preview/draft frames to the visual baseline. Never enabled automatically.' },
+        waive_qa_findings: { type: 'array', items: { type: 'string' }, description: 'QA finding codes the user chose to skip, for composition.inspect/snapshot/draft and production.segment_qa. Requires decision_evidence with gate qa_waiver quoting the user verbatim from the current turn. Accepted waivers persist on this production: the findings report as informational and stop blocking. Evidence-integrity findings cannot be waived.' },
         voice: { type: 'string', description: 'Legacy schema_version 1 compatibility only. New manifests must use the production-plan-confirmed audio.narration_intent from speech.capabilities.' },
         speed: { type: 'number', description: 'Legacy schema_version 1 compatibility only. New manifests read speed from the production-plan-confirmed audio.narration_intent.' },
-        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Structured design-review verdict for composition.submit_design_review.' },
+        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Structured design-review verdict for composition.submit_design_review. passed requires review_findings to be omitted or []; repair and blocked require one or more concrete unresolved findings.' },
         review_scope: { type: 'string', description: 'What the design review inspected (contact sheet, sampled frames, hierarchy, typography, rhythm).' },
-        review_findings: { type: 'array', items: { type: 'string' }, description: 'Concise visual findings or required repairs.' },
+        review_findings: { type: 'array', items: { type: 'string' }, description: 'Unresolved visual defects that still require repair. For review_verdict=passed, omit this field or send []; do not put positive observations or a pass summary here. For repair or blocked, send one or more concrete findings.' },
         quality_scores: {
           type: 'object',
           description: 'Evidence-based 0-100 design scores. cover_communication is always required; reference_fidelity is additionally required for concrete visual references.',
@@ -5443,10 +8738,13 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           required: ['content_alignment', 'cover_communication', 'hierarchy', 'text_legibility', 'motion_readiness', 'specificity'],
         },
         reviewed_frame_paths: { type: 'array', items: { type: 'string' }, description: 'Every returned snapshot frame path actually inspected during a preview design review. Required to cover the complete current preview frame set before the preview can be shown.' },
+        phase: { type: 'string', enum: ['lint', 'inspect', 'snapshot'], description: 'QA phase for production.segment_qa.' },
+        segment_ids: { type: 'array', items: { type: 'string' }, description: 'Segments for production.segment_qa. Omit to check every segment the ledger reports as stale or uncaptured.' },
         input_path: { type: 'string', description: 'Input audio/video path for speech.transcribe.' },
         transcript_path: { type: 'string', description: 'Optional transcript JSON output path for speech.transcribe.' },
         model: { type: 'string', description: 'ASR model id/path. Backend-specific.' },
-        language: { type: 'string', description: 'ASR language code, or auto.' },
+        language: { type: 'string', description: 'ASR language code for speech.transcribe, or auto. For speech.capabilities, the deliverable narration language: the listing then carries only the voices verified for it.' },
+        all_voices: { type: 'boolean', description: 'List every eligible voice for speech.capabilities instead of a use-case-diverse sample. Use when the user named a particular voice; the default sample is what a narration choice needs.' },
         timestamps: { type: 'string', enum: ['segment', 'word'], description: 'ASR timestamp detail.' },
         allow_model_download: { type: 'boolean', description: 'Whether native ASR may download a missing model. Backend-specific.' },
       },
@@ -5461,28 +8759,70 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       // Compatibility for an observed model mistake. Keep the schema canonical
       // so new calls learn the namespaced operation, but do not burn a turn when
       // an older/resumed rollout sends the unambiguous legacy alias.
-      const op = (rawOp === 'doctor' ? 'composition.doctor' : rawOp) as VideoStudioOp;
+      let op = (rawOp === 'doctor' ? 'composition.doctor' : rawOp) as VideoStudioOp;
       if (!OPS.has(op)) {
         return { content: `op must be one of: ${[...OPS].join(', ')}`, isError: true } as ToolResult;
       }
+
+      // Resolve once for this call. COMPOSE can route the decision only after
+      // it has loaded the durable reviewed candidate below; a plan decision on
+      // an unrelated operation or an already-approved plan must remain scoped
+      // to the operation the model actually requested.
+      const turnPlanDecision = resolveVideoStudioCurrentTurnDecision(
+        opts.userMessage,
+        'plan',
+        input.decision_evidence,
+      );
+      let decisionRoutedFromOp = '';
 
       const roots = allowedRoots(opts);
 
       if (op === 'speech.capabilities') {
         const routes = await listTtsCapabilities(ctx.signal);
+        const availability = routes.length > 0
+          ? { available: true as const, reason: 'available' as const }
+          : getTtsAvailabilityDetails(false);
+        // The catalog is ~100 voices and the selection rule below is the host's
+        // own; applying it here costs one optional argument and saves the model
+        // a result larger than its whole inline budget. all_voices reopens the
+        // full eligible catalog for a user who named a specific voice.
+        const wantedLanguage = String(input.language || '').trim();
+        const listingLimit = input.all_voices === true ? Number.POSITIVE_INFINITY : undefined;
+        const listings = publicTtsCapabilities(routes).map((route) => ({
+          route,
+          listing: listableTtsVoices(route.voices, {
+            ...(wantedLanguage ? { language: wantedLanguage } : {}),
+            ...(listingLimit === undefined ? {} : { limit: listingLimit }),
+          }),
+        }));
+        const eligibleTotal = listings.reduce((sum, item) => sum + item.listing.eligible, 0);
         return {
           content: resultContent({
             ok: routes.length > 0,
             op,
             status: routes.length ? 'ready' : 'unavailable',
-            routes: publicTtsCapabilities(routes).map((route) => ({
+            availability: availability.reason,
+            ...(!availability.available ? {
+              error_code: availability.errorCode,
+              message: availability.message,
+              next_action: availability.nextAction,
+            } : {}),
+            ...(wantedLanguage ? { requested_language: wantedLanguage } : {}),
+            ...(wantedLanguage && routes.length && eligibleTotal === 0 ? {
+              message: `No configured voice is verified for ${wantedLanguage}. Narrate in a language a listed route covers, or call again with all_voices true to see every voice this account has.`,
+            } : {}),
+            routes: listings.map(({ route, listing }) => ({
               route_ref: route.routeRef,
               provider: route.provider,
               model: route.model,
               display_name: route.displayName,
               catalog_status: route.catalogStatus,
               default_voice_ref: route.defaultVoiceRef,
-              voices: route.voices.map((voice) => ({
+              voice_count: listing.eligible,
+              ...(listing.voices.length < listing.eligible
+                ? { voices_shown: listing.voices.length }
+                : {}),
+              voices: listing.voices.map((voice) => ({
                 voice_ref: voice.voiceRef,
                 display_name: voice.displayName,
                 locale: voice.locale,
@@ -5490,6 +8830,18 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 supported_locales: voice.supportedLocales,
                 mixed_language_support: voice.mixedLanguageSupport,
                 language_confidence: voice.languageConfidence,
+                // Only when nothing named the voice's language. The host lists
+                // it BECAUSE it cannot be ruled out for the requested
+                // language; without saying so, `supported_locales:["und"]`
+                // reads as proof it speaks something else.
+                ...(voice.languageDeclared === false
+                  ? {
+                    language_declared: false,
+                    language_note: 'This endpoint publishes no voice catalog, so nothing declares what this voice speaks.'
+                      + ' It is listed because it cannot be ruled out for the requested language, not because it was checked.'
+                      + ' It is usable: select it, and judge the language from the first synthesized line.',
+                  }
+                  : {}),
                 ...(voice.accent ? { accent: voice.accent } : {}),
                 gender: voice.gender,
                 style_tags: voice.styleTags,
@@ -5498,7 +8850,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               })),
               supports: route.supports,
             })),
-            invariant: 'Choose only a returned route_ref + voice_ref pair whose native_locale or verified supported_locales matches the deliverable language, and sign route_ref, voice_ref, language, display_name, and speed during production plan confirmation. language_confidence=candidate is unavailable for non-native production until verified; mixed_language_support permits inline foreign tokens, not an unsupported narration language. Never invent or pass an ad hoc provider voice id.',
+            invariant: 'When no route is listed, narration cannot be synthesized at all: the ways out are delivering with captions and no narration track, or the setup named by this result. A narration audio file the user supplies is NOT one of them — a schema_version 2 plan takes narration only from a route listed here and no segment or track binds supplied audio, so do not offer that (2026-08-09: it was offered, and it cannot work). Choose only a returned route_ref + voice_ref pair, and sign route_ref, voice_ref, language, display_name, and speed during production plan confirmation. Pass language to list only the voices verified for the deliverable language; without it the list spans every language, a voice qualifies on native_locale or verified supported_locales, language_confidence=candidate stays unavailable for non-native production until verified EXCEPT when language_declared is false, which means nothing declares this voice\'s language at all — such a voice is listed because it cannot be ruled out and is usable, so select it rather than abandoning narration, and mixed_language_support permits inline foreign tokens rather than an unsupported narration language. voices_shown under voice_count means the list is a use-case-diverse sample of the eligible voices — pass all_voices true for the rest, as when the user named a particular voice. Never invent or pass an ad hoc provider voice id.',
           }),
           isError: routes.length === 0,
         } as ToolResult;
@@ -5511,7 +8863,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         if (!isPathAllowed(planAbs, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: plan_path is outside scope: ${planAbs}`, isError: true } as ToolResult;
         }
-        const planErr = await ensureInputFile(planAbs);
+        const planErr = await ensureInputFile(planAbs, 'plan_path');
         if (planErr) return { content: planErr, isError: true } as ToolResult;
         const statePath = videoProductionControlStatePath({
           userId: opts.userId,
@@ -5522,14 +8874,124 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (op === 'production.status') {
             const identity = await readVideoProductionPlanIdentity(planAbs);
             const state = await readVideoProductionControlState(statePath, planAbs);
+            const records = await videoProductionSegmentReviewRecords({
+              opts,
+              planPathAbs: planAbs,
+              identity,
+              roots,
+            });
+            const review = videoProductionReviewStatus({
+              identity,
+              facts: records.map((record) => record.fact),
+            });
+            // Verify the DELIVERED artifact, not the route that produced it.
+            // Every assembly check lives on the op that performs the step, so
+            // hand-written ffmpeg — a legitimate fallback that stays available
+            // — drops all of them at once: the 2026-08-10 run shipped 0.44s of
+            // two voices, -18.3 LUFS, and none of its 8 declared caption lines
+            // while reporting success. Reading the file and the signed plan
+            // holds every route to one bar without closing the fallback.
+            let deliveryCheck: Record<string, unknown> | undefined;
+            const deliveredPathRaw = typeof input.delivered_video_path === 'string'
+              ? input.delivered_video_path.trim()
+              : '';
+            if (deliveredPathRaw) {
+              const deliveredAbs = path.isAbsolute(deliveredPathRaw)
+                ? deliveredPathRaw
+                : path.resolve(path.dirname(planAbs), deliveredPathRaw);
+              const missing = await ensureInputFile(deliveredAbs, 'delivered_video_path');
+              if (missing) return { content: missing, isError: true } as ToolResult;
+              deliveryCheck = await verifyProductionDelivery({
+                planAbsPath: planAbs,
+                plan: identity.plan,
+                videoAbsPath: deliveredAbs,
+                ...(ctx.signal ? { signal: ctx.signal } : {}),
+              }) as unknown as Record<string, unknown>;
+            } else if (videoProductionLooksAssembled(identity.plan)) {
+              deliveryCheck = {
+                status: 'not_run',
+                reason: 'Every segment reports a produced_path, so this production has something to deliver.'
+                  + ' Pass delivered_video_path to have the final file checked against the approved plan —'
+                  + ' length, canvas, narration placement, loudness, and declared captions — whichever way it'
+                  + ' was assembled. This is the QA headline the final-video stop needs.',
+              };
+            }
+            // The host hands the plan text over for an unapproved plan so the
+            // model always has the exact wording to present; nothing records
+            // that it did, because nothing reads such a record — the
+            // presentation gate that would have was withdrawn the same day it
+            // shipped (unobservable property, two false positives).
             return {
               content: resultContent({
                 ok: true,
                 op,
                 status: 'reported',
+                ...(deliveryCheck ? { delivery_check: deliveryCheck } : {}),
+                ...(state.plan_approval ? {} : {
+                  plan_summary: renderVideoProductionPlanSummary(identity.plan),
+                  plan_presentation: 'This plan is not approved yet. Present plan_summary verbatim in the user\'s language before asking them to approve it.',
+                }),
                 production_control: videoProductionControlSummary(identity, state),
+                production_review: {
+                  renderable: review.renderable,
+                  uncaptured_segment_ids: review.uncaptured_segment_ids,
+                  segments: review.segments,
+                  invariant: 'Segment frames are shown to the user, never put to them for approval: publish the current frames and keep working. Only the production plan, paid generation, and the final video wait for the user. A segment listed in uncaptured_segment_ids has no current frames and needs its QA phase re-run; everything else is ready to assemble.',
+                },
               }),
               isError: false,
+            } as ToolResult;
+          }
+          if (op === 'production.segment_qa') {
+            const phase = String(input.phase || '').trim();
+            if (phase !== 'lint' && phase !== 'inspect' && phase !== 'snapshot') {
+              return { content: 'E_SEGMENT_QA_PHASE_REQUIRED: phase must be lint, inspect, or snapshot.', isError: true } as ToolResult;
+            }
+            const requestedSegmentIds = Array.isArray(input.segment_ids)
+              ? input.segment_ids.filter((id): id is string => typeof id === 'string' && !!id.trim()).map((id) => id.trim())
+              : [];
+            const requestedQaWaivers = normalizedQaWaiverCodes(input.waive_qa_findings);
+            let waiverQuote = '';
+            if (requestedQaWaivers.length) {
+              const verdict = verifyQaWaiverRequest(op, opts.userMessage, requestedQaWaivers, input.decision_evidence);
+              if (verdict.error) {
+                return { content: resultContent(verdict.error), isError: true } as ToolResult;
+              }
+              waiverQuote = verdict.quote || '';
+            }
+            const batch = await runProductionSegmentQa({
+              opts,
+              ctx,
+              planPathAbs: planAbs,
+              phase,
+              requestedSegmentIds,
+              roots,
+              failedSignatures: batchedQaFailedSignatures,
+              ...(requestedQaWaivers.length ? { waiveQaFindings: requestedQaWaivers, waiverQuote } : {}),
+            });
+            const productionContactSheet = batch.ok === true
+              && phase === 'snapshot'
+              && typeof batch.production_contact_sheet === 'string'
+              ? batch.production_contact_sheet
+              : '';
+            const modelVisual = productionContactSheet
+              ? await prepareVideoStudioModelVisual(productionContactSheet)
+              : null;
+            const modelFacingBatch = modelVisual
+              ? {
+                  ...batch,
+                  visual_evidence: {
+                    attached: true,
+                    role: 'production_contact_sheet',
+                    path: productionContactSheet,
+                    policy: 'attached_only_after_all_segment_snapshot_qa_passed',
+                  },
+                }
+              : batch;
+            return {
+              content: resultContent(modelFacingBatch),
+              ...(modelVisual ? { images: [modelVisual] } : {}),
+              isError: batch.ok !== true,
             } as ToolResult;
           }
           if (!opts.turnId) {
@@ -5541,12 +9003,91 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               'plan',
               input.decision_evidence,
             );
-            const invalidEvidence = invalidDecisionEvidenceResult(op, 'plan', resolvedDecision);
+            if (!currentUserTurnAvailable(opts.userMessage)) {
+              return {
+                content: resultContent(missingUserTurnGateResult(op, 'plan')),
+                isError: true,
+              } as ToolResult;
+            }
+            const invalidEvidence = decisionEvidenceCorrectionResult(op, 'plan', resolvedDecision, {
+              correctOmittedEvidence: true,
+            });
             if (invalidEvidence) {
               return { content: resultContent(invalidEvidence), isError: true } as ToolResult;
             }
-            if (resolvedDecision.decision !== 'approve') {
-              return { content: 'E_VIDEO_PRODUCTION_GATE_B_EXPLICIT_APPROVAL_REQUIRED: the current real user turn must explicitly approve the displayed EDL.', isError: true } as ToolResult;
+            // Same exemption as the composition line: a change the user named
+            // in this turn does not have to be confirmed back to them. The
+            // quote is host-verified against the current user message, the
+            // caller must declare it is applying a change, and the EDL must
+            // actually differ from the one already approved.
+            const controlBefore = await readVideoProductionControlState(statePath, planAbs).catch(() => null);
+            const identityNow = await readVideoProductionPlanIdentity(planAbs).catch(() => null);
+            const priorPlanSignature = controlBefore?.plan_approval?.signature || '';
+            const edlChanged = !!priorPlanSignature && !!identityNow
+              && priorPlanSignature !== identityNow.signature;
+            const userInstructed = resolvedDecision.decision === 'revise'
+              && resolvedDecision.evidence_status === 'valid'
+              && input.expected_plan_change === true
+              && edlChanged;
+            if (resolvedDecision.decision !== 'approve' && !userInstructed) {
+              const digest = videoProductionPlanDigest(identityNow?.plan);
+              return {
+                content: resultContent({
+                  ok: false,
+                  op,
+                  errorCode: 'E_VIDEO_PRODUCTION_GATE_B_EXPLICIT_APPROVAL_REQUIRED',
+                  message: 'The current real user turn must explicitly approve this plan, or name the exact change being applied'
+                    + ' (decision_evidence decision="revise" quoting the user, with expected_plan_change=true).'
+                    + ' Present plan_summary below to the user verbatim, in their language, then end the turn.',
+                  presentation_required: true,
+                  requires_user_decision: true,
+                  next_step_owner: 'user',
+                  next_action: 'present_plan_then_await_user_decision',
+                  ...(identityNow ? { plan_summary: renderVideoProductionPlanSummary(identityNow.plan) } : {}),
+                  ...(digest ? { plan_digest: digest } : {}),
+                }),
+                isError: true,
+              } as ToolResult;
+            }
+            // No refusal here. Presentation cannot be verified from inside a
+            // tool call — the host never sees the assistant's message — so the
+            // gate that required a recorded hand-over in an earlier turn was a
+            // proxy, and two live runs (2026-08-08) showed the proxy is wrong
+            // in the common case: both models composed a complete plan of
+            // their own and called approve_plan only after the user replied,
+            // so both were refused and both cost the user a confirmation for
+            // presenting correctly. Two false positives, no true positive, and
+            // the cost lands on the one metric this whole gate class exists to
+            // protect. What survives is the part that worked: the host renders
+            // the plan and hands it over (production.status for an unapproved
+            // plan, and the no-evidence branch above), so the model always has
+            // the exact text, and the hand-over is recorded for diagnostics.
+            // Budget every narration line BEFORE the plan is signed. Each of
+            // these would otherwise surface as its own E_TTS_TEXT_TOO_LONG at
+            // the paid gate, one line per round trip, against an already
+            // user-approved script; the resulting shorten is then the exact
+            // fit-repair the inheritance rule exists to absorb. One reply
+            // here lists every over-budget line, and the model repairs them
+            // in the same turn the user's approval evidence is still valid,
+            // so the confirmation count does not move.
+            if (identityNow) {
+              const overBudget = edlNarrationBudgetIssues(identityNow.plan);
+              if (overBudget.length) {
+                return {
+                  content: resultContent({
+                    ok: false,
+                    op,
+                    errorCode: 'E_VIDEO_PRODUCTION_NARRATION_OVERBUDGET',
+                    message: `${overBudget.length} narration line(s) cannot be spoken inside their windows: `
+                      + overBudget.map((line) => `line ${line.index} needs ~${line.estimated_sec}s for a ${line.target_sec}s window — it has ${line.current_units} ${line.unit}, cut about ${line.remove_units} to reach ≈${line.shorten_to_units}`).join('; ')
+                      + '. Shorten those lines in the plan (retiming their windows as needed) and call this operation again in this turn. Cut to the stated counts rather than trimming by eye — a line that lands over budget again costs another full round. No approval was recorded and no synthesis was attempted.',
+                    over_budget_lines: overBudget,
+                    next_action: 'shorten_listed_lines_then_retry_production.approve_plan',
+                    billable_request_sent: false,
+                  }),
+                  isError: true,
+                } as ToolResult;
+              }
             }
             const narrationSelection = await validateEdlNarrationSelection(planAbs, ctx.signal);
             if (narrationSelection.ok === false) {
@@ -5559,6 +9100,10 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 op,
                 status: 'approved',
                 gate: 'B',
+                plan_authorization: userInstructed ? 'user_instruction' : 'explicit_approval',
+                ...(userInstructed ? {
+                  message: 'The user named this change in the current turn, so applying it is already authorized. Continue to the next reviewable artifact; do not ask them to confirm the change they just asked for.',
+                } : {}),
                 ...(narrationSelection.selection ? {
                   narration_selection: {
                     route_ref: narrationSelection.selection.routeRef,
@@ -5579,7 +9124,15 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             'generation',
             input.decision_evidence,
           );
-          const invalidEvidence = invalidDecisionEvidenceResult(op, 'generation', resolvedDecision);
+          if (!currentUserTurnAvailable(opts.userMessage)) {
+            return {
+              content: resultContent(missingUserTurnGateResult(op, 'generation')),
+              isError: true,
+            } as ToolResult;
+          }
+          const invalidEvidence = decisionEvidenceCorrectionResult(op, 'generation', resolvedDecision, {
+            correctOmittedEvidence: true,
+          });
           if (invalidEvidence) {
             return { content: resultContent(invalidEvidence), isError: true } as ToolResult;
           }
@@ -5605,13 +9158,123 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
 
       if (op.startsWith('composition.')) {
         const compositionRaw = String(input.composition_dir || '').trim();
-        if (!compositionRaw) return { content: 'composition_dir is required', isError: true } as ToolResult;
+        if (!compositionRaw) {
+          // Naming the convention costs nothing and the caller cannot infer it:
+          // it appears in no skill, and on 2026-08-08 a model that had been told
+          // (correctly) to inherit a segment approval with plan_path+segment_id
+          // spent four round trips listing directories to guess this argument.
+          const segmentId = String(input.segment_id || '').trim();
+          const planPath = String(input.plan_path || '').trim();
+          const suggestion = segmentId && planPath
+            ? ` For segment "${segmentId}" of ${planPath} that is `
+              + `${path.posix.join(path.posix.dirname(planPath.split(path.sep).join('/')), 'compositions', segmentId)}, `
+              + 'which must already exist.'
+            : '';
+          return {
+            content: resultContent({
+              ok: false,
+              op,
+              errorCode: 'E_COMPOSITION_DIR_REQUIRED',
+              message: `composition_dir is required: pass the directory holding this composition's `
+                + `composition-manifest.json and index.html.${suggestion}`,
+              next_action: 'retry_with_composition_dir',
+            }),
+            isError: true,
+          } as ToolResult;
+        }
         const compositionDirAbs = resolvePath(ctx, opts, compositionRaw, roots);
         if (!isPathAllowed(compositionDirAbs, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: composition_dir is outside scope: ${compositionDirAbs}`, isError: true } as ToolResult;
         }
-        const dirErr = await ensureInputDir(compositionDirAbs);
-        if (dirErr) return { content: dirErr, isError: true } as ToolResult;
+        // What KIND of segment this is decides whether ANY composition
+        // operation applies, so it is answered before the directory is
+        // examined or created. A 2026-08-09 run called approve_plan for an
+        // `edit` segment: the directory was created for it (the manifest
+        // derivation then refused, leaving it empty), the artifacts check
+        // answered "restore composition-manifest.json" — a file that segment
+        // must never have — doctor passed on the empty directory, and
+        // reconcile died on a raw ENOENT. The parent plan knew all along.
+        //
+        // Reads the one field it needs. Resolving the full plan identity here
+        // would validate and hash the whole EDL on every composition call to
+        // answer "what source is this segment", and would skip the check
+        // entirely for a plan with any unrelated validation error.
+        {
+          const boundSegment = String(input.segment_id || '').trim();
+          const boundPlan = String(input.plan_path || '').trim();
+          if (boundSegment && boundPlan) {
+            const parentPlanAbs = resolvePath(ctx, opts, boundPlan, roots);
+            if (isPathAllowed(parentPlanAbs, roots)) {
+              const source = await fs.readFile(parentPlanAbs, 'utf8')
+                .then((raw) => {
+                  const plan = JSON.parse(raw) as { segments?: unknown };
+                  const segments = Array.isArray(plan.segments) ? plan.segments : [];
+                  const segment = segments.find((entry) => isIntentRecord(entry) && entry.id === boundSegment);
+                  return isIntentRecord(segment) ? String(segment.source || '') : '';
+                })
+                .catch(() => '');
+              if (source && source !== 'compose') {
+                return {
+                  content: resultContent({
+                    ok: false,
+                    op,
+                    errorCode: 'E_PARENT_SEGMENT_NOT_A_COMPOSITION',
+                    message: `Segment "${boundSegment}" is ${/^[aeiou]/i.test(source) ? 'an' : 'a'} ${source} segment, not a composition: its artifact is its produced_path file, so it has no composition-manifest.json and no composition operation applies to it. Produce it on its own line and let the production QA phases pick it up from the file.`,
+                    next_action: 'produce_this_segment_on_its_own_line',
+                    requires_user_decision: false,
+                  }),
+                  isError: true,
+                } as ToolResult;
+              }
+            }
+          }
+        }
+        const dirCheck = await inspectInputDir(compositionDirAbs);
+        const standaloneMissingStatus = op === 'composition.status'
+          && !dirCheck.exists
+          && !String(input.segment_id || '').trim()
+          && !String(input.plan_path || '').trim();
+        if (dirCheck.error && !standaloneMissingStatus) {
+          // An AUTO child's composition directory holds nothing the model
+          // authors before inheritance: composition.approve_plan derives the
+          // manifest from the signed parent into it. Demanding the directory
+          // exist first made "mkdir" the model's entire first round trip, and
+          // the miss-message sent it further astray — on 2026-08-08 the reply
+          // to this error was five hand-authored manifests (which the next
+          // gate rejected for signing a voice), because "is not a directory"
+          // says nothing about WHO creates the contents. The host creates the
+          // directory exactly where it creates the manifest; every other
+          // composition op with the parent binding points at that step.
+          const segmentId = String(input.segment_id || '').trim();
+          const planPath = String(input.plan_path || '').trim();
+          if (segmentId && planPath) {
+            if (op === 'composition.approve_plan') {
+              // Created here only because the very next step derives the
+              // manifest into it. A non-compose segment derives nothing, so
+              // creating one leaves an empty directory that looks like a
+              // composition to every later operation — 2026-08-09: doctor
+              // passed on it and reconcile died on the missing manifest. The
+              // binding check below refuses that segment by name; let it.
+              await fs.mkdir(compositionDirAbs, { recursive: true });
+            } else {
+              return {
+                content: resultContent({
+                  ok: false,
+                  op,
+                  errorCode: 'E_PARENT_SEGMENT_NOT_DERIVED',
+                  message: `${compositionDirAbs} does not exist yet. For segment "${segmentId}" of ${planPath}, `
+                    + 'call composition.approve_plan with the same composition_dir, plan_path, and segment_id first: '
+                    + 'it inherits the parent Gate B, creates the directory, and derives composition-manifest.json '
+                    + 'from the signed parent. Do not create the directory or author the manifest by hand.',
+                  next_action: 'inherit_parent_approval_via_composition.approve_plan',
+                }),
+                isError: true,
+              } as ToolResult;
+            }
+          } else {
+            return { content: dirCheck.error, isError: true } as ToolResult;
+          }
+        }
 
         const format = input.format === 'webm' ? 'webm' as RenderFormat : 'mp4' as RenderFormat;
         const quality = (input.quality === 'standard' || input.quality === 'high' || input.quality === 'draft')
@@ -5625,9 +9288,21 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         let outputAbsPath: string | undefined;
         let requestedOutput = '';
         let renamed = false;
+        let snapshotOutputRelocatedFrom = '';
         if (op === 'composition.draft' || op === 'composition.export') {
           const outputRaw = String(input.output_path || '').trim();
-          if (!outputRaw) return { content: 'output_path is required', isError: true } as ToolResult;
+          if (!outputRaw) {
+            return {
+              content: resultContent({
+                ok: false,
+                op,
+                errorCode: 'E_OUTPUT_PATH_REQUIRED',
+                message: 'output_path is required and must sit outside composition_dir. Use project/render/<name>.',
+                next_action: 'retry_with_project_render_output',
+              }),
+              isError: true,
+            } as ToolResult;
+          }
           requestedOutput = withExtension(resolvePath(ctx, opts, outputRaw, roots), format);
           if (!isPathAllowed(requestedOutput, roots)) {
             return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${requestedOutput}`, isError: true } as ToolResult;
@@ -5649,9 +9324,32 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           outputAbsPath = unique.finalPath;
           renamed = unique.renamed;
         } else if (op === 'composition.snapshot') {
+          // Snapshots have exactly one canonical destination, prescribed by
+          // the skill and excluded from the composition signature, so an
+          // omitted output_path is a defaultable argument rather than a
+          // failure. It used to cost a full round trip (~30s of model time on
+          // 2026-08-07) for a bare string carrying no error code.
           const outputRaw = String(input.output_path || '').trim();
-          if (!outputRaw) return { content: 'output_path is required for composition.snapshot', isError: true } as ToolResult;
-          outputAbsPath = withExtension(resolvePath(ctx, opts, outputRaw, roots), 'png');
+          const requestedSnapshot = outputRaw
+            ? withExtension(resolvePath(ctx, opts, outputRaw, roots), 'png')
+            : path.join(compositionDirAbs, DEFAULT_SNAPSHOT_OUTPUT_RELATIVE_PATH);
+          // A snapshot written into the signed composition — anywhere but the
+          // signature-excluded preview/ subtree — invalidates itself: its
+          // frame directory carries a fresh random run id, so capturing
+          // changes the very signature the draft preflight then compares
+          // against. 2026-08-07: the model snapshotted to
+          // <composition>/project/render/ (generalizing draft/export's "use
+          // project/render" rule), draft answered E_HTML_PREVIEW_STALE, and
+          // each retry captured another directory and re-armed the same
+          // failure. Six accumulated across four "继续" replies before the
+          // user gave up. draft/export refuse an in-source output for exactly
+          // this reason; snapshot is the step immediately before draft, so it
+          // relocates to the canonical destination and says so rather than
+          // spending a round trip on a correction the host can make itself.
+          outputAbsPath = runtimeArtifactInsideSignature(requestedSnapshot, compositionDirAbs, 'preview')
+            ? path.join(compositionDirAbs, 'preview', path.basename(requestedSnapshot))
+            : requestedSnapshot;
+          if (outputAbsPath !== requestedSnapshot) snapshotOutputRelocatedFrom = requestedSnapshot;
           if (!isPathAllowed(outputAbsPath, roots)) {
             return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${outputAbsPath}`, isError: true } as ToolResult;
           }
@@ -5663,6 +9361,23 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         if (reportAbsPath && !isPathAllowed(reportAbsPath, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: report_path is outside scope: ${reportAbsPath}`, isError: true } as ToolResult;
         }
+        // The report is this render's durable QA evidence, and the passing-draft
+        // projection below points the model at it instead of inlining ~50K
+        // characters of per-frame samples. Leaving the file to an optional
+        // argument made both conditional on the model supplying it: on
+        // 2026-08-09 seven passing drafts arrived with no report_path, so
+        // nothing was written, the projection stayed off, and each ~95K result
+        // spilled to disk anyway — as an opaque tool-result ref instead of the
+        // report. Default it beside the required output, which draft has
+        // already refused to place inside composition_dir. Same reasoning as
+        // the snapshot default above: a defaultable argument is not worth a
+        // round trip. Draft only — export runs once and writes into the
+        // directory the user collects the finished video from, so a report
+        // nobody asked for does not belong beside it.
+        const effectiveReportPath = reportAbsPath
+          ?? (outputAbsPath && op === 'composition.draft'
+            ? `${outputAbsPath.replace(/\.[^./\\]+$/, '')}-report.json`
+            : undefined);
         if ((op === 'composition.draft' || op === 'composition.export')
           && reportAbsPath
           && isWithinDirectory(reportAbsPath, compositionDirAbs)) {
@@ -5677,9 +9392,23 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             isError: true,
           } as ToolResult;
         }
-        const findingsAbsPath = typeof input.findings_path === 'string' && input.findings_path.trim()
+        // Findings are runtime evidence, not authored input, and they carry
+        // the same self-invalidation hazard the snapshot destination does:
+        // written into the signed composition they change the signature the
+        // next preflight compares against. The batched segment-QA path
+        // already hard-codes `qa/` for this reason; a model-supplied
+        // findings_path gets the same guarantee by relocation.
+        const requestedFindings = typeof input.findings_path === 'string' && input.findings_path.trim()
           ? resolvePath(ctx, opts, input.findings_path, roots)
           : undefined;
+        const defaultFindingsRelativePath = DEFAULT_QA_FINDINGS_RELATIVE_PATH[op] || '';
+        const findingsAbsPath = requestedFindings
+          ? (runtimeArtifactInsideSignature(requestedFindings, compositionDirAbs, 'qa')
+            ? path.join(compositionDirAbs, 'qa', path.basename(requestedFindings))
+            : requestedFindings)
+          : (defaultFindingsRelativePath
+            ? path.join(compositionDirAbs, defaultFindingsRelativePath)
+            : undefined);
         if (findingsAbsPath && !isPathAllowed(findingsAbsPath, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: findings_path is outside scope: ${findingsAbsPath}`, isError: true } as ToolResult;
         }
@@ -5713,18 +9442,56 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           compositionDirAbs,
           stateBefore,
         );
+        stateBefore = await grantVisualQaCycleOnUserTurn({
+          statePath: gateStatePath,
+          compositionDirAbs,
+          state: stateBefore,
+          opts,
+        });
+
+        // A natural-language plan decision belongs to the user turn, not to
+        // the first operation the model happens to choose. Route it only while
+        // a ready, unapproved candidate from an earlier turn is outstanding;
+        // once approval is recorded the candidate is deleted, so later plan
+        // evidence cannot hijack draft, narration, QA, or recovery operations.
+        if (turnPlanDecision.decision === 'approve'
+          && stateBefore.plan_review_candidate
+          && stateBefore.plan_review_candidate.checked_turn_id !== opts.turnId
+          && op !== 'composition.approve_plan') {
+          decisionRoutedFromOp = op;
+          op = 'composition.approve_plan';
+        }
+
+        // User-authorized QA waivers are accepted before any admission gate:
+        // the user already made this decision, and losing it because the
+        // operation then failed some other precondition would force the model
+        // to ask them to skip the same check twice. Invalid requests fail
+        // closed here without writing state.
+        const requestedQaWaivers = normalizedQaWaiverCodes(input.waive_qa_findings);
+        if (requestedQaWaivers.length) {
+          const verdict = verifyQaWaiverRequest(op, opts.userMessage, requestedQaWaivers, input.decision_evidence);
+          if (verdict.error) {
+            return { content: resultContent(verdict.error), isError: true } as ToolResult;
+          }
+          stateBefore = await recordQaWaivers({
+            statePath: gateStatePath,
+            compositionDirAbs,
+            codes: requestedQaWaivers,
+            quote: verdict.quote || '',
+            turnId: opts.turnId,
+          });
+        }
         const policyFactsBefore = narrationPolicyFacts(stateBefore, narrationIdentityBefore);
-        const misroutedGateBApproval = op === 'composition.begin_visual_revision'
-          && resolveVideoStudioCurrentTurnDecision(
-            opts.userMessage,
-            'plan',
-            input.decision_evidence,
-          ).decision === 'approve';
-        if (PLAN_APPROVAL_REQUIRED_OPS.has(op) && !misroutedGateBApproval) {
+        if (PLAN_APPROVAL_REQUIRED_OPS.has(op)) {
+          const boundSegmentId = String(input.segment_id || '').trim();
+          const boundPlanPath = String(input.plan_path || '').trim();
           const planApproval = await validatePlanApproval(
             gateStatePath,
             compositionDirAbs,
             roots,
+            boundSegmentId && boundPlanPath
+              ? { segmentId: boundSegmentId, planPath: boundPlanPath }
+              : undefined,
           );
           if (planApproval.ok === false) {
             const blockedResult = {
@@ -5733,6 +9500,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               errorCode: planApproval.errorCode,
               message: planApproval.message,
               ...(planApproval.evidence ? { evidence: planApproval.evidence } : {}),
+              ...(planApproval.artifactIssues?.length
+                ? { artifact_issues: planApproval.artifactIssues }
+                : {}),
               billable_request_sent: false,
               ...(stateBefore.current_candidate
                 ? { current_candidate: stateBefore.current_candidate }
@@ -5754,7 +9524,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           }
         }
         const admission = evaluateVideoProductionOperation(stateBefore, op, policyFactsBefore);
-        if (!misroutedGateBApproval && admission.ok === false) {
+        if (admission.ok === false) {
           const blockedResult = {
             ok: false,
             op,
@@ -5826,15 +9596,34 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             || (!!stateBefore.plan_approval
               && planIdentity.complete
               && !planApprovalCurrent);
+          // The plan itself, not just facts about it. Until now this reported
+          // hashes, drift flags and requirement issues while the only readable
+          // rendering of the plan lived on the AUTO path, so a COMPOSE run had
+          // no operation that could hand the model something to show — and
+          // asking for it produced another approval request instead
+          // (2026-08-09). Carried while the approval is not yet current, which
+          // is exactly when someone still has to read it.
+          const planSummary = planApprovalCurrent
+            ? undefined
+            : await compositionPlanSummaryFor(compositionDirAbs);
+          const freshMissingComposition = !dirCheck.exists && stateBefore.revision === 0;
           return {
             content: resultContent({
               ok: true,
               op,
-              status: 'reported',
+              status: freshMissingComposition ? 'not_started' : 'reported',
+              composition_dir_exists: dirCheck.exists,
+              ...(freshMissingComposition ? {
+                message: 'No composition has been authored at this location yet. Author composition-manifest.json first; after plan approval, composition.prepare owns the generated index.html scaffold.',
+                next_action: 'author_composition_manifest',
+                billable_request_sent: false,
+              } : {}),
+              ...(planSummary ? { plan_summary: planSummary } : {}),
               artifact_drift: artifactDrift,
               reconciliation_required: artifactDrift
                 || planRecordRefreshRequired
                 || planArtifactConflict
+                || (!dirCheck.exists && !freshMissingComposition)
                 || !!stateBefore.narration_transaction
                 || !!stateBefore.active_operation,
               plan_record_refresh_required: planRecordRefreshRequired,
@@ -5849,106 +9638,14 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 : stateBefore.plan_approval?.signature || null,
               candidate_intent_hash: planIdentity.signature || null,
               plan_approval_current: planApprovalCurrent,
+              ...(planApprovalCurrent
+                ? {}
+                : intentChangesField(approvedPlanIntentChanges(stateBefore.plan_approval, planIdentity))),
               inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,
               visual_qa_cycle_stale: !!legacyVisualQaCycle(stateBefore.visual_qa)
                 && !currentVisualQaCycle(stateBefore.visual_qa),
               repair_state: repairState,
               production_state: summarizeVideoProductionState(stateBefore, policyFactsBefore),
-            }),
-            isError: false,
-          } as ToolResult;
-        }
-        if (op === 'composition.begin_visual_revision') {
-          if (misroutedGateBApproval) {
-            return {
-              content: resultContent({
-                ok: false,
-                op,
-                errorCode: 'E_GATE_B_APPROVE_PLAN_REQUIRED',
-                message: 'The current user already approved the displayed production-plan amendment. Apply that exact patch to the canonical plan artifacts, then call composition.approve_plan with expected_plan_change=true in this turn. Do not request visual recovery or another production plan confirmation.',
-                expected_plan_change: true,
-                visual_revision_recovery_available: false,
-                next_action: 'apply_approved_amendment_then_composition.approve_plan',
-              }),
-              isError: true,
-            } as ToolResult;
-          }
-          const existingCycle = currentVisualQaCycle(stateBefore.visual_qa);
-          if (existingCycle?.started_by_turn_id === opts.turnId
-            && existingCycle.failed_signatures.length === 0) {
-            return {
-              content: resultContent({
-                ok: true,
-                op,
-                status: 'already_started',
-                preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
-                next_action: 'composition.lint',
-                visual_repair_cycle: visualQaRepairSummary(existingCycle),
-                production_state: summarizeVideoProductionState(stateBefore),
-              }),
-              isError: false,
-            } as ToolResult;
-          }
-          if (!visualQaBudgetExhausted(stateBefore.visual_qa)) {
-            return {
-              content: resultContent({
-                ok: false,
-                op,
-                errorCode: 'E_VISUAL_REVISION_NOT_REQUIRED',
-                message: 'The current visual QA cycle is not exhausted. Continue the existing cycle instead of resetting it.',
-                visual_revision_recovery_available: false,
-                next_action: 'continue_current_cycle_without_recovery',
-                visual_repair_cycle: visualQaRepairSummary(legacyVisualQaCycle(stateBefore.visual_qa)),
-              }),
-              isError: true,
-            } as ToolResult;
-          }
-          if (stateBefore.draft?.status === 'approved') {
-            return {
-              content: resultContent({
-                ok: false,
-                op,
-                errorCode: 'E_VISUAL_REVISION_APPROVED_DRAFT_INVALID',
-                message: 'A visual QA recovery revision cannot start after the current draft was approved; use the signed follow-up edit workflow.',
-              }),
-              isError: true,
-            } as ToolResult;
-          }
-          const artifacts = await videoProductionArtifacts(compositionDirAbs);
-          const visualRevision = nextVisualRevision(stateBefore.visual_qa);
-          const revised = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
-            const cycle = newVisualQaCycle({ visualRevision, turnId: opts.turnId });
-            next.visual_qa = {
-              cycle,
-              history: visualQaHistoryWithCurrent(next.visual_qa),
-            };
-            delete next.preview;
-            delete next.draft;
-            delete next.blocked_operation;
-            next.artifacts = { ...next.artifacts, ...artifacts };
-            next.stage = 'visuals_ready';
-            recordVideoProductionTransition(next, {
-              op,
-              status: 'passed',
-              turnId: opts.turnId,
-              stage: 'visuals_ready',
-              artifacts,
-            });
-          }, { expectedRevision: stateBefore.revision });
-          return {
-            content: resultContent({
-              ok: true,
-              op,
-              status: 'started',
-              visual_revision: visualRevision,
-              inspector_version: VIDEO_STUDIO_INSPECTOR_VERSION,
-              recovery_started_automatically: true,
-              requires_user_decision: false,
-              preserved_artifacts: ['plan_approval', 'script', 'shotlist', 'composition_manifest', 'narration'],
-              invalidated_artifacts: ['preview', 'draft'],
-              next_action: 'composition.lint',
-              visual_repair_cycle: visualQaRepairSummary(revised.visual_qa?.cycle),
-              production_state: summarizeVideoProductionState(revised),
             }),
             isError: false,
           } as ToolResult;
@@ -5970,6 +9667,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             statePath: gateStatePath,
             roots,
             turnId: opts.turnId,
+            ctx,
           });
           if (result.ok) await notifyWritten(opts, [result.html_path]);
           let reconciledState = await recordCurrentVideoProductionCandidate({
@@ -5992,11 +9690,87 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           return { content: resultContent(result), isError: result.ok !== true } as ToolResult;
         }
         if (op === 'composition.check_narration_fit') {
+          const pendingPlanReview = stateBefore.plan_review_candidate;
+          const replyTargetsEarlierReview = !!pendingPlanReview
+            && !!opts.turnId
+            && !!pendingPlanReview.checked_turn_id
+            && pendingPlanReview.checked_turn_id !== opts.turnId
+            && currentUserTurnAvailable(opts.userMessage);
+          if (replyTargetsEarlierReview && turnPlanDecision.decision !== 'revise') {
+            const invalidEvidence = decisionEvidenceCorrectionResult(
+              'composition.approve_plan',
+              'plan',
+              turnPlanDecision,
+              { correctOmittedEvidence: true },
+            );
+            if (invalidEvidence) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                presentable: false,
+                result: invalidEvidence,
+              });
+            }
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              presentable: false,
+              result: {
+                ok: false,
+                op,
+                errorCode: turnPlanDecision.decision === 'reject'
+                  ? 'E_GATE_B_REPLY_REJECTED_PLAN'
+                  : 'E_GATE_B_REPLY_UNRESOLVED',
+                message: turnPlanDecision.decision === 'reject'
+                  ? 'The current user reply rejects the reviewed production plan. Honor that decision or apply the change they requested; do not run another fit check or ask them to reject it again.'
+                  : 'A ready production plan was reviewed in an earlier turn and the current real user reply is still available. Classify that reply once. If it approves the plan, retry any VideoStudio operation with plan decision_evidence and the same composition_dir; the host will record approval before that operation. If it is a question or unrelated, answer it without reopening the production-plan confirmation.',
+                reviewed_plan_signature: pendingPlanReview.signature,
+                decision_received: turnPlanDecision.decision === 'reject',
+                decision_still_valid: turnPlanDecision.decision === 'reject',
+                requires_user_decision: false,
+                user_reconfirmation_required: false,
+                presentation_required: false,
+                next_step_owner: 'agent',
+                same_turn_continuation_required: true,
+                next_action: turnPlanDecision.decision === 'reject'
+                  ? 'honor_current_plan_rejection_without_reconfirmation'
+                  : 'classify_current_reply_then_retry_with_plan_evidence_or_continue_without_gate',
+              },
+            });
+          }
           if (typeof input.speed === 'number'
             && (!Number.isFinite(input.speed) || input.speed < 0.5 || input.speed > 2)) {
             return {
               content: 'E_TTS_SPEED_INVALID: speed must be between 0.5 and 2.0; prefer a natural pace near 1.0.',
               isError: true,
+            } as ToolResult;
+          }
+          // A segment of an assembled production carries narration text only so
+          // frames can be captioned and timed; the parent EDL owns the voice
+          // and the mix. Without this short-circuit the schema-v2 path answers
+          // "sign an audio.narration_intent" — the exact instruction that made
+          // a silent segment sign a voice on 2026-08-04 — and the v1 path runs
+          // a fit check whose repair loop edits words the parent already signed.
+          const ownerFit = await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8')
+            .then((raw) => (JSON.parse(raw) as { audio?: { owner?: unknown } }).audio?.owner)
+            .catch((err) => {
+              log.warn('narration fit owner lookup failed', { error: logErrorSummary(err) });
+              return undefined;
+            });
+          if (ownerFit === 'assembler') {
+            return {
+              content: resultContent({
+                ok: true,
+                op,
+                status: 'not_applicable',
+                gate_b_ready: true,
+                gate_b_required: false,
+                requires_user_decision: false,
+                billable_request_sent: false,
+                message: 'This composition declares audio.owner:"assembler": the parent production owns narration selection, timing fit, and synthesis, and this segment renders silent. There is nothing to fit here — do not sign an audio.narration_intent and do not edit narration text for timing. Continue with visual authoring and the parent production flow.',
+                next_action: 'continue_visual_authoring',
+              }),
+              isError: false,
             } as ToolResult;
           }
           const identity = await videoProductionPlanIdentity(compositionDirAbs, {
@@ -6020,7 +9794,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 message: identity.evidence.conflicts[0]?.message
                   || (artifactInvalid
                     ? 'The current plan files are present, but one or more files could not be parsed or validated. Repair the listed file fields without changing the approved meaning, then retry this free check in the same turn.'
-                    : 'One or more current plan files are missing. Restore the listed script, shotlist, or manifest before checking narration fit.'),
+                    : 'The canonical plan manifest is missing. Restore composition-manifest.json before checking narration fit.'),
                 evidence: identity.evidence,
                 artifact_issues: identity.artifactIssues || [],
                 billable_request_sent: false,
@@ -6062,7 +9836,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 ok: false,
                 op,
                 errorCode: 'E_COMPOSITION_MANIFEST_INVALID',
-                message: (err as Error).message,
+                message: compositionManifestFailure(err).detail,
                 evidence: identity.evidence,
                 requires_user_decision: false,
                 next_action: 'repair_current_manifest_then_recheck_narration_fit',
@@ -6098,9 +9872,10 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               isError: true,
             } as ToolResult;
           }
+          const deliveryTargetDurationSec = await approvedTargetDurationSec(manifest, identity);
           const fit = compositionNarrationFit({
             text,
-            targetDurationSec: await approvedTargetDurationSec(manifest, identity),
+            targetDurationSec: narrationTimingBudget(manifest, deliveryTargetDurationSec).targetDurationSec,
             planSignature: identity.signature,
             state: stateBefore,
             ...(narrationSelection.legacy
@@ -6112,10 +9887,63 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               }),
             speed: narrationSelection.speed,
           });
+          const pendingTimingEpisode = stateBefore.narration_timing_episode?.status === 'awaiting_user_decision'
+            && [
+              identity.signature,
+              stateBefore.plan_approval?.signature,
+              stateBefore.narration_repair?.approval_signature,
+            ].includes(stateBefore.narration_timing_episode.approval_signature)
+            ? stateBefore.narration_timing_episode
+            : undefined;
+          if (pendingTimingEpisode) {
+            const decision = resolveNarrationRetryDecision(opts.userMessage, input.decision_evidence);
+            const invalidEvidence = decisionEvidenceCorrectionResult(op, 'narration_retry', decision.decision);
+            if (invalidEvidence) {
+              return { content: resultContent(invalidEvidence), isError: true } as ToolResult;
+            }
+            if (decision.decision.decision === 'reject') {
+              return {
+                content: resultContent({
+                  ok: false,
+                  op,
+                  errorCode: 'E_NARRATION_TIMING_WAIVER_MATERIALIZATION_REQUIRED',
+                  message: 'The user chose to continue with the current complete narration. Call composition.materialize_narration now with the same current-turn narration_retry decision evidence so the duration waiver is recorded and the composition is retimed without truncating speech.',
+                  billable_request_sent: false,
+                  requires_user_decision: false,
+                  user_reconfirmation_required: false,
+                  same_turn_continuation_required: true,
+                  next_step_owner: 'agent',
+                  next_action: 'composition.materialize_narration',
+                }),
+                isError: true,
+              } as ToolResult;
+            }
+            if (decision.decision.decision === 'unknown') {
+              const blocked = narrationTimingDecisionResult({
+                episode: pendingTimingEpisode,
+                measuredDurationSec: pendingTimingEpisode.latest_measured_duration_sec,
+                billableRequestSent: false,
+              });
+              return {
+                content: resultContent({ ...blocked, op }),
+                isError: true,
+              } as ToolResult;
+            }
+            stateBefore = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
+              const episode = next.narration_timing_episode;
+              if (!episode || episode.episode_id !== pendingTimingEpisode.episode_id
+                || episode.status !== 'awaiting_user_decision') {
+                throw new Error('E_NARRATION_TIMING_DECISION_STATE_CHANGED: timing episode changed before authorization.');
+              }
+              episode.user_authorized_requests += 1;
+              episode.status = 'active';
+              episode.updated_at = new Date().toISOString();
+            });
+          }
           const repeatedMeasuredRepairInput = !!stateBefore.narration_repair
             && stateBefore.narration_fit?.source === 'measured_calibration'
             && stateBefore.narration_fit.text_sha256 === fit.text_sha256
-            && stateBefore.narration_fit.status !== 'fits';
+            && narrationFitBlocksProduction(stateBefore.narration_fit.status);
           if (repeatedMeasuredRepairInput) {
             return reviewToolResult({
               opts,
@@ -6150,6 +9978,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const planApprovalCurrent = planApprovalMatchesIdentity(stateBefore.plan_approval, identity);
           const gateBRequired = !planApprovalCurrent && (repairAssessment.status === 'none'
             || repairAssessment.status === 'rejected');
+          const fitReady = !narrationFitBlocksProduction(fit.status);
           const archivedNarrationPath = approvalInherited
             ? await archiveStaleNarrationAudio({
               state: stateBefore,
@@ -6158,8 +9987,24 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               roots,
             })
             : '';
+          const repairedVisualSignature = approvalInherited
+            ? await videoStudioVisualCompositionSignature(compositionDirAbs).catch(() => '')
+            : '';
           const checked = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
             next.narration_fit = fit;
+            if (gateBRequired && fitReady) {
+              next.plan_review_candidate = {
+                signature: identity.signature,
+                manifest_json: `${JSON.stringify(manifest, null, 2)}\n`,
+                ...(opts.turnId ? { checked_turn_id: opts.turnId } : {}),
+                checked_at: fit.checked_at,
+                validation_version: 1,
+              };
+            } else if (planApprovalCurrent
+              || !fitReady
+              || next.plan_review_candidate?.signature !== identity.signature) {
+              delete next.plan_review_candidate;
+            }
             if (approvalInherited && next.narration_repair) {
               const authorization = next.narration_repair;
               setCurrentPlanApproval(next, {
@@ -6176,10 +10021,16 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 inheritance_reason: 'measured_narration_fit_repair',
                 validation_version: 3,
               });
+              if (next.narration_timing_episode
+                && next.narration_timing_episode.approval_signature === authorization.approval_signature) {
+                next.narration_timing_episode.approval_signature = identity.signature;
+                next.narration_timing_episode.updated_at = new Date().toISOString();
+              }
+              appendNarrationTransactionHistory(next, next.narration_transaction);
               delete next.narration;
               delete next.narration_transaction;
               delete next.narration_repair;
-              delete next.preview;
+              invalidateVisualEvidenceUnlessCurrent(next, repairedVisualSignature);
               delete next.draft;
               next.stage = 'manifest_ready';
             } else if (next.narration_repair && repairAssessment.status === 'pending') {
@@ -6198,7 +10049,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const preparedHtmlPresent = !!(await fs.stat(path.join(compositionDirAbs, 'index.html')).catch(() => null));
           const message = approvalInherited
             ? `${narrationFitMessage(fit)} The existing production plan confirmation was inherited for this bounded measured-duration repair. Do not request it again; run composition.prepare next.`
-            : planApprovalCurrent && fit.status === 'fits'
+            : planApprovalCurrent && fitReady
               ? `${narrationFitMessage(fit)} The current production plan confirmation already covers this unchanged narration plan. Do not request it again; follow the current native narration operation.`
             : repairAssessment.status === 'pending'
               ? repairAssessment.reason === 'repair_strategy_review_required'
@@ -6212,8 +10063,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ok: true,
               op,
               status: fit.status,
-              gate_b_ready: fit.status === 'fits',
+              gate_b_ready: fitReady,
               gate_b_required: gateBRequired,
+              ...(gateBRequired
+                ? intentChangesField(approvedPlanIntentChanges(stateBefore.plan_approval, identity))
+                : {}),
               approval_inherited: approvalInherited,
               repair_authorization_status: repairAssessment.status,
               repair_authorization_reason: repairAssessment.reason,
@@ -6222,11 +10076,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 : {}),
               next_action: approvalInherited
                 ? 'composition.prepare'
-                : planApprovalCurrent && fit.status === 'fits'
+                : planApprovalCurrent && fitReady
                   ? preparedHtmlPresent ? 'composition.materialize_narration' : 'composition.prepare'
                 : repairAssessment.status === 'pending'
                   ? 'revise_narration_then_composition.check_narration_fit'
-                    : fit.status === 'fits'
+                    : fitReady
                       ? 'open_gate_b'
                       : 'revise_narration_then_composition.check_narration_fit',
               requires_user_decision: gateBRequired,
@@ -6259,7 +10113,18 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             input.decision_evidence,
           );
           if (!parentPlanRaw && !parentSegmentId) {
-            const invalidEvidence = invalidDecisionEvidenceResult(op, 'plan', resolvedPlanDecision);
+            // AUTO inheritance reuses a recorded parent approval and needs no
+            // user turn; a first-party Gate B always does.
+            if (!currentUserTurnAvailable(opts.userMessage)) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                result: missingUserTurnGateResult(op, 'plan'),
+              });
+            }
+            const invalidEvidence = decisionEvidenceCorrectionResult(op, 'plan', resolvedPlanDecision, {
+              correctOmittedEvidence: true,
+            });
             if (invalidEvidence) {
               return reviewToolResult({
                 opts,
@@ -6268,10 +10133,138 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               });
             }
           }
-          const identity = await videoProductionPlanIdentity(compositionDirAbs, {
+          if (parentPlanRaw || parentSegmentId) {
+            // Derive the child's plan artifacts from the signed parent before
+            // anything grades them. The parent binding IS the child's
+            // specification, and the host has held it all along — see
+            // materializeChildPlanArtifacts. Deriving from an unapproved
+            // parent would launder authorization, so a parent whose approval
+            // does not validate is left to the existing error path below.
+            if (parentPlanRaw && parentSegmentId) {
+              const derivedParentPlanAbs = resolvePath(ctx, opts, parentPlanRaw, roots);
+              if (isPathAllowed(derivedParentPlanAbs, roots)) {
+                const approvedParent = await validateVideoProductionPlanApproval({
+                  statePath: videoProductionControlStatePath({
+                    userId: opts.userId,
+                    ...(opts.projectId ? { projectId: opts.projectId } : {}),
+                    planPath: derivedParentPlanAbs,
+                  }),
+                  planPath: derivedParentPlanAbs,
+                }).catch(() => null);
+                if (approvedParent) {
+                  await materializeChildPlanArtifacts({
+                    parentIdentity: approvedParent.identity,
+                    segmentId: parentSegmentId,
+                    compositionDirAbs,
+                  }).catch(() => ({ written: [] }));
+                }
+              }
+            }
+            // An assembled child's audio ownership is judged before standalone
+            // plan-artifact validation. The manifest schema's
+            // standalone-narration rule assumes a composition that owes its own
+            // voice; applied to a segment it reports "sign an
+            // audio.narration_intent" at something that must never speak, and
+            // following that advice is what produced the 2026-08-04 run's
+            // fourth confirmation.
+            const rawChildManifest = await fs.readFile(
+              path.join(compositionDirAbs, 'composition-manifest.json'),
+              'utf8',
+            ).then((raw) => JSON.parse(raw) as unknown).catch(() => null);
+            const audioFault = rawChildManifest ? parentCompositionAudioFault(rawChildManifest) : '';
+            if (audioFault) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                result: {
+                  ok: false,
+                  op,
+                  errorCode: 'E_PARENT_COMPOSITION_AUDIO_OWNERSHIP',
+                  message: `AUTO child compositions must remain silent; the parent assembler owns narration and audio. ${audioFault}`,
+                  requires_user_decision: false,
+                  user_reconfirmation_required: false,
+                  next_step_owner: 'agent',
+                  same_turn_continuation_required: true,
+                  interaction_required: false,
+                  billable_request_sent: false,
+                  next_action: 'repair_child_audio_ownership_then_retry_composition.approve_plan',
+                },
+              });
+            }
+          }
+          let identity = await videoProductionPlanIdentity(compositionDirAbs, {
             roots,
             preferLocal: !!parentPlanRaw || !!parentSegmentId,
           });
+          let reviewedPlanRestored = false;
+          const reviewedPlan = stateBefore.plan_review_candidate;
+          const consumesExplicitReviewedApproval = !parentPlanRaw
+            && !parentSegmentId
+            && resolvedPlanDecision.decision === 'approve'
+            && input.expected_plan_change !== true;
+          if (consumesExplicitReviewedApproval
+            && reviewedPlan
+            && identity.signature !== reviewedPlan.signature) {
+            let reviewedManifest: CompositionManifest | undefined;
+            try {
+              reviewedManifest = CompositionManifestSchema.parse(JSON.parse(reviewedPlan.manifest_json));
+            } catch {
+              reviewedManifest = undefined;
+            }
+            if (!reviewedManifest
+              || compositionPlanIntentSignature(reviewedManifest) !== reviewedPlan.signature) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                presentable: false,
+                result: {
+                  ok: false,
+                  op,
+                  errorCode: 'E_GATE_B_REVIEW_SNAPSHOT_INVALID',
+                  message: 'The durable reviewed-plan snapshot could not be validated. Preserve the current user approval, recover the reviewed candidate from conversation evidence, and retry in this same turn; do not ask the user to confirm again.',
+                  approval_received: true,
+                  approval_still_valid: true,
+                  requires_user_decision: false,
+                  user_reconfirmation_required: false,
+                  presentation_required: false,
+                  next_step_owner: 'agent',
+                  same_turn_continuation_required: true,
+                  next_action: 'recover_reviewed_plan_candidate_then_retry_composition.approve_plan',
+                },
+              });
+            }
+            const manifestPath = path.join(compositionDirAbs, 'composition-manifest.json');
+            try {
+              await writeTextAtomic(manifestPath, reviewedPlan.manifest_json, ctx);
+              await notifyWritten(opts, [manifestPath]);
+              identity = await videoProductionPlanIdentity(compositionDirAbs, { roots });
+              reviewedPlanRestored = identity.complete
+                && identity.signature === reviewedPlan.signature;
+            } catch {
+              reviewedPlanRestored = false;
+            }
+            if (!reviewedPlanRestored) {
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                presentable: false,
+                result: {
+                  ok: false,
+                  op,
+                  errorCode: 'E_GATE_B_REVIEW_SNAPSHOT_RESTORE_FAILED',
+                  message: 'The reviewed production plan could not be restored atomically. Keep the current user approval and retry recovery in this same turn; do not reopen the production-plan confirmation.',
+                  approval_received: true,
+                  approval_still_valid: true,
+                  requires_user_decision: false,
+                  user_reconfirmation_required: false,
+                  presentation_required: false,
+                  next_step_owner: 'agent',
+                  same_turn_continuation_required: true,
+                  next_action: 'retry_reviewed_plan_restore_without_user_reconfirmation',
+                },
+              });
+            }
+          }
           const planChanged = !planApprovalMatchesIdentity(stateBefore.plan_approval, identity);
           if (!identity.complete) {
             const artifactInvalid = (identity.artifactIssues?.length || 0) > 0;
@@ -6291,13 +10284,17 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 message: identity.evidence.conflicts[0]?.message
                   || (artifactInvalid
                     ? `${approvalReceived ? 'Your confirmation is still valid. ' : ''}The current plan files are present, but one or more files could not be parsed or validated. Repair only the listed structure or fields without changing the confirmed plan, then retry approval validation in this same turn.`
-                    : `${approvalReceived ? 'Your confirmation was received. ' : ''}One or more current plan files are missing. Restore the listed script, shotlist, or manifest, then retry approval validation in this same turn.`),
+                    : `${approvalReceived ? 'Your confirmation was received. ' : ''}The canonical plan manifest is missing. Restore composition-manifest.json, then retry approval validation in this same turn.`),
                 evidence: identity.evidence,
                 artifact_issues: identity.artifactIssues || [],
                 billable_request_sent: false,
                 requires_user_decision: false,
                 approval_received: approvalReceived,
+                approval_still_valid: approvalReceived,
                 user_reconfirmation_required: !approvalReceived,
+                next_step_owner: 'agent',
+                same_turn_continuation_required: true,
+                interaction_required: false,
                 next_action: artifactInvalid
                   ? 'repair_invalid_plan_artifacts_then_retry_composition.approve_plan'
                   : 'restore_missing_plan_artifacts_then_retry_composition.approve_plan',
@@ -6305,6 +10302,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             });
           }
           if (identity.requirementIssues.length > 0) {
+            const approvalReceived = resolvedPlanDecision.decision === 'approve';
             return reviewToolResult({
               opts,
               state: stateBefore,
@@ -6317,10 +10315,17 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 evidence: identity.evidence,
                 requirement_issues: identity.requirementIssues,
                 requires_user_decision: false,
+                approval_received: approvalReceived,
+                approval_still_valid: approvalReceived,
+                user_reconfirmation_required: !approvalReceived,
+                next_step_owner: 'agent',
+                same_turn_continuation_required: true,
+                interaction_required: false,
                 next_action: 'repair_current_plan_artifacts_before_confirmation',
               },
             });
           }
+          let planAuthorization: 'explicit_approval' | 'user_instruction' | 'inherited' = 'inherited';
           let inheritedParent: {
             signature: string;
             turnId: string;
@@ -6371,12 +10376,57 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 isError: true,
               } as ToolResult;
             }
-            if (resolvedPlanDecision.decision !== 'approve') {
+            // A change the user dictated in this turn is already authorized by
+            // the instruction itself. On 2026-08-04 the user asked for a brand
+            // animation at 12:11, the model applied it at 12:12 and then opened
+            // a confirmation asking whether to do what they had just asked for
+            // — a whole round trip spent re-agreeing. The exemption is narrow:
+            // the quote must appear verbatim in the current user turn (the host
+            // checks that), the caller must declare it is applying a change,
+            // and the plan must actually have changed. A model-initiated
+            // rewrite carries no such quote and still opens a confirmation.
+            // `planChanged` is deliberately not part of this condition: the
+            // check just below already refuses a declared amendment that did
+            // not change anything, and it names that defect precisely instead
+            // of reporting a missing approval.
+            //
+            // A prior approval IS required. An instruction amends a plan the
+            // user has already seen; without this condition the very first
+            // Gate B could be recorded from a revise quote — planChanged is
+            // vacuously true when nothing was ever approved, so the
+            // amendment-not-applied check below would never fire, and a plan
+            // the user never reviewed would become the signed baseline.
+            const hadPlanApproval = !!stateBefore.plan_approval
+              || (stateBefore.plan_approval_history?.length || 0) > 0;
+            const userInstructed = resolvedPlanDecision.decision === 'revise'
+              && resolvedPlanDecision.evidence_status === 'valid'
+              && input.expected_plan_change === true
+              && hadPlanApproval;
+            if (resolvedPlanDecision.decision !== 'approve' && !userInstructed) {
+              // Same reason as the production gate: hand back what is being
+              // approved, so "the displayed plan" is a thing the model can
+              // actually display rather than an assumption about the turn.
+              const manifestDigest = await compositionManifestApprovalDigest(compositionDirAbs);
+              const manifestSummary = await compositionPlanSummaryFor(compositionDirAbs);
               return {
-                content: 'E_GATE_B_EXPLICIT_APPROVAL_REQUIRED: composition.approve_plan is allowed only when the current real user message explicitly approves the displayed script and shotlist.',
+                content: resultContent({
+                  ok: false,
+                  op,
+                  errorCode: 'E_GATE_B_EXPLICIT_APPROVAL_REQUIRED',
+                  message: 'composition.approve_plan is allowed only when the current real user message explicitly approves this plan,'
+                    + ' or names the exact change being applied (decision_evidence decision="revise" quoting the user, with expected_plan_change=true).'
+                    + ' Show the plan below in their language first — they cannot approve what they have not seen.',
+                  presentation_required: true,
+                  requires_user_decision: true,
+                  next_step_owner: 'user',
+                  next_action: 'present_plan_then_await_user_decision',
+                  ...(manifestSummary ? { plan_summary: manifestSummary } : {}),
+                  ...(manifestDigest ? { plan_digest: manifestDigest } : {}),
+                }),
                 isError: true,
               } as ToolResult;
             }
+            planAuthorization = userInstructed ? 'user_instruction' : 'explicit_approval';
           }
           if (input.expected_plan_change === true && !planChanged) {
             return reviewToolResult({
@@ -6387,7 +10437,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 ok: false,
                 op,
                 errorCode: 'E_GATE_B_AMENDMENT_NOT_APPLIED',
-                message: 'The approved production-plan amendment did not change the signed script, shotlist, or composition manifest. Apply the exact displayed patch to the canonical plan artifacts, then retry composition.approve_plan in this same approval turn. Do not request visual recovery or another production plan confirmation.',
+                message: 'The approved production-plan amendment did not change the signed composition manifest. Apply the exact displayed patch to composition-manifest.json, then retry composition.approve_plan in this same approval turn. Do not request visual recovery or another production plan confirmation.',
                 expected_plan_change: true,
                 plan_changed: false,
                 visual_revision_recovery_available: false,
@@ -6399,7 +10449,15 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const manifest = CompositionManifestSchema.parse(JSON.parse(
             await fs.readFile(path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8'),
           ));
-          const approvedNarrationText = compositionNarrationText(manifest);
+          // Narration selection and the fit check belong to whoever will
+          // synthesize the audio. An assembled child carries the words so the
+          // frames can be captioned and timed, but the parent EDL signs the
+          // voice and owns the mix — asking the child for a voice made a silent
+          // segment sign one, which is how the 2026-08-04 run acquired its
+          // fourth confirmation.
+          const approvedNarrationText = manifest.audio.owner === 'assembler'
+            ? ''
+            : compositionNarrationText(manifest);
           const approvedNarrationTextSha = approvedNarrationText
             ? crypto.createHash('sha256').update(approvedNarrationText).digest('hex')
             : '';
@@ -6417,8 +10475,15 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               isError: true,
             } as ToolResult;
           }
+          const approvedNarrationDeliveryTarget = approvedNarrationText
+            ? await approvedTargetDurationSec(manifest, identity)
+            : 0;
+          const approvedNarrationTarget = approvedNarrationText
+            ? narrationTimingBudget(manifest, approvedNarrationDeliveryTarget).targetDurationSec
+            : 0;
           const checkedNarrationFit = stateBefore.narration_fit?.plan_signature === identity.signature
             && stateBefore.narration_fit.text_sha256 === approvedNarrationTextSha
+            && Math.abs(stateBefore.narration_fit.target_duration_sec - approvedNarrationTarget) <= 0.001
             && (!approvedNarrationSelection
               || (approvedNarrationSelection.legacy
                 ? Math.abs(stateBefore.narration_fit.speed - approvedNarrationSelection.speed) <= 0.0001
@@ -6430,7 +10495,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const approvedNarrationFit = approvedNarrationText
             ? checkedNarrationFit || compositionNarrationFit({
               text: approvedNarrationText,
-              targetDurationSec: await approvedTargetDurationSec(manifest, identity),
+              targetDurationSec: approvedNarrationTarget,
               planSignature: identity.signature,
               state: stateBefore,
               ...(approvedNarrationSelection?.ok === true
@@ -6448,7 +10513,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 : {}),
             })
             : undefined;
-          if (approvedNarrationFit && approvedNarrationFit.status !== 'fits') {
+          if (approvedNarrationFit && narrationFitBlocksProduction(approvedNarrationFit.status)) {
             return reviewToolResult({
               opts,
               state: stateBefore,
@@ -6484,8 +10549,27 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             compositionDirAbs,
             roots,
           });
-          const visualQaReset = planChanged && !!stateBefore.visual_qa;
+          // The plan artifacts are already in their amended form here. A plan
+          // amendment that leaves the visual projection untouched (narration
+          // wording, audio intent) keeps the recorded preview and its QA
+          // cycle; only a visual intent change resets them. Legacy preview
+          // entries without a visual signature keep the old full reset.
+          const planVisualSignature = planChanged
+            ? await videoStudioVisualCompositionSignature(compositionDirAbs)
+            : '';
+          const previewSurvivesPlanChange = planChanged
+            && stateBefore.preview?.visual_signature === planVisualSignature;
+          const previewGoAheadSurvivesPlanChange = previewSurvivesPlanChange
+            && !!stateBefore.plan_approval?.signature
+            && stateBefore.preview_go_ahead?.plan_signature === stateBefore.plan_approval.signature;
+          const visualQaReset = planChanged && !previewSurvivesPlanChange && !!stateBefore.visual_qa;
+          // Display-only label for review surfaces. Recorded here because the
+          // confirmed plan is the one moment the caller has the user's own
+          // wording for the whole production; it never takes part in approval
+          // identity, and a caller that omits it keeps the previous title.
+          const taskTitle = String(input.task_title || '').replace(/\s+/g, ' ').trim().slice(0, 120);
           const approved = await updateVideoProductionState(gateStatePath, compositionDirAbs, (next) => {
+            if (taskTitle) next.task_title = taskTitle;
             setCurrentPlanApproval(next, {
               gate: 'B',
               signature: identity.signature,
@@ -6508,11 +10592,27 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             else delete next.narration_fit;
             delete next.narration_repair;
             if (planChanged) {
-              delete next.preview;
+              if (!(next.preview?.visual_signature && next.preview.visual_signature === planVisualSignature)) {
+                delete next.preview;
+                delete next.preview_go_ahead;
+                delete next.visual_qa;
+              } else if (next.preview_go_ahead) {
+                if (previewGoAheadSurvivesPlanChange) {
+                  // The user has already seen these exact silent frames. Re-key
+                  // their reply to the narration-amended plan so draft admission
+                  // does not ask them to confirm unchanged visuals again.
+                  next.preview_go_ahead = {
+                    ...next.preview_go_ahead,
+                    plan_signature: identity.signature,
+                  };
+                } else {
+                  delete next.preview_go_ahead;
+                }
+              }
               delete next.draft;
-              delete next.visual_qa;
               if (!narrationTextStillCurrent || !narrationSelectionStillCurrent) {
                 delete next.narration;
+                appendNarrationTransactionHistory(next, next.narration_transaction);
                 delete next.narration_transaction;
                 delete next.narration_retry_authorization;
               }
@@ -6529,18 +10629,50 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             });
           });
           if (archivedNarrationPath) await notifyWritten(opts, [archivedNarrationPath]);
+          // The readable plan is a rendered view of what was just signed, so
+          // it exists the moment the plan does and can never disagree with it.
+          // Returned as text, never written. A file inside the composition
+          // directory would change the composition signature and stale the
+          // preview — the same trap the QA findings file fell into earlier
+          // today — and the user reads the plan in the confirmation message,
+          // not on disk.
+          const approvedManifest = await fs.readFile(
+            path.join(compositionDirAbs, 'composition-manifest.json'), 'utf8',
+          ).then((raw) => CompositionManifestSchema.parse(JSON.parse(raw))).catch(() => null);
+          const planScript = approvedManifest
+            ? renderPlanScript(
+              approvedManifest,
+              taskTitle || (await readVideoProductionState(gateStatePath, compositionDirAbs)).task_title || '',
+            )
+            : '';
           return {
             content: resultContent({
               ok: true,
               op,
               status: 'approved',
               gate: 'B',
+              ...(planScript ? { plan_script: planScript } : {}),
               plan_signature: identity.signature,
               approved_intent_hash: identity.signature,
               plan_identity_kind: 'approved_intent_sha256',
               plan_changed: planChanged,
               visual_qa_reset: visualQaReset,
+              requires_user_decision: false,
+              user_reconfirmation_required: false,
               approval_inherited: !!inheritedParent,
+              plan_authorization: planAuthorization,
+              ...(decisionRoutedFromOp ? { decision_routed_from_op: decisionRoutedFromOp } : {}),
+              ...(reviewedPlanRestored
+                ? {
+                  reviewed_plan_restored: true,
+                  message: 'The user approved the reviewed plan. An unrequested agent rewrite made after that review was discarded, and production continues from the reviewed signature without another confirmation.',
+                }
+                : {}),
+              ...(planAuthorization === 'user_instruction'
+                ? {
+                  message: 'The user named this change in the current turn, so applying it is already authorized. Continue to the next reviewable artifact; do not ask them to confirm the change they just asked for.',
+                }
+                : {}),
               ...(approvedNarrationSelection?.ok === true ? {
                 narration_selection: {
                   route_ref: approvedNarrationSelection.selection.routeRef,
@@ -6754,14 +10886,52 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             isError: false,
           } as ToolResult;
         }
-        if (op === 'composition.approve_preview' || op === 'composition.approve_draft') {
-          const kind = op === 'composition.approve_preview' ? 'preview' : 'draft';
+        if (op === 'composition.approve_draft') {
+          const kind = 'draft' as const;
+          // A segment of an assembled production is not a thing the user was
+          // asked about: the assembled video is what they confirm, and a
+          // segment's own draft is an intermediate the parent assembles.
+          const segmentApproval = stateBefore.plan_approval;
+          if (segmentApproval?.inheritance_reason === 'parent_edl_segment') {
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              result: {
+                ok: false,
+                op,
+                errorCode: 'E_SEGMENT_HAS_NO_USER_GATE',
+                message: `This composition is segment "${segmentApproval.parent_segment_id || ''}" of an assembled production, which is reviewed as one video. Do not ask the user about a single segment: re-capture it, keep producing, and let the assembled video be what they confirm. This segment's updated frames are already visible in the production review.`,
+                requires_user_decision: false,
+                user_reconfirmation_required: false,
+                next_step_owner: 'agent',
+                interaction_required: false,
+                same_turn_continuation_required: true,
+                billable_request_sent: false,
+                ...(segmentApproval.parent_plan_path
+                  ? { production_plan_path: segmentApproval.parent_plan_path }
+                  : {}),
+                next_action: 'read_production_status_then_continue_assembly',
+              },
+              // The refusal's own point: a segment is not put to the user, so
+              // it carries no presentation payload either.
+              presentable: false,
+            });
+          }
           const resolvedDecision = resolveVideoStudioCurrentTurnDecision(
             opts.userMessage,
             kind,
             input.decision_evidence,
           );
-          const invalidEvidence = invalidDecisionEvidenceResult(op, kind, resolvedDecision);
+          if (!currentUserTurnAvailable(opts.userMessage)) {
+            return reviewToolResult({
+              opts,
+              state: stateBefore,
+              result: missingUserTurnGateResult(op, kind),
+            });
+          }
+          const invalidEvidence = decisionEvidenceCorrectionResult(op, kind, resolvedDecision, {
+            correctOmittedEvidence: true,
+          });
           if (invalidEvidence) {
             return reviewToolResult({
               opts,
@@ -6776,8 +10946,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             compositionDirAbs,
             opts.turnId || '',
             explicitlyApproved,
-            resolvedDecision.source,
-            resolvedDecision.artifact_signature,
+            resolvedDecision.source === 'form'
+              ? resolvedDecision.artifact_signature
+              : undefined,
           );
           if (approval.ok === false) {
             if (approval.errorCode === 'E_VIDEO_REVIEW_SUBMISSION_SUPERSEDED') {
@@ -6795,6 +10966,24 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                   current_review_status: 'pending',
                   requires_user_decision: true,
                   user_reconfirmation_required: false,
+                  next_step_owner: 'user',
+                  interaction_required: true,
+                  interaction_mode: 'resume_current_review',
+                  form_policy: 'plain_message_current_artifact_no_duplicate_form',
+                  automatic_recovery_expected: false,
+                  same_turn_continuation_required: false,
+                  user_options: [
+                    {
+                      id: 'approve_current',
+                      label: 'Approve the latest complete video',
+                      effect: `Approve only the displayed current ${kind} artifact.`,
+                    },
+                    {
+                      id: 'revise_current',
+                      label: 'Request video changes',
+                      effect: `Keep the current ${kind} artifact and apply the requested changes.`,
+                    },
+                  ],
                   billable_request_sent: false,
                   next_action: 'show_current_artifact_and_keep_existing_review_pending',
                   ...(stateBefore.current_candidate
@@ -6810,11 +10999,11 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               ok: true,
               op,
               status: 'approved',
-              stage: kind === 'preview' ? 'preview_approval' : 'draft_approval',
+              stage: 'draft_approval',
               artifact_signature: approval.entry.signature,
               approved_at: approval.entry.approved_at,
               decision_source: resolvedDecision.source,
-              next_allowed_ops: kind === 'preview' ? ['composition.draft'] : ['composition.export'],
+              next_allowed_ops: ['composition.export'],
               production_state: summarizeVideoProductionState(
                 await readVideoProductionState(gateStatePath, compositionDirAbs),
               ),
@@ -6873,8 +11062,27 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           }
           return { content: resultContent(narrationResult), isError: narrationResult.ok !== true } as ToolResult;
         }
-        if (op === 'composition.draft' && await videoStudioPreviewRequired(compositionDirAbs)) {
-          const gate = await validateVideoStudioGate(gateStatePath, 'preview', compositionDirAbs, opts.turnId || '');
+        // The keyframe preview stop, enforced.
+        //
+        // A long or multi-scene composition must be rendered from frames that
+        // were actually captured and still match its bytes, AND that the user
+        // has seen and replied to. The frame-currency half was always here;
+        // the user half was prose only after the form protocol was removed,
+        // and on 2026-08-06 the model went straight from a passing snapshot to
+        // rendering the video — the exact stop the user asked to restore. The
+        // model's choice of composition.draft is the semantic go-ahead; the
+        // host then verifies that the frames came from an earlier turn and a
+        // real user turn exists. AUTO
+        // children are exempt from per-segment stops: the delivered
+        // production's aggregate visual identity covers them, and changes to
+        // any child make that aggregate go-ahead stale.
+        const draftParentLink = op === 'composition.draft' ? parentEdlLinkOf(stateBefore) : { segmentId: '', planPath: '' };
+        const draftPreviewRequired = op === 'composition.draft'
+          && (await videoStudioPreviewRequired(compositionDirAbs)
+            || (!!draftParentLink.segmentId && !!draftParentLink.planPath
+              && await assembledProductionPreviewRequired(draftParentLink.planPath)));
+        if (draftPreviewRequired) {
+          const gate = await validateCompositionFrameEvidence(gateStatePath, compositionDirAbs);
           if (gate.ok === false) {
             const currentState = await readVideoProductionState(gateStatePath, compositionDirAbs);
             const blockedResult = {
@@ -6899,6 +11107,37 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               }),
               isError: true,
             } as ToolResult;
+          }
+          // This is deliberately draft-only. A status/read/repair call in a
+          // user turn is not evidence that the user authorized production.
+          stateBefore = await recordKeyframePreviewGoAhead({
+            statePath: gateStatePath,
+            compositionDirAbs,
+            state: stateBefore,
+            opts,
+          });
+          const previewStop = keyframePreviewStopBlock({
+            state: stateBefore,
+            entry: gate.entry,
+            opts,
+            ...(await productionPreviewGoAheadGranted(opts, stateBefore).then((granted) => ({
+              productionPreviewGoAhead: granted.granted,
+            }))),
+          });
+          if (previewStop) {
+            // Deliberately NOT terminal. Ending the turn here guarantees the
+            // stop but leaves the host unable to write the message that goes
+            // with it: on 2026-08-07 the user's whole reply was "Snapshot 通过
+            // （0 阻断）。直接渲染草稿。" — the half-thought that happened to
+            // precede the refused call — with no frames offered and nothing to
+            // answer. The render is what must be blocked; the message has to
+            // be authored by the model, which needs one more inference to
+            // write it. Refusing without terminating gives it exactly that,
+            // with the frame paths in hand. A model that ignores this and
+            // retries the same call instead is caught by the repeated-failure
+            // breaker, which forces a user-facing summary — bounded, and
+            // still with nothing rendered.
+            return { content: resultContent(previewStop), isError: true } as ToolResult;
           }
         }
         if (op === 'composition.export') {
@@ -6931,6 +11170,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         }
         if (op === 'composition.inspect' || op === 'composition.snapshot') {
           const guarded = await guardVisualQaAttempt({
+            opts,
             statePath: gateStatePath,
             compositionDirAbs,
             op,
@@ -6997,24 +11237,42 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as ToolResult;
         }
 
+        const activeQaWaivers = (stateBefore.qa_waivers || []).map((waiver) => waiver.code);
+
         await startVideoStudioOperationState({
           statePath: gateStatePath,
           compositionDirAbs,
           op,
           turnId: opts.turnId,
           ...(outputAbsPath ? { outputPath: outputAbsPath } : {}),
-          ...(reportAbsPath ? { reportPath: reportAbsPath } : {}),
+          ...(effectiveReportPath ? { reportPath: effectiveReportPath } : {}),
           ...(findingsAbsPath ? { findingsPath: findingsAbsPath } : {}),
         });
 
+        const renderVisualSignature = (op === 'composition.draft' || op === 'composition.export')
+          ? await videoStudioVisualCompositionSignature(compositionDirAbs).catch((err) => {
+            log.warn('render visual signature failed', { error: logErrorSummary(err) });
+            return '';
+          })
+          : '';
+        // Every op on this path runs the shared preflight, whose design
+        // contract carries the cover family — so the opening determination
+        // must reach lint/inspect too, not only the frame-sampling ops.
+        const deliveredOpening = await compositionIsDeliveredOpening(stateBefore);
         const common = {
           compositionDirAbs,
+          ...(deliveredOpening ? {} : { isDeliveredOpening: false }),
+          ...(activeQaWaivers.length ? { waivedQaFindings: activeQaWaivers } : {}),
           ...(op === 'composition.draft' || op === 'composition.export'
-            ? { repairStateAbsPath: videoStudioRepairStatePath(opts, compositionDirAbs) }
+            ? {
+              repairStateAbsPath: videoStudioRepairStatePath(opts, compositionDirAbs),
+              segmentCacheDirAbs: videoStudioSegmentCachePath(opts, compositionDirAbs),
+            }
             : {}),
+          ...(renderVisualSignature ? { visualSignature: renderVisualSignature } : {}),
           ...(outputAbsPath && op !== 'composition.snapshot' ? { outputAbsPath } : {}),
           ...(outputAbsPath && op === 'composition.snapshot' ? { snapshotAbsPath: outputAbsPath } : {}),
-          ...(reportAbsPath ? { reportAbsPath } : {}),
+          ...(effectiveReportPath ? { reportAbsPath: effectiveReportPath } : {}),
           ...(findingsAbsPath ? { findingsAbsPath } : {}),
           ...((op === 'composition.export') ? { quality: 'high' as RenderQuality } : quality ? { quality } : {}),
           ...((op === 'composition.export')
@@ -7090,32 +11348,71 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as ToolResult;
         }
 
+        // P3: the model-scored design review is advisory. Deterministic QA
+        // (lint/inspect/snapshot semantic checks) remains the hard gate; a
+        // passing snapshot opens the preview review directly. The
+        // submit_design_review op still records verdicts for skills that
+        // submit them, but nothing blocks on it anymore — self-graded scores
+        // were ritual, not independent evidence, and their schema failures
+        // were a production loop source.
         if (result.ok && op === 'composition.snapshot') {
           result = {
             ...result,
-            design_review_required: true,
-            preview_design_review_required: true,
-            preview_gate_ready: false,
-            next_action: 'composition.submit_design_review',
-            next_allowed_ops: ['composition.submit_design_review'],
+            design_review_required: false,
+            preview_design_review_required: false,
+            ...(snapshotOutputRelocatedFrom
+              ? {
+                output_path_relocated: {
+                  requested: snapshotOutputRelocatedFrom,
+                  used: outputAbsPath,
+                  reason: 'a snapshot inside the composition invalidates its own preview; frames belong under preview/',
+                },
+              }
+              : {}),
           } as typeof result;
         }
 
         if (result.ok && op === 'composition.draft') {
-          const previewEntry = stateBefore.preview;
-          const previewReviewInherited = !!previewEntry
-            && previewEntry.status === 'approved'
-            && previewEntry.design_review?.status === 'passed'
-            && (await checkVideoStudioGateSignature(compositionDirAbs, previewEntry)).matches;
-          const designReviewRequired = previewReviewInherited
-            ? false
-            : await videoStudioDesignReviewRequired(compositionDirAbs, result);
+          // P3: design review is advisory — a passing draft (deterministic
+          // render/media/frame QA) opens Gate D directly.
           result = {
             ...result,
-            design_review_required: designReviewRequired,
-            design_review_inherited_from_preview: previewReviewInherited,
-            gate_d_ready: !designReviewRequired,
-            next_action: designReviewRequired ? 'composition.submit_design_review' : 'open_gate_d',
+            design_review_required: false,
+            gate_d_ready: true,
+            next_action: 'open_gate_d',
+          } as typeof result;
+        }
+
+        // The expensive model-facing visual pass happens only after native
+        // preflight/inspect/sampled-frame QA has passed. Snapshot contributes
+        // one complete contact sheet, not N sequential frame reads. A short
+        // composition allowed to skip preview contributes its draft contact
+        // sheet once; a draft with an already reviewed preview does not pay
+        // for the same static visual evidence again.
+        const shouldAttachSnapshotVisual = result.ok
+          && op === 'composition.snapshot'
+          && typeof result.contact_sheet === 'string'
+          && !!result.contact_sheet;
+        const shouldAttachFirstDraftVisual = result.ok
+          && op === 'composition.draft'
+          && !stateBefore.preview
+          && typeof result.contact_sheet === 'string'
+          && !!result.contact_sheet;
+        const modelVisualPath = shouldAttachSnapshotVisual || shouldAttachFirstDraftVisual
+          ? String(result.contact_sheet)
+          : '';
+        const modelVisual = modelVisualPath
+          ? await prepareVideoStudioModelVisual(modelVisualPath)
+          : null;
+        if (modelVisual) {
+          result = {
+            ...result,
+            visual_evidence: {
+              attached: true,
+              role: shouldAttachSnapshotVisual ? 'preview_contact_sheet' : 'first_draft_contact_sheet',
+              path: modelVisualPath,
+              policy: 'attached_only_after_native_deterministic_qa_passed',
+            },
           } as typeof result;
         }
 
@@ -7141,8 +11438,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           if (report) {
             report.op = 'composition.export';
             report.next_action = result.ok ? 'deliver_final' : report.next_action;
-            if (reportAbsPath) {
-              await fs.writeFile(reportAbsPath, JSON.stringify(report, null, 2), 'utf8');
+            if (effectiveReportPath) {
+              await fs.writeFile(effectiveReportPath, JSON.stringify(report, null, 2), 'utf8');
             }
           }
           result = {
@@ -7154,6 +11451,15 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               confirmation_required: false,
             },
             ...(result.ok ? { next_action: 'deliver_final' } : {}),
+            // The chat player only loads `chat-media://local`. Image and
+            // video tools state this form in their descriptions; this tool
+            // never did, so the model wrote the path under a convention from
+            // its own training (`sandbox:/…`) and a finished 62s video reached
+            // the user as a black frame stuck at 0:00 (2026-08-09). The exact
+            // line to paste is cheaper than an instruction to compose one.
+            ...(result.ok && outputAbsPath
+              ? { deliver_markdown: `[${path.basename(outputAbsPath)}](${chatMediaLocalUrl(outputAbsPath)})` }
+              : {}),
           } as typeof result;
         }
 
@@ -7163,6 +11469,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
             compositionDirAbs,
             op,
             ok: result.ok === true,
+            ...(opts.turnId ? { turnId: opts.turnId } : {}),
             ...(typeof result.errorCode === 'string' ? { errorCode: result.errorCode } : {}),
           });
           result = {
@@ -7176,8 +11483,8 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         if (findingsAbsPath && await existingCandidateFile(findingsAbsPath)) {
           result = { ...result, findings_path: findingsAbsPath } as typeof result;
         }
-        if (reportAbsPath && await existingCandidateFile(reportAbsPath)) {
-          result = { ...result, report_path: reportAbsPath } as typeof result;
+        if (effectiveReportPath && await existingCandidateFile(effectiveReportPath)) {
+          result = { ...result, report_path: effectiveReportPath } as typeof result;
         }
 
         let productionState: VideoProductionStateV1;
@@ -7243,6 +11550,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           } as typeof result;
         }
         if (result.ok) {
+          if (op === 'composition.draft' || op === 'composition.export') {
+            await finalizeVideoBeforePublish(opts, op, result.path, result.cover_path);
+          }
           await notifyWritten(opts, [
             result.path,
             result.cover_path,
@@ -7261,9 +11571,22 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               result.cover_path,
             ]);
           }
+          // P3: with design review advisory, a passing snapshot is the
+          // preview-review moment — publish the contact sheet immediately
+          // instead of waiting for a review submission that no longer gates.
+          if (op === 'composition.snapshot' && result.ok) {
+            await publishVisibleOutputs(opts, [result.contact_sheet]);
+          }
         }
         const renameNote = renamed && outputAbsPath ? renderRenameSignal(requestedOutput, outputAbsPath) : '';
-        return { content: resultContent(result, renameNote), isError: result.ok === false } as ToolResult;
+        // State, candidate locators, and the review package were all recorded
+        // from the full result above; resultContent applies the model-facing
+        // projection at serialization time for every return path.
+        return {
+          content: resultContent(result, renameNote),
+          ...(modelVisual ? { images: [modelVisual] } : {}),
+          isError: result.ok === false,
+        } as ToolResult;
       }
 
       const inputRaw = String(input.input_path || '').trim();
@@ -7272,7 +11595,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       if (!isPathAllowed(inputAbsPath, roots)) {
         return { content: `E_PATH_OUT_OF_SCOPE: input_path is outside scope: ${inputAbsPath}`, isError: true } as ToolResult;
       }
-      const fileErr = await ensureInputFile(inputAbsPath);
+      const fileErr = await ensureInputFile(inputAbsPath, 'input_path');
       if (fileErr) return { content: fileErr, isError: true } as ToolResult;
 
       const transcriptAbsPath = typeof input.transcript_path === 'string' && input.transcript_path.trim()
@@ -7293,6 +11616,29 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       });
       if (result.ok) await notifyWritten(opts, [result.transcript_path]);
       return { content: resultContent(result), isError: result.ok === false } as ToolResult;
+    },
+  };
+  let contractCheck: VideoStudioContractCheck | undefined;
+  return {
+    ...inner,
+    async execute(input, ctx) {
+      const op = String(input.op || '').trim();
+      if (CONTRACT_SENSITIVE_OPS.has(op)) {
+        contractCheck ??= checkInstalledVideoStudioContract(
+          opts.userId,
+          opts.agentId || VIDEO_STUDIO_AGENT_ID,
+        );
+        if (contractCheck.compatible === false) {
+          return videoStudioContractMismatchResult(op, contractCheck);
+        }
+      }
+      // Run the real operation first: a retry after a genuine external repair
+      // (e.g. the model restored a missing plan file with write_file and then
+      // resent the identical call) must still be able to succeed.
+      const result = await inner.execute(input, ctx);
+      return applyVideoStudioTurnBoundary(
+        applyVideoStudioFailureBreaker(failureStreaks, input, result),
+      );
     },
   };
 }

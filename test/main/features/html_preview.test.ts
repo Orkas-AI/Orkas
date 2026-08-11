@@ -1,11 +1,12 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  renderInteractiveHtmlSmoke,
   renderResponsiveHtmlPreview,
   type HtmlPreviewRuntimeDeps,
 } from '../../../src/main/features/html_preview';
@@ -47,6 +48,15 @@ function fakeRuntime(options: {
   downloadObserved?: boolean;
   downloadBytes?: number;
   keyboardFocusIndicator?: boolean;
+  controlsExercised?: number;
+  stateChangesObserved?: number;
+  artifactMessagesObserved?: number;
+  stateControlsFound?: number;
+  stateControlsExercised?: number;
+  stateTransitionsObserved?: number;
+  formsFound?: number;
+  formsSubmitted?: number;
+  interactionFailures?: string[];
   loadFailure?: boolean;
 } = {}): {
   deps: HtmlPreviewRuntimeDeps;
@@ -59,6 +69,9 @@ function fakeRuntime(options: {
     display: Array<Record<string, unknown>>;
   };
   sessionCleanup: { cache: boolean; storage: boolean };
+  loadedEntryUrls: string[];
+  bridgeAvailableAtLoad: boolean[];
+  interactionExecutions: string[];
 } {
   const windows: Array<{ options: Record<string, any>; destroyed: boolean }> = [];
   const requestDecisions: Array<{ url: string; cancel: boolean }> = [];
@@ -69,6 +82,9 @@ function fakeRuntime(options: {
     display: [] as Array<Record<string, unknown>>,
   };
   const sessionCleanup = { cache: false, storage: false };
+  const loadedEntryUrls: string[] = [];
+  const bridgeAvailableAtLoad: boolean[] = [];
+  const interactionExecutions: string[] = [];
   let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean }) => void) => void) | undefined;
   const sessionListeners = new Map<string, Function>();
   let tabKeyDowns = 0;
@@ -101,6 +117,7 @@ function fakeRuntime(options: {
               : null;
           }
           if (script.includes('downloadCandidates')) {
+            interactionExecutions.push(String(windowOptions.width));
             if (options.downloadObserved) {
               sessionListeners.get('will-download')?.(
                 { preventDefault: () => undefined },
@@ -113,12 +130,18 @@ function fakeRuntime(options: {
               );
             }
             return {
+              controlsExercised: options.controlsExercised ?? 1,
+              stateChangesObserved: options.stateChangesObserved ?? 0,
+              artifactMessagesObserved: options.artifactMessagesObserved ?? 0,
+              stateControlsFound: options.stateControlsFound ?? 0,
+              stateControlsExercised: options.stateControlsExercised ?? 0,
+              stateTransitionsObserved: options.stateTransitionsObserved ?? 0,
               downloadCandidates: options.downloadCandidate ? ['Download resume'] : [],
-              formsFound: 0,
-              formsSubmitted: 0,
+              formsFound: options.formsFound ?? 0,
+              formsSubmitted: options.formsSubmitted ?? 0,
               hashLinksChecked: 0,
               mailtoLinksChecked: 0,
-              failures: [],
+              failures: options.interactionFailures ?? [],
             };
           }
           return script.startsWith('(async')
@@ -137,6 +160,9 @@ function fakeRuntime(options: {
     }
 
     async loadURL(url: string) {
+      loadedEntryUrls.push(url);
+      const entryPath = fileURLToPath(url);
+      bridgeAvailableAtLoad.push(fs.existsSync(path.join(path.dirname(entryPath), '__orkas', 'bridge.js')));
       requestHandler?.({ url }, (decision) => requestDecisions.push({ url, cancel: decision.cancel }));
       if (options.loadFailure) throw new Error('synthetic preview load failure');
       if (options.externalRequest) {
@@ -193,7 +219,16 @@ function fakeRuntime(options: {
       },
     }),
   };
-  return { deps, windows, requestDecisions, permissionDecisions, sessionCleanup };
+  return {
+    deps,
+    windows,
+    requestDecisions,
+    permissionDecisions,
+    sessionCleanup,
+    loadedEntryUrls,
+    bridgeAvailableAtLoad,
+    interactionExecutions,
+  };
 }
 
 const viewports = [
@@ -224,6 +259,8 @@ describe('responsive HTML preview renderer', () => {
       sequence: ['Contact'],
       failures: [],
     });
+    expect(result.evidence.interactions.performed).toBe(true);
+    expect(runtime.interactionExecutions).toEqual(['1440']);
     expect(result.screenshots.map((value) => value.toString())).toEqual([
       'png:1440x900',
       'png:390x844',
@@ -255,6 +292,67 @@ describe('responsive HTML preview renderer', () => {
       display: [{}],
     });
     expect(runtime.sessionCleanup).toEqual({ cache: true, storage: true });
+  });
+
+  it('renders and audits only the one fixed viewport requested by the caller', async () => {
+    const runtime = fakeRuntime();
+    const mobileOnly = [{ name: 'mobile' as const, width: 390, height: 844 }];
+
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      mobileOnly,
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.viewports.map((item) => item.name)).toEqual(['mobile']);
+    expect(result.evidence.screenshotCaptures).toEqual([
+      { viewport: 'mobile', width: 390, height: 844, captured: true },
+    ]);
+    expect(result.evidence.interactions.viewport).toBe('mobile');
+    expect(result.screenshots.map((value) => value.toString())).toEqual(['png:390x844']);
+    expect(runtime.windows).toHaveLength(1);
+    expect(runtime.windows[0].destroyed).toBe(true);
+  });
+
+  it('preserves render, layout, screenshot, and keyboard evidence without exercising UI behavior', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 7,
+      formsSubmitted: 3,
+      interactionFailures: ['enabled control produced no observable outcome: Sign in'],
+    });
+
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+      { interactions: false },
+    );
+
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.viewports).toMatchObject([{
+      name: 'desktop',
+      readyState: 'complete',
+      horizontalOverflowPx: 0,
+      consoleErrors: [],
+    }]);
+    expect(result.evidence.screenshotCaptures).toEqual([
+      { viewport: 'desktop', width: 1440, height: 900, captured: true },
+    ]);
+    expect(result.evidence.interactions).toMatchObject({
+      performed: false,
+      controlsExercised: 0,
+      formsSubmitted: 0,
+      failures: [],
+      keyboard: {
+        method: 'tab-key',
+        uniqueTabStopsVisited: 1,
+        visibleFocusIndicators: 1,
+        failures: [],
+      },
+    });
+    expect(runtime.interactionExecutions).toEqual([]);
+    expect(result.screenshots.map((value) => value.toString())).toEqual(['png:1440x900']);
   });
 
   it('turns mobile overflow into a blocking result instead of a successful screenshot-only claim', async () => {
@@ -373,5 +471,72 @@ describe('responsive HTML preview renderer', () => {
       failures: ['Tab traversal found no visible focus indicator'],
     });
     expect(result.evidence.blockers).toContain('1 keyboard traversal check(s) failed');
+  });
+
+  it('returns multi-state coverage and blocks a control with no observable outcome', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 7,
+      stateChangesObserved: 5,
+      stateControlsFound: 3,
+      stateControlsExercised: 3,
+      stateTransitionsObserved: 2,
+      formsFound: 3,
+      formsSubmitted: 3,
+      interactionFailures: ['enabled control produced no observable outcome: Create account'],
+    });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      [{ name: 'desktop', width: 1440, height: 900 }],
+      runtime.deps,
+    );
+
+    expect(result.evidence.ok).toBe(false);
+    expect(result.evidence.interactions).toMatchObject({
+      stateControlsFound: 3,
+      stateControlsExercised: 3,
+      stateTransitionsObserved: 2,
+      formsFound: 3,
+      formsSubmitted: 3,
+    });
+    expect(result.evidence.blockers).toContain('1 safe interaction check(s) failed');
+  });
+
+  it('requires an observable behavior only for interactive artifact smoke', async () => {
+    const staticRuntime = fakeRuntime({ controlsExercised: 1, stateChangesObserved: 0 });
+    const staticResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      staticRuntime.deps,
+    );
+    expect(staticResult.evidence.ok).toBe(false);
+    expect(staticResult.evidence.blockers).toContain(
+      'interactive artifact smoke observed no visible state change, artifact submission, or download',
+    );
+
+    const downloadRuntime = fakeRuntime({
+      controlsExercised: 1,
+      downloadCandidate: true,
+      downloadObserved: true,
+    });
+    const downloadResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      downloadRuntime.deps,
+    );
+    expect(downloadResult.evidence.ok).toBe(true);
+
+    const interactiveRuntime = fakeRuntime({ controlsExercised: 2, stateChangesObserved: 1 });
+    const interactiveResult = await renderInteractiveHtmlSmoke(
+      path.join(root, 'index.html'),
+      interactiveRuntime.deps,
+      { bridgeJavaScript: 'window.orkasArtifact = { send() {} };' },
+    );
+    expect(interactiveResult.evidence.ok).toBe(true);
+    expect(interactiveResult.evidence.interactions).toMatchObject({
+      controlsExercised: 2,
+      stateChangesObserved: 1,
+    });
+    expect(interactiveRuntime.bridgeAvailableAtLoad).toEqual([true, true]);
+    expect(interactiveRuntime.loadedEntryUrls.every((url) => (
+      !fs.existsSync(path.dirname(fileURLToPath(url)))
+    ))).toBe(true);
   });
 });

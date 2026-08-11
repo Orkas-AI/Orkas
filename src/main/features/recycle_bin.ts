@@ -27,7 +27,7 @@ import {
 import { safeId, writeJson } from '../storage';
 import { t } from '../i18n';
 import {
-  EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE, findTitleClauseBoundary,
+  EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE,
 } from '../util/auto-title';
 import {
   logErrorRef,
@@ -1307,9 +1307,7 @@ function titleFromText(value: string): string {
     if (text === before) break;
   }
   text = text.trim();
-  const clauseIdx = findTitleClauseBoundary(text);
-  if (clauseIdx >= 4) text = text.slice(0, clauseIdx);
-  text = text.trim() || raw;
+  text = text || raw;
   if (text.length > TITLE_MAX) text = text.slice(0, TITLE_MAX) + '…';
   return text || t('chat.default_title');
 }
@@ -1725,7 +1723,11 @@ export async function createAppRecycleBatchForConversation(
   cid: string,
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(cid)) return null;
-  return createAppRecycleBatch(uid, [cloudRelForAbs(uid, conversationMessageReadFile(uid, cid))], { kind: 'conversation' });
+  return createAppRecycleBatch(
+    uid,
+    [cloudRelForAbs(uid, conversationMessageReadFile(uid, cid))],
+    { kind: 'conversation', strict: true },
+  );
 }
 
 export async function createAppRecycleBatchForConversations(
@@ -1733,7 +1735,7 @@ export async function createAppRecycleBatchForConversations(
   cids: string[],
 ): Promise<SyncRecycleBatch | null> {
   const rels = Array.from(new Set(cids.filter(safeId).map((cid) => cloudRelForAbs(uid, conversationMessageReadFile(uid, cid)))));
-  return createAppRecycleBatch(uid, rels, { kind: 'conversations' });
+  return createAppRecycleBatch(uid, rels, { kind: 'conversations', strict: true });
 }
 
 export async function createAppRecycleBatchForAutoTask(
@@ -1742,7 +1744,7 @@ export async function createAppRecycleBatchForAutoTask(
 ): Promise<SyncRecycleBatch | null> {
   if (!safeId(taskId)) return null;
   const loc = findAutoTaskLocation(uid, taskId) || globalAutoTaskLocation(uid, taskId);
-  return createAppRecycleBatch(uid, [loc.configRelPath], { kind: 'auto_task' });
+  return createAppRecycleBatch(uid, [loc.configRelPath], { kind: 'auto_task', strict: true });
 }
 
 async function conversationIdsForProject(uid: string, projectId: string): Promise<string[]> {
@@ -1810,7 +1812,10 @@ export async function createAppRecycleBatchForCloudEntry(
   relPath: string,
   kind: RecycleKind = 'other',
 ): Promise<SyncRecycleBatch | null> {
-  return createAppRecycleBatch(uid, [relPath], { kind });
+  // Every caller uses this immediately before a user-visible delete that is
+  // advertised as recoverable. A partial best-effort archive is therefore
+  // worse than no delete: it can remove content the recycle bin cannot restore.
+  return createAppRecycleBatch(uid, [relPath], { kind, strict: true });
 }
 
 export async function createAppRecycleBatchForAgent(

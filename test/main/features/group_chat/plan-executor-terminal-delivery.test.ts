@@ -74,6 +74,30 @@ describe('group_chat plan executor terminal delivery', () => {
     expect(text.match(/⚠️/g)).toHaveLength(1);
   });
 
+  it('turns an empty Agent result into a retryable model failure', async () => {
+    const prevLang = getCurrentLang();
+    setCurrentLang('zh');
+    try {
+      const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
+        actor: { id: 'product-developer', kind: 'agent' },
+        finalText: '',
+        errText: null,
+        activityEvents: 12,
+      }));
+
+      expect(outcome).toMatchObject({
+        kind: 'persist',
+        failureKind: 'model',
+        failureCode: 'empty_response',
+      });
+      const text = outcome.kind === 'persist' ? outcome.text : '';
+      expect(text).toContain('模型未返回内容');
+      expect(text).not.toContain('(no reply)');
+    } finally {
+      setCurrentLang(prevLang);
+    }
+  });
+
   it('labels a local agent runtime error as an agent run failure', async () => {
     const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
       actor: { id: 'hermes', kind: 'agent' },
@@ -124,5 +148,37 @@ describe('group_chat plan executor terminal delivery', () => {
       failureKind: 'validation',
       failureCode: 'skill_mutation_rejected',
     });
+  });
+
+  it.each([
+    {
+      label: 'insufficient credits',
+      error: '积分不足',
+      code: 'orkas_llm_quota_exceeded',
+    },
+    {
+      label: 'network interruption',
+      error: 'fetch failed',
+      code: 'provider_network',
+    },
+  ])('keeps partial prose and produced files after $label', async ({ error, code }) => {
+    const outcome = await onTurnFinished('u1', 'c1', commanderEvent({
+      actor: { id: 'office-writer', kind: 'agent' },
+      finalText: '文档排版已完成，文件见下方。',
+      errText: error,
+      failureKind: 'model',
+      failureCode: code,
+      produced: ['/workspace/formatted.docx'],
+    }));
+
+    expect(outcome).toMatchObject({
+      kind: 'persist',
+      failureKind: 'model',
+      failureCode: code,
+      produced: ['/workspace/formatted.docx'],
+    });
+    const text = outcome.kind === 'persist' ? outcome.text : '';
+    expect(text).toContain('文档排版已完成，文件见下方。');
+    expect(text).toContain('color:var(--danger)');
   });
 });

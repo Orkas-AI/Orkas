@@ -3,7 +3,7 @@ name: wps
 description_zh: 使用内置 Office 工具处理 WPS 兼容的 DOCX、XLSX、PPTX 和 PDF 交付，并检查中文字体、A4 版式、编号、打印设置和 WPS 兼容风险。适合“WPS 文档格式乱了帮我排查”“整理 WPS 表格并设置打印区域”“检查 WPS 演示导出 PDF”；触发词：WPS、WPS文字、WPS表格、WPS演示、格式兼容、中文办公、打印、导出PDF
 description_en: Use the built-in Office tools for WPS-compatible DOCX, XLSX, PPTX, and PDF delivery, with checks for Chinese fonts, A4 layout, numbering, print settings, and WPS compatibility risks. Use for WPS Writer, Spreadsheets, Presentation, Chinese-office formatting, print, and PDF-export workflows.
 category: office
-min_app_version: 1.7.0
+min_app_version: 1.6.1
 ---
 
 # WPS Compatibility

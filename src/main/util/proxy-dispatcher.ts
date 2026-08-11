@@ -28,6 +28,7 @@ import { logErrorSummary } from './log-redact';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { Readable } from 'node:stream';
+import { isRetriableHttpStatus, retryAsync } from './retry';
 
 const log = createLogger('proxy-dispatcher');
 
@@ -40,6 +41,52 @@ const SYSTEM_ROUTE_CACHE_MAX_ORIGINS = 256;
 const DISPATCHER_OPTS = { headersTimeout: 0, bodyTimeout: 0, connect: { timeout: 30_000 } };
 
 type FetchLike = typeof globalThis.fetch;
+
+export interface BinaryFetchResult {
+  status: number;
+  body: Buffer;
+}
+
+export interface BinaryFetchOptions {
+  signal?: AbortSignal;
+  headers?: Record<string, string>;
+  maxBytes?: number;
+  redirect?: RequestRedirect;
+}
+
+export type BinaryFetchLike = (
+  url: string,
+  options?: BinaryFetchOptions,
+) => Promise<BinaryFetchResult>;
+
+export interface BinaryDownloadOptions extends BinaryFetchOptions {
+  label: string;
+  retries?: number;
+  delaysMs?: number[];
+  validate?: (body: Buffer) => void;
+}
+
+export class BinaryFetchSizeError extends Error {
+  constructor(maxBytes: number) {
+    super(`binary response exceeds ${maxBytes} bytes`);
+    this.name = 'BinaryFetchSizeError';
+  }
+}
+
+export class BinaryDownloadHttpError extends Error {
+  readonly status: number;
+
+  constructor(status: number, label: string) {
+    super(`${label} returned HTTP ${status}`);
+    this.name = 'BinaryDownloadHttpError';
+    this.status = status;
+  }
+}
+
+/** Statuses that may be temporary for a newly-published CDN object. */
+export function isRetriableBinaryDownloadStatus(status: number): boolean {
+  return status === 404 || status === 409 || status === 425 || isRetriableHttpStatus(status);
+}
 
 export interface EnvProxyConfig {
   httpProxy?: string;
@@ -60,6 +107,8 @@ let _originalFetchValue: FetchLike | undefined;
 let _baseFetch: FetchLike | undefined;
 let _fetchDelegate: FetchLike | undefined;
 let _fetchRouter: FetchLike | undefined;
+let _baseBinaryFetch: BinaryFetchLike | undefined;
+let _binaryFetchDelegate: BinaryFetchLike | undefined;
 let _childFetchBridge: Promise<ChildFetchBridge> | undefined;
 
 interface ChildFetchBridge {
@@ -274,6 +323,116 @@ async function electronSystemFetch(): Promise<FetchLike> {
 }
 
 /**
+ * Electron's `net.fetch` materialises every response header as a WHATWG
+ * `Headers` value. Some object-storage providers return non-Latin-1 metadata
+ * headers; Chromium decodes those to Unicode and the subsequent ByteString
+ * conversion throws before callers can read the body. `net.request` exposes a
+ * byte stream instead, so binary delivery can deliberately ignore all
+ * upstream headers and consume only the status code and body.
+ */
+async function electronSystemBinaryFetch(
+  url: string,
+  options: BinaryFetchOptions = {},
+): Promise<BinaryFetchResult> {
+  const { net, session } = await import('electron');
+  const signal = options.signal;
+  return await new Promise<BinaryFetchResult>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('operation aborted'));
+      return;
+    }
+
+    const request = net.request({
+      url,
+      method: 'GET',
+      redirect: options.redirect || 'follow',
+      session: session.defaultSession,
+    });
+    let settled = false;
+    const finish = (err?: Error, result?: BinaryFetchResult) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener?.('abort', onAbort);
+      if (err) reject(err);
+      else resolve(result as BinaryFetchResult);
+    };
+    const onAbort = () => {
+      request.abort();
+      finish(new Error('operation aborted'));
+    };
+
+    request.on('response', (response) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      response.on('data', (chunk: Buffer | Uint8Array) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        total += buffer.length;
+        if (options.maxBytes && total > options.maxBytes) {
+          finish(new BinaryFetchSizeError(options.maxBytes));
+          request.abort();
+          return;
+        }
+        chunks.push(buffer);
+      });
+      response.on('end', () => {
+        finish(undefined, {
+          status: response.statusCode,
+          body: Buffer.concat(chunks),
+        });
+      });
+      response.on('aborted', () => finish(new Error('binary response aborted')));
+      response.on('error', (err: Error) => finish(err));
+    });
+    request.on('error', (err) => finish(err));
+    for (const [name, value] of Object.entries(options.headers || {})) {
+      request.setHeader(name, value);
+    }
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    request.end();
+  });
+}
+
+async function readBinaryFetchBody(response: Response, maxBytes?: number): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (maxBytes && total > maxBytes) {
+        throw new BinaryFetchSizeError(maxBytes);
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, total);
+  } catch (err) {
+    try { await reader.cancel(err); } catch { /* response may already be closed */ }
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function createFetchBinary(fetchImpl: FetchLike): BinaryFetchLike {
+  return async (url, options = {}) => {
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      ...(options.headers ? { headers: options.headers } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.redirect ? { redirect: options.redirect } : {}),
+    });
+    return {
+      status: response.status,
+      body: await readBinaryFetchBody(response, options.maxBytes),
+    };
+  };
+}
+
+/**
  * Start the loopback fetch bridge used by app-owned Node children. The random
  * token prevents unrelated local processes from turning it into an open
  * proxy. Request and response bodies stay streamed in both directions.
@@ -394,6 +553,8 @@ function ensureFetchRouter(): void {
   _originalFetchValue = current;
   _baseFetch = current.bind(globalThis) as FetchLike;
   _fetchDelegate = _baseFetch;
+  _baseBinaryFetch = createFetchBinary(_baseFetch);
+  _binaryFetchDelegate = _baseBinaryFetch;
   _fetchRouter = ((input: Parameters<FetchLike>[0], init?: Parameters<FetchLike>[1]) => {
     return (_fetchDelegate as FetchLike)(input, init);
   }) as FetchLike;
@@ -464,6 +625,93 @@ export function createSystemProxyFetch(
 }
 
 /**
+ * Binary counterpart to `createSystemProxyFetch`. The routing policy is the
+ * same, but the system-proxy branch may use a header-agnostic transport such
+ * as Electron `net.request`.
+ */
+export function createSystemProxyBinaryFetch(
+  fallbackFetch: BinaryFetchLike,
+  systemFetch: BinaryFetchLike,
+  resolveProxy: (url: string) => Promise<string>,
+  routeCacheMs = SYSTEM_ROUTE_CACHE_MS,
+): BinaryFetchLike {
+  const cache = new Map<string, { expiresAt: number; route: Promise<ResolvedProxyRoute> }>();
+
+  return async (rawUrl, options = {}) => {
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      return fallbackFetch(rawUrl, options);
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return fallbackFetch(rawUrl, options);
+    }
+
+    const now = Date.now();
+    let entry = cache.get(url.origin);
+    if (!entry || entry.expiresAt <= now) {
+      if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
+        for (const [origin, cached] of cache) {
+          if (cached.expiresAt <= now) cache.delete(origin);
+        }
+        if (cache.size >= SYSTEM_ROUTE_CACHE_MAX_ORIGINS) {
+          const oldestOrigin = cache.keys().next().value as string | undefined;
+          if (oldestOrigin) cache.delete(oldestOrigin);
+        }
+      }
+      const route = resolveProxy(url.href)
+        .then(parseResolvedProxyRoute)
+        .catch(() => ({ kind: 'unsupported', value: 'resolve_failed' }) as ResolvedProxyRoute);
+      entry = { expiresAt: now + Math.max(0, routeCacheMs), route };
+      cache.set(url.origin, entry);
+    }
+    const route = await entry.route;
+    return route.kind === 'direct'
+      ? fallbackFetch(rawUrl, options)
+      : systemFetch(rawUrl, options);
+  };
+}
+
+/** Download bytes through the same direct/environment/system proxy policy as global fetch. */
+export async function fetchBinaryWithProxyPolicy(
+  url: string,
+  options: BinaryFetchOptions = {},
+): Promise<BinaryFetchResult> {
+  ensureFetchRouter();
+  return await (_binaryFetchDelegate as BinaryFetchLike)(url, options);
+}
+
+/**
+ * Retry an idempotent binary GET without replaying the operation that produced
+ * it. Callers provide byte validation so a transient CDN HTML/XML body with a
+ * misleading 200 status is retried at the delivery boundary as well.
+ */
+export async function downloadBinaryWithProxyPolicy(
+  url: string,
+  options: BinaryDownloadOptions,
+): Promise<BinaryFetchResult> {
+  return await retryAsync(options.label, async () => {
+    const result = await fetchBinaryWithProxyPolicy(url, options);
+    if (result.status < 200 || result.status >= 300) {
+      throw new BinaryDownloadHttpError(result.status, options.label);
+    }
+    options.validate?.(result.body);
+    return result;
+  }, {
+    retries: options.retries ?? 2,
+    delaysMs: options.delaysMs ?? [500, 1_500],
+    signal: options.signal,
+    isRetriable: (err) => {
+      if (options.signal?.aborted) return false;
+      if (err instanceof BinaryFetchSizeError) return false;
+      if (err instanceof BinaryDownloadHttpError) return isRetriableBinaryDownloadStatus(err.status);
+      return true;
+    },
+  });
+}
+
+/**
  * Phase 1 — install the stable router and honor explicit launch-environment
  * proxy settings. This function performs the dispatcher change synchronously
  * before returning its resolved Promise, so early provider imports cannot race
@@ -531,6 +779,11 @@ export async function installSystemProxyDispatcher(
       resolveProxy = (url: string) => session.defaultSession.resolveProxy(url);
     }
     _fetchDelegate = createSystemProxyFetch(_baseFetch as FetchLike, systemFetch, resolveProxy);
+    _binaryFetchDelegate = createSystemProxyBinaryFetch(
+      _baseBinaryFetch as BinaryFetchLike,
+      electronSystemBinaryFetch,
+      resolveProxy,
+    );
     _active = 'system:per-request';
     log.info('installed per-request Electron system-proxy routing for global fetch');
     return true;
@@ -557,6 +810,8 @@ export function _resetProxyRoutingForTests(): void {
   _baseFetch = undefined;
   _fetchDelegate = undefined;
   _fetchRouter = undefined;
+  _baseBinaryFetch = undefined;
+  _binaryFetchDelegate = undefined;
   if (_childFetchBridge) {
     void _childFetchBridge.then(({ close }) => close()).catch(() => undefined);
     _childFetchBridge = undefined;

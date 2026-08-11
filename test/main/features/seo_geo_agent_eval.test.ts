@@ -18,6 +18,7 @@ describe('SeoGeoAgent built-in evaluation', () => {
     const agent = JSON.parse(
       fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'),
     ) as {
+      workflow: string;
       standards: string[];
     };
     const standards = agent.standards.join('\n');
@@ -37,5 +38,26 @@ describe('SeoGeoAgent built-in evaluation', () => {
     expect(standards).toContain('never prefix the command with mkdir');
     expect(standards).toContain('geo-probe geo_probe -- --op queries');
     expect(standards).toContain('geo-probe geo_probe -- --op score');
+    expect(standards).toContain('a blocked or failed crawl is an evidence limitation');
+    expect(standards).toContain('ACTION-PLAN.md plus a structured JSON strategy artifact');
+    expect(standards).toContain('Strategy crawl-failure fast path');
+    expect(standards).toContain('do not call an execution-plan tool, retry, search, or fetch');
+    expect(standards).toContain('write_file exactly twice in sequence');
+    expect(standards).toContain('.orkas-seo-audit/strategy-baseline.json');
+  });
+
+  it('keeps the only first crawl command runner-only and platform-neutral', () => {
+    const agent = JSON.parse(
+      fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'),
+    ) as {
+      workflow: string;
+    };
+    const firstCrawlCommand = agent.workflow.match(
+      /1\. Crawl the verified target once\. This is the only first command:\n\n```\n([\s\S]*?)\n```/,
+    )?.[1]?.trim();
+
+    expect(firstCrawlCommand).toBe(
+      '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" seo-crawl crawl -- "<url>" --out .orkas-seo-audit/crawl.json',
+    );
   });
 });

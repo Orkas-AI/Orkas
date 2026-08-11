@@ -4,6 +4,18 @@ type ElectronProcess = NodeJS.Process & { getSystemVersion?: () => string };
 
 export type DesktopPlatform = 'mac' | 'windows' | 'pc';
 
+export function preferredSystemLanguage(languages: unknown): string {
+  if (!Array.isArray(languages)) return 'und';
+  const first = languages.find((value) => typeof value === 'string' && value.trim());
+  if (typeof first !== 'string') return 'und';
+  try {
+    const canonical = Intl.getCanonicalLocales(first.trim().replace(/_/g, '-'))[0] || '';
+    return canonical && canonical.length <= 64 ? canonical : 'und';
+  } catch {
+    return 'und';
+  }
+}
+
 export function osVersion(): string {
   try {
     const getSystemVersion = (process as ElectronProcess).getSystemVersion;

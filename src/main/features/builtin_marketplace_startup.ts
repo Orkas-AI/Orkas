@@ -1,13 +1,13 @@
 import * as users from './users';
 import * as builtinMarketplace from './builtin_marketplace';
+import * as runtimeContentPublish from './runtime_content_publish';
 import { createLogger } from '../logger';
 import { maskId } from '../util/log-redact';
 import type { BuiltinMarketplaceSeedResult } from './builtin_marketplace';
 
 const log = createLogger('builtin-marketplace');
 
-let inFlightUid = '';
-let inFlight: Promise<BuiltinMarketplaceSeedResult | null> | null = null;
+const inFlightByUid = new Map<string, Promise<BuiltinMarketplaceSeedResult>>();
 
 export interface SeedBuiltinMarketplaceForActiveUserOptions {
   reason: string;
@@ -32,6 +32,23 @@ function _activeUidOrNull(): string | null {
   }
 }
 
+export async function seedBuiltinMarketplaceForUser(
+  uid: string,
+  opts: { reason: string; shouldContinue?: () => boolean },
+): Promise<BuiltinMarketplaceSeedResult> {
+  const existing = inFlightByUid.get(uid);
+  if (existing) return existing;
+
+  const inFlight = builtinMarketplace.seedBuiltinMarketplaceForUser(uid, {
+    shouldContinue: opts.shouldContinue,
+    activationGuard: (activate) => runtimeContentPublish.withIdleRuntimePublish(uid, activate),
+  }).finally(() => {
+    if (inFlightByUid.get(uid) === inFlight) inFlightByUid.delete(uid);
+  });
+  inFlightByUid.set(uid, inFlight);
+  return inFlight;
+}
+
 export async function seedBuiltinMarketplaceForActiveUser(
   opts: SeedBuiltinMarketplaceForActiveUserOptions,
 ): Promise<BuiltinMarketplaceSeedResult | null> {
@@ -40,17 +57,19 @@ export async function seedBuiltinMarketplaceForActiveUser(
     log.warn('skip builtin marketplace seed: no active user', { reason: opts.reason });
     return null;
   }
-
-  if (inFlight && inFlightUid === uid) return inFlight;
+  const existing = inFlightByUid.get(uid);
+  if (existing) return existing;
 
   const shouldContinue = (): boolean => {
     if (opts.shouldContinue && !opts.shouldContinue()) return false;
     return _activeUidOrNull() === uid;
   };
 
-  inFlightUid = uid;
-  inFlight = (async () => {
-    const result = await builtinMarketplace.seedBuiltinMarketplaceForUser(uid, { shouldContinue });
+  return (async () => {
+    const result = await seedBuiltinMarketplaceForUser(uid, {
+      reason: opts.reason,
+      shouldContinue,
+    });
     if (_hasSeedChanges(result)) {
       log.info('seeded builtin marketplace for active user', {
         reason: opts.reason,
@@ -67,12 +86,5 @@ export async function seedBuiltinMarketplaceForActiveUser(
       error: (err as Error).message,
     });
     return null;
-  }).finally(() => {
-    if (inFlightUid === uid) {
-      inFlightUid = '';
-      inFlight = null;
-    }
   });
-
-  return inFlight;
 }

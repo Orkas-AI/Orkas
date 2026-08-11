@@ -56,9 +56,11 @@ runtime/
 
 The app resolves `current` first, then `<platform>-<arch>`. It injects
 `ORKAS_PYTHON` / `ORKAS_UV` / `ORKAS_BUNDLED_NODE` when binaries are present
-and prepends their executable directories to command PATH. `ORKAS_NODE` remains
-Electron-as-Node for Orkas internal scripts; third-party package CLIs use
-`ORKAS_BUNDLED_NODE` or plain `node` from PATH.
+and prepends their executable directories to command PATH. Skill runners,
+package helpers, MCP adapters, and CLI bridges all use `ORKAS_BUNDLED_NODE`
+directly so macOS never treats each headless helper as another Orkas GUI app
+launch; third-party package CLIs also use bundled Node or plain `node` from
+PATH.
 
 Bundled runtimes are app resources and may be replaced during app updates.
 Installed package dependencies are not stored here: npm writes package-local

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "bd3aa973b8d565ef906fe0575aacc626217ae53d9520ce4f2a50beeff1885a04",
+  "content_tree_sha256": "1c030aa661b622b4f4e3193f5adc440a057bc72079b52d6735e4869e10174e39",
   "files": [
     {
       "path": "marketplace/agents/173d4235a431/_meta.json",
@@ -9,8 +9,8 @@
     },
     {
       "path": "marketplace/agents/173d4235a431/agent.json",
-      "bytes": 3121,
-      "sha256": "8ed7d1c1402caffc53ced8d3e255a44693ee0aea986c538c70719623d18fc18b"
+      "bytes": 3908,
+      "sha256": "2ffb9059ec006e3844f7ff7f432e8d066e5f9c8efc1ac0916c2e8bf919aed10c"
     },
     {
       "path": "marketplace/agents/78900d8758bc/_meta.json",
@@ -19,13 +19,13 @@
     },
     {
       "path": "marketplace/agents/78900d8758bc/agent.json",
-      "bytes": 23765,
-      "sha256": "6ec2cebf20933ffa76747dd51d4697b818dac2b7b6e60ae4602d103d4f6a3538"
+      "bytes": 28284,
+      "sha256": "347063e502fa951d8d3c3777e31518ab8c78b8dea1d9586ad072d59711434145"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/agent.json",
-      "bytes": 43568,
-      "sha256": "9207892bafe97e34dfe7a8656778bc959e5ab6be32551db28b97dc3d3e98bc25"
+      "bytes": 48024,
+      "sha256": "dea53722da39deaf06e96554634dae558d3b7e2115a45316811a6412d50a5322"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/bundled-runtime.ts",
@@ -64,18 +64,18 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit.ts",
-      "bytes": 51686,
-      "sha256": "b2d91d64e189e74bfbdf05e5f397a016b6e6816eb7f440199e72af344bfacc4f"
+      "bytes": 72059,
+      "sha256": "b18e42e74a0bc1565852d5bc8665866ba8ab8e869bfb0f55fe1b066f02b22ffa"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl.ts",
-      "bytes": 50242,
-      "sha256": "80013791e5c7648a0b1241842bc26a0a0266dc50438172a663590ca15f7f3b03"
+      "bytes": 51914,
+      "sha256": "de44a6ed8ca3f77f2085d40ab84afbfba88f6bb246742d009e8a3946fa3e81f6"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/composition-design-review/SKILL.md",
-      "bytes": 10134,
-      "sha256": "c12701c4e749362e93a03fc7bfccb2b1de2f1275479c351b42230458c56a37ba"
+      "bytes": 7780,
+      "sha256": "2e298868100fca9083b96b106e0732545125736895b7849d90ca868868cee680"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/design-system-importer/SKILL.md",
@@ -99,23 +99,38 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/frontend-design/SKILL.md",
-      "bytes": 21236,
-      "sha256": "5bea538d519bdbfe2d475c6695d2306cbdf5645569b45a03bc67adfbe95294ac"
+      "bytes": 22781,
+      "sha256": "30fe1bf03d90db4b4a01ec1ef15833dda775cc916556339c0ca8bef3060a3734"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/gate-control/references/narration-recovery.md",
+      "bytes": 4067,
+      "sha256": "fa883265f08e0747be72b72af61dfd45140190baeee9cbf86b8658fca6f651d9"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/gate-control/scripts/resolve-transition.mjs",
-      "bytes": 12652,
-      "sha256": "3855dc674ac816ceb7fb8b4cbdb9f911aa16e75e9fb172d12ba5fe2e9d16ac09"
+      "bytes": 14173,
+      "sha256": "fecca6fe97110d1ce028da23ca642af285a515a9ba69f6d6e421d8c7ba82e5b3"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/gate-control/SKILL.md",
-      "bytes": 37063,
-      "sha256": "b2f2c974330d5c948e9b393fd22bfea71be18c767917b933c10b70ce6175c557"
+      "bytes": 46695,
+      "sha256": "ecfccd65e43eb965636f0f4f6436febe55f206890edc293aed4c539d01ed2e88"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-assemble/SKILL.md",
-      "bytes": 18137,
-      "sha256": "da9e07edfce25dd880b85c3c30b7494b8a05117a71288d62c34f2fb2742deffd"
+      "bytes": 23743,
+      "sha256": "48dd34b46a846862939b0468e9d4aa47f9ec1768f85d7dbc90df1a8f6ab9991b"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/references/narration.md",
+      "bytes": 5498,
+      "sha256": "d01e8c94d760f0f71901e91c87b1bcc5555701a9da87c164557042b2b0def09c"
+    },
+    {
+      "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/references/no-runtime-package.md",
+      "bytes": 1738,
+      "sha256": "e00b2019c05de66119c53c47c729d53d4b71192ef826ab35cad6243fbf727142"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/scripts/vendor/gsap.min.js",
@@ -124,8 +139,8 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-compose/SKILL.md",
-      "bytes": 59308,
-      "sha256": "364d9e93a6bfe89904b24be6f08f3f173a51d34b6c82a11bb5e3e0563ca9452e"
+      "bytes": 47819,
+      "sha256": "614802ad5c2251bc6a18e6d62d614c66e861d6defc655904e0d0f90789a12a43"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-consistency/SKILL.md",
@@ -144,23 +159,23 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/edit_video.js",
-      "bytes": 12625,
-      "sha256": "92e983179264ef521da4bc3a805b5ff4a20b30a30ca223c900847d35003175a6"
+      "bytes": 13294,
+      "sha256": "942eccdc8d3d904aa9ea39f2dc1ae3e5475c817a2d4c826262b7270ea9664b84"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_analyze_core.cjs",
-      "bytes": 44779,
-      "sha256": "7d72b02d1101b819b7dc71fbe25e3f6bc359a983bea206db24c761bdd4abf59e"
+      "bytes": 47141,
+      "sha256": "d5142882cecf7981e160d796273c429f74ef8920c562bda77b5a4a4b1e670c1a"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/scripts/lib/video_edit_core.cjs",
-      "bytes": 45776,
-      "sha256": "8f179efad33a6c4d071228f4113506c634b1d6d6a26ef00aba8911756598aafd"
+      "bytes": 54934,
+      "sha256": "515a4ecf36e3c0ee9913f71d5130c8163595c276e30530c0ba8c7d7cd508880e"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-edit/SKILL.md",
-      "bytes": 20842,
-      "sha256": "69886fd8728780c5e3739c4e9ac874598eacf5784755452597cebbdee5762791"
+      "bytes": 21127,
+      "sha256": "c11eeda8d59a845514bd3abcd60bf41dc9d6e36be0ca6615c48059cab47cc7f2"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-generate/SKILL.md",
@@ -174,13 +189,13 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/scripts/lib/video_edl_core.cjs",
-      "bytes": 31180,
-      "sha256": "e719e98a22a129b957f687d3f59328370285444d8a5d428b37461edd2ce2db83"
+      "bytes": 32009,
+      "sha256": "845d446c5e691ee013512b363ce5a932b7665d35d62c6156b69a8ce2d9803560"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/scripts/video_plan.js",
-      "bytes": 9305,
-      "sha256": "2eaf74389cd437d8eeb75c61a53da3573aebbdc6010edc3621de821a01b78ece"
+      "bytes": 9928,
+      "sha256": "92c1b1837cbba1137408e4dedf632b5a054cef5de6cbf2473fa40815b0a04715"
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/stage-plan/SKILL.md",
@@ -194,18 +209,43 @@
     },
     {
       "path": "marketplace/agents/79df9cc89f5f/skills/video-router/SKILL.md",
-      "bytes": 6257,
-      "sha256": "a113a097542f50bcc8a2c7f2778cfd0ea6fb2f89e8e65c054c5a44170560ba18"
+      "bytes": 6664,
+      "sha256": "9d53f89196b485899ea7ed789b4c8e879d7fb7ab85ec13eddd4d89757a31832c"
+    },
+    {
+      "path": "marketplace/agents/7e91cb9ec9e9/agent.json",
+      "bytes": 14660,
+      "sha256": "ba35a8f5b0e15c7e84ef52d3dd61a57c662f8f8fdc024b3cb64f35584af90ca2"
+    },
+    {
+      "path": "marketplace/agents/7e91cb9ec9e9/skills/ppt-craft/SKILL.md",
+      "bytes": 15127,
+      "sha256": "14f581a9cba4d8e4cb695fd3cee6c856a9c8ba7e22ac73ffd34516ba40582dc8"
+    },
+    {
+      "path": "marketplace/agents/7e91cb9ec9e9/skills/ppt-planner/SKILL.md",
+      "bytes": 19134,
+      "sha256": "afb258f3f20e11375cabd44c1219d04e8ffa8082221b85b51e247ba94fd91311"
+    },
+    {
+      "path": "marketplace/agents/7e91cb9ec9e9/skills/ppt-review/SKILL.md",
+      "bytes": 16294,
+      "sha256": "985681e7fd34effa4e150c959962f6d9cc493bd04aa3dbf54d9b07cc547cae4a"
+    },
+    {
+      "path": "marketplace/agents/7e91cb9ec9e9/skills/ppt-router/SKILL.md",
+      "bytes": 7327,
+      "sha256": "a8d9cd1a8402e9ecfbd1067279faa39ecb0946a5392e3e8b7f734148f916ff8a"
     },
     {
       "path": "marketplace/agents/814b61b027f0/agent.json",
-      "bytes": 12770,
-      "sha256": "498d00bad402aa881f2ea7c9e69a1955944c2f15dbc3455c8a758659cd7d7731"
+      "bytes": 16975,
+      "sha256": "d4b45b761ba3e2aff54fc992fdbdf19fca31096b8800e3a9702127100edb72da"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-canvas/SKILL.md",
-      "bytes": 3386,
-      "sha256": "15e9318d3c95acd5093cba9ede2606274714fce04d987091e1f1592b07587eef"
+      "bytes": 3947,
+      "sha256": "953d11c84b8de64e1622cfc5be0e4f313b1e7edc4848b91d610252c43219d889"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-compose/references/structured-visuals.md",
@@ -224,18 +264,18 @@
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-compose/SKILL.md",
-      "bytes": 7074,
-      "sha256": "0e9b59fb90c9597ad7d5c23bb14fa7caf9cceb4da642691551ffe3741a9ca5b3"
+      "bytes": 9876,
+      "sha256": "ea585aa30b7498c355fc51d0353b53572e803fb54a9006261dda3b932d8f0217"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-craft/SKILL.md",
-      "bytes": 3373,
-      "sha256": "e883f8848cd94ab3dbc224e7cfd0d3415da8e96c1e9afeff408a56a71875d259"
+      "bytes": 3956,
+      "sha256": "a1e42b4ea8c597a99c4938e1cbb9519bf6d60096e5401a6d3d5272d4044f1351"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-design-review/SKILL.md",
-      "bytes": 4893,
-      "sha256": "c19fa82e289e7de25f5d53e8d7eeb21f08aca1cad120a0d78cec3ce954b68a02"
+      "bytes": 7999,
+      "sha256": "1754bece090cdb959be4503875301f41bfc9d886a3747354d11540881def4b1f"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-generate/references/external-workflows.md",
@@ -244,13 +284,13 @@
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-generate/SKILL.md",
-      "bytes": 9165,
-      "sha256": "0b8153d8b6bb2d45e3418550b96ab8de42d10d8574f9acada4fd2e83c7488d91"
+      "bytes": 10543,
+      "sha256": "a14ac2665fc6d66200ddbac5a4d9375c08142e070103ca2bb2216251dcdab8aa"
     },
     {
       "path": "marketplace/agents/814b61b027f0/skills/image-router/SKILL.md",
-      "bytes": 6258,
-      "sha256": "b812fc1eeb70f8e0f2c12973e99e25ab407179a8ece608869bf8f83a9df6acc7"
+      "bytes": 8840,
+      "sha256": "63a2e3ae6101e700b3e99c6b7ebb19e15ba6f5dc603becbcc7b830f6759685f9"
     },
     {
       "path": "marketplace/agents/a19101ba698a/_meta.json",
@@ -259,8 +299,8 @@
     },
     {
       "path": "marketplace/agents/a19101ba698a/agent.json",
-      "bytes": 10118,
-      "sha256": "bf55cec7ec3b125c50f47c2b12f3156c7d802e8473b0c537585ddc1c23253a4e"
+      "bytes": 11307,
+      "sha256": "c4c6559405bd4e7dfb18d8e27dd2d63e20a77a85bae61103f9808ec424144120"
     },
     {
       "path": "marketplace/agents/a316881746f9/_meta.json",
@@ -269,18 +309,18 @@
     },
     {
       "path": "marketplace/agents/a316881746f9/agent.json",
-      "bytes": 13254,
-      "sha256": "7c46239e61743395f40457e0f436933dd0304f708ecbea4ab6baf53eba4b0cdc"
+      "bytes": 14432,
+      "sha256": "243cf29850b04b9045a0869eca810f29aa365767df62bdaf01d433cf4f074f1b"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/agent.json",
-      "bytes": 17732,
-      "sha256": "25285274f725d7bcab2b820deb03b54fbd3079fe0e08bd856cf8d3aaee1bead7"
+      "bytes": 18461,
+      "sha256": "1f0e2188000a973f0ebf8f5e6a05b84a2e17137d167dbd00b3a01111261c12fa"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-artifact-workspace/SKILL.md",
-      "bytes": 13182,
-      "sha256": "5a19ca452cfbb708034d2419d5ec1519091cffac116a1ddfa296d0ccb07de620"
+      "bytes": 13833,
+      "sha256": "cbd1b1c145f162d0ecadcad53ca1b49315bc75b9273703d19de875e462cb5092"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-color/SKILL.md",
@@ -289,8 +329,8 @@
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-controls-accessibility/SKILL.md",
-      "bytes": 6560,
-      "sha256": "6d9d735bc86ff0d5a57d28559475f84438389841fd358d3d22f54ec7f400cf9e"
+      "bytes": 6899,
+      "sha256": "7db72c9396d0a7e24014b96fb65cd1542f9a4a4d721a88ec346a0d09763225fb"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-craft-checks/SKILL.md",
@@ -304,13 +344,13 @@
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-executor/scripts/validate-html-artifact.mjs",
-      "bytes": 10675,
-      "sha256": "ef746cb2fd01baa172deb0c6fb339fc1eb6e35921369e4d82836bd87458ca8c6"
+      "bytes": 29524,
+      "sha256": "66250cbd1436bb8d30a96fd870be3d050e868c95e75d0de2d727ab91faa4e9f8"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-executor/SKILL.md",
-      "bytes": 11868,
-      "sha256": "e11b1629b144a9b17263fb092052a04c1084e3c4d2cb73203cd904e2050acc35"
+      "bytes": 15832,
+      "sha256": "7eefc5820e22f02f20ab487aefe56541c0588bef2c733fab521c7c9a48c594f8"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-design-review/SKILL.md",
@@ -329,13 +369,13 @@
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-html-renderer/SKILL.md",
-      "bytes": 19501,
-      "sha256": "084394274e21bfaa893c4c1cea029e0d6cfd12325f23c6c0dab8df3a21444c3d"
+      "bytes": 19618,
+      "sha256": "d959467c1d913fcbf2ef8627e13b1876ac51e045ea8411a002d9840e719cee51"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-live-artifact/SKILL.md",
-      "bytes": 5115,
-      "sha256": "c128fdb891a42a2f6f2e279a193d437260157fa07e3c39618bcca51df011d16a"
+      "bytes": 5353,
+      "sha256": "9ae33db7fa86c72388aac031f27c412c698f6c0606c9a284f652bc367507e92c"
     },
     {
       "path": "marketplace/agents/bcfcb4921dce/skills/ui-reference-packs/references/design-system-packs.md",
@@ -359,8 +399,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/agent.json",
-      "bytes": 16236,
-      "sha256": "87b29fa3f9a5a6a38691eaca6ddbeabddce790571c9f213359ccaf7f6fa362eb"
+      "bytes": 19230,
+      "sha256": "14ea766a4e8f8cfee7421967793a3cf77afd935244f4e7eb098b5707c9b32b09"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/README.md",
@@ -424,8 +464,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/SKILL.md",
-      "bytes": 6231,
-      "sha256": "fb90a5876b11ffcb155f7a412c1fde05f63422fda4e1e39ff933d238e7a8a93f"
+      "bytes": 6517,
+      "sha256": "5fb2f06126a49a4aa77f48acf5a23bfa7e0222fe27f52837019b90b289d060ab"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-crawl/test/test_crawl.py",
@@ -454,8 +494,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-monitor/SKILL.md",
-      "bytes": 3222,
-      "sha256": "867747a2395c7047a14ae348667c21a6f878e60889d24a4651d0b0a22b59ef12"
+      "bytes": 4014,
+      "sha256": "641bb3abf10d3c9ea0aa257a77cddabb0f76d2b59ee7584becfae4dd6015bede"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-monitor/test/test_monitor.py",
@@ -469,8 +509,8 @@
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-opportunity/SKILL.md",
-      "bytes": 3386,
-      "sha256": "79b1515d4230528ddfdec0081e7496a6d2cddcafceb20da57e56d679eef06a47"
+      "bytes": 4638,
+      "sha256": "84fd819bd4717bde1576db7f0181bd2cd3eaf065b831a03559348863858b8b69"
     },
     {
       "path": "marketplace/agents/e064dca9e1bd/skills/seo-opportunity/test/test_opportunity.py",
@@ -535,22 +575,22 @@
     {
       "path": "marketplace/skills/081c15ffbab4/_meta.json",
       "bytes": 153,
-      "sha256": "ac67787fba376821d373cc8033677323165bde8cd28ee71206d9475fb4648649"
+      "sha256": "114375efc8461fb7f3f16b5f45577694ab71c29a4829f515f1aaedcafc1e0688"
     },
     {
       "path": "marketplace/skills/081c15ffbab4/SKILL.md",
-      "bytes": 7147,
-      "sha256": "1b7e8b2cbaf7ae56fa973a2356f0fbd094b1b90c37c63a4728a963199d294646"
+      "bytes": 7384,
+      "sha256": "352016b7364e049daf55cebac6c8f17eea385fe1a39f2bf82d14ca8ee2b9cd6a"
     },
     {
       "path": "marketplace/skills/36bd44ae956c/_meta.json",
       "bytes": 153,
-      "sha256": "82fc8018a51fe858af89e39aa3f7f3f685a14cd57370581e3ded6c8304cebc3c"
+      "sha256": "afac1a386cc6a00a0c73dea0fb1b9828de24c1bd9f97e86ccdf043df3ca858a5"
     },
     {
       "path": "marketplace/skills/36bd44ae956c/SKILL.md",
       "bytes": 3077,
-      "sha256": "74012a2ccc32e4e6a2949e1684531cd5942c1c17084fa1f275f508e6d0ccd364"
+      "sha256": "4f7c4d4e0a5fd0ab1d43e2d4f84b072be8979798224552f2dd26457249a0b573"
     },
     {
       "path": "marketplace/skills/6743aa0797a2/_meta.json",
@@ -569,8 +609,8 @@
     },
     {
       "path": "marketplace/skills/68fb048b85cb/_meta.json",
-      "bytes": 1402,
-      "sha256": "d7dffe56f7100a5586fef7a9cc70c857d16129f91fec4b865d261bcf174a5b0f"
+      "bytes": 1372,
+      "sha256": "bcc1b05ec7873bc349cfc7784d72117d41085a4a34373725f1a064b3baf376b7"
     },
     {
       "path": "marketplace/skills/68fb048b85cb/references/architecture-decision.md",
@@ -614,8 +654,8 @@
     },
     {
       "path": "marketplace/skills/68fb048b85cb/references/review-and-finish.md",
-      "bytes": 2699,
-      "sha256": "25c505c8d2259cfc9c048e670eba74895fd206fb18205e8f2b237d196a9fe0d7"
+      "bytes": 2865,
+      "sha256": "dda81e69a6680beb9b6c0f7cf6765517617a6159decf66df60beb66ad7053c03"
     },
     {
       "path": "marketplace/skills/68fb048b85cb/references/technical-spike.md",
@@ -624,23 +664,23 @@
     },
     {
       "path": "marketplace/skills/68fb048b85cb/SKILL.md",
-      "bytes": 4884,
-      "sha256": "28c0d075927de5dc930a70c58faf1b4039477cf256f56464a737183eb5020d65"
+      "bytes": 6062,
+      "sha256": "d53595c06f1f23bf8a26ea5eab8545b85259cc64f22b84d3558cce0a9bc4aa7f"
     },
     {
       "path": "marketplace/skills/88aca13869d9/_meta.json",
-      "bytes": 1085,
-      "sha256": "c407c9d1a1567f212b053702c9e81147a6f0cd5996e3f8bcc870c2a0419c1657"
+      "bytes": 1171,
+      "sha256": "f4a00f996b0f19dc275ab858a8fc85c52a232bf527ec7638fdd1952a10b84b5a"
     },
     {
       "path": "marketplace/skills/88aca13869d9/SKILL.md",
-      "bytes": 2172,
-      "sha256": "c006dfd8452b30d661517eb7a49fa9521b6eff0524639cb9b3593a41bd4da5fb"
+      "bytes": 4111,
+      "sha256": "2f652c0275b82531a3f2d4a596e073770cb743c2a0b4ceace99cc84aea55e99d"
     },
     {
       "path": "marketplace/skills/9b1241732f3a/_meta.json",
-      "bytes": 1086,
-      "sha256": "2070d8e64c287470c1a762668c1ab2aa4bf48d826598c7eec2cb0f4a64b8faf7"
+      "bytes": 1056,
+      "sha256": "2fe1e557298d8578410084934d523ffb86a1856cae3fe2185e8e9ed46450bdc8"
     },
     {
       "path": "marketplace/skills/9b1241732f3a/references/product-test-template.md",
@@ -694,8 +734,8 @@
     },
     {
       "path": "marketplace/skills/9dfbd4e00c0d/_meta.json",
-      "bytes": 1607,
-      "sha256": "1424a3fffa41152ea64fa681584b8734b08d1addd3af02a833c27cd1228cbd9b"
+      "bytes": 1577,
+      "sha256": "c0d526873dd449e395a9408a2a936d861ea9bfadf762f5055b022f314fac6a7d"
     },
     {
       "path": "marketplace/skills/9dfbd4e00c0d/references/audit-and-delivery.md",
@@ -704,8 +744,8 @@
     },
     {
       "path": "marketplace/skills/9dfbd4e00c0d/references/content-formats.md",
-      "bytes": 7889,
-      "sha256": "e95ce3df315331cd4fd1cd372e0b28bdda8bd62f856883f01fa1401edee87742"
+      "bytes": 8245,
+      "sha256": "93fb83ba2178a894a72b14796bb1f4b05309a63f5fe9855dd9cd870d82d3efa1"
     },
     {
       "path": "marketplace/skills/9dfbd4e00c0d/references/editorial-quality.md",
@@ -729,13 +769,13 @@
     },
     {
       "path": "marketplace/skills/9dfbd4e00c0d/SKILL.md",
-      "bytes": 15034,
-      "sha256": "84bfc19a48339c3762d689b879653480cf0f1783391f08001d9efa7af3827c16"
+      "bytes": 15107,
+      "sha256": "dce9384432bab899716545a27e806724b1c9b7f6288ffa070eb751690a958565"
     },
     {
       "path": "marketplace/skills/b1f384166705/_meta.json",
-      "bytes": 1282,
-      "sha256": "decb15e4d22333dfeee2257e54e95b841dd2b599af93fb7bdf080cd48f1df607"
+      "bytes": 1252,
+      "sha256": "f7a63d1ddb324036aef72bf4b8baf66d5a85477b86fbd6754829213f7fed6e80"
     },
     {
       "path": "marketplace/skills/b1f384166705/references/demystify-swiftui-performance-wwdc23.md",
@@ -749,8 +789,8 @@
     },
     {
       "path": "marketplace/skills/b1f384166705/references/native-trace.md",
-      "bytes": 3996,
-      "sha256": "7c0d7d4cb852915540feac89d1af37cab1f14ec27acf18fc8b93cefd4bf10cac"
+      "bytes": 4327,
+      "sha256": "b2f55397e1729c4c7c32196ec87f4dd37f6b84b53544fa90522eb73657e45e1b"
     },
     {
       "path": "marketplace/skills/b1f384166705/references/optimizing-swiftui-performance-instruments.md",
@@ -800,12 +840,12 @@
     {
       "path": "marketplace/skills/c72c656eca12/_meta.json",
       "bytes": 153,
-      "sha256": "82fc8018a51fe858af89e39aa3f7f3f685a14cd57370581e3ded6c8304cebc3c"
+      "sha256": "afac1a386cc6a00a0c73dea0fb1b9828de24c1bd9f97e86ccdf043df3ca858a5"
     },
     {
       "path": "marketplace/skills/c72c656eca12/SKILL.md",
-      "bytes": 3338,
-      "sha256": "485fd1a3a776e45cfd1b4f5b5b86349a762e4f1e00d9a2f56a9ac7cd5cf75442"
+      "bytes": 3499,
+      "sha256": "4fdefa93cb3df706ce415ceea4b3d18810bc9b6572ff8b3eef768fe81604ef40"
     },
     {
       "path": "marketplace/skills/e7f5c0e6f1be/_meta.json",
@@ -854,8 +894,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/_meta.json",
-      "bytes": 123,
-      "sha256": "b32fde7cae2a4575fa415cb449cd71f71727561bc2aa67e26bec930f47b86654"
+      "bytes": 124,
+      "sha256": "286cbaab16d22da5b8b8d15f530d15820e051a80c6853c2f2461a1afd3d6b8de"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/references/citation-style.md",
@@ -899,8 +939,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/scripts/citations.py",
-      "bytes": 37855,
-      "sha256": "3ffab4f830b775fee8fd97f8012b3bbcea042808112aa4972c39ebfc37d870c1"
+      "bytes": 41191,
+      "sha256": "db7119b5dd17ed1d1be5648a8349086b263f32e69b3b24f2e8ceffd18115e15d"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/scripts/compress.py",
@@ -909,8 +949,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/SKILL.md",
-      "bytes": 10130,
-      "sha256": "ebda08faaa004f3c79fbd656f8ccc4fdb610193d233020db8b96822a0f7783bc"
+      "bytes": 18991,
+      "sha256": "1e2c17ed87283e6700af909b653f7020eccb8c36104ac71c1101d10088fd3815"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_academic.py",
@@ -924,8 +964,8 @@
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_citations.py",
-      "bytes": 26167,
-      "sha256": "6ae44fa2df668a1e46f0431c76a27eaa138f6b31eeb00f479d47162d531db974"
+      "bytes": 34130,
+      "sha256": "11369d939b84a9f5a0e8c8fe4cae99c35e2b097f5acc27ba7d2d96d2909d79c2"
     },
     {
       "path": "marketplace/skills/ee99fbb42964/test/test_compress.py",
@@ -940,17 +980,17 @@
     {
       "path": "marketplace/skills/f283632103ba/_meta.json",
       "bytes": 153,
-      "sha256": "5144f48083c67ff98ab83c0ee44c552f20a4ff2c4f9d8ed99db8b1fa9b7a5577"
+      "sha256": "5b546815f4025c31bc23d40d4c9e477954dd9105a0507ed0f595e1dccf9e910d"
     },
     {
       "path": "marketplace/skills/f283632103ba/SKILL.md",
       "bytes": 3340,
-      "sha256": "67ec10ec1f993bdd94261b351bdfe4d5ce4c141bf12bdb14eb97a250a93b9e0b"
+      "sha256": "1c99d20a5fd2c69181978e1dc21398b9d2366250cc99046494109e9bca93b843"
     },
     {
       "path": "marketplace/skills/f347f715469c/_meta.json",
       "bytes": 153,
-      "sha256": "82fc8018a51fe858af89e39aa3f7f3f685a14cd57370581e3ded6c8304cebc3c"
+      "sha256": "afac1a386cc6a00a0c73dea0fb1b9828de24c1bd9f97e86ccdf043df3ca858a5"
     },
     {
       "path": "marketplace/skills/f347f715469c/references/wps-reference.md",
@@ -960,12 +1000,12 @@
     {
       "path": "marketplace/skills/f347f715469c/SKILL.md",
       "bytes": 3406,
-      "sha256": "dfbd41d0e79fc6e8dbe81ed9b8f7008af1405dd7bd327987a098b70916fecc12"
+      "sha256": "4421af591565ce77c677e653f5c39cd582ccee34adafa7fbcedf71753234459d"
     },
     {
       "path": "marketplace/skills/fc125b9df078/_meta.json",
-      "bytes": 1219,
-      "sha256": "c88e5436790b14c4cd2d42faee2979ec725236342f045642fafc15300a56dccd"
+      "bytes": 1228,
+      "sha256": "f6b2bb78c68e450bdc4ba53e705834208fa7dc5e6368c4ed2b1a7c29970ac723"
     },
     {
       "path": "marketplace/skills/fc125b9df078/references/design-style-index.md",
@@ -1249,23 +1289,23 @@
     },
     {
       "path": "marketplace/skills/fc125b9df078/references/ui-implementation.md",
-      "bytes": 3963,
-      "sha256": "0eda7b2415bc277b6d7cbc94cb57883682c40d0afa8f9b5f45cea1cb152a0f36"
+      "bytes": 4218,
+      "sha256": "9f04a3c3a2e2620c0963a49f0910334c8f966ffd59befb40559a4b6f3254f774"
     },
     {
       "path": "marketplace/skills/fc125b9df078/SKILL.md",
-      "bytes": 5876,
-      "sha256": "836b3ea918b54529d998bab9fb5934c49970d84bf5ba740b3ba7a53e3573b5d6"
+      "bytes": 6544,
+      "sha256": "1d836bbb64d9b4c23fd15a359940d1da855a8b55bff32abb5f869eaa2c4f47a8"
     },
     {
       "path": "system/skills/_system.json",
       "bytes": 278,
-      "sha256": "46ec9c5b8578dcd4c09ade626b03165ee9b18cc0b3d79f8cb949ef5d53b68c33"
+      "sha256": "e1045bd31e8f49db002003900fa030b40bffa67adb9c73492af9a4884da37740"
     },
     {
       "path": "system/skills/agent-creator/SKILL.md",
-      "bytes": 41621,
-      "sha256": "09ab848ebdfdcedfb7ceb9455bb81607780a04651b4c86db12a6391e0bac0ee1"
+      "bytes": 41967,
+      "sha256": "ec65db838299131be84e6c99f33d8415e362cfc804a03e084261101e7f5d6ea4"
     },
     {
       "path": "system/skills/autotask-creator/SKILL.md",
@@ -1279,15 +1319,15 @@
     },
     {
       "path": "system/skills/skill-creator/SKILL.md",
-      "bytes": 44290,
-      "sha256": "849aabaee1a658eb865ccb15488bc7241377e93b9f2277e8aa8871a0eae6b80e"
+      "bytes": 46590,
+      "sha256": "566dafec2d923f76c27cb6765abb86fc42bf90eaae7723de9a61c6bd6fed7acc"
     }
   ],
   "inventory": {
     "system_skills": [
       {
         "id": "agent-creator",
-        "update_at": 1784564940000
+        "update_at": 1786165133000
       },
       {
         "id": "autotask-creator",
@@ -1299,17 +1339,17 @@
       },
       {
         "id": "skill-creator",
-        "update_at": 1781406695433
+        "update_at": 1786165133000
       }
     ],
     "marketplace_agents": [
       {
         "id": "173d4235a431",
         "name": "ContentWriter",
-        "version": "1.0.24",
+        "version": "1.0.28",
         "icon": "document",
         "color": "lavender",
-        "updated_at": "2026-07-29T08:01:00.000Z",
+        "updated_at": "2026-08-08T11:44:58.000Z",
         "skill_list": [
           "9dfbd4e00c0d"
         ],
@@ -1318,10 +1358,10 @@
       {
         "id": "78900d8758bc",
         "name": "DeepResearcher",
-        "version": "1.0.34",
+        "version": "1.0.49",
         "icon": "search",
         "color": "sky",
-        "updated_at": "2026-07-29T04:00:00Z",
+        "updated_at": "2026-08-08T16:50:00.000Z",
         "skill_list": [
           "6743aa0797a2",
           "9be6fda271a5",
@@ -1333,10 +1373,10 @@
       {
         "id": "79df9cc89f5f",
         "name": "VideoStudio",
-        "version": "1.1.40",
+        "version": "1.6.31",
         "icon": "film",
         "color": "violet",
-        "updated_at": "2026-07-29T16:43:00.000Z",
+        "updated_at": "2026-08-10T11:40:26.000Z",
         "skill_list": [
           "composition-design-review",
           "design-system-importer",
@@ -1369,12 +1409,33 @@
         ]
       },
       {
+        "id": "7e91cb9ec9e9",
+        "name": "PptMaker",
+        "version": "1.2.21",
+        "icon": "presentation",
+        "color": "violet",
+        "updated_at": "2026-08-09T03:49:33.000Z",
+        "skill_list": [
+          "f283632103ba",
+          "ppt-craft",
+          "ppt-planner",
+          "ppt-review",
+          "ppt-router"
+        ],
+        "embedded_skills": [
+          "ppt-craft",
+          "ppt-planner",
+          "ppt-review",
+          "ppt-router"
+        ]
+      },
+      {
         "id": "814b61b027f0",
         "name": "ImageStudio",
-        "version": "1.3.12",
+        "version": "1.3.24",
         "icon": "image",
         "color": "violet",
-        "updated_at": "2026-07-28T14:50:13.319Z",
+        "updated_at": "2026-08-08T18:10:00.000Z",
         "skill_list": [
           "image-canvas",
           "image-compose",
@@ -1395,10 +1456,10 @@
       {
         "id": "a19101ba698a",
         "name": "OfficeWorker",
-        "version": "1.0.7",
+        "version": "1.0.10",
         "icon": "briefcase",
         "color": "sky",
-        "updated_at": "2026-07-28T12:00:00.000Z",
+        "updated_at": "2026-08-07T13:26:41.000Z",
         "skill_list": [
           "081c15ffbab4",
           "36bd44ae956c",
@@ -1411,10 +1472,10 @@
       {
         "id": "a316881746f9",
         "name": "ProductDeveloper",
-        "version": "1.0.3",
+        "version": "1.0.8",
         "icon": "code",
         "color": "sage",
-        "updated_at": "2026-07-28T15:52:00.000Z",
+        "updated_at": "2026-08-08T06:00:00.000Z",
         "skill_list": [
           "68fb048b85cb",
           "88aca13869d9",
@@ -1427,10 +1488,10 @@
       {
         "id": "bcfcb4921dce",
         "name": "UIDesigner",
-        "version": "1.3.8",
+        "version": "1.3.24",
         "icon": "palette",
         "color": "violet",
-        "updated_at": "2026-07-29T04:13:48.000Z",
+        "updated_at": "2026-08-09T13:41:05.000Z",
         "skill_list": [
           "ui-artifact-workspace",
           "ui-color",
@@ -1465,10 +1526,10 @@
       {
         "id": "e064dca9e1bd",
         "name": "SeoGeoAgent",
-        "version": "1.0.12",
+        "version": "1.0.24",
         "icon": "target",
         "color": "gold",
-        "updated_at": "2026-07-28T18:00:00.000Z",
+        "updated_at": "2026-08-08T17:05:00.000Z",
         "skill_list": [
           "geo-probe",
           "geo-score",
@@ -1499,14 +1560,14 @@
       {
         "id": "081c15ffbab4",
         "name": "office-excel",
-        "version": "1.0.5",
-        "updated_at": "2026-07-28T12:00:00.000Z"
+        "version": "1.0.7",
+        "updated_at": "2026-08-08T11:49:11.000Z"
       },
       {
         "id": "36bd44ae956c",
         "name": "pdf-editing",
-        "version": "1.0.1",
-        "updated_at": "2026-07-21T12:40:05.000Z"
+        "version": "1.0.2",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "6743aa0797a2",
@@ -1517,20 +1578,20 @@
       {
         "id": "68fb048b85cb",
         "name": "product-dev",
-        "version": "1.0.2",
-        "updated_at": "2026-07-28T13:32:31.000Z"
+        "version": "1.0.4",
+        "updated_at": "2026-08-05T09:08:30.000Z"
       },
       {
         "id": "88aca13869d9",
         "name": "github",
-        "version": "1.0.1",
-        "updated_at": "2026-07-28T13:32:31.000Z"
+        "version": "1.0.7",
+        "updated_at": "2026-08-08T06:00:00.000Z"
       },
       {
         "id": "9b1241732f3a",
         "name": "product-test",
-        "version": "1.0.1",
-        "updated_at": "2026-07-28T13:32:31.000Z"
+        "version": "1.0.2",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "9be6fda271a5",
@@ -1541,20 +1602,20 @@
       {
         "id": "9dfbd4e00c0d",
         "name": "content-writer",
-        "version": "1.0.35",
-        "updated_at": "2026-07-29T08:04:00.000Z"
+        "version": "1.0.41",
+        "updated_at": "2026-08-08T11:44:58.000Z"
       },
       {
         "id": "b1f384166705",
         "name": "swiftui-dev",
-        "version": "1.0.2",
-        "updated_at": "2026-07-28T13:32:31.000Z"
+        "version": "1.0.3",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "c72c656eca12",
         "name": "office-word",
-        "version": "1.0.1",
-        "updated_at": "2026-07-21T12:40:05.000Z"
+        "version": "1.0.2",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "e7f5c0e6f1be",
@@ -1565,26 +1626,26 @@
       {
         "id": "ee99fbb42964",
         "name": "deep-research",
-        "version": "1.0.9",
-        "updated_at": "2026-07-28T15:00:00.000Z"
+        "version": "1.0.23",
+        "updated_at": "2026-08-08T17:00:00.000Z"
       },
       {
         "id": "f283632103ba",
         "name": "office-ppt",
-        "version": "1.0.2",
-        "updated_at": "2026-07-21T12:40:05.000Z"
+        "version": "1.0.3",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "f347f715469c",
         "name": "wps",
-        "version": "1.0.1",
-        "updated_at": "2026-07-21T12:40:05.000Z"
+        "version": "1.0.2",
+        "updated_at": "2026-08-02T09:34:40.000Z"
       },
       {
         "id": "fc125b9df078",
         "name": "product-ui",
-        "version": "1.0.2",
-        "updated_at": "2026-07-28T13:32:31.000Z"
+        "version": "1.0.5",
+        "updated_at": "2026-08-08T08:01:45.000Z"
       }
     ]
   }

@@ -372,6 +372,54 @@ describe('local-tools › bash › disabled skills', () => {
     expect(r.content).toContain('disabled-skill');
   });
 
+  it('rejects a unique display-name invocation when its canonical marketplace id is disabled', async () => {
+    await grant();
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const paths = await import('../../../../src/main/paths');
+    const skillDir = paths.userMarketplaceSkillDir(UID, '74e05fe08cc5');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: "agent-browser"\ndescription: browser automation\n---\n',
+      'utf8',
+    );
+    enabled.setSkillEnabled(UID, '74e05fe08cc5', false);
+
+    const bash = await buildBashTool();
+    const r = await run(bash, {
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" agent-browser search -- query',
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).toContain('74e05fe08cc5');
+  });
+
+  it('does not let a disabled marketplace alias shadow an enabled exact custom id', async () => {
+    await grant();
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const paths = await import('../../../../src/main/paths');
+    for (const skillDir of [
+      paths.userMarketplaceSkillDir(UID, '74e05fe08cc5'),
+      path.join(paths.userSkillsDir(UID), 'agent-browser'),
+    ]) {
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(skillDir, 'SKILL.md'),
+        '---\nname: agent-browser\ndescription: browser automation\n---\n',
+        'utf8',
+      );
+    }
+    enabled.setSkillEnabled(UID, '74e05fe08cc5', false);
+
+    const bash = await buildBashTool();
+    const r = await run(bash, {
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" agent-browser search -- query',
+    });
+
+    expect(r.content).not.toContain('E_SKILL_DISABLED');
+  });
+
   it('rejects commands that directly enter a disabled skill directory', async () => {
     await grant();
     const enabled = await import('../../../../src/main/features/component_enabled');
@@ -399,6 +447,190 @@ describe('local-tools › edit_file › permission mode', () => {
     const r = await run(edit, { path: p, old_string: 'hello', new_string: 'hi' });
     expect(r.isError).toBeFalsy();
     expect(fs.readFileSync(p, 'utf8')).toBe('hi world');
+  });
+});
+
+describe('local-tools › edit_file › trailing-whitespace fallback', () => {
+  // `old_string` is byte-exact, so a multi-line block whose only difference is
+  // a space before a newline fails E_NO_MATCH and costs a re-read plus a
+  // retry. Claude Code reports a 6-7% Edit error rate as its baseline; a
+  // VideoStudio run on 2026-08-07 hit 2 in 16. Codex's apply_patch relaxes the
+  // same way (exact → rstrip → trim). This fallback is deliberately narrower
+  // than Codex's: line ends only, and only when the result is unique.
+  const block = (trailing: string) => [
+    '<section class="clip">',
+    `  <h1>Launch</h1>${trailing}`,
+    '</section>',
+  ].join('\n');
+
+  it('matches when the FILE carries line-end whitespace the old_string omits', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    fs.writeFileSync(p, `${block('   ')}\n`);
+    const r = await run(edit, { path: p, old_string: block(''), new_string: '<section class="clip">\n  <h1>Go</h1>\n</section>' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('match="whitespace_relaxed"');
+    expect(fs.readFileSync(p, 'utf8')).toBe('<section class="clip">\n  <h1>Go</h1>\n</section>\n');
+  });
+
+  it('matches when the OLD_STRING carries line-end whitespace the file omits', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    fs.writeFileSync(p, `${block('')}\n`);
+    const r = await run(edit, { path: p, old_string: block('  \t'), new_string: 'REPLACED' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('match="whitespace_relaxed"');
+    expect(fs.readFileSync(p, 'utf8')).toBe('REPLACED\n');
+  });
+
+  it('leaves an exact match exact and does not flag it as relaxed', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    fs.writeFileSync(p, `${block('')}\n`);
+    const r = await run(edit, { path: p, old_string: block(''), new_string: 'REPLACED' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).not.toContain('whitespace_relaxed');
+  });
+
+  it('refuses a relaxed match that is not unique', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    // Two blocks whose line ends BOTH differ from the old_string, so the exact
+    // pass finds nothing and relaxing makes both candidates. Picking either
+    // would edit a block the caller never named.
+    const before = `${block('   ')}\n${block(' \t')}\n`;
+    fs.writeFileSync(p, before);
+    const r = await run(edit, { path: p, old_string: block(''), new_string: 'REPLACED' });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NO_MATCH');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+  });
+
+  it('names the first line of old_string that is not in the file', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    // 2026-08-08: after eight reads of one region the caller sent a block whose
+    // JS comment it had built from an HTML comment elsewhere in the file. It
+    // got 1,200 characters of context and "copy from this", tried a shortened
+    // fragment, failed again — two round trips at ~30s to learn one thing the
+    // host could compare directly.
+    const before = [
+      '      tl.set("#scene-cta", { opacity: 1 }, 44);',
+      '      // ORKAS-SCENE-MOTION-END:commander',
+      '    <!-- ====== SCENE 5: FEATURES (44-55s) ====== -->',
+    ].join('\n');
+    fs.writeFileSync(p, `${before}\n`);
+    const r = await run(edit, {
+      path: p,
+      old_string: [
+        '      tl.set("#scene-cta", { opacity: 1 }, 44);',
+        '      // ORKAS-SCENE-MOTION-END:commander',
+        '      /* ---- SCENE 5: FEATURES (44-55s) ---- */',
+      ].join('\n'),
+      new_string: 'x',
+    });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NO_MATCH');
+    expect(r.content).toContain('Line 3 of `old_string` appears nowhere in the file');
+    expect(r.content).toContain('SCENE 5: FEATURES');
+    expect(fs.readFileSync(p, 'utf8')).toBe(`${before}\n`);
+  });
+
+  it('reports an indentation-only mismatch as such, and still refuses the edit', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'app.py');
+    const before = 'def run():\n    if ready:\n        go()\n';
+    fs.writeFileSync(p, before);
+    const r = await run(edit, { path: p, old_string: 'def run():\n  if ready:\n    go()', new_string: 'x' });
+    expect(r.isError).toBe(true);
+    // The diagnosis explains the refusal; it does not soften it. Leading
+    // whitespace stays byte-exact because it carries meaning here.
+    expect(r.content).toContain('leading indentation is removed');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+  });
+
+  it('says nothing extra when the lines are all present but not adjacent', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'a.txt');
+    const before = 'alpha\nintruder\nbeta\n';
+    fs.writeFileSync(p, before);
+    const r = await run(edit, { path: p, old_string: 'alpha\nbeta', new_string: 'x' });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('not as one consecutive block');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+  });
+
+  it('never relaxes LEADING indentation', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'app.py');
+    // Indentation is meaning in Python and YAML; relaxing it would let a
+    // needle match a differently nested block that reads the same.
+    const before = 'def run():\n    if ready:\n        go()\n';
+    fs.writeFileSync(p, before);
+    const r = await run(edit, { path: p, old_string: 'def run():\n  if ready:\n    go()', new_string: 'x' });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NO_MATCH');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+  });
+
+  it('never relaxes a single-line old_string', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'a.txt');
+    // There is no internal line break to disagree about, and relaxing a bare
+    // `value = 1` would start matching `value = 1   ` anywhere in the file.
+    const before = 'value = 1\nvalue = 2\n';
+    fs.writeFileSync(p, before);
+    const missing = await run(edit, { path: p, old_string: 'value = 1  ', new_string: 'z' });
+    expect(missing.isError).toBe(true);
+    expect(missing.content).toContain('E_NO_MATCH');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+
+    // The exact substring still edits, through the exact path.
+    const exact = await run(edit, { path: p, old_string: 'value = 1', new_string: 'value = 9' });
+    expect(exact.isError).toBeFalsy();
+    expect(exact.content).not.toContain('whitespace_relaxed');
+    expect(fs.readFileSync(p, 'utf8')).toBe('value = 9\nvalue = 2\n');
+  });
+
+  it('does not relax a genuine content difference', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'index.html');
+    const before = `${block('  ')}\n`;
+    fs.writeFileSync(p, before);
+    const r = await run(edit, {
+      path: p,
+      old_string: '<section class="clip">\n  <h1>Launched</h1>\n</section>',
+      new_string: 'x',
+    });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NO_MATCH');
+    expect(fs.readFileSync(p, 'utf8')).toBe(before);
+  });
+
+  it('treats regex metacharacters in old_string as literal text', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'a.ts');
+    const before = 'const re = /^a.+(b|c)$/;   \nconst next = 1;\n';
+    fs.writeFileSync(p, before);
+    const r = await run(edit, {
+      path: p,
+      old_string: 'const re = /^a.+(b|c)$/;\nconst next = 1;',
+      new_string: 'const re = null;\nconst next = 2;',
+    });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('match="whitespace_relaxed"');
+    expect(fs.readFileSync(p, 'utf8')).toBe('const re = null;\nconst next = 2;\n');
   });
 });
 
@@ -461,6 +693,38 @@ describe('local-tools › edit_file › sandbox', () => {
     } finally {
       fs.rmSync(readOnlyDir, { recursive: true, force: true });
     }
+  });
+
+  it('protects read-only roots appended after local tools were constructed', async () => {
+    await allFilesApproval();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const runtimeRoots: string[] = [];
+    const tools = localTools.createLocalTools({
+      userId: UID,
+      cid: CID,
+      runtimeReadOnlyRoots: runtimeRoots,
+    });
+    const write = tools.find((tool) => tool.name === 'write_file');
+    const del = tools.find((tool) => tool.name === 'delete_file');
+    if (!write || !del) throw new Error('expected local tools missing');
+
+    const referencedRoot = path.join(tmpDir, 'runtime-read-only');
+    const existing = path.join(referencedRoot, 'source.md');
+    fs.mkdirSync(referencedRoot, { recursive: true });
+    fs.writeFileSync(existing, 'preserve me');
+    runtimeRoots.push(referencedRoot);
+
+    const writeResult = await run(write, {
+      path: path.join(referencedRoot, 'new.md'),
+      content: 'must not be created',
+    });
+    const deleteResult = await run(del, { path: existing });
+
+    expect(writeResult.isError).toBe(true);
+    expect(writeResult.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(deleteResult.isError).toBe(true);
+    expect(deleteResult.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.readFileSync(existing, 'utf8')).toBe('preserve me');
   });
 
   it('blocks direct local-tool mutation of marketplace installs in all-files mode', async () => {
@@ -637,6 +901,38 @@ describe('local-tools › apply_patch › transactional text changes', () => {
     ]));
     expect(written.sort()).toEqual([notes, source].sort());
     expect(JSON.stringify(applyPatch.inputSchema)).not.toContain('domain');
+  });
+
+  it('names the character that is wrong in a near-miss file header', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'index.html');
+    fs.writeFileSync(source, 'const a = 1;\n');
+    const patchWith = (header: string) => applyPatch.execute({
+      patch: ['*** Begin Patch', header, '@@', '-const a = 1;', '+const a = 2;', '*** End Patch'].join('\n'),
+    }, { workingDir: wsDir, state: {} } as any);
+
+    // 2026-08-08: a caller wrote this and read back "expected Add File,
+    // Delete File, or Update File; received: *** Update File /path" — word for
+    // word the same thing it had sent. It could not see the missing colon,
+    // abandoned apply_patch, and failed three more times at another tool.
+    const missingColon = await patchWith(`*** Update File ${source}`);
+    expect(missingColon.isError).toBe(true);
+    expect(missingColon.content).toContain('E_PATCH_FORMAT');
+    expect(missingColon.content).toContain('the `:` missing');
+
+    const wrongCase = await patchWith(`*** update file: ${source}`);
+    expect(wrongCase.content).toContain('case-sensitive');
+
+    const unifiedDiff = await patchWith(`--- a/${source}`);
+    expect(unifiedDiff.content).toContain('unified diff');
+
+    // The hint is for near misses only: an unrelated header still gets the
+    // plain expectation, not a guess about what the caller meant.
+    const unrelated = await patchWith('*** Rename File: x');
+    expect(unrelated.content).toContain('E_PATCH_FORMAT');
+    expect(unrelated.content).not.toContain('missing');
+    expect(fs.readFileSync(source, 'utf8')).toBe('const a = 1;\n');
   });
 
   it('preflights the whole patch before creating or changing any target', async () => {
@@ -1083,12 +1379,28 @@ describe('local-tools › edit_file › read-before-edit + OCC', () => {
 // runner-side wiring: the gate, the cid+sink presence condition, the
 // onArtifactCreated callback, and that backend rejections surface as isError.
 
-async function buildCreateArtifactTool(opts: { cid?: string | null; onArtifactCreated?: (a: { id: string; title: string }) => void; agentId?: string } = {}) {
+async function buildCreateArtifactTool(opts: {
+  cid?: string | null;
+  onArtifactCreated?: (a: { id: string; title: string }) => void;
+  agentId?: string;
+  artifactInteractionSmoke?: (entryPath: string) => Promise<{
+    ok: boolean;
+    blockers: string[];
+    controlsExercised?: number;
+    observableEffects?: number;
+  }>;
+} = {}) {
   const localTools = await import('../../../../src/main/model/core-agent/local-tools');
   const tools = localTools.createLocalTools({
     userId: UID,
     ...(opts.cid === undefined ? { cid: CID } : opts.cid ? { cid: opts.cid } : {}),
     ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    artifactInteractionSmoke: opts.artifactInteractionSmoke ?? (async () => ({
+      ok: true,
+      blockers: [],
+      controlsExercised: 1,
+      observableEffects: 1,
+    })),
     ...(opts.onArtifactCreated ? { onArtifactCreated: opts.onArtifactCreated } : {}),
   });
   return tools.find((t) => t.name === 'create_artifact') || null;
@@ -1114,6 +1426,33 @@ describe('local-tools › create_artifact › permission mode', () => {
     const r = await run(tool, { title: 'X', files: MIN_FILES });
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/do NOT paste/i);
+    expect(r.content).toMatch(/interaction smoke passed/i);
+  });
+
+  it('rejects and discards a static candidate before firing onArtifactCreated', async () => {
+    await grant();
+    const created: unknown[] = [];
+    let candidateDir = '';
+    const tool = await buildCreateArtifactTool({
+      onArtifactCreated: (a) => created.push(a),
+      artifactInteractionSmoke: async (entryPath) => {
+        candidateDir = path.dirname(entryPath);
+        return {
+          ok: false,
+          blockers: ['interactive artifact smoke observed no visible state change'],
+          controlsExercised: 1,
+          observableEffects: 0,
+        };
+      },
+    });
+    const r = await run(tool, { title: 'Static app', files: MIN_FILES });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_ARTIFACT_INTERACTION_INCOMPLETE');
+    expect(r.content).toContain('Repair the app behavior');
+    expect(created).toEqual([]);
+    expect(candidateDir).toBeTruthy();
+    expect(fs.existsSync(candidateDir)).toBe(false);
   });
 });
 
@@ -1188,5 +1527,23 @@ describe('local-tools › direct CLI › script progress scanner', () => {
     expect(line).toContain('42%');
     expect(line).toContain('t=13s');
     expect(formatScriptProgress({})).toBe('script progress');
+  });
+});
+
+// An unresolvable target used to be quoted back in full and introduced by a
+// doubled command name: a live refusal read `bash bash script target "set -euo
+// pipefail\ncd /Users/...` with the whole script inline, burying the sentence
+// that said what to do (2026-08-10). The reason already names the command, and
+// a target that is script-sized is not readable as a path.
+describe('bash path refusal wording', () => {
+  it('quotes an unresolvable target once and bounded', async () => {
+    const { truncateForMessage } = await import('../../../../src/main/model/core-agent/local-tools');
+    const script = 'set -euo pipefail\ncd /Users/test/work\n'.repeat(20);
+    const shown = truncateForMessage(script);
+    expect(shown.length).toBeLessThanOrEqual(80);
+    expect(shown).not.toContain('\n');
+    expect(shown.endsWith('…')).toBe(true);
+    // An ordinary path is left exactly as written.
+    expect(truncateForMessage('project/render/run.sh')).toBe('project/render/run.sh');
   });
 });

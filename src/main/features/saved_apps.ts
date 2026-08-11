@@ -504,7 +504,7 @@ export function saveFromPath(
   }
 }
 
-/** List the user's saved apps, sorted A→Z by title (CLAUDE.md §8 inventory rule). */
+/** List the user's saved apps, newest save first. */
 export function listSavedApps(userId: string): SavedAppListItem[] {
   const root = userSavedAppsDir(userId);
   let names: string[];
@@ -533,8 +533,20 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
       sourceCid: typeof meta.sourceCid === 'string' ? meta.sourceCid : '',
     });
   }
-  items.sort((a, b) =>
-    (a.title || a.id).localeCompare(b.title || b.id, undefined, { sensitivity: 'base', numeric: true }));
+  items.sort((a, b) => {
+    const aSavedAt = Date.parse(a.savedAt);
+    const bSavedAt = Date.parse(b.savedAt);
+    const aHasSavedAt = Number.isFinite(aSavedAt);
+    const bHasSavedAt = Number.isFinite(bSavedAt);
+    if (aHasSavedAt !== bHasSavedAt) return aHasSavedAt ? -1 : 1;
+    if (aHasSavedAt && bHasSavedAt && aSavedAt !== bSavedAt) return bSavedAt - aSavedAt;
+
+    const byTitle = (a.title || a.id).localeCompare(b.title || b.id, undefined, {
+      sensitivity: 'base',
+      numeric: true,
+    });
+    return byTitle || a.id.localeCompare(b.id);
+  });
   return items;
 }
 

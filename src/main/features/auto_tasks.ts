@@ -169,6 +169,26 @@ function _isValidSchedule(s: any): s is Schedule {
   return false;
 }
 
+function _schedulesEqual(a: Schedule, b: Schedule): boolean {
+  if (a.type === 'one_time') {
+    return b.type === 'one_time'
+      && new Date(a.at).getTime() === new Date(b.at).getTime();
+  }
+  if (a.type === 'daily') {
+    return b.type === 'daily' && a.hour === b.hour && a.minute === b.minute;
+  }
+  if (a.type === 'weekly') {
+    return b.type === 'weekly'
+      && a.weekday === b.weekday
+      && a.hour === b.hour
+      && a.minute === b.minute;
+  }
+  return b.type === 'monthly'
+    && a.day === b.day
+    && a.hour === b.hour
+    && a.minute === b.minute;
+}
+
 function _isValidRecipient(r: any): r is TaskRecipient {
   if (!r || typeof r !== 'object') return false;
   if (r.kind === 'commander') return true;
@@ -611,6 +631,7 @@ export async function updateTask(
     const stored = await _readOne(uid, taskId);
     if (!stored) return { ok: false as const, error: 'not_found' as const };
     const cur = await _migrateLegacyDeviceBindingIfOwned(uid, stored);
+    const priorDueAtMs = _timers.get(taskId)?.dueAtMs;
     const legacyMessageChanged = patch.content !== undefined
       || patch.skill !== undefined
       || patch.connector !== undefined;
@@ -639,10 +660,13 @@ export async function updateTask(
     if (!norm.ok) return { ok: false as const, error: (norm as { error: TaskError }).error };
     const scopeError = await _validateProjectScope(uid, norm.fields);
     if (scopeError) return { ok: false as const, error: scopeError };
+    const updatedAt = nowIso();
+    const scheduleChanged = patch.schedule !== undefined
+      && !_schedulesEqual(cur.schedule, norm.fields.schedule);
     const next: AutoTask = {
       ...cur,
       ...norm.fields,
-      updated_at: nowIso(),
+      updated_at: updatedAt,
     };
     if (patch.run_on_current_device === true) {
       const device = getCurrentDevice();
@@ -663,7 +687,17 @@ export async function updateTask(
     if (!norm.fields.attachments) delete next.attachments;
     await _writeOne(uid, next);
     log.info(`task updated uid=${uid} id=${taskId}`);
-    _scheduleTask(uid, next);
+    // A changed schedule starts at its next valid boundary. Preserve an
+    // immediate occurrence only when the unchanged schedule already had that
+    // boundary armed; all other edits reuse the restore/sync no-backfill rule.
+    const updatedAtDate = new Date(updatedAt);
+    const preserveArmedDueBoundary = !scheduleChanged
+      && priorDueAtMs !== undefined
+      && priorDueAtMs <= updatedAtDate.getTime();
+    const scheduleBaseline = preserveArmedDueBoundary
+      ? undefined
+      : _baselineWithoutBackfill(next, updatedAtDate);
+    _scheduleTask(uid, next, scheduleBaseline);
     return { ok: true as const, task: next };
   });
 }
@@ -1195,13 +1229,27 @@ type FireTaskResult =
   | { ok: true; cid: string }
   | { ok: false; error: 'conv_create_failed' | 'send_not_ok' | 'send_threw' };
 
-async function _fireTask(uid: string, task: AutoTask): Promise<FireTaskResult> {
+export type AutoFireSource = 'scheduled' | 'manual';
+export type AutoFireErrorCode =
+  | 'conv_create_failed'
+  | 'send_not_ok'
+  | 'send_threw'
+  | 'invalid_id'
+  | 'not_found'
+  | 'mark_ran_failed';
+
+async function _fireTask(
+  uid: string,
+  task: AutoTask,
+  source: AutoFireSource,
+): Promise<FireTaskResult> {
   const startedAt = Date.now();
   const title = _buildFireTitle(task);
   let cid = '';
-  const emitFailure = (errorCode: string): void => {
+  const emitFailure = (errorCode: AutoFireErrorCode): void => {
     _emitFire({
       type: 'fire_failed',
+      source,
       user_id: uid,
       task_id: task.id,
       ...(cid ? { cid } : {}),
@@ -1245,6 +1293,7 @@ async function _fireTask(uid: string, task: AutoTask): Promise<FireTaskResult> {
     log.info(`fired uid=${uid} id=${task.id} cid=${cid} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
     _emitFire({
       type: 'conv_created',
+      source,
       user_id: uid,
       cid,
       task_id: task.id,
@@ -1266,10 +1315,27 @@ export async function runTaskNow(
   uid: string,
   taskId: string,
 ): Promise<FireTaskResult | { ok: false; error: 'invalid_id' | 'not_found' }> {
-  if (!_isValidTaskId(taskId)) return { ok: false, error: 'invalid_id' };
+  const startedAt = Date.now();
+  const emitPreflightFailure = (errorCode: 'invalid_id' | 'not_found'): void => {
+    _emitFire({
+      type: 'fire_failed',
+      source: 'manual',
+      user_id: uid,
+      task_id: taskId,
+      error_code: errorCode,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
+  };
+  if (!_isValidTaskId(taskId)) {
+    emitPreflightFailure('invalid_id');
+    return { ok: false, error: 'invalid_id' };
+  }
   const task = await getTask(uid, taskId);
-  if (!task) return { ok: false, error: 'not_found' };
-  return _fireTask(uid, task);
+  if (!task) {
+    emitPreflightFailure('not_found');
+    return { ok: false, error: 'not_found' };
+  }
+  return _fireTask(uid, task, 'manual');
 }
 
 async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string): Promise<string[]> {
@@ -1301,6 +1367,7 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
 export type AutoFireEvent =
   | {
       type: 'conv_created';
+      source: AutoFireSource;
       user_id: string;
       cid: string;
       task_id: string;
@@ -1308,10 +1375,11 @@ export type AutoFireEvent =
     }
   | {
       type: 'fire_failed';
+      source: AutoFireSource;
       user_id: string;
       task_id: string;
       cid?: string;
-      error_code: string;
+      error_code: AutoFireErrorCode;
       duration_ms?: number;
     };
 
@@ -1579,6 +1647,7 @@ async function _onTimerFire(
       claimedElsewhereBoundary = dueBoundary;
       log.info(`fire skipped duplicate uid=${uid} id=${taskId} boundary=${dueBoundary.toISOString()}`);
     } else {
+      const markStartedAt = Date.now();
       try {
         // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
         // can't get re-picked by a future re-schedule.
@@ -1587,12 +1656,20 @@ async function _onTimerFire(
       } catch (err) {
         _releaseFireBoundaryClaim(uid, task, dueBoundary);
         log.warn(`fire mark failed id=${taskId}: ${(err as Error).message}`);
+        _emitFire({
+          type: 'fire_failed',
+          source: 'scheduled',
+          user_id: uid,
+          task_id: taskId,
+          error_code: 'mark_ran_failed',
+          duration_ms: Math.max(0, Date.now() - markStartedAt),
+        });
         const fresh = await _readOne(uid, taskId);
         if (fresh) _scheduleTask(uid, fresh);
         return;
       }
       try {
-        await _fireTask(uid, task);
+        await _fireTask(uid, task, 'scheduled');
       } catch (err) {
         log.warn(`fire failed id=${taskId}: ${(err as Error).message}`);
       }

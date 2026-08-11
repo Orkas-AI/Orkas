@@ -1,4 +1,9 @@
 const _shimLog = createLogger('ipc-shim');
+const _IPC_ERROR_DEDUPE_MS = 60 * 1000;
+const _IPC_ERROR_MAX_PER_SESSION = 50;
+const _IPC_ERROR_MAX_KEYS = 100;
+const _ipcErrorRecent = new Map();
+let _ipcErrorSentCount = 0;
 // ─── HTTP → IPC shim ─────────────────────────────────────────────────
 // The original app was served over HTTP; every network call went through
 // `apiFetch(url, options)` which wrapped `fetch`. In Electron we route the
@@ -66,6 +71,7 @@ const _IPC_ROUTES = [
   ['POST',   /^\/api\/conversations\/([^/]+)\/pin$/,       'conversations.pin',          ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/rename$/,    'conversations.rename',       ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
+  ['GET',    /^\/api\/conversations\/([^/]+)\/turns$/,     'conversations.turns',        ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/files$/,     'conversations.files.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send$/,      'groupChat.send',             ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send\/stream$/, 'conversations.sendStream', ['cid'], { stream: true }],
@@ -145,11 +151,28 @@ function _mockErrorResponse(error, status) {
 
 function _monitorIpcError(kind, channel, data) {
   try {
-    if (!window.Monitor || !(() => {})) return;
-    (() => {})(kind, {
+    if (_ipcErrorSentCount >= _IPC_ERROR_MAX_PER_SESSION) return;
+    const payload = {
       channel: String(channel || '').slice(0, 120),
       ...(data || {}),
-    });
+    };
+    const fingerprint = [
+      String(kind || ''),
+      payload.channel,
+      String(payload.error_name || ''),
+      String(payload.error_code || ''),
+      String(payload.method || ''),
+      String(payload.transport || ''),
+    ].join('|');
+    const now = Date.now();
+    const previousAt = _ipcErrorRecent.get(fingerprint) || 0;
+    if (previousAt && now - previousAt < _IPC_ERROR_DEDUPE_MS) return;
+    _ipcErrorRecent.set(fingerprint, now);
+    if (_ipcErrorRecent.size > _IPC_ERROR_MAX_KEYS) {
+      _ipcErrorRecent.delete(_ipcErrorRecent.keys().next().value);
+    }
+    _ipcErrorSentCount += 1;
+    _shimLog.warn('IPC bridge failure', { kind, ...payload });
   } catch (_) {}
 }
 
@@ -272,7 +295,7 @@ async function _uploadBinary(channel, options, extraParams) {
     const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
     return _mockJsonResponse(result);
   } catch (err) {
-    _monitorIpcError('ipc_upload', channel, _ipcFailureMeta(err));
+    _monitorIpcError('ipc_invoke', channel, { ..._ipcFailureMeta(err), transport: 'upload' });
     throw new Error('ipc upload failed');
   }
 }

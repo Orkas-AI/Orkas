@@ -30,8 +30,17 @@ const log = createLogger('util/tool-result-cap');
 /** One simple default for original tool results. Results above this estimated
  * token count are persisted losslessly; smaller results may still spill when
  * the shared per-model-step inline ledger is exhausted. Persisted-result
- * retrieval tools retain their own stricter 2K/4K limits. */
-export const DEFAULT_INLINE_RESULT_TOKENS = 8_000;
+ * retrieval tools retain their own stricter 2K/4K limits.
+ *
+ * The value is the token-aware equivalent of the 50K-character threshold this
+ * module used before the char→token switch: 50_000 / 4 = 12_500 for ASCII.
+ * Picking 8K instead silently tightened the effective budget by 36% and pushed
+ * `skill-creator` (11.1K tokens) and `agent-creator` (10.6K) — the two system
+ * skills whose SKILL.md is a machine protocol that must be read verbatim —
+ * over the line, so commander authored `<skill>` / `<agent>` containers from a
+ * 600-token head/tail preview and emitted unparseable blocks. Keep the CJK
+ * weighting (that part of the switch was the point) but restore the reach. */
+export const DEFAULT_INLINE_RESULT_TOKENS = 12_500;
 
 /** `AgentRunner` creates one of these ledgers for every model tool-use step.
  * The result transformer consumes it synchronously after each tool completes,
@@ -41,13 +50,20 @@ export const TOOL_RESULT_INLINE_LEDGER_STATE_KEY = 'toolResultInlineLedger';
 export type ToolResultInlineLedger = {
   initialTokens: number;
   remainingTokens: number;
+  /** Per-result ceiling for this round, derived from the resolved context
+   *  budget. Absent when no model window was resolvable, in which case the
+   *  caller's `maxInlineTokens` default applies unchanged. */
+  perResultTokens?: number;
+  /** Per-result ceiling for a document the model was told to read whole.
+   *  Absent alongside `perResultTokens`. */
+  verbatimDocumentTokens?: number;
 };
 
-/** Backward-compatible ASCII-sized threshold used by CLI tests/callers. The
- * actual spill decision is token-aware through `estimateToolResultTokens`. */
-export const PERSIST_THRESHOLD = DEFAULT_INLINE_RESULT_TOKENS * 4;
-
 export const PERSISTED_PREVIEW_TOKENS = 600;
+/** Head-only preview kept alongside a section map. Smaller than the plain
+ *  head/tail preview because the outline already covers the rest of the
+ *  document, and the two together should stay near the same total. */
+export const OUTLINE_HEAD_PREVIEW_TOKENS = 250;
 /** New refs retain the full SHA-256 digest. The reader still accepts legacy
  *  16-hex refs so existing persisted markers remain usable. */
 export const TOOL_RESULT_REF_HASH_HEX = 64;
@@ -134,7 +150,8 @@ export function capToolResult(
   const content = result.content || '';
   const len = content.length;
   const estimatedTokens = estimateToolResultTokens(content);
-  const exceedsPerResultBudget = estimatedTokens > opts.maxInlineTokens;
+  const perResultBudget = resolvePerResultBudget(ctx, opts, !!result.verbatimDocument);
+  const exceedsPerResultBudget = estimatedTokens > perResultBudget;
   const exceedsRoundBudget = !exceedsPerResultBudget && !claimRoundInlineBudget(ctx, estimatedTokens);
   if (!exceedsPerResultBudget && !exceedsRoundBudget) return result;
 
@@ -146,7 +163,7 @@ export function capToolResult(
       session_id: maskId(sid),
       size: len,
       estimated_tokens: estimatedTokens,
-      inline_budget_tokens: opts.maxInlineTokens,
+      inline_budget_tokens: perResultBudget,
       spill_reason: exceedsPerResultBudget ? 'per_result_limit' : 'round_limit',
       is_error: !!result.isError,
       path: logPathRef(absPath),
@@ -197,6 +214,38 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
       return capToolResult(tool.name, result, ctx, opts);
     },
   };
+}
+
+/** The ceiling this one result may inline under.
+ *
+ * The round ledger — not this number — is what protects the context window:
+ * it is derived from real remaining headroom and falls to zero as the request
+ * fills, and every result must claim from it regardless of what this returns.
+ * So the per-result ceiling is a policy about ONE item, and it says: do not
+ * admit verbatim what the active checkpoint has already been told it cannot
+ * keep. `perResultTokens` therefore tracks `activeSingleStepMaxTokens`. When
+ * no model window was resolvable there is no such budget, and the caller's
+ * historical default applies unchanged.
+ */
+function resolvePerResultBudget(
+  ctx: ToolContext,
+  opts: WrapOpts,
+  verbatimDocument: boolean,
+): number {
+  const value = ctx.state[TOOL_RESULT_INLINE_LEDGER_STATE_KEY];
+  const ledger = value && typeof value === 'object'
+    ? value as Partial<ToolResultInlineLedger>
+    : undefined;
+  if (verbatimDocument) {
+    const declared = ledger?.verbatimDocumentTokens;
+    if (Number.isFinite(declared) && (declared as number) > 0) return declared as number;
+    // No resolved window means no derived ceiling to widen; the historical
+    // default stands rather than inventing a multiple here.
+    return opts.maxInlineTokens;
+  }
+  const declared = ledger?.perResultTokens;
+  if (Number.isFinite(declared) && (declared as number) > 0) return declared as number;
+  return opts.maxInlineTokens;
 }
 
 function claimRoundInlineBudget(ctx: ToolContext, estimatedTokens: number): boolean {
@@ -428,17 +477,72 @@ export function buildPersistedOutputMarkerFromPreview(
   },
 ): string {
   const ref = toolResultRefForPath(absPath);
-  const body = buildBoundedPreview(preview, PERSISTED_PREVIEW_TOKENS);
+  // The outline needs the whole document to be honest about its offsets. The
+  // streamed-adoption path passes a partial `preview` against the persisted
+  // `sizeChars`, so only build one when we were handed the full text.
+  const outline = preview.length >= meta.sizeChars ? buildStructureOutline(preview) : null;
+  const body = outline
+    ? `${buildBoundedPreview(preview, OUTLINE_HEAD_PREVIEW_TOKENS)}\n\n`
+      + `[Section map — @N is the 0-based char cursor for tool_result_read_chunk(ref, N)]\n`
+      + outline
+    : buildBoundedPreview(preview, PERSISTED_PREVIEW_TOKENS);
   const sourceWarning = meta.sourceTruncated
     ? '[WARNING: The producer exceeded its hard safety limit. The stored file is an incomplete prefix; do not treat it as a lossless full result.]\n'
     : '';
+  const retrievalHint = outline
+    ? `[Full content is stored under result ref ${ref}. Seek a section with tool_result_read_chunk(ref, cursor) using the @N offsets above; use tool_result_search(ref, query) when you do not know which section you need. Do not use read_file on the stored path.]`
+    : `[Full content is stored under result ref ${ref}. Use tool_result_search(ref, query) first, or tool_result_read_chunk(ref, cursor, maxTokens) for an exact bounded slice. Do not use read_file on the stored path.]`;
   return (
     `<persisted-output ref="${escapeAttr(ref)}" tool="${escapeAttr(toolName)}" size="${meta.sizeChars}" estimated_tokens="${meta.estimatedTokens}" status="${meta.isError ? 'error' : 'success'}" source_truncated="${meta.sourceTruncated ? 'true' : 'false'}">\n` +
     sourceWarning +
     `${body}\n` +
-    `[Full content is stored under result ref ${ref}. Use tool_result_search(ref, query) first, or tool_result_read_chunk(ref, cursor, maxTokens) for an exact bounded slice. Do not use read_file on the stored path.]\n` +
+    `${retrievalHint}\n` +
     `</persisted-output>`
   );
+}
+
+/** Outline entries emitted at most; keeps the marker bounded on a document with
+ *  hundreds of headings. */
+const OUTLINE_MAX_ENTRIES = 40;
+/** Below this a document isn't structured enough for an outline to beat a plain
+ *  head/tail preview. */
+const OUTLINE_MIN_ENTRIES = 3;
+
+/** Build a heading outline with **character offsets**, so the model can feed an
+ *  entry straight into `tool_result_read_chunk(ref, cursor)`.
+ *
+ *  A head/tail preview is close to useless on a structured document: it shows
+ *  the opening and the closing and hides everything in between, which is where
+ *  reference material actually lives. A protocol spec whose block-syntax
+ *  section sits a third of the way in reads as "not present" — the model then
+ *  keyword-searches for something it cannot name, or guesses. An outline costs
+ *  the same tokens and turns retrieval into one targeted seek.
+ *
+ *  Offsets, not line numbers: `tool_result_read_chunk` takes a 0-based char
+ *  cursor, so anything else would need a conversion the model can't perform.
+ *
+ *  Returns null when the text has too little structure to be worth it. */
+export function buildStructureOutline(content: string): string | null {
+  const entries: string[] = [];
+  let offset = 0;
+  let inFence = false;
+  let truncated = false;
+  for (const line of content.split('\n')) {
+    const fence = /^\s{0,3}(?:```|~~~)/.test(line);
+    if (fence) inFence = !inFence;
+    if (!inFence && !fence) {
+      const m = /^(#{1,6})\s+(\S.*?)\s*$/.exec(line);
+      if (m) {
+        if (entries.length >= OUTLINE_MAX_ENTRIES) { truncated = true; break; }
+        const depth = m[1].length;
+        entries.push(`@${offset}\t${'  '.repeat(depth - 1)}${m[2]}`);
+      }
+    }
+    offset += line.length + 1;
+  }
+  if (entries.length < OUTLINE_MIN_ENTRIES) return null;
+  if (truncated) entries.push('… [more sections follow]');
+  return entries.join('\n');
 }
 
 export function buildBoundedPreview(content: string, maxTokens: number): string {

@@ -14,6 +14,8 @@
 // clickable shapes that MUST survive and resource-only/private shapes that
 // MUST NOT become top-level links. Media protocols remain valid for src.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { afterEach, describe, it, expect, vi } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const utils = require('../../src/renderer/modules/utils.js');
@@ -21,11 +23,13 @@ const {
   _safeHref,
   inlineFormat,
   _sanitizeHtmlWithoutPurifier,
+  sanitizeHtml,
   sanitizeSvgIconHtml,
 } = utils as {
   _safeHref: (url: string) => string;
   inlineFormat: (text: string) => string;
   _sanitizeHtmlWithoutPurifier: (html: string) => string;
+  sanitizeHtml: (html: string) => string;
   sanitizeSvgIconHtml: (svg: string) => string;
 };
 
@@ -134,6 +138,84 @@ describe('sanitizeHtml — missing-runtime containment', () => {
   });
 });
 
+describe('sanitizeHtml — DOMPurify hardening', () => {
+  it('pins a DOMPurify release containing the prototype-pollution bypass fix', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/vendor/dompurify/purify.min.js'),
+      'utf8',
+    );
+    const provenance = fs.readFileSync(
+      path.join(__dirname, '../../src/renderer/vendor/dompurify/README.txt'),
+      'utf8',
+    );
+    expect(source).toContain('@license DOMPurify 3.4.13');
+    expect(source).not.toContain('@license DOMPurify 3.2.4');
+    expect(provenance).toContain('DOMPurify 3.4.13');
+    expect(provenance).toContain('verified dompurify@3.4.13 npm package');
+  });
+
+  it('passes a null-prototype config that explicitly disables custom elements', () => {
+    const sanitize = vi.fn((value: string) => value);
+    (globalThis as typeof globalThis & { DOMPurify?: unknown }).DOMPurify = {
+      sanitize,
+      addHook: vi.fn(),
+    };
+
+    sanitizeHtml('<x-unsafe tabindex="0" onfocus="alert(1)">x</x-unsafe>');
+
+    const config = sanitize.mock.calls[0][1] as Record<string, unknown>;
+    expect(Object.getPrototypeOf(config)).toBeNull();
+    expect(config.CUSTOM_ELEMENT_HANDLING).toEqual({
+      tagNameCheck: null,
+      attributeNameCheck: null,
+      allowCustomizedBuiltInElements: false,
+    });
+  });
+
+  it('does not inherit attacker-controlled tag or attribute allow-lists', () => {
+    const prototype = Object.prototype as Record<string, unknown>;
+    const polluted = {
+      ALLOWED_TAGS: ['x-unsafe', 'script'],
+      ALLOWED_ATTR: ['onfocus', 'onerror'],
+      ADD_TAGS: ['x-unsafe'],
+    };
+    const previous = new Map(
+      Object.keys(polluted).map((key) => [
+        key,
+        Object.getOwnPropertyDescriptor(prototype, key),
+      ]),
+    );
+    const sanitize = vi.fn((value: string) => value);
+    try {
+      for (const [key, value] of Object.entries(polluted)) {
+        Object.defineProperty(prototype, key, {
+          value,
+          configurable: true,
+          writable: true,
+        });
+      }
+      (globalThis as typeof globalThis & { DOMPurify?: unknown }).DOMPurify = {
+        sanitize,
+        addHook: vi.fn(),
+      };
+
+      sanitizeHtml('<x-unsafe onfocus="alert(1)">x</x-unsafe>');
+
+      const config = sanitize.mock.calls[0][1] as Record<string, unknown>;
+      expect(Object.getPrototypeOf(config)).toBeNull();
+      for (const key of Object.keys(polluted)) {
+        expect(Object.prototype.hasOwnProperty.call(config, key)).toBe(false);
+        expect(key in config).toBe(false);
+      }
+    } finally {
+      for (const [key, descriptor] of previous) {
+        if (descriptor) Object.defineProperty(prototype, key, descriptor);
+        else delete prototype[key];
+      }
+    }
+  });
+});
+
 describe('sanitizeSvgIconHtml — connector icon hardening', () => {
   it('drops remote SVG icons when DOMPurify is unavailable', () => {
     expect(sanitizeSvgIconHtml('<svg onload="alert(1)"></svg>')).toBe('');
@@ -152,6 +234,12 @@ describe('sanitizeSvgIconHtml — connector icon hardening', () => {
     expect(out).toBe('<svg viewBox="0 0 1 1"><path d="M0 0h1v1z"></path></svg>');
     expect(sanitize).toHaveBeenCalledTimes(1);
     const config = sanitize.mock.calls[0][1];
+    expect(Object.getPrototypeOf(config)).toBeNull();
+    expect(config.CUSTOM_ELEMENT_HANDLING).toEqual({
+      tagNameCheck: null,
+      attributeNameCheck: null,
+      allowCustomizedBuiltInElements: false,
+    });
     expect(config.USE_PROFILES).toEqual({ svg: true, svgFilters: true });
     expect(config.FORBID_TAGS).toContain('script');
     expect(config.FORBID_TAGS).toContain('foreignObject');

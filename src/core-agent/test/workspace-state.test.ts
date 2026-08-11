@@ -258,3 +258,56 @@ describe("workspace_diff", () => {
     }
   });
 });
+
+describe("read repetition after a compaction boundary", () => {
+  const hash = (body: string) => `sha256:${createHash("sha256").update(body).digest("hex")}`;
+
+  // Compaction trades context size against re-reading: whatever the checkpoint
+  // fails to carry, the model fetches again. The budget ratios and ceilings in
+  // context-budget.ts were set conservatively and are meant to be calibrated
+  // against this number rather than by argument, so it has to separate a
+  // genuine re-read from a first read and from a read of changed content.
+  const read = (session: Session, callId: string, filePath: string, content: string) => {
+    session.addAssistantMessage([{ type: "tool_use", id: callId, name: "read_file", input: { path: filePath } }]);
+    session.addToolResult(callId, content, undefined, false);
+    session.recordToolObservations({
+      toolCallId: callId,
+      tool: "read_file",
+      observations: { fileReads: [{ path: filePath, hash: hash(content) }] },
+    });
+  };
+
+  it("counts only reads that repeat what was already read before the boundary", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "task" }]);
+
+    read(session, "r1", "/w/a.ts", "alpha");
+    read(session, "r2", "/w/b.ts", "beta");
+    const cursor = session.workspaceObservationCursor();
+
+    // Same path, same content — the re-read recovered nothing.
+    read(session, "r3", "/w/a.ts", "alpha");
+    // Same path, different content — the file genuinely changed, so re-reading
+    // it was necessary, not waste.
+    read(session, "r4", "/w/b.ts", "beta-v2");
+    // A path never seen before the boundary is not a re-read at all.
+    read(session, "r5", "/w/c.ts", "gamma");
+
+    const repetition = session.readRepetitionSince(cursor);
+    expect(repetition.readsAfter).toBe(3);
+    expect(repetition.repeatedPaths).toBe(2);
+    expect(repetition.repeatedIdenticalContent).toBe(1);
+  });
+
+  it("reports nothing before any boundary has been recorded", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "task" }]);
+    read(session, "r1", "/w/a.ts", "alpha");
+    // Cursor taken after every read: nothing falls after it.
+    expect(session.readRepetitionSince(session.workspaceObservationCursor())).toEqual({
+      readsAfter: 0,
+      repeatedPaths: 0,
+      repeatedIdenticalContent: 0,
+    });
+  });
+});

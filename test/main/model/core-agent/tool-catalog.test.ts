@@ -175,6 +175,13 @@ describe('tool-catalog', () => {
     expect(names.length).toBe(new Set(names).size);
   });
 
+  it('describes edit_office preview rendering as explicit and optional', () => {
+    const summary = TOOL_CATALOG.find((entry) => entry.name === 'edit_office')?.summary ?? '';
+    expect(summary).toContain('optionally returns');
+    expect(summary).toContain('preview:true');
+    expect(summary).not.toContain('returns a PNG preview');
+  });
+
   it('provider tool definitions preserve descriptions without a hard length cap', () => {
     const lost: string[] = [];
     for (const tool of enumerateAllInjectedTools()) {
@@ -214,12 +221,13 @@ describe('tool-catalog', () => {
 
   it('critical tools keep enough provider-visible guidance to choose and call them', () => {
     const checks: Record<string, string[]> = {
-      read_file: ['read', 'charstart', 'charend', 'stat_file'],
-      read_files: ['several', 'path', 'charstart', 'charend', 'bounded'],
+      read_file: ['read', 'range', 'unit', 'start', 'end', 'stat_file'],
+      read_files: ['several', 'path', 'range', 'unit', 'bounded'],
       stat_file: ['total_chars', 'before', 'read_file'],
       search_files: ['path is unknown', 'substring', 'glob'],
       grep_files: ['pattern', 'glob', 'output_mode'],
       write_file: ['write', 'path', 'content'],
+      append_file: ['append', 'path', 'content', 'base_revision', 'expected_size', 'replay'],
       apply_patch: ['transactional', 'patch', 'add file', 'update file', 'read'],
       edit_file: ['old_string', 'new_string', 'unique', 'e_stale'],
       publish_outputs: ['complete', 'final', 'paths', 'this turn'],

@@ -2,11 +2,9 @@
  * Per-conversation CLI session bindings.
  *
  * Each resumable (cid, aid, cli) tuple gets a CLI-reported session id so the
- * next dispatch can pass the backend's continuation handle. The CLI keeps its own
- * conversation memory; we only persist the handle. Host prompts stay
- * current-turn-only while this handle is valid; if the handle is absent
- * after prior visible turns (for example cwd changed), group_chat may
- * bridge that transcript once into the fresh CLI session.
+ * next dispatch can pass the backend's continuation handle. The CLI keeps its
+ * own conversation memory, while Orkas supplies bounded canonical history on
+ * first contact and bounded canonical deltas after the last successful reply.
  *
  * Storage: `<uid>/local/cli-sessions/<cid>.json`, shape:
  *   { "<aid>": { "cli": "claude", "sessionId": "...", "updatedAt": "...",
@@ -52,6 +50,9 @@ export interface CliSessionRecord {
   turnId?: string;
   runId?: string;
   terminalStatus?: string;
+  /** Canonical visible reply through which this CLI session was successfully
+   * synchronized. Updated only after that reply is durably appended. */
+  historySyncedThroughMessageId?: string;
 }
 
 interface CliSessionsFile {
@@ -116,6 +117,11 @@ export async function setSessionId(
 ): Promise<void> {
   if (!sessionId) return;
   const file = await read(uid, cid);
+  const previous = file[aid];
+  const preservedHistoryCursor = previous?.cli === cli
+    && previous.sessionId === sessionId
+    ? previous.historySyncedThroughMessageId
+    : undefined;
   file[aid] = {
     cli,
     sessionId,
@@ -129,10 +135,38 @@ export async function setSessionId(
     ...(provenance.contextProtocolVersion
       ? { contextProtocolVersion: provenance.contextProtocolVersion }
       : {}),
+    ...(preservedHistoryCursor
+      ? { historySyncedThroughMessageId: preservedHistoryCursor }
+      : {}),
   };
   try { await write(uid, cid, file); }
   catch (err) {
     log.warn('setSessionId failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
+  }
+}
+
+/** Advance canonical-history delivery only after a successful visible CLI
+ * reply has been persisted. Failed, cancelled, timed-out, and slash-command
+ * turns deliberately leave the prior cursor untouched. */
+export async function markHistorySyncedThrough(
+  uid: string,
+  cid: string,
+  aid: string,
+  cli: string,
+  messageId: string,
+): Promise<void> {
+  if (!messageId) return;
+  const file = await read(uid, cid);
+  const current = file[aid];
+  if (!current || current.cli !== cli || !current.sessionId) return;
+  file[aid] = {
+    ...current,
+    historySyncedThroughMessageId: messageId,
+    updatedAt: new Date().toISOString(),
+  };
+  try { await write(uid, cid, file); }
+  catch (err) {
+    log.warn('markHistorySyncedThrough failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
 }
 

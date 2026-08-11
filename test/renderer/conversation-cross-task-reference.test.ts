@@ -38,7 +38,7 @@ describe('conversation cross-task message reference UI', () => {
   });
 
   it('adds quote plus copy/select overflow actions to persisted user messages', () => {
-    expect(conversationSource).toContain("} else if (role === 'user') {");
+    expect(conversationSource).toContain("} else if (role === 'user' && opts.messageActions !== 'errors-only') {");
     expect(conversationSource).toContain('_attachBubbleActions(msgDiv, () => (');
     expect(conversationSource).toContain('), { archive: false });');
     expect(conversationSource).not.toContain('bubble-share-btn');
@@ -118,8 +118,12 @@ describe('conversation cross-task message reference UI', () => {
   it('sends references as structured sidecar data and persists them with drafts', () => {
     expect(conversationSource).toContain('const references = _referenceSnapshotsForQuotes(quotes)');
     expect(conversationSource).toContain('...(references.length ? { references } : {})');
+    expect(conversationSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(raw\)/);
+    expect(conversationSource).toContain('if (titleText) conv.title = _autoTitle(titleText)');
     expect(projectDetailSource).toContain('const references = (typeof _referenceSnapshotsForQuotes === \'function\')');
     expect(projectDetailSource).toContain('...(references.length ? { references } : {})');
+    expect(projectDetailSource).toMatch(/const titleText = \(typeof transformChatUseTokens === 'function'\)[\s\S]*?transformChatUseTokens\(raw\)/);
+    expect(projectDetailSource).toContain('if (titleText) {');
     expect(indexSource).toContain('id="new-chat-quote-preview"');
     expect(indexSource).toContain('id="project-chat-quote-preview"');
     expect(draftSource).toContain('function _persistQuoteDraft(cid)');

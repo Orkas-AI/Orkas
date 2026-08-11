@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { NativeImage as ElectronNativeImage } from 'electron';
 
+import { authoredAbsoluteTimelinePositions } from './video_studio_contract';
 import { parseHtmlStructure } from './video_studio_html_check';
 import {
   approvedShotReferenceIndex,
@@ -23,6 +24,9 @@ export type Issue = {
   sampleTimeSec?: number;
   activeScene?: boolean;
   evidence?: Record<string, unknown>;
+  /** Set when a user decision waived this finding; it stays visible in the
+   * report as informational and no longer blocks. */
+  waived_by_user?: boolean;
 };
 
 export const VIDEO_STUDIO_INSPECTOR_VERSION = 3;
@@ -99,6 +103,9 @@ export type FrameSampleEvidence = {
   frame_index: number;
   path: string;
   hash: string;
+  /** Set when the R0 video-track reuse path carried this sample over from the
+   * provenance-matched prior render instead of capturing it live. */
+  reused_from_prior_render?: boolean;
   perceptual_hash?: string;
   brightness: number;
   contrast: number;
@@ -109,11 +116,53 @@ export type FrameSampleEvidence = {
   visible_roles?: string[];
   visible_text?: string;
   visible_elements?: VisibleSemanticElementEvidence[];
+  /** Why the semantically interesting elements that are NOT visible failed the
+   *  visibility test. The probe walks the ancestor chain and computes this to
+   *  decide visibility at all; keeping it turns "scene x is not visible" from a
+   *  verdict into a diagnosis. */
+  hidden_elements?: HiddenSemanticElementEvidence[];
   capture_source_width?: number;
   capture_source_height?: number;
   capture_scale_factor?: number;
   capture_retry_count?: number;
 };
+
+/** Why one semantically interesting element did not render at a sampled time.
+ *
+ * 2026-08-07: `EXPECTED_SCENE_NOT_VISIBLE` cost 15.8 minutes of a 29.5-minute
+ * production turn. The probe already measured the answer — it walks the
+ * ancestor chain, reads `getComputedStyle`, and multiplies opacity — and then
+ * returned a boolean, so the model spent seven QA rounds grepping, opening
+ * frames, and guessing at CSS specificity to reconstruct it. */
+export type HiddenSemanticElementEvidence = {
+  /** Readable identity: `#id`, else `tag[data-scene-id=...]` / `tag[data-role=...]`. */
+  selector: string;
+  scene_id?: string;
+  role?: string;
+  reason:
+    | 'display_none'
+    | 'visibility_hidden'
+    | 'transparent'
+    | 'zero_size'
+    | 'offscreen';
+  /** The ancestor that caused it, when the element itself is not the cause. */
+  blocked_by?: string;
+  /** Cumulative opacity down to and including the blocking node. */
+  computed_opacity?: number;
+  cover_hero?: boolean;
+};
+
+/** A frame flatter than this has no pixel variation at all — a single colour
+ *  field. The capture-retry check in `video_studio.ts` reads the same constant:
+ *  the host must retry exactly the frames it would later call blank, or it
+ *  either re-shoots frames QA accepts or ships ones it does not. */
+export const BLANK_FRAME_MAX_CONTRAST = 1.5;
+
+/** How many absolute-second replacements one finding lists. A composition that
+ *  was authored before the scaffold helpers existed can hold dozens, and each
+ *  one this message drops is a round trip at roughly 30 seconds to rediscover
+ *  something already computed. The cap is a payload bound, not a sample. */
+const AUTHORED_ABSOLUTE_POSITIONS_REPORTED = 60;
 
 export type VisibleSemanticElementEvidence = {
   scene_id?: string;
@@ -125,6 +174,10 @@ export type VisibleSemanticElementEvidence = {
   width_ratio?: number;
   height_ratio?: number;
   area_ratio?: number;
+  /** Viewport-relative origin. Present since the capture-contradiction check
+   *  started asking whether an element's own region got painted. */
+  left_ratio?: number;
+  top_ratio?: number;
 };
 
 export type FrameEvidence = {
@@ -154,6 +207,33 @@ export type VideoFrameQaOptions = {
   minimumSamples?: number;
   designContract?: unknown;
   sceneMap?: unknown;
+  /** Canonical scene windows (manifest id/start/duration). Enables the
+   *  converse of EXPECTED_SCENE_NOT_VISIBLE: a scene whose window excludes
+   *  the sample time must not be visibly rendered there. The DOM sampler
+   *  reads computed styles, so it sees an author-forced `!important`
+   *  visibility override that the clip timing model would hide — on
+   *  2026-08-07 a pinned `#scene-s1_hook{opacity:1!important}` overlaid the
+   *  hook title on every later scene and passed QA with zero blockers,
+   *  because only the expected-scene direction was ever checked. */
+  sceneWindows?: Array<{ id: string; start: number; duration: number }>;
+  /** Whether a frozen sampled run is an error rather than a warning. Set for
+   *  the visual-preview gate, where the user is about to approve the frames on
+   *  the contact sheet: a still stretch they cannot spot in three thumbnails is
+   *  exactly the defect that must not reach them. The draft/final path leaves
+   *  it advisory so one motionless scene cannot consume the render repair
+   *  budget and stall a whole multi-segment video. */
+  /** Whether this composition's first frame is also the DELIVERED video's first
+   *  frame. False for a middle segment of an assembled production, whose frame
+   *  0 plays somewhere inside the finished video and is not its hook. The
+   *  opening promise is a whole-video property; demanding a title card at the
+   *  head of every segment applies cover semantics to the middle of a film.
+   *  A blank frame is judged separately and stays an error either way — at a
+   *  cut it is a visible gap wherever it sits. */
+  isDeliveredOpening?: boolean;
+  /** Finding codes the user chose to skip (recorded on the production state
+   *  with their verbatim authorization). Matching findings report as
+   *  informational instead of blocking. */
+  waivedFindings?: string[];
 };
 
 /**
@@ -288,9 +368,13 @@ const DESIGN_QUALITY_PASS_THRESHOLD = 80;
 const DESIGN_QUALITY_DIMENSION_FLOOR = 70;
 
 const GENERIC_AESTHETIC_RE = /\b(?:modern tech|clean modern|sleek|premium|minimalist|minimal|futuristic|dynamic|engaging|professional|high[- ]end|beautiful|polished)\b/i;
+/** Design-contract codes that still block a preview. Completeness stays here
+ * — a missing section means the model never made the decision. Judgments
+ * about how GOOD a present decision is do not: GENERIC_AESTHETIC_THESIS
+ * grades authored prose, and the user reviews the resulting frames at the
+ * keyframe preview stop. */
 const HARD_PREVIEW_DESIGN_CODES = new Set([
   'AESTHETIC_THESIS_INCOMPLETE',
-  'GENERIC_AESTHETIC_THESIS',
   'VISUAL_DIRECTION_INCOMPLETE',
   'SCENE_DEPTH_LAYERS_MISSING',
   'SCENE_MOTION_VERBS_MISSING',
@@ -307,6 +391,40 @@ const PREVIEW_REQUIRED_DESIGN_SECTIONS = new Set([
 function designSeverity(code: string, hard = true): Issue['severity'] {
   if (code === 'DESIGN_CONTRACT_BUDGET_INCOMPLETE') return hard ? 'error' : 'warning';
   return HARD_PREVIEW_DESIGN_CODES.has(code) ? 'error' : 'warning';
+}
+
+/** Finding codes a user cannot waive: they mark missing or corrupt evidence,
+ * not a judgment. Waiving one would blind QA rather than accept a look the
+ * user has seen and chosen to keep. */
+const NON_WAIVABLE_QA_CODES = new Set([
+  'VIDEO_SAMPLE_FRAMES_MISSING',
+  'VIDEO_SCENE_EVIDENCE_MISSING',
+  'COVER_SEMANTIC_EVIDENCE_MISSING',
+  'SCENE_MAP_REQUIRED_FOR_AUDIO_TIMING',
+  'SCENE_MAP_REQUIRED_FOR_SOURCE_ALIGNMENT',
+]);
+
+export function qaFindingIsWaivable(code: string): boolean {
+  return !NON_WAIVABLE_QA_CODES.has(code) && !/_PARSE_FAILED$/.test(code);
+}
+
+/** Downgrade user-waived findings to informational. The finding stays in the
+ * report — the user chose to accept it, not to unsee it — but it no longer
+ * counts toward any blocking decision. Only judgment findings are eligible;
+ * evidence-integrity codes keep their severity regardless of the waiver
+ * list. */
+export function applyQaFindingWaivers(issues: Issue[], waivedCodes: string[] | undefined): Issue[] {
+  if (!waivedCodes || !waivedCodes.length) return issues;
+  const waived = new Set(waivedCodes.filter((code) => qaFindingIsWaivable(code)));
+  if (!waived.size) return issues;
+  return issues.map((issue) => (waived.has(issue.code) && issue.severity === 'error'
+    ? {
+      ...issue,
+      severity: 'info' as const,
+      waived_by_user: true,
+      message: `${issue.message} [skipped by user decision]`,
+    }
+    : issue));
 }
 
 function round2(n: number): number {
@@ -432,6 +550,16 @@ function textFrom(value: unknown): string {
 function numberFrom(value: unknown): number {
   const n = Number(value);
   return Number.isFinite(n) ? n : 0;
+}
+
+function positiveNumber(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function nonNegativeNumber(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : null;
 }
 
 function normalizeForSearch(value: unknown): string {
@@ -642,6 +770,18 @@ function extractScenes(value: unknown): Array<Record<string, unknown>> {
   return [];
 }
 
+/** Whether a file named shotlist.json is actually a legacy shotlist.
+ *
+ * `extractShotlistShots` also accepts a `scenes` array, a tolerance for older
+ * authored shapes. That tolerance is what let a retired layer wake up: on
+ * 2026-08-07 the model wrote a scratch `{scenes:[...]}` file under the retired
+ * name and it read as a real shotlist. Activation needs the artifact's own
+ * shape — a bare shot array, or an object carrying `shots`. */
+function isLegacyShotlist(value: unknown): boolean {
+  if (Array.isArray(value)) return value.filter(isRecord).length > 0;
+  return isRecord(value) && Array.isArray(value.shots) && value.shots.filter(isRecord).length > 0;
+}
+
 function extractShotlistShots(value: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(value)) return value.filter(isRecord);
   if (!isRecord(value)) return [];
@@ -712,11 +852,66 @@ function sceneLayoutKey(scene: Record<string, unknown>): string {
   ).trim().toLowerCase();
 }
 
+/** The design-contract readiness of a manifest, judged at prepare time.
+ *
+ * Every fixHint in this family says "before writing HTML" — and until now the
+ * first time any of them could appear was composition.inspect, which runs
+ * AFTER the HTML exists: on 2026-08-08 five host-derived child manifests
+ * (which carry no art_direction) sailed through prepare, the model wrote five
+ * pages, and inspect then blocked five times with instructions addressed to a
+ * moment already gone. Prepare is the hand-off to HTML authoring, so this is
+ * where the requirement has to be audible. Cover-family checks stay with
+ * inspect: they need the delivered-opening context prepare does not have, and
+ * demanding a poster from a mid-film segment is exactly the misdirection the
+ * opening-only rule exists to prevent. Reuses the one advisory implementation
+ * so prepare and inspect can never disagree about what complete means. */
+export function designContractReadiness(manifest: unknown): {
+  status: 'missing' | 'incomplete' | 'ready';
+  issues: Issue[];
+} {
+  const record = isRecord(manifest) ? manifest : {};
+  const contract = isRecord(record.art_direction) ? record.art_direction : undefined;
+  if (!contract) {
+    return {
+      status: 'missing',
+      issues: [{
+        code: 'DESIGN_CONTRACT_MISSING',
+        severity: 'error',
+        selector: 'composition-manifest.json#art_direction',
+        message: `composition-manifest.json has no art_direction design contract yet. It needs: ${DESIGN_CONTRACT_SECTIONS.map(designContractSectionShape).join('; ')}.`,
+        fixHint: 'Author every section listed above COMPLETE in one pass BEFORE writing index.html — a partial contract just re-blocks on its own fields, and inspect blocks on all of it once the HTML exists.',
+        source: 'orkas-native-design-contract',
+      }],
+    };
+  }
+  const issues: Issue[] = [];
+  addDesignContractAdvisories(issues, contract, record, 'composition-manifest.json#art_direction', false);
+  return {
+    status: issues.some((issue) => issue.severity === 'error') ? 'incomplete' : 'ready',
+    issues,
+  };
+}
+
+/** A design-contract section named together with the fields it must contain.
+ * Shared by both entry points on purpose: the field lists first landed only
+ * on the incomplete-contract message, so a manifest with NO art_direction —
+ * which is exactly what the host derives for an AUTO child, i.e. the common
+ * case — still got a section-name-only hint and still took two rounds
+ * (2026-08-09 run, verifying the very fix that missed it). */
+function designContractSectionShape(key: string): string {
+  if (key === 'aesthetic') return `aesthetic{${AESTHETIC_FIELDS.join(', ')}}`;
+  if (key === 'visual_direction') return `visual_direction{${VISUAL_DIRECTION_FIELDS.join(', ')}}`;
+  if (key === 'cover') return `cover{${COVER_CONTRACT_FIELDS.join(', ')}}`;
+  if (key === 'typography_tokens') return 'typography_tokens{title/body/label role tokens with video-size floors}';
+  return key;
+}
+
 function addDesignContractAdvisories(
   issues: Issue[],
   contract: unknown,
   sceneMap: unknown,
   sourceSelector = 'composition-manifest.json#art_direction',
+  deliveredOpening = true,
 ): void {
   if (!isRecord(contract)) return;
 
@@ -724,19 +919,37 @@ function addDesignContractAdvisories(
   if (missingSections.length) {
     const code = 'DESIGN_CONTRACT_BUDGET_INCOMPLETE';
     const missingPreviewRequiredSections = missingSections.filter((key) => PREVIEW_REQUIRED_DESIGN_SECTIONS.has(key));
+    // A missing section names its OWN required fields, because the field
+    // checks below only speak once their section exists: reported as bare
+    // section names, an empty contract took two structurally guaranteed
+    // rounds per segment — "add these sections" (model adds shells), then
+    // "each section is missing these fields" — and on 2026-08-08 that was
+    // 2 rounds x 4 segments = 8 failed calls. The host held every field list
+    // as a constant the whole time.
     issues.push({
       code,
       severity: designSeverity(code, missingPreviewRequiredSections.length > 0),
       selector: sourceSelector,
-      message: `Design contract is missing low-cost aesthetic budget fields: ${missingSections.join(', ')}.`,
-      fixHint: 'Add compact aesthetic, layout, type, color, motion, and scene-variation budgets before writing HTML.',
+      message: `Design contract is missing low-cost aesthetic budget fields: ${missingSections.map(designContractSectionShape).join('; ')}.`,
+      fixHint: 'Write each listed section COMPLETE with the fields named above in one pass, before writing HTML — a section added as an empty shell just re-blocks on its fields.',
       source: 'orkas-native-design-contract',
     });
   }
 
+  // Cover semantics are a whole-video property: frame 0 of the DELIVERED
+  // video is its poster. A middle segment of an assembled production plays
+  // inside the finished video, so demanding a designed cover from it applies
+  // poster standards to the middle of a film — the same reasoning that keeps
+  // HOOK_PROMISE_NOT_VISIBLE advisory there. The whole cover family
+  // (contract completeness and its sub-checks) is skipped for non-opening
+  // segments; the segment that plays first keeps every check.
   const cover = isRecord(contract.cover) ? contract.cover : {};
-  const missingCoverFields = COVER_CONTRACT_FIELDS.filter((key) => !hasCoverContractValue(key, cover[key]));
-  if (missingCoverFields.length) {
+  const missingCoverFields = deliveredOpening
+    ? COVER_CONTRACT_FIELDS.filter((key) => !hasCoverContractValue(key, cover[key]))
+    : [];
+  if (!deliveredOpening) {
+    // No cover requirement and no sub-checks for a mid-film segment.
+  } else if (missingCoverFields.length) {
     issues.push({
       code: 'COVER_CONTRACT_INCOMPLETE',
       severity: 'error',
@@ -774,8 +987,10 @@ function addDesignContractAdvisories(
       : [];
     if (contentSignals.length < 2) {
       issues.push({
+        // How many signals the cover DECLARES is an ambition judgment; the
+        // contract's completeness (COVER_CONTRACT_INCOMPLETE) stays blocking.
         code: 'COVER_CONTENT_SIGNALS_THIN',
-        severity: 'error',
+        severity: 'warning',
         selector: `${sourceSelector}.cover.content_signals`,
         message: 'The cover needs at least two concrete content signals so it communicates the video topic instead of only showing a generic title treatment.',
         fixHint: 'Name two visible topic-specific signals such as the product/object, result, diagram, person, place, or before/after state.',
@@ -865,7 +1080,27 @@ function addDesignContractAdvisories(
   }
 
   const scenes = extractScenes(contract).length ? extractScenes(contract) : extractScenes(sceneMap);
-  const scenesMissingDepth = scenes.filter((scene) => !hasContent(scene.depth_layers)).slice(0, 4);
+  // Where these fields go has to be said, not implied by a selector. The
+  // manifest's own `scenes[]` is a strict schema: on 2026-08-08 a run read
+  // "give each non-trivial scene a depth_layers field", added depth_layers /
+  // motion_verbs / motion_choreography to the only scenes it could see, and
+  // took E_GATE_B_ARTIFACT_INVALID x5 for unrecognized keys — one check
+  // demanding what another forbids in the only place the caller can reach.
+  // `art_direction` is a free-form record, so the design-contract copy of the
+  // scene list is where scene art direction belongs.
+  const sceneHome = `${sourceSelector}.scenes[]`;
+  // The check accepts the MEANING, not one spelling. `depth_layers` is the
+  // canonical field, but the old fixHint itself told the model to write "a
+  // background field, midground hero, and foreground accent" — and on
+  // 2026-08-06 a run did exactly that across six segments, failed this check
+  // three times per segment, and concluded the checker was broken. A scene
+  // that carries all three layers as separate fields has the depth design
+  // this rule exists for.
+  const sceneHasDepth = (scene: Record<string, unknown>): boolean => (
+    hasContent(scene.depth_layers)
+    || (hasContent(scene.background) && hasContent(scene.midground) && hasContent(scene.foreground))
+  );
+  const scenesMissingDepth = scenes.filter((scene) => !sceneHasDepth(scene)).slice(0, 4);
   if (scenes.length && scenesMissingDepth.length) {
     const code = 'SCENE_DEPTH_LAYERS_MISSING';
     issues.push({
@@ -873,14 +1108,15 @@ function addDesignContractAdvisories(
       severity: designSeverity(code),
       selector: `${sourceSelector}.scenes`,
       message: `Scene art direction is missing background/midground/foreground depth layers for ${scenesMissingDepth.map(sceneLabel).join(', ')}.`,
-      fixHint: 'Give each non-trivial scene a topic-derived background field, dominant midground hero, and foreground accent/metadata layer.',
+      fixHint: `Add these under ${sceneHome} (matching scene ids) — NOT on the manifest's own scenes[], whose schema rejects unknown keys. Give each non-trivial scene a \`depth_layers\` field (or all three of \`background\`/\`midground\`/\`foreground\`): a topic-derived background, dominant midground hero, and foreground accent/metadata layer.`,
       source: 'orkas-native-design-contract',
     });
   }
 
-  const scenesMissingMotionVerbs = scenes
-    .filter((scene) => !hasContent(scene.motion_verbs) && !hasContent(scene.motion_choreography))
-    .slice(0, 4);
+  const sceneHasMotion = (scene: Record<string, unknown>): boolean => (
+    hasContent(scene.motion_verbs) || hasContent(scene.motion_choreography) || hasContent(scene.motion)
+  );
+  const scenesMissingMotionVerbs = scenes.filter((scene) => !sceneHasMotion(scene)).slice(0, 4);
   if (scenes.length && scenesMissingMotionVerbs.length) {
     const code = 'SCENE_MOTION_VERBS_MISSING';
     issues.push({
@@ -888,7 +1124,7 @@ function addDesignContractAdvisories(
       severity: designSeverity(code),
       selector: `${sourceSelector}.scenes`,
       message: `Scene art direction is missing motion verbs/choreography for ${scenesMissingMotionVerbs.map(sceneLabel).join(', ')}.`,
-      fixHint: 'Assign concrete verbs such as draw, lock, drift, slam, count up, or reveal to primary scene elements before writing GSAP.',
+      fixHint: `Add these under ${sceneHome} (matching scene ids) — NOT on the manifest's own scenes[], whose schema rejects unknown keys. Assign concrete verbs such as draw, lock, drift, slam, count up, or reveal to primary scene elements in a \`motion_verbs\` (or \`motion\`) field before writing GSAP.`,
       source: 'orkas-native-design-contract',
     });
   }
@@ -925,6 +1161,30 @@ function addDesignContractAdvisories(
       source: 'orkas-native-design-contract',
     });
   }
+}
+
+/** Turn the probe's hidden-element records into one readable clause.
+ *
+ * The reason an element did not render is measured during the visibility walk
+ * itself, so appending it costs nothing and removes the guessing pass: a
+ * finding that says which ancestor set `opacity: 0` is repaired in one edit,
+ * where "scene x is not visible" took seven QA rounds on 2026-08-07. */
+function hiddenElementClause(
+  hidden: HiddenSemanticElementEvidence[] | undefined,
+  match: (entry: HiddenSemanticElementEvidence) => boolean,
+): string {
+  const entries = (hidden || []).filter(match).slice(0, 3);
+  if (!entries.length) return '';
+  const parts = entries.map((entry) => {
+    const cause = entry.blocked_by && entry.blocked_by !== entry.selector
+      ? ` via ancestor ${entry.blocked_by}`
+      : '';
+    const opacity = typeof entry.computed_opacity === 'number'
+      ? ` (cumulative opacity ${entry.computed_opacity})`
+      : '';
+    return `${entry.selector}: ${entry.reason}${cause}${opacity}`;
+  });
+  return ` Measured at this frame — ${parts.join('; ')}.`;
 }
 
 function concreteReferenceFidelityRequirement(contract: unknown): {
@@ -975,19 +1235,32 @@ async function addReferenceFidelityIssues(
     missing.push('verification.minimum_score');
   }
   if (missing.length) {
+    // Advisory, not blocking. These four fields describe how faithfully the
+    // design intends to follow its references; they change nothing that
+    // renders. Their only consumer is the design-review floor
+    // (`E_REFERENCE_FIDELITY_BELOW_FLOOR`), and that review has been advisory
+    // since P3 — so an incomplete contract used to stop preview and render for
+    // a threshold nothing blocks on. On 2026-08-07 it was the sole blocker of
+    // a whole QA cycle, about 2.6 minutes, on a composition that rendered fine.
+    // The reference list itself stays blocking: a missing id, an invalid
+    // temporal anchor, or an unreachable path all change what renders.
     issues.push({
       code: 'REFERENCE_FIDELITY_CONTRACT_INCOMPLETE',
-      severity: 'error',
+      severity: 'warning',
       selector,
-      message: `Concrete visual references need an executable fidelity contract: ${missing.join(', ')} missing or invalid.`,
+      message: `Concrete visual references have no executable fidelity contract: ${missing.join(', ')} missing or invalid. Nothing is blocked — this sets the bar the fidelity review scores against, so without it that review falls back to the default floor.`,
       fixHint: 'Declare image/video references, exact/close/adapt fidelity, preserve/may-change rules, any layout or temporal anchors, and a scored review threshold.',
       source: 'orkas-native-design-contract',
     });
   }
+  // How ambitious an exact-fidelity contract is (how many axes it pledges to
+  // preserve, how high it sets its own review bar) is a judgment about the
+  // plan's aspiration, not a defect in it. The fidelity review scores the
+  // actual result, and the user sees the frames.
   if (mode === 'exact' && preserve.length < 3) {
     issues.push({
       code: 'REFERENCE_EXACT_PRESERVE_THIN',
-      severity: 'error',
+      severity: 'warning',
       selector: `${selector}.preserve`,
       message: 'Exact fidelity must explicitly preserve at least three visual axes such as composition, typography, palette, geometry, imagery, or spacing.',
       source: 'orkas-native-design-contract',
@@ -996,7 +1269,7 @@ async function addReferenceFidelityIssues(
   if (mode === 'exact' && Number.isFinite(minimumScore) && minimumScore < 85) {
     issues.push({
       code: 'REFERENCE_EXACT_SCORE_FLOOR_LOW',
-      severity: 'error',
+      severity: 'warning',
       selector: `${selector}.verification.minimum_score`,
       message: 'Exact fidelity requires a reference_fidelity review threshold of at least 85.',
       source: 'orkas-native-design-contract',
@@ -1517,12 +1790,21 @@ function audioTargetDuration(contract: unknown, sceneMap: unknown): number {
   );
 }
 
+export type ContractHtmlQaOptions = {
+  /** See VideoFrameQaOptions.isDeliveredOpening — gates the cover contract
+   * family, which only the delivered video's opening segment must satisfy. */
+  isDeliveredOpening?: boolean;
+  /** See VideoFrameQaOptions.waivedFindings. */
+  waivedFindings?: string[];
+};
+
 export async function runContractHtmlQa(
   meta: CompositionMeta,
   metaIssues: Issue[],
   contractLoad: JsonLoad,
   sceneMapLoad: JsonLoad,
   compositionDirAbs: string,
+  qaOpts: ContractHtmlQaOptions = {},
 ): Promise<Record<string, unknown>> {
   const issues: Issue[] = metaIssues.map((issue) => ({
     ...issue,
@@ -1614,6 +1896,7 @@ export async function runContractHtmlQa(
     contract,
     sceneMap,
     contractSelector === 'composition-manifest.json' ? 'composition-manifest.json#art_direction' : contractSelector,
+    qaOpts.isDeliveredOpening !== false,
   );
   await addReferenceFidelityIssues(
     issues,
@@ -1737,11 +2020,55 @@ export async function runContractHtmlQa(
     prevEnd = Math.max(prevEnd, start + sceneDuration);
   });
 
+  // A literal timeline second is correct only until the narration is measured,
+  // and a TTS retry can reach that step after the HTML is authored. Report it
+  // while the model is still holding the file, with the offset expression the
+  // scene windows already determine — the alternative is transcribing every
+  // literal by hand once they are all one scene off.
+  const absolutePositions = authoredAbsoluteTimelinePositions(
+    meta.html,
+    scenes.map((scene) => ({
+      id: sceneId(scene),
+      start: sceneStartSec(scene),
+      duration: sceneDurationSec(scene),
+    })).filter((scene) => !!scene.id && scene.duration > 0),
+  );
+  if (absolutePositions.length) {
+    // Every replacement, not a sample. Each omitted one is another round trip
+    // at ~30s to rediscover, and the whole point of computing them here is that
+    // the host already knows all of them.
+    const shown = absolutePositions.slice(0, AUTHORED_ABSOLUTE_POSITIONS_REPORTED);
+    const remainder = absolutePositions.length - shown.length;
+    issues.push({
+      code: 'AUTHORED_ABSOLUTE_TIMELINE_SECONDS',
+      severity: 'error',
+      selector: 'index.html',
+      message: `${absolutePositions.length} timeline position(s) are written as absolute seconds. Scene windows are re-measured from the narration audio, and every literal then plays against the wrong scene. Replace, at index.html: `
+        + shown.map((entry) => `line ${entry.line} ${entry.seconds} -> ${entry.suggestion}`).join('; ')
+        + (remainder > 0 ? `; and ${remainder} more this message does not list.` : '.'),
+      fixHint: 'Position tweens from the scaffold helpers S(sceneId)/D(sceneId), which read each section\'s data-start/data-duration and stay correct after any retiming.',
+      source: 'orkas-native-contract-html',
+    });
+  }
+
   const htmlSearch = normalizeForSearch(parseHtmlStructure(meta.html).textContent);
+  // Splitting a line across elements is how per-word reveals are authored,
+  // and element boundaries put whitespace into textContent. A line that
+  // carries no whitespace of its own — every CJK line — could therefore
+  // never be found once animated word by word: "用AI聊过很多次" became
+  // "用ai 聊过 很多次" in the haystack (2026-08-09, two rounds and counting
+  // against copy that was on screen, in order, the whole time). Latin copy
+  // has its own spaces, so it keeps the exact comparison and this cannot
+  // loosen it.
+  const htmlSearchCompact = htmlSearch.replace(/\s+/g, '');
+  const htmlContains = (needle: string): boolean => (
+    htmlSearch.includes(needle)
+    || (!/\s/.test(needle) && htmlSearchCompact.includes(needle))
+  );
   for (const [index, scene] of scenes.slice(0, 16).entries()) {
     for (const text of flattenSceneText(scene).slice(0, 5)) {
       const needle = normalizeForSearch(text);
-      if (needle && !htmlSearch.includes(needle)) {
+      if (needle && !htmlContains(needle)) {
         issues.push({
           code: 'HTML_MISSING_SCENE_COPY',
           severity: 'error',
@@ -1753,18 +2080,19 @@ export async function runContractHtmlQa(
     }
   }
 
-  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+  const finalIssues = applyQaFindingWaivers(issues, qaOpts.waivedFindings);
+  const errorCount = finalIssues.filter((issue) => issue.severity === 'error').length;
   return {
     ok: errorCount === 0,
     error_count: errorCount,
-    warning_count: issues.filter((issue) => issue.severity === 'warning').length,
-    issue_count: issues.length,
+    warning_count: finalIssues.filter((issue) => issue.severity === 'warning').length,
+    issue_count: finalIssues.length,
     contract_path: contractLoad.path,
     scene_map_path: sceneMapLoad.path,
     ...(contractLoad.path === sceneMapLoad.path ? { manifest_path: contractLoad.path } : {}),
     semantic_hooks: semanticHooks,
     scene_visibility: sceneVisibility,
-    issues,
+    issues: finalIssues,
   };
 }
 
@@ -1773,8 +2101,15 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
   const timelineSelector = path.basename(sceneMapLoad.path) || 'composition-manifest.json';
   const scenes = extractScenes(sceneMapLoad.value);
   const shots = extractShotlistShots(shotlistLoad.value);
-  if (!shotlistLoad.exists) {
-    return { ok: true, skipped: true, reason: 'shotlist_missing', issues };
+  // shotlist.json is retired. This whole layer survives only to keep checking
+  // plans signed while it still existed, so it activates on the artifact's
+  // SHAPE, never on a filename: on 2026-08-07 a stale host message told the
+  // model to "restore the listed script, shotlist, or manifest", it wrote a
+  // scratch `{scenes:[...]}` file under that name, and a retired code path
+  // would otherwise have come back to life and judged the production against
+  // a contract nobody signed.
+  if (!shotlistLoad.exists || !isLegacyShotlist(shotlistLoad.value)) {
+    return { ok: true, skipped: true, reason: 'no_legacy_shotlist', issues };
   }
   if (shotlistLoad.error) {
     issues.push({
@@ -1890,6 +2225,17 @@ export async function runSourceAlignmentQa(sceneMapLoad: JsonLoad, shotlistLoad:
   };
 }
 
+/** Does the composition deliver what it promised to deliver?
+ *
+ * Only captions are checked here. The retired shotlist.json also declared a
+ * target duration, a language, an audio mode and a music mode — and every one
+ * of those checks compared that declaration to the manifest's own
+ * `composition.duration`, `composition.language`, `audio.owner` and
+ * `audio.tracks`. Reconciling two copies of one fact is not quality
+ * assurance; it is bookkeeping that can fail on its own. Captions are the one
+ * delivery promise the composition cannot make on its own, because captions
+ * live in the HTML or a sidecar rather than in the manifest.
+ */
 export async function runDeliveryRequirementsQa(
   meta: CompositionMeta,
   sceneMapLoad: JsonLoad,
@@ -1897,70 +2243,29 @@ export async function runDeliveryRequirementsQa(
   compositionDirAbs: string,
 ): Promise<Record<string, unknown>> {
   const issues: Issue[] = [];
-  if (!shotlistLoad.exists) return { ok: true, skipped: true, reason: 'shotlist_missing', issues };
-  const shotlist = isRecord(shotlistLoad.value) ? shotlistLoad.value : {};
-  const requiredString = (field: string): string => {
-    const value = typeof shotlist[field] === 'string' ? String(shotlist[field]).trim() : '';
-    if (!value) issues.push({
-      code: 'DELIVERY_REQUIREMENT_MISSING',
-      severity: 'error',
-      selector: `shotlist.json#${field}`,
-      message: `Gate B shotlist must declare ${field}.`,
-      source: 'orkas-native-delivery-requirements',
-    });
-    return value.toLowerCase();
-  };
-  const audioMode = requiredString('audio_mode');
-  const captionMode = requiredString('caption_mode');
-  const musicMode = requiredString('music_mode');
-  const videoLanguage = requiredString('video_language');
-  const targetDuration = Number(shotlist.target_duration_seconds);
-  if (!(Number.isFinite(targetDuration) && targetDuration > 0)) {
-    issues.push({
-      code: 'DELIVERY_TARGET_DURATION_MISSING', severity: 'error', selector: 'shotlist.json#target_duration_seconds',
-      message: 'Gate B shotlist must declare a positive target_duration_seconds.', source: 'orkas-native-delivery-requirements',
-    });
-  } else if (Math.abs(meta.durationSec - targetDuration) > 0.15) {
-    issues.push({
-      code: 'DELIVERY_TARGET_DURATION_MISMATCH', severity: 'error', selector: 'composition-manifest.json#composition.duration',
-      message: `Composition duration ${meta.durationSec}s does not match the approved ${targetDuration}s delivery target.`, source: 'orkas-native-delivery-requirements',
-    });
-  }
   const sceneMap = isRecord(sceneMapLoad.value) ? sceneMapLoad.value : {};
   const canvas = isRecord(sceneMap.canvas) ? sceneMap.canvas : {};
-  const manifestLanguage = String(canvas.language || '').trim().toLowerCase();
-  if (videoLanguage && manifestLanguage && videoLanguage !== manifestLanguage) {
-    issues.push({
-      code: 'DELIVERY_LANGUAGE_MISMATCH', severity: 'error', selector: 'composition-manifest.json#composition.language',
-      message: `Composition language ${manifestLanguage} does not match approved video_language ${videoLanguage}.`, source: 'orkas-native-delivery-requirements',
-    });
+  const legacyShotlist = isRecord(shotlistLoad.value) ? shotlistLoad.value : {};
+  const captionMode = String(
+    canvas.caption_mode ?? (isLegacyShotlist(shotlistLoad.value) ? legacyShotlist.caption_mode : '') ?? '',
+  ).trim().toLowerCase();
+  if (!captionMode || /^(?:none|off|disabled)$/.test(captionMode)) {
+    return { ok: true, caption_mode: captionMode || 'none', issue_count: 0, issues };
   }
-  if (captionMode && !/^(?:none|off|disabled)$/.test(captionMode)) {
-    const hasBurnedInCaptions = /data-role\s*=\s*["']caption["']/i.test(meta.html);
-    const sidecarCandidates = ['captions.vtt', 'captions.srt', 'subtitles.vtt', 'subtitles.srt'];
-    const hasSidecar = (await Promise.all(sidecarCandidates.map((name) => fs.stat(path.join(compositionDirAbs, name)).catch(() => null))))
-      .some((stat) => stat?.isFile());
-    if (!hasBurnedInCaptions && !hasSidecar) issues.push({
+  const hasBurnedInCaptions = /data-role\s*=\s*["']caption["']/i.test(meta.html);
+  const sidecarCandidates = ['captions.vtt', 'captions.srt', 'subtitles.vtt', 'subtitles.srt'];
+  const hasSidecar = (await Promise.all(sidecarCandidates.map((name) => fs.stat(path.join(compositionDirAbs, name)).catch(() => null))))
+    .some((stat) => stat?.isFile());
+  if (!hasBurnedInCaptions && !hasSidecar) {
+    issues.push({
       code: 'DELIVERY_CAPTIONS_MISSING', severity: 'error', selector: 'index.html',
       message: `caption_mode=${captionMode} requires burned-in data-role="caption" elements or a captions sidecar file.`, source: 'orkas-native-delivery-requirements',
     });
   }
-  const audio = isRecord(sceneMap.audio) ? sceneMap.audio : {};
-  const tracks = Array.isArray(audio.tracks) ? audio.tracks.filter(isRecord) : [];
-  if (/^(?:required|yes|on|music)$/.test(musicMode) && !tracks.some((track) => track.kind === 'music')) {
-    issues.push({
-      code: 'DELIVERY_MUSIC_MISSING', severity: 'error', selector: 'composition-manifest.json#audio.tracks',
-      message: 'music_mode requires a declarative music track, but none is present.', source: 'orkas-native-delivery-requirements',
-    });
-  }
-  if (audioMode && /^(?:narration|voice|voiceover|tts)$/.test(audioMode) && !tracks.some((track) => track.kind === 'narration')) {
-    issues.push({
-      code: 'DELIVERY_NARRATION_MISSING', severity: 'error', selector: 'composition-manifest.json#audio.tracks',
-      message: `audio_mode=${audioMode} requires a narration track.`, source: 'orkas-native-delivery-requirements',
-    });
-  }
   const errorCount = issues.filter((issue) => issue.severity === 'error').length;
-  return { ok: errorCount === 0, error_count: errorCount, issue_count: issues.length, issues };
+  return {
+    ok: errorCount === 0, caption_mode: captionMode, error_count: errorCount, issue_count: issues.length, issues,
+  };
 }
 
 export async function runAudioTimingQa(
@@ -2057,6 +2362,33 @@ export async function runAudioTimingQa(
 
   const narrationLines = extractNarrationLines(narrationMapLoad.value);
   const narrationLineByKey = narrationLineKeyIndex(narrationLines);
+  const narrationMap = isRecord(narrationMapLoad.value) ? narrationMapLoad.value : {};
+  const narrationAudioDuration = positiveNumber(narrationMap.narration_audio_duration);
+  const narrationAudioStart = nonNegativeNumber(narrationMap.narration_audio_start) ?? 0;
+  const narrationAudioEnd = positiveNumber(narrationMap.narration_audio_end)
+    ?? (narrationAudioDuration !== null ? narrationAudioStart + narrationAudioDuration : null);
+  if (narrationLines.length && narrationAudioEnd !== null) {
+    const firstMappedStart = Math.min(...narrationLines.map((line) => line.start));
+    const lastMappedEnd = Math.max(...narrationLines.map(narrationLineEnd));
+    if (firstMappedStart > narrationAudioStart + 1.25) {
+      issues.push({
+        code: 'NARRATION_MAP_AUDIO_COVERAGE_INCOMPLETE',
+        severity: 'error',
+        selector: 'narration-map.json',
+        message: `Narration audio begins at ${round2(narrationAudioStart)}s but the first mapped spoken line begins at ${round2(firstMappedStart)}s. The map does not cover the measured audio timeline.`,
+        source: 'orkas-native-audio-timing',
+      });
+    }
+    if (lastMappedEnd < narrationAudioEnd - 1.25) {
+      issues.push({
+        code: 'NARRATION_MAP_AUDIO_COVERAGE_INCOMPLETE',
+        severity: 'error',
+        selector: 'narration-map.json',
+        message: `Narration audio runs until ${round2(narrationAudioEnd)}s but mapped spoken lines end at ${round2(lastMappedEnd)}s. Do not treat scene-projected timestamps as measured alignment.`,
+        source: 'orkas-native-audio-timing',
+      });
+    }
+  }
   const refScenes = scenes.filter((scene) => sceneNarrationRefs(scene).length);
   if (refScenes.length && narrationLines.length) {
     for (const scene of refScenes) {
@@ -2150,6 +2482,14 @@ export async function runAudioTimingQa(
     narration_file_exists: narrationFileExists,
     narration_map_path: narrationMapLoad.path,
     narration_line_count: narrationLines.length,
+    alignment_method: typeof narrationMap.alignment_method === 'string'
+      ? narrationMap.alignment_method
+      : 'undeclared',
+    line_timing_evidence: isRecord(narrationMap.timing_evidence)
+      ? narrationMap.timing_evidence.line_timing || 'undeclared'
+      : 'undeclared',
+    narration_audio_start: narrationAudioStart,
+    narration_audio_end: narrationAudioEnd,
     scene_count: scenes.length,
     audio_track_count: meta.audioTracks.length,
     error_count: errorCount,
@@ -2485,6 +2825,48 @@ function perceptualHash(bitmap: Buffer, width: number, height: number): string {
   return out;
 }
 
+/**
+ * Contrast inside one rectangle of a capture, as a fraction of the frame.
+ *
+ * Whole-frame contrast cannot answer "did this element get painted": a page
+ * with a gradient background and a grid overlay measures a healthy 9.03 while
+ * its 88px headline is absent from the pixels — measured on a real 2026-08-08
+ * run, where the same composition rendered correctly to video. The region a
+ * DOM-visible element occupies is the only place the question can be asked.
+ */
+export function regionContrast(
+  image: ElectronNativeImage,
+  region: { left: number; top: number; width: number; height: number },
+): number {
+  const size = image.getSize();
+  const bitmap = image.toBitmap();
+  const bytesPerPixel = Math.max(1, Math.floor(bitmap.length / Math.max(1, size.width * size.height)));
+  const left = Math.max(0, Math.round(region.left * size.width));
+  const top = Math.max(0, Math.round(region.top * size.height));
+  const right = Math.min(size.width, left + Math.round(region.width * size.width));
+  const bottom = Math.min(size.height, top + Math.round(region.height * size.height));
+  if (right - left < 2 || bottom - top < 2) return Number.POSITIVE_INFINITY;
+  let sum = 0;
+  let sumSq = 0;
+  let n = 0;
+  const step = Math.max(1, Math.floor((right - left) / 160));
+  for (let y = top; y < bottom; y += step) {
+    for (let x = left; x < right; x += step) {
+      const i = ((y * size.width) + x) * bytesPerPixel;
+      const r = bitmap[i] ?? 0;
+      const g = bitmap[i + 1] ?? r;
+      const b = bitmap[i + 2] ?? r;
+      const luma = (0.2126 * r) + (0.7152 * g) + (0.0722 * b);
+      sum += luma;
+      sumSq += luma * luma;
+      n += 1;
+    }
+  }
+  if (!n) return Number.POSITIVE_INFINITY;
+  const mean = sum / n;
+  return round2(Math.sqrt(Math.max(0, (sumSq / n) - (mean * mean))));
+}
+
 export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; perceptual_hash: string; brightness: number; contrast: number; width: number; height: number } {
   const size = image.getSize();
   const bitmap = image.toBitmap();
@@ -2512,7 +2894,16 @@ export function analyzeNativeImage(image: ElectronNativeImage): { hash: string; 
   };
 }
 
-export async function writeFrameContactSheet(evidenceDirAbs: string, samples: FrameSampleEvidence[]): Promise<string> {
+export async function writeFrameContactSheet(
+  evidenceDirAbs: string,
+  samples: FrameSampleEvidence[],
+  opts: {
+    /** Label cells with `sample.label` alone. A production sheet spans several
+     *  compositions, where each cell's own timeline start says nothing useful
+     *  and "@ 0s" on every cell would be false. */
+    labelOnly?: boolean;
+  } = {},
+): Promise<string> {
   const thumbW = 320;
   const thumbH = 180;
   const gap = 16;
@@ -2529,7 +2920,8 @@ export async function writeFrameContactSheet(evidenceDirAbs: string, samples: Fr
     // Embed every captured PNG so the contact sheet is a self-contained image.
     const frameBytes = await fs.readFile(sample.path);
     const href = `data:image/png;base64,${frameBytes.toString('base64')}`;
-    const label = `${sample.label} @ ${sample.time_seconds}s`.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const label = (opts.labelOnly ? sample.label : `${sample.label} @ ${sample.time_seconds}s`)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;');
     return `<image href="${href}" x="${x}" y="${y}" width="${thumbW}" height="${thumbH}" preserveAspectRatio="xMidYMid meet"/><text x="${x}" y="${y + thumbH + 24}" fill="#111" font-family="system-ui, sans-serif" font-size="16">${label}</text>`;
   }));
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#fff"/>\n${items.join('\n')}\n</svg>\n`;
@@ -2730,6 +3122,15 @@ function normalizeVisibleCopy(value: unknown): string {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
+/** Compare copy the way a viewer reads it rather than the way it is marked up:
+ *  case-folded, entity-decoded, and free of the layout whitespace introduced by
+ *  line breaks and element boundaries. CJK copy carries no word spaces at all,
+ *  so dropping whitespace is what lets a two-line headline compare equal to the
+ *  one sentence it renders. */
+function normalizeForVisibleMatch(value: unknown): string {
+  return normalizeForSearch(value).replace(/\s+/g, '');
+}
+
 function isEnglishAllCaps(value: string): boolean {
   const letters = value.match(/[A-Za-z]/g) || [];
   return letters.length >= 2 && /[A-Z]/.test(value) && !/[a-z]/.test(value);
@@ -2777,7 +3178,13 @@ function addCoverFrameContractIssues(
   seen: Set<string>,
   firstFrame: FrameSampleEvidence | undefined,
   designContract: unknown,
+  deliveredOpening = true,
 ): void {
+  // Cover semantics belong to the delivered video's frame 0. A mid-film
+  // segment's first frame plays at a cut, where blank-frame and
+  // expected-scene checks still apply — but headline/signals/hero poster
+  // enforcement does not (2026-08-06: middle segments were cover-blocked).
+  if (!deliveredOpening) return;
   if (!firstFrame || !isRecord(designContract) || !isRecord(designContract.cover)) return;
   const cover = designContract.cover;
   const elements = firstFrame.visible_elements;
@@ -2798,12 +3205,23 @@ function addCoverFrameContractIssues(
     return;
   }
 
+  // Frame 0 rendered nothing. `HOOK_PROMISE_NOT_VISIBLE` / `EMPTY_HOOK_FRAME`
+  // already name that defect precisely; the three cover findings below would
+  // add "you forgot the markers", which sent the 2026-08-04 run repairing
+  // attributes on an empty frame until its repair budget ran out.
+  if (!elements.length) return;
+
   const expectedHeadline = normalizeVisibleCopy(cover.headline);
   const visibleTitles = elements
     .filter((element) => String(element.role || '').toLowerCase() === 'title')
     .map((element) => normalizeVisibleCopy(element.text))
     .filter(Boolean);
-  if (expectedHeadline && !visibleTitles.some((text) => normalizeForSearch(text).includes(normalizeForSearch(expectedHeadline)))) {
+  // A headline the design breaks across two title lines is the same headline —
+  // the viewer reads one sentence. Requiring it inside a single element failed
+  // s1 at 15:45 on "一个目标，不该变成10个" + "割裂的对话框", which is exactly
+  // the two-line treatment the design asked for.
+  const visibleTitleRun = normalizeForVisibleMatch(visibleTitles.join(' '));
+  if (expectedHeadline && !visibleTitleRun.includes(normalizeForVisibleMatch(expectedHeadline))) {
     const key = 'COVER_HEADLINE_NOT_VISIBLE';
     if (!seen.has(key)) {
       seen.add(key);
@@ -2814,7 +3232,7 @@ function addCoverFrameContractIssues(
         role: 'title',
         sampleTimeSec: firstFrame.time_seconds,
         message: 'The approved cover headline is not visibly rendered in the frame-0 title.',
-        fixHint: 'Render the approved headline at 0s inside a visible data-role="title" element.',
+        fixHint: 'Render the approved headline at 0s in visible data-role="title" copy; it may run across consecutive title lines.',
         source: 'orkas-native-video-qa',
       });
     }
@@ -2828,22 +3246,68 @@ function addCoverFrameContractIssues(
       .map((element) => normalizeForSearch(element.cover_signal))
       .filter(Boolean),
   );
-  const matchedSignals = expectedSignals.filter((signal) => visibleSignals.has(normalizeForSearch(signal)));
-  if (expectedSignals.length >= 2 && new Set(matchedSignals.map(normalizeForSearch)).size < 2) {
+  // A declared signal the frame actually renders as readable copy IS visible,
+  // whatever identifier the author put in `data-cover-signal`. Requiring the
+  // attribute to repeat the declared string verbatim turned this into a
+  // guessing game: at 15:45 the markers read "hook-pain-point" and
+  // "agent-collaboration" while one declared signal sat word for word in a
+  // body line, and QA reported 0 of 2 — so the repair passes went into
+  // renaming attributes instead of designing a second signal.
+  //
+  // The headline is deliberately excluded. A cover needs the promise PLUS two
+  // concrete signals of what the viewer will see; counting the title would let
+  // a bare title card satisfy its own contract.
+  //
+  // Rendered-copy matching is PER ELEMENT, unlike the headline's joined title
+  // run. The headline is one sentence a design may set on consecutive title
+  // lines; a signal is one statement the viewer reads in one place. Joining
+  // all non-title copy before matching would also invent substrings across
+  // element boundaries once whitespace is stripped — "team" + "work" reading
+  // as "teamwork" — and pass signals nothing actually renders.
+  const nonHeadlineTexts = elements
+    .filter((element) => String(element.role || '').toLowerCase() !== 'title')
+    .map((element) => normalizeForVisibleMatch(normalizeVisibleCopy(element.text)))
+    .filter(Boolean);
+  const signalMatch = (signal: string): 'marked' | 'rendered' | 'headline_only' | 'none' => {
+    if (visibleSignals.has(normalizeForSearch(signal))) return 'marked';
+    const normalized = normalizeForVisibleMatch(signal);
+    if (!normalized) return 'none';
+    if (nonHeadlineTexts.some((text) => text.includes(normalized))) return 'rendered';
+    return visibleTitleRun.includes(normalized) ? 'headline_only' : 'none';
+  };
+  const signalVerdicts = expectedSignals.map((signal) => ({ signal, match: signalMatch(signal) }));
+  const matchedSignals = signalVerdicts.filter((entry) => entry.match === 'marked' || entry.match === 'rendered');
+  const headlineOnlySignals = signalVerdicts
+    .filter((entry) => entry.match === 'headline_only')
+    .map((entry) => entry.signal);
+  const distinctMatches = new Set(matchedSignals.map((entry) => normalizeForSearch(entry.signal))).size;
+  if (expectedSignals.length >= 2 && distinctMatches < 2) {
     const key = 'COVER_CONTENT_SIGNALS_NOT_VISIBLE';
     if (!seen.has(key)) {
       seen.add(key);
       issues.push({
         code: key,
-        severity: 'error',
+        // Composition judgment on a frame the user sees at the keyframe
+        // preview stop before anything is assembled. The cover contract is
+        // taught in frontend-design before authoring; when the model's
+        // reading of "two visible signals" differs from the checker's,
+        // bouncing the run costs more than letting the user look.
+        severity: 'warning',
         sceneId: String(cover.scene_id || firstFrame.expected_scene_id || ''),
         sampleTimeSec: firstFrame.time_seconds,
-        message: `Frame 0 visibly maps ${new Set(matchedSignals.map(normalizeForSearch)).size} of ${expectedSignals.length} declared cover content signals; at least two are required.`,
-        fixHint: 'Mark two visible topic-specific frame-0 elements with data-cover-signal values copied exactly from art_direction.cover.content_signals.',
+        message: `Frame 0 visibly maps ${distinctMatches} of ${expectedSignals.length} declared cover content signals; at least two are required.`
+          + (headlineOnlySignals.length
+            ? ` ${headlineOnlySignals.length} declared signal(s) appear only as the headline, which restates the promise instead of adding a signal.`
+            : ''),
+        fixHint: headlineOnlySignals.length
+          ? 'Give the cover concrete signals distinct from the headline — what the viewer will see or learn — and render them as visible frame-0 copy.'
+          : 'Render at least two of the declared art_direction.cover.content_signals as visible frame-0 copy, or mark the elements that carry them with matching data-cover-signal values.',
         source: 'orkas-native-video-qa',
         evidence: {
           expected_signals: expectedSignals,
           visible_signals: [...visibleSignals],
+          matched_signals: matchedSignals.map((entry) => entry.signal),
+          headline_only_signals: headlineOnlySignals,
         },
       });
     }
@@ -2865,7 +3329,9 @@ function addCoverFrameContractIssues(
       seen.add(key);
       issues.push({
         code: key,
-        severity: 'error',
+        // Same class as the signals check: a hero-size judgment on a frame
+        // the user is about to review.
+        severity: 'warning',
         sceneId: String(cover.scene_id || firstFrame.expected_scene_id || ''),
         role: 'visual',
         sampleTimeSec: firstFrame.time_seconds,
@@ -2904,12 +3370,19 @@ function addEnglishCasingIssues(
       const textTransform = String(element.text_transform || '').trim().toLowerCase();
       const allCaps = isEnglishAllCaps(text);
 
+      // Casing findings below are advisory. The rules are taught before
+      // authoring (frontend-design + stage-compose typography tokens), the
+      // defect is plainly visible on the very frames the keyframe preview
+      // stop shows the user, and 2026-08-04 spent a whole repair budget
+      // bouncing casing judgments. The one exception stays blocking:
+      // changing the casing of copy the user APPROVED is a signed-intent
+      // violation, not taste.
       let issue: Issue | null = null;
       if (PRIMARY_ENGLISH_TEXT_ROLES.has(role)) {
         if (textTransform === 'uppercase') {
           issue = {
             code: 'UPPERCASE_TRANSFORM_FORBIDDEN',
-            severity: 'error',
+            severity: 'warning',
             sceneId: sceneIdValue || undefined,
             role,
             sampleTimeSec: sample.time_seconds,
@@ -2933,7 +3406,7 @@ function addEnglishCasingIssues(
         } else if (allCaps && !isShortAcronymOrCode(text)) {
           issue = {
             code: 'PRIMARY_COPY_ALL_CAPS',
-            severity: 'error',
+            severity: 'warning',
             sceneId: sceneIdValue || undefined,
             role,
             sampleTimeSec: sample.time_seconds,
@@ -2953,7 +3426,7 @@ function addEnglishCasingIssues(
         if (!authorized) {
           issue = {
             code: 'UNAUTHORIZED_ALL_CAPS_ACCENT',
-            severity: 'error',
+            severity: 'warning',
             sceneId: sceneIdValue || undefined,
             role,
             sampleTimeSec: sample.time_seconds,
@@ -2991,7 +3464,7 @@ function addEnglishCasingIssues(
       seen.add(key);
       issues.push({
         code: 'ALL_CAPS_ACCENT_OVERUSED',
-        severity: 'error',
+        severity: 'warning',
         sceneId: sceneIdValue || undefined,
         sampleTimeSec: sample.time_seconds,
         message: `Scene "${sceneIdValue}" visibly uses ${count} uppercase text items; only one short approved label, acronym, or code is allowed.`,
@@ -3041,11 +3514,12 @@ export function summarizeVideoFrameQa(
     }
   }
   for (const sample of samples) {
-    if (sample.brightness < 4 || sample.brightness > 251 || sample.contrast < 1.5) {
+    if (sample.brightness < 4 || sample.brightness > 251 || sample.contrast < BLANK_FRAME_MAX_CONTRAST) {
       issues.push({
         code: sample.label === 'first-frame' ? 'EMPTY_HOOK_FRAME' : 'BLANK_SAMPLE_FRAME',
         severity: 'error',
-        message: `Sample "${sample.label}" at ${sample.time_seconds}s appears blank or nearly flat (brightness=${sample.brightness}, contrast=${sample.contrast}).`,
+        message: `Sample "${sample.label}" at ${sample.time_seconds}s appears blank or nearly flat (brightness=${sample.brightness}, contrast=${sample.contrast}).`
+          + hiddenElementClause(sample.hidden_elements, () => true),
         source: 'orkas-native-video-qa',
       });
     }
@@ -3056,7 +3530,12 @@ export function summarizeVideoFrameQa(
           code: 'EXPECTED_SCENE_NOT_VISIBLE',
           severity: 'error',
           sceneId: sample.expected_scene_id,
-          message: `Sample "${sample.label}" at ${sample.time_seconds}s does not show expected scene "${sample.expected_scene_id}".`,
+          message: `Sample "${sample.label}" at ${sample.time_seconds}s does not show expected scene "${sample.expected_scene_id}".`
+            + hiddenElementClause(
+              sample.hidden_elements,
+              (entry) => entry.scene_id === sample.expected_scene_id
+                || entry.selector.includes(String(sample.expected_scene_id)),
+            ),
           source: 'orkas-native-video-qa',
         });
       }
@@ -3065,13 +3544,58 @@ export function summarizeVideoFrameQa(
       const roles = sample.visible_roles || [];
       const visibleText = String(sample.visible_text || '').trim();
       if (!roles.includes('title') || !visibleText) {
+        // A middle segment opens inside the finished video, so a missing
+        // opening title is a note about its own composition rather than a
+        // broken promise to the viewer. Its blank-frame check above is
+        // untouched: an empty frame at a cut is a visible gap at any position.
+        const deliveredOpening = opts.isDeliveredOpening !== false;
         issues.push({
           code: 'HOOK_PROMISE_NOT_VISIBLE',
-          severity: 'error',
-          message: 'The first frame must expose a visible data-role="title" and readable promise text.',
+          severity: deliveredOpening ? 'error' : 'warning',
+          message: deliveredOpening
+            ? 'The first frame must expose a visible data-role="title" and readable promise text.'
+              + hiddenElementClause(
+                sample.hidden_elements,
+                (entry) => entry.role === 'title' || entry.cover_hero === true,
+              )
+            : 'This segment opens without a visible data-role="title". It plays inside the assembled video rather than at its start, so this is advisory — the delivered opening is checked on the segment that plays first.',
           source: 'orkas-native-video-qa',
         });
       }
+    }
+  }
+  if (opts.requireSemanticCoverage && opts.sceneWindows?.length) {
+    // A scene rendered outside its own window means author styling overrode
+    // the renderer's clip visibility (the sampler reads computed styles, so
+    // it sees what the pixels show). Tolerance keeps samples near a cut from
+    // flagging the neighbouring scene.
+    const INACTIVE_SCENE_TOLERANCE_SEC = 0.25;
+    const offendersByScene = new Map<string, number[]>();
+    for (const sample of samples) {
+      const visible = new Set(sample.visible_scene_ids || []);
+      const t = Number(sample.time_seconds || 0);
+      for (const scene of opts.sceneWindows) {
+        if (!scene.id || !visible.has(scene.id)) continue;
+        const start = Number(scene.start || 0);
+        const end = start + Number(scene.duration || 0);
+        const active = t >= start - INACTIVE_SCENE_TOLERANCE_SEC
+          && t <= end + INACTIVE_SCENE_TOLERANCE_SEC;
+        if (active) continue;
+        const times = offendersByScene.get(scene.id) || [];
+        times.push(t);
+        offendersByScene.set(scene.id, times);
+      }
+    }
+    for (const [id, times] of offendersByScene) {
+      const shown = times.slice(0, 4).map((t) => `${t}s`).join(', ');
+      issues.push({
+        code: 'INACTIVE_SCENE_VISIBLE',
+        severity: 'error',
+        sceneId: id,
+        message: `Scene "${id}" is visibly rendered outside its own window at ${shown}${times.length > 4 ? ` and ${times.length - 4} more sample(s)` : ''} — its content overlays the scenes that play there.`,
+        fixHint: 'Remove forced visibility on the scene container (e.g. an `opacity/visibility !important` override) and let the renderer\'s clip timing own when scenes show; a layer meant to persist across scenes belongs at the composition root, outside any scene section.',
+        source: 'orkas-native-video-qa',
+      });
     }
   }
   if (opts.requireSemanticCoverage) {
@@ -3080,6 +3604,7 @@ export function summarizeVideoFrameQa(
       seenSemanticIssues,
       samples.find((sample) => sample.label === 'first-frame'),
       opts.designContract,
+      opts.isDeliveredOpening !== false,
     );
     addEnglishCasingIssues(issues, seenSemanticIssues, samples, opts.sceneMap);
   }
@@ -3094,34 +3619,19 @@ export function summarizeVideoFrameQa(
       source: 'orkas-native-video-qa',
     });
   }
-  let runStart = 0;
-  for (let i = 1; i <= samples.length; i += 1) {
-    const sameAsRun = i < samples.length && samples[i].hash === samples[runStart].hash;
-    if (sameAsRun) continue;
-    const runLen = i - runStart;
-    const span = runLen > 1 ? samples[i - 1].time_seconds - samples[runStart].time_seconds : 0;
-    if (runLen >= 3 && span >= Math.min(6, Math.max(2, durationSec * 0.35))) {
-      issues.push({
-        code: 'FROZEN_FRAME_RUN',
-        severity: 'warning',
-        message: `${runLen} sampled frames are identical across ${round2(span)}s. Review the contact sheet for intentionally static or unsampled local motion.`,
-        source: 'orkas-native-video-qa',
-      });
-    }
-    runStart = i;
-  }
-  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+  const finalIssues = applyQaFindingWaivers(issues, opts.waivedFindings);
+  const errorCount = finalIssues.filter((issue) => issue.severity === 'error').length;
   return {
     ok: errorCount === 0,
-    issue_count: issues.length,
+    issue_count: finalIssues.length,
     error_count: errorCount,
-    warning_count: issues.filter((issue) => issue.severity === 'warning').length,
+    warning_count: finalIssues.filter((issue) => issue.severity === 'warning').length,
     evidence_dir: frameEvidence?.evidence_dir || '',
     contact_sheet: frameEvidence?.contact_sheet || '',
     frame_paths: frameEvidence?.frame_paths || [],
     samples,
     expected_minimum_samples: expectedMinimum,
     semantic_coverage_required: opts.requireSemanticCoverage === true,
-    issues,
+    issues: finalIssues,
   };
 }

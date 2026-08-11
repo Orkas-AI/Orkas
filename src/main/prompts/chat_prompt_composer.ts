@@ -23,11 +23,11 @@ export function composeChatPrompt(input: {
 }): string {
   const withStableFragments = (input.stableFragments ?? [])
     .reduce((prompt, fragment) => insertStablePromptFragment(prompt, fragment), input.main);
-  const index = withStableFragments.indexOf(RUNTIME_MARKER);
-  const withLanguage = index < 0
-    ? `${withStableFragments}\n\n---\n\n${input.languageDirective}`
-    : `${withStableFragments.slice(0, index)}${input.languageDirective}\n\n---\n\n${withStableFragments.slice(index)}`;
-  return `${withLanguage}\n\n---\n\n${input.runtimeDatetimeBlock}`;
+  // Keep the response-language contract after the English-authored role,
+  // workflow, runtime, and skill context. This makes the user's selected
+  // language the final stable instruction instead of letting a later agent
+  // workflow accidentally establish English as the response style.
+  return `${withStableFragments}\n\n---\n\n${input.languageDirective}\n\n---\n\n${input.runtimeDatetimeBlock}`;
 }
 
 /** Render the output-format preference shared by commander and group agents. */

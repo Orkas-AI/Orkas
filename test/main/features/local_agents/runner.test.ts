@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import * as net from 'node:net';
 
 // Mocks must be declared at top-level for vi to hoist them. The
 // registry mock keeps real exports but swaps `detectOne`; the claude
@@ -54,7 +55,62 @@ async function loadRunner() {
   return import('../../../../src/main/features/local_agents/runner');
 }
 
+async function callRunnerBridge(
+  bridge: { server: { env: Record<string, string> } },
+  method: string,
+  params: Record<string, unknown>,
+): Promise<any> {
+  const envFile = bridge.server.env.ORKAS_BRIDGE_ENV_FILE;
+  const secret = JSON.parse(fs.readFileSync(envFile, 'utf8'));
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(secret.ORKAS_BRIDGE_SOCKET);
+    socket.setEncoding('utf8');
+    let buf = '';
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('bridge test RPC timed out'));
+    }, 4000);
+    socket.on('connect', () => socket.write(`${JSON.stringify({
+      id: 1,
+      token: secret.ORKAS_BRIDGE_TOKEN,
+      method,
+      params,
+    })}\n`));
+    socket.on('data', (chunk: string) => {
+      buf += chunk;
+      const idx = buf.indexOf('\n');
+      if (idx < 0) return;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(JSON.parse(buf.slice(0, idx)));
+    });
+    socket.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 describe('local_agents/runner', () => {
+  it('advertises only granted bridge categories and directs Commander-only work to handoff', async () => {
+    const runner = await loadRunner();
+    const restricted = runner.buildBridgeSystemPrompt([
+      'skills.read', 'skills.run', 'kb.read', 'chat.read', 'commander.handoff',
+    ]);
+    expect(restricted).toContain('orkas_handoff_to_commander');
+    expect(restricted).toContain('Do not emit Commander-only <auto-task>');
+    expect(restricted).not.toContain('orkas_list_connector_tools');
+
+    const connectorGranted = runner.buildBridgeSystemPrompt(['connectors', 'commander.handoff']);
+    expect(connectorGranted).toContain('ordinary Orkas group-chat Agent');
+    expect(connectorGranted).toContain('orkas_call_connector_tool');
+
+    const openOnly = runner.buildBridgeSystemPrompt(['skills.read', 'skills.run']);
+    expect(openOnly).toContain('orkas_run_skill');
+    expect(openOnly).not.toContain('orkas_handoff_to_commander');
+    expect(openOnly).not.toContain('<auto-task>');
+  });
+
   it('builds local agent log context without raw prompts, args, resume ids, or paths', async () => {
     const runner = await loadRunner();
     const ctx = runner.localAgentRunContextForLog({
@@ -63,7 +119,6 @@ describe('local_agents/runner', () => {
       agentId: 'agent-private-abcdef',
       projectId: 'project-private-abcdef',
       cli: 'claude',
-      model: 'claude-test',
       customArgs: ['--token', 'super-secret-token'],
       resumeSessionId: 'resume-private-session-id',
       prompt: 'private prompt body',
@@ -315,11 +370,130 @@ describe('local_agents/runner', () => {
     expect(meta.endedAt).toBeTruthy();
   });
 
-  it('removes private thinking text before forwarding or persistence', async () => {
-    const privateThought = 'PRIVATE_THOUGHT_SENTINEL: recall the user profile';
+  it('adds and persists a duration for each correlated CLI tool result', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent }) => {
-      onEvent({ type: 'thinking', text: privateThought });
+      onEvent({
+        type: 'tool-event', tool: 'web_fetch', callId: 'web-1', phase: 'use',
+        input: { url: 'https://example.com/docs' },
+      });
+      onEvent({
+        type: 'tool-event', tool: 'tool_result', callId: 'web-1', phase: 'result',
+        output: 'ok',
+      });
+      onEvent({
+        type: 'tool-event', tool: 'read_file', callId: 'read-1', phase: 'use',
+        input: { path: 'README.md' },
+      });
+      onEvent({
+        type: 'tool-event', tool: 'tool_result', callId: 'read-1', phase: 'result',
+        durationMs: 41, output: 'read',
+      });
+      onEvent({ type: 'done', status: 'completed', output: 'done', durationMs: 1 });
+    };
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-tool-duration', agentId: 'agent-x',
+      cli: 'claude', prompt: 'read docs', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    const resultEvent = events.find((event) => event.type === 'tool-event' && event.phase === 'result');
+    expect(resultEvent.durationMs).toBeGreaterThanOrEqual(0);
+    expect(events.find((event) => event.type === 'tool-event'
+      && event.callId === 'read-1' && event.phase === 'result'))
+      .toMatchObject({ phase: 'result', durationMs: 41 });
+
+    const eventPath = path.join(
+      tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'events.jsonl',
+    );
+    const persisted = fs.readFileSync(eventPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(persisted.find((event) => event.type === 'tool-event' && event.phase === 'result'))
+      .toMatchObject({ callId: 'web-1', durationMs: resultEvent.durationMs });
+    expect(persisted.find((event) => event.type === 'tool-event'
+      && event.callId === 'read-1' && event.phase === 'result'))
+      .toMatchObject({ phase: 'result', durationMs: 41 });
+  });
+
+  it('forwards the backend active-run ingress and always clears it after the attempt', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const ingress = {
+      submit: vi.fn(async (input: any) => ({ mode: 'steered', acceptedId: input.id })),
+    };
+    mockBackendImpl = async ({ onActiveRunIngress, onEvent }) => {
+      onActiveRunIngress?.(ingress);
+      onEvent({ type: 'done', status: 'completed', output: 'ok' });
+      // Deliberately omit the backend-side null callback: runner must fail
+      // closed even for an adapter that throws or forgets terminal cleanup.
+    };
+    const runner = await loadRunner();
+    const states: any[] = [];
+
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-ingress',
+      agentId: 'agent-x',
+      currentMessageId: 'message-x',
+      cli: 'claude',
+      prompt: 'do work',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      onActiveRunIngress: value => states.push(value),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(states).toEqual([ingress, null]);
+  });
+
+  it('returns a structured Commander handoff recorded through the live run bridge', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ bridge, onEvent }) => {
+      const reply = await callRunnerBridge(bridge, 'commander.handoff', {
+        reason: 'Automation creation belongs to Commander.',
+        context: 'Create a daily task at 08:00.',
+      });
+      expect(reply).toMatchObject({ ok: true, result: { accepted: true } });
+      onEvent({ type: 'done', status: 'completed', output: 'Transferred with requirements intact.' });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID,
+      cid: 'c-commander-handoff',
+      agentId: 'agent-x',
+      agentName: 'CLI Agent',
+      currentMessageId: 'message-x',
+      cli: 'claude',
+      prompt: 'create an automation',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result).toMatchObject({
+      status: 'completed',
+      commanderHandoff: {
+        reason: 'Automation creation belongs to Commander.',
+        context: 'Create a daily task at 08:00.',
+      },
+    });
+  });
+
+  it('keeps a bounded reasoning summary while removing raw thinking text', async () => {
+    const privateThought = 'PRIVATE_THOUGHT_SENTINEL: recall the user profile';
+    const publicSummary = 'Reviewing the relevant project files';
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({
+        type: 'thinking',
+        text: privateThought,
+        summary: publicSummary,
+        itemId: 'reasoning-1',
+        heartbeat: true,
+      });
       onEvent({ type: 'done', status: 'completed', output: 'Public answer' });
     };
 
@@ -332,7 +506,13 @@ describe('local_agents/runner', () => {
       onEvent: e => events.push(e),
     });
 
-    expect(events[0]).toEqual({ type: 'thinking', chars: privateThought.length });
+    expect(events[0]).toEqual({
+      type: 'thinking',
+      chars: privateThought.length,
+      summary: publicSummary,
+      itemId: 'reasoning-1',
+      heartbeat: true,
+    });
     expect(JSON.stringify(events)).not.toContain('PRIVATE_THOUGHT_SENTINEL');
 
     const eventsPath = path.join(
@@ -349,7 +529,28 @@ describe('local_agents/runner', () => {
     expect(JSON.parse(persisted.trim().split('\n')[0])).toEqual({
       type: 'thinking',
       chars: privateThought.length,
+      summary: publicSummary,
+      itemId: 'reasoning-1',
+      heartbeat: true,
     });
+  });
+
+  it('redacts and bounds public reasoning summaries', async () => {
+    const runner = await loadRunner();
+    const raw = [
+      // The semicolon is a realistic prose boundary and ensures this one case
+      // independently exercises path hashing, secret masking, and truncation.
+      'Reviewing /Users/test/private/customer-plan.md;',
+      'token=sk-proj-local-agent-secret-123456789',
+      'x'.repeat(3_000),
+    ].join(' ');
+    const summary = runner.sanitizePublicThinkingSummary(raw);
+
+    expect(summary).not.toContain('/Users/alice');
+    expect(summary).not.toContain('sk-proj-local-agent-secret-123456789');
+    expect(summary).toMatch(/^Reviewing <abs-path:[a-f0-9]{12}>; token=\*\*\*/);
+    expect(summary.length).toBeLessThanOrEqual(2_049);
+    expect(summary.endsWith('…')).toBe(true);
   });
 
   it('redacts private CLI diagnostics before forwarding or persistence', async () => {
@@ -654,13 +855,27 @@ describe('local_agents/runner', () => {
       const idleCount2 = events.filter(e => e.type === 'idle').length;
       expect(idleCount2).toBeGreaterThan(idleCount1);
 
-      // Backend emits a real event — deadline should reset, so no new
-      // idle pulse during the next sub-threshold window.
-      onEventCb!({ type: 'text-delta', text: 'still here' });
-      const beforeReset = events.filter(e => e.type === 'idle').length;
+      // A content-free Codex reasoning heartbeat is UI liveness only. It must
+      // remain visible without resetting the real backend-activity deadline.
+      onEventCb!({ type: 'thinking', chars: 0, itemId: 'reasoning-1', heartbeat: true, synthetic: true });
+      const beforeHeartbeat = events.filter(e => e.type === 'idle').length;
       await vi.advanceTimersByTimeAsync(80);  // less than 120ms threshold
-      const afterReset = events.filter(e => e.type === 'idle').length;
-      expect(afterReset).toBe(beforeReset);  // no new idle fired
+      const afterHeartbeat = events.filter(e => e.type === 'idle').length;
+      expect(afterHeartbeat).toBeGreaterThan(beforeHeartbeat);
+      expect(events).toContainEqual({
+        type: 'thinking',
+        chars: 0,
+        itemId: 'reasoning-1',
+        heartbeat: true,
+        synthetic: true,
+      });
+
+      // A real protocol event still resets both idle reporting and the
+      // backend watchdog activity clock.
+      onEventCb!({ type: 'status', status: 'running' });
+      const beforeRealReset = events.filter(e => e.type === 'idle').length;
+      await vi.advanceTimersByTimeAsync(80);
+      expect(events.filter(e => e.type === 'idle')).toHaveLength(beforeRealReset);
 
       resolveBackend();
       await vi.advanceTimersByTimeAsync(0);
@@ -675,8 +890,9 @@ describe('local_agents/runner', () => {
   });
 
   it('spills oversized tool-event results to disk and rewrites output + outputPath', async () => {
-    const { PERSIST_THRESHOLD } = await import('../../../../src/main/util/tool-result-cap');
-    const big = 'X'.repeat(PERSIST_THRESHOLD + 200);
+    const { DEFAULT_INLINE_RESULT_TOKENS } = await import('../../../../src/main/util/tool-result-cap');
+    // ASCII length past the token-aware spill budget (~4 chars per token).
+    const big = 'X'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4 + 200);
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent }) => {
       onEvent({ type: 'process-info', pid: 1, cwd: '/x', cmd: 'claude', args: [] });

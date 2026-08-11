@@ -49,6 +49,7 @@ function makeElement(tag: string): any {
 
 function loadConnectorsRenderer(
   invoke: (channel: string, payload: any) => Promise<any> = async () => ({ ok: true }),
+  confirmInstall: (args?: any) => Promise<boolean> = async () => true,
 ) {
   const code = fs.readFileSync(
     path.join(__dirname, '../../src/renderer/modules/connectors.js'),
@@ -56,16 +57,28 @@ function loadConnectorsRenderer(
   );
   const storage = new Map<string, string>();
   const alerts: string[] = [];
+  const clicks: Array<[string, Record<string, unknown>]> = [];
   const events: Array<[string, Record<string, unknown>]> = [];
   const errors: Array<[string, Record<string, unknown>]> = [];
   const pushHandlers = new Map<string, (payload: any) => void>();
+  const windowHandlers = new Map<string, Array<(payload?: any) => void>>();
+  const timers = new Map<number, { at: number; handler: () => void }>();
+  let timerNow = 0;
+  let timerId = 0;
   const monitor = {
-    click: () => {},
+    click: (name: string, data: Record<string, unknown>) => { clicks.push([name, data]); },
     event: (name: string, data: Record<string, unknown>) => { events.push([name, data]); },
     error: (name: string, data: Record<string, unknown>) => { errors.push([name, data]); },
   };
   const context: any = {
     console,
+    AbortController,
+    setTimeout: (handler: () => void, delay = 0) => {
+      const id = ++timerId;
+      timers.set(id, { at: timerNow + Number(delay || 0), handler });
+      return id;
+    },
+    clearTimeout: (id: number) => { timers.delete(id); },
     performance: { now: () => 100 },
     currentUserId: 'u-degraded',
     currentView: 'connectors',
@@ -87,8 +100,14 @@ function loadConnectorsRenderer(
       removeEventListener: () => {},
     },
     window: {
-      addEventListener: () => {},
-      removeEventListener: () => {},
+      addEventListener: (name: string, handler: (payload?: any) => void) => {
+        const handlers = windowHandlers.get(name) || [];
+        handlers.push(handler);
+        windowHandlers.set(name, handlers);
+      },
+      removeEventListener: (name: string, handler: (payload?: any) => void) => {
+        windowHandlers.set(name, (windowHandlers.get(name) || []).filter((item) => item !== handler));
+      },
       innerWidth: 1200,
       innerHeight: 800,
       Monitor: monitor,
@@ -99,6 +118,11 @@ function loadConnectorsRenderer(
     },
     Monitor: monitor,
     uiAlert: (message: string) => { alerts.push(message); },
+    uiConfirmDanger: async () => true,
+    uiConfirm: confirmInstall,
+    setView: () => {},
+    setChatRecipient: () => {},
+    setChatConnector: () => {},
     // Echo the key so assertions can match on it without depending on locale copy.
     t: (key: string, params?: Record<string, unknown>) =>
       (params && 'n' in params ? `${key}:${params.n}` : key),
@@ -119,9 +143,30 @@ function loadConnectorsRenderer(
     vm.runInContext('_connectorsState.instances = __pending;', context);
   };
   context.__alerts = alerts;
+  context.__clicks = clicks;
   context.__events = events;
   context.__errors = errors;
   context.__emitPush = (channel: string, payload: any) => pushHandlers.get(channel)?.(payload);
+  context.__emitWindow = (name: string, payload?: any) => {
+    for (const handler of windowHandlers.get(name) || []) handler(payload);
+  };
+  context.__advanceTimers = (durationMs: number) => {
+    timerNow += durationMs;
+    while (true) {
+      const due = [...timers.entries()]
+        .filter(([, timer]) => timer.at <= timerNow)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0]);
+      if (!due.length) break;
+      const [id, timer] = due[0];
+      timers.delete(id);
+      timer.handler();
+    }
+  };
+  context.__runInstallConfirm = async (info: unknown) => {
+    context.__pendingInstallInfo = info;
+    vm.runInContext('_connectorInstallQueue.push(__pendingInstallInfo);', context);
+    await context._drainConnectorInstallQueue();
+  };
   return context;
 }
 
@@ -177,6 +222,87 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     // LLM so a tool call can heal it.
     expect(ctx.isConnectorLive('gsearch-console')).toBe(false);
     expect(ctx.listUsableConnectorsForPicker().map((c: any) => c.id)).not.toContain('gsearch-console');
+  });
+
+  it('reports one diagnostic result for an enable business failure without a paired error', async () => {
+    const ctx = loadConnectorsRenderer(async (channel: string) => {
+      if (channel === 'connectors.set_enabled') {
+        return { ok: false, code: 'E_STORAGE', error: 'network unavailable' };
+      }
+      return { ok: true };
+    });
+
+    await ctx._toggleConnectorEnabled(
+      { id: 'notion', display_name: 'Notion' },
+      { id: 'notion', status: { kind: 'connected' }, enabled: true },
+      false,
+    );
+
+    expect(ctx.__alerts).toHaveLength(1);
+  });
+
+  it('does not overwrite a committed enable success when the presentation refresh throws', async () => {
+    const ctx = loadConnectorsRenderer(async (channel: string) => {
+      if (channel === 'connectors.set_enabled') return { ok: true };
+      return { ok: true };
+    });
+    ctx._renderConnectorsGrid = () => { throw new Error('render refresh failed'); };
+
+    await expect(ctx._toggleConnectorEnabled(
+      { id: 'notion', display_name: 'Notion' },
+      { id: 'notion', status: { kind: 'connected' }, enabled: true },
+      false,
+    )).rejects.toThrow('render refresh failed');
+
+  });
+
+  it('fails a broken Agent install dialog closed and reports one bounded failure', async () => {
+    const invoke = vi.fn(async () => ({ handled: true }));
+    const ctx = loadConnectorsRenderer(
+      invoke,
+      async () => { throw new Error('/Users/test/private/dialog.json'); },
+    );
+
+    await ctx.__runInstallConfirm({
+      request_id: 'private-request',
+      display_name: 'Private Server',
+      summary: 'private command',
+      kind: 'stdio',
+    });
+
+    expect(invoke).toHaveBeenCalledWith('connectors.install_confirm_response', {
+      request_id: 'private-request',
+      approved: false,
+    });
+  });
+
+  it('closes a main-cancelled Agent install dialog without a stale response or funnel row', async () => {
+    const invoke = vi.fn(async () => ({ handled: true }));
+    const ctx = loadConnectorsRenderer(
+      invoke,
+      async (args) => new Promise<boolean>((resolve) => {
+        args.signal.addEventListener('abort', () => resolve(false), { once: true });
+      }),
+    );
+
+    ctx.__emitPush('connectors:install-confirm', {
+      request_id: 'cancelled-install',
+      display_name: 'Private Server',
+      summary: 'private command',
+      kind: 'stdio',
+    });
+    await Promise.resolve();
+    ctx.__emitPush('connectors:install-confirm-cancelled', {
+      request_ids: ['cancelled-install'],
+      cid: 'c1',
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(ctx.__events).toEqual([]);
+    expect(vm.runInContext('_connectorInstallDialogOpen', ctx)).toBe(false);
   });
 
   it('still renders a genuinely connected card as connected', () => {
@@ -303,7 +429,9 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     });
     const ctx = loadConnectorsRenderer(invoke);
 
-    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+    const entry = { id: 'github', display_name: 'GitHub' };
+    await ctx._runConnect(entry);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
     expect(ctx.__events.filter(([name]: [string]) => name === 'connector_connect_result')).toEqual([]);
 
     ctx.__emitPush('connectors:oauth-result', {
@@ -316,9 +444,10 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx.__events).toEqual([]);
     expect(ctx.__errors).toEqual([]);
     expect(ctx.__alerts).toEqual([]);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
   });
 
-  it('shows loading only after the browser returns and clears it on the matching result', async () => {
+  it('shows disabled loading immediately, clears launch feedback on blur, then tracks callback finalization', async () => {
     const invoke = vi.fn(async (channel: string) => {
       if (channel === 'connectors.start_oauth') {
         return { ok: true, started: true, attempt_id: 'attempt-loading' };
@@ -331,6 +460,12 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     const entry = { id: 'github', display_name: 'GitHub' };
 
     await ctx._runConnect(entry);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('disabled');
+
+    // Opening the system browser moves focus away from Orkas. Only the short launch spinner is
+    // cleared; the accepted attempt remains correlated for callback/result telemetry.
+    ctx.__emitWindow('blur');
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
 
     ctx.__emitPush('connectors:oauth-callback', {
@@ -339,6 +474,8 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     });
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('connectors.action.connecting');
+    ctx.__advanceTimers(2000);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
 
     // A stale terminal event must not clear the active callback's feedback.
     ctx.__emitPush('connectors:oauth-result', {
@@ -358,6 +495,45 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     });
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
     expect(ctx.__events).toEqual([]);
+  });
+
+  it('throttles clicks for two seconds while keeping launch loading visible until window blur', async () => {
+    const resolveStarts: Array<(value: unknown) => void> = [];
+    const invoke = vi.fn((channel: string) => {
+      if (channel === 'connectors.start_oauth') {
+        return new Promise((resolve) => { resolveStarts.push(resolve); });
+      }
+      return Promise.resolve({ ok: true });
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+    const entry = { id: 'gmail', display_name: 'Gmail' };
+
+    const first = ctx._runConnect(entry);
+    const second = ctx._runConnect(entry);
+
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'connectors.start_oauth')).toHaveLength(1);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('aria-busy="true"');
+
+    ctx.__advanceTimers(1999);
+    await ctx._runConnect(entry);
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'connectors.start_oauth')).toHaveLength(1);
+
+    ctx.__advanceTimers(1);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('disabled');
+    const retry = ctx._runConnect(entry);
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'connectors.start_oauth')).toHaveLength(2);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('aria-busy="true"');
+
+    resolveStarts[0]({ ok: true, started: true, attempt_id: 'attempt-old' });
+    resolveStarts[1]({ ok: true, started: true, attempt_id: 'attempt-retry' });
+    await Promise.all([first, second, retry]);
+
+    ctx.__advanceTimers(2000);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('disabled');
+    ctx.__emitWindow('blur');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
   });
 
   it('reports an asynchronous user cancellation without an error or alert', async () => {
@@ -428,10 +604,12 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     });
     const ctx = loadConnectorsRenderer(invoke);
 
-    await ctx._runConnect({ id: 'github', display_name: 'GitHub' });
+    const entry = { id: 'github', display_name: 'GitHub' };
+    await ctx._runConnect(entry);
 
     expect(ctx.__events).toEqual([]);
     expect(ctx.__errors).toEqual([]);
     expect(ctx.__alerts).toHaveLength(1);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
   });
 });

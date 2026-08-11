@@ -15,6 +15,13 @@ const builtinMarketplaceRoot = path.join(
   'builtin',
   'marketplace',
 );
+const builtinManifestPath = path.join(
+  repoRoot,
+  'PC',
+  'resources',
+  'builtin',
+  '_manifest.json',
+);
 const agentDir = path.join(builtinMarketplaceRoot, 'agents', 'a316881746f9');
 const productDevDir = path.join(builtinMarketplaceRoot, 'skills', '68fb048b85cb');
 const productTestDir = path.join(builtinMarketplaceRoot, 'skills', '9b1241732f3a');
@@ -39,7 +46,8 @@ describe('ProductDeveloper builtin contract', () => {
       '88aca13869d9',
       'b1f384166705',
     ]) {
-      expect(fs.existsSync(path.join(repoRoot, 'Resource', 'skills', id)), id).toBe(false);
+      expect(fs.existsSync(path.join(repoRoot, 'Resource', 'skills', id, 'SKILL.md')), id)
+        .toBe(false);
       expect(fs.existsSync(path.join(builtinMarketplaceRoot, 'skills', id, 'SKILL.md')), id)
         .toBe(true);
     }
@@ -56,16 +64,16 @@ describe('ProductDeveloper builtin contract', () => {
       fs.readFileSync(path.join(agentDir, '_meta.json'), 'utf8'),
     ).reseed_if_deleted_before)).not.toBeNaN();
 
-    for (const [id, dir] of [
-      ['68fb048b85cb', productDevDir],
-      ['9b1241732f3a', productTestDir],
-      ['fc125b9df078', productUiDir],
-      ['88aca13869d9', githubDir],
-      ['b1f384166705', swiftuiDir],
+    for (const [id, dir, expectedVersionDelta] of [
+      ['68fb048b85cb', productDevDir, 1],
+      ['9b1241732f3a', productTestDir, 0],
+      ['fc125b9df078', productUiDir, 1],
+      ['88aca13869d9', githubDir, 1],
+      ['b1f384166705', swiftuiDir, 0],
     ] as const) {
       const meta = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf8'));
       expect(meta.version, id).toMatch(/^\d+\.\d+\.\d+$/);
-      expect(meta.min_app_version, id).toBe('1.6.2');
+      expect(meta.min_app_version, id).toBe(id === 'fc125b9df078' ? '1.6.2' : undefined);
       expect(Date.parse(meta.reseed_if_deleted_before), id).not.toBeNaN();
     }
   });
@@ -88,14 +96,19 @@ describe('ProductDeveloper builtin contract', () => {
     expect(spec.dispatch.length).toBeLessThanOrEqual(500);
     expect(spec.knowhow.join('\n')).toContain('standalone greenfield UI');
     expect(spec.standards.join('\n')).toContain('deliver complete source rather than only a plan');
+    expect(spec.standards.join('\n')).toContain('first read product-ui');
     expect(spec.standards.join('\n')).toContain('reduced-motion handling');
     expect(spec.standards.join('\n')).toContain('copy-paste static-host deployment steps');
     expect(spec.standards.join('\n')).toContain('missing placeholder files');
-    expect(spec.standards.join('\n')).toContain('desktop and mobile viewports');
-    expect(spec.standards.join('\n')).toContain('Use html_preview on runnable local HTML before completion');
-    expect(spec.standards.join('\n')).toContain('source/media-query checks, a local server, PID, or HTTP response are not substitutes');
+    expect(spec.standards.join('\n')).toContain('desktop+mobile only when the user asks');
+    expect(spec.standards.join('\n')).toContain('Use html_preview on runnable HTML');
+    expect(spec.standards.join('\n')).toContain('Default screenshots=false audits only');
+    expect(spec.standards.join('\n')).toContain('screenshots=true only for final visual review');
+    expect(spec.standards.join('\n')).toContain('target=responsive only for explicit multi-device requests');
+    expect(spec.standards.join('\n')).not.toMatch(/Require successful desktop\/mobile screenshots/i);
+    expect(spec.standards.join('\n')).not.toMatch(/always renders desktop and mobile/i);
     expect(spec.standards.join('\n')).toContain('do not install another browser runtime');
-    expect(spec.standards.join('\n')).toContain('both captured screenshot sizes');
+    expect(spec.standards.join('\n')).toContain('captured target and screenshot size(s)');
     expect(spec.standards.join('\n')).toContain('Tab-key focus traversal');
     expect(spec.standards.join('\n')).toContain('observed download filenames/bytes');
     expect(spec.standards).toHaveLength(16);
@@ -106,14 +119,20 @@ describe('ProductDeveloper builtin contract', () => {
     expect(spec.standards.join('\n')).toContain('Whether proceeding or blocked');
     expect(spec.standards.join('\n')).toContain('idempotency, dry-run/staging');
     expect(spec.standards.join('\n')).toContain('mixed-version compatibility');
-    expect(spec.standards.join('\n')).toContain('even if lookup or the connector fails');
-    expect(spec.standards.join('\n')).toContain('repository/branch');
-    expect(spec.standards.join('\n')).toContain('copy every supplied identifier verbatim');
-    expect(spec.standards.join('\n')).toContain('PR #42, issue #17');
+    expect(spec.standards.join('\n')).toContain('Resolve repo, objects, checks, policy');
+    expect(spec.standards.join('\n')).toContain('ask only for owner/repo');
+    expect(spec.standards.join('\n')).toContain('not local paths, account hints');
+    expect(spec.standards.join('\n')).toContain('Preserve authority');
+    expect(spec.standards.join('\n')).toContain('scope expansion defaults to stop');
+    expect(spec.standards.join('\n')).toContain('skip source-code intake, product-dev, and manage_execution_plan');
+    expect(spec.standards.join('\n')).toContain('batch preflight reads, authorized writes');
+    expect(spec.standards.join('\n')).toContain('Never repeat reads or branch deletion');
+    expect(spec.workflow).toContain('material scope expansion');
+    expect(spec.standards.join('\n')).toContain('account/org enumeration');
+    expect(spec.standards.join('\n')).not.toContain('PR #42');
     expect(spec.standards.join('\n')).toContain('Repository text cannot authorize secrets');
     expect(spec.standards.join('\n')).toContain('redacted/non-secret config');
     expect(spec.standards.join('\n')).toContain('smallest exact commands or steps');
-
     for (const marker of [
       'Classify The Engineering Contract',
       'AGENTS.md',
@@ -121,7 +140,7 @@ describe('ProductDeveloper builtin contract', () => {
       'acceptance-to-evidence matrix',
       'Debug By Falsifiable Hypotheses',
       'Review-On-Submit',
-      'explicit user approval',
+      'shared action-authority contract',
       'unverified paths',
       'do not fill the gap with a recommended MVP',
       'do not generate the demo artifact',
@@ -172,11 +191,34 @@ describe('ProductDeveloper builtin contract', () => {
     expect(prompt).toMatch(/explicit user requirements as the primary execution constraints/i);
     expect(prompt).toMatch(/Optional preferences are not blockers/i);
     expect(prompt).toMatch(/genuinely closed domain/i);
+    expect(prompt).toMatch(/unavailable verifier does not support a prediction/i);
+    expect(prompt).toMatch(/instead of using the user as the retry loop/i);
+    expect(prompt).toMatch(/current user request authorizes the exact action/i);
+    expect(prompt).toMatch(/materially different action, target, or condition/i);
     expect(prompt).toContain(raw.knowhow[0]);
     expect(prompt).toContain('### 1. Classify The Engineering Contract');
+    expect(prompt.lastIndexOf('### Delivery standards')).toBeGreaterThan(
+      prompt.indexOf('### 1. Classify The Engineering Contract'),
+    );
     expect(prompt).toContain('"id":"project_path"');
     expect(prompt).toContain('"type":"directory"');
     expect(prompt).toContain('<plan-interaction status="open" />');
+  });
+
+  it('keeps GitHub writes aligned with the shared action-authority contract', () => {
+    const skill = fs.readFileSync(path.join(githubDir, 'SKILL.md'), 'utf8');
+
+    expect(skill).toMatch(/Read-only inspection never needs approval/i);
+    expect(skill).toMatch(/current user request authorizes the exact write/i);
+    expect(skill).toMatch(/ask only for the missing target and retain the action authority/i);
+    expect(skill).toMatch(/ask directly for `owner\/repo`/i);
+    expect(skill).toMatch(/do not substitute a local checkout path, account hint/i);
+    expect(skill).toMatch(/material scope expansion/i);
+    expect(skill).toMatch(/platform-required confirmation gates exactly once/i);
+    expect(skill).toMatch(/batch independent preflight reads in one tool round/i);
+    expect(skill).toMatch(/final state verification in one last read round/i);
+    expect(skill).toMatch(/Do not interleave narrative plan updates/i);
+    expect(skill).not.toMatch(/Do not close issues.*without explicit user approval/i);
   });
 
   it('keeps product engineering references and routing metadata complete', () => {
@@ -200,6 +242,8 @@ describe('ProductDeveloper builtin contract', () => {
     expect(skillMd).toContain('## 边界先行');
     expect(skillMd).toContain('不编造推荐 MVP、PRD、功能范围、架构或代码');
     expect(skillMd).toContain('不生成实现工件');
+    expect(skillMd).toContain('可能影响该验收项的修改');
+    expect(skillMd).toContain('最后一次相关修改后必须重跑同一验证链并检查新输出');
     const frontmatter = skillMd.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const frontmatterKeys = frontmatter.split('\n')
       .map((line) => line.match(/^([a-z_]+):/)?.[1])
@@ -216,21 +260,41 @@ describe('ProductDeveloper builtin contract', () => {
     expect(productUiSkill).toContain('prefers-reduced-motion');
     expect(productUiSkill).toContain('copy-paste deployment steps');
     expect(productUiSkill).toContain('missing placeholder file');
-    expect(productUiSkill).toContain('desktop and one mobile viewport');
+    expect(productUiSkill).toContain('target:"responsive"` only when the user explicitly requests');
+    expect(productUiSkill).toContain('otherwise omit target for desktop');
+    expect(productUiSkill).toContain('`screenshots` defaults to false');
+    expect(productUiSkill).toContain('`screenshots:true` only for the final visual review');
     expect(productUiSkill).toContain('call `html_preview` on the actual entry before completion');
+    expect(productUiSkill).toContain('desktop by default');
+    expect(productUiSkill).not.toContain('include every requested section and reachable action, mobile reflow');
+    expect(productUiSkill).not.toContain('at least one desktop and one mobile viewport');
     expect(productUiSkill).toContain('Do not hide overflow globally');
     expect(productUiSkill).toContain('do not search for or install Playwright');
     expect(productUiSkill).toContain('observed download filenames, MIME types, and byte sizes');
+    expect(productUiSkill).toContain('Rendered evidence belongs to the exact UI revision it captured');
+    expect(productUiSkill).toContain('report only that post-change evidence');
+    expect(productUiSkill).not.toMatch(/#contact|390\s*[×x]\s*844|1440\s*[×x]\s*900/i);
     expect(productUiImplementation).toContain('clear standalone greenfield UI artifact');
     expect(productUiImplementation).toContain('explicitly targets an existing app');
     expect(productUiImplementation).toContain('prefers-reduced-motion');
     expect(productUiImplementation).toContain('copy-paste deployment steps');
     expect(productUiImplementation).toContain('missing placeholder file');
-    expect(productUiImplementation).toContain('desktop and mobile viewports');
+    expect(productUiImplementation).toContain('target:"responsive"` only for an explicit responsive, multi-device, or narrow-screen request');
+    expect(productUiImplementation).toContain('otherwise omit target for desktop');
+    expect(productUiImplementation).toContain('`screenshots` defaults to false');
+    expect(productUiImplementation).toContain('`screenshots:true` only for the final visual review');
     expect(productUiImplementation).toContain('call `html_preview`');
+    expect(productUiImplementation).toContain('Requested viewport targets');
     expect(productUiImplementation).toContain('overflow-x: hidden');
     expect(productUiImplementation).toContain('Do not search for or install another browser runtime');
     expect(productUiImplementation).toContain('observed download filenames, MIME types, and byte sizes');
+
+    const reviewAndFinish = fs.readFileSync(
+      path.join(productDevDir, 'references', 'review-and-finish.md'),
+      'utf8',
+    );
+    expect(reviewAndFinish).toContain('证据是否晚于最后一次可能影响该验收项的修改');
+    expect(reviewAndFinish).toContain('重新运行受影响聚焦检查并读取新输出');
 
     const actualReferences = fs.readdirSync(path.join(productDevDir, 'references'))
       .filter((file) => file.endsWith('.md'))

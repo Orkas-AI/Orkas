@@ -243,6 +243,61 @@ export function setConnectorEnabled(uid: string, connectorId: string, enabled: b
   log.info(`connector ${connectorId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
+/**
+ * Move an explicit agent/skill disabled override to a replacement id.
+ *
+ * Both ids receive item clocks in the same atomic file write: the source clock
+ * is an enable tombstone so an older synced device cannot resurrect the legacy
+ * false key, while the destination receives the migrated override. A newer
+ * destination decision always wins (for example, a user already re-enabled
+ * the canonical id on another device).
+ *
+ * An absent source override is never re-migrated even when its tombstone clock
+ * remains, which makes retries idempotent.
+ */
+export function migrateComponentEnabledId(
+  uid: string,
+  kind: 'agent' | 'skill',
+  fromId: string,
+  toId: string,
+): boolean {
+  if (!fromId || !toId) throw new Error('fromId and toId required');
+  if (fromId === toId) return false;
+
+  const bucketKey = kind === 'agent' ? 'agents' : 'skills';
+  const cur = readEnabledMap(uid);
+  const clocks = sanitiseClocks(cur._item_updated_at) || {};
+  const bucketClocks = clocks[bucketKey] || {};
+  const sourceDisabled = Object.prototype.hasOwnProperty.call(cur[bucketKey], fromId);
+  const sourceClock = Number(bucketClocks[fromId]) || 0;
+  if (!sourceDisabled) return false;
+
+  const destinationHasOverride = Object.prototype.hasOwnProperty.call(cur[bucketKey], toId);
+  const destinationClock = Number(bucketClocks[toId]) || 0;
+  const destinationHasDecision = destinationHasOverride || destinationClock > 0;
+  const sourceWins = !destinationHasDecision || destinationClock <= 0 || sourceClock > destinationClock;
+
+  const next: ComponentEnabledFile = {
+    version: SCHEMA_VERSION,
+    agents: { ...cur.agents },
+    skills: { ...cur.skills },
+    connectors: { ...cur.connectors },
+    _item_updated_at: clocks,
+  };
+  delete next[bucketKey][fromId];
+  touchClock(next, bucketKey, fromId);
+
+  if (sourceWins) {
+    next[bucketKey][toId] = false;
+    touchClock(next, bucketKey, toId);
+  }
+
+  writeAtomic(uid, next);
+  _notifyDirty();
+  log.info(`${kind} enabled-state id migrated ${fromId} → ${toId}${sourceWins ? '' : ' (newer destination kept)'}`);
+  return true;
+}
+
 /** Bulk read — used by the renderer to render toggle states without re-fetching
  *  per row. Returns `{agents, skills, connectors: Set<disabledId>}`. */
 export function readDisabledSets(uid: string): { agents: Set<string>; skills: Set<string>; connectors: Set<string> } {

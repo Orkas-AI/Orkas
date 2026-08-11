@@ -315,6 +315,40 @@ describe('produced.readText › size cap', () => {
   });
 });
 
+describe('produced.readText › inferred visual HTML layout', () => {
+  it('recognizes the legacy responsive-poster canvas contract', async () => {
+    const { _inferHtmlPreviewLayoutFromCssForTest } = await import('../../../src/main/ipc/index');
+    const html = `<style>
+      html, body { width: 100%; height: 100%; }
+      .poster {
+        width: 100%; height: 100%;
+        max-width: 1080px; max-height: 1350px;
+        aspect-ratio: 4 / 5;
+      }
+    </style>`;
+
+    expect(_inferHtmlPreviewLayoutFromCssForTest(html))
+      .toEqual({ kind: 'fixed-canvas', width: 1080, height: 1350 });
+  });
+
+  it('accepts fixed pixel dimensions when the declared ratio agrees', async () => {
+    const { _inferHtmlPreviewLayoutFromCssForTest } = await import('../../../src/main/ipc/index');
+    expect(_inferHtmlPreviewLayoutFromCssForTest(
+      '<style>.slide { width: 1920px; height: 1080px; aspect-ratio: 1.7777778; }</style>',
+    )).toEqual({ kind: 'fixed-canvas', width: 1920, height: 1080 });
+  });
+
+  it.each([
+    '<style>.poster { max-width:1080px; max-height:1350px; }</style>',
+    '<style>.poster { max-width:1080px; max-height:1350px; aspect-ratio:16/9; }</style>',
+    '<style>.poster { max-width:100%; max-height:100%; aspect-ratio:4/5; }</style>',
+    '<style>.width { max-width:1080px; aspect-ratio:4/5; } .height { max-height:1350px; }</style>',
+  ])('rejects ambiguous or contradictory CSS canvas lookalike', async (html) => {
+    const { _inferHtmlPreviewLayoutFromCssForTest } = await import('../../../src/main/ipc/index');
+    expect(_inferHtmlPreviewLayoutFromCssForTest(html)).toBeNull();
+  });
+});
+
 describe('produced.readText › content', () => {
   it('strips a leading UTF-8 BOM so it doesn\'t render as an invisible char', async () => {
     const ws = await import('../../../src/main/features/user_workspace');

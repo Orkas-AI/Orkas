@@ -21,7 +21,7 @@ describe('officeArgError — OfficeCLI argument-injection guard', () => {
 
   it('page must be a positive integer', () => {
     for (const ok of ['1', '12', '007']) expect(officeArgError(ok, 'page')).toBeNull();
-    for (const bad of ['--save=/tmp/x', '-1', '1.5', 'a', '', '1 2']) {
+    for (const bad of ['0', '00', '--save=/tmp/x', '-1', '1.5', 'a', '', '1 2']) {
       expect(officeArgError(bad, 'page')).toMatch(/positive integer/);
     }
   });

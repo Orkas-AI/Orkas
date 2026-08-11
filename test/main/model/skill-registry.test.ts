@@ -96,6 +96,45 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).not.toContain('(id: 6bb95f967501)');
   });
 
+  it('builds run-scoped logical refs from the already-filtered Skill list', async () => {
+    writeSkill(builtinDir(), '6bb95f967501', 'github', 'GitHub skill');
+    writeSkill(builtinDir(), 'daa4378ab55a', 'find-skill', 'Find skill');
+    writeSkill(builtinDir(), 'not-selected', 'hidden-skill', 'Hidden skill');
+    const runtimeBindings = new Map();
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      allowlist: ['github', 'find-skill'],
+      runtimeBindings,
+    });
+
+    expect(text).toContain('read_file("@skill/<read-ref>")');
+    expect(text).toContain('read ref: @skill/github');
+    expect(text).toContain('read ref: @skill/find-skill');
+    expect(text).not.toContain(path.resolve(builtinDir()));
+    expect(text).not.toContain('internal read id');
+    expect(runtimeBindings.get('github')).toMatchObject({
+      id: '6bb95f967501',
+      name: 'github',
+      root: path.join(path.resolve(builtinDir()), '6bb95f967501'),
+    });
+    expect(runtimeBindings.get('6bb95f967501')).toBe(runtimeBindings.get('github'));
+    expect(runtimeBindings.has('hidden-skill')).toBe(false);
+    expect(runtimeBindings.has('not-selected')).toBe(false);
+  });
+
+  it('falls back to unique ids for same-name runtime refs without overwriting the first binding', async () => {
+    writeSkill(builtinDir(), '111111111111', 'agent-static-review', 'first marketplace desc');
+    writeSkill(builtinDir(), '222222222222', 'agent-static-review', 'second marketplace desc');
+    const runtimeBindings = new Map();
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ runtimeBindings });
+
+    expect(text).toContain('read ref: @skill/agent-static-review');
+    expect(text).toContain('read ref: @skill/222222222222');
+    expect(runtimeBindings.get('agent-static-review')?.id).toBe('111111111111');
+    expect(runtimeBindings.get('222222222222')?.id).toBe('222222222222');
+  });
+
   it('returns empty string when allowlist is [] (agent opting out of all skills)', async () => {
     writeSkill(builtinDir(), 'translate', 'Translate', 'T');
     const { getSystemPromptBlock } = await loadRegistry();
@@ -276,18 +315,28 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
 
     writeSkill(agentPrivateDir('video-studio'), 'private-one', 'private-one', 'first private skill');
     const { getSystemPromptBlock } = await loadRegistry();
-    const first = await getSystemPromptBlock({ agentId: 'video-studio' });
+    const firstBindings = new Map();
+    const first = await getSystemPromptBlock({
+      agentId: 'video-studio',
+      runtimeBindings: firstBindings,
+    });
 
     expect(first).toContain('private-one');
+    expect(firstBindings.get('private-one')?.id).toBe('private-one');
     expect(constructed).toBe(2); // trusted loader + one agent-private root loader
 
     writeSkill(agentPrivateDir('video-studio'), 'private-two', 'private-two', 'second private skill');
     const later = new Date(Date.now() + 2000);
     fs.utimesSync(agentPrivateDir('video-studio'), later, later);
-    const second = await getSystemPromptBlock({ agentId: 'video-studio' });
+    const secondBindings = new Map();
+    const second = await getSystemPromptBlock({
+      agentId: 'video-studio',
+      runtimeBindings: secondBindings,
+    });
 
     expect(second).toContain('private-one');
     expect(second).toContain('private-two');
+    expect(secondBindings.has('private-two')).toBe(true);
     expect(constructed).toBe(2);
   });
 
@@ -349,6 +398,22 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain(path.resolve(systemDirFor(otherUid)));
     expect(systemText).not.toContain(path.resolve(systemDir()));
     expect(fs.existsSync(path.join(systemDirFor(otherUid), 'agent-creator', 'SKILL.md'))).toBe(true);
+  });
+
+  it('registers system skills in the same run-scoped logical namespace', async () => {
+    writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
+    const runtimeBindings = new Map();
+    const { getSystemSkillsPromptBlock } = await loadRegistry();
+    const text = await getSystemSkillsPromptBlock(undefined, runtimeBindings);
+
+    expect(text).toContain('read_file("@skill/<read-ref>")');
+    expect(text).toContain('read ref: @skill/agent-creator');
+    expect(text).not.toContain('SYSTEM_SKILLS_ROOT');
+    expect(runtimeBindings.get('agent-creator')).toMatchObject({
+      id: 'agent-creator',
+      source: 'system',
+      root: path.join(path.resolve(systemDir()), 'agent-creator'),
+    });
   });
 });
 

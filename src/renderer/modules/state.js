@@ -180,20 +180,15 @@ function startPolling(cid) {
         : isGroupConversationBusy(cid);
 
       if (lastKey && lastKey !== known && _isPolledAssistantMsg(last)) {
-        // New visible assistant message arrived. While the commander is
-        // still orchestrating, this may be a mid-turn reply while other
-        // actors are still running; reloading history then detaches live
-        // placeholders and makes bubbles flash. Treat polling as rescue only
-        // once runtime is idle; the live stream owns in-flight DOM updates.
-        if (runtimeBusy) {
-          const recovered = await window.ConversationRuntime?.recoverPolledMessages?.(cid, msgs);
-          if (pollTimers.get(cid) !== timer) return;
-          if (recovered) pollMsgCounts.set(cid, lastKey);
-          return;
-        }
+        // New visible assistant message arrived. While runtime is still busy
+        // the bus observer owns every in-flight DOM update — polling must not
+        // render, because a second producer of the same message is what let one
+        // reply appear as two bubbles. Leave `pollMsgCounts` untouched so the
+        // message is still treated as unseen once runtime goes idle below.
+        if (runtimeBusy) return;
         pollMsgCounts.set(cid, lastKey);
         stopPolling(cid);
-        _onPolledResponse(cid, last);
+        await _onPolledResponse(cid, last);
         return;
       }
 
@@ -203,14 +198,14 @@ function startPolling(cid) {
       if (!runtimeBusy && isConvPending(cid) && _isPolledAssistantMsg(last)) {
         pollMsgCounts.set(cid, lastKey);
         stopPolling(cid);
-        _onPolledResponse(cid, last);
+        await _onPolledResponse(cid, last);
         return;
       }
 
       // If server is no longer processing but last message is still user → request was lost
       if (_isPolledUserMsg(last) && data.conversation?.processing === false) {
         stopPolling(cid);
-        _onPolledResponse(cid, t('chat.reply_interrupted'), true);
+        await _onPolledResponse(cid, t('chat.reply_interrupted'), true);
         return;
       }
 
@@ -222,7 +217,7 @@ function startPolling(cid) {
         const elapsedSec = (Date.now() - new Date(since).getTime()) / 1000;
         if (elapsedSec > 2100) {
           stopPolling(cid);
-          _onPolledResponse(cid, t('chat.reply_timeout'), true);
+          await _onPolledResponse(cid, t('chat.reply_timeout'), true);
         }
       }
     } catch (_) {}
@@ -237,7 +232,7 @@ function stopPolling(cid) {
   pollTimers.delete(cid);
 }
 
-function _onPolledResponse(cid, contentOrMessage, isError = false) {
+async function _onPolledResponse(cid, contentOrMessage, isError = false) {
   const polledMessage = contentOrMessage && typeof contentOrMessage === 'object'
     ? contentOrMessage
     : null;
@@ -247,61 +242,77 @@ function _onPolledResponse(cid, contentOrMessage, isError = false) {
   setGroupConversationBusy(cid, false);
   _updateConvSidebarBadge(cid, false);
 
-  const el = state?.loadingEl;
-  // Drop the standalone loading bubble (if any) and re-load history. Going
-  // through `loadConversationHistory` instead of swapping innerHTML inline
-  // matters for messages that carry sidecar fields the poll handler doesn't
-  // see — process trail, produced files, form widget, plan announcement,
-  // created-agent chip. The historical "patch the bubble's content
-  // directly" path lost all of those because polling only had access to
-  // `last.content` (a string), so an aborted commander turn that was
-  // recovered by polling rendered as bare "(stopped)" without the process
-  // info that the user already watched stream in.
-  if (el && el.isConnected) {
-    const finalEl = el.querySelector('[data-role="final"]');
-    const alreadyFinalized = finalEl
-      && finalEl.style.display !== 'none'
-      && (finalEl.textContent || '').trim().length > 0;
-    if (alreadyFinalized) {
-      // Stream already finalized this bubble in place. Leave it alone only
-      // when polling is reporting the same persisted message. If polling saw a
-      // later assistant record (common for plan-generated user forms emitted
-      // right after the commander's plan card), reload history so sidecar
-      // fields like `form` are mounted instead of silently disappearing.
-      const finalizedId = el.dataset.msgId || '';
-      const polledId = polledMessage?.id || '';
-      const sidecarMissing = !!polledMessage && (
-        (polledMessage.form && !el.querySelector('.chat-input-form'))
-        || (Array.isArray(polledMessage.produced) && polledMessage.produced.length && !el.querySelector('.chat-msg-produced'))
-        || (polledMessage.plan_announcement && !el.querySelector('.chat-plan-announce'))
-      );
-      if (polledId && (finalizedId !== polledId || sidecarMissing)) {
-        if (cid === currentCid) {
-          loadConversationHistory(cid);
-          _updateConvSendUI(cid);
+  try {
+    const el = state?.loadingEl;
+    // Drop the standalone loading bubble (if any) and re-load history. Going
+    // through `loadConversationHistory` instead of swapping innerHTML inline
+    // matters for messages that carry sidecar fields the poll handler doesn't
+    // see — process trail, produced files, form widget, plan announcement,
+    // created-agent chip. The historical "patch the bubble's content
+    // directly" path lost all of those because polling only had access to
+    // `last.content` (a string), so an aborted commander turn that was
+    // recovered by polling rendered as bare "(stopped)" without the process
+    // info that the user already watched stream in.
+    if (el && el.isConnected) {
+      const finalEl = el.querySelector('[data-role="final"]');
+      const alreadyFinalized = finalEl
+        && finalEl.style.display !== 'none'
+        && (finalEl.textContent || '').trim().length > 0;
+      if (alreadyFinalized) {
+        // Stream already finalized this bubble in place. Leave it alone only
+        // when polling is reporting the same persisted message. If polling saw a
+        // later assistant record (common for plan-generated user forms emitted
+        // right after the commander's plan card), reload history so sidecar
+        // fields like `form` are mounted instead of silently disappearing.
+        const finalizedId = el.dataset.msgId || '';
+        const polledId = polledMessage?.id || '';
+        const sidecarMissing = !!polledMessage && (
+          (polledMessage.form && !el.querySelector('.chat-input-form'))
+          || (Array.isArray(polledMessage.produced) && polledMessage.produced.length && !el.querySelector('.chat-msg-produced'))
+          || (polledMessage.plan_announcement && !el.querySelector('.chat-plan-announce'))
+        );
+        if (polledId && (finalizedId !== polledId || sidecarMissing)) {
+          if (cid === currentCid) {
+            // Polling can finish after the user has already started reading
+            // upward. Reconcile the richer persisted message without treating
+            // this background refresh like a fresh conversation entry. Await
+            // the rebuild so the next queued turn cannot race its DOM reset.
+            await loadConversationHistory(cid, { preserveScroll: true });
+            _updateConvSendUI(cid);
+          }
+          return;
         }
+        if (cid === currentCid) _updateConvSendUI(cid);
         return;
       }
-      if (cid === currentCid) _updateConvSendUI(cid);
-      return;
+      if (isError) {
+        // Polling reports interrupt / timeout — render the inline error and
+        // bail. No persisted message to fetch back, so a full reload would
+        // just remove the bubble we just told the user "request lost".
+        el.querySelector('.chat-bubble').innerHTML =
+          `<span style="color:var(--danger)">${escapeHtml(content)}</span>`;
+        const metaTime = el.querySelector('.chat-meta-time');
+        if (metaTime) metaTime.textContent = formatTime(new Date().toISOString());
+        el.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        if (cid === currentCid) _updateConvSendUI(cid);
+        return;
+      }
+      el.remove();
     }
-    if (isError) {
-      // Polling reports interrupt / timeout — render the inline error and
-      // bail. No persisted message to fetch back, so a full reload would
-      // just remove the bubble we just told the user "request lost".
-      el.querySelector('.chat-bubble').innerHTML =
-        `<span style="color:var(--danger)">${escapeHtml(content)}</span>`;
-      const metaTime = el.querySelector('.chat-meta-time');
-      if (metaTime) metaTime.textContent = formatTime(new Date().toISOString());
-      el.scrollIntoView({ behavior: 'smooth', block: 'end' });
-      if (cid === currentCid) _updateConvSendUI(cid);
-      return;
+    if (cid === currentCid) {
+      // Preserve the user's reading position across the terminal polling
+      // reconcile. Users who stayed near the bottom still follow the final
+      // message; users who scrolled up are no longer pulled back down.
+      await loadConversationHistory(cid, { preserveScroll: true });
+      _updateConvSendUI(cid);
     }
-    el.remove();
-  }
-  if (cid === currentCid) {
-    loadConversationHistory(cid);
-    _updateConvSendUI(cid);
+  } finally {
+    // A successful send stream can close just before its final idle
+    // state_changed reaches the renderer. Polling is the recovery owner for
+    // that race, so it must also release the durable queue. This cannot depend
+    // on the conversation being visible: background tasks have no history
+    // reload whose completion would otherwise kick the next item.
+    if (typeof _dispatchNextQueued === 'function') _dispatchNextQueued(cid);
   }
 }
 
@@ -356,11 +367,25 @@ function bindStaticHandlers() {
   // Conversation detail input
   const chatInput = document.getElementById('chat-input');
   const chatSendBtn = document.getElementById('chat-send-btn');
+  const queueEditDeleteBtn = document.getElementById('chat-queue-edit-delete-btn');
+  queueEditDeleteBtn?.addEventListener('click', () => {
+    if (!currentCid
+        || typeof _isQueueItemEditing !== 'function'
+        || !_isQueueItemEditing(currentCid)) return;
+    _deleteQueueItemEdit(currentCid);
+  });
   chatSendBtn.addEventListener('click', () => {
+    const editingQueueItem = currentCid
+      && typeof _isQueueItemEditing === 'function'
+      && _isQueueItemEditing(currentCid);
     // While a reply is streaming, the button is a stop icon — click aborts
     // the in-flight reply. Queued messages (if any) stay put and will drain
-    // one-by-one after the abort completes. To add to the queue, use Enter.
-    if (currentCid && isConvPending(currentCid)) {
+    // one-by-one after the abort completes. While a queued item owns the
+    // composer, the same button commits that edit instead of stopping or
+    // starting any send.
+    if (editingQueueItem) {
+      handleChatSubmit();
+    } else if (currentCid && isConvPending(currentCid)) {
       abortConvStream(currentCid, { userInitiated: true });
     } else {
       handleChatSubmit();
@@ -370,6 +395,13 @@ function bindStaticHandlers() {
     // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip IME
     // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
     if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Escape'
+        && typeof _isQueueItemEditing === 'function'
+        && _isQueueItemEditing(currentCid)) {
+      e.preventDefault();
+      _cancelQueueItemEdit(currentCid);
+      return;
+    }
     if (_handleModifiedComposerEnter(e)) return;
     if (_isPlainComposerEnter(e)) {
       e.preventDefault();
@@ -430,7 +462,7 @@ function bindStaticHandlers() {
     if (typeof load !== 'function') return;
     load('marketplace').then(() => openMarketplace('agent')).catch(() => {});
   });
-  document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
+  document.getElementById('agents-back-btn')?.addEventListener('click', () => _returnFromAgentsDetailView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
     if (_selectedAgent && !_agentsCache?.some((a) => a.agent_id === _selectedAgent.id && a.enabled === false)) {
       useAgent(_selectedAgent.id);
@@ -455,14 +487,14 @@ function bindStaticHandlers() {
   const agentChatInput = document.getElementById('agents-chat-input');
   agentChatInput?.addEventListener('input', () => autoGrow(agentChatInput, 120));
   bindAgentPickers();
-  // Esc returns to grid when detail view is open
+  // Esc follows the same entry-page return path as the detail Back button.
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     const agentsPanel = document.getElementById('panel-agents');
     if (!agentsPanel || !agentsPanel.classList.contains('active')) return;
     const detail = document.getElementById('agents-detail-view');
     if (detail && detail.style.display !== 'none') {
-      _showAgentsGridView();
+      _returnFromAgentsDetailView();
       e.preventDefault();
     }
   });

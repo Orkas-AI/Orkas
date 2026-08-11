@@ -51,6 +51,31 @@ export interface RunOfficeCliOpts {
 
 const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
+/**
+ * OfficeCLI's HTML renderer discovers macOS browsers by probing executable
+ * paths inside /Applications. A child process attributed to Orkas can then
+ * make Chrome perform bundle-maintenance writes, which macOS reports as Orkas
+ * trying to modify another app. Office document operations never need to
+ * execute an installed app bundle, so deny that capability at the process
+ * boundary. The default-allow profile keeps OfficeCLI's document, font,
+ * network, and resident-process behavior unchanged.
+ */
+export const MAC_OFFICECLI_SANDBOX_PROFILE = [
+  '(version 1)',
+  '(allow default)',
+  '(deny process-exec (subpath "/Applications"))',
+  '(deny process-exec (subpath "/System/Applications"))',
+  '(deny process-exec (subpath "/System/Cryptexes/App/System/Applications"))',
+].join('');
+
+function officeCliSpawnCommand(bin: string, args: string[]): { command: string; args: string[] } {
+  if (process.platform !== 'darwin') return { command: bin, args };
+  return {
+    command: '/usr/bin/sandbox-exec',
+    args: ['-p', MAC_OFFICECLI_SANDBOX_PROFILE, bin, ...args],
+  };
+}
+
 let availableCache: boolean | null = null;
 
 export function _resetOfficeCliAvailableForTest(): void {
@@ -90,7 +115,8 @@ export function runOfficeCli(args: string[], opts: RunOfficeCliOpts): Promise<Of
   return new Promise<OfficeCliResult>((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(bin, args, {
+      const launch = officeCliSpawnCommand(bin, args);
+      child = spawn(launch.command, launch.args, {
         cwd: opts.cwd,
         detached: process.platform !== 'win32',
         // OfficeCLI enables background self-updates by default. Orkas vendors

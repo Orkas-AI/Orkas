@@ -13,11 +13,14 @@ describe('renderer conversation-list pagination wiring', () => {
 
     expect(conversation).toContain('const startup = !(options && options.full === true)');
     expect(conversation).toContain('mode=project&project_id=${encodeURIComponent(pid)}&offset=${offset}');
-    expect(conversation).toContain('mode=old_unprojected&bucket=${bucket}&offset=${offset}');
-    expect(conversation).toContain('data-conv-bucket-more="1"');
+    expect(conversation).toContain('mode=unprojected&offset=${offset}');
+    expect(conversation).toContain('data-unprojected-conv-more="1"');
+    expect(conversation).not.toContain('data-conv-bucket-more="1"');
+    expect(conversation).toContain('_resetUnprojectedConversations');
     expect(conversation).not.toMatch(/_deleteConversationWithConfirm[\s\S]*?await loadConversations\(\);[\s\S]*?function _conversationActionItems/);
     expect(projects).toContain('data-project-conv-more=');
     expect(projects).toContain('loadConversationProject(pid, { append: true })');
+    expect(projects).toContain('loadConversationProject(pid, { reset: true })');
     expect(projectDetail).toContain('data-project-detail-conv-more="1"');
   });
 });

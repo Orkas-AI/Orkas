@@ -36,13 +36,26 @@ describe('ContentWriter builtin contract', () => {
 
     expect(spec.agent_id).toBe('173d4235a431');
     expect(spec.name).toBe('ContentWriter');
-    expect(spec.min_app_version).toBe('1.7.0');
+    expect(spec.min_app_version).toBeUndefined();
     expect(spec.skill_list).toEqual(['9dfbd4e00c0d']);
     expect(spec.interactive).toBe(false);
     expect(spec.inputs.find((input: any) => input.id === 'task')?.required).toBe(true);
     expect(spec.inputs.find((input: any) => input.id === 'files')?.multiple).toBe(true);
+    expect(spec.inputs.map((input: any) => input.id)).toEqual(['task', 'files']);
     expect(spec.description_zh).toContain('社媒成稿');
     expect(spec.description_en).toContain('social');
+    expect(spec.standards.join('\n')).toContain('user-supplied range only as scope');
+    expect(spec.standards.join('\n')).toContain('internal values');
+    expect(spec.standards.join('\n')).toContain('label that exact occurrence Hypothesis/Proposed');
+    expect(spec.standards.join('\n')).toContain('skip manage_execution_plan');
+    expect(spec.standards.join('\n')).toContain('completion summary is not an artifact');
+    expect(spec.standards.join('\n')).not.toMatch(/20\s*[-–]\s*100|SaaS|remote collaboration/i);
+    expect(spec.workflow).toContain('silently audit scope');
+    expect(spec.workflow).toContain('a supplied range is audience scope only');
+    expect(spec.workflow).toContain('disclaimers/assumptions cannot preserve them');
+    expect(spec.workflow).toContain('Never ask for a publishing platform');
+    expect(spec.workflow).toContain('if the user names one, apply only material platform rules');
+    expect(spec.workflow).toContain('otherwise use a platform-neutral default');
 
     expect(spec.workflow.length).toBeLessThan(1_500);
     for (const marker of [
@@ -99,7 +112,7 @@ describe('ContentWriter builtin contract', () => {
     expect(routedReferences).toEqual(actualReferences);
 
     const meta = JSON.parse(fs.readFileSync(path.join(skillDir, '_meta.json'), 'utf8'));
-    expect(meta.min_app_version).toBe('1.7.0');
+    expect(meta.min_app_version).toBeUndefined();
     expect(Date.parse(meta.reseed_if_deleted_before)).not.toBeNaN();
     expect(meta.category).toBe('creation');
     expect(meta.descriptions.zh).toBeTruthy();
@@ -135,6 +148,22 @@ describe('ContentWriter builtin contract', () => {
     for (const policy of ['supplied-only', 'source-grounded', 'current-research', 'prose-only']) {
       expect(skill).toContain(`\`${policy}\``);
     }
+    expect(skill).toContain("Match evidence work to the user's citation request and claim risk");
+    expect(skill).toContain('require a matrix only for research-backed');
+    expect(skill).toContain('without forced source gaps');
+    expect(skill).toContain('In plan, label Reader');
+    expect(skill).toContain('Format/type, Tone, Working assumptions');
+    expect(skill).toContain('unsupplied premises or none');
+    expect(skill).toContain('Platform is optional');
+    expect(skill).toContain('never ask for it or offer choices');
+    expect(skill).toContain('Before returning a plan, audit titles, headings, assumptions, examples, and bullets');
+    expect(skill).toContain('Input ranges define scope only');
+    expect(skill).toContain('Delete each unsourced stage split, threshold, scale-behavior, causal, or maturity claim');
+    expect(skill).toContain('a disclaimer or assumptions block cannot preserve it');
+    expect(skill).toContain('mark that occurrence `Hypothesis` or `Proposed`');
+    expect(skill).toContain('give each major section its job or question');
+    expect(skill).not.toMatch(/engineering organization|5\s*[-–]\s*10\s*people/i);
+    expect(skill).not.toContain('Populate every row; a generic evidence note after the outline');
     for (const pass of ['developmental edit', 'evidence edit', 'line edit', 'copy edit']) {
       expect(bundle).toContain(pass);
     }
@@ -148,6 +177,9 @@ describe('ContentWriter builtin contract', () => {
     expect(skill).toContain('individual social posts');
     expect(skill).toContain('first non-empty line a distinct headline');
     expect(skill).toContain('explicit low-friction action or decision prompt');
+    expect(skill).toContain('skip `manage_execution_plan`');
+    expect(skill).toContain('artifact-first `draft`, `revise`, `humanize`, or `adapt`');
+    expect(skill).toContain('not a plan/status update or completion summary');
     expect(skill).toContain('before/after durations');
     expect(skill).toContain('quantified performance or outcome claims');
     expect(skill).toContain('Replaceable options');
@@ -178,11 +210,15 @@ describe('ContentWriter builtin contract', () => {
     expect(skill).toContain('parsing, inspection, conversion, or recovery');
     expect(skill).toContain('do not persist the blocked input as `ARTICLE.md`');
     expect(skill).toContain('vague rhetorical question');
-    expect(skill).toContain('no matching template');
+    expect(skill).toContain('For an unlisted format');
     expect(skill).toContain('unfamiliar channel');
     expect(skill).toContain('bounded `current-research`, do not load it');
     expect(skill).toContain('`publish_outputs` on this fast path');
     expect(formats).toContain('roughly 450–700 Chinese characters');
+    expect(formats).toContain('Never ask which publishing platform to use');
+    expect(formats).toContain('only when they materially change the artifact');
+    expect(formats).toContain('do not call `manage_execution_plan`');
+    expect(formats).toContain('status/completion summary');
     expect(formats).toContain('If the exact format is not listed');
     expect(bundle).toContain('Judge the delivered artifact after applied edits');
     expect(bundle).toContain('Evidence required for the stronger claim');
@@ -201,7 +237,7 @@ describe('ContentWriter builtin contract', () => {
       'verification action',
       'paired boundary',
       'deletion blacklist',
-      'return only the finished artifact',
+      'return the complete artifact',
       'count the literal destination',
       'distinct subject as the first non-empty line',
       'rejected value → accepted value',

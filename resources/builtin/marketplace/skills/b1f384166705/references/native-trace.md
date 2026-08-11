@@ -39,8 +39,12 @@ Stop and report the exact blocker if any required dependency is missing.
 ```bash
 xcrun xctrace help record
 xcrun atos -h
+kill -0 <pid>
+ps -p <pid> -o pid=,comm=
 test -x /path/App.app/Contents/MacOS/App
 ```
+
+The PID check must succeed, and the reported process executable must resolve to the app binary whose symbols will be used. When a dSYM is supplied, compare its UUID with the app binary using `dwarfdump --uuid` before recording; do not interpret symbolicated hotspots when the UUIDs differ.
 
 All included scripts must be invoked through the standard Orkas Skill Runner. Do not bypass it with a direct interpreter invocation or a relative path into the skill's script directory.
 

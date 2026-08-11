@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  classifyCurrentHistoryReadMode,
   LOCAL_AGENT_ENV_KEYS,
   localAgentBenchmarkScenariosFor,
   classifyLiveFailure,
@@ -23,6 +24,7 @@ import {
   parseLiveArgs,
   scoreLocalAgentBenchmarkScenario,
   summarizeLiveFailure,
+  validateLiveProtocolTrace,
   validateLocalAgentBenchmarkInventory,
 } from './local-agent-live-support.mjs';
 import { resolveCliCommand } from '../src/main/features/local_agents/spawn-command.js';
@@ -42,7 +44,7 @@ function usage(): string {
     '  --no-install               Fail instead of installing a missing CLI',
     '  --install-only             Install and version-check, skip model calls',
     '  --benchmark                Run the objective model-quality suite',
-    '  --k N                      Benchmark rollouts per scenario; default: 3',
+    '  --k N                      Benchmark rollouts per scenario; default: 2',
     '  --no-save                  Print benchmark scorecard without saving it',
     '  -h, --help                 Show this help',
   ].join('\n');
@@ -118,6 +120,25 @@ function applyManagedRuntimeEnv(entry: { type: string; path?: string | null }): 
 
 async function installAgent(type: string): Promise<void> {
   fs.mkdirSync(installRoot, { recursive: true });
+  if (type === 'hermes') {
+    const repository = path.join(installRoot, 'hermes-home', 'hermes-agent');
+    if (fs.existsSync(repository)) {
+      const validManagedClone = fs.existsSync(path.join(repository, '.git', 'HEAD'))
+        && (fs.existsSync(path.join(repository, 'pyproject.toml'))
+          || fs.existsSync(path.join(repository, 'setup.py')));
+      if (!validManagedClone) {
+        // The official updater treats any existing directory as a Git clone.
+        // Removing an interrupted test-only install prevents `git -C` from
+        // walking upward into the enclosing Orkas repository.
+        fs.rmSync(repository, {
+          recursive: true,
+          force: true,
+          maxRetries: process.platform === 'win32' ? 20 : 0,
+          retryDelay: process.platform === 'win32' ? 100 : 0,
+        });
+      }
+    }
+  }
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), `orkas-${type}-installer-`));
   try {
     const plan = installerPlan(type, {
@@ -126,10 +147,29 @@ async function installAgent(type: string): Promise<void> {
       downloadDir,
     });
     for (const step of plan) {
-      await runProcess(step.command, step.args, { env: step.env });
+      try {
+        await runProcess(step.command, step.args, { env: step.env });
+      } catch (error) {
+        // OpenCode's Windows postinstall can finish copying a valid platform
+        // executable and then fail while npm removes the staging directory.
+        // Accept that narrow partial-success case; ensureRequestedAgents will
+        // still run the production version probe before considering it ready.
+        if (type === 'opencode' && process.platform === 'win32' && bindManagedBinary(type)) {
+          process.stderr.write(
+            `[local-agent-live] warning: OpenCode installer exited non-zero after producing a managed executable: ${(error as Error).message}\n`,
+          );
+          break;
+        }
+        throw error;
+      }
     }
   } finally {
-    fs.rmSync(downloadDir, { recursive: true, force: true });
+    fs.rmSync(downloadDir, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: process.platform === 'win32' ? 100 : 0,
+    });
   }
   if (!bindManagedBinary(type)) {
     throw new Error(`${type} installer completed but no managed executable was found under ${installRoot}`);
@@ -182,6 +222,13 @@ async function runQualityBenchmark(
   }
   const startedAt = new Date().toISOString();
   const results: QualityRun[] = [];
+  const [chats, storage, layout, paths, skillRegistry] = await Promise.all([
+    import('../src/main/features/chats.js'),
+    import('../src/main/storage.js'),
+    import('../src/main/util/project-layout.js'),
+    import('../src/main/paths.js'),
+    import('../src/main/model/core-agent/skill-registry.js'),
+  ]);
 
   for (const entry of entries) {
     for (const scenario of localAgentBenchmarkScenariosFor(entry.type)) {
@@ -193,20 +240,64 @@ async function runQualityBenchmark(
           fs.mkdirSync(path.dirname(absPath), { recursive: true });
           fs.writeFileSync(absPath, String(content), 'utf8');
         }
+        const bridgeSkills = Object.entries((scenario as any).bridgeSkills || {});
+        for (const [skillId, skillBody] of bridgeSkills) {
+          const skillDir = path.join(paths.userSkillsDir(uid), skillId);
+          fs.mkdirSync(skillDir, { recursive: true });
+          fs.writeFileSync(path.join(skillDir, 'SKILL.md'), String(skillBody), 'utf8');
+        }
+        if (bridgeSkills.length) await skillRegistry.invalidateSkills();
+
+        const cid = `c-bench-${entry.type}-${scenario.id}-${rollout}`;
+        const agentId = `a-bench-${entry.type}`;
+        const currentMessageId = `trigger-${scenario.id}-${rollout}`;
+        await chats.createConversation(uid, {
+          conversationId: cid,
+          title: `Local Agent benchmark: ${scenario.id}`,
+        });
+        const messageFile = layout.conversationMessageFile(uid, cid);
+        const historyRows = Array.isArray((scenario as any).chatHistory?.messages)
+          ? (scenario as any).chatHistory.messages
+          : [];
+        const baseTime = Date.parse('2033-01-01T00:00:00.000Z');
+        for (const [index, row] of historyRows.entries()) {
+          await storage.appendJsonlAtomic(messageFile, {
+            id: `history-${scenario.id}-${index + 1}`,
+            ts: new Date(baseTime + index * 1_000).toISOString(),
+            from: row.from,
+            to: [...row.to],
+            text: row.text,
+          });
+        }
+        await storage.appendJsonlAtomic(messageFile, {
+          id: currentMessageId,
+          ts: new Date(baseTime + historyRows.length * 1_000).toISOString(),
+          from: 'user',
+          to: [agentId],
+          text: scenario.prompt,
+        });
 
         let terminalEvent: any = null;
+        const toolNames: string[] = [];
+        const historyReadModes: string[] = [];
         const t0 = Date.now();
         const result = await run({
           uid,
-          cid: `c-bench-${entry.type}-${rollout}`,
-          agentId: `a-bench-${entry.type}`,
+          cid,
+          agentId,
           agentName: `Benchmark ${entry.type}`,
+          currentMessageId,
           cli: entry.type,
           prompt: scenario.prompt,
           cwd,
           signal: new AbortController().signal,
           onEvent: (event: any) => {
             if (event?.type === 'done') terminalEvent = event;
+            if (event?.type === 'tool-event' && event?.phase === 'use' && event?.tool) {
+              toolNames.push(String(event.tool));
+              const historyReadMode = classifyCurrentHistoryReadMode(event.tool, event.input);
+              if (historyReadMode) historyReadModes.push(historyReadMode);
+            }
           },
         });
         const files: Record<string, string | null> = {};
@@ -220,6 +311,9 @@ async function runQualityBenchmark(
           output,
           files,
           workspaceFiles: listWorkspaceFiles(cwd),
+          toolNames,
+          historyReadModes,
+          commanderHandoff: result.commanderHandoff || null,
         });
         const passed = checks.every(check => check.pass);
         const failureKind = passed
@@ -341,6 +435,7 @@ async function main(): Promise<void> {
       const cwd = path.join(testDataRoot, `work-${entry.type}`);
       fs.mkdirSync(cwd, { recursive: true });
       const eventCounts: Record<string, number> = {};
+      const eventTypes: string[] = [];
       let terminalEvent: any = null;
       process.stdout.write(`\n[local-agent-live] probing ${entry.type}...\n`);
       const result = await run({
@@ -348,6 +443,7 @@ async function main(): Promise<void> {
         cid: `c-live-${entry.type}`,
         agentId: `a-live-${entry.type}`,
         agentName: `Live ${entry.type} probe`,
+        currentMessageId: `trigger-live-${entry.type}`,
         cli: entry.type,
         prompt: 'Do not call tools or access or modify files. Reply with exactly ORKAS_AGENT_OK and nothing else.',
         cwd,
@@ -355,11 +451,17 @@ async function main(): Promise<void> {
         onEvent: (event: any) => {
           const type = String(event?.type || 'unknown');
           eventCounts[type] = (eventCounts[type] || 0) + 1;
+          eventTypes.push(type);
           if (type === 'done') terminalEvent = event;
         },
       });
       const output = String(result.output || '').trim();
-      if (result.status === 'completed' && output === 'ORKAS_AGENT_OK') {
+      const protocolIssues = validateLiveProtocolTrace(entry.type, result, {
+        eventTypes,
+        terminalEvent,
+      });
+
+      if (result.status === 'completed' && output === 'ORKAS_AGENT_OK' && protocolIssues.length === 0) {
         process.stdout.write(`  ✓ ${entry.type}: round-trip passed ${JSON.stringify(eventCounts)}\n`);
       } else {
         const failure = {
@@ -367,7 +469,10 @@ async function main(): Promise<void> {
           stderrTail: typeof terminalEvent?.stderrTail === 'string' ? terminalEvent.stderrTail : '',
         };
         const kind = classifyLiveFailure(failure);
-        const detail = summarizeLiveFailure(failure);
+        const baseDetail = summarizeLiveFailure(failure);
+        const detail = protocolIssues.length
+          ? `${baseDetail}; protocol=${protocolIssues.join(', ')}`
+          : baseDetail;
         failures.push(`${entry.type} [${kind}]: ${detail}`);
         process.stderr.write(`  ✗ ${entry.type} [${kind}]: ${detail}\n`);
       }
@@ -377,7 +482,15 @@ async function main(): Promise<void> {
       throw new Error(`local-agent live verification failed:\n${failures.map(item => `- ${item}`).join('\n')}`);
     }
   } finally {
-    fs.rmSync(testDataRoot, { recursive: true, force: true });
+    // A just-exited CLI can keep its working directory briefly open on
+    // Windows. Use Node's bounded rimraf retry instead of turning an otherwise
+    // successful live benchmark into an EBUSY infrastructure failure.
+    fs.rmSync(testDataRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: process.platform === 'win32' ? 20 : 0,
+      retryDelay: process.platform === 'win32' ? 100 : 0,
+    });
   }
 }
 

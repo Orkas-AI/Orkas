@@ -8,6 +8,8 @@ category: data
 
 # seo-crawl
 
+Agent-wide core connector rule: when any connected search console is used, discover its operations with `list_connector_tools` and invoke each selected operation through `call_connector_tool`; naming `list_sites` or an analytics operation without the core invocation is not execution.
+
 Fetch one URL and return the raw on-page signals the SEO/GEO audits consume. This is the data-acquisition step: it does NOT score or judge — it extracts facts.
 
 ## When to use

@@ -19,7 +19,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { defineTool, type AgentTool } from "./base.js";
+import { defineTool, type AgentTool, type ToolResult } from "./base.js";
 import { createLogger } from "../shared/logger.js";
 
 const log = createLogger("web-search");
@@ -644,11 +644,12 @@ export const WEB_SEARCH_MAX_COUNT = MAX_COUNT;
 /** Public web_search execution — exposes the keyless multi-provider pipeline so
  *  embedders (e.g. Orkas's overriding `web_search` tool) can fall back to
  *  it when the user hasn't configured a paid search API. Returns the same
- *  `{ content, isError }` shape as the AgentTool execute callback. */
+ *  `ToolResult` shape as the AgentTool execute callback, including the
+ *  host-only display name of the provider that actually answered. */
 export async function runBuiltinWebSearch(
   query: string,
   count: number = DEFAULT_COUNT,
-): Promise<{ content: string; isError?: boolean }> {
+): Promise<ToolResult> {
   const q = (query || "").trim();
   const n = Math.min(count, MAX_COUNT);
   if (!q) return { content: "Error: query is required", isError: true };
@@ -687,7 +688,7 @@ export const webSearchTool: AgentTool = defineTool({
 async function runWebSearchInternal(
   query: string,
   count: number,
-): Promise<{ content: string; isError?: boolean }> {
+): Promise<ToolResult> {
   const state = searchRuntimeState();
   return enqueueSearch(state, () => runSerializedWebSearch(state, query, count));
 }
@@ -696,7 +697,7 @@ async function runSerializedWebSearch(
   state: SearchRuntimeState,
   query: string,
   count: number,
-): Promise<{ content: string; isError?: boolean }> {
+): Promise<ToolResult> {
   const cached = loadCache();
   const queryOrder = providerOrderForQuery(query);
   const cachedPreferred = cached?.preferred ?? queryOrder[0];
@@ -723,7 +724,10 @@ async function runSerializedWebSearch(
             : "successful direct request",
         });
       }
-      return { content: formatResults(query, result.results, provider, count) };
+      return {
+        content: formatResults(query, result.results, provider, count),
+        displayName: PROVIDERS[provider].label,
+      };
     }
 
     const detail = providerFailureDetail(result);

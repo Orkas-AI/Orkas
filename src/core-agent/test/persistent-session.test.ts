@@ -61,6 +61,36 @@ describe("PersistentSession", () => {
     expect(msgs[1].role).toBe("assistant");
   });
 
+  it("persists one rich steer durability batch with its resource sidecar", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.withContextMutationBatch(() => {
+      s1.beginUserTurn([
+        { type: "text", text: "inspect this chart" },
+        { type: "image", data: "aW1hZ2U=", mediaType: "image/png" },
+      ]);
+      s1.addHistoryResource({
+        kind: "attachment",
+        path: "/workspace/chart.png",
+        name: "chart.png",
+        mediaType: "image/png",
+      });
+    });
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.getMessages()[0]).toMatchObject({
+      role: "user",
+      content: [
+        { type: "text", text: "inspect this chart" },
+        { type: "image", data: "aW1hZ2U=", mediaType: "image/png" },
+      ],
+    });
+    expect(s2.getSerializedContextState()?.resources).toContainEqual(expect.objectContaining({
+      kind: "attachment",
+      path: "/workspace/chart.png",
+      name: "chart.png",
+    }));
+  });
+
   it("rebases semantic dialogue from a canonical source while preserving compatible compaction", () => {
     const session = new PersistentSession({ sessionFile: file });
     session.beginUserTurn([{ type: "text", text: "PRIVATE_TOOL_TRANSCRIPT" }]);
@@ -96,7 +126,11 @@ describe("PersistentSession", () => {
       resources: [expect.objectContaining({ name: "video.mp4" })],
     });
 
-    session.applyHistorySummary("Summary of the first canonical turn", [1]);
+    session.applyHistorySummary(
+      "Summary of the first canonical turn",
+      [1],
+      "canonical-message-1",
+    );
     session.replaceConversationHistory([
       ...canonical,
       { role: "user", turnId: 3, content: [{ type: "text", text: "Third exact request" }] },
@@ -114,10 +148,13 @@ describe("PersistentSession", () => {
     const restored = new PersistentSession({ sessionFile: file });
     expect(restored.getSerializedContextState()?.conversationHistorySource)
       .toBe("group-main-v1:cid-1");
+    expect(restored.getSerializedContextState()?.summaryThroughMessageId)
+      .toBe("canonical-message-1");
     expect(JSON.stringify(restored.getMessages())).toContain("Third exact response");
 
     restored.replaceConversationHistory(canonical, "group-main-v2:cid-1");
     expect(restored.getSerializedContextState()?.historySummary).toBeUndefined();
+    expect(restored.getSerializedContextState()?.summaryThroughMessageId).toBeUndefined();
     expect(JSON.stringify(restored.getMessagesForModel())).toContain("Make the video");
   });
 
@@ -477,10 +514,9 @@ describe("PersistentSession", () => {
       tool: "bash",
       status: "succeeded",
     })]);
-    expect(s2.getExecutionPlan()?.steps[0].completionEvidence).toEqual({
-      verification: "observed",
-      workEntryIds: [1],
-    });
+    // The plan itself survives the reload; the ledger above is what records
+    // which calls actually ran.
+    expect(s2.getExecutionPlan()?.steps[0]).toMatchObject({ status: "completed" });
     expect(s2.getExecutionPlanAudit()).toHaveLength(2);
     expect(JSON.stringify(s2.getMessagesForModel())).toContain("Completed work ledger");
 

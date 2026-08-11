@@ -23,6 +23,15 @@ describe('icons.js', () => {
     expect(html).not.toContain('M12 11v5');
   });
 
+  it('renders the purchase source as a recognizable shopping cart', () => {
+    const { uiIconHtml } = loadIcons();
+    const html = uiIconHtml('shopping-cart');
+
+    expect(html).toContain('is-shopping-cart');
+    expect(html).toContain('M3 4h2l2.4 11.2');
+    expect(html).not.toContain('is-info');
+  });
+
   it('routes Library file extensions to distinct SVG icon families', () => {
     const { fileKindForName, fileKindIconHtml } = loadIcons();
 

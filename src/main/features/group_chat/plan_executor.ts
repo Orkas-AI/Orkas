@@ -101,7 +101,7 @@ export async function onTurnFinished(
  * second empty commander bubble would be redundant. Real config / auth errors
  * surface as an errorBubble.
  *
- * agent empty-final → always persist '(no reply)'.
+ * agent empty-final → persist a retryable empty-response failure.
  */
 function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   if (evt.aborted) {
@@ -142,7 +142,12 @@ function outcomeForDirectTurn(evt: TurnFinishedEvent): TurnOutcome {
   }
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText, evt.failureKind, evt.failureCode), ...failureFields(evt, true) };
-  return { kind: 'persist', text: '(no reply)', ...failureFields(evt) };
+  return {
+    kind: 'persist',
+    text: errorBubble(t('model.empty_response'), 'model', 'empty_response'),
+    failureKind: 'model',
+    failureCode: 'empty_response',
+  };
 }
 
 /** Aborted-turn outcome: salvage partial reply + side effects, NO "(stopped)"

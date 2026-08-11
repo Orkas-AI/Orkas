@@ -47,8 +47,10 @@ import * as auth from '../features/auth';
 import * as imageAuth from '../features/image_auth';
 import * as searchAuth from '../features/search_auth';
 import * as videoAuth from '../features/video_auth';
+import * as videoStudioReview from '../features/video_studio_review';
 import * as ttsAuth from '../features/tts_auth';
 import * as permissions from '../features/permissions';
+import * as notificationPermissions from '../features/notification_permissions';
 import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import * as commanderProfile from '../features/commander_profile';
@@ -56,6 +58,10 @@ import * as commanderRuntimeStats from '../features/commander_runtime_stats';
 import { getQuickStartConfigState } from '../features/client_config';
 import { getRendererTables, isLang, t } from '../i18n';
 import { isPathAllowed } from '../util/path-sandbox';
+import {
+  officeFileToPreviewHtml,
+  officePreviewKindForExt as sharedOfficePreviewKindForExt,
+} from '../util/office-preview';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
@@ -70,7 +76,7 @@ import {
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
-import { DEFAULT_USER_WORKSPACE, WS_ROOT, projectFilesDir } from '../paths';
+import { DEFAULT_USER_WORKSPACE, WS_ROOT, chatAttachmentDraftDir, projectFilesDir } from '../paths';
 import {
   chatAttachmentDirForConversation,
   chatAttachmentRelPath,
@@ -78,7 +84,7 @@ import {
   globalAutoTaskLocation,
 } from '../util/project-layout';
 import { readState as readGroupChatState } from '../features/group_chat/state';
-import { logErrorRef } from '../util/log-redact';
+import { logErrorRef, logPathRef } from '../util/log-redact';
 import { chatMediaLocalPathFromUrl } from '../util/chat-media-url';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { normalizeAppError } from '../util/app-error';
@@ -90,6 +96,35 @@ import {
 } from './security';
 
 const log = createLogger('ipc');
+
+const IPC_RESULT_FAILURE_DEDUPE_MS = 60_000;
+const IPC_RESULT_FAILURE_MAX_KEYS = 512;
+const ipcResultFailureState = new Map<string, { at: number; suppressed: number }>();
+
+function logInvokeResultFailure(channel: string, result: Record<string, unknown>): void {
+  const rawCode = result.code;
+  const code = typeof rawCode === 'string' || typeof rawCode === 'number'
+    ? String(rawCode).slice(0, 80)
+    : 'operation_rejected';
+  const key = `${channel}|${code}`;
+  const now = Date.now();
+  const previous = ipcResultFailureState.get(key);
+  if (previous && now - previous.at < IPC_RESULT_FAILURE_DEDUPE_MS) {
+    previous.suppressed += 1;
+    return;
+  }
+  const suppressed = previous?.suppressed || 0;
+  ipcResultFailureState.set(key, { at: now, suppressed: 0 });
+  if (ipcResultFailureState.size > IPC_RESULT_FAILURE_MAX_KEYS) {
+    ipcResultFailureState.delete(ipcResultFailureState.keys().next().value!);
+  }
+  log.warn('invoke returned failure', {
+    channel,
+    code,
+    error: typeof result.error === 'string' ? result.error : 'operation rejected',
+    ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
+  });
+}
 
 function markPreferencesDirty(): void {}
 
@@ -280,6 +315,9 @@ async function _resolveWorkspaceScope(
 function _attachmentScopeForPayload(userId: string, payload: any): string | null {
   if (!payload || typeof payload.cid !== 'string' || !payload.cid) return null;
   if (!safeId(payload.cid)) return null;
+  if (chatAttachments.isDraftAttachmentCid(payload.cid)) {
+    return path.resolve(chatAttachmentDraftDir(userId, payload.cid));
+  }
   return path.resolve(chatAttachmentDirForConversation(userId, payload.cid));
 }
 
@@ -536,6 +574,7 @@ type HtmlPreviewLayout = {
 
 const HTML_PREVIEW_LAYOUT_MANIFEST_MAX_BYTES = 256 * 1024;
 const HTML_PREVIEW_LAYOUT_MAX_AREA = 16_777_216;
+const HTML_PREVIEW_LAYOUT_CSS_PROBE_MAX_BYTES = 512 * 1024;
 
 function _validHtmlPreviewLayout(width: unknown, height: unknown): HtmlPreviewLayout | null {
   const parsedWidth = Number(width);
@@ -546,6 +585,38 @@ function _validHtmlPreviewLayout(width: unknown, height: unknown): HtmlPreviewLa
       || parsedWidth * parsedHeight > HTML_PREVIEW_LAYOUT_MAX_AREA) return null;
   return { kind: 'fixed-canvas', width: parsedWidth, height: parsedHeight };
 }
+
+// Some generated visual HTML predates the explicit data-preview-* contract
+// but still describes one unambiguous canvas in CSS, for example:
+//   .poster { max-width:1080px; max-height:1350px; aspect-ratio:4/5 }
+// Accept only that high-confidence shape: width, height, and a matching ratio
+// must live in the same declaration block. This avoids treating ordinary
+// responsive page breakpoints as a fixed canvas.
+function _inferHtmlPreviewLayoutFromCss(html: string): HtmlPreviewLayout | null {
+  const source = String(html || '').replace(/\/\*[\s\S]*?\*\//g, '');
+  const blocks = source.matchAll(/([^{}]+)\{([^{}]*)\}/g);
+  for (const match of blocks) {
+    const declarations = String(match[2] || '');
+    const px = (property: string): number => {
+      const found = declarations.match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*(\\d+(?:\\.\\d+)?)px\\b`, 'i'));
+      return found ? Number(found[1]) : 0;
+    };
+    const aspect = declarations.match(/(?:^|;)\s*aspect-ratio\s*:\s*(\d+(?:\.\d+)?)(?:\s*\/\s*(\d+(?:\.\d+)?))?\s*(?:;|$)/i);
+    if (!aspect) continue;
+    const width = px('max-width') || px('width');
+    const height = px('max-height') || px('height');
+    const layout = _validHtmlPreviewLayout(width, height);
+    if (!layout) continue;
+    const declaredRatio = Number(aspect[1]) / Number(aspect[2] || 1);
+    const canvasRatio = layout.width / layout.height;
+    if (!Number.isFinite(declaredRatio) || declaredRatio <= 0) continue;
+    if (Math.abs(declaredRatio - canvasRatio) > Math.max(0.01, canvasRatio * 0.02)) continue;
+    return layout;
+  }
+  return null;
+}
+
+export const _inferHtmlPreviewLayoutFromCssForTest = _inferHtmlPreviewLayoutFromCss;
 
 // Compatibility adapter for ImageStudio projects authored before the shared
 // HTML preview contract was added. The renderer does not know about
@@ -571,17 +642,23 @@ async function _readAdjacentHtmlPreviewLayout(absPath: string): Promise<HtmlPrev
 
 // Scan an HTML file with constant memory for an authored fixed-canvas
 // contract. The renderer receives only normalized dimensions, never product-
-// specific metadata or a synthetic HTML tag. Responsive HTML has no contract
-// and stays on the normal full-width iframe path.
+// specific metadata or a synthetic HTML tag. A bounded prefix also supports
+// the older high-confidence CSS canvas shape handled above; genuinely fluid
+// documents still return no layout.
 async function _readHtmlPreviewLayout(absPath: string): Promise<HtmlPreviewLayout | null> {
   const stream = fs.createReadStream(absPath, { encoding: 'utf8', highWaterMark: 64 * 1024 });
   const rootPattern = /<[^>]*\b(?:data-preview-layout\s*=\s*["']fixed-canvas["']|data-composition-id\s*=\s*["'][^"']+["'])[^>]*>/i;
   const MAX_TAG_CARRY_CHARS = 64 * 1024;
   let carry = '';
+  let cssProbe = '';
   let layout: HtmlPreviewLayout | null = null;
   try {
     for await (const chunk of stream) {
-      const combined = carry + String(chunk);
+      const text = String(chunk);
+      if (cssProbe.length < HTML_PREVIEW_LAYOUT_CSS_PROBE_MAX_BYTES) {
+        cssProbe += text.slice(0, HTML_PREVIEW_LAYOUT_CSS_PROBE_MAX_BYTES - cssProbe.length);
+      }
+      const combined = carry + text;
       const match = combined.match(rootPattern);
       if (match) {
         const attrNumber = (name: string): number => {
@@ -611,7 +688,7 @@ async function _readHtmlPreviewLayout(absPath: string): Promise<HtmlPreviewLayou
       });
     }
   }
-  return layout || _readAdjacentHtmlPreviewLayout(absPath);
+  return layout || _inferHtmlPreviewLayoutFromCss(cssProbe) || _readAdjacentHtmlPreviewLayout(absPath);
 }
 
 function _contextTreeHasPath(nodes: contexts.ContextNode[], relPath: string): boolean {
@@ -763,13 +840,34 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
     if (rel.startsWith('cloud/contexts/')) {
       const ctxRel = rel.slice('cloud/contexts/'.length);
       if (ctxRel) {
-        search.upsertContext(ctx.userId, ctxRel);
-        kbIndexer.enqueue(ctx.userId, ctxRel, 'upsert');
+        try {
+          search.upsertContext(ctx.userId, ctxRel);
+        } catch (err) {
+          log.warn('context search index after recycle restore failed', {
+            path: logPathRef(rel),
+            error: logErrorRef(err),
+          });
+        }
+        try {
+          kbIndexer.enqueue(ctx.userId, ctxRel, 'upsert');
+        } catch (err) {
+          log.warn('context vector index after recycle restore failed', {
+            path: logPathRef(rel),
+            error: logErrorRef(err),
+          });
+        }
       }
     }
     const projectFile = /^cloud\/projects\/([^/]+)\/(?:contexts|files)\/(.+)$/.exec(rel);
     if (projectFile && safeId(projectFile[1]) && projectFile[2]) {
-      projectLibraryIndexer.enqueue(ctx.userId, projectFile[1], projectFile[2], 'upsert');
+      try {
+        projectLibraryIndexer.enqueue(ctx.userId, projectFile[1], projectFile[2], 'upsert');
+      } catch (err) {
+        log.warn('project indexing after recycle restore failed', {
+          path: logPathRef(rel),
+          error: logErrorRef(err),
+        });
+      }
     }
   }
   if (change.domains.includes('agents')) {
@@ -797,7 +895,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return user;
   },
 
-  'conversations.list': async ({ mode, active_cid, expanded_projects, project_id, task_id, bucket, offset }, ctx) => {
+  'conversations.list': async ({ mode, active_cid, expanded_projects, project_id, task_id, offset }, ctx) => {
     if (mode === 'startup') {
       const expandedProjectIds = String(expanded_projects || '')
         .split(',')
@@ -812,13 +910,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       if (!safeId(project_id)) throw new Error('invalid project id');
       return chats.listProjectConversationPage(ctx.userId, project_id, offset);
     }
+    if (mode === 'unprojected') {
+      return chats.listUnprojectedConversationPage(ctx.userId, offset);
+    }
     if (mode === 'auto_task') {
       if (!safeId(task_id)) throw new Error('invalid auto task id');
       return chats.listAutoTaskConversationPage(ctx.userId, task_id, offset);
-    }
-    if (mode === 'old_unprojected') {
-      if (bucket !== 'last30' && bucket !== 'older') throw new Error('invalid conversation bucket');
-      return chats.listOldUnprojectedConversationPage(ctx.userId, bucket, offset);
     }
     return { conversations: await chats.listConversations(ctx.userId) };
   },
@@ -837,7 +934,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.history': async (args, ctx) => {
-    const { cid, limit = 10, before, around_index } = args;
+    const { cid, limit = 10, before, around_index, around_message_id } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
     const projectIdHint = conversationProjectHint(args);
     const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
@@ -851,8 +948,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const requestedLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 10)));
     const requestedBefore = Number(before);
     const requestedAroundIndex = Number(around_index);
+    const requestedAroundMessageId = typeof around_message_id === 'string' && safeId(around_message_id)
+      ? around_message_id
+      : '';
     const hasAroundIndex = Number.isSafeInteger(requestedAroundIndex) && requestedAroundIndex >= 0;
-    const page = hasAroundIndex
+    let page = hasAroundIndex
       ? await chats.getMessagesPageAtIndex(
         ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
       : await chats.getMessagesPage(
@@ -862,6 +962,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
         resolvedProjectId,
       );
+    if (hasAroundIndex && requestedAroundMessageId
+        && !page.history.some((message) => message.id === requestedAroundMessageId)) {
+      const repairedIndex = await chats.findMessageIndexById(
+        ctx.userId, cid, requestedAroundMessageId, resolvedProjectId,
+      );
+      if (repairedIndex !== null) {
+        page = await chats.getMessagesPageAtIndex(
+          ctx.userId, cid, repairedIndex, requestedLimit, resolvedProjectId,
+        );
+      }
+    }
     return {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: page.history,
@@ -870,6 +981,36 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         page_start: page.pageStart,
         history_indexes: page.historyIndexes,
       } : {}),
+    };
+  },
+
+  'conversations.turns': async (args, ctx) => {
+    const { cid, before } = args;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const projectIdHint = conversationProjectHint(args);
+    const conv = await chats.getConversation(ctx.userId, cid, projectIdHint);
+    if (!conv) throw new Error('conversation not found');
+    const requestedBefore = Number(before);
+    const page = await chats.getConversationTurnPage(
+      ctx.userId,
+      cid,
+      Number.isSafeInteger(requestedBefore) && requestedBefore >= 0
+        ? requestedBefore
+        : undefined,
+      conv.project_id ?? null,
+    );
+    return {
+      turns: page.turns.map((turn) => ({
+        turn_no: turn.turnNo,
+        message_id: turn.messageId,
+        client_message_id: turn.clientMessageId,
+        message_index: turn.messageIndex,
+        user_preview: turn.userPreview,
+        assistant_preview: turn.assistantPreview,
+      })),
+      total: page.total,
+      next_cursor: page.nextCursor,
+      page_size: page.pageSize,
     };
   },
 
@@ -906,9 +1047,26 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'conversations.delete': async (args, ctx) => {
     const { cid } = args;
     if (!safeId(cid)) throw new Error('invalid cid');
-    await recycleBin.createAppRecycleBatchForConversation(ctx.userId, cid);
+    const batch = await recycleBin.createAppRecycleBatchForConversation(ctx.userId, cid);
+    if (!batch?.items?.length) throw _codedError('recycle_archive_failed');
     const ok = await chats.deleteConversation(ctx.userId, cid, conversationProjectHint(args));
+    if (!ok) await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
     return { deleted: ok };
+  },
+
+  // Roll back a conversation that was created for a first message but
+  // never received that message (for example because draft attachment adoption
+  // failed). Unlike an explicit user delete this does not create a recycle-bin
+  // entry. The empty-history guard keeps the cleanup endpoint from deleting a
+  // conversation that has already started.
+  'conversations.discardEmpty': async (args, ctx) => {
+    const { cid } = args;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const projectIdHint = conversationProjectHint(args);
+    const page = await chats.getMessagesPage(ctx.userId, cid, 1, null, projectIdHint);
+    if (page.history.length) return { discarded: false, error: 'conversation_not_empty' };
+    const discarded = await chats.deleteConversation(ctx.userId, cid, projectIdHint);
+    return { discarded };
   },
 
   'conversations.pin': async (args, ctx) => {
@@ -931,11 +1089,30 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'conversations.deleteAll': async (_args, ctx) => {
     const convs = await chats.listConversations(ctx.userId);
-    await recycleBin.createAppRecycleBatchForConversations(
+    if (!convs.length) return { deleted: 0 };
+    const batch = await recycleBin.createAppRecycleBatchForConversations(
       ctx.userId,
       convs.map((c) => c.conversation_id),
     );
+    if (!batch?.items?.length) throw _codedError('recycle_archive_failed');
     const deleted = await chats.deleteAllConversations(ctx.userId);
+    if (deleted !== convs.length) {
+      const recovery = await recycleBin.restoreRecycleBatch(ctx.userId, batch.id);
+      let recoveryComplete = recovery.batch !== null && recovery.failed_paths.length === 0;
+      try {
+        const restored = await chats.listConversations(ctx.userId);
+        const restoredIds = new Set(restored.map((row) => row.conversation_id));
+        recoveryComplete = recoveryComplete
+          && convs.every((row) => restoredIds.has(row.conversation_id));
+      } catch {
+        recoveryComplete = false;
+      }
+      if (recoveryComplete) {
+        await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
+        throw _codedError('cascade_failed');
+      }
+      throw _codedError('cascade_recovery_incomplete');
+    }
     return { deleted };
   },
 
@@ -963,8 +1140,52 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!batch?.items?.length) throw _codedError('recycle_archive_failed');
     const result = await projects.deleteProject(ctx.userId, projectId);
     if (!result.ok) {
-      await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
-      throw new Error((result as { error: string }).error);
+      const error = (result as { error: string }).error;
+      if (error !== 'cascade_failed') {
+        await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
+        throw new Error(error);
+      }
+
+      // A child may have been removed before the cascade faulted. Recover from
+      // the strict pre-delete snapshot, then verify the project relationships
+      // users can observe before discarding that snapshot. If verification is
+      // incomplete, retain the recycle entry for an explicit retry.
+      const recovery = await recycleBin.restoreRecycleBatch(ctx.userId, batch.id);
+      const expectedConversationIds = new Set(
+        (batch.metadata?.chat_index_rows || [])
+          .filter((row: any) => row?.project_id === projectId && safeId(row?.conversation_id))
+          .map((row: any) => row.conversation_id),
+      );
+      const expectedAutoTaskIds = new Set(
+        batch.items.map((item) => (
+          /^(?:cloud\/projects\/[^/]+\/auto_tasks|cloud\/auto_tasks)\/([^/]+)\/config\.json$/.exec(item.path)?.[1] || ''
+        )).filter((id) => safeId(id)),
+      );
+      let recoveryComplete = recovery.batch !== null && recovery.failed_paths.length === 0;
+      try {
+        const [project, conversations, tasks] = await Promise.all([
+          projects.getProject(ctx.userId, projectId),
+          chats.listConversations(ctx.userId),
+          autoTasks.listTasks(ctx.userId, { projectId }),
+        ]);
+        const actualConversationIds = new Set(
+          conversations
+            .filter((row) => row.project_id === projectId)
+            .map((row) => row.conversation_id),
+        );
+        const actualAutoTaskIds = new Set(tasks.map((task) => task.id));
+        recoveryComplete = recoveryComplete
+          && project !== null
+          && Array.from(expectedConversationIds).every((id) => actualConversationIds.has(id))
+          && Array.from(expectedAutoTaskIds).every((id) => actualAutoTaskIds.has(id));
+      } catch {
+        recoveryComplete = false;
+      }
+      if (recoveryComplete) {
+        await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
+        throw _codedError('cascade_failed');
+      }
+      throw _codedError('cascade_recovery_incomplete');
     }
     return { deleted_convs: result.deleted_convs, deleted_auto_tasks: result.deleted_auto_tasks };
   },
@@ -1008,7 +1229,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       title, detail, status, owner_agent, owner_agent_id, depends_on, created_by: 'user',
     });
     if (!r.ok) throw new Error((r as { error: string }).error);
-    return { task: r.task };
+    return { task: r.task, alreadyExists: r.alreadyExists };
   },
 
   'projects.tasks.update': async ({ projectId, taskId, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
@@ -1063,10 +1284,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return projectFiles.uploadProjectFile(ctx.userId, projectId, name || '', buf);
   },
 
+  'projects.files.attachToDraft': async ({ cid, projectId, name } = {}, ctx) => {
+    if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof name !== 'string' || !name.trim()) throw new Error('missing name');
+    const resolved = await projectFiles.resolveProjectFileAbsPath(ctx.userId, projectId, name);
+    if (!resolved.ok) throw new Error((resolved as { error?: string }).error || 'not_found');
+    const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, resolved.absPath);
+    if (!imported.ok) throw new Error((imported as { error?: string }).error || 'attach_failed');
+    return { info: imported.info };
+  },
+
   'projects.files.pickAndUpload': async ({ projectId, targetDir } = {}, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
     const picked = await _pickLocalFiles('Choose files', PROJECT_PICK_EXTENSIONS, true);
+    if (!picked.length) return { ok: true, cancelled: true, files: [] };
     const results = [];
     for (const filePath of picked) {
       const name = path.basename(filePath);
@@ -1383,6 +1616,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'autoTasks.attachments.pickAndUpload': async ({ taskId } = {}, ctx) => {
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     const picked = await _pickLocalFiles('Choose files', CHAT_PICK_EXTENSIONS, true);
+    if (!picked.length) return { cancelled: true, items: [], failed: [] };
     const items: string[] = [];
     const failed: Array<{ name: string; error: string }> = [];
     for (const filePath of picked) {
@@ -1396,7 +1630,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         failed.push({ name, error: (err as Error)?.message || String(err) });
       }
     }
-    return { items, failed };
+    return { cancelled: false, items, failed };
   },
 
   'autoTasks.attachments.delete': async ({ taskId, name }, ctx) => {
@@ -1421,9 +1655,28 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'autoTasks.delete': async ({ taskId }, ctx) => {
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    await recycleBin.createAppRecycleBatchForAutoTask(ctx.userId, taskId);
+    const batch = await recycleBin.createAppRecycleBatchForAutoTask(ctx.userId, taskId);
+    if (!batch?.items?.length) throw _codedError('recycle_archive_failed');
     const res = await autoTasks.deleteTask(ctx.userId, taskId);
-    return { deleted: res.ok };
+    if (res.ok) return { deleted: true };
+
+    // A recursive directory removal can fail after deleting only part of an
+    // automation (for example its config before an attachment fault). Restore
+    // the strict snapshot and verify the task is visible again before consuming
+    // the recovery batch; otherwise retain it for an explicit retry.
+    const recovery = await recycleBin.restoreRecycleBatch(ctx.userId, batch.id);
+    let recoveryComplete = recovery.batch !== null && recovery.failed_paths.length === 0;
+    try {
+      recoveryComplete = recoveryComplete
+        && (await autoTasks.getTask(ctx.userId, taskId)) !== null;
+    } catch {
+      recoveryComplete = false;
+    }
+    if (recoveryComplete) {
+      await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
+      throw _codedError('cascade_failed');
+    }
+    throw _codedError('cascade_recovery_incomplete');
   },
 
   'autoTasks.setEnabled': async ({ taskId, enabled }, ctx) => {
@@ -1445,13 +1698,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(cid)) throw new Error('invalid cid');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
-    const titleText = typeof title_text === 'string' ? title_text.trim() : '';
+    const hasTitleText = typeof title_text === 'string';
+    const titleText = hasTitleText ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
     const refs = Array.isArray(references) ? references : [];
     return groupChat.send({
       userId: ctx.userId, cid, text,
-      ...(titleText ? { title_text: titleText } : {}),
+      ...(hasTitleText ? { title_text: titleText } : {}),
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(refs.length ? { references: refs } : {}),
@@ -1567,6 +1821,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'conversations.attachments.pickAndUpload': async ({ cid } = {}, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const picked = await _pickLocalFiles('Choose files', CHAT_PICK_EXTENSIONS, true);
+    if (!picked.length) return { cancelled: true, items: [], failed: [] };
     const items = [];
     const failed: Array<{ name: string; error: string }> = [];
     for (const filePath of picked) {
@@ -1580,7 +1835,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         failed.push({ name, error: (err as Error)?.message || String(err) });
       }
     }
-    return { items, failed };
+    return { cancelled: false, items, failed };
   },
 
   'conversations.attachments.import': async (payload, ctx) => {
@@ -2102,7 +2357,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     await _afterRecycleRestore(ctx, changed);
     return {
       ok: true,
-      restored: changed.length,
+      changed: changed.length,
+      restored: res.restored_paths.length,
+      skipped: res.skipped_paths.length,
+      reactivated: res.reactivated_paths.length,
+      failed: res.failed_paths.length,
       restored_paths: res.restored_paths,
       skipped_paths: res.skipped_paths,
       failed_paths: res.failed_paths,
@@ -2146,6 +2405,15 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return contexts.writeContextFile(path || '', content || '');
   },
 
+  'contexts.attachToDraft': async ({ cid, relPath } = {}, ctx) => {
+    if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
+    if (typeof relPath !== 'string' || !relPath.trim()) throw new Error('missing relPath');
+    const absPath = contexts.resolveContextFileAbsPath(relPath);
+    const imported = await chatAttachments.importAttachmentFromPath(ctx.userId, cid, absPath);
+    if (!imported.ok) throw new Error((imported as { error?: string }).error || 'attach_failed');
+    return { info: imported.info };
+  },
+
   // Edit an existing text file (refuses to create).
   'contexts.update': async ({ path, content }) => {
     return contexts.updateContextFile(path || '', content || '');
@@ -2168,6 +2436,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'contexts.pickAndUpload': async ({ targetDir } = {}) => {
     const picked = await _pickLocalFiles('Choose files', CONTEXT_PICK_EXTENSIONS, true, /* seedWorkspaceOnFirstOpen */ true);
+    if (!picked.length) return { cancelled: true, files: [] };
     const results = [];
     for (const filePath of picked) {
       const name = path.basename(filePath);
@@ -2190,7 +2459,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         results.push({ ok: false, name, bytes, ext, error: (err as Error)?.message || String(err) });
       }
     }
-    return { files: results };
+    return { cancelled: false, files: results };
   },
 
   'contexts.mkdir': async ({ path }) => {
@@ -2329,6 +2598,32 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { enabled: next };
   },
 
+  // Native task-terminal notifications. Missing preference means enabled;
+  // only an explicit false suppresses the main-process notification outlet.
+  'prefs.getTaskNotifications': async () => ({
+    enabled: appConfig.getTaskNotificationsEnabled(),
+    permission: await notificationPermissions.getSystemNotificationPermission(),
+  }),
+  'prefs.setTaskNotifications': async ({ enabled }) => {
+    const previous = appConfig.getTaskNotificationsEnabled();
+    const next = appConfig.setTaskNotificationsEnabled(!!enabled);
+    markPreferencesDirty();
+    // Preference persistence must not wait for the platform permission probe.
+    // On Windows that probe launches PowerShell and can take several seconds
+    // under load. Settings already refreshes OS permission independently on
+    // load and focus, so keep this mutation responsive and return the saved
+    // preference immediately.
+    log.info('task notification preference changed', {
+      previous_enabled: previous,
+      enabled: next,
+      platform: process.platform,
+    });
+    return { enabled: next };
+  },
+  'prefs.openTaskNotificationSettings': async () => ({
+    opened: await notificationPermissions.openSystemNotificationSettings(),
+  }),
+
   // ── Auth / model config (settings page) ──
   'auth.listProviders': async () => auth.listProviders(),
   'auth.listModels': async ({ provider }) => auth.listModels(provider),
@@ -2360,6 +2655,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.addEntry':        async ({ provider, model, profileId }) => auth.addEntry({ provider, model, profileId }),
   'auth.removeEntry':     async ({ entryId }) => auth.removeEntry(entryId),
   'auth.reorderEntries':  async ({ orderedIds }) => auth.reorderEntries(orderedIds || []),
+  'auth.selectEntry':     async ({ entryId, model }) => auth.selectEntry(entryId, model),
   'auth.updateEntryModel':async ({ entryId, model }) => auth.updateEntryModel(entryId, model),
 
   // ── Image-generation API key (independent from chat entries) ──
@@ -2381,6 +2677,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'imageAuth.remove':   async ({ id }) => imageAuth.removeImageProfile(id),
   'imageAuth.reorder':  async ({ orderedIds }) => imageAuth.reorderImageProfiles(orderedIds || []),
   'imageAuth.test':     async ({ id }) => imageAuth.testImageProfile(id),
+
+  // ── VideoStudio host review panel (read-only production state view) ──
+  'videoStudio.reviewPanel': async ({ cid }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const panel = await videoStudioReview.buildVideoStudioReviewPanel(ctx.userId, cid);
+    return { ok: true, panel };
+  },
 
   // ── Video-generation API key (independent from chat/image entries) ──
   'videoAuth.list':     async () => ({
@@ -2584,7 +2887,15 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
     const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId, projectId);
     if (!result.ok) throw new Error((result as { ok: false; error: string }).error);
-    return { path: result.path };
+    return {
+      path: result.path,
+      ...(result.fallbackUsed
+        ? {
+          fallback_used: true,
+          fallback_reason: result.fallbackReason,
+        }
+        : {}),
+    };
   },
 
   // Open the OS file manager focused on a single file (Finder on macOS,
@@ -2774,7 +3085,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // Convert modern Office files into a local, sandboxed HTML preview.
-  // This is a content preview, not a high-fidelity Office layout renderer.
+  // Word, spreadsheet, and presentation files use the bundled Office layout
+  // renderer, with the lightweight content path retained as a failure fallback.
   // It shares the same path scope as produced.readText and revealPath.
   'produced.officePreviewHtml': async (payload, ctx) => {
     const target = payload?.path;
@@ -2785,7 +3097,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!await _isAllowedFileActionPath(ctx.userId, payload, norm)) {
       throw new Error('path is outside the user workspace');
     }
-    const kind = _officePreviewKindForExt(path.extname(norm).toLowerCase());
+    const kind = sharedOfficePreviewKindForExt(path.extname(norm).toLowerCase());
     if (!kind) return { ok: false, error: 'unsupported' };
     let st: fs.Stats;
     try { st = fs.statSync(norm); }
@@ -2798,19 +3110,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
     try {
       const buf = fs.readFileSync(norm);
-      let fragment = '';
-      if (kind === 'word') {
-        const { docxBufferToHtml } = await import('../util/extract-docx');
-        fragment = await docxBufferToHtml(buf);
-      } else if (kind === 'spreadsheet') {
-        const { xlsxBufferToHtml } = await import('../util/extract-office');
-        fragment = xlsxBufferToHtml(buf);
-      } else {
-        const { pptxBufferToHtml } = await import('../util/extract-office');
-        fragment = pptxBufferToHtml(buf);
-      }
-      const html = _wrapOfficePreviewHtml(kind, path.basename(norm), fragment || '<p class="office-muted">(no previewable content)</p>');
-      return { ok: true, html, kind, size: st.size };
+      const preview = await officeFileToPreviewHtml(kind, path.basename(norm), norm, buf);
+      return { ok: true, ...preview, size: st.size };
     } catch (err) {
       return { ok: false, error: String((err as Error).message || 'preview failed') };
     }
@@ -2901,7 +3202,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, title_text, attachments, use_selections, references, retry_message_id }, ctx, signal) {
+  'conversations.sendStream': async function* ({ cid, content, title_text, attachments, use_selections, references, retry_message_id, client_msg_id }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
@@ -2911,23 +3212,30 @@ const streamHandlers: Record<string, StreamHandler> = {
       yield { type: 'error', text: 'empty message' };
       return;
     }
-    const titleText = typeof title_text === 'string' ? title_text.trim() : '';
+    const hasTitleText = typeof title_text === 'string';
+    const titleText = hasTitleText ? title_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     const useSelections = Array.isArray(use_selections) ? use_selections : [];
     const refs = Array.isArray(references) ? references : [];
-    // Legacy `conversations.stream` is now a thin wrapper around the
-    // group_chat bus. Subscribe to the bus directly BEFORE calling
-    // `groupChat.send` — `send` internally wakes the recipient worker
-    // synchronously, and that worker's first state_changed / process events
-    // can fire on the same microtask cycle as `send` returns. We also drain
-    // the subscription while `send` is still in flight: plan-triggered runs
-    // can spend real time dispatching/reconciling before `send` resolves,
-    // but the bus is already carrying the agent's process/delta stream.
+    // Subscribe to the bus BEFORE calling `groupChat.send`: `send` wakes the
+    // recipient worker synchronously, and that worker's first events can fire
+    // on the same microtask cycle as `send` returns. Establishing the
+    // subscription here — synchronously, in the same call that starts the turn —
+    // is why this stream cannot miss a turn's opening events.
     //
-    // We relay events until the bus is fully quiescent (no worker running
-    // AND every actor's queue empty) — checked via the in-memory bus
-    // state, since on-disk state.json briefly shows 'idle' in the gap
-    // between an actor finishing and the next one's wake.
+    // This is the renderer's PRIMARY event source. `groupChat.events` stays
+    // attached as a redundant one: it is built asynchronously and can be torn
+    // down by several paths, so relying on it alone let a whole turn's events be
+    // dropped when its abort raced a new send (the reply was persisted but never
+    // rendered). Duplicate delivery across the two is safe now that the renderer
+    // addresses rows by render key — a `message` re-delivered simply updates the
+    // row it already owns. Append-semantics `process` events are NOT idempotent,
+    // so the observer skips those while this stream is alive.
+    //
+    // We relay until the bus is fully quiescent (no worker running AND every
+    // actor's queue empty), checked via the in-memory bus state since on-disk
+    // state.json briefly shows 'idle' between an actor finishing and the next
+    // one's wake.
     const buf: GroupEvent[] = [];
     let wake: (() => void) | null = null;
     let cancelled = signal.aborted;
@@ -2960,10 +3268,16 @@ const streamHandlers: Record<string, StreamHandler> = {
               cid,
               failedMessageId: retryMessageId,
               visibleText: text,
+              ...(typeof client_msg_id === 'string' && client_msg_id.trim()
+                ? { client_msg_id: client_msg_id.trim().slice(0, 64) }
+                : {}),
             })
           : await groupChat.send({
               userId: ctx.userId, cid, text,
-              ...(titleText ? { title_text: titleText } : {}),
+              ...(typeof client_msg_id === 'string' && client_msg_id.trim()
+                ? { client_msg_id: client_msg_id.trim().slice(0, 64) }
+                : {}),
+              ...(hasTitleText ? { title_text: titleText } : {}),
               ...(atts.length ? { attachments: atts } : {}),
               ...(useSelections.length ? { use_selections: useSelections } : {}),
               ...(refs.length ? { references: refs } : {}),
@@ -3259,6 +3573,9 @@ export function register(): void {
     try {
       const ctx = await resolveContext(event.sender);
       const result = await handler(payload || {}, ctx);
+      if (result && typeof result === 'object' && result.ok === false) {
+        logInvokeResultFailure(channel, result);
+      }
       return { ok: true, ...(result || {}) };
     } catch (err) {
       const normalized = normalizeAppError(err);

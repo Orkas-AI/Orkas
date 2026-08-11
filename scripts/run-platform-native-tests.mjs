@@ -48,6 +48,7 @@ const commonSuites = [
   'test/main/features/packages.test.ts',
   'test/main/util/media_probe.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
+  'test/main/features/video_studio_delivery.test.ts',
   'test/main/install-data-root.test.ts',
 ];
 
@@ -60,6 +61,7 @@ const platformSuites = process.platform === 'win32'
       'test/main/features/platform-foundations.test.ts',
       'test/main/features/user_workspace.test.ts',
       'test/main/conversation-files.test.ts',
+      'test/main/native/notification-permissions-darwin.test.ts',
     ];
 
 console.log(`[platform-native-tests] host=${process.platform}; suites=${commonSuites.length + platformSuites.length}`);

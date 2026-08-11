@@ -94,6 +94,7 @@ function createHarness(options: {
   });
   const uiToast = vi.fn();
   const uiAlert = vi.fn(async () => undefined);
+  const monitorEvent = vi.fn();
   const labels: Record<string, string> = {
     'conversation_info.file_reveal_action': 'Show in folder',
     'conversation_info.file_add_to_chat_action': 'Add to chat',
@@ -133,6 +134,7 @@ function createHarness(options: {
     },
     uiToast,
     uiAlert,
+    Monitor: { event: monitorEvent },
     document: {
       readyState: 'complete',
       body,
@@ -143,6 +145,7 @@ function createHarness(options: {
       removeEventListener() {},
     },
     window: {
+      Monitor: true,
       innerWidth: 1200,
       innerHeight: 800,
       addEventListener() {},
@@ -167,6 +170,7 @@ function createHarness(options: {
     invoke,
     uiToast,
     uiAlert,
+    monitorEvent,
     async clickAddToLibrary(filePath: string) {
       const anchor = new FakeElement();
       await context.window.ConversationInfo.openFileMenu(
@@ -198,6 +202,12 @@ describe('ConversationInfo produced-file Library import', () => {
     });
     expect(harness.uiToast).toHaveBeenCalledWith('Added to Project Library', { variant: 'success' });
     expect(harness.uiAlert).not.toHaveBeenCalled();
+    expect(harness.monitorEvent).toHaveBeenCalledWith('file_preview_add_library_result', expect.objectContaining({
+      result: 'success',
+      surface: 'conversation_info',
+      kind: 'image',
+      scope: 'project',
+    }));
   });
 
   it('uses the shipped Chinese copy to say the result was saved to Project Library', async () => {
@@ -237,6 +247,14 @@ describe('ConversationInfo produced-file Library import', () => {
 
     expect(harness.uiToast).not.toHaveBeenCalled();
     expect(harness.uiAlert).toHaveBeenCalledWith('Add to Library failed: not_found');
+    expect(harness.monitorEvent).toHaveBeenCalledWith('file_preview_add_library_result', expect.objectContaining({
+      result: 'failure',
+      surface: 'conversation_info',
+      kind: 'image',
+      error_type: 'operation',
+      error_code: 'source_not_found',
+    }));
+    expect(JSON.stringify(harness.monitorEvent.mock.calls)).not.toContain('/workspace/poster.png');
   });
 
   it('executes the project-only video action instead of silently returning', async () => {

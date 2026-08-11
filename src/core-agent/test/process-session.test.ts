@@ -38,6 +38,28 @@ function json(content: string): Record<string, any> {
   return JSON.parse(content) as Record<string, any>;
 }
 
+async function waitForProcessRead(
+  owner: string,
+  sessionId: string,
+  cursor: number,
+  predicate: (payload: Record<string, any>) => boolean,
+  timeoutMs = 10_000,
+) {
+  const deadline = performance.now() + timeoutMs;
+  let lastPayload: Record<string, any> | null = null;
+  while (performance.now() < deadline) {
+    const result = await tool("process_read").execute({
+      session_id: sessionId,
+      cursor,
+    }, context(owner));
+    const payload = json(result.content);
+    lastPayload = payload;
+    if (predicate(payload)) return { result, payload };
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`process session did not reach the expected state: ${JSON.stringify(lastPayload)}`);
+}
+
 beforeEach(async () => {
   workingDir = await fs.mkdtemp(path.join(os.tmpdir(), "core-process-session-"));
 });
@@ -56,29 +78,46 @@ describe("persistent process sessions", () => {
   it("streams cursor-based output across separate Agent tool contexts", async () => {
     const command = shellInvoke(TEST_NODE, [
       "-e",
-      "process.stdout.write('first\\n');setTimeout(()=>{process.stdout.write('second\\n')},500);setTimeout(()=>process.exit(0),550)",
+      "process.stdout.write('first\\n');process.stdin.once('data',()=>{process.stdout.write('second\\n');process.exit(0)})",
     ]);
     const started = await tool("process_start").execute({ command }, context("conversation-a"));
     expect(started.isError).toBeUndefined();
-    const first = json(started.content);
+    let firstResult = { result: started, payload: json(started.content) };
+    if (!String(firstResult.payload.output).includes("first")) {
+      firstResult = await waitForProcessRead(
+        "conversation-a",
+        firstResult.payload.session_id,
+        firstResult.payload.next_cursor,
+        (payload) => String(payload.output).includes("first"),
+      );
+    }
+    const first = firstResult.payload;
     expect(first.output).toContain("first");
 
-    await new Promise((resolve) => setTimeout(resolve, 650));
-    const later = await tool("process_read").execute({
+    const written = await tool("process_write").execute({
       session_id: first.session_id,
-      cursor: first.next_cursor,
+      chars: "continue",
+      add_newline: true,
     }, context("conversation-a"));
-    const second = json(later.content);
+    expect(written.isError).toBeUndefined();
+
+    const later = await waitForProcessRead(
+      "conversation-a",
+      first.session_id,
+      first.next_cursor,
+      (payload) => String(payload.output).includes("second") && payload.status === "exited",
+    );
+    const second = later.payload;
     expect(second.output).toContain("second");
     expect(second.output).not.toContain("first");
     expect(second.status).toBe("exited");
-    expect(later.observations?.execution).toMatchObject({
+    expect(later.result.observations?.execution).toMatchObject({
       status: "succeeded",
       exitCode: 0,
       timedOut: false,
       outputLimitExceeded: false,
     });
-    expect(later.observations?.execution?.stdout.bytes).toBeGreaterThan(0);
+    expect(later.result.observations?.execution?.stdout.bytes).toBeGreaterThan(0);
 
     const emptyResult = await tool("process_read").execute({
       session_id: first.session_id,
@@ -144,14 +183,23 @@ describe("persistent process sessions", () => {
       { command },
       context("owner-a"),
     );
-    const payload = json(result.content);
+    let terminal = { result, payload: json(result.content) };
+    if (terminal.payload.status === "running") {
+      terminal = await waitForProcessRead(
+        "owner-a",
+        terminal.payload.session_id,
+        terminal.payload.next_cursor,
+        (payload) => payload.status !== "running",
+      );
+    }
+    const payload = terminal.payload;
     expect(payload.status).toBe("error");
     expect(payload.exit_code).toBe(7);
-    expect(result.isError).toBe(true);
-    expect(result.observations?.execution).toMatchObject({
+    expect(terminal.result.isError).toBe(true);
+    expect(terminal.result.observations?.execution).toMatchObject({
       status: "failed",
       exitCode: 7,
     });
-    expect(result.observations?.execution?.stderr.bytes).toBeGreaterThan(0);
+    expect(terminal.result.observations?.execution?.stderr.bytes).toBeGreaterThan(0);
   });
 });

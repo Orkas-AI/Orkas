@@ -73,7 +73,7 @@ describe('auto device display name', () => {
     expect(html).toContain('id="auto-run-device-select"');
     expect(html).not.toContain('id="auto-run-current-device-input"');
     expect(html).not.toContain('id="auto-task-dialog-sync-note"');
-    expect(zh['auto.run_label']).toBe('运行');
+    expect(zh['auto.run_label']).toBe('执行设备');
     expect(zh['auto.sync_note_create']).toBeUndefined();
   });
 

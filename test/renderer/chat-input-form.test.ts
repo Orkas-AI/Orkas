@@ -120,6 +120,19 @@ function loadFormModule() {
       createElement: (tag: string) => new FakeElement(tag),
       createElementNS: (_ns: string, tag: string) => new FakeElement(tag),
     },
+    _aiSelectMount: (host: FakeElement) => {
+      let value = '';
+      const trigger = new FakeElement('button');
+      trigger.className = 'ai-select-trigger';
+      host.appendChild(trigger);
+      return {
+        setOptions: (options: Array<{ value: string }>, state: { value?: string } = {}) => {
+          value = state.value || options[0]?.value || '';
+        },
+        getValue: () => value,
+        onChange: () => {},
+      };
+    },
     window: {},
   };
   context.window.window = context.window;
@@ -196,5 +209,55 @@ describe('chat input form widget', () => {
     expect(encoded).toContain('- Tags：\n');
     expect(encoded).not.toContain('unfilled');
     expect(encoded).not.toContain('undefined');
+  });
+
+  it('renders and submits revision feedback beside a VideoStudio draft decision', () => {
+    const context = loadFormModule();
+    const container = new FakeElement('div');
+    const submissions: any[] = [];
+    const message = {
+      form: {
+        form_id: 'draft1234',
+        agent_id: '79df9cc89f5f',
+        fields: [
+          {
+            id: 'gate_d_decision',
+            label: '是否批准当前草稿，并导出最终版视频？',
+            type: 'select',
+            required: true,
+            default: 'revise',
+            options: [
+              { value: 'approve', label: '批准并导出' },
+              { value: 'revise', label: '先修改草稿' },
+            ],
+          },
+          {
+            id: 'adjustments',
+            label: '修改意见（选择修改时填写）',
+            type: 'textarea',
+            required: false,
+            default: '',
+          },
+        ],
+      },
+    };
+
+    context.window.renderChatInputForm(container, message, {
+      cid: 'c1',
+      onSubmit: (encoded: string, values: Record<string, unknown>) => submissions.push({ encoded, values }),
+    });
+
+    const feedback = container.querySelectorAll('textarea')[0];
+    expect(feedback).toBeDefined();
+    feedback.value = '把结尾字幕停留时间延长两秒';
+    feedback.dispatch('input');
+    container.querySelectorAll('button').find((btn) => btn.textContent === 'Submit')?.dispatch('click');
+
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0].values).toEqual({
+      gate_d_decision: 'revise',
+      adjustments: '把结尾字幕停留时间延长两秒',
+    });
+    expect(submissions[0].encoded).toContain('- 修改意见（选择修改时填写）：把结尾字幕停留时间延长两秒');
   });
 });

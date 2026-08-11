@@ -27,6 +27,7 @@ function loadCommentaryHarness() {
   const paint = vi.fn((_msg, finalEl, text) => { finalEl.innerHTML = text; });
   const context = {
     _streamingAppendProgress: (_msg: unknown, text: string, kind: string) => progress.push({ text, kind }),
+    _isRepeatedPriorTurnCommentary: () => false,
     _cancelPendingStreamRaf: cancel,
     _stripSkillCreateBlocksForStream: (value: string) => value,
     _stripAgentCreateBlocksForStream: (value: string) => value,
@@ -47,6 +48,23 @@ function loadCommentaryHarness() {
 }
 
 describe('conversation commentary finalization', () => {
+  it('formats multilingual commentary as readable sentence paragraphs', () => {
+    const formatter = vm.runInNewContext(
+      `${extractFunction('_formatStreamingCommentary')}\n_formatStreamingCommentary`,
+    );
+
+    expect(formatter('先检查实现。再补充测试！最后验证？')).toBe(
+      '先检查实现。\n\n再补充测试！\n\n最后验证？',
+    );
+    expect(formatter('First inspect the implementation. Then add tests! Finally verify it.')).toBe(
+      'First inspect the implementation.\n\nThen add tests!\n\nFinally verify it.',
+    );
+    expect(formatter('実装を確認します。次にテストを追加します。')).toBe(
+      '実装を確認します。\n\n次にテストを追加します。',
+    );
+    expect(formatter('已有一段。\n\n已有二段。')).toBe('已有一段。\n\n已有二段。');
+  });
+
   it('moves commentary into process and starts final text from an empty body', () => {
     const { finalize, append, progress, cancel, paint } = loadCommentaryHarness();
     const finalEl = { style: { display: '' }, innerHTML: 'live commentary' };

@@ -8,6 +8,7 @@ import {
   managedBinaryCandidates,
   parseLiveArgs,
   summarizeLiveFailure,
+  validateLiveProtocolTrace,
 } from '../../../../scripts/local-agent-live-support.mjs';
 
 describe('local-agent live test support', () => {
@@ -17,7 +18,7 @@ describe('local-agent live test support', () => {
       installMissing: true,
       installOnly: false,
       benchmark: false,
-      k: 3,
+      k: 2,
       noSave: false,
       help: false,
     });
@@ -52,11 +53,24 @@ describe('local-agent live test support', () => {
     expect(steps[1].args).toEqual(expect.arrayContaining([
       '--skip-setup', '--skip-browser', '--dir', path.join('/managed', 'hermes'),
     ]));
+    expect(steps[1].env).toMatchObject({
+      HERMES_HOME: path.join('/managed', 'hermes-home'),
+      GIT_CEILING_DIRECTORIES: '/managed',
+    });
   });
 
   it('resolves test-managed executable locations on POSIX and Windows', () => {
     expect(managedBinaryCandidates('opencode', { platform: 'darwin', installRoot: '/m' }))
       .toContain(path.join('/m', 'npm', 'opencode', 'node_modules', '.bin', 'opencode'));
+    expect(managedBinaryCandidates('opencode', { platform: 'win32', installRoot: 'C:\\m' }))
+      .toContain(path.join(
+        'C:\\m', 'npm', 'opencode', 'node_modules',
+        'opencode-windows-x64-baseline', 'bin', 'opencode.exe',
+      ));
+    expect(managedBinaryCandidates('hermes', { platform: 'win32', installRoot: 'C:\\m' })[0])
+      .toBe(path.join(
+        'C:\\m', 'hermes-home', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe',
+      ));
     expect(managedBinaryCandidates('codex', { platform: 'win32', installRoot: 'C:\\m' })[0])
       .toMatch(/codex\.cmd$/);
   });
@@ -116,5 +130,36 @@ describe('local-agent live test support', () => {
       error: 'cli exited with code 1',
       output: 'Failed to authenticate. API Error: 401 OAuth token expired.',
     })).toMatch(/^Failed to authenticate/);
+  });
+
+  it('validates terminal protocol invariants for real CLI smoke traces', () => {
+    expect(validateLiveProtocolTrace('codex', { status: 'completed' }, {
+      eventTypes: ['process-info', 'status', 'text-delta', 'done'],
+      terminalEvent: {
+        type: 'done',
+        status: 'completed',
+        sessionId: 'thread-1',
+      },
+    })).toEqual([]);
+
+    expect(validateLiveProtocolTrace('claude', { status: 'completed' }, {
+      eventTypes: ['process-info', 'done', 'status'],
+      terminalEvent: {
+        type: 'done',
+        status: 'failed',
+      },
+    })).toEqual([
+      'last event=status',
+      'terminal/result mismatch=failed/completed',
+      'missing resumable session id',
+    ]);
+
+    expect(validateLiveProtocolTrace('opencode', { status: 'failed' }, {
+      eventTypes: ['done', 'done'],
+      terminalEvent: { type: 'done', status: 'failed' },
+    })).toEqual([
+      'process-info count=0',
+      'done count=2',
+    ]);
   });
 });

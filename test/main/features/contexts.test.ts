@@ -9,6 +9,15 @@ vi.mock('../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
 
+// The layout-rendering behavior is covered with a deterministic OfficeCLI mock
+// in util/office-preview-rendered.test.ts. Filesystem/context tests exercise the
+// lightweight fallback so they do not depend on a platform binary.
+vi.mock('../../../src/main/features/office/office_engine', () => ({
+  officeCliAvailable: () => false,
+  runOfficeCli: vi.fn(),
+  closeOfficeFile: vi.fn(),
+}));
+
 /**
  * contexts.ts tests for the single-region user-owned model. Mocks
  * kb_indexer + search so mutation side-effects don't pull in fastembed /

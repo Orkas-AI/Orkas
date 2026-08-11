@@ -103,9 +103,9 @@ export class SkillLoader {
   // **Orkas does NOT use this in production** — it ships its own renderer
   // at `src/main/model/core-agent/skill-registry.ts::renderSkillLines` that
   // (a) decides Source label by the resolved root path (basename collides
-  // when both roots end in `/skills`) and (b) inlines `<ROOT>/<id>/SKILL.md`
-  // patterns + resolved ROOT values right in the block so the LLM doesn't
-  // need to consult a separate path-constants section. Other hosts may use
+  // when both roots end in `/skills`) and (b) gives production runners a
+  // host-resolved `@skill/<ref>` while retaining the absolute-root format for
+  // standalone prompt fragments. Other hosts may use
   // this default helper, in which case Source is taken from the dirs[]
   // basename.
   renderSystemPromptBlock(lang: string = 'en'): string {

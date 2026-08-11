@@ -42,19 +42,52 @@ const EMBED_BATCH_SIZE = 32;
 let _embedder: any = null;
 const _initLock = new Mutex();
 
+function nativeEmbedLoadCode(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (code !== 'ERR_DLOPEN_FAILED') return '';
+  const details = [
+    (err as { message?: unknown } | null)?.message,
+    (err as { stack?: unknown } | null)?.stack,
+  ].map((value) => String(value || '').toLowerCase()).join('\n');
+  if (details.includes('onnxruntime')) return 'E_LIBRARY_NATIVE_ONNX_LOAD';
+  if (details.includes('tokenizers')) return 'E_LIBRARY_NATIVE_TOKENIZERS_LOAD';
+  return 'E_LIBRARY_NATIVE_EMBED_LOAD';
+}
+
+function normalizeEmbedLoadError(err: unknown): unknown {
+  const code = nativeEmbedLoadCode(err);
+  if (!code) return err;
+  const component = code === 'E_LIBRARY_NATIVE_ONNX_LOAD'
+    ? 'onnxruntime'
+    : code === 'E_LIBRARY_NATIVE_TOKENIZERS_LOAD'
+      ? 'tokenizers'
+      : 'embedding runtime';
+  const wrapped = new Error(`${component} native module failed to load`, { cause: err });
+  (wrapped as Error & { code: string }).code = code;
+  return wrapped;
+}
+
 async function initEmbedder(): Promise<void> {
   if (_embedder) return;
   await _initLock.runExclusive(async () => {
     if (_embedder) return;
     const started = Date.now();
-    const { FlagEmbedding, EmbeddingModel } = require('fastembed') as typeof import('fastembed');
-    _embedder = await FlagEmbedding.init({
-      model: EmbeddingModel.BGESmallZH,
-      cacheDir: embeddingModelDir(),
-      // Model files come bundled with the installer (see resources/embedding-model);
-      // any attempt to download is a bug — never silently spinner-download.
-      showDownloadProgress: false,
-    });
+    try {
+      // fastembed eagerly loads both native dependencies from its CJS entry.
+      // Classify a dlopen failure here while the original stack still names
+      // the failing package; downstream telemetry intentionally omits paths
+      // and raw exception text.
+      const { FlagEmbedding, EmbeddingModel } = require('fastembed') as typeof import('fastembed');
+      _embedder = await FlagEmbedding.init({
+        model: EmbeddingModel.BGESmallZH,
+        cacheDir: embeddingModelDir(),
+        // Model files come bundled with the installer (see resources/embedding-model);
+        // any attempt to download is a bug — never silently spinner-download.
+        showDownloadProgress: false,
+      });
+    } catch (err) {
+      throw normalizeEmbedLoadError(err);
+    }
     log.info(`initialized in ${Date.now() - started}ms (model=bge-small-zh-v1.5, dim=512)`);
   });
 }
@@ -98,4 +131,8 @@ export function closeEmbedder(): void {
   } catch (err) {
     log.warn(`close: ${(err as Error).message}`);
   }
+}
+
+export function _nativeEmbedLoadCodeForTests(err: unknown): string {
+  return nativeEmbedLoadCode(err);
 }

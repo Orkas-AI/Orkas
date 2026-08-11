@@ -26,7 +26,10 @@ const {
   _markdownImageHtml,
   _markdownVideoHtml,
   _markdownAudioHtml,
+  _markdownHtmlEmbedHtml,
+  _isHtmlSrc,
   _chatMediaLocalPathFromUrl,
+  _normalizeLocalMediaSrc,
   _chatVideoNativeControlsHit,
 } = utils as {
   _BARE_URL_RE: RegExp;
@@ -35,7 +38,10 @@ const {
   _markdownImageHtml: (src: string, alt: string, title?: string) => string;
   _markdownVideoHtml: (src: string, label: string, title?: string) => string;
   _markdownAudioHtml: (src: string, label: string, title?: string) => string;
+  _markdownHtmlEmbedHtml: (src: string, label: string, title?: string) => string;
+  _isHtmlSrc: (src: string) => boolean;
   _chatMediaLocalPathFromUrl: (src: string) => string;
+  _normalizeLocalMediaSrc: (src: string) => string;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
 };
 
@@ -169,6 +175,64 @@ describe('markdown media links', () => {
     expect(out).toContain('title="&quot;preview&quot;"');
   });
 
+  it.each([
+    ['HTML', 'chat-media://local/Users/test/poster.html?v=123'],
+    ['HTM', 'chat-media://local/Users/test/poster.htm#page'],
+    ['uppercase extension', 'chat-media://local/Users/test/poster.HTML'],
+    ['encoded Chinese path', 'chat-media://local/Users/test/%E5%9F%8E%E5%B8%82%E6%B5%B7%E6%8A%A5.html?v=123#preview'],
+    ['encoded spaces and punctuation', 'chat-media://local/Users/test/poster%20%231%3F.html?v=123'],
+  ])('routes local %s markdown image targets to an inline HTML mount point', (_label, src) => {
+    const out = inlineFormat(`![poster preview](${src})`);
+    expect(out).toContain('<span class="chat-md-html-embed is-loading"');
+    expect(out).toContain('data-chat-md-html-embed="1"');
+    expect(out).toContain(`data-html-src="${src}"`);
+    expect(out).toContain('data-html-title="Preview: poster preview"');
+    expect(out).not.toContain('<img ');
+    expect(out).not.toContain('<iframe');
+  });
+
+  it('emits one independent mount point for each local HTML output', () => {
+    const out = inlineFormat([
+      '![first](chat-media://local/Users/test/first.html)',
+      '![second](chat-media://local/Users/test/second.htm)',
+    ].join('\n'));
+
+    expect(out.match(/data-chat-md-html-embed="1"/g)).toHaveLength(2);
+    expect(out).toContain('data-html-src="chat-media://local/Users/test/first.html"');
+    expect(out).toContain('data-html-src="chat-media://local/Users/test/second.htm"');
+  });
+
+  it.each([
+    'chat-media://local/Users/test/poster.html.png',
+    'chat-media://local/Users/test/poster.html5',
+    'chat-media://local/Users/test/poster.xhtml',
+    'chat-media://local/Users/test/poster.png?download=poster.html',
+    'chat-media://local/Users/test/poster.png#poster.html',
+  ])('keeps the HTML lookalike %s on the normal image path', (src) => {
+    const out = inlineFormat(`![poster](${src})`);
+    expect(_isHtmlSrc(src)).toBe(false);
+    expect(out).toContain('<img class="chat-md-img"');
+    expect(out).not.toContain('data-chat-md-html-embed');
+  });
+
+  it('escapes HTML mount attributes and keeps unsafe non-local targets inert', () => {
+    const local = _markdownHtmlEmbedHtml(
+      'chat-media://local/Users/test/poster.html?x="y"',
+      '<poster>',
+      '"preview"',
+    );
+    expect(local).toContain('data-html-src="chat-media://local/Users/test/poster.html?x=&quot;y&quot;"');
+    expect(local).toContain('data-html-title="&quot;preview&quot;"');
+    expect(_markdownHtmlEmbedHtml('javascript:alert(1).html', '<poster>')).toBe('&lt;poster&gt;');
+  });
+
+  it('keeps a remote HTML target as an external preview link instead of embedding it', () => {
+    const out = inlineFormat('![docs](https://example.test/preview.html)');
+    expect(out).toContain('<a href="https://example.test/preview.html"');
+    expect(out).toContain('>docs</a>');
+    expect(out).not.toContain('data-chat-md-html-embed');
+  });
+
   it('renders a normal markdown link to chat-media mp4 as an inline player', () => {
     const out = inlineFormat('[video](chat-media://local/Users/test/car_driving.mp4)');
     expect(out).toContain('<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble">');
@@ -186,6 +250,49 @@ describe('markdown media links', () => {
     expect(out).toContain('data-video-src="chat-media://local/Users/test/car_driving.mp4"');
     expect(out).toContain('aria-label="Fullscreen"');
     expect(out).not.toContain('<a ');
+  });
+
+  // A finished 62s video reached the user as a dead player: the agent wrote
+  // `[视频成片](sandbox:/Users/…/orkas-promo-final.mp4)` — a path convention from
+  // its own training — and the media branches dispatch on the file extension
+  // alone, so Chromium got a scheme it cannot fetch. Controls rendered, 0:00,
+  // black frame, and the main process never saw a request. `_safeHref` is no
+  // safety net here: it allows only http(s)/mailto/tel, so the alternative was
+  // bare text. Two earlier conversations carry the same shape.
+  it('plays a local file an agent addressed with its own path convention', () => {
+    const cases = [
+      'sandbox:/Users/test/render/orkas-promo-final.mp4',
+      '/Users/test/render/orkas-promo-final.mp4',
+      'file:///Users/test/render/orkas-promo-final.mp4',
+    ];
+    for (const src of cases) {
+      for (const md of [`[视频成片](${src})`, `![成片](${src})`]) {
+        const out = inlineFormat(md);
+        expect(out, md).toContain('src="chat-media://local/Users/test/render/orkas-promo-final.mp4"');
+        expect(out, md).toContain('<video class="chat-md-video"');
+        // The floating-player button only appears once the src resolves back to
+        // a local path, so it doubles as proof the rewrite reached the player.
+        expect(out, md).toContain('data-chat-md-video-open="1"');
+        expect(out, md).not.toContain('sandbox:');
+      }
+    }
+  });
+
+  it('leaves srcs it cannot resolve or must not touch alone', () => {
+    // No base directory exists in the renderer, so a relative path stays as
+    // authored — these are document illustrations, not chat media.
+    expect(inlineFormat('![fig](k3-figs/post05/01-cover.png)')).toContain('src="k3-figs/post05/01-cover.png"');
+    // Already-servable schemes are untouched.
+    expect(inlineFormat('[clip](https://x.test/a.mp4)')).toContain('src="https://x.test/a.mp4"');
+    expect(inlineFormat('[clip](chat-media://local/Users/test/a.mp4)'))
+      .toContain('src="chat-media://local/Users/test/a.mp4"');
+    // A non-media link keeps ordinary link handling: an unsafe scheme still
+    // renders as text rather than becoming an anchor.
+    expect(inlineFormat('[doc](sandbox:/Users/test/notes.txt)')).not.toContain('chat-media://');
+    expect(_normalizeLocalMediaSrc('C:\\Users\\test\\render\\clip.mp4'))
+      .toBe('chat-media://local/C:/Users/test/render/clip.mp4');
+    expect(_normalizeLocalMediaSrc('/Users/test/has space.mp4'))
+      .toBe('chat-media://local/Users/test/has%20space.mp4');
   });
 
   it('escapes markdown video attributes', () => {

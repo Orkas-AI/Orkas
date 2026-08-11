@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -299,4 +300,106 @@ async function runStreamingRecords(
       });
     });
   });
+}
+
+// ── Ignore-file support for the walk fallback ────────────────────────────
+//
+// `rg --files` already honours ignore files, so the repository backend needs
+// nothing here. The walk fallback (no ripgrep on the machine) previously
+// filtered only by a hard-coded directory list, so on those machines
+// `search_files` returned build output, logs and local config that the project
+// had explicitly ignored — contradicting the tool's own contract and filling
+// the model's context with noise.
+//
+// This is the common subset of gitignore semantics, not the whole spec:
+// comments/blank lines, a trailing `/` for directory-only rules, a leading `/`
+// anchoring to the file's own directory, `!` negation, and `*` / `?` / `**`
+// globs. Nested `.gitignore` files apply to their own subtree, matching git's
+// scoping. Character classes, and the rarely-used escaping rules, are not
+// interpreted; an unsupported pattern simply fails to match rather than
+// throwing, so the walk degrades to "shows a bit more" and never to a crash.
+
+export type IgnoreRule = {
+  re: RegExp;
+  negate: boolean;
+  dirOnly: boolean;
+};
+
+export type IgnoreScope = {
+  /** Directory the rules were declared in; patterns resolve relative to it. */
+  dir: string;
+  rules: IgnoreRule[];
+};
+
+function globToRegExpSource(glob: string): string {
+  let out = '';
+  for (let i = 0; i < glob.length; i += 1) {
+    const ch = glob[i];
+    if (ch === '*') {
+      if (glob[i + 1] === '*') {
+        // `**` spans directory separators; `*` stops at one.
+        i += 1;
+        if (glob[i + 1] === '/') i += 1;
+        out += '(?:.*/)?';
+      } else {
+        out += '[^/]*';
+      }
+      continue;
+    }
+    if (ch === '?') { out += '[^/]'; continue; }
+    out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return out;
+}
+
+export function parseIgnoreRules(content: string): IgnoreRule[] {
+  const rules: IgnoreRule[] = [];
+  for (const raw of String(content || '').split(/\r?\n/)) {
+    let line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const negate = line.startsWith('!');
+    if (negate) line = line.slice(1);
+    const dirOnly = line.endsWith('/');
+    if (dirOnly) line = line.slice(0, -1);
+    if (!line) continue;
+    // A pattern containing a slash anywhere (other than a trailing one) is
+    // anchored to the declaring directory; a bare name matches at any depth.
+    const anchored = line.startsWith('/') || line.slice(0, -1).includes('/');
+    if (line.startsWith('/')) line = line.slice(1);
+    if (!line) continue;
+    const body = globToRegExpSource(line);
+    const source = anchored ? `^${body}$` : `^(?:.*/)?${body}$`;
+    try { rules.push({ re: new RegExp(source), negate, dirOnly }); }
+    catch { /* unsupported pattern: skip rather than fail the whole walk */ }
+  }
+  return rules;
+}
+
+/** Read `<dir>/.gitignore`, returning null when absent or unreadable. */
+export function readIgnoreScope(dir: string): IgnoreScope | null {
+  let content: string;
+  try { content = fs.readFileSync(path.join(dir, '.gitignore'), 'utf8'); }
+  catch { return null; }
+  const rules = parseIgnoreRules(content);
+  return rules.length ? { dir, rules } : null;
+}
+
+/** Last matching rule wins, exactly like git, so a later `!pattern` re-includes. */
+export function isIgnoredByScopes(
+  absPath: string,
+  isDir: boolean,
+  scopes: readonly IgnoreScope[],
+): boolean {
+  let ignored = false;
+  for (const scope of scopes) {
+    const rel = path.relative(scope.dir, absPath);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    const posix = rel.split(path.sep).join('/');
+    for (const rule of scope.rules) {
+      if (rule.dirOnly && !isDir) continue;
+      if (!rule.re.test(posix)) continue;
+      ignored = !rule.negate;
+    }
+  }
+  return ignored;
 }

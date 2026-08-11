@@ -17,6 +17,7 @@ const {
 } = require('../bin/packaged-resource-gate.cjs');
 const { verifySourceEntrypointContract } = require('../bin/packaged-entrypoint-gate.cjs');
 const { verifyBuiltinExtraResourcesConfig, verifyBuiltinRoot } = require('../bin/builtin-resource-gate.cjs');
+const { verifyOfficeCliRuntimePolicy } = require('../bin/officecli-policy-gate.cjs');
 
 const ARCH_MAP = new Map([
   ['0', 'ia32'],
@@ -59,6 +60,11 @@ module.exports = async function ensureRuntimeBeforePack(context) {
     : process.platform;
   const arch = normalizeArch(context && context.arch);
   const arches = arch === 'universal' ? ['x64', 'arm64'] : [arch];
+
+  // Release packaging must fail closed if an OfficeCLI upgrade or refactor can
+  // once again launch an installed browser/App bundle from the Orkas process
+  // tree. This gate is intentionally before provisioning/downloading work.
+  verifyOfficeCliRuntimePolicy(pcRoot);
 
   for (const targetArch of arches) {
     const addon = spawnSync(process.execPath, [

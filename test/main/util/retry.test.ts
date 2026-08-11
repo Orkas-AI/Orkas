@@ -17,6 +17,24 @@ describe('retryAsync', () => {
     await expect(retryAsync('test:retry', fn, { delaysMs: [0, 0, 0] })).resolves.toBe('ok');
     expect(fn).toHaveBeenCalledTimes(4);
   });
+
+  it('cancels a pending backoff immediately and never starts another attempt', async () => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const fn = vi.fn().mockRejectedValue(new Error('temporary failure'));
+    const pending = retryAsync('test:abort-backoff', fn, {
+      retries: 2,
+      delaysMs: [10_000],
+      signal: controller.signal,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    controller.abort(new Error('user cancelled download'));
+
+    await expect(pending).rejects.toThrow('user cancelled download');
+    expect(fn).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });
 
 describe('fetchWithRetry', () => {

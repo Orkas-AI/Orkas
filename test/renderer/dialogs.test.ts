@@ -299,6 +299,32 @@ describe('shared renderer dialogs', () => {
     expect(overlays(ctx)).toHaveLength(0);
   });
 
+  it('removes externally cancelled confirm and choice dialogs without user input', async () => {
+    const ctx = loadDialogs();
+    const confirmController = new AbortController();
+    const confirm = ctx.uiConfirm({
+      message: 'Stale confirmation',
+      signal: confirmController.signal,
+    });
+    expect(overlays(ctx)).toHaveLength(1);
+
+    confirmController.abort();
+    await expect(confirm).resolves.toBe(false);
+    expect(overlays(ctx)).toHaveLength(0);
+
+    const choiceController = new AbortController();
+    const choice = ctx.uiChoice({
+      message: 'Stale choice',
+      choices: [{ id: 'allow', label: 'Allow' }],
+      signal: choiceController.signal,
+    });
+    expect(overlays(ctx)).toHaveLength(1);
+
+    choiceController.abort();
+    await expect(choice).resolves.toBeNull();
+    expect(overlays(ctx)).toHaveLength(0);
+  });
+
   it('keeps IME composition inside an accessible prompt and returns the final input value', async () => {
     const ctx = loadDialogs();
     let settled = false;

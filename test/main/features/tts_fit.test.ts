@@ -6,7 +6,28 @@ import {
   estimateNarrationDuration,
   measureNarrationUnits,
   narrationDurationCalibrationScale,
+  narrationFitBlocksProduction,
 } from '../../../src/main/features/tts';
+
+/** A neutral estimate whose estimatedSec each case overrides, so a band case
+ *  reads as the one duration under test rather than as a script to decode. */
+const estimateStub = {
+  estimatedSec: 1,
+  unit: 'characters' as const,
+  units: 24,
+  unitsPerSec: 4,
+  breakdown: {
+    cjkCharacters: 24,
+    latinWords: 0,
+    numericDigits: 0,
+    numericSeparators: 0,
+    majorPauses: 0,
+    minorPauses: 0,
+    longPauses: 0,
+    speechSec: 6,
+    pauseSec: 0,
+  },
+};
 
 describe('assessNarrationFit', () => {
   it('flags a narration that is too short for the clip (the draft scenario)', () => {
@@ -162,17 +183,53 @@ describe('calibrated narration duration preflight', () => {
     });
   });
 
-  it('uses the same delivery band before and after synthesis', () => {
-    const estimate = estimateNarrationDuration(Array.from({ length: 150 }, () => 'word').join(' '));
-    expect(assessEstimatedNarrationFit({ estimate, targetSec: 60 })?.status).toBe('fits');
-    expect(assessEstimatedNarrationFit({
-      estimate: { ...estimate, estimatedSec: 60.16 },
+  it('uses the symmetric five-second floor before classifying an early read', () => {
+    const shortForTheClip = assessEstimatedNarrationFit({
+      estimate: { ...estimateStub, estimatedSec: 1.99 },
+      targetSec: 7,
+    });
+
+    expect(shortForTheClip?.status).toBe('under');
+    expect(shortForTheClip?.suggestedUnits).toBeGreaterThan(estimateStub.units);
+    expect(shortForTheClip).toMatchObject({
+      toleranceRatio: 0.05,
+      toleranceFloorSec: 5,
+      toleranceSec: 5,
+      minDurationSec: 2,
+      maxDurationSec: 12,
+    });
+    expect(narrationFitBlocksProduction(shortForTheClip!.status)).toBe(true);
+    expect(narrationFitBlocksProduction('fits')).toBe(false);
+    expect(narrationFitBlocksProduction('over')).toBe(true);
+  });
+
+  it('uses plus-or-minus five percent with a minimum five-second tolerance', () => {
+    const at = (estimatedSec: number, targetSec: number) => assessEstimatedNarrationFit({
+      estimate: { ...estimateStub, estimatedSec },
+      targetSec,
+    });
+
+    expect(at(40, 45)?.status).toBe('fits');
+    expect(at(50, 45)?.status).toBe('fits');
+    expect(at(39.99, 45)?.status).toBe('under');
+    expect(at(50.01, 45)?.status).toBe('over');
+    expect(at(190, 200)).toMatchObject({ status: 'fits', toleranceSec: 10 });
+    expect(at(210, 200)).toMatchObject({ status: 'fits', toleranceSec: 10 });
+    expect(at(210.01, 200)?.status).toBe('over');
+  });
+
+  it('keeps the calibrated estimate honest at the widened boundary', () => {
+    // A measured-calibration scale must be applied before the band, or the
+    // widened tolerance would silently absorb a voice that reads 20% slow.
+    const scaled = assessEstimatedNarrationFit({
+      estimate: { ...estimateStub, estimatedSec: 55 },
       targetSec: 60,
-    })?.status).toBe('over');
-    expect(assessEstimatedNarrationFit({
-      estimate: { ...estimate, estimatedSec: 53.99 },
-      targetSec: 60,
-    })?.status).toBe('under');
+      durationScale: 1.2,
+    });
+
+    expect(scaled?.estimatedSec).toBe(66);
+    expect(scaled?.maxDurationSec).toBe(65);
+    expect(scaled?.status).toBe('over');
   });
 });
 

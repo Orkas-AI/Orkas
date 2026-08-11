@@ -10,6 +10,8 @@ type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Pro
 interface RetryOptions {
   retries?: number;
   delaysMs?: number[];
+  /** Cancels both the next attempt and any pending retry backoff. */
+  signal?: AbortSignal;
 }
 
 export interface FetchRetryOptions extends RetryOptions {
@@ -39,8 +41,24 @@ export function isRetriableHttpStatus(status: number): boolean {
   return status === 408 || status === 429 || (status >= 500 && status < 600);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function abortReason(signal: AbortSignal): Error {
+  const reason = (signal as AbortSignal & { reason?: unknown }).reason;
+  return reason instanceof Error ? reason : new Error('operation aborted');
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortReason(signal as AbortSignal));
+    };
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+  });
 }
 
 export async function retryAsync<T>(
@@ -55,6 +73,7 @@ export async function retryAsync<T>(
   const isRetriable = opts.isRetriable ?? (() => true);
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (opts.signal?.aborted) throw abortReason(opts.signal);
     try {
       return await fn();
     } catch (err) {
@@ -68,7 +87,7 @@ export async function retryAsync<T>(
         next_delay_ms: nextDelay,
         error: logErrorRef(err),
       });
-      if (nextDelay > 0) await delay(nextDelay);
+      if (nextDelay > 0) await delay(nextDelay, opts.signal);
     }
   }
   throw lastErr;

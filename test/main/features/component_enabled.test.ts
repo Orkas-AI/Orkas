@@ -70,6 +70,39 @@ describe('component_enabled resolver', () => {
     expect(map._item_updated_at?.skills?.s1).toBeGreaterThan(disabledClock);
   });
 
+  it('atomically migrates a disabled decision to a replacement skill id', async () => {
+    const ce = await import('../../../src/main/features/component_enabled');
+    ce.setSkillEnabled(TEST_UID, 'legacy-skill', false);
+    const legacyClock = ce.readEnabledMap(TEST_UID)._item_updated_at?.skills?.['legacy-skill'] || 0;
+
+    expect(ce.migrateComponentEnabledId(TEST_UID, 'skill', 'legacy-skill', 'abc123def456')).toBe(true);
+
+    const map = ce.readEnabledMap(TEST_UID);
+    expect(map.skills).toEqual({ abc123def456: false });
+    expect(map._item_updated_at?.skills?.['legacy-skill']).toBeGreaterThan(legacyClock);
+    expect(map._item_updated_at?.skills?.abc123def456).toBeGreaterThan(legacyClock);
+    expect(ce.isSkillEnabled(TEST_UID, 'legacy-skill')).toBe(true);
+    expect(ce.isSkillEnabled(TEST_UID, 'abc123def456')).toBe(false);
+    expect(ce.migrateComponentEnabledId(TEST_UID, 'skill', 'legacy-skill', 'abc123def456')).toBe(false);
+    expect(ce.readEnabledMap(TEST_UID)).toEqual(map);
+  });
+
+  it('keeps a newer canonical enabled decision while tombstoning the legacy id', async () => {
+    const ce = await import('../../../src/main/features/component_enabled');
+    ce.setSkillEnabled(TEST_UID, 'legacy-skill', false);
+    ce.setSkillEnabled(TEST_UID, 'abc123def456', false);
+    ce.setSkillEnabled(TEST_UID, 'abc123def456', true);
+    const canonicalClock = ce.readEnabledMap(TEST_UID)._item_updated_at?.skills?.abc123def456 || 0;
+
+    expect(ce.migrateComponentEnabledId(TEST_UID, 'skill', 'legacy-skill', 'abc123def456')).toBe(true);
+
+    const map = ce.readEnabledMap(TEST_UID);
+    expect(map.skills).toEqual({});
+    expect(map._item_updated_at?.skills?.abc123def456).toBe(canonicalClock);
+    expect(map._item_updated_at?.skills?.['legacy-skill']).toBeGreaterThan(canonicalClock);
+    expect(ce.isSkillEnabled(TEST_UID, 'abc123def456')).toBe(true);
+  });
+
   it('readDisabledSets returns ids of currently-disabled overrides only', async () => {
     const ce = await import('../../../src/main/features/component_enabled');
     ce.setAgentEnabled(TEST_UID, 'a1', false);

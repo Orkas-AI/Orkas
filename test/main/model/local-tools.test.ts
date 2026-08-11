@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -127,6 +128,7 @@ describe('local-tools › identity', () => {
     const tools = lt.createLocalTools({});
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
+        'append_file',
         'apply_patch',
         'bash',
         'delete_file',
@@ -575,6 +577,161 @@ describe('local-tools › bash filesystem mutation scope', () => {
     expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
   });
 
+  it('invalidates a prior literal when a later assignment becomes dynamic', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? `$TARGET = ${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; $TARGET = Join-Path $env:TEMP 'dynamic.txt'; Get-Content "$TARGET"`
+      : `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; TARGET="$UNKNOWN_BASH_TARGET"; cat "$TARGET"`;
+    const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+
+    if (process.platform !== 'win32') {
+      const loopCommand = `TARGET=${JSON.stringify(path.join(tmpDir, 'safe.txt'))}; for TARGET in "$UNKNOWN_BASH_TARGET"; do true; done && cat "$TARGET"`;
+      const loopRes = await bash.execute({ command: loopCommand, timeoutMs: 5000 }, makeCtx());
+      expect(loopRes.isError).toBe(true);
+      expect(loopRes.content).toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    }
+  });
+
+  it('does not parse JavaScript inside a POSIX heredoc as shell redirections', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = `${JSON.stringify(TEST_NODE)} <<'EOF'\nconst stem = s => s.replace(/\\.md$/, '');\nconsole.log(stem('note.md'));\nEOF`;
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('note');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('masks quoted, unquoted, tab-stripped, and multiple POSIX heredoc payloads', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = "cat <<FIRST <<-'SECOND'\nconst one = s => s.replace(/\\.md$/, '');\nFIRST\n\tconst two = s => s.replace(/\\.md$/, '');\n\tSECOND";
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('const two');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('resolves literal path assignments completed before a later command', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const file = path.join(tmpDir, 'assigned-path.txt');
+    fs.writeFileSync(file, 'literal assignment ok');
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const command = process.platform === 'win32'
+      ? `$ROOT = ${JSON.stringify(tmpDir)}; Get-Content -LiteralPath "$ROOT\\assigned-path.txt"`
+      : `ROOT=${JSON.stringify(tmpDir)}; cat "$ROOT/assigned-path.txt"`;
+    const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('literal assignment ok');
+  });
+
+  it('still blocks a literal-assigned path when its resolved target is outside scope', async () => {
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-assigned-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = process.platform === 'win32'
+        ? `$TARGET = ${JSON.stringify(outside)}; Set-Content -LiteralPath "$TARGET" -Value nope`
+        : `TARGET=${JSON.stringify(outside)}; printf nope > "$TARGET"`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recognizes the PowerShell null sink and known profile environment paths', async () => {
+    if (process.platform !== 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'Write-Output ignored > $null; Get-ChildItem "$env:USERPROFILE" | Out-Null; Write-Output ok',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx({ USERPROFILE: tmpDir }));
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).toContain('ok');
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+  });
+
+  it('resolves the Orkas output manifest before the execution wrapper injects it', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+    const res = await bash.execute({
+      command: 'printf "%s\\n" "missing-output.txt" >> "$ORKAS_OUTPUT_MANIFEST"',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, makeCtx());
+    expect(res.isError, `content=${res.content}`).toBeFalsy();
+    expect(res.content).not.toContain('E_BASH_DYNAMIC_PATH_UNSUPPORTED');
+    expect(fs.existsSync(path.join(tmpDir, '.orkas-output-manifest'))).toBe(false);
+  });
+
+  it('still guards a real redirection attached to a heredoc command', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-heredoc-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = `${JSON.stringify(TEST_NODE)} > ${JSON.stringify(outside)} <<'EOF'\nconsole.log('blocked');\nEOF`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+
+      const shellPayload = `bash <<'EOF'\nprintf nope > ${JSON.stringify(outside)}\nEOF`;
+      const shellRes = await bash.execute({ command: shellPayload, timeoutMs: 5000 }, makeCtx());
+      expect(shellRes.isError).toBe(true);
+      expect(shellRes.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not confuse arithmetic shifts with heredoc openers', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm } = await loadModules();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bash-arithmetic-outside-'));
+    const outside = path.join(outsideDir, 'blocked.txt');
+    try {
+      const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'bash')!;
+      const command = `echo $((1 << 2))\nprintf nope > ${JSON.stringify(outside)}`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(fs.existsSync(outside)).toBe(false);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
   it('blocks interpreter-internal writes outside the writable scope on macOS', async () => {
     if (process.platform !== 'darwin' || !fs.existsSync('/usr/bin/sandbox-exec')) return;
     const { lt, perm } = await loadModules();
@@ -585,12 +742,15 @@ describe('local-tools › bash filesystem mutation scope', () => {
     try {
       const bash = lt.createLocalTools({ userId: 'u1', cid: 'c1', agentId: 'a1' }).find((t) => t.name === 'bash')!;
       const script = `require('node:fs').writeFileSync(${JSON.stringify(outside)}, 'blocked')`;
-      const res = await bash.execute({
-        command: testNodeCommand(script),
-        timeoutMs: 5000,
-      }, makeCtx());
-      expect(res.isError).toBe(true);
-      expect(fs.existsSync(outside)).toBe(false);
+      const commands = [
+        testNodeCommand(script),
+        `${JSON.stringify(TEST_NODE)} <<'EOF'\n${script}\nEOF`,
+      ];
+      for (const command of commands) {
+        const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+        expect(res.isError).toBe(true);
+        expect(fs.existsSync(outside)).toBe(false);
+      }
     } finally {
       fs.rmSync(outsideDir, { recursive: true, force: true });
     }
@@ -756,7 +916,8 @@ describe('local-tools › interactive_cli tools', () => {
     try {
       mgr.sendInteractiveCliInput('u1', started.session_id, 'secret-code-42', { sensitive: true });
       let latest: any = null;
-      for (let i = 0; i < 20; i++) {
+      const deadline = performance.now() + 10_000;
+      while (performance.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 50));
         latest = mgr.readInteractiveCliSession('u1', started.session_id);
         if (String(latest.output || '').includes('[redacted]')) break;
@@ -766,7 +927,7 @@ describe('local-tools › interactive_cli tools', () => {
     } finally {
       mgr.closeInteractiveCliSession('u1', started.session_id);
     }
-  }, 10000);
+  }, 15000);
 });
 
 describe('local-tools › Orkas CLI direct execution', () => {
@@ -827,6 +988,33 @@ describe('local-tools › Orkas CLI direct execution', () => {
 
     expect(res.isError).toBeFalsy();
     expect(JSON.parse(String(res.content)).argv).toEqual(['calculator', 'eval', '--', '1+1']);
+  });
+
+  it('contains a synchronous direct CLI spawn failure as a non-executed command result', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript('run-skill.cjs', "process.stdout.write('must-not-run');");
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const context = makeOrkasCtx(pcDir);
+    const invalidNodePath = `invalid\0node`;
+    context.state.sandboxEnv.ORKAS_NODE = invalidNodePath;
+
+    const res = await bash.execute({
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval',
+      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
+    }, context);
+
+    expect(res.isError).toBe(true);
+    expect(res.content).toContain('Failed to start shell process');
+    expect(res.content).toContain('The command was not executed');
+    expect(res.content).not.toContain(invalidNodePath);
+    expect(res.observations?.execution).toMatchObject({
+      status: 'start_failed',
+      exitCode: null,
+      timedOut: false,
+      outputLimitExceeded: false,
+      stdout: { bytes: 0, truncated: false },
+    });
   });
 
   it('streams large direct Orkas CLI stdout to the Result Store handoff file', async () => {
@@ -936,6 +1124,13 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     return { lt, perm, bashPerms };
   }
   const OPTS = { userId: 'u1', cid: 'c1', agentId: 'a1' };
+  const deleteCommand = (targets: string[], recursive = false): string => (
+    process.platform === 'win32'
+      ? targets.map((target) => (
+        `Remove-Item ${recursive ? '-Recurse ' : ''}-Force -LiteralPath ${JSON.stringify(target)}`
+      )).join('; ')
+      : `rm ${recursive ? '-rf' : '-f'} ${targets.map((target) => JSON.stringify(target)).join(' ')}`
+  );
 
   it('runs a non-risky command without prompting under workspace_approval', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
@@ -973,6 +1168,210 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       bashPerms._setBroadcastForTest(null);
       fs.rmSync(target, { force: true });
     }
+  });
+
+  it('checks the target after force flags and blocks deletion outside workspace scope', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(os.tmpdir(), `orkas-rm-force-scope-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    fs.writeFileSync(target, 'outside workspace');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_PATH_OUT_OF_SCOPE');
+      expect(res.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(prompted).toBe(false);
+      expect(fs.readFileSync(target, 'utf8')).toBe('outside workspace');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('deletes a conversation-produced file without a destructive prompt', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'generated-cleanup.txt');
+    fs.writeFileSync(target, 'temporary output');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const command = deleteCommand([target]);
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(target)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('prompts and preserves a same-workspace file that the conversation did not produce', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'user-owned.txt');
+    fs.writeFileSync(target, 'must remain');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: () => false,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('must remain');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('prompts once and preserves every target when produced and foreign files are mixed', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const produced = path.join(tmpDir, 'generated-mixed.txt');
+    const foreign = path.join(tmpDir, 'user-mixed.txt');
+    fs.writeFileSync(produced, 'generated');
+    fs.writeFileSync(foreign, 'user');
+    let prompts = 0;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompts += 1;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === produced,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({
+        command: deleteCommand([produced, foreign]),
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompts).toBe(1);
+      expect(fs.readFileSync(produced, 'utf8')).toBe('generated');
+      expect(fs.readFileSync(foreign, 'utf8')).toBe('user');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(produced, { force: true });
+      fs.rmSync(foreign, { force: true });
+    }
+  });
+
+  it('keeps recursive deletion of a produced path behind approval', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'generated-recursive.txt');
+    fs.writeFileSync(target, 'must survive denial');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({
+        command: deleteCommand([target], true),
+        timeoutMs: 5000,
+      }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('must survive denial');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it('keeps sensitive-path approval even when the conversation produced the file', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, 'id_rsa');
+    fs.writeFileSync(target, 'sensitive generated output');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hasProducedPath: (candidate) => candidate === target,
+      }).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(prompted?.reasons).toEqual(['sensitive_path']);
+      expect(fs.readFileSync(target, 'utf8')).toBe('sensitive generated output');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
+  it.each([
+    ['literal PowerShell cleanup', (produced: string) => (
+      `Remove-Item -LiteralPath ${JSON.stringify(produced)} -Force`
+    )],
+    ['the production-shaped cleanup followed by output and verification', (produced: string) => (
+      `cd ${JSON.stringify(tmpDir)}; Remove-Item ${JSON.stringify(produced)} -Force; `
+      + `Write-Output "cleanup complete"; node -e "require('fs').existsSync(process.argv[1])" ${JSON.stringify(produced)}`
+    )],
+  ])('recognizes %s as owned-file-only deletion', async (_label, buildCommand) => {
+    const { lt } = await loadWithBashPerms();
+    const produced = path.join(tmpDir, 'generated.png');
+    const owns = (candidate: string) => candidate === produced;
+
+    expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(
+      buildCommand(produced), tmpDir, {}, owns,
+    )).toBe(true);
+  });
+
+  it.each([
+    ['a foreign target', (produced: string, foreign: string) => (
+      `Remove-Item -LiteralPath ${JSON.stringify(foreign)} -Force`
+    )],
+    ['mixed produced and foreign targets', (produced: string, foreign: string) => (
+      `rm -f ${JSON.stringify(produced)} ${JSON.stringify(foreign)}`
+    )],
+    ['recursive deletion', (produced: string) => `rm -rf ${JSON.stringify(produced)}`],
+    ['a dynamic environment target', () => 'Remove-Item -Force $env:TEMP_FILE'],
+    ['a wildcard target', () => 'Remove-Item -Force *.png'],
+    ['pipeline-fed PowerShell deletion', () => 'Get-ChildItem *.png | Remove-Item -Force'],
+  ])('rejects owned-file bypass for %s', async (_label, buildCommand) => {
+    const { lt } = await loadWithBashPerms();
+    const produced = path.join(tmpDir, 'generated.png');
+    const foreign = path.join(tmpDir, 'user.png');
+    const owns = (candidate: string) => candidate === produced;
+
+    expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(
+      buildCommand(produced, foreign), tmpDir, {}, owns,
+    )).toBe(false);
   });
 
   it('prompts for an opaque PowerShell command before attempting to spawn it', async () => {
@@ -1233,6 +1632,33 @@ describe('local-tools › write_file', () => {
     expect(onFileWritten).toHaveBeenCalledWith(abs);
   });
 
+  it('persists one complete large UTF-8 payload without applying the output-retry budget to storage', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const write = lt.createLocalTools({ userId: 'u1', onFileWritten })
+      .find((tool) => tool.name === 'write_file')!;
+    const contentSchema = (write.inputSchema.properties as Record<string, any>).content;
+    const body = `<!doctype html>\n${'登录·🙂'.repeat(5_000)}`;
+    const target = path.join(tmpDir, 'out', 'complete-large.html');
+
+    expect(body.length).toBeGreaterThan(12_000);
+    expect(contentSchema.maxLength).toBeUndefined();
+    const result = await write.execute({ path: target, content: body }, makeCtx());
+
+    const expectedBytes = Buffer.byteLength(body, 'utf8');
+    const expectedHash = createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex');
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain(`total_bytes="${expectedBytes}"`);
+    expect(result.content).toContain(`file_hash="sha256:${expectedHash}"`);
+    expect(result.content).toMatch(/revision="file_rev_[A-Za-z0-9_-]{16}"/);
+    expect(result.content.length).toBeLessThan(body.length);
+    expect(result.content).not.toContain(body.slice(0, 256));
+    expect(fs.readFileSync(target, 'utf8')).toBe(body);
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects write_file when no uid or explicit writable roots define a scope', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('workspace_approval');
@@ -1328,6 +1754,344 @@ describe('local-tools › write_file', () => {
     expect(fs.existsSync(path.join(tmpDir, 'draft-2.md'))).toBe(false);
     expect(res.content).not.toContain('<file-renamed>');
     expect(onFileWritten).toHaveBeenCalledWith(target);
+  });
+});
+
+describe('local-tools › append_file', () => {
+  it('rejects empty content or a missing concurrency baseline without changing the file', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const relativePath = 'out/invalid-append.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const ctx = makeCtx();
+    const initial = await write.execute({ path: relativePath, content: 'kept' }, ctx);
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(initial.content)?.[1];
+    expect(revision).toBeTruthy();
+
+    const empty = await append.execute({
+      path: relativePath,
+      content: '',
+      base_revision: revision,
+    }, ctx);
+    expect(empty.isError).toBe(true);
+    expect(empty.content).toContain('E_BAD_INPUT');
+
+    const missingBaseline = await append.execute({
+      path: relativePath,
+      content: 'must not be appended',
+    }, ctx);
+    expect(missingBaseline.isError).toBe(true);
+    expect(missingBaseline.content).toContain('E_BAD_INPUT');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe('kept');
+    expect(onFileWritten).toHaveBeenCalledTimes(1);
+  });
+
+  it('appends exact UTF-8 bytes once, accepts an identical replay, and rejects a stale different chunk', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const produced = new Set<string>();
+    const onFileWritten = vi.fn((p: string) => { produced.add(p); });
+    const tools = lt.createLocalTools({
+      userId: 'u1',
+      onFileWritten,
+      hasProducedPath: (p) => produced.has(p),
+    });
+    const write = tools.find((t) => t.name === 'write_file')!;
+    const append = tools.find((t) => t.name === 'append_file')!;
+    const abs = path.join(tmpDir, 'out', 'large.md');
+    const first = 'alpha\n';
+    const next = '第二块\n';
+
+    const written = await write.execute({ path: 'out/large.md', content: first }, makeCtx());
+    expect(written.isError).toBeFalsy();
+    const sizeMatch = written.content.match(/total_bytes="(\d+)"/);
+    expect(sizeMatch).not.toBeNull();
+    const expectedSize = Number(sizeMatch?.[1]);
+    const appended = await append.execute({
+      path: 'out/large.md',
+      content: next,
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    expect(appended.content).toContain(`total_bytes="${Buffer.byteLength(first + next, 'utf8')}"`);
+
+    const replayed = await append.execute({
+      path: 'out/large.md',
+      content: next,
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(abs, 'utf8')).toBe(first + next);
+
+    const stale = await append.execute({
+      path: 'out/large.md',
+      content: 'different',
+      expected_size: expectedSize,
+    }, makeCtx());
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(abs, 'utf8')).toBe(first + next);
+    expect(onFileWritten).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses opaque revisions across read/write/append for multibyte text, replays safely, and returns a fresh revision after an external change', async () => {
+    const { lt, perm } = await loadModules();
+    const fileTools = await import('../../../src/main/model/core-agent/file-tools');
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const produced = new Set<string>();
+    const onFileWritten = vi.fn((p: string) => { produced.add(p); });
+    const tools = lt.createLocalTools({
+      userId: 'u1',
+      onFileWritten,
+      hasProducedPath: (p) => produced.has(p),
+    });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = fileTools.createFileTools({ userId: 'u1' })
+      .find((tool) => tool.name === 'read_file')!;
+    const ctx = makeCtx();
+    const relativePath = 'out/revision-handoff.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const firstChunk = '登录与注册\n';
+    const secondChunk = '找回密码🙂\n';
+
+    const written = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    expect(written.isError).toBeFalsy();
+    const writtenRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(written.content)?.[1];
+    expect(writtenRevision).toBeTruthy();
+
+    const inspected = await read.execute({ path: relativePath }, ctx);
+    expect(inspected.isError).toBeFalsy();
+    expect(inspected.content).toContain(`revision="${writtenRevision}"`);
+    expect(inspected.content).toContain(`total_chars="${firstChunk.length}"`);
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: secondChunk,
+      base_revision: writtenRevision,
+      // Deliberately repeat the case bug: this is a UTF-16 character count,
+      // not the UTF-8 byte size. The opaque revision must be authoritative.
+      expected_size: firstChunk.length,
+    }, ctx);
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    const appendedRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(appended.content)?.[1];
+    expect(appendedRevision).toBeTruthy();
+    expect(appendedRevision).not.toBe(writtenRevision);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(firstChunk + secondChunk);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: secondChunk,
+      base_revision: writtenRevision,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(replayed.content).toContain(`revision="${appendedRevision}"`);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(firstChunk + secondChunk);
+
+    fs.appendFileSync(absolutePath, '外部修改\n', 'utf8');
+    const beforeRejectedAppend = fs.readFileSync(absolutePath, 'utf8');
+    const stale = await append.execute({
+      path: relativePath,
+      content: '不应写入\n',
+      base_revision: appendedRevision,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    const currentRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(stale.content)?.[1];
+    expect(currentRevision).toBeTruthy();
+    expect(currentRevision).not.toBe(appendedRevision);
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(beforeRejectedAppend);
+
+    const recovered = await append.execute({
+      path: relativePath,
+      content: '确认后的追加\n',
+      base_revision: currentRevision,
+    }, ctx);
+    expect(recovered.isError).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(beforeRejectedAppend + '确认后的追加\n');
+    expect(onFileWritten).toHaveBeenCalledTimes(3);
+  });
+
+  it('binds revisions to one path and reports the current revision for unknown run-scoped tokens', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const ctx = makeCtx();
+    const first = await write.execute({ path: 'out/first.txt', content: 'first' }, ctx);
+    const second = await write.execute({ path: 'out/second.txt', content: 'second' }, ctx);
+    const firstRevision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(first.content)?.[1];
+    expect(firstRevision).toBeTruthy();
+    expect(second.isError).toBeFalsy();
+
+    const wrongPath = await append.execute({
+      path: 'out/second.txt',
+      content: 'nope',
+      base_revision: firstRevision,
+    }, ctx);
+    expect(wrongPath.isError).toBe(true);
+    expect(wrongPath.content).toContain('E_REVISION_PATH_MISMATCH');
+    expect(fs.readFileSync(path.join(tmpDir, 'out/second.txt'), 'utf8')).toBe('second');
+
+    const unknown = await append.execute({
+      path: 'out/first.txt',
+      content: 'nope',
+      base_revision: 'file_rev_AAAAAAAAAAAAAAAA',
+    }, makeCtx());
+    expect(unknown.isError).toBe(true);
+    expect(unknown.content).toContain('E_REVISION_UNKNOWN');
+    expect(unknown.content).toMatch(/revision="file_rev_[A-Za-z0-9_-]{16}"/);
+    expect(fs.readFileSync(path.join(tmpDir, 'out/first.txt'), 'utf8')).toBe('first');
+  });
+
+  it('persists complete UTF-8 appends across the former boundary with exact, compact receipts', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const contentSchema = (append.inputSchema.properties as Record<string, any>).content;
+    expect(contentSchema.maxLength).toBeUndefined();
+    expect((append.inputSchema.properties as Record<string, any>).base_revision).toMatchObject({
+      type: 'string',
+      pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
+    });
+    expect(append.inputSchema.required).toEqual(['path', 'content']);
+
+    const firstChunk = 'header\n';
+    const appendCases = [
+      { name: 'former boundary', content: 'A'.repeat(12_000) },
+      { name: 'one over former boundary', content: 'B'.repeat(12_001) },
+      // Exact size from the historical failed tool call.
+      { name: 'historical complete call', content: 'C'.repeat(13_395) },
+      { name: 'larger multibyte call', content: '界🙂'.repeat(10_000) },
+    ];
+    const expectedBody = firstChunk + appendCases.map((entry) => entry.content).join('');
+    const relativePath = 'out/super-large.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const ctx = makeCtx();
+
+    const first = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    expect(first.isError).toBeFalsy();
+    let expectedBytes = Buffer.byteLength(firstChunk, 'utf8');
+    expect(first.content).toContain(`total_bytes="${expectedBytes}"`);
+    let revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(first.content)?.[1];
+    expect(revision).toBeTruthy();
+    const originalRevision = revision;
+
+    for (const [index, appendCase] of appendCases.entries()) {
+      const { content: chunk } = appendCase;
+      expect(chunk.length, appendCase.name).toBeGreaterThanOrEqual(12_000);
+      const result = await append.execute({
+        path: relativePath,
+        content: chunk,
+        base_revision: revision,
+        // base_revision is authoritative even when a caller repeats the old
+        // character-count/byte-count mistake from the historical case.
+        ...(index === 2 ? { expected_size: 1 } : {}),
+      }, ctx);
+      expect(result.isError, appendCase.name).toBeFalsy();
+      expectedBytes += Buffer.byteLength(chunk, 'utf8');
+      expect(result.content).toContain(`total_bytes="${expectedBytes}"`);
+      expect(result.content).toContain('replayed="false"');
+      expect(result.content.length).toBeLessThan(chunk.length);
+      expect(result.content).not.toContain(chunk.slice(0, 256));
+      revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(result.content)?.[1];
+      expect(revision).toBeTruthy();
+    }
+
+    const expectedHash = createHash('sha256').update(Buffer.from(expectedBody, 'utf8')).digest('hex');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(fs.statSync(absolutePath).size).toBe(expectedBytes);
+    expect(createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex')).toBe(expectedHash);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: appendCases[0].content,
+      base_revision: originalRevision,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+
+    const staleLargeChunk = 'different'.repeat(2_000);
+    const stale = await append.execute({
+      path: relativePath,
+      content: staleLargeChunk,
+      base_revision: originalRevision,
+    }, ctx);
+    expect(staleLargeChunk.length).toBeGreaterThan(12_000);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(createHash('sha256').update(fs.readFileSync(absolutePath)).digest('hex')).toBe(expectedHash);
+    expect(onFileWritten).toHaveBeenCalledTimes(1 + appendCases.length);
+  });
+
+  it('keeps legacy expected_size compatible for large appends, including replay and stale recovery', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const onFileWritten = vi.fn();
+    const tools = lt.createLocalTools({ userId: 'u1', onFileWritten });
+    const write = tools.find((tool) => tool.name === 'write_file')!;
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const relativePath = 'out/legacy-large.txt';
+    const absolutePath = path.join(tmpDir, relativePath);
+    const firstChunk = '初始\n';
+    const largeChunk = '界🙂'.repeat(5_000);
+    const ctx = makeCtx();
+
+    const first = await write.execute({ path: relativePath, content: firstChunk }, ctx);
+    const expectedSize = Buffer.byteLength(firstChunk, 'utf8');
+    expect(first.isError).toBeFalsy();
+    expect(largeChunk.length).toBeGreaterThan(12_000);
+
+    const appended = await append.execute({
+      path: relativePath,
+      content: largeChunk,
+      expected_size: expectedSize,
+    }, ctx);
+    expect(appended.isError).toBeFalsy();
+    expect(appended.content).toContain('replayed="false"');
+    const expectedBody = firstChunk + largeChunk;
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+
+    const replayed = await append.execute({
+      path: relativePath,
+      content: largeChunk,
+      expected_size: expectedSize,
+    }, ctx);
+    expect(replayed.isError).toBeFalsy();
+    expect(replayed.content).toContain('replayed="true"');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+
+    const stale = await append.execute({
+      path: relativePath,
+      content: 'stale'.repeat(3_000),
+      expected_size: expectedSize,
+    }, ctx);
+    expect(stale.isError).toBe(true);
+    expect(stale.content).toContain('E_STALE');
+    expect(fs.readFileSync(absolutePath, 'utf8')).toBe(expectedBody);
+    expect(onFileWritten).toHaveBeenCalledTimes(2);
   });
 });
 

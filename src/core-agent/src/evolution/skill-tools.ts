@@ -112,6 +112,9 @@ export function createSkillManageTool(
                 "",
                 skill.body,
               ].join("\n"),
+              // Learned skills use skill_manage instead of read_file, but the
+              // returned body has the same load-bearing, read-whole semantics.
+              verbatimDocument: true,
             };
           }
 

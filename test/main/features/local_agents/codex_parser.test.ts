@@ -3,9 +3,11 @@ import {
   CodexAgentMessageAccumulator,
   buildCodexThreadPermissionOverrides,
   buildCodexTurnPermissionOverrides,
+  buildCodexTurnRuntimeOverrides,
   extractCodexDiffFiles,
   extractThreadId,
   extractCodexUsage,
+  mapCodexItemToolEvent,
   selectCodexTurnPrompt,
 } from '../../../../src/main/features/local_agents/backends/codex';
 
@@ -48,6 +50,145 @@ describe('local_agents/backends/codex › phased agent messages', () => {
     commentaryOnly.rememberItem({ id: 'comment-1', type: 'agentMessage', phase: 'commentary' });
     commentaryOnly.appendDelta({ itemId: 'comment-1', delta: 'partial work' });
     expect(commentaryOnly.output()).toBe('partial work');
+  });
+});
+
+describe('local_agents/backends/codex › structured work items', () => {
+  it('maps MCP and background-agent items onto visible tool lifecycle events', () => {
+    expect(mapCodexItemToolEvent({
+      id: 'mcp-1',
+      type: 'mcpToolCall',
+      server: 'browser',
+      tool: 'navigate',
+      arguments: { url: 'https://example.com' },
+    }, 'use')).toEqual({
+      type: 'tool-event',
+      tool: 'browser.navigate',
+      callId: 'mcp-1',
+      phase: 'use',
+      input: { url: 'https://example.com' },
+    });
+    expect(mapCodexItemToolEvent({
+      id: 'agent-1',
+      type: 'subAgentActivity',
+      kind: 'completed',
+    }, 'result')).toEqual({
+      type: 'tool-event',
+      tool: 'background_agent',
+      callId: 'agent-1',
+      phase: 'result',
+      output: 'completed',
+    });
+  });
+
+  it('does not remap text and command items handled by dedicated paths', () => {
+    expect(mapCodexItemToolEvent({ type: 'agentMessage' }, 'use')).toBeNull();
+    expect(mapCodexItemToolEvent({ type: 'commandExecution' }, 'result')).toBeNull();
+  });
+
+  it.each([
+    {
+      name: 'dynamic tool',
+      raw: {
+        id: 'dynamic-1',
+        type: 'dynamicToolCall',
+        namespace: 'design',
+        tool: 'render',
+        arguments: { page: 2 },
+        contentItems: [{ type: 'text', text: 'rendered' }],
+      },
+      tool: 'design.render',
+      input: { page: 2 },
+      output: [{ type: 'text', text: 'rendered' }],
+    },
+    {
+      name: 'collaboration tool',
+      raw: {
+        id: 'collab-1',
+        type: 'collabAgentToolCall',
+        tool: 'spawn_agent',
+        receiverThreadIds: ['thread-a', 'thread-b'],
+        prompt: 'inspect the parser',
+        agentsStates: { 'thread-a': 'completed' },
+      },
+      tool: 'collaboration:spawn_agent',
+      input: { receiverCount: 2, prompt: 'inspect the parser' },
+      output: { 'thread-a': 'completed' },
+    },
+    {
+      name: 'web search',
+      raw: {
+        id: 'search-1',
+        type: 'webSearch',
+        query: 'protocol docs',
+        results: [{ title: 'Docs' }],
+      },
+      tool: 'web_search',
+      input: { query: 'protocol docs' },
+      output: [{ title: 'Docs' }],
+    },
+    {
+      name: 'image view',
+      raw: {
+        id: 'image-1',
+        type: 'imageView',
+        path: '/tmp/screenshot.png',
+        status: 'completed',
+      },
+      tool: 'view_image',
+      input: { path: '/tmp/screenshot.png' },
+      output: 'completed',
+    },
+    {
+      name: 'image generation',
+      raw: {
+        id: 'generation-1',
+        type: 'imageGeneration',
+        prompt: 'a blue square',
+        result: { path: '/tmp/generated.png' },
+      },
+      tool: 'image_generation',
+      input: { prompt: 'a blue square' },
+      output: { path: '/tmp/generated.png' },
+    },
+    {
+      name: 'background wait',
+      raw: {
+        id: 'sleep-1',
+        type: 'sleep',
+        durationMs: 250,
+        status: 'completed',
+      },
+      tool: 'background_wait',
+      input: { durationMs: 250 },
+      output: 'completed',
+    },
+    {
+      name: 'context compaction',
+      raw: {
+        id: 'compact-1',
+        type: 'contextCompaction',
+        status: 'completed',
+      },
+      tool: 'context_compaction',
+      input: {},
+      output: 'completed',
+    },
+  ])('maps $name start and completion payloads', ({ raw, tool, input, output }) => {
+    expect(mapCodexItemToolEvent(raw, 'use')).toEqual({
+      type: 'tool-event',
+      tool,
+      callId: raw.id,
+      phase: 'use',
+      input,
+    });
+    expect(mapCodexItemToolEvent(raw, 'result')).toEqual({
+      type: 'tool-event',
+      tool,
+      callId: raw.id,
+      phase: 'result',
+      output,
+    });
   });
 });
 
@@ -138,6 +279,14 @@ describe('local_agents/backends/codex › trusted local permissions', () => {
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
     });
+  });
+
+  it('omits CLI-owned defaults and sends only explicit per-Agent turn overrides', () => {
+    expect(buildCodexTurnRuntimeOverrides({})).toEqual({});
+    expect(buildCodexTurnRuntimeOverrides({
+      modelOverride: 'gpt-5.4',
+      thinkingLevel: 'high',
+    })).toEqual({ model: 'gpt-5.4', effort: 'high' });
   });
 });
 

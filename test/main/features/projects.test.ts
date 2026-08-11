@@ -376,6 +376,28 @@ describe('projects › deleteProject', () => {
     expect(after.projects?.[pid]).toBeUndefined();
   });
 
+  it('keeps the workspace selection when project-root deletion fails', async () => {
+    const projects = await loadProjects();
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await projects.createProject(TEST_UID, 'Workspace survives failed delete');
+    if (!p.ok) throw new Error('precondition');
+    const pid = p.project.project_id;
+    const dir = path.join(tmpDir, 'selected-project-workspace');
+    fs.mkdirSync(dir, { recursive: true });
+    expect(ws.setWorkspacePath(TEST_UID, dir, pid).ok).toBe(true);
+    projects._setProjectRootRemoverForTest(async () => {
+      throw new Error('injected project-root removal failure');
+    });
+
+    const result = await projects.deleteProject(TEST_UID, pid);
+
+    expect(result).toEqual({ ok: false, error: 'cascade_failed' });
+    const cfgFile = path.join(tmpDir, TEST_UID, 'local', 'workspace.json');
+    const config = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+    expect(config.projects?.[pid]?.selectedPath).toBe(dir);
+    expect(await projects.getProject(TEST_UID, pid)).not.toBeNull();
+  });
+
   it('returns not_found for unknown projectId without touching anything', async () => {
     const projects = await loadProjects();
     const chats = await loadChats();
@@ -387,6 +409,43 @@ describe('projects › deleteProject', () => {
 
     const convs = await chats.listConversations(TEST_UID);
     expect(convs).toHaveLength(1);
+  });
+
+  it('keeps the whole project when conversation enumeration is temporarily unavailable', async () => {
+    const chats = await loadChats();
+    const projects = await loadProjects();
+    const p = await projects.createProject(TEST_UID, 'Do not guess an empty cascade');
+    if (!p.ok) throw new Error('precondition');
+    const pid = p.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { projectId: pid });
+    const projectFile = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'project.json');
+
+    vi.spyOn(chats, 'listConversations').mockRejectedValueOnce(new Error('temporary index read failure'));
+    const result = await projects.deleteProject(TEST_UID, pid);
+
+    expect(result).toEqual({ ok: false, error: 'cascade_failed' });
+    expect(fs.existsSync(projectFile)).toBe(true);
+    expect(await projects.getProject(TEST_UID, pid)).toEqual(expect.objectContaining({ project_id: pid }));
+    expect((await chats.listConversations(TEST_UID)).map((row) => row.conversation_id))
+      .toContain(conv.conversation_id);
+  });
+
+  it('keeps the whole project when automation enumeration is temporarily unavailable', async () => {
+    const chats = await loadChats();
+    const autoTasks = await import('../../../src/main/features/auto_tasks');
+    const projects = await loadProjects();
+    const p = await projects.createProject(TEST_UID, 'Automation inventory must be known');
+    if (!p.ok) throw new Error('precondition');
+    const pid = p.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { projectId: pid });
+
+    vi.spyOn(autoTasks, 'listTasks').mockRejectedValueOnce(new Error('temporary task read failure'));
+    const result = await projects.deleteProject(TEST_UID, pid);
+
+    expect(result).toEqual({ ok: false, error: 'cascade_failed' });
+    expect(await projects.getProject(TEST_UID, pid)).toEqual(expect.objectContaining({ project_id: pid }));
+    expect((await chats.listConversations(TEST_UID)).map((row) => row.conversation_id))
+      .toContain(conv.conversation_id);
   });
 });
 

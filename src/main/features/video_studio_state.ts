@@ -18,6 +18,12 @@ export type VideoProductionStage =
 
 export type VideoProductionGateEntry = {
   signature: string;
+  /** Visual projection of the composition (audio bytes and narration text
+   * excluded; scene windows retained). Present on preview entries recorded since the
+   * P1 sub-identity split: while it matches the live tree, the preview and
+   * its approval/design review survive narration-only changes. Older entries
+   * without this proof fail closed into one fresh preview. */
+  visual_signature?: string;
   revision_id?: string;
   turn_id: string;
   created_at: string;
@@ -100,6 +106,8 @@ export type VideoProductionNarrationTransaction = {
   authorized_turn_id?: string;
   authorization_source?: 'form' | 'model_interpreted_user_message';
   attempt_number?: number;
+  timing_episode_id?: string;
+  attempt_kind?: 'initial' | 'automatic_timing_retry' | 'user_authorized_timing_retry' | 'provider_retry';
   started_at: string;
   updated_at: string;
 };
@@ -149,6 +157,11 @@ export type VideoProductionNarrationFit = {
   voice?: string;
   speed: number;
   target_duration_sec: number;
+  tolerance_ratio: number;
+  tolerance_floor_sec: number;
+  tolerance_sec: number;
+  min_duration_sec: number;
+  max_duration_sec: number;
   generic_estimated_duration_sec: number;
   estimated_duration_sec: number;
   duration_scale: number;
@@ -156,6 +169,47 @@ export type VideoProductionNarrationFit = {
   narration_units: number;
   suggested_units: number;
   checked_at: string;
+  validation_version: 1 | 2;
+};
+
+/** The exact COMPOSE plan candidate whose free narration preflight was ready
+ * to present. Natural-language approval is interpreted by the model in a later
+ * turn; keeping this one bounded snapshot lets the host bind that decision to
+ * what was reviewed even if the agent rewrites the manifest before it records
+ * the approval. This is review provenance, not a workflow stage. */
+export type VideoProductionPlanReviewCandidate = {
+  signature: string;
+  manifest_json: string;
+  checked_turn_id?: string;
+  checked_at: string;
+  validation_version: 1;
+};
+
+export type VideoProductionNarrationTimingEpisode = {
+  episode_id: string;
+  approval_signature: string;
+  target_duration_sec: number;
+  tolerance_ratio: number;
+  tolerance_floor_sec: number;
+  tolerance_sec: number;
+  min_duration_sec: number;
+  max_duration_sec: number;
+  initial_transaction_id: string;
+  transaction_ids: string[];
+  automatic_retry_limit: 1;
+  automatic_retries_used: 0 | 1;
+  user_authorized_requests: number;
+  user_authorization_consumed: number;
+  status: 'active' | 'awaiting_user_decision' | 'accepted' | 'accepted_by_user_waiver';
+  latest_measured_duration_sec: number;
+  latest_text_sha256: string;
+  created_at: string;
+  updated_at: string;
+  user_waiver?: {
+    quote: string;
+    turn_id: string;
+    created_at: string;
+  };
   validation_version: 1;
 };
 
@@ -165,8 +219,10 @@ export type VideoProductionPlanFileRecord = {
 };
 
 export type VideoProductionPlanFiles = {
-  script: VideoProductionPlanFileRecord;
-  shotlist: VideoProductionPlanFileRecord;
+  /** Retired inputs, recorded only for approvals signed before the manifest
+   * became the whole plan. New plans have neither. */
+  script?: VideoProductionPlanFileRecord;
+  shotlist?: VideoProductionPlanFileRecord;
   manifest: VideoProductionPlanFileRecord;
 };
 
@@ -194,6 +250,38 @@ export type VideoProductionPlanApproval = {
   parent_segment_id?: string;
   validation_version: 1 | 2 | 3;
 };
+
+export type VideoProductionQaWaiverV1 = {
+  /** The exact QA finding code the user chose to skip. */
+  code: string;
+  /** The user's verbatim words from the turn that authorized the waiver. */
+  quote: string;
+  turn_id: string;
+  created_at: string;
+};
+
+/** The parent EDL this composition is a segment of, resolved from the current
+ * plan approval and falling back to the newest history entry that still
+ * carries the link. Being a segment of a plan is structural identity — it
+ * survives approvals that were re-signed without resolving the parent, and
+ * consumers (review grouping, delivered-opening checks) must all read it the
+ * same way or one video scatters into per-segment behavior. */
+export function parentEdlLinkOf(
+  state: VideoProductionStateV1 | undefined,
+): { planPath: string; segmentId: string } {
+  const candidates = [
+    state?.plan_approval,
+    ...[...(state?.plan_approval_history || [])].reverse(),
+  ];
+  for (const approval of candidates) {
+    if (approval?.inheritance_reason === 'parent_edl_segment'
+      && typeof approval.parent_plan_path === 'string' && approval.parent_plan_path
+      && typeof approval.parent_segment_id === 'string' && approval.parent_segment_id) {
+      return { planPath: approval.parent_plan_path, segmentId: approval.parent_segment_id };
+    }
+  }
+  return { planPath: '', segmentId: '' };
+}
 
 export type VideoProductionNarrationRepairAuthorization = {
   source: 'measured_duration_mismatch';
@@ -229,8 +317,14 @@ export type VideoProductionArtifactState = {
   composition_signature?: string;
   manifest_sha256?: string;
   html_sha256?: string;
-  /** Hash of the last runtime-owned scaffold. A different current HTML hash
-   * proves that visual authoring happened after prepare/narration materialize. */
+  /** Visual-only projection of the current composition. Narration audio,
+   * bindings, and retimed delivery windows do not change this identity. */
+  visual_signature?: string;
+  /** Visual-only identity recorded when the runtime scaffold was prepared. */
+  scaffold_visual_signature?: string;
+  /** Legacy full-HTML scaffold identity retained for transaction recovery and
+   * old states. It is not sufficient to prove visual authoring because the
+   * runtime itself changes HTML when it binds narration. */
   scaffold_html_sha256?: string;
 };
 
@@ -267,6 +361,10 @@ export type VideoProductionCandidateRevision = {
   revision_id: string;
   parent_revision_id?: string;
   content_hash: string;
+  /** Visual projection hash of this candidate (see the preview gate entry's
+   * field of the same name). Lets review labeling recognize that a preview
+   * approval still covers a candidate whose only drift is narration/audio. */
+  visual_signature?: string;
   artifacts: VideoProductionArtifactState;
   locators: VideoProductionCandidateLocators;
   snapshot?: VideoProductionCandidateSnapshot;
@@ -358,8 +456,18 @@ export type VideoProductionVisualQaCycle = {
   passed_signatures: Partial<Record<'inspect' | 'snapshot', string>>;
   last_signature?: string;
   last_error_code?: string;
+  /** The turn that recorded the most recent failure. A later real user turn
+   *  means that repair episode was abandoned rather than continued. */
+  last_failure_turn_id?: string;
+  /** Set once an exhausted cycle has measured one further repair. The model
+   *  always writes its next repair before it learns the budget is gone, and
+   *  presenting pre-repair findings asks the user to choose blind. */
+  final_repair_measured?: boolean;
   started_at: string;
   started_by_turn_id?: string;
+  /** The turn in which this cycle's budget ran out. The next real user turn
+   *  after it is the reply that grants the following cycle. */
+  exhausted_by_turn_id?: string;
   updated_at: string;
 };
 
@@ -380,6 +488,11 @@ export type VideoProductionStateV1 = {
   schema_version: 1;
   revision: number;
   composition_dir: string;
+  /** One-line restatement of what the user asked for, recorded when the plan
+   * is confirmed. Display only: review surfaces show it instead of the
+   * composition path, which users cannot read. Absent on states written
+   * before this field and by skills that do not send it. */
+  task_title?: string;
   stage: VideoProductionStage;
   artifacts: VideoProductionArtifactState;
   plan_approval?: VideoProductionPlanApproval;
@@ -402,15 +515,36 @@ export type VideoProductionStateV1 = {
   narration_calibration?: VideoProductionNarrationCalibration;
   /** Signature-bound free preflight result for the candidate Gate B plan. */
   narration_fit?: VideoProductionNarrationFit;
+  /** Latest ready, unapproved COMPOSE plan candidate. The full manifest stays
+   * durable for same-turn recovery but is omitted from model-facing status. */
+  plan_review_candidate?: VideoProductionPlanReviewCandidate;
   /** Bounded authorization for a timing-only narration repair after measured
    * speech misses the approved delivery band. */
   narration_repair?: VideoProductionNarrationRepairAuthorization;
+  /** One approved narration plan may spend at most one automatic timing retry,
+   * even though each timing edit necessarily changes text_sha256. */
+  narration_timing_episode?: VideoProductionNarrationTimingEpisode;
   preview?: VideoProductionGateEntry;
+  /** The keyframe preview's one user go-ahead, admitted through the signed plan.
+   * Recorded when a render admission passes the preview stop (the user
+   * replied after seeing frames). It follows a re-signed plan only when the
+   * recorded visual signature is unchanged, so narration-only amendments do
+   * not re-open a silent preview while real visual amendments still do. */
+  preview_go_ahead?: {
+    plan_signature: string;
+    turn_id: string;
+    created_at: string;
+  };
   draft?: VideoProductionGateEntry;
   active_operation?: VideoProductionActiveOperation;
   operation_journal?: VideoProductionOperationJournalEntry[];
   blocked_operation?: VideoProductionBlockedOperation;
   visual_qa?: VideoProductionVisualQaState;
+  /** User-authorized waivers of named QA finding codes. Each records the
+   * user's verbatim current-turn quote that authorized skipping that check;
+   * once recorded, every later QA phase on this production reports the
+   * finding as informational instead of blocking. */
+  qa_waivers?: VideoProductionQaWaiverV1[];
   /** Current authored candidate plus bounded content-addressed history. */
   current_candidate?: VideoProductionCandidateRevision;
   candidate_history?: VideoProductionCandidateRevision[];
@@ -553,9 +687,7 @@ const PLAN_APPROVAL_REQUIRED_OPS = new Set([
   'composition.materialize_narration',
   'composition.lint',
   'composition.inspect',
-  'composition.begin_visual_revision',
   'composition.snapshot',
-  'composition.approve_preview',
   'composition.submit_design_review',
   'composition.draft',
   'composition.approve_draft',
@@ -617,17 +749,29 @@ export function nextVideoProductionOps(
     return ['composition.approve_plan', ...recoveryOps];
   }
   const narrationPending = facts?.narrationRequired && !facts.narrationMaterialized;
-  const visualEvidenceOps = [
-    'composition.snapshot',
-    ...(state.preview?.design_review?.required && state.preview.design_review.status !== 'passed'
-      ? ['composition.submit_design_review']
-      : state.preview?.status === 'ready' ? ['composition.approve_preview'] : []),
-  ];
+  // A segment of an assembled production has no user gate of its own: the
+  // whole production is confirmed once, and the host books each segment from
+  // that one answer. Advertising the per-composition approval here is what
+  // made a user-requested tweak to one scene open a confirmation for that
+  // scene — the model was doing what this list offered it.
+  const assembledSegment = state.plan_approval?.inheritance_reason === 'parent_edl_segment';
+  // Once the required inputs and preview exist, expose the single productive
+  // frontier. Returning the full capability inventory here made the model
+  // repeatedly re-inspect/re-snapshot while deciding whether a clear user
+  // reply counted; composition.draft is itself the semantic decision point.
+  if (!narrationPending && state.draft?.status === 'approved') {
+    return ['composition.export'];
+  }
+  if (!narrationPending && state.draft?.status === 'ready') {
+    return assembledSegment ? [] : ['composition.approve_draft'];
+  }
+  if (!narrationPending && state.preview) {
+    return ['composition.draft'];
+  }
+  const visualEvidenceOps = ['composition.snapshot'];
   const completionOps = narrationPending ? [] : [
     'composition.draft',
-    ...(state.draft?.design_review?.required && state.draft.design_review.status !== 'passed'
-      ? ['composition.submit_design_review']
-      : state.draft?.status === 'ready' ? ['composition.approve_draft'] : []),
+    ...(!assembledSegment && state.draft?.status === 'ready' ? ['composition.approve_draft'] : []),
     ...(state.draft?.status === 'approved' ? ['composition.export'] : []),
   ];
   const candidates = [...new Set([
@@ -636,7 +780,6 @@ export function nextVideoProductionOps(
     ...(!facts || narrationPending ? ['composition.materialize_narration'] : []),
     'composition.lint',
     'composition.inspect',
-    ...(state.visual_qa?.cycle?.status === 'exhausted' ? ['composition.begin_visual_revision'] : []),
     ...visualEvidenceOps,
     ...completionOps,
     ...recoveryOps,
@@ -769,6 +912,7 @@ export function recordVideoProductionCandidate(
   state: VideoProductionStateV1,
   input: {
     contentHash: string;
+    visualSignature?: string;
     artifacts: VideoProductionArtifactState;
     locators?: VideoProductionCandidateLocators;
     snapshot?: VideoProductionCandidateSnapshot;
@@ -796,6 +940,7 @@ export function recordVideoProductionCandidate(
   if (current?.content_hash === input.contentHash) {
     state.current_candidate = {
       ...current,
+      ...(input.visualSignature ? { visual_signature: input.visualSignature } : {}),
       artifacts: { ...current.artifacts, ...input.artifacts },
       locators: mergeCandidateLocators(current.locators, input.locators || {}),
       ...(input.snapshot ? { snapshot: input.snapshot } : {}),
@@ -818,6 +963,7 @@ export function recordVideoProductionCandidate(
     revision_id: `candidate-${input.contentHash.slice(0, 16)}`,
     ...(current ? { parent_revision_id: current.revision_id } : {}),
     content_hash: input.contentHash,
+    ...(input.visualSignature ? { visual_signature: input.visualSignature } : {}),
     artifacts: { ...input.artifacts },
     locators: { ...(input.locators || {}) },
     ...(input.snapshot ? { snapshot: input.snapshot } : {}),
@@ -830,16 +976,82 @@ export function recordVideoProductionCandidate(
   return state.current_candidate;
 }
 
+/**
+ * Drop a candidate revision's frozen-store bookkeeping before a model sees it.
+ *
+ * The live locators sit beside these and are the paths skills repair and
+ * publish from; a frozen-store path is an internal content-addressed copy that
+ * would be wrong to hand a user anyway. It was 2.6KB of every status call. This
+ * lives here rather than in the result compactor because it is not a size
+ * decision — the bytes are not usable at any size.
+ */
+export function projectCandidateRevisionForModel<T>(revision: T): T {
+  if (!revision || typeof revision !== 'object' || Array.isArray(revision)) return revision;
+  const record = { ...(revision as Record<string, unknown>) };
+  const snapshot = record.snapshot;
+  if (snapshot && typeof snapshot === 'object' && !Array.isArray(snapshot)) {
+    // An allow-list, not a deny-list: the frozen store owns this object and
+    // grows its own bookkeeping (a source index, for one), so a projection
+    // that only names what to drop leaks every field added later.
+    const kept = snapshot as Record<string, unknown>;
+    record.snapshot = {
+      ...(kept.manifest_path !== undefined ? { manifest_path: kept.manifest_path } : {}),
+      ...(kept.root_path !== undefined ? { root_path: kept.root_path } : {}),
+      ...(kept.source_file_count !== undefined ? { source_file_count: kept.source_file_count } : {}),
+      ...(kept.source_total_bytes !== undefined ? { source_total_bytes: kept.source_total_bytes } : {}),
+      ...(kept.updated_at !== undefined ? { updated_at: kept.updated_at } : {}),
+    };
+  }
+  return record as unknown as T;
+}
+
 export function summarizeVideoProductionState(
   state: VideoProductionStateV1,
   facts?: VideoProductionPolicyFacts,
 ): Record<string, unknown> {
+  const visualReadiness = !state.artifacts.html_sha256
+    ? 'missing'
+    : state.artifacts.scaffold_visual_signature && state.artifacts.visual_signature
+      ? state.artifacts.visual_signature === state.artifacts.scaffold_visual_signature
+        ? 'scaffold_only'
+        : 'authored'
+      : state.artifacts.scaffold_html_sha256
+        && state.artifacts.html_sha256 === state.artifacts.scaffold_html_sha256
+        ? 'scaffold_only'
+        : 'authored';
+  const narrationReadiness = state.narration?.status === 'materialized'
+    ? 'materialized'
+    : state.narration_transaction
+      ? state.narration_transaction.status === 'synthesized'
+        ? 'synthesized_not_accepted'
+        : state.narration_transaction.status
+      : 'missing';
+  const narrationRequired = facts?.narrationRequired
+    ?? state.capability_check?.narration_required
+    ?? true;
   return {
     schema_version: state.schema_version,
     revision: state.revision,
     stage: state.stage,
     artifacts: state.artifacts,
-    plan_approval: state.plan_approval || null,
+    artifact_readiness: {
+      visuals: visualReadiness,
+      narration: narrationReadiness,
+      preview: state.preview?.status || 'missing',
+      draft: state.draft?.status || 'missing',
+      complete_delivery_ready: (!narrationRequired || !!state.narration)
+        && visualReadiness === 'authored'
+        && !!state.draft,
+    },
+    // The approved-intent snapshot is the host's own comparison input, not
+    // something a reader acts on: the currency check reads it from durable
+    // state, and the only question a model could ask of it — what changed
+    // since the approval — is answered directly by `plan_intent_changes`.
+    // 1.5KB of every status call. `artifact_records` stays: it is a path and a
+    // hash, and where the approved plan file lives is a status fact.
+    plan_approval: state.plan_approval
+      ? (({ intent_snapshot: _snapshot, ...rest }) => rest)(state.plan_approval)
+      : null,
     preserved_plan_approval_count: state.plan_approval_history?.length || 0,
     capability_check: state.capability_check || null,
     ...(state.narration ? { narration: state.narration } : {}),
@@ -850,19 +1062,61 @@ export function summarizeVideoProductionState(
       : {}),
     ...(state.narration_calibration ? { narration_calibration: state.narration_calibration } : {}),
     ...(state.narration_fit ? { narration_fit: state.narration_fit } : {}),
+    ...(state.plan_review_candidate
+      ? {
+        plan_review_candidate: {
+          signature: state.plan_review_candidate.signature,
+          checked_turn_id: state.plan_review_candidate.checked_turn_id,
+          checked_at: state.plan_review_candidate.checked_at,
+          validation_version: state.plan_review_candidate.validation_version,
+        },
+      }
+      : {}),
     ...(state.narration_repair ? { narration_repair: state.narration_repair } : {}),
+    ...(state.narration_timing_episode
+      ? { narration_timing_episode: state.narration_timing_episode }
+      : {}),
     ...(state.active_operation ? { active_operation: state.active_operation } : {}),
-    operation_journal: state.operation_journal || [],
+    // Bounded on purpose. Measured over the 2026-08-04 run: 202 native results
+    // totalling 15.0MB, median 62KB each, and the size was uniform rather than
+    // driven by a few large failures. Half of every returned byte was durable
+    // state echoed back in full — candidate_history alone was 33%, the journal
+    // 8% — and no prompt or skill ever asks the model to read either. Both are
+    // append-at-end, so the tail is the recent end; the full records stay on
+    // disk and the counts below keep the "how many" fact.
+    //
+    // The journal entries keep what a reader can act on. `operation_id` and
+    // `input_hash` were 1.4KB of every status call and neither is actionable
+    // from outside: the model cannot compute a hash, and the repeated-input
+    // question it would answer is decided host-side and returned as
+    // `same_input_attempts` by the operation that needs it.
+    operation_journal: (state.operation_journal || []).slice(-10).map((entry) => {
+      const { operation_id: _id, input_hash: _hash, ...actionable } = entry;
+      return actionable;
+    }),
+    operation_journal_count: state.operation_journal?.length || 0,
     ...(state.blocked_operation ? { blocked_operation: state.blocked_operation } : {}),
     ...(state.visual_qa ? { visual_qa: state.visual_qa } : {}),
-    ...(state.current_candidate ? { current_candidate: state.current_candidate } : {}),
-    candidate_history: state.candidate_history || [],
+    ...(state.current_candidate
+      ? { current_candidate: projectCandidateRevisionForModel(state.current_candidate) }
+      : {}),
+    // The count, not the entries. Superseded revisions had exactly one reader —
+    // an assembled segment's "fall back to the last version that rendered" —
+    // and that path is gone: nothing restored a segment from a preserved
+    // snapshot, and a segment never gets its own user approval to fall back to.
+    // With it removed no reader is left, while the entries were 11.3KB of every
+    // status call, 84% of it absolute frozen-store paths. The full records stay
+    // on disk for audit.
     candidate_history_count: state.candidate_history?.length || 0,
     ...(state.last_operation ? { last_operation: state.last_operation } : {}),
     preview_status: state.preview?.status || 'missing',
-    preview_design_review: state.preview?.design_review || null,
+    ...(state.preview?.design_review
+      ? { preview_design_review: state.preview.design_review }
+      : {}),
     draft_status: state.draft?.status || 'missing',
-    draft_design_review: state.draft?.design_review || null,
+    ...(state.draft?.design_review
+      ? { draft_design_review: state.draft.design_review }
+      : {}),
     next_allowed_ops: nextVideoProductionOps(state, facts),
     updated_at: state.updated_at,
   };

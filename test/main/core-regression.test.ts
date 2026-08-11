@@ -126,8 +126,8 @@ describe('PC core regression unit coverage', () => {
     await auth.reorderEntries([second.entryId, first.entryId]);
     entries = (await auth.listEntries()).entries;
     expect(entries.map((entry) => entry.entryId)).toEqual([second.entryId, first.entryId]);
-    await auth.updateEntryModel(second.entryId, 'gpt-5.6-luna');
-    expect((await auth.listEntries()).entries[0].model).toBe('gpt-5.6-luna');
+    await auth.updateEntryModel(second.entryId, 'gpt-5.6-sol');
+    expect((await auth.listEntries()).entries[0].model).toBe('gpt-5.6-sol');
 
     const search = searchAuth.addSearchProfile({
       provider: 'tavily',

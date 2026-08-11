@@ -28,6 +28,14 @@ export interface SearchAdapterResult {
   results: NormalisedSearchResult[];
 }
 
+/** Account-level search failure that should not be retried immediately. */
+export class SearchAccountError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SearchAccountError';
+  }
+}
+
 const REQUEST_TIMEOUT_MS = 15_000;
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Response> {
@@ -262,7 +270,12 @@ export const SEARCH_PROVIDER_DOCS: Record<string, string> = {
   metaso:            'https://metaso.cn/',
 };
 
-export async function runSearchAdapter(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
+export async function runSearchAdapter(
+  profile: SearchProfile,
+  query: string,
+  count: number,
+  _context?: unknown,
+): Promise<SearchAdapterResult> {
   const adapter = searchAdaptersByProvider[profile.provider];
   if (!adapter) throw new Error(`no search adapter registered for provider "${profile.provider}"`);
   log.debug('runSearchAdapter', { provider: profile.provider, count });

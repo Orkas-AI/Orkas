@@ -21,8 +21,8 @@ Record this as `reference_intent:{mode,basis:"user|inferred",instructions,minimu
 ## Route selection
 
 - Choose `COMPOSE` when typography, diagrams, charts, abstract geometry, cards, covers, posters, social graphics, simple illustrations, or brand layouts can be expressed faithfully with HTML/CSS/SVG. This route uses zero image-generation calls.
-- Choose `HYBRID` when one photographic, painterly, character, or textured raster asset is needed but exact copy, layout, logo placement, or labels should remain deterministic in HTML/SVG. The normal budget is one generated raster asset.
-- Choose `GENERATE` when the desired output is primarily photographic, cinematic, painterly, character-led, or otherwise depends on synthesized pixels. The normal budget is one initial call and at most one repair call after evidence-based review.
+- Choose `HYBRID` when one photographic, painterly, character, or textured raster asset is needed but exact copy, layout, logo placement, or labels should remain deterministic in HTML/SVG. The normal budget is one generated raster asset per user turn.
+- Choose `GENERATE` when the desired output is primarily photographic, cinematic, painterly, character-led, or otherwise depends on synthesized pixels. The normal budget per user turn is one initial call and at most one repair call after evidence-based review.
 - Choose `EDIT` when the user supplied a raster image and requested a semantic pixel change that HTML overlays cannot accomplish. The manifest must use `reference_intent.mode:"edit"`, name a required `edit_source`, list the exact instructions, and preserve every unaffected region.
 - Distinguish `HYBRID` from `EDIT` by the final artifact contract, not merely by the presence of a supplied photo. A poster or layout that keeps a supplied product/subject image as an immutable foreground layer, generates a separate background asset, and places exact copy/logo deterministically is `HYBRID`. Use `EDIT` only when the final raster remains the supplied source canvas and pixels inside that source must be semantically reconstructed, such as replacing a portrait background in place.
 - A `reproduce` request does not force `EDIT`: choose COMPOSE, HYBRID, or GENERATE according to the visual material required to reproduce the declared attributes.
@@ -31,7 +31,62 @@ Route using call count and capability, not a remembered provider price. Once a g
 
 ## Lock output
 
-Record the route in `image-manifest.json` with numeric `schema_version:1`, canvas dimensions, required copy, must-include and must-avoid items, references, art direction, and `generation_budget.max_calls`. For every reference, lock whether it controls style, identity, composition, structure, content, mask, or edit source; record what must remain and what may change. User-declared instructions, roles, regions, preserve, and may-change items override inferred defaults. Reproduction requires `minimum_score >= 85`. Editing requires `minimum_score >= 80`, at least one instruction, and non-empty non-overlapping preserve/may-change boundaries on the required edit source. Do not switch routes after authoring begins unless the user changes the deliverable or the current route is technically incapable of satisfying it.
+Lock the route in the routing handoff, but do not create or edit project files during routing. `image-manifest.json` is written only after the selected production skill (`image-compose` or `image-generate`) has been read and the routed planning skills have supplied their values. It uses numeric `schema_version:1`. For every reference, lock whether it controls style, identity, composition, structure, content, mask, or edit source; record what must remain and what may change. User-declared instructions, roles, regions, preserve, and may-change items override inferred defaults. Reproduction requires `minimum_score >= 85`. Editing requires `minimum_score >= 80`, at least one instruction, and non-empty non-overlapping preserve/may-change boundaries on the required edit source. Do not switch routes after authoring begins unless the user changes the deliverable or the current route is technically incapable of satisfying it.
+
+Supplementary creative copy is allowed when the user did not request strict fidelity; keep it editable and do not present it as user-supplied fact. When the user asks for strict, exact-only, or no-added-copy output, `brief.required_copy` is the complete visible-copy allowlist: do not add subtitles, quantities, credentials, promises, or CTAs.
+
+## Canonical image-manifest v1
+
+This is the single structural template for `image-manifest.json`. Production skills must copy its nesting and value types instead of reconstructing the schema from memory. Replace every example value with the current brief, route, and budget; the host applies `generation_budget.max_calls` independently to each user turn and keeps prior-turn transactions only for audit. Omit optional `visual_plan` only when `image-canvas` was not selected. Route-specific reference and generation fields extend this template without changing its existing nesting.
+
+```json
+{
+  "schema_version": 1,
+  "route": "compose",
+  "canvas": { "width": 1080, "height": 1350 },
+  "brief": {
+    "purpose": "What this image is for",
+    "audience": "Who should respond to it",
+    "required_copy": ["Exact visible copy"],
+    "must_include": ["Required visual or fact"],
+    "must_avoid": ["Concrete visual failure"]
+  },
+  "art_direction": {
+    "subject_world": "Specific subject world",
+    "one_job": "The single communication job",
+    "visual_tradition": "Named visual tradition",
+    "composition": "Concrete hierarchy and placement",
+    "signature_device": "Distinctive geometry or material device",
+    "typography": "Typeface roles and casing",
+    "color_light_material": "Palette, light, and material"
+  },
+  "visual_plan": {
+    "global_description": "One concrete sentence describing the complete visual thesis",
+    "reading_order": ["hero", "details"],
+    "regions": [
+      {
+        "id": "hero",
+        "bounds": { "x": 0, "y": 0, "width": 1, "height": 0.65 },
+        "depth": "foreground",
+        "role": "hero",
+        "description": "Primary focal region",
+        "detail_prompts": [],
+        "reference_ids": []
+      },
+      {
+        "id": "details",
+        "bounds": { "x": 0, "y": 0.65, "width": 1, "height": 0.35 },
+        "depth": "midground",
+        "role": "support",
+        "description": "Supporting information region",
+        "detail_prompts": [],
+        "reference_ids": []
+      }
+    ]
+  },
+  "generation_budget": { "max_calls": 0 }
+}
+```
 
 ## Progressive-disclosure handoff
 

@@ -30,7 +30,9 @@ function startDeleteFileConfirmSubscription() {
       _handleDeleteFileConfirmRequest,
     );
   } catch (err) {
-    _deleteFileLog.warn('subscribe failed: ' + ((err && err.message) || String(err)));
+    _deleteFileLog.warn('subscribe failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 
@@ -158,6 +160,7 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     settled: false,
     accepting: true,
     hasTurnId,
+    createdAt: Date.now(),
     fallbackTimer: null,
   };
   _refreshDeleteConfirmFallbackWindow(batch);
@@ -177,8 +180,39 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     card.classList.add(granted ? 'is-confirmed' : 'is-cancelled');
     resultEl.textContent = _deleteConfirmResultText(granted, count);
     resultEl.hidden = false;
+    let failedCount = 0;
     for (const entry of entries) {
-      await _respondDeleteConfirm(entry.confirm_id, granted);
+      if (!await _respondDeleteConfirm(entry.confirm_id, granted)) failedCount += 1;
+    }
+    try {
+      const level = failedCount > 0 ? 'warn' : 'info';
+      _deleteFileLog[level]('delete confirmation result', {
+        result: failedCount > 0 ? 'failure' : 'success',
+        decision: granted ? 'allow' : 'deny',
+        file_count: count,
+        failed_count: failedCount,
+        duration_ms: Math.max(0, Date.now() - batch.createdAt),
+      });
+    } catch (_) {}
+    try {
+      if (window.Monitor) {
+        const decision = granted ? 'allow' : 'deny';
+        const result = failedCount > 0 ? 'failure' : 'success';
+        const payload = {
+          result,
+          decision,
+          file_count: count,
+          failed_count: failedCount,
+          duration_ms: Math.max(0, Date.now() - batch.createdAt),
+        };
+        if (failedCount > 0) {
+          payload.error_code = 'response_failed';
+          payload.error_type = 'ipc';
+        }
+        Monitor.event('delete_file_confirmation_result', payload);
+      }
+    } catch (_) {
+      // File approval must not depend on observability.
     }
     // The token state flip alone doesn't wake the LLM — Step 1 already
     // ended the turn, so without a fresh user message Step 2 never fires
@@ -187,7 +221,7 @@ function _createDeleteConfirmBatch(container, key, hasTurnId) {
     // so the LLM gets a new turn and retries with the tokens. Cancel doesn't need
     // this — the LLM treats `denied` as terminal.
     if (granted) {
-      const trigger = _tDelete('local.delete_file.user_continue', '已确认,请继续。');
+      const trigger = _tDelete('local.delete_file.user_continue', '已确认删除，请继续。');
       const fired = _autoTriggerLLMContinue(trigger);
       if (!fired) {
         const hint = _tDelete('local.delete_file.send_to_continue', '请发送一条消息让智能体继续完成删除。');
@@ -220,9 +254,13 @@ function _ackDeleteConfirmVisible(card, confirmId) {
   if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
   try {
     window.orkas.invoke('delete_file.visible', { confirm_id: confirmId })
-      .catch((err) => _deleteFileLog.warn('visible ack failed: ' + ((err && err.message) || String(err))));
+      .catch((err) => _deleteFileLog.warn('visible ack failed', {
+        error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+      }));
   } catch (err) {
-    _deleteFileLog.warn('visible ack failed: ' + ((err && err.message) || String(err)));
+    _deleteFileLog.warn('visible ack failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 
@@ -243,8 +281,8 @@ function _renderDeleteConfirmBatch(batch) {
     ? _tDelete('local.delete_file.batch_title', '确认删除 {count} 个文件', { count })
     : _tDelete('local.delete_file.title', '确认删除文件');
   batch.messageEl.textContent = isBatch
-    ? _tDelete('local.delete_file.batch_message', '智能体请求删除以下 {count} 个文件,确认后立即从磁盘移除,不可撤销。', { count })
-    : _tDelete('local.delete_file.message', '是否删除以下文件?该操作不可撤销。');
+    ? _tDelete('local.delete_file.batch_message', '智能体请求删除以下 {count} 个文件。确认后将立即删除，且无法恢复。', { count })
+    : _tDelete('local.delete_file.message', '智能体请求删除以下文件。确认后将立即删除，且无法恢复。');
   batch.okBtn.textContent = isBatch
     ? _tDelete('local.delete_file.batch_confirm_button', '删除全部 {count} 个', { count })
     : _tDelete('local.delete_file.confirm_button', '删除');
@@ -335,9 +373,17 @@ function _dispatchDeleteContinueEnter(inputEl) {
 
 async function _respondDeleteConfirm(confirmId, granted) {
   try {
-    await window.orkas.invoke('delete_file.respond', { confirm_id: confirmId, granted });
+    const result = await window.orkas.invoke('delete_file.respond', { confirm_id: confirmId, granted });
+    if (result && result.ok === false) {
+      _deleteFileLog.warn('respond rejected');
+      return false;
+    }
+    return !!(result && result.ok);
   } catch (err) {
-    _deleteFileLog.warn('respond failed: ' + ((err && err.message) || String(err)));
+    _deleteFileLog.warn('respond failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
+    return false;
   }
 }
 

@@ -12,6 +12,25 @@ function containsGitExecutable(value) {
     .some((entry) => entry && fs.existsSync(path.join(entry, 'git.exe')));
 }
 
+function pathEntries(value) {
+  return String(value || '')
+    .split(path.delimiter)
+    .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+}
+
+function containsPathEntry(entries, candidate) {
+  const normalized = path.resolve(candidate).toLowerCase();
+  return entries.some((entry) => path.resolve(entry).toLowerCase() === normalized);
+}
+
+function gitBashBinCandidates(gitBins) {
+  return [...new Set(gitBins.flatMap((gitBin) => [
+    gitBin,
+    path.resolve(gitBin, '..', 'bin'),
+  ]))];
+}
+
 export function windowsGitBinCandidates(env) {
   const candidates = [];
   const explicitGit = String(env.ORKAS_TEST_GIT || '').trim();
@@ -50,10 +69,37 @@ export function withWindowsGitOnPath(env, platform = process.platform) {
 
   const pathKey = environmentPathKey(result);
   const currentPath = String(result[pathKey] || '');
-  if (containsGitExecutable(currentPath)) return result;
+  const currentEntries = pathEntries(currentPath);
+  const configuredGitBins = windowsGitBinCandidates(result)
+    .filter((candidate) => fs.existsSync(path.join(candidate, 'git.exe')));
+  const currentGitBins = currentEntries
+    .filter((entry) => fs.existsSync(path.join(entry, 'git.exe')));
+  const prepend = [];
 
-  const gitBin = windowsGitBinCandidates(result)
-    .find((candidate) => fs.existsSync(path.join(candidate, 'git.exe')));
-  if (gitBin) result[pathKey] = currentPath ? `${gitBin}${path.delimiter}${currentPath}` : gitBin;
+  if (!containsGitExecutable(currentPath) && configuredGitBins[0]) {
+    prepend.push(configuredGitBins[0]);
+  }
+
+  // Windows ships a System32/bash.exe placeholder that only opens the WSL
+  // installation prompt. Shell-contract tests need the bash.exe that belongs
+  // to Git for Windows, even when another git.exe is already visible on PATH.
+  const gitBashBin = gitBashBinCandidates([...currentGitBins, ...configuredGitBins])
+    .find((candidate) => (
+      fs.existsSync(path.join(candidate, 'git.exe'))
+      && fs.existsSync(path.join(candidate, 'bash.exe'))
+    ));
+  const configuredBash = String(result.ORKAS_TEST_BASH || '').trim();
+  const gitBashPath = configuredBash && fs.existsSync(configuredBash)
+    ? configuredBash
+    : (gitBashBin ? path.join(gitBashBin, 'bash.exe') : '');
+  if (gitBashBin && !containsPathEntry(currentEntries, gitBashBin)) {
+    prepend.unshift(gitBashBin);
+  }
+  if (gitBashPath) result.ORKAS_TEST_BASH = gitBashPath;
+
+  if (prepend.length) {
+    result[pathKey] = [...new Set(prepend), ...(currentPath ? [currentPath] : [])]
+      .join(path.delimiter);
+  }
   return result;
 }

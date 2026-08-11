@@ -69,6 +69,28 @@ describe('chat_artifacts › createArtifact', () => {
     expect(fs.existsSync(path.join(dir, 'style.css'))).toBe(true);
   });
 
+  it('discards one failed candidate without removing sibling artifacts', async () => {
+    const m = await loadMod();
+    const first = m.createArtifact(UID, CID, AGENT, { title: 'First', files: MIN_FILES });
+    const second = m.createArtifact(UID, CID, AGENT, { title: 'Second', files: MIN_FILES });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+
+    expect(m.discardArtifact(UID, CID, first.artifactId)).toEqual({ ok: true, deleted: true });
+    expect(fs.existsSync(path.join(cidDir(), first.artifactId))).toBe(false);
+    expect(fs.existsSync(path.join(cidDir(), second.artifactId, 'index.html'))).toBe(true);
+  });
+
+  it('does not expose validation details when a discard identity is invalid', async () => {
+    const m = await loadMod();
+
+    expect(m.discardArtifact(UID, CID, '../private-artifact')).toEqual({
+      ok: false,
+      error: 'invalid artifact identity',
+    });
+  });
+
   it('accepts base64-encoded binary content for an image asset', async () => {
     const m = await loadMod();
     const pngB64 = Buffer.from([0x89, 0x50, 0x4e, 0x47]).toString('base64');

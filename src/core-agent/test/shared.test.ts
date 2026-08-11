@@ -122,9 +122,17 @@ describe("Errors", () => {
       expect(classifyTransientNetworkError(err)).toBe("connection_dropped");
     });
 
-    it("does not retry an explicit empty provider terminal", () => {
-      const err = Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_RESPONSE" });
-      expect(isRetryableError(err)).toBe(false);
+    it("retries only transport-class empty responses", () => {
+      const transport = Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_TRANSPORT" });
+      expect(classifyRetryableError(transport)).toBe("connection_dropped");
+      for (const code of [
+        "PROVIDER_EMPTY_RESPONSE",
+        "PROVIDER_EMPTY_NORMAL",
+        "PROVIDER_EMPTY_SAFETY",
+        "PROVIDER_EMPTY_UNKNOWN",
+      ]) {
+        expect(isRetryableError(Object.assign(new Error("empty response"), { code }))).toBe(false);
+      }
     });
 
     it("returns true for hosted WebSocket stream drops", () => {
@@ -270,6 +278,9 @@ describe("Errors", () => {
       for (const code of [
         "PROVIDER_NO_FIRST_EVENT_TIMEOUT",
         "PROVIDER_EMPTY_RESPONSE",
+        "PROVIDER_EMPTY_NORMAL",
+        "PROVIDER_EMPTY_SAFETY",
+        "PROVIDER_EMPTY_UNKNOWN",
         "PROVIDER_NETWORK_EXHAUSTED",
         "PROVIDER_RATE_LIMIT_EXHAUSTED",
       ]) {

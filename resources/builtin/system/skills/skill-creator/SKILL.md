@@ -5,7 +5,7 @@ description: "Author or edit a user-explicit custom skill via `<skill>` containe
 
 # skill-creator
 
-Authoring rules for creating or editing a custom skill via the `<skill>...</skill>` container, lightweight metadata tags, and `<<<skill-file>>>` blocks. Used by group-chat commander and per-skill inline edit chats. The container is parsed post-stream by `bus.ts` (commander surface) or `features/skills.ts` (per-skill chat); the LLM does not call any tool — it embeds the container in its final reply text and ends the turn.
+Authoring rules for creating or editing a custom skill via the `<skill>...</skill>` container, lightweight metadata tags, and `<<<skill-file>>>` blocks. Used by group-chat commander and per-skill inline edit chats. The containers are parsed post-stream by `bus.ts` (commander surface) or `features/skills.ts` (per-skill chat). Commander instead uses `import_skill_package` for a user-explicit local directory or ZIP import so unchanged package files never pass through model output.
 
 ## When to consult this skill
 
@@ -30,7 +30,7 @@ A skill is **an independent tool capability**, not a tutorial. When the LLM sees
 
 ## Hard rules (non-negotiable)
 
-- **Mutation only via lightweight metadata tags or `<<<skill-file>>>` blocks.** Use metadata tags for metadata-only changes (`name`, `description`, optional `description_zh`, optional `description_en`, `category`, and routing hints). Use `<<<skill-file>>>` for file content changes. Do NOT use `edit_file` / `write_file` / `bash` (with redirects) to mutate any file under the skill directory. Read for inspection is allowed; every write goes through the parsed protocol so skill rename / registry invalidation / progress events run correctly.
+- **Mutation only via the native local-package importer, lightweight metadata tags, or `<<<skill-file>>>` blocks.** When `import_skill_package` is available and the current user explicitly supplies a local Skill directory or ZIP in user text or as a current-turn attachment, call it once with the exact absolute path from that user text or attachment manifest. Use metadata tags for metadata-only changes (`name`, `description`, optional `description_zh`, optional `description_en`, `category`, and routing hints). Use `<<<skill-file>>>` for new or changed file content. Do NOT use `edit_file` / `write_file` / `bash` (with redirects) to mutate any file under the skill directory. Read for inspection is allowed; every write goes through one of these host-owned paths so validation, registry invalidation, progress, and created-resource events run correctly.
 - **Bundled scripts use the standard Skill Runner only.** Every command in SKILL.md that executes a bundled script must call `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs"` with the skill name/id and script basename. Never construct, expose, or invoke a path under the skill installation directory; never rely on the caller's current working directory. Imported skills are adapted to this entrypoint before they are considered usable.
 - **Do NOT dump the container or any inner block as a workspace file.** The server parses them inline and persists to `<skill_dir>/<path>`.
 - **Explicit creation intent required.** Do not create a custom skill merely because the user provided a URL, file, repo, README, or tool docs. Create/import only when the user's wording names skill creation/import, asks to convert material into a skill, or is already inside a per-skill creation/edit flow. If intent is ambiguous, ask one short clarification or use the package installer for a plain install.
@@ -49,7 +49,7 @@ Apply these design moves while authoring; they apply on top of the dedicated `Qu
 2. **State the boundary AND the non-goals.** The dispatch description already carries what the skill does (existing rules); also state what the skill explicitly does NOT do where the boundary is fuzzy (e.g. "fetches X but does NOT cache or rate-limit; caller handles those") so the dispatch LLM doesn't pick the skill for the wrong job.
 3. **Write the body as actionable steps, not narrative.** Body's "How to call" lists steps the LLM can execute (existing rule). If a draft section reads as documentation prose ("this skill helps with X by considering Y"), rewrite it into the steps the LLM actually runs. Bodies that read like marketing copy instead of an interface are the dominant authoring failure.
 4. **Stabilize the return schema for executable skills.** Body's "Return format" gives the same key set on success and failure, with `ok` as the discriminator. Stability lets the caller pattern-match without runtime sniffing — and makes the skill verifier-friendly.
-5. **Require a confirm step before irreversible operations.** For skill operations that delete / overwrite / mutate external state (DB / API write / public post), the body's "How to call" instructs the caller to confirm before execution.
+5. **Preserve action authority for irreversible operations.** A current user request authorizes that exact action. For skill operations that delete, overwrite, or mutate external state, the body's "How to call" distinguishes an unresolved target from a scope expansion: ask only for the missing target, and pause only for a materially different action/target or a platform-required confirmation.
 6. **Refuse to author across validator safety gates.** Apply the validator-aligned safety gates below to `SKILL.md`, scripts, references, and imported source. If the source material requires a blocked pattern, stop and explain the request crosses a security gate instead of preserving it.
 7. **Preserve source fidelity when source exists.** If source material already provides `SKILL.md`, `scripts/`, `references/`, `assets/`, `examples/`, tests, configs, prompts, or templates, keep their meaning, order, filenames, and directory layout. Apply the scratch-authoring template only to brand-new skills without source material.
 
@@ -302,6 +302,19 @@ Other languages: take params from argv, write JSON / text to stdout, non-zero ex
 
 If the source material the user gives is a multi-skill package: install each source `SKILL.md` as an independent skill. Preserve each sub-skill's own files and boundaries; do not consolidate them into a single "suite" skill. If the source has mutual dependencies, make each imported skill self-contained only where Orkas execution requires it — do not rewrite or merge just to simplify the package.
 
+## Native local package import (Commander)
+
+Use this path when `import_skill_package` is available and the current user explicitly asks to import/create Skill(s) from an absolute local directory or `.zip` supplied in the same turn, including a current-turn attachment.
+
+1. Copy the exact absolute path from the current user text or current-turn `<attachments>` manifest into `source_path`; never infer a sibling, parent, remembered, or discovered path.
+2. Call `import_skill_package` once. The host discovers every `SKILL.md`, copies unchanged files directly, applies path/archive limits, validates each Skill, rolls back only rejected siblings, refreshes the registry, and binds successful Skills to the current project when applicable.
+3. Do not re-emit unchanged package files. Do not emit `<<<skill-file>>>` blocks for files the tool already installed. This is the token-limit invariant that keeps large imports reliable.
+4. If the bounded result reports rejected siblings, name the affected Skill(s) and reason; do not retry with renamed ids or an override. Successful siblings remain installed.
+5. A small metadata-only `<skill>` edit is allowed after success when category or routing clearly needs correction. Do not rewrite source files merely to perform that review.
+6. If the package has no `SKILL.md`, stop and explain that it is not an existing Skill package. Use scratch authoring only if the user separately asks to convert those materials into a new Skill.
+
+If `import_skill_package` is absent, do not invent the tool. Follow the per-skill inline edit modes below using only files already copied into the current Skill draft.
+
 ## Three creation modes (per-skill inline edit chat)
 
 When the user opens an inline edit chat, the first message lands in one of three modes:
@@ -328,7 +341,7 @@ URL might be GitHub / a skill-introduction blog post / raw SKILL.md / a release 
 
 ### Mode C — "Help me import this existing skill: <directory path or attachment>"
 
-All files in the directory have already been copied into this skill's directory. Flow:
+This is the per-skill inline-edit fallback; Commander must use the native local package path above when that tool is available. All files in the directory have already been copied into this skill's directory. Flow:
 
 1. First do `bash ls -R` or `search_files` to inspect — don't ask the user "where is that file?".
 2. Read every visible `SKILL.md` first. If there are multiple `SKILL.md` files, treat each one as a separate skill, make the first source skill become the current import draft, and do not combine their bodies or files. Then read the scripts / config / references each one needs to understand the capability.

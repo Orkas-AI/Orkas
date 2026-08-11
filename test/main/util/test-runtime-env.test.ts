@@ -63,4 +63,29 @@ describe('test runtime environment', () => {
     const posix = { PATH: '/usr/bin:/bin', LOCALAPPDATA: 'unused' };
     expect(withWindowsGitOnPath(posix, 'darwin')).toEqual(posix);
   });
+
+  it('places Git for Windows bash ahead of the System32 WSL placeholder', () => {
+    const programFiles = temporaryRoot();
+    const gitCmd = path.join(programFiles, 'Git', 'cmd');
+    const gitBin = path.join(programFiles, 'Git', 'bin');
+    const system32 = path.join(temporaryRoot(), 'System32');
+    fs.mkdirSync(gitCmd, { recursive: true });
+    fs.mkdirSync(gitBin, { recursive: true });
+    fs.mkdirSync(system32, { recursive: true });
+    fs.writeFileSync(path.join(gitCmd, 'git.exe'), '');
+    fs.writeFileSync(path.join(gitBin, 'git.exe'), '');
+    fs.writeFileSync(path.join(gitBin, 'bash.exe'), '');
+    fs.writeFileSync(path.join(system32, 'bash.exe'), '');
+
+    const result = withWindowsGitOnPath({
+      Path: system32,
+      ProgramFiles: programFiles,
+    }, 'win32');
+    const entries = result.Path?.split(path.delimiter) || [];
+
+    expect(entries[0]).toBe(gitBin);
+    expect(entries[1]).toBe(gitCmd);
+    expect(entries.at(-1)).toBe(system32);
+    expect(result.ORKAS_TEST_BASH).toBe(path.join(gitBin, 'bash.exe'));
+  });
 });

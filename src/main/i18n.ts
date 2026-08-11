@@ -218,9 +218,9 @@ export function getCurrentLang(): Lang {
 }
 
 // ── LLM language directive ───────────────────────────────────────────────
-// Inserted after the stable role prompt and before higher-frequency runtime
-// context so the user's chosen UI language stays early without becoming the
-// system prompt's first instruction.
+// Prompt composers place this after role/workflow/runtime context, and the
+// runner preserves it as the final system instruction. That keeps English-
+// authored internal material from becoming the user-visible reply language.
 
 export function buildLanguageDirective(lang: Lang = _current): string {
   const name = getLocaleMeta(lang).llmName;

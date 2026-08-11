@@ -415,12 +415,15 @@ describe("Evolution: skill_manage tool", () => {
     );
     expect(createResult.content).toContain("Skill created");
     expect(createResult.isError).toBeUndefined();
+    expect(createResult.verbatimDocument).toBeUndefined();
 
     const listResult = await tool.execute({ action: "list" }, ctx);
     expect(listResult.content).toContain("test-skill");
+    expect(listResult.verbatimDocument).toBeUndefined();
 
     const readResult = await tool.execute({ action: "read", id: "test-skill" }, ctx);
     expect(readResult.content).toContain("Do things step by step");
+    expect(readResult.verbatimDocument).toBe(true);
   });
 
   it("patch via tool", async () => {

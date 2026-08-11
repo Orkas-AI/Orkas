@@ -437,7 +437,30 @@ describe('user_workspace › openWorkspaceInFileManager', () => {
 
     const result = await ws.openWorkspaceInFileManager('userOpen');
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.path).toBe(dir);
+    if (result.ok) {
+      expect(result.path).toBe(dir);
+      expect(result.fallbackUsed).toBeUndefined();
+      expect(result.fallbackReason).toBeUndefined();
+    }
+    expect(shell.openPath).toHaveBeenCalledWith(dir);
+  });
+
+  it('does not mark normal project inheritance as a fallback', async () => {
+    const { shell } = await import('electron');
+    (shell.openPath as ReturnType<typeof vi.fn>).mockClear();
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const dir = path.join(tmpDir, 'inherited-default');
+    fs.mkdirSync(dir, { recursive: true });
+    ws.setWorkspacePath('userInherited', dir);
+
+    const result = await ws.openWorkspaceInFileManager('userInherited', 'p_inherit');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.path).toBe(dir);
+      expect(result.fallbackUsed).toBeUndefined();
+      expect(result.fallbackReason).toBeUndefined();
+    }
     expect(shell.openPath).toHaveBeenCalledWith(dir);
   });
 
@@ -474,8 +497,35 @@ describe('user_workspace › openWorkspaceInFileManager', () => {
 
     const result = await ws.openWorkspaceInFileManager('userGone');
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.path).toBe(p.DEFAULT_USER_WORKSPACE);
+    if (result.ok) {
+      expect(result.path).toBe(p.DEFAULT_USER_WORKSPACE);
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.fallbackReason).toBe('selected_unavailable');
+    }
     expect(shell.openPath).toHaveBeenCalledWith(p.DEFAULT_USER_WORKSPACE);
+  });
+
+  it('marks an unavailable project selection when opening its valid default fallback', async () => {
+    const { shell } = await import('electron');
+    (shell.openPath as ReturnType<typeof vi.fn>).mockClear();
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const defaultDir = path.join(tmpDir, 'project-fallback-default');
+    const projectDir = path.join(tmpDir, 'project-fallback-gone');
+    fs.mkdirSync(defaultDir, { recursive: true });
+    fs.mkdirSync(projectDir, { recursive: true });
+    ws.setWorkspacePath('userProjectGone', defaultDir);
+    ws.setWorkspacePath('userProjectGone', projectDir, 'p_gone');
+    fs.rmSync(projectDir, { recursive: true, force: true });
+
+    const result = await ws.openWorkspaceInFileManager('userProjectGone', 'p_gone');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.path).toBe(defaultDir);
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.fallbackReason).toBe('selected_unavailable');
+    }
+    expect(shell.openPath).toHaveBeenCalledWith(defaultDir);
   });
 });
 

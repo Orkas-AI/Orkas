@@ -93,6 +93,67 @@ function loadRedundantCommanderRecord(): (record: unknown) => boolean {
   return vm.runInNewContext(combined, {});
 }
 
+function loadRepeatedPriorTurnCommentary(): (message: unknown, commentary: string) => boolean {
+  const combined = [
+    `function _hasChatMessageClass(el, cls) {
+      return !!(el && el.classList && el.classList.contains(cls));
+    }`,
+    `function _previousChatMessage(el) {
+      let prev = el ? el.previousElementSibling : null;
+      while (prev && !_hasChatMessageClass(prev, 'chat-message')) prev = prev.previousElementSibling;
+      return prev || null;
+    }`,
+    `(${extractFunction('_isRepeatedPriorTurnCommentary')})`,
+  ].join('\n');
+  return vm.runInNewContext(combined, {});
+}
+
+function messageElement(dataset: Record<string, string>, classes: string[]) {
+  return {
+    dataset,
+    previousElementSibling: null as any,
+    classList: { contains: (name: string) => classes.includes(name) },
+  };
+}
+
+describe('_isRepeatedPriorTurnCommentary', () => {
+  it('suppresses replayed commander commentary in the next segment of the same turn', () => {
+    const isRepeated = loadRepeatedPriorTurnCommentary();
+    const previous = messageElement({
+      turnId: 'turn-1',
+      fromActor: 'commander',
+      finalized: '1',
+      finalText: '我会先按截图对齐现有交互，再定位对应组件。',
+    }, ['chat-message', 'assistant']);
+    const resumed = messageElement({
+      turnId: 'turn-1',
+      fromActor: 'commander',
+    }, ['chat-message', 'assistant']);
+    resumed.previousElementSibling = previous;
+
+    expect(isRepeated(resumed, previous.dataset.finalText)).toBe(true);
+  });
+
+  it('preserves commentary from another turn or with new content', () => {
+    const isRepeated = loadRepeatedPriorTurnCommentary();
+    const previous = messageElement({
+      turnId: 'turn-1',
+      fromActor: 'commander',
+      finalized: '1',
+      finalText: '旧进度',
+    }, ['chat-message', 'assistant']);
+    const nextTurn = messageElement({
+      turnId: 'turn-2',
+      fromActor: 'commander',
+    }, ['chat-message', 'assistant']);
+    nextTurn.previousElementSibling = previous;
+
+    expect(isRepeated(nextTurn, '旧进度')).toBe(false);
+    nextTurn.dataset.turnId = 'turn-1';
+    expect(isRepeated(nextTurn, '新的进度')).toBe(false);
+  });
+});
+
 // `_processEventName` is the tag that drives the `turn_silent` handoff-only
 // drop: a process line inherits it as `dataset.eventName`, and the handler
 // removes a silent placeholder only when EVERY line is `hand_off_to`. So the

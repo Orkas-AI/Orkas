@@ -110,15 +110,15 @@ function ca(): Promise<CoreAgentModule> {
   return _caPromise;
 }
 
-/** Lazy loader for pi-ai's OAuth providers (anthropic, openai-codex, etc.).
+/** Lazy loader for pi-ai's provider-owned OAuth flows (anthropic, openai-codex, etc.).
  *  On first load we also register our custom providers (MiniMax Portal).
  *  Idempotent — pi-ai's registry is id-keyed. */
-type PiOauthModule = typeof import('@earendil-works/pi-ai/oauth');
+type PiOauthModule = typeof import('../../core-agent/src/auth/oauth-compat');
 let _oauthPromise: Promise<PiOauthModule> | null = null;
 function piOauth(): Promise<PiOauthModule> {
   if (!_oauthPromise) {
     _oauthPromise = (async () => {
-      const mod = await import('@earendil-works/pi-ai/oauth');
+      const mod = await import('../../core-agent/src/auth/oauth-compat');
       try {
         const { registerMinimaxOAuthProviders } = await import('./oauth-minimax');
         await registerMinimaxOAuthProviders();
@@ -181,6 +181,7 @@ interface ApiKeyProfile {
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
+  reasoningEffort?: 'low' | 'medium' | 'high';
   email?: string;
   createdAt: number;
   lastUsed: number;
@@ -280,7 +281,7 @@ interface ProfilesFile {
   ttsProfiles?: TtsProfile[];
 }
 
-const PROFILES_FILE_VERSION = 4;
+const PROFILES_FILE_VERSION = 6;
 const AUTH_SECRET_NAMESPACE = 'auth.profiles';
 const AUTH_SECRET_RECORD_ID = 'auth-profiles.json';
 
@@ -352,15 +353,26 @@ function loadProfiles(): ProfilesFile {
     // format. Plain JSON is also accepted as a one-shot migration input.
     const uid = getActiveUserId();
     const { json, needsRewrite } = decryptProfilesPayload(raw, uid);
+    let shouldRewrite = needsRewrite;
     const data = JSON.parse(json) as Partial<ProfilesFile>;
     if (data && typeof data === 'object' && data.profiles && typeof data.profiles === 'object') {
       const profiles: Record<string, StoredProfile> = {};
       for (const [id, p] of Object.entries(data.profiles)) {
         const prof = p as any;
         if (!prof || typeof prof !== 'object' || !prof.provider || !prof.type) continue;
+        const normalizedProfile = { ...prof };
+        if (
+          Number((data as any).version) < 6
+          && normalizedProfile.provider === CUSTOM_MODEL_PROVIDER
+          && normalizedProfile.type === 'api_key'
+          && normalizedProfile.maxTokens === 8_192
+        ) {
+          delete normalizedProfile.maxTokens;
+          shouldRewrite = true;
+        }
         const label = prof.label || id.split(':').slice(1).join(':') || 'default';
         profiles[id] = {
-          ...prof,
+          ...normalizedProfile,
           label,
           createdAt: typeof prof.createdAt === 'number' ? prof.createdAt : Date.now(),
           lastUsed: typeof prof.lastUsed === 'number' ? prof.lastUsed : 0,
@@ -383,7 +395,7 @@ function loadProfiles(): ProfilesFile {
       const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
       const ttsProfiles = parseTtsProfilesArray((data as any).ttsProfiles);
       const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles, ttsProfiles };
-      if (needsRewrite) saveProfiles(store);
+      if (shouldRewrite || Number((data as any).version) !== PROFILES_FILE_VERSION) saveProfiles(store);
       return store;
     }
   } catch (err) {
@@ -576,7 +588,7 @@ function sanitizeCustomLabel(input: string): string {
 
 const CUSTOM_MODEL_PROVIDER = 'custom';
 const DEFAULT_CUSTOM_CONTEXT_WINDOW = 131_072;
-const DEFAULT_CUSTOM_MAX_TOKENS = 8_192;
+const DEFAULT_CUSTOM_MAX_TOKENS = 32_768;
 const MAX_CUSTOM_TOKEN_LIMIT = 16_777_216;
 
 function customConfigError(code: string, message: string): Error & { code: string } {
@@ -643,7 +655,15 @@ function customRuntimeConfigFromProfile(
       'maxTokens',
     );
     if (maxTokens > contextWindow) return null;
-    return { baseUrl, contextWindow, maxTokens };
+    const reasoningEffort = ['low', 'medium', 'high'].includes(String(profile.reasoningEffort || ''))
+      ? profile.reasoningEffort as 'low' | 'medium' | 'high'
+      : undefined;
+    return {
+      baseUrl,
+      contextWindow,
+      maxTokens,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+    };
   } catch {
     return null;
   }
@@ -789,7 +809,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
   let oauthIds: Set<string>;
   try {
     const oauth = await piOauth();
-    oauthIds = new Set(oauth.getOAuthProviders().map((p: any) => p.id));
+    oauthIds = new Set((await oauth.getOAuthProviders()).map((p) => p.id));
   } catch {
     oauthIds = new Set(OAUTH_PROVIDERS.map((p) => p.id));
   }
@@ -994,6 +1014,7 @@ export interface AddCustomModelEntryInput {
   apiKey: string;
   contextWindow?: number | string | null;
   maxTokens?: number | string | null;
+  reasoningEffort?: 'low' | 'medium' | 'high' | null;
 }
 
 export async function addCustomModelEntry(
@@ -1014,12 +1035,22 @@ export async function addCustomModelEntry(
     DEFAULT_CUSTOM_CONTEXT_WINDOW,
     'contextWindow',
   );
-  const maxTokens = normalizeCustomTokenLimit(
-    input.maxTokens,
-    DEFAULT_CUSTOM_MAX_TOKENS,
-    'maxTokens',
-  );
-  if (maxTokens > contextWindow) {
+  const hasExplicitMaxTokens = input.maxTokens !== undefined
+    && input.maxTokens !== null
+    && String(input.maxTokens).trim() !== '';
+  const maxTokens = hasExplicitMaxTokens
+    ? normalizeCustomTokenLimit(input.maxTokens, DEFAULT_CUSTOM_MAX_TOKENS, 'maxTokens')
+    : undefined;
+  const reasoningEffort = input.reasoningEffort == null
+    ? undefined
+    : String(input.reasoningEffort).trim().toLowerCase();
+  if (reasoningEffort && !['low', 'medium', 'high'].includes(reasoningEffort)) {
+    throw customConfigError(
+      'CUSTOM_REASONING_EFFORT_INVALID',
+      'reasoningEffort must be low, medium, or high',
+    );
+  }
+  if (maxTokens !== undefined && maxTokens > contextWindow) {
     throw customConfigError(
       'CUSTOM_TOKEN_LIMIT_INVALID',
       'Maximum output tokens cannot exceed the context window',
@@ -1046,7 +1077,10 @@ export async function addCustomModelEntry(
     key,
     baseUrl,
     contextWindow,
-    maxTokens,
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(reasoningEffort
+      ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' }
+      : {}),
     createdAt: existingProfile?.createdAt ?? now,
     lastUsed: 0,
   };
@@ -1271,6 +1305,21 @@ export async function reorderEntries(orderedIds: string[]): Promise<{ entries: E
   };
 }
 
+/** Promote one configured entry to the active slot, optionally choosing a
+ * different model for that same user-owned credential first. */
+export async function selectEntry(
+  entryId: string,
+  model?: string,
+): Promise<{ entries: EntryView[] }> {
+  const id = String(entryId || '').trim();
+  if (!id) throw new Error('entryId required');
+  const requestedModel = String(model || '').trim();
+  if (requestedModel) await updateEntryModel(id, requestedModel);
+  const store = loadProfiles();
+  if (!store.entries.some((entry) => entry.entryId === id)) throw new Error('entry not found');
+  return reorderEntries([id]);
+}
+
 // ── OAuth flow orchestration ─────────────────────────────────────────────
 
 interface FlowPrompt { message: string; placeholder?: string; allowEmpty?: boolean }
@@ -1371,7 +1420,7 @@ export async function startOAuth(
   const id = String(providerId || '').trim();
   if (!id) throw new Error('provider required');
   const oauth = await piOauth();
-  const provider = oauth.getOAuthProvider(id as any);
+  const provider = await oauth.getOAuthProvider(id);
   if (!provider) {
     const hint = _minimaxRegisterError && id.startsWith('minimax-portal')
       ? t('oauth.minimax.register_error_hint', { message: _minimaxRegisterError })
@@ -1776,7 +1825,7 @@ async function refreshOAuthProfile(profileId: string): Promise<string | undefine
   if (!prof || prof.type !== 'oauth') return undefined;
 
   const oauth = await piOauth();
-  const provider = oauth.getOAuthProvider(prof.provider);
+  const provider = await oauth.getOAuthProvider(prof.provider);
   if (!provider) return undefined;
 
   const creds = {

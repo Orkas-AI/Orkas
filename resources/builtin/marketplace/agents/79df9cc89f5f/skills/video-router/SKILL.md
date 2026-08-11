@@ -19,10 +19,10 @@ in the same response with a complete **unexecuted production package**:
 assumptions, script/narration, timed storyboard or shotlist, on-screen
 copy/captions, visual and audio direction, provenance/fallback assets, export
 target, preview-review checklist, and final QA checklist. Do not stop at a
-Direction confirmation form and withhold the package. Clearly distinguish
+plan-confirmation form and withhold the package. Clearly distinguish
 planned files/media from produced files/media, and reserve future confirmation
 only for an operation the unavailable runtime would actually execute.
-Do not title the package “Direction confirmation”. Make every timed scene
+Do not title the package “Production plan confirmation”. Make every timed scene
 production-usable with narration, exact visible copy/caption, visual action,
 and edit/transition instruction.
 For a narrated package, include the full verbatim caption line for every
@@ -69,6 +69,14 @@ AUTO does not abandon the axes — it sequences them through one cross-modal pla
 - Decide the primary axis at the brief/proposal stage and **state it in the proposal**.
 - Once locked, do not silently switch the primary axis mid-run. If a later step reveals the wrong choice, surface it to the user and re-confirm rather than quietly changing course.
 - Layering is fine and expected (e.g. Compose captions over Generated footage); "locking" governs the **primary** path, not the allowed overlays.
+
+## Runtime handoff
+
+When the production runtime is available, routing ends at the direction
+boundary, not at a production plan. For a Chinese UI, use the exact gate-control
+title `制作方向确认` (never `创意方向确认`) and show only two or three direction
+concepts plus the facts already locked by the brief. Do not write a manifest,
+script, narration copy, or art direction before that choice.
 
 ## Boundary / non-goals
 

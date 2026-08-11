@@ -136,6 +136,40 @@ describe('ipc/connectors renderer DTO', () => {
     expect(dto.status).toEqual(inst.status);
   });
 
+  it('does not expose hosted Discord webhook target metadata or secrets', async () => {
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const dto = _toClientInstanceForTest({
+      ...baseInstance({
+        kind: 'stdio',
+        command: '/usr/local/bin/node',
+        args: ['discord-mcp-server.cjs'],
+        env: {},
+      }),
+      id: 'discord',
+      display_name: 'Discord',
+      origin: undefined,
+      discord_webhook_targets: [{
+        id: 'discord-wh-1',
+        webhook_id: 'webhook-1',
+        webhook_token: 'webhook-token-secret',
+        webhook_url: 'https://discord.com/api/webhooks/webhook-1/webhook-token-secret',
+        guild_id: 'guild-1',
+        guild_name: 'Orkas Lab',
+        channel_id: 'channel-1',
+        channel_name: 'alerts',
+        created_at: '2026-06-29T00:00:00.000Z',
+        updated_at: '2026-06-29T00:00:00.000Z',
+      }],
+    }, true);
+
+    const json = JSON.stringify(dto);
+    expect(json).not.toContain('Orkas Lab');
+    expect(json).not.toContain('alerts');
+    expect(json).not.toContain('webhook-token-secret');
+    expect(json).not.toContain('discord.com/api/webhooks');
+    expect(dto.oauth_grant).toEqual({ account_label: 'me@example.com' });
+  });
+
   it('returns the latest connector status after refresh', async () => {
     const degraded = {
       ...baseInstance({

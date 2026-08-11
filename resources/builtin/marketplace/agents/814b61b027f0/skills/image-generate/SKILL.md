@@ -10,9 +10,11 @@ category: creation
 
 Read this skill only after route lock when the task needs synthesized or content-aware reconstructed pixels: `GENERATE`, semantic `EDIT`, or the raster phase of `HYBRID`. Do not load it for `COMPOSE`, deterministic transforms, or overlays. It governs direct `generate_image` calls and the stable host workflow kernel; engine-specific request formats and reusable graphs remain private skill resources rather than new application tools.
 
+This production skill is the earliest point at which a manifest for a direct `GENERATE` or `EDIT` task may be created. Initialize `image-manifest.json` from the `Canonical image-manifest v1` block in `image-router`; it is the single structural source. Replace the locked route and budget, then add the reference and generation fields below. Do not reconstruct the base schema from memory.
+
 ## Generation rules
 
-- Respect `generation_budget.max_calls`. `COMPOSE` has a budget of zero; `HYBRID` normally has one; `GENERATE` and `EDIT` normally allow one initial call and one evidence-based repair.
+- Respect `generation_budget.max_calls` within the current user turn. The host reapplies this limit independently for each new user turn while retaining older transactions only as audit history. `COMPOSE` has a budget of zero; `HYBRID` normally has one; `GENERATE` and `EDIT` normally allow one initial call and one evidence-based repair in that turn.
 - Generate at the final aspect ratio whenever the provider supports it. Do not rely on destructive cropping to fix a mismatched composition.
 - Use reference images only when they encode composition, identity, product fidelity, or edit continuity that the prompt cannot preserve reliably.
 - Mirror manifest references into `generate_image.reference_bindings` using the exact concatenated reference order. Include role, strength, preserve, may-change, and target region. Send `generation_contract.negative_prompt` separately.
@@ -33,11 +35,11 @@ Before every direct `generate_image` call, call `image_studio generation.quote` 
 - The open build does not estimate provider prices or maintain an in-app credit balance. Never infer a price from model names, cache a local price table, or multiply a remembered per-image rate.
 - Stop when the quote reports an unavailable provider or `sufficient:false`. Do not spend a new request id, consume a manifest call slot, or silently switch to another billing path.
 - `generate_image` checks provider availability again immediately before it creates the durable generation transaction.
-- A completed stable request id is reused without a new quote or provider call. A pending or failed id remains closed and cannot be bypassed.
+- A completed stable request id is reused without a new quote or provider call only within the same user turn. A pending or failed id remains closed in that turn and cannot be bypassed. A later user turn receives a fresh call scope even when it resumes the same project; do not treat earlier-turn exhaustion as current-turn exhaustion.
 
 When returning a cost decision or execution handoff, keep the state machine
 machine-readable: state whether dispatch is allowed, whether external billing
-applies, project call slots consumed, the exact next operation, and the
+applies, project call slots consumed in the current turn, the exact next operation, and the
 `generation.quote` recheck. Do not replace these fields with a vague prose
 summary.
 
@@ -57,9 +59,9 @@ Use an external workflow only when the user or host has already configured Comfy
   `"sd_keep_unmasked_area": true`; a prompt, `protected_content`, or review
   instruction saying "preserve unmasked pixels" does not replace this field.
 - `workflow_path` must be a project-local engine request JSON. Prefer a user-exported, reviewed graph; do not invent custom server nodes or install missing nodes/models.
-- Call `workflow.run` with the configured engine, stable `image_request_id`, project-local output, and optional output node/index. It consumes the manifest's durable generation budget exactly like `generate_image`.
+- Call `workflow.run` with the configured engine, stable `image_request_id`, project-local output, and optional output node/index. It consumes the manifest's durable generation budget, scoped to the current user turn, exactly like `generate_image`.
 - A host-configured workflow does not use in-app billing. Its host/provider may still have separate billing; report that billing as external and not estimated.
-- Treat `pending_uncertain` as a dispatched call. Do not retry it or create a replacement request id; inspect the host queue and report the pending state.
+- Treat `pending_uncertain` as a dispatched call in the current turn. Do not retry it or create a replacement request id in that turn; inspect the host queue and report the pending state.
 - Capability evidence proves protocol reachability, not that a particular graph node or model exists. Report the executed engine and returned dispatch evidence without claiming broader native-control support.
 
 An execution handoff must retain concrete, executable fields: the exact
@@ -78,6 +80,6 @@ For missing capabilities:
 
 ## Review loop
 
-After either generation path, call `image_studio` with `project.inspect`, passing the raster path. Inspect the evidence and the actual reference side-by-side for subject accuracy, changed-versus-protected regions, composition, anatomy, material behavior, text artifacts, continuity, and the manifest's must-avoid constraints. A repair call must address concrete findings from the current evidence; never spend the second call on an ungrounded variation search.
+After either generation path, call `image_studio` with `project.inspect`, passing the raster path. Deterministic project/raster validation runs first; only a passing result attaches the full-color candidate followed by every declared reference in one ordered model batch. Inspect those attachments side-by-side for subject accuracy, changed-versus-protected regions, composition, anatomy, material behavior, text artifacts, continuity, and the manifest's must-avoid constraints. Do not reopen the same paths individually through generic `read_file`. A repair call must address concrete findings from the current evidence; never spend the second call on an ungrounded variation search.
 
-Submit a signature-bound design review and export the exact approved raster through `image_studio`. A definite pre-dispatch failure is recorded but does not consume a generation call; a dispatched, terminal failure or `pending_uncertain` attempt still counts. If the repair budget is exhausted, use `project.status.current_candidate` and `recovery_context`: keep the best reviewed image visible, apply any useful deterministic zero-call repair, and report the remaining finding. Ask the user only before an additional paid call or a material intent/quality tradeoff; a direct chat reply is sufficient and no recovery form is required.
+Submit a signature-bound design review and export the exact approved raster through `image_studio`. A definite pre-dispatch failure is recorded but does not consume a generation call; a dispatched, terminal failure or `pending_uncertain` attempt still counts in the current turn. If the repair budget is exhausted in that turn, use `project.status.current_candidate` and `recovery_context`: keep the best reviewed image visible, apply any useful deterministic zero-call repair, report the remaining finding, and end the turn. Never raise manifest `max_calls` or request a quota-increase form to bypass the same-turn limit. A later direct user message starts a fresh turn-scoped allowance automatically; never carry earlier-turn exhaustion forward or request extra authorization solely because that earlier turn used its calls. Ask the user only for a material intent/quality/reference/delivery tradeoff, using normal chat rather than a recovery form.

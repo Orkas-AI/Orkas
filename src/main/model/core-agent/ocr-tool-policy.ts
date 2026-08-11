@@ -1,10 +1,10 @@
-const OFFICE_WORKER_AGENT_ID = 'a19101ba698a';
-
-const OCR_INTENT =
-  /\bocr\b|文字识别|(?:识别|提取|转写).{0,12}(?:图片|图中|截图|扫描件|扫描文档).{0,12}(?:文字|文本|内容|字符)|扫描(?:件|文档|版\s*pdf)|图片型\s*pdf|逐字(?:转写|抄录)/i;
+const DIRECT_OCR_INTENT =
+  /\bocr\b|文字识别|扫描(?:件|文档|版\s*pdf)|图片型\s*pdf|逐字(?:转写|抄录)/i;
+const OCR_ACTION = /识别|提取|转写|抄录/i;
+const OCR_MEDIA = /图片|图中|截图|扫描件|扫描文档/i;
+const OCR_TEXT_TARGET = /文字|文本|内容|字符|表格/i;
 
 export interface OcrToolPolicyInput {
-  agentId?: string;
   userMessage?: string;
   attachmentTypes?: readonly string[];
   conversationAttachmentNames?: readonly string[];
@@ -22,13 +22,21 @@ function hasExtension(names: readonly string[] | undefined, extensions: readonly
 /**
  * Keep local OCR as a specialized capability instead of a default temptation
  * on every image task. It remains available for scanned-PDF workflows,
- * explicit OCR requests, OfficeWorker, and image input routed to a model that
- * cannot receive images.
+ * explicit OCR requests, and image input routed to a model that cannot receive
+ * images.
  */
 export function shouldExposeOcrFileTool(input: OcrToolPolicyInput): boolean {
-  if (input.agentId === OFFICE_WORKER_AGENT_ID) return true;
   const userMessage = String(input.userMessage || '');
-  if (OCR_INTENT.test(userMessage) || /\.pdf(?:\b|$)/i.test(userMessage)) return true;
+  const hasComposedOcrIntent = OCR_ACTION.test(userMessage)
+    && OCR_MEDIA.test(userMessage)
+    && OCR_TEXT_TARGET.test(userMessage);
+  if (
+    DIRECT_OCR_INTENT.test(userMessage)
+    || hasComposedOcrIntent
+    || /\.pdf(?:\b|$)/i.test(userMessage)
+  ) {
+    return true;
+  }
 
   const hasCurrentAttachments = !!input.attachmentTypes?.length;
   if (hasKind(input.attachmentTypes, 'pdf')) return true;

@@ -50,12 +50,13 @@ describe('open-source VideoStudio resources', () => {
     expect(agent.skill_list).toContain('gate-control');
     expect(stageCompose).toMatch(/gate-control.*single canonical authorization and state-transition policy/is);
     expect(gateControl).toMatch(/Authority is not the same as recovery/);
-    expect(gateControl).toMatch(/`revise` is the complete user authorization/i);
-    expect(gateControl).toMatch(/An authorization error cannot establish recovery availability|does not (?:by itself )?justify a form/i);
-    expect(gateControl).toMatch(/One user decision may produce at most one follow-up authorization form/i);
+    expect(gateControl).toMatch(/A named change is the complete user authorization/i);
+    expect(gateControl).toMatch(/E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED.*Query status.*never starts a cycle/is);
+    expect(gateControl).toMatch(/One user decision may produce at most one follow-up authorization request/i);
     expect(standards).toMatch(/read gate-control and run its bundled transition resolver/i);
     expect(standards).toMatch(/single authorization source across COMPOSE, AUTO, GENERATE, and EDIT/i);
-    expect(standards).toMatch(/composition\.begin_visual_revision runs internally when the resolver reports recovery available/i);
+    expect(standards).toMatch(/A user revise decision grants bounded edit authority/i);
+    expect(standards).toMatch(/never emit a new visual_recovery_decision form/i);
   });
 
   it('resolves post-gate authorization traces without duplicate recovery forms', () => {
@@ -63,29 +64,19 @@ describe('open-source VideoStudio resources', () => {
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'not_available',
     ]);
-    expect(directGateDRevision).toMatchObject({ next_action: 'edit_current_cycle', form: null });
-    expect(directGateDRevision.prohibited_ops).toContain('composition.begin_visual_revision');
-    expect(directGateDRevision.prohibited_ops).toContain('emit_form');
-
-    expect(resolveGateTransition([
-      '--line', 'compose', '--artifact', 'composition',
-      '--gate', 'preview', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'not_available',
-    ])).toMatchObject({ next_action: 'edit_current_cycle', form: null });
+    expect(directGateDRevision).toMatchObject({
+      next_action: 'edit_current_cycle',
+      authorities: ['edit_current_artifact'],
+    });
+    expect(directGateDRevision.prohibited_ops).toContain('stop_for_user');
+    expect(directGateDRevision.prohibited_ops).toContain('restart_visual_qa_cycle');
 
     expect(resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'gate_b_payload', '--recovery', 'not_available',
     ])).toMatchObject({
       next_action: 'open_gate_b_amendment',
-      form: { fields: ['gate_b_decision'] },
-    });
-
-    expect(resolveGateTransition([
-      '--line', 'compose', '--artifact', 'composition',
-      '--gate', 'preview', '--decision', 'revise', '--scope', 'gate_b_payload', '--recovery', 'available',
-    ])).toMatchObject({
-      next_action: 'open_gate_b_amendment',
-      form: { fields: ['gate_b_decision'] },
+      authorities: ['edit_current_artifact'],
     });
 
     const unknownRecovery = resolveGateTransition([
@@ -94,49 +85,48 @@ describe('open-source VideoStudio resources', () => {
     ]);
     expect(unknownRecovery).toMatchObject({
       next_action: 'open_gate_b_amendment',
-      form: { fields: ['gate_b_decision'] },
+      authorities: ['edit_current_artifact'],
     });
 
     expect(resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'unknown',
       '--error-code', 'E_VISUAL_REVISION_NOT_REQUIRED',
-    ])).toMatchObject({ next_action: 'edit_current_cycle', form: null });
+    ])).toMatchObject({ next_action: 'edit_current_cycle' });
 
     const misleadingAuthError = resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'unknown',
       '--error-code', 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED',
     ]);
-    expect(misleadingAuthError).toMatchObject({ next_action: 'query_status', form: null });
-    expect(misleadingAuthError.prohibited_ops).toContain('emit_form');
+    expect(misleadingAuthError).toMatchObject({ next_action: 'query_status' });
+    expect(misleadingAuthError.prohibited_ops).toContain('stop_for_user');
 
     expect(resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
       '--gate', 'none', '--decision', 'none', '--scope', 'none', '--recovery', 'available',
       '--recovery-decision', 'new_visual_revision',
     ])).toMatchObject({
-      next_action: 'begin_visual_revision',
-      form: null,
-      allowed_ops: ['composition.begin_visual_revision'],
+      next_action: 'edit_current_cycle',
+      authorities: ['edit_current_artifact'],
     });
 
     const existingApproval = resolveGateTransition([
       '--line', 'compose', '--artifact', 'composition',
-      '--gate', 'preview', '--decision', 'none', '--scope', 'none', '--recovery', 'not_available',
+      '--gate', 'gate_d', '--decision', 'none', '--scope', 'none', '--recovery', 'not_available',
       '--artifact-state', 'unchanged', '--approval-status', 'approved',
     ]);
     expect(existingApproval).toMatchObject({
       next_action: 'continue_from_existing_approval',
-      form: null,
+      authorities: ['consume_existing_approval'],
     });
-    expect(existingApproval.prohibited_ops).toContain('emit_form');
+    expect(existingApproval.prohibited_ops).toContain('stop_for_user');
 
     const editRevision = resolveGateTransition([
       '--line', 'edit', '--artifact', 'production',
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'not_available',
     ]);
-    expect(editRevision).toMatchObject({ next_action: 'edit_current_cycle', form: null });
+    expect(editRevision).toMatchObject({ next_action: 'edit_current_cycle' });
     expect(editRevision.allowed_ops).toContain('run_line_native_qa');
 
     expect(resolveGateTransition([
@@ -145,7 +135,6 @@ describe('open-source VideoStudio resources', () => {
     ])).toMatchObject({
       next_action: 'approve_plan',
       allowed_ops: ['production.approve_plan'],
-      form: null,
     });
 
     const autoChildStatus = resolveGateTransition([
@@ -153,7 +142,7 @@ describe('open-source VideoStudio resources', () => {
       '--gate', 'gate_d', '--decision', 'revise', '--scope', 'visual_only', '--recovery', 'unknown',
       '--error-code', 'E_VISUAL_REVISION_EXPLICIT_AUTHORIZATION_REQUIRED',
     ]);
-    expect(autoChildStatus).toMatchObject({ next_action: 'query_status', form: null });
+    expect(autoChildStatus).toMatchObject({ next_action: 'query_status' });
     expect(autoChildStatus.allowed_ops).toEqual(['composition.status']);
   });
 });

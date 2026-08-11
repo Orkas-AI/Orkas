@@ -23,6 +23,7 @@ const ConversationInfo = (() => {
   let _loadingSeq = 0;
   let _error = '';
   let _fileMenuScrollHost = null;
+  let _fileMenuAnchor = null;
   let _snapshot = {
     conversation: null,
     history: [],
@@ -43,9 +44,12 @@ const ConversationInfo = (() => {
     'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
     'sql', 'graphql', 'gql',
   ]);
-  const _CI_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+  const _CI_IMAGE_EXTS = new Set([
+    'png', 'apng', 'jpg', 'jpeg', 'jpe', 'jfif', 'webp', 'gif',
+    'avif', 'bmp', 'ico', 'svg',
+  ]);
   const _CI_VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv']);
-  const _CI_AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'opus', 'm4a', 'aac', 'flac']);
+  const _CI_AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'oga', 'opus', 'weba', 'm4a', 'aac', 'flac']);
   const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
   const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
   const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
@@ -74,6 +78,61 @@ const ConversationInfo = (() => {
     const base = _baseName(name);
     const idx = base.lastIndexOf('.');
     return idx >= 0 ? base.slice(idx + 1).toLowerCase() : '';
+  }
+
+  function _savedAppSourceKind(path, resourceKind) {
+    if (resourceKind === 'dir') return 'directory';
+    const ext = _extForName(path);
+    if (ext === 'html' || ext === 'htm') return 'html';
+    if (ext === 'css') return 'css';
+    if (ext === 'js' || ext === 'mjs') return 'javascript';
+    return 'file';
+  }
+
+  function _savedAppSaveFailure(value, fallbackType = 'operation') {
+    const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    let errorCode = 'saved_app_save_failed';
+    if (rawCode === 'not_found' || /not found|does not exist/.test(message)) errorCode = 'source_not_found';
+    else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+    else if (/unsupported|no html entry/.test(message)) errorCode = 'unsupported_source';
+    else if (!value) errorCode = 'invalid_response';
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    else if (errorCode === 'source_not_found') errorType = 'operation';
+    return { error_type: errorType, error_code: errorCode };
+  }
+
+  function _libraryImportFailure(value, fallbackType = 'operation') {
+    const rawCode = String((value && (value.error_code || value.code || value.error)) || '').toLowerCase();
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    let errorCode = 'library_import_failed';
+    if (rawCode === 'not_found' || /not[_ ]found|does not exist/.test(message)) errorCode = 'source_not_found';
+    else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+    else if (rawCode === 'not_supported' || /unsupported/.test(message)) errorCode = 'unsupported_source';
+    else if (!value) errorCode = 'invalid_response';
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    return { error_type: errorType, error_code: errorCode };
+  }
+
+  function _trackSavedAppSaveResult(startedAt, result, path, resourceKind, failure = {}) {
+    const payload = {
+      result,
+      surface: 'conversation_info',
+      kind: _savedAppSourceKind(path, resourceKind),
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result !== 'success') Object.assign(payload, failure);
+    try { if (window.Monitor) Monitor.event('file_preview_save_app_result', payload); } catch (_) {}
+    if (result === 'failure') {
+      _infoLog.warn('conversation info app save failed', {
+        error_type: payload.error_type,
+        error_code: payload.error_code,
+      });
+    }
   }
 
   function _dirName(p) {
@@ -179,6 +238,39 @@ const ConversationInfo = (() => {
     return 'unsupported';
   }
 
+  function _telemetryFileKind(name) {
+    const ext = _extForName(name);
+    if (ext === 'html' || ext === 'htm') return 'html';
+    if (ext === 'md' || ext === 'markdown') return 'markdown';
+    const kind = _kindForName(name);
+    if (kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation') return 'office';
+    if (kind === 'legacy_office') return 'unsupported';
+    return kind;
+  }
+
+  function _trackLibraryImportResult(startedAt, result, absPath, response, failure = {}) {
+    const payload = {
+      result,
+      surface: 'conversation_info',
+      kind: _telemetryFileKind(absPath),
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result === 'success') {
+      payload.scope = response && response.scope === 'project'
+        ? 'project'
+        : (response && response.scope === 'global' ? 'global' : 'unknown');
+    } else {
+      Object.assign(payload, failure);
+    }
+    try { if (window.Monitor) Monitor.event('file_preview_add_library_result', payload); } catch (_) {}
+    if (result === 'failure') {
+      _infoLog.warn('conversation info library import failed', {
+        error_type: payload.error_type,
+        error_code: payload.error_code,
+      });
+    }
+  }
+
   function _fileOperationPolicy() {
     return typeof window !== 'undefined' ? window.FileOperationPolicy : null;
   }
@@ -191,11 +283,6 @@ const ConversationInfo = (() => {
   function _canAddEntryToChat(name) {
     const policy = _fileOperationPolicy();
     return !!(policy && policy.canAddToChat(name));
-  }
-
-  function _canShareEntry(name) {
-    const policy = _fileOperationPolicy();
-    return !!(policy && policy.canShare(name));
   }
 
   function _isProjectConversation(cid) {
@@ -421,9 +508,9 @@ const ConversationInfo = (() => {
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-closed">${_uiIcon('folder', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-open">${_uiIcon('folder-open', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-name">${escapeHtml(name)}</span>
-          ${dirPath ? `<button type="button" class="conversation-info-file-menu-btn" data-file-menu
+          ${dirPath ? `<button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
                   data-entry-kind="dir" data-entry-path="${escapeHtml(dirPath)}" data-entry-name="${escapeHtml(name)}"
-                  title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}">⋯</button>` : ''}
+                  title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>` : ''}
         </summary>
         ${_renderTreeNode(child, depth + 1)}
       </details>
@@ -436,9 +523,9 @@ const ConversationInfo = (() => {
               data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
         <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
         <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
-        <button type="button" class="conversation-info-file-menu-btn" data-file-menu
+        <button type="button" class="ctx-row-menu-btn conversation-info-file-menu-btn" data-file-menu
                 data-entry-kind="${escapeHtml(kind)}" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
-                title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}">⋯</button>
+                title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}" aria-haspopup="menu" aria-expanded="false">${_uiIcon('more-horizontal', 'ctx-row-menu-icon')}</button>
       </div>
     `;
     }).join('');
@@ -828,6 +915,10 @@ const ConversationInfo = (() => {
     const menu = document.getElementById('conversation-info-file-menu');
     if (!menu || !menu.style) return;
     menu.style.display = 'none';
+    if (_fileMenuAnchor && typeof _fileMenuAnchor.setAttribute === 'function') {
+      _fileMenuAnchor.setAttribute('aria-expanded', 'false');
+    }
+    _fileMenuAnchor = null;
     if (menu.dataset) {
       delete menu.dataset.filePath;
       delete menu.dataset.fileName;
@@ -899,6 +990,10 @@ const ConversationInfo = (() => {
     menu.dataset.entryKind = entryKind;
     const row = anchorBtn.closest('.conversation-info-file, .conversation-info-dir-summary, .chat-msg-produced-item');
     if (row) row.classList.add('is-menu-open');
+    _fileMenuAnchor = anchorBtn;
+    if (typeof anchorBtn.setAttribute === 'function') {
+      anchorBtn.setAttribute('aria-expanded', 'true');
+    }
     _positionFileMenu(menu, anchorBtn);
     _fileMenuScrollHost = anchorBtn.closest('.chat-msg-produced');
     if (_fileMenuScrollHost && _fileMenuScrollHost.addEventListener) {
@@ -954,9 +1049,39 @@ const ConversationInfo = (() => {
   async function _addEntryToLibrary(absPath, cidOverride) {
     const targetCid = cidOverride || _cid;
     if (!_canAddEntryToLibrary(absPath, _isProjectConversation(targetCid))) return;
+    const startedAt = Date.now();
+    let res;
     try {
-      const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
-      if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
+      res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
+    } catch (err) {
+      _trackLibraryImportResult(
+        startedAt,
+        'failure',
+        absPath,
+        null,
+        _libraryImportFailure(err, 'ipc'),
+      );
+      await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
+        reason: String(err && err.message || err),
+      }));
+      return;
+    }
+    if (!res || !res.ok) {
+      _trackLibraryImportResult(
+        startedAt,
+        'failure',
+        absPath,
+        res,
+        _libraryImportFailure(res, 'operation'),
+      );
+      await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
+        reason: String((res && res.error) || 'failed'),
+      }));
+      return;
+    }
+
+    _trackLibraryImportResult(startedAt, 'success', absPath, res);
+    try {
       const libraryLabel = res.scope === 'project'
         ? _label('contexts.transfer.project_library', 'Project Library')
         : _label('contexts.transfer.global_library', 'Global Library');
@@ -971,23 +1096,55 @@ const ConversationInfo = (() => {
       if (res.scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
         loadProjectDetail(res.projectId).catch(() => {});
       }
-    } catch (err) {
-      await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
-        reason: String(err && err.message || err),
-      }));
+    } catch (_) {
+      _infoLog.warn('conversation info library import presentation failed', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
     }
   }
 
-  async function _saveEntryAsApp(absPath, cidOverride) {
+  async function _saveEntryAsApp(absPath, cidOverride, resourceKind = 'file') {
+    const startedAt = Date.now();
+    let res;
     try {
-      const res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
-      if (!res || res.ok === false) throw new Error((res && res.error) || 'failed');
+      res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
+    } catch (err) {
+      _trackSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(err, 'ipc'));
+      try {
+        await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String(err && err.message || err));
+      } catch (_) {
+        _infoLog.warn('conversation info app save presentation failed', {
+          error_type: 'presentation',
+          error_code: 'file_viewer_presentation_failed',
+        });
+      }
+      return;
+    }
+    if (!res || res.ok === false) {
+      _trackSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(res, 'operation'));
+      try {
+        await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String((res && res.error) || 'failed'));
+      } catch (_) {
+        _infoLog.warn('conversation info app save presentation failed', {
+          error_type: 'presentation',
+          error_code: 'file_viewer_presentation_failed',
+        });
+      }
+      return;
+    }
+
+    _trackSavedAppSaveResult(startedAt, 'success', absPath, resourceKind);
+    try {
       const message = _label('apps.saved_toast', 'Saved to My Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
       else if (typeof uiAlert === 'function') await uiAlert(message);
-      try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-    } catch (err) {
-      await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String(err && err.message || err));
+      if (typeof loadSavedApps === 'function') loadSavedApps(true);
+    } catch (_) {
+      _infoLog.warn('conversation info app save presentation failed', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
     }
   }
 
@@ -1032,7 +1189,7 @@ const ConversationInfo = (() => {
 
   async function _runFileMenuAction(action, absPath, displayName, kind, options = {}) {
     if (action === 'reveal') return _revealEntry(absPath, options.cid);
-    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid);
+    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid, kind);
     if (action === 'add-to-library') return _addEntryToLibrary(absPath, options.cid);
     if (action === 'add-to-chat') return _addEntryToChat(absPath, kind, options.cid);
     if (action === 'delete') return _deleteEntry(absPath, displayName, kind, options);

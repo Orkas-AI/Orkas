@@ -1,5 +1,9 @@
 export { AgentRunner } from "./runner.js";
-export type { ReflectionModelCallEvent } from "./runner.js";
+export type {
+  ReflectionModelCallEvent,
+  SharedHistorySummaryCache,
+  SharedHistorySummaryCheckpoint,
+} from "./runner.js";
 export { Session } from "./session.js";
 export { PersistentSession } from "./persistent-session.js";
 export { discoverRepositoryInstructions, repositoryInstructionsText } from "./repository-instructions.js";
@@ -38,4 +42,6 @@ export type {
   AgentRunTimings,
   AgentRunConvergenceSignal,
   AgentRunEvent,
+  AgentRunSteerInput,
+  AgentRunSteerMessage,
 } from "./types.js";

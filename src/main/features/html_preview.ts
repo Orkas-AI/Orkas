@@ -1,5 +1,6 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -64,7 +65,14 @@ export interface HtmlPreviewKeyboardEvidence {
 }
 
 export interface HtmlPreviewInteractionEvidence {
+  performed: boolean;
   viewport: HtmlPreviewViewportName;
+  controlsExercised: number;
+  stateChangesObserved: number;
+  artifactMessagesObserved: number;
+  stateControlsFound: number;
+  stateControlsExercised: number;
+  stateTransitionsObserved: number;
   downloadCandidates: string[];
   formsFound: number;
   formsSubmitted: number;
@@ -108,6 +116,10 @@ export interface HtmlPreviewRuntimeDeps {
   loadElectron?: () => Promise<ElectronRuntime>;
 }
 
+export interface HtmlPreviewRenderOptions {
+  interactions?: boolean;
+}
+
 type PageEvidence = Omit<
   HtmlPreviewViewportEvidence,
   'name' | 'width' | 'height' | 'screenshotWidth' | 'screenshotHeight' | 'consoleErrors'
@@ -115,12 +127,30 @@ type PageEvidence = Omit<
 
 type PageInteractionEvidence = Omit<
   HtmlPreviewInteractionEvidence,
-  'viewport' | 'downloads' | 'keyboard'
+  'performed' | 'viewport' | 'downloads' | 'keyboard'
 >;
 
 type RenderInteractionEvidence = PageInteractionEvidence & {
+  performed: boolean;
   keyboard: HtmlPreviewKeyboardEvidence;
 };
+
+function emptyPageInteractionEvidence(): PageInteractionEvidence {
+  return {
+    controlsExercised: 0,
+    stateChangesObserved: 0,
+    artifactMessagesObserved: 0,
+    stateControlsFound: 0,
+    stateControlsExercised: 0,
+    stateTransitionsObserved: 0,
+    downloadCandidates: [],
+    formsFound: 0,
+    formsSubmitted: 0,
+    hashLinksChecked: 0,
+    mailtoLinksChecked: 0,
+    failures: [],
+  };
+}
 
 const READY_SCRIPT = `(async () => {
   if (document.fonts && document.fonts.ready) await document.fonts.ready;
@@ -202,6 +232,54 @@ const INTERACTION_SCRIPT = `(async () => {
   ).replace(/\\s+/g, ' ').trim().slice(0, 120);
   const failures = [];
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const maxGenericControls = 5;
+  const maxStateControls = 8;
+  const maxFormStates = 5;
+  let controlsExercised = 0;
+  let stateChangesObserved = 0;
+  let artifactMessagesObserved = 0;
+  let stateControlsFound = 0;
+  let stateControlsExercised = 0;
+  let stateTransitionsObserved = 0;
+  window.addEventListener('message', (event) => {
+    if (event && event.data && event.data.__orkasArtifact === true) artifactMessagesObserved += 1;
+  });
+
+  const visibleState = () => JSON.stringify(
+    Array.from(document.body?.querySelectorAll('*') || [])
+      .filter((element) => visible(element) && !element.matches('textarea,select,option'))
+      .slice(0, 240)
+      .map((element) => [
+        String(element.tagName || '').toLowerCase(),
+        String(element.id || ''),
+        String(element.className || '').slice(0, 120),
+        String(element.getAttribute?.('aria-expanded') || ''),
+        String(element.getAttribute?.('aria-pressed') || ''),
+        String(element.getAttribute?.('aria-selected') || ''),
+        element instanceof HTMLInputElement ? String(element.type || '') : '',
+        element instanceof HTMLInputElement ? String(element.checked) : '',
+        element instanceof HTMLImageElement ? String(element.currentSrc || element.src || '') : '',
+        element instanceof HTMLProgressElement ? String(element.value) : '',
+        String(element.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 180)
+      ])
+  );
+
+  const settleVisibleState = async (before, maxWaitMs = 1200, waitForFullWindow = false) => {
+    let latest = before;
+    let stableTicks = 0;
+    const attempts = Math.max(1, Math.ceil(maxWaitMs / 100));
+    for (let index = 0; index < attempts; index += 1) {
+      await sleep(100);
+      const next = visibleState();
+      if (next === latest) stableTicks += 1;
+      else {
+        latest = next;
+        stableTicks = 0;
+      }
+      if (!waitForFullWindow && latest !== before && stableTicks >= 1) break;
+    }
+    return latest;
+  };
 
   const hashLinks = Array.from(document.querySelectorAll('a[href^="#"]')).filter(visible);
   let hashLinksChecked = 0;
@@ -238,53 +316,198 @@ const INTERACTION_SCRIPT = `(async () => {
   for (const control of downloadControls) {
     try {
       control.click();
+      controlsExercised += 1;
       await sleep(120);
     } catch (error) {
       failures.push('download action failed for ' + label(control) + ': ' + String(error?.message || error));
     }
   }
 
-  const forms = Array.from(document.forms || []).filter(visible).slice(0, 6);
+  const seenFormStates = new Set();
+  const formIds = new WeakMap();
+  let nextFormId = 1;
+  const formIdentity = (form) => {
+    if (!formIds.has(form)) formIds.set(form, nextFormId++);
+    return formIds.get(form);
+  };
+  const formStateKey = (form) => JSON.stringify([
+    formIdentity(form),
+    String(form.id || ''),
+    String(form.getAttribute?.('name') || ''),
+    String(form.getAttribute?.('action') || ''),
+    Array.from(form.elements || [])
+      .filter((field) => visible(field) && !field.disabled)
+      .map((field) => [
+        String(field.tagName || '').toLowerCase(),
+        String(field.type || ''),
+        String(field.id || ''),
+        String(field.getAttribute?.('name') || ''),
+        String(field.getAttribute?.('aria-label') || '')
+      ])
+  ]);
+  let formsFound = 0;
   let formsSubmitted = 0;
-  for (const form of forms) {
-    try {
-      for (const field of Array.from(form.elements || [])) {
-        if (!visible(field) || field.disabled) continue;
-        const type = String(field.type || '').toLowerCase();
-        if (type === 'checkbox' || type === 'radio') {
-          if (field.required) field.checked = true;
-        } else if (field instanceof HTMLSelectElement) {
-          const option = Array.from(field.options).find((candidate) => !candidate.disabled && candidate.value);
-          if (option) field.value = option.value;
-        } else if (
-          field instanceof HTMLInputElement
-          || field instanceof HTMLTextAreaElement
-        ) {
-          if (type === 'email') field.value = 'preview-check@example.invalid';
-          else if (type === 'url') field.value = 'https://example.invalid/';
-          else if (type === 'number') field.value = field.min || '1';
-          else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
-            field.value = 'Preview interaction check';
+  const exercisedStateControls = new WeakSet();
+  const exerciseVisibleForms = async () => {
+    const forms = Array.from(document.forms || []).filter(visible);
+    for (const form of forms) {
+      if (formsFound >= maxFormStates) break;
+      const hasPendingLocalControl = Array.from(form.querySelectorAll('button,[role="button"],[role="tab"]'))
+        .some((control) => {
+          const type = String(control.getAttribute?.('type') || 'button').toLowerCase();
+          return visible(control)
+            && !control.disabled
+            && control.getAttribute?.('aria-disabled') !== 'true'
+            && !['submit', 'reset'].includes(type)
+            && !downloadControls.includes(control)
+            && !exercisedStateControls.has(control);
+        });
+      if (hasPendingLocalControl) continue;
+      const key = formStateKey(form);
+      if (seenFormStates.has(key)) continue;
+      seenFormStates.add(key);
+      formsFound += 1;
+      try {
+        for (const field of Array.from(form.elements || [])) {
+          if (!visible(field) || field.disabled) continue;
+          const type = String(field.type || '').toLowerCase();
+          if (type === 'checkbox' || type === 'radio') {
+            if (field.required) field.checked = true;
+          } else if (field instanceof HTMLSelectElement) {
+            const option = Array.from(field.options).find((candidate) => !candidate.disabled && candidate.value);
+            if (option) field.value = option.value;
+          } else if (
+            field instanceof HTMLInputElement
+            || field instanceof HTMLTextAreaElement
+          ) {
+            if (type === 'email') field.value = 'preview-check@example.invalid';
+            else if (type === 'url') field.value = 'https://example.invalid/';
+            else if (type === 'number') field.value = field.min || '1';
+            else if (type === 'password') field.value = 'Preview-Check-9!';
+            else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
+              field.value = 'Preview interaction check';
+            }
+            field.dispatchEvent(new Event('input', { bubbles: true }));
+            field.dispatchEvent(new Event('change', { bubbles: true }));
           }
-          field.dispatchEvent(new Event('input', { bubbles: true }));
-          field.dispatchEvent(new Event('change', { bubbles: true }));
         }
+        if (!form.checkValidity()) {
+          failures.push('form remained invalid after safe sample fill: ' + label(form));
+          continue;
+        }
+        const before = visibleState();
+        const messagesBefore = artifactMessagesObserved;
+        form.requestSubmit();
+        formsSubmitted += 1;
+        controlsExercised += 1;
+        const after = await settleVisibleState(before, 1100, true);
+        if (after !== before || artifactMessagesObserved > messagesBefore) stateChangesObserved += 1;
+        else failures.push('form submit produced no observable outcome: ' + label(form));
+      } catch (error) {
+        failures.push('form submit failed for ' + label(form) + ': ' + String(error?.message || error));
       }
-      if (!form.checkValidity()) {
-        failures.push('form remained invalid after safe sample fill: ' + label(form));
-        continue;
+    }
+  };
+
+  const stateControlQueue = [];
+  const seenStateControls = new WeakSet();
+  const enqueueVisibleStateControls = () => {
+    const candidates = Array.from(document.querySelectorAll('button,[role="button"],[role="tab"]'))
+      .filter((control) => (
+        visible(control)
+        && !control.disabled
+        && control.getAttribute?.('aria-disabled') !== 'true'
+        && !(
+          control.closest('form')
+          && ['submit', 'reset'].includes(String(control.getAttribute?.('type') || 'submit').toLowerCase())
+        )
+        && !downloadControls.includes(control)
+      ))
+      .sort((left, right) => Number(!left.closest('form')) - Number(!right.closest('form')));
+    for (const control of candidates) {
+      if (stateControlsFound >= maxStateControls || seenStateControls.has(control)) continue;
+      seenStateControls.add(control);
+      stateControlQueue.push(control);
+      stateControlsFound += 1;
+    }
+  };
+
+  enqueueVisibleStateControls();
+  await exerciseVisibleForms();
+  for (let index = 0; index < stateControlQueue.length && index < maxStateControls; index += 1) {
+    const control = stateControlQueue[index];
+    if (!visible(control) || control.disabled || control.getAttribute?.('aria-disabled') === 'true') continue;
+    try {
+      const before = visibleState();
+      const messagesBefore = artifactMessagesObserved;
+      const alreadySelected = control.getAttribute?.('aria-selected') === 'true'
+        || (
+          control.hasAttribute?.('aria-current')
+          && control.getAttribute?.('aria-current') !== 'false'
+        );
+      control.click();
+      exercisedStateControls.add(control);
+      controlsExercised += 1;
+      stateControlsExercised += 1;
+      const after = await settleVisibleState(before, 600);
+      if (after !== before || artifactMessagesObserved > messagesBefore) {
+        stateChangesObserved += 1;
+        stateTransitionsObserved += 1;
+      } else if (!alreadySelected) {
+        failures.push('enabled control produced no observable outcome: ' + label(control));
       }
-      form.requestSubmit();
-      formsSubmitted += 1;
-      await sleep(160);
+      enqueueVisibleStateControls();
+      await exerciseVisibleForms();
     } catch (error) {
-      failures.push('form submit failed for ' + label(form) + ': ' + String(error?.message || error));
+      failures.push('control interaction failed for ' + label(control) + ': ' + String(error?.message || error));
     }
   }
 
+  const fields = Array.from(document.querySelectorAll('input,textarea,select'))
+    .filter((field) => visible(field) && !field.disabled && !field.closest('form'))
+    .slice(0, maxGenericControls);
+  for (const field of fields) {
+    try {
+      const before = visibleState();
+      if (field instanceof HTMLSelectElement) {
+        const alternatives = Array.from(field.options).filter((option) => !option.disabled);
+        const next = alternatives.find((option) => option.value !== field.value);
+        if (next) field.value = next.value;
+      } else if (field instanceof HTMLInputElement) {
+        const type = String(field.type || '').toLowerCase();
+        if (type === 'checkbox') field.checked = !field.checked;
+        else if (type === 'radio') field.checked = true;
+        else if (type === 'number' || type === 'range') {
+          const current = Number(field.value || 0);
+          const step = Math.max(1, Number(field.step || 1) || 1);
+          field.value = String(current + step);
+        } else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
+          field.value = String(field.value || '') + ' preview';
+        }
+      } else if (field instanceof HTMLTextAreaElement) {
+        field.value = String(field.value || '') + ' preview';
+      }
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+      field.dispatchEvent(new Event('change', { bubbles: true }));
+      controlsExercised += 1;
+      const after = await settleVisibleState(before, 500);
+      if (after !== before) stateChangesObserved += 1;
+      else failures.push('standalone field produced no observable outcome: ' + label(field));
+    } catch (error) {
+      failures.push('control interaction failed for ' + label(field) + ': ' + String(error?.message || error));
+    }
+  }
+  await sleep(40);
+
   return {
+    controlsExercised,
+    stateChangesObserved,
+    artifactMessagesObserved,
+    stateControlsFound,
+    stateControlsExercised,
+    stateTransitionsObserved,
     downloadCandidates,
-    formsFound: forms.length,
+    formsFound,
     formsSubmitted,
     hashLinksChecked,
     mailtoLinksChecked,
@@ -511,6 +734,7 @@ async function renderViewport(
   ses: Session,
   entryUrl: string,
   viewport: HtmlPreviewViewport,
+  auditKeyboard: boolean,
   exerciseInteractions: boolean,
 ): Promise<{
   evidence: HtmlPreviewViewportEvidence;
@@ -553,17 +777,24 @@ async function renderViewport(
       webContents.capturePage(),
       `E_HTML_PREVIEW_CAPTURE_TIMEOUT: ${viewport.name} screenshot timed out`,
     );
-    const interactions = exerciseInteractions
+    const interactions = auditKeyboard
       ? await withTimeout(
         (async () => {
           const keyboard = await auditKeyboardTraversal(webContents, page.focusableCount);
+          if (!exerciseInteractions) {
+            return {
+              performed: false,
+              ...emptyPageInteractionEvidence(),
+              keyboard,
+            };
+          }
           const safeInteractions = await webContents.executeJavaScript(
             INTERACTION_SCRIPT,
             true,
           ) as PageInteractionEvidence;
-          return { ...safeInteractions, keyboard };
+          return { performed: true, ...safeInteractions, keyboard };
         })(),
-        `E_HTML_PREVIEW_INTERACTION_TIMEOUT: ${viewport.name} safe interaction audit timed out`,
+        `E_HTML_PREVIEW_AUDIT_TIMEOUT: ${viewport.name} preview audit timed out`,
       )
       : undefined;
     const size = image.getSize();
@@ -586,15 +817,17 @@ async function renderViewport(
 }
 
 /**
- * Render one local HTML entry at a desktop and mobile viewport using the
+ * Render one local HTML entry at one or more declared viewports using the
  * packaged Electron runtime. Network access is denied; only data/blob/about
  * URLs and real files below the entry directory are allowed.
  */
 export async function renderResponsiveHtmlPreview(
   entryPath: string,
-  viewports: readonly [HtmlPreviewViewport, HtmlPreviewViewport],
+  viewports: readonly HtmlPreviewViewport[],
   deps: HtmlPreviewRuntimeDeps = {},
+  options: HtmlPreviewRenderOptions = {},
 ): Promise<HtmlPreviewRenderResult> {
+  if (!viewports.length) throw new Error('E_HTML_PREVIEW_VIEWPORT_REQUIRED: at least one viewport is required');
   const entryAbs = path.resolve(entryPath);
   const entryReal = fs.realpathSync(entryAbs);
   const entryRootReal = fs.realpathSync(path.dirname(entryReal));
@@ -637,8 +870,16 @@ export async function renderResponsiveHtmlPreview(
       screenshot: Buffer;
       interactions?: RenderInteractionEvidence;
     }> = [];
+    const exerciseInteractions = options.interactions !== false;
     for (const [index, viewport] of viewports.entries()) {
-      rendered.push(await renderViewport(BrowserWindow, ses, entryUrl, viewport, index === 0));
+      rendered.push(await renderViewport(
+        BrowserWindow,
+        ses,
+        entryUrl,
+        viewport,
+        index === 0,
+        index === 0 && exerciseInteractions,
+      ));
     }
 
     const blockers: string[] = [];
@@ -668,11 +909,8 @@ export async function renderResponsiveHtmlPreview(
       blockers.push(`${blocked.count} external or out-of-directory resource request(s) were blocked`);
     }
     const pageInteractions = rendered[0]?.interactions ?? {
-      downloadCandidates: [],
-      formsFound: 0,
-      formsSubmitted: 0,
-      hashLinksChecked: 0,
-      mailtoLinksChecked: 0,
+      performed: exerciseInteractions,
+      ...emptyPageInteractionEvidence(),
       keyboard: {
         method: 'tab-key' as const,
         focusableFound: rendered[0]?.evidence.focusableCount ?? 0,
@@ -680,17 +918,18 @@ export async function renderResponsiveHtmlPreview(
         uniqueTabStopsVisited: 0,
         visibleFocusIndicators: 0,
         sequence: [],
-        failures: ['desktop keyboard audit did not return evidence'],
+        failures: [`${viewports[0].name} keyboard audit did not return evidence`],
       },
-      failures: ['desktop interaction audit did not return evidence'],
     };
     if (pageInteractions.keyboard.failures.length) {
       blockers.push(`${pageInteractions.keyboard.failures.length} keyboard traversal check(s) failed`);
     }
-    if (pageInteractions.failures.length) {
+    if (pageInteractions.performed && pageInteractions.failures.length) {
       blockers.push(`${pageInteractions.failures.length} safe interaction check(s) failed`);
     }
     if (
+      pageInteractions.performed
+      &&
       pageInteractions.downloadCandidates.length
       && downloads.length < pageInteractions.downloadCandidates.length
     ) {
@@ -726,6 +965,7 @@ export async function renderResponsiveHtmlPreview(
           captured: true as const,
         })),
         interactions: {
+          performed: pageInteractions.performed,
           viewport: rendered[0]?.evidence.name ?? 'desktop',
           ...pageInteractions,
           downloads,
@@ -736,4 +976,63 @@ export async function renderResponsiveHtmlPreview(
   } finally {
     await clearPreviewSession(ses);
   }
+}
+
+const ARTIFACT_SMOKE_VIEWPORTS = [
+  { name: 'desktop' as const, width: 1280, height: 800 },
+  { name: 'mobile' as const, width: 390, height: 844 },
+] as const;
+
+/** Render an interactive chat artifact and require one observable behavior.
+ *  The ordinary HTML preview remains valid for static documents; this stricter
+ *  wrapper is only used by create_artifact before its card is exposed. */
+export async function renderInteractiveHtmlSmoke(
+  entryPath: string,
+  deps: HtmlPreviewRuntimeDeps = {},
+  options: { bridgeJavaScript?: string } = {},
+): Promise<HtmlPreviewRenderResult> {
+  let previewEntry = entryPath;
+  let previewRoot = '';
+  if (options.bridgeJavaScript) {
+    previewRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-artifact-smoke-'));
+    const sourceRoot = path.dirname(path.resolve(entryPath));
+    for (const name of fs.readdirSync(sourceRoot)) {
+      fs.cpSync(path.join(sourceRoot, name), path.join(previewRoot, name), { recursive: true });
+    }
+    const bridgePath = path.join(previewRoot, '__orkas', 'bridge.js');
+    fs.mkdirSync(path.dirname(bridgePath), { recursive: true });
+    fs.writeFileSync(bridgePath, options.bridgeJavaScript, 'utf8');
+    previewEntry = path.join(previewRoot, path.basename(entryPath));
+  }
+  let rendered: HtmlPreviewRenderResult;
+  try {
+    rendered = await renderResponsiveHtmlPreview(
+      previewEntry,
+      ARTIFACT_SMOKE_VIEWPORTS,
+      deps,
+      { interactions: true },
+    );
+  } finally {
+    if (previewRoot) fs.rmSync(previewRoot, { recursive: true, force: true });
+  }
+  const interactions = rendered.evidence.interactions;
+  const blockers = [...rendered.evidence.blockers];
+  if ((interactions.controlsExercised ?? 0) <= 0) {
+    blockers.push('interactive artifact smoke found no operable control to exercise');
+  }
+  if (
+    (interactions.stateChangesObserved ?? 0) <= 0
+    && (interactions.artifactMessagesObserved ?? 0) <= 0
+    && interactions.downloads.length <= 0
+  ) {
+    blockers.push('interactive artifact smoke observed no visible state change, artifact submission, or download');
+  }
+  return {
+    ...rendered,
+    evidence: {
+      ...rendered.evidence,
+      ok: blockers.length === 0,
+      blockers,
+    },
+  };
 }

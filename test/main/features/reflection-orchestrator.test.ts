@@ -249,19 +249,26 @@ describe('reflection-orchestrator › loop lifecycle', () => {
     const mod = await loadModule();
     const users = await import('../../../src/main/features/users');
     const reflectedUids: string[] = [];
+    let resolveReflection!: (uid: string) => void;
+    const reflectionStarted = new Promise<string>((resolve) => {
+      resolveReflection = resolve;
+    });
     const handle = mod.startReflectionLoop(TEST_UID, {
-      reflect: async (uid) => { reflectedUids.push(uid); },
+      reflect: async (uid) => {
+        reflectedUids.push(uid);
+        resolveReflection(uid);
+      },
       isDirty: async () => true,
     });
 
     users.activateUser('u2');
     await vi.advanceTimersByTimeAsync(3_000);
-    // listAgents uses filesystem promises. Give native IO callbacks a chance
-    // to complete without advancing the 30-second background slice timer.
-    for (let i = 0; i < 50; i++) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      if (mod.readReflectionState('u2').lastReflectedAt[mod.DEFAULT_AGENT_ID]) break;
-    }
+    // Fake timers only drive scheduler admission. Native filesystem promises
+    // remain on the real event loop, so wait on the injected reflection seam
+    // instead of assuming an arbitrary number of setImmediate turns is enough
+    // on a loaded Windows runner.
+    await reflectionStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
     handle.stop();
 
     expect(reflectedUids).toEqual(['u2']);
@@ -278,8 +285,15 @@ describe('reflection-orchestrator › loop lifecycle', () => {
     const users = await import('../../../src/main/features/users');
     const hooks = await import('../../../src/main/features/user-switch-hooks');
     const reflectedUids: string[] = [];
+    let resolveReflection!: (uid: string) => void;
+    const reflectionStarted = new Promise<string>((resolve) => {
+      resolveReflection = resolve;
+    });
     const handle = mod.startReflectionLoop(TEST_UID, {
-      reflect: async (uid) => { reflectedUids.push(uid); },
+      reflect: async (uid) => {
+        reflectedUids.push(uid);
+        resolveReflection(uid);
+      },
       isDirty: async () => true,
     });
     hooks.registerUserSwitchHook('reflection-test-failure', () => {
@@ -295,10 +309,8 @@ describe('reflection-orchestrator › loop lifecycle', () => {
       hooks.registerUserSwitchHook('reflection-test-failure', () => {});
       users.activateUser('u2');
       await vi.advanceTimersByTimeAsync(3_000);
-      for (let i = 0; i < 50; i++) {
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        if (mod.readReflectionState('u2').lastReflectedAt[mod.DEFAULT_AGENT_ID]) break;
-      }
+      await reflectionStarted;
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(reflectedUids).toEqual(['u2']);
     } finally {
       hooks.registerUserSwitchHook('reflection-test-failure', () => {});

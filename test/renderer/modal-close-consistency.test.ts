@@ -24,7 +24,7 @@ const dialogSources = [
 ];
 
 describe('modal close control consistency', () => {
-  it('does not dismiss the audited dialogs from a backdrop click', () => {
+  it('does not dismiss the audited open-source dialogs from a backdrop click', () => {
     for (const source of backdropDismissSources) {
       expect(source).not.toMatch(/event\.target\s*===\s*overlay|e\.target\s*===\s*overlay/);
     }
@@ -39,6 +39,7 @@ describe('modal close control consistency', () => {
 
   it('uses the shared control in static and dynamically mounted dialogs', () => {
     expect(indexSource).toContain('class="modal-close-btn project-library-modal-close"');
+    expect(indexSource).toContain('class="modal-close-btn oauth-flow-close-btn"');
     for (const source of dialogSources) {
       expect(source).toContain('modal-close-btn');
       expect(source).toContain('modal-close-icon');
@@ -46,9 +47,9 @@ describe('modal close control consistency', () => {
   });
 
   it('keeps viewer function buttons on the same small corner radius', () => {
-    expect(styleSource).toMatch(/\.chat-lightbox-add-library,\s*\.chat-lightbox-reveal\s*\{[\s\S]*?border-radius: 8px;/);
+    expect(styleSource).toMatch(/\.chat-lightbox-share,\s*\.chat-lightbox-add-library,\s*\.chat-lightbox-reveal\s*\{[\s\S]*?border-radius: 8px;/);
     expect(styleSource).toMatch(/\.chat-file-viewer-md-actions \.ctx-viewer-action-icon-btn\s*\{[\s\S]*?border-radius: 8px;/);
-    expect(styleSource).toMatch(/\.chat-file-viewer-add-library,\s*\.chat-file-viewer-save-app,\s*\.chat-file-viewer-reveal\s*\{[\s\S]*?border-radius: 8px;/);
+    expect(styleSource).toMatch(/\.chat-file-viewer-add-library,\s*\.chat-file-viewer-save-app,\s*\.chat-file-viewer-share,\s*\.chat-file-viewer-reveal\s*\{[\s\S]*?border-radius: 8px;/);
   });
 
   it('uses one title, body, and action-button sizing contract', () => {

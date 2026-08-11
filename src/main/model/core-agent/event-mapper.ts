@@ -6,9 +6,10 @@
  *
  * Mapping rules:
  *   text_delta → accumulated into `finalText`; surfaced as {type:'final'} at done
- *   tool_start → {type:'event', event:{stream:'tool', data:{phase:'start', id, name}}}
- *                + a {type:'progress'} line so the UI's log shows it even if
- *                  the process panel filters events
+ *   tool_delta → first named/id-bearing delta emits the visible
+ *                {phase:'start'} milestone before argument assembly
+ *   tool_start → emits {phase:'progress'} with complete input when an early
+ *                milestone exists, otherwise falls back to {phase:'start'}
  *   tool_progress → {type:'event', event:{stream:'tool', data:{phase:'progress', id, name, message}}}
  *   tool_end   → {type:'event', event:{stream:'tool', data:{phase:'end', id, name, isError, result_preview}}}
  *                + optional errorCode/errorSeverity for recoverable guard rails
@@ -35,10 +36,12 @@ import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { userAgentsDir, userMarketplaceAgentsDir, userSystemSkillsDir } from '../../paths';
 import { providerLabel } from '../provider_catalog';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import {
   classifyTransientNetworkError,
   isStorageFullError,
 } from '../../../core-agent/src/shared/errors';
+import { classifyKeyFailure, type KeyFailureKind } from './auth-error';
 
 const log = createLogger('model');
 
@@ -47,12 +50,21 @@ type AgentRunEvent = CA extends { AgentRunner: infer _ } ? import('#core-agent')
 
 export interface MapCoreAgentEventsOptions {
   userId?: string;
+  /** Whether development-only process diagnostics may be rendered. Defaults
+   *  to false so a missing caller option cannot expose internal routing. */
+  isDev?: boolean;
+  /** Active run root. Used only to attach semantic UI metadata; the path is
+   *  never copied into the additional field or exposed as a new log value. */
+  workingDir?: string;
   /** UI-only metadata collected while rendering the skills prompt block.
    *  This avoids a second skill scan and does not change model-visible text. */
   skillDisplayNameById?: ReadonlyMap<string, string>;
   /** UI-only metadata collected before the run starts. Used to label
    *  read_file(agent.json) process rows without scanning agents again. */
   agentDisplayNameById?: ReadonlyMap<string, string>;
+  /** Monotonic lifecycle clock used for persisted per-tool end-to-end timing.
+   *  Production uses performance.now(); tests may inject a deterministic clock. */
+  nowMs?: () => number;
 }
 
 export interface SkillReadEventMetadata {
@@ -85,7 +97,11 @@ function modelFailureDetails(
 
   if (isStorageFullError(error)) failureCode = 'storage_full';
   else if (code === 'PROVIDER_NO_FIRST_EVENT_TIMEOUT') failureCode = 'provider_no_first_event';
-  else if (code === 'PROVIDER_EMPTY_RESPONSE') failureCode = 'empty_response';
+  else if (code === 'PROVIDER_EMPTY_NORMAL') failureCode = 'empty_response_normal';
+  else if (code === 'PROVIDER_EMPTY_SAFETY') failureCode = 'empty_response_safety';
+  else if (code === 'PROVIDER_EMPTY_UNKNOWN') failureCode = 'empty_response_unknown';
+  else if (code === 'PROVIDER_EMPTY_TRANSPORT') failureCode = 'provider_network';
+  else if (code === 'PROVIDER_EMPTY_RESPONSE') failureCode = 'empty_response_unknown';
   else if (code === 'PROVIDER_NETWORK_EXHAUSTED') failureCode = 'provider_network';
   else if (transientKind === 'timeout') failureCode = 'provider_timeout';
   else if (transientKind === 'connection_dropped' || transientKind === 'network') failureCode = 'provider_network';
@@ -113,26 +129,6 @@ function resultPreview(s: string, max = 300): string {
   if (!s) return '';
   const oneLine = s.replace(/\s+/g, ' ').trim();
   return oneLine.length > max ? oneLine.slice(0, max) + '…' : oneLine;
-}
-
-const TOOL_INPUT_STREAM_START_NAMES = new Set([
-  'write_file',
-  'edit_file',
-  'create_artifact',
-  'markdown_to_pdf',
-  'html_to_pdf',
-]);
-
-function partialJsonStringField(source: string, field: string): string {
-  if (!source) return '';
-  const re = new RegExp(`"${field}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)`);
-  const m = re.exec(source);
-  if (!m) return '';
-  try {
-    return JSON.parse(`"${m[1].replace(/"$/, '')}"`);
-  } catch {
-    return m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"');
-  }
 }
 
 /**
@@ -192,7 +188,9 @@ export function friendlyRetryReason(reason: string): string {
 function localizeKnownRunnerText(text: string, code?: string): string {
   const trimmed = String(text || '').trim();
   if (isStorageFullError({ message: trimmed, code })) return t('errors.storage_full');
-  if (String(code || '').trim().toUpperCase() === 'PROVIDER_EMPTY_RESPONSE') return t('model.empty_response');
+  if (/^PROVIDER_EMPTY_(?:RESPONSE|NORMAL|SAFETY|UNKNOWN|TRANSPORT)$/.test(String(code || '').trim().toUpperCase())) {
+    return t('model.empty_response');
+  }
   if (trimmed === '(Tool loop limit reached)') return t('model.tool_loop_limit_reached');
   if (trimmed === 'Run aborted') return t('model.run_aborted');
   if (trimmed === 'Max retries exceeded') return t('model.max_retries_exceeded');
@@ -204,15 +202,28 @@ function localizeKnownRunnerError(error: AgentErrorMeta): string {
   const raw = error.message || 'unknown error';
   const known = localizeKnownRunnerText(raw, error.code);
   if (known !== raw) return known;
+  const code = String(error.code || '').trim().toUpperCase();
+  const explicitKind: KeyFailureKind | null = error.kind === 'auth' || code === 'PROVIDER_AUTH_EXHAUSTED'
+    ? 'auth'
+    : code === 'PROVIDER_PERMISSION_EXHAUSTED'
+      ? 'permission'
+      : error.kind === 'rate_limit' || code === 'PROVIDER_RATE_LIMIT_EXHAUSTED'
+        ? 'rate_limit'
+        : code === 'PROVIDER_BALANCE_EXHAUSTED'
+          ? 'balance'
+          : code === 'PROVIDER_NETWORK_EXHAUSTED'
+            ? 'network'
+            : classifyKeyFailure({ message: raw, code: error.code });
+  if (explicitKind === 'auth') return t('errors.model_auth_unavailable');
+  if (explicitKind === 'permission') return t('errors.model_permission_unavailable');
+  if (explicitKind === 'rate_limit') return t('errors.model_rate_limited');
+  if (explicitKind === 'balance') return t('errors.model_credits_insufficient');
+  if (explicitKind === 'network') return t('errors.model_network_unavailable');
   const transientKind = classifyTransientNetworkError(error);
-  if (
-    transientKind === 'connection_dropped'
-    || transientKind === 'timeout'
-    || transientKind === 'network'
-  ) {
+  if (transientKind === 'connection_dropped' || transientKind === 'timeout' || transientKind === 'network') {
     return t('errors.model_network_unavailable');
   }
-  return raw;
+  return raw.replace(/^Error:\s*/i, '').replace(/\s+/g, ' ').trim() || 'unknown error';
 }
 
 function toolInputPath(input: unknown): string {
@@ -221,6 +232,22 @@ function toolInputPath(input: unknown): string {
   if (typeof input !== 'object') return '';
   const p = (input as Record<string, unknown>).path;
   return typeof p === 'string' ? p : '';
+}
+
+function toolResourceScopeForStart(
+  toolName: string,
+  input: unknown,
+  workingDir: string | undefined,
+): 'current_workspace' | null {
+  if (toolName !== 'list_files' || !workingDir) return null;
+  const requestedPath = toolInputPath(input);
+  if (!requestedPath) return null;
+  const root = path.resolve(workingDir);
+  const target = path.resolve(root, requestedPath);
+  const same = process.platform === 'win32'
+    ? root.toLowerCase() === target.toLowerCase()
+    : root === target;
+  return same ? 'current_workspace' : null;
 }
 
 export function skillReadMetadataForToolStart(
@@ -369,7 +396,8 @@ export async function* mapCoreAgentEvents(
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
   const earlyToolStarts = new Set<string>();
   const toolDeltaNames = new Map<string, string>();
-  const toolDeltaInputPreviews = new Map<string, string>();
+  const toolLifecycleStartedAt = new Map<string, number>();
+  const nowMs = opts.nowMs ?? (() => performance.now());
 
   // Separator between turns (tool-loop interim commentary + final answer).
   // Inserted lazily on the first delta of a new turn so we don't append a
@@ -395,18 +423,18 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_delta': {
-        const id = ev.id || 'stream_tool';
+        const id = String(ev.id || '').trim();
+        // An early row is useful only when every later event can address that
+        // exact call. Never fall back to a shared or positional identity: two
+        // parallel calls with the same name must remain impossible to cross.
+        if (!id) break;
+        // The first provider event for a tool call is the only accurate
+        // end-to-end start boundary. It precedes argument assembly and, for
+        // large write/edit calls, can be much earlier than tool execution.
+        if (!toolLifecycleStartedAt.has(id)) toolLifecycleStartedAt.set(id, nowMs());
         const name = String(ev.name || toolDeltaNames.get(id) || '');
         if (name) toolDeltaNames.set(id, name);
-        if (!name || !TOOL_INPUT_STREAM_START_NAMES.has(name) || earlyToolStarts.has(id)) break;
-        const delta = String(ev.inputDelta || '');
-        if (!delta) break;
-        const inputPreview = (toolDeltaInputPreviews.get(id) || '') + delta;
-        toolDeltaInputPreviews.set(id, inputPreview.slice(0, 8192));
-        const pathHint = partialJsonStringField(inputPreview, 'path')
-          || partialJsonStringField(inputPreview, 'filename')
-          || partialJsonStringField(inputPreview, 'title');
-        if (!pathHint) break;
+        if (!name || earlyToolStarts.has(id)) break;
         earlyToolStarts.add(id);
         yield {
           type: 'event',
@@ -416,7 +444,6 @@ export async function* mapCoreAgentEvents(
               phase: 'start',
               id,
               name,
-              ...(pathHint ? { arguments: { path: pathHint } } : {}),
             },
           },
         };
@@ -424,22 +451,30 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_start': {
+        // Providers that do not stream tool-call deltas fall back to the
+        // execution boundary. This remains exact for the lifecycle evidence
+        // actually available rather than manufacturing model-wait time.
+        if (!toolLifecycleStartedAt.has(ev.id)) toolLifecycleStartedAt.set(ev.id, nowMs());
         toolDeltaNames.delete(ev.id);
-        toolDeltaInputPreviews.delete(ev.id);
         const skillMeta = skillReadMetadataForToolStart(ev.name, ev.input, opts);
         if (skillMeta) skillReadByToolId.set(ev.id, skillMeta);
         const agentMeta = agentReadMetadataForToolStart(ev.name, ev.input, opts);
         if (agentMeta) agentReadByToolId.set(ev.id, agentMeta);
-        if (earlyToolStarts.has(ev.id)) break;
+        const resourceScope = toolResourceScopeForStart(ev.name, ev.input, opts.workingDir);
+        const wasAnnounced = earlyToolStarts.has(ev.id);
         yield {
           type: 'event',
           event: {
             stream: 'tool',
             data: {
-              phase: 'start',
+              // A streamed call already produced the one countable start
+              // milestone. The execution boundary only enriches that same
+              // lifecycle row with complete, validated input.
+              phase: wasAnnounced ? 'progress' : 'start',
               id: ev.id,
               name: ev.name,
               arguments: ev.input,
+              ...(resourceScope ? { resource_scope: resourceScope } : {}),
               ...skillReadEventFields(skillMeta),
               ...agentReadEventFields(agentMeta),
             },
@@ -475,9 +510,22 @@ export async function* mapCoreAgentEvents(
       case 'tool_end': {
         const rawResult = ev.result || '';
         const preview = resultPreview(rawResult);
+        const lifecycleStartedAt = toolLifecycleStartedAt.get(ev.id);
+        toolLifecycleStartedAt.delete(ev.id);
+        const executionDurationMs = Number.isFinite(ev.durationMs)
+          ? Math.max(0, Math.round(ev.durationMs!))
+          : null;
+        const observedEndToEndMs = lifecycleStartedAt === undefined
+          ? null
+          : Math.max(0, Math.round(nowMs() - lifecycleStartedAt));
+        // The execution duration is a lower bound for end-to-end time. Taking
+        // the maximum protects the persisted UI value from coarse/fake clocks
+        // and from an end event delivered in the same clock tick as start.
+        const endToEndDurationMs = observedEndToEndMs === null
+          ? executionDurationMs
+          : Math.max(observedEndToEndMs, executionDurationMs ?? 0);
         earlyToolStarts.delete(ev.id);
         toolDeltaNames.delete(ev.id);
-        toolDeltaInputPreviews.delete(ev.id);
         const skillMeta = skillReadByToolId.get(ev.id) || null;
         skillReadByToolId.delete(ev.id);
         const agentMeta = agentReadByToolId.get(ev.id) || null;
@@ -501,7 +549,9 @@ export async function* mapCoreAgentEvents(
           name: ev.name,
           isError: !!ev.isError,
           result_preview: preview,
-          ...(Number.isFinite(ev.durationMs) ? { duration_ms: Math.max(0, Math.round(ev.durationMs!)) } : {}),
+          ...(ev.displayName ? { display_name: ev.displayName } : {}),
+          ...(executionDurationMs !== null ? { duration_ms: executionDurationMs } : {}),
+          ...(endToEndDurationMs !== null ? { end_to_end_duration_ms: endToEndDurationMs } : {}),
           ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
           ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
           ...skillReadEventFields(skillMeta),
@@ -574,6 +624,11 @@ export async function* mapCoreAgentEvents(
         break;
       }
 
+      case 'provider_call':
+        // Internal latency telemetry. The user already sees streamed model
+        // output/progress; rendering another row would add noise.
+        break;
+
       case 'context_status': {
         yield {
           type: 'event',
@@ -633,6 +688,12 @@ export async function* mapCoreAgentEvents(
           // Prefer the explicit `result.text` over our accumulated delta —
           // the runner may have trimmed trailing whitespace etc.
           if (result.text) finalText = localizeKnownRunnerText(result.text);
+          if (
+            finalText
+            && result.meta.convergenceSignals?.includes('output_limit_unrecovered')
+          ) {
+            finalText = `${finalText}\n\n${t('model.output_incomplete')}`;
+          }
         }
         break;
       }

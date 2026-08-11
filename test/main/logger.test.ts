@@ -71,8 +71,8 @@ describe('logger › redact', () => {
     }) as any;
     expect(out.url).toBe('https://example.test/oauth/callback?code=***&state=***&ok=1');
     expect(out.note).toBe('contact a***@example.com phone 138****8000');
-    expect(out.absPath).toContain('<abs-path:');
-    expect(out.relPath).toContain('<cloud-path:');
+    expect(out.absPath).toBe('***REDACTED_PATH***');
+    expect(out.relPath).toBe('***REDACTED_PATH***');
     expect(JSON.stringify(out)).not.toContain('/Users/alice');
     expect(JSON.stringify(out)).not.toContain('customer-plan.md');
     expect(out.user_id).toBe('ABCD...7890');

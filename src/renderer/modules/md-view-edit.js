@@ -473,6 +473,27 @@ function _mveSetSavingUi(state, saving) {
     .forEach(btn => { btn.disabled = saving; });
 }
 
+function _mveSourceType(source) {
+  if (source.kind === 'context') return 'library';
+  if (source.kind === 'project-file' || source.projectId) return 'project';
+  return source.cid ? 'conversation' : 'workspace';
+}
+
+function _mveTrackSaveResult(source, content, startedAt, result, errorCode = '') {
+  try {
+    if (!window.Monitor) return;
+    const payload = {
+      result,
+      surface: 'markdown_editor',
+      source_type: _mveSourceType(source),
+      char_count: String(content || '').length,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result !== 'success') payload.error_code = errorCode || 'unknown';
+    Monitor.event('text_editor_save_result', payload);
+  } catch (_) {}
+}
+
 async function _mveSave(state) {
   if (state.saving && state.savePromise) return state.savePromise;
   const ta = state.bodyEl.querySelector('[data-mve-textarea]');
@@ -580,9 +601,17 @@ async function _mveToggleTask(state, lineIdx, liEl, boxEl) {
   const nextMark = wasChecked ? ' ' : 'x';
   lines[lineIdx] = `${m[1]}- [${nextMark}] ${m[3]}`;
   const next = lines.join('\n');
+  const startedAt = Date.now();
   if (liEl) liEl.classList.toggle('is-done', !wasChecked);
   if (boxEl) boxEl.checked = !wasChecked;
   const res = await _mveWriteSource(state.source, next);
+  _mveTrackSaveResult(
+    state.source,
+    next,
+    startedAt,
+    res && res.ok ? 'success' : 'failure',
+    res && res.ok ? '' : 'write_failed',
+  );
   if (!res.ok) {
     if (liEl) liEl.classList.toggle('is-done', wasChecked);
     if (boxEl) boxEl.checked = wasChecked;
@@ -862,6 +891,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _mveOnKey,
     _mveSave,
     _mveScanTaskLines,
+    _mveToggleTask,
     _mveWriteSource,
     _MVE_TODO_LINE_RE,
   };

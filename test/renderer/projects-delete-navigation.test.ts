@@ -13,6 +13,9 @@ function loadProjectsRenderer(options: {
 }) {
   const setViewCalls: any[] = [];
   const refreshAutoProjectCalls: string[] = [];
+  const monitorClicks: any[] = [];
+  const monitorEvents: any[] = [];
+  const monitorErrors: any[] = [];
   const context: any = {
     console,
     setTimeout,
@@ -23,6 +26,11 @@ function loadProjectsRenderer(options: {
     conversations: [],
     _projectDetailPid: '',
     createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
+    Monitor: {
+      click: (name: string, payload: any) => monitorClicks.push({ name, payload }),
+      event: (name: string, payload: any) => monitorEvents.push({ name, payload }),
+      error: (name: string, payload: any) => monitorErrors.push({ name, payload }),
+    },
     escapeHtml: (value: unknown) => String(value ?? ''),
     t: (key: string) => key,
     uiConfirmDanger: async () => true,
@@ -49,6 +57,7 @@ function loadProjectsRenderer(options: {
     },
     window: {
       addEventListener() {},
+      Monitor: true,
       uiIconHtml: () => '',
       refreshAutoProjectOptions: (pid: string) => { refreshAutoProjectCalls.push(pid); },
       orkas: {
@@ -76,6 +85,9 @@ function loadProjectsRenderer(options: {
   };
   context.__setViewCalls = setViewCalls;
   context.__refreshAutoProjectCalls = refreshAutoProjectCalls;
+  context.__monitorClicks = monitorClicks;
+  context.__monitorEvents = monitorEvents;
+  context.__monitorErrors = monitorErrors;
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/projects.js'), 'utf8');
   vm.runInContext(source, context);
@@ -83,6 +95,21 @@ function loadProjectsRenderer(options: {
 }
 
 describe('project delete navigation', () => {
+  it('renders a running-count mount beside each idle Project title', () => {
+    const context = loadProjectsRenderer({
+      afterProjects: [],
+      afterConversations: [],
+    });
+
+    const html = context._renderProjectRow(
+      { project_id: 'p1', name: 'Alpha' },
+      [],
+    );
+
+    expect(html).toContain('class="sidebar-btn-running-chip project-running-chip"');
+    expect(html).toContain('data-project-running-chip="p1" hidden');
+  });
+
   it('moves from the deleted detail page to the next project', async () => {
     const context = loadProjectsRenderer({
       afterProjects: [
@@ -142,6 +169,20 @@ describe('project delete navigation', () => {
       },
     ]);
     expect(context.__refreshAutoProjectCalls).toEqual(['p1']);
+  });
+
+  it('keeps a successful delete authoritative when post-mutation refresh fails without PC telemetry', async () => {
+    const context = loadProjectsRenderer({
+      afterProjects: [],
+      afterConversations: [],
+    });
+    context.__setProjectsCache([{ project_id: 'p-private', name: 'Private', conv_count: 0 }]);
+    context.loadConversations = async () => { throw new Error('refresh failed'); };
+
+    await context._confirmDeleteProject('p-private', 'detail');
+
+    expect(context.__monitorEvents).toEqual([]);
+    expect(context.__monitorErrors).toEqual([]);
   });
 });
 
@@ -256,6 +297,8 @@ describe('project create navigation', () => {
     expect(html).toContain('project-rename-input is-error');
     expect(html).toContain('project-inline-error');
     expect(html).toContain('project.name_dup_inline');
+    expect(context.__monitorEvents).toEqual([]);
+    expect(context.__monitorErrors).toEqual([]);
   });
 
   it('freezes an in-flight create and does not discard its result by starting a rename', async () => {

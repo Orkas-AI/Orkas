@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -10,6 +11,7 @@ const h = vi.hoisted(() => ({
   attachments: '',
   runOfficeCli: vi.fn(),
   closeOfficeFile: vi.fn(),
+  renderOfficePageToPng: vi.fn(),
 }));
 
 vi.mock('../../../../src/main/features/permissions', () => ({
@@ -36,6 +38,9 @@ vi.mock('../../../../src/main/features/office/office_engine', () => {
     closeOfficeFile: (...args: unknown[]) => h.closeOfficeFile(...args),
   };
 });
+vi.mock('../../../../src/main/features/office/office_page_renderer', () => ({
+  renderOfficePageToPng: (...args: unknown[]) => h.renderOfficePageToPng(...args),
+}));
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
 }));
@@ -62,6 +67,8 @@ describe('Office built-in tools', () => {
     h.engineAvailable = true;
     h.runOfficeCli.mockReset();
     h.closeOfficeFile.mockReset();
+    h.renderOfficePageToPng.mockReset();
+    h.renderOfficePageToPng.mockResolvedValue(Buffer.from('png-bytes'));
     h.runOfficeCli.mockImplementation(async (args: string[]) => {
       if (args[0] === 'create' && args[1]) {
         fs.mkdirSync(path.dirname(args[1]), { recursive: true });
@@ -160,6 +167,9 @@ describe('Office built-in tools', () => {
     expect(docx.isError).toBeUndefined();
     expect(xlsx.isError).toBeUndefined();
     expect(pptx.isError).toBeUndefined();
+    expect(docx.content).toContain('(2 paragraphs)');
+    expect(xlsx.content).toContain('(4 cells)');
+    expect(pptx.content).toContain('(1 slide)');
     const report = path.join(h.workspace, 'out', 'report.docx');
     const data = path.join(h.workspace, 'out', 'data.xlsx');
     const deck = path.join(h.workspace, 'out', 'deck.pptx');
@@ -227,6 +237,96 @@ describe('Office built-in tools', () => {
     });
   });
 
+  it('exposes PPTX visual controls and emits native charts in the initial create batch', async () => {
+    const tool = getTool('create_pptx');
+    const schema = tool.inputSchema as any;
+    const slideProps = schema.properties.slides.items.properties;
+    expect(tool.description).toContain('native editable charts');
+    expect(slideProps.shapes.items.properties.gradient).toBeDefined();
+    expect(slideProps.shapes.items.properties.margin).toBeDefined();
+    expect(slideProps.shapes.items.properties.shadow).toMatchObject({
+      type: ['string', 'boolean'],
+    });
+    expect(slideProps.shapes.items.properties.shadow.description).toContain('Do not use preset names');
+    expect(slideProps.images.items.properties.crop).toBeDefined();
+    expect(slideProps.charts.items.properties.type.enum).toContain('waterfall');
+    expect(slideProps.tables.items.properties.headerFill).toBeDefined();
+
+    const imagePath = path.join(h.attachments, 'hero.png');
+    fs.writeFileSync(imagePath, 'png');
+    const result = await tool.execute({
+      path: 'out/designed.pptx',
+      slides: [{
+        background: '#F7F8FC',
+        shapes: [{
+          text: '增长概览', x: '0.7in', y: '0.55in', width: '4in', height: '0.55in',
+          gradient: '#5B5BD6-#8957E5-25', margin: '0.08in', line: '#FFFFFF', lineWidth: '1pt',
+        }],
+        images: [{ src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: 'cover', alt: '产品界面' }],
+        charts: [{
+          type: 'column', data: '营收:32,48,66;利润:8,14,21', categories: 'Q1,Q2,Q3',
+          x: '0.7in', y: '1.5in', width: '7.6in', height: '4.8in', colors: '#5B5BD6,#22A06B',
+        }],
+        tables: [{ rows: [['指标', '结果']], x: '8.7in', y: '3in', width: '3.8in', headerFill: '#111827', firstRow: true }],
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toContain('(1 slide)');
+    expect(result.content).not.toContain('(5 slides)');
+    const batchCall = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
+    const operations = JSON.parse(batchCall?.[1]?.stdin as string);
+    expect(operations).toContainEqual({
+      command: 'add', parent: '/slide[1]', type: 'chart',
+      props: {
+        chartType: 'column', data: '营收:32,48,66;利润:8,14,21', categories: 'Q1,Q2,Q3',
+        x: '0.7in', y: '1.5in', width: '7.6in', height: '4.8in', colors: '#5B5BD6,#22A06B',
+      },
+    });
+    expect(operations).toContainEqual({
+      command: 'add', parent: '/slide[1]', type: 'picture',
+      props: {
+        src: imagePath, x: '9.5in', y: '0.5in', width: '3in', height: '2in', crop: 'cover', alt: '产品界面',
+      },
+    });
+    expect(operations).toContainEqual(expect.objectContaining({
+      command: 'add', parent: '/slide[1]', type: 'table',
+      props: expect.objectContaining({ headerFill: '#111827', firstRow: 'true' }),
+    }));
+  });
+
+  it('allows intentionally repeated placeholder and shape copy', async () => {
+    const result = await getTool('create_pptx').execute({
+      path: 'out/duplicate-title.pptx',
+      slides: [{
+        title: 'One visible title',
+        shapes: [{
+          text: 'One visible title',
+          x: '0.7in', y: '0.5in', width: '5in', height: '0.6in',
+        }],
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toContain('(1 slide)');
+    const batchCall = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
+    const operations = JSON.parse(batchCall?.[1]?.stdin as string);
+    expect(operations).toContainEqual(expect.objectContaining({
+      command: 'add',
+      parent: '/',
+      type: 'slide',
+      props: expect.objectContaining({ title: 'One visible title' }),
+    }));
+    expect(operations).toContainEqual(expect.objectContaining({
+      command: 'add',
+      parent: '/slide[1]',
+      type: 'shape',
+      props: expect.objectContaining({ text: 'One visible title' }),
+    }));
+  });
+
   it('returns typed create/batch failures and still closes OfficeCLI state', async () => {
     h.runOfficeCli.mockResolvedValueOnce({ code: 2, stdout: '', stderr: 'create failed' });
     const createFailed = await getTool('create_docx').execute({ path: 'failed.docx', preview: false }, ctx());
@@ -244,6 +344,36 @@ describe('Office built-in tools', () => {
     expect(batchFailed.content).toContain('E_OFFICE_BATCH_FAILED: batch failed');
     expect(fs.existsSync(path.join(h.workspace, 'failed.xlsx'))).toBe(false);
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('closes a stale Office resident and retries one busy batch exactly once', async () => {
+    h.runOfficeCli.mockImplementationOnce(async (args: string[]) => {
+      expect(args[0]).toBe('create');
+      fs.mkdirSync(path.dirname(args[1]), { recursive: true });
+      fs.writeFileSync(args[1], 'created-office-file');
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    h.runOfficeCli.mockResolvedValueOnce({
+      code: 3,
+      stdout: '',
+      stderr: 'Resident is running but the batch could not be delivered (main pipe busy or unresponsive).',
+    });
+    h.runOfficeCli.mockResolvedValueOnce({ code: 0, stdout: 'ok', stderr: '' });
+
+    const result = await getTool('create_pptx').execute({
+      path: 'retry-resident.pptx',
+      slides: [{ title: 'Recovered' }],
+      preview: false,
+    }, ctx());
+
+    expect(result.isError).toBeUndefined();
+    const batchCalls = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+    expect(batchCalls).toHaveLength(2);
+    expect(batchCalls[1][0][1]).toBe(batchCalls[0][0][1]);
+    expect(h.closeOfficeFile).toHaveBeenCalledWith(
+      batchCalls[0][0][1],
+      path.dirname(batchCalls[0][0][1]),
+    );
   });
 
   it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {
@@ -334,6 +464,176 @@ describe('Office built-in tools', () => {
     expect(batchArgs).toContain('--stop-on-error');
     expect(validateArgs).toEqual(['validate', batchArgs[1], '--json']);
     expect(onFileWritten).toHaveBeenCalledWith(output);
+  });
+
+  it('keeps edit previews opt-in while preserving an explicit first-page preview', async () => {
+    const file = path.join(h.workspace, 'intermediate.xlsx');
+    const defaultOutput = path.join(h.workspace, 'intermediate-edited.xlsx');
+    const previewOutput = path.join(h.workspace, 'review-now.xlsx');
+    fs.writeFileSync(file, 'source-workbook');
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'batch') fs.writeFileSync(args[1], 'edited-workbook');
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+    const edit = getTool('edit_office');
+    const schema = edit.inputSchema as any;
+
+    const intermediate = await edit.execute({
+      path: file,
+      operations: [{ action: 'set', path: '/Sheet1/A1', props: { value: 'draft' } }],
+    }, ctx());
+
+    expect(intermediate.isError).toBeUndefined();
+    expect(intermediate.images).toBeUndefined();
+    expect(fs.existsSync(defaultOutput)).toBe(true);
+    expect(h.renderOfficePageToPng).not.toHaveBeenCalled();
+    expect(schema.properties.preview.description).toContain('Default false');
+    expect(edit.description).toContain('Preview rendering is opt-in with `preview:true`');
+
+    const requested = await edit.execute({
+      path: file,
+      output_path: previewOutput,
+      operations: [{ action: 'set', path: '/Sheet1/A1', props: { value: 'review' } }],
+      preview: true,
+    }, ctx());
+
+    expect(requested.isError).toBeUndefined();
+    expect(requested.images).toEqual([{
+      data: Buffer.from('png-bytes').toString('base64'),
+      mediaType: 'image/png',
+    }]);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledWith(
+      previewOutput,
+      path.dirname(previewOutput),
+      '1',
+      undefined,
+    );
+  });
+
+  it('regresses production table edits by seeding a grid into one atomic working-copy batch', async () => {
+    const file = path.join(h.workspace, 'telemetry-report.docx');
+    const output = path.join(h.workspace, 'telemetry-report-edited.docx');
+    fs.writeFileSync(file, 'complete-original-document');
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[0] === 'batch') fs.writeFileSync(args[1], 'original-plus-section-3.2-table');
+      return { code: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const result = await getTool('edit_office').execute({
+      path: file,
+      operations: [{
+        action: 'add',
+        parent: '/body',
+        type: 'table',
+        props: {
+          rows: [
+            ['Parameter', 'Overall'],
+            ['Records', 57_750],
+            ['Completeness', '98.7%'],
+          ],
+          style: 'medium2',
+        },
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(result.isError).toBeUndefined();
+    expect(result.content).toContain(`Edited ${output}`);
+    expect(fs.readFileSync(file, 'utf8')).toBe('complete-original-document');
+    expect(fs.readFileSync(output, 'utf8')).toBe('original-plus-section-3.2-table');
+    const batchCalls = h.runOfficeCli.mock.calls.filter(([args]) => args[0] === 'batch');
+    expect(batchCalls).toHaveLength(1);
+    expect(JSON.parse(String(batchCalls[0]?.[1].stdin))).toEqual([{
+      command: 'add',
+      parent: '/body',
+      type: 'table',
+      props: {
+        rows: '3', cols: '2', style: 'medium2',
+        r1c1: 'Parameter', r1c2: 'Overall', r2c1: 'Records', r2c2: '57750',
+        r3c1: 'Completeness', r3c2: '98.7%',
+      },
+    }]);
+    expect(h.runOfficeCli.mock.calls.some(([args]) => args[0] === 'create')).toBe(false);
+  });
+
+  it('rejects invalid nested edit props before creating a working copy', async () => {
+    const file = path.join(h.workspace, 'telemetry-report.docx');
+    const output = path.join(h.workspace, 'telemetry-report-edited.docx');
+    fs.writeFileSync(file, 'complete-original-document');
+
+    const ragged = await getTool('edit_office').execute({
+      path: file,
+      operations: [{
+        action: 'add', parent: '/body', type: 'table',
+        props: { rows: [['Parameter', 'Overall'], ['Records']] },
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(ragged).toMatchObject({ isError: true });
+    expect(ragged.content).toContain('E_BAD_INPUT');
+    expect(ragged.content).toContain('must be rectangular');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('complete-original-document');
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('documents add element types by Office format instead of mixing incompatible examples', () => {
+    const edit = getTool('edit_office');
+    const schema = edit.inputSchema as any;
+    const typeDescription = schema.properties.operations.items.properties.type.description;
+
+    expect(typeDescription).toContain('DOCX "p", "table", "picture"');
+    expect(typeDescription).toContain('XLSX "cell", "table", "chart", "picture"');
+    expect(typeDescription).toContain('PPTX "shape", "textbox", "picture", "chart", "table", "slide"');
+    expect(typeDescription).toContain('DOCX "p" is invalid under a PPTX slide');
+  });
+
+  it('requires an explicit worksheet range before adding a populated XLSX table', async () => {
+    const file = path.join(h.workspace, 'channel-report.xlsx');
+    const output = path.join(h.workspace, 'channel-report-edited.xlsx');
+    fs.writeFileSync(file, 'source-workbook');
+    const edit = getTool('edit_office');
+    const schema = edit.inputSchema as any;
+
+    const missingPlacement = await edit.execute({
+      path: file,
+      operations: [{
+        action: 'add', parent: '/渠道分析', type: 'table',
+        props: { rows: [['渠道', '销售额'], ['淘宝天猫', 96_540]] },
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(missingPlacement).toMatchObject({ isError: true });
+    expect(missingPlacement.content).toContain('E_BAD_INPUT');
+    expect(missingPlacement.content).toContain('requires props.ref or props.range');
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(fs.readFileSync(file, 'utf8')).toBe('source-workbook');
+    expect(fs.existsSync(output)).toBe(false);
+
+    const result = await edit.execute({
+      path: file,
+      operations: [{
+        action: 'add', parent: '/渠道分析', type: 'table',
+        props: { ref: 'A1:B2', rows: [['渠道', '销售额'], ['淘宝天猫', 96_540]] },
+      }],
+      preview: false,
+    }, ctx());
+
+    expect(result.isError).toBeUndefined();
+    expect(schema.properties.operations.items.properties.props.description).toContain('requires ref or range');
+    const batchCall = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
+    expect(JSON.parse(String(batchCall?.[1].stdin))).toEqual([{
+      command: 'add',
+      parent: '/渠道分析',
+      type: 'table',
+      props: {
+        rows: '2', cols: '2', ref: 'A1:B2',
+        r1c1: '渠道', r1c2: '销售额', r2c1: '淘宝天猫', r2c2: '96540',
+      },
+    }]);
   });
 
   it('refines a conversation-produced Office file in place through an atomic validated temporary copy', async () => {
@@ -492,6 +792,7 @@ describe('Office built-in tools', () => {
   it('checks OpenXML validity and document issues without hiding validation findings', async () => {
     const file = path.join(h.workspace, 'existing.docx');
     fs.writeFileSync(file, 'fixture');
+    const artifactSha256 = `sha256:${createHash('sha256').update('fixture').digest('hex')}`;
     h.runOfficeCli
       .mockResolvedValueOnce({ code: 2, stdout: '{"valid":false,"errors":["bad rel"]}', stderr: '' })
       .mockResolvedValueOnce({ code: 0, stdout: '{"issues":[{"type":"format"}]}', stderr: '' });
@@ -501,12 +802,18 @@ describe('Office built-in tools', () => {
 
     expect(result.isError).toBe(true);
     expect(payload).toMatchObject({
-      path: file,
       valid: false,
+      issue_count: 1,
+      artifact_revision: artifactSha256.slice('sha256:'.length, 'sha256:'.length + 16),
+      path: file,
+      artifact_sha256: artifactSha256,
       validation_exit_code: 2,
       validation: { valid: false, errors: ['bad rel'] },
       issue_scan_ok: true,
       issues: { issues: [{ type: 'format' }] },
+    });
+    expect(result.observations).toEqual({
+      fileReads: [{ path: file, hash: artifactSha256 }],
     });
     expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
       ['validate', file, '--json'],
@@ -517,35 +824,127 @@ describe('Office built-in tools', () => {
     h.runOfficeCli.mockReset();
     h.runOfficeCli
       .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
-      .mockResolvedValueOnce({ code: 0, stdout: '{"issues":[{"type":"format","severity":"warning"}]}', stderr: '' });
+      .mockResolvedValueOnce({
+        code: 0,
+        stdout: '{"success":true,"data":{"count":18,"issues":[{"type":"format","severity":"warning"}]}}',
+        stderr: '',
+      });
     const warningOnly = await getTool('office_check').execute({ path: file }, ctx());
     expect(warningOnly.isError).toBeUndefined();
     expect(JSON.parse(warningOnly.content)).toMatchObject({
       valid: true,
-      issues: { issues: [{ severity: 'warning' }] },
+      issue_count: 18,
+      artifact_revision: artifactSha256.slice('sha256:'.length, 'sha256:'.length + 16),
+      issues: { data: { count: 18, issues: [{ severity: 'warning' }] } },
     });
+  });
+
+  it('supplements the PPTX issue scan with theme-aware contrast findings', async () => {
+    const file = path.join(h.workspace, 'existing.pptx');
+    fs.writeFileSync(file, 'fixture');
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"success":true,"data":{"count":0,"issues":[]}}', stderr: '' })
+      .mockResolvedValueOnce({
+        code: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: {
+            path: '/',
+            type: 'presentation',
+            format: { 'theme.color.dk1': '#000000', 'theme.color.lt1': '#FFFFFF' },
+            children: [{
+              path: '/slide[1]',
+              type: 'slide',
+              format: { background: '#0F172A' },
+              children: [{
+                path: '/slide[1]/shape[1]',
+                type: 'placeholder',
+                children: [{
+                  path: '/slide[1]/shape[1]/p[1]/r[1]',
+                  type: 'run',
+                  text: 'AI 办公助手',
+                  format: { 'effective.size': '44pt' },
+                }],
+              }],
+            }],
+          },
+        }),
+        stderr: '',
+      });
+
+    const result = await getTool('office_check').execute({ path: file }, ctx());
+    const payload = JSON.parse(result.content);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      valid: true,
+      issue_count: 1,
+      contrast_scan_ok: true,
+      contrast_findings: 1,
+      contrast_text_runs: 1,
+      issues: {
+        data: {
+          count: 1,
+          issues: [expect.objectContaining({
+            subtype: 'low_contrast',
+            severity: 'blocker',
+            path: '/slide[1]/shape[1]',
+          })],
+        },
+      },
+    });
+    expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
+      ['validate', file, '--json'],
+      ['view', file, 'issues', '--json'],
+      ['get', file, '/', '--depth', '6', '--json'],
+    ]);
   });
 
   it('renders a page to an inline PNG and validates the page before execution', async () => {
     const file = path.join(h.workspace, 'existing.pptx');
     fs.writeFileSync(file, 'fixture');
-    h.runOfficeCli.mockImplementation(async (args: string[]) => {
-      if (args[0] === 'view' && args[2] === 'screenshot') {
-        const output = args[args.indexOf('-o') + 1];
-        fs.writeFileSync(output, 'png-bytes');
-      }
-      return { code: 0, stdout: '', stderr: '' };
-    });
     const render = getTool('office_render');
+    const schema = render.inputSchema as any;
 
-    const result = await render.execute({ path: file, page: '2' }, ctx());
+    const result = await render.execute({
+      path: file,
+      page: '2',
+      analysis_mode: 'quality_review',
+    }, ctx());
     const invalid = await render.execute({ path: file, page: '--save=escaped.bin' }, ctx());
+    const zero = await render.execute({ path: file, page: '0' }, ctx());
+    const worksheetName = await render.execute({ path: file, page: '每日趋势' }, ctx());
 
     expect(result.isError).toBeUndefined();
-    expect(result.images).toEqual([{ data: Buffer.from('png-bytes').toString('base64'), mediaType: 'image/png' }]);
+    expect(schema.properties.analysis_mode.enum).toEqual(['understand', 'quality_review']);
+    expect(schema.properties.analysis_mode.description).toContain('Default "understand"');
+    expect(schema.properties.page.description).toContain('XLSX worksheet position in workbook order');
+    expect(schema.properties.page.description).toContain('Never pass an XLSX worksheet name or cell range');
+    expect(render.description).toContain('`analysis_mode:"quality_review"`');
+    expect(render.description).toContain('use office_read mode "outline"');
+    expect(render.description).toContain('available to the next inference only');
+    expect(result.images).toEqual([{
+      data: Buffer.from('png-bytes').toString('base64'),
+      mediaType: 'image/png',
+      analysisMode: 'quality_review',
+    }]);
+    const artifactSha256 = `sha256:${createHash('sha256').update('fixture').digest('hex')}`;
+    const imageSha256 = `sha256:${createHash('sha256').update('png-bytes').digest('hex')}`;
+    expect(result.content).toContain('page=2 mode=quality_review');
+    expect(result.content).toContain(`artifact_revision=${artifactSha256.slice(7, 23)}`);
+    expect(result.content).toContain(`image_revision=${imageSha256.slice(7, 23)}`);
+    expect(result.observations).toEqual({
+      fileReads: [{ path: file, hash: artifactSha256 }],
+    });
     expect(invalid).toMatchObject({ isError: true });
     expect(invalid.content).toContain('positive integer');
-    expect(h.runOfficeCli).toHaveBeenCalledTimes(1);
+    expect(zero).toMatchObject({ isError: true });
+    expect(worksheetName).toMatchObject({ isError: true });
+    expect(worksheetName.content).toContain('worksheet order, not a name or range');
+    expect(h.renderOfficePageToPng).toHaveBeenCalledWith(file, path.dirname(file), '2', undefined);
+    expect(h.renderOfficePageToPng).toHaveBeenCalledTimes(1);
+    expect(h.runOfficeCli).not.toHaveBeenCalled();
     expect(h.closeOfficeFile).toHaveBeenCalledWith(file, path.dirname(file));
   });
 });

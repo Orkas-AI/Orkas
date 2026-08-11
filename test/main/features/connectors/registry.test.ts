@@ -65,7 +65,7 @@ describe('features/connectors/registry', () => {
     expect(reconnected._deleted_at.github).toBeUndefined();
   });
 
-  it('preserves undecryptable secrets_enc when patching metadata', async () => {
+  it('preserves undecryptable secrets_enc and its synced status when patching metadata', async () => {
     const uid = 'uid-renamed';
     const originalSeed = 'uid-original';
     const file = path.join(tmpDir, uid, 'cloud', 'config', 'connectors.json');
@@ -108,20 +108,74 @@ describe('features/connectors/registry', () => {
     expect(loaded.connections.gmail.oauth_grant).toBeUndefined();
     expect(loaded.connections.gmail.status).toMatchObject({
       kind: 'error',
-      message: 'connector_reconnect_required',
+      message: 'connector_secrets_unavailable',
     });
+    expect(registry.hasUnavailableSecrets(loaded.connections.gmail)).toBe(true);
     const beforePatch = JSON.parse(fs.readFileSync(file, 'utf8'));
     expect(beforePatch.connections.gmail.status.kind).toBe('connected');
     expect(beforePatch.connections.gmail.secrets_enc).toBe(originalSecrets);
 
     await registry.update(uid, 'gmail', (cur) => ({
       ...cur,
+      enabled_subtools: ['search_messages'],
       status: { kind: 'error', message: 'transport unresolved', at: 2 },
       updated_at: '2026-01-01T00:01:00.000Z',
     }));
 
     const after = JSON.parse(fs.readFileSync(file, 'utf8'));
-    expect(after.connections.gmail.status.kind).toBe('error');
+    expect(after.connections.gmail.status).toEqual({ kind: 'connected', since: 1 });
+    expect(after.connections.gmail.enabled_subtools).toEqual(['search_messages']);
+    expect(after.connections.gmail.updated_at).toBe('2026-01-01T00:01:00.000Z');
     expect(after.connections.gmail.secrets_enc).toBe(originalSecrets);
+  });
+
+  it('treats decryptable non-JSON secret plaintext as device-local unavailable state', async () => {
+    const uid = 'uid-malformed-plaintext';
+    const file = path.join(tmpDir, uid, 'cloud', 'config', 'connectors.json');
+    const cryptoVault = await import('../../../../src/main/util/crypto-vault');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const malformedSecrets = cryptoVault.encrypt(
+      `connectors.instance\0${uid}\0gmail`,
+      'this plaintext is not JSON',
+    );
+
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      connections: {
+        gmail: {
+          id: 'gmail',
+          display_name: 'Gmail',
+          enabled_subtools: null,
+          tools_cache: [],
+          tools_cached_at: 0,
+          status: { kind: 'connected', since: 7 },
+          created_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+          secrets_enc: malformedSecrets,
+        },
+      },
+    }, null, 2));
+
+    const loaded = registry.load(uid).connections.gmail;
+    expect(loaded.status).toMatchObject({
+      kind: 'error',
+      message: 'connector_secrets_unavailable',
+    });
+    expect(registry.hasUnavailableSecrets(loaded)).toBe(true);
+
+    await registry.update(uid, 'gmail', (cur) => ({
+      ...cur,
+      enabled_subtools: ['list_labels'],
+      updated_at: '2026-01-01T00:02:00.000Z',
+    }));
+
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(persisted.connections.gmail).toMatchObject({
+      enabled_subtools: ['list_labels'],
+      status: { kind: 'connected', since: 7 },
+      updated_at: '2026-01-01T00:02:00.000Z',
+      secrets_enc: malformedSecrets,
+    });
   });
 });

@@ -358,6 +358,7 @@ describe("web-search tool execution", () => {
     const result = await webSearchTool.execute({ query: "cross platform", count: 1 }, { state: {} });
 
     expect(result.isError).toBeUndefined();
+    expect(result.displayName).toBe("Brave");
     expect(result.content).toContain("Search results for: \"cross platform\" (via Brave)");
     expect(result.content).toContain("Example A");
     expect(result.content).not.toContain("Example B");
@@ -382,6 +383,7 @@ describe("web-search tool execution", () => {
     const result = await webSearchTool.execute({ query: "fallback" }, { state: {} });
 
     expect(result.isError).toBeUndefined();
+    expect(result.displayName).toBe("DuckDuckGo");
     expect(result.content).toContain("via DuckDuckGo");
     expect(result.content).toContain("Duck & result");
     const cache = JSON.parse(fs.readFileSync(path.join(stateDir, "web-search-cache.json"), "utf8"));
@@ -522,6 +524,7 @@ describe("web-search tool execution", () => {
     ]);
 
     expect(results.every((result) => result.isError !== true)).toBe(true);
+    expect(results.every((result) => result.displayName === "DuckDuckGo")).toBe(true);
     expect(results.every((result) => result.content.includes("via DuckDuckGo"))).toBe(true);
     expect(maxActive).toBe(1);
     expect(fetchMock.mock.calls.filter(([url]) => String(url).includes("brave.com"))).toHaveLength(1);

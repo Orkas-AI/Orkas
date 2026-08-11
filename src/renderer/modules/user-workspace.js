@@ -122,7 +122,10 @@ async function _fetchWorkspaceInfo(target) {
       };
     }
   } catch (err) {
-    _wsLog.warn('failed to fetch workspace info', err);
+    _wsLog.warn('failed to fetch workspace info', {
+      target,
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 
@@ -161,11 +164,14 @@ async function _selectAndSetWorkspace(target, dirPath) {
       _wsLog.info('workspace selected', { target, path: setResult.path });
     } else {
       _showWorkspaceSetFailure((setResult && setResult.error) || t('workspace.set_failed'));
-      _wsLog.warn('workspace selection rejected', { target, path: selectedPath, error: setResult && setResult.error });
+      _wsLog.warn('workspace selection rejected', { target, error_code: 'set_failed' });
     }
   } catch (err) {
     _showWorkspaceSetFailure(err);
-    _wsLog.error('workspace selection failed', err);
+    _wsLog.error('workspace selection failed', {
+      target,
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 
@@ -187,10 +193,18 @@ async function _openWorkspaceFolder(target) {
   try {
     const result = await window.orkas.invoke('workspace.openPath', hint);
     if (result && result.ok) {
-      _wsLog.info('workspace opened', result.path);
+      _trackWorkspaceOpenFolderResult(target, 'success', startedAt, '', result);
+      _wsLog.info('workspace opened', { target });
+    } else {
+      _trackWorkspaceOpenFolderResult(target, 'failure', startedAt, 'open_rejected');
+      _wsLog.warn('workspace open rejected', { target, error_code: 'open_rejected' });
     }
   } catch (err) {
-    _wsLog.error('workspace open failed', err);
+    _trackWorkspaceOpenFolderResult(target, 'failure', startedAt, 'invoke_failed');
+    _wsLog.error('workspace open failed', {
+      target,
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
   }
 }
 

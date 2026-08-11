@@ -36,25 +36,74 @@
     } catch (_) {}
   }
 
-  function _track(action, data) {
-    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+  function _track(action, data) { void action; void data; }
+  function _trackError(action, data) { void action; void data; }
+
+  const _SAVED_APP_STABLE_ERROR_CODES = new Set([
+    'invalid_response',
+    'invalid_title',
+    'permission_denied',
+    'saved_app_delete_failed',
+    'saved_app_edit_failed',
+    'saved_app_not_found',
+    'saved_app_open_failed',
+    'saved_app_rename_failed',
+    'saved_app_viewer_failed',
+  ]);
+
+  function _savedAppFailureCode(value, fallback) {
+    const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
+    if (rawCode === 'not_found') return 'saved_app_not_found';
+    if (rawCode === 'forbidden') return 'permission_denied';
+    if (rawCode === 'bad_input') return 'invalid_response';
+    if (_SAVED_APP_STABLE_ERROR_CODES.has(rawCode)) return rawCode;
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    if (/not found|missing (?:its )?html entry/.test(message)) return 'saved_app_not_found';
+    if (/outside .*workspace|path traversal|symlink escape|forbidden/.test(message)) return 'permission_denied';
+    if (/title required/.test(message)) return 'invalid_title';
+    if (/create a conversation|attach .*app source|open.*editing/.test(message)) return 'saved_app_edit_failed';
+    if (/rename/.test(message)) return 'saved_app_rename_failed';
+    if (/delete/.test(message)) return 'saved_app_delete_failed';
+    return _SAVED_APP_STABLE_ERROR_CODES.has(fallback) ? fallback : 'invalid_response';
   }
 
-  function _trackError(action, data) {
-    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+  function _savedAppFailure(value, fallback, fallbackType = 'operation') {
+    const errorCode = _savedAppFailureCode(value, fallback);
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response' || errorCode === 'invalid_title') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    else if (errorCode === 'saved_app_viewer_failed') errorType = 'presentation';
+    else if (errorCode === 'saved_app_not_found') errorType = 'operation';
+    return { error_type: errorType, error_code: errorCode };
   }
 
-  function _trackManageResult(startedAt, action, result, errorCode = '') {
-    try {
-      if (!window.Monitor) return;
-      const payload = {
-        result,
+  function _appsLogFailure(action, data) {
+    _appsLog.warn('saved app operation failed', { action, ...(data || {}) });
+  }
+
+  function _trackManageResult(startedAt, action, result, failure = {}) {
+    const payload = {
+      result,
+      action,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result !== 'success') Object.assign(payload, failure);
+    if (result === 'failure') {
+      _appsLogFailure('saved_app_manage', {
         action,
-        duration_ms: Math.max(0, Date.now() - startedAt),
-      };
-      if (result !== 'success') payload.error_code = errorCode || 'unknown';
-      Monitor.event('saved_app_manage_result', payload);
-    } catch (_) {}
+        error_type: payload.error_type,
+        error_code: payload.error_code,
+      });
+    }
+  }
+
+  function _trackOpenResult(startedAt, result, failure = {}) {
+    const payload = {
+      result,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    };
+    if (result !== 'success') Object.assign(payload, failure);
+    if (result === 'failure') _appsLogFailure('saved_app_open', failure);
   }
 
   function _esc(s) {
@@ -222,15 +271,30 @@
 
   // ── actions ─────────────────────────────────────────────────────────────
   async function _openApp(appId) {
+    const startedAt = Date.now();
+    let r;
     try {
-      const r = await window.orkas.invoke('savedApps.openInApp', { appId: String(appId) });
-      if (!r || r.ok === false || !r.url) throw new Error((r && r.error) || 'open failed');
+      r = await window.orkas.invoke('savedApps.openInApp', { appId: String(appId) });
+    } catch (err) {
+      _trackOpenResult(startedAt, 'failure', _savedAppFailure(err, 'saved_app_open_failed', 'ipc'));
+      _fail(_t('apps.open_failed', 'Could not open the app'), err);
+      return;
+    }
+    if (!r || r.ok === false || !r.url) {
+      const failure = _savedAppFailure(r, r && r.ok === false ? 'saved_app_open_failed' : 'invalid_response');
+      _trackOpenResult(startedAt, 'failure', failure);
+      _fail(_t('apps.open_failed', 'Could not open the app'), { message: (r && r.error) || 'open failed' });
+      return;
+    }
+    try {
       const app = (_appsCache || []).find((a) => a && a.id === appId);
       _openAppViewer(r.url, (app && app.title) || _t('artifact.title', 'Interactive app'));
     } catch (err) {
       _trackError('saved_app_open', { error_message: 'saved_app_open_failed' });
       _fail(_t('apps.open_failed', 'Could not open the app'), err);
+      return;
     }
+    _trackOpenResult(startedAt, 'success');
   }
 
   // "Edit" — backend creates a fresh conversation with the app's source bundled
@@ -242,18 +306,23 @@
     let r;
     try {
       r = await window.orkas.invoke('savedApps.openForEditing', { appId: String(appId) });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'open-for-editing failed');
     } catch (err) {
-      _trackManageResult(startedAt, 'edit', 'failure', 'open_failed');
+      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(err, 'saved_app_edit_failed', 'ipc'));
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err);
+      return;
+    }
+    if (!r || r.ok === false) {
+      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'saved_app_edit_failed'));
+      _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), { message: (r && r.error) || 'open-for-editing failed' });
       return;
     }
     const conv = r.conversation;
     if (!conv || !conv.conversation_id) {
-      _trackManageResult(startedAt, 'edit', 'failure', 'invalid_response');
+      _trackManageResult(startedAt, 'edit', 'failure', _savedAppFailure(r, 'invalid_response'));
       _fail(_t('apps.edit_failed', 'Could not open an edit conversation'));
       return;
     }
+    _trackManageResult(startedAt, 'edit', 'success');
     // Add to the sidebar list. Set last_active_at explicitly — backend
     // create response doesn't include the derived field, so timeBucket
     // would otherwise put this brand-new row in the 'older' bucket.
@@ -282,8 +351,12 @@
         setTimeout(() => { try { input.focus(); } catch (_) {} }, 60);
       }
       if (typeof _chatAttachRefreshFromServer === 'function') _chatAttachRefreshFromServer(conv.conversation_id);
-    } catch (err) { _appsLog.warn('edit post-nav setup failed', err && err.message ? err.message : err); }
-    _trackManageResult(startedAt, 'edit', 'success');
+    } catch (_) {
+      _appsLogFailure('saved_app_edit_presentation', {
+        error_type: 'presentation',
+        error_code: 'saved_app_viewer_failed',
+      });
+    }
   }
 
   async function _renameApp(appId) {
@@ -296,16 +369,23 @@
     next = String(next).trim();
     if (!next || (cur && next === cur.title)) return;
     const startedAt = Date.now();
+    let r;
     try {
-      const r = await window.orkas.invoke('savedApps.rename', { appId: String(appId), title: next });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'rename failed');
+      r = await window.orkas.invoke('savedApps.rename', { appId: String(appId), title: next });
     } catch (err) {
-      _trackManageResult(startedAt, 'rename', 'failure', 'rename_failed');
+      _trackManageResult(startedAt, 'rename', 'failure', _savedAppFailure(err, 'saved_app_rename_failed', 'ipc'));
       _fail(_t('apps.rename_failed', 'Could not rename'), err);
       return;
     }
+    if (!r || r.ok === false) {
+      _trackManageResult(startedAt, 'rename', 'failure', _savedAppFailure(r, 'saved_app_rename_failed'));
+      _fail(_t('apps.rename_failed', 'Could not rename'), { message: (r && r.error) || 'rename failed' });
+      return;
+    }
     _trackManageResult(startedAt, 'rename', 'success');
-    loadSavedApps(true);
+    try { loadSavedApps(true); } catch (_) {
+      _appsLogFailure('saved_app_refresh', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
+    }
   }
 
   async function _deleteApp(appId) {
@@ -324,16 +404,23 @@
     } catch (_) { ok = false; }
     if (!ok) return;
     const startedAt = Date.now();
+    let r;
     try {
-      const r = await window.orkas.invoke('savedApps.delete', { appId: String(appId) });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'delete failed');
+      r = await window.orkas.invoke('savedApps.delete', { appId: String(appId) });
     } catch (err) {
-      _trackManageResult(startedAt, 'delete', 'failure', 'delete_failed');
+      _trackManageResult(startedAt, 'delete', 'failure', _savedAppFailure(err, 'saved_app_delete_failed', 'ipc'));
       _fail(_t('apps.delete_failed', 'Could not delete'), err);
       return;
     }
+    if (!r || r.ok === false) {
+      _trackManageResult(startedAt, 'delete', 'failure', _savedAppFailure(r, 'saved_app_delete_failed'));
+      _fail(_t('apps.delete_failed', 'Could not delete'), { message: (r && r.error) || 'delete failed' });
+      return;
+    }
     _trackManageResult(startedAt, 'delete', 'success');
-    loadSavedApps(true);
+    try { loadSavedApps(true); } catch (_) {
+      _appsLogFailure('saved_app_refresh', { error_type: 'presentation', error_code: 'saved_app_viewer_failed' });
+    }
   }
 
   // Short relative formatter for the meta row's "updated" slot.

@@ -62,8 +62,28 @@ describe('ensure-deps package-tree health', () => {
       packageName: 'electron',
     });
 
-    expect(lockedVersion).toBe('41.7.1');
+    expect(lockedVersion).toBe('42.8.0');
     expect(packageJson.devDependencies?.electron).toBe(lockedVersion);
+  });
+
+  it('locks the Electron 42 native-module compatibility set used by notifications', () => {
+    const packageJson = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    const lockedBetterSqlite = ensureDeps.lockedPackageVersion({
+      lockFile: path.resolve('package-lock.json'),
+      packageName: 'better-sqlite3',
+    });
+    const lockedElectronRebuild = ensureDeps.lockedPackageVersion({
+      lockFile: path.resolve('package-lock.json'),
+      packageName: '@electron/rebuild',
+    });
+
+    expect(packageJson.dependencies?.['better-sqlite3']).toBe('^12.11.1');
+    expect(lockedBetterSqlite).toBe('12.11.1');
+    expect(packageJson.devDependencies?.['@electron/rebuild']).toBe('4.2.0');
+    expect(lockedElectronRebuild).toBe('4.2.0');
   });
 
   it('detects missing and corrupt required package manifests while ignoring optional packages', () => {

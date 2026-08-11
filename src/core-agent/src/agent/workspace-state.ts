@@ -244,6 +244,74 @@ export function reconcileWorkspaceObservations(
   });
 }
 
+export type WorkspaceReadRepetition = {
+  /** File reads recorded after the boundary. */
+  readsAfter: number;
+  /** Of those, reads of a path that had already been read before it. */
+  repeatedPaths: number;
+  /** Of those, reads whose content hash also matches the earlier read — the
+   *  file had not changed, so the re-read recovered nothing new. */
+  repeatedIdenticalContent: number;
+};
+
+/**
+ * How much of what was read after a boundary had already been read before it.
+ *
+ * Compaction trades context size against re-reading: whatever the checkpoint
+ * fails to carry, the model fetches again. That trade is measurable rather than
+ * arguable, and this is the measurement — the thresholds and ceilings in
+ * `context-budget.ts` were chosen conservatively and are meant to be calibrated
+ * against it rather than by argument.
+ *
+ * `repeatedIdenticalContent` is the sharper number: the same path AND the same
+ * content hash means the second read returned exactly what the first one did.
+ *
+ * Bounded by the observation history that survives (`WORKSPACE_COMPACTED_MAX_READS`
+ * entries), so on a very long run this under-counts rather than over-counts.
+ */
+export function workspaceReadRepetition(
+  state: WorkspaceObservationState | undefined,
+  boundarySequence: number,
+): WorkspaceReadRepetition {
+  const empty: WorkspaceReadRepetition = {
+    readsAfter: 0,
+    repeatedPaths: 0,
+    repeatedIdenticalContent: 0,
+  };
+  if (!state) return empty;
+
+  const before = new Map<string, Set<string>>();
+  const after: FileReadObservation[] = [];
+  const consider = (sequence: number, read: FileReadObservation): void => {
+    if (!read?.path) return;
+    // `boundarySequence` is the cursor value taken at the compaction point,
+    // i.e. the next sequence to be assigned — so anything below it happened
+    // before, and the cursor value itself belongs to the first read after.
+    if (sequence < boundarySequence) {
+      const hashes = before.get(read.path) ?? new Set<string>();
+      if (read.hash) hashes.add(read.hash);
+      before.set(read.path, hashes);
+      return;
+    }
+    after.push(read);
+  };
+
+  for (const item of state.compacted?.latestReads ?? []) consider(item.sequence, item.read);
+  for (const entry of state.entries) {
+    for (const read of entry.fileReads ?? []) consider(entry.sequence, read);
+  }
+
+  let repeatedPaths = 0;
+  let repeatedIdenticalContent = 0;
+  for (const read of after) {
+    const hashes = before.get(read.path);
+    if (!hashes) continue;
+    repeatedPaths++;
+    if (read.hash && hashes.has(read.hash)) repeatedIdenticalContent++;
+  }
+  return { readsAfter: after.length, repeatedPaths, repeatedIdenticalContent };
+}
+
 export function renderWorkspaceContext(
   state: WorkspaceObservationState | undefined,
   activeTurnId: number,

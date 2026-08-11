@@ -100,6 +100,11 @@ interface Pending {
   timer: NodeJS.Timeout;
 }
 
+export interface PermissionResponseOutcome {
+  handled: boolean;
+  always_saved?: boolean;
+}
+
 const _pending = new Map<string, Pending>();
 
 /** Lazy ipc lookup — same pattern `connectors/registry.ts` uses for
@@ -161,6 +166,7 @@ export async function requestPermission(opts: {
         connector_id: maskId(opts.connectorId),
         tool: opts.toolName,
       });
+      _broadcast('bridge:permission_cancelled', { request_ids: [requestId], cid: opts.cid });
       resolve(false);
     }, RESPONSE_TIMEOUT_MS);
     if (typeof timer.unref === 'function') timer.unref();
@@ -176,25 +182,45 @@ export async function requestPermission(opts: {
 
 /** Renderer answer (via `bridge.permission_response`). Unknown ids are
  *  ignored (stale dialog after timeout). */
-export function respond(requestId: string, allow: boolean, always: boolean): boolean {
+export function respondWithOutcome(
+  requestId: string,
+  allow: boolean,
+  always: boolean,
+): PermissionResponseOutcome {
   const pending = _pending.get(requestId);
-  if (!pending) return false;
+  if (!pending) return { handled: false };
   _pending.delete(requestId);
   clearTimeout(pending.timer);
+  let alwaysSaved = false;
   if (allow && always) {
-    try { recordAlwaysAllow(pending.uid, pending.info.agent_id, pending.info.connector_id); }
+    try {
+      recordAlwaysAllow(pending.uid, pending.info.agent_id, pending.info.connector_id);
+      alwaysSaved = true;
+    }
     catch (err) { log.warn('always-allow persist failed', { error: logErrorRef(err) }); }
   }
   pending.resolve(allow);
-  return true;
+  return {
+    handled: true,
+    ...(allow && always ? { always_saved: alwaysSaved } : {}),
+  };
+}
+
+export function respond(requestId: string, allow: boolean, always: boolean): boolean {
+  return respondWithOutcome(requestId, allow, always).handled;
 }
 
 /** Abandon every pending request for a conversation (run ended / aborted). */
 export function cancelForCid(cid: string): void {
+  const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
     if (pending.info.cid !== cid) continue;
     _pending.delete(id);
     clearTimeout(pending.timer);
+    requestIds.push(id);
     pending.resolve(false);
+  }
+  if (requestIds.length) {
+    _broadcast('bridge:permission_cancelled', { request_ids: requestIds, cid });
   }
 }

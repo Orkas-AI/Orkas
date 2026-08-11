@@ -51,16 +51,18 @@ describe('connectors registry secret storage', () => {
   it('writes token-bearing fields as local-secret ciphertext', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
 
     await registry.upsert(TEST_UID, sampleInstance());
 
     const raw = fs.readFileSync(paths.userConnectorsConfigFile(TEST_UID), 'utf8');
-    const localSecrets = await import('../../../../src/main/util/local-secret-store');
     expect(raw).not.toContain('access-secret');
     expect(raw).not.toContain('refresh-secret');
     const disk = JSON.parse(raw);
     expect(disk.connections.github.oauth_grant).toBeUndefined();
+    expect(localSecrets.preferredLocalSecretKind()).toBe('fallback');
     expect(localSecrets.isEncryptedSecret(disk.connections.github.secrets_enc)).toBe(true);
+    expect(localSecrets.isHostedEncryptedSecret(disk.connections.github.secrets_enc)).toBe(false);
 
     const loaded = registry.load(TEST_UID);
     expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');
@@ -90,8 +92,7 @@ describe('connectors registry secret storage', () => {
     expect(loaded.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
 
     const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const localSecrets = await import('../../../../src/main/util/local-secret-store');
-    expect(localSecrets.isEncryptedSecret(migrated.connections.github.secrets_enc)).toBe(true);
+    expect(cryptoVault.isEncryptedPayload(migrated.connections.github.secrets_enc)).toBe(true);
     expect(JSON.stringify(migrated)).not.toContain('refresh-secret');
   });
 
@@ -123,7 +124,7 @@ describe('connectors registry secret storage', () => {
     first.connections.github.display_name = 'mutated outside registry';
     const second = registry.load(TEST_UID);
 
-    expect(decryptSpy).toHaveBeenCalled();
+    expect(decryptSpy).toHaveBeenCalledTimes(1);
     expect(second.connections.github.display_name).toBe('GitHub');
     expect(second.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
   });

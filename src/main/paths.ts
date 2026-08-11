@@ -407,6 +407,9 @@ export const userAgentRuntimeConfigFile = (uid: string) => path.join(userLocalCo
 export const userSearchDir           = (uid: string) => path.join(userLocalRoot(uid), 'search');
 export const userContextsIndexPath   = (uid: string) => path.join(userSearchDir(uid), 'contexts.idx.json');
 export const userChatsIndexPath      = (uid: string) => path.join(userSearchDir(uid), 'chats.idx.json');
+export const userConversationTurnIndexesDir = (uid: string) => path.join(userSearchDir(uid), 'conversation-turns');
+export const userConversationTurnIndexPath = (uid: string, cid: string) =>
+  path.join(userConversationTurnIndexesDir(uid), `${cid}.idx.json`);
 
 // Dev-only LLM-call archive (features/devtools.ts + model/core-agent/client.ts).
 export const userTestDir = (uid: string) => path.join(userLocalRoot(uid), 'test');

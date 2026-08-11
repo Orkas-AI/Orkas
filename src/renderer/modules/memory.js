@@ -10,6 +10,22 @@
 // `usage.limit` — never hardcoded here. Stored entries are plain text.
 
 const _MEM_LIMIT_WARN = 0.85; // usage bar turns warn above this fraction
+const _MEM_IPC_FAILURE_DEDUPE_MS = 60 * 1000;
+const _MEM_IPC_FAILURE_MAX_PER_SESSION = 20;
+const _MEM_IPC_CHANNELS = new Set([
+  'memory.list',
+  'memory.add',
+  'memory.replace',
+  'memory.remove',
+  'memory.exportInfo',
+  'memory.reveal',
+  'memory.importParse',
+]);
+const _memLog = (typeof createLogger === 'function')
+  ? createLogger('memory')
+  : { info() {}, warn() {} };
+const _memIpcFailureState = new Map();
+let _memIpcFailureCount = 0;
 
 // Ordered scope descriptors for the current render:
 //   { key, kind:'user'|'shared', title, sub, icon }
@@ -25,29 +41,136 @@ function _memIc(name, className) {
 }
 
 function _memToast(msg, variant) {
-  if (typeof uiToast === 'function') uiToast(msg, { variant: variant || 'info' });
+  try {
+    if (typeof uiToast === 'function') uiToast(msg, { variant: variant || 'info' });
+  } catch (_) { /* presentation must not change a completed memory result */ }
 }
 
-function _memTrack(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+function _memLogSafe(level, message, data) {
+  try {
+    if (_memLog && typeof _memLog[level] === 'function') _memLog[level](message, data || {});
+  } catch (_) { /* diagnostics must not alter the operation result */ }
+}
+
+function _memTrackEvent(action, data) {
+  _memLogSafe('info', 'memory action result', { action, ...(data || {}) });
 }
 
 function _memTrackError(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
-async function _memInvoke(channel, payload) {
+function _memDuration(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
+}
+
+function _memTarget(target) {
+  return target === 'user' ? 'user' : 'shared';
+}
+
+function _memChannel(channel) {
+  return _MEM_IPC_CHANNELS.has(channel) ? channel : 'unknown';
+}
+
+function _memFailureDetails(result) {
+  if (result && result.__memory_error_type && result.__memory_error_code) {
+    return {
+      error_type: result.__memory_error_type,
+      error_code: result.__memory_error_code,
+    };
+  }
+  const message = String((result && result.error) || '').trim().toLowerCase();
+  if (message.startsWith('blocked:')) {
+    return { error_type: 'validation', error_code: 'memory_content_blocked' };
+  }
+  if (message.includes('empty content')) {
+    return { error_type: 'validation', error_code: 'memory_content_empty' };
+  }
+  if (message.includes('old_text is required')) {
+    return { error_type: 'validation', error_code: 'memory_entry_selector_missing' };
+  }
+  if (message.includes('old_text not found')) {
+    return { error_type: 'validation', error_code: 'memory_entry_not_found' };
+  }
+  if (message.includes('old_text is ambiguous')) {
+    return { error_type: 'validation', error_code: 'memory_entry_ambiguous' };
+  }
+  if (message.includes('ipc bridge unavailable')) {
+    return { error_type: 'ipc', error_code: 'memory_ipc_unavailable' };
+  }
+  if (message.includes('no response')) {
+    return { error_type: 'ipc', error_code: 'memory_ipc_no_response' };
+  }
+  return { error_type: 'runtime', error_code: 'memory_operation_failed' };
+}
+
+function _memReportIpcFailure(channel, result) {
+  const safeChannel = _memChannel(channel);
+  const details = _memFailureDetails(result);
+  const key = `${safeChannel}:${details.error_code}`;
+  const now = Date.now();
+  const previous = _memIpcFailureState.get(key) || 0;
+  if (now - previous < _MEM_IPC_FAILURE_DEDUPE_MS) return;
+  if (_memIpcFailureCount >= _MEM_IPC_FAILURE_MAX_PER_SESSION) return;
+  _memIpcFailureState.set(key, now);
+  _memIpcFailureCount += 1;
+  _memTrackError('memory_ipc', {
+    channel: safeChannel,
+    error_type: details.error_type,
+    error_code: details.error_code,
+    error_message: details.error_code,
+  });
+}
+
+async function _memInvoke(channel, payload, options) {
+  const resultOwned = Boolean(options && options.resultOwned);
   if (!window.orkas || typeof window.orkas.invoke !== 'function') {
-    return { ok: false, error: 'ipc bridge unavailable' };
+    const failure = {
+      ok: false,
+      error: 'ipc bridge unavailable',
+      __memory_error_type: 'ipc',
+      __memory_error_code: 'memory_ipc_unavailable',
+    };
+    _memLogSafe('warn', 'memory IPC unavailable', {
+      channel: _memChannel(channel),
+      error_code: failure.__memory_error_code,
+    });
+    if (!resultOwned) _memReportIpcFailure(channel, failure);
+    return failure;
   }
 
   try {
     const res = await window.orkas.invoke(channel, payload || {});
-    if (res && res.ok === false) _memTrackError('memory_ipc_result', { channel, error_message: res.error || 'failed' });
-    return res || { ok: false, error: 'no response' };
+    const failure = res || {
+      ok: false,
+      error: 'no response',
+      __memory_error_type: 'ipc',
+      __memory_error_code: 'memory_ipc_no_response',
+    };
+    if (failure.ok === false) {
+      const details = _memFailureDetails(failure);
+      _memLogSafe('warn', 'memory operation rejected', {
+        channel: _memChannel(channel),
+        error_type: details.error_type,
+        error_code: details.error_code,
+      });
+      if (!resultOwned) _memReportIpcFailure(channel, failure);
+    }
+    return failure;
   } catch (err) {
-    _memTrackError('memory_ipc', { channel, error_message: (err && err.message) || String(err) });
-    return { ok: false, error: (err && err.message) || String(err) };
+    const failure = {
+      ok: false,
+      error: (err && err.message) || String(err),
+      __memory_error_type: 'ipc',
+      __memory_error_code: 'memory_ipc_invoke_failed',
+    };
+    _memLogSafe('warn', 'memory IPC failed', {
+      channel: _memChannel(channel),
+      error_type: 'ipc',
+      error_code: failure.__memory_error_code,
+    });
+    if (!resultOwned) _memReportIpcFailure(channel, failure);
+    return failure;
   }
 }
 
@@ -56,7 +179,7 @@ async function _memInvoke(channel, payload) {
 // A scope-key ('user' | 'shared') → the IPC payload the backend expects.
 // 'memory' (legacy) is accepted as 'shared'.
 function _memParseScope(key) {
-  if (key === 'user') return { target: 'user' };
+  if (_memTarget(key) === 'user') return { target: 'user' };
   return { target: 'shared' }; // 'shared' | 'memory' | default
 }
 
@@ -308,44 +431,73 @@ function _memRerender() {
 }
 
 async function _memSaveEditor(target) {
-  const editorEl = document.querySelector(`[data-mem-editor="${CSS.escape(target)}"]`);
+  const safeTarget = _memTarget(target);
+  const editorEl = document.querySelector(`[data-mem-editor="${CSS.escape(safeTarget)}"]`);
   const ta = editorEl && editorEl.querySelector('.memory-entry-textarea');
   if (!ta) return;
   const content = ta.value.trim();
   if (!content) return;
   const isEdit = _memEditor && _memEditor.mode === 'edit';
+  const mode = isEdit ? 'edit' : 'add';
+  const startedAt = Date.now();
   const res = isEdit
-    ? await _memInvoke('memory.replace', _memScopePayload(target, { oldText: _memEditor.oldText, content }))
-    : await _memInvoke('memory.add', _memScopePayload(target, { content }));
+    ? await _memInvoke('memory.replace', _memScopePayload(safeTarget, { oldText: _memEditor.oldText, content }), { resultOwned: true })
+    : await _memInvoke('memory.add', _memScopePayload(safeTarget, { content }), { resultOwned: true });
+  const durationMs = _memDuration(startedAt);
   if (!res.ok) {
-    _memTrackEvent('memory_entry_save_result', { result: 'failure', target, mode: isEdit ? 'edit' : 'add' });
-    _memTrackError('memory_entry_save', { target, mode: isEdit ? 'edit' : 'add', error_message: res.error || 'failed' });
+    const details = _memFailureDetails(res);
+    _memTrackEvent('memory_entry_save_result', {
+      result: 'failure',
+      target: safeTarget,
+      mode,
+      duration_ms: durationMs,
+      ...details,
+    });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrackEvent('memory_entry_save_result', { result: 'success', target, mode: isEdit ? 'edit' : 'add', chars: content.length });
+  _memTrackEvent('memory_entry_save_result', {
+    result: 'success',
+    target: safeTarget,
+    mode,
+    chars: content.length,
+    char_count: content.length,
+    duration_ms: durationMs,
+  });
   _memEditor = null;
   // Refresh just this scope from the op result (it already carries entries+usage).
-  const prev = _memData[target] || {};
-  _memData[target] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
+  const prev = _memData[safeTarget] || {};
+  _memData[safeTarget] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
 }
 
 async function _memDelete(target, text) {
+  const safeTarget = _memTarget(target);
   const ok = (typeof uiConfirm === 'function')
     ? await uiConfirm({ message: t('memory.delete_confirm'), okLabel: t('memory.delete'), cancelLabel: t('memory.cancel') })
     : true;
   if (!ok) return;
-  const res = await _memInvoke('memory.remove', _memScopePayload(target, { oldText: text }));
+  const startedAt = Date.now();
+  const res = await _memInvoke('memory.remove', _memScopePayload(safeTarget, { oldText: text }), { resultOwned: true });
+  const durationMs = _memDuration(startedAt);
   if (!res.ok) {
-    _memTrackEvent('memory_entry_delete_result', { result: 'failure', target });
-    _memTrackError('memory_entry_delete', { target, error_message: res.error || 'failed' });
+    const details = _memFailureDetails(res);
+    _memTrackEvent('memory_entry_delete_result', {
+      result: 'failure',
+      target: safeTarget,
+      duration_ms: durationMs,
+      ...details,
+    });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
-  _memTrackEvent('memory_entry_delete_result', { result: 'success', target });
-  const prev = _memData[target] || {};
-  _memData[target] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
+  _memTrackEvent('memory_entry_delete_result', {
+    result: 'success',
+    target: safeTarget,
+    duration_ms: durationMs,
+  });
+  const prev = _memData[safeTarget] || {};
+  _memData[safeTarget] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
 }
 
@@ -471,7 +623,14 @@ function _memDecodeBase64Text(b64) {
 async function _memDoParse(text) {
   if (!text.trim()) { _memToast(t('memory.import_empty'), 'warning'); return; }
   const res = await _memInvoke('memory.importParse', { text });
-  if (!res.ok || !Array.isArray(res.items)) { _memTrackError('memory_import_parse', { error_message: res.error || 'failed' }); _memToast(t('memory.error_generic'), 'error'); return; }
+  if (!res.ok || !Array.isArray(res.items)) {
+    _memLogSafe('warn', 'memory import parse failed', {
+      error_type: res.ok === false ? _memFailureDetails(res).error_type : 'runtime',
+      error_code: res.ok === false ? _memFailureDetails(res).error_code : 'memory_import_parse_invalid',
+    });
+    _memToast(t('memory.error_generic'), 'error');
+    return;
+  }
   if (!res.items.length) { _memToast(t('memory.import_empty'), 'warning'); return; }
   // Flagged items default to unchecked; clean ones checked. The backend
   // classifier emits 'memory'|'user' — normalize 'memory' → 'shared'.
@@ -570,22 +729,36 @@ function _memUpdateMergeSummary(host) {
 async function _memDoMerge() {
   const kept = _memImportItems.filter((it) => it.keep);
   if (!kept.length) return;
+  const startedAt = Date.now();
   let added = 0;
   let failed = 0;
+  const failureTypes = new Set();
   for (const it of kept) {
     // it.target is 'user' | 'shared' (a scope-key the backend accepts directly).
-    const res = await _memInvoke('memory.add', _memScopePayload(it.target, { content: it.text }));
+    const res = await _memInvoke('memory.add', _memScopePayload(_memTarget(it.target), { content: it.text }), { resultOwned: true });
     if (res.ok) added++;
-    else failed++;
+    else {
+      failed++;
+      failureTypes.add(_memFailureDetails(res).error_type);
+    }
   }
+  const result = failed ? (added ? 'partial_failure' : 'failure') : 'success';
+  const resultPayload = {
+    result,
+    added_count: added,
+    failed_count: failed,
+    duration_ms: _memDuration(startedAt),
+  };
+  if (failed) {
+    resultPayload.error_type = failureTypes.size === 1 ? Array.from(failureTypes)[0] : 'unknown';
+    resultPayload.error_code = added ? 'memory_import_partial_failure' : 'memory_import_failed';
+  }
+  // Persistence is the terminal boundary. Modal/toast/render failures cannot
+  // erase or reverse the completed aggregate result.
+  _memTrackEvent('memory_import_result', resultPayload);
   _memCloseModal();
   if (added) _memToast(t('memory.merge_done', { n: added }), 'success');
   if (failed) _memToast(t('memory.merge_partial', { n: failed }), 'warning');
-  _memTrackEvent('memory_import_result', {
-    result: failed ? (added ? 'partial_failure' : 'failure') : 'success',
-    added_count: added,
-    failed_count: failed,
-  });
   await renderMemoryPage();
 }
 

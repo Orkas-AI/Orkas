@@ -50,16 +50,18 @@ describe('ImageStudio generation control', () => {
       projectDirAbs: root,
       requestId: 'hero-1',
       outputAbsPath: path.join(root, 'hero.png'),
+      turnId: 'turn-1',
     })).rejects.toThrow('E_IMAGE_GENERATION_BUDGET_EXHAUSTED');
   });
 
-  it('persists HYBRID one-call budget and reuses a completed request id', async () => {
+  it('persists HYBRID one-call budget and reuses a completed request id within one turn', async () => {
     writeManifest('hybrid', 1);
     const begun = await beginImageStudioGeneration({
       stateAbsPath: statePath,
       projectDirAbs: root,
       requestId: 'hero-1',
       outputAbsPath: path.join(root, 'hero.png'),
+      turnId: 'turn-1',
     });
     expect(begun.status).toBe('started');
     fs.writeFileSync(path.join(root, 'hero.png'), 'generated image placeholder');
@@ -75,6 +77,7 @@ describe('ImageStudio generation control', () => {
       projectDirAbs: root,
       requestId: 'hero-1',
       outputAbsPath: path.join(root, 'hero.png'),
+      turnId: 'turn-1',
     });
     expect(reused.status).toBe('reused');
 
@@ -83,7 +86,20 @@ describe('ImageStudio generation control', () => {
       projectDirAbs: root,
       requestId: 'hero-2',
       outputAbsPath: path.join(root, 'hero-2.png'),
+      turnId: 'turn-1',
     })).rejects.toThrow('E_IMAGE_GENERATION_BUDGET_EXHAUSTED');
+
+    await expect(beginImageStudioGeneration({
+      stateAbsPath: statePath,
+      projectDirAbs: root,
+      requestId: 'hero-1',
+      outputAbsPath: path.join(root, 'hero-next-turn.png'),
+      turnId: 'turn-2',
+    })).resolves.toMatchObject({
+      status: 'started',
+      callCount: 1,
+      transaction: { request_id: 'hero-1', turn_id: 'turn-2' },
+    });
   });
 
   it('serializes parallel admission so a one-call budget cannot be raced', async () => {
@@ -94,12 +110,14 @@ describe('ImageStudio generation control', () => {
         projectDirAbs: root,
         requestId: 'parallel-a',
         outputAbsPath: path.join(root, 'parallel-a.png'),
+        turnId: 'turn-1',
       }),
       beginImageStudioGeneration({
         stateAbsPath: statePath,
         projectDirAbs: root,
         requestId: 'parallel-b',
         outputAbsPath: path.join(root, 'parallel-b.png'),
+        turnId: 'turn-1',
       }),
     ]);
     expect(outcomes.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
@@ -114,6 +132,7 @@ describe('ImageStudio generation control', () => {
       projectDirAbs: root,
       requestId: 'invalid-workflow',
       outputAbsPath: path.join(root, 'invalid.png'),
+      turnId: 'turn-1',
     });
     await finishImageStudioGeneration({
       stateAbsPath: statePath,
@@ -124,7 +143,7 @@ describe('ImageStudio generation control', () => {
     });
 
     const state = await readImageGenerationControlState(statePath);
-    expect(summarizeImageGenerationBudget(state, 1)).toMatchObject({
+    expect(summarizeImageGenerationBudget(state, 1, 'turn-1')).toMatchObject({
       attempts_recorded: 1,
       calls_started: 0,
       calls_remaining: 1,
@@ -135,12 +154,54 @@ describe('ImageStudio generation control', () => {
       projectDirAbs: root,
       requestId: 'repaired-workflow',
       outputAbsPath: path.join(root, 'repaired.png'),
+      turnId: 'turn-1',
     })).resolves.toMatchObject({ status: 'started', callCount: 1, maxCalls: 1 });
     await expect(beginImageStudioGeneration({
       stateAbsPath: statePath,
       projectDirAbs: root,
       requestId: 'invalid-workflow',
       outputAbsPath: path.join(root, 'invalid-retry.png'),
+      turnId: 'turn-1',
     })).rejects.toThrow('E_IMAGE_GENERATION_REQUEST_ALREADY_USED');
+  });
+
+  it('does not charge legacy unscoped attempts to a later named user turn', async () => {
+    writeManifest('hybrid', 1);
+    const legacy = await beginImageStudioGeneration({
+      stateAbsPath: statePath,
+      projectDirAbs: root,
+      requestId: 'legacy-failed',
+      outputAbsPath: path.join(root, 'legacy.png'),
+    });
+    await finishImageStudioGeneration({
+      stateAbsPath: statePath,
+      transactionId: legacy.transaction.transaction_id,
+      ok: false,
+      errorCode: 'PROVIDER_API_ERROR',
+    });
+
+    const stateBefore = await readImageGenerationControlState(statePath);
+    expect(summarizeImageGenerationBudget(stateBefore, 1)).toMatchObject({
+      attempts_recorded: 1,
+      calls_started: 1,
+      calls_remaining: 0,
+    });
+    expect(summarizeImageGenerationBudget(stateBefore, 1, 'new-turn')).toMatchObject({
+      attempts_recorded: 0,
+      calls_started: 0,
+      calls_remaining: 1,
+    });
+
+    await expect(beginImageStudioGeneration({
+      stateAbsPath: statePath,
+      projectDirAbs: root,
+      requestId: 'legacy-failed',
+      outputAbsPath: path.join(root, 'new-turn.png'),
+      turnId: 'new-turn',
+    })).resolves.toMatchObject({
+      status: 'started',
+      transaction: { request_id: 'legacy-failed', turn_id: 'new-turn' },
+      callCount: 1,
+    });
   });
 });

@@ -438,6 +438,39 @@ describe('locale resource contract', () => {
     }
   });
 
+  it('describes message actions by their user-visible effect without internal tool names', () => {
+    const tables = localeTables('renderer');
+    const editCopyLabels = {
+      en: 'Edit copy',
+      zh: '编辑副本',
+      ja: 'コピーを編集',
+      pt: 'Editar cópia',
+    } as const;
+    const sendVerbs = {
+      en: /\bsend\b/i,
+      zh: /发送/,
+      ja: /送る|送信/,
+      pt: /\benviar\b/i,
+    } as const;
+
+    for (const lang of LANGS) {
+      expect(tables[lang]['chat.menu.scratch_edit'], `${lang}: edit selected copy`)
+        .toBe(editCopyLabels[lang]);
+      expect(tables[lang]['chat.md_drawer.scratch_title'], `${lang}: edited copy title`)
+        .toBe(editCopyLabels[lang]);
+      expect(tables[lang]['chat.md_drawer.send_to_chat'], `${lang}: add edited text`)
+        .not.toMatch(sendVerbs[lang]);
+      expect(tables[lang]['chat.quote_btn_title'], `${lang}: add quote`)
+        .not.toMatch(sendVerbs[lang]);
+      expect(tables[lang]['chat.quote_files_label'], `${lang}: attached file label`)
+        .not.toContain('read_file');
+      expect(tables[lang]['chat.archive_btn'], `${lang}: Library action`)
+        .toBe(tables[lang]['chat.archive_btn_title']);
+      expect(tables[lang]['chat.archive_picker_title'], `${lang}: Library picker`)
+        .toBe(tables[lang]['chat.archive_btn_title']);
+    }
+  });
+
   it('defines every literal Renderer translation key referenced by HTML or JS', () => {
     const rendererEnglish = localeTables('renderer').en;
     const html = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8');

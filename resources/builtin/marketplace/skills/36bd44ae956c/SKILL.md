@@ -3,7 +3,7 @@ name: pdf-editing
 description_zh: 使用内置 PDF 工具读取、OCR、创建和编辑 PDF，支持合并、提取、删除、重排、旋转页面，添加中文水印、文字或图片覆盖层，填写表单并逐页渲染检查。适合“合并这些 PDF”“删除第 3 页”“加中文水印”“填写 PDF 表单”“修改后检查页面”；触发词：PDF、编辑PDF、合并PDF、拆分PDF、旋转页面、水印、表单、PDF检查
 description_en: Use the built-in PDF tools to read, OCR, create, and edit PDFs, including merge, extract, delete, reorder, and rotate pages; add CJK watermarks, text or image overlays; fill forms; and render changed pages for review. Use for PDF editing, page operations, watermarks, forms, OCR, and delivery QA.
 category: office
-min_app_version: 1.7.0
+min_app_version: 1.6.1
 ---
 
 # PDF Editing

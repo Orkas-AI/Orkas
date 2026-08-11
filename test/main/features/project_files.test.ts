@@ -20,6 +20,14 @@ vi.mock('../../../src/main/features/project_library_indexer', () => ({
   },
 }));
 
+// High-fidelity Office rendering has its own deterministic engine contract
+// tests. Keep project filesystem tests independent of the bundled binary.
+vi.mock('../../../src/main/features/office/office_engine', () => ({
+  officeCliAvailable: () => false,
+  runOfficeCli: vi.fn(),
+  closeOfficeFile: vi.fn(),
+}));
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-project-files-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;

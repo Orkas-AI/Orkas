@@ -4,16 +4,20 @@
  * Replaces the individual Anthropic/OpenAI implementations with pi-ai's
  * multi-provider layer — the same approach used by OpenClaw.
  */
+// The compatibility stream helpers retain custom-provider dispatch. Model
+// discovery below deliberately uses pi-ai's native built-in provider catalog.
 import {
-  getModel,
-  getModels,
-  getProviders,
   complete as piComplete,
   stream as piStream,
   completeSimple as piCompleteSimple,
   streamSimple as piStreamSimple,
   Type,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
+import {
+  getBuiltinModel,
+  getBuiltinModels,
+  getBuiltinProviders,
+} from "@earendil-works/pi-ai/providers/all";
 import type {
   Model,
   Api,
@@ -21,12 +25,27 @@ import type {
   AssistantMessage as PiAssistantMessage,
   Tool as PiTool,
   KnownProvider,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 
 import * as crypto from "node:crypto";
 
-import type { Message, MessageContent, StreamEvent, StopReason, Usage } from "../shared/types.js";
-import { AuthError, ProviderError, RateLimitError, ContextOverflowError } from "../shared/errors.js";
+import type {
+  Message,
+  MessageContent,
+  ProviderTerminationCategory,
+  ServerModelFallbackReason,
+  StreamEvent,
+  StopReason,
+  Usage,
+} from "../shared/types.js";
+import {
+  AuthError,
+  ProviderError,
+  RateLimitError,
+  ContextOverflowError,
+  StorageFullError,
+  isStorageFullError,
+} from "../shared/errors.js";
 import { createLogger } from "../shared/logger.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
@@ -35,6 +54,44 @@ const log = createLogger("pi-provider");
 // Core-agent favors stable HTTP event streams over WebSocket optimizations.
 // Providers that do not support transport selection ignore this option.
 const CORE_AGENT_TRANSPORT = "sse" as const;
+
+/** pi-ai's portable image block has no extension slot for Orkas analysis
+ * intent. Encode the generic intent as a same-message control block so the
+ * managed Server can consume it without reverse-engineering the tool call
+ * that produced the image. Non-managed visual providers simply receive the
+ * equivalent plain-text instruction beside the image. */
+function visualAnalysisMarker(mode: "understand" | "quality_review"): string {
+  return `<orkas_visual_analysis mode="${mode}"/>`;
+}
+
+function resolvedResponseModel(
+  response: { responseModel?: string; model?: string },
+  fallbackModel: string,
+): string {
+  return response.responseModel || response.model || fallbackModel;
+}
+
+const SERVER_FALLBACK_REASON_BY_MARKER: Readonly<Record<string, ServerModelFallbackReason>> = {
+  pro_rate_limited: "rate_limited",
+  pro_transport_error: "transport_error",
+  pro_configuration_error: "configuration_error",
+  pro_not_configured: "not_configured",
+  pro_upstream_error: "upstream_error",
+  pro_empty_response: "empty_response",
+  pro_unavailable: "unavailable",
+};
+
+/**
+ * Decode only the closed-world marker emitted by Orkas Server. A normal
+ * provider response id is deliberately ignored; unknown marker values are
+ * collapsed rather than forwarded into logs or analytics.
+ */
+function serverFallbackReasonFromResponseId(responseId: unknown): ServerModelFallbackReason | undefined {
+  const marker = typeof responseId === "string" ? responseId.trim() : "";
+  const prefix = "orkas-fallback:";
+  if (!marker.startsWith(prefix)) return undefined;
+  return SERVER_FALLBACK_REASON_BY_MARKER[marker.slice(prefix.length)] || "unknown";
+}
 
 /**
  * Clamp a session id to a provider-safe cache key. OpenAI / Codex / Azure
@@ -89,6 +146,7 @@ function buildPiContext(
   model?: { api: string; provider: string; id: string },
 ): PiContext {
   const piMessages: PiContext["messages"] = [];
+  const toolNameByCallId = new Map<string, string>();
 
   for (const msg of messages) {
     if (msg.role === "system") continue;
@@ -101,10 +159,14 @@ function buildPiContext(
       // Emit tool result messages first
       for (const tr of toolResults) {
         if (tr.type !== "tool_result") continue;
+        const toolName = toolNameByCallId.get(tr.toolUseId);
+        if (!toolName) {
+          continue;
+        }
         piMessages.push({
           role: "toolResult",
           toolCallId: tr.toolUseId,
-          toolName: "", // pi-ai tolerates empty
+          toolName,
           content: [{ type: "text", text: tr.content }],
           isError: tr.isError ?? false,
           timestamp: Date.now(),
@@ -118,6 +180,9 @@ function buildPiContext(
           if (c.type === "text") {
             piContent.push({ type: "text", text: c.text });
           } else if (c.type === "image") {
+            if (c.analysisMode) {
+              piContent.push({ type: "text", text: visualAnalysisMarker(c.analysisMode) });
+            }
             piContent.push({ type: "image", data: c.data, mimeType: c.mediaType });
           }
         }
@@ -135,11 +200,18 @@ function buildPiContext(
         if (c.type === "text") {
           piContent.push({ type: "text", text: c.text });
         } else if (c.type === "tool_use") {
+          const toolCallId = String(c.id || "").trim();
+          const toolName = String(c.name || "").trim();
+          if (!toolCallId || !toolName) {
+            continue;
+          }
+          toolNameByCallId.set(toolCallId, toolName);
           piContent.push({
             type: "toolCall",
-            id: c.id,
-            name: c.name,
+            id: toolCallId,
+            name: toolName,
             arguments: c.input,
+            ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
           });
         } else if (c.type === "thinking") {
           // Re-inject reasoning into outgoing context — required by DeepSeek
@@ -175,6 +247,9 @@ function buildPiContext(
           });
         }
       }
+      if (piContent.length === 0) {
+        continue;
+      }
       piMessages.push({
         role: "assistant",
         content: piContent,
@@ -197,33 +272,12 @@ function buildPiContext(
   const piTools: PiTool[] | undefined = tools?.map((t) => ({
     name: t.name,
     description: t.description,
-    parameters: Type.Object(
-      Object.fromEntries(
-        Object.entries((t.inputSchema as Record<string, unknown>).properties ?? {}).map(
-          ([key, schema]) => {
-            const s = schema as Record<string, unknown>;
-            const required = ((t.inputSchema as Record<string, unknown>).required as string[] | undefined)?.includes(key);
-            const typeStr = s.type as string;
-            let tbType;
-            switch (typeStr) {
-              case "number":
-                tbType = Type.Number({ description: s.description as string });
-                break;
-              case "boolean":
-                tbType = Type.Boolean({ description: s.description as string });
-                break;
-              case "array":
-                tbType = Type.Array(Type.Any(), { description: s.description as string });
-                break;
-              default:
-                tbType = Type.String({ description: s.description as string });
-                break;
-            }
-            return [key, required ? tbType : Type.Optional(tbType)];
-          },
-        ),
-      ),
-    ),
+    // ToolDefinition already carries provider-ready JSON Schema. Wrapping the
+    // schema keeps nested objects, array items, enums, unions, and required
+    // fields intact while adding the TypeBox marker pi-ai expects. Rebuilding
+    // only the top-level properties would misdeclare object inputs as strings
+    // and array items as Any, teaching the model to emit invalid tool calls.
+    parameters: Type.Unsafe(t.inputSchema),
   }));
 
   return {
@@ -231,6 +285,15 @@ function buildPiContext(
     messages: piMessages,
     tools: piTools,
   };
+}
+
+export function buildPiContextForTest(
+  messages: Message[],
+  systemPrompt?: string,
+  tools?: ToolDefinition[],
+  model?: { api: string; provider: string; id: string },
+): PiContext {
+  return buildPiContext(messages, systemPrompt, tools, model);
 }
 
 /** Map pi-ai StopReason to our StopReason. */
@@ -248,6 +311,56 @@ function mapStopReason(reason: PiAssistantMessage["stopReason"]): StopReason {
     default:
       return "end_turn";
   }
+}
+
+/**
+ * Preserve only the bounded semantic class of a native stop marker. Raw
+ * provider strings are intentionally not propagated into analytics.
+ *
+ * A known native marker takes precedence over pi-ai's normalized reason. If
+ * the provider adds a new marker, fail closed as `unknown` instead of treating
+ * pi-ai's successful `done` envelope as proof that an empty result is safe to
+ * retry or switch across models.
+ */
+function providerTerminationCategory(
+  rawStopReason: unknown,
+  normalizedStopReason: unknown,
+): ProviderTerminationCategory {
+  const raw = typeof rawStopReason === "string"
+    ? rawStopReason.trim().toLowerCase().replace(/[\s-]+/g, "_")
+    : "";
+  if (raw) {
+    const safetyReasons = new Set([
+      "content_filter",
+      "refusal",
+      "sensitive",
+      "safety",
+      "spii",
+      "blocklist",
+      "prohibited_content",
+      "recitation",
+      "image_safety",
+      "image_prohibited_content",
+      "image_recitation",
+    ]);
+    if (safetyReasons.has(raw)) return "safety";
+    if (["stop", "end", "end_turn", "stop_sequence", "completed", "pause_turn", "tool_use", "tool_calls", "function_call"].includes(raw)) {
+      return "normal";
+    }
+    if (["length", "max_tokens", "model_context_window_exceeded", "incomplete"].includes(raw)) {
+      return "length";
+    }
+    if (["error", "failed", "cancelled", "canceled", "aborted", "network_error"].includes(raw)) {
+      return "error";
+    }
+    return "unknown";
+  }
+
+  const normalized = String(normalizedStopReason || "").trim();
+  if (normalized === "stop" || normalized === "toolUse") return "normal";
+  if (normalized === "length") return "length";
+  if (normalized === "error" || normalized === "aborted") return "error";
+  return "unknown";
 }
 
 /** Convert pi-ai Usage to our Usage. */
@@ -273,6 +386,7 @@ function mapContent(content: PiAssistantMessage["content"]): MessageContent[] {
         id: block.id,
         name: block.name,
         input: block.arguments,
+        ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
       });
     } else if (block.type === "thinking") {
       // Preserve reasoning blocks for round-trip. DeepSeek-style reasoners
@@ -291,20 +405,45 @@ function mapContent(content: PiAssistantMessage["content"]): MessageContent[] {
   return result;
 }
 
+export function mapContentForTest(content: PiAssistantMessage["content"]): MessageContent[] {
+  return mapContent(content);
+}
+
+const REASONING_LEVELS = ["minimal", "low", "medium", "high"] as const;
+type PiReasoningLevel = typeof REASONING_LEVELS[number];
+
+/** Normalize an agent-requested reasoning level to the closest level an
+ * upstream endpoint declares. Exported so provider compatibility can be
+ * verified without making a network request. */
+export function normalizeReasoningForProvider(
+  requested: PiReasoningLevel | undefined,
+  supported?: ReadonlyArray<PiReasoningLevel>,
+): PiReasoningLevel | undefined {
+  if (!requested || !supported?.length || supported.includes(requested)) return requested;
+  const requestedIndex = REASONING_LEVELS.indexOf(requested);
+  return [...supported].sort((a, b) => {
+    const distance = Math.abs(REASONING_LEVELS.indexOf(a) - requestedIndex)
+      - Math.abs(REASONING_LEVELS.indexOf(b) - requestedIndex);
+    return distance || REASONING_LEVELS.indexOf(a) - REASONING_LEVELS.indexOf(b);
+  })[0];
+}
+
 // ─── Provider creation ────────────────────────────────────────────────────
 
 /**
  * Create an LLMProvider backed by pi-ai for the given provider/model.
  *
- * This is the main factory — it uses pi-ai's `getModel()` to resolve the
- * model, then wraps `complete()` and `stream()` behind our LLMProvider interface.
+ * This is the main factory — it resolves built-in models from pi-ai's native
+ * provider catalog, then wraps `complete()` and `stream()` behind our
+ * LLMProvider interface.
  */
 export function createPiProvider(config: {
   provider: string;
   model?: string;
   apiKey?: string;
   baseUrl?: string;
-  /** Pre-built pi-ai Model object. Bypasses `getModel()` lookup — use for
+  headers?: Record<string, string>;
+  /** Pre-built pi-ai Model object. Bypasses native catalog lookup — use for
    *  providers not registered in pi-ai's catalog (e.g. Moonshot's open
    *  platform), where the `Model<"openai-completions">` shape is
    *  hand-constructed by the caller. When set, `config.model` /
@@ -316,17 +455,19 @@ export function createPiProvider(config: {
    *  Forwarded directly to pi-ai's hook of the same name; the upper
    *  layer can use it to inject vendor server-side tools (e.g.
    *  `{type:"web_search_preview"}`) without modifying pi-ai source. */
-  onPayload?: (params: unknown, model: Model<Api>) => unknown | Promise<unknown>;
+  onPayload?: (params: unknown, model: Model<Api>, requestMetadata?: Record<string, unknown>) => unknown | Promise<unknown>;
   /** Default thinking level applied when the caller does not pass
    *  `params.reasoning`. Set this for models whose API requires
    *  `reasoning_effort` to be present whenever `model.reasoning === true` —
-   *  notably DeepSeek V4 Pro, which 400s with a misleading
-   *  "reasoning_content in the thinking mode must be passed back" error if
-   *  the request lacks `reasoning_effort` while the assistant history
-   *  carries `reasoning_content`. The caller can still pass
-   *  `params.reasoning: 'off'` to bypass this default for a specific call
-   *  (e.g. cost-sensitive utility calls). */
+   *  provider integrations may use this when their protocol requires an
+   *  explicit effort. The caller can still pass `params.reasoning: 'off'`
+   *  to bypass the configured default for a specific call. */
   defaultReasoning?: "minimal" | "low" | "medium" | "high";
+  /** Reasoning levels accepted by the upstream endpoint. Some OpenAI-
+   *  compatible gateways expose a narrower enum than pi-ai (for example the
+   *  managed Orkas route does not accept `minimal`). Requested levels are
+   *  clamped to the nearest supported level before the request is sent. */
+  supportedReasoning?: ReadonlyArray<"minimal" | "low" | "medium" | "high">;
 }): LLMProvider {
   const providerId = config.provider as KnownProvider;
 
@@ -335,7 +476,7 @@ export function createPiProvider(config: {
   let resolvedModel: Model<Api> | undefined = config.customModel;
   if (!resolvedModel && config.model) {
     try {
-      resolvedModel = getModel(providerId as any, config.model as any);
+      resolvedModel = getBuiltinModel(providerId as any, config.model as any);
     } catch {
       // Model not found in pi-ai catalog — will be resolved later per-request
     }
@@ -354,8 +495,10 @@ export function createPiProvider(config: {
     paramReasoning: CompletionParams["reasoning"],
   ): "minimal" | "low" | "medium" | "high" | undefined => {
     if (paramReasoning === "off") return undefined;
-    if (paramReasoning) return paramReasoning;
-    return config.defaultReasoning;
+    return normalizeReasoningForProvider(
+      paramReasoning || config.defaultReasoning,
+      config.supportedReasoning,
+    );
   };
 
   const provider: LLMProvider = {
@@ -367,6 +510,9 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
+      const onPayload = config.onPayload
+        ? ((payload: unknown, hookModel: Model<Api>) => config.onPayload!(payload, hookModel, params.requestMetadata))
+        : undefined;
 
       log.debug(`complete ${providerId}/${model.id}`);
 
@@ -383,7 +529,7 @@ export function createPiProvider(config: {
             reasoning,
             cacheRetention: params.cacheRetention,
             sessionId,
-            ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
+            ...(onPayload ? { onPayload: onPayload as any } : {}),
           });
         } else {
           result = await piComplete(model, context, {
@@ -394,7 +540,7 @@ export function createPiProvider(config: {
             temperature: params.temperature,
             cacheRetention: params.cacheRetention,
             sessionId,
-            ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
+            ...(onPayload ? { onPayload: onPayload as any } : {}),
           });
         }
 
@@ -409,7 +555,7 @@ export function createPiProvider(config: {
           content: mapContent(result.content),
           stopReason: mapStopReason(result.stopReason),
           usage: mapUsage(result.usage),
-          model: result.model || model.id,
+          model: resolvedResponseModel(result, model.id),
         };
       } catch (err) {
         throw wrapError(err, providerId);
@@ -421,6 +567,9 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
+      const onPayload = config.onPayload
+        ? ((payload: unknown, hookModel: Model<Api>) => config.onPayload!(payload, hookModel, params.requestMetadata))
+        : undefined;
 
       log.debug(`stream ${providerId}/${model.id}`);
 
@@ -435,7 +584,7 @@ export function createPiProvider(config: {
               reasoning,
               cacheRetention: params.cacheRetention,
               sessionId,
-              ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
+              ...(onPayload ? { onPayload: onPayload as any } : {}),
             })
           : piStream(model, context, {
               apiKey: config.apiKey,
@@ -445,7 +594,7 @@ export function createPiProvider(config: {
               temperature: params.temperature,
               cacheRetention: params.cacheRetention,
               sessionId,
-              ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
+              ...(onPayload ? { onPayload: onPayload as any } : {}),
             });
 
         for await (const event of eventStream) {
@@ -474,15 +623,25 @@ export function createPiProvider(config: {
               yield { type: "tool_use_end", id: event.toolCall.id };
               break;
             case "done":
+              const serverFallbackReason = serverFallbackReasonFromResponseId(event.message.responseId);
               yield {
                 type: "message_end",
                 stopReason: mapStopReason(event.reason),
                 usage: mapUsage(event.message.usage),
                 content: mapContent(event.message.content),
-                model: event.message.model || model.id,
+                model: resolvedResponseModel(event.message, model.id),
+                ...(serverFallbackReason ? { serverFallbackReason } : {}),
+                providerTermination: {
+                  category: providerTerminationCategory(
+                    event.message.rawStopReason,
+                    event.reason,
+                  ),
+                },
               };
               break;
             case "error":
+              const errorServerFallbackReason = serverFallbackReasonFromResponseId(event.error.responseId);
+              const responseModel = resolvedResponseModel(event.error, model.id);
               // Surface everything we can from the stream error event.
               // pi-ai's fetch layer swallows the original Error(cause chain)
               // and only keeps `.message` on `errorMessage`; any extra field
@@ -502,10 +661,12 @@ export function createPiProvider(config: {
               } catch (_) { /* best-effort */ }
               yield {
                 type: "error",
-                error: new ProviderError(
+                error: wrapError(new ProviderError(
                   event.error.errorMessage ?? "Stream error",
                   providerId,
-                ),
+                ), providerId),
+                ...(responseModel ? { model: responseModel } : {}),
+                ...(errorServerFallbackReason ? { serverFallbackReason: errorServerFallbackReason } : {}),
               };
               break;
           }
@@ -535,6 +696,10 @@ export function createPiProvider(config: {
   return provider;
 }
 
+export const resolvedResponseModelForTest = resolvedResponseModel;
+export const providerTerminationCategoryForTest = providerTerminationCategory;
+export const serverFallbackReasonFromResponseIdForTest = serverFallbackReasonFromResponseId;
+
 /** Resolve a pi-ai Model for the given provider + model ID. */
 function resolveModel(
   providerId: string,
@@ -552,7 +717,7 @@ function resolveModel(
   // so the next branches (cached / first-of-provider / throw) can run.
   if (modelId) {
     try {
-      const m = getModel(providerId as any, modelId as any);
+      const m = getBuiltinModel(providerId as any, modelId as any);
       if (m) return baseUrl ? { ...m, baseUrl } : m;
     } catch {
       // Fall through
@@ -564,8 +729,13 @@ function resolveModel(
     return baseUrl ? { ...cached, baseUrl } : cached;
   }
 
-  // Pick first available model for this provider
-  const models = getModels(providerId as any);
+  if (modelId) {
+    throw new ProviderError(`No model found for provider: ${providerId}, model: ${modelId}`, providerId);
+  }
+
+  // Pick first available model for provider-only callers, such as auth
+  // validation paths that intentionally do not pin a specific model.
+  const models = getBuiltinModels(providerId as any);
   if (models.length > 0) {
     return baseUrl ? { ...models[0], baseUrl } : models[0];
   }
@@ -583,12 +753,18 @@ function resolveModel(
  * status signal would be dropped and classification would be forced to
  * fall back on fragile message-pattern matching alone. */
 function wrapError(err: unknown, providerId: string): Error {
+  if (err instanceof StorageFullError) return err;
+
+  const original = err instanceof Error ? err : undefined;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (isStorageFullError(err)) {
+    return new StorageFullError(msg, original);
+  }
+
   if (err instanceof AuthError || err instanceof RateLimitError || err instanceof ContextOverflowError || err instanceof ProviderError) {
     return err;
   }
 
-  const original = err instanceof Error ? err : undefined;
-  const msg = err instanceof Error ? err.message : String(err);
   const msgLower = msg.toLowerCase();
 
   if (msgLower.includes("401") || msgLower.includes("403") || msgLower.includes("authentication") || msgLower.includes("unauthorized")) {
@@ -641,13 +817,13 @@ export function createOpenAIProvider(config: {
 
 /** List all providers available via pi-ai. */
 export function listPiProviders(): string[] {
-  return getProviders();
+  return getBuiltinProviders();
 }
 
 /** List all models for a provider. */
 export function listPiModels(provider: string): Array<{ id: string; name: string; contextWindow: number }> {
   try {
-    return getModels(provider as any).map((m) => ({
+    return getBuiltinModels(provider as any).map((m) => ({
       id: m.id,
       name: m.name,
       contextWindow: m.contextWindow,

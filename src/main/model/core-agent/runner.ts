@@ -30,7 +30,11 @@ import {
   getConfiguredModelOAuthExpiredMessage,
   type ChatEntryChoice,
 } from '../../features/auth';
-import { getSystemPromptBlock, getSystemSkillsPromptBlock } from './skill-registry';
+import {
+  getSystemPromptBlock,
+  getSystemSkillsPromptBlock,
+  type SkillRuntimeBinding,
+} from './skill-registry';
 import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
@@ -67,6 +71,7 @@ import { officeCliAvailable } from '../../features/office/office_engine';
 import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
+import { createGenerateSpeechTool } from './generate-speech-tool';
 import { createVideoStudioTool } from './video-studio-tool';
 import { createImageStudioTool } from './image-studio-tool';
 import { isToolVisibleToAgent } from './tool-catalog';
@@ -106,64 +111,14 @@ import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-to
 import { hasAnySearchProfile } from '../../features/search_auth';
 import { createConnectorMetaTools, getConnectorPromptBlock } from './connector-meta-tools';
 import { createLogger } from '../../logger';
+import { createConversationHistorySummaryCache } from '../../features/group_chat/history-summary-cache';
 import { logErrorSummary, maskId } from '../../util/log-redact';
 import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
+import { repairOpenAIToolMessageOrder } from './openai-payload';
 
 const runnerLog = createLogger('runner');
-const CONTENT_WRITER_AGENT_ID = '173d4235a431';
-const CONTENT_WRITER_GATE_BUDGET_CODE = 'E_CONTENT_WRITER_GATE_BUDGET';
-const CONTENT_WRITER_BASH_SCOPE_CODE = 'E_CONTENT_WRITER_BASH_SCOPE';
-
-function contentWriterRunnerKind(command: string): 'research_gate' | 'audit_content' | null {
-  const trimmed = command.trim();
-  if (
-    !trimmed
-    || /(?:&&|\|\||[;|`]|\r|\n)/.test(trimmed)
-  ) {
-    return null;
-  }
-  const match = trimmed.match(
-    /^["']?\$ORKAS_NODE["']?\s+["']?\$ORKAS_PC_DIR[/\\]bin[/\\]run-skill\.cjs["']?\s+content-writer\s+(research_gate|audit_content)(?:\s|$)/i,
-  );
-  return match?.[1]?.toLowerCase() as 'research_gate' | 'audit_content' | undefined ?? null;
-}
-
-export function _createContentWriterBashGuard(bashTool: AgentTool): AgentTool {
-  let researchGateRuns = 0;
-  return {
-    ...bashTool,
-    description:
-      'ContentWriter deterministic runner only. Use exactly one documented '
-      + '`"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" content-writer '
-      + 'research_gate|audit_content ...` command. Arbitrary shell, retrieval, '
-      + 'parsing, inspection, and command chaining are unavailable.',
-    async execute(input, context) {
-      const command = String((input as any)?.command || (input as any)?.cmd || '');
-      const runnerKind = contentWriterRunnerKind(command);
-      if (!runnerKind) {
-        return {
-          content:
-            `${CONTENT_WRITER_BASH_SCOPE_CODE}: ContentWriter bash is limited to the documented `
-            + 'research_gate and audit_content Skill Runner commands. Do not retry or use shell '
-            + 'for retrieval, parsing, inspection, or recovery; continue with the available '
-            + 'evidence and deliver the visible result now.',
-          isError: false,
-        };
-      }
-      if (runnerKind === 'research_gate' && researchGateRuns >= 2) {
-        return {
-          content:
-            `${CONTENT_WRITER_GATE_BUDGET_CODE}: the two allowed ContentWriter research gates have already run. `
-            + 'Use the last gate result and deliver explicit gaps/HOLD when incomplete.',
-          isError: true,
-        };
-      }
-      if (runnerKind === 'research_gate') researchGateRuns += 1;
-      return bashTool.execute(input, context);
-    },
-  };
-}
+const legacySkillEnabledRepairAttempted = new Set<string>();
 
 function isNativeSearchEnabled(): boolean {
   return true;
@@ -255,9 +210,14 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
+  conversationTitle?: string;
+  conversationTitleUpdatedAt?: number;
   /** Stable id for the current visible actor/model turn. Used by delete_file
    *  confirmation UI so batching never crosses prior conversation turns. */
   turnId?: string;
+  /** Stable inbound message id used as the exclusive upper bound for
+   * current-conversation history tools. */
+  historyBoundaryMessageId?: string;
   /** Current real user text, used by tools that must bind an approval action
    * to explicit user intent rather than merely to the existence of a turn. */
   userMessage?: string;
@@ -274,8 +234,11 @@ export interface BuildRunnerParams {
   /** Human-readable actor name used in user-facing local permission prompts. */
   agentName?: string;
   /** Max tool-call rounds per turn before force-end. Undefined → core-agent
-   *  default (50). Group chat raises it for the commander's long builds. */
+   *  default (100). Group chat raises it for the commander's long builds. */
   maxToolLoops?: number;
+  /** Optional one-time soft convergence threshold. Undefined preserves the
+   *  core-agent default; this does not change the hard tool-loop limit. */
+  elapsedConvergenceMs?: number;
   /** Provider stream deadline before its first usable text/tool event. This
    * boundary is safe for fallback because no visible output has committed. */
   providerFirstEventTimeoutMs?: number;
@@ -314,6 +277,12 @@ export interface BuildRunnerParams {
    *  are never passed to localTools, so `delete_file` and other local-exec
    *  tools cannot act on them. Used for user-approved read-only folder grants. */
   fileReadOnlyExtraRoots?: readonly string[];
+  /** Mutable run-scoped roots admitted after runner construction by rich
+   * interrupt-steer. Read tools observe additions; local mutation tools use
+   * the same identity as a deny-only scope. */
+  runtimeReadOnlyRoots?: string[];
+  /** Expose the stable tool superset needed by rich active-turn messages. */
+  richSteerEnabled?: boolean;
   /** Fires with the absolute path after each successful `write_file` /
    * `markdown_to_pdf` / `html_to_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
@@ -346,6 +315,9 @@ export interface BuildRunnerParams {
    *  not the rotating-provider's primary label. Fires at most once per
    *  call; not invoked when rotation rolls past a candidate. */
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
+  /** Reports configured/currently available rotating-provider candidates even
+   * when the call succeeds on the first candidate. */
+  onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void;
 }
 
 export interface NativeSearchInjectedInfo {
@@ -432,6 +404,17 @@ function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeIn
   };
 }
 
+function splitLanguageDirectiveBlock(prompt: string): { stable: string; languageDirectiveBlock: string } {
+  const marker = '\n\n---\n\n## User language';
+  const idx = prompt.lastIndexOf(marker);
+  if (idx < 0) return { stable: prompt, languageDirectiveBlock: '' };
+  const blockStart = idx + '\n\n---\n\n'.length;
+  return {
+    stable: prompt.slice(0, idx).trim(),
+    languageDirectiveBlock: prompt.slice(blockStart).trim(),
+  };
+}
+
 /**
  * Peel the commander's `## Orchestration state` section out of the cached
  * prefix. Its body renders the per-turn `orchestration_ledger` JSON (status,
@@ -512,6 +495,29 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // fall through to the active-user singleton. Wrapped in a try/catch so ad-hoc
   // test paths that activate no user just see a null uid → empty disabled set.
   const earlyUid = params.userId || _safeActiveUserId();
+  if (
+    earlyUid
+    && earlyUid === _safeActiveUserId()
+    && !legacySkillEnabledRepairAttempted.has(earlyUid)
+  ) {
+    legacySkillEnabledRepairAttempted.add(earlyUid);
+    try {
+      // Lazy require avoids the skills -> model/client -> runner import cycle.
+      // The repair must precede the disabled-id snapshot so the current turn
+      // sees canonical marketplace ids immediately after an upgrade.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+      const skills = require('../../features/skills') as {
+        repairLegacySkillEnabledIdsForActiveUser?: () => Promise<number>;
+      };
+      await skills.repairLegacySkillEnabledIdsForActiveUser?.();
+    } catch (err) {
+      legacySkillEnabledRepairAttempted.delete(earlyUid);
+      log.warn('legacy skill enabled-state repair failed', {
+        user_id: maskId(earlyUid),
+        error: logErrorSummary(err),
+      });
+    }
+  }
   const disabledSkillIds = earlyUid ? readDisabledSets(earlyUid).skills : new Set<string>();
 
   // System A render allowlist = intersect(skillList, project bindings).
@@ -523,13 +529,20 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
   const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
   const skillDisplayNameById = new Map<string, string>();
+  // Host-only logical paths for this runner. The registry fills this from the
+  // exact filtered prompt render; every provider/tool round then reuses the
+  // same snapshot without rescanning Skill directories or persisting paths in
+  // conversation history.
+  const skillRuntimeBindings = new Map<string, SkillRuntimeBinding>();
   const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
   const openSkillSourcesVisible = openSkillSourcesExposureFromSessionId(params.sessionId);
-  const [mod, session, systemSkillsBlock, skillsBlock] = await Promise.all([
-    ca(),
-    earlyUid ? getSessionForUser(earlyUid, params.sessionId) : getSession(params.sessionId),
-    systemSkillsVisible ? getSystemSkillsPromptBlock(earlyUid || undefined) : Promise.resolve(''),
-    getSystemPromptBlock({
+  const skillBlocksPromise = (async (): Promise<[string, string]> => {
+    // Register system skills first so cross-tier same-name collisions resolve
+    // deterministically; the regular entry falls back to its id read ref.
+    const systemBlock = systemSkillsVisible
+      ? await getSystemSkillsPromptBlock(earlyUid || undefined, skillRuntimeBindings)
+      : '';
+    const regularBlock = await getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
       // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's
@@ -538,9 +551,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ...(params.agentId ? { agentId: params.agentId } : {}),
       ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
       displayNameById: skillDisplayNameById,
+      runtimeBindings: skillRuntimeBindings,
       ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
       ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
-    }),
+    });
+    return [systemBlock, regularBlock];
+  })();
+  const [mod, session, [systemSkillsBlock, skillsBlock]] = await Promise.all([
+    ca(),
+    earlyUid ? getSessionForUser(earlyUid, params.sessionId) : getSession(params.sessionId),
+    skillBlocksPromise,
   ]);
 
   const providerId = primary?.provider || 'anthropic';
@@ -576,7 +596,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // the `project_instructions` tool) and project memory. Dispatched sub-agents
   // (gmember / gworker / cli) get read-only access to both. Derived from the
   // immutable session id, so it can't drift mid-session.
-  const isCommander = sessionKindOf(params.sessionId) === 'gconv';
+  const sessionKind = sessionKindOf(params.sessionId);
+  const isCommander = sessionKind === 'gconv';
+  const isGroupAgent = sessionKind === 'gmember';
+  const sharedHistorySummaryCache = (
+    uid
+    && params.cid
+    && params.conversationHistory
+    && (isCommander || isGroupAgent)
+  ) ? createConversationHistorySummaryCache({
+      uid,
+      cid: params.cid,
+      source: params.conversationHistory.source,
+    }) : null;
   const agentDisplayNameById = new Map<string, string>();
   if (uid) {
     try {
@@ -668,7 +700,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           created_by: 'agent',
           ...(cid ? { origin_cid: cid } : {}),
         });
-        return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
+        return r.ok
+          ? { ok: true, task: toView(r.task), alreadyExists: r.alreadyExists }
+          : { ok: false, error: (r as { error: string }).error };
       },
       update: async (taskId: string, patch: { title?: string; detail?: string; status?: projectTasks.TaskStatus; owner?: string; result_ref?: string }) => {
         const r = await projectTasks.updateTask(uid, pid, taskId, {
@@ -738,6 +772,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // builtins in the list so `AgentRunner`'s last-write-wins tool map
   // overrides `bash` and `write_file` with the permission-gated versions.
   const systemSkillReadRoots = uid ? [userSystemSkillsDir(uid)] : [];
+  const runtimeSkillReadRoots = Array.from(new Set(
+    Array.from(skillRuntimeBindings.values(), (binding) => path.resolve(binding.root)),
+  ));
   const agentPrivateSkillReadRoots = uid && agentId
     ? [
       userMarketplaceAgentSkillsDir(uid, agentId),
@@ -750,16 +787,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(params.readOnlyExtraRoots || []),
     ...systemSkillReadRoots,
     ...agentPrivateSkillReadRoots,
+    ...runtimeSkillReadRoots,
   ];
   const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
   const visionFallbackAvailable = inputImageLimitForChoice(mod, primary) > 0;
-  const includeOcrFile = !!uid && shouldExposeOcrFileTool({
-    agentId,
-    userMessage: params.userMessage,
-    attachmentTypes: params.attachmentMetadata?.attachmentTypes,
-    conversationAttachmentNames: conversationAttachmentNames(uid, params.cid, params.projectId),
-    visionAvailable: visionFallbackAvailable,
-  });
+  const includeOcrFile = !!uid && (
+    params.richSteerEnabled === true
+    || shouldExposeOcrFileTool({
+      userMessage: params.userMessage,
+      attachmentTypes: params.attachmentMetadata?.attachmentTypes,
+      conversationAttachmentNames: conversationAttachmentNames(uid, params.cid, params.projectId),
+      visionAvailable: visionFallbackAvailable,
+    })
+  );
   const localReadOnlyDenyRoots = [
     ...fileReadOnlyExtraRoots,
     ...(toolResultsDir ? [toolResultsDir] : []),
@@ -796,6 +836,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         includeOcrFile,
         visionFallbackAvailable,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
         ...(agentId ? { agentId } : {}),
         ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
@@ -803,6 +845,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(fileReadOnlyExtraRoots.length || toolResultsDir
           ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, ...(toolResultsDir ? [toolResultsDir] : [])] }
           : {}),
+        ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+        ...(skillRuntimeBindings.size ? { skillRuntimeBindings } : {}),
         ...(toolResultsDir ? { toolResultsRoot: toolResultsDir } : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
@@ -823,15 +867,21 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(params.projectId ? { projectId: params.projectId } : {}),
   }) : [];
 
-  // Conversation-history tools (chat_search + chat_read). Commander-only:
-  // agent workers receive the material they need through their visibility
-  // slice / dispatcher payload and must never browse full conversation logs.
-  // Project commanders search their own project by default; Library remains
-  // authoritative for durable document facts.
-  const chatHistoryTools = uid && isCommander ? createChatHistoryTools({
+  // Conversation-history tools (chat_search + chat_read). Group Agents get
+  // only a host-bound current-conversation scope; they never receive automatic
+  // canonical-history replay and cannot browse sibling conversations.
+  // Commander additionally retains all scope, plus project only when this
+  // conversation is actually bound to a project.
+  const chatHistoryTools = uid && (isCommander || isGroupAgent) ? createChatHistoryTools({
     userId: uid,
     ...(params.cid ? { currentCid: params.cid } : {}),
+    ...(params.historyBoundaryMessageId
+      ? { currentMessageId: params.historyBoundaryMessageId }
+      : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
+    allowedScopes: isCommander
+      ? (params.projectId ? ['current', 'project', 'all'] : ['current', 'all'])
+      : ['current'],
   }) : [];
 
   // Media generation. Shares the localExec access mode with
@@ -842,6 +892,22 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? [createImageGenTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })]
+    : [];
+  const speechGenTools: AgentTool[] = uid
+    ? [createGenerateSpeechTool({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.conversationTitle ? { conversationTitle: params.conversationTitle } : {}),
+        ...(params.conversationTitleUpdatedAt ? { conversationTitleUpdatedAt: params.conversationTitleUpdatedAt } : {}),
         ...(params.turnId ? { turnId: params.turnId } : {}),
         ...(agentId ? { agentId } : {}),
         ...(agentName ? { agentName } : {}),
@@ -870,6 +936,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? [createImageStudioTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.turnId ? { turnId: params.turnId } : {}),
         ...(agentId ? { agentId } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
@@ -913,7 +980,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // built-in Brave/Bing scraper. See `model/core-agent/search-tools.ts`.
   // Async because the factory pulls `defineTool` / `runBuiltinWebSearch`
   // off the ESM core-agent dynamic import.
-  const searchOverrideTools: AgentTool[] = [await createWebSearchOverrideTool()];
+  const searchOverrideTools: AgentTool[] = [await createWebSearchOverrideTool({
+    conversationId: params.cid || '',
+    conversationTitle: params.conversationTitle || '',
+    conversationTitleUpdatedAt: params.conversationTitleUpdatedAt || 0,
+    turnId: params.turnId || '',
+    agentId,
+    agentName,
+  })];
 
   // Connector meta-tools + system-prompt block (MCP-based, umbrella pattern). When ≥1
   // connector is visible to this actor we inject the two meta-tools (`list_connector_tools` /
@@ -953,19 +1027,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         {
           userId: uid,
           ...(params.cid ? { cid: params.cid } : {}),
+          ...(params.richSteerEnabled ? { allowRuntimeRefresh: true } : {}),
         },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
     : [];
 
   const builtinTools = mod.getBuiltinTools();
-  const contentWriterTurnGuards: AgentTool[] = [];
-  if (agentId === CONTENT_WRITER_AGENT_ID) {
-    const bashTool = localTools.find((tool) => tool.name === 'bash');
-    if (bashTool) {
-      contentWriterTurnGuards.push(_createContentWriterBashGuard(bashTool));
-    }
-  }
 
   // Merge injected tools with extra tools from caller
   const allTools = [
@@ -975,6 +1043,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...kbTools,
     ...chatHistoryTools,
     ...imageGenTools,
+    ...speechGenTools,
     ...videoStudioTools,
     ...imageStudioTools,
     ...officeTools,
@@ -983,7 +1052,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...toolResultTools,
     ...(params.extraTools || []),
     ...connectorMetaTools,
-    ...contentWriterTurnGuards,
   ];
 
   // Authoritative owner-scoped visibility gate: drop any tool whose catalog
@@ -1055,7 +1123,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // Finalize system prompt. Cache-friendly order:
   //   [base prompt] → [connectors] → [system skills] → [skills]
-  //   → [agents] → [runtime injection] → [memory] → [orchestration state]
+  //   → [agents] → [runtime injection] → [memory]
+  //   → [response language] → [orchestration state]
   //   → [volatile datetime tail].
   // Everything from [runtime injection] onward is the turn-volatile region;
   // the stable prefix above it is what the provider prompt-cache reuses.
@@ -1064,7 +1133,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const parts: string[] = [];
   const { stable: stableSystemPrompt, volatileTail } = splitVolatilePromptTail(params.systemPrompt);
   const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
-  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutAgents);
+  const { stable: stableWithoutLanguage, languageDirectiveBlock } = splitLanguageDirectiveBlock(stableWithoutAgents);
+  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutLanguage);
   // Orchestration state carries the per-turn `orchestration_ledger` JSON; it
   // must leave the cached prefix or it invalidates the whole prefix after it
   // every commander turn a ledger is live. Peel it here and re-emit it in the
@@ -1108,6 +1178,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     && metacognition.isFeatureEnabledForUser(uid)
   ) ? metacognition.formatForSystemPromptForUser(uid, agentId) : '';
   if (metacognitionBlock) parts.push(metacognitionBlock);
+  // Keep the selected response language as the final system instruction.
+  // Agent workflows, skills, and memory may legitimately be authored in
+  // English, but their source language must not become the reply language.
+  if (languageDirectiveBlock) parts.push(languageDirectiveBlock);
   const resolvedSystemPrompt = parts.join('\n\n');
   // P2: the truly per-turn-volatile blocks — the orchestration ledger (~7-9K
   // JSON that changes every commander turn) and the datetime tail — do NOT go
@@ -1202,6 +1276,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       group,
       params.onNativeSearchInjected,
       params.onCandidateChosen,
+      params.onCandidatesObserved,
       params.providerFirstEventTimeoutMs,
     );
     // Inject the rotating provider into BOTH the factory slot AND the
@@ -1241,15 +1316,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     config,
     providers,
     session,
+    ...(params.elapsedConvergenceMs != null
+      ? { elapsedConvergenceMs: params.elapsedConvergenceMs }
+      : {}),
+    ...(isCommander ? { requirePlanForRepeatedMutations: true } : {}),
     ...(visibleTools.length ? { tools: visibleTools } : {}),
     ...(transformToolResult ? { transformToolResult } : {}),
     ...(toolResultsDir ? { toolContextState: { toolResultSpoolDir: toolResultsDir } } : {}),
-    ...(agentId === CONTENT_WRITER_AGENT_ID
-      ? { disabledToolNames: ['manage_execution_plan'] }
-      : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
     ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
+    ...(sharedHistorySummaryCache ? { sharedHistorySummaryCache } : {}),
   });
 
   return {
@@ -1368,6 +1445,7 @@ async function buildRotatingProvider(
   group: ChatEntryChoice[],
   onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
   onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
+  onCandidatesObserved?: (info: { candidateCount: number; availableCandidateCount: number }) => void,
   firstEventTimeoutMs?: number,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
@@ -1384,6 +1462,7 @@ async function buildRotatingProvider(
     const maxInputImages = modelInputImageLimit(candProviderId, candModelId, candidateModel);
     return {
       profileId: choice.profileId,
+      cooldownId: choice.profileId,
       providerId: candProviderId,
       modelId: candModelId,
       maxInputImages,
@@ -1417,12 +1496,17 @@ async function buildRotatingProvider(
   return createRotatingProvider({
     providerId,
     candidates,
-    onSuccess: (profileId) => {
-      const winner = group.find((c) => c.profileId === profileId);
+    onSuccess: (profileId, candidate) => {
+      const winner = group.find((choice) => (
+        choice.profileId === profileId
+        && choice.provider === candidate.providerId
+        && choice.model === candidate.modelId
+      ));
       if (winner) bumpEntryLastUsed(winner.entryId);
-      clearCooldown(profileId);
+      clearCooldown(candidate.cooldownId || profileId);
     },
     ...(onCandidateChosen ? { onCandidateChosen } : {}),
+    ...(onCandidatesObserved ? { onCandidatesObserved } : {}),
     ...(Number.isFinite(firstEventTimeoutMs) ? { firstEventTimeoutMs } : {}),
   });
 }
@@ -1455,23 +1539,24 @@ function buildNativeSearchOnPayload(
   onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
 ): (params: unknown, model: { api?: string }) => unknown {
   return (params, model) => {
-    if (!isNativeSearchEnabled()) return params;
+    const repaired = repairOpenAIToolMessageOrder(params);
+    if (!isNativeSearchEnabled()) return repaired;
     // Don't inject the model-side native search when the user has any paid
     // search-tool API key configured — let the overriding `web_search` tool
     // (search-tools.ts) be the single search surface, otherwise the LLM
     // sees two competing tools and may bypass the paid one the user paid for.
-    if (hasAnySearchProfile()) return params;
+    if (hasAnySearchProfile()) return repaired;
     const api = model?.api;
-    if (!api) return params;
+    if (!api) return repaired;
     const tool = nativeSearchToolForApi(api);
-    if (!tool) return params;
+    if (!tool) return repaired;
     const toolName = nativeSearchToolName(tool) || 'native_web_search';
     // Payload shape + size stamped into each injection so post-incident
     // grepping can correlate fetch failures to body size / turn length.
     // Cheap — one JSON.stringify of an already-serialisable object.
-    const cur = params as { tools?: unknown[]; messages?: unknown[]; input?: unknown[] } & Record<string, unknown>;
+    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[] } & Record<string, unknown>;
     let approxBodyBytes = -1;
-    try { approxBodyBytes = JSON.stringify(params).length; } catch { /* circular — give up */ }
+    try { approxBodyBytes = JSON.stringify(repaired).length; } catch { /* circular — give up */ }
     const msgCount = Array.isArray(cur.messages)
       ? cur.messages.length
       : (Array.isArray(cur.input) ? cur.input.length : -1);

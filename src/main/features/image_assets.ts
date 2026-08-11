@@ -17,6 +17,16 @@ export interface ImageAssetProcessResult {
   model_calls: 0;
 }
 
+export interface LosslessModelImageResult {
+  buf: Buffer;
+  mediaType: 'image/png' | 'image/webp';
+  width: number;
+  height: number;
+  sourceBytes: number;
+  encodedBytes: number;
+  transcoded: boolean;
+}
+
 const MAX_DIMENSION = 16_384;
 const MAX_AREA = 100_000_000;
 
@@ -72,6 +82,36 @@ export async function inspectImageAssetBuffer(buffer: Buffer): Promise<{
     height: metadata.height,
     channels: metadata.channels || 0,
     bytes: buffer.length,
+  };
+}
+
+/** Build the smallest lossless model-facing representation of a PNG.
+ *
+ * HTML preview screenshots remain PNG evidence locally. The model copy is
+ * always passed through the lossless encoder, but the original is retained
+ * when lossless WebP would be larger so preprocessing can never inflate the
+ * network payload. Sharp failures are surfaced instead of silently sending an
+ * unprocessed screenshot because this transform is part of the model-input
+ * contract. */
+export async function prepareLosslessModelImage(buffer: Buffer): Promise<LosslessModelImageResult> {
+  const inspected = await inspectImageAssetBuffer(buffer);
+  if (inspected.format !== 'png') {
+    throw new Error('E_IMAGE_ASSET_FORMAT: lossless model preprocessing requires PNG input.');
+  }
+  const sharp = await loadSharp();
+  const webp = await sharp(buffer, { failOn: 'error', limitInputPixels: MAX_AREA })
+    .webp({ lossless: true, effort: 4 })
+    .toBuffer();
+  const useWebp = webp.length < buffer.length;
+  const selected = useWebp ? webp : buffer;
+  return {
+    buf: selected,
+    mediaType: useWebp ? 'image/webp' : 'image/png',
+    width: inspected.width,
+    height: inspected.height,
+    sourceBytes: buffer.length,
+    encodedBytes: selected.length,
+    transcoded: useWebp,
   };
 }
 

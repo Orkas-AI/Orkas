@@ -53,6 +53,7 @@ function _markBootReady() {
   document.documentElement.dataset.orkasBootReady = 'true';
   window.dispatchEvent(new Event('orkas:boot-ready'));
 }
+
 for (const eventName of ['pointerdown', 'keydown', 'wheel', 'touchstart']) {
   window.addEventListener(eventName, _reportBootUserActivity, { capture: true, passive: true });
 }
@@ -102,79 +103,66 @@ async function _bootStage(name, fn) {
 async function bootApp() {
   _bootLog.info('app boot');
   const _bootT0 = performance.now();
-  _sidebarNavWarmUntil = Math.max(_sidebarNavWarmUntil, _bootT0 + _SIDEBAR_NAV_BOOT_WARM_MS);
-  _migrateLegacyLocalStorageKeys();
-  // i18n must be ready before any other UI module renders labels.
-  await _bootStage('initI18n', initI18n);
+  let _bootFailureStage = 'init_i18n';
+  try {
+    _sidebarNavWarmUntil = Math.max(_sidebarNavWarmUntil, _bootT0 + _SIDEBAR_NAV_BOOT_WARM_MS);
+    _migrateLegacyLocalStorageKeys();
+    // i18n must be ready before any other UI module renders labels.
+    await _bootStage('initI18n', initI18n);
 
-  // ── Stage A (parallel, no inter-dependencies) ──────────────────────
-  // All four are independent IPC calls. Three downstream constraints,
-  // all honored by staging:
-  //   - `_stampSettingsVersion` stamps body.is-dev BEFORE Stage B's
-  //     `loadAgents` / later `loadSkills` read `false`.
-  //   - `initAvatarCatalog` must finish BEFORE `loadAgents` so cards
-  //     render with their icon SVGs instead of a fallback frame.
-  //   - `initUser` → `initUserWorkspace` stays sequential (workspace
-  //     paths key off the activated uid).
-  // `refreshModelGuard` is the no-model banner — non-critical, deferred
-  // to Stage C with the other warmup-only work.
-  await _bootStage('stageA', () => Promise.all([
-    _stampSettingsVersion(),
-    (async () => { await initUser(); await initUserWorkspace(); })(),
-    initAvatarCatalog(),
-    loadProjects(),
-  ]));
+    // Stage A contains independent first-paint prerequisites.
+    _bootFailureStage = 'stage_a';
+    await _bootStage('stageA', () => Promise.all([
+      _stampSettingsVersion(),
+      (async () => { await initUser(); await initUserWorkspace(); })(),
+      initAvatarCatalog(),
+      loadProjects(),
+    ]));
 
-  // ── Stage B (parallel, depends on Stage A) ─────────────────────────
-  // Both feed the first chat view: the sidebar list (loadConversations)
-  // and a lightweight @-mention / actor-label cache. The full Agent specs
-  // (workflows, profiles, memory and skill references) load only on the
-  // Agents tab.
-  await _bootStage('stageB', () => Promise.all([
-    loadConversations({ startup: true }),
-    loadAgents(false, { summary: true }),
-  ]));
+    // Stage B loads the sidebar and lightweight actor-label cache.
+    _bootFailureStage = 'stage_b';
+    await _bootStage('stageB', () => Promise.all([
+      loadConversations({ startup: true }),
+      loadAgents(false, { summary: true }),
+    ]));
 
-  // User now sees the last conversation. _ensureCommanderAvatarLoaded is
-  // fire-and-forget but kicked off NOW (not in Stage C) so the first
-  // chat render finds the commander avatar warm; one cheap IPC, worth
-  // it to avoid a default-avatar flash on the first frame.
-  _restoreLastView();
-  if (typeof _consumePendingTaskNotificationConversation === 'function') {
-    _consumePendingTaskNotificationConversation();
-  }
-  _markBootReady();
-  if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
-  // Inline `delete_file` confirm-card subscription is attached here (NOT in
-  // Stage C) so a tool call fired within the first 2.5 s of boot still has
-  // a receiver. The listener is cheap (one IPC subscribe); deferring it
-  // would risk the main-side `delete_file` tool sitting on a 5-minute
-  // timeout because no renderer was listening yet.
-  if (typeof startDeleteFileConfirmSubscription === 'function') {
-    startDeleteFileConfirmSubscription();
-  }
-
-  const _bootTotalMs = Math.round(performance.now() - _bootT0);
-  if (_bootTotalMs > _BOOT_TOTAL_WARN_MS) {
-    _bootLog.warn(`boot total slow: ${_bootTotalMs}ms (threshold ${_BOOT_TOTAL_WARN_MS}ms) — likely a new serial await landed in bootApp; see boot stage timings above`);
-  } else {
-    _bootLog.info(`boot total: ${_bootTotalMs}ms`);
-  }
-  _sidebarNavWarmUntil = Math.max(_sidebarNavWarmUntil, performance.now() + _SIDEBAR_NAV_BOOT_WARM_MS);
-
-  // ── Stage C (deferred ~2.5 s, no impact on first paint) ────────────
-  // These do not block first-frame interactivity:
-  //   - refreshModelGuard: no-model banner can appear a tick later.
-  //   - subscriptions: passive event sinks, not on the critical path.
-  // Skill data deliberately does NOT prefetch here. The Skills tab already
-  // loads it on entry; pulling the full catalog at +2.5 s competes with the
-  // user's first interactions on low-end devices for no chat-path benefit.
-  setTimeout(() => {
-    try { refreshModelGuard(); } catch (_) { /* non-fatal */ }
-    if (typeof startAutoEventsSubscription === 'function') {
-      startAutoEventsSubscription();
+    _bootFailureStage = 'restore_view';
+    _restoreLastView();
+    if (typeof _consumePendingTaskNotificationConversation === 'function') {
+      _consumePendingTaskNotificationConversation();
     }
-  }, 2500);
+    _markBootReady();
+    if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
+    if (typeof startDeleteFileConfirmSubscription === 'function') {
+      startDeleteFileConfirmSubscription();
+    }
+
+    const _bootTotalMs = Math.round(performance.now() - _bootT0);
+    if (_bootTotalMs > _BOOT_TOTAL_WARN_MS) {
+      _bootLog.warn(`boot total slow: ${_bootTotalMs}ms (threshold ${_BOOT_TOTAL_WARN_MS}ms) — likely a new serial await landed in bootApp; see boot stage timings above`);
+    } else {
+      _bootLog.info(`boot total: ${_bootTotalMs}ms`);
+    }
+    _sidebarNavWarmUntil = Math.max(
+      _sidebarNavWarmUntil,
+      performance.now() + _SIDEBAR_NAV_BOOT_WARM_MS,
+    );
+
+    // Deferred warmup does not block the first interactive frame.
+    setTimeout(() => {
+      try { refreshModelGuard(); } catch (_) { /* non-fatal */ }
+      if (typeof startAutoEventsSubscription === 'function') {
+        startAutoEventsSubscription();
+      }
+    }, 2500);
+    return true;
+  } catch (err) {
+    _bootLog.error('app boot failed', {
+      stage: _bootFailureStage,
+      error: (err && err.message) || String(err),
+    });
+    return false;
+  }
 }
 
 async function _stampSettingsVersion() {
@@ -185,11 +173,8 @@ async function _stampSettingsVersion() {
     if (env && env.version) {
       _setRendererVersionLabel(env.version);
     }
-    // Stamp body so renderer modules can branch on dev mode synchronously
-    // via `document.body.classList.contains('is-dev')`. Used by skills /
-    // agents grids to expose builtin ⋯ menu (edit / delete) and the
-    // "promote to builtin" item on custom cards.
-    if (env && env.isDev) document.body.classList.add('is-dev');
+    // The open build has no runtime development mode; source and packaged builds
+    // expose the same renderer capabilities.
   } catch (_) { /* ignore — non-critical */ }
 }
 
@@ -379,6 +364,15 @@ async function initUser() {
 // ─── View routing ───
 
 function setView(view, cid, opts = {}) {
+  // A resource detail opened from another page is only a transient overlay.
+  // Any explicit sidebar/programmatic navigation dismisses it first, so a
+  // later visit to AI Team or Skills always starts from its list.
+  if (typeof _resetAgentsDetailForNavigation === 'function') {
+    _resetAgentsDetailForNavigation();
+  }
+  if (typeof _resetSkillsDetailForNavigation === 'function') {
+    _resetSkillsDetailForNavigation();
+  }
   if (opts.forceEnter || currentView !== view || (view === 'conversation' && currentCid !== cid)) {
     _bootLog.info('view change', { view, cid: cid || undefined });
   }
@@ -422,6 +416,17 @@ function setView(view, cid, opts = {}) {
   }
   if (view === 'conversation' && cid) {
     currentCid = cid;
+    // Opening the task is the read boundary for its completed reply. This also
+    // runs when the already-selected row is clicked again.
+    if (typeof _markConversationRead === 'function') _markConversationRead(cid);
+    // Bind the video review drawer to the conversation being shown, here rather
+    // than inside loadConversationHistory. Only one of the three branches below
+    // loads history: a freshly created conversation takes `skipLoad`, so the
+    // drawer never re-bound and stayed pointed at the previous conversation —
+    // and because notifyTurnEnd drops events whose cid is not the bound one, it
+    // then ignored every update the new conversation produced and never
+    // recovered.
+    try { window.VideoReviewPanel?.probe?.(cid); } catch (_) { /* optional surface */ }
     if (typeof onEnterConversationView === 'function') onEnterConversationView();
     // If this conversation has an in-flight stream and its bubble is still
     // attached to #chat-history (sidebar tab toggle didn't wipe it), skip
@@ -463,7 +468,7 @@ function setView(view, cid, opts = {}) {
       _dispatchNextQueued(cid);
     }
     _updateConvSendUI(cid);
-    setTimeout(() => document.getElementById('chat-input')?.focus(), 50);
+    setTimeout(() => focusChatComposerIfIdle('chat-input'), 50);
   } else if (view === 'new-chat') {
     // Leaving conversation view: hide any queue panel remnants.
     renderMessageQueue(null);

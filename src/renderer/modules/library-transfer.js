@@ -4,6 +4,10 @@
 // across global/project Libraries. Move/Copy is chosen inside this dialog so
 // row menus stay compact. Main owns path validation and copy/move semantics.
 (function initLibraryTransfer(root) {
+  const transferLog = (typeof createLogger === 'function')
+    ? createLogger('library-transfer')
+    : { warn() {} };
+
   function _libraryValue(ref) {
     return ref && ref.scope === 'project' ? `project:${ref.projectId || ''}` : 'global';
   }
@@ -36,8 +40,33 @@
     return state?.loading === false && state?.destinationReady === true;
   }
 
-  function _transferFailureTelemetry(_error) {
-    return { error_type: 'exception' };
+  function _transferFailureTelemetry(error) {
+    const raw = typeof error === 'string'
+      ? error.trim()
+      : String((error && (error.error_code || error.code || error.error || error.message)) || '').trim();
+    const known = new Set([
+      'account_changed',
+      'invalid_batch',
+      'invalid_mode',
+      'invalid_path',
+      'invalid_project',
+      'invalid_request',
+      'invalid_scope',
+      'invalid_target',
+      'not_found',
+      'rollback_failed',
+      'source_delete_failed',
+      'target_exists',
+      'transfer_failed',
+      'unsupported_destination',
+    ]);
+    const errorCode = known.has(raw)
+      ? raw
+      : (/^E_[A-Z0-9_]{1,64}$/.test(raw) && raw !== 'E_UNKNOWN' ? raw : 'transfer_failed');
+    const errorType = /invalid|unsupported/.test(errorCode)
+      ? 'validation'
+      : (/target_exists|account_changed/.test(errorCode) ? 'conflict' : 'operation');
+    return { error_code: errorCode, error_type: errorType };
   }
 
   function _createLatestFolderLoader(loadTree, handlers) {
@@ -262,62 +291,93 @@
         destination_scope: currentRef.scope,
         entry_count: paths.length,
       }, 'click');
+      let result;
       try {
-        const result = await root.orkas.invoke('library.transfer', {
+        result = await root.orkas.invoke('library.transfer', {
           mode,
           source,
           paths,
           destination: { ...currentRef, dir: targetDir },
         });
-        if (!result?.ok) throw new Error(result?.error || 'transfer_failed');
+      } catch (err) {
+        const failure = _transferFailureTelemetry(err);
         _track('library_transfer_result', {
-          result: Number(result.failed || 0) === 0
-            ? 'success'
-            : (Number(result.succeeded || 0) > 0 ? 'partial' : 'failure'),
+          result: 'failure',
           mode,
           source_scope: source.scope,
           destination_scope: currentRef.scope,
           entry_count: paths.length,
-          succeeded_count: Number(result.succeeded || 0),
-          failed_count: Number(result.failed || 0),
+          succeeded_count: 0,
+          failed_count: paths.length,
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
-        if (Number(result.succeeded || 0) === 0) {
-          const firstError = result.results?.find((row) => !row.ok)?.error;
-          showError(_errorLabel(firstError));
-          confirmBtn.disabled = false;
-          return;
-        }
-        close();
-        if (typeof opts?.onComplete === 'function') {
-          await opts.onComplete({ ...result, mode, source, destination: { ...currentRef, dir: targetDir } });
-        }
-        const key = result.failed
-          ? 'contexts.transfer.partial_result'
-          : (mode === 'copy' ? 'contexts.transfer.copy_success' : 'contexts.transfer.move_success');
-        if (typeof uiToast === 'function') {
-          uiToast(t(key, {
-            count: Number(result.succeeded || 0),
-            failed: Number(result.failed || 0),
-          }), { variant: result.failed ? 'warning' : 'success', timeoutMs: result.failed ? 6000 : 3200 });
-        }
-      } catch (err) {
-        _track('library_transfer', {
+        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+        showError(t('contexts.transfer.error_generic'));
+        confirmBtn.disabled = false;
+        return;
+      }
+      if (!result?.ok) {
+        const failure = _transferFailureTelemetry(result);
+        _track('library_transfer_result', {
+          result: 'failure',
           mode,
           source_scope: source.scope,
           destination_scope: currentRef.scope,
-          ..._transferFailureTelemetry(err),
-        }, 'error');
-        showError(t('contexts.transfer.error_generic'));
+          entry_count: paths.length,
+          succeeded_count: 0,
+          failed_count: paths.length,
+          duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
+        });
+        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+        showError(_errorLabel(failure.error_code));
         confirmBtn.disabled = false;
+        return;
+      }
+      const succeededCount = Number(result.succeeded || 0);
+      const failedCount = Number(result.failed || 0);
+      const resultValue = failedCount === 0
+        ? 'success'
+        : (succeededCount > 0 ? 'partial' : 'failure');
+      const firstError = result.results?.find((row) => !row.ok)?.error;
+      const failure = resultValue === 'success' ? {} : _transferFailureTelemetry(firstError || 'transfer_failed');
+      _track('library_transfer_result', {
+        result: resultValue,
+        mode,
+        source_scope: source.scope,
+        destination_scope: currentRef.scope,
+        entry_count: paths.length,
+        succeeded_count: succeededCount,
+        failed_count: failedCount,
+        duration_ms: Math.round(performance.now() - startedAt),
+        ...failure,
+      });
+      if (succeededCount === 0) {
+        transferLog.warn('library transfer failed', { mode, source_scope: source.scope, destination_scope: currentRef.scope, ...failure });
+        showError(_errorLabel(firstError));
+        confirmBtn.disabled = false;
+        return;
+      }
+      close();
+      if (typeof opts?.onComplete === 'function') {
+        try {
+          await opts.onComplete({ ...result, mode, source, destination: { ...currentRef, dir: targetDir } });
+        } catch (err) {
+          transferLog.warn('refresh after library transfer failed', err);
+        }
+      }
+      const key = result.failed
+        ? 'contexts.transfer.partial_result'
+        : (mode === 'copy' ? 'contexts.transfer.copy_success' : 'contexts.transfer.move_success');
+      if (typeof uiToast === 'function') {
+        uiToast(t(key, {
+          count: succeededCount,
+          failed: failedCount,
+        }), { variant: result.failed ? 'warning' : 'success', timeoutMs: result.failed ? 6000 : 3200 });
       }
     });
 
-    _track('library_transfer_open', {
-      source_scope: source.scope,
-      entry_count: paths.length,
-      entry_point: opts?.entryPoint || 'menu',
-    }, 'click');
     await refreshFolders(initialLibrary);
     return { close };
   }

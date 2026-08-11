@@ -10,6 +10,7 @@
  *   docx   — .docx / .docm
  *   spreadsheet  — .xlsx / .xlsm
  *   presentation — .pptx / .pptm
+ *   archive — .zip (opaque path-only input for host-native import tools)
  *   image  — .png / .jpg / .jpeg / .webp / .gif
  *   video  — .mp4 / .webm / .mov / .m4v / .ogv (display-only, not sent to
  *            the model; bytes streamed to the renderer via the
@@ -79,10 +80,11 @@ const PDF_EXT = '.pdf';
 const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
 const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
 const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
+const ARCHIVE_EXTS: ReadonlySet<string> = new Set(['.zip']);
 export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
   ...TEXT_EXTS,
   PDF_EXT, ...DOCX_EXTS, ...SPREADSHEET_EXTS, ...PRESENTATION_EXTS,
-  ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS,
+  ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS, ...ARCHIVE_EXTS,
 ]);
 
 const MAX_BYTES_TEXT  = 5   * 1024 * 1024;
@@ -92,6 +94,10 @@ const MAX_BYTES_IMAGE = 20  * 1024 * 1024;
 const MAX_BYTES_PDF   = 100 * 1024 * 1024;
 const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
 const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
+// Keep the composer boundary aligned with the authoritative native Skill ZIP
+// importer. The importer still re-checks compressed/uncompressed size, entry
+// count, and traversal safety before extraction.
+const MAX_BYTES_ARCHIVE = 8 * 1024 * 1024;
 
 const MAX_FILENAME_LEN = 200;
 const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
@@ -108,6 +114,7 @@ export type AttachmentKind =
   | 'docx'
   | 'spreadsheet'
   | 'presentation'
+  | 'archive'
   | 'image'
   | 'video'
   | 'audio';
@@ -164,6 +171,7 @@ function kindOf(ext: string): AttachmentKind {
   if (DOCX_EXTS.has(e)) return 'docx';
   if (SPREADSHEET_EXTS.has(e)) return 'spreadsheet';
   if (PRESENTATION_EXTS.has(e)) return 'presentation';
+  if (ARCHIVE_EXTS.has(e)) return 'archive';
   if (IMAGE_EXTS.has(e)) return 'image';
   if (VIDEO_EXTS.has(e)) return 'video';
   if (AUDIO_EXTS.has(e)) return 'audio';
@@ -178,6 +186,7 @@ function maxBytesFor(ext: string): number {
   if (IMAGE_EXTS.has(e)) return MAX_BYTES_IMAGE;
   if (VIDEO_EXTS.has(e)) return MAX_BYTES_VIDEO;
   if (AUDIO_EXTS.has(e)) return MAX_BYTES_AUDIO;
+  if (ARCHIVE_EXTS.has(e)) return MAX_BYTES_ARCHIVE;
   return MAX_BYTES_TEXT;
 }
 
@@ -896,6 +905,7 @@ export function adoptDraftAttachments(
   try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
   catch { /* ignore */ }
   let movedNames: Array<{ source: string; target: string }> = [];
+  const movedPaths: Array<{ from: string; target: string }> = [];
 
   try {
     if (!fs.existsSync(dst)) {
@@ -907,6 +917,7 @@ export function adoptDraftAttachments(
         const from = path.join(src, name);
         const target = uniqueTarget(dst, name);
         _moveFileBestEffort(from, target);
+        movedPaths.push({ from, target });
         if (!name.startsWith('.')) {
           movedNames.push({ source: name, target: path.basename(target) });
         }
@@ -914,6 +925,19 @@ export function adoptDraftAttachments(
       try { fs.rmdirSync(src); } catch { /* best-effort */ }
     }
   } catch (err) {
+    // The freshly-created conversation must never receive only part of the
+    // user's draft. Restore every entry already moved so the renderer can keep
+    // the original chips and let the user retry the whole send.
+    for (const item of movedPaths.reverse()) {
+      try {
+        fs.mkdirSync(path.dirname(item.from), { recursive: true });
+        _moveFileBestEffort(item.target, item.from);
+      } catch (rollbackErr) {
+        log.warn(
+          `adopt rollback failed user=${userId} ${dstSafe} → ${srcSafe}: ${(rollbackErr as Error).message}`,
+        );
+      }
+    }
     return { ok: false, error: (err as Error).message };
   }
 
@@ -1010,6 +1034,8 @@ export interface BuildConversationAttachmentIndexOpts {
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
  *   - video/audio     → listed by path for media tools, without inline bytes.
+ *   - archive         → listed by path only for a task-specific host tool;
+ *                       archive bytes are never parsed into model context.
  */
 export async function buildAttachmentManifest(
   userId: string,
@@ -1084,6 +1110,11 @@ export async function buildAttachmentManifest(
       continue;
     }
 
+    if (kind === 'archive') {
+      entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="archive" model_readable="false"/>`);
+      continue;
+    }
+
     // text / pdf / modern Office → manifest entry (path + kind + total_chars if known).
     let totalChars: number | undefined;
     if (kind === 'text') {
@@ -1111,16 +1142,22 @@ export async function buildAttachmentManifest(
     entries.push(`<file ${attrs.join(' ')}/>`);
   }
 
-  const hasMedia = entries.some((e) => e.includes('model_readable="false"'));
+  const hasMedia = entries.some((e) => (
+    e.includes('kind="video"') || e.includes('kind="audio"')
+  ));
   const mediaNote = hasMedia
     ? '\n<!-- video/audio are not vision input; read their content with media tools (probe / transcribe / extract frames) via the path — do not treat them as unreadable -->'
+    : '';
+  const hasArchives = entries.some((e) => e.includes('kind="archive"'));
+  const archiveNote = hasArchives
+    ? '\n<!-- ZIP archives are opaque inputs. Do not call read_file on them; use a task-specific host import tool with the exact path when the user requested that import. -->'
     : '';
   const hasImages = entries.some((e) => e.includes('kind="image"'));
   const imageNote = hasImages
     ? '\n<!-- image delivery is bounded by the active model. image_order maps prepared vision blocks in source order. If an image is deferred or is not actually visible in this request, call read_file(path=...) for that image, one at a time; listing a path alone is not visual processing. -->'
     : '';
   const manifest = entries.length
-    ? `<attachments>${mediaNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
+    ? `<attachments>${mediaNote}${archiveNote}${imageNote}\n${entries.join('\n')}\n</attachments>`
     : '';
   return { manifest, images, skipped, metadata: metadata() };
 }
@@ -1189,7 +1226,7 @@ export async function buildConversationAttachmentIndex(
     }
 
     if (kind === 'image') attrs.push('inline="false"');
-    if (kind === 'video' || kind === 'audio') attrs.push('model_readable="false"');
+    if (kind === 'video' || kind === 'audio' || kind === 'archive') attrs.push('model_readable="false"');
     entries.push(`<file ${attrs.join(' ')}/>`);
   }
 
@@ -1199,7 +1236,7 @@ export async function buildConversationAttachmentIndex(
     : '';
   return (
     `<conversation-attachments cid="${escapeAttr(safeConvId)}">\n` +
-    '<!-- Files uploaded earlier in this conversation. Use read_file/stat_file with path for content; images/videos are not inline. -->\n' +
+    '<!-- Files uploaded earlier in this conversation. Use read_file/stat_file for readable files and task-specific host tools for opaque archives; images/videos/archives are not inline. -->\n' +
     entries.join('\n') +
     omitted +
     '\n</conversation-attachments>'

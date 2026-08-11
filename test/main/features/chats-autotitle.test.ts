@@ -2,10 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { autoTitle } from '../../../src/main/features/chats';
 
 // Heuristic autoTitle ladder: trim → filler strip (zh+en, longest-first, loop
-// ≤ 5) → first-clause split with ≥ 4 char floor → 30 char truncate → fallback
-// to original input → fallback to default-title key. Per CLAUDE.md §9 LLM-
-// output text munging rule: pin set A (must produce a clean title) AND
-// set B (must NOT over-strip / must NOT crash).
+// ≤ 5) → 25 char truncate → fallback to original input → fallback to
+// default-title key. Per CLAUDE.md text-munging rule: pin set A (must produce
+// a clean title) AND set B (must NOT over-strip / must NOT crash).
 
 describe('autoTitle — set A (produces clean title)', () => {
   it('strips Chinese filler "看下" prefix', () => {
@@ -25,26 +24,27 @@ describe('autoTitle — set A (produces clean title)', () => {
   });
 
   it('strips English filler "Can you " case-insensitively', () => {
-    expect(autoTitle('Can you help me debug this?')).toBe('debug this');
+    expect(autoTitle('Can you help me debug this?')).toBe('debug this?');
   });
 
   it('strips stacked English fillers ("Could you please ...")', () => {
     expect(autoTitle('Could you please review my PR')).toBe('review my PR');
   });
 
-  it('cuts at first clause when ≥ 4 chars', () => {
-    expect(autoTitle('本地修改，顺便看下提交')).toBe('本地修改');
+  it('preserves punctuation and the clauses after it', () => {
+    expect(autoTitle('本地修改，顺便看下提交')).toBe('本地修改，顺便看下提交');
+    expect(autoTitle('Please review this PR, then push it.')).toBe('review this PR, then push…');
   });
 
-  it('keeps punctuation inside an HTTPS URL', () => {
+  it('preserves URL punctuation', () => {
     expect(autoTitle('你根据 https://orkas.ai')).toBe('你根据 https://orkas.ai');
-    expect(autoTitle('分析 https://x.co/a?q=one,two')).toBe('分析 https://x.co/a?q=one,two');
+    expect(autoTitle('分析 https://x.co/a?q=one,two')).toBe('分析 https://x.co/a?q=one,t…');
     expect(autoTitle('查看 www.orkas.ai 的内容')).toBe('查看 www.orkas.ai 的内容');
   });
 
-  it('still cuts at sentence punctuation immediately after a URL', () => {
-    expect(autoTitle('根据 https://orkas.ai，分析首页内容')).toBe('根据 https://orkas.ai');
-    expect(autoTitle('Review https://orkas.ai, then summarize')).toBe('Review https://orkas.ai');
+  it('preserves punctuation and text immediately after a URL', () => {
+    expect(autoTitle('根据 https://orkas.ai，分析首页内容')).toBe('根据 https://orkas.ai，分析首页内…');
+    expect(autoTitle('Review https://orkas.ai, then summarize')).toBe('Review https://orkas.ai, …');
   });
 
   it('keeps full text when input lacks any filler', () => {
@@ -56,10 +56,12 @@ describe('autoTitle — set A (produces clean title)', () => {
     expect(autoTitle('看下\n本地\n  修改')).toBe('本地 修改');
   });
 
-  it('truncates at 30 chars with ellipsis', () => {
-    const long = '搜索下' + 'A'.repeat(50);
-    const out = autoTitle(long);
-    expect(out.length).toBe(31);              // 30 + …
+  it('truncates at 25 chars with ellipsis', () => {
+    const atLimit = 'A'.repeat(25);
+    const out = autoTitle('A'.repeat(26));
+    expect(autoTitle(atLimit)).toBe(atLimit);
+    expect(out.length).toBe(26);              // 25 + …
+    expect(out).toBe(`${atLimit}…`);
     expect(out.endsWith('…')).toBe(true);
   });
 });
@@ -83,8 +85,7 @@ describe('autoTitle — set B (must NOT over-strip / must NOT crash)', () => {
     expect(autoTitle('本地的看下逻辑对吗')).toBe('本地的看下逻辑对吗');
   });
 
-  it('clause split with short first clause keeps full text', () => {
-    // "AI" is 2 chars → below the 4-char floor → don't cut, keep whole text.
+  it('preserves punctuation after a short first clause', () => {
     expect(autoTitle('AI，请说说看')).toBe('AI，请说说看');
   });
 
@@ -101,7 +102,7 @@ describe('autoTitle — set B (must NOT over-strip / must NOT crash)', () => {
     expect(autoTitle('Search the latest AI news')).toBe('Search the latest AI news');
   });
 
-  it('does not treat a look-alike scheme as an HTTP URL', () => {
-    expect(autoTitle('检查 httpsx://orkas.ai 的内容')).toBe('检查 httpsx://orkas');
+  it('preserves punctuation in a look-alike URL scheme too', () => {
+    expect(autoTitle('检查 httpsx://orkas.ai 的内容')).toBe('检查 httpsx://orkas.ai 的内容');
   });
 });

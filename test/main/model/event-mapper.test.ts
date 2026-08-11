@@ -24,10 +24,12 @@ type AgentRunEvent =
       name: string;
       id: string;
       result: string;
+      displayName?: string;
       persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;
       errorCode?: string;
       errorSeverity?: 'recoverable' | 'error';
+      durationMs?: number;
     }
   | {
       type: 'compaction';
@@ -45,10 +47,13 @@ type AgentRunEvent =
   | { type: 'retry'; attempt: number; reason: string }
   | {
       type: 'provider_fallback';
-      reason: 'auth';
+      reason: 'auth' | 'server_model_fallback';
       providerId: string;
       candidateIndex?: number;
       candidateCount?: number;
+      fromModel?: string;
+      toModel?: string;
+      serverFallbackReason?: 'transport_error';
     }
   | {
       type: 'context_status';
@@ -62,6 +67,12 @@ type AgentRunEvent =
       data?: Record<string, unknown>;
     }
   | {
+      type: 'provider_call';
+      durationMs: number;
+      outcome: 'completed' | 'failed';
+      model: string;
+    }
+  | {
       type: 'done';
       result: {
         text: string;
@@ -71,6 +82,7 @@ type AgentRunEvent =
             message: string;
             code?: string;
           };
+          convergenceSignals?: string[];
         };
       };
     };
@@ -86,6 +98,19 @@ async function collect(events: AgentRunEvent[], opts?: Parameters<typeof mapCore
   for await (const ev of gen) out.push(ev);
   return out;
 }
+
+it('keeps provider-call diagnostics internal', async () => {
+  const out = await collect([
+    { type: 'provider_call', durationMs: 70_000, outcome: 'completed', model: 'private-model-id' },
+    { type: 'text_delta', text: 'visible' },
+    { type: 'done', result: { text: 'visible', meta: { error: null } } },
+  ]);
+
+  expect(out).toEqual([
+    { type: 'delta', text: 'visible' },
+    { type: 'final', text: 'visible' },
+  ]);
+});
 
 describe('event-mapper › tool_start / tool_end emit a single structured event', () => {
   // The mapper used to yield both a `progress` text (▶ name · arg / ✓ name ·
@@ -134,6 +159,47 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(startEvent.event.data.arguments).toEqual({ path: '/tmp/foo.md' });
   });
 
+  it('marks only a list of the run root as the current task workspace', async () => {
+    const workingDir = '/tmp/workspace/chat-2026-08-08-1';
+    const out = await collect([
+      { type: 'tool_start', name: 'list_files', id: 'c-root', input: { path: workingDir } },
+      {
+        type: 'tool_start', name: 'list_files', id: 'c-child',
+        input: { path: `${workingDir}/evidence` },
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { workingDir });
+
+    const starts = out.filter((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(starts[0].event.data).toMatchObject({
+      name: 'list_files',
+      arguments: { path: workingDir },
+      resource_scope: 'current_workspace',
+    });
+    expect(starts[1].event.data).toMatchObject({
+      name: 'list_files',
+      arguments: { path: `${workingDir}/evidence` },
+    });
+    expect(starts[1].event.data.resource_scope).toBeUndefined();
+  });
+
+  it('tool_end forwards a provider display name for process rendering', async () => {
+    const out = await collect([
+      {
+        type: 'tool_end',
+        name: 'web_search',
+        id: 'c-search',
+        result: 'Search results for: "query"',
+        displayName: 'External Search',
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.name).toBe('web_search');
+    expect(endEvent.event.data.display_name).toBe('External Search');
+  });
+
   it('tool_progress → single structured progress event with message', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'generate_image', id: 'c-image', input: { output_path: 'out.png' } },
@@ -172,9 +238,33 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     });
   });
 
-  it('write_file tool input deltas surface a start event before execution starts', async () => {
+  it('marks a preserved max_tokens draft as incomplete in the selected UI language', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([{
+        type: 'done',
+        result: {
+          text: '已生成的报告内容',
+          meta: {
+            error: null,
+            convergenceSignals: ['output_limit_continuation', 'output_limit_unrecovered'],
+          },
+        },
+      }]);
+
+      expect(out).toEqual([{
+        type: 'final',
+        text: '已生成的报告内容\n\n内容达到模型单次输出上限，以上结果可能不完整。你可以继续生成剩余内容。',
+      }]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('surfaces a named tool call immediately and enriches it at execution without another start', async () => {
     const content = 'x'.repeat(5200);
     const out = await collect([
+      { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: '', inputBytes: 0 },
       { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: '{"path":"notes/report.md","content":"', inputBytes: 36 },
       { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: content.slice(0, 600), inputBytes: 636 },
       { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: content.slice(600), inputBytes: 5236 },
@@ -187,11 +277,98 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(starts).toHaveLength(1);
     expect(starts[0].event.stream).toBe('tool');
     expect(starts[0].event.data.name).toBe('write_file');
-    expect(starts[0].event.data.arguments).toEqual({ path: 'notes/report.md' });
+    expect(starts[0].event.data.arguments).toBeUndefined();
+    const executionUpdate = out.find((e) => (
+      e.type === 'event'
+      && e.event?.stream === 'tool'
+      && e.event?.data?.phase === 'progress'
+      && e.event?.data?.id === 'c-write'
+    ));
+    expect(executionUpdate?.event.data.arguments).toEqual({ path: 'notes/report.md', content });
     const endIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     const startIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'start');
     expect(startIdx).toBeGreaterThanOrEqual(0);
     expect(endIdx).toBeGreaterThan(startIdx);
+  });
+
+  it('uses the same early lifecycle contract for non-file tools', async () => {
+    const out = await collect([
+      { type: 'tool_delta', name: 'web_fetch', id: 'c-web', inputDelta: '', inputBytes: 0 },
+      { type: 'tool_start', name: 'web_fetch', id: 'c-web', input: { url: 'https://example.com/docs' } },
+      { type: 'tool_end', name: 'web_fetch', id: 'c-web', result: 'ok' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const lifecycle = out
+      .filter((e) => e.type === 'event' && e.event?.stream === 'tool')
+      .map((e) => ({ phase: e.event.data.phase, id: e.event.data.id }));
+    expect(lifecycle).toEqual([
+      { phase: 'start', id: 'c-web' },
+      { phase: 'progress', id: 'c-web' },
+      { phase: 'end', id: 'c-web' },
+    ]);
+  });
+
+  it('does not surface an uncorrelatable early call when its id is absent', async () => {
+    const out = await collect([
+      { type: 'tool_delta', name: 'write_file', id: '', inputDelta: '', inputBytes: 0 },
+      { type: 'tool_start', name: 'write_file', id: 'c-late-id', input: { path: 'report.md', content: 'body' } },
+      { type: 'tool_end', name: 'write_file', id: 'c-late-id', result: 'written' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const starts = out.filter((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].event.data.id).toBe('c-late-id');
+    expect(starts[0].event.data.arguments).toEqual({ path: 'report.md', content: 'body' });
+  });
+
+  it('persists tool end-to-end duration from the first streamed call event', async () => {
+    const ticks = [1_000, 1_640];
+    const out = await collect([
+      { type: 'tool_delta', name: 'write_file', id: 'c-e2e', inputDelta: '', inputBytes: 0 },
+      { type: 'tool_delta', name: 'write_file', id: 'c-e2e', inputDelta: '{"path":"report.html"', inputBytes: 21 },
+      { type: 'tool_start', name: 'write_file', id: 'c-e2e', input: { path: 'report.html', content: 'body' } },
+      { type: 'tool_end', name: 'write_file', id: 'c-e2e', result: 'written', durationMs: 9 },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { nowMs: () => ticks.shift() ?? 1_640 });
+
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.duration_ms).toBe(9);
+    expect(endEvent.event.data.end_to_end_duration_ms).toBe(640);
+  });
+
+  it('falls back to the execution boundary when the provider emits no tool deltas', async () => {
+    const ticks = [5_000, 5_025];
+    const out = await collect([
+      { type: 'tool_start', name: 'read_file', id: 'c-exec-only', input: { path: 'notes.md' } },
+      { type: 'tool_end', name: 'read_file', id: 'c-exec-only', result: 'notes', durationMs: 31 },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { nowMs: () => ticks.shift() ?? 5_025 });
+
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.duration_ms).toBe(31);
+    expect(endEvent.event.data.end_to_end_duration_ms).toBe(31);
+  });
+
+  it('does not wait for a fragmented path before surfacing a write_file start event', async () => {
+    const content = 'body';
+    const out = await collect([
+      { type: 'tool_delta', name: 'write_file', id: 'c-fragmented-path', inputDelta: '{"path":"sn', inputBytes: 11 },
+      { type: 'tool_delta', name: 'write_file', id: 'c-fragmented-path', inputDelta: 'ake-game.html', inputBytes: 24 },
+      { type: 'tool_delta', name: 'write_file', id: 'c-fragmented-path', inputDelta: '","content":"body"}', inputBytes: 42 },
+      { type: 'tool_start', name: 'write_file', id: 'c-fragmented-path', input: { path: 'snake-game.html', content } },
+      { type: 'tool_end', name: 'write_file', id: 'c-fragmented-path', result: 'wrote snake-game.html' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const starts = out.filter((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].event.data.arguments).toBeUndefined();
+    const executionUpdate = out.find((e) => (
+      e.type === 'event' && e.event?.data?.phase === 'progress'
+    ));
+    expect(executionUpdate?.event.data.arguments).toEqual({ path: 'snake-game.html', content });
   });
 
   it('read_file of marketplace SKILL.md carries the display name without another skill scan', async () => {
@@ -354,7 +531,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(retryProgress.text).not.toContain('finish_reason');
   });
 
-  it('provider auth fallback is visible and does not look like a network retry', async () => {
+  it('user-configured provider auth fallback stays visible in production and does not look like a network retry', async () => {
     setCurrentLang('zh');
     try {
       const out = await collect([
@@ -366,7 +543,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
           candidateCount: 3,
         },
         { type: 'done', result: { text: '', meta: { error: null } } },
-      ]);
+      ], { isDev: false });
       const progress = out.find((e) => e.type === 'progress');
       expect(progress.text).toContain('OpenAI Codex 模型凭证已失效');
       expect(progress.text).toContain('备用模型继续执行');
@@ -523,7 +700,13 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     }
   });
 
-  it('preserves an explicit empty provider terminal as empty_response', async () => {
+  it.each([
+    ['PROVIDER_EMPTY_NORMAL', 'empty_response_normal'],
+    ['PROVIDER_EMPTY_SAFETY', 'empty_response_safety'],
+    ['PROVIDER_EMPTY_UNKNOWN', 'empty_response_unknown'],
+    ['PROVIDER_EMPTY_RESPONSE', 'empty_response_unknown'],
+    ['PROVIDER_EMPTY_TRANSPORT', 'provider_network'],
+  ] as const)('maps %s to a bounded empty-response failure code', async (code, failureCode) => {
     setCurrentLang('zh');
     try {
       const out = await collect([
@@ -535,7 +718,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
               error: {
                 kind: 'provider_error',
                 message: 'empty response',
-                code: 'PROVIDER_EMPTY_RESPONSE',
+                code,
               },
             },
           },
@@ -545,7 +728,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
         type: 'error',
         text: '模型未返回内容',
         failureKind: 'model',
-        failureCode: 'empty_response',
+        failureCode,
         failurePhase: 'provider_wait',
       }]);
     } finally {

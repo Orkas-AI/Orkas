@@ -58,8 +58,12 @@ function _uiRestoreDialogFocus(previousFocus) {
   }
 }
 
-function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
+function _uiShowDialog({ message, showCancel, okLabel, cancelLabel, signal }) {
   return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve(false);
+      return;
+    }
     const previousFocus = document.activeElement;
     const dialogId = _uiNextDialogId();
     const messageId = `${dialogId}-message`;
@@ -107,10 +111,13 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
+    const onAbort = () => finish(false);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     okBtn.addEventListener('click', () => finish(true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => finish(false));
     document.addEventListener('keydown', onKey, true);
@@ -132,6 +139,7 @@ function uiConfirm(arg) {
       showCancel: true,
       okLabel: arg.okLabel,
       cancelLabel: arg.cancelLabel,
+      signal: arg.signal,
     });
   }
   return _uiShowDialog({ message: arg, showCancel: true });
@@ -262,8 +270,12 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
 // 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
 // or more neutral/contextual choices on the left edge of the actions row.
-function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel } = {}) {
+function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel, signal } = {}) {
   return new Promise((resolve) => {
+    if (signal && signal.aborted) {
+      resolve(null);
+      return;
+    }
     const previousFocus = document.activeElement;
     const dialogId = _uiNextDialogId();
     const titleId = `${dialogId}-title`;
@@ -311,10 +323,13 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);
     };
+    const onAbort = () => finish(null);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     overlay.querySelectorAll('[data-act="choice"]').forEach((btn) => {
       btn.addEventListener('click', () => finish(btn.dataset.id || null));
     });

@@ -228,17 +228,44 @@ describe('group_chat router › resolveRecipients', () => {
 });
 
 describe('group_chat router › extractHandbackFromFinal', () => {
-  it('detects + strips a self-closing <handback /> marker', () => {
+  it('detects + strips a legacy bare marker without inventing a reason', () => {
     const r = extractHandbackFromFinal('All done for now.\n<handback />');
     expect(r.handback).toBe(true);
+    expect(r.reason).toBeUndefined();
     expect(r.cleanText).toBe('All done for now.');
     expect(r.cleanText).not.toContain('handback');
   });
 
-  it('detects the paired <handback></handback> form too', () => {
-    const r = extractHandbackFromFinal('Out of my scope.\n<handback></handback>');
+  it('extracts completed_handoff from the paired marker form', () => {
+    const r = extractHandbackFromFinal(
+      "Finished the delegated work.\n<handback reason='completed_handoff'></handback>",
+    );
     expect(r.handback).toBe(true);
-    expect(r.cleanText).toBe('Out of my scope.');
+    expect(r.reason).toBe('completed_handoff');
+    expect(r.cleanText).toBe('Finished the delegated work.');
+  });
+
+  it('extracts capability_boundary from a self-closing marker', () => {
+    const r = extractHandbackFromFinal(
+      'Video production is outside my workflow.\n<handback reason="capability_boundary" />',
+    );
+    expect(r.handback).toBe(true);
+    expect(r.reason).toBe('capability_boundary');
+    expect(r.cleanText).toBe('Video production is outside my workflow.');
+  });
+
+  it('strips unknown or conflicting reasons but leaves the routing reason undefined', () => {
+    for (const text of [
+      '<handback reason="done" />',
+      '<handback reason="capability_boundary" reason="completed_handoff" />',
+      '<handback reason="capability_boundary" />\n<handback />',
+      '<handback reason="capability_boundary" />\n<handback reason="completed_handoff" />',
+    ]) {
+      const r = extractHandbackFromFinal(text);
+      expect(r.handback).toBe(true);
+      expect(r.reason).toBeUndefined();
+      expect(r.cleanText).toBe('');
+    }
   });
 
   it('no marker → handback undefined, text untouched', () => {

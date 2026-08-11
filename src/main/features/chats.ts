@@ -22,7 +22,8 @@ import * as readline from 'node:readline';
 import { randomUUID } from 'node:crypto';
 
 import {
-  userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, WS_ROOT,
+  userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile,
+  userConversationTurnIndexPath, WS_ROOT,
 } from '../paths';
 import {
   conversationLayout,
@@ -37,9 +38,10 @@ import {
   readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, appendJsonlAtomic,
 } from '../storage';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import {
-  ZH_FILLER_RE, EN_FILLER_RE, TITLE_MAX, findTitleClauseBoundary,
+  ZH_FILLER_RE, EN_FILLER_RE, TITLE_MAX,
 } from '../util/auto-title';
 import { isExpiredIsoTombstone, pruneExpiredDeletedRecords } from '../util/tombstone_retention';
 import {
@@ -1199,7 +1201,7 @@ export async function listConversations(userId: string): Promise<Conversation[]>
 
 export interface StartupConversationList {
   conversations: Conversation[];
-  deferred_unprojected: { last30: number; older: number };
+  unprojected_pagination: ConversationPageInfo;
   loaded_project_ids: string[];
   project_pagination: Record<string, ConversationPageInfo>;
 }
@@ -1262,21 +1264,10 @@ async function _enrichConversationPage(
   };
 }
 
-function _startupOldBucket(c: Conversation, now = new Date()): 'last30' | 'older' | null {
-  if (c.pinned_at) return null;
-  const activityMs = _conversationActivityMs(c);
-  const today = new Date(now);
-  today.setHours(0, 0, 0, 0);
-  const dayMs = 24 * 60 * 60 * 1000;
-  if (activityMs >= today.getTime() - 7 * dayMs) return null;
-  if (activityMs >= today.getTime() - 30 * dayMs) return 'last30';
-  return 'older';
-}
-
 /** Startup-only sidebar slice. Aggregate indexes are still the authority, but
  * per-conversation state/member/history enrichment is limited to rows that can
- * actually appear on first paint. Collapsed project rows and old unprojected
- * buckets are fetched through the scoped readers below when opened. */
+ * actually appear on first paint. Project and unprojected task lists each use
+ * one chronological 10-row page; time buckets are only a renderer grouping. */
 export async function listStartupConversations(
   userId: string,
   options: { activeConversationId?: string; expandedProjectIds?: string[] } = {},
@@ -1285,8 +1276,8 @@ export async function listStartupConversations(
     (options.expandedProjectIds || []).filter((id) => typeof id === 'string' && safeId(id)),
   );
   const activeCid = safeId(options.activeConversationId || '') ? options.activeConversationId! : '';
-  const deferred = { last30: 0, older: 0 };
   let loadedProjects: string[] = [];
+  let unprojectedPagination: ConversationPageInfo = { total: 0, next_offset: null };
   const projectPagination: Record<string, ConversationPageInfo> = {};
   const conversations = await _listConversationsUncached(userId, () => false, (all) => {
     const visibleProjects = new Set(requestedProjects);
@@ -1294,6 +1285,20 @@ export async function listStartupConversations(
     if (active?.project_id && safeId(active.project_id)) visibleProjects.add(active.project_id);
     loadedProjects = Array.from(visibleProjects);
     const selectedProjectCids = new Set<string>();
+    const unprojectedRows = all
+      .filter((c) => !c.project_id)
+      .sort(_compareConversationIndexRows);
+    const selectedUnprojectedCids = new Set(
+      unprojectedRows
+        .slice(0, CONVERSATION_LIST_PAGE_SIZE)
+        .map((c) => c.conversation_id),
+    );
+    unprojectedPagination = {
+      total: unprojectedRows.length,
+      next_offset: unprojectedRows.length > CONVERSATION_LIST_PAGE_SIZE
+        ? CONVERSATION_LIST_PAGE_SIZE
+        : null,
+    };
     for (const projectId of visibleProjects) {
       const rows = all
         .filter((c) => c.project_id === projectId)
@@ -1309,21 +1314,15 @@ export async function listStartupConversations(
       };
     }
     if (active?.project_id) selectedProjectCids.add(active.conversation_id);
-    for (const c of all) {
-      if (c.project_id || c.pinned_at) continue;
-      const bucket = _startupOldBucket(c);
-      if (bucket) deferred[bucket] += 1;
-    }
+    else if (active) selectedUnprojectedCids.add(active.conversation_id);
     return all.filter((c) => {
-      if (c.conversation_id === activeCid) return true;
       if (c.project_id) return selectedProjectCids.has(c.conversation_id);
-      if (c.pinned_at) return true;
-      return _startupOldBucket(c) === null;
+      return selectedUnprojectedCids.has(c.conversation_id);
     });
   });
   return {
     conversations,
-    deferred_unprojected: deferred,
+    unprojected_pagination: unprojectedPagination,
     loaded_project_ids: loadedProjects,
     project_pagination: projectPagination,
   };
@@ -1341,6 +1340,18 @@ export async function listProjectConversationPage(
     await _readScopedRawConversations(userId, projectId),
     offset,
   );
+}
+
+/** Read one chronological 10-row page from the project-less task list.
+ * Relative-time buckets are deliberately not part of this contract: the
+ * renderer groups whichever rows have been loaded using the current time. */
+export async function listUnprojectedConversationPage(
+  userId: string,
+  offset = 0,
+): Promise<ConversationPage> {
+  const rows = (await _readScopedRawConversations(userId))
+    .filter((c) => !c.project_id);
+  return _enrichConversationPage(userId, rows, offset);
 }
 
 /** Read one 10-row execution-history page for an automation task.
@@ -1386,20 +1397,6 @@ export async function countAutoTaskConversations(
   return counts;
 }
 
-/** Read and enrich one 10-row page from one old unprojected age bucket. */
-export async function listOldUnprojectedConversationPage(
-  userId: string,
-  bucket: 'last30' | 'older',
-  offset = 0,
-): Promise<ConversationPage> {
-  if (bucket !== 'last30' && bucket !== 'older') {
-    return { conversations: [], total: 0, next_offset: null };
-  }
-  const rows = (await _readScopedRawConversations(userId))
-    .filter((c) => !c.project_id && _startupOldBucket(c) === bucket);
-  return _enrichConversationPage(userId, rows, offset);
-}
-
 /** Load one expanded project's rows without touching other collapsed projects. */
 export async function listProjectConversations(userId: string, projectId: string): Promise<Conversation[]> {
   if (!safeId(projectId)) return [];
@@ -1408,16 +1405,6 @@ export async function listProjectConversations(userId: string, projectId: string
     () => false,
     undefined,
     () => _readScopedRawConversations(userId, projectId),
-  );
-}
-
-/** Load the two collapsed age buckets for the unprojected sidebar only. */
-export async function listOldUnprojectedConversations(userId: string): Promise<Conversation[]> {
-  return _listConversationsUncached(
-    userId,
-    () => false,
-    (all) => all.filter((c) => !c.project_id && _startupOldBucket(c) !== null),
-    () => _readScopedRawConversations(userId),
   );
 }
 
@@ -1920,6 +1907,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
   try { await fsp.unlink(msgFile); } catch { /* ignore missing */ }
   invalidateLineCount(msgFile);
   await search.dropChatConversation(userId, cid);
+  await purgeConversationTurnIndex(userId, cid);
 
   // Purge commander session + every per-agent member session.
   purgeSession(userId, removed?.session_id || buildConversationSessionId(cid));
@@ -2068,6 +2056,365 @@ export async function getMessagesPageAtIndex(
   };
 }
 
+/** Resolve a stable message id only when an index-based anchor became stale
+ * after sync rewrote/reordered the source JSONL. Normal navigation stays on
+ * the direct index window and never pays for this streaming fallback. */
+export async function findMessageIndexById(
+  userId: string,
+  cid: string,
+  messageId: string,
+  projectIdHint?: string | null,
+): Promise<number | null> {
+  if (!messageId) return null;
+  const file = conversationMessageReadFile(userId, cid, projectIdHint);
+  let stream: fs.ReadStream | null = null;
+  let lines: readline.Interface | null = null;
+  let recordIndex = 0;
+  let malformedRecordReported = false;
+  try {
+    stream = fs.createReadStream(file, { encoding: 'utf8' });
+    lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let record: any;
+      try { record = JSON.parse(trimmed); } catch (err) {
+        if (!malformedRecordReported) {
+          malformedRecordReported = true;
+          log.warn('conversation message lookup skipped malformed records', {
+            file: logPathRef(file),
+            error: logErrorSummary(err),
+          });
+        }
+        continue;
+      }
+      const sourceIndex = recordIndex;
+      recordIndex += 1;
+      if (String(record?.id || '') === messageId && !record?.deleted_at) return sourceIndex;
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  } finally {
+    lines?.close();
+    if (stream && !stream.closed) {
+      // destroy() schedules the Windows file-handle close asynchronously.
+      // Callers may immediately delete or replace the conversation tree, so
+      // do not report the scan complete until that handle is actually closed.
+      await new Promise<void>((resolve) => {
+        stream!.once('close', resolve);
+        stream!.destroy();
+      });
+    }
+  }
+  return null;
+}
+
+// ── Compact conversation-turn navigation index ──────────────────────────
+
+/**
+ * The transcript stays tail-paged, but its navigation rail needs one stable
+ * address for every user turn. This machine-local derived index is deliberately
+ * compact and rebuildable: it never enters sync or the conversation metadata.
+ */
+const CONVERSATION_TURN_INDEX_VERSION = 1;
+export const CONVERSATION_TURN_PAGE_SIZE = 15;
+export const CONVERSATION_TURN_USER_PREVIEW_CHARS = 40;
+export const CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS = 80;
+
+export interface ConversationTurnIndexEntry {
+  messageId: string;
+  clientMessageId: string;
+  messageIndex: number;
+  userPreview: string;
+  assistantPreview: string;
+}
+
+interface ConversationTurnIndexSource {
+  owner: string;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  ino: number;
+}
+
+interface ConversationTurnIndexFile {
+  version: number;
+  source: ConversationTurnIndexSource;
+  turns: ConversationTurnIndexEntry[];
+}
+
+export interface ConversationTurnPageEntry extends ConversationTurnIndexEntry {
+  turnNo: number;
+}
+
+export interface ConversationTurnPage {
+  turns: ConversationTurnPageEntry[];
+  total: number;
+  nextCursor: number | null;
+  pageSize: number;
+}
+
+const _conversationTurnIndexMemory = new Map<string, ConversationTurnIndexFile>();
+const _conversationTurnIndexBuilds = new Map<string, Promise<ConversationTurnIndexFile>>();
+
+function _conversationTurnIndexKey(userId: string, cid: string): string {
+  return `${userId}\u0000${cid}`;
+}
+
+function _conversationTurnSourceOwner(projectIdHint?: string | null): string {
+  return projectIdHint ? `project:${projectIdHint}` : 'global';
+}
+
+async function _conversationTurnSource(
+  file: string,
+  projectIdHint?: string | null,
+): Promise<ConversationTurnIndexSource> {
+  try {
+    const stat = await fsp.stat(file);
+    return {
+      owner: _conversationTurnSourceOwner(projectIdHint),
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      ino: Number(stat.ino) || 0,
+    };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('conversation turn source stat failed', {
+        file: logPathRef(file),
+        error: logErrorSummary(err),
+      });
+      throw err;
+    }
+    return {
+      owner: _conversationTurnSourceOwner(projectIdHint),
+      size: 0,
+      mtimeMs: 0,
+      ctimeMs: 0,
+      ino: 0,
+    };
+  }
+}
+
+function _sameConversationTurnSource(
+  left: ConversationTurnIndexSource | null | undefined,
+  right: ConversationTurnIndexSource,
+): boolean {
+  return !!left
+    && left.owner === right.owner
+    && Number(left.size) === right.size
+    && Number(left.mtimeMs) === right.mtimeMs
+    && Number(left.ctimeMs) === right.ctimeMs
+    && Number(left.ino || 0) === right.ino;
+}
+
+function _truncateConversationTurnPreview(value: string, maximum: number): string {
+  const chars = Array.from(String(value || ''));
+  if (chars.length <= maximum) return chars.join('');
+  return `${chars.slice(0, Math.max(1, maximum - 1)).join('')}…`;
+}
+
+function _conversationTurnPreviewText(raw: unknown): string {
+  return String(raw || '')
+    .replace(/!\[([^\]]*)\]\([^\s)]+(?:\s+[^)]*)?\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^\s)]+(?:\s+[^)]*)?\)/g, '$1')
+    .replace(/<[^>\n]+>/g, ' ')
+    .replace(/(^|\s)(?:#{1,6}|>|[-+*]|\d+[.)])\s+/gm, '$1')
+    .replace(/[`*_~]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _isConversationTurnUserRecord(record: any): boolean {
+  return String(record?.from || record?.role || '') === 'user';
+}
+
+function _isConversationTurnVisibleAssistantRecord(record: any): boolean {
+  if (!record || record.deleted_at || record.dispatch) return false;
+  const role = String(record.from || record.role || '');
+  return role !== 'user';
+}
+
+async function _scanConversationTurnIndex(file: string): Promise<ConversationTurnIndexEntry[]> {
+  let stream: fs.ReadStream | null = null;
+  let lines: readline.Interface | null = null;
+  const turns: ConversationTurnIndexEntry[] = [];
+  let current: ConversationTurnIndexEntry | null = null;
+  let recordIndex = 0;
+  let malformedRecordReported = false;
+  try {
+    stream = fs.createReadStream(file, { encoding: 'utf8' });
+    lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let record: any;
+      try { record = JSON.parse(trimmed); } catch (err) {
+        if (!malformedRecordReported) {
+          malformedRecordReported = true;
+          log.warn('conversation turn index skipped malformed records', {
+            file: logPathRef(file),
+            error: logErrorSummary(err),
+          });
+        }
+        continue;
+      }
+      const sourceIndex = recordIndex;
+      recordIndex += 1;
+      if (!record || record.deleted_at) continue;
+      if (_isConversationTurnUserRecord(record)) {
+        if (current) turns.push(current);
+        current = {
+          messageId: typeof record.id === 'string' ? record.id : '',
+          clientMessageId: typeof record.client_msg_id === 'string' ? record.client_msg_id : '',
+          messageIndex: sourceIndex,
+          userPreview: _truncateConversationTurnPreview(
+            _conversationTurnPreviewText(_messageText(record)),
+            CONVERSATION_TURN_USER_PREVIEW_CHARS,
+          ),
+          assistantPreview: '',
+        };
+        continue;
+      }
+      if (!current || !_isConversationTurnVisibleAssistantRecord(record)) continue;
+      const reply = _conversationTurnPreviewText(_messageText(record));
+      if (!reply) continue;
+      const combined = current.assistantPreview
+        ? `${current.assistantPreview} · ${reply}`
+        : reply;
+      current.assistantPreview = _truncateConversationTurnPreview(
+        combined,
+        CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS,
+      );
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  } finally {
+    lines?.close();
+    stream?.destroy();
+  }
+  if (current) turns.push(current);
+  return turns;
+}
+
+function _isConversationTurnIndexFile(value: any): value is ConversationTurnIndexFile {
+  return value?.version === CONVERSATION_TURN_INDEX_VERSION
+    && value.source && typeof value.source === 'object'
+    && Array.isArray(value.turns)
+    && value.turns.every((turn: any) => (
+      turn && typeof turn === 'object'
+      && typeof turn.messageId === 'string'
+      && typeof turn.clientMessageId === 'string'
+      && Number.isSafeInteger(turn.messageIndex) && turn.messageIndex >= 0
+      && typeof turn.userPreview === 'string'
+      && typeof turn.assistantPreview === 'string'
+    ));
+}
+
+async function _buildConversationTurnIndex(
+  userId: string,
+  cid: string,
+  file: string,
+  projectIdHint?: string | null,
+): Promise<ConversationTurnIndexFile> {
+  // A sync pull or live append can move the source while the lazy legacy scan
+  // is running. Retry once so the atomically-published index describes one
+  // coherent file revision rather than a mixed snapshot.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const sourceBefore = await _conversationTurnSource(file, projectIdHint);
+    const turns = await _scanConversationTurnIndex(file);
+    const sourceAfter = await _conversationTurnSource(file, projectIdHint);
+    if (!_sameConversationTurnSource(sourceBefore, sourceAfter)) {
+      if (attempt === 0) continue;
+      throw new Error('conversation turn index source did not stabilize');
+    }
+    const index: ConversationTurnIndexFile = {
+      version: CONVERSATION_TURN_INDEX_VERSION,
+      source: sourceAfter,
+      turns,
+    };
+    await writeJson(userConversationTurnIndexPath(userId, cid), index);
+    _conversationTurnIndexMemory.set(_conversationTurnIndexKey(userId, cid), index);
+    return index;
+  }
+  throw new Error('conversation turn index source did not stabilize');
+}
+
+async function _getConversationTurnIndex(
+  userId: string,
+  cid: string,
+  projectIdHint?: string | null,
+): Promise<ConversationTurnIndexFile> {
+  const key = _conversationTurnIndexKey(userId, cid);
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const source = await _conversationTurnSource(sourceFile, projectIdHint);
+  const memory = _conversationTurnIndexMemory.get(key);
+  if (memory && _sameConversationTurnSource(memory.source, source)) return memory;
+
+  const persisted = await readJson<ConversationTurnIndexFile>(
+    userConversationTurnIndexPath(userId, cid),
+  );
+  if (_isConversationTurnIndexFile(persisted)
+      && _sameConversationTurnSource(persisted.source, source)) {
+    _conversationTurnIndexMemory.set(key, persisted);
+    return persisted;
+  }
+
+  const existingBuild = _conversationTurnIndexBuilds.get(key);
+  if (existingBuild) return existingBuild;
+  const build = _buildConversationTurnIndex(userId, cid, sourceFile, projectIdHint);
+  _conversationTurnIndexBuilds.set(key, build);
+  try {
+    return await build;
+  } finally {
+    if (_conversationTurnIndexBuilds.get(key) === build) {
+      _conversationTurnIndexBuilds.delete(key);
+    }
+  }
+}
+
+/** Return one newest-tail page of compact user-turn navigation entries. */
+export async function getConversationTurnPage(
+  userId: string,
+  cid: string,
+  before?: number | null,
+  projectIdHint?: string | null,
+): Promise<ConversationTurnPage> {
+  const index = await _getConversationTurnIndex(userId, cid, projectIdHint);
+  const total = index.turns.length;
+  const requestedEnd = Number(before);
+  const end = Number.isSafeInteger(requestedEnd) && requestedEnd >= 0
+    ? Math.min(requestedEnd, total)
+    : total;
+  const start = Math.max(0, end - CONVERSATION_TURN_PAGE_SIZE);
+  return {
+    turns: index.turns.slice(start, end).map((turn, offset) => ({
+      ...turn,
+      turnNo: start + offset + 1,
+    })),
+    total,
+    nextCursor: start > 0 ? start : null,
+    pageSize: CONVERSATION_TURN_PAGE_SIZE,
+  };
+}
+
+export async function purgeConversationTurnIndex(userId: string, cid: string): Promise<void> {
+  const key = _conversationTurnIndexKey(userId, cid);
+  _conversationTurnIndexMemory.delete(key);
+  _conversationTurnIndexBuilds.delete(key);
+  try {
+    await fsp.unlink(userConversationTurnIndexPath(userId, cid));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('conversation turn index purge failed', {
+        user_id: maskId(userId),
+        cid: maskId(cid),
+        error: logErrorSummary(err),
+      });
+    }
+  }
+}
+
 /** Drop every conversation belonging to `userId`. Loops `deleteConversation`
  *  so the full cascade (group dir / main jsonl / sessions / attachments / CLI
  *  / search index) runs per cid; one cid's failure doesn't abort the rest.
@@ -2132,11 +2479,6 @@ export function autoTitle(content: string): string {
     if (text === before) break;
   }
   text = text.trim();
-  // Take the first clause IF it's long enough on its own — guards against
-  // clipping "AI，怎么样" down to bare "AI" which loses all signal.
-  const clauseIdx = findTitleClauseBoundary(text);
-  if (clauseIdx >= 4) text = text.slice(0, clauseIdx);
-  text = text.trim();
   // If stripping killed everything (input was pure filler), fall back to
   // the original trimmed input so the sidebar still shows what the user
   // actually typed.
@@ -2151,6 +2493,9 @@ interface ConversationStateCandidate {
   uid: string;
   cid: string;
   file: string;
+  /** This candidate came from this machine's local running journal. Synced
+   * state alone is not proof that this process/device owned the run. */
+  journalTracked?: boolean;
 }
 
 async function _conversationStateCandidates(uid: string): Promise<ConversationStateCandidate[]> {
@@ -2187,22 +2532,51 @@ async function _indexedConversationStateCandidates(uid: string): Promise<Convers
   return out;
 }
 
+function _latestHistorySettlesStaleRun(records: GroupMessage[]): boolean {
+  let latest: GroupMessage | undefined;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record && !record.deleted_at) {
+      latest = record;
+      break;
+    }
+  }
+  if (!latest) return false;
+  // A prior recovery notice already settles this stale state. This keeps a
+  // damaged/recreated journal from appending the same notice on every boot.
+  if (latest.system_kind === 'reply_interrupted') return true;
+  // `source_message_id` is persisted on the actor's official terminal reply.
+  // If that reply is the canonical tail, no newer user/dispatch record
+  // started more work, so a lagging `state.json: running` is completion
+  // residue rather than proof that the app exited mid-reply.
+  const hasTerminalSource = typeof latest.source_message_id === 'string'
+    && latest.source_message_id.trim().length > 0;
+  return hasTerminalSource
+    && latest.dispatch !== true
+    && latest.from !== 'user';
+}
+
+async function _historySettlesStaleRun(uid: string, cid: string): Promise<boolean> {
+  const file = conversationMessageReadFile(uid, cid);
+  const tail = await readJsonl<GroupMessage>(file, 8);
+  return _latestHistorySettlesStaleRun(tail);
+}
+
 /**
- * Any group whose state.json says `running` when the app starts was
- * interrupted by a crash or hard quit. Flip them to `idle` (not aborted —
- * abort is a deliberate user action) and persist one actor-owned interruption
- * bubble so a reload cannot silently erase the live assistant placeholder.
- * The next user message kicks off a fresh worker from durable state.
+ * Reconcile groups whose state.json still says `running` at startup. A
+ * durable terminal history tail proves the status write merely lagged and is
+ * cleared silently. Otherwise the app stopped mid-run: flip to `idle` (not
+ * aborted — abort is a deliberate user action) and persist one actor-owned
+ * interruption bubble so a reload cannot silently erase the live assistant
+ * placeholder. The next user message starts a fresh worker from durable state.
  */
 export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swept: number }> {
   if (!fs.existsSync(WS_ROOT)) return { swept: 0 };
   let swept = 0;
-  let pruneJournalRows = false;
   const candidates: ConversationStateCandidate[] = [];
   if (activeUserId) {
     const tracked = await readRunningConversationRegistry(activeUserId);
     if (tracked.valid) {
-      pruneJournalRows = true;
       // Normal pre-window path: one compact read, then only the handful of
       // conversations that were actually running when the process stopped.
       for (const item of tracked.items) {
@@ -2212,6 +2586,7 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
           file: conversationLayout(
             activeUserId, item.conversation_id, item.project_id,
           ).stateFile,
+          journalTracked: true,
         });
       }
     } else {
@@ -2221,13 +2596,29 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       candidates.push(...await _indexedConversationStateCandidates(activeUserId));
     }
   } else {
-    // Maintenance/recovery path: retain full discovery for unindexed state
-    // directories and inactive users, but run it after the startup window.
+    // Maintenance/recovery path: every user has a machine-local running
+    // journal. Do not scan valid journals' synced state directories: another
+    // process/device may legitimately own a live run there, and this process
+    // has no in-memory worker with which to prove liveness. Full discovery is
+    // retained only as a one-time migration/corruption fallback.
     for (const entry of await fsp.readdir(WS_ROOT, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const uid = entry.name;
       const chatsDir = userChatsDir(uid);
       if (!fs.existsSync(chatsDir)) continue;
+      const tracked = await readRunningConversationRegistry(uid);
+      if (tracked.valid) {
+        for (const item of tracked.items) {
+          candidates.push({
+            uid,
+            cid: item.conversation_id,
+            file: conversationLayout(uid, item.conversation_id, item.project_id).stateFile,
+            journalTracked: true,
+          });
+        }
+        continue;
+      }
+      await ensureRunningConversationRegistry(uid);
       candidates.push(...await _conversationStateCandidates(uid));
     }
   }
@@ -2239,11 +2630,13 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
   // Loaded lazily to avoid the chats ↔ bus module cycle during startup. The
   // CJS path deliberately shares the same in-memory runtime map as send().
   const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
-  await _runBounded(candidates, 32, async ({ uid, cid, file }) => {
+  await _runBounded(candidates, 32, async ({
+    uid, cid, file, journalTracked,
+  }) => {
     try {
       const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
       if (raw?.status !== 'running') {
-        if (pruneJournalRows) await untrackRunningConversation(uid, cid);
+        if (journalTracked) await untrackRunningConversation(uid, cid);
         return;
       }
       const lastActiveMs = Date.parse(String(raw.last_active_at || ''));
@@ -2258,7 +2651,21 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
         // live in-memory work always wins over disk maintenance.
         return;
       }
+      const alreadySettled = await _historySettlesStaleRun(uid, cid);
+      if (!journalTracked && !alreadySettled) {
+        // A missing/corrupt local journal provides no ownership proof. This
+        // may be a live run synced from another device, so the migration scan
+        // may reconcile a durable terminal tail but must never manufacture an
+        // interruption from `state.json: running` alone.
+        return;
+      }
       await setStatus(uid, cid, 'idle');
+      if (alreadySettled) {
+        // The terminal reply (or a prior recovery notice) is already durable.
+        // Reconcile only the stale status/journal; adding an interruption row
+        // here would turn a successfully completed task into a false failure.
+        return;
+      }
       const interruptedActors = Array.isArray(raw.in_flight)
         ? raw.in_flight.filter((actorId: unknown): actorId is string => safeId(actorId))
         : [];
@@ -2291,7 +2698,7 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
       swept += 1;
     } catch {
       // Missing/malformed state is idle; prune any stale journal row.
-      if (pruneJournalRows) await untrackRunningConversation(uid, cid);
+      if (journalTracked) await untrackRunningConversation(uid, cid);
     }
   });
   if (swept) log.info(`cleared ${swept} stale running conversations`);

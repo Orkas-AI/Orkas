@@ -92,15 +92,14 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         },
       });
 
-      // Pre-build session/new params: include model up front (Hermes
-      // accepts it; CLIs that don't honor model in session/new ignore
-      // it). The set_model fallback below covers servers that need
-      // an explicit setter.
+      // Include the model on session/new for ACP implementations that accept
+      // it there. session/set_model below covers implementations that require
+      // the explicit setter. Missing means the CLI/account default.
       const sessionNewParams: Record<string, unknown> = {
         cwd: opts.cwd,
         mcpServers: [],
       };
-      if (opts.model) sessionNewParams.model = opts.model;
+      if (opts.modelOverride) sessionNewParams.model = opts.modelOverride;
 
       let sessionNewSent = false;
       const sendSessionNew = () => {
@@ -115,6 +114,20 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       };
 
       const splitter = new LineSplitter();
+      let modelSetTimer: NodeJS.Timeout | undefined;
+      let promptSent = false;
+      const sendPrompt = (id: string) => {
+        if (promptSent) return;
+        promptSent = true;
+        if (modelSetTimer) clearTimeout(modelSetTimer);
+        send({
+          jsonrpc: '2.0', id: PROMPT_REQ_ID, method: 'session/prompt',
+          params: {
+            sessionId: id,
+            prompt: [{ type: 'text', text: opts.prompt }],
+          },
+        });
+      };
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
         splitter.push(chunk, line => {
@@ -131,23 +144,23 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             return;
           }
           if (Number(env.id) === 1 && !env.error) sendSessionNew();
+          if (Number(env.id) === 3 && sessionId) sendPrompt(sessionId);
           handleAcpMessage(env, {
             onSessionNew: id => {
               sessionId = id;
               opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
-              // Optional model selection. We swallow errors here:
-              // some CLIs reject unknown ids; we still try the prompt
-              // so the user gets something rather than a hard fail.
-              if (opts.model) {
-                send({ jsonrpc: '2.0', id: 3, method: 'session/set_model', params: { sessionId: id, modelId: opts.model } });
+              if (opts.modelOverride) {
+                send({
+                  jsonrpc: '2.0', id: 3, method: 'session/set_model',
+                  params: { sessionId: id, modelId: opts.modelOverride },
+                });
+                // Version-skewed ACP servers may accept the setter without
+                // replying. Never let optional selection block the task.
+                modelSetTimer = setTimeout(() => sendPrompt(id), 250);
+                if (typeof modelSetTimer.unref === 'function') modelSetTimer.unref();
+              } else {
+                sendPrompt(id);
               }
-              send({
-                jsonrpc: '2.0', id: PROMPT_REQ_ID, method: 'session/prompt',
-                params: {
-                  sessionId: id,
-                  prompt: [{ type: 'text', text: opts.prompt }],
-                },
-              });
             },
             onTextDelta: text => {
               resultText += text;
@@ -217,6 +230,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           exited = true;
           watchdog.disarm();
           clearTimeout(initTimer);
+          if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
           opts.onEvent({
             type: 'done',

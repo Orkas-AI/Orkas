@@ -161,6 +161,29 @@ describe('packages › listPackagesForUi', () => {
 });
 
 describe('packages › runPackageCommand guards', () => {
+  it('scrubs Electron identity from the package-helper child environment', async () => {
+    const previousMarker = process.env.ELECTRON_RUN_AS_NODE;
+    process.env.ELECTRON_RUN_AS_NODE = '1';
+    try {
+      const { buildPackageCommandEnv } = await loadPackages();
+      const env = buildPackageCommandEnv(TEST_UID, '/opt/orkas/pc', {
+        executable: '/opt/orkas/runtime/node',
+        electronAsNode: false,
+      });
+
+      expect(env).toMatchObject({
+        ORKAS_UID: TEST_UID,
+        ORKAS_PC_DIR: '/opt/orkas/pc',
+        ORKAS_NODE: '/opt/orkas/runtime/node',
+        ORKAS_BUNDLED_NODE: '/opt/orkas/runtime/node',
+      });
+      expect(env.ELECTRON_RUN_AS_NODE).toBeUndefined();
+    } finally {
+      if (previousMarker === undefined) delete process.env.ELECTRON_RUN_AS_NODE;
+      else process.env.ELECTRON_RUN_AS_NODE = previousMarker;
+    }
+  });
+
   it('rejects unsupported commands and bad names without spawning', async () => {
     const { runPackageCommand } = await loadPackages();
     expect((await runPackageCommand(TEST_UID, 'install', 'x')).ok).toBe(false);

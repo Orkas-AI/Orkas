@@ -78,6 +78,8 @@ Do not scale font size with viewport width. Use explicit type roles and breakpoi
 
 If the brief explicitly forbids horizontal scrolling or names a narrow target such as 320px, do not choose horizontal table/nav scrolling. Use column priority, stacked labeled rows/cards, wrapped navigation, and full-width actions so the primary workflow fits the viewport.
 
+When 320px or long localized copy is explicit but preview tools are unavailable, delivery must still name the unrun viewport/text-fit check and its concrete pass criteria: `scrollWidth <= clientWidth`, all primary actions remain visible and reachable, and the longest supplied localized label/help text wraps without clipping or overlap.
+
 ## Form And Data Rules
 
 Forms:

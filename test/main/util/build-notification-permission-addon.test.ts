@@ -30,6 +30,11 @@ const addonBuilder = require('../../../scripts/build-notification-permission-add
       stderr?: string;
     };
   }): string | null;
+  findNodeHeaders(options?: {
+    env?: Record<string, string | undefined>;
+    execPath?: string;
+    exists?: (candidate: string) => boolean;
+  }): string;
   outputPath(arch: string, outputRoot?: string): string;
 };
 
@@ -120,6 +125,7 @@ describe('notification permission native addon build', () => {
     expect(spawn.mock.calls[0][0]).toBe('xcrun');
     expect(spawn.mock.calls[0][1]).toEqual(expect.arrayContaining([
       'clang++',
+      '-std=c++20',
       '-arch',
       'arm64',
       sourceFile,
@@ -162,5 +168,38 @@ describe('notification permission native addon build', () => {
 
     expect(() => addonBuilder.build(buildOptions({ spawn }))).toThrow('compiler timed out');
     expect(fs.readdirSync(outputRoot).some((entry) => entry.endsWith('.tmp'))).toBe(false);
+  });
+
+  it('resolves N-API headers from the npm-launching Node when the host binary ships none', () => {
+    // `npm test` runs under Electron, whose dist has no include/node. Losing
+    // this candidate makes the whole macOS native suite unbuildable on any
+    // machine without Homebrew or a system Node.
+    const electron = '/app/node_modules/electron/dist/Orkas.app/Contents/MacOS/Orkas';
+    const nvmNode = '/opt/test-node/v24.13.0/bin/node';
+    const nvmHeaders = path.resolve('/opt/test-node/v24.13.0', 'include', 'node');
+    const nodedirHeaders = path.resolve('/opt/pinned-node', 'include', 'node');
+    const has = (...dirs: string[]) => (candidate: string) => dirs
+      .some((dir) => candidate === path.join(dir, 'node_api.h'));
+
+    expect(addonBuilder.findNodeHeaders({
+      env: { npm_node_execpath: nvmNode },
+      execPath: electron,
+      exists: has(nvmHeaders),
+    })).toBe(nvmHeaders);
+
+    // An explicit nodedir still outranks every discovered candidate.
+    expect(addonBuilder.findNodeHeaders({
+      env: { npm_config_nodedir: '/opt/pinned-node', npm_node_execpath: nvmNode },
+      execPath: electron,
+      exists: has(nodedirHeaders, nvmHeaders),
+    })).toBe(nodedirHeaders);
+
+    // Negative control: with nothing available it must fail loudly and name
+    // the escape hatch, never hand the compiler a directory that is not there.
+    expect(() => addonBuilder.findNodeHeaders({
+      env: {},
+      execPath: electron,
+      exists: () => false,
+    })).toThrow(/node_api\.h not found .*npm_config_nodedir/s);
   });
 });

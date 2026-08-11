@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -156,7 +156,9 @@ function matches(el: FakeElement, selector: string) {
   return false;
 }
 
-function loadHarness() {
+function loadHarness(
+  invokeImpl: (channel: string, payload: any) => Promise<any> = async () => ({ ok: true }),
+) {
   const elements = new Map<string, FakeElement>();
   const history = makeEl('div');
   history.id = 'chat-history';
@@ -169,6 +171,8 @@ function loadHarness() {
   elements.set(send.id, send);
 
   const invokeCalls: Array<{ channel: string; payload: any }> = [];
+  const monitor = { event: vi.fn(), error: vi.fn() };
+  const warn = vi.fn();
   let sendClicks = 0;
   send.click = async () => { sendClicks += 1; };
 
@@ -196,7 +200,7 @@ function loadHarness() {
     RegExp,
     setTimeout,
     clearTimeout,
-    createLogger: () => ({ info() {}, warn() {} }),
+    createLogger: () => ({ info() {}, warn }),
     t: (key: string, vars?: Record<string, unknown>) => {
       let text = dict[key] || key;
       for (const [k, v] of Object.entries(vars || {})) {
@@ -223,13 +227,15 @@ function loadHarness() {
       createElement: (tagName: string) => makeEl(tagName),
     },
     window: {
+      Monitor: true,
       orkas: {
         invoke: async (channel: string, payload: any) => {
           invokeCalls.push({ channel, payload });
-          return { ok: true };
+          return invokeImpl(channel, payload);
         },
       },
     },
+    Monitor: monitor,
   };
   context.window.window = context.window;
   vm.createContext(context);
@@ -244,6 +250,8 @@ function loadHarness() {
     input,
     send,
     invokeCalls,
+    monitor,
+    warn,
     get sendClicks() { return sendClicks; },
   };
 }
@@ -279,6 +287,18 @@ describe('delete-file-confirm batching', () => {
     expect(h.input.value).toBe('Confirmed, please continue.');
     expect(card.classList.contains('is-confirmed')).toBe(true);
     expect(card.querySelector('.delete-confirm-result')?.textContent).toBe('Deletion confirmed for 2 files');
+    expect(h.monitor.event).toHaveBeenCalledOnce();
+    expect(h.monitor.event).toHaveBeenCalledWith(
+      'delete_file_confirmation_result',
+      expect.objectContaining({
+        result: 'success',
+        decision: 'allow',
+        file_count: 2,
+        failed_count: 0,
+      }),
+    );
+    expect(JSON.stringify(h.monitor.event.mock.calls)).not.toContain('tok-a');
+    expect(JSON.stringify(h.monitor.event.mock.calls)).not.toContain('a.txt');
   });
 
   it('cancels every token in the grouped card without auto-continuing', async () => {
@@ -312,5 +332,43 @@ describe('delete-file-confirm batching', () => {
     expect(h.history.children[1].dataset.deleteConfirmCount).toBe('1');
     expect(pathTexts(h.history.children[0])).toEqual(['old.txt']);
     expect(pathTexts(h.history.children[1])).toEqual(['new.txt']);
+  });
+
+  it('aggregates response failures without leaking confirmation ids or paths', async () => {
+    const h = loadHarness(async (channel, payload) => {
+      if (channel === 'delete_file.respond' && payload.confirm_id === 'private-token-b') {
+        return { ok: false, error: '/Users/test/private/secret.txt' };
+      }
+      return { ok: true };
+    });
+
+    h.context._handleDeleteFileConfirmRequest({
+      confirm_id: 'private-token-a', path: '/Users/test/private/a.txt', cid: 'private-cid', turn_id: 'turn-1',
+    });
+    h.context._handleDeleteFileConfirmRequest({
+      confirm_id: 'private-token-b', path: '/Users/test/private/b.txt', cid: 'private-cid', turn_id: 'turn-1',
+    });
+    await h.history.children[0].querySelector('[data-delete-act="cancel"]')!.click();
+
+    expect(h.monitor.event).toHaveBeenCalledWith(
+      'delete_file_confirmation_result',
+      expect.objectContaining({
+        result: 'failure',
+        decision: 'deny',
+        file_count: 2,
+        failed_count: 1,
+        error_type: 'ipc',
+        error_code: 'response_failed',
+      }),
+    );
+    expect(h.monitor.error).not.toHaveBeenCalled();
+    const diagnostics = JSON.stringify([
+      h.monitor.event.mock.calls,
+      h.monitor.error.mock.calls,
+      h.warn.mock.calls,
+    ]);
+    expect(diagnostics).not.toContain('/Users/alice');
+    expect(diagnostics).not.toContain('private-token');
+    expect(diagnostics).not.toContain('private-cid');
   });
 });

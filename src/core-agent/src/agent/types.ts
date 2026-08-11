@@ -1,6 +1,35 @@
-import type { Usage, StopReason, MessageContent } from "../shared/types.js";
+import type {
+  ProviderEmptyKind,
+  ServerModelFallbackReason,
+  Usage,
+  StopReason,
+  MessageContent,
+} from "../shared/types.js";
 import type { HistoryResource } from "./session.js";
 import type { CommandExecutionObservation } from "../tools/base.js";
+
+/** A user-authored message admitted into an already-running AgentRunner.
+ *
+ * The host resolves UI/domain objects (attachments, references, skills,
+ * connectors) before they cross this boundary. CoreAgent only persists the
+ * provider-facing rich content plus durable resource references. `onApplied`
+ * is the host's acknowledgement boundary: it runs only after the Session has
+ * accepted the message and resources, so a queued source item can remain
+ * recoverable when preparation or persistence fails. */
+export type AgentRunSteerMessage = {
+  /** Stable host id used to make repeated drains idempotent within one run. */
+  id: string;
+  /** Provider-facing user content. At least one non-empty text or image block. */
+  content: MessageContent[];
+  /** Host-verified resources that must survive turn compaction/history trim. */
+  historyResources?: HistoryResource[];
+  /** Called after the message and resources have been committed to Session. */
+  onApplied?: () => void | Promise<void>;
+};
+
+/** Text remains accepted for compatibility with non-host callers and older
+ * tests. Product integrations should use the structured shape above. */
+export type AgentRunSteerInput = string | AgentRunSteerMessage;
 
 /** Parameters for starting an agent run. */
 export type AgentRunParams = {
@@ -59,10 +88,28 @@ export type AgentRunParams = {
    * tool results are committed, before the next LLM call). Return any user
    * messages the host wants folded into THIS run — each becomes a `user` turn
    * so the agent course-corrects mid-task instead of finishing the now-stale
-   * work and handling the message as a separate follow-up turn. Synchronous
-   * (the runner calls it between awaits); return `[]`/undefined for no steer.
+   * work and handling the message as a separate follow-up turn. The hook may
+   * asynchronously hydrate attachments/skills/references; the runner never
+   * calls it while a provider request or tool mutation is being committed.
    */
-  drainSteer?: () => string[] | undefined;
+  drainSteer?: () =>
+    | AgentRunSteerInput[]
+    | undefined
+    | Promise<AgentRunSteerInput[] | undefined>;
+  /**
+   * Host-side terminal-response guard. Called when the model produces a final
+   * answer with no tool calls. Return a correction instruction to REJECT that
+   * answer: the runner folds it in as a request control and re-prompts, so the
+   * model repairs the response inside the SAME turn instead of shipping a
+   * broken one to the user. Return null/undefined to accept.
+   *
+   * Runs on every terminal answer but REJECTS at most once per run: a guard
+   * that keeps failing cannot spin the turn, and the second offence ships
+   * (logged) with the user still able to act. Domain rules belong in the host —
+   * the runner owns only the reject-and-re-prompt mechanism, the same shape as
+   * the premature-completion nudge.
+   */
+  terminalTextGuard?: (text: string) => string | null | undefined;
 };
 
 /** Result of a single agent run. */
@@ -94,8 +141,14 @@ export type AgentRunConvergenceSignal =
   | "tool_loop_limit_nudge"
   | "elapsed_convergence_nudge"
   | "spin_convergence_nudge"
+  | "no_progress_nudge"
+  | "discovery_stall_nudge"
   | "tool_loop_limit"
-  | "repetitive_tool_calls";
+  | "repetitive_tool_calls"
+  | "no_progress_stop"
+  | "discovery_stall_stop"
+  | "output_limit_continuation"
+  | "output_limit_unrecovered";
 
 /** Metadata about an agent run. */
 export type AgentRunMeta = {
@@ -148,6 +201,7 @@ export type AgentRunEvent =
       name: string;
       id: string;
       result: string;
+      displayName?: string;
       persistedOutput?: { path: string; size: number; ref: string };
       isError?: boolean;
       errorCode?: string;
@@ -157,6 +211,15 @@ export type AgentRunEvent =
     }
   | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage; durationMs?: number }
   | {
+      /** Low-cardinality timing for one main/final-summary provider request.
+       * Internal telemetry only; host event mappers do not render it. */
+      type: "provider_call";
+      durationMs: number;
+      outcome: "completed" | "failed";
+      model: string;
+      stopReason?: StopReason;
+    }
+  | {
       type: "context_status";
       phase:
         | "history_summary_start"
@@ -164,15 +227,31 @@ export type AgentRunEvent =
         | "history_summary_failed"
         | "active_process_compaction_start"
         | "active_process_compaction_done"
-        | "active_process_compaction_failed";
+        | "active_process_compaction_failed"
+        /** Layered compaction could not hold the request under the ceiling, so
+         *  raw tool output was dropped without a summary. Distinct from the
+         *  phases above because information was lost, not condensed. */
+        | "emergency_reduction";
       data?: Record<string, unknown>;
     }
   | { type: "retry"; attempt: number; reason: string; waitMs?: number }
   | {
       type: "provider_fallback";
-      reason: "auth" | "no_first_event_timeout";
+      reason: "auth" | "no_first_event_timeout" | "server_model_fallback";
       providerId: string;
       candidateIndex?: number;
       candidateCount?: number;
+      fromModel?: string;
+      toModel?: string;
+      serverFallbackReason?: ServerModelFallbackReason;
+    }
+  | {
+      type: "provider_empty";
+      kind: ProviderEmptyKind;
+      providerId: string;
+      candidateIndex: number;
+      candidateCount: number;
+      terminalEventSeen: boolean;
+      usage?: Partial<Usage>;
     }
   | { type: "done"; result: AgentRunResult };

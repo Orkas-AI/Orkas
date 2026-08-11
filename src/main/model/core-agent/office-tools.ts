@@ -11,6 +11,7 @@
  * uniquify-on-collision, and fire `onFileWritten` so the produced-file chip
  * shows. The OfficeCLI resident daemon is always reaped in a `finally`.
  */
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -23,17 +24,42 @@ import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { fileEditLock } from '../../util/locks';
 import { officeCliAvailable, runOfficeCli, closeOfficeFile, OfficeCliError } from '../../features/office/office_engine';
+import { renderOfficePageToPng } from '../../features/office/office_page_renderer';
 import {
   buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, serializeOfficeBatch,
   type DocxParagraphSpec, type DocxTableSpec, type DocxImageSpec,
   type XlsxCell, type XlsxSheetSpec, type PptxSlideSpec, type PptxImageSpec,
-  type EditOp, type OfficeBatchOp,
+  type EditOp, type OfficeBatchOp, OfficeEditInputError,
 } from './office-batch';
 import { DENY_MESSAGE } from './local-tools';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import { auditPptxContrast } from './pptx-contrast';
 
 const log = createLogger('office-tools');
+
+function sha256Bytes(bytes: Buffer): string {
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+function sha256File(file: string): string {
+  return sha256Bytes(fs.readFileSync(file));
+}
+
+function shortRevision(sha256: string): string {
+  return sha256.replace(/^sha256:/, '').slice(0, 16);
+}
+
+function officeIssueCount(value: unknown): number | null {
+  if (Array.isArray(value)) return value.length;
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  if (Number.isFinite(record.count) && Number(record.count) >= 0) {
+    return Math.trunc(Number(record.count));
+  }
+  if (Array.isArray(record.issues)) return record.issues.length;
+  return officeIssueCount(record.data);
+}
 
 export interface OfficeToolsOpts {
   /** Active uid — used to resolve the workspace + attachment sandbox roots. */
@@ -57,6 +83,12 @@ function deniedResult(): ToolResult {
 
 function errResult(code: string, msg: string): ToolResult {
   return { content: `${code}: ${msg}`, isError: true };
+}
+
+function isResidentDeliveryFailure(result: { stdout: string; stderr: string }): boolean {
+  const message = `${result.stderr || ''}\n${result.stdout || ''}`;
+  return /batch could not be delivered|main pipe (?:busy|unresponsive)|resident.+(?:busy|unresponsive)/i
+    .test(message);
 }
 
 /** Workspace + attachment + extra roots for the current (uid, cid). Mirrors
@@ -193,6 +225,20 @@ function normalizeEditOperations(
   return { operations };
 }
 
+function xlsxTablePlacementError(operations: readonly EditOp[]): string | null {
+  for (const [index, operation] of operations.entries()) {
+    if (operation.action !== 'add' || operation.type !== 'table') continue;
+    const ref = operation.props?.ref;
+    const range = operation.props?.range;
+    const hasPlacement = (typeof ref === 'string' && ref.trim())
+      || (typeof range === 'string' && range.trim());
+    if (!hasPlacement) {
+      return `Excel add-table operation at operations[${index}] requires props.ref or props.range (e.g. "A1:G6")`;
+    }
+  }
+  return null;
+}
+
 function editedCopyPath(source: string): string {
   const ext = path.extname(source);
   return path.join(path.dirname(source), `${path.basename(source, ext)}-edited${ext}`);
@@ -216,26 +262,12 @@ async function acquireFileLocks(absPaths: readonly string[]): Promise<() => void
 /** Render one page to a PNG and return it as a tool-result image. Best-effort
  *  for the create-preview path; the caller decides whether a null is fatal. */
 async function renderToImage(file: string, cwd: string, page: string, signal?: AbortSignal): Promise<ToolResultImage | null> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oc-prev-'));
-  const png = path.join(dir, 'preview.png');
   try {
-    const r = await runOfficeCli(['view', file, 'screenshot', '-o', png, '--page', page], {
-      cwd, timeoutMs: 60_000, ...(signal ? { signal } : {}),
-    });
-    if (r.code !== 0 || !fs.existsSync(png)) {
-      log.warn('render failed', {
-        code: r.code,
-        stderr_chars: r.stderr?.length || 0,
-        stdout_chars: r.stdout?.length || 0,
-      });
-      return null;
-    }
-    return { data: fs.readFileSync(png).toString('base64'), mediaType: 'image/png' };
+    const png = await renderOfficePageToPng(file, cwd, page, signal);
+    return { data: png.toString('base64'), mediaType: 'image/png' };
   } catch (err) {
     log.warn('render error', { error: logErrorRef(err) });
     return null;
-  } finally {
-    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 
@@ -245,7 +277,15 @@ async function renderToImage(file: string, cwd: string, page: string, signal?: A
 async function runCreate(
   opts: OfficeToolsOpts,
   ctx: ToolContext,
-  args: { inputAbs: string; createFlags: string[]; ops: OfficeBatchOp[]; wantPreview: boolean; noun: string; unit: string },
+  args: {
+    inputAbs: string;
+    createFlags: string[];
+    ops: OfficeBatchOp[];
+    wantPreview: boolean;
+    noun: string;
+    unit: string;
+    unitCount: number;
+  },
 ): Promise<ToolResult> {
   // Resolve inside the try so a uniquify failure (collision exhaustion) returns
   // a ToolResult like every other error path instead of throwing past the
@@ -272,9 +312,19 @@ async function runCreate(
     }
 
     if (args.ops.length) {
-      const batched = await runOfficeCli(['batch', workPath], {
+      let batched = await runOfficeCli(['batch', workPath], {
         cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
+      // A freshly-created file can very rarely leave OfficeCLI's detached
+      // resident alive but not accepting its next batch yet. Close that stale
+      // resident and retry exactly once. Other validation/authoring failures
+      // remain model-visible and are never retried blindly.
+      if (batched.code !== 0 && isResidentDeliveryFailure(batched)) {
+        await closeOfficeFile(workPath, tempDir);
+        batched = await runOfficeCli(['batch', workPath], {
+          cwd: tempDir, stdin: serializeOfficeBatch(args.ops), ...(ctx.signal ? { signal: ctx.signal } : {}),
+        });
+      }
       if (batched.code !== 0) {
         return errResult('E_OFFICE_BATCH_FAILED', batched.stderr || batched.stdout || `exit ${batched.code}`);
       }
@@ -308,7 +358,7 @@ async function runCreate(
       catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
     }
 
-    const n = args.ops.length;
+    const n = args.unitCount;
     const base = `${args.noun} created: ${finalPath} (${n} ${args.unit}${n === 1 ? '' : 's'})`;
     const content = renamed ? `${base}${renderRenameSignal(args.inputAbs, finalPath)}` : base;
     return { content, ...(preview ? { images: [preview] } : {}) };
@@ -442,6 +492,7 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
         ops: buildDocxBatch(paragraphs, tables, images),
         wantPreview: input.preview !== false,
         noun: 'Word document', unit: 'paragraph',
+        unitCount: paragraphs.length,
       });
     },
   };
@@ -632,6 +683,12 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
         ops: buildXlsxWorkbookBatch(sheets),
         wantPreview: input.preview !== false,
         noun: 'Excel workbook', unit: 'cell',
+        unitCount: sheets.reduce(
+          (total, sheet) => total + (Array.isArray(sheet.rows)
+            ? sheet.rows.reduce((sheetTotal, row) => sheetTotal + (Array.isArray(row) ? row.length : 0), 0)
+            : 0),
+          0,
+        ),
       });
     },
   };
@@ -641,7 +698,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_pptx',
     description:
-      'Create a .pptx with path and slides. slides: [{title?, body?, layout?, background?, transition?, shapes?, images?, tables?}]. shapes need text/x/y/width/height plus style fields; images need src/x/y/width/height with src in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
+      'Create an editable .pptx with designed slides. Supports free-positioned styled shapes, cropped images, native editable charts, styled tables, slide backgrounds, and transitions. Use explicit geometry and a coherent design system; images must be in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -674,8 +731,27 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                     size: { type: 'string', description: 'Font size, e.g. "24" or "24pt".' },
                     bold: { type: 'boolean', description: 'Bold text.' },
                     align: { type: 'string', description: 'Text alignment: left/center/right.' },
+                    valign: { type: 'string', description: 'Vertical alignment: top/middle/bottom.' },
                     font: { type: 'string', description: 'Font family.' },
+                    'font.ea': { type: 'string', description: 'East-Asian font family for CJK text.' },
                     geometry: { type: 'string', description: 'Preset shape, e.g. "rect", "roundRect", "ellipse". Default rect.' },
+                    opacity: { type: 'number', description: 'Fill opacity from 0 to 100. Use with fill, gradient, or pattern; ignored without a fill carrier.' },
+                    margin: { type: 'string', description: 'Internal text margin, e.g. "0.12in" or "0.08in,0.12in,0.08in,0.12in".' },
+                    line: { type: 'string', description: 'Outline color, e.g. "#D7DEE8".' },
+                    lineWidth: { type: 'string', description: 'Outline width, e.g. "1pt".' },
+                    lineDash: { type: 'string', description: 'Outline dash style.' },
+                    lineOpacity: { type: 'number', description: 'Outline opacity from 0 to 100.' },
+                    gradient: { type: 'string', description: 'Gradient fill, e.g. "#0F172A-#1E3A5F-25".' },
+                    rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
+                    autoFit: { type: 'boolean', description: 'Auto-fit text to its shape.' },
+                    lineSpacing: { type: 'string', description: 'Line spacing, e.g. "1.15".' },
+                    spaceBefore: { type: 'string', description: 'Paragraph spacing before.' },
+                    spaceAfter: { type: 'string', description: 'Paragraph spacing after.' },
+                    shadow: {
+                      type: ['string', 'boolean'],
+                      description: 'Outer shadow: true for the default black shadow, "none" to remove it, or a color such as "#808080". Do not use preset names such as "outer".',
+                    },
+                    name: { type: 'string', description: 'Stable element name for later inspection/editing.' },
                   },
                 },
               },
@@ -690,8 +766,52 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                     y: { type: 'string', description: 'Top position with unit.' },
                     width: { type: 'string', description: 'Width with unit.' },
                     height: { type: 'string', description: 'Height with unit.' },
+                    crop: { type: 'string', description: 'Crop mode or crop rectangle supported by OfficeCLI.' },
+                    cropLeft: { type: 'number', description: 'Crop percentage from the left.' },
+                    cropRight: { type: 'number', description: 'Crop percentage from the right.' },
+                    cropTop: { type: 'number', description: 'Crop percentage from the top.' },
+                    cropBottom: { type: 'number', description: 'Crop percentage from the bottom.' },
+                    opacity: { type: 'number', description: 'Image opacity from 0 to 100.' },
+                    rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
+                    alt: { type: 'string', description: 'Accessible alternative text.' },
+                    name: { type: 'string', description: 'Stable element name for later inspection/editing.' },
                   },
                   required: ['src'],
+                },
+              },
+              charts: {
+                type: 'array',
+                description: 'Native editable PowerPoint charts. Use only verified numeric data and add a visible source note when the data comes from external material.',
+                items: {
+                  type: 'object',
+                  properties: {
+                    type: {
+                      type: 'string',
+                      enum: ['bar', 'column', 'line', 'pie', 'doughnut', 'area', 'scatter', 'bubble', 'radar', 'stock', 'combo', 'waterfall', 'funnel', 'treemap', 'sunburst', 'boxWhisker', 'histogram', 'pareto'],
+                      description: 'Native chart type.',
+                    },
+                    data: { type: 'string', description: 'Series data: "Name:1,2,3;Name 2:4,5,6".' },
+                    categories: { type: 'string', description: 'Comma-separated category labels.' },
+                    title: { type: 'string', description: 'Chart title.' },
+                    x: { type: 'string', description: 'Left position with unit.' },
+                    y: { type: 'string', description: 'Top position with unit.' },
+                    width: { type: 'string', description: 'Width with unit.' },
+                    height: { type: 'string', description: 'Height with unit.' },
+                    anchor: { type: 'string', description: 'Positioning anchor supported by OfficeCLI.' },
+                    legend: { type: 'string', description: 'Legend position or visibility.' },
+                    colors: { type: 'string', description: 'Comma-separated series colors.' },
+                    dataLabels: { type: 'string', description: 'Data-label style or visibility.' },
+                    preset: { type: 'string', description: 'Built-in chart style preset.' },
+                    axismin: { type: 'number', description: 'Value-axis minimum.' },
+                    axismax: { type: 'number', description: 'Value-axis maximum.' },
+                    catTitle: { type: 'string', description: 'Category-axis title.' },
+                    axistitle: { type: 'string', description: 'Value-axis title.' },
+                    gridlines: { type: 'string', description: 'Gridline style or visibility.' },
+                    plotFill: { type: 'string', description: 'Plot-area fill color.' },
+                    chartFill: { type: 'string', description: 'Chart-area fill color.' },
+                    name: { type: 'string', description: 'Stable chart name for later inspection/editing.' },
+                  },
+                  required: ['type', 'data'],
                 },
               },
               tables: {
@@ -707,7 +827,19 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                     },
                     x: { type: 'string', description: 'Left position with unit.' },
                     y: { type: 'string', description: 'Top position with unit.' },
+                    width: { type: 'string', description: 'Table width with unit.' },
+                    height: { type: 'string', description: 'Table height with unit.' },
+                    rowHeight: { type: 'string', description: 'Default row height.' },
                     colWidths: { type: 'string', description: 'Comma-separated column widths, e.g. "2in,3in".' },
+                    headerFill: { type: 'string', description: 'Header-row fill color.' },
+                    bodyFill: { type: 'string', description: 'Body-row fill color.' },
+                    style: { type: 'string', description: 'Native PowerPoint table style name.' },
+                    'border.all': { type: 'string', description: 'All-border style/color.' },
+                    'border.horizontal': { type: 'string', description: 'Horizontal-border style/color.' },
+                    'border.vertical': { type: 'string', description: 'Vertical-border style/color.' },
+                    firstRow: { type: 'boolean', description: 'Apply header-row emphasis.' },
+                    bandedRows: { type: 'boolean', description: 'Apply alternating body-row styling.' },
+                    name: { type: 'string', description: 'Stable table name for later inspection/editing.' },
                   },
                   required: ['rows'],
                 },
@@ -742,6 +874,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
         ops: buildPptxBatch(slides),
         wantPreview: input.preview !== false,
         noun: 'PowerPoint deck', unit: 'slide',
+        unitCount: slides.length,
       });
     },
   };
@@ -751,14 +884,29 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'office_render',
     description:
-      'Render a page of an existing Word/Excel/PowerPoint file to a PNG image so you can see how it looks ' +
+      'Render one numbered page of an existing Word/Excel/PowerPoint file to a PNG image so you can see how it looks ' +
       '(layout, fonts, CJK glyphs). Uses the built-in Office engine (no Microsoft Office required). ' +
-      'Provide `path` (a .docx/.xlsx/.pptx in this conversation) and an optional `page` (default "1"). Returns the image.',
+      'Provide `path` (a .docx/.xlsx/.pptx in this conversation), an optional one-based positive-integer string ' +
+      '`page` (default "1"), and ' +
+      '`analysis_mode:"quality_review"` only when the returned image must be checked for visual defects. ' +
+      'For XLSX, `page` is the worksheet position in workbook order; use office_read mode "outline" to map names ' +
+      'to positions, and never pass a worksheet name or cell range as `page`. ' +
+      'The image is available to the next inference only: preserve concrete findings in assistant text before follow-up tools. ' +
+      'Returns the image plus artifact/image revision ids so later turns can distinguish current from stale evidence.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Path to an existing .docx/.xlsx/.pptx (absolute or workspace-relative).' },
-        page: { type: 'string', description: 'Page / slide number to render, e.g. "1". Default "1".' },
+        page: {
+          type: 'string',
+          description: 'One-based page/slide number, or XLSX worksheet position in workbook order, e.g. "1". Never pass an XLSX worksheet name or cell range. Default "1".',
+        },
+        analysis_mode: {
+          type: 'string',
+          enum: ['understand', 'quality_review'],
+          description:
+            'How the model should analyze the returned PNG. Default "understand"; use "quality_review" only for explicit visual-defect review.',
+        },
       },
       required: ['path'],
     },
@@ -785,7 +933,18 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
       try {
         const img = await renderToImage(abs, cwd, page, ctx.signal);
         if (!img) return errResult('E_OFFICE_RENDER_FAILED', `could not render ${abs} page ${page}`);
-        return { content: `Rendered ${abs} page ${page}`, images: [img] };
+        const artifactSha256 = sha256File(abs);
+        const imageSha256 = sha256Bytes(Buffer.from(img.data, 'base64'));
+        const analysisMode = input.analysis_mode === 'quality_review' ? 'quality_review' : 'understand';
+        return {
+          content:
+            `Rendered page=${page} mode=${analysisMode} ` +
+            `artifact_revision=${shortRevision(artifactSha256)} ` +
+            `image_revision=${shortRevision(imageSha256)} path=${abs} ` +
+            `artifact_sha256=${artifactSha256} image_sha256=${imageSha256}`,
+          images: [{ ...img, analysisMode }],
+          observations: { fileReads: [{ path: abs, hash: artifactSha256 }] },
+        };
       } finally {
         await closeOfficeFile(abs, cwd);
       }
@@ -835,17 +994,46 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
         const issues = await runOfficeCli(['view', abs, 'issues', '--json'], {
           cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
+        let normalizedIssues = normalizeOutput(issues.stdout, issues.stderr);
+        let contrastScanOk: boolean | undefined;
+        let contrastFindings: number | undefined;
+        let contrastTextRuns: number | undefined;
+        if (path.extname(abs).toLowerCase() === '.pptx') {
+          const tree = await runOfficeCli(['get', abs, '/', '--depth', '6', '--json'], {
+            cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+          });
+          contrastScanOk = tree.code === 0;
+          if (contrastScanOk) {
+            const audit = auditPptxContrast(
+              normalizedIssues,
+              normalizeOutput(tree.stdout, tree.stderr),
+            );
+            normalizedIssues = audit.issues;
+            contrastFindings = audit.findingCount;
+            contrastTextRuns = audit.scannedTextCount;
+          }
+        }
+        const artifactSha256 = sha256File(abs);
         const payload = {
-          path: abs,
           valid: validate.code === 0,
-          validation_exit_code: validate.code,
-          validation: normalizeOutput(validate.stdout, validate.stderr),
+          issue_count: officeIssueCount(normalizedIssues),
+          artifact_revision: shortRevision(artifactSha256),
           issue_scan_ok: issues.code === 0,
+          validation_exit_code: validate.code,
           issue_scan_exit_code: issues.code,
-          issues: normalizeOutput(issues.stdout, issues.stderr),
+          ...(contrastScanOk === undefined ? {} : {
+            contrast_scan_ok: contrastScanOk,
+            contrast_findings: contrastFindings ?? 0,
+            contrast_text_runs: contrastTextRuns ?? 0,
+          }),
+          path: abs,
+          artifact_sha256: artifactSha256,
+          validation: normalizeOutput(validate.stdout, validate.stderr),
+          issues: normalizedIssues,
         };
         return {
           content: JSON.stringify(payload),
+          observations: { fileReads: [{ path: abs, hash: artifactSha256 }] },
           ...(payload.valid ? {} : { isError: true }),
         };
       } catch (err) {
@@ -876,7 +1064,9 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
 export function officeArgError(value: string, kind: 'target' | 'page' | 'locale'): string | null {
   if (typeof value !== 'string') return `\`${kind}\` must be a string.`;
   if (kind === 'page') {
-    return /^[0-9]+$/.test(value) ? null : '`page` must be a positive integer (e.g. "1").';
+    return /^(?!0+$)[0-9]+$/.test(value)
+      ? null
+      : '`page` must be a one-based positive integer string (e.g. "1"); for XLSX use worksheet order, not a name or range.';
   }
   if (kind === 'locale') {
     return /^[A-Za-z][A-Za-z0-9-]*$/.test(value) ? null : '`locale` must be a BCP-47-style tag (e.g. "zh-CN").';
@@ -949,10 +1139,16 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
       'Safely edit DOCX/XLSX/PPTX. Provide source `path`, optional `output_path`, and `operations`: ' +
       'only {action:"set",path,props}, {action:"add",parent,type,props}, or {action:"remove",path}. ' +
       'For targeted text replacement use {action:"set",path:"/body/p[2]",props:{find:"old",replace:"new"}}; ' +
-      'there is no replace action or edits field. A pre-existing source becomes a ' +
+      'Add a table grid with action "add", type "table", parent "/body" (Word) or "/slide[N]" (PowerPoint), ' +
+      'and props {rows:[["Header","Value"],["Records",57750]],style:"medium2"}; it is seeded atomically. ' +
+      'For Excel, use the worksheet parent (for example "/Sheet1") and include the mandatory placement in props, ' +
+      'for example {ref:"A1:B2",rows:[["Header","Value"],["Records",57750]]}; `range` is accepted instead of `ref`. ' +
+      'Preview rendering is opt-in with `preview:true`; normally finish edits, run `office_check`, then call `office_render` ' +
+      'for the pages or worksheets that need visual QA. ' +
+      'There is no replace action or edits field. A pre-existing source becomes a ' +
       '`-edited` copy and is never overwritten; a conversation-produced file may be refined in place. ' +
       'Use `office_read` for stable element paths. File-bearing props such as `src` must be sandboxed. The batch is ' +
-      'validated before atomic commit; returns the saved path and preview.',
+      'validated before atomic commit; returns the saved path and an optional requested preview.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -970,13 +1166,19 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
               action: { type: 'string', enum: ['set', 'add', 'remove'] },
               path: { type: 'string', description: 'Target element path (action set/remove).' },
               parent: { type: 'string', description: 'Parent element path (action add).' },
-              type: { type: 'string', description: 'Element type to add, e.g. "p", "cell", "slide" (action add).' },
-              props: { type: 'object', description: 'Property key/value pairs (action set/add).' },
+              type: {
+                type: 'string',
+                description: 'Element type for action add. Format-specific examples: DOCX "p", "table", "picture"; XLSX "cell", "table", "chart", "picture"; PPTX "shape", "textbox", "picture", "chart", "table", "slide". DOCX "p" is invalid under a PPTX slide; use "textbox" or a text-bearing "shape".',
+              },
+              props: {
+                type: 'object',
+                description: 'Scalar property key/value pairs. For action add + type table, rows may be a rectangular two-dimensional cell grid; other nested arrays/objects are rejected. An XLSX table also requires ref or range, such as "A1:G6", to place the grid on its parent worksheet.',
+              },
             },
             required: ['action'],
           },
         },
-        preview: { type: 'boolean', description: 'Render a first-page PNG preview after editing. Default true.' },
+        preview: { type: 'boolean', description: 'Render a first-page PNG preview after editing. Default false; use explicit office_render for final visual QA.' },
       },
       required: ['path', 'operations'],
     },
@@ -998,7 +1200,17 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
 
       const normalized = normalizeEditOperations(opts, ctx, input.operations);
       if ('error' in normalized) return errResult('E_BAD_INPUT', normalized.error);
-      const ops = buildEditBatch(normalized.operations);
+      if (sourceExt === '.xlsx') {
+        const placementError = xlsxTablePlacementError(normalized.operations);
+        if (placementError) return errResult('E_BAD_INPUT', placementError);
+      }
+      let ops: OfficeBatchOp[];
+      try {
+        ops = buildEditBatch(normalized.operations);
+      } catch (err) {
+        if (err instanceof OfficeEditInputError) return errResult('E_BAD_INPUT', err.message);
+        throw err;
+      }
       if (!ops.length) return errResult('E_BAD_INPUT', '`operations` must contain at least one valid {action,…} entry');
 
       const sourceWasProduced = !!opts.hasProducedPath?.(sourceAbs);
@@ -1051,7 +1263,7 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
         await closeOfficeFile(workPath, workCwd);
         fs.renameSync(workPath, finalPath);
 
-        const preview = input.preview !== false ? await renderToImage(finalPath, finalCwd, '1', ctx.signal) : null;
+        const preview = input.preview === true ? await renderToImage(finalPath, finalCwd, '1', ctx.signal) : null;
         if (opts.onFileWritten) {
           try { await opts.onFileWritten(finalPath); }
           catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }

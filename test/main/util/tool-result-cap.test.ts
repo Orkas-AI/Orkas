@@ -7,10 +7,11 @@ import {
   capToolResult,
   DEFAULT_INLINE_RESULT_TOKENS,
   DEFAULT_LOCAL_TOOL_RESULTS_MAX_BYTES,
-  PERSIST_THRESHOLD,
   TOOL_RESULT_REF_HASH_HEX,
   TOOL_RESULT_INLINE_LEDGER_STATE_KEY,
   buildPersistedOutputMarker,
+  buildPersistedOutputMarkerFromPreview,
+  buildStructureOutline,
   estimateToolResultTokens,
   maybeSpillToolResult,
   persistToolResult,
@@ -32,11 +33,18 @@ const makeTmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-tool-cap-'
 const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });
 
 describe('tool-result-cap configuration', () => {
-  it('uses one 8K token-aware inline budget', () => {
-    expect(DEFAULT_INLINE_RESULT_TOKENS).toBe(8_000);
-    expect(PERSIST_THRESHOLD).toBe(32_000);
+  it('keeps the token budget at the pre-switch 50K-char equivalent', () => {
+    expect(DEFAULT_INLINE_RESULT_TOKENS).toBe(12_500);
     expect(TOOL_RESULT_REF_HASH_HEX).toBe(64);
     expect(DEFAULT_LOCAL_TOOL_RESULTS_MAX_BYTES).toBe(1024 ** 3);
+  });
+
+  // Regression: an 8K budget spilled `skill-creator` (11.1K tokens) and
+  // `agent-creator` (10.6K), so commander authored machine containers from a
+  // head/tail preview and emitted unparseable blocks. Both must stay inline.
+  it('keeps the largest system-skill protocol specs inline', () => {
+    expect(estimateToolResultTokens('a'.repeat(44_000)))
+      .toBeLessThan(DEFAULT_INLINE_RESULT_TOKENS);
   });
 
   it('counts CJK more aggressively than ASCII', () => {
@@ -78,6 +86,81 @@ describe('wrapToolWithCap', () => {
     const files = fs.readdirSync(dir);
     expect(files).toEqual([expect.stringMatching(/^web_fetch\.[0-9a-f]{64}\.txt$/)]);
     expect(fs.readFileSync(path.join(dir, files[0]), 'utf8')).toBe(original);
+  });
+
+  it('keeps the observed agent-creator-sized read inline under the verbatim ceiling', () => {
+    // Regression from 2026-08-07: a system-skill read was ~10,940 tokens while
+    // gpt-5.6-luna derived a 7,917-token ordinary ceiling. The round still had
+    // enough room, so correct skill classification must admit the document.
+    const ledger = () => ({
+      initialTokens: 11_728,
+      remainingTokens: 11_728,
+      perResultTokens: 7_917,
+      verbatimDocumentTokens: 15_834,
+    });
+    const body = 'x'.repeat(43_760);
+    expect(estimateToolResultTokens(body)).toBe(10_940);
+
+    const spilled = capToolResult('read_file', { content: body }, {
+      ...ctx,
+      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger() },
+    } as unknown as typeof ctx, {
+      maxInlineTokens: 12_500,
+      toolResultsDir: dir,
+    });
+    expect(spilled.content).toMatch(/^<persisted-output/);
+
+    const inlined = capToolResult('read_file', { content: body, verbatimDocument: true }, {
+      ...ctx,
+      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger() },
+    } as unknown as typeof ctx, {
+      maxInlineTokens: 12_500,
+      toolResultsDir: dir,
+    });
+    expect(inlined.content).toBe(body);
+  });
+
+  it('still charges a verbatim document to the round ledger', () => {
+    // The wider ceiling is a per-item policy, not an exemption: the ledger is
+    // what protects the context window, and it falls to zero as the request
+    // fills. A skill read that no longer fits the round spills like anything
+    // else.
+    const ledger = {
+      initialTokens: 50_000,
+      remainingTokens: 100,
+      perResultTokens: 400,
+      verbatimDocumentTokens: 100_000,
+    };
+    const tightCtx = {
+      ...ctx,
+      state: { [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger },
+    } as unknown as typeof ctx;
+    const result = capToolResult(
+      'read_file',
+      { content: 'x'.repeat(2_400), verbatimDocument: true },
+      tightCtx,
+      { maxInlineTokens: 12_500, toolResultsDir: dir },
+    );
+    expect(result.content).toMatch(/^<persisted-output/);
+  });
+
+  it('keeps the caller default when no budget was resolved', () => {
+    // Unknown model, reflection, one-shots: there is no window to derive from,
+    // so behaviour must be exactly what it was before the derivation existed —
+    // including for a verbatim document, which gets no invented multiple.
+    const body = 'x'.repeat(2_400);
+    const plain = capToolResult('read_file', { content: body }, ctx, {
+      maxInlineTokens: 1_000,
+      toolResultsDir: dir,
+    });
+    expect(plain.content).toBe(body);
+    const verbatim = capToolResult(
+      'read_file',
+      { content: 'x'.repeat(8_000), verbatimDocument: true },
+      ctx,
+      { maxInlineTokens: 1_000, toolResultsDir: dir },
+    );
+    expect(verbatim.content).toMatch(/^<persisted-output/);
   });
 
   it('marks persistence failure as an error without leaking the backing path', async () => {
@@ -302,6 +385,51 @@ describe('persisted result helpers', () => {
     expect(marker).toContain('chars omitted; full result is stored');
     expect(estimateToolResultTokens(marker)).toBeLessThan(1_000);
   });
+
+  // A head/tail preview hides the middle of a structured document, which is
+  // where reference material lives. The section map replaces guesswork with a
+  // seek: every offset is a `tool_result_read_chunk` cursor.
+  it('emits a section map with char cursors for structured documents', () => {
+    const doc = [
+      '# Title',
+      'intro'.repeat(200),
+      '## Alpha',
+      'a'.repeat(9_000),
+      '## Block format',
+      'the part that matters',
+      '## Omega',
+      'z'.repeat(9_000),
+    ].join('\n');
+    const marker = buildPersistedOutputMarker('/tmp/read_file.0123456789abcdef.txt', 'read_file', doc);
+
+    expect(marker).toContain('Section map');
+    expect(marker).toContain('Block format');
+    expect(marker).toContain('Omega');
+    const offset = Number(/@(\d+)\t\s*## ?Block format|@(\d+)\t\s*Block format/.exec(marker)?.slice(1).find(Boolean));
+    expect(doc.slice(offset)).toMatch(/^## Block format/);
+    expect(estimateToolResultTokens(marker)).toBeLessThan(1_000);
+  });
+
+  it('does not fabricate an outline from a partial streamed preview', () => {
+    const full = ['# A', 'x'.repeat(5_000), '## B', 'y'.repeat(5_000), '## C'].join('\n');
+    const marker = buildPersistedOutputMarkerFromPreview(
+      '/tmp/bash.0123456789abcdef.txt',
+      'bash',
+      full.slice(0, 200),
+      { sizeChars: full.length, estimatedTokens: 3_000, isError: false, sourceTruncated: false },
+    );
+    expect(marker).not.toContain('Section map');
+  });
+
+  it('leaves unstructured output on the plain head/tail preview', () => {
+    const marker = buildPersistedOutputMarker(
+      '/tmp/bash.0123456789abcdef.txt',
+      'bash',
+      'no headings here\n'.repeat(4_000),
+    );
+    expect(marker).not.toContain('Section map');
+    expect(marker).toContain('chars omitted; full result is stored');
+  });
 });
 
 describe('maybeSpillToolResult', () => {
@@ -320,7 +448,8 @@ describe('maybeSpillToolResult', () => {
   });
 
   it('spills output above the budget and returns its durable path', () => {
-    const original = 'X'.repeat(PERSIST_THRESHOLD + 100);
+    // ASCII length past the token-aware spill budget (~4 chars per token).
+    const original = 'X'.repeat(DEFAULT_INLINE_RESULT_TOKENS * 4 + 100);
     const result = maybeSpillToolResult({
       toolResultsDir: dir,
       toolName: 'bash',

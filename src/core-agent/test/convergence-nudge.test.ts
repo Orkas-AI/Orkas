@@ -56,4 +56,11 @@ describe("shouldNudgeElapsedConvergence", () => {
     expect(shouldNudgeElapsedConvergence(RUN_CONVERGENCE_ELAPSED_MS - 1, RUN_CONVERGENCE_MIN_TOOL_LOOPS)).toBe(false);
     expect(shouldNudgeElapsedConvergence(RUN_CONVERGENCE_ELAPSED_MS, RUN_CONVERGENCE_MIN_TOOL_LOOPS - 1)).toBe(false);
   });
+
+  it("honors a host-supplied earlier threshold without relaxing the tool-work minimum", () => {
+    const thresholdMs = 3 * 60 * 1000;
+    expect(shouldNudgeElapsedConvergence(thresholdMs, RUN_CONVERGENCE_MIN_TOOL_LOOPS, thresholdMs)).toBe(true);
+    expect(shouldNudgeElapsedConvergence(thresholdMs - 1, RUN_CONVERGENCE_MIN_TOOL_LOOPS, thresholdMs)).toBe(false);
+    expect(shouldNudgeElapsedConvergence(thresholdMs, RUN_CONVERGENCE_MIN_TOOL_LOOPS - 1, thresholdMs)).toBe(false);
+  });
 });

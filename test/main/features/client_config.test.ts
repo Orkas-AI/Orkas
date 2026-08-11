@@ -77,6 +77,7 @@ describe('client_config', () => {
       { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', template: 'gpt-5.5', contextWindow: 372000, maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', template: 'gpt-5.5', contextWindow: 272000, maxTokens: 128000, maxInputImages: 20 },
       { id: 'gpt-5.5', name: 'GPT-5.5', maxInputImages: 20 },
+      { id: 'gpt-5.4', name: 'GPT-5.4', maxInputImages: 20 },
     ]);
   });
 

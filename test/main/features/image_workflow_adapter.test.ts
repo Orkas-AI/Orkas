@@ -11,6 +11,7 @@ import {
   runImageWorkflow,
   validateImageWorkflowBaseUrl,
 } from '../../../src/main/features/image_workflow_adapter';
+import { _resetProxyRoutingForTests } from '../../../src/main/util/proxy-dispatcher';
 
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
@@ -46,6 +47,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  _resetProxyRoutingForTests();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   for (const [key, value] of Object.entries(previousEnv)) {
     if (value === undefined) delete process.env[key];
@@ -139,22 +142,134 @@ describe('image workflow adapter execution', () => {
       output_node_id: '9',
     });
     const calls: Array<{ url: string; init: RequestInit }> = [];
+    let promptCount = 0;
+    let downloadCount = 0;
     vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
       calls.push({ url, init });
-      if (url.endsWith('/prompt')) return new Response(JSON.stringify({ prompt_id: 'prompt-1', number: 1 }), { status: 200 });
+      if (url.endsWith('/prompt')) {
+        promptCount += 1;
+        return new Response(JSON.stringify({ prompt_id: 'prompt-1', number: 1 }), { status: 200 });
+      }
       if (url.endsWith('/history/prompt-1')) return new Response(JSON.stringify({
         'prompt-1': { status: { completed: true, status_str: 'success' }, outputs: { '9': { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } } },
       }), { status: 200 });
-      if (url.includes('/view?')) return new Response(PNG_1X1, { status: 200, headers: { 'content-type': 'image/png' } });
+      if (url.includes('/view?')) {
+        downloadCount += 1;
+        if (downloadCount === 1) throw new Error('temporary output transfer failure');
+        return new Response(PNG_1X1, { status: 200, headers: { 'content-type': 'image/png' } });
+      }
       throw new Error(`unexpected URL ${url}`);
     });
     const prepared = await prepareImageWorkflow({ engine: 'comfyui', projectDirAbs: projectDir, workflowAbsPath: workflow });
-    const result = await runImageWorkflow({ prepared, projectDirAbs: projectDir, outputAbsPath: path.join(projectDir, 'result.png'), timeoutMs: 5_000, pollIntervalMs: 0 });
+    vi.useFakeTimers();
+    const execution = runImageWorkflow({ prepared, projectDirAbs: projectDir, outputAbsPath: path.join(projectDir, 'result.png'), timeoutMs: 5_000, pollIntervalMs: 0 });
+    await vi.advanceTimersByTimeAsync(600);
+    const result = await execution;
+    vi.useRealTimers();
 
     expect(result).toMatchObject({ engine: 'comfyui', dispatch_id: 'prompt-1', output_node_id: '9', width: 1, height: 1, generation_calls: 1 });
     expect(fs.statSync(result.output_path).size).toBeGreaterThan(0);
+    expect(promptCount).toBe(1);
+    expect(downloadCount).toBe(2);
     expect((calls[0]?.init.headers as Record<string, string>)['X-API-Key']).toBe('comfy-key');
     expect(JSON.parse(String(calls[0]?.init.body))).toMatchObject({ prompt: { '9': { class_type: 'SaveImage' } } });
+  });
+
+  it('exhausts only the ComfyUI output GET and never re-enqueues the completed workflow', async () => {
+    process.env.ORKAS_COMFYUI_BASE_URL = 'http://127.0.0.1:8188';
+    const workflow = writeWorkflow('comfy-download-failure.json', {
+      workflow: { '9': { class_type: 'SaveImage', inputs: {} } },
+      output_node_id: '9',
+    });
+    let promptCount = 0;
+    let downloadCount = 0;
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.endsWith('/prompt')) {
+        promptCount += 1;
+        return new Response(JSON.stringify({ prompt_id: 'prompt-delivered' }), { status: 200 });
+      }
+      if (url.endsWith('/history/prompt-delivered')) return new Response(JSON.stringify({
+        'prompt-delivered': {
+          status: { completed: true, status_str: 'success' },
+          outputs: { '9': { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+        },
+      }), { status: 200 });
+      if (url.includes('/view?')) {
+        downloadCount += 1;
+        return new Response('temporarily unavailable', { status: 503 });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    });
+    const prepared = await prepareImageWorkflow({ engine: 'comfyui', projectDirAbs: projectDir, workflowAbsPath: workflow });
+    vi.useFakeTimers();
+    const execution = runImageWorkflow({
+      prepared,
+      projectDirAbs: projectDir,
+      outputAbsPath: path.join(projectDir, 'must-not-exist.png'),
+      timeoutMs: 5_000,
+      pollIntervalMs: 0,
+    });
+    const assertion = expect(execution).rejects.toMatchObject<ImageWorkflowError>({
+      code: 'E_IMAGE_WORKFLOW_DOWNLOAD',
+      dispatched: true,
+      terminal: true,
+      dispatchId: 'prompt-delivered',
+    });
+    await vi.advanceTimersByTimeAsync(2_100);
+    await assertion;
+
+    expect(promptCount).toBe(1);
+    expect(downloadCount).toBe(3);
+    expect(fs.existsSync(path.join(projectDir, 'must-not-exist.png'))).toBe(false);
+  });
+
+  it('uses one total workflow deadline across download attempts and pending backoff', async () => {
+    process.env.ORKAS_COMFYUI_BASE_URL = 'http://127.0.0.1:8188';
+    const workflow = writeWorkflow('comfy-download-timeout.json', {
+      workflow: { '9': { class_type: 'SaveImage', inputs: {} } },
+      output_node_id: '9',
+    });
+    let promptCount = 0;
+    let downloadCount = 0;
+    vi.stubGlobal('fetch', async (url: string) => {
+      if (url.endsWith('/prompt')) {
+        promptCount += 1;
+        return new Response(JSON.stringify({ prompt_id: 'prompt-deadline' }), { status: 200 });
+      }
+      if (url.endsWith('/history/prompt-deadline')) return new Response(JSON.stringify({
+        'prompt-deadline': {
+          status: { completed: true, status_str: 'success' },
+          outputs: { '9': { images: [{ filename: 'out.png', subfolder: '', type: 'output' }] } },
+        },
+      }), { status: 200 });
+      if (url.includes('/view?')) {
+        downloadCount += 1;
+        return new Response('busy', { status: 503 });
+      }
+      throw new Error(`unexpected URL ${url}`);
+    });
+    const prepared = await prepareImageWorkflow({ engine: 'comfyui', projectDirAbs: projectDir, workflowAbsPath: workflow });
+    vi.useFakeTimers();
+    const execution = runImageWorkflow({
+      prepared,
+      projectDirAbs: projectDir,
+      outputAbsPath: path.join(projectDir, 'deadline.png'),
+      timeoutMs: 1_000,
+      pollIntervalMs: 0,
+    });
+    const assertion = expect(execution).rejects.toMatchObject<ImageWorkflowError>({
+      code: 'E_IMAGE_WORKFLOW_DOWNLOAD',
+      dispatched: true,
+      terminal: true,
+      dispatchId: 'prompt-deadline',
+      message: expect.stringMatching(/timed out after 1 seconds/i),
+    });
+    await vi.advanceTimersByTimeAsync(1_001);
+    await assertion;
+
+    expect(promptCount).toBe(1);
+    expect(downloadCount).toBe(2);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('runs the current InvokeAI enqueue/item/image protocol', async () => {
@@ -210,6 +325,32 @@ describe('image workflow adapter execution', () => {
     expect(result).toMatchObject({ engine: 'automatic1111', width: 1, height: 1, generation_calls: 1 });
     expect((submitted?.init_images as string[])[0]).toMatch(/^data:image\/png;base64,/);
     expect(submitted?.mask).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it('does not replay an AUTOMATIC1111 POST whose dispatch result is unknown', async () => {
+    process.env.ORKAS_AUTOMATIC1111_BASE_URL = 'http://127.0.0.1:7860';
+    const workflow = writeWorkflow('automatic1111-uncertain.json', {
+      mode: 'txt2img',
+      request: { prompt: 'one potentially billable image' },
+    });
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
+      throw new Error('connection closed after request bytes were sent');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const prepared = await prepareImageWorkflow({ engine: 'automatic1111', projectDirAbs: projectDir, workflowAbsPath: workflow });
+
+    await expect(runImageWorkflow({
+      prepared,
+      projectDirAbs: projectDir,
+      outputAbsPath: path.join(projectDir, 'uncertain.png'),
+      timeoutMs: 5_000,
+    })).rejects.toMatchObject<ImageWorkflowError>({
+      code: 'E_IMAGE_WORKFLOW_SUBMIT_UNCERTAIN',
+      dispatched: true,
+      terminal: false,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.method).toBe('POST');
   });
 
   it('runs IOPaint inpaint with project-local image and mask', async () => {

@@ -1,13 +1,13 @@
-// Open-source-driven · ① new-chat tool-enhancement rail + shared helpers for the
-// marketplace「开源项目」专区 (②).
+// Open-source-driven · new-chat Quick task entry + shared helpers for the
+// marketplace「开源项目」专区.
 //
 // Data is the curated catalog served by `marketplace.listProjects` (config-as-
-// code on the Server — see PC/docs/plans/oss-driven.md). ① and ② share the
-// same cache layer, keyed by home/category/search options.
+// code on the Server — see PC/docs/plans/oss-driven.md). Marketplace listings
+// use the cache layer below, keyed by category/search options.
 //
-// Clicking a home card PREFILLS a complete install request and focuses the
-// Commander composer — it does NOT auto-send. The home subset intentionally
-// excludes capabilities already covered by Quick start agents.
+// The new-chat entry opens the marketplace's Open Source page in the current
+// content surface. Marketplace owns the return stack, so Back returns directly
+// to New Task without switching the selected sidebar tab.
 
 const _ossLog = createLogger('oss');
 
@@ -53,7 +53,6 @@ const _ossCatalogCache = new Map();
 const _ossCatalogInflight = new Map();
 const _ossCatalogNextRefreshAt = new Map();
 const _ossCatalogColdRefreshChecked = new Set();
-let _ossHomeLoadTelemetrySent = false;
 
 function _ossNormalizeCatalogOpts(forceOrOpts) {
   if (typeof forceOrOpts === 'boolean') return { force: forceOrOpts };
@@ -416,171 +415,40 @@ function _ossPromptForComposer(p, input) {
   return `${prompt}\n\n${existing}`;
 }
 
-// Desktop users naturally reach for the vertical mouse wheel even though this
-// strip scrolls horizontally. Keep wheel gestures inside the strip, amplify
-// vertical movement so one mouse-wheel notch advances roughly one card, and
-// preserve direct horizontal trackpad movement.
-function _bindOssWheelScroll(grid) {
-  if (!grid || grid._ossWheelScrollBound || typeof grid.addEventListener !== 'function') return;
-  grid._ossWheelScrollBound = true;
-  grid.addEventListener('wheel', (event) => {
-    if (event?.ctrlKey) return;
-    const deltaY = Number(event?.deltaY || 0);
-    const deltaX = Number(event?.deltaX || 0);
-    if (!deltaY && !deltaX) return;
-
-    const clientWidth = Math.max(0, Number(grid.clientWidth || 0));
-    const maxScrollLeft = Math.max(0, Number(grid.scrollWidth || 0) - clientWidth);
-    if (!maxScrollLeft) return;
-
-    const deltaMode = Number(event?.deltaMode || 0);
-    const scale = deltaMode === 1 ? 16 : deltaMode === 2 ? Math.max(1, clientWidth) : 1;
-    const delta = Math.abs(deltaY) >= Math.abs(deltaX) ? deltaY * 2 : deltaX;
-    const current = Math.max(0, Math.min(maxScrollLeft, Number(grid.scrollLeft || 0)));
-    const next = Math.max(0, Math.min(maxScrollLeft, current + delta * scale));
-
-    grid.scrollLeft = next;
-    event.preventDefault();
-  }, { passive: false });
-}
-
-// ① entry — render the task cards into #oss-entry-grid + bind clicks. Called on
-// every new-chat view enter (and on i18n-change, since task text is localized).
 function _openOssMarketplace() {
-  _ossTrackClick('commander_oss_more', { source_view: 'new_chat' });
+  _ossTrackClick('commander_oss_quick_task', {
+    source_view: 'new_chat',
+    destination: 'marketplace_oss',
+  });
   const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
   if (typeof load !== 'function') {
-    _ossLog.warn('Commander OSS more failed: marketplace loader unavailable');
+    _ossLog.warn('Commander OSS quick task failed: marketplace loader unavailable');
     return;
   }
-  load('marketplace').then(() => openMarketplace('oss')).catch((err) => {
-    _ossLog.warn('Commander OSS more failed to load marketplace', {
+  load('marketplace').then(() => openMarketplace('oss', {
+    returnView: 'new-chat',
+    preserveReturnTab: true,
+  })).catch((err) => {
+    _ossLog.warn('Commander OSS quick task failed to load marketplace', {
       error: err && err.message ? err.message : String(err || ''),
     });
   });
 }
 
-function _resetOssScrollForProjectChange(grid, projects) {
-  if (!grid) return;
-  const renderKey = JSON.stringify((projects || []).map((p) => String((p && p.id) || '')));
-  const previousRenderKey = String((grid.dataset && grid.dataset.ossProjectRenderKey) || '');
-  if (grid.dataset) grid.dataset.ossProjectRenderKey = renderKey;
-  if (previousRenderKey !== renderKey) grid.scrollLeft = 0;
-}
-
-async function initOssEntry(opts = {}) {
-  const entry = document.getElementById('oss-entry');
-  const grid = document.getElementById('oss-entry-grid');
-  if (!entry || !grid) return;
-  _bindOssWheelScroll(grid);
-
-  // Bind the compact “更多” header link once.
-  const more = document.getElementById('oss-entry-more');
-  if (more && !more.dataset.bound) {
-    more.addEventListener('click', _openOssMarketplace);
-    more.dataset.bound = '1';
-  }
-
-  let data;
-  try {
-    data = await loadOssCatalog({
-      homeOnly: true,
-      revalidate: opts.revalidate === false ? false : 'cold-start',
-    });
-  }
-  catch (err) {
-    _ossLog.warn('oss entry load failed', { error: err && err.message });
-    if (!_ossHomeLoadTelemetrySent) {
-      _ossHomeLoadTelemetrySent = true;
-      _ossTrackEvent('commander_oss_load_result', {
-        result: 'failure',
-        reason: 'catalog_load_failed',
-        item_count: 0,
-      });
-    }
-    entry.style.display = 'none';
-    return;
-  }
-
-  // ① receives the curated home subset from the Server. The Server config
-  // controls how many rows are returned; the client renders whatever it gets.
-  const projects = data.projects || [];
-  if (!_ossHomeLoadTelemetrySent) {
-    _ossHomeLoadTelemetrySent = true;
-    _ossTrackEvent('commander_oss_load_result', {
-      result: 'success',
-      source: String(data.sourceType || 'cache'),
-      item_count: projects.length,
-    });
-  }
-  if (!projects.length) { entry.style.display = 'none'; return; }
-  entry.style.display = '';
-
-  const toolCards = projects.map((p) => {
-    const task = escapeHtml(ossTaskFor(p));
-    const name = escapeHtml(p.name || p.id || '');
-    const category = escapeHtml(ossCatLabel(p.category, data.categories));
-    const icon = uiIconHtml(ossIconFor(p.category), 'oss-card-icon');
-    const addLabel = (typeof t === 'function') ? t('oss.add_to_task') : 'Add';
-    return `
-      <button type="button" class="oss-card" data-oss-id="${escapeHtml(p.id)}">
-        <span class="oss-card-glyph" style="--oss-c:${escapeHtml(p.color || 'var(--primary)')}" aria-hidden="true">${icon}</span>
-        <span class="oss-card-copy">
-          <span class="oss-card-name-row">
-            <strong class="oss-card-name">${name}</strong>
-            <span class="oss-card-category">${category}</span>
-          </span>
-          <span class="oss-card-fit">${task}</span>
-        </span>
-        <span class="oss-card-add">
-          <span>${escapeHtml(addLabel)}</span>
-        </span>
-      </button>`;
-  }).join('');
-  grid.innerHTML = toolCards;
-  _resetOssScrollForProjectChange(grid, projects);
-
-  grid.querySelectorAll('.oss-card[data-oss-id]').forEach((btn, index) => {
-    const p = projects.find((x) => x.id === btn.dataset.ossId);
-    btn.addEventListener('click', () => {
-      if (!p) return;
-      const telemetry = {
-        resource_id: String(p.id || ''),
-        position: index + 1,
-        source: 'commander_home',
-      };
-      _ossTrackClick('commander_oss_task', telemetry);
-      const input = document.getElementById('new-chat-input');
-      const hadDraft = !!String((input && input.value) || '').trim();
-      const applied = prefillCommander(
-        ossInstallPromptFor(p),
-        {
-          entry_point: 'oss_tool',
-          recipient_type: 'commander',
-          ...telemetry,
-        },
-        { trackPlaceholder: false },
-      );
-      _ossTrackEvent('commander_oss_prefill_result', {
-        ...telemetry,
-        result: applied ? 'success' : 'failure',
-        had_draft: hadDraft,
-        ...(applied ? {} : { reason: 'composer_missing' }),
-      });
-    });
-  });
+/** Bind the quick-start header's open-source entry — the single path from the
+ * landing page into the marketplace「开源项目」list. */
+function initOssQuickTask() {
+  const link = document.getElementById('quick-panel-oss-more');
+  if (!link || link.dataset.bound === '1') return;
+  link.dataset.bound = '1';
+  link.addEventListener('click', _openOssMarketplace);
 }
 
 window.addEventListener('i18n-change', () => {
-  if (document.getElementById('oss-entry-grid')) initOssEntry();
-});
-window.addEventListener('oss-catalog-updated', (e) => {
-  const d = (e && e.detail) || {};
-  if (!d.homeOnly) return;
-  if (document.getElementById('oss-entry-grid')) initOssEntry({ revalidate: false });
+  initOssQuickTask();
 });
 
-// Exposed for marketplace.js (② rendering) + conversation.js (① init).
+// Exposed for marketplace.js rendering + conversation.js Quick task init.
 window.loadOssCatalog = loadOssCatalog;
 window.ossCatalogCacheKey = ossCatalogCacheKey;
 window.OSS_MARKETPLACE_PAGE_SIZE = OSS_MARKETPLACE_PAGE_SIZE;
@@ -597,4 +465,4 @@ window.ossInstallPromptFor = ossInstallPromptFor;
 window.ossOpenRepo = ossOpenRepo;
 window.prefillCommander = prefillCommander;
 window.unresolvedOssTemplatePlaceholder = unresolvedOssTemplatePlaceholder;
-window.initOssEntry = initOssEntry;
+window.initOssQuickTask = initOssQuickTask;

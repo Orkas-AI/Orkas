@@ -28,6 +28,12 @@
 // eslint-disable-next-line no-unused-vars
 const createLogger = (function () {
   const SECRET_KEY_RE = /^(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|phone|mobile|email|username)$/i;
+  const PRIVATE_FILE_KEY_RE = /^(?:path|abs_?path|rel_?path|file_?path|file_?name|filename|working_?dir|cwd)$/i;
+  const PATH_END = '(?=\\s+(?:then|while|failed|failure|error|at|from|to|for|because|with)\\b|$|[\\\'",);`])';
+  const FILE_URL_RE = new RegExp(`file:\\/\\/\\/?[^\\n\\r)'";]+?${PATH_END}`, 'gi');
+  const POSIX_PATH_RE = new RegExp(`(^|[\\s"'(=])\\/(?:Users|private|var|tmp|Volumes|home|opt)\\/[^\\n\\r)<>'";]+?${PATH_END}`, 'g');
+  const WINDOWS_PATH_RE = new RegExp(`(^|[\\s"'(=])[A-Za-z]:\\\\[^\\n\\r)<>'";]+?${PATH_END}`, 'g');
+  const CLOUD_PATH_RE = new RegExp(`\\bcloud\\/[^\\n\\r)'",;]+?${PATH_END}`, 'g');
 
   function sanitizeText(value) {
     return String(value ?? '')
@@ -35,6 +41,10 @@ const createLogger = (function () {
       .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, 'Basic ***')
       .replace(/\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/g, '***JWT***')
       .replace(/([?&](?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)=)([^&#\s"']+)/gi, '$1***')
+      .replace(FILE_URL_RE, 'file:///<redacted>')
+      .replace(POSIX_PATH_RE, '$1<local_path>')
+      .replace(WINDOWS_PATH_RE, '$1<local_path>')
+      .replace(CLOUD_PATH_RE, '<cloud_path>')
       .replace(/\b(?:sk|rk)-[A-Za-z0-9][A-Za-z0-9_-]{12,}\b/g, '***TOKEN***')
       .replace(/\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g, '$1***$2')
       .replace(/\b(1[3-9]\d)\d{4}(\d{4})\b/g, '$1****$2');
@@ -56,7 +66,9 @@ const createLogger = (function () {
     if (Array.isArray(value)) return value.map((it) => sanitizeValue(it, seen));
     const out = {};
     Object.entries(value).forEach(([k, v]) => {
-      out[k] = SECRET_KEY_RE.test(k) ? '***REDACTED***' : sanitizeValue(v, seen);
+      if (SECRET_KEY_RE.test(k)) out[k] = '***REDACTED***';
+      else if (PRIVATE_FILE_KEY_RE.test(k) && typeof v === 'string') out[k] = '***REDACTED_PATH***';
+      else out[k] = sanitizeValue(v, seen);
     });
     return out;
   }
@@ -64,7 +76,12 @@ const createLogger = (function () {
   function send(level, module, message, args) {
     try {
       if (window.orkas && typeof window.orkas.log === 'function') {
-        window.orkas.log({ level, module, message: String(message ?? ''), data: args });
+        window.orkas.log({
+          level,
+          module,
+          message: sanitizeText(message),
+          data: args.map((arg) => sanitizeValue(arg, new WeakSet())),
+        });
       }
     } catch (_) { /* never let logging crash the UI */ }
   }

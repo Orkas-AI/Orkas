@@ -43,7 +43,8 @@ import {
   type AgentRuntimeStatsBucket,
 } from './agent_runtime_stats';
 import { getCurrentDevice } from '../util/device';
-import { localCliCapabilities } from './local_agents/registry';
+import { LOCAL_CLI_TYPES, localCliCapabilities, type LocalCliType } from './local_agents/registry';
+import { ensureEditChatRuntimeProcessItem, normalizeEditChatRuntimeEvent } from './edit_chat_runtime';
 
 const log = createLogger('agents');
 
@@ -212,6 +213,13 @@ export interface Agent {
    * to manually @-mention every reply. Maintained by the agent-edit LLM
    * via the `<interactive>` child of `<agent>`; missing = false. */
   interactive?: boolean;
+  /** How this agent collects user input in conversation. The platform default
+   * `form` teaches the `<agent-input-form>` protocol; `prose` replaces it with
+   * plain-language questions for agents whose own protocol forbids forms
+   * (VideoStudio's publish-and-continue flow). Host-generated onboarding
+   * forms (declared `inputs`, directory pickers) are unaffected — this only
+   * selects which asking protocol the MODEL is taught. Missing = `form`. */
+  input_channel?: 'form' | 'prose';
   /** Rich display profile for "AI employee" style agents. This is optional
    *  compatibility data: marketplace/new agents can provide it explicitly,
    *  while legacy agents keep using description/workflow. */
@@ -296,6 +304,7 @@ export interface AgentRaw {
   icon?: unknown;
   color?: unknown;
   interactive?: unknown;
+  input_channel?: unknown;
   runtime?: unknown;
   category?: unknown;
   status?: unknown;
@@ -343,8 +352,11 @@ export type AgentRuntime =
        *  `features/local_agents/registry.ts`. Validated on read; an
        *  unknown value drops the runtime field entirely. */
       cli: string;
-      /** Optional model id; empty means "let the CLI pick its default". */
-      model?: string;
+      /** Per-Agent model override. Missing means use the CLI default. */
+      model_override?: string;
+      /** Per-Agent effort / thinking / variant override. Missing means use
+       * the selected model's CLI default. */
+      thinking_level?: string;
       /** Extra CLI flags appended after our own args. Strings only;
        *  not shell-parsed by us. */
       custom_args?: string[];
@@ -939,6 +951,9 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   } else if (raw.interactive === 'false') {
     agent.interactive = false;
   }
+  // input_channel — closed enum; anything but the explicit prose opt-out
+  // collapses to "no field set" (downstream readers default to form).
+  if (raw.input_channel === 'prose') agent.input_channel = 'prose';
   const rt = _normalizeRuntime(raw.runtime);
   if (rt) agent.runtime = rt;
   // output_format: enum-coerce + legacy alias canonicalization. Missing /
@@ -963,12 +978,22 @@ function _normalizeRuntime(raw: unknown): AgentRuntime | null {
   const cli = typeof r.cli === 'string' ? r.cli.trim() : '';
   if (!cli) return null;
   const out: AgentRuntime = { kind: 'cli', cli };
-  if (typeof r.model === 'string' && r.model.trim()) out.model = r.model.trim();
+  const modelOverride = _normalizeCliRuntimeOverride(r.model_override);
+  if (modelOverride) out.model_override = modelOverride;
+  const thinkingLevel = _normalizeCliRuntimeOverride(r.thinking_level);
+  if (thinkingLevel) out.thinking_level = thinkingLevel;
   if (Array.isArray(r.custom_args)) {
     const args = r.custom_args.filter((s): s is string => typeof s === 'string');
     if (args.length) out.custom_args = args;
   }
   return out;
+}
+
+function _normalizeCliRuntimeOverride(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 200 || /[\u0000-\u001f\u007f]/.test(trimmed)) return '';
+  return trimmed;
 }
 
 /** True when this CLI is a coding agent (Claude Code / Codex). Coding
@@ -988,8 +1013,17 @@ export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): bo
 }
 
 interface AgentRuntimeLocalConfig {
-  version: 1;
+  version: 2;
   project_dirs: Record<string, { path: string; updated_at?: string }>;
+  resolved_models: Record<string, AgentCliResolvedModelInfo>;
+}
+
+export interface AgentCliResolvedModelInfo {
+  cli: LocalCliType;
+  /** Empty means the run inherited Claude Code's account/config default. */
+  requested_model: string;
+  resolved_model: string;
+  updated_at: string;
 }
 
 export interface AgentCliProjectDirInfo {
@@ -1007,7 +1041,7 @@ export interface AgentCliProjectDirInfo {
 }
 
 function _emptyAgentRuntimeConfig(): AgentRuntimeLocalConfig {
-  return { version: 1, project_dirs: {} };
+  return { version: 2, project_dirs: {}, resolved_models: {} };
 }
 
 function _readAgentRuntimeConfig(uid: string): AgentRuntimeLocalConfig {
@@ -1027,6 +1061,28 @@ function _readAgentRuntimeConfig(uid: string): AgentRuntimeLocalConfig {
         };
       }
     }
+    const resolvedModels = raw && typeof raw === 'object' ? (raw as any).resolved_models : null;
+    if (resolvedModels && typeof resolvedModels === 'object') {
+      for (const [agentId, entry] of Object.entries(resolvedModels)) {
+        if (!safeId(agentId) || !entry || typeof entry !== 'object') continue;
+        const cli = typeof (entry as any).cli === 'string'
+          && (LOCAL_CLI_TYPES as readonly string[]).includes((entry as any).cli)
+          ? (entry as any).cli as LocalCliType
+          : null;
+        const resolvedModel = _normalizeCliRuntimeOverride((entry as any).resolved_model);
+        const requestedModel = _normalizeCliRuntimeOverride((entry as any).requested_model) || '';
+        const updatedAt = typeof (entry as any).updated_at === 'string'
+          ? (entry as any).updated_at.trim().slice(0, 80)
+          : '';
+        if (!cli || !resolvedModel || !updatedAt) continue;
+        out.resolved_models[agentId] = {
+          cli,
+          requested_model: requestedModel,
+          resolved_model: resolvedModel,
+          updated_at: updatedAt,
+        };
+      }
+    }
     return out;
   } catch {
     return _emptyAgentRuntimeConfig();
@@ -1043,9 +1099,45 @@ function _writeAgentRuntimeConfig(uid: string, cfg: AgentRuntimeLocalConfig): vo
 
 function _deleteAgentRuntimeConfigEntry(uid: string, agentId: string): void {
   const cfg = _readAgentRuntimeConfig(uid);
-  if (!Object.prototype.hasOwnProperty.call(cfg.project_dirs, agentId)) return;
+  const hasProjectDir = Object.prototype.hasOwnProperty.call(cfg.project_dirs, agentId);
+  const hasResolvedModel = Object.prototype.hasOwnProperty.call(cfg.resolved_models, agentId);
+  if (!hasProjectDir && !hasResolvedModel) return;
   delete cfg.project_dirs[agentId];
+  delete cfg.resolved_models[agentId];
   _writeAgentRuntimeConfig(uid, cfg);
+}
+
+/** Last concrete model reported by a local CLI for this Agent on this device.
+ * It is intentionally local-only: account configuration and provider routing
+ * can resolve the same stable alias differently on another machine. */
+export function getAgentCliResolvedModelInfo(
+  userId: string,
+  agentId: string,
+): AgentCliResolvedModelInfo | null {
+  if (!safeId(agentId)) return null;
+  return _readAgentRuntimeConfig(userId).resolved_models[agentId] || null;
+}
+
+export function recordAgentCliResolvedModel(
+  userId: string,
+  agentId: string,
+  cli: string,
+  requestedModel: unknown,
+  resolvedModel: unknown,
+): AgentCliResolvedModelInfo | null {
+  if (!safeId(agentId) || !(LOCAL_CLI_TYPES as readonly string[]).includes(cli)) return null;
+  const resolved = _normalizeCliRuntimeOverride(resolvedModel);
+  if (!resolved) return null;
+  const observation: AgentCliResolvedModelInfo = {
+    cli: cli as LocalCliType,
+    requested_model: _normalizeCliRuntimeOverride(requestedModel) || '',
+    resolved_model: resolved,
+    updated_at: nowIso(),
+  };
+  const cfg = _readAgentRuntimeConfig(userId);
+  cfg.resolved_models[agentId] = observation;
+  _writeAgentRuntimeConfig(userId, cfg);
+  return observation;
 }
 
 function _dirExists(dirPath: string): boolean {
@@ -2479,8 +2571,7 @@ export function buildAgentEditSystemPrompt(agent: {
   const isCli = agent.runtime?.kind === 'cli';
   // Pick the right template + the placeholder set it expects. The CLI
   // template doesn't reference `$workflow` (workflow is hidden for CLI
-  // agents) but does reference the runtime cli + model so the LLM can
-  // talk concretely about which CLI it is.
+  // agents) and deliberately stays independent of the selected CLI/model.
   const profile = normalizeAgentProfile({
     profile: agent.profile,
     knowhow: agent.knowhow,
@@ -2664,7 +2755,7 @@ export async function sendToAgentEditChat(
       ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
     });
 
-  const { chatWithModel } = require('../model/client');
+  const { chatWithModel } = await import('../model/client');
   // Read-only access to the builtin skills root so the LLM can `read_file`
   // the `agent-creator` skill (the canonical authoring rules pointer in
   // `chat_agent_setup.md`). No write side — every mutation goes through
@@ -2680,9 +2771,11 @@ export async function sendToAgentEditChat(
 
   if (!result.ok) {
     const errMsg = `Model response failed: ${result.error || 'unknown'}`;
+    const partial = String(result.text || '').trim();
+    const content = partial ? `${result.text}\n\n${errMsg}` : errMsg;
     await _appendAgentChatMessage(userId, agentId,
-      { time: nowIso(), role: 'assistant', content: errMsg });
-    return { ok: false, message: errMsg, error: result.error || '' };
+      { time: nowIso(), role: 'assistant', content });
+    return { ok: false, message: content, error: result.error || '' };
   }
 
   const { cleanText, blocks } = extractAgentFieldBlocks(result.text);
@@ -2747,6 +2840,7 @@ export async function* streamSendToAgentEditChat(
   let streamingText = '';
   const updated: ExtractedFields = {};
   const processItems: any[] = [];
+  const runStartedAt = Date.now();
 
   try {
     for await (let event of streamChatWithModel({
@@ -2759,6 +2853,7 @@ export async function* streamSendToAgentEditChat(
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
+      event = normalizeEditChatRuntimeEvent(event);
       const etype = event.type;
       if (etype === 'delta' && typeof event.text === 'string') {
         streamingText += event.text;
@@ -2776,16 +2871,20 @@ export async function* streamSendToAgentEditChat(
         if (Object.keys(fields).length) {
           await updateAgentSpec(agentId, fields);
           Object.assign(updated, fields);
-          for (const k of ['name', 'workflow', 'category'] as const) {
-            if (fields[k] !== undefined) {
-              synthesizedProgress.push(t('process.agent.update_field', { field: k }));
+          for (const [fieldKey, labelKey] of [
+            ['name', 'process.agent.field.name'],
+            ['workflow', 'process.agent.field.workflow'],
+            ['category', 'process.agent.field.category'],
+          ] as const) {
+            if (fields[fieldKey] !== undefined) {
+              synthesizedProgress.push(t('process.agent.update_field', { field: t(labelKey) }));
             }
           }
           if (fields.knowhow !== undefined) {
-            synthesizedProgress.push(t('process.agent.update_field', { field: 'knowhow' }));
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.knowhow') }));
           }
           if (fields.standards !== undefined) {
-            synthesizedProgress.push(t('process.agent.update_field', { field: 'standards' }));
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.standards') }));
           }
           // Collapse description / description_zh / description_en into one
           // user-facing progress event — the user sees "description updated"
@@ -2794,7 +2893,7 @@ export async function* streamSendToAgentEditChat(
             || fields.description_zh !== undefined
             || fields.description_en !== undefined;
           if (descTouched) {
-            synthesizedProgress.push(t('process.agent.update_field', { field: 'description' }));
+            synthesizedProgress.push(t('process.agent.update_field', { field: t('process.agent.field.description') }));
           }
           if (fields.skill_list !== undefined) {
             synthesizedProgress.push(fields.skill_list.length
@@ -2807,7 +2906,11 @@ export async function* streamSendToAgentEditChat(
               : t('process.agent.clear_inputs'));
           }
           if (fields.interactive !== undefined) {
-            synthesizedProgress.push(t('process.agent.update_interactive', { value: String(fields.interactive) }));
+            synthesizedProgress.push(t('process.agent.update_interactive', {
+              value: t(fields.interactive
+                ? 'process.agent.interactive_enabled'
+                : 'process.agent.interactive_disabled'),
+            }));
           }
         }
         finalText = cleanText;
@@ -2846,7 +2949,12 @@ export async function* streamSendToAgentEditChat(
     // for-await, which triggers `return()` on this generator — bypassing any
     // append placed after the loop. Keeping it here covers normal finish,
     // caught errors, and abort-driven returns alike.
-    const saved = processItems.length ? processItems : null;
+    const hadProcessItems = processItems.length > 0;
+    ensureEditChatRuntimeProcessItem(processItems, runStartedAt, {
+      aborted: opts.abortSignal?.aborted,
+      errored: !!errMsg,
+    });
+    const saved = processItems;
     try {
       if (finalText !== null) {
         await _appendAgentChatMessage(userId, agentId,
@@ -2857,7 +2965,7 @@ export async function* streamSendToAgentEditChat(
         const content = partial ? `${streamingText}\n\n${errMsg}` : errMsg;
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
-      } else if (streamingText.trim() || processItems.length) {
+      } else if (streamingText.trim() || hadProcessItems) {
         const content = streamingText.trim()
           ? `${streamingText}\n\n(reply interrupted)`
           : '(reply interrupted)';

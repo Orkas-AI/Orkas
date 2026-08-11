@@ -1,6 +1,6 @@
 {
-  "version": "1.0.2",
-  "updated_at": "2026-07-21T12:40:05.000Z",
-  "min_app_version": "1.7.0",
+  "version": "1.0.3",
+  "updated_at": "2026-08-02T09:34:40.000Z",
+  "min_app_version": "1.6.1",
   "reseed_if_deleted_before": "2026-07-21T12:34:01Z"
 }

@@ -2,9 +2,8 @@
  * MiniMax Portal OAuth — custom pi-ai `OAuthProviderInterface`.
  *
  * ## Why custom
- * pi-ai's built-in OAuth registry only ships Anthropic / OpenAI-Codex /
- * Google-CLI / Antigravity / GitHub-Copilot. None of the Chinese providers
- * are included upstream. MiniMax is the only mainland provider whose
+ * pi-ai's provider-owned OAuth flows do not include a Chinese provider.
+ * MiniMax is the only mainland provider whose
  * subscription flow is a straightforward **device-code + PKCE** OAuth 2.0
  * flow, making it a clean candidate to implement ourselves.
  *
@@ -41,7 +40,11 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import type { OAuthCredentials, OAuthProviderInterface, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
+import type {
+  OAuthCredentials,
+  OAuthProviderInterface,
+  OAuthLoginCallbacks,
+} from '../../core-agent/src/auth/oauth-compat';
 import { t } from '../i18n';
 import { fetchWithTimeout } from '../util/abort';
 
@@ -392,8 +395,8 @@ export function buildMinimaxPortalProvider(region: MiniMaxRegion): OAuthProvider
 }
 
 /**
- * Register both region variants with pi-ai. Idempotent — safe to call
- * multiple times (pi-ai's registry uses id as key).
+ * Register both region variants with Orkas' OAuth compatibility registry.
+ * Idempotent — safe to call multiple times (the registry uses id as key).
  *
  * **Registry consistency**: pi-ai is an ESM-only package, but the
  * Orkas main process is transpiled at runtime via `tsx/cjs`. We've
@@ -404,11 +407,11 @@ export function buildMinimaxPortalProvider(region: MiniMaxRegion): OAuthProvider
  * cause is locatable.
  */
 export async function registerMinimaxOAuthProviders(): Promise<void> {
-  const oauth = await import('@earendil-works/pi-ai/oauth');
+  const oauth = await import('../../core-agent/src/auth/oauth-compat');
   const providers = [buildMinimaxPortalProvider('global'), buildMinimaxPortalProvider('cn')];
   for (const p of providers) {
     oauth.registerOAuthProvider(p);
-    const readback = oauth.getOAuthProvider(p.id as any);
+    const readback = await oauth.getOAuthProvider(p.id);
     if (!readback) {
       throw new Error(`pi-ai oauth registry self-check failed: registerOAuthProvider('${p.id}') was not readable afterwards — the ESM/CJS registry may be split`);
     }

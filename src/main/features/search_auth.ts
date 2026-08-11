@@ -48,14 +48,13 @@ export function listSearchProfiles(): SearchProfile[] {
  * the keyless built-in web_search).
  */
 export function pickActiveSearchProfile(): SearchProfile | null {
-  const list = loadSearchProfiles();
-  return list.length ? list[0] : null;
+  return listSearchProfiles()[0] || null;
 }
 
 /** Quick boolean for `native-search-tools.ts` to short-circuit native
  *  search injection when the user has any paid search API configured. */
 export function hasAnySearchProfile(): boolean {
-  return loadSearchProfiles().length > 0;
+  return listSearchProfiles().length > 0;
 }
 
 export interface AddSearchProfileInput {

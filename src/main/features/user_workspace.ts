@@ -447,8 +447,26 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
 export async function openWorkspaceInFileManager(
   userId: string,
   projectId?: string,
-): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
-  const target = getWorkspacePath(userId, projectId);
+): Promise<
+  | {
+    ok: true;
+    path: string;
+    fallbackUsed?: true;
+    fallbackReason?: 'selected_unavailable';
+  }
+  | { ok: false; error: string }
+> {
+  const cfg = readConfig(userId);
+  // A project with no explicit selection normally inherits the default
+  // workspace. That is not a degradation. Only mark a fallback when the
+  // first configured candidate for this scope differs from the effective
+  // path because the configured candidate can no longer be used.
+  const configuredPath = projectId && cfg.projects[projectId]?.selectedPath
+    ? cfg.projects[projectId].selectedPath
+    : cfg.default.selectedPath;
+  const target = _effectivePath(cfg, projectId);
+  const fallbackUsed = !!configuredPath
+    && path.resolve(configuredPath) !== path.resolve(target);
   try {
     const stat = fs.statSync(target);
     if (!stat.isDirectory()) return { ok: false, error: t('errors.target_not_dir') };
@@ -459,6 +477,14 @@ export async function openWorkspaceInFileManager(
   if (err) {
     log.warn('failed to open workspace path', { userId, path: logPathRef(target), err });
     return { ok: false, error: err };
+  }
+  if (fallbackUsed) {
+    return {
+      ok: true,
+      path: target,
+      fallbackUsed: true,
+      fallbackReason: 'selected_unavailable',
+    };
   }
   return { ok: true, path: target };
 }

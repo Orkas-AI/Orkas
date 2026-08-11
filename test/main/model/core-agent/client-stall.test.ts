@@ -49,6 +49,9 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
 vi.mock('../../../../src/main/model/core-agent/session-store', () => ({
   getSession: async () => null,
   getSessionForUser: async () => null,
+  // client.ts logs the session kind on every stream; without this export the
+  // whole suite dies on an unmocked call rather than on anything it tests.
+  sessionKindOf: (sessionId: string) => String(sessionId || '').split('-')[0] || '',
 }));
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -95,6 +98,41 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+  it('keeps partial blocking-call text after a provider network interruption', async () => {
+    h.makeStream = () => (async function* () {
+      yield { type: 'text_delta', text: '正文和产物说明已经生成。' };
+      yield {
+        type: 'done',
+        result: {
+          text: '',
+          content: [],
+          meta: {
+            durationMs: 25,
+            model: 'mock-model',
+            provider: 'mock-provider',
+            stopReason: 'error',
+            usage: { inputTokens: 1, outputTokens: 8, totalTokens: 9 },
+            error: { kind: 'provider_error', message: 'fetch failed', code: 'PROVIDER_NETWORK' },
+          },
+        },
+      };
+    })();
+
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const result = await client.chatWithModel({
+      userId: 'u1',
+      message: 'hi',
+      sessionId: 'gconv-partial-provider-network',
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      text: '正文和产物说明已经生成。',
+      aborted: false,
+    });
+    expect(result.error).not.toBe('');
+  });
+
   it('SHORT model-stream window catches a stream that started then stalled (no long wait)', async () => {
     // Stream emits one delta, then goes silent. After the first text event, the
     // model-stream phase uses streamIdleTimeout (0.3s), NOT idleTimeout (10s).

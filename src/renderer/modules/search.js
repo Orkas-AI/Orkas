@@ -3,6 +3,10 @@
 // grouped by kind; clicking one navigates to the source. Search history is
 // persisted in localStorage per user.
 
+const _searchLog = (typeof createLogger === 'function')
+  ? createLogger('search')
+  : { warn() {} };
+
 const _SEARCH_HISTORY_KEY = 'search_history';
 const _SEARCH_HISTORY_MAX = 12;
 const _SEARCH_FETCH_LIMIT = 200;   // backend cap; we filter/slice locally per tab
@@ -13,12 +17,67 @@ let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'con
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
+const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
+const _SEARCH_FAILURE_MAX_KEYS = 16;
+const _SEARCH_FAILURE_MAX_PER_SESSION = 30;
+const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
+const _searchFailureState = new Map();
+let _searchFailureReportCount = 0;
+const _SEARCH_DEGRADATION_CODES = new Set([
+  'library_content_embedding_unavailable',
+  'library_global_content_unavailable',
+  'library_project_catalog_unavailable',
+  'library_project_content_unavailable',
+  'multiple',
+]);
+const _SEARCH_FAILURE_CODES = new Set([
+  'search_failed',
+  'search_request_failed',
+  'search_rejected',
+  'search_degraded',
+  ..._SEARCH_DEGRADATION_CODES,
+]);
+
+function _searchFailureCode(value, fallback) {
+  const raw = String((value && value.code) || '').trim().toLowerCase();
+  if (_SEARCH_FAILURE_CODES.has(raw)) return raw;
+  const safeFallback = String(fallback || '').trim().toLowerCase();
+  return _SEARCH_FAILURE_CODES.has(safeFallback) ? safeFallback : 'search_failed';
+}
+
+function _searchDegradationErrorCode(value) {
+  const code = String(value || '').trim();
+  return _SEARCH_DEGRADATION_CODES.has(code) ? code : 'search_degraded';
+}
+
+function _reportGlobalSearchFailure(stage, error, fallbackCode) {
+  const safeStage = _SEARCH_FAILURE_STAGES.has(stage) ? stage : 'unknown';
+  const errorCode = _searchFailureCode(error, fallbackCode || 'search_failed');
+  let key = `${safeStage}|${errorCode}`;
+  if (!_searchFailureState.has(key) && _searchFailureState.size >= _SEARCH_FAILURE_MAX_KEYS) {
+    key = 'unknown|search_failed';
+  }
+  const now = Date.now();
+  const previous = _searchFailureState.get(key);
+  if (previous && now - previous.at < _SEARCH_FAILURE_DEDUPE_MS) {
+    previous.suppressed += 1;
+    return;
+  }
+  const suppressed = previous?.suppressed || 0;
+  _searchFailureState.set(key, { at: now, suppressed: 0 });
+  _searchLog.warn('global search failed', {
+    stage: safeStage,
+    error_code: errorCode,
+    error,
+    ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
+  });
+}
 
 function _bindGlobalSearch() {
-  document.getElementById('sidebar-search-btn')?.addEventListener('click', openGlobalSearch);
+  document.getElementById('sidebar-search-btn')?.addEventListener('click', () => openGlobalSearch('sidebar'));
   // Library page-header search button reuses the same Cmd+K overlay
   // (Step 7 in the main-screen redesign — confirmed by user).
-  document.getElementById('contexts-page-header-search')?.addEventListener('click', openGlobalSearch);
+  document.getElementById('contexts-page-header-search')?.addEventListener('click', () => openGlobalSearch('library_header'));
   document.getElementById('search-close-btn')?.addEventListener('click', closeGlobalSearch);
   const input = document.getElementById('search-input');
   if (input && !input.dataset.bound) {
@@ -43,7 +102,7 @@ function _bindGlobalSearch() {
       if (overlay && overlay.style.display !== 'none') {
         closeGlobalSearch();
       } else {
-        openGlobalSearch();
+        openGlobalSearch('keyboard');
       }
     } else if (e.key === 'Escape' && document.getElementById('search-overlay').style.display !== 'none') {
       closeGlobalSearch();
@@ -61,9 +120,10 @@ function _setSearchTab(tab) {
   _renderSearchResults(_searchLastQuery);
 }
 
-function openGlobalSearch() {
+function openGlobalSearch(entryPoint = 'unknown') {
   const overlay = document.getElementById('search-overlay');
   if (!overlay) return;
+  void entryPoint;
   overlay.style.display = '';
   const input = document.getElementById('search-input');
   if (input) {
@@ -92,6 +152,10 @@ function closeGlobalSearch() {
   const input = document.getElementById('search-input');
   const q = (input?.value || '').trim();
   if (q) _saveSearchHistoryEntry(q);
+  // A closed overlay has no current query. Invalidate any response still in
+  // flight so it cannot repaint hidden state or report a failure the user no
+  // longer encountered.
+  _searchSeq++;
   overlay.style.display = 'none';
   if (_searchTimer) { clearTimeout(_searchTimer); _searchTimer = null; }
 }
@@ -145,13 +209,23 @@ async function _runSearchNow(queryArg) {
     });
     const data = await res.json();
     if (seq !== _searchSeq) return;     // a newer query arrived; drop this
-    if (!data.ok) { _renderSearchError(data.error); return; }
+    if (!data.ok) {
+      _reportGlobalSearchFailure('response', data, 'search_rejected');
+      _renderSearchError(data.error);
+      return;
+    }
+    if (data.degradation_code) {
+      _reportGlobalSearchFailure('partial', {
+        code: _searchDegradationErrorCode(data.degradation_code),
+      }, 'search_degraded');
+    }
     _searchResults = data.results || [];
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
     _renderSearchResults(query);
   } catch (e) {
     if (seq !== _searchSeq) return;
+    _reportGlobalSearchFailure('request', e, 'search_request_failed');
     _renderSearchError(e.message || String(e));
   }
 }
@@ -393,6 +467,9 @@ function _moveSearchSelection(delta) {
 
 async function _gotoSearchResult(r) {
   if (!r) return;
+  const agentReturnTarget = r.kind === 'agent' && typeof _captureAgentDetailReturnTarget === 'function'
+    ? _captureAgentDetailReturnTarget()
+    : null;
   closeGlobalSearch();
   if (r.kind === 'context') {
     if (r.library_scope === 'project' && r.project_id) {
@@ -427,26 +504,24 @@ async function _gotoSearchResult(r) {
   } else if (r.kind === 'agent') {
     // Open the agent detail view in read mode. Edit mode is intentionally
     // NOT auto-toggled — the user is looking up "this agent", not editing.
-    setView('agents');
     setTimeout(async () => {
-      if (typeof _showAgentsDetailView === 'function') {
-        await _showAgentsDetailView(r.id);
+      if (typeof openAgentDetail === 'function') {
+        await openAgentDetail(r.id, { returnTarget: agentReturnTarget });
       }
     }, 100);
   } else if (r.kind === 'skill') {
-    setView('skills');
     const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
     if (typeof loader === 'function') await loader('skills');
     if (typeof loadSkills === 'function') await loadSkills();
     const cached = (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache))
       ? _skillsCache.find((s) => s.id === r.id)
       : null;
-    if (cached && typeof _showSkillsDetailView === 'function') {
-      await _showSkillsDetailView(cached.source, cached.id);
-    } else if (typeof _showSkillsDetailView === 'function') {
+    if (cached && typeof openSkillDetail === 'function') {
+      await openSkillDetail(cached.source, cached.id);
+    } else if (typeof openSkillDetail === 'function') {
       // Cache may not be primed yet — fall back to the search result's own
       // source field so we still land on the right card.
-      await _showSkillsDetailView(r.source, r.id);
+      await openSkillDetail(r.source, r.id);
     }
   }
 }

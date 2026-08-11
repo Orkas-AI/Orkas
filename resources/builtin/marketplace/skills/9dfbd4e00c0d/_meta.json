@@ -1,7 +1,6 @@
 {
-  "version": "1.0.35",
-  "updated_at": "2026-07-29T08:04:00.000Z",
-  "min_app_version": "1.7.0",
+  "version": "1.0.41",
+  "updated_at": "2026-08-08T11:44:58.000Z",
   "reseed_if_deleted_before": "2026-07-29T08:04:00Z",
   "category": "creation",
   "descriptions": {
