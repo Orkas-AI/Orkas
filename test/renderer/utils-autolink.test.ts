@@ -27,6 +27,7 @@ const {
   _markdownVideoHtml,
   _markdownAudioHtml,
   _chatMediaLocalPathFromUrl,
+  _normalizeLocalMediaSrc,
   _chatVideoNativeControlsHit,
 } = utils as {
   _BARE_URL_RE: RegExp;
@@ -36,6 +37,7 @@ const {
   _markdownVideoHtml: (src: string, label: string, title?: string) => string;
   _markdownAudioHtml: (src: string, label: string, title?: string) => string;
   _chatMediaLocalPathFromUrl: (src: string) => string;
+  _normalizeLocalMediaSrc: (src: string) => string;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
 };
 
@@ -186,6 +188,37 @@ describe('markdown media links', () => {
     expect(out).toContain('data-video-src="chat-media://local/Users/test/car_driving.mp4"');
     expect(out).toContain('aria-label="Fullscreen"');
     expect(out).not.toContain('<a ');
+  });
+
+  it('plays local media delivered with a sandbox, file, or absolute path', () => {
+    const sources = [
+      'sandbox:/Users/test/render/final.mp4',
+      '/Users/test/render/final.mp4',
+      'file:///Users/test/render/final.mp4',
+    ];
+
+    for (const src of sources) {
+      for (const markdown of [`[video](${src})`, `![video](${src})`]) {
+        const out = inlineFormat(markdown);
+        expect(out, markdown).toContain('src="chat-media://local/Users/test/render/final.mp4"');
+        expect(out, markdown).toContain('<video class="chat-md-video"');
+        expect(out, markdown).toContain('data-chat-md-video-open="1"');
+        expect(out, markdown).not.toContain('sandbox:');
+      }
+    }
+  });
+
+  it('leaves remote and unresolved media paths unchanged', () => {
+    expect(inlineFormat('![figure](images/figure.png)')).toContain('src="images/figure.png"');
+    expect(inlineFormat('[clip](https://example.test/a.mp4)'))
+      .toContain('src="https://example.test/a.mp4"');
+    expect(inlineFormat('[clip](chat-media://local/Users/test/a.mp4)'))
+      .toContain('src="chat-media://local/Users/test/a.mp4"');
+    expect(inlineFormat('[notes](sandbox:/Users/test/notes.txt)')).not.toContain('chat-media://');
+    expect(_normalizeLocalMediaSrc('C:\\Users\\test\\render\\clip.mp4'))
+      .toBe('chat-media://local/C:/Users/test/render/clip.mp4');
+    expect(_normalizeLocalMediaSrc('/Users/test/has space.mp4'))
+      .toBe('chat-media://local/Users/test/has%20space.mp4');
   });
 
   it('escapes markdown video attributes', () => {

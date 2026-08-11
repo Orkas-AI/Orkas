@@ -1151,6 +1151,34 @@ function _chatMediaLocalPathFromUrl(src) {
   }
 }
 
+// Rewrite local paths into the private protocol that validates and serves
+// local media under its existing extension and size gates. Relative paths stay
+// unchanged because the renderer has no workspace base from which to resolve them.
+function _normalizeLocalMediaSrc(src) {
+  const raw = String(src === null || src === undefined ? '' : src).trim();
+  if (!raw) return raw;
+  if (/^(?:chat-media|https?|data|blob|kb-file|chat-app):/i.test(raw)) return raw;
+
+  let abs = '';
+  if (/^file:/i.test(raw)) {
+    try {
+      const decoded = decodeURIComponent(new URL(raw).pathname || '');
+      abs = /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded;
+    } catch (_) { return raw; }
+  } else {
+    const bare = raw.replace(/^sandbox:/i, '');
+    if (bare.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bare)) abs = bare;
+  }
+  if (!abs) return raw;
+
+  let normalized = abs.includes('\\') ? abs.replace(/\\/g, '/') : abs;
+  if (normalized.startsWith('/')) normalized = normalized.slice(1);
+  const encoded = normalized.split('/').map((segment, index) => (
+    index === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)
+  )).join('/');
+  return `chat-media://local/${encoded}`;
+}
+
 function _markdownVideoOpenFloatingLabel() {
   const key = 'chat.video_open_floating_title';
   try {
@@ -1465,7 +1493,8 @@ function inlineFormat(text) {
     // Media: ![alt](src) — dispatch to <video> when src looks like a video
     // file, else <img>. Must run before link syntax.
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-      (_, alt, src, title) => {
+      (_, alt, rawSrc, title) => {
+        const src = _normalizeLocalMediaSrc(rawSrc);
         if (_isVideoSrc(src)) {
           // `preload=metadata` so listings don't auto-fetch the whole file;
           // controls visible so user can play/seek.
@@ -1476,7 +1505,10 @@ function inlineFormat(text) {
       })
     // Markdown links: [text](url "title")
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-      (_, txt, url, title) => {
+      (_, txt, rawUrl, title) => {
+        const url = _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
+          ? _normalizeLocalMediaSrc(rawUrl)
+          : rawUrl;
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
         if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
@@ -1974,6 +2006,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _markdownVideoHtml,
     _markdownAudioHtml,
     _chatMediaLocalPathFromUrl,
+    _normalizeLocalMediaSrc,
     _chatVideoNativeControlsHit,
     escapeHtml,
     sanitizeHtml,

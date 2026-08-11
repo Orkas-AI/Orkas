@@ -3181,6 +3181,10 @@ describe('VideoStudio production-state tool protocol', () => {
     expect(result.isError).toBe(false);
     expect(fs.readFileSync(finalPath, 'utf8')).toBe('clean final');
     expect(events).toEqual(['render', 'written', 'published']);
+    expect(parseResult(result.content)).toMatchObject({
+      next_action: 'deliver_final',
+      deliver_markdown: `[final.mp4](chat-media://local${finalPath})`,
+    });
   });
 
   it('enforces Gate B and prevents authored visuals from bypassing pending narration', async () => {

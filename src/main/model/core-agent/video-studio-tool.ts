@@ -95,6 +95,7 @@ import {
 import { probeMediaDurationSec } from '../../util/media_probe';
 import { bundledFfmpegPaths, bundledWhisperPaths } from '../../util/bundled-runtime';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { chatMediaLocalUrl } from '../../util/chat-media-url';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { decodeSubmission } from '../../features/group_chat/router';
@@ -7154,6 +7155,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
               confirmation_required: false,
             },
             ...(result.ok ? { next_action: 'deliver_final' } : {}),
+            ...(result.ok && outputAbsPath
+              ? { deliver_markdown: `[${path.basename(outputAbsPath)}](${chatMediaLocalUrl(outputAbsPath)})` }
+              : {}),
           } as typeof result;
         }
 
