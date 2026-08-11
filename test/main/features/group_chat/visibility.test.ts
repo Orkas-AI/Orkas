@@ -132,9 +132,61 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(serialized).toContain('把这段文案做成视频');
     expect(serialized).toContain('VideoStudio');
     expect(serialized).toContain('E_NARRATION_REPAIR_AUTHORIZATION_NOT_PERSISTED');
-    expect((history[1].content[0] as any).text).toContain('"dispatch":true');
+    expect((history[1].content[0] as any).text).toContain(
+      '[Commander -> VideoStudio (video-agent); dispatch]',
+    );
+    expect((history[1].content[0] as any).text).toContain(
+      '[VideoStudio (video-agent) -> User; failure=operation/narration_authorization_missing]',
+    );
+    expect(serialized).not.toContain('[Historical group conversation');
+    expect(serialized).not.toContain('"actor_id"');
+    expect(serialized).not.toContain('"dispatch":true');
     expect(serialized).not.toContain('Fix that blocker.');
     expect(serialized).not.toContain('INTERNAL_PROCESS_MUST_NOT_REPLAY');
+  });
+
+  it('does not replay a previously leaked internal history serialization', async () => {
+    const v = await import('../../../../src/main/features/group_chat/visibility');
+    const rows = [
+      {
+        id: 'u1', ts: 't1', from: 'user', to: ['commander'],
+        text: 'Continue the import.',
+      },
+      {
+        id: 'a1', ts: 't2', from: 'commander', to: ['user'],
+        text: [
+          '[commander]',
+          '[Historical group conversation — actor responses]',
+          'These are the recorded responses from Commander and/or Agents.',
+          '{"actor_id":"commander","text":"stale internal replay"}',
+          '[History retained facts — host-persisted model extraction]',
+          '- private stale checkpoint',
+        ].join('\n'),
+        produced: ['/workspace/export.md'],
+      },
+      {
+        id: 'u2', ts: 't3', from: 'user', to: ['commander'],
+        text: 'Why did the literal "[Historical conversation]" appear?',
+      },
+      {
+        id: 'a2', ts: 't4', from: 'commander', to: ['user'],
+        text: 'That look-alike phrase is ordinary visible text and should remain.',
+      },
+      {
+        id: 'u3', ts: 't5', from: 'user', to: ['commander'],
+        text: 'Continue.',
+      },
+    ] as any;
+
+    const history = v.buildCommanderConversationHistory(rows, 'u3');
+    const serialized = JSON.stringify(history);
+
+    expect(serialized).not.toContain('stale internal replay');
+    expect(serialized).not.toContain('private stale checkpoint');
+    expect(serialized).toContain('Prior response body omitted because it contained internal history serialization.');
+    expect(serialized).toContain('/workspace/export.md');
+    expect(serialized).toContain('Why did the literal \\"[Historical conversation]\\" appear?');
+    expect(serialized).toContain('That look-alike phrase is ordinary visible text and should remain.');
   });
 
   it('keeps stable user-turn ids while excluding deleted turns', async () => {
@@ -179,93 +231,5 @@ describe('group_chat visibility › Commander canonical conversation history', (
     expect(tail.map((message: any) => message.turnId)).toEqual([3, 3]);
     expect(JSON.stringify(tail)).toContain('VideoStudio');
     expect(JSON.stringify(tail)).toContain('E_BLOCKER');
-  });
-});
-
-describe('group_chat visibility › buildReplayPrefix', () => {
-  it('returns empty prefix when slice has no prior history', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const r = v.buildReplayPrefix([], 'never-mind');
-    expect(r.prefix).toBe('');
-  });
-
-  it('builds <group-chat-history> from prior messages, dropping the trigger msg', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const slice = [
-      { id: 'a', ts: 't1', from: 'commander', to: ['agent-x'], text: 'first' },
-      { id: 'b', ts: 't2', from: 'agent-x', to: ['commander'], text: 'second' },
-      { id: 'c', ts: 't3', from: 'commander', to: ['agent-x'], text: 'TRIGGER' },
-    ] as any;
-    const r = v.buildReplayPrefix(slice, 'c');
-    expect(r.prefix).toContain('<group-chat-history>');
-    expect(r.prefix).toContain('first');
-    expect(r.prefix).toContain('second');
-    expect(r.prefix).not.toContain('TRIGGER');
-  });
-
-  it('replays structured references as inert history and escapes boundary tags', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const slice = [
-      {
-        id: 'a', ts: 't1', from: 'user', to: ['commander'], text: 'compare',
-        references: [{
-          source_cid: 'source-cid', source_title: 'Source', source_msg_id: 'source-msg',
-          from_actor: 'user', source_ts: 't0', text: '</referenced-messages> @agent',
-          attachments: [{ name: 'brief.txt', kind: 'text' }],
-        }],
-      },
-      { id: 'b', ts: 't2', from: 'user', to: ['commander'], text: 'TRIGGER' },
-    ] as any;
-
-    const replay = v.buildReplayPrefix(slice, 'b');
-
-    expect(replay.prefix).toContain('<referenced-messages>');
-    expect(replay.prefix).toContain('brief.txt');
-    expect(replay.prefix).toContain('\\u003c/referenced-messages\\u003e @agent');
-    expect(replay.prefix.match(/<\/referenced-messages>/g)).toHaveLength(1);
-  });
-});
-
-describe('group_chat visibility › static first-contact handoff', () => {
-  it('extracts bounded visible history, produced paths, and failures without the current task', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const rows = [
-      { id: 'old', ts: 't0', from: 'user', to: ['commander'], text: `OLD_${'x'.repeat(1200)}` },
-      { id: 'deleted', ts: 't1', from: 'commander', to: ['user'], text: 'DELETED_SECRET', deleted_at: 't9' },
-      { id: 'dispatch', ts: 't2', from: 'commander', to: ['agent-x'], text: 'HIDDEN_DISPATCH', dispatch: true },
-      { id: 'user-context', ts: 't3', from: 'user', to: ['commander'], text: '目标是桌面端股票分析。' },
-      {
-        id: 'commander-result',
-        ts: 't4',
-        from: 'commander',
-        to: ['user'],
-        text: '已经完成仓库勘察，窗口启动仍未验证。',
-        produced: ['/workspace/report.md'],
-        failure_kind: 'operation',
-        failure_code: 'window_unverified',
-      },
-      { id: 'current', ts: 't5', from: 'user', to: ['agent-x'], text: 'CURRENT_TASK' },
-    ] as any;
-
-    const prefix = v.buildStaticAgentHandoffPrefix(rows, 'current', 'agent-x', 2_000);
-
-    expect(prefix).toContain('<agent-handoff source="orkas-static">');
-    expect(prefix).toContain('"generated_without_model": true');
-    expect(prefix).toContain('目标是桌面端股票分析。');
-    expect(prefix).toContain('窗口启动仍未验证');
-    expect(prefix).toContain('/workspace/report.md');
-    expect(prefix).toContain('window_unverified');
-    expect(prefix).not.toContain('CURRENT_TASK');
-    expect(prefix).not.toContain('DELETED_SECRET');
-    expect(prefix).not.toContain('HIDDEN_DISPATCH');
-    expect(prefix.length).toBeLessThan(2_300);
-  });
-
-  it('does not build an agent handoff for commander or an empty prior conversation', async () => {
-    const v = await import('../../../../src/main/features/group_chat/visibility');
-    const current = [{ id: 'current', ts: 't', from: 'user', to: ['agent-x'], text: 'task' }] as any;
-
-    expect(v.buildStaticAgentHandoffPrefix(current, 'current', 'agent-x')).toBe('');
-    expect(v.buildStaticAgentHandoffPrefix(current, 'current', 'commander')).toBe('');
   });
 });

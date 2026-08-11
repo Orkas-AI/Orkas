@@ -45,6 +45,7 @@
     lock: '<path d="M5 11h14v9a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1z M8 11V7a4 4 0 0 1 8 0v4"></path>',
     scissors: '<circle cx="6" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M8.1 8.1 20 20 M8.1 15.9 20 4"></path>',
     coin: '<circle cx="8" cy="8" r="6"></circle><path d="M18.09 10.37A6 6 0 1 1 10.34 18"></path><path d="M7 6h1v4"></path><path d="m16.71 13.88.7.71-2.82 2.82"></path>',
+    'shopping-cart': '<circle cx="9" cy="20" r="1"></circle><circle cx="19" cy="20" r="1"></circle><path d="M3 4h2l2.4 11.2a2 2 0 0 0 2 1.6h7.9a2 2 0 0 0 2-1.6L21 8H6"></path>',
     crop: '<path d="M6 2v14a2 2 0 0 0 2 2h14 M2 6h14a2 2 0 0 1 2 2v14"></path>',
     undo: '<path d="M9 14 4 9l5-5 M4 9h11a5 5 0 0 1 0 10h-4"></path>',
     redo: '<path d="M15 14l5-5-5-5 M20 9H9a5 5 0 0 0 0 10h4"></path>',
@@ -70,6 +71,7 @@
     'chevron-down': '<path d="m6 9 6 6 6-6"></path>',
     'chevron-right': '<path d="m9 6 6 6-6 6"></path>',
     'chevron-left': '<path d="m15 6-6 6 6 6"></path>',
+    'log-out': '<path d="M10 17l5-5-5-5"></path><path d="M15 12H3"></path><path d="M15 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"></path>',
     plus: '<path d="M12 5v14M5 12h14"></path>',
     'file-text': '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9.5 11h5"></path><path d="M9.5 14h5"></path><path d="M9.5 17h3"></path>',
     presentation: '<rect x="4" y="4" width="16" height="11" rx="2"></rect><path d="M12 15v5"></path><path d="M8 20h8"></path><path d="M8 9h8"></path><path d="M8 12h5"></path>',
@@ -100,6 +102,7 @@
     eye: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"></path><circle cx="12" cy="12" r="2.5"></circle>',
     command: '<path d="M9 9H6.5a3 3 0 1 1 3-3V18a3 3 0 1 1-3-3H18a3 3 0 1 1-3 3V6a3 3 0 1 1 3 3H9z"></path>',
     link: '<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"></path><path d="M14 11a5 5 0 0 0-7.1 0l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1"></path>',
+    'share-2': '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle><circle cx="18" cy="19" r="3"></circle><path d="m8.6 10.5 6.8-4M8.6 13.5l6.8 4"></path>',
     image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2.5"></rect><circle cx="8.5" cy="9" r="1.6"></circle><path d="M5 17l4.4-4.4a1.5 1.5 0 0 1 2.1 0L14 15l2-2a1.5 1.5 0 0 1 2.1 0L20 14.9"></path>',
     list: '<path d="M9 6h11M9 12h11M9 18h11"></path><path d="M4 6h.01M4 12h.01M4 18h.01"></path>',
     'list-ordered': '<path d="M10 6h10M10 12h10M10 18h10"></path><path d="M4 5h1v3M4 8h2"></path><path d="M4 11.5h2L4 14h2"></path><path d="M4 17h2v3H4"></path>',
@@ -116,6 +119,10 @@
     live: '<path d="M12 4a8 8 0 1 1-8 8"></path><path d="M12 4v8h8"></path>',
     box: '<path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><path d="M3.3 7 12 12l8.7-5"></path><path d="M12 22V12"></path>',
     star: '<path d="M12 2.5l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.8 6.1 20.9l1.1-6.5L2.5 9.8l6.5-.9z"></path>',
+    // Credits/membership native pages (F1 topbar card + F2 usage). Lucide-style.
+    gift: '<rect x="3" y="8" width="18" height="4" rx="1"></rect><path d="M12 8v13"></path><path d="M5 12v8a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-8"></path><path d="M12 8H7.5a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8z"></path><path d="M12 8h4.5a2.5 2.5 0 0 0 0-5C13 3 12 8 12 8z"></path>',
+    crown: '<path d="M3 8l4.5 4L12 5l4.5 7L21 8l-1.8 10H4.8z"></path><path d="M4 20h16"></path>',
+    cpu: '<rect x="5" y="5" width="14" height="14" rx="2"></rect><rect x="9" y="9" width="6" height="6"></rect><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"></path>',
   };
 
   const FILE_ICONS = {

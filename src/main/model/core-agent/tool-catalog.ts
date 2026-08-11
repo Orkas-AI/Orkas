@@ -77,6 +77,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/modern Office text or image as multimodal).' },
   { name: 'read_files',    group: 'fs', summary: 'Read several related workspace/attachment file slices in one bounded parallel call.' },
   { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
+  { name: 'append_file',   group: 'fs', permission: 'localExec', summary: 'Append one bounded, byte-offset-checked text chunk to an existing workspace file without duplicate replay writes.' },
   { name: 'apply_patch',   group: 'fs', permission: 'localExec', summary: 'Apply one validated, transactional multi-file text patch using Add/Update/Move/Delete operations.' },
   { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
   { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file. Files inside the current workspace/attachment/editor scope are deleted immediately; files outside that scope use an inline confirmation card with a token, and multiple out-of-scope deletes from the same turn are grouped when possible. Use instead of `bash rm` for removals.' },
@@ -86,11 +87,11 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched); optional `glob` scope + `output_mode` files/count.' },
   { name: 'workspace_diff', group: 'fs', summary: 'Read the bounded net file changes observed from agent tools for the current turn or session.' },
-  { name: 'tool_result_search', group: 'fs', summary: 'Search a persisted oversized tool result by opaque ref and return bounded matching excerpts.' },
-  { name: 'tool_result_read_chunk', group: 'fs', summary: 'Read one bounded cursor chunk from a persisted oversized tool result by opaque ref.' },
+  { name: 'tool_result_search', group: 'fs', summary: 'Search persisted oversized tool results by opaque ref; batch independent queries in one call and receive bounded matching excerpts.' },
+  { name: 'tool_result_read_chunk', group: 'fs', summary: 'Read bounded cursor chunks from persisted oversized tool results; batch independent chunks in one call.' },
   { name: 'publish_outputs', group: 'fs', summary: 'Declare the complete set of current-turn files that should appear as final deliverables in the message footer.' },
   { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
-  { name: 'html_preview', group: 'fs', permission: 'localExec', summary: 'Render a local HTML entry at desktop and mobile viewports; returns inline screenshots plus runtime, resource, overflow, image, Tab-key focus, and safe local form/link/download evidence. Network and browser host permissions are blocked.' },
+  { name: 'html_preview', group: 'fs', permission: 'localExec', summary: 'Audit local HTML at the default desktop target, an explicit mobile target, or responsive desktop/mobile when the user requests multi-device behavior. Screenshots are returned as model-visible images only when screenshots=true and checks pass; no separate vision API is invoked. Network and browser host permissions are blocked.' },
 
   // Shell
   { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
@@ -112,9 +113,9 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // Office documents (bundled OfficeCLI engine — no MS Office needed)
   { name: 'create_docx',   group: 'office', permission: 'localExec', summary: 'Create a Word (.docx) document from paragraphs (styles + inline bold/font/size/color), plus tables and images; CJK-ready, first-page PNG preview; built-in engine, no MS Office required.' },
   { name: 'create_xlsx',   group: 'office', permission: 'localExec', summary: 'Create one Excel (.xlsx) workbook from rows (values + formulas + number formats + cell styling), multiple sheets, column widths, and native editable charts bound to cell ranges; CJK-ready, PNG preview.' },
-  { name: 'create_pptx',   group: 'office', permission: 'localExec', summary: 'Create a PowerPoint (.pptx) deck (title/body/layout, slide background/transition, free-positioned styled shapes, plus images and tables for designed slides); CJK-ready, first-slide PNG preview.' },
+  { name: 'create_pptx',   group: 'office', permission: 'localExec', summary: 'Create an editable PowerPoint (.pptx) deck with free-positioned styled shapes, cropped images, native charts, styled tables, backgrounds, and transitions; CJK-ready, first-slide PNG preview.' },
   { name: 'office_read',   group: 'office', permission: 'localExec', summary: 'Read an existing .docx/.xlsx/.pptx with element paths (text/outline/get/query) so edits can target them; pairs with edit_office.' },
-  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Safely edit an existing .docx/.xlsx/.pptx (set/add/remove on element paths): pre-existing sources become validated working copies, while conversation-produced outputs can be refined in place; returns a PNG preview.' },
+  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Safely edit an existing .docx/.xlsx/.pptx (set/add/remove on element paths): pre-existing sources become validated working copies, while conversation-produced outputs can be refined in place; optionally returns a first-page PNG with preview:true.' },
   { name: 'office_check',  group: 'office', permission: 'localExec', summary: 'Validate an existing .docx/.xlsx/.pptx against OpenXML and scan for formatting/content/structure issues before delivery; invalid OpenXML is a fatal result.' },
   { name: 'office_render', group: 'office', permission: 'localExec', summary: 'Render a page of an existing .docx/.xlsx/.pptx to a PNG image to inspect layout / fonts / CJK glyphs.' },
 
@@ -124,12 +125,13 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a Library file that kb_search has hit.' },
 
   // Conversation history
-  { name: 'chat_search',   group: 'chat', summary: 'Search prior messages for missing continuity context; project conversations default to same-project history.' },
-  { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from a known conversation.' },
+  { name: 'chat_search',   group: 'chat', summary: 'Search quoted prior messages for missing continuity context; current scope is bound to the active conversation.' },
+  { name: 'chat_read',     group: 'chat', summary: 'Read quoted nearby or latest messages; current scope stops before the triggering message.' },
 
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
   { name: 'image_studio', group: 'image', permission: 'localExec', ownerAgent: IMAGE_STUDIO_AGENT_ID, summary: 'ImageStudio-owned security kernel for project inspection, local snapshot review, configured workflow dispatch, and approved image export.' },
+  { name: 'generate_speech', group: 'video', permission: 'localExec', summary: 'Text-to-speech audio via a configured BYO speech provider.' },
   { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HTML preview, QA-gated draft/export, and speech transcription fallback orchestration.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)

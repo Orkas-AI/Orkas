@@ -42,7 +42,7 @@ function loadOss(opts: LoadOpts = {}) {
   };
   let invokeCount = 0;
   const invokeCalls: Array<{ channel: string; payload: any }> = [];
-  const calls = { setView: [] as string[], setRecipient: [] as any[], openMarketplace: [] as string[] };
+  const calls = { setView: [] as string[], setRecipient: [] as any[], openMarketplace: [] as any[] };
 
   const context: any = {
     console,
@@ -75,7 +75,8 @@ function loadOss(opts: LoadOpts = {}) {
     },
     setView: (v: string) => { calls.setView.push(v); },
     setChatRecipient: (target: string, next: any) => { calls.setRecipient.push({ target, next }); },
-    openMarketplace: (tab: string) => { calls.openMarketplace.push(tab); },
+    loadRendererFeature: async () => {},
+    openMarketplace: (tab: string, openOpts?: unknown) => { calls.openMarketplace.push({ tab, opts: openOpts }); },
   };
   context.window.orkas = {
     invoke: opts.invoke || (async (channel: string) => {
@@ -99,28 +100,38 @@ function loadOss(opts: LoadOpts = {}) {
 }
 
 describe('oss.js', () => {
-  it('keeps the home rail hierarchy compact without shrinking its content', () => {
+  it('surfaces open source as one localized entry on the quick-start header', () => {
     const html = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
     const css = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
-    const zh = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/zh.json'), 'utf8'));
-    const header = html.match(/<div class="oss-entry-head">[\s\S]*?<\/button>\s*<\/div>/)?.[0] || '';
+    const conversation = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+    const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((lang) => [
+      lang,
+      JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8')),
+    ]));
+    const zh = locales.zh;
 
-    expect(zh['oss.add_to_task']).toBe('+安装');
-    expect(header).not.toContain('oss-entry-badge');
-    expect(header).not.toContain('data-ui-icon="diamond"');
-    expect(header.indexOf('data-i18n="oss.subtitle"'))
-      .toBeLessThan(header.indexOf('data-i18n="oss.optional"'));
-    expect(header).toContain('oss-entry-sub-divider');
-    expect(header).toContain('data-ui-icon="chevron-right"');
-    expect(css).toMatch(/\.oss-entry-title\s*\{[\s\S]*?font-size:\s*13px;[\s\S]*?font-weight:\s*400;/);
-    expect(css).toMatch(/\.oss-entry\s*\{[^}]*margin-top:\s*2px;[^}]*display:\s*flex;/);
-    expect(css).not.toMatch(/\.oss-entry\s*\{[^}]*border-top:/);
-    expect(css).toMatch(/\.oss-card\s*\{[\s\S]*?height:\s*60px;[\s\S]*?padding:\s*5px 8px;/);
-    expect(css).toMatch(/\.oss-card-name\s*\{[\s\S]*?font-size:\s*12px;/);
-    expect(css).toMatch(/\.oss-card-fit\s*\{[\s\S]*?font-size:\s*10px;/);
-    expect(css).toMatch(/\.oss-card-add\s*\{[\s\S]*?margin-right:\s*8px;[\s\S]*?color:\s*var\(--muted\);/);
-    expect(css).toMatch(/\.oss-card:hover \.oss-card-add\s*\{[\s\S]*?color:\s*var\(--primary-text\);/);
-    expect(css).not.toMatch(/\.oss-card-add\s*\{[^}]*(?:background|border|box-shadow):/);
+    // Neither the old rail nor a grid card: the entry lives on the header row
+    // beside the quick-start title, so the grid stays a list of runnable tasks.
+    expect(html).not.toContain('id="oss-entry"');
+    expect(html).not.toContain('id="oss-entry-grid"');
+    expect(html.match(/id="quick-panel-oss-more"/g)).toHaveLength(1);
+    expect(html).toMatch(/quick-panel-rule[\s\S]{0,200}quick-panel-oss-more/);
+    expect(conversation).not.toContain('oss-quick-task-card');
+    expect(conversation).not.toContain("_quickStartText('new_chat.quick.task.oss'");
+    expect(css).toContain('.quick-panel-more');
+    expect(css).not.toContain('.quick-thumb-oss');
+    expect(css).not.toContain('.oss-entry {');
+    expect(zh['new_chat.quick.oss_more']).toBe('接入开源工具能力');
+    expect(zh['new_chat.quick.oss']).toBeUndefined();
+    expect(zh['new_chat.quick.task.oss']).toBeUndefined();
+    expect(zh['new_chat.quick.deliver.oss']).toBeUndefined();
+    for (const [lang, messages] of Object.entries(locales)) {
+      expect((messages as any)['new_chat.quick.oss_more'], `${lang} label`).toBeTruthy();
+    }
+    expect(Object.fromEntries(Object.entries(locales).map(([lang, messages]: [string, any]) => [
+      lang,
+      messages['sidebar.new_chat'],
+    ]))).toEqual({ en: 'New Task', zh: '新任务', ja: '新規タスク', pt: 'Nova tarefa' });
   });
 
   it('prefillCommander writes the task, focuses, sets the Commander recipient, and does NOT send', () => {
@@ -196,117 +207,31 @@ describe('oss.js', () => {
       .toContain('[describe your task here]');
   });
 
-  it('handles OSS row load, task click, prefill, and More without telemetry', async () => {
-    const { context, el } = loadOss({
-      invoke: async (channel) => {
-        if (channel === 'marketplace.getListingsCache') return { entries: {} };
-        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
-        return {
-          source: 'bundled',
-          list: [{
-            id: 'project-x',
-            name: 'Project X',
-            task_zh: '处理任务',
-            task_en: 'Handle task',
-            category: 'anim',
-            repo: 'org/project-x',
-          }],
-          categories: [],
-          total: 1,
-        };
-      },
-    });
-    const clicks: any[] = [];
-    const events: any[] = [];
+  it('opens the marketplace OSS page from the header entry and keeps New Task as the return view', async () => {
+    const { context, calls, invokeCount } = loadOss();
     let cardClick: Function | null = null;
-    let moreClick: Function | null = null;
     const card = {
-      dataset: { ossId: 'project-x' },
-      addEventListener(type: string, fn: Function) { if (type === 'click') cardClick = fn; },
-    };
-    const grid = {
-      innerHTML: '',
-      querySelectorAll: () => [card],
-    };
-    const entry = { style: { display: 'none' } };
-    const more = {
       dataset: {} as Record<string, string>,
-      addEventListener(type: string, fn: Function) { if (type === 'click') moreClick = fn; },
+      addEventListener(type: string, fn: Function) { if (type === 'click') cardClick = fn; },
     };
     const baseGetElementById = context.document.getElementById;
     context.document.getElementById = (id: string) => {
-      if (id === 'oss-entry') return entry;
-      if (id === 'oss-entry-grid') return grid;
-      if (id === 'oss-entry-more') return more;
-      if (id === 'new-chat-input') return el(id);
+      if (id === 'quick-panel-oss-more') return card;
       return baseGetElementById(id);
     };
-    context.Monitor = {
-      click: (name: string, payload: any) => clicks.push({ name, payload }),
-      event: (name: string, payload: any) => events.push({ name, payload }),
-    };
-    context.window.Monitor = true;
 
-    await context.initOssEntry({ revalidate: false });
+    context.initOssQuickTask();
+    context.initOssQuickTask();
+    expect(card.dataset.bound).toBe('1');
+    expect(invokeCount()).toBe(0);
     cardClick!();
-    moreClick!();
+    await Promise.resolve();
+    await Promise.resolve();
 
-    expect(entry.style.display).toBe('');
-    expect(clicks).toEqual([]);
-    expect(events).toEqual([]);
-  });
-
-  it('amplifies vertical wheel gestures and keeps them within the horizontal card strip', () => {
-    const { context } = loadOss();
-    let wheel: Function | null = null;
-    const grid = {
-      scrollLeft: 0,
-      scrollWidth: 1000,
-      clientWidth: 400,
-      addEventListener(type: string, fn: Function, options: unknown) {
-        if (type === 'wheel') {
-          expect(options).toEqual({ passive: false });
-          wheel = fn;
-        }
-      },
-    };
-    context._bindOssWheelScroll(grid);
-
-    let prevented = false;
-    wheel!({ deltaY: 120, deltaX: 0, preventDefault: () => { prevented = true; } });
-    expect(grid.scrollLeft).toBe(240);
-    expect(prevented).toBe(true);
-
-    grid.scrollLeft = 600;
-    prevented = false;
-    wheel!({ deltaY: 120, deltaX: 0, preventDefault: () => { prevented = true; } });
-    expect(grid.scrollLeft).toBe(600);
-    expect(prevented).toBe(true);
-
-    grid.scrollLeft = 0;
-    prevented = false;
-    wheel!({ deltaY: -120, deltaX: 0, preventDefault: () => { prevented = true; } });
-    expect(grid.scrollLeft).toBe(0);
-    expect(prevented).toBe(true);
-  });
-
-  it('returns the rail to the first card only when the project list changes', () => {
-    const { context } = loadOss();
-    const grid = {
-      dataset: {} as Record<string, string>,
-      scrollLeft: 999,
-    };
-    const originalProjects = [{ id: 'hyperframes' }, { id: 'ppt-master' }];
-
-    context._resetOssScrollForProjectChange(grid, originalProjects);
-    expect(grid.scrollLeft).toBe(0);
-
-    grid.scrollLeft = 240;
-    context._resetOssScrollForProjectChange(grid, originalProjects);
-    expect(grid.scrollLeft).toBe(240);
-
-    context._resetOssScrollForProjectChange(grid, [...originalProjects, { id: 'OfficeCLI' }]);
-    expect(grid.scrollLeft).toBe(0);
+    expect(calls.openMarketplace).toEqual([{
+      tab: 'oss',
+      opts: { returnView: 'new-chat', preserveReturnTab: true },
+    }]);
   });
 
   it('loadOssCatalog uses bundled cache first, then refreshes without duplicate calls', async () => {

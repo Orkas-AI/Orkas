@@ -2,6 +2,8 @@
  * Auth credential store — persists OAuth and API key credentials to disk.
  *
  * Credentials are stored in a JSON file at `~/.core-agent/auth-profiles.json`.
+ * Embedders may point this module at a host-managed encrypted store; that
+ * opaque file must be left for the host to read and write.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -13,6 +15,22 @@ import type { AuthCredential, AuthStore, OAuthCredential } from "./types.js";
 const log = createLogger("auth-store");
 
 const AUTH_STORE_VERSION = 1;
+const ORKAS_HOSTED_SECRET_PREFIX = "ORKLSEC1:";
+const ORKAS_VAULT_MAGIC = Buffer.from("ORKVAULT1");
+
+/** Orkas desktop owns and decrypts these whole-file envelopes before it
+ * injects provider credentials. Core-agent must neither parse nor overwrite
+ * them as its standalone plaintext store. */
+function isHostManagedEncryptedStore(raw: string): boolean {
+  if (raw.startsWith(ORKAS_HOSTED_SECRET_PREFIX)) return true;
+  try {
+    const prefix = Buffer.from(raw.slice(0, 12), "base64");
+    return prefix.length >= ORKAS_VAULT_MAGIC.length
+      && prefix.subarray(0, ORKAS_VAULT_MAGIC.length).equals(ORKAS_VAULT_MAGIC);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Resolve the directory for storing auth data.
@@ -50,6 +68,9 @@ export function loadAuthStore(): AuthStore {
   const storePath = resolveAuthStorePath();
   try {
     const raw = fs.readFileSync(storePath, "utf-8");
+    if (isHostManagedEncryptedStore(raw)) {
+      return { version: AUTH_STORE_VERSION, profiles: {} };
+    }
     const data = JSON.parse(raw) as Record<string, unknown>;
 
     if (data.profiles && typeof data.profiles === "object") {
@@ -71,6 +92,14 @@ export function loadAuthStore(): AuthStore {
 export function saveAuthStore(store: AuthStore): void {
   ensureAuthDir();
   const storePath = resolveAuthStorePath();
+  try {
+    const existing = fs.readFileSync(storePath, "utf-8");
+    if (isHostManagedEncryptedStore(existing)) {
+      throw new Error("auth store is managed by the embedding host");
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
   fs.writeFileSync(storePath, JSON.stringify(store, null, 2), "utf-8");
   log.debug("saved auth store", { path: storePath });
 }

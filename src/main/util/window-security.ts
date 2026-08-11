@@ -114,6 +114,97 @@ interface GuardedWebContents {
   on(event: 'will-navigate', handler: (event: NavigationEvent, url: string) => void): void;
 }
 
+export const OFFLINE_HTML_PREVIEW_CSP = [
+  "default-src 'none'",
+  "script-src 'unsafe-inline' 'unsafe-eval' blob:",
+  "style-src 'unsafe-inline'",
+  'img-src chat-media://local data: blob:',
+  'media-src chat-media://local data: blob:',
+  'font-src data: blob:',
+  "connect-src 'none'",
+  "frame-src 'none'",
+  'worker-src blob:',
+  "object-src 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "manifest-src 'none'",
+].join('; ');
+
+/**
+ * Preserve the streamed/range response while making local HTML previews
+ * offline-first. Inline code remains usable inside the existing sandbox, but
+ * network-loaded code/assets and programmatic connections fail closed.
+ */
+export function withOfflineHtmlPreviewPolicy(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('Content-Security-Policy', OFFLINE_HTML_PREVIEW_CSP);
+  headers.set('Referrer-Policy', 'no-referrer');
+  headers.set('X-Content-Type-Options', 'nosniff');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function parsedLocalChatMediaUrl(raw: unknown): URL | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'chat-media:' && url.hostname.toLowerCase() === 'local'
+      ? url
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isOfflineHtmlPreviewUrl(raw: unknown): boolean {
+  const url = parsedLocalChatMediaUrl(raw);
+  if (!url) return false;
+  try {
+    return /\.html?$/i.test(decodeURIComponent(url.pathname));
+  } catch {
+    return false;
+  }
+}
+
+interface PreviewFrameRef {
+  url: string;
+}
+
+interface PreviewFrameNavigationEvent extends NavigationEvent {
+  url: string;
+  isMainFrame: boolean;
+  frame?: PreviewFrameRef | null;
+  initiator?: PreviewFrameRef | null;
+}
+
+interface PreviewFrameWebContents {
+  on(
+    event: 'will-frame-navigate',
+    handler: (event: PreviewFrameNavigationEvent) => void,
+  ): void;
+}
+
+/**
+ * CSP resource directives do not cover every document navigation. Keep an
+ * already-loaded local HTML preview on the validated local protocol so inline
+ * code cannot exfiltrate data by assigning an HTTP(S) URL to its own frame.
+ */
+export function installOfflineHtmlPreviewNavigationGuard(
+  webContents: PreviewFrameWebContents,
+): void {
+  webContents.on('will-frame-navigate', (event) => {
+    if (event.isMainFrame) return;
+    const sourceUrl = event.frame?.url || event.initiator?.url || '';
+    if (!isOfflineHtmlPreviewUrl(sourceUrl)) return;
+    if (parsedLocalChatMediaUrl(event.url)) return;
+    event.preventDefault();
+  });
+}
+
 /**
  * Keep the application renderer on its original local document. HTTP(S)
  * destinations are handed to the OS browser; every in-app navigation,

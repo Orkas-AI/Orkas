@@ -4,12 +4,24 @@
 //      either an API Key form or the OAuth flow, depending on what the
 //      provider supports. On success we auto-create a priority-list
 //      entry pointing at the new credential.
-//   2. "Configured (by priority)": ordered list of
-//      (provider, model, profile)
-//      entries. First = default model; later items are the fallback chain.
-//      Rows are drag-reorderable.
+//   2. "Model configuration (by priority)": ordered list of
+//      (provider, model, profile) entries. The first available entry is the
+//      default model; later available items are the fallback chain. Available
+//      rows are drag-reorderable. Disabled official rows stay at the bottom
+//      as gray, non-rotating entries with an Enable action.
 
 const _settingsLog = createLogger('settings');
+const _OPENROUTER_CUSTOM_MODEL_VALUE = '__openrouter_custom_model__';
+
+function _settingsIsOpenRouterCustomModel(providerId, modelId) {
+  return providerId === 'openrouter' && modelId === _OPENROUTER_CUSTOM_MODEL_VALUE;
+}
+
+function _settingsResolveApiKeyModelId(providerId, selectedModelId, enteredModelId) {
+  return _settingsIsOpenRouterCustomModel(providerId, selectedModelId)
+    ? String(enteredModelId || '').trim()
+    : String(selectedModelId || '').trim();
+}
 
 let _settingsState = {
   providers: [],      // from auth.listProviders  [{id, label, supportsApiKey, supportsOAuth, profiles, ...}]
@@ -29,8 +41,11 @@ let _settingsState = {
     permission: { state: 'unknown', can_open_settings: false },
   },
   taskNotificationsBound: false,
+  taskNotificationsToggleEpoch: 0,
   taskNotificationPermissionRefreshTimer: null,
+  taskNotificationPermissionTelemetryKey: '',
   clientConfigBound: false,
+  recycleBound: false,
 };
 
 function _settingsTrackClick() {}
@@ -43,6 +58,15 @@ function _settingsTrackEvent(action, payload) {
 function _settingsTrackError(action, payload) {
   void action;
   void payload;
+}
+
+// The open build keeps the settings flow intact but intentionally has no
+// internal model-configuration telemetry sink.
+function _settingsTrackModelConfigResult() {}
+
+function _settingsResultErrorCode(res, fallback = 'operation_failed') {
+  const code = String((res && res.code) || '').trim();
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? code : fallback;
 }
 
 async function _settingsSafeCall(label, fn) {
@@ -61,6 +85,7 @@ async function loadSettings() {
   _settingsBindLanguageOnce();
   _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
+  _settingsBindRecycleBinOnce();
   _settingsSyncLanguageRadio();
   await Promise.all([
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
@@ -73,6 +98,7 @@ async function loadSettings() {
     _settingsSafeCall('settings task notifications refresh', _settingsRefreshTaskNotifications),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
+    _settingsSafeCall('settings recycle bin refresh', _settingsRefreshRecycleBin),
   ]);
   await _settingsSafeCall('settings picker render', _settingsRenderPicker);
   await _settingsSafeCall('settings entries render', _settingsRenderEntries);
@@ -95,45 +121,80 @@ async function loadSettings() {
 }
 
 // ── Native task notifications ──
+// Stored at preferences.json::task_notifications_enabled. Missing means ON;
+// the main-process notification outlet reads the same preference at delivery
+// time, so changes apply immediately to manual and scheduled tasks.
 
 function _settingsTaskNotificationPermissionState(state) {
   return String(state?.permission?.state || 'unknown');
 }
 
-async function _settingsRefreshTaskNotifications() {
+function _settingsNormalizeTaskNotificationPermission(permission) {
+  return {
+    state: String(permission && permission.state || 'unknown'),
+    can_open_settings: !!(permission && permission.can_open_settings),
+  };
+}
+
+function _settingsReportTaskNotificationPermission(source) {
+  const state = _settingsState.taskNotifications || {
+    enabled: true,
+    permission: { state: 'unknown', can_open_settings: false },
+  };
+  const permissionState = _settingsTaskNotificationPermissionState(state);
+  const key = `${!!state.enabled}:${permissionState}`;
+  if (_settingsState.taskNotificationPermissionTelemetryKey === key) return;
+  _settingsState.taskNotificationPermissionTelemetryKey = key;
+  const payload = {
+    enabled: !!state.enabled,
+    permission_state: permissionState,
+    source: String(source || 'settings_load'),
+  };
+  _settingsTrackEvent('task_notification_permission_state', payload);
+  _settingsLog.info('task notification state observed', payload);
+}
+
+async function _settingsRefreshTaskNotifications(source = 'settings_load') {
+  const epoch = _settingsState.taskNotificationsToggleEpoch;
   try {
     const res = await window.orkas.invoke('prefs.getTaskNotifications');
-    _settingsState.taskNotifications = (res && res.ok)
-      ? {
-          enabled: !!res.enabled,
-          permission: {
-            state: String(res.permission && res.permission.state || 'unknown'),
-            can_open_settings: !!(res.permission && res.permission.can_open_settings),
-          },
-        }
-      : {
-          enabled: true,
-          permission: { state: 'unknown', can_open_settings: false },
-        };
+    if (!res || !res.ok) return false;
+    const permission = _settingsNormalizeTaskNotificationPermission(res.permission);
+    if (epoch !== _settingsState.taskNotificationsToggleEpoch) {
+      // The preference read is stale, but the OS permission is an independent
+      // device constraint. Preserve the newer user choice while still applying
+      // the permission result and its recovery UI.
+      _settingsState.taskNotifications = {
+        ...(_settingsState.taskNotifications || { enabled: true }),
+        permission,
+      };
+    } else {
+      _settingsState.taskNotifications = {
+        enabled: !!res.enabled,
+        permission,
+      };
+    }
   } catch (_) {
-    _settingsState.taskNotifications = {
-      enabled: true,
-      permission: { state: 'unknown', can_open_settings: false },
-    };
+    return false;
   }
+  _settingsReportTaskNotificationPermission(source);
+  _settingsRenderTaskNotifications();
+  return true;
 }
 
 function _settingsBindTaskNotificationsOnce() {
   if (_settingsState.taskNotificationsBound) return;
   _settingsState.taskNotificationsBound = true;
   window.addEventListener('focus', () => {
+    // The user can change the permission by opening System Settings directly,
+    // so refresh on every return to Orkas rather than only after our own link.
     if (typeof currentView !== 'undefined' && currentView !== 'settings') return;
     if (_settingsState.taskNotificationPermissionRefreshTimer) {
       clearTimeout(_settingsState.taskNotificationPermissionRefreshTimer);
     }
     _settingsState.taskNotificationPermissionRefreshTimer = setTimeout(async () => {
       _settingsState.taskNotificationPermissionRefreshTimer = null;
-      await _settingsRefreshTaskNotifications();
+      await _settingsRefreshTaskNotifications('window_focus');
       _settingsRenderTaskNotifications();
     }, 350);
   });
@@ -149,25 +210,36 @@ function _settingsRenderTaskNotifications() {
   cb.checked = !!state.enabled;
 
   const warning = document.getElementById('settings-task-notification-permission');
+  const warningText = document.getElementById('settings-task-notification-permission-text');
   const openBtn = document.getElementById('settings-task-notification-open-settings');
-  // Only make the definitive "system notifications are off" claim when the
-  // platform also exposes an actionable per-app settings destination. A
-  // delivery failure on an unsupported/unprobeable desktop can surface as
-  // `denied` without proving that the user disabled Orkas in system settings.
-  const permissionDenied = state.enabled
-    && state.permission
-    && state.permission.state === 'denied'
-    && state.permission.can_open_settings;
-  if (warning) warning.hidden = !permissionDenied;
+  const permissionState = String(state.permission && state.permission.state || 'unknown');
+  const permissionBlocked = state.enabled
+    && (permissionState === 'denied' || permissionState === 'presentation_disabled');
+  if (warning) warning.hidden = !permissionBlocked;
+  if (warningText) {
+    const warningKey = permissionState === 'presentation_disabled'
+      ? 'settings.task_notifications.presentation_disabled'
+      : 'settings.task_notifications.permission_disabled';
+    warningText.dataset.i18n = warningKey;
+    warningText.textContent = t(warningKey);
+  }
   if (openBtn) {
     openBtn.hidden = !(state.permission && state.permission.can_open_settings);
     if (!openBtn.dataset.bound) {
       openBtn.addEventListener('click', async () => {
         openBtn.disabled = true;
+        _settingsTrackClick('task_notification_permission_open');
         try {
-          await window.orkas.invoke('prefs.openTaskNotificationSettings');
+          const res = await window.orkas.invoke('prefs.openTaskNotificationSettings');
+          if (!res || !res.ok || !res.opened) {
+            _settingsLog.warn('open task notification settings rejected', {
+              error_code: 'open_settings_rejected',
+            });
+          }
         } catch (err) {
-          _settingsLog.warn('open task notification settings failed', err);
+          _settingsLog.warn('open task notification settings failed', {
+            error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+          });
         } finally {
           openBtn.disabled = false;
         }
@@ -175,45 +247,103 @@ function _settingsRenderTaskNotifications() {
       openBtn.dataset.bound = '1';
     }
   }
-
   if (!cb.dataset.bound) {
     cb.addEventListener('change', async () => {
+      _settingsState.taskNotificationsToggleEpoch += 1;
+      const startedAt = Date.now();
       const next = !!cb.checked;
       const currentState = _settingsState.taskNotifications || {
         enabled: true,
         permission: { state: 'unknown', can_open_settings: false },
       };
       const previous = !!currentState.enabled;
+      const targetState = next ? 'enabled' : 'disabled';
       const permissionState = _settingsTaskNotificationPermissionState(currentState);
+      // Keep state aligned with the already-changed checkbox while persistence
+      // is pending. A concurrent permission refresh can then render without
+      // visually rolling the user's choice back.
+      _settingsState.taskNotifications = { ...currentState, enabled: next };
+      _settingsLog.info('task notification toggle requested', {
+        previous_enabled: previous,
+        enabled: next,
+        permission_state: permissionState,
+      });
       cb.disabled = true;
       try {
         const res = await window.orkas.invoke('prefs.setTaskNotifications', { enabled: next });
-        if (res && res.ok) {
+        const savedEnabled = !!(res && res.enabled);
+        const latestState = _settingsState.taskNotifications || currentState;
+        if (res && res.ok && savedEnabled === next) {
           _settingsState.taskNotifications = {
-            ...currentState,
-            enabled: !!res.enabled,
+            ...latestState,
+            enabled: savedEnabled,
             permission: res.permission
-              ? {
-                  state: String(res.permission.state || 'unknown'),
-                  can_open_settings: !!res.permission.can_open_settings,
-                }
-              : currentState.permission,
+              ? _settingsNormalizeTaskNotificationPermission(res.permission)
+              : latestState.permission,
           };
+          const savedPermissionState = _settingsTaskNotificationPermissionState(_settingsState.taskNotifications);
+          _settingsTrackEvent('task_notification_toggle_result', {
+            result: 'success',
+            enabled: savedEnabled,
+            target_state: targetState,
+            permission_state: savedPermissionState,
+            duration_ms: Math.max(0, Date.now() - startedAt),
+          });
           _settingsLog.info('task notification toggle saved', {
             previous_enabled: previous,
-            enabled: !!res.enabled,
-            permission_state: _settingsTaskNotificationPermissionState(_settingsState.taskNotifications),
+            enabled: savedEnabled,
+            permission_state: savedPermissionState,
           });
+          _settingsReportTaskNotificationPermission('toggle_result');
         } else {
-          _settingsState.taskNotifications = { ...currentState, enabled: previous };
+          const actualEnabled = res && res.ok ? savedEnabled : previous;
+          _settingsState.taskNotifications = {
+            ...latestState,
+            enabled: actualEnabled,
+            permission: res && res.permission
+              ? _settingsNormalizeTaskNotificationPermission(res.permission)
+              : latestState.permission,
+          };
+          const actualPermissionState = _settingsTaskNotificationPermissionState(
+            _settingsState.taskNotifications,
+          );
+          const mismatch = !!(res && res.ok);
+          _settingsTrackEvent('task_notification_toggle_result', {
+            result: 'failure',
+            enabled: actualEnabled,
+            target_state: targetState,
+            permission_state: actualPermissionState,
+            duration_ms: Math.max(0, Date.now() - startedAt),
+            error_type: 'persistence',
+            error_code: mismatch ? 'update_mismatch' : 'update_rejected',
+          });
           _settingsLog.warn('set task notifications rejected', {
             target_enabled: next,
-            error: String(res?.error || 'preference update rejected'),
+            actual_enabled: actualEnabled,
+            error_code: mismatch ? 'update_mismatch' : 'update_rejected',
           });
+          if (mismatch) _settingsReportTaskNotificationPermission('toggle_result');
         }
       } catch (err) {
-        _settingsState.taskNotifications = { ...currentState, enabled: previous };
-        _settingsLog.warn('set task notifications failed', err);
+        _settingsState.taskNotifications = {
+          ...(_settingsState.taskNotifications || currentState),
+          enabled: previous,
+        };
+        const actualPermissionState = _settingsTaskNotificationPermissionState(
+          _settingsState.taskNotifications,
+        );
+        _settingsTrackEvent('task_notification_toggle_result', {
+          result: 'failure',
+          enabled: previous,
+          target_state: targetState,
+          permission_state: actualPermissionState,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+          error_type: 'ipc',
+          error_code: 'invoke_failed',
+        });
+        _settingsLog.warn('set task notifications failed', {
+          error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+        });
       } finally {
         cb.disabled = false;
         _settingsRenderTaskNotifications();
@@ -225,14 +355,128 @@ function _settingsRenderTaskNotifications() {
 
 function _settingsBindClientConfigOnce() {}
 
+// ── Local recycle bin ──
+
+function _settingsRecycleAvailable() {
+  return !!(
+    window.orkas
+    && window.orkas.recycleBin
+    && typeof window.orkas.recycleBin.list === 'function'
+  );
+}
+
+function _settingsRecycleTitle(batch) {
+  const direct = String(batch?.display_title || batch?.label || '').trim();
+  if (direct) return direct;
+  const displayItems = Array.isArray(batch?.display_items) ? batch.display_items : [];
+  const titles = displayItems
+    .map((item) => String(item?.title || '').trim())
+    .filter(Boolean);
+  if (titles.length) return titles.join('; ');
+  const paths = Array.isArray(batch?.paths_preview) ? batch.paths_preview : [];
+  const names = paths
+    .map((item) => String(item || '').split('/').filter(Boolean).pop() || '')
+    .filter(Boolean);
+  return names.join('; ') || t('settings.recycle.display_unknown');
+}
+
+function _settingsRecycleRowHtml(batch) {
+  const id = escapeHtml(String(batch?.id || ''));
+  const title = escapeHtml(_settingsRecycleTitle(batch));
+  const timestamp = Number(batch?.created_at_ms) || 0;
+  const deletedAt = timestamp ? new Date(timestamp).toLocaleString() : '';
+  return `
+    <div class="settings-recycle-row">
+      <div class="settings-recycle-row-head">
+        <div class="settings-recycle-main">
+          <div class="settings-recycle-name">${title}</div>
+          <div class="settings-recycle-meta">${escapeHtml(deletedAt)}</div>
+        </div>
+        <div class="settings-recycle-actions">
+          <button class="btn btn-sm" type="button" data-recycle-restore="${id}">${escapeHtml(t('settings.recycle.restore'))}</button>
+          <button class="btn btn-sm btn-danger" type="button" data-recycle-delete="${id}">${escapeHtml(t('settings.recycle.delete'))}</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function _settingsRefreshRecycleBin() {
+  const body = document.getElementById('settings-recycle-body');
+  if (!body || !_settingsRecycleAvailable()) return;
+  try {
+    const res = await window.orkas.recycleBin.list();
+    const batches = Array.isArray(res?.batches) ? res.batches : [];
+    body.innerHTML = batches.length
+      ? batches.map(_settingsRecycleRowHtml).join('')
+      : `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
+  } catch (err) {
+    _settingsLog.warn('recycle bin refresh failed', {
+      error: (err && err.message) || String(err),
+    });
+    body.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
+  }
+}
+
+function _settingsBindRecycleBinOnce() {
+  if (_settingsState.recycleBound) return;
+  const body = document.getElementById('settings-recycle-body');
+  if (!body) return;
+  _settingsState.recycleBound = true;
+  body.addEventListener('click', async (event) => {
+    const button = event.target?.closest?.('[data-recycle-restore], [data-recycle-delete]');
+    if (!button || !_settingsRecycleAvailable()) return;
+    const deleting = button.hasAttribute('data-recycle-delete');
+    const id = button.getAttribute(deleting ? 'data-recycle-delete' : 'data-recycle-restore') || '';
+    if (!id) return;
+    const confirmed = deleting && typeof uiConfirmDanger === 'function'
+      ? await uiConfirmDanger({
+          title: t('settings.recycle.delete_title'),
+          message: t('settings.recycle.delete_confirm'),
+          dangerLabel: t('settings.recycle.delete'),
+        })
+      : await uiConfirm({
+          message: t(deleting ? 'settings.recycle.delete_confirm' : 'settings.recycle.restore_confirm'),
+          okLabel: t(deleting ? 'settings.recycle.delete' : 'settings.recycle.restore'),
+        });
+    if (!confirmed) return;
+    button.disabled = true;
+    try {
+      if (deleting) {
+        const res = await window.orkas.recycleBin.delete(id);
+        if (!res?.deleted) throw new Error(t('settings.recycle.delete_not_found'));
+      } else {
+        await window.orkas.recycleBin.restore(id);
+        if (typeof loadProjects === 'function') await loadProjects(true);
+        if (typeof loadConversations === 'function') await loadConversations();
+      }
+    } catch (err) {
+      _settingsLog.warn(`recycle bin ${deleting ? 'delete' : 'restore'} failed`, {
+        error: (err && err.message) || String(err),
+      });
+      if (typeof uiAlert === 'function') {
+        await uiAlert((err && err.message) || t(
+          deleting ? 'settings.recycle.delete_failed' : 'settings.recycle.restore_failed',
+        ));
+      }
+    } finally {
+      button.disabled = false;
+      await _settingsRefreshRecycleBin();
+    }
+  });
+}
+
 // ── Tool execution access permission ──
 
 const _LOCALEXEC_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 
 async function _settingsRefreshLocalExec() {
+  const epoch = _settingsState.localExecToggleEpoch;
   const res = await window.orkas.invoke('permissions.getLocalExec');
+  if (epoch !== _settingsState.localExecToggleEpoch) return;
   const mode = (res && res.ok && _LOCALEXEC_MODES.includes(res.mode)) ? res.mode : 'all_files_approval';
   _settingsState.localExec = { mode };
+  _settingsRenderLocalExec();
 }
 
 function _settingsRenderLocalExec() {
@@ -245,21 +489,36 @@ function _settingsRenderLocalExec() {
     radios.forEach((radio) => {
       radio.addEventListener('change', async () => {
         if (!radio.checked) return;
+        _settingsState.localExecToggleEpoch += 1;
+        const startedAt = Date.now();
         const next = radio.value;
         const prev = (_settingsState.localExec && _settingsState.localExec.mode) || 'all_files_approval';
         try {
           const res = await window.orkas.invoke('permissions.setLocalExecMode', { mode: next });
-          if (res && res.ok && res.mode) {
+          const returnedMode = res && _LOCALEXEC_MODES.includes(res.mode) ? res.mode : '';
+          if (res && res.ok && returnedMode === next) {
             _settingsState.localExec = { mode: res.mode };
             _settingsRenderLocalExec();
           } else {
-            _settingsState.localExec = { mode: prev };
+            const actual = res && res.ok && returnedMode ? returnedMode : prev;
+            _settingsState.localExec = { mode: actual };
             _settingsRenderLocalExec();
+            _settingsTrackOperationResult(
+              'localexec_mode_change_result', startedAt, 'failure',
+              { target_mode: next, actual_mode: actual },
+              res && res.ok ? 'update_mismatch' : 'update_rejected',
+            );
           }
         } catch (err) {
           _settingsState.localExec = { mode: prev };
           _settingsRenderLocalExec();
-          _settingsLog.warn('local exec mode set failed', err);
+          _settingsTrackOperationResult(
+            'localexec_mode_change_result', startedAt, 'failure',
+            { target_mode: next, actual_mode: prev }, 'invoke_failed', 'ipc',
+          );
+          _settingsLog.warn('local exec mode set failed', {
+            error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+          });
         }
       });
     });
@@ -273,15 +532,114 @@ function _settingsRenderLocalExec() {
 // (surfaced as `envForcedOff`); when active, the UI greys out the
 // toggle and shows an explanatory hint.
 
-async function _settingsRefreshMetacognition() {
+async function _settingsRefreshMetacognition(options = {}) {
+  const epoch = _settingsState.metacognitionToggleEpoch;
+  const hasFailureFallback = typeof options.failureFallbackEnabled === 'boolean';
   try {
     const res = await window.orkas.invoke('prefs.getMetacognition');
-    _settingsState.metacognition = (res && res.ok)
+    const refreshed = (res && res.ok)
       ? { enabled: !!res.enabled, envForcedOff: !!res.envForcedOff }
-      : { enabled: true, envForcedOff: false };
+      : {
+          enabled: hasFailureFallback ? options.failureFallbackEnabled : true,
+          envForcedOff: false,
+        };
+    if (epoch !== _settingsState.metacognitionToggleEpoch) {
+      if (!res || !res.ok) return;
+      // A newer user preference supersedes only the stale enabled value. The
+      // environment kill switch is an independent, authoritative capability
+      // gate and must still reach the UI.
+      _settingsState.metacognition = {
+        ...(_settingsState.metacognition || { enabled: true }),
+        envForcedOff: refreshed.envForcedOff,
+      };
+      // Rendering a forced-off result immediately is required for correctness.
+      // A false result can wait for the pending write, keeping the control
+      // disabled until that write settles.
+      if (refreshed.envForcedOff) _settingsRenderMetacognition();
+      return !!(res && res.ok);
+    }
+    _settingsState.metacognition = refreshed;
+    // This read is independent of the other settings requests. Render it as
+    // soon as it resolves instead of leaving the toggle stale until the
+    // slowest request in loadSettings() finishes.
+    _settingsRenderMetacognition();
+    return !!(res && res.ok);
   } catch (_) {
-    _settingsState.metacognition = { enabled: true, envForcedOff: false };
+    if (epoch !== _settingsState.metacognitionToggleEpoch) return false;
+    _settingsState.metacognition = {
+      enabled: hasFailureFallback ? options.failureFallbackEnabled : true,
+      envForcedOff: false,
+    };
+    _settingsRenderMetacognition();
+    return false;
   }
+}
+
+function _settingsBindMetacognitionOnce() {
+  const cb = document.getElementById('settings-metacognition-toggle');
+  if (!cb || cb.dataset.bound) return;
+  cb.addEventListener('change', async () => {
+    if (cb.disabled) return;
+    const epoch = ++_settingsState.metacognitionToggleEpoch;
+    const startedAt = Date.now();
+    const next = !!cb.checked;
+    const previous = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
+    _settingsState.metacognition = {
+      envForcedOff: false,
+      ...(_settingsState.metacognition || {}),
+      enabled: next,
+    };
+    cb.disabled = true;
+    try {
+      const res = await window.orkas.invoke('prefs.setMetacognition', { enabled: next });
+      if (epoch !== _settingsState.metacognitionToggleEpoch) return;
+      if (res && res.ok) {
+        _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
+        _settingsTrackEvent('metacognition_toggle_result', {
+          result: 'success',
+          enabled: !!res.enabled,
+          target_enabled: next,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+        });
+      } else {
+        // The initial preference read may have been in flight when the user
+        // clicked. Its enabled value is intentionally ignored after the epoch
+        // changes, so a rejected write must fetch the persisted truth again
+        // instead of rolling back to a possibly uninitialized placeholder.
+        await _settingsRefreshMetacognition({ failureFallbackEnabled: previous });
+        const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
+        _settingsLog.warn('setMetacognition rejected', { error_code: 'update_rejected' });
+        _settingsTrackEvent('metacognition_toggle_result', {
+          result: 'failure',
+          enabled: actualEnabled,
+          target_enabled: next,
+          duration_ms: Math.max(0, Date.now() - startedAt),
+          error_type: 'operation',
+          error_code: 'update_rejected',
+        });
+      }
+    } catch (err) {
+      if (epoch !== _settingsState.metacognitionToggleEpoch) return;
+      await _settingsRefreshMetacognition({ failureFallbackEnabled: previous });
+      const actualEnabled = !!(_settingsState.metacognition && _settingsState.metacognition.enabled);
+      _settingsLog.warn('setMetacognition failed', {
+        error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+      });
+      _settingsTrackEvent('metacognition_toggle_result', {
+        result: 'failure',
+        enabled: actualEnabled,
+        target_enabled: next,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+        error_type: 'ipc',
+        error_code: 'invoke_failed',
+      });
+    } finally {
+      if (epoch === _settingsState.metacognitionToggleEpoch) {
+        _settingsRenderMetacognition();
+      }
+    }
+  });
+  cb.dataset.bound = '1';
 }
 
 function _settingsRenderMetacognition() {
@@ -346,16 +704,36 @@ function _settingsRenderDataRoot() {
   span.textContent = _settingsState.dataRoot || '';
   if (!btn.dataset.bound) {
     btn.addEventListener('click', async () => {
+      const startedAt = Date.now();
+      let res;
       try {
         await window.orkas.invoke('app.openDataRoot');
       } catch (err) {
-        _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
-        _settingsTrackEvent('settings_open_data_root_result', { result: 'failure' });
-        _settingsTrackError('settings_open_data_root', {
-          error_type: 'operation',
-          error_message: 'open_data_root_failed',
+        _settingsLog.warn('open data root failed', {
+          error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
         });
+        _settingsTrackEvent('settings_open_data_root_result', {
+          result: 'failure',
+          duration_ms: Math.max(0, Date.now() - startedAt),
+          error_type: 'ipc',
+          error_code: 'invoke_failed',
+        });
+        return;
       }
+      if (!res || res.ok === false) {
+        _settingsLog.warn('open data root rejected', { error_code: 'open_rejected' });
+        _settingsTrackEvent('settings_open_data_root_result', {
+          result: 'failure',
+          duration_ms: Math.max(0, Date.now() - startedAt),
+          error_type: 'operation',
+          error_code: 'open_rejected',
+        });
+        return;
+      }
+      _settingsTrackEvent('settings_open_data_root_result', {
+        result: 'success',
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      });
     });
     btn.dataset.bound = '1';
   }
@@ -533,8 +911,16 @@ async function _settingsPopulatePickerModel(providerId, selected) {
   // from the previously selected provider instead of rendering a model list
   // that the main-process catalog will reject for the current provider.
   if ((_settingsState.pickerProviderSel?.getValue() || '') !== providerId) return;
+  const options = models.map((m) => ({ value: m.id, label: m.name || m.id }));
+  if (providerId === 'openrouter') {
+    options.unshift({
+      value: _OPENROUTER_CUSTOM_MODEL_VALUE,
+      label: t('settings.picker.openrouter_custom_model'),
+      hint: t('settings.picker.openrouter_custom_hint'),
+    });
+  }
   sel.setOptions(
-    models.map((m) => ({ value: m.id, label: m.name || m.id })),
+    options,
     { value: selected || '', placeholder: providerId ? t('settings.picker.select_model') : t('settings.picker.pick_provider_first') },
   );
 }
@@ -561,6 +947,10 @@ async function _settingsClickAddEntry() {
 // ── Method chooser + credential forms ──
 
 function _settingsChooseAccountMethod(provider, modelId) {
+  if (_settingsIsOpenRouterCustomModel(provider.id, modelId)) {
+    _settingsShowApiKeyForm(provider, modelId);
+    return;
+  }
 
   const hasApi   = !!provider.supportsApiKey;
   const hasOAuth = !!provider.supportsOAuth;
@@ -628,8 +1018,17 @@ function _settingsShowApiKeyForm(provider, modelId) {
   const subNoteHtml = provider.subscriptionNote
     ? `<div class="form-hint form-hint-warn">${escapeHtml(t(provider.subscriptionNote))}</div>`
     : '';
+  const enterOpenRouterModel = _settingsIsOpenRouterCustomModel(provider.id, modelId);
+  const openRouterModelHtml = enterOpenRouterModel
+    ? `<div class="form-row">
+      <label>${escapeHtml(t('settings.custom.model_id'))}</label>
+      <input type="text" class="openrouter-model-input form-input" placeholder="x-ai/grok-4.20" autocomplete="off" spellcheck="false" />
+      <div class="form-hint">${escapeHtml(t('settings.picker.openrouter_custom_hint'))}</div>
+    </div>`
+    : '';
   body.innerHTML = `
     ${subNoteHtml}
+    ${openRouterModelHtml}
     <div class="form-row">
       <label>${escapeHtml(t('settings.modal.label'))}</label>
       <input type="text" class="api-label-input form-input" placeholder="${escapeHtml(t('settings.modal.label_placeholder'))}" autocomplete="off" spellcheck="false" />
@@ -643,6 +1042,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
   `;
   actions.innerHTML = '';
 
+  const modelInput = body.querySelector('.openrouter-model-input');
   const labelInput = body.querySelector('.api-label-input');
   const keyInput   = body.querySelector('.api-key-input');
   const msg        = body.querySelector('.form-msg');
@@ -656,18 +1056,37 @@ function _settingsShowApiKeyForm(provider, modelId) {
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = t('settings.save');
   const save = async () => {
+    const startedAt = Date.now();
+    const resolvedModelId = _settingsResolveApiKeyModelId(provider.id, modelId, modelInput?.value);
     const label  = (labelInput.value || '').trim();
     const apiKey = (keyInput.value || '').trim();
-    if (!apiKey) { msg.textContent = t('settings.paste_key_first'); msg.className = 'form-msg error'; return; }
+    if (!resolvedModelId) {
+      msg.textContent = t('settings.custom.error_model');
+      msg.className = 'form-msg error';
+      _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'blocked', 'model_required');
+      modelInput?.focus();
+      return;
+    }
+    if (!apiKey) {
+      msg.textContent = t('settings.paste_key_first');
+      msg.className = 'form-msg error';
+      _settingsTrackModelConfigResult(startedAt, 'add', 'api_key', 'blocked', 'api_key_required');
+      return;
+    }
     saveBtn.disabled = true;
-    const startedAt = Date.now();
     msg.textContent = t('settings.save_loading'); msg.className = 'form-msg';
-    _settingsLog.info('add api key', { provider: provider.id, model: modelId, has_label: !!label });
-    const addRes = await window.orkas.invoke('auth.addApiKey', {
-      provider: provider.id,
-      apiKey,
-      label: label || undefined,
-    });
+    _settingsLog.info('add api key', { provider: provider.id, model: resolvedModelId, has_label: !!label });
+    let addRes = null;
+    try {
+      addRes = await window.orkas.invoke('auth.addApiKeyEntry', {
+        provider: provider.id,
+        model: resolvedModelId,
+        apiKey,
+        label: label || undefined,
+      });
+    } catch (_) {
+      addRes = { ok: false, code: 'invoke_failed' };
+    }
     if (!addRes || !addRes.ok) {
       saveBtn.disabled = false;
       msg.textContent = (addRes && addRes.error) || t('settings.save_failed');
@@ -683,6 +1102,10 @@ function _settingsShowApiKeyForm(provider, modelId) {
   saveBtn.onclick = save;
   // IME guard (CLAUDE.md §8): Enter on these inputs advances focus / saves;
   // skip while a Chinese / Japanese / Korean candidate is being composed.
+  modelInput?.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter') { labelInput.focus(); e.preventDefault(); }
+  });
   labelInput.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') { keyInput.focus(); e.preventDefault(); }
@@ -695,7 +1118,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
   actions.appendChild(cancelBtn);
   actions.appendChild(saveBtn);
   _settingsOpenModal(overlay);
-  setTimeout(() => labelInput.focus(), 0);
+  setTimeout(() => (modelInput || labelInput).focus(), 0);
 }
 
 function _settingsCustomModelError(code, fallback) {
@@ -707,6 +1130,16 @@ function _settingsCustomModelError(code, fallback) {
     CUSTOM_TOKEN_LIMIT_INVALID: 'settings.custom.error_token_limits',
   })[String(code || '')];
   return key ? t(key) : (fallback || t('settings.save_failed'));
+}
+
+function _settingsModelConfigValidationCode(code) {
+  return ({
+    CUSTOM_BASE_URL_REQUIRED: 'base_url_required',
+    CUSTOM_BASE_URL_INVALID: 'base_url_invalid',
+    CUSTOM_MODEL_REQUIRED: 'model_required',
+    CUSTOM_API_KEY_REQUIRED: 'api_key_required',
+    CUSTOM_TOKEN_LIMIT_INVALID: 'token_limit_invalid',
+  })[String(code || '')] || 'validation_failed';
 }
 
 function _settingsValidateCustomBaseUrl(value) {
@@ -737,11 +1170,13 @@ function _settingsNormalizeCustomBaseUrl(value) {
 }
 
 function _settingsBuildCustomModelPayload(values) {
+  const maxTokens = String(values.maxTokens ?? '').trim();
   return {
     label: String(values.label || '').trim(),
     baseUrl: _settingsNormalizeCustomBaseUrl(values.baseUrl),
     model: String(values.model || '').trim(),
     apiKey: String(values.apiKey || '').trim(),
+    ...(maxTokens ? { maxTokens } : {}),
   };
 }
 
@@ -769,6 +1204,11 @@ function _settingsShowCustomModelForm(provider) {
       <label>${escapeHtml(t('settings.custom.model_id'))}</label>
       <input type="text" class="custom-model-input form-input" placeholder="${escapeHtml(t('settings.custom.model_placeholder'))}" autocomplete="off" spellcheck="false" />
     </div>
+    <div class="form-row custom-model-advanced">
+      <label>${escapeHtml(t('settings.custom.max_tokens'))}</label>
+      <input type="number" class="custom-max-tokens-input form-input" min="1" max="16777216" step="1" placeholder="32768" inputmode="numeric" />
+      <div class="form-hint">${escapeHtml(t('settings.custom.max_tokens_hint'))}</div>
+    </div>
     <div class="form-row">
       <label>API Key</label>
       <input type="password" class="custom-key-input form-input" placeholder="sk-…" autocomplete="new-password" spellcheck="false" />
@@ -780,6 +1220,7 @@ function _settingsShowCustomModelForm(provider) {
   const labelInput = body.querySelector('.custom-label-input');
   const baseUrlInput = body.querySelector('.custom-base-url-input');
   const modelInput = body.querySelector('.custom-model-input');
+  const maxTokensInput = body.querySelector('.custom-max-tokens-input');
   const keyInput = body.querySelector('.custom-key-input');
   const msg = body.querySelector('.form-msg');
 
@@ -792,10 +1233,12 @@ function _settingsShowCustomModelForm(provider) {
   saveBtn.className = 'btn btn-primary';
   saveBtn.textContent = t('settings.save');
   const save = async () => {
+    const startedAt = Date.now();
     const payload = _settingsBuildCustomModelPayload({
       label: labelInput.value,
       baseUrl: baseUrlInput.value,
       model: modelInput.value,
+      maxTokens: maxTokensInput.value,
       apiKey: keyInput.value,
     });
     const { label, baseUrl, model, apiKey } = payload;
@@ -805,11 +1248,17 @@ function _settingsShowCustomModelForm(provider) {
     if (errorCode) {
       msg.textContent = _settingsCustomModelError(errorCode);
       msg.className = 'form-msg error';
+      _settingsTrackModelConfigResult(
+        startedAt,
+        'add',
+        'custom',
+        'blocked',
+        _settingsModelConfigValidationCode(errorCode),
+      );
       return;
     }
 
     saveBtn.disabled = true;
-    const startedAt = Date.now();
     msg.textContent = t('settings.save_loading');
     msg.className = 'form-msg';
     _settingsLog.info('add custom model', { provider: provider.id, model, has_label: !!label });
@@ -852,7 +1301,8 @@ function _settingsShowCustomModelForm(provider) {
   };
   focusNextOnEnter(labelInput, baseUrlInput);
   focusNextOnEnter(baseUrlInput, modelInput);
-  focusNextOnEnter(modelInput, keyInput);
+  focusNextOnEnter(modelInput, maxTokensInput);
+  focusNextOnEnter(maxTokensInput, keyInput);
   keyInput.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') { save(); e.preventDefault(); }
@@ -886,6 +1336,13 @@ let _oauthFlowId        = null;
 let _oauthFlowTarget    = null; // { provider, modelId }
 let _oauthFlowTelemetry = null;
 
+function _settingsFinishOAuthTelemetry(result, errorCode = '') {
+  if (!_oauthFlowTelemetry || _oauthFlowTelemetry.done) return;
+  const startedAt = _oauthFlowTelemetry.startedAt;
+  _oauthFlowTelemetry.done = true;
+  _settingsTrackModelConfigResult(startedAt, 'add', 'oauth', result, errorCode);
+}
+
 async function _settingsStartOAuthFlow(provider, modelId) {
   const overlay   = document.getElementById('oauth-flow-modal');
   const title     = document.getElementById('oauth-flow-title');
@@ -907,19 +1364,8 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(t('settings.oauth.starting'))}</div>${aliasTip}`;
   overlay.classList.add('open');
 
-  const finishTelemetry = (result, errorCode = '') => {
-    if (!_oauthFlowTelemetry || _oauthFlowTelemetry.done) return;
-    _oauthFlowTelemetry.done = true;
-    _settingsTrackModelConfigResult(
-      _oauthFlowTelemetry.startedAt,
-      'add',
-      'oauth',
-      result,
-      errorCode,
-    );
-  };
   const closeFlow = () => {
-    finishTelemetry('cancelled', 'cancelled');
+    _settingsFinishOAuthTelemetry('cancelled', 'cancelled');
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     if (_oauthFlowId) {
       window.orkas.invoke('auth.cancelOAuthFlow', { flowId: _oauthFlowId }).catch(() => {});
@@ -1049,7 +1495,26 @@ function _oauthFlowRender(provider, status, closeFlow) {
     body.innerHTML = `<div class="oauth-flow-stage ok">${escapeHtml(t('settings.oauth.success_writing'))}</div>`;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
     (async () => {
-      if (target && target.modelId && profileId) {
+      const removeNewCredential = async () => {
+        if (!profileId) return;
+        await window.orkas.invoke('auth.removeCredential', { profileId }).catch(() => {});
+      };
+      const failEntrySave = async (errorCode, message, logContext = {}) => {
+        await removeNewCredential();
+        body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(message || t('settings.add_entry_failed'))}</div>`;
+        _settingsLog.warn('oauth entry save failed', {
+          error_code: errorCode,
+          ...logContext,
+        });
+        _settingsFinishOAuthTelemetry('failure', errorCode);
+      };
+
+      if (!target || !target.modelId || !profileId) {
+        await failEntrySave('entry_context_missing', t('settings.add_entry_failed'));
+        return;
+      }
+
+      try {
         // profileId is namespaced with the OAuth back-end provider (e.g.
         // `openai-codex:default`), so the entry must use the same provider
         // or addEntry will reject it as a cross-provider mismatch.
@@ -1075,36 +1540,20 @@ function _oauthFlowRender(provider, status, closeFlow) {
           // model entry cannot be committed, remove it again so a catalog
           // race or write failure cannot look successful or leave hidden
           // credential-only state.
-          await window.orkas.invoke('auth.removeCredential', { profileId }).catch(() => {});
           const message = (entryRes && entryRes.error) || t('settings.add_entry_failed');
-          body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(message)}</div>`;
-          _settingsLog.warn('oauth entry save failed', {
+          await failEntrySave(_settingsResultErrorCode(entryRes, 'entry_save_failed'), message, {
             provider: entryProvider,
             model,
-            error: entryRes && entryRes.error,
           });
-          if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
-            _settingsTrackModelConfigResult(
-              _oauthFlowTelemetry.startedAt,
-              'add',
-              'oauth',
-              'failure',
-              _settingsResultErrorCode(entryRes, 'entry_save_failed'),
-            );
-            _oauthFlowTelemetry.done = true;
-          }
           return;
         }
+      } catch (err) {
+        await failEntrySave('invoke_failed', t('settings.add_entry_failed'), {
+          error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+        });
+        return;
       }
-      if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
-        _settingsTrackModelConfigResult(
-          _oauthFlowTelemetry.startedAt,
-          'add',
-          'oauth',
-          'success',
-        );
-        _oauthFlowTelemetry.done = true;
-      }
+      _settingsFinishOAuthTelemetry('success');
       closeFlow();
       await _settingsReload();
     })();
@@ -1114,16 +1563,7 @@ function _oauthFlowRender(provider, status, closeFlow) {
   if (status.kind === 'error') {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(status.error || t('settings.oauth.auth_failed'))}</div>`;
     if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
-    if (_oauthFlowTelemetry && !_oauthFlowTelemetry.done) {
-      _settingsTrackModelConfigResult(
-        _oauthFlowTelemetry.startedAt,
-        'add',
-        'oauth',
-        'failure',
-        'oauth_failed',
-      );
-      _oauthFlowTelemetry.done = true;
-    }
+    _settingsFinishOAuthTelemetry('failure', 'oauth_failed');
     return;
   }
 }
@@ -1140,16 +1580,24 @@ function _settingsRenderEntries() {
     return;
   }
 
-  _settingsState.entries.forEach((entry, idx) => {
+  const displayedEntries = _settingsState.entries.filter((entry) => (
+    entry && entry.official !== true && entry.profileType !== 'managed'
+  ));
+  displayedEntries.forEach((entry, idx) => {
     container.appendChild(_settingsRenderEntryRow(entry, idx));
   });
 }
 
 function _settingsEntryModelState(entry, list) {
   const unavailable = entry.modelAvailable === false;
+  const models = Array.isArray(list) ? [...list] : [];
+  if (!unavailable && entry.provider === 'openrouter' && entry.model
+      && !models.some((model) => model.id === entry.model)) {
+    models.unshift({ id: entry.model, name: entry.model });
+  }
   return {
     unavailable,
-    options: list.map(m => ({ value: m.id, label: m.name || m.id })),
+    options: models.map(m => ({ value: m.id, label: m.name || m.id })),
     value: unavailable ? '' : entry.model,
     placeholder: unavailable
       ? t('settings.entries.model_unavailable')
@@ -1167,15 +1615,54 @@ function _settingsEntryProblem(entry) {
   return '';
 }
 
-function _settingsRenderEntryRow(entry, idx) {
+async function _settingsUpdateEntryModel(entry, model, modelSel) {
+  const requestedModel = String(model || '').trim();
+  if (
+    !entry
+    || !entry.entryId
+    || !requestedModel
+    || requestedModel === String(entry.model || '').trim()
+  ) return false;
+  const startedAt = Date.now();
+  let res = null;
+  try {
+    res = await window.orkas.invoke('auth.updateEntryModel', {
+      entryId: entry.entryId,
+      model: requestedModel,
+    });
+  } catch (_) {
+    res = { ok: false, code: 'invoke_failed' };
+  }
+  if (!res || !res.ok) {
+    const errorCode = _settingsResultErrorCode(res);
+    _settingsLog.warn('model configuration update failed', { error_code: errorCode });
+    _settingsTrackModelConfigResult(
+      startedAt,
+      'update_model',
+      'existing',
+      'failure',
+      errorCode,
+    );
+    await uiAlert((res && res.error) || t('settings.entries.switch_model_failed'));
+    modelSel?.setValue(entry.model);
+    return false;
+  }
+  _settingsTrackModelConfigResult(startedAt, 'update_model', 'existing', 'success');
+  await _settingsReload();
+  return true;
+}
+
+function _settingsRenderEntryRow(entry, priorityIdx) {
   const row = document.createElement('div');
-  row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+  row.className = 'entry-row' + (priorityIdx === 0 ? ' is-default' : '');
   row.dataset.entryId = entry.entryId;
   row.draggable = true;
 
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
-  rank.textContent = idx === 0 ? t('settings.entries.default_tag') : `#${idx + 1}`;
+  rank.textContent = priorityIdx === 0
+    ? t('settings.entries.default_tag')
+    : `#${priorityIdx + 1}`;
   row.appendChild(rank);
 
   const main = document.createElement('div');
@@ -1195,9 +1682,9 @@ function _settingsRenderEntryRow(entry, idx) {
   main.appendChild(primary);
 
   // Inline model picker — lets users switch the entry's model without
-  // deleting + re-adding. auth.listModels is the complete whitelist; a saved
-  // model that left the catalog remains visible only as a remediation row and
-  // is never injected back into these options.
+  // deleting + re-adding. auth.listModels is the shortcut catalog; a valid
+  // manually entered OpenRouter id is injected only for its existing row so
+  // the picker can continue to display that saved selection.
   const modelEl = primary.querySelector('.entry-model-select');
   if (modelEl) {
     const initialModelState = _settingsEntryModelState(entry, []);
@@ -1216,14 +1703,7 @@ function _settingsRenderEntryRow(entry, idx) {
         placeholder: modelState.placeholder,
       });
       modelSel.onChange(async (val) => {
-        if (!val || val === entry.model) return;
-        const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
-        if (!up || !up.ok) {
-          await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));
-          modelSel.setValue(entry.model);
-          return;
-        }
-        await _settingsReload();
+        await _settingsUpdateEntryModel(entry, val, modelSel);
       });
     })();
   }
@@ -1234,9 +1714,6 @@ function _settingsRenderEntryRow(entry, idx) {
   if (entry.profileType === 'oauth') {
     badge.className = 'account-type-badge oauth' + (entry.oauthExpired ? ' expired' : '');
     badge.textContent = entry.oauthExpired ? t('settings.entries.oauth_expired') : t('settings.entries.oauth_badge');
-  } else if (entry.profileType === 'managed') {
-    badge.className = 'account-type-badge';
-    badge.textContent = 'Orkas';
   } else {
     badge.className = 'account-type-badge';
     badge.textContent = 'API Key';
@@ -1432,6 +1909,12 @@ function _settingsSetRowStatus(el, kind, text, baseCls = 'account-row-status') {
 // Brave Search API / Baidu AI Search); see search-adapters.ts for the
 // canonical registry.
 
+function _settingsVisibleApiProfiles(profiles) {
+  return (Array.isArray(profiles) ? profiles : []).filter((profile) => (
+    profile && profile.managed !== true && !String(profile.id || '').startsWith('managed:')
+  ));
+}
+
 const _SEARCH_PROVIDER_OPTIONS = [
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
@@ -1503,7 +1986,7 @@ function _settingsRenderSearchEntries() {
   const container = document.getElementById('settings-search-entries');
   if (!container) return;
   container.innerHTML = '';
-  const list = _settingsState.searchProfiles || [];
+  const list = _settingsVisibleApiProfiles(_settingsState.searchProfiles);
   if (!list.length) {
     container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.search.empty'))}</div>`;
     return;
@@ -1551,7 +2034,7 @@ function _settingsRenderSearchEntries() {
     _settingsAttachReorderDnd(row, {
       kind: 'search',
       id: p.id,
-      getIds: () => (_settingsState.searchProfiles || []).map((x) => x.id),
+      getIds: () => _settingsVisibleApiProfiles(_settingsState.searchProfiles).map((x) => x.id),
       ipcName: 'searchAuth.reorder',
       onSuccess: async () => {
         await _settingsRefreshSearchProfiles();
@@ -1636,7 +2119,7 @@ function _settingsRenderImageEntries() {
   const container = document.getElementById('settings-image-entries');
   if (!container) return;
   container.innerHTML = '';
-  const list = _settingsState.imageProfiles || [];
+  const list = _settingsVisibleApiProfiles(_settingsState.imageProfiles);
   if (!list.length) {
     container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.image.empty'))}</div>`;
     return;
@@ -1684,7 +2167,7 @@ function _settingsRenderImageEntries() {
     _settingsAttachReorderDnd(row, {
       kind: 'image',
       id: p.id,
-      getIds: () => (_settingsState.imageProfiles || []).map((x) => x.id),
+      getIds: () => _settingsVisibleApiProfiles(_settingsState.imageProfiles).map((x) => x.id),
       ipcName: 'imageAuth.reorder',
       onSuccess: async () => {
         await _settingsRefreshImageProfiles();
@@ -1699,7 +2182,7 @@ function _settingsRenderImageEntries() {
 // ── Video generation API key section ────────────────────────────────────
 //
 // Dedicated BYO video-generation credentials. The open-source build exposes
-// user-owned provider keys only; managed Orkas video providers stay stripped.
+// User-owned provider keys only; bundled video providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
   { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
@@ -1789,7 +2272,7 @@ function _settingsRenderVideoEntries() {
   const container = document.getElementById('settings-video-entries');
   if (!container) return;
   container.innerHTML = '';
-  const list = _settingsState.videoProfiles || [];
+  const list = _settingsVisibleApiProfiles(_settingsState.videoProfiles);
   if (!list.length) {
     container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.video.empty'))}</div>`;
     return;
@@ -1837,7 +2320,7 @@ function _settingsRenderVideoEntries() {
     _settingsAttachReorderDnd(row, {
       kind: 'video',
       id: p.id,
-      getIds: () => (_settingsState.videoProfiles || []).map((x) => x.id),
+      getIds: () => _settingsVisibleApiProfiles(_settingsState.videoProfiles).map((x) => x.id),
       ipcName: 'videoAuth.reorder',
       onSuccess: async () => {
         await _settingsRefreshVideoProfiles();
@@ -1886,6 +2369,7 @@ function _settingsTtsPreset(providerId) {
 }
 
 function _ttsProviderLabel(id) {
+  if (id === 'orkas-voice') return 'Orkas · Voice';
   const hit = (_settingsState.ttsPresets || []).find((p) => p.id === id);
   return hit ? hit.label : (id || 'custom');
 }
@@ -1981,7 +2465,7 @@ function _settingsRenderTtsEntries() {
   const container = document.getElementById('settings-tts-entries');
   if (!container) return;
   container.innerHTML = '';
-  const list = _settingsState.ttsProfiles || [];
+  const list = _settingsVisibleApiProfiles(_settingsState.ttsProfiles);
   if (!list.length) {
     container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.tts.empty'))}</div>`;
     return;
@@ -2029,7 +2513,7 @@ function _settingsRenderTtsEntries() {
     _settingsAttachReorderDnd(row, {
       kind: 'tts',
       id: p.id,
-      getIds: () => (_settingsState.ttsProfiles || []).map((x) => x.id),
+      getIds: () => _settingsVisibleApiProfiles(_settingsState.ttsProfiles).map((x) => x.id),
       ipcName: 'ttsAuth.reorder',
       onSuccess: async () => {
         await _settingsRefreshTtsProfiles();

@@ -13,8 +13,10 @@ import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
 import { desktopPlatform } from '../system_info';
 import { withCommonHeaders } from './api_common';
+import { DEFAULT_RETRY_ERROR_POLICY, type RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors';
 import { PUBLIC_PROVIDER_MODELS, type ProviderModelEntry } from '../model/public_model_catalog';
 
+export type { RetryErrorPolicyConfig } from '../../core-agent/src/shared/errors';
 export type { ProviderModelEntry } from '../model/public_model_catalog';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
@@ -405,6 +407,14 @@ function applyPayload(body: Record<string, unknown>, etag: string): boolean {
   return result.updated;
 }
 
+function activeConfigOwner(): string | null {
+  try {
+    return hasActiveUser() ? getActiveUserId() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadElectronRuntime(): Promise<{
   app: ElectronAppLike;
   powerMonitor: ElectronPowerMonitorLike;
@@ -426,6 +436,7 @@ export async function refresh(
   if (inFlight) return inFlight;
 
   inFlight = (async () => {
+    const requestOwner = activeConfigOwner();
     const current = clientConfig.readCache();
     clientConfig.markRefreshAttempt();
     try {
@@ -434,6 +445,10 @@ export async function refresh(
       if (current.etag) headers['If-None-Match'] = current.etag;
       const res = await fetchWithRetry('client-config:refresh', buildUrl(app), { method: 'GET', headers });
       const etag = res.headers.get('etag') || '';
+      if (activeConfigOwner() !== requestOwner) {
+        log.info('stale client config response ignored after account switch', { reason });
+        return { updated: false, skipped: true, stale: true };
+      }
       if (res.status === 304) {
         clientConfig.markNotModified(etag || current.etag || '');
         log.debug('client config not modified', { reason });
@@ -523,11 +538,12 @@ export interface AppUpdatePolicyConfig {
 
 export type QuickStartScenarioId =
   | 'data'
+  | 'office'
+  | 'ppt'
+  | 'creation'
   | 'video'
   | 'image'
   | 'ui_design'
-  | 'office'
-  | 'creation'
   | 'rnd'
   | 'seo_geo';
 
@@ -550,6 +566,14 @@ interface ModelCatalogConfig {
 
 const VALID_IMAGE_APIS = new Set(['openai', 'gemini', 'doubao']);
 
+function cloneRetryErrorPolicyConfig(config: RetryErrorPolicyConfig): RetryErrorPolicyConfig {
+  return {
+    permanent_statuses: [...config.permanent_statuses],
+    permanent_message_patterns: [...config.permanent_message_patterns],
+    permanent_code_patterns: [...config.permanent_code_patterns],
+  };
+}
+
 export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
@@ -566,11 +590,12 @@ export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapa
  */
 export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = [
   { id: 'data', agent_id: '78900d8758bc' },
-  { id: 'video', agent_id: '79df9cc89f5f' },
-  { id: 'image', agent_id: '814b61b027f0' },
-  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
   { id: 'office', agent_id: 'a19101ba698a' },
+  { id: 'ppt', agent_id: '7e91cb9ec9e9' },
   { id: 'creation', agent_id: '173d4235a431' },
+  { id: 'image', agent_id: '814b61b027f0' },
+  { id: 'video', agent_id: '79df9cc89f5f' },
+  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
   { id: 'rnd', agent_id: 'a316881746f9' },
   { id: 'seo_geo', agent_id: 'e064dca9e1bd' },
 ];
@@ -610,26 +635,52 @@ function emptyModelCatalog(): ModelCatalogConfig {
 function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
   if (!Array.isArray(value)) return null;
   const out: ProviderModelEntry[] = [];
+  const seenIds = new Set<string>();
   for (const item of value) {
-    if (!item || typeof item !== 'object') continue;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
     const r = item as Record<string, unknown>;
     const id = typeof r.id === 'string' ? r.id.trim() : '';
-    if (!id) continue;
+    if (!id || id.length > 200 || seenIds.has(id)) return null;
+    seenIds.add(id);
     const name = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : id;
+    if (name.length > 200) return null;
+    const description = typeof r.description === 'string' ? r.description.trim() : undefined;
+    if (r.description !== undefined && (!description || description.length > 500)) return null;
+    const recommended = r.recommended === true;
     const template = typeof r.template === 'string' && r.template.trim() ? r.template.trim() : undefined;
     const contextWindow = normalizePositiveInteger(r.contextWindow);
     const maxTokens = normalizePositiveInteger(r.maxTokens);
     const maxInputImages = normalizeNonNegativeInteger(r.maxInputImages);
+    const includedModels = normalizeIncludedModels(r.includedModels);
+    if (r.includedModels !== undefined && includedModels === null) return null;
     out.push({
       id,
       name,
+      ...(description ? { description } : {}),
+      ...(recommended ? { recommended: true } : {}),
+      ...(includedModels ? { includedModels } : {}),
       ...(template ? { template } : {}),
       ...(contextWindow ? { contextWindow } : {}),
       ...(maxTokens ? { maxTokens } : {}),
       ...(maxInputImages !== undefined ? { maxInputImages } : {}),
     });
   }
-  return out;
+  return out.length ? out : null;
+}
+
+function normalizeIncludedModels(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length > 12) return null;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (typeof item !== 'string') return null;
+    const label = item.trim();
+    if (!label || label.length > 80) return null;
+    if (seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out.length ? out : null;
 }
 
 function normalizePositiveInteger(value: unknown): number | undefined {
@@ -737,6 +788,62 @@ function mergeAppUpdatePolicyConfig(baseRaw: unknown, overrideRaw: unknown): App
   };
 }
 
+function normalizeStringPatternList(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter(Boolean);
+}
+
+function normalizeStatusList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (const item of value) {
+    const n = typeof item === 'number' ? item : Number(item);
+    if (!Number.isInteger(n) || n < 100 || n > 599 || seen.has(n)) continue;
+    seen.add(n);
+    out.push(n);
+  }
+  return out;
+}
+
+function normalizeRetryErrorPolicyConfig(raw: unknown): Partial<RetryErrorPolicyConfig> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const permanentStatuses = normalizeStatusList(r.permanent_statuses);
+  const permanentMessagePatterns = normalizeStringPatternList(r.permanent_message_patterns);
+  const permanentCodePatterns = normalizeStringPatternList(r.permanent_code_patterns);
+
+  return {
+    ...(permanentStatuses !== undefined ? { permanent_statuses: permanentStatuses } : {}),
+    ...(permanentMessagePatterns !== undefined ? { permanent_message_patterns: permanentMessagePatterns } : {}),
+    ...(permanentCodePatterns !== undefined ? { permanent_code_patterns: permanentCodePatterns } : {}),
+  };
+}
+
+function mergeRetryErrorPolicyConfig(baseRaw: unknown, overrideRaw: unknown): RetryErrorPolicyConfig {
+  const base = normalizeRetryErrorPolicyConfig(baseRaw);
+  const override = normalizeRetryErrorPolicyConfig(overrideRaw);
+  return {
+    permanent_statuses: override.permanent_statuses !== undefined
+      ? [...override.permanent_statuses]
+      : base.permanent_statuses !== undefined
+        ? [...base.permanent_statuses]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_statuses],
+    permanent_message_patterns: override.permanent_message_patterns !== undefined
+      ? [...override.permanent_message_patterns]
+      : base.permanent_message_patterns !== undefined
+        ? [...base.permanent_message_patterns]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_message_patterns],
+    permanent_code_patterns: override.permanent_code_patterns !== undefined
+      ? [...override.permanent_code_patterns]
+      : base.permanent_code_patterns !== undefined
+        ? [...base.permanent_code_patterns]
+        : [...DEFAULT_RETRY_ERROR_POLICY.permanent_code_patterns],
+  };
+}
+
 function mergeModelCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ModelCatalogConfig {
   const base = normalizeModelCatalogConfig(baseRaw);
   const override = normalizeModelCatalogConfig(overrideRaw);
@@ -791,6 +898,15 @@ clientConfig.registerDefault<QuickStartConfigEntry[]>(
   {
   effect: 'immediate',
   merge: mergeQuickStartConfig,
+  },
+);
+
+clientConfig.registerDefault<RetryErrorPolicyConfig>(
+  'model.retry_error_policy',
+  cloneRetryErrorPolicyConfig(DEFAULT_RETRY_ERROR_POLICY),
+  {
+    effect: 'immediate',
+    merge: mergeRetryErrorPolicyConfig,
   },
 );
 
@@ -864,4 +980,12 @@ export function getQuickStartConfigState(): QuickStartConfigState {
     items: DEFAULT_QUICK_START_CONFIG.map((entry) => ({ ...entry })),
     source: 'pc_default',
   };
+}
+
+export function getRetryErrorPolicyConfig(): RetryErrorPolicyConfig {
+  const fallback = cloneRetryErrorPolicyConfig(DEFAULT_RETRY_ERROR_POLICY);
+  return mergeRetryErrorPolicyConfig(
+    DEFAULT_RETRY_ERROR_POLICY,
+    clientConfig.get('model.retry_error_policy', fallback),
+  );
 }

@@ -500,8 +500,12 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
-  override applyHistorySummary(summary: string, turnIds: readonly number[]): void {
-    super.applyHistorySummary(summary, turnIds);
+  override applyHistorySummary(
+    summary: string,
+    turnIds: readonly number[],
+    throughMessageId?: string,
+  ): void {
+    super.applyHistorySummary(summary, turnIds, throughMessageId);
     this.requestContextWrite();
   }
 

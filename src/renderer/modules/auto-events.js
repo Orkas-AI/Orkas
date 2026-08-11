@@ -16,30 +16,6 @@ function _autoEventsActiveUserId() {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function _autoEventsIdentifier(value) {
-  return typeof value === 'string' ? value.slice(0, 128) : '';
-}
-
-function _autoEventsErrorCode(value) {
-  return typeof value === 'string' && /^[a-z0-9_.-]{1,64}$/i.test(value)
-    ? value
-    : 'unknown';
-}
-
-function _autoEventsDuration(value) {
-  const duration = Number(value);
-  if (!Number.isFinite(duration)) return 0;
-  return Math.min(24 * 60 * 60 * 1000, Math.max(0, duration));
-}
-
-function _autoEventsTrack(kind, action, data) {
-  try {
-    if (window.Monitor && typeof window.Monitor[kind] === 'function') {
-      window.Monitor[kind](action, data || {});
-    }
-  } catch (_) {}
-}
-
 function _autoEventsScheduleRetry() {
   if (_autoEventsStopping || _autoEventsRetryTimer || _autoEventsHandle) return;
   if (!window.orkas || typeof window.orkas.stream !== 'function') return;
@@ -64,23 +40,10 @@ function _autoEventsOpenSubscription() {
       const activeUserId = _autoEventsActiveUserId();
       if (!activeUserId || inner.user_id !== activeUserId) return;
       _autoEventsRetryAttempt = 0;
-      const taskId = _autoEventsIdentifier(inner.taskId || inner.task_id);
-      const cid = _autoEventsIdentifier(inner.cid || inner.conversation_id);
       if (inner.type === 'fire_failed') {
-        const errorCode = _autoEventsErrorCode(inner.error_code);
-        _autoEventsTrack('event', 'auto_task_fire_result', {
-          result: 'failure', task_id: taskId, conversation_id: cid,
-          duration_ms: _autoEventsDuration(inner.duration_ms), error_code: errorCode,
-        });
-        _autoEventsTrack('error', 'auto_task_fire', {
-          task_id: taskId, conversation_id: cid, error_type: 'runtime',
-          error_code: errorCode, error_message: errorCode,
-        });
+        // Main reports the reliable privacy-safe telemetry terminal. This
+        // stream only refreshes visible state and must never duplicate it.
       } else if (inner.type === 'conv_created') {
-        _autoEventsTrack('event', 'auto_task_fire_result', {
-          result: 'success', task_id: taskId, conversation_id: cid,
-          duration_ms: _autoEventsDuration(inner.duration_ms),
-        });
         if (typeof loadConversations === 'function') {
           Promise.resolve(loadConversations())
             .catch(() => _autoEventsLog.warn('reload after fire failed'));

@@ -63,6 +63,16 @@ const log = createLogger('projects');
 // requests cannot both observe the same pre-write directory snapshot.
 const projectNameMutationTails = new Map<string, Promise<void>>();
 const projectInstructionsMutationTails = new Map<string, Promise<void>>();
+type ProjectRootRemover = (dir: string) => Promise<void>;
+let projectRootRemover: ProjectRootRemover = async (dir) => {
+  await fsp.rm(dir, { recursive: true, force: true });
+};
+
+export function _setProjectRootRemoverForTest(remover: ProjectRootRemover | null): void {
+  projectRootRemover = remover || (async (dir) => {
+    await fsp.rm(dir, { recursive: true, force: true });
+  });
+}
 
 async function withProjectNameMutationLock<T>(uid: string, work: () => Promise<T>): Promise<T> {
   const previous = projectNameMutationTails.get(uid) || Promise.resolve();
@@ -357,7 +367,13 @@ export async function getProject(uid: string, projectId: string): Promise<Projec
   return _readProject(uid, projectId);
 }
 
-export type ProjectError = 'name_empty' | 'name_dup' | 'not_found' | 'has_running_conv' | 'too_long';
+export type ProjectError =
+  | 'name_empty'
+  | 'name_dup'
+  | 'not_found'
+  | 'has_running_conv'
+  | 'too_long'
+  | 'cascade_failed';
 
 export async function createProject(
   uid: string,
@@ -531,7 +547,25 @@ export async function deleteProject(
   const cur = await _readProject(uid, projectId);
   if (!cur) return { ok: false, error: 'not_found' };
 
-  const allConvs = await chats.listConversations(uid).catch(() => []);
+  let allConvs: Awaited<ReturnType<typeof chats.listConversations>>;
+  let ownedTasks: Awaited<ReturnType<typeof autoTasks.listTasks>>;
+  try {
+    // Enumerate every durable child before mutating any of them. Treating a
+    // transient list failure as an empty project previously removed the whole
+    // project tree and reported success even though the cascade scope was
+    // unknown.
+    [allConvs, ownedTasks] = await Promise.all([
+      chats.listConversations(uid),
+      autoTasks.listTasks(uid, { projectId }),
+    ]);
+  } catch (err) {
+    log.warn('project cascade preflight failed', {
+      uid,
+      pid: projectId,
+      error: logErrorRef(err),
+    });
+    return { ok: false, error: 'cascade_failed' };
+  }
   const owned = allConvs.filter((c) => (c as any).project_id === projectId);
 
   // Running-conv guard: refuse if any conv has a live turn.
@@ -546,10 +580,13 @@ export async function deleteProject(
   }
 
   let deletedConvs = 0;
+  let cascadeFailed = false;
   for (const c of owned) {
     try {
       if (await chats.deleteConversation(uid, c.conversation_id, projectId)) deletedConvs++;
+      else cascadeFailed = true;
     } catch (err) {
+      cascadeFailed = true;
       log.warn(`cascade del user=${uid} pid=${projectId} cid=${c.conversation_id}: ${(err as Error).message}`);
     }
   }
@@ -558,33 +595,40 @@ export async function deleteProject(
   // cancel the per-task timer in the scheduler). `deleteTask` is idempotent
   // and `rm -rf`s the whole `<uid>/cloud/auto_tasks/<task_id>/` directory.
   let deletedAutoTasks = 0;
-  try {
-    const ownedTasks = await autoTasks.listTasks(uid, { projectId });
-    for (const t of ownedTasks) {
-      try {
-        const res = await autoTasks.deleteTask(uid, t.id);
-        if (res.ok) deletedAutoTasks++;
-      } catch (err) {
-        log.warn(`cascade auto-task del user=${uid} pid=${projectId} task=${t.id}: ${(err as Error).message}`);
-      }
+  for (const t of ownedTasks) {
+    try {
+      const res = await autoTasks.deleteTask(uid, t.id);
+      if (res.ok) deletedAutoTasks++;
+      else cascadeFailed = true;
+    } catch (err) {
+      cascadeFailed = true;
+      log.warn(`cascade auto-task del user=${uid} pid=${projectId} task=${t.id}: ${(err as Error).message}`);
     }
-  } catch (err) {
-    log.warn(`enumerate auto tasks user=${uid} pid=${projectId}: ${(err as Error).message}`);
   }
 
-  // Drop the per-project workspace selection (machine-private; no cascade
-  // needed beyond removing the dangling pid → path entry).
-  try { purgeProjectWorkspace(uid, projectId); }
-  catch (err) { log.warn(`purge project ws user=${uid} pid=${projectId}: ${(err as Error).message}`); }
+  // Never convert a partial child cascade into a green project deletion. The
+  // user-facing IPC owner has already created a strict recycle snapshot and
+  // can restore any child removed before the failure. Keeping project.json
+  // here also keeps the project visible while that recovery runs.
+  if (cascadeFailed) {
+    log.warn(`project cascade incomplete user=${uid} pid=${projectId} convs=${deletedConvs}/${owned.length} auto_tasks=${deletedAutoTasks}/${ownedTasks.length}`);
+    return { ok: false, error: 'cascade_failed' };
+  }
 
   // Drop the entire project directory (project.json + bindings.json + any
   // future per-project assets).
   try {
     const d = projectDir(uid, projectId);
-    if (fs.existsSync(d)) await fsp.rm(d, { recursive: true, force: true });
+    if (fs.existsSync(d)) await projectRootRemover(d);
   } catch (err) {
     log.warn(`drop project dir user=${uid} pid=${projectId}: ${(err as Error).message}`);
+    return { ok: false, error: 'cascade_failed' };
   }
+  // Remove the machine-private workspace selection only after the durable
+  // project root is gone. If root deletion fails, IPC restores child data from
+  // the recycle snapshot and the user's workspace choice must survive too.
+  try { purgeProjectWorkspace(uid, projectId); }
+  catch (err) { log.warn(`purge project ws user=${uid} pid=${projectId}: ${(err as Error).message}`); }
   try {
     const projectLibrary = await import('./project_library_indexer');
     await projectLibrary.dropProjectIndex(uid, projectId);

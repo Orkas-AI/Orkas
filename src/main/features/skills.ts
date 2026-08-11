@@ -21,10 +21,12 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import AdmZip from 'adm-zip';
 
 import {
   userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT, SRC_ROOT,
   userMarketplaceSkillsDir, userSystemSkillsDir, userSkillCatalogCacheFile,
+  userChatAttachmentsDir,
 } from '../paths';
 import { chatAttachmentDirForConversation } from '../util/project-layout';
 import { evictSession } from '../model/core-agent/session-store';
@@ -33,6 +35,8 @@ import { createLogger } from '../logger';
 import { t, buildLanguageDirective, descriptionLang } from '../i18n';
 import { buildAttachmentManifest } from './chat_attachments';
 import { getLanguage } from './config';
+import { logErrorSummary } from '../util/log-redact';
+import { ensureEditChatRuntimeProcessItem, normalizeEditChatRuntimeEvent } from './edit_chat_runtime';
 
 // Custom skills live per-user at `<uid>/cloud/skills/`. Resolved lazily
 // from the active uid.
@@ -48,7 +52,11 @@ import {
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
-import { readDisabledSets, setSkillEnabled } from './component_enabled';
+import {
+  migrateComponentEnabledId,
+  readDisabledSets,
+  setSkillEnabled,
+} from './component_enabled';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   validateSkillFile,
@@ -62,6 +70,12 @@ import {
 } from './marketplace_biz';
 import { normalizeInstallVersion } from './marketplace_installs';
 import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
+import {
+  extractBundleSafely,
+  inspectMarketplaceBundle,
+  MAX_MARKETPLACE_BUNDLE_BYTES,
+  parseMarketplaceBundle,
+} from './marketplace_bundle';
 
 // Names hidden from the in-app skill source-tree view. Marketplace sidecars are tooling
 // metadata, not authored content — surfacing them confuses users and looks like noise.
@@ -774,11 +788,52 @@ function _overlaySkillEnabled(list: SkillListing[]): SkillListing[] {
   return list.map((s) => ({ ...s, enabled: !disabledSkillIds.has(s.id) }));
 }
 
+const CANONICAL_PLATFORM_SKILL_ID_RE = /^[0-9a-f]{12}$/;
+
+/**
+ * Compatibility repair for builds that persisted a platform skill's authored
+ * name (for example `agent-browser`) before marketplace ids became canonical
+ * 12-hex ids. This never resolves or deduplicates skill content by display
+ * name: it only moves a stale preference when the old key is not a current id
+ * and exactly one installed marketplace skill advertises that exact name.
+ * Existing ids and ambiguous names are deliberately left untouched.
+ */
+function _repairLegacySkillEnabledIds(uid: string, listings: SkillListing[]): number {
+  const disabled = readDisabledSets(uid).skills;
+  let migrated = 0;
+  for (const legacyId of [...disabled].sort()) {
+    if (CANONICAL_PLATFORM_SKILL_ID_RE.test(legacyId)) continue;
+    if (listings.some((skill) => skill.id === legacyId)) continue;
+    const matches = listings.filter((skill) => (
+      !skill.ownerAgent
+      && skill.source === 'marketplace'
+      && CANONICAL_PLATFORM_SKILL_ID_RE.test(skill.id)
+      && skill.name === legacyId
+    ));
+    if (matches.length !== 1) continue;
+    try {
+      if (migrateComponentEnabledId(uid, 'skill', legacyId, matches[0].id)) migrated++;
+    } catch (err) {
+      log.warn('legacy skill enabled-state repair failed', { error: logErrorSummary(err) });
+    }
+  }
+  if (migrated) invalidateCoreAgentSkills();
+  return migrated;
+}
+
+/** Repair stale platform-name preference keys for the active user. */
+export async function repairLegacySkillEnabledIdsForActiveUser(): Promise<number> {
+  const uid = getActiveUserId();
+  return _repairLegacySkillEnabledIds(uid, await _allSkillListingsCached());
+}
+
 /** User-facing skill list — custom + marketplace, EXCLUDING agent-private
  *  (`ownerAgent`) skills (those belong to one agent's internal pipeline and
  *  must not appear in the panel; see PC CLAUDE.md §Skills). */
 export async function listSkills(): Promise<SkillListing[]> {
-  return _overlaySkillEnabled((await _allSkillListingsCached()).filter((s) => !s.ownerAgent));
+  const all = await _allSkillListingsCached();
+  _repairLegacySkillEnabledIds(getActiveUserId(), all);
+  return _overlaySkillEnabled(all.filter((s) => !s.ownerAgent));
 }
 
 /** Dev-only: the agent-private (`ownerAgent`) skills hidden from `listSkills`.
@@ -1262,6 +1317,12 @@ interface ImportPathPolicyOptions {
   sourceRoot?: string;
   workspaceRoot?: string;
   homeDir?: string;
+  tempDir?: string;
+}
+
+function _realPathForImportPolicy(value: string): string {
+  try { return fs.realpathSync(value); }
+  catch { return value; }
 }
 
 function _pathPolicyContains(candidate: string, root: string, platform: NodeJS.Platform): boolean {
@@ -1284,9 +1345,11 @@ export function _isBlacklistedImportSourceForTest(
 ): { blocked: true; reason: string } | { blocked: false } {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
-  const sourceRoot = options.sourceRoot ?? SRC_ROOT;
-  const workspaceRoot = options.workspaceRoot ?? WS_ROOT;
-  const home = options.homeDir ?? os.homedir();
+  const sourceRoot = _realPathForImportPolicy(options.sourceRoot ?? SRC_ROOT);
+  const workspaceRoot = _realPathForImportPolicy(options.workspaceRoot ?? WS_ROOT);
+  const home = _realPathForImportPolicy(options.homeDir ?? os.homedir());
+  const configuredTempDir = options.tempDir ?? os.tmpdir();
+  const tempDir = _realPathForImportPolicy(configuredTempDir);
   const contains = (root: string): boolean => _pathPolicyContains(realDir, root, platform);
 
   // Orkas's own trees — pulling these in would recursion-bomb and/or leak
@@ -1305,7 +1368,11 @@ export function _isBlacklistedImportSourceForTest(
 
   // Platform blacklists (absolute or prefix match).
   const mac = ['/System', '/private', '/etc', '/var', '/usr'];
-  const macExcept = ['/usr/local', '/private/tmp'];
+  // macOS resolves its per-user temporary directory beneath
+  // /private/var/folders. ZIP extraction and ordinary user-selected files in
+  // that exact temp tree are safe import sources; the rest of /private and
+  // /var remain blocked.
+  const macExcept = ['/usr/local', '/private/tmp', tempDir];
   const systemRoot = env.SystemRoot || env.WINDIR || 'C:\\Windows';
   const systemDriveRoot = path.win32.parse(systemRoot).root || 'C:\\';
   const win = [
@@ -1388,7 +1455,15 @@ export interface ImportResult {
   seedMessage?: string | false;
   report?: QualityReport;
   skillId?: string;
+  failures?: ImportFailure[];
   error?: string;
+}
+
+export interface ImportFailure {
+  sourceName: string;
+  skillId?: string;
+  error: string;
+  report?: QualityReport;
 }
 
 function _defaultSkillNameFromUrl(url: string): string {
@@ -1594,30 +1669,61 @@ function _hasNonOverrideableAuthoringViolation(report: QualityReport): boolean {
 async function _installSourceSkillRoots(
   name: string | null,
   description: string | null,
-  realSrc: string,
+  _realSrc: string,
   files: { src: string; rel: string; size: number }[],
   sourceRoots: string[],
   totalBytes: number,
-  opts: { force?: boolean } = {},
+  opts: {
+    force?: boolean;
+    continueOnError?: boolean;
+    rejectExisting?: boolean;
+  } = {},
 ): Promise<ImportResult> {
   const reserved = new Set<string>();
   const createdIds: string[] = [];
   const createdSkills: CustomSkill[] = [];
+  const failures: ImportFailure[] = [];
   const single = sourceRoots.length === 1;
 
-  try {
-    for (const sourceRoot of sourceRoots) {
-      const sourceSkillMd = path.join(sourceRoot, 'SKILL.md');
-      const baseName = single && (name || '').trim()
-        ? (name || '').trim()
-        : _skillNameFromSourceSkillMd(sourceSkillMd, sourceRoot);
-      const effectiveName = _dedupeImportName(baseName, reserved);
-      const effectiveDesc = single && (description || '').trim()
-        ? (description || '').trim()
-        : _sourceSkillImportDescription(sourceSkillMd, t('skills.import.default_desc_dir'));
-      const created = await createCustomSkill(effectiveName, effectiveDesc);
+  const rollbackCreated = async (): Promise<void> => {
+    for (const id of createdIds) {
+      try { await deleteCustomSkill(id); } catch { /* best-effort rollback */ }
+    }
+  };
+
+  for (const sourceRoot of sourceRoots) {
+    const sourceName = path.basename(sourceRoot) || 'skill';
+    const sourceSkillMd = path.join(sourceRoot, 'SKILL.md');
+    const baseName = single && (name || '').trim()
+      ? (name || '').trim()
+      : _skillNameFromSourceSkillMd(sourceSkillMd, sourceRoot);
+    const nameTaken = reserved.has(baseName)
+      || fs.existsSync(customSkillDir(baseName))
+      || fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), baseName));
+    if (opts.rejectExisting && nameTaken) {
+      const failure: ImportFailure = {
+        sourceName,
+        skillId: baseName,
+        error: t('skills.errors.skill_exists', { name: baseName }),
+      };
+      failures.push(failure);
+      if (!opts.continueOnError) {
+        await rollbackCreated();
+        return { ok: false, error: failure.error, failures };
+      }
+      continue;
+    }
+
+    const effectiveName = opts.rejectExisting
+      ? (reserved.add(baseName), baseName)
+      : _dedupeImportName(baseName, reserved);
+    const effectiveDesc = single && (description || '').trim()
+      ? (description || '').trim()
+      : _sourceSkillImportDescription(sourceSkillMd, t('skills.import.default_desc_dir'));
+    let created: CustomSkill | null = null;
+    try {
+      created = await createCustomSkill(effectiveName, effectiveDesc);
       if (!created) throw new Error(t('skills.errors.create_failed'));
-      createdIds.push(created.id);
 
       const skillDir = customSkillDir(created.id);
       const rootFiles = _dropSourceMetaFiles(_filesForSourceSkillRoot(sourceRoot, files, sourceRoots));
@@ -1625,54 +1731,78 @@ async function _installSourceSkillRoots(
       _copyImportedSkillFilesPreservingSource(skillDir, rootFiles);
       writeSkillOrkasMetaFullSync(skillDir, _sourceSkillInstallMeta(sourceRoot, sourceSkillMd));
 
+      const report = validateSkillDir(skillDir);
+      void persistQualityReport({
+        uid: getActiveUserId(), kind: 'skill', id: created.id, report,
+      });
+      if (!report.ok && (opts.force !== true || _hasNonOverrideableAuthoringViolation(report))) {
+        const failure: ImportFailure = {
+          sourceName,
+          skillId: created.id,
+          error: t('skills.errors.validation_blocked'),
+          report,
+        };
+        failures.push(failure);
+        try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
+        if (!opts.continueOnError) {
+          await rollbackCreated();
+          return {
+            ok: false,
+            error: failure.error,
+            report,
+            skillId: created.id,
+            failures,
+          };
+        }
+        continue;
+      }
+
       const fresh = await getCustomSkill(created.id);
-      if (fresh) createdSkills.push(fresh);
+      if (!fresh) throw new Error(t('skills.errors.create_failed'));
+      createdIds.push(created.id);
+      createdSkills.push(fresh);
+    } catch (err) {
+      if (created) {
+        try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
+      }
+      const failure: ImportFailure = {
+        sourceName,
+        ...(created?.id ? { skillId: created.id } : {}),
+        error: opts.continueOnError
+          ? t('skills.errors.package_item_failed')
+          : t('skills.errors.copy_failed', { message: (err as Error).message }),
+      };
+      failures.push(failure);
+      log.warn('import-dir skill install failed', {
+        source_type: 'skill_root',
+        created_count: createdIds.length,
+        error: logErrorSummary(err),
+      });
+      if (!opts.continueOnError) {
+        await rollbackCreated();
+        return { ok: false, error: failure.error, failures };
+      }
     }
-  } catch (err) {
-    log.warn('import-dir direct install failed', {
-      source_type: 'skill_roots',
-      created_count: createdIds.length,
-      error_message: (err as Error).message,
-    });
-    for (const id of createdIds) {
-      try { await deleteCustomSkill(id); } catch { /* best-effort rollback */ }
-    }
-    return { ok: false, error: t('skills.errors.copy_failed', { message: (err as Error).message }) };
+  }
+
+  if (createdSkills.length === 0) {
+    return {
+      ok: false,
+      error: failures[0]?.error || t('skills.errors.create_failed'),
+      ...(failures.length ? { failures } : {}),
+    };
   }
 
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
-
-  let firstReport: QualityReport | undefined;
-  let firstReportSkillId = '';
-  for (const skill of createdSkills) {
-    const report = validateSkillDir(customSkillDir(skill.id));
-    void persistQualityReport({
-      uid: getActiveUserId(), kind: 'skill', id: skill.id, report,
-    });
-    if (!firstReport && !report.ok) {
-      firstReport = report;
-      firstReportSkillId = skill.id;
-    }
-  }
-  if (firstReport && (opts.force !== true || _hasNonOverrideableAuthoringViolation(firstReport))) {
-    for (const id of createdIds) {
-      try { await deleteCustomSkill(id); } catch { /* best-effort rollback */ }
-    }
-    return {
-      ok: false,
-      error: t('skills.errors.validation_blocked'),
-      report: firstReport,
-      skillId: firstReportSkillId,
-    };
-  }
   await _markSourceSkillMetadataSession(createdSkills[0]?.id || '', createdSkills.map((skill) => skill.id));
 
   log.info('created-from-dir direct skill install', {
     skill_count: createdSkills.length,
+    failure_count: failures.length,
     files: files.length,
     bytes: totalBytes,
-    source_root: realSrc,
+    source_type: 'directory',
   });
   const seedModelText = _sourceSkillMetadataSeed(createdSkills);
   return {
@@ -1681,6 +1811,7 @@ async function _installSourceSkillRoots(
     skills: createdSkills,
     seedModelText,
     seedMessage: seedModelText,
+    ...(failures.length ? { failures } : {}),
   };
 }
 
@@ -1833,7 +1964,12 @@ export async function createFromDir(
   name: string | null,
   description: string | null,
   srcDir: string,
-  opts: { force?: boolean } = {},
+  opts: {
+    force?: boolean;
+    continueOnError?: boolean;
+    rejectExisting?: boolean;
+    requireSkillMd?: boolean;
+  } = {},
 ): Promise<ImportResult> {
   if (!srcDir || !path.isAbsolute(srcDir)) {
     return { ok: false, error: t('skills.errors.path_not_absolute') };
@@ -1863,13 +1999,99 @@ export async function createFromDir(
   const sourceRoots = _findSourceSkillRoots(realSrc, files);
   if (sourceRoots.length > 0) {
     return _installSourceSkillRoots(
-      name, description, realSrc, files, sourceRoots, totalBytes, { force: opts.force },
+      name, description, realSrc, files, sourceRoots, totalBytes, {
+        force: opts.force,
+        continueOnError: opts.continueOnError,
+        rejectExisting: opts.rejectExisting,
+      },
     );
+  }
+
+  if (opts.requireSkillMd) {
+    return { ok: false, error: t('skills.errors.no_skill_md') };
   }
 
   return _createEditableDraftFromImportDir(
     name, description, realSrc, files, totalBytes, { force: opts.force },
   );
+}
+
+/** Import a user-selected local Skill directory or ZIP package without asking
+ * the model to serialize unchanged files. This stricter package entry point
+ * requires at least one SKILL.md, rejects existing ids instead of suffixing
+ * duplicates, and lets valid siblings survive an independently rejected one. */
+export async function importSkillPackageFromPath(sourcePath: string): Promise<ImportResult> {
+  const trimmed = String(sourcePath || '').trim();
+  if (!trimmed || !path.isAbsolute(trimmed)) {
+    return { ok: false, error: t('skills.errors.path_not_absolute') };
+  }
+
+  let realSource: string;
+  let st: fs.Stats;
+  try {
+    realSource = fs.realpathSync(trimmed);
+    st = fs.statSync(realSource);
+  } catch {
+    return { ok: false, error: t('skills.errors.dir_inaccessible') };
+  }
+
+  const black = _isBlacklistedImportSource(realSource);
+  // Current-turn ZIP attachments intentionally live inside Orkas's own data
+  // tree. Admit only a regular .zip beneath the active user's attachment
+  // pool; directories and every other workspace path remain blocked.
+  const isActiveUserAttachmentZip = st.isFile()
+    && path.extname(realSource).toLowerCase() === '.zip'
+    && _pathPolicyContains(
+      realSource,
+      _realPathForImportPolicy(userChatAttachmentsDir(getActiveUserId())),
+      process.platform,
+    );
+  if (black.blocked && !isActiveUserAttachmentZip) {
+    return { ok: false, error: t('skills.errors.import_refused', { reason: black.reason || '' }) };
+  }
+
+  const importOptions = {
+    continueOnError: true,
+    rejectExisting: true,
+    requireSkillMd: true,
+  } as const;
+  if (st.isDirectory()) {
+    return createFromDir(null, null, realSource, importOptions);
+  }
+  if (!st.isFile() || path.extname(realSource).toLowerCase() !== '.zip') {
+    return { ok: false, error: t('skills.errors.path_not_package') };
+  }
+  if (st.size > MAX_MARKETPLACE_BUNDLE_BYTES) {
+    return {
+      ok: false,
+      error: t('skills.errors.archive_too_large', {
+        mb: (st.size / 1024 / 1024).toFixed(1),
+        max: Math.round(MAX_MARKETPLACE_BUNDLE_BYTES / 1024 / 1024),
+      }),
+    };
+  }
+
+  let extractDir = '';
+  try {
+    const zip: AdmZip = parseMarketplaceBundle(fs.readFileSync(realSource));
+    const unsafeEntry = inspectMarketplaceBundle(zip)
+      .some(({ entry, relPath }) => !entry.isDirectory && !relPath);
+    if (unsafeEntry) return { ok: false, error: t('skills.errors.archive_unsafe') };
+
+    extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-package-'));
+    extractBundleSafely(zip, extractDir);
+    return await createFromDir(null, null, extractDir, importOptions);
+  } catch (err) {
+    log.warn('skill package archive import failed', {
+      source_type: 'zip',
+      error: logErrorSummary(err),
+    });
+    return { ok: false, error: t('skills.errors.archive_invalid') };
+  } finally {
+    if (extractDir) {
+      try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { /* temp cleanup */ }
+    }
+  }
 }
 
 // ── target skill write guard ─────────────────────────────────────────────
@@ -2494,6 +2716,12 @@ export interface SkillContainerExtracted {
   files: SkillFileBlock[];
   /** Optional field-level metadata updates, used for cheap category/description edits. */
   metadata?: SkillMetadataUpdate;
+  /** Verbatim inner text of the container, kept so a caller can echo what the
+   *  model actually wrote when parsing yields nothing. `extractSkillContainers`
+   *  strips the container from the visible text before the apply step runs, so
+   *  without this the malformed payload is unrecoverable and the next turn sees
+   *  only "container empty" with no evidence of its own mistake. */
+  raw?: string;
 }
 
 function _parseSkillContainer(inner: string): SkillContainerExtracted {
@@ -2505,6 +2733,7 @@ function _parseSkillContainer(inner: string): SkillContainerExtracted {
     ...(skillId ? { skillId } : {}),
     files,
     ...(_hasSkillMetadataUpdate(metadata) ? { metadata } : {}),
+    ...(inner.trim() ? { raw: inner } : {}),
   };
 }
 
@@ -2678,7 +2907,16 @@ export async function applySkillContainerFromCommander(
 ): Promise<SkillContainerResult> {
   const hasMetadata = _hasSkillMetadataUpdate(container.metadata);
   if (!container.files.length && !hasMetadata) {
-    return { ok: false, error: t('skills.errors.container_empty') };
+    // Distinguish "the model wrote nothing" from "the model wrote a payload we
+    // could not parse". Both land here, but only the second is a protocol-shape
+    // mistake the model can fix, and calling it "empty" actively misleads it
+    // into re-sending the same malformed blocks.
+    return {
+      ok: false,
+      error: (container.raw || '').trim()
+        ? t('skills.errors.container_no_blocks')
+        : t('skills.errors.container_empty'),
+    };
   }
   if (container.skillId) {
     return _applySkillContainerEdit(container.skillId, container.files, container.metadata, opts);
@@ -3008,7 +3246,7 @@ export async function sendToSkillChat(
       ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
     });
 
-  const { chatWithModel } = require('../model/client');
+  const { chatWithModel } = await import('../model/client');
   const result = await chatWithModel({
     userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
@@ -3035,9 +3273,11 @@ export async function sendToSkillChat(
 
   if (!result.ok) {
     const errMsg = `Model response failed: ${result.error || 'unknown'}`;
+    const partial = String(result.text || '').trim();
+    const content = partial ? `${result.text}\n\n${errMsg}` : errMsg;
     await _appendSkillChatMessage(userId, skillId,
-      { time: nowIso(), role: 'assistant', content: errMsg });
-    return { ok: false, message: errMsg, error: result.error || '' };
+      { time: nowIso(), role: 'assistant', content });
+    return { ok: false, message: content, error: result.error || '' };
   }
 
   const extracted = _extractInlineSkillEditMutations(result.text, skillId);
@@ -3157,6 +3397,7 @@ export async function* streamSendToSkillChat(
   let streamingText = '';
   const processItems: any[] = [];
   const written: string[] = [];
+  const runStartedAt = Date.now();
   // Set when the URL-import chat finalized as an external-package install: the
   // placeholder skill is deleted, so the post-loop persist must be skipped (it
   // would recreate the just-purged chat dir for a skill that no longer exists).
@@ -3181,6 +3422,7 @@ export async function* streamSendToSkillChat(
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
+      event = normalizeEditChatRuntimeEvent(event);
       const etype = event.type;
       if (etype === 'delta' && typeof event.text === 'string') {
         streamingText += event.text;
@@ -3435,7 +3677,12 @@ export async function* streamSendToSkillChat(
     // for-await, which triggers `return()` on this generator — bypassing any
     // append placed after the loop. Keeping it here covers normal finish,
     // caught errors, and abort-driven returns alike.
-    const saved = processItems.length ? processItems : null;
+    const hadProcessItems = processItems.length > 0;
+    ensureEditChatRuntimeProcessItem(processItems, runStartedAt, {
+      aborted: opts.abortSignal?.aborted,
+      errored: !!errMsg,
+    });
+    const saved = processItems;
     try {
       if (installedAsPkg) {
         // Placeholder skill (and its chat dir) was deleted after resolving the
@@ -3451,7 +3698,7 @@ export async function* streamSendToSkillChat(
         const content = partial ? `${partial}\n\n${errMsg}` : errMsg;
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
-      } else if (streamingText.trim() || processItems.length) {
+      } else if (streamingText.trim() || hadProcessItems) {
         const partial = _visibleInlineSkillEditText(streamingText, skillId).trim();
         const content = partial
           ? `${partial}\n\n(reply interrupted)`

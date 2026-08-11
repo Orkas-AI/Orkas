@@ -10,6 +10,8 @@ category: data
 
 Detect SEO/GEO regressions over time by snapshotting and diffing. Pure analysis — no network (the agent re-crawls; this compares).
 
+MONITOR completion invariant: when an existing baseline is supplied, the run is incomplete until it also reads the prior ACTION-PLAN and reports every TODO as `done`, `open`, or `new` by comparing its Leading indicator with the fresh evidence. A baseline-only drift table is not a complete monitor delivery.
+
 ## When to use
 
 - Scheduled monitoring (e.g. an auto-task dispatches the agent in monitor mode daily/weekly).
@@ -49,6 +51,10 @@ Compare a fresh snapshot against the baseline:
                         "leading_indicator": "...", "failure_criterion": "...", "data_tier": "Measured" } ],
   "summary": { "critical": 1, "total": 1 }, "baseline_at": "...", "current_at": "...", "url": "..." } }
 ```
+
+## ACTION-PLAN reconciliation
+
+When a prior baseline exists, read the prior ACTION-PLAN alongside it. For every prior TODO, compare its Leading indicator with the fresh diagnosis and current snapshot: mark it `done` only when the indicator is met, otherwise keep it `open`. Create a `new` TODO for every newly observed regression. Report all `done` / `open` / `new` transitions before refreshing the baseline; never infer a transition by comparing the current snapshot with itself.
 
 ## Rules (severity)
 

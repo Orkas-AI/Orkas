@@ -62,6 +62,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'test/main/features/video_studio_native_qa.test.ts',
     evidence: 'runVideoProcessForTest',
   },
+  'src/main/features/video_studio_delivery.ts': {
+    suite: 'test/main/features/video_studio_delivery.test.ts',
+    evidence: 'verifyProductionDelivery',
+  },
   'src/main/model/core-agent/interactive-cli-sessions.ts': {
     suite: 'test/main/model/local-tools.test.ts',
     evidence: 'startInteractiveCliSession',

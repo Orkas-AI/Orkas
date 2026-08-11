@@ -10,6 +10,10 @@ category: data
 
 Build a one-diagnosis keyword/GEO opportunity pool. This skill is deterministic and stdlib-only: it does not fetch data, call models, or persist anything.
 
+Connector acquisition invariant: naming connector operations is not enough. Discover each connected console with `list_connector_tools`, then invoke its selected operations through the core `call_connector_tool`; for GSC the order is `list_sites` before `query_search_analytics`.
+
+Ownership evidence invariant: a verified Search Console property is not evidence that its root URL owns a query. When query evidence lacks a page dimension, keep the owner page unconfirmed, request query+page rows, and defer owner-page edits until that row or crawl evidence identifies the target. Never convert a property-level query row into a homepage claim.
+
 ## When to use
 
 - After `seo-crawl` and any available Search Console / Bing Webmaster query exports.
@@ -26,6 +30,10 @@ Build a one-diagnosis keyword/GEO opportunity pool. This skill is deterministic 
 
 - Python 3.9+ (stdlib only).
 - At least one `seo-crawl` JSON. GSC/Bing/GEO inputs are optional.
+
+## Connector evidence acquisition
+
+When `## Connectors` lists a search console, first call `list_connector_tools` once for that connector, then invoke every selected connector operation through the core `call_connector_tool`. For Google Search Console, call `list_sites`, select the verified property that owns the target URL, then call `query_search_analytics` once for the relevant query/page dimensions. Reconcile any user-declared target queries with the actual returned query rows before recommending an opportunity. Store raw connector results with `write_file`; only returned fields become Measured.
 
 ## How to call
 

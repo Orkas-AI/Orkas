@@ -8,9 +8,7 @@ import { describe, expect, it } from 'vitest';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 function pcDir() {
-  return fs.existsSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'))
-    ? process.cwd()
-    : path.resolve(process.cwd(), 'PC');
+  return process.cwd();
 }
 
 function skillDir(skillId: 'stage-edit' | 'stage-plan') {
@@ -33,7 +31,6 @@ function runSkill(
   extraEnv: Record<string, string> = {},
 ) {
   const dir = pcDir();
-  const workspaceRoot = path.join(os.tmpdir(), 'orkas-video-skill-workspace');
   return spawnSync(
     TEST_NODE,
     [path.join(dir, 'bin', 'run-skill.cjs'), skillId, script, '--', ...args],
@@ -44,7 +41,7 @@ function runSkill(
         ...process.env,
         ORKAS_PC_DIR: dir,
         ORKAS_RUN_SKILL_DIR: skillDir(skillId),
-        ORKAS_WORKSPACE_ROOT: workspaceRoot,
+        ORKAS_WORKSPACE_ROOT: path.dirname(dir),
         ...extraEnv,
       },
     },

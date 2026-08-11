@@ -72,19 +72,23 @@ export async function pdfBufferToPages(buf: Buffer): Promise<string[]> {
     useSystemFonts: true,
     disableFontFace: true,
   });
-  const doc = await loadingTask.promise;
-
-  const numPages = doc.numPages;
-  const pageTexts: string[] = [];
-  for (let i = 1; i <= numPages; i++) {
-    const page = await doc.getPage(i);
-    const content = await page.getTextContent();
-    pageTexts.push(stitchTextItems(content.items));
-    page.cleanup();
+  try {
+    const doc = await loadingTask.promise;
+    const numPages = doc.numPages;
+    const pageTexts: string[] = [];
+    for (let i = 1; i <= numPages; i++) {
+      const page = await doc.getPage(i);
+      try {
+        const content = await page.getTextContent();
+        pageTexts.push(stitchTextItems(content.items));
+      } finally {
+        page.cleanup();
+      }
+    }
+    return pageTexts;
+  } finally {
+    await loadingTask.destroy();
   }
-  await doc.destroy();
-
-  return pageTexts;
 }
 
 /** pdfjs returns items with `str` and a transform — stitch with newlines on big y deltas. */

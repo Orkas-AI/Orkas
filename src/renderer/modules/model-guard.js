@@ -12,9 +12,14 @@
 
 const _guardLog = createLogger('model-guard');
 
+function _modelGuardErrorType(error) {
+  return error && typeof error.name === 'string' ? error.name : 'unknown';
+}
+
 let _hasConfiguredModel = true;   // optimistic — flipped to false after refresh if empty
 let _guardBannerEl = null;
 let _guardChecked = false;
+let _modelGuardRefreshSequence = 0;
 let _modelConfigSnapshotSignature = '';
 
 function _ensureGuardBanner() {
@@ -34,7 +39,9 @@ function _ensureGuardBanner() {
     <button type="button" class="btn btn-sm btn-primary model-guard-cta">${escapeHtml(t('model_guard.cta'))}</button>
   `;
   el.querySelector('.model-guard-cta').addEventListener('click', () => {
-    if (typeof setView === 'function') setView('settings');
+    if (typeof setView === 'function') {
+      setView('settings', null, { entryPoint: 'model_guard_banner' });
+    }
     // Drop the user straight on the 配置 (Credentials) tab — that's where
     // the model-auth UI lives now (Phase 4 4-tab restructure).
     _activateModelCredentialsTab();
@@ -58,9 +65,25 @@ function _applyGuardVisuals() {
   const banner = _ensureGuardBanner();
   if (banner) banner.style.display = _hasConfiguredModel ? 'none' : '';
   document.body.classList.toggle('model-not-configured', !_hasConfiguredModel);
+  syncModelGuardBannerTelemetry();
+}
+
+/** Called after both model-state refreshes and logical view changes. The CSS
+ * hides this banner on Settings, so only count an impression on a view where
+ * the user can actually see it. */
+function syncModelGuardBannerTelemetry() {
+  const visible = !_hasConfiguredModel
+    && _modelGuardSourceView() !== 'settings'
+    && !!_guardBannerEl
+    && _guardBannerEl.style.display !== 'none';
+  if (visible && !_guardBannerTelemetryVisible && window.Monitor) {
+    Monitor.event('model_guard_banner_impression', _modelGuardTelemetryPayload());
+  }
+  _guardBannerTelemetryVisible = visible;
 }
 
 async function refreshModelGuard() {
+  const refreshSequence = ++_modelGuardRefreshSequence;
   try {
     const res = await window.orkas.invoke('auth.hasConfiguredModel');
     // Only flip the flag when the IPC returned a definitive answer. A
@@ -69,15 +92,22 @@ async function refreshModelGuard() {
     // out of every feature. The backend runner still fails loudly on
     // actual sends if no entry exists, so we don't lose correctness.
     if (res && res.ok) {
-      _hasConfiguredModel = !!res.configured;
-      _guardChecked = true;
+      const configured = !!res.configured;
+      const telemetryContext = configured
+        ? null
+        : await _refreshModelGuardTelemetryContext();
       await refreshModelConfigSnapshot();
+      if (refreshSequence !== _modelGuardRefreshSequence) return _hasConfiguredModel;
+      _hasConfiguredModel = configured;
+      _guardChecked = true;
+      if (telemetryContext) _guardTelemetryContext = telemetryContext;
     } else {
       _guardLog.warn('refresh ipc not-ok', { error: res && res.error });
     }
   } catch (e) {
-    _guardLog.warn('refresh failed', { error: (e && e.message) || String(e) });
+      _guardLog.warn('refresh failed', { error: (e && e.message) || String(e) });
   }
+  if (refreshSequence !== _modelGuardRefreshSequence) return _hasConfiguredModel;
   _applyGuardVisuals();
   return _hasConfiguredModel;
 }
@@ -96,20 +126,31 @@ async function refreshModelConfigSnapshot() {
   }
 }
 
+function _modelConfigTelemetryEntry(entry, entryRank) {
+  const rawProvider = String((entry && entry.provider) || '').trim();
+  const rawModel = String((entry && entry.model) || '').trim();
+  if (!rawProvider || !rawModel) return null;
+  const legacyDynamicProvider = /^cp:/i.test(rawProvider) || rawProvider === 'custom-openai';
+  const userEnteredModel = legacyDynamicProvider
+    || rawProvider === 'custom'
+    || rawProvider === 'openrouter';
+  const normalizedProvider = legacyDynamicProvider ? 'custom' : rawProvider;
+  return {
+    provider: /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(normalizedProvider)
+      ? normalizedProvider
+      : 'unknown',
+    model: userEnteredModel
+      ? 'custom'
+      : (/^[A-Za-z0-9][A-Za-z0-9._:/+\-]{0,119}$/.test(rawModel) ? rawModel : 'unknown'),
+    entry_rank: entryRank,
+  };
+}
+
 function trackModelConfigSnapshot(entries) {
   try {
     if (!window.Monitor || typeof Monitor.event !== 'function') return;
     const safeEntries = (Array.isArray(entries) ? entries : [])
-      .map((entry, idx) => {
-        const provider = String((entry && entry.provider) || '').trim();
-        const model = String((entry && entry.model) || '').trim();
-        if (!provider || !model) return null;
-        return {
-          provider: provider.slice(0, 80),
-          model: model.slice(0, 120),
-          entry_rank: idx + 1,
-        };
-      })
+      .map((entry, idx) => _modelConfigTelemetryEntry(entry, idx + 1))
       .filter(Boolean);
     const uid = (typeof globalThis.currentUserId === 'string') ? globalThis.currentUserId : '';
     const signature = uid + '|' + safeEntries
@@ -156,7 +197,9 @@ function ensureModelConfigured(opts = {}) {
       if (typeof uiAlert === 'function') uiAlert(msg);
       else window.alert(msg);
     } catch (_) { /* swallow — alert is best-effort */ }
-    if (typeof setView === 'function') setView('settings');
+    if (typeof setView === 'function') {
+      setView('settings', null, { entryPoint: 'model_guard_blocked_action' });
+    }
     _activateModelCredentialsTab();
   }
   return false;

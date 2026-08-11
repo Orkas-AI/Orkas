@@ -547,6 +547,12 @@
     if (!message || !message.form || !Array.isArray(message.form.fields)) return;
     const form = message.form;
     const submitted = !!(opts.readonly || form.submitted);
+    // A stale form is unsubmitted but superseded by a newer form from the
+    // same agent: its values can no longer decide anything (the backend
+    // rejects them against the current artifact), so offering a live submit
+    // button would only collect a doomed click. Rendered like a readonly
+    // form plus a pointer to the newest card.
+    const stale = !submitted && !!opts.stale;
 
     // Draft hydration: an unsubmitted form re-rendered after a tab switch
     // pulls the user's in-progress values out of `_formDrafts` so they
@@ -558,9 +564,10 @@
 
     container.classList.add('chat-input-form');
     if (submitted) container.classList.add('is-submitted');
+    if (stale) container.classList.add('is-stale');
     const title = document.createElement('div');
     title.className = 'form-title';
-    title.textContent = t(submitted ? 'chat.form.readonly_title' : 'chat.form.title');
+    title.textContent = t(submitted ? 'chat.form.readonly_title' : stale ? 'chat.form.stale_title' : 'chat.form.title');
     container.appendChild(title);
 
     const bodyEl = document.createElement('div');
@@ -584,7 +591,7 @@
       // cleared this field" (preset = '' / 0 / false / []) from "no preset,
       // fall back to field.default". Passing the key with value `undefined`
       // would defeat that and hide the schema-defined defaults.
-      const buildOpts = { disabled: submitted };
+      const buildOpts = { disabled: submitted || stale };
       if (submitted && form.values
           && Object.prototype.hasOwnProperty.call(form.values, f.id)) {
         buildOpts.presetValue = form.values[f.id];
@@ -606,6 +613,13 @@
       stamp.textContent = at
         ? t('chat.form.submitted_at', { time: at })
         : t('chat.form.submitted_no_time');
+      container.appendChild(stamp);
+      return;
+    }
+    if (stale) {
+      const stamp = document.createElement('div');
+      stamp.className = 'form-submitted-stamp';
+      stamp.textContent = t('chat.form.superseded_by_newer');
       container.appendChild(stamp);
       return;
     }

@@ -2,8 +2,9 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { fetchAndReadWithTimeout } from '../util/abort';
+import { composeAbortSignal, fetchAndReadWithTimeout } from '../util/abort';
 import { isPathAllowed } from '../util/path-sandbox';
+import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import { writeImageAssetBuffer } from './image_assets';
 
 export type ImageWorkflowEngine = 'comfyui' | 'invokeai' | 'automatic1111' | 'iopaint';
@@ -440,9 +441,31 @@ async function downloadAndWrite(input: {
   timeoutMs: number;
   signal?: AbortSignal;
 }): Promise<Awaited<ReturnType<typeof writeImageAssetBuffer>>> {
-  const { response, buffer } = await requestBuffer(input.config, input.route, { method: 'GET', headers: { Accept: 'image/*' } }, input.timeoutMs, input.signal, MAX_IMAGE_RESPONSE_BYTES);
-  if (!response.ok) throw new ImageWorkflowError('E_IMAGE_WORKFLOW_DOWNLOAD', `${input.config.engine} image download returned HTTP ${response.status}.`);
-  return await writeImageAssetBuffer({ projectDirAbs: input.projectDirAbs, outputAbsPath: input.outputAbsPath, buffer });
+  const timeoutMessage = `${input.config.engine} image download timed out after ${Math.round(input.timeoutMs / 1000)} seconds`;
+  const composed = composeAbortSignal(input.signal, input.timeoutMs, timeoutMessage);
+  try {
+    const result = await downloadBinaryWithProxyPolicy(endpoint(input.config, input.route), {
+      label: `${input.config.engine} image output download`,
+      signal: composed.signal,
+      headers: { ...input.config.headers, Accept: 'image/*' },
+      redirect: 'error',
+      maxBytes: MAX_IMAGE_RESPONSE_BYTES,
+      validate: (body) => {
+        if (!body.length) throw new Error(`${input.config.engine} image download returned an empty body.`);
+      },
+    });
+    return await writeImageAssetBuffer({
+      projectDirAbs: input.projectDirAbs,
+      outputAbsPath: input.outputAbsPath,
+      buffer: result.body,
+    });
+  } catch (error) {
+    if (input.signal?.aborted) throw new Error('operation aborted');
+    if (composed.signal.aborted) throw new Error(timeoutMessage);
+    throw error;
+  } finally {
+    composed.cleanup();
+  }
 }
 
 async function runComfyWorkflow(input: {

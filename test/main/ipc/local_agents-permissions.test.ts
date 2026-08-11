@@ -20,6 +20,11 @@ afterEach(() => {
 });
 
 describe('ipc/local_agents permission responses', () => {
+  it('does not expose the removed per-CLI model catalog handler', () => {
+    expect(invokeHandlers).not.toHaveProperty('localAgents.listModels');
+    expect(invokeHandlers).toHaveProperty('localAgents.runtimeOptions');
+  });
+
   it('rejects malformed bash decisions before they reach the pending-request map', async () => {
     await expect(bashResponse({ decision: 'deny' })).rejects.toThrow(/request_id/);
     await expect(bashResponse({ request_id: 'req-1', decision: 'always' })).rejects.toThrow(/decision/);

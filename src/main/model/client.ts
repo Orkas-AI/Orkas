@@ -14,7 +14,7 @@
  * cross-module contract between features/ and model/.
  */
 
-import type { AgentTool, HistoryResource, Message } from '#core-agent';
+import type { AgentRunSteerInput, AgentTool, HistoryResource, Message } from '#core-agent';
 
 import {
   abortActiveSession as _abortActiveSession,
@@ -44,6 +44,9 @@ export interface StreamEvent {
 
 export interface ChatResult {
   ok: boolean;
+  /** Completed text on success, or the safely accumulated partial text when
+   * the provider fails after output has started. Callers must still honor
+   * `ok=false` and must not execute structured mutations from partial text. */
   text: string;
   error: string;
   aborted: boolean;
@@ -59,8 +62,8 @@ export interface ChatOptions {
   message: string;
   sessionId?: string;
   /** Host-authoritative completed dialogue to mirror into the execution
-   * session before starting a normal turn. Used by group-chat Commander,
-   * whose semantic history includes replies from every visible actor. */
+   * session before starting a normal turn. Used by in-process named group
+   * actors, whose semantic history includes replies from every visible actor. */
   conversationHistory?: {
     source: string;
     messages: Message[];
@@ -105,7 +108,15 @@ export interface ChatOptions {
    *  which legitimately run long multi-step builds (e.g. VideoStudio draft/render,
    *  DeepResearcher gathering); loop_detection still guards true runaway loops. */
   maxToolLoops?: number;
+  /** Optional elapsed tool-execution threshold for the runner's one-time soft
+   *  convergence reminder. It does not stop the turn or change maxToolLoops;
+   *  undefined preserves core-agent's default eight-minute threshold. */
+  elapsedConvergenceMs?: number;
   abortSignal?: AbortSignal | null;
+  /** Optional host-owned structural check for terminal text. Returning a
+   * correction asks the runner for one repair attempt; a second rejection is
+   * still shipped, so this can improve delivery without becoming a hard gate. */
+  terminalTextGuard?: (text: string) => string | null | undefined;
   /** Legacy openclaw CLI timeout — ignored, retained for signature parity. */
   timeout?: number;
   /** Subset of skill ids to inject into this call's system prompt. Undefined
@@ -137,10 +148,18 @@ export interface ChatOptions {
    *  read_file / search_files / grep_files scope to this conv's attachment
    *  dir in addition to the user's active workspace. */
   cid?: string;
+  /** Current user-visible conversation title for short-lived credit-history
+   * display metadata. Never logged or used as runtime conversation state. */
+  conversationTitle?: string;
+  /** Epoch milliseconds of the title version, used to reject stale updates. */
+  conversationTitleUpdatedAt?: number;
   /** Stable id for the visible actor turn. Group chat passes this through as
    *  part of its turn-scoped execution contract; file output now stays in the
    *  conversation workspace rather than a turn-specific subdirectory. */
   turnId?: string;
+  /** Stable id of the inbound conversation message that triggered this run.
+   * Current-scope history tools stop strictly before this record. */
+  historyBoundaryMessageId?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Caller (group_chat
@@ -165,6 +184,14 @@ export interface ChatOptions {
    *  `markdown_to_pdf`, or `html_to_pdf`. Used for user-approved read-only
    *  folder grants. */
   fileReadOnlyExtraRoots?: readonly string[];
+  /** Mutable, run-scoped read-only roots admitted by rich interrupt-steer.
+   * The array identity is retained by file/local tools and may only be
+   * extended by the trusted main-process attachment/reference resolver. */
+  runtimeReadOnlyRoots?: string[];
+  /** Build the stable superset of tools needed by a rich active-turn ingress
+   * (currently OCR plus connector meta-tools that resolve availability when
+   * executed). Group Chat sets this only for top-level CoreAgent turns. */
+  richSteerEnabled?: boolean;
   /** Fired with the absolute path of every file produced by the local-exec
    * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`, `bash`)
    * during this run.
@@ -204,13 +231,10 @@ export interface ChatOptions {
    * a future settings-page toggle will flip it per-user. Providers without
    * prompt-cache support (e.g. Mistral) silently ignore it. */
   cacheRetention?: 'none' | 'short' | 'long';
-  /** Thinking/reasoning effort for reasoner models. Undefined lets the
-   *  provider pick its default — for DeepSeek V4 Pro that's `'low'`
-   *  (the API requires `reasoning_effort` whenever `model.reasoning` is
-   *  true, otherwise 400 with a misleading "reasoning_content must be
-   *  passed back" error); for Anthropic / OpenAI it stays off (cost-
-   *  preserving). Set `'off'` to suppress thinking even on a reasoner;
-   *  set `'low'` / `'high'` to override. */
+  /** Thinking/reasoning effort for reasoner models. Undefined omits an
+   *  explicit effort so the upstream applies its model default. Set `'off'`
+   *  to suppress a provider-configured default; set `'low'` / `'high'` to
+   *  override when the selected provider supports the field. */
   thinkingLevel?: 'off' | 'low' | 'high';
   /** G8d in-process nested sub-run (a dispatch tool running a worker/agent turn
    *  inside its caller's turn). When true, the run does NOT acquire a global
@@ -221,11 +245,13 @@ export interface ChatOptions {
    *  (the nested session is fresh/unique, so it's uncontended). Default false =
    *  top-level turn = current behavior. */
   nested?: boolean;
-  /** interrupt-steer (G9). Called at each tool-loop boundary; returns user
-   *  messages to fold into THIS run instead of running them as a follow-up
-   *  turn. The group-chat bus passes a closure that drains pending user
-   *  messages aimed at the running actor from its FIFO. Synchronous. */
-  drainSteer?: () => string[] | undefined;
+  /** interrupt-steer (G9). Called at each safe model/tool-loop boundary. The
+   * group-chat host may asynchronously hydrate rich queued content before it
+   * is atomically folded into this run. */
+  drainSteer?: () =>
+    | AgentRunSteerInput[]
+    | undefined
+    | Promise<AgentRunSteerInput[] | undefined>;
 }
 
 export const chatWithModel = _chatWithModel;

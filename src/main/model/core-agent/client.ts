@@ -24,7 +24,12 @@ import {
   sessionLock, globalSlots,
   type Releaser,
 } from '../../util/locks';
-import type { AgentRunConvergenceSignal, AgentRunTimings, AgentTool } from '#core-agent';
+import type {
+  AgentRunConvergenceSignal,
+  AgentRunTimings,
+  AgentTool,
+  ServerModelFallbackReason,
+} from '#core-agent';
 import { createLogger } from '../../logger';
 import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact';
 
@@ -34,13 +39,18 @@ import type { ChatOptions, ChatResult, StreamEvent } from '../client';
 
 import { buildRunner, type ToolDefSnapshot } from './runner';
 import { mapCoreAgentEvents } from './event-mapper';
-import { getSessionForUser as _getCachedSessionForUser } from './session-store';
+import {
+  getSessionForUser as _getCachedSessionForUser,
+  sessionKindOf,
+} from './session-store';
 import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import * as paths from '../../paths';
 import { getCurrentLang } from '../../i18n';
 import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../../util/bundled-runtime';
+import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 
 interface NoopRecorder {
   record(event: unknown): void;
@@ -92,22 +102,18 @@ export async function* stopStreamOnAbort<T>(
 }
 
 /**
- * Env vars injected into the sandbox child process so skill scripts can
- * run under Electron-as-Node:
- *   - `ORKAS_NODE` = Electron binary path (runs as stock Node because of
- *     `ELECTRON_RUN_AS_NODE=1` in the child env)
+ * Env vars injected into the sandbox child process so skill scripts can run
+ * under Orkas's bundled stock Node:
+ *   - `ORKAS_NODE` / `ORKAS_BUNDLED_NODE` = bundled Node binary path
  *   - `ORKAS_PC_DIR` = PC root, rewritten to `app.asar.unpacked` in
  *     packaged mode so `bin/run-skill.cjs` + tsx + skills resolve on real disk
  *   - `ORKAS_WORKSPACE_ROOT` = canonical data root so `run-skill.cjs` can
  *     find installed per-user skills under `<uid>/local/marketplace/skills`
- *   - `ORKAS_PYTHON` / `ORKAS_UV` / `ORKAS_BUNDLED_NODE` = optional bundled
- *     runtimes under resources/runtime. `ORKAS_NODE` intentionally remains
- *     Electron-as-Node for Orkas internal scripts; package CLIs use bundled
- *     Node via PATH / `ORKAS_BUNDLED_NODE`.
+ *   - `ORKAS_PYTHON` / `ORKAS_UV` = optional bundled runtimes under
+ *     resources/runtime.
  *   - `ORKAS_VENV_ROOT` = shared machine-local dependency env root under
  *     data/venv, plus uv/pip/npm cache dirs there so package installs survive
- *     app updates and are reused across Orkas accounts on this device
- *   - `ELECTRON_RUN_AS_NODE` = makes the Electron binary boot as Node
+ *     app updates and are reused across Orkas accounts on this device.
  *
  * Injected via `AgentRunParams.sandboxEnv` → `ToolContext.state.sandboxEnv`
  * → `SandboxExecutor.config.env`, so the env only reaches the bash-tool
@@ -123,12 +129,11 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
   const pcDir = isPackaged
     ? paths.PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked')
     : paths.PC_ROOT;
-  _skillSandboxEnvStatic = {
-    ORKAS_NODE: process.execPath,
+  const nodeRuntime = resolveBackgroundNodeRuntime();
+  _skillSandboxEnvStatic = withBackgroundNodeEnv({
     ORKAS_PC_DIR: pcDir,
     ORKAS_WORKSPACE_ROOT: paths.WS_ROOT,
-    ELECTRON_RUN_AS_NODE: '1',
-  };
+  }, nodeRuntime);
   return _skillSandboxEnvStatic;
 }
 
@@ -140,10 +145,10 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *     parsing users.json.
  *   - `ORKAS_AGENT_ID` = the current acting agent id, so `bin/run-skill.cjs`
  *     can resolve agent-private installed skills from the per-user data tree.
-   *   - `ORKAS_PATH_PREPEND` = bundled runtime bins plus enabled external
-   *     package CLI dirs (`.bin`, package-local bin fallbacks) when present.
-   *     Composed into PATH by the sandbox executor (see core-agent
-   *     sandbox/executor.ts) so the augmented brew/system PATH is preserved.
+ *   - `ORKAS_PATH_PREPEND` = bundled runtime bins plus enabled external
+ *     package CLI dirs (`.bin`, package-local bin fallbacks) when present.
+ *     Composed into PATH by the sandbox executor (see core-agent
+ *     sandbox/executor.ts) so the augmented brew/system PATH is preserved.
  */
 function safeAgentEnvId(agentId?: string): string {
   const text = String(agentId || '').trim();
@@ -397,11 +402,25 @@ export interface ModelRunLogDiagnostics {
   compactionCount: number;
   compactionAttemptCount: number;
   compactionFailureCount: number;
+  providerCallCount: number;
+  providerCallMaxMs: number;
+  providerSlowCallCount: number;
   toolDeltaCount: number;
   toolStarts: number;
   toolProgress: number;
   toolEnds: number;
   toolErrors: number;
+  /** Tool-returned failures, excluding runner/runtime exceptions. */
+  toolResultErrors: number;
+  /** Tool-returned failures followed by a later successful call to the same
+   * tool operation. This is deliberately sequence-based: a sibling call that
+   * was already running when the failure arrived cannot count as recovery. */
+  toolResultErrorsRecovered: number;
+  toolEventSequence: number;
+  toolStartSequenceById: Record<string, number>;
+  toolRecoveryKeyById: Record<string, string>;
+  toolRecoveryFallbackKeyById: Record<string, string>;
+  pendingToolResultErrorSequences: Record<string, number[]>;
   firstRawEventMs?: number;
   /** First model-produced event (text or tool-call construction), excluding
    * host retry/fallback/context bookkeeping. */
@@ -431,7 +450,18 @@ export interface ModelRunLogDiagnostics {
   providerFallbackCount: number;
   providerFallbackAuthCount: number;
   providerFallbackTimeoutCount: number;
+  serverFallbackCount: number;
+  serverFallbackReason?: ServerModelFallbackReason;
+  effectiveModel?: string;
   providerCandidateCount: number;
+  providerAvailableCandidateCount: number;
+  providerEmptyCount: number;
+  providerEmptyTransportCount: number;
+  providerEmptyNormalCount: number;
+  providerEmptySafetyCount: number;
+  providerEmptyUnknownCount: number;
+  providerEmptyTerminalCount: number;
+  providerEmptyOutputTokens: number;
   lastFallbackCandidateIndex: number;
   toolCounts: Record<string, ToolRunLogCounter>;
   toolTimeline: ToolTimelineLogEntry[];
@@ -445,13 +475,28 @@ export interface ModelRunLogDiagnostics {
 
 function sessionKindForLog(sessionId: string | undefined): string {
   const raw = String(sessionId || '');
-  const idx = raw.indexOf('-');
-  return idx > 0 ? raw.slice(0, idx) : (raw ? 'unknown' : '');
+  return raw ? (sessionKindOf(raw) || 'unknown') : '';
 }
 
 function finiteNumber(value: unknown): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function boundedServerFallbackReason(value: unknown): ServerModelFallbackReason {
+  const reason = String(value || '').trim().toLowerCase();
+  switch (reason) {
+    case 'rate_limited':
+    case 'transport_error':
+    case 'configuration_error':
+    case 'not_configured':
+    case 'upstream_error':
+    case 'empty_response':
+    case 'unavailable':
+      return reason;
+    default:
+      return 'unknown';
+  }
 }
 
 function safeUsageForLog(usage: unknown): SafeUsage | undefined {
@@ -488,16 +533,35 @@ export function createModelRunLogDiagnostics(nowMs = Date.now()): ModelRunLogDia
     compactionCount: 0,
     compactionAttemptCount: 0,
     compactionFailureCount: 0,
+    providerCallCount: 0,
+    providerCallMaxMs: 0,
+    providerSlowCallCount: 0,
     toolDeltaCount: 0,
     toolStarts: 0,
     toolProgress: 0,
     toolEnds: 0,
     toolErrors: 0,
+    toolResultErrors: 0,
+    toolResultErrorsRecovered: 0,
+    toolEventSequence: 0,
+    toolStartSequenceById: {},
+    toolRecoveryKeyById: {},
+    toolRecoveryFallbackKeyById: {},
+    pendingToolResultErrorSequences: {},
     retryKinds: {},
     providerFallbackCount: 0,
     providerFallbackAuthCount: 0,
     providerFallbackTimeoutCount: 0,
+    serverFallbackCount: 0,
     providerCandidateCount: 0,
+    providerAvailableCandidateCount: 0,
+    providerEmptyCount: 0,
+    providerEmptyTransportCount: 0,
+    providerEmptyNormalCount: 0,
+    providerEmptySafetyCount: 0,
+    providerEmptyUnknownCount: 0,
+    providerEmptyTerminalCount: 0,
+    providerEmptyOutputTokens: 0,
     lastFallbackCandidateIndex: 0,
     toolCounts: {},
     toolTimeline: [],
@@ -528,6 +592,80 @@ const MAX_RUN_TIMELINE_LOG_ENTRIES = 120;
 
 function safeToolNameForLog(rawName: unknown): string {
   return String(rawName || 'unknown').slice(0, 80) || 'unknown';
+}
+
+type ToolRecoveryIdentity = {
+  primaryKey: string;
+  fallbackKey?: string;
+};
+
+const TOOL_OPERATION_SELECTOR_KEYS = new Set(['op', 'action', 'operation', 'tool_name']);
+
+/** A low-cardinality operation identity used only inside one model run to
+ * correlate an error with a later corrective call. Argument values are
+ * intentionally excluded: they can contain private data and a correction
+ * normally changes those values. When an invalid call omitted its operation
+ * selector, its top-level schema shape is a conservative fallback for a retry
+ * that supplies the selector. */
+function toolRecoveryIdentity(rawName: unknown, rawInput: unknown): ToolRecoveryIdentity {
+  const name = safeToolNameForLog(rawName);
+  if (!rawInput || typeof rawInput !== 'object' || Array.isArray(rawInput)) {
+    return { primaryKey: name };
+  }
+  const input = rawInput as Record<string, unknown>;
+  const shape = Object.keys(input)
+    .filter((key) => !TOOL_OPERATION_SELECTOR_KEYS.has(key))
+    .sort()
+    .join(',');
+  const shapeKey = shape ? `${name}:shape=${shape}` : undefined;
+  for (const key of TOOL_OPERATION_SELECTOR_KEYS) {
+    const value = typeof input[key] === 'string' ? input[key].trim().slice(0, 80) : '';
+    if (value) {
+      return {
+        primaryKey: `${name}:${key}=${value}`,
+        ...(shapeKey ? { fallbackKey: shapeKey } : {}),
+      };
+    }
+  }
+  return { primaryKey: shapeKey || name };
+}
+
+function toolCallIdentity(rawId: unknown): string {
+  return String(rawId || '');
+}
+
+function recordToolResultRecovery(
+  stats: ModelRunLogDiagnostics,
+  event: Record<string, unknown>,
+  isReturnedError: boolean,
+): void {
+  const id = toolCallIdentity(event.id);
+  const startedSequence = (id && stats.toolStartSequenceById[id]) || (stats.toolEventSequence + 1);
+  const completedSequence = ++stats.toolEventSequence;
+  const fallbackIdentity = toolRecoveryIdentity(event.name, undefined);
+  const recoveryKey = (id && stats.toolRecoveryKeyById[id]) || fallbackIdentity.primaryKey;
+  const recoveryFallbackKey = id ? stats.toolRecoveryFallbackKeyById[id] : undefined;
+  if (id) {
+    delete stats.toolStartSequenceById[id];
+    delete stats.toolRecoveryKeyById[id];
+    delete stats.toolRecoveryFallbackKeyById[id];
+  }
+  if (isReturnedError) {
+    stats.toolResultErrors += 1;
+    (stats.pendingToolResultErrorSequences[recoveryKey] ||= []).push(completedSequence);
+    return;
+  }
+  if (event.isError) return;
+  const candidateKeys = [...new Set([recoveryKey, recoveryFallbackKey].filter(Boolean) as string[])];
+  for (const candidateKey of candidateKeys) {
+    const pending = stats.pendingToolResultErrorSequences[candidateKey] || [];
+    const recovered = pending.filter((failedSequence) => failedSequence < startedSequence).length;
+    if (!recovered) continue;
+    stats.toolResultErrorsRecovered += recovered;
+    const unresolved = pending.filter((failedSequence) => failedSequence >= startedSequence);
+    if (unresolved.length) stats.pendingToolResultErrorSequences[candidateKey] = unresolved;
+    else delete stats.pendingToolResultErrorSequences[candidateKey];
+  }
 }
 
 function noteToolTimelineForLog(
@@ -598,6 +736,7 @@ function formatToolTimelineEntryForLog(entry: ToolTimelineLogEntry): string {
 function retryKindForLog(rawReason: unknown): string {
   const reason = String(rawReason || '').toLowerCase();
   if (!reason) return 'unknown';
+  if (reason.includes('empty response')) return 'empty_response';
   if (reason.includes('rate') || reason.includes('429')) return 'rate_limit';
   if (reason.includes('timeout') || reason.includes('timed out') || reason.includes('etimedout')) return 'timeout';
   if (reason.includes('abort')) return 'aborted';
@@ -650,6 +789,16 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
     }
     case 'tool_start': {
       stats.toolStarts += 1;
+      stats.toolEventSequence += 1;
+      const id = toolCallIdentity(e.id);
+      if (id) {
+        const recoveryIdentity = toolRecoveryIdentity(e.name, e.input);
+        stats.toolStartSequenceById[id] = stats.toolEventSequence;
+        stats.toolRecoveryKeyById[id] = recoveryIdentity.primaryKey;
+        if (recoveryIdentity.fallbackKey) {
+          stats.toolRecoveryFallbackKeyById[id] = recoveryIdentity.fallbackKey;
+        }
+      }
       toolCounter(stats, e.name).starts += 1;
       noteToolTimelineForLog(stats, e, 'start', nowMs);
       noteRunTimelineForLog(stats, 'tool_start', nowMs, `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)}`);
@@ -711,6 +860,46 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
           stats.lastFallbackCandidateIndex ? `candidate=${stats.lastFallbackCandidateIndex}` : '',
           stats.providerCandidateCount ? `of=${stats.providerCandidateCount}` : '',
         ].filter(Boolean).join(' '),
+      );
+      break;
+    }
+    case 'provider_call': {
+      const durationMs = Math.max(0, Math.round(finiteNumber(e.durationMs) || 0));
+      stats.providerCallCount += 1;
+      stats.providerCallMaxMs = Math.max(stats.providerCallMaxMs, durationMs);
+      if (durationMs >= 60_000) stats.providerSlowCallCount += 1;
+      noteRunTimelineForLog(
+        stats,
+        'provider_call',
+        nowMs,
+        `outcome=${String(e.outcome || 'unknown')} duration_ms=${durationMs}`,
+      );
+      break;
+    }
+    case 'provider_empty': {
+      stats.providerEmptyCount += 1;
+      const kind = String(e.kind || 'unknown_empty');
+      if (kind === 'transport_empty') stats.providerEmptyTransportCount += 1;
+      else if (kind === 'normal_end_empty') stats.providerEmptyNormalCount += 1;
+      else if (kind === 'safety_filtered_empty') stats.providerEmptySafetyCount += 1;
+      else stats.providerEmptyUnknownCount += 1;
+      if (e.terminalEventSeen) stats.providerEmptyTerminalCount += 1;
+      const usage = e.usage && typeof e.usage === 'object'
+        ? e.usage as Record<string, unknown>
+        : {};
+      stats.providerEmptyOutputTokens += Math.max(
+        0,
+        Math.round(finiteNumber(usage.outputTokens) || 0),
+      );
+      stats.providerCandidateCount = Math.max(
+        stats.providerCandidateCount,
+        Math.max(0, Math.round(finiteNumber(e.candidateCount) || 0)),
+      );
+      noteRunTimelineForLog(
+        stats,
+        'provider_empty',
+        nowMs,
+        `kind=${kind} terminal=${e.terminalEventSeen ? 'true' : 'false'}`,
       );
       break;
     }
@@ -838,11 +1027,17 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     compactionCount: stats.compactionCount,
     compactionAttemptCount: stats.compactionAttemptCount,
     compactionFailureCount: stats.compactionFailureCount,
+    providerCallCount: stats.providerCallCount,
+    providerCallMaxMs: stats.providerCallMaxMs,
+    providerSlowCallCount: stats.providerSlowCallCount,
     toolDeltaCount: stats.toolDeltaCount,
     toolStarts: stats.toolStarts,
     toolProgress: stats.toolProgress,
     toolEnds: stats.toolEnds,
     toolErrors: stats.toolErrors,
+    toolResultErrors: stats.toolResultErrors,
+    toolResultErrorsRecovered: stats.toolResultErrorsRecovered,
+    toolResultErrorsUnresolved: Math.max(0, stats.toolResultErrors - stats.toolResultErrorsRecovered),
     toolNames,
     toolCounts: stats.toolCounts,
     toolTimeline: stats.toolTimeline.map(formatToolTimelineEntryForLog),
@@ -872,7 +1067,18 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
     providerFallbackCount: stats.providerFallbackCount,
     providerFallbackAuthCount: stats.providerFallbackAuthCount,
     providerFallbackTimeoutCount: stats.providerFallbackTimeoutCount,
+    serverFallbackCount: stats.serverFallbackCount,
+    serverFallbackReason: stats.serverFallbackReason,
+    effectiveModel: stats.effectiveModel,
     providerCandidateCount: stats.providerCandidateCount,
+    providerAvailableCandidateCount: stats.providerAvailableCandidateCount,
+    providerEmptyCount: stats.providerEmptyCount,
+    providerEmptyTransportCount: stats.providerEmptyTransportCount,
+    providerEmptyNormalCount: stats.providerEmptyNormalCount,
+    providerEmptySafetyCount: stats.providerEmptySafetyCount,
+    providerEmptyUnknownCount: stats.providerEmptyUnknownCount,
+    providerEmptyTerminalCount: stats.providerEmptyTerminalCount,
+    providerEmptyOutputTokens: stats.providerEmptyOutputTokens,
     lastFallbackCandidateIndex: stats.lastFallbackCandidateIndex,
     runTimeline: stats.runTimeline.map(formatRunTimelineEntryForLog),
     runTimelineTruncated: stats.runTimelineTruncated,
@@ -880,7 +1086,7 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
 }
 
 function providerCategoryForTelemetry(providerId?: string): string {
-  const text = String(providerId || '').toLowerCase();
+  const text = String(providerId || '').trim().toLowerCase();
   if (!text) return 'unknown';
   const patterns: Array<[string, RegExp]> = [
     ['openai', /\b(openai|chatgpt|gpt)\b/],
@@ -891,7 +1097,7 @@ function providerCategoryForTelemetry(providerId?: string): string {
     ['qwen', /\b(qwen|dashscope|aliyun)\b/],
     ['doubao', /\b(doubao|volc|bytedance)\b/],
     ['moonshot', /\b(moonshot|kimi)\b/],
-    ['zhipu', /\b(zhipu|glm)\b/],
+    ['zhipu', /\b(zhipu|glm|zai|z-ai)\b/],
     ['minimax', /\bminimax\b/],
     ['mistral', /\bmistral\b/],
     ['openrouter', /\bopenrouter\b/],
@@ -908,8 +1114,10 @@ function providerCategoryForTelemetry(providerId?: string): string {
 }
 
 function modelFamilyForTelemetry(modelId?: string, providerId?: string): string {
-  const text = `${String(providerId || '')} ${String(modelId || '')}`.toLowerCase();
-  if (!String(modelId || '').trim() && !String(providerId || '').trim()) return 'unknown';
+  const providerText = String(providerId || '').trim().toLowerCase();
+  const modelText = String(modelId || '').trim().toLowerCase();
+  if (!modelText && !providerText) return 'unknown';
+  const text = `${providerText} ${modelText}`;
   const patterns: Array<[string, RegExp]> = [
     ['gpt', /\b(gpt|o[1-9]|chatgpt)\b/],
     ['claude', /\bclaude\b/],
@@ -922,12 +1130,26 @@ function modelFamilyForTelemetry(modelId?: string, providerId?: string): string 
     ['glm', /\b(glm|zhipu)\b/],
     ['minimax', /\bminimax\b/],
     ['mistral', /\bmistral\b/],
-    ['llama', /\b(llama|llm)\b/],
+    ['mimo', /\bmimo\b/],
   ];
   for (const [family, pattern] of patterns) {
     if (pattern.test(text)) return family;
   }
   return 'other';
+}
+
+export function modelRunIdsForTelemetry(
+  activeProviderId?: string,
+  activeModelId?: string,
+  responseProviderId?: string,
+  responseModelId?: string,
+): { providerId: string; modelId: string } {
+  const configuredProvider = String(activeProviderId || '').trim();
+  const configuredModel = String(activeModelId || '').trim();
+  return {
+    providerId: String(responseProviderId || '').trim() || configuredProvider,
+    modelId: String(responseModelId || '').trim() || configuredModel,
+  };
 }
 
 function toolCountBucketForTelemetry(count: number): string {
@@ -999,6 +1221,7 @@ export function modelTurnContextForLog(input: {
   idleTimeout?: number;
   streamIdleTimeout?: number;
   maxToolLoops?: number;
+  elapsedConvergenceMs?: number;
   skillList?: readonly string[];
   forceOpenSkillRefs?: readonly string[];
   projectAllowedSkillIds?: readonly string[];
@@ -1049,6 +1272,7 @@ export function modelTurnContextForLog(input: {
     idle_timeout_sec: input.idleTimeout,
     stream_idle_timeout_sec: input.streamIdleTimeout,
     max_tool_loops: input.maxToolLoops,
+    elapsed_convergence_ms: input.elapsedConvergenceMs,
     skill_list_mode: input.skillList === undefined ? 'all' : 'allowlist',
     skill_list_count: input.skillList === undefined ? undefined : input.skillList.length,
     force_open_skill_count: input.forceOpenSkillRefs?.length,
@@ -1091,6 +1315,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     idleTimeout = 1800,
     streamIdleTimeout = 180,
     maxToolLoops,
+    elapsedConvergenceMs,
     abortSignal = null,
     skillList,
     forceOpenSkillRefs,
@@ -1099,9 +1324,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     extraRoots,
     readOnlyExtraRoots,
     fileReadOnlyExtraRoots,
+    runtimeReadOnlyRoots,
+    richSteerEnabled = false,
     agentId,
     cid,
+    conversationTitle,
+    conversationTitleUpdatedAt,
     turnId,
+    historyBoundaryMessageId,
     projectId,
     onFileWritten,
     onOutputsPublished,
@@ -1113,6 +1343,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     thinkingLevel,
     nested = false,
     drainSteer,
+    terminalTextGuard,
   } = opts;
 
   const diagnostics = createModelRunLogDiagnostics();
@@ -1132,6 +1363,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     idleTimeout,
     streamIdleTimeout,
     maxToolLoops,
+    elapsedConvergenceMs,
     skillList,
     forceOpenSkillRefs,
     projectAllowedSkillIds,
@@ -1319,9 +1551,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
+      ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
+      ...(conversationTitle ? { conversationTitle } : {}),
+      ...(conversationTitleUpdatedAt ? { conversationTitleUpdatedAt } : {}),
       ...(turnId ? { turnId } : {}),
+      ...(historyBoundaryMessageId ? { historyBoundaryMessageId } : {}),
       ...(message ? { userMessage: message } : {}),
       ...(attachmentMetadata ? { attachmentMetadata } : {}),
       ...(projectId ? { projectId } : {}),
@@ -1332,6 +1568,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
       ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(fileReadOnlyExtraRoots && fileReadOnlyExtraRoots.length ? { fileReadOnlyExtraRoots } : {}),
+      ...(runtimeReadOnlyRoots ? { runtimeReadOnlyRoots } : {}),
+      ...(richSteerEnabled ? { richSteerEnabled: true } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(onOutputsPublished ? { onOutputsPublished } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
@@ -1353,6 +1591,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // is always live by then.
       onCandidateChosen: (info) => {
         recorder.setActiveCandidate(info);
+      },
+      onCandidatesObserved: (info) => {
+        diagnostics.providerCandidateCount = Math.max(
+          diagnostics.providerCandidateCount,
+          Math.max(0, Math.round(Number(info.candidateCount) || 0)),
+        );
+        diagnostics.providerAvailableCandidateCount = Math.max(
+          0,
+          Math.round(Number(info.availableCandidateCount) || 0),
+        );
       },
     }).finally(() => {
       runnerBuildMs = Math.max(0, Date.now() - buildStartedAt);
@@ -1377,6 +1625,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       idleTimeout,
       streamIdleTimeout,
       maxToolLoops,
+      elapsedConvergenceMs,
       skillList,
       forceOpenSkillRefs,
       projectAllowedSkillIds,
@@ -1455,6 +1704,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(cacheRetention ? { cacheRetention } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
       ...(drainSteer ? { drainSteer } : {}),
+      ...(terminalTextGuard ? { terminalTextGuard } : {}),
     });
 
     // Wrap raw events to capture the AgentRunResult for post-run reflection.
@@ -1510,7 +1760,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // terminal final/error synthesis. We re-yield every event it produces,
     // resetting the idle timer on each one.
     let eventCount = 0;
-    const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById });
+    const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), {
+      userId,
+      isDev: false,
+      workingDir,
+      skillDisplayNameById,
+      agentDisplayNameById,
+    });
     for await (const ev of stopStreamOnAbort(mappedEvents, controller.signal, turnTag)) {
       // The raw-event wrapper owns phase tracking. Reset here too because
       // mapped UI events can be synthesized from accumulated raw state.
@@ -1656,11 +1912,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const terminalStatus = abortedFlag
       ? 'aborted'
       : (errText ? (idleHit ? 'idle_timeout' : 'error') : (finalText ? 'completed' : 'empty'));
+    const telemetryIds = modelRunIdsForTelemetry(
+      activeProviderId,
+      activeModelId,
+      diagnostics.provider,
+      diagnostics.model,
+    );
     yield agentRunResultEventForTelemetry({
       status: terminalStatus,
       durationMs: Date.now() - runStartedAt,
-      providerId: diagnostics.provider || activeProviderId,
-      modelId: diagnostics.model || activeModelId,
+      providerId: telemetryIds.providerId,
+      modelId: telemetryIds.modelId,
       toolCount: activeToolCount,
       nested,
       idleWindowSec: idleHit ? idleHitWindow : undefined,
@@ -1691,13 +1953,20 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
 /** Blocking chat — drains the stream and picks up the final/error event. */
 export async function chatWithModel(opts: ChatOptions): Promise<ChatResult> {
   let finalText: string | null = null;
+  let partialText = '';
   let errText: string | null = null;
   let aborted = false;
   for await (const ev of streamChatWithModel(opts)) {
-    if (ev.type === 'final') finalText = ev.text || '';
+    if (ev.type === 'delta' && typeof ev.text === 'string') partialText += ev.text;
+    else if (ev.type === 'final') finalText = ev.text || '';
     else if (ev.type === 'error' && !errText) errText = ev.text || '';
     if (ev.aborted) aborted = true;
   }
   if (finalText) return { ok: true, text: finalText, error: '', aborted: false };
-  return { ok: false, text: '', error: errText || 'unknown error', aborted };
+  return {
+    ok: false,
+    text: partialText,
+    error: errText || 'unknown error',
+    aborted,
+  };
 }

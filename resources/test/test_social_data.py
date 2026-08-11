@@ -134,6 +134,7 @@ def test_cookie_loader_uses_configured_browser_order_and_falls_back_after_opt_in
 
 
 def test_command_helpers_and_external_failures_are_fail_closed(monkeypatch):
+    monkeypatch.delenv("ORKAS_BUNDLED_NODE", raising=False)
     monkeypatch.setattr(fetch_core.shutil, "which", lambda _name: None)
     assert fetch_core.yt_dlp_cmd("video") == [sys.executable, "-m", "yt_dlp", "video"]
     assert fetch_core.xreach_cmd("topic", 3) == ["xreach", "search", "topic", "--json", "-n", "3"]

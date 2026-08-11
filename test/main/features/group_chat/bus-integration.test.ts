@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import AdmZip from 'adm-zip';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -58,6 +59,16 @@ const _recordedCalls = vi.hoisted(() => [] as Array<{
   sid: string;
   message: string;
   model: string;
+  // Tool names offered to this turn. Lets a test assert the commander/worker
+  // capability split — notably that global-folder `skill_search` never
+  // reaches a runtime worker.
+  extraToolNames: string[];
+  conversationHistory?: {
+    source: string;
+    messages: unknown[];
+    replaceFromTurnId?: number;
+    checkpoint?: string;
+  };
 }>);
 // Records the result each tool's execute() returned — lets a test assert that a
 // G8d in-process dispatch tool (run_worker) handed its sub-run's full reply back
@@ -72,6 +83,10 @@ vi.mock('../../../../src/main/model/client', () => ({
       sid,
       message: String(opts.message || ''),
       model,
+      extraToolNames: (Array.isArray(opts.extraTools) ? opts.extraTools : []).map((t: any) => String(t?.name || '')),
+      ...(opts.conversationHistory
+        ? { conversationHistory: JSON.parse(JSON.stringify(opts.conversationHistory)) }
+        : {}),
     });
     // Ephemeral worker sessions have a random id (`gworker-<cid>-<rand>`); a
     // test can't pre-script them by id, so route any gworker turn to a fixed
@@ -439,6 +454,56 @@ describe('group_chat bus integration › model selection turn boundaries', () =>
 });
 
 describe('group_chat bus integration › direct agent handback', () => {
+  it('keeps global-folder skill_search commander-only, never on a runtime worker', async () => {
+    // A global skill that advertises itself as the mandatory entry point for a
+    // whole domain once overrode a specialist agent's own production protocol:
+    // the agent searched, found it, declared its own pipeline missing, and ran
+    // an external framework instead. A runtime worker gets exactly its authored
+    // skills plus its own private ones; discovery of unbounded user content
+    // stays with the commander (and with agent-edit authoring).
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: 'done\n<agent-result status="success" />' },
+    ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: 'acknowledged' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} write something`,
+    });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const workerCalls = _recordedCalls.filter((c) => c.sid === state.buildGmemberSessionId(cid, AGENT_ID));
+    expect(workerCalls.length).toBeGreaterThan(0);
+    for (const call of workerCalls) {
+      expect(call.extraToolNames, JSON.stringify(call.extraToolNames)).not.toContain('skill_search');
+    }
+
+    expect(_recordedCalls.filter((c) => c.sid === state.buildGconvSessionId(cid))).toHaveLength(0);
+
+    // Negative control: explicitly address Commander in a separate turn, so
+    // this pins the actor split without relying on a successful Agent reply to
+    // create a synthetic handback continuation.
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: '@commander inspect the available tools',
+    });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const commanderCalls = _recordedCalls.filter((c) => c.sid === state.buildGconvSessionId(cid));
+    expect(commanderCalls.length).toBeGreaterThan(0);
+    expect(commanderCalls.some((c) => c.extraToolNames.includes('skill_search'))).toBe(true);
+  }, 12_000);
+
   it('wakes commander once with the original goal, attachment, and capability report', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -459,7 +524,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     };
 
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
-      { type: 'final', text: 'Video production is outside my declared writing workflow.\n<agent-result status="success" />\n<handback />' },
+      { type: 'final', text: 'Video production is outside my declared writing workflow.\n<agent-result status="success" />\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: 'COMMANDER-RECOVERED: I will handle the video workflow.' },
@@ -479,6 +544,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     const commanderCalls = _recordedCalls.filter((call) => call.sid === state.buildGconvSessionId(cid));
     expect(commanderCalls).toHaveLength(1);
     expect(commanderCalls[0].message).toContain('<agent-handback>');
+    expect(commanderCalls[0].message).toContain('"reason": "capability_boundary"');
     expect(commanderCalls[0].message).toContain('create a school launch video');
     expect(commanderCalls[0].message).toContain('outside my declared writing workflow');
     expect(commanderCalls[0].message).toContain('Do not send the unchanged goal back to the same agent');
@@ -508,10 +574,10 @@ describe('group_chat bus integration › direct agent handback', () => {
     const commanderSid = state.buildGconvSessionId(cid);
 
     _setScript(agentSid, [
-      { type: 'final', text: 'This needs a different capability.\n<handback />' },
+      { type: 'final', text: 'This needs a different capability.\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(agentSid, [
-      { type: 'final', text: 'The capability is still unavailable.\n<handback />' },
+      { type: 'final', text: 'The capability is still unavailable.\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(commanderSid, [
       { type: '__call_tool__', name: 'hand_off_to', input: { to: AGENT_NAME, message: 'Run the unchanged task again.' } },
@@ -543,10 +609,10 @@ describe('group_chat bus integration › direct agent handback', () => {
     }));
 
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
-      { type: 'final', text: 'Writer cannot produce this outcome.\n<handback />' },
+      { type: 'final', text: 'Writer cannot produce this outcome.\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(state.buildGmemberSessionId(cid, SECOND_AGENT_ID), [
-      { type: 'final', text: 'Researcher cannot produce this outcome.\n<handback />' },
+      { type: 'final', text: 'Researcher cannot produce this outcome.\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: 'COMMANDER-COALESCED' },
@@ -572,7 +638,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
 
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
-      { type: 'final', text: 'This crosses my capability boundary.\n<handback />' },
+      { type: 'final', text: 'This crosses my capability boundary.\n<handback reason="capability_boundary" />' },
     ]);
     _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: 'COMMANDER-ALREADY-ADDRESSED' },
@@ -591,7 +657,12 @@ describe('group_chat bus integration › direct agent handback', () => {
     expect(_recordedCalls.filter((call) => call.sid === state.buildGmemberSessionId(cid, AGENT_ID))).toHaveLength(1);
   }, 12_000);
 
-  it('still continues when a malformed capability reply contains only the hidden marker', async () => {
+  it.each([
+    ['legacy bare marker', '<handback />'],
+    ['misapplied completed marker', '<handback reason="completed_handoff" />'],
+    ['unknown reason', '<handback reason="done" />'],
+    ['conflicting reasons', '<handback reason="capability_boundary" />\n<handback reason="completed_handoff" />'],
+  ])('does not fabricate a capability boundary from a direct %s', async (_label, marker) => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
     const bus = await import('../../../../src/main/features/group_chat/bus');
@@ -599,20 +670,23 @@ describe('group_chat bus integration › direct agent handback', () => {
     const storage = await import('../../../../src/main/storage');
 
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
-      { type: 'final', text: '<handback />' },
+      { type: 'final', text: `The requested poster is complete.\n<agent-result status="success" />\n${marker}` },
     ]);
     _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: 'COMMANDER-HANDLED-EMPTY-REPORT' },
     ]);
 
     bus.subscribe(TEST_UID, cid, () => {});
-    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} unsupported task` });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} create the requested poster` });
     await waitForQuiescent(TEST_UID, cid, 5000);
 
-    expect(_recordedCalls.filter((call) => call.sid === state.buildGconvSessionId(cid))).toHaveLength(1);
+    expect(_recordedCalls.filter((call) => call.sid === state.buildGconvSessionId(cid))).toHaveLength(0);
     const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
     expect(messages.some((message: any) => String(message.text || '').includes('<handback'))).toBe(false);
-    expect(messages.some((message: any) => String(message.text || '').includes('COMMANDER-HANDLED-EMPTY-REPORT'))).toBe(true);
+    expect(messages.some((message: any) => String(message.text || '').includes('The requested poster is complete.'))).toBe(true);
+    expect(messages.some((message: any) => String(message.text || '').includes('COMMANDER-HANDLED-EMPTY-REPORT'))).toBe(false);
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(AGENT_ID);
+    expect((await state.readState(TEST_UID, cid)).active_recipient_source).toBe('user_selection');
   }, 12_000);
 
   it('does not turn a failed agent runtime into a direct handback continuation', async () => {
@@ -621,7 +695,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
 
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
-      { type: 'final', text: 'The model stream failed.\n<handback />' },
+      { type: 'final', text: 'The model stream failed.\n<handback reason="capability_boundary" />' },
       { type: 'error', text: 'model stream failed', failureKind: 'model', failureCode: 'stream_failed' },
     ]);
     _setScript(state.buildGconvSessionId(cid), [
@@ -633,7 +707,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     await waitForQuiescent(TEST_UID, cid, 5000);
 
     expect(_recordedCalls.filter((call) => call.sid === state.buildGconvSessionId(cid))).toHaveLength(0);
-    expect((await state.readState(TEST_UID, cid)).active_recipient).toBeUndefined();
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(AGENT_ID);
   }, 12_000);
 
   it('prefers an input form over handback when a malformed reply contains both controls', async () => {
@@ -649,7 +723,7 @@ describe('group_chat bus integration › direct agent handback', () => {
     _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
       {
         type: 'final',
-        text: `I need the topic.\n<handback />\n<agent-input-form>\n${JSON.stringify(formPayload)}\n</agent-input-form>`,
+        text: `I need the topic.\n<handback reason="capability_boundary" />\n<agent-input-form>\n${JSON.stringify(formPayload)}\n</agent-input-form>`,
       },
     ]);
 
@@ -663,6 +737,298 @@ describe('group_chat bus integration › direct agent handback', () => {
     expect(agentReply?.form?.fields?.[0]?.id).toBe('topic');
     expect(agentReply?.text).not.toContain('<handback');
     expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(AGENT_ID);
+  }, 12_000);
+});
+
+describe('group_chat bus integration › native Skill package import', () => {
+  it('authorizes an attached ZIP from the current turn without requiring its host path in user text', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const attachmentName = 'attached-skill.zip';
+    const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
+    const archive = path.join(attachmentDir, attachmentName);
+    fs.mkdirSync(attachmentDir, { recursive: true });
+    const zip = new AdmZip();
+    zip.addFile('attached-skill/SKILL.md', Buffer.from([
+      '---',
+      'name: "attached-skill"',
+      'description: "Import the attached Skill package"',
+      '---',
+      '',
+      '# Attached Skill',
+    ].join('\n')));
+    zip.writeZip(archive);
+
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [
+      { type: '__call_tool__', name: 'import_skill_package', input: { source_path: archive } },
+      { type: 'final', text: 'Imported the attached Skill.' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'Import the attached ZIP as a Skill.',
+      attachments: [attachmentName],
+    });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+
+    expect(_recordedCalls.find((call) => call.sid === sid)?.message).toContain(archive);
+    const toolResult = _recordedToolResults.find((result) => result.name === 'import_skill_package');
+    expect(JSON.parse(toolResult!.content), toolResult!.content).toMatchObject({
+      ok: true,
+      installed: [{ skill_id: 'attached-skill' }],
+    });
+    expect(fs.existsSync(
+      path.join(paths.userSkillsDir(TEST_UID), 'attached-skill', 'SKILL.md'),
+    )).toBe(true);
+  }, 12_000);
+
+  it('imports only the current-turn authorized directory and returns a bounded manifest', async () => {
+    const cid = newCid();
+    const sourceParent = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-source-'));
+    try {
+      const source = path.join(sourceParent, 'skill-pack');
+      for (const id of ['alpha-skill', 'beta-skill']) {
+        const skillDir = path.join(source, id);
+        fs.mkdirSync(path.join(skillDir, 'references'), { recursive: true });
+        fs.writeFileSync(path.join(skillDir, 'SKILL.md'), [
+          '---',
+          `name: "${id}"`,
+          `description: "Imported ${id}"`,
+          '---',
+          '',
+          `# ${id}`,
+        ].join('\n'));
+        fs.writeFileSync(path.join(skillDir, 'references', 'large.md'), 'x'.repeat(12_000));
+      }
+
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const storage = await import('../../../../src/main/storage');
+      const sid = state.buildGconvSessionId(cid);
+      _setScript(sid, [
+        { type: '__call_tool__', name: 'import_skill_package', input: { source_path: source } },
+        { type: 'final', text: 'Imported both Skills.' },
+      ]);
+
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `Import every Skill from ${source}`,
+      });
+      await waitForQuiescent(TEST_UID, cid, 6000);
+
+      expect(_recordedCalls.find((call) => call.sid === sid)?.extraToolNames)
+        .toContain('import_skill_package');
+      const toolResult = _recordedToolResults.find((result) => result.name === 'import_skill_package');
+      expect(toolResult).toBeTruthy();
+      expect(toolResult!.content.length).toBeLessThan(1500);
+      expect(toolResult!.content).not.toContain('x'.repeat(100));
+      expect(toolResult!.content).not.toContain('<skill>');
+      const parsedToolResult = JSON.parse(toolResult!.content);
+      expect(parsedToolResult, toolResult!.content).toMatchObject({
+        ok: true,
+        installed: [
+          { skill_id: 'alpha-skill' },
+          { skill_id: 'beta-skill' },
+        ],
+      });
+
+      for (const id of ['alpha-skill', 'beta-skill']) {
+        expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), id, 'SKILL.md'))).toBe(true);
+        expect(fs.readFileSync(
+          path.join(paths.userSkillsDir(TEST_UID), id, 'references', 'large.md'),
+          'utf8',
+        )).toHaveLength(12_000);
+      }
+      const messages = await storage.readJsonl<any>(
+        path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`),
+      );
+      const reply = messages.find((message: any) => message.from === 'commander'
+        && String(message.text || '').includes('Imported both Skills.'));
+      expect(reply?.created_skills?.map((skill: any) => skill.skill_id).sort())
+        .toEqual(['alpha-skill', 'beta-skill']);
+    } finally {
+      fs.rmSync(sourceParent, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  it('rejects a model-selected package path absent as an exact path from the current user turn', async () => {
+    const cid = newCid();
+    const sourceParent = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-source-'));
+    try {
+      const source = path.join(sourceParent, 'unauthorized-skill');
+      fs.mkdirSync(source, { recursive: true });
+      fs.writeFileSync(path.join(source, 'SKILL.md'), [
+        '---',
+        'name: "unauthorized-skill"',
+        'description: "Must not be imported"',
+        '---',
+        '',
+        '# Private',
+      ].join('\n'));
+
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+      const sid = state.buildGconvSessionId(cid);
+      _setScript(sid, [
+        { type: '__call_tool__', name: 'import_skill_package', input: { source_path: source } },
+        { type: 'final', text: 'Import was not authorized.' },
+      ]);
+
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `Import the different package ${source}-lookalike.`,
+      });
+      await waitForQuiescent(TEST_UID, cid, 6000);
+
+      const toolResult = _recordedToolResults.find((result) => result.name === 'import_skill_package');
+      expect(JSON.parse(toolResult!.content)).toMatchObject({
+        ok: false,
+        code: 'source_path_not_authorized',
+      });
+      expect(fs.existsSync(path.join(paths.userSkillsDir(TEST_UID), 'unauthorized-skill'))).toBe(false);
+    } finally {
+      fs.rmSync(sourceParent, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  it('does not authorize a Skill ZIP that was attached only on an earlier turn', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const attachmentName = 'earlier-turn-skill.zip';
+    const archive = path.join(
+      layout.chatAttachmentDirForConversation(TEST_UID, cid),
+      attachmentName,
+    );
+    fs.mkdirSync(path.dirname(archive), { recursive: true });
+    const zip = new AdmZip();
+    zip.addFile('earlier-turn-skill/SKILL.md', Buffer.from([
+      '---',
+      'name: "earlier-turn-skill"',
+      'description: "Must require a fresh current-turn attachment"',
+      '---',
+      '',
+      '# Earlier turn Skill',
+    ].join('\n')));
+    zip.writeZip(archive);
+
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [{ type: 'final', text: 'Attachment retained; no import requested.' }]);
+    _setScript(sid, [
+      { type: '__call_tool__', name: 'import_skill_package', input: { source_path: archive } },
+      { type: 'final', text: 'The earlier attachment is not authorized for this turn.' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'Keep this attachment for later; do not import it now.',
+      attachments: [attachmentName],
+    });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'Now import the Skill ZIP from the previous turn.',
+    });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+
+    const results = _recordedToolResults.filter(
+      (result) => result.name === 'import_skill_package',
+    );
+    expect(results).toHaveLength(1);
+    expect(JSON.parse(results[0].content)).toMatchObject({
+      ok: false,
+      code: 'source_path_not_authorized',
+    });
+    expect(fs.existsSync(
+      path.join(paths.userSkillsDir(TEST_UID), 'earlier-turn-skill'),
+    )).toBe(false);
+  }, 12_000);
+
+  it('keeps one installed Skill and one created resource when the model retries the same import', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const sourceParent = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-retry-'));
+    try {
+      const source = path.join(sourceParent, 'retry-safe-skill');
+      fs.mkdirSync(source, { recursive: true });
+      fs.writeFileSync(path.join(source, 'SKILL.md'), [
+        '---',
+        'name: "retry-safe-skill"',
+        'description: "A retry-safe native Skill import"',
+        '---',
+        '',
+        '# Retry safe Skill',
+      ].join('\n'));
+
+      const sid = state.buildGconvSessionId(cid);
+      _setScript(sid, [
+        { type: '__call_tool__', name: 'import_skill_package', input: { source_path: source } },
+        { type: '__call_tool__', name: 'import_skill_package', input: { source_path: source } },
+        { type: 'final', text: 'Imported retry-safe-skill once.' },
+      ]);
+
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `Import the Skill from ${source}`,
+      });
+      await waitForQuiescent(TEST_UID, cid, 6000);
+
+      const results = _recordedToolResults.filter(
+        (result) => result.name === 'import_skill_package',
+      );
+      expect(results).toHaveLength(2);
+      expect(JSON.parse(results[0].content)).toMatchObject({
+        ok: true,
+        installed: [{ skill_id: 'retry-safe-skill' }],
+      });
+      expect(JSON.parse(results[1].content)).toMatchObject({
+        ok: false,
+        code: 'skill_package_import_failed',
+      });
+      expect(fs.readdirSync(paths.userSkillsDir(TEST_UID)).filter(
+        (name) => name.startsWith('retry-safe-skill'),
+      )).toEqual(['retry-safe-skill']);
+      const messages = await storage.readJsonl<any>(
+        path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`),
+      );
+      const reply = messages.find((message: any) => (
+        message.from === 'commander'
+        && String(message.text || '').includes('Imported retry-safe-skill once.')
+      ));
+      expect(reply?.created_skills).toEqual([
+        expect.objectContaining({ skill_id: 'retry-safe-skill' }),
+      ]);
+    } finally {
+      fs.rmSync(sourceParent, { recursive: true, force: true });
+    }
   }, 12_000);
 });
 
@@ -1040,6 +1406,145 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(commanderTurns, 'commander should run exactly one turn (no re-wake)').toBe(1);
   }, 12_000);
 
+  it.each(['dispatch_to', 'hand_off_to', 'run_worker'] as const)(
+    '%s relies on canonical history for an unresolved “above” reference without duplicating source snapshots',
+    async (sourceTool) => {
+      const cid = newCid();
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+
+      const ORIGINAL_COPY = [
+        'SOURCE-COPY-ASTER-47',
+        `A complete article body: ${'tulip-market-detail '.repeat(80)}`,
+        'The exact closing sentence is: bubbles end when buyers stop believing.',
+      ].join('\n');
+      expect(ORIGINAL_COPY.length).toBeGreaterThan(1_600);
+      _setScript(state.buildGconvSessionId(cid), [
+        { type: 'final', text: 'I have the complete source copy and can route the next task.' },
+      ]);
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: ORIGINAL_COPY,
+      });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+
+      const triggerText = sourceTool === 'hand_off_to'
+        ? '用上述文案，做一个适合孩子观看的竖版讲解视频。'
+        : 'Use the above copy to make a child-friendly vertical explainer.';
+      const delegatedTask = sourceTool === 'hand_off_to'
+        ? '请基于用户上一条提供的完整文案制作竖版视频，保留原文事实。'
+        : 'Use the user\'s previous complete copy; keep its facts and make the tone child-friendly.';
+      const toolInput = sourceTool === 'run_worker'
+        ? { to: AGENT_NAME, task: delegatedTask }
+        : { to: AGENT_NAME, message: delegatedTask };
+      _setScript(state.buildGconvSessionId(cid), [
+        { type: '__call_tool__', name: sourceTool, input: toolInput },
+        { type: 'final', text: sourceTool === 'dispatch_to' ? 'I incorporated the specialist result.' : 'Handing this to the specialist.' },
+      ]);
+      _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+        { type: 'final', text: `SPECIALIST-${sourceTool}: source received.` },
+      ]);
+      const triggerMessage = await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: triggerText,
+      });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+
+      const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
+      const agentCall = _recordedCalls.filter((call) => call.sid === agentSid).at(-1);
+      expect(agentCall, 'the named agent should receive a nested turn').toBeTruthy();
+      expect(agentCall!.message).toContain(delegatedTask);
+      expect(agentCall!.message).not.toContain('<referenced-messages>');
+      expect(agentCall!.message).not.toContain('SOURCE-COPY-ASTER-47');
+      expect(agentCall!.message).not.toContain('bubbles end when buyers stop believing.');
+      expect(agentCall!.message).not.toContain(triggerText);
+      const canonicalHistory = JSON.stringify(agentCall!.conversationHistory);
+      expect(canonicalHistory).toContain('SOURCE-COPY-ASTER-47');
+      expect(canonicalHistory).toContain('bubbles end when buyers stop believing.');
+      expect(canonicalHistory).toContain(triggerText);
+
+      const lines = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf-8')
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      const dispatch = lines.find((message: any) => (
+        message.from === 'commander'
+        && message.dispatch === true
+        && message.text === delegatedTask
+      ));
+      expect(dispatch, 'the hidden dispatch source should be persisted').toBeTruthy();
+      expect(dispatch.source_message_id).toBe(triggerMessage.id);
+      expect(dispatch.references).toBeUndefined();
+    },
+    20_000,
+  );
+
+  it.each(['dispatch_to', 'hand_off_to', 'run_worker'] as const)(
+    '%s preserves an explicit cross-conversation reference snapshot without adding the trigger as a reference',
+    async (sourceTool) => {
+      const cid = newCid();
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const paths = await import('../../../../src/main/paths');
+
+      const triggerText = 'Create the requested deliverable from my quoted source.';
+      const delegatedTask = 'Produce the final two-sentence deliverable from the explicit quoted reference.';
+      const explicitReference = {
+        source_cid: 'other-conversation-47',
+        source_title: 'Archived source conversation',
+        source_msg_id: 'quoted-message-88',
+        from_actor: 'user',
+        source_ts: '2026-07-30T08:00:00.000Z',
+        text: 'CROSS-CONVERSATION-SNAPSHOT-51: preserve this exact quoted requirement.',
+      };
+      const toolInput = sourceTool === 'run_worker'
+        ? { to: AGENT_NAME, task: delegatedTask }
+        : { to: AGENT_NAME, message: delegatedTask };
+      _setScript(state.buildGconvSessionId(cid), [
+        { type: '__call_tool__', name: sourceTool, input: toolInput },
+        { type: 'final', text: 'The referenced deliverable is ready.' },
+      ]);
+      _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+        { type: 'final', text: `SPECIALIST-${sourceTool}: explicit reference received.` },
+      ]);
+      bus.subscribe(TEST_UID, cid, () => {});
+      const triggerMessage = await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: triggerText,
+        references: [explicitReference],
+      });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+
+      const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
+      const agentCall = _recordedCalls.filter((call) => call.sid === agentSid).at(-1);
+      expect(agentCall).toBeTruthy();
+      expect(agentCall!.message).toContain(delegatedTask);
+      expect(agentCall!.message).toContain('<referenced-messages>');
+      expect(agentCall!.message).toContain('CROSS-CONVERSATION-SNAPSHOT-51');
+      expect(agentCall!.message).not.toContain(triggerText);
+
+      const lines = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf-8')
+        .split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      const dispatch = lines.find((message: any) => (
+        message.from === 'commander'
+        && message.dispatch === true
+        && message.text === delegatedTask
+      ));
+      expect(dispatch, 'the hidden dispatch source should be persisted').toBeTruthy();
+      expect(dispatch.source_message_id).toBe(triggerMessage.id);
+      expect(dispatch.references).toHaveLength(1);
+      expect(dispatch.references[0]).toMatchObject(explicitReference);
+      expect(dispatch.references[0].source_msg_id).not.toBe(triggerMessage.id);
+    },
+    20_000,
+  );
+
   it('dispatch_to can fan out to multiple named agents in one commander turn and keep both visible replies', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -1093,11 +1598,16 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       && String(m.text || '').includes('combined handoff'))).toBe(true);
 
     // Live UX must match persisted chronology even when Commander emitted no
-    // prose before the parallel tool batch. The boundary releases its
-    // turn-start placeholder; both agent replies then arrive before synthesis.
-    const boundaryIndex = events.findIndex((event) => (
-      event.type === 'segment_boundary' && event.actor === 'commander'
-    ));
+    // prose before the parallel tool batch. A dispatch boundary with nothing to
+    // persist still closes its segment, so the synthesis belongs to a LATER
+    // segment than the turn started in — that is what makes the renderer open
+    // it as a new row below the agent replies instead of reusing the row the
+    // turn opened above them. (This replaced a live-only `segment_boundary`
+    // event that asked the renderer to hide and re-create that row.)
+    const synthesisMsg = lines.find((m: any) => m.from === 'commander'
+      && String(m.text || '').includes('combined handoff'));
+    expect(synthesisMsg?.seg, 'synthesis after an empty dispatch boundary starts a new segment')
+      .toBeGreaterThan(0);
     const writerIndex = events.findIndex((event) => (
       event.type === 'message'
       && event.msg?.from === AGENT_ID
@@ -1113,9 +1623,8 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       && event.msg?.from === 'commander'
       && String(event.msg?.text || '').includes('combined handoff')
     ));
-    expect(boundaryIndex).toBeGreaterThanOrEqual(0);
-    expect(writerIndex).toBeGreaterThan(boundaryIndex);
-    expect(reviewerIndex).toBeGreaterThan(boundaryIndex);
+    expect(writerIndex).toBeGreaterThanOrEqual(0);
+    expect(reviewerIndex).toBeGreaterThanOrEqual(0);
     expect(synthesisIndex).toBeGreaterThan(writerIndex);
     expect(synthesisIndex).toBeGreaterThan(reviewerIndex);
   }, 12_000);
@@ -1231,6 +1740,72 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(lines.indexOf(agentMsg)).toBeLessThan(lines.indexOf(segs[1]));
   }, 12_000);
 
+  // Streaming events must carry the SAME segment identity as the message that
+  // later persists that segment. The renderer attributes deltas by
+  // `${turn_id}:${seg}`; if a delta lands on the wrong segment (or on none),
+  // one segment's text gets split across two bubbles — the long-standing
+  // "commander says the same thing twice" defect. The oracle here is
+  // independent of the fixture: live delta text is regrouped by the event's own
+  // `seg` and compared against what the bus independently persisted.
+  it('streaming process events carry the segment identity of the message that persists them', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    const PRE = 'Handing this to the writer first.';
+    const SYN = 'Here is the summary of that draft.';
+
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'delta', text: PRE },
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'draft it' } },
+      { type: 'delta', text: SYN },
+      { type: 'final', text: SYN },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: 'AGENT-SEG-IDENTITY: draft body.' },
+    ]);
+
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, (ev: any) => { events.push(ev); });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'make me a draft' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const commanderDeltas = events.filter((ev) => (
+      ev.type === 'process'
+      && ev.actor === 'commander'
+      && ev.data?.type === 'delta'
+      && typeof ev.data?.text === 'string'
+    ));
+    expect(commanderDeltas.length, 'commander should stream text on both sides of the dispatch').toBeGreaterThan(0);
+    // Every streamed token must be attributable — an absent `seg` is exactly the
+    // state that forced the renderer to guess which bubble owns the text.
+    for (const ev of commanderDeltas) {
+      expect(ev.seg, 'every commander delta must carry a segment index').toBeTypeOf('number');
+    }
+
+    const streamedBySeg = new Map<number, string>();
+    for (const ev of commanderDeltas) {
+      streamedBySeg.set(ev.seg, (streamedBySeg.get(ev.seg) || '') + ev.data.text);
+    }
+
+    const segMessages = events.filter((ev) => (
+      ev.type === 'message'
+      && ev.msg?.from === 'commander'
+      && ev.msg?.seg !== undefined
+    ));
+    expect(segMessages.length, 'a visible dispatch splits the turn into two persisted segments').toBe(2);
+    for (const ev of segMessages) {
+      const seg = ev.msg.seg;
+      expect(
+        (streamedBySeg.get(seg) || '').trim(),
+        `segment ${seg} text streamed live must match what the bus persisted for it`,
+      ).toBe(String(ev.msg.text || '').trim());
+    }
+    // The two segments must not be attributed to the same index, otherwise the
+    // renderer would fold the synthesis into the pre-dispatch bubble.
+    expect(new Set(segMessages.map((ev) => ev.msg.seg)).size).toBe(2);
+  }, 12_000);
+
   // The inverse: an anonymous worker is the commander's invisible hands, so the
   // turn must NOT segment (no second bubble with nothing visible between).
   it('commander loop bubbles: an anonymous run_worker does NOT split the commander bubble', async () => {
@@ -1258,7 +1833,11 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
 
     const commanderMsgs = lines.filter((m: any) => m.from === 'commander' && !m.dispatch);
     expect(commanderMsgs.length, 'anonymous worker turn stays a single commander bubble').toBe(1);
-    expect(commanderMsgs[0].seg, 'no seg marker when nothing visible was dispatched').toBeUndefined();
+    // An unsplit turn is segment 0, not "no segment": the renderer addresses a
+    // live row by `${turn_id}:${seg}` from the first streamed token, so a reply
+    // that omitted `seg` could not resolve the row its own stream wrote to and
+    // would render a second bubble beside it.
+    expect(commanderMsgs[0].seg, 'an unsplit turn closes segment 0').toBe(0);
   }, 12_000);
 
   // hand_off_to an INTERACTIVE agent: the agent answers the user, the commander
@@ -1321,6 +1900,12 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
         .filter((t: any) => t.actor === tutorId)
         .every((t: any) => Number.isFinite(t.started_at_ms) && t.started_at_ms > 0)),
       'nested active turns must expose a stable execution start for elapsed-time recovery',
+    ).toBe(true);
+    expect(
+      tutorActive.every((e: any) => e.active_turns
+        .filter((t: any) => t.actor === tutorId)
+        .every((t: any) => t.steerable === false)),
+      'nested dispatches must never advertise active-turn user ingress',
     ).toBe(true);
     expect(
       tutorActive.every((e: any) => !e.active_turns.some((t: any) => t.actor === 'commander')),
@@ -1429,6 +2014,23 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       && ev.data?.event?.stream === 'runtime'
       && ev.data?.event?.data?.phase === 'segment_end'),
     'renderer must receive the segment runtime before the bubble finalizes').toBe(true);
+    const commanderSegmentIndex = events.findIndex((ev) => ev.type === 'message'
+      && ev.msg?.from === 'commander'
+      && String(ev.msg?.text || '').includes('资料搜集已基本完备'));
+    const segmentBoundaryIndex = events.findIndex((ev, index) => index > commanderSegmentIndex
+      && ev.type === 'segment_boundary'
+      && ev.actor === 'commander');
+    const specialistActiveIndex = events.findIndex((ev) => ev.type === 'state_changed'
+      && Array.isArray(ev.active_turns)
+      && ev.active_turns.some((turn: any) => turn.actor === AGENT_ID));
+    expect(commanderSegmentIndex,
+      'the narrated pre-handoff segment must reach the renderer').toBeGreaterThanOrEqual(0);
+    expect(segmentBoundaryIndex,
+      'the finalized segment must suppress a second live Commander placeholder')
+      .toBeGreaterThan(commanderSegmentIndex);
+    expect(specialistActiveIndex,
+      'the delegated agent should become active after Commander is suppressed')
+      .toBeGreaterThan(segmentBoundaryIndex);
     expect(events.some((ev) => ev.type === 'turn_silent'
       && ev.actor === 'commander'
       && ev.reason === 'terminal_handoff'),
@@ -1638,7 +2240,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(st.orchestration_ledger?.resume_instruction).toContain('routing recommendation');
 
     _setScript(state.buildGmemberSessionId(cid, coachId), [
-      { type: 'final', text: 'The user wants normal chat prompts to trigger specialist routing when quality improves.\n<handback />' },
+      { type: 'final', text: 'The user wants normal chat prompts to trigger specialist routing when quality improves.\n<handback reason="completed_handoff" />' },
     ]);
     _setScript(commanderSid, [
       { type: 'final', text: 'RESUMED-COMMANDER: based on the scenario, keep routing quality-first and resume remaining synthesis.' },
@@ -1656,6 +2258,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     ));
     expect(resumeCall?.message).toContain('normal chat prompts to trigger specialist routing');
     expect(resumeCall?.message).toContain('routing recommendation');
+    expect(resumeCall?.message).toContain('"handback_reason": "completed_handoff"');
 
     const lines = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf-8')
       .split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -1663,6 +2266,104 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       && String(m.model_text || '').includes('<orchestration-resume>'))).toBe(true);
     expect(lines.some((m: any) => m.from === 'commander'
       && String(m.text || '').includes('RESUMED-COMMANDER'))).toBe(true);
+  }, 15_000);
+
+  // A form submission parks the ledger in `waiting_for_form`, so the agent-side
+  // take returns null even though an orchestration IS pending. That used to fall
+  // through to the direct-handback wake WHILE the form branch also resumed —
+  // Commander ran twice and persisted two identical syntheses. Exactly one wake.
+  it('wakes commander once when a form submission and a handback land in the same agent turn', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+
+    const coachId = 'aa11bb22cc33';
+    const coachName = 'FormCoach';
+    const coachDir = paths.agentDir(TEST_UID, coachId);
+    fs.mkdirSync(coachDir, { recursive: true });
+    fs.writeFileSync(path.join(coachDir, 'agent.json'), JSON.stringify({
+      agent_id: coachId, name: coachName, description: 'collects scope through a form', workflow: 'coach',
+      interactive: true, created_at: 't', updated_at: 't',
+    }));
+
+    const commanderSid = state.buildGconvSessionId(cid);
+    _setScript(commanderSid, [
+      {
+        type: '__call_tool__',
+        name: 'hand_off_to',
+        input: {
+          to: coachName,
+          message: 'Collect the research scope first.',
+          resume: 'After FormCoach hands back, summarize the confirmed scope.',
+        },
+      },
+      { type: 'final', text: 'Handing this to FormCoach.' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, coachId), [
+      {
+        type: 'final',
+        text: [
+          'I need the research question first.',
+          '<agent-input-form>',
+          JSON.stringify({
+            agent_id: coachId,
+            fields: [{ id: 'question', label: 'Research question', type: 'textarea', required: true }],
+          }),
+          '</agent-input-form>',
+          '<plan-interaction status="open" />',
+        ].join('\n'),
+      },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Plan the research, ask me what you need' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    let st = await state.readState(TEST_UID, cid);
+    expect(st.orchestration_ledger?.status, 'the form parks the ledger').toBe('waiting_for_form');
+    expect(st.orchestration_ledger?.owner_agent_id).toBe(coachId);
+    const formId = String(st.orchestration_ledger?.form_id || '');
+    expect(formId).toBeTruthy();
+
+    // The submission turn: the agent answers AND hands back in one reply.
+    _setScript(state.buildGmemberSessionId(cid, coachId), [
+      { type: 'final', text: 'Scope confirmed: enterprise adoption risk.\n<handback />' },
+    ]);
+    _setScript(commanderSid, [
+      { type: 'final', text: 'RESUMED-ONCE: the confirmed scope is enterprise adoption risk.' },
+    ]);
+
+    const submission = [
+      '- Research question：enterprise adoption risk',
+      '',
+      `<agent-input-submission form_id="${formId}" agent_id="${coachId}">`,
+      JSON.stringify({ question: 'enterprise adoption risk' }),
+      '</agent-input-submission>',
+    ].join('\n');
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: submission });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    st = await state.readState(TEST_UID, cid);
+    expect(st.orchestration_ledger, 'the ledger is consumed exactly once').toBeUndefined();
+
+    const lines = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf-8')
+      .split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    // Count the WAKES, not the replies: a scripted model stops producing text
+    // once its script is consumed, so a second commander turn would leave no
+    // second bubble here even though it really ran and burned a model call.
+    const commanderWakes = lines.filter((m: any) => m.dispatch === true
+      && Array.isArray(m.to) && m.to.includes('commander'));
+    expect(
+      commanderWakes.length,
+      'the form resume and the hand-back must not both wake commander',
+    ).toBe(1);
+    expect(String(commanderWakes[0]?.model_text || '')).toContain('<orchestration-resume>');
+    expect(String(commanderWakes[0]?.model_text || '')).toContain('"handback_reason": "legacy_unspecified"');
+    const resumedReplies = lines.filter((m: any) => m.from === 'commander'
+      && !m.dispatch
+      && String(m.text || '').includes('RESUMED-ONCE'));
+    expect(resumedReplies.length, 'commander synthesizes once').toBe(1);
   }, 15_000);
 
   it('user explicitly returning to commander consumes an interrupted orchestration ledger', async () => {
@@ -1886,7 +2587,13 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(builderForm).toBeTruthy();
 
     _setScript(builderSid, [
-      { type: 'final', text: 'RECOVERY-BUILDER-COMPLETE: manifest repaired, validated, and original export completed.' },
+      {
+        type: 'final',
+        text: [
+          'RECOVERY-BUILDER-COMPLETE: manifest repaired, validated, and original export completed.',
+          ...(sourceTool === 'hand_off_to' ? ['<handback reason="completed_handoff" />'] : []),
+        ].join('\n'),
+      },
     ]);
     _setScript(commanderSid, [
       { type: 'final', text: 'RECOVERY-COMMANDER-COMPLETE: verified the repair result and closed the original goal.' },
@@ -1907,16 +2614,20 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(st.active_recipient,
       'once the Agent result resumes Commander, the prior execution tool must not leave the floor behind').toBeUndefined();
     expect(st.orchestration_ledger).toBeUndefined();
-    const resumeCall = _recordedCalls.find((call) => (
+    const resumeCalls = _recordedCalls.filter((call) => (
       call.sid === commanderSid && call.message.includes('<orchestration-resume>')
     ));
+    expect(resumeCalls,
+      'a submitted form plus completed_handoff must consume one ledger and wake Commander once')
+      .toHaveLength(1);
+    const resumeCall = resumeCalls[0];
     expect(resumeCall?.message).toContain('RECOVERY-BUILDER-COMPLETE');
     expect(resumeCall?.message).toContain('close the original export goal');
 
     rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
       .split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    expect(rows.some((row: any) => row.from === 'commander'
-      && String(row.text || '').includes('RECOVERY-COMMANDER-COMPLETE'))).toBe(true);
+    expect(rows.filter((row: any) => row.from === 'commander'
+      && String(row.text || '').includes('RECOVERY-COMMANDER-COMPLETE'))).toHaveLength(1);
     },
     15_000,
   );
@@ -2220,6 +2931,40 @@ describe('group_chat bus integration › task terminal boundary', () => {
     expect(await waitUntil(() => terminals.length === 1)).toBe(true);
 
     expect(terminals[0].status).toBe('cancelled');
+    unsubscribe();
+  }, 10_000);
+
+  it('emits one cancelled terminal synchronously when an account switch owns teardown', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const terminals: any[] = [];
+    const unsubscribe = bus.subscribeTaskTerminals((event) => {
+      if (event.conversation_id === cid) terminals.push(event);
+    });
+
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: '__wait_for_abort__' },
+    ]);
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} long task before switching account`,
+    });
+    expect(await waitUntil(() => !bus.isQuiescent(TEST_UID, cid))).toBe(true);
+
+    bus.cancelForUserSwitch(TEST_UID);
+
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toMatchObject({
+      user_id: TEST_UID,
+      conversation_id: cid,
+      status: 'cancelled',
+    });
+    expect(await waitUntil(() => bus._cidStateForTest(TEST_UID, cid) === null)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(terminals).toHaveLength(1);
     unsubscribe();
   }, 10_000);
 });

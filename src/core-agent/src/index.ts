@@ -7,7 +7,16 @@ export { loadConfig, createConfig, CoreAgentConfigSchema } from "./config/index.
 export type { CoreAgentConfig, AgentConfig, MemoryConfig, ProviderConfig, ModelConfig, EvolutionConfig } from "./config/index.js";
 
 // Shared types & utilities
-export type { Message, MessageContent, Usage, StopReason, StreamEvent } from "./shared/types.js";
+export type {
+  Message,
+  MessageContent,
+  ProviderEmptyKind,
+  ServerModelFallbackReason,
+  ProviderTerminationCategory,
+  Usage,
+  StopReason,
+  StreamEvent,
+} from "./shared/types.js";
 export {
   CoreAgentError,
   AuthError,
@@ -40,7 +49,11 @@ export { ProviderRegistry } from "./providers/index.js";
 
 // Agent Harness
 export { AgentRunner } from "./agent/index.js";
-export type { ReflectionModelCallEvent } from "./agent/index.js";
+export type {
+  ReflectionModelCallEvent,
+  SharedHistorySummaryCache,
+  SharedHistorySummaryCheckpoint,
+} from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
 export { discoverRepositoryInstructions, repositoryInstructionsText } from "./agent/index.js";
@@ -70,6 +83,8 @@ export type {
   AgentRunTimings,
   AgentRunConvergenceSignal,
   AgentRunEvent,
+  AgentRunSteerInput,
+  AgentRunSteerMessage,
 } from "./agent/index.js";
 
 // Tools

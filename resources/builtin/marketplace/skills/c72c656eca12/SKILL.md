@@ -3,7 +3,7 @@ name: office-word
 description_zh: 使用内置 Office 工具创建、读取、编辑和检查 Word / DOCX 文档，重点保护样式、编号、修订、批注、字段、表格、分节和页眉页脚。适合“做一份 Word 报告”“修改这份 DOCX 并保留格式”“检查长文档编号和版式”；触发词：Word、DOCX、文档、修订、批注、字段、模板、排版、编号、页眉页脚
 description_en: Use the built-in Office tools to create, read, edit, and check Word/DOCX documents while protecting styles, numbering, revisions, comments, fields, tables, sections, headers, and footers. Use for Word reports, DOCX edits, redlines, comments, templates, numbering cleanup, and layout-safe delivery.
 category: office
-min_app_version: 1.7.0
+min_app_version: 1.6.1
 ---
 
 # Office Word
@@ -50,6 +50,7 @@ acceptable.
 1. Inspect styles, numbering, relationships, sections, headers/footers, fields, comments, and revisions before editing an existing document.
 2. Change the smallest safe element. Preserve bookmarks, comment anchors, revision blocks, numbering definitions, fields, section settings, and relationship files unless the user requests otherwise.
 3. For new documents, use named heading/body styles and explicit page size, margins, table widths, and section settings.
+   For documents containing CJK text, explicitly name CJK-capable fonts for those styles; do not rely on an unspecified “Chinese font” or renderer fallback.
 4. Treat tracked changes, comments, fields, and complex layout as fidelity-sensitive. If the exposed tool contract cannot express the requested operation safely, report the limitation instead of falling back to an unreviewed package or raw XML rewrite.
 
 ## Delivery Check

@@ -17,10 +17,13 @@ import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
+  type LocalActiveRunIngress,
+  type LocalActiveRunInput,
   type BackendRunOptions,
   type LocalEvent,
   StderrTail,
   spawnCli,
+  reapCliAfterProtocolTerminal,
   bindAbort,
   armKillWatchdog,
   LineSplitter,
@@ -43,6 +46,11 @@ export const claudeBackend: LocalBackend = {
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
     let resultUsage: Record<string, number | string> | undefined;
+    let activeInputOpen = false;
+    let finishRun: (
+      status: 'completed' | 'failed' | 'cancelled' | 'timeout',
+      extra?: Partial<LocalEvent>,
+    ) => void = () => {};
     /** Running token tally accumulated from each `assistant` block's
      *  `message.usage` (mirrors multica's per-model map). The final
      *  `result.usage` claude itself emits is authoritative and overwrites
@@ -71,6 +79,62 @@ export const claudeBackend: LocalBackend = {
       lastEventAt: opts.lastEventAt,
     });
 
+    // Serialize user messages and control responses through one writer. Claude
+    // Code's stream-json stdin is a multiplexed protocol; concurrent writes
+    // must never interleave records or let a steer overtake a pending approval
+    // response.
+    let stdinWrites: Promise<void> = Promise.resolve();
+    const writeInputRecord = (record: Record<string, unknown>): Promise<void> => {
+      const line = `${JSON.stringify(record)}\n`;
+      const write = stdinWrites.then(() => new Promise<void>((resolve, reject) => {
+        if (exited || child.stdin.destroyed || !child.stdin.writable) {
+          reject(new Error('claude stdin is no longer writable'));
+          return;
+        }
+        child.stdin.write(line, (err?: Error | null) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      }));
+      // Keep the shared chain usable after one failed record while returning
+      // the original rejection to that caller.
+      stdinWrites = write.catch(() => {});
+      return write;
+    };
+
+    const publishActiveIngress = (ready: boolean): void => {
+      activeInputOpen = ready && !exited;
+      if (!activeInputOpen) {
+        try { opts.onActiveRunIngress?.(null); } catch { /* host already gone */ }
+        return;
+      }
+      const ingress: LocalActiveRunIngress = {
+        submit: async (input: LocalActiveRunInput) => {
+          if (!activeInputOpen || exited) {
+            return { mode: 'queued_followup', reason: 'claude turn is no longer active' };
+          }
+          const text = String(input.text || '').trim();
+          if (!text) return { mode: 'rejected', reason: 'empty active-turn input' };
+          try {
+            await writeInputRecord({
+              type: 'user',
+              message: {
+                role: 'user',
+                content: [{ type: 'text', text }],
+              },
+            });
+            return { mode: 'steered', acceptedId: input.id };
+          } catch (err) {
+            return {
+              mode: 'queued_followup',
+              reason: (err as Error).message || String(err),
+            };
+          }
+        },
+      };
+      try { opts.onActiveRunIngress?.(ingress); } catch { /* host already gone */ }
+    };
+
     // Build and send the single user message, but keep stdin OPEN —
     // claude code's stream-json protocol uses stdin for two channels:
     //   1. The user message that kicks off the turn (one and done).
@@ -81,17 +145,18 @@ export const claudeBackend: LocalBackend = {
     //      waiting for a stdin response we never send if we close
     //      stdin here. That's the "silent hang for 20 minutes" symptom
     //      users report — fix by writing the prompt without `.end()`
-    //      and closing stdin only once we see the terminal `result`
-    //      record (handled below in mapClaudeEvent's 'result' branch
-    //      via the closeStdin callback).
-    const inputLine = JSON.stringify({
+    //      and closing/reaping the process only once we see the terminal
+    //      `result` record.
+    const initialInput = {
       type: 'user',
       message: {
         role: 'user',
         content: [{ type: 'text', text: opts.prompt }],
       },
-    }) + '\n';
-    child.stdin.write(inputLine);
+    };
+    void writeInputRecord(initialInput).catch((err) => {
+      log.warn('claude initial input write failed', { error: logErrorSummary(err) });
+    });
 
     /** Auto-allow control_request — claude code asks for tool-use /
      *  hook permission through this channel. We're a daemon-style
@@ -113,11 +178,9 @@ export const claudeBackend: LocalBackend = {
           },
         },
       };
-      try {
-        child.stdin.write(JSON.stringify(response) + '\n');
-      } catch (err) {
+      void writeInputRecord(response).catch((err) => {
         log.warn('claude control_response write failed', { error: logErrorSummary(err) });
-      }
+      });
     };
 
     // stdout: line-buffered JSON parsing.
@@ -125,6 +188,7 @@ export const claudeBackend: LocalBackend = {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       splitter.push(chunk, line => {
+        if (exited) return;
         const trimmed = line.trim();
         if (!trimmed) return;
         let obj: any;
@@ -177,28 +241,41 @@ export const claudeBackend: LocalBackend = {
           }
         }
         const ev = mapClaudeEvent(obj, sessionId, partialState);
+        const hadSession = !!sessionId;
         if (ev?.captureSession && obj.session_id) sessionId = String(obj.session_id);
-        if (ev?.event) opts.onEvent(ev.event);
+        if (obj?.session_id && !sessionId) sessionId = String(obj.session_id);
+        if (!hadSession && sessionId) publishActiveIngress(true);
+        if (ev?.events) {
+          for (const event of ev.events) opts.onEvent(event);
+        } else if (ev?.event) {
+          opts.onEvent(ev.event);
+        }
         if (ev?.terminal) {
           resultStatus = ev.terminal.status;
           resultText = ev.terminal.text;
           resultError = ev.terminal.error;
           resultUsage = ev.terminal.usage as typeof resultUsage;
-          // Terminal record received — close stdin so the CLI's
-          // post-result cleanup can exit (we kept it open through the
-          // run to handle control_request). EPIPE on this write is
-          // safe; base.ts's stdin.on('error') swallows it.
-          try { child.stdin.end(); } catch { /* already gone */ }
+          finishRun(resultStatus, {
+            output: resultText,
+            ...(resultError ? { error: resultError, stderrTail: tail.toString() } : {}),
+            ...(resultUsage || accUsage ? { usage: resultUsage || accUsage } : {}),
+          });
+          // The result record is the authoritative terminal boundary. Do not
+          // keep Orkas loading while a background task or inherited stdio pipe
+          // delays the CLI process's close event.
+          reapCliAfterProtocolTerminal(child);
         }
       });
     });
     child.stdout.on('end', () => splitter.flush(line => {
+      if (exited) return;
       const trimmed = line.trim();
       if (trimmed) opts.onEvent({ type: 'text-delta', text: trimmed });
     }));
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
+      if (exited) return;
       tail.push(chunk);
       // Emit one event per stderr line so live UI can show progress.
       for (const line of chunk.split(/\r?\n/)) {
@@ -209,6 +286,7 @@ export const claudeBackend: LocalBackend = {
     return new Promise<void>(resolve => {
       const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Partial<LocalEvent> = {}) => {
         if (exited) return;
+        publishActiveIngress(false);
         exited = true;
         watchdog.disarm();
         detachAbort();
@@ -222,6 +300,7 @@ export const claudeBackend: LocalBackend = {
         });
         resolve();
       };
+      finishRun = finish;
 
       child.on('error', err => {
         log.warn('claude spawn error', { error: logErrorSummary(err) });
@@ -243,10 +322,11 @@ export const claudeBackend: LocalBackend = {
 };
 
 /** Args mirroring the multica skeleton, distilled to what we actually
- *  use in v1: stream-json in/out, `--print` (non-interactive),
- *  bypass permissions for daemon-style execution, optional model. */
+ *  use in v1: stream-json in/out, `--print` (non-interactive), and
+ *  bypass permissions for daemon-style execution. Missing runtime overrides
+ *  deliberately leave model and effort to Claude Code configuration. */
 export function buildClaudeArgs(opts: Pick<BackendRunOptions,
-  'model' | 'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt'
+  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel'
 >): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
@@ -259,12 +339,14 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
     '--output-format', 'stream-json',
     '--input-format', 'stream-json',
     '--include-partial-messages',
+    '--include-hook-events',
     '--verbose',
     '--permission-mode', 'bypassPermissions',
     '--dangerously-skip-permissions',
   ];
-  if (opts.model) args.push('--model', opts.model);
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
+  if (opts.modelOverride) args.push('--model', opts.modelOverride);
+  if (opts.thinkingLevel) args.push('--effort', opts.thinkingLevel);
   // orkas-bridge: ADD the per-run MCP server alongside the user's own MCP
   // config (no --strict-mcp-config — their servers must keep working), and
   // tell the agent the bridge exists via an appended system prompt.
@@ -306,7 +388,17 @@ export function mapClaudeEvent(
   partialState: { sawTextStreamEvent: boolean } = { sawTextStreamEvent: false },
 ):
   | undefined
-  | { event?: LocalEvent; captureSession?: boolean; terminal?: { status: 'completed' | 'failed'; text: string; error?: string; usage?: Record<string, number | string> } } {
+  | {
+      event?: LocalEvent;
+      events?: LocalEvent[];
+      captureSession?: boolean;
+      terminal?: {
+        status: 'completed' | 'failed';
+        text: string;
+        error?: string;
+        usage?: Record<string, number | string>;
+      };
+    } {
   if (!obj || typeof obj !== 'object') return undefined;
   const type = obj.type;
   if (type === 'system' && obj.subtype === 'init') {
@@ -318,6 +410,155 @@ export function mapClaudeEvent(
     return {
       captureSession: true,
       event: { type: 'status', status: 'running' },
+    };
+  }
+  if (type === 'system') {
+    const subtype = String(obj.subtype || '');
+    if (subtype === 'api_retry') {
+      return {
+        event: {
+          type: 'status',
+          status: 'retrying',
+          attempt: finitePositiveInteger(obj.attempt),
+          maxRetries: finitePositiveInteger(obj.max_retries),
+          retryDelayMs: finiteNonNegativeNumber(obj.retry_delay_ms),
+          errorStatus: finiteNonNegativeNumber(obj.error_status),
+          error: String(obj.error || ''),
+        },
+      };
+    }
+    if (subtype === 'status') {
+      const status = String(obj.status || '');
+      return status ? { event: { type: 'status', status } } : undefined;
+    }
+    if (subtype === 'compact_boundary') {
+      return { event: { type: 'status', status: 'compacted' } };
+    }
+    if (subtype === 'task_started') {
+      return {
+        event: {
+          type: 'status',
+          status: 'background-started',
+          taskId: String(obj.task_id || ''),
+          taskType: String(obj.task_type || ''),
+          message: String(obj.description || ''),
+        },
+      };
+    }
+    if (subtype === 'task_progress') {
+      return {
+        event: {
+          type: 'status',
+          status: 'background-running',
+          taskId: String(obj.task_id || ''),
+          taskType: String(obj.subagent_type || ''),
+          message: String(obj.summary || obj.description || obj.last_tool_name || ''),
+          usage: obj.usage && typeof obj.usage === 'object' ? obj.usage : undefined,
+        },
+      };
+    }
+    if (subtype === 'task_notification') {
+      const taskStatus = String(obj.status || 'completed').toLowerCase();
+      return {
+        event: {
+          type: 'status',
+          status: taskStatus === 'failed'
+            ? 'background-failed'
+            : (taskStatus === 'stopped' ? 'background-stopped' : 'background-completed'),
+          taskId: String(obj.task_id || ''),
+          message: String(obj.summary || ''),
+          usage: obj.usage && typeof obj.usage === 'object' ? obj.usage : undefined,
+        },
+      };
+    }
+    if (subtype === 'task_updated') {
+      const patch = obj.patch && typeof obj.patch === 'object' ? obj.patch : {};
+      const taskStatus = String(patch.status || '').toLowerCase();
+      const normalized = taskStatus === 'completed'
+        ? 'background-completed'
+        : (taskStatus === 'failed'
+            ? 'background-failed'
+            : (taskStatus === 'killed' ? 'background-stopped' : 'background-running'));
+      return {
+        event: {
+          type: 'status',
+          status: normalized,
+          taskId: String(obj.task_id || ''),
+          message: String(patch.error || patch.description || ''),
+        },
+      };
+    }
+    if (subtype === 'hook_started') {
+      return {
+        event: {
+          type: 'tool-event',
+          tool: `hook:${String(obj.hook_name || obj.hook_event || 'hook')}`,
+          callId: String(obj.hook_id || ''),
+          phase: 'use',
+          input: { event: String(obj.hook_event || '') },
+        },
+      };
+    }
+    if (subtype === 'hook_progress') {
+      return {
+        event: {
+          type: 'status',
+          status: 'tool-progress',
+          callId: String(obj.hook_id || ''),
+          tool: `hook:${String(obj.hook_name || obj.hook_event || 'hook')}`,
+          message: String(obj.output || obj.stdout || obj.stderr || ''),
+        },
+      };
+    }
+    if (subtype === 'hook_response') {
+      const output = String(obj.output || obj.stdout || obj.stderr || obj.outcome || '');
+      return {
+        event: {
+          type: 'tool-event',
+          tool: `hook:${String(obj.hook_name || obj.hook_event || 'hook')}`,
+          callId: String(obj.hook_id || ''),
+          phase: 'result',
+          output,
+        },
+      };
+    }
+    if (subtype === 'local_command_output' && typeof obj.content === 'string') {
+      return { event: { type: 'text-delta', text: obj.content } };
+    }
+  }
+  if (type === 'tool_progress') {
+    return {
+      event: {
+        type: 'status',
+        status: 'tool-progress',
+        callId: String(obj.tool_use_id || ''),
+        tool: String(obj.tool_name || 'tool'),
+        taskId: String(obj.task_id || ''),
+        elapsedSeconds: finiteNonNegativeNumber(obj.elapsed_time_seconds),
+      },
+    };
+  }
+  if (type === 'auth_status') {
+    return {
+      event: {
+        type: 'status',
+        status: obj.error ? 'error' : (obj.isAuthenticating ? 'authenticating' : 'running'),
+        message: String(obj.error || (Array.isArray(obj.output) ? obj.output.join('\n') : '')),
+      },
+    };
+  }
+  if (type === 'rate_limit_event') {
+    const info = obj.rate_limit_info && typeof obj.rate_limit_info === 'object'
+      ? obj.rate_limit_info
+      : {};
+    return {
+      event: {
+        type: 'status',
+        status: 'rate-limit',
+        rateLimitStatus: String(info.status || ''),
+        resetsAt: finiteNonNegativeNumber(info.resetsAt),
+        utilization: finiteNonNegativeNumber(info.utilization),
+      },
     };
   }
   if (type === 'log') {
@@ -372,6 +613,7 @@ export function mapClaudeEvent(
   }
   if (type === 'assistant') {
     const content = Array.isArray(obj?.message?.content) ? obj.message.content : [];
+    const events: LocalEvent[] = [];
     for (const part of content) {
       if (part?.type === 'text' && typeof part.text === 'string') {
         // Already streamed via stream_event partials → skip to avoid
@@ -379,32 +621,32 @@ export function mapClaudeEvent(
         // flag (older versions), no stream_event with text fired and
         // we fall back to emitting it here so the user still sees the
         // reply.
-        if (partialState.sawTextStreamEvent) return undefined;
-        return { event: { type: 'text-delta', text: part.text } };
+        if (!partialState.sawTextStreamEvent) {
+          events.push({ type: 'text-delta', text: part.text });
+        }
+        continue;
       }
       if (part?.type === 'thinking') {
-        if (partialState.sawTextStreamEvent) return undefined;
-        if (typeof part.thinking === 'string') {
-          return { event: { type: 'thinking', text: part.thinking } };
+        if (!partialState.sawTextStreamEvent && typeof part.thinking === 'string') {
+          events.push({ type: 'thinking', text: part.thinking });
         }
-        return undefined;
+        continue;
       }
       if (part?.type === 'tool_use') {
-        return {
-          event: {
+        events.push({
             type: 'tool-event',
             tool: String(part.name || 'unknown'),
             callId: String(part.id || ''),
             phase: 'use',
             input: part.input ?? {},
-          },
-        };
+        });
       }
     }
-    return undefined;
+    return packClaudeEvents(events);
   }
   if (type === 'user') {
     const content = Array.isArray(obj?.message?.content) ? obj.message.content : [];
+    const events: LocalEvent[] = [];
     for (const part of content) {
       if (part?.type === 'tool_result') {
         const out = typeof part.content === 'string'
@@ -412,23 +654,29 @@ export function mapClaudeEvent(
           : Array.isArray(part.content)
             ? part.content.filter((c: any) => c?.type === 'text').map((c: any) => c.text).join('\n')
             : '';
-        return {
-          event: {
+        events.push({
             type: 'tool-event',
             tool: 'tool_result',
             callId: String(part.tool_use_id || ''),
             phase: 'result',
             output: out,
-          },
-        };
+        });
       }
     }
-    return undefined;
+    return packClaudeEvents(events);
   }
   if (type === 'result') {
     const ok = obj.subtype === 'success';
     const text = typeof obj.result === 'string' ? obj.result : '';
-    const error = !ok && typeof obj.error === 'string' ? obj.error : undefined;
+    const error = !ok
+      ? (
+          typeof obj.error === 'string'
+            ? obj.error
+            : (Array.isArray(obj.errors)
+                ? obj.errors.map((entry: unknown) => String(entry || '')).filter(Boolean).join('\n')
+                : undefined)
+        )
+      : undefined;
     // Extract usage in the same shape multica daemon does
     // (input_tokens / output_tokens / cache_read_input_tokens /
     // cache_creation_input_tokens). Model lives on the message
@@ -450,6 +698,23 @@ export function mapClaudeEvent(
     };
   }
   return undefined;
+}
+
+function packClaudeEvents(events: LocalEvent[]): undefined | { event: LocalEvent; events?: LocalEvent[] } {
+  if (!events.length) return undefined;
+  return events.length === 1
+    ? { event: events[0] }
+    : { event: events[0], events };
+}
+
+function finiteNonNegativeNumber(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+function finitePositiveInteger(value: unknown): number | undefined {
+  const n = finiteNonNegativeNumber(value);
+  return n !== undefined && n > 0 ? Math.round(n) : undefined;
 }
 
 /** Pull token-usage fields out of a claude-code `type:result` record

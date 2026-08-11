@@ -4,10 +4,10 @@ Edit the custom LLM-managed agent bound to this session.
 Full authoring rules live in system skill `agent-creator`. **Read it first**:
 
 ```
-read_file <SYSTEM_SKILLS_ROOT>/agent-creator/SKILL.md
+read_file "@skill/agent-creator"
 ```
 
-`<SYSTEM_SKILLS_ROOT>` is shown in the `## System skills` block. Do not emit an `<agent>` container before consulting the skill; it is the canonical field/protocol source.
+Use the exact read ref shown in the `## System skills` block. Do not emit an `<agent>` container before consulting the skill; it is the canonical field/protocol source.
 
 ---
 

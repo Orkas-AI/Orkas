@@ -18,6 +18,18 @@ vi.mock('electron', () => ({
   },
 }));
 
+vi.mock('../../../../src/main/util/bundled-runtime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/util/bundled-runtime')>();
+  return {
+    ...actual,
+    bundledNodeExecutable: () => '/opt/orkas/runtime/node',
+    bundledRuntimeEnv: () => ({
+      ...actual.bundledRuntimeEnv(),
+      ORKAS_BUNDLED_NODE: '/opt/orkas/runtime/node',
+    }),
+  };
+});
+
 let tmpDir: string;
 let prevWs: string | undefined;
 
@@ -37,9 +49,9 @@ afterEach(() => {
 describe('core-agent client skill sandbox env', () => {
   it('passes the canonical workspace root through to bash skill invocations', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
+    const env = client.buildSkillSandboxEnv();
 
-    expect(client.buildSkillSandboxEnv()).toMatchObject({
-      ELECTRON_RUN_AS_NODE: '1',
+    expect(env).toMatchObject({
       ORKAS_PC_DIR: process.cwd(),
       ORKAS_WORKSPACE_ROOT: path.resolve(tmpDir),
       ORKAS_VENV_ROOT: path.join(path.resolve(tmpDir), 'venv'),
@@ -47,6 +59,9 @@ describe('core-agent client skill sandbox env', () => {
       UV_CACHE_DIR: path.join(path.resolve(tmpDir), 'venv', 'python', 'cache', 'uv'),
       PIP_CACHE_DIR: path.join(path.resolve(tmpDir), 'venv', 'python', 'cache', 'pip'),
     });
+    expect(env.ORKAS_NODE).toBe(env.ORKAS_BUNDLED_NODE);
+    expect(env.ORKAS_NODE).not.toBe(process.execPath);
+    expect(env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
   });
 
   it('adds the current agent id to bash skill invocations when provided', async () => {
@@ -118,6 +133,7 @@ describe('core-agent client skill sandbox env', () => {
       modelId: 'gpt-test',
       profileId: 'profile-secret-123456',
       entryId: 'entry-secret-123456',
+      elapsedConvergenceMs: 3 * 60 * 1000,
       buildDurationMs: 42,
     });
 
@@ -125,6 +141,7 @@ describe('core-agent client skill sandbox env', () => {
     expect(ctx.system_prompt_chars).toBe('private system rules'.length);
     expect(ctx.extra_root_count).toBe(1);
     expect(ctx.read_only_extra_root_count).toBe(1);
+    expect(ctx.elapsed_convergence_ms).toBe(3 * 60 * 1000);
     expect(ctx.tool_count).toBe(2);
     expect(ctx.tool_names).toEqual(['dispatch_to', 'read_file']);
     const serialized = JSON.stringify(ctx);
@@ -136,6 +153,31 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('conversation-private');
     expect(serialized).not.toContain('turn-private');
     expect(serialized).not.toContain('profile-secret');
+  });
+
+  it('preserves compound session kinds instead of truncating them at the first dash', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    expect(client.modelTurnContextForLog({ sessionId: 'extract-img-private-tail' }).session_kind)
+      .toBe('extract-img');
+    expect(client.modelTurnContextForLog({ sessionId: 'memory-extract-private-tail' }).session_kind)
+      .toBe('memory-extract');
+    expect(client.modelTurnContextForLog({ sessionId: 'private-prefix-tail' }).session_kind)
+      .toBe('unknown');
+  });
+
+  it('uses the response provider and model for external-provider fallbacks', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    expect(client.modelRunIdsForTelemetry(
+      'openrouter',
+      'openai/gpt-5.6-sol',
+      'anthropic',
+      'claude-opus-4-8',
+    )).toEqual({
+      providerId: 'anthropic',
+      modelId: 'claude-opus-4-8',
+    });
   });
 
   it('summarizes model events without tool arguments, tool results, or final text', async () => {
@@ -307,6 +349,27 @@ describe('core-agent client skill sandbox env', () => {
       candidateCount: 3,
     }, 1_220);
     client.recordModelRawEventForLog(stats, {
+      type: 'provider_empty',
+      kind: 'normal_end_empty',
+      providerId: 'private-provider-id',
+      candidateIndex: 1,
+      candidateCount: 3,
+      terminalEventSeen: true,
+      usage: { inputTokens: 12, outputTokens: 2, totalTokens: 14 },
+    }, 1_230);
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_call',
+      outcome: 'completed',
+      model: 'private-model-id',
+      durationMs: 70_000,
+    }, 1_240);
+    client.recordModelRawEventForLog(stats, {
+      type: 'provider_call',
+      outcome: 'completed',
+      model: 'private-model-id',
+      durationMs: 500,
+    }, 1_250);
+    client.recordModelRawEventForLog(stats, {
       type: 'tool_delta',
       id: 'private-call-id',
       name: 'read_file',
@@ -321,7 +384,14 @@ describe('core-agent client skill sandbox env', () => {
       providerFallbackCount: 2,
       providerFallbackAuthCount: 1,
       providerFallbackTimeoutCount: 1,
+      providerCallCount: 2,
+      providerCallMaxMs: 70_000,
+      providerSlowCallCount: 1,
       providerCandidateCount: 3,
+      providerEmptyCount: 1,
+      providerEmptyNormalCount: 1,
+      providerEmptyTerminalCount: 1,
+      providerEmptyOutputTokens: 2,
       lastFallbackCandidateIndex: 2,
     });
     expect(JSON.stringify(summary)).not.toContain('private-provider-id');

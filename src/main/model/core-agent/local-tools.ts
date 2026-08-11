@@ -15,6 +15,9 @@
  *                       does not claim it (i.e. it's not our own prior
  *                       write being refined). The rename is surfaced via a
  *                       `<file-renamed>` block in the tool result.
+ *   - `append_file`   — append one bounded UTF-8 chunk to an existing text
+ *                       file with an expected byte offset. Replayed chunks
+ *                       are idempotent; stale offsets fail without writing.
  *   - `edit_file`     — in-place `old_string → new_string` replacement on
  *                       an existing text file. Sandbox-checked
  *                       (workspace + current attachment dir + extraRoots);
@@ -46,7 +49,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 // Electron boots main/ through tsx/cjs. Keep #core-agent type-only here:
 // importing runtime values from its barrel eagerly require()s ESM-only pi-ai
@@ -69,7 +72,12 @@ import {
   normalizeBashTimeoutMs,
   writeFileTool as coreWriteFileTool,
 } from '../../../core-agent/src/tools/builtin';
-import { buildSandboxEnv, decodeProcessOutput, killProcessTree } from '../../../core-agent/src/sandbox/executor';
+import {
+  buildSandboxEnv,
+  decodeProcessOutput,
+  formatProcessStartFailure,
+  killProcessTree,
+} from '../../../core-agent/src/sandbox/executor';
 import {
   ProcessOutputCapture,
   discardStreamedToolOutput,
@@ -100,9 +108,11 @@ import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
 import {
+  renderInteractiveHtmlSmoke,
   renderResponsiveHtmlPreview,
   type HtmlPreviewViewport,
 } from '../../features/html_preview';
+import { prepareLosslessModelImage } from '../../features/image_assets';
 import {
   cancelConfirmation as cancelDeleteConfirmation,
   consumeGrantedConfirmation,
@@ -111,6 +121,13 @@ import {
 } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
 import { checkEditFreshness, forgetRead, recordRead } from './read-tracker';
+import {
+  canonicalFileRevisionPath,
+  findAppendReplay,
+  issueFileRevision,
+  recordAppendReplay,
+  resolveFileRevision,
+} from './file-revision';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { t } from '../../i18n';
@@ -128,6 +145,13 @@ import {
 } from './browser-automation-guard';
 
 const log = createLogger('local-tools');
+
+export interface ArtifactInteractionSmokeResult {
+  ok: boolean;
+  blockers: string[];
+  controlsExercised?: number;
+  observableEffects?: number;
+}
 
 export interface LocalToolsOpts {
   /** Host shell platform override for deterministic wrapper integration tests.
@@ -168,8 +192,11 @@ export interface LocalToolsOpts {
    *  mutate. This is a deny-only lane: it does not make paths readable or
    *  writable for localTools, and it overrides all-files access modes. */
   readOnlyExtraRoots?: readonly string[];
+  /** Mutable deny-only roots admitted after runner construction. File tools
+   * may read them; local write/delete/bash paths must never mutate them. */
+  runtimeReadOnlyRoots?: readonly string[];
   /** Fires with absolute path after every successful write (write_file,
-   * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
+   * append_file, edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Validates and records the complete list declared through
@@ -179,15 +206,17 @@ export interface LocalToolsOpts {
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
   onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Internal override for deterministic tests. Production uses the packaged
+   *  isolated-browser interaction smoke before exposing an artifact card. */
+  artifactInteractionSmoke?: (entryPath: string) => Promise<ArtifactInteractionSmokeResult>;
   /** Predicate: returns true when the given absolute path was already
    *  written by this caller in the current scope (typically: a Set
-   *  populated by `onFileWritten` this turn). When true, the wrapped
-   *  tool overwrites in place — the refinement pattern. When false /
-   *  absent, an existing file at the target is treated as a foreign
-   *  collision and uniquify (`-2 / -3 / ...`) kicks in. Consumed by
-   *  `write_file` / `markdown_to_pdf` / `html_to_pdf`; `edit_file`
-   *  ignores it (its semantics is "modify existing", uniquify would be
-   *  wrong). */
+   *  populated by `onFileWritten` this turn). When true, wrapped output
+   *  tools overwrite in place — the refinement pattern — and the shared bash
+   *  gate may delete that exact file without a generic destructive prompt.
+   *  When false / absent, an existing output target is treated as a foreign
+   *  collision and uniquify (`-2 / -3 / ...`) kicks in. `edit_file` ignores
+   *  it because its semantics is explicitly to modify an existing file. */
   hasProducedPath?: (absPath: string) => boolean;
 }
 
@@ -495,6 +524,7 @@ function protectedWriteRootsFor(opts: LocalToolsOpts): string[] {
     );
   }
   if (opts.readOnlyExtraRoots?.length) roots.push(...opts.readOnlyExtraRoots);
+  if (opts.runtimeReadOnlyRoots?.length) roots.push(...opts.runtimeReadOnlyRoots);
   return _uniqueResolvedRoots(roots);
 }
 
@@ -1021,13 +1051,41 @@ async function executeDirectOrkasCli(
     let settleTimer: NodeJS.Timeout | null = null;
     let abortListener: (() => void) | null = null;
 
-    const child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
-      cwd: workingDir,
-      env,
-      detached: process.platform !== 'win32',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true,
-    });
+    const startFailureResult = (error: unknown): ToolResult => {
+      const message = formatProcessStartFailure(error);
+      return withDirectCommandObservation(
+        { content: message, isError: true },
+        {
+          status: 'start_failed',
+          exitCode: null,
+          durationMs: Date.now() - startedAt,
+          timedOut: false,
+          outputLimitExceeded: false,
+          stdout: '',
+          stderr: message,
+          stdoutBytes: 0,
+          stderrBytes: Buffer.byteLength(message),
+          stdoutTruncated: false,
+          stderrTruncated: false,
+        },
+      );
+    };
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
+        cwd: workingDir,
+        env,
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      stdoutCapture?.discard();
+      stderrCapture?.discard();
+      resolve(startFailureResult(error));
+      return;
+    }
 
     const finish = (result: ToolResult) => {
       if (settled) return;
@@ -1233,22 +1291,7 @@ async function executeDirectOrkasCli(
     child.on('error', (err) => {
       stdoutCapture?.discard();
       stderrCapture?.discard();
-      finish(withDirectCommandObservation(
-        { content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true },
-        {
-          status: 'start_failed',
-          exitCode: null,
-          durationMs: Date.now() - startedAt,
-          timedOut: false,
-          outputLimitExceeded: false,
-          stdout: '',
-          stderr: err.message,
-          stdoutBytes: 0,
-          stderrBytes: Buffer.byteLength(err.message),
-          stdoutTruncated: false,
-          stderrTruncated: false,
-        },
-      ));
+      finish(startFailureResult(err));
     });
     child.on('close', (code) => {
       finishFromChunks(code);
@@ -1426,6 +1469,12 @@ function deleteRequiresUserConfirmation(opts: LocalToolsOpts, abs: string): bool
 }
 
 type BashPathToken = { type: 'word' | 'op'; value: string };
+type BashPathSegment = {
+  words: string[];
+  redirectTargets: string[];
+  inputTargets: string[];
+  separatorAfter?: string;
+};
 type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean };
 type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
 type BashFilesystemGuardResult = { result: ToolResult | null; approvedReasons: LocalAccessRiskCategory[] };
@@ -1437,6 +1486,10 @@ const BASH_NON_FILE_INPUT_REDIR_OPS = new Set(['<<', '<<<']);
 const BASH_GUARD_WRAPPERS = new Set(['env', 'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid']);
 const BASH_GUARD_PRIV_ESC = new Set(['sudo', 'doas', 'pkexec']);
 const BASH_MUTATE_ALL_OPERANDS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'mkdir', 'touch', 'chmod', 'chown', 'chgrp', 'mv', 'ln']);
+const BASH_DELETE_MUTATION_CMDS = new Set(['rm', 'rmdir', 'unlink']);
+const BASH_SHRED_FLAGS_WITH_VALUE = new Set([
+  '-n', '--iterations', '-s', '--size', '--random-source',
+]);
 const BASH_DEST_LAST_OPERAND = new Set(['cp', 'install', 'rsync']);
 const BASH_READ_ALL_OPERANDS = new Set([
   'cat', 'less', 'more', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls', 'find',
@@ -1444,10 +1497,18 @@ const BASH_READ_ALL_OPERANDS = new Set([
   'get-content', 'get-childitem', 'get-item', 'test-path', 'resolve-path',
 ]);
 const BASH_READ_PATTERN_FIRST_CMDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack']);
+/** A path echoed back in a refusal, bounded. An unresolvable "target" can be a
+ *  whole script body, and quoting all of it buries the instruction under it. */
+export function truncateForMessage(raw: string): string {
+  const oneLine = String(raw || '').replace(/\s+/g, ' ').trim();
+  return oneLine.length > 80 ? `${oneLine.slice(0, 79)}…` : oneLine;
+}
+
 const BASH_READ_SCRIPT_CMDS = new Set([
   'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
   'python', 'python3', 'node', 'ruby', 'perl', 'php',
 ]);
+const BASH_POSIX_SHELL_CMDS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish']);
 const BASH_PROTECTED_READ_ONLY_CMDS = new Set([
   'cat', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls',
   'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'find',
@@ -1475,6 +1536,170 @@ const POWERSHELL_CONTENT_FLAGS_WITH_VALUE = new Set([
   '-exclude',
   '-stream',
 ]);
+const POWERSHELL_DELETE_PATH_FLAGS = new Set(['-path', '-literalpath']);
+const POWERSHELL_DELETE_FLAGS_WITH_VALUE = new Set([
+  ...POWERSHELL_DELETE_PATH_FLAGS,
+  '-erroraction',
+  '-warningaction',
+  '-informationaction',
+  '-progressaction',
+  '-errorvariable',
+  '-warningvariable',
+  '-informationvariable',
+  '-outvariable',
+  '-outbuffer',
+  '-pipelinevariable',
+]);
+const POWERSHELL_DELETE_UNSAFE_FLAGS = new Set(['-recurse', '-include', '-exclude', '-filter']);
+const POWERSHELL_DELETE_SWITCHES = new Set([
+  '-force', '-whatif', '-verbose', '-debug', '-confirm:$false',
+]);
+const POSIX_RM_SAFE_SWITCHES = new Set([
+  '-f', '--force', '-v', '--verbose',
+  '--preserve-root', '--no-preserve-root',
+]);
+
+type BashHeredocSpec = { delimiter: string; stripTabs: boolean; shellPayload: boolean };
+
+function bashHeredocReceiverIsShell(prefix: string): boolean {
+  let words: string[] = [];
+  let expectOperand = false;
+  for (const token of tokenizeBashPathGuard(prefix)) {
+    if (token.type === 'op') {
+      if (BASH_PATH_SEGMENT_OPS.has(token.value)) words = [];
+      expectOperand = BASH_OUTPUT_REDIR_OPS.has(token.value)
+        || BASH_FILE_INPUT_REDIR_OPS.has(token.value)
+        || BASH_NON_FILE_INPUT_REDIR_OPS.has(token.value);
+      continue;
+    }
+    if (expectOperand) { expectOperand = false; continue; }
+    words.push(token.value);
+  }
+  const effective = bashEffectiveCommand(words);
+  return !!effective && BASH_POSIX_SHELL_CMDS.has(effective.cmd);
+}
+
+/**
+ * Find POSIX heredoc openers on one shell command line. The heredoc payload is
+ * data for the receiving process, not shell syntax; parsing it as shell text
+ * makes JavaScript arrows (`=>`) and comparisons look like redirections.
+ */
+function bashHeredocSpecs(line: string): BashHeredocSpec[] {
+  const specs: BashHeredocSpec[] = [];
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let arithmeticDepth = 0;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && quote !== "'") { escaped = true; continue; }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (arithmeticDepth > 0) {
+      if (ch === '(') arithmeticDepth += 1;
+      else if (ch === ')') arithmeticDepth -= 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === '#' && (i === 0 || /\s/.test(line[i - 1]))) break;
+    if (line.slice(i, i + 3) === '$((') {
+      arithmeticDepth = 2;
+      i += 2;
+      continue;
+    }
+    if (line.slice(i, i + 2) === '(('
+      && (i === 0 || /[\s;&|()]/.test(line[i - 1]))) {
+      arithmeticDepth = 2;
+      i += 1;
+      continue;
+    }
+    if (ch !== '<' || line[i + 1] !== '<' || line[i + 2] === '<') continue;
+
+    let j = i + 2;
+    let stripTabs = false;
+    if (line[j] === '-') { stripTabs = true; j += 1; }
+    while (line[j] === ' ' || line[j] === '\t') j += 1;
+
+    let delimiter = '';
+    let wordQuote: "'" | '"' | null = null;
+    let wordEscaped = false;
+    let started = false;
+    for (; j < line.length; j++) {
+      const c = line[j];
+      if (wordEscaped) {
+        delimiter += c;
+        started = true;
+        wordEscaped = false;
+        continue;
+      }
+      if (c === '\\' && wordQuote !== "'") {
+        wordEscaped = true;
+        started = true;
+        continue;
+      }
+      if (wordQuote) {
+        if (c === wordQuote) wordQuote = null;
+        else delimiter += c;
+        started = true;
+        continue;
+      }
+      if (c === "'" || c === '"') {
+        wordQuote = c;
+        started = true;
+        continue;
+      }
+      if (/\s/.test(c) || /[;&|<>]/.test(c)) break;
+      delimiter += c;
+      started = true;
+    }
+    if (started && delimiter) {
+      specs.push({ delimiter, stripTabs, shellPayload: bashHeredocReceiverIsShell(line.slice(0, i)) });
+    }
+    i = Math.max(i, j - 1);
+  }
+  return specs;
+}
+
+/** Preserve shell command lines/newlines while blanking heredoc payload and
+ * terminator lines. This surface is only for shell path syntax analysis; the
+ * original command still goes through protected-root checks, risk approval,
+ * configured command policies, and the OS write sandbox. */
+function maskBashHeredocBodies(command: string): string {
+  const pending: BashHeredocSpec[] = [];
+  let out = '';
+  let offset = 0;
+  while (offset < command.length) {
+    let end = offset;
+    while (end < command.length && command[end] !== '\n' && command[end] !== '\r') end += 1;
+    const line = command.slice(offset, end);
+    let newline = '';
+    if (end < command.length) {
+      if (command[end] === '\r' && command[end + 1] === '\n') {
+        newline = '\r\n';
+        end += 2;
+      } else {
+        newline = command[end];
+        end += 1;
+      }
+    }
+
+    if (pending.length) {
+      const current = pending[0];
+      const comparable = current.stripTabs ? line.replace(/^\t+/, '') : line;
+      const isTerminator = comparable === current.delimiter;
+      out += (current.shellPayload && !isTerminator ? line : ' '.repeat(line.length)) + newline;
+      if (isTerminator) pending.shift();
+    } else {
+      out += line + newline;
+      pending.push(...bashHeredocSpecs(line));
+    }
+    offset = end;
+  }
+  return out;
+}
 
 function tokenizeBashPathGuard(input: string): BashPathToken[] {
   const toks: BashPathToken[] = [];
@@ -1542,23 +1767,25 @@ function tokenizeBashPathGuard(input: string): BashPathToken[] {
   return toks;
 }
 
-function bashPathSegments(command: string): Array<{ words: string[]; redirectTargets: string[]; inputTargets: string[] }> {
-  const out: Array<{ words: string[]; redirectTargets: string[]; inputTargets: string[] }> = [];
+function bashPathSegments(command: string): BashPathSegment[] {
+  const out: BashPathSegment[] = [];
   let words: string[] = [];
   let redirectTargets: string[] = [];
   let inputTargets: string[] = [];
   let expect: 'out' | 'in' | 'skip' | null = null;
-  const push = () => {
-    if (words.length || redirectTargets.length || inputTargets.length) out.push({ words, redirectTargets, inputTargets });
+  const push = (separatorAfter?: string) => {
+    if (words.length || redirectTargets.length || inputTargets.length) {
+      out.push({ words, redirectTargets, inputTargets, ...(separatorAfter ? { separatorAfter } : {}) });
+    }
     words = [];
     redirectTargets = [];
     inputTargets = [];
   };
 
-  for (const tok of tokenizeBashPathGuard(command)) {
+  for (const tok of tokenizeBashPathGuard(maskBashHeredocBodies(command))) {
     if (tok.type === 'op') {
       if (BASH_PATH_SEGMENT_OPS.has(tok.value)) {
-        push();
+        push(tok.value);
         expect = null;
       } else if (BASH_OUTPUT_REDIR_OPS.has(tok.value)) {
         expect = 'out';
@@ -1588,6 +1815,97 @@ function bashPathSegments(command: string): Array<{ words: string[]; redirectTar
     words.push(tok.value);
   }
   push();
+  return out;
+}
+
+const BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS = new Set([';', '&&']);
+const BASH_ASSIGNMENT_BUILTINS = new Set(['export', 'readonly', 'declare', 'typeset', 'local']);
+const BASH_UNSET_BUILTINS = new Set(['unset', 'unset-variable', 'remove-variable', 'clear-variable']);
+const BASH_PATH_ASSIGN_WORD_RE = /^([A-Za-z_][A-Za-z0-9_]*)(\+)?=(.*)$/s;
+
+function bashLiteralAssignmentValue(value: string): string | null {
+  if (!value
+    || /[$`*?\[\]{}]/.test(value)
+    || /%[A-Za-z_][A-Za-z0-9_]*%/.test(value)
+    || /(^|:)~(?:[/\\]|$)/.test(value)) return null;
+  return value;
+}
+
+/** Resolve only assignments whose value is already a literal in a completed
+ * shell statement. Temporary command assignments, pipelines, background jobs,
+ * loop variables, substitutions, and calculated PowerShell expressions remain
+ * unresolved and fail closed. */
+function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<string, string | null> | null {
+  if (!segment.separatorAfter || !BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) return null;
+  if (segment.words.length > 0 && segment.words.every((word) => BASH_PATH_ASSIGN_WORD_RE.test(word))) {
+    const assignments: Record<string, string | null> = {};
+    for (const word of segment.words) {
+      const match = BASH_PATH_ASSIGN_WORD_RE.exec(word)!;
+      assignments[match[1]] = match[2] ? null : bashLiteralAssignmentValue(match[3]);
+    }
+    return assignments;
+  }
+
+  if (segment.words.length >= 2 && segment.words[1] === '=') {
+    const match = /^\$(?:env:)?([A-Za-z_][A-Za-z0-9_]*)$/i.exec(segment.words[0]);
+    if (match) {
+      const value = segment.words.length === 3 ? bashLiteralAssignmentValue(segment.words[2]) : null;
+      return { [match[1]]: value };
+    }
+  }
+
+  const command = segment.words[0]?.toLowerCase();
+  if ((command === 'for' || command === 'select') && /^[A-Za-z_][A-Za-z0-9_]*$/.test(segment.words[1] || '')) {
+    return { [segment.words[1]]: null };
+  }
+  if (command && BASH_ASSIGNMENT_BUILTINS.has(command)) {
+    const assignments: Record<string, null> = {};
+    for (const word of segment.words.slice(1)) {
+      const match = BASH_PATH_ASSIGN_WORD_RE.exec(word);
+      if (match) assignments[match[1]] = null;
+    }
+    return Object.keys(assignments).length ? assignments : null;
+  }
+  if (command && BASH_UNSET_BUILTINS.has(command)) {
+    const assignments: Record<string, null> = {};
+    for (const word of segment.words.slice(1)) {
+      const name = word.replace(/^\$(?:env:)?/i, '');
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) assignments[name] = null;
+    }
+    return Object.keys(assignments).length ? assignments : null;
+  }
+  if (command === 'read') {
+    const names = segment.words.slice(1).filter((word) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(word));
+    return Object.fromEntries((names.length ? names : ['REPLY']).map((name) => [name, null]));
+  }
+  if (command === 'printf') {
+    const variableIndex = segment.words.findIndex((word) => word === '-v');
+    const name = variableIndex >= 0 ? segment.words[variableIndex + 1] : '';
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name || '')) return { [name]: null };
+  }
+  return null;
+}
+
+function updateBashPathEnv(env: Record<string, string>, assignments: Record<string, string | null>): void {
+  for (const [name, value] of Object.entries(assignments)) {
+    for (const existing of Object.keys(env)) {
+      if (existing.toLowerCase() === name.toLowerCase()) delete env[existing];
+    }
+    if (value !== null) env[name] = value;
+  }
+}
+
+function bashPathSegmentsWithEnv(
+  command: string,
+  baseEnv: Record<string, string>,
+): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
+  const env = { ...baseEnv };
+  const out: Array<{ segment: BashPathSegment; env: Record<string, string> }> = [];
+  for (const segment of bashPathSegments(command)) {
+    out.push({ segment, env: { ...env } });
+    const assignments = bashPersistentLiteralAssignments(segment);
+    if (assignments) updateBashPathEnv(env, assignments);
+  }
   return out;
 }
 
@@ -1674,10 +1992,125 @@ function powershellContentWriteOperands(args: string[]): string[] {
   return bashNonFlagOperands(args, POWERSHELL_CONTENT_FLAGS_WITH_VALUE).slice(0, 1);
 }
 
+function powershellDeleteOperands(args: string[]): string[] {
+  const explicit: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i].toLowerCase();
+    if (POWERSHELL_DELETE_PATH_FLAGS.has(flag) && args[i + 1]) {
+      explicit.push(args[i + 1]);
+      i += 1;
+    }
+  }
+  if (explicit.length) return explicit;
+  return bashNonFlagOperands(args, POWERSHELL_DELETE_FLAGS_WITH_VALUE);
+}
+
+function bashMutationOperands(cmd: string, args: string[]): string[] {
+  // Delete switches such as `rm -f` do not consume the following path. The
+  // generic table includes value-taking flags used by unrelated commands.
+  if (BASH_DELETE_MUTATION_CMDS.has(cmd)) return bashNonFlagOperands(args, new Set());
+  if (cmd === 'shred') return bashNonFlagOperands(args, BASH_SHRED_FLAGS_WITH_VALUE);
+  return bashNonFlagOperands(args);
+}
+
+function windowsDeleteOperands(args: string[]): string[] {
+  return args.filter((arg) => !/^\/(?:[afq]|a(?::.*)?)$/i.test(arg));
+}
+
+function simpleFileDeleteOperands(cmd: string, args: string[]): string[] | null {
+  if (cmd === 'rm') {
+    if (args.some((arg) => arg === '--recursive' || /^-[A-Za-z]*[rR][A-Za-z]*$/.test(arg))) return null;
+    for (const arg of args) {
+      if (arg === '--' || !arg.startsWith('-')) continue;
+      if (POSIX_RM_SAFE_SWITCHES.has(arg) || arg.startsWith('--preserve-root=')) continue;
+      if (/^-[fv]+$/.test(arg)) continue;
+      return null;
+    }
+    return bashNonFlagOperands(args, new Set());
+  }
+  if (cmd === 'unlink') {
+    if (args.some((arg) => arg.startsWith('-') && arg !== '--')) return null;
+    return bashNonFlagOperands(args, new Set());
+  }
+  if (cmd === 'remove-item') {
+    const lower = args.map((arg) => arg.toLowerCase());
+    if (lower.some((arg) => POWERSHELL_DELETE_UNSAFE_FLAGS.has(arg))) return null;
+    for (let i = 0; i < args.length; i++) {
+      const flag = lower[i];
+      if (!args[i].startsWith('-')) continue;
+      if (POWERSHELL_DELETE_FLAGS_WITH_VALUE.has(flag)) {
+        if (!args[i + 1]) return null;
+        i += 1;
+        continue;
+      }
+      if (POWERSHELL_DELETE_SWITCHES.has(flag)) continue;
+      return null;
+    }
+    return powershellDeleteOperands(args);
+  }
+  if (cmd === 'del' || cmd === 'erase') {
+    if (args.some((arg) => /^\/[ps]$/i.test(arg))) return null;
+    if (args.some((arg) => arg.startsWith('/') && !/^\/(?:[afq]|a(?::.*)?)$/i.test(arg))) return null;
+    return windowsDeleteOperands(args);
+  }
+  return null;
+}
+
+function isLiteralOwnedDeleteTarget(
+  raw: string,
+  workingDir: string,
+  env: Record<string, string>,
+  hasProducedPath: (absPath: string) => boolean,
+): boolean {
+  if (!raw || /[$`*?\[\]{}]/.test(raw) || /%[A-Za-z_][A-Za-z0-9_]*%/.test(raw) || /^@\(/.test(raw)) {
+    return false;
+  }
+  const resolved = resolveBashCandidate(raw, workingDir, env);
+  return !!resolved?.abs && !resolved.dynamic && hasProducedPath(resolved.abs);
+}
+
+/**
+ * Narrow ownership exception for the generic `destructive` command category.
+ * Every destructive segment must be a simple, literal, non-recursive file
+ * deletion and every target must be owned by this conversation. Other risk
+ * categories and configured policy matches are evaluated separately.
+ */
+export function bashDestructiveRiskIsOnlyProducedFileDeletion(
+  command: string,
+  workingDir: string,
+  env: Record<string, string>,
+  hasProducedPath: ((absPath: string) => boolean) | undefined,
+): boolean {
+  if (!hasProducedPath || !command.trim()) return false;
+  let sawOwnedFileDelete = false;
+  for (const { segment, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+    if (segment.redirectTargets.length || segment.inputTargets.length) return false;
+    const effective = bashEffectiveCommand(segment.words);
+    if (!effective) continue;
+    const operands = simpleFileDeleteOperands(effective.cmd, effective.args);
+    if (operands !== null) {
+      if (!operands.length || !operands.every((raw) => (
+        isLiteralOwnedDeleteTarget(raw, workingDir, segmentEnv, hasProducedPath)
+      ))) return false;
+      sawOwnedFileDelete = true;
+      continue;
+    }
+    if (classifyBashCommand(segment.words.join(' ')).reasons.includes('destructive')) return false;
+  }
+  return sawOwnedFileDelete;
+}
+
 function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<string, string> {
+  const hostPathEnv: Record<string, string> = {};
+  for (const name of ['HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR']) {
+    const value = process.env[name];
+    if (value) hostPathEnv[name] = value;
+  }
   return {
+    ...hostPathEnv,
     ...(ctx.state.sandboxEnv as Record<string, string> | undefined),
     ORKAS_OUTPUT_DIR: workingDir,
+    ORKAS_OUTPUT_MANIFEST: path.join(workingDir, BASH_OUTPUT_MANIFEST_NAME),
     PWD: workingDir,
     HOME: process.env.HOME || process.env.USERPROFILE || '',
   };
@@ -1808,57 +2241,75 @@ function awkReadOperands(args: string[]): string[] {
   return hasScriptFile ? operands : operands.slice(1);
 }
 
-function collectBashMutationCandidates(command: string, workingDir: string, env: Record<string, string>): BashPathCandidate[] {
+function collectBashMutationCandidates(
+  command: string,
+  workingDir: string,
+  env: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const seg of bashPathSegments(command)) {
-    for (const target of seg.redirectTargets) addBashCandidate(out, target, 'redirection', workingDir, env);
+  for (const { segment: seg, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+    for (const target of seg.redirectTargets) {
+      if (hostPlatform === 'win32' && target.toLowerCase() === '$null') continue;
+      addBashCandidate(out, target, 'redirection', workingDir, segmentEnv);
+    }
     const eff = bashEffectiveCommand(seg.words);
     if (!eff) continue;
     const { cmd, args } = eff;
 
     if (POWERSHELL_CONTENT_WRITE_CMDS.has(cmd)) {
       for (const operand of powershellContentWriteOperands(args)) {
-        addBashCandidate(out, operand, cmd, workingDir, env);
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      }
+    } else if (cmd === 'remove-item') {
+      for (const operand of powershellDeleteOperands(args)) {
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      }
+    } else if (cmd === 'del' || cmd === 'erase') {
+      for (const operand of windowsDeleteOperands(args)) {
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
       }
     } else if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
-      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+      for (const operand of bashMutationOperands(cmd, args)) {
+        addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
+      }
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
-      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, workingDir, env);
+      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, workingDir, segmentEnv);
     } else if (cmd === 'tee') {
       for (const operand of bashNonFlagOperands(args, new Set(['-a', '-i', '-p', '--append', '--ignore-interrupts']))) {
-        addBashCandidate(out, operand, 'tee output', workingDir, env);
+        addBashCandidate(out, operand, 'tee output', workingDir, segmentEnv);
       }
     } else if (cmd === 'dd') {
-      for (const a of args) if (a.startsWith('of=')) addBashCandidate(out, a.slice(3), 'dd output', workingDir, env);
+      for (const a of args) if (a.startsWith('of=')) addBashCandidate(out, a.slice(3), 'dd output', workingDir, segmentEnv);
     } else if (cmd === 'sed' && args.some((a) => a === '-i' || a.startsWith('-i'))) {
       for (const operand of bashNonFlagOperands(args).filter((a) => {
-        const r = resolveBashCandidate(a, workingDir, env);
+        const r = resolveBashCandidate(a, workingDir, segmentEnv);
         return !!r?.abs && fs.existsSync(r.abs);
-      })) addBashCandidate(out, operand, 'sed in-place edit', workingDir, env);
+      })) addBashCandidate(out, operand, 'sed in-place edit', workingDir, segmentEnv);
     } else if (cmd === 'perl' && args.some((a) => /^-.*i/.test(a))) {
       for (const operand of bashNonFlagOperands(args).filter((a) => {
-        const r = resolveBashCandidate(a, workingDir, env);
+        const r = resolveBashCandidate(a, workingDir, segmentEnv);
         return !!r?.abs && fs.existsSync(r.abs);
-      })) addBashCandidate(out, operand, 'perl in-place edit', workingDir, env);
+      })) addBashCandidate(out, operand, 'perl in-place edit', workingDir, segmentEnv);
     } else if (cmd === 'curl') {
-      addBashCurlTargets(out, args, workingDir, env);
+      addBashCurlTargets(out, args, workingDir, segmentEnv);
     } else if (cmd === 'wget') {
-      addBashWgetTargets(out, args, workingDir, env);
+      addBashWgetTargets(out, args, workingDir, segmentEnv);
     } else if (cmd === 'git' && args[0] === 'clone') {
       const dest = gitCloneDestination(args);
-      if (dest) addBashCandidate(out, dest, 'git clone destination', workingDir, env);
+      if (dest) addBashCandidate(out, dest, 'git clone destination', workingDir, segmentEnv);
     } else if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'clone') {
       const dest = gitCloneDestination(args, true);
-      if (dest) addBashCandidate(out, dest, 'gh repo clone destination', workingDir, env);
+      if (dest) addBashCandidate(out, dest, 'gh repo clone destination', workingDir, segmentEnv);
     } else if (cmd === 'tar' && args.some((a) => /^-.*x/.test(a) || a === '--extract')) {
       const cIdx = args.findIndex((a) => a === '-C' || a === '--directory');
       const eq = args.find((a) => a.startsWith('--directory='));
-      if (cIdx >= 0 && args[cIdx + 1]) addBashCandidate(out, args[cIdx + 1], 'tar extract directory', workingDir, env);
-      else if (eq) addBashCandidate(out, eq.slice('--directory='.length), 'tar extract directory', workingDir, env);
+      if (cIdx >= 0 && args[cIdx + 1]) addBashCandidate(out, args[cIdx + 1], 'tar extract directory', workingDir, segmentEnv);
+      else if (eq) addBashCandidate(out, eq.slice('--directory='.length), 'tar extract directory', workingDir, segmentEnv);
     } else if (cmd === 'unzip') {
       const dIdx = args.findIndex((a) => a === '-d');
-      if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', workingDir, env);
+      if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', workingDir, segmentEnv);
     }
   }
   return out;
@@ -1866,35 +2317,35 @@ function collectBashMutationCandidates(command: string, workingDir: string, env:
 
 function collectBashReadCandidates(command: string, workingDir: string, env: Record<string, string>): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const seg of bashPathSegments(command)) {
-    for (const target of seg.inputTargets) addBashCandidate(out, target, 'input redirection', workingDir, env);
+  for (const { segment: seg, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+    for (const target of seg.inputTargets) addBashCandidate(out, target, 'input redirection', workingDir, segmentEnv);
     const eff = bashEffectiveCommand(seg.words);
     if (!eff) continue;
     const { cmd, args } = eff;
 
     if (BASH_READ_ALL_OPERANDS.has(cmd)) {
-      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
     } else if (BASH_READ_PATTERN_FIRST_CMDS.has(cmd)) {
-      for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+      for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
     } else if (cmd === 'sed') {
-      for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', workingDir, env);
+      for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', workingDir, segmentEnv);
     } else if (cmd === 'awk') {
-      for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', workingDir, env);
+      for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', workingDir, segmentEnv);
     } else if (cmd === 'cd' || cmd === 'pushd') {
       const operand = bashNonFlagOperands(args)[0];
-      if (operand) addBashCandidate(out, operand, cmd, workingDir, env);
+      if (operand) addBashCandidate(out, operand, cmd, workingDir, segmentEnv);
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
       const operands = bashNonFlagOperands(args);
-      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, workingDir, env);
+      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, workingDir, segmentEnv);
     } else if (BASH_READ_SCRIPT_CMDS.has(cmd)) {
       const operand = bashScriptOperand(cmd, args);
-      if (operand) addBashCandidate(out, operand, `${cmd} script`, workingDir, env);
+      if (operand) addBashCandidate(out, operand, `${cmd} script`, workingDir, segmentEnv);
     } else if (cmd === 'tar') {
       const operand = tarFileOperand(args);
-      if (operand) addBashCandidate(out, operand, 'tar archive', workingDir, env);
+      if (operand) addBashCandidate(out, operand, 'tar archive', workingDir, segmentEnv);
     } else if (cmd === 'unzip') {
       const operand = bashNonFlagOperands(args)[0];
-      if (operand) addBashCandidate(out, operand, 'unzip archive', workingDir, env);
+      if (operand) addBashCandidate(out, operand, 'unzip archive', workingDir, segmentEnv);
     }
   }
   return out;
@@ -1970,7 +2421,7 @@ async function guardBashPathCandidates(
         result: {
           content: errText(
             'E_BASH_DYNAMIC_PATH_UNSUPPORTED',
-            `bash ${c.reason} target "${c.raw}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
+            `The ${c.reason} target "${truncateForMessage(c.raw)}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
             + (access === 'write'
               ? 'Use an explicit path inside the workspace, or use write_file/edit_file/delete_file for file changes.'
               : 'Use an explicit path inside the workspace, or ask the user to switch to an all-files access mode.'),
@@ -2016,7 +2467,7 @@ async function guardBashFilesystemTargets(
     opts,
     ctx,
     workingDir,
-    collectBashMutationCandidates(command, workingDir, env),
+    collectBashMutationCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform),
     'write',
   );
   mergeRiskReasons(approvedReasons, mutation.approvedReasons);
@@ -2049,6 +2500,50 @@ function editableFileHash(body: string): string {
   return `sha256:${crypto.createHash('sha256').update(body, 'utf8').digest('hex')}`;
 }
 
+/**
+ * One graded fallback for `edit_file`: match again ignoring TRAILING
+ * whitespace at each internal line break, and only when that lands on exactly
+ * one span.
+ *
+ * `old_string` is byte-exact, so a multi-line block whose only difference is a
+ * stray space before a newline fails with E_NO_MATCH and costs a round trip —
+ * a re-read plus a retry. Claude Code measures a 6-7% Edit error rate as its
+ * normal baseline (`utils/file.ts`, compact-prefix soak); a VideoStudio run on
+ * 2026-08-07 hit 2 in 16. Codex's apply_patch already relaxes the same way
+ * (`apply-patch/src/seek_sequence.rs`: exact, then rstrip, then trim).
+ *
+ * Deliberately narrow:
+ *  - LEADING whitespace is never relaxed. Indentation carries meaning in
+ *    Python and YAML, and relaxing it lets a needle match a differently
+ *    nested block that reads the same.
+ *  - Single-line needles are never relaxed. There is no internal line break to
+ *    disagree about, and a bare `foo` would start matching `foo   `.
+ *  - A relaxed match that is not unique is refused, so the fallback can never
+ *    pick between candidates the caller did not distinguish.
+ */
+function findTrailingWhitespaceRelaxedMatch(
+  body: string,
+  needle: string,
+): { text: string; count: number } | null {
+  if (!needle.includes('\n')) return null;
+  const escape = (raw: string): string => raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Strip the needle's own line-end whitespace as well, so the relaxation is
+  // symmetric: it repairs a needle that dropped spaces the file has AND a
+  // needle that added spaces the file does not have.
+  const pattern = needle
+    .split('\n')
+    .map((line) => escape(line.replace(/[ \t]+$/, '')))
+    .join('[ \\t]*\\r?\\n');
+  let matches: RegExpMatchArray | null;
+  try {
+    matches = body.match(new RegExp(pattern, 'g'));
+  } catch {
+    return null;
+  }
+  if (!matches?.length) return null;
+  return { text: matches[0], count: matches.length };
+}
+
 function deletedFileObservation(abs: string, st: fs.Stats): FileChangeObservation {
   if (kindOf(abs) === 'text') {
     try {
@@ -2074,6 +2569,44 @@ function deletedFileObservation(abs: string, st: fs.Stats): FileChangeObservatio
     binary: true,
     coverage: 'exact',
   };
+}
+
+/**
+ * Why this `old_string` did not match, computed rather than left to the caller.
+ *
+ * Both strings are already in hand, so the comparison the caller would have to
+ * make by eye costs nothing here. 2026-08-08: after reading one region eight
+ * times a caller sent a block whose fourth line — a JS comment it had built
+ * from an HTML comment elsewhere in the file — existed nowhere; it got 1,200
+ * characters of surrounding text and "retry with an old_string copied from
+ * this current raw context", tried a hand-shortened fragment, failed again,
+ * and burned two round trips at roughly 30 seconds each. "Line 4 is not in the
+ * file" ends that immediately.
+ */
+function editNoMatchReason(body: string, needle: string): string {
+  const shorten = (text: string): string => (text.length > 90 ? `${text.slice(0, 90)}…` : text);
+  const needleLines = needle.split(/\r?\n/);
+  const bodyLines = new Set(body.split(/\r?\n/).map((line) => line.trim()));
+  for (const [index, line] of needleLines.entries()) {
+    const trimmed = line.trim();
+    // A fragment the caller sliced out of a longer line is still present, so
+    // `includes` has to clear it before the line counts as invented.
+    if (!trimmed || bodyLines.has(trimmed) || body.includes(trimmed)) continue;
+    return `Line ${index + 1} of \`old_string\` appears nowhere in the file: ${JSON.stringify(shorten(trimmed))}.`;
+  }
+  const deindent = (text: string): string => text
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[ \t]+/, ''))
+    .join('\n');
+  if (needleLines.length > 1 && deindent(body).includes(deindent(needle))) {
+    return 'Every line matches once leading indentation is removed, so `old_string` has different indentation from the file. Leading whitespace is never relaxed — copy the lines exactly.';
+  }
+  if (body.replace(/\r\n/g, '\n').includes(needle.replace(/\r\n/g, '\n'))) {
+    return 'The block matches apart from line endings: the file and `old_string` disagree on CRLF vs LF.';
+  }
+  return needleLines.filter((line) => line.trim()).length > 1
+    ? 'Every line of `old_string` exists in the file, but not as one consecutive block — something sits between them, or they appear in a different order.'
+    : '';
 }
 
 function editRecoveryContext(body: string, needle: string, fileHash: string): string {
@@ -2117,6 +2650,61 @@ function extractRunSkillRefs(command: string): string[] {
   return out;
 }
 
+function readSkillDisplayNameForDisabledGuard(skillDir: string): string {
+  try {
+    const md = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+    if (!md.startsWith('---')) return '';
+    const end = md.indexOf('\n---', 3);
+    if (end < 0) return '';
+    for (const line of md.slice(3, end).split(/\r?\n/)) {
+      if (!line || /^\s/.test(line)) continue;
+      const match = /^name\s*:\s*(.*)$/.exec(line);
+      if (!match) continue;
+      const raw = match[1].trim();
+      if (raw.startsWith('"')) {
+        try {
+          const parsed = JSON.parse(raw);
+          return typeof parsed === 'string' ? parsed : '';
+        } catch { return ''; }
+      }
+      if (raw.startsWith("'") && raw.endsWith("'")) {
+        return raw.slice(1, -1).replace(/''/g, "'");
+      }
+      return raw;
+    }
+  } catch { /* unreadable/missing skill metadata is not an alias match */ }
+  return '';
+}
+
+/**
+ * Resolve only an unambiguous authored-name alias. Exact directory ids take
+ * precedence (matching run-skill.cjs), and ambiguous names are left alone so
+ * an enabled custom skill cannot be blocked by a disabled platform namesake.
+ */
+function uniqueInstalledSkillAliasId(uid: string, ref: string): string | null {
+  if (!ref || ref === '.' || ref === '..' || /[\\/\0]/.test(ref)) return null;
+  const roots = [userSkillsDir(uid), userMarketplaceSkillsDir(uid)];
+  for (const root of roots) {
+    try {
+      if (fs.statSync(path.join(root, ref)).isDirectory()) return null;
+    } catch { /* no exact id in this root */ }
+  }
+
+  const ids = new Set<string>();
+  for (const root of roots) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      if (readSkillDisplayNameForDisabledGuard(path.join(root, entry.name)) === ref) ids.add(entry.name);
+      if (ids.size > 1) return null;
+    }
+  }
+  return ids.size === 1 ? [...ids][0] : null;
+}
+
 function commandMentionsSkillRoot(command: string, uid: string, skillId: string): boolean {
   const unescaped = command.replace(/\\([\\ "'$`])/g, '$1');
   const roots = [
@@ -2140,6 +2728,13 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
       return errText(
         'E_SKILL_DISABLED',
         `skill "${ref}" is disabled for this user; re-enable it before running its workflow.`,
+      );
+    }
+    const aliasId = uniqueInstalledSkillAliasId(uid, ref);
+    if (aliasId && disabled.has(aliasId)) {
+      return errText(
+        'E_SKILL_DISABLED',
+        `skill "${aliasId}" (invoked as "${ref}") is disabled for this user; re-enable it before running its workflow.`,
       );
     }
   }
@@ -2511,9 +3106,17 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
         const base = classifyBashCommand(command);
         const pathApprovalCoveredSensitive = filesystemGate.approvedReasons.includes('sensitive_path');
-        const baseReasons = pathApprovalCoveredSensitive
+        let baseReasons = pathApprovalCoveredSensitive
           ? base.reasons.filter((reason) => reason !== 'sensitive_path')
           : base.reasons;
+        if (baseReasons.includes('destructive') && bashDestructiveRiskIsOnlyProducedFileDeletion(
+          command,
+          workingDirForGuard,
+          bashEnvForPathResolution(ctx, workingDirForGuard),
+          opts.hasProducedPath,
+        )) {
+          baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
+        }
         const reasons = classifyConfiguredBashCommand(command, baseReasons, {
           includePathPatterns: !pathApprovalCoveredSensitive,
         });
@@ -3061,7 +3664,7 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'write_file',
     description:
-      'Write a kept workspace artifact such as source, notes, markdown, or CSV. Creates parents. On collision with a file not written by you this turn, the basename is auto-suffixed and reported in <file-renamed>; use that final path afterward.',
+      'Write a kept workspace artifact such as source, notes, markdown, or CSV. Creates parents. If a long new file does not fit in one complete model response, write its first complete chunk, then use append_file with the returned final path and opaque revision token for later chunks. Prefer edit_file or apply_patch for existing files. On collision with a file not written by you this turn, the basename is auto-suffixed and reported in <file-renamed>; use that final path afterward.',
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
@@ -3096,13 +3699,250 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
           log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
         }
       }
-      if (!result.isError && renamed) {
+      if (!result.isError) {
+        const written = Buffer.from(String(rewritten.content ?? ''), 'utf8');
+        const fileHash = fileBufferHash(written);
+        const revision = issueFileRevision(ctx, finalPath, written.length, fileHash);
+        const receipt = `<file path="${finalPath}" total_bytes="${written.length}" file_hash="${fileHash}" revision="${revision}"/>`;
         return {
           ...result,
-          content: `${result.content ?? ''}${renderRenameSignal(inputAbs, finalPath)}`,
+          content: [
+            result.content ?? '',
+            receipt,
+            ...(renamed ? [renderRenameSignal(inputAbs, finalPath)] : []),
+          ].filter(Boolean).join('\n'),
         };
       }
       return result;
+    },
+  };
+}
+
+function fileBufferHash(body: Buffer): string {
+  return `sha256:${crypto.createHash('sha256').update(body).digest('hex')}`;
+}
+
+function appendFileReceipt(
+  abs: string,
+  appendedBytes: number,
+  totalBytes: number,
+  fileHash: string,
+  revision: string,
+  replayed: boolean,
+): string {
+  return `<file path="${abs}" appended_bytes="${appendedBytes}" total_bytes="${totalBytes}" file_hash="${fileHash}" revision="${revision}" replayed="${replayed}"/>`;
+}
+
+/** Append one complete text chunk with revision-first OCC and replay idempotency. */
+function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'append_file',
+    description:
+      'Append one complete UTF-8 text chunk. For a long new file, use write_file once, then copy each returned revision into append_file.base_revision. This validates exact file state without byte/character math; if model output truncates, retry only the unfinished chunk. expected_size is legacy. Exact replay is idempotent; stale or foreign revisions fail without writing and return the current revision. Prefer edit_file or apply_patch for existing files.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Existing absolute or workspace-relative UTF-8 text file path.',
+        },
+        content: {
+          type: 'string',
+          description: 'Complete UTF-8 text chunk to append.',
+        },
+        base_revision: {
+          type: 'string',
+          description: 'Preferred opaque revision token from the preceding read_file, write_file, or append_file result.',
+          pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
+        },
+        expected_size: {
+          type: 'number',
+          description: 'Legacy expected current byte size. Omit when base_revision is available.',
+          minimum: 0,
+        },
+      },
+      required: ['path', 'content'],
+    },
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const rawPath = String(input.path ?? '');
+      const content = typeof input.content === 'string' ? input.content : null;
+      const baseRevision = typeof input.base_revision === 'string' ? input.base_revision.trim() : '';
+      const hasExpectedSize = input.expected_size !== undefined && input.expected_size !== null;
+      const expectedSize = Number(input.expected_size);
+      if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      if (content === null || content.length === 0) {
+        return { content: errText('E_BAD_INPUT', '`content` must be a non-empty string'), isError: true };
+      }
+      if (!baseRevision && (!hasExpectedSize || !Number.isSafeInteger(expectedSize) || expectedSize < 0)) {
+        return {
+          content: errText('E_BAD_INPUT', 'copy `base_revision` from the preceding file result; legacy `expected_size` must be a non-negative safe integer byte size'),
+          isError: true,
+        };
+      }
+
+      const abs = resolveAbs(ctx, rawPath);
+      const scopeErr = await gateEditPath(opts, abs, ctx);
+      if (scopeErr) {
+        log.warn('append_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+        return { content: scopeErr, isError: true };
+      }
+
+      const release = await fileEditLock(abs).acquire();
+      try {
+        let st: fs.Stats;
+        try { st = fs.lstatSync(abs); }
+        catch (err) {
+          log.warn('append_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
+          return {
+            content: errText('E_NOT_FOUND', `${abs}: file does not exist (use write_file for the first chunk)`),
+            isError: true,
+          };
+        }
+        if (!st.isFile() || st.isSymbolicLink()) {
+          return { content: errText('E_NOT_EDITABLE', `${abs}: not a regular non-symlink file`), isError: true };
+        }
+        if (kindOf(abs) !== 'text') {
+          return { content: errText('E_NOT_EDITABLE', `${abs}: append_file supports UTF-8 text files only`), isError: true };
+        }
+
+        let before: Buffer;
+        try { before = fs.readFileSync(abs); }
+        catch (err) {
+          return { content: errText('E_APPEND_FAILED', `${abs}: read failed: ${(err as Error).message}`), isError: true };
+        }
+        const beforeText = before.toString('utf8');
+        if (!Buffer.from(beforeText, 'utf8').equals(before)) {
+          return { content: errText('E_NOT_EDITABLE', `${abs}: file is not valid UTF-8 text`), isError: true };
+        }
+        const chunk = Buffer.from(content, 'utf8');
+        const currentHash = fileBufferHash(before);
+        const currentRevision = issueFileRevision(ctx, abs, before.length, currentHash);
+        const chunkHash = fileBufferHash(chunk);
+        const revisionRecord = baseRevision ? resolveFileRevision(ctx, baseRevision) : null;
+
+        if (baseRevision) {
+          const replay = findAppendReplay(ctx, baseRevision, chunkHash);
+          if (revisionRecord?.path !== canonicalFileRevisionPath(abs)) {
+            return {
+              content: `${errText(
+                revisionRecord ? 'E_REVISION_PATH_MISMATCH' : 'E_REVISION_UNKNOWN',
+                revisionRecord
+                  ? `${abs}: base_revision belongs to a different file; no bytes were written`
+                  : `${abs}: base_revision is not available in this run; use the returned current revision`,
+              )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
+              isError: true,
+            };
+          }
+          if (revisionRecord.hash !== currentHash || revisionRecord.size !== before.length) {
+            const replayEnd = replay?.baseSize != null
+              ? replay.baseSize + replay.appendedBytes
+              : revisionRecord.size + chunk.length;
+            const replayed = !!replay
+              && replay.baseSize === revisionRecord.size
+              && replay.appendedBytes === chunk.length
+              && replayEnd <= before.length
+              && before.subarray(replay.baseSize, replayEnd).equals(chunk);
+            if (replayed) {
+              recordRead(ctx, abs, st, currentHash);
+              return {
+                content: appendFileReceipt(
+                  abs,
+                  chunk.length,
+                  before.length,
+                  currentHash,
+                  currentRevision,
+                  true,
+                ),
+              };
+            }
+            return {
+              content: `${errText(
+                'E_STALE',
+                `${abs}: base_revision no longer matches the current file; no bytes were written`,
+              )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
+              isError: true,
+            };
+          }
+        }
+
+        // A provider/host retry may replay a tool call after its write already
+        // committed. Detect the exact bytes at the declared offset and return
+        // the current receipt instead of appending them twice.
+        if (!baseRevision && before.length !== expectedSize) {
+          const replayEnd = expectedSize + chunk.length;
+          const replayed = replayEnd <= before.length
+            && before.subarray(expectedSize, replayEnd).equals(chunk);
+          if (replayed) {
+            recordRead(ctx, abs, st, currentHash);
+            return {
+              content: appendFileReceipt(
+                abs,
+                chunk.length,
+                before.length,
+                currentHash,
+                currentRevision,
+                true,
+              ),
+            };
+          }
+          return {
+            content: `${errText(
+              'E_STALE',
+              `${abs}: expected ${expectedSize} bytes before append, current size is ${before.length}; use the returned revision and regenerate only the missing chunk`,
+            )}\n<file path="${abs}" total_bytes="${before.length}" file_hash="${currentHash}" revision="${currentRevision}"/>`,
+            isError: true,
+          };
+        }
+
+        const afterText = beforeText + content;
+        const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(afterText);
+        if (oauthClientMismatchErr) {
+          log.warn('append_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+          return { content: oauthClientMismatchErr, isError: true };
+        }
+        try { fs.appendFileSync(abs, chunk); }
+        catch (err) {
+          return { content: errText('E_APPEND_FAILED', `${abs}: write failed: ${(err as Error).message}`), isError: true };
+        }
+
+        const after = Buffer.concat([before, chunk]);
+        const beforeHash = fileBufferHash(before);
+        const afterHash = fileBufferHash(after);
+        const nextStat = fs.statSync(abs);
+        recordRead(ctx, abs, nextStat, afterHash);
+        const nextRevision = issueFileRevision(ctx, abs, after.length, afterHash);
+        if (baseRevision) {
+          recordAppendReplay(ctx, {
+            baseRevision,
+            contentHash: chunkHash,
+            baseSize: before.length,
+            appendedBytes: chunk.length,
+            resultRevision: nextRevision,
+            resultHash: afterHash,
+          });
+        }
+        try { await opts.onFileWritten?.(abs); }
+        catch (err) { log.warn('onFileWritten callback failed', { error: logErrorRef(err) }); }
+        return {
+          content: appendFileReceipt(abs, chunk.length, after.length, afterHash, nextRevision, false),
+          observations: {
+            fileChanges: [{
+              operation: 'update',
+              sourcePath: abs,
+              beforeExists: true,
+              afterExists: true,
+              beforeHash,
+              afterHash,
+              beforeBytes: before.length,
+              afterBytes: after.length,
+              coverage: 'exact',
+            }],
+          },
+        };
+      } finally {
+        release();
+      }
     },
   };
 }
@@ -3183,7 +4023,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. Pass read_file\'s file_hash as expected_hash for explicit optimistic concurrency. E_NOT_READ/E_STALE/E_NO_MATCH return bounded current context and a fresh hash for one safe retry. Cannot edit PDF/Office/image sources in place.',
+      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. An exact match is tried first; if that fails, one fallback ignores trailing whitespace at line breaks and is used only when it resolves to a single span (the receipt then carries match="whitespace_relaxed"). Leading indentation is never relaxed. Pass read_file\'s file_hash as expected_hash for explicit optimistic concurrency. E_NOT_READ/E_STALE/E_NO_MATCH return bounded current context and a fresh hash for one safe retry. Cannot edit PDF/Office/image sources in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3283,11 +4123,26 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        const count = countOccurrences(body, oldStr);
+        let count = countOccurrences(body, oldStr);
+        // The text actually present in the file. It differs from `old_string`
+        // only when the trailing-whitespace fallback below resolves the match.
+        let matchText = oldStr;
+        let whitespaceRelaxed = false;
+        if (count === 0) {
+          const relaxed = findTrailingWhitespaceRelaxedMatch(body, oldStr);
+          if (relaxed?.count === 1) {
+            matchText = relaxed.text;
+            count = 1;
+            whitespaceRelaxed = true;
+          }
+        }
         if (count === 0) {
           recordRead(ctx, abs, st, currentHash);
           return {
-            content: `${errText('E_NO_MATCH', `${abs}: \`old_string\` not found in the current file`)}\n${editRecoveryContext(body, oldStr, currentHash)}`,
+            content: `${errText('E_NO_MATCH', [
+              `${abs}: \`old_string\` not found in the current file`,
+              editNoMatchReason(body, oldStr),
+            ].filter(Boolean).join(' '))}\n${editRecoveryContext(body, oldStr, currentHash)}`,
             isError: true,
           };
         }
@@ -3301,7 +4156,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
 
-        const next = replaceAll ? body.split(oldStr).join(newStr) : body.replace(oldStr, newStr);
+        const next = replaceAll ? body.split(matchText).join(newStr) : body.replace(matchText, newStr);
         const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(next);
         if (oauthClientMismatchErr) {
           log.warn('edit_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
@@ -3330,7 +4185,10 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
 
         return {
-          content: `<file path="${abs}" edited="${replaced}" kind="${kind}" file_hash="${nextHash}"/>`,
+          // `match="whitespace_relaxed"` says the edit landed on text that
+          // differs from `old_string` in line-end whitespace only, so a caller
+          // comparing its own string against the file is not left guessing.
+          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"${whitespaceRelaxed ? ' match="whitespace_relaxed"' : ''} file_hash="${nextHash}"/>`,
           observations: {
             fileChanges: [{
               operation: 'update',
@@ -3363,7 +4221,7 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
     description:
       'Declare the complete final deliverable list for this turn after all file generation is finished. ' +
       'Include every file the user should see in the message footer; exclude source assets, previews, caches, logs, and other working files. ' +
-      'Use an empty paths list when this turn created only working files and has no user-facing file deliverable. ' +
+      'Use an empty paths list only when this turn created working files, has no user-facing deliverable, and the active Agent workflow permits an explicit empty declaration; do not call this tool at a capability boundary when that workflow forbids publication. ' +
       'Only files actually written in this turn are accepted. A later call replaces the earlier declaration.',
     inputSchema: {
       type: 'object',
@@ -3569,7 +4427,11 @@ function htmlPreviewViewport(
 }
 
 function guardHtmlPreviewPath(opts: LocalToolsOpts, abs: string): string | null {
-  const roots = [...allowedRootsFor(opts), ...(opts.readOnlyExtraRoots ?? [])];
+  const roots = [
+    ...allowedRootsFor(opts),
+    ...(opts.readOnlyExtraRoots ?? []),
+    ...(opts.runtimeReadOnlyRoots ?? []),
+  ];
   if (roots.length && isPathAllowed(abs, roots)) return null;
   if (!localAccessAllowsOutsideWorkspace()) {
     return errText(
@@ -3584,16 +4446,31 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'html_preview',
     description:
-      'Render local .html in the packaged isolated browser at desktop and mobile viewports. ' +
-      'Returns screenshots plus bounded runtime, resource, overflow, image, Tab-focus, link/form, and download evidence. ' +
-      'Network and host permissions (clipboard, media, display capture, filesystem, and devices) are denied. ' +
-      'Fails on detected defects; repair and rerun. Interactions use sample-only form fill, local links, and cancelled downloads; add app-specific tests when needed.',
+      'Render local .html in the isolated browser. target defaults to desktop; use mobile for a mobile-only artifact or responsive only on a user multi-device request. ' +
+      'Always checks runtime, resources, overflow, images, and keyboard focus. interactions defaults to true for compatibility; set it false for visual-only UI review so controls and forms are not exercised. screenshots defaults to false and only controls whether passing screenshots are returned as model-visible image blocks; it never invokes a separate vision API. ' +
+      'Failed checks never return images. Network and host permissions are blocked.',
     inputSchema: {
       type: 'object',
       properties: {
         path: {
           type: 'string',
           description: 'Existing local .html/.htm entry path, absolute or relative to $working_dir.',
+        },
+        target: {
+          type: 'string',
+          enum: ['responsive', 'desktop', 'mobile'],
+          default: 'desktop',
+          description: 'Optional deliverable target. Defaults to desktop. Use responsive only when viewport-dependent reflow is explicitly requested.',
+        },
+        screenshots: {
+          type: 'boolean',
+          default: false,
+          description: 'Whether a passing result should include lossless viewport screenshots as model-visible image blocks. Defaults to false. This never invokes a separate vision API, and failed checks never include images.',
+        },
+        interactions: {
+          type: 'boolean',
+          default: true,
+          description: 'Whether to exercise bounded controls, forms, links, and downloads. Defaults to true. Set false for visual-only UI review; runtime, resource, layout, focus, and screenshot checks still run.',
         },
         desktop: {
           type: 'object',
@@ -3663,23 +4540,87 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
         };
       }
 
-      const desktop = htmlPreviewViewport('desktop', input.desktop, { width: 1440, height: 900 });
-      if (typeof desktop === 'string') return { content: desktop, isError: true };
-      const mobile = htmlPreviewViewport('mobile', input.mobile, { width: 390, height: 844 });
-      if (typeof mobile === 'string') return { content: mobile, isError: true };
+      const target = input.target === undefined || input.target === null
+        ? 'desktop'
+        : input.target;
+      if (target !== 'responsive' && target !== 'desktop' && target !== 'mobile') {
+        return {
+          content: errText(
+            'E_BAD_INPUT',
+            '`target` must be responsive, desktop, or mobile when provided',
+          ),
+          isError: true,
+        };
+      }
+      if (input.screenshots !== undefined && typeof input.screenshots !== 'boolean') {
+        return {
+          content: errText('E_BAD_INPUT', '`screenshots` must be a boolean when provided'),
+          isError: true,
+        };
+      }
+      if (input.interactions !== undefined && typeof input.interactions !== 'boolean') {
+        return {
+          content: errText('E_BAD_INPUT', '`interactions` must be a boolean when provided'),
+          isError: true,
+        };
+      }
+      const viewports: HtmlPreviewViewport[] = [];
+      if (target === 'responsive' || target === 'desktop') {
+        const desktop = htmlPreviewViewport('desktop', input.desktop, { width: 1440, height: 900 });
+        if (typeof desktop === 'string') return { content: desktop, isError: true };
+        viewports.push(desktop);
+      }
+      if (target === 'responsive' || target === 'mobile') {
+        const mobile = htmlPreviewViewport('mobile', input.mobile, { width: 390, height: 844 });
+        if (typeof mobile === 'string') return { content: mobile, isError: true };
+        viewports.push(mobile);
+      }
 
       try {
-        const rendered = await renderResponsiveHtmlPreview(
-          abs,
-          [desktop, mobile],
+        const rendered = input.interactions === false
+          ? await renderResponsiveHtmlPreview(abs, viewports, {}, { interactions: false })
+          : await renderResponsiveHtmlPreview(abs, viewports);
+        if (!rendered.evidence.ok) {
+          return {
+            content: JSON.stringify({
+              ...rendered.evidence,
+              visual_evidence: {
+                attached: false,
+                reason: 'deterministic_checks_failed',
+                policy: 'attach_only_after_requested_preview_checks_pass',
+              },
+            }),
+            isError: true,
+          };
+        }
+        if (input.screenshots !== true) {
+          return {
+            content: JSON.stringify({
+              ...rendered.evidence,
+              visual_evidence: {
+                attached: false,
+                reason: 'not_requested',
+                policy: 'attach_only_when_requested_after_preview_checks_passed',
+              },
+            }),
+          };
+        }
+        const modelScreenshots = await Promise.all(
+          rendered.screenshots.map((data) => prepareLosslessModelImage(data)),
         );
         return {
-          content: JSON.stringify(rendered.evidence),
-          images: rendered.screenshots.map((data) => ({
-            data: data.toString('base64'),
-            mediaType: 'image/png',
+          content: JSON.stringify({
+            ...rendered.evidence,
+            visual_evidence: {
+              attached: true,
+              viewports: rendered.evidence.viewports.map((viewport) => viewport.name),
+              policy: 'attached_when_requested_after_preview_checks_passed',
+            },
+          }),
+          images: modelScreenshots.map((image) => ({
+            data: image.buf.toString('base64'),
+            mediaType: image.mediaType,
           })),
-          ...(rendered.evidence.ok ? {} : { isError: true }),
         };
       } catch (error) {
         return {
@@ -3704,7 +4645,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'create_artifact',
     description:
-      'Create an offline interactive HTML/CSS/JS artifact rendered live in chat. Use for calculators, dashboards, filters, simulations, quizzes, mini-games; prefer :::dashboard for static summaries. Input files: [{path, content, encoding?}], including top-level index.html; no network/CDN, use relative sibling files. Optional __orkas/bridge.js provides send(payload)/resize. Do not paste HTML after calling.',
+      'Create an offline interactive HTML/CSS/JS artifact rendered live in chat. Use for calculators, dashboards, filters, simulations, quizzes, mini-games; prefer :::dashboard for static summaries. Input files: [{path, content, encoding?}], including top-level index.html; no network/CDN, use relative sibling files. Optional __orkas/bridge.js provides send(payload)/resize. Before success the host loads the app and requires an operable control plus an observable state change, artifact submission, or download. Do not paste HTML after calling.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3760,13 +4701,66 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
           source: 'create_artifact',
         });
       } catch (err) {
+        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
         log.warn('create_artifact finalizer failed', {
           user_id: maskId(uid),
           cid: maskId(cid),
           artifact_id: maskId(r.artifactId),
+          discarded: discarded.ok,
           error: logErrorRef(err),
         });
         return { content: errText('E_ARTIFACT_FINALIZE_FAILED', (err as Error).message || 'artifact post-processing failed'), isError: true };
+      }
+      let smoke: ArtifactInteractionSmokeResult;
+      try {
+        const runSmoke = opts.artifactInteractionSmoke ?? (async (entryPath: string) => {
+          const rendered = await renderInteractiveHtmlSmoke(entryPath, {}, {
+            bridgeJavaScript: chatArtifacts.BRIDGE_JS,
+          });
+          const interactions = rendered.evidence.interactions;
+          return {
+            ok: rendered.evidence.ok,
+            blockers: rendered.evidence.blockers,
+            controlsExercised: interactions.controlsExercised,
+            observableEffects:
+              interactions.stateChangesObserved
+              + interactions.artifactMessagesObserved
+              + interactions.downloads.length,
+          };
+        });
+        smoke = await runSmoke(path.join(resolved.dirPath, 'index.html'));
+      } catch (err) {
+        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
+        log.warn('create_artifact interaction smoke failed to run', {
+          user_id: maskId(uid),
+          cid: maskId(cid),
+          artifact_id: maskId(r.artifactId),
+          discarded: discarded.ok,
+          error: logErrorRef(err),
+        });
+        return {
+          content: errText('E_ARTIFACT_SMOKE_FAILED', (err as Error).message || 'artifact interaction smoke failed to run'),
+          isError: true,
+        };
+      }
+      if (!smoke.ok) {
+        const blockers = smoke.blockers.slice(0, 3).join('; ') || 'no observable interaction completed';
+        const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
+        log.warn('create_artifact interaction smoke rejected artifact', {
+          user_id: maskId(uid),
+          cid: maskId(cid),
+          artifact_id: maskId(r.artifactId),
+          controls_exercised: smoke.controlsExercised,
+          observable_effects: smoke.observableEffects,
+          discarded: discarded.ok,
+        });
+        return {
+          content: errText(
+            'E_ARTIFACT_INTERACTION_INCOMPLETE',
+            `${blockers}. Repair the app behavior and call create_artifact again.`,
+          ),
+          isError: true,
+        };
       }
       if (opts.onArtifactCreated) {
         try { opts.onArtifactCreated({ id: r.artifactId, title: r.title }); }
@@ -3781,7 +4775,9 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       });
       return {
         content:
-          `Artifact "${r.title}" created (id ${r.artifactId}) — it is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
+          `Artifact "${r.title}" created (id ${r.artifactId}); interaction smoke passed ` +
+          `(${smoke.controlsExercised ?? 0} control(s), ${smoke.observableEffects ?? 0} observable effect(s)). ` +
+          `It is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
           `To receive what the user does in it, the app calls ` +
           `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*") ` +
           `(or, with <script src="__orkas/bridge.js"></script>, window.orkasArtifact.send(payload)); ` +
@@ -3998,6 +4994,7 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
     createInteractiveCliSendTool(opts),
     createInteractiveCliCloseTool(opts),
     createWriteFileTool(opts),
+    createAppendFileTool(opts),
     createHostApplyPatchTool(opts),
     createEditFileTool(opts),
     createDeleteFileTool(opts),

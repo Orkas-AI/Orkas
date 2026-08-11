@@ -8,6 +8,7 @@ import {
   assertImageQualityVerdict,
   compileImageQualityScorecard,
   inspectImageStudioProject,
+  requiredCopyLayoutIssues,
   validateImageStudioManifest,
 } from '../../../src/main/features/image_studio';
 
@@ -81,6 +82,72 @@ describe('ImageStudio project contract', () => {
       code: 'A_ENGLISH_ALL_CAPS_OVERUSE',
       message: 'Multiple English text roles use all caps.',
     }])).toThrow('E_IMAGE_REVIEW_ENGLISH_CASING_REQUIRED');
+  });
+
+  it('accepts open-ended review dimensions without letting bonus scores dilute the mandatory baseline', () => {
+    const mandatoryScores = {
+      intent_alignment: 92,
+      composition: 86,
+      craft: 84,
+      text_legibility: 95,
+      defect_freedom: 88,
+      specificity: 83,
+    };
+    const scorecard = compileImageQualityScorecard(mandatoryScores, false, [{
+      id: 'icon_language_consistency',
+      label: 'Icon language consistency',
+      reason: 'The poster uses several functional icons as one visual family.',
+      evidence: 'Every visible icon uses the same monochrome stroke weight and corner treatment.',
+      score: 100,
+    }]);
+
+    // The independent oracle is the mandatory-score mean. An easy extra 100
+    // must not inflate the comparable quality result.
+    expect(scorecard.overall).toBe(88);
+    expect(scorecard.additional_dimensions).toEqual([
+      expect.objectContaining({ id: 'icon_language_consistency', score: 100 }),
+    ]);
+    expect(() => assertImageQualityVerdict('passed', [], scorecard)).not.toThrow();
+
+    const weakTaskSpecificAxis = compileImageQualityScorecard(mandatoryScores, false, [{
+      id: 'product_recognizability',
+      label: 'Product recognizability',
+      reason: 'The requested product must remain identifiable at thumbnail size.',
+      evidence: 'The product silhouette is lost behind the headline crop.',
+      score: 62,
+    }]);
+    expect(weakTaskSpecificAxis.overall).toBe(88);
+    expect(() => assertImageQualityVerdict('passed', [], weakTaskSpecificAxis))
+      .toThrow('E_IMAGE_REVIEW_SCORE_BELOW_FLOOR');
+  });
+
+  it('rejects ambiguous, duplicate, reserved, or ungrounded additional review dimensions', () => {
+    const mandatoryScores = {
+      intent_alignment: 90,
+      composition: 90,
+      craft: 90,
+      text_legibility: 90,
+      defect_freedom: 90,
+      specificity: 90,
+    };
+    const valid = {
+      id: 'brand_coherence',
+      label: 'Brand coherence',
+      reason: 'The supplied brand system is a material delivery constraint.',
+      evidence: 'The palette and mark placement match the declared brand roles.',
+      score: 88,
+    };
+
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [valid, valid]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_DUPLICATE');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [{ ...valid, id: 'composition' }]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_RESERVED');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, [{ ...valid, evidence: '' }]))
+      .toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_EVIDENCE');
+    expect(() => compileImageQualityScorecard(mandatoryScores, false, Array.from(
+      { length: 9 },
+      (_, index) => ({ ...valid, id: `task_axis_${index}` }),
+    ))).toThrow('E_IMAGE_REVIEW_ADDITIONAL_DIMENSIONS_LIMIT');
   });
 
   it('locks route-specific generation budgets', () => {
@@ -173,6 +240,43 @@ describe('ImageStudio project contract', () => {
       .not.toThrow();
   });
 
+  it('supports a multi-image style anchor with the existing reference contract', () => {
+    const validated = validateImageStudioManifest(manifest({
+      references: [{
+        id: 'style_anchor',
+        path: 'refs/style-anchor.png',
+        role: 'style',
+        strength: 1,
+        required: true,
+        preserve: [
+          'palette roles',
+          'typography roles',
+          'spacing and grid rhythm',
+          'shape and icon language',
+          'material treatment',
+          'signature device',
+        ],
+        may_change: ['content', 'local composition'],
+        region_ids: [],
+      }],
+      reference_intent: {
+        mode: 'guide',
+        basis: 'inferred',
+        instructions: ['Keep this image in the same visual set as the style anchor.'],
+        minimum_score: 85,
+      },
+    }));
+
+    expect(validated.issues).toEqual([]);
+    expect(validated.manifest?.references?.[0]).toMatchObject({
+      role: 'style',
+      required: true,
+      may_change: ['content', 'local composition'],
+    });
+    expect(validated.manifest?.reference_intent?.minimum_score).toBe(85);
+    expect(validated.manifest?.reference_intent).toMatchObject({ mode: 'guide', basis: 'inferred' });
+  });
+
   it('inspects local HTML, exact copy, and local resources into one signature', async () => {
     fs.writeFileSync(path.join(root, 'image-manifest.json'), JSON.stringify(manifest(), null, 2));
     fs.writeFileSync(path.join(root, 'texture.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
@@ -223,6 +327,35 @@ describe('ImageStudio project contract', () => {
     expect(explicitlyRequired.advisories).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ code: 'A_ENGLISH_ALL_CAPS_OVERUSE' }),
     ]));
+  });
+
+  it('blocks an automatic one-glyph orphan line while preserving deliberate breaks and vertical type', () => {
+    expect(requiredCopyLayoutIssues([{
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [6, 1],
+      explicitBreak: false,
+      writingMode: 'horizontal-tb',
+    }])).toEqual([expect.objectContaining({
+      code: 'E_REQUIRED_COPY_ORPHAN_LINE',
+      message: expect.stringContaining('6+1'),
+    })]);
+
+    expect(requiredCopyLayoutIssues([{
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [4, 3],
+      explicitBreak: false,
+      writingMode: 'horizontal-tb',
+    }, {
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [6, 1],
+      explicitBreak: true,
+      writingMode: 'horizontal-tb',
+    }, {
+      copy: '把复杂，做简单',
+      lineGlyphCounts: [1, 1, 1, 1, 1, 1, 1],
+      explicitBreak: false,
+      writingMode: 'vertical-rl',
+    }])).toEqual([]);
   });
 
   it('blocks missing required copy, remote resources, embedded pages, and traversal', async () => {

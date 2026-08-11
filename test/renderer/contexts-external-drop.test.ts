@@ -25,6 +25,7 @@ function loadContextsScript() {
     path.join(__dirname, '../../src/renderer/modules/contexts.js'),
     'utf8',
   );
+  const monitorError = vi.fn();
   const context: any = {
     AbortController,
     TextDecoder,
@@ -36,7 +37,10 @@ function loadContextsScript() {
     t: (key: string, vars?: Record<string, unknown>) => `${key}:${JSON.stringify(vars || {})}`,
     window: {
       addEventListener: vi.fn(),
+      Monitor: { error: monitorError },
     },
+    Monitor: { error: monitorError },
+    __monitorError: monitorError,
     document: {
       addEventListener: vi.fn(),
       body: {},
@@ -74,7 +78,7 @@ function makeTree({ folderPath }: { folderPath?: string } = {}) {
       return [];
     },
   };
-  return { root, rootListeners, node, nodeListeners, wrapListeners };
+  return { root, rootListeners, node, nodeListeners, wrap, wrapListeners };
 }
 
 function makeDropSurface() {
@@ -106,6 +110,103 @@ describe('Library external file drag-and-drop', () => {
     expect(context._kbUnavailableHtml()).toContain('data-kb-status-retry');
     expect(context._applyKbStatusResult({ ok: true, files: [] })).toBe(true);
     expect(context._kbUnavailableHtml()).toBe('');
+  });
+
+  it.each(['ENOSPC', 'SQLITE_FULL'])('normalizes %s status failures to the storage-full recovery code', (rawCode) => {
+    const context = loadContextsScript();
+
+    expect(context._applyKbStatusResult({
+      ok: false,
+      code: rawCode,
+      error: '/Users/test/private/vector.db is full',
+    })).toBe(false);
+
+    expect(context._kbUnavailableHtml()).toContain('contexts.kb.storage_full');
+  });
+
+  it('does not duplicate a rejected invoke already owned by the IPC diagnostic', () => {
+    const context = loadContextsScript();
+
+    expect(context._applyKbStatusResult({ ok: false, error: 'ipc request failed' })).toBe(false);
+
+    expect(context._kbUnavailableHtml()).toContain('contexts.kb.unavailable');
+    expect(context.__monitorError).not.toHaveBeenCalled();
+  });
+
+  it('renders a native vectorization failure as a generic clickable retry action', async () => {
+    const context = loadContextsScript();
+    const tree = makeTree({ folderPath: 'Research/windows-native.md' });
+    if (!tree.wrap) throw new Error('file row fixture missing');
+    tree.wrap.dataset.type = 'file';
+    context._applyKbEvent({
+      relPath: 'Research/windows-native.md',
+      status: 'failed',
+      stage: 'embed',
+      errorCode: 'E_LIBRARY_NATIVE_ONNX_LOAD',
+      error: 'onnxruntime native module failed to load',
+    });
+    const chip = context._kbStatusChipHtml('Research/windows-native.md');
+
+    expect(chip).toContain('data-kb-reprocess');
+    expect(chip).toContain('contexts.kb.failed');
+    expect(chip).not.toContain('onnxruntime');
+    expect(chip).not.toContain('E_LIBRARY_NATIVE_ONNX_LOAD');
+
+    context._updateCtxKbChip = vi.fn();
+    context._scheduleKbStatusRefreshIfNeeded = vi.fn();
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+    context._bindCtxTreeHandlers(tree.root);
+    const retryTarget = {};
+    const click = {
+      stopPropagation: vi.fn(),
+      target: {
+        closest: (selector: string) => (selector === '[data-kb-reprocess]' ? retryTarget : null),
+      },
+    };
+
+    await tree.nodeListeners.click(click);
+
+    expect(click.stopPropagation).toHaveBeenCalledOnce();
+    expect(context.apiFetch).toHaveBeenCalledWith('/api/kb/reprocess', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: 'Research/windows-native.md' }),
+    });
+    expect(context._kbStatusChipHtml('Research/windows-native.md')).toContain('is-processing');
+  });
+
+  it.each([
+    [
+      'backend rejection',
+      async () => ({
+        json: async () => ({ ok: false, error: 'C:\\private\\native\\binding.node' }),
+      }),
+    ],
+    [
+      'transport rejection',
+      async () => {
+        throw new Error('network rejected C:\\private\\native\\binding.node');
+      },
+    ],
+  ])('restores the clickable failed state after %s', async (_label, request) => {
+    const context = loadContextsScript();
+    context._applyKbEvent({
+      relPath: 'windows-native.md',
+      status: 'failed',
+      errorCode: 'E_LIBRARY_NATIVE_ONNX_LOAD',
+    });
+    context._updateCtxKbChip = vi.fn();
+    context._scheduleKbStatusRefreshIfNeeded = vi.fn();
+    context.apiFetch = vi.fn(request);
+    context.uiAlert = vi.fn(async () => undefined);
+
+    await context.reprocessCtxKbFile('windows-native.md');
+
+    const chip = context._kbStatusChipHtml('windows-native.md');
+    expect(chip).toContain('is-failed');
+    expect(chip).toContain('data-kb-reprocess');
+    expect(context.uiAlert).toHaveBeenCalledWith('contexts.kb.reprocess_failed:{}');
+    expect(context.uiAlert.mock.calls[0][0]).not.toContain('binding.node');
   });
 
   it('uploads operating-system files into the hovered folder with copy semantics', async () => {
@@ -360,5 +461,80 @@ describe('Library external file drag-and-drop', () => {
     expect(context.apiFetch).not.toHaveBeenCalled();
     expect(zh['contexts.file.del_confirm']).toContain('删除后可在回收站恢复');
     expect(zh['contexts.dir.del_confirm']).toContain('删除后可在回收站恢复');
+  });
+
+  it('keeps one successful delete result when the post-mutation refresh fails', async () => {
+    const context = loadContextsScript();
+    const event = vi.fn();
+    const error = vi.fn();
+    context.window.Monitor = {};
+    context.Monitor = { event, error };
+    context.uiConfirm = vi.fn(async () => true);
+    context.uiAlert = vi.fn(async () => undefined);
+    context.apiFetch = vi.fn(async () => ({ json: async () => ({ ok: true }) }));
+    context.loadContexts = vi.fn(async () => { throw new Error('refresh failed'); });
+
+    await context.deleteCtxEntry('Research/private-note.md', 'file');
+
+    expect(event).toHaveBeenCalledTimes(1);
+    expect(event).toHaveBeenCalledWith('library_entry_action_result', expect.objectContaining({
+      result: 'success',
+      action: 'delete',
+    }));
+    expect(error).not.toHaveBeenCalled();
+    expect(context.uiAlert).not.toHaveBeenCalled();
+  });
+
+  it('treats a resolved native IPC rejection as failure instead of cancellation', async () => {
+    const context = loadContextsScript();
+    const event = vi.fn();
+    const error = vi.fn();
+    context.window.Monitor = {};
+    context.Monitor = { click: vi.fn(), event, error };
+    context.window.orkas = {
+      invoke: vi.fn(async () => ({ ok: false, code: 'E_IPC_REQUEST', error: 'private backend detail' })),
+    };
+    context.uiAlert = vi.fn(async () => undefined);
+    context.loadContexts = vi.fn(async () => undefined);
+
+    await context.handleCtxNativeUpload('Research');
+
+    expect(context.loadContexts).not.toHaveBeenCalled();
+  });
+
+  it('reports explicit native picker cancellation outside the upload success denominator', async () => {
+    const context = loadContextsScript();
+    const event = vi.fn();
+    const error = vi.fn();
+    context.window.Monitor = {};
+    context.Monitor = { click: vi.fn(), event, error };
+    context.window.orkas = {
+      invoke: vi.fn(async () => ({ ok: true, cancelled: true, files: [] })),
+    };
+    context.uiAlert = vi.fn(async () => undefined);
+    context.loadContexts = vi.fn(async () => undefined);
+
+    await context.handleCtxNativeUpload('Research');
+
+    expect(context.uiAlert).not.toHaveBeenCalled();
+    expect(context.loadContexts).not.toHaveBeenCalled();
+  });
+
+  it('keeps a successful upload result when the later tree refresh fails', async () => {
+    const context = loadContextsScript();
+    const event = vi.fn();
+    const error = vi.fn();
+    const file = { name: 'stable.md', size: 8 };
+    context.window.Monitor = {};
+    context.Monitor = { click: vi.fn(), event, error };
+    context.window.orkas = {
+      importLocalFiles: vi.fn(async () => ({ files: [{ ok: true, name: file.name }] })),
+    };
+    context.loadContexts = vi.fn(async () => { throw new Error('refresh failed'); });
+    context.uiAlert = vi.fn(async () => undefined);
+
+    await context.handleCtxUpload([file], 'Research');
+
+    expect(context.uiAlert).not.toHaveBeenCalled();
   });
 });

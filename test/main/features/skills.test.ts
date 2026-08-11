@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import AdmZip from 'adm-zip';
 
 // skills.ts pulls path constants + the module-level _skillListCache at load.
 // Reset ORKAS_WORKSPACE_ROOT + module graph per test for isolation.
@@ -64,6 +65,15 @@ function writeCustomSkill(id: string, frontmatter = `name: "${id}"\ndescription:
   const d = path.join(customSkillsDir(), id);
   fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(d, 'SKILL.md'), `---\n${frontmatter}\n---\n\n${body}`);
+}
+
+function writeMarketplaceSkill(id: string, name: string, body = '# body'): void {
+  const d = path.join(builtinSkillsDir(), id);
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(
+    path.join(d, 'SKILL.md'),
+    `---\nname: "${name}"\ndescription: "platform test"\n---\n\n${body}`,
+  );
 }
 
 function markImportDraft(id: string, source: 'url' | 'dir' = 'dir'): void {
@@ -403,6 +413,32 @@ describe('skills › extractSkillContainers', () => {
     expect(r.containers[1].skillId).toBe('second');
     expect(r.cleanText).toContain('mid');
     expect(r.cleanText).not.toContain('<skill>');
+  });
+
+  // ── Set A (parse-failure evidence): raw payload survives extraction ────
+  // `extractSkillContainers` strips the container from cleanText before the
+  // apply step runs. Without `raw`, a shape error costs the model its own
+  // output: the next turn sees only "nothing was written" and cannot tell an
+  // attribute mistake from a missing newline, so it re-sends the same blocks.
+  it('A6: container whose blocks fail to parse still carries the raw payload', async () => {
+    const s = await loadSkills();
+    // One-line block: `SKILL_FILE_BLOCK_RE` needs a newline after the
+    // attributes, so this parses to zero files.
+    const text = '<skill>\n<<<skill-file path=SKILL.md>>>\nname: broken\n</skill>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].files).toEqual([]);
+    expect(r.containers[0].raw).toContain('<<<skill-file path=SKILL.md>>>');
+    expect(r.containers[0].raw).toContain('name: broken');
+    expect(r.cleanText).not.toContain('<<<skill-file');
+  });
+
+  it('A7: a genuinely empty container carries no raw payload', async () => {
+    const s = await loadSkills();
+    const r = s.extractSkillContainers('<skill>\n\n</skill>');
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].files).toEqual([]);
+    expect(r.containers[0].raw).toBeUndefined();
   });
 
   // ── Set B: look-alike shapes (must NOT extract / must NOT mis-route) ───
@@ -747,6 +783,53 @@ describe('skills › listSkills', () => {
     expect((await s.listSkills()).find((x) => x.id === 'alpha')?.enabled).toBe(false);
   });
 
+  it('repairs a legacy disabled display-name key to the unique canonical marketplace id', async () => {
+    writeMarketplaceSkill('74e05fe08cc5', 'agent-browser');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'agent-browser', false);
+    const legacyClock = enabled.readEnabledMap(TEST_UID)._item_updated_at?.skills?.['agent-browser'] || 0;
+
+    const s = await loadSkills();
+    const row = (await s.listSkills()).find((skill) => skill.id === '74e05fe08cc5');
+
+    expect(row?.enabled).toBe(false);
+    const map = enabled.readEnabledMap(TEST_UID);
+    expect(map.skills).toEqual({ '74e05fe08cc5': false });
+    expect(map._item_updated_at?.skills?.['agent-browser']).toBeGreaterThan(legacyClock);
+    expect(map._item_updated_at?.skills?.['74e05fe08cc5']).toBeGreaterThan(legacyClock);
+
+    s.setSkillEnabledForActiveUser('74e05fe08cc5', true);
+    expect((await s.listSkills()).find((skill) => skill.id === '74e05fe08cc5')?.enabled).toBe(true);
+    expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({});
+  });
+
+  it('does not steal a legacy disabled key from an existing custom skill id', async () => {
+    writeMarketplaceSkill('74e05fe08cc5', 'agent-browser');
+    writeCustomSkill('agent-browser');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'agent-browser', false);
+
+    const s = await loadSkills();
+    const rows = await s.listSkills();
+
+    expect(rows.find((skill) => skill.id === 'agent-browser')?.enabled).toBe(false);
+    expect(rows.find((skill) => skill.id === '74e05fe08cc5')?.enabled).toBe(true);
+    expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ 'agent-browser': false });
+  });
+
+  it('leaves an ambiguous legacy display-name key untouched', async () => {
+    writeMarketplaceSkill('74e05fe08cc5', 'agent-browser');
+    writeMarketplaceSkill('cb90c8437a71', 'agent-browser');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'agent-browser', false);
+
+    const s = await loadSkills();
+    const rows = await s.listSkills();
+
+    expect(rows.filter((skill) => skill.name === 'agent-browser').every((skill) => skill.enabled)).toBe(true);
+    expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ 'agent-browser': false });
+  });
+
   it('ignores skill directories that do not contain SKILL.md', async () => {
     fs.mkdirSync(path.join(customSkillsDir(), 'empty-custom'), { recursive: true });
     const platformOnlyMeta = path.join(builtinSkillsDir(), 'empty-platform');
@@ -946,6 +1029,22 @@ describe('skills › createCustomSkill', () => {
 });
 
 describe('skills › createFromDir', () => {
+  it('allows the current macOS temp tree while keeping neighboring private trees blocked', async () => {
+    const s = await loadSkills();
+    const options = {
+      platform: 'darwin' as const,
+      sourceRoot: '/Applications/Orkas.app/Contents/Resources',
+      workspaceRoot: '/Users/test/.orkas/data',
+      homeDir: '/Users/alice',
+      tempDir: '/private/var/folders/ab/session/T',
+    };
+
+    expect(s._isBlacklistedImportSourceForTest(
+      '/private/var/folders/ab/session/T/orkas-skill-package-123', options,
+    ).blocked).toBe(false);
+    expect(s._isBlacklistedImportSourceForTest('/private/var/db/orkas-skill', options).blocked).toBe(true);
+  });
+
   it('enforces Windows import blacklists case-insensitively on the actual system drive', async () => {
     const s = await loadSkills();
     const options = {
@@ -1308,6 +1407,119 @@ describe('skills › createFromDir', () => {
       expect(result.ok).toBe(false);
       expect(result.report?.violations.map((v: any) => v.rule)).toContain('skill_script_requires_runner');
       expect(fs.existsSync(path.join(customSkillsDir(), 'direct-script-import'))).toBe(false);
+    } finally {
+      fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('imports a ZIP package per skill and rolls back only the rejected sibling', async () => {
+    const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-'));
+    try {
+      const archive = path.join(srcParent, 'mixed-skills.zip');
+      const zip = new AdmZip();
+      zip.addFile('skills/good-skill/SKILL.md', Buffer.from([
+        '---',
+        'name: "good-skill"',
+        'description: "A valid imported skill"',
+        '---',
+        '',
+        '# Good Body',
+      ].join('\n')));
+      zip.addFile('skills/good-skill/references/guide.md', Buffer.from('preserved reference\n'));
+      zip.addFile('skills/bad-skill/SKILL.md', Buffer.from([
+        '---',
+        'name: "bad-skill"',
+        'description: "A rejected imported skill"',
+        '---',
+        '',
+        'node scripts/run.js',
+      ].join('\n')));
+      zip.addFile(
+        'skills/bad-skill/scripts/run.js',
+        Buffer.from('module.exports = async () => ({ ok: true });\n'),
+      );
+      zip.writeZip(archive);
+
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(archive);
+
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      expect(result.skills?.map((skill: any) => skill.id)).toEqual(['good-skill']);
+      expect(result.failures).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          skillId: 'bad-skill',
+          error: expect.any(String),
+          report: expect.objectContaining({ ok: false }),
+        }),
+      ]));
+      expect(fs.readFileSync(
+        path.join(customSkillsDir(), 'good-skill', 'SKILL.md'),
+        'utf8',
+      )).toContain('# Good Body');
+      expect(fs.readFileSync(
+        path.join(customSkillsDir(), 'good-skill', 'references', 'guide.md'),
+        'utf8',
+      )).toBe('preserved reference\n');
+      expect(fs.existsSync(path.join(customSkillsDir(), 'bad-skill'))).toBe(false);
+    } finally {
+      fs.rmSync(srcParent, { recursive: true, force: true });
+    }
+  });
+
+  it('admits an active-user attachment ZIP without opening the rest of the workspace tree', async () => {
+    const pathsMod = await import('../../../src/main/paths');
+    const attachmentDir = path.join(pathsMod.userChatAttachmentsDir(TEST_UID), 'conversation-1');
+    fs.mkdirSync(attachmentDir, { recursive: true });
+    const attachmentArchive = path.join(attachmentDir, 'attached.zip');
+    const attachmentZip = new AdmZip();
+    attachmentZip.addFile('attachment-feature-skill/SKILL.md', Buffer.from([
+      '---',
+      'name: "attachment-feature-skill"',
+      'description: "Import a current-turn attached Skill"',
+      '---',
+      '',
+      '# Attached Skill',
+    ].join('\n')));
+    attachmentZip.writeZip(attachmentArchive);
+
+    const blockedArchive = path.join(pathsMod.WS_ROOT, 'unrelated-workspace.zip');
+    const blockedZip = new AdmZip();
+    blockedZip.addFile('blocked-workspace-skill/SKILL.md', Buffer.from([
+      '---',
+      'name: "blocked-workspace-skill"',
+      'description: "Must stay blocked"',
+      '---',
+      '',
+      '# Blocked',
+    ].join('\n')));
+    blockedZip.writeZip(blockedArchive);
+
+    const s = await loadSkills();
+    const imported = await s.importSkillPackageFromPath(attachmentArchive);
+    const blocked = await s.importSkillPackageFromPath(blockedArchive);
+
+    expect(imported.ok, JSON.stringify(imported)).toBe(true);
+    expect(imported.skills?.map((skill: any) => skill.id)).toEqual(['attachment-feature-skill']);
+    expect(blocked).toMatchObject({ ok: false });
+    expect(blocked.error).toMatch(/Import refused|拒绝导入|拒否|recusada/i);
+    expect(fs.existsSync(
+      path.join(pathsMod.userSkillsDir(TEST_UID), 'blocked-workspace-skill'),
+    )).toBe(false);
+  });
+
+  it('requires a source SKILL.md for native package import without creating a draft', async () => {
+    const srcParent = fs.mkdtempSync(path.join(process.cwd(), '.tmp-skill-package-'));
+    try {
+      const src = path.join(srcParent, 'plain-notes');
+      fs.mkdirSync(src, { recursive: true });
+      fs.writeFileSync(path.join(src, 'README.md'), 'not a skill package\n');
+
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(src);
+
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/SKILL\.md/i);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'plain-notes'))).toBe(false);
     } finally {
       fs.rmSync(srcParent, { recursive: true, force: true });
     }
@@ -1785,6 +1997,32 @@ describe('skills › readSkillFile path safety', () => {
   });
 });
 
+describe('skills › blocking edit-chat failure recovery', () => {
+  it.each([
+    ['积分不足', '已完成的 Skill 说明。'],
+    ['fetch failed', '已生成的导入预览。'],
+  ])('persists partial model text before %s', async (error, partial) => {
+    writeCustomSkill('alpha');
+    chatImpl.current = async () => ({
+      ok: false,
+      text: partial,
+      error,
+      aborted: false,
+    });
+    const s = await loadSkills();
+
+    const result = await s.sendToSkillChat('u1', 'alpha', '更新 Skill');
+    expect(result).toMatchObject({ ok: false, error });
+    expect(result.message).toContain(partial);
+    expect(result.message).toContain(error);
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.at(-1)?.content).toContain(partial);
+    expect(rows.at(-1)?.content).toContain(error);
+  });
+});
+
 describe('skills › streamSendToSkillChat synthesized progress', () => {
   beforeEach(async () => {
     const { setLanguage } = await import('../../../src/main/features/config');
@@ -1838,6 +2076,73 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       .toContain('◯ 拒绝写入 ../evil.md');
   });
 
+  it('normalizes and persists terminal runtime for live and restored edit chat', async () => {
+    streamImpl.current = async function* () {
+      yield { type: 'final', text: 'done' };
+      yield {
+        type: 'event',
+        event: {
+          stream: 'agent_run_result',
+          data: {
+            result: 'success',
+            terminal_status: 'completed',
+            duration_ms: 37_000,
+            provider_ms: 35_000,
+            tool_ms: 2_000,
+          },
+        },
+      };
+    };
+    writeCustomSkill('alpha');
+
+    const s = await loadSkills();
+    const events: any[] = [];
+    for await (const ev of s.streamSendToSkillChat('u1', 'alpha', 'edit')) {
+      events.push(ev);
+    }
+
+    expect(events).not.toContainEqual(expect.objectContaining({
+      event: expect.objectContaining({ stream: 'agent_run_result' }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'event',
+      event: expect.objectContaining({
+        stream: 'runtime',
+        data: expect.objectContaining({ phase: 'end', duration_ms: 37_000, status: 'success' }),
+      }),
+    }));
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const runtime = rows.at(-1)?.process?.find((item: any) => item.event?.stream === 'runtime');
+    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 37_000, status: 'success' });
+  });
+
+  it('persists an errored fallback runtime when no terminal receipt arrives', async () => {
+    streamImpl.current = async function* () {
+      yield { type: 'error', text: 'provider failed' };
+    };
+    writeCustomSkill('alpha');
+
+    const s = await loadSkills();
+    for await (const _ev of s.streamSendToSkillChat('u1', 'alpha', 'edit')) {
+      // drain
+    }
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'skill', 'alpha', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const assistant = rows.at(-1);
+    const runtime = assistant?.process?.find((item: any) => item.event?.stream === 'runtime');
+    expect(assistant?.content).toContain('Model response failed: provider failed');
+    expect(runtime?.event?.data).toMatchObject({
+      phase: 'end',
+      status: 'error',
+      aborted: false,
+      errored: true,
+    });
+    expect(runtime?.event?.data?.duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
   it('applies skill-meta blocks and emits metadata progress', async () => {
     streamImpl.current = async function* () {
       yield {
@@ -1854,7 +2159,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     }
 
     expect(events.filter((e) => e.type === 'progress').map((e) => e.text))
-      .toContain('▶ 更新技能元信息');
+      .toContain('▶ 更新技能信息');
     const md = fs.readFileSync(path.join(customSkillsDir(), 'alpha', 'SKILL.md'), 'utf8');
     expect(md).not.toContain('category: "data"');
     expect(md).toContain('body');
@@ -1900,7 +2205,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
       prerequisites: ['imported notes are present'],
     });
     expect(events.filter((e) => e.type === 'progress').map((e) => e.text))
-      .toContain('▶ 更新技能元信息');
+      .toContain('▶ 更新技能信息');
   });
 
   it('uses explicit skill-reply as the visible final text for mutation turns', async () => {
@@ -1955,7 +2260,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     expect(finalText).toBe('已完成技能更新。');
     expect(finalText).not.toContain('<skill>');
     expect(events.filter((e) => e.type === 'progress').map((e) => e.text))
-      .toContain('▶ 更新技能元信息');
+      .toContain('▶ 更新技能信息');
 
     const meta = JSON.parse(fs.readFileSync(path.join(customSkillsDir(), 'alpha', '_meta.json'), 'utf8'));
     expect(meta.category).toBe('general');
@@ -1965,7 +2270,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     const assistantMsg = JSON.parse(lines[lines.length - 1]);
     expect(assistantMsg.content).toBe('已完成技能更新。');
     expect(assistantMsg.content).not.toContain('<skill>');
-    expect(assistantMsg.process.map((p: any) => p.text)).toContain('▶ 更新技能元信息');
+    expect(assistantMsg.process.map((p: any) => p.text)).toContain('▶ 更新技能信息');
   });
 
   it('hides skill-file content from live deltas before final parsing', async () => {

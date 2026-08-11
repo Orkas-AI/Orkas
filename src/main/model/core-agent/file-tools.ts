@@ -1,8 +1,9 @@
 /**
  * File-scoped tools injected into every main-conv runner.
  *
- *   - `read_file`     — read a slice of a file's text by char offsets. All
- *                       kinds use `charStart` / `charEnd` (0-based, half-open);
+ *   - `read_file`     — read a slice of a file's text through an optional
+ *                       tagged line/character range. The executor retains the
+ *                       legacy flat range fields for conversation compatibility;
  *                       the server does not truncate. Text works as-is; rich
  *                       document kinds require a prior `stat_file` call so this tool
  *                       never triggers extract side-effects. Image returns an
@@ -58,12 +59,17 @@ import { macosTccSensitivePath } from '../../util/macos-tcc';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { isSkillEnabled } from '../../features/component_enabled';
 import { recordRead } from './read-tracker';
+import { issueFileRevision } from './file-revision';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import type { SkillRuntimeBinding } from './skill-registry';
 import {
   fallbackDirectoryExcluded,
   fallbackFileExcluded,
   grepRepository,
   listRepositoryFiles,
+  readIgnoreScope,
+  isIgnoredByScopes,
+  type IgnoreScope,
 } from './repository-search';
 
 const log = createLogger('file-tools');
@@ -121,6 +127,13 @@ export interface FileToolsOpts {
    *  channels for those resources, and a sandbox-level lock keeps the LLM
    *  honest even when its prompt strays. */
   readOnlyExtraRoots?: readonly string[];
+  /** Mutable read-only roots granted after runner construction by a trusted
+   * rich-message resolver. Never populated from raw model/renderer paths. */
+  runtimeReadOnlyRoots?: readonly string[];
+  /** Run-scoped logical Skill paths collected from the exact prompt render.
+   * Values are host-created only; the model can reference them as
+   * `@skill/<ref>` or `@skill/<ref>/<relative-path>`. */
+  skillRuntimeBindings?: ReadonlyMap<string, SkillRuntimeBinding>;
   /** Session-scoped persisted tool-result root. It is visible for path scope
    *  checks but generic read_file must never use it; retrieval is only through
    *  tool_result_search / tool_result_read_chunk. */
@@ -155,11 +168,126 @@ function allowedRoots(opts: FileToolsOpts): string[] {
   if (opts.readOnlyExtraRoots?.length) {
     for (const r of opts.readOnlyExtraRoots) if (r) roots.push(r);
   }
-  return roots;
+  if (opts.runtimeReadOnlyRoots?.length) {
+    for (const r of opts.runtimeReadOnlyRoots) if (r) roots.push(r);
+  }
+  if (opts.skillRuntimeBindings?.size) {
+    for (const binding of opts.skillRuntimeBindings.values()) {
+      if (binding.root) roots.push(binding.root);
+    }
+  }
+  // A binding is normally indexed by both display name and id, and Runner
+  // also supplies its roots to the read-only lane. Collapse those aliases so
+  // every path gate performs one containment check per physical root, not one
+  // per logical alias.
+  const seen = new Set<string>();
+  return roots.filter((root) => {
+    const key = path.resolve(root);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function resolveAbs(ctx: ToolContext, p: string): string {
   return path.resolve(ctx.workingDir ?? '.', p);
+}
+
+type RequestedPathResolution =
+  | { abs: string; displayPath: string; skillRef?: string; error?: never }
+  | { abs?: never; displayPath?: never; skillRef?: never; error: string };
+
+/** Resolve the virtual Skill namespace before the ordinary cwd resolver. The
+ * final containment check is the same symlink-safe guard used by all file
+ * tools, so a reference file cannot escape its bound Skill root. */
+function resolveRequestedPath(
+  opts: FileToolsOpts,
+  ctx: ToolContext,
+  requestedPath: string,
+  behavior: { bareSkillRefTarget?: 'entry' | 'root' } = {},
+): RequestedPathResolution {
+  if (!requestedPath.startsWith('@skill/')) {
+    return { abs: resolveAbs(ctx, requestedPath), displayPath: requestedPath };
+  }
+  if (requestedPath.includes('\0') || requestedPath.includes('\\')) {
+    return { error: errText('E_SKILL_REF_INVALID', 'Skill references must use forward slashes and cannot contain NUL bytes.') };
+  }
+
+  const tail = requestedPath.slice('@skill/'.length);
+  const slash = tail.indexOf('/');
+  const ref = (slash >= 0 ? tail.slice(0, slash) : tail).trim();
+  const relative = slash >= 0 ? tail.slice(slash + 1) : '';
+  if (!ref || ref === '.' || ref === '..') {
+    return { error: errText('E_SKILL_REF_INVALID', 'Use @skill/<read-ref> with the exact read ref advertised in Available skills.') };
+  }
+  const binding = opts.skillRuntimeBindings?.get(ref);
+  if (!binding) {
+    return {
+      error: errText(
+        'E_SKILL_NOT_AVAILABLE',
+        `@skill/${ref} is not bound for this run. Use an exact read ref from the current Available skills block.`,
+      ),
+    };
+  }
+
+  const segments = relative ? relative.split('/') : [];
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) {
+    return { error: errText('E_SKILL_REF_INVALID', 'Skill-relative paths cannot contain empty, ".", or ".." segments.') };
+  }
+  const bareTarget = behavior.bareSkillRefTarget === 'root' ? binding.root : binding.entry;
+  const abs = relative ? path.resolve(binding.root, ...segments) : path.resolve(bareTarget);
+  if (!isPathAllowed(abs, [binding.root])) {
+    return {
+      error: errText(
+        'E_SKILL_PATH_OUT_OF_SCOPE',
+        `the requested Skill file resolves outside @skill/${ref}; use only files inside that Skill.`,
+      ),
+    };
+  }
+  return { abs, displayPath: requestedPath, skillRef: ref };
+}
+
+/** Keep a run-scoped Skill address logical in every model-visible result.
+ * Internal scope checks and extraction still use the canonical filesystem
+ * path; only the returned address is rewritten. */
+function displayDescendantPath(abs: string, rootAbs: string, rootDisplayPath: string): string {
+  if (!rootDisplayPath.startsWith('@skill/')) return abs;
+  const relative = path.relative(rootAbs, abs);
+  if (!relative) return rootDisplayPath;
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return rootDisplayPath;
+  return `${rootDisplayPath.replace(/\/$/, '')}/${relative.split(path.sep).join('/')}`;
+}
+
+function displayErrorMessage(err: unknown, abs: string, displayPath: string): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return abs === displayPath ? message : message.split(abs).join(displayPath);
+}
+
+/** True when a successfully-read path is part of the portable skill
+ * instruction surface: the skill body itself, or any document below its
+ * `references/` tree. This is deliberately structural rather than tied to
+ * Orkas source attribution — system, custom, marketplace, agent-owned,
+ * package, and global skills all use the same on-disk protocol.
+ *
+ * Access control has already admitted the path before this classification is
+ * used, so recognizing a document never widens the model's readable scope. */
+export function isPortableSkillDocumentPath(absPath: string): boolean {
+  if (!absPath) return false;
+  const abs = path.resolve(absPath);
+  if (path.basename(abs) === 'SKILL.md') return true;
+
+  let cursor = path.dirname(abs);
+  while (true) {
+    if (path.basename(cursor) === 'references') {
+      const skillBody = path.join(path.dirname(cursor), 'SKILL.md');
+      try {
+        if (fs.statSync(skillBody).isFile()) return true;
+      } catch { /* this references/ directory does not belong to a skill */ }
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) return false;
+    cursor = parent;
+  }
 }
 
 /** Prefix each line with its 1-based absolute line number + tab (compact
@@ -276,37 +404,123 @@ function isExtractableRichKind(kind: string): boolean {
   return kind === 'pdf' || kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation';
 }
 
+type ReadAddress = {
+  charStart?: number;
+  charEnd?: number;
+  lineStart?: number;
+  lineEnd?: number;
+};
+
+type ReadAddressResult =
+  | { address: ReadAddress; error?: never }
+  | { address?: never; error: string };
+
+const LEGACY_READ_RANGE_KEYS = ['charStart', 'charEnd', 'lineStart', 'lineEnd'] as const;
+
+function taggedReadRangeSchema(): Record<string, unknown> {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      unit: {
+        type: 'string',
+        enum: ['line', 'char'],
+        description: 'Addressing unit: line is 1-based/inclusive; char is 0-based with an exclusive end.',
+      },
+      start: { type: 'integer', description: 'Start position in the selected unit.' },
+      end: { type: 'integer', description: 'End position: inclusive for line, exclusive for char.' },
+    },
+    required: ['unit', 'start', 'end'],
+  };
+}
+
+/** Parse the provider-visible tagged range while retaining old flat fields for
+ * already-running conversations and non-model callers. New and legacy forms
+ * cannot be combined because their precedence would otherwise be ambiguous. */
+function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
+  const rawRange = input.range;
+  if (rawRange !== undefined) {
+    if (LEGACY_READ_RANGE_KEYS.some((key) => input[key] !== undefined)) {
+      return { error: '`range` cannot be combined with legacy flat range fields' };
+    }
+    if (!rawRange || typeof rawRange !== 'object' || Array.isArray(rawRange)) {
+      return { error: '`range` must be an object with unit, start, and end' };
+    }
+    const range = rawRange as Record<string, unknown>;
+    const unit = range.unit;
+    const start = range.start;
+    const end = range.end;
+    if (unit !== 'line' && unit !== 'char') {
+      return { error: '`range.unit` must be "line" or "char"' };
+    }
+    if (!Number.isInteger(start) || !Number.isInteger(end)) {
+      return { error: '`range.start` and `range.end` must be integers' };
+    }
+    const numericStart = start as number;
+    const numericEnd = end as number;
+    const minimumStart = unit === 'line' ? 1 : 0;
+    if (numericStart < minimumStart || numericEnd < numericStart) {
+      return {
+        error: unit === 'line'
+          ? '`range` line positions must satisfy 1 <= start <= end'
+          : '`range` character positions must satisfy 0 <= start <= end',
+      };
+    }
+    return unit === 'line'
+      ? { address: { lineStart: numericStart, lineEnd: numericEnd } }
+      : { address: { charStart: numericStart, charEnd: numericEnd } };
+  }
+
+  const hasCharRange = typeof input.charStart === 'number' || typeof input.charEnd === 'number';
+  const hasLineRange = typeof input.lineStart === 'number' || typeof input.lineEnd === 'number';
+  if (hasCharRange && hasLineRange) {
+    return { error: 'use either charStart/charEnd or lineStart/lineEnd, not both' };
+  }
+  return {
+    address: {
+      ...(typeof input.charStart === 'number' ? { charStart: input.charStart } : {}),
+      ...(typeof input.charEnd === 'number' ? { charEnd: input.charEnd } : {}),
+      ...(typeof input.lineStart === 'number' ? { lineStart: input.lineStart } : {}),
+      ...(typeof input.lineEnd === 'number' ? { lineEnd: input.lineEnd } : {}),
+    },
+  };
+}
+
 // ── read_file ─────────────────────────────────────────────────────────────
 
-function createReadFileTool(opts: FileToolsOpts): AgentTool {
+function createReadFileTool(
+  opts: FileToolsOpts,
+  behavior: { defaultCharLimit?: number } = {},
+): AgentTool {
   return {
     name: 'read_file',
     executionMode: 'parallel',
     description:
-      'Read a file by 1-based inclusive lineStart/lineEnd or 0-based charStart/charEnd. Text lines are returned as "<line>\\t<text>"; do not include that prefix in edits. For new PDF/Office files, stat_file may be required first; images return an inline preview.',
+      'Read a whole file or an exact range: {unit:"line",start,end} is 1-based/inclusive; {unit:"char",start,end} is 0-based/end-exclusive. Text results include an opaque revision token for exact follow-up file mutations; copy it instead of converting character counts to byte offsets. Text lines are returned as "<line>\\t<text>"; do not include that prefix in edits. For new PDF/Office files, stat_file may be required first; images return an inline preview.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path:      { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
-        charStart: { type: 'number', description: '0-based start char (inclusive). Default 0.' },
-        charEnd:   { type: 'number', description: '0-based end char (exclusive). Default total_chars.' },
-        lineStart: { type: 'number', description: '1-based start line (inclusive). Cannot be combined with charStart/charEnd.' },
-        lineEnd:   { type: 'number', description: '1-based end line (inclusive). Cannot be combined with charStart/charEnd.' },
+        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+        range: taggedReadRangeSchema(),
       },
       required: ['path'],
     },
     async execute(input, ctx) {
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const abs = resolveAbs(ctx, raw);
-      const hasCharRange = typeof input.charStart === 'number' || typeof input.charEnd === 'number';
-      const hasLineRange = typeof input.lineStart === 'number' || typeof input.lineEnd === 'number';
-      if (hasCharRange && hasLineRange) {
+      const resolvedPath = resolveRequestedPath(opts, ctx, raw);
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      const { abs, displayPath } = resolvedPath;
+      const parsedAddress = parseReadAddress(input);
+      if (parsedAddress.error) {
         return {
-          content: errText('E_BAD_INPUT', 'use either charStart/charEnd or lineStart/lineEnd, not both'),
+          content: errText('E_BAD_INPUT', parsedAddress.error),
           isError: true,
         };
       }
+      const { address } = parsedAddress;
+      const hasLineRange = address.lineStart !== undefined || address.lineEnd !== undefined;
 
       const scopeErr = await gatePathAccess(opts, abs, 'read_file', ctx);
       if (scopeErr) {
@@ -328,7 +542,8 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         };
       }
 
-      try { fs.statSync(abs); }
+      let sourceStat: fs.Stats;
+      try { sourceStat = fs.statSync(abs); }
       catch (err) {
         const siblings = findUniquifySiblings(abs);
         log.warn('read_file not found', {
@@ -337,7 +552,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           sibling_count: siblings.length,
           error: logErrorRef(err),
         });
-        let content = errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`);
+        let content = errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`);
         if (siblings.length) {
           content +=
             '\n\n<file-renamed-earlier>\n'
@@ -350,10 +565,11 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       }
 
       const kind = kindOf(abs);
+      const portableSkillDocument = isPortableSkillDocumentPath(abs);
       try {
         if (kind === 'image') {
           const img = await readImageAsGrayJpeg(opts.userId, abs);
-          const header = `<file path="${abs}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} gray JPEG q=70"/>`;
+          const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} gray JPEG q=70"/>`;
           log.info('read_file image loaded', {
             user_id: maskId(opts.userId),
             path: logPathRef(abs),
@@ -366,16 +582,25 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           };
         }
 
+        const appliesDefaultCharLimit = !hasLineRange
+          && address.charStart === undefined
+          && address.charEnd === undefined
+          && behavior.defaultCharLimit !== undefined
+          && !portableSkillDocument;
         let result = await readRange(opts.userId, abs, {
-          ...(typeof input.charStart === 'number' ? { charStart: input.charStart } : {}),
-          ...(typeof input.charEnd   === 'number' ? { charEnd:   input.charEnd   } : {}),
+          ...(address.charStart !== undefined ? { charStart: address.charStart } : {}),
+          ...(address.charEnd !== undefined
+            ? { charEnd: address.charEnd }
+            : appliesDefaultCharLimit
+              ? { charEnd: behavior.defaultCharLimit }
+              : {}),
         });
         if (hasLineRange) {
           const full = result.content;
-          const requestedStart = Math.max(1, Math.trunc(Number(input.lineStart) || 1));
+          const requestedStart = Math.max(1, Math.trunc(Number(address.lineStart) || 1));
           const requestedEnd = Math.max(
             requestedStart,
-            Math.trunc(Number(input.lineEnd) || requestedStart + 399),
+            Math.trunc(Number(address.lineEnd) || requestedStart + 399),
           );
           let currentLine = 1;
           let startChar = requestedStart === 1 ? 0 : full.length;
@@ -401,16 +626,20 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         const total = result.meta.totalChars ?? 0;
         const cs = result.range.charStart;
         const ce = result.range.charEnd;
+        const revision = kind === 'text' && result.sourceHash
+          ? issueFileRevision(ctx, abs, sourceStat.size, result.sourceHash)
+          : '';
         // Number the lines for display (the model thinks in lines for code);
         // char offsets remain the addressing/paging unit.
         const { text: numberedContent, lastLine } = addLineNumbers(result.content, result.startLine);
         const attrs = [
-          `path="${abs}"`,
+          `path="${displayPath}"`,
           `kind="${kind}"`,
           `total_chars="${total}"`,
           `covered="${cs}-${ce}"`,
           `lines="${result.startLine}-${lastLine}"`,
           ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
+          ...(revision ? [`revision="${revision}"`] : []),
           ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
@@ -429,7 +658,21 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         // signal (per Claude Code conventions). Emit AFTER the successful
         // text read — image / rich-document SKILL.md is not a real shape.
         if (opts.onSkillInvoked) {
-          const parsed = parseSkillPath(abs, opts.userId);
+          const runtimeBinding = resolvedPath.skillRef
+            ? opts.skillRuntimeBindings?.get(resolvedPath.skillRef)
+            : undefined;
+          const runtimeParsed = runtimeBinding
+            && path.resolve(abs) === path.resolve(runtimeBinding.entry)
+            ? {
+              skill_id: runtimeBinding.id,
+              system: runtimeBinding.source === 'custom'
+                ? 'A.custom' as const
+                : runtimeBinding.source === 'builtin' || runtimeBinding.source === 'platform'
+                  ? 'A.platform' as const
+                  : 'B' as const,
+            }
+            : null;
+          const parsed = runtimeParsed || parseSkillPath(abs, opts.userId);
           if (parsed) {
             try { opts.onSkillInvoked(parsed.skill_id, parsed.system, 'read_file'); }
             catch (err) { log.warn('onSkillInvoked callback failed', { error: logErrorRef(err) }); }
@@ -441,6 +684,11 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         recordRead(ctx, abs, undefined, result.sourceHash);
         return {
           content: `${header}\n${numberedContent}\n</file>`,
+          // A skill body or its reference is a document the model was told to
+          // read whole. Spilled, it comes back as a stub the model keyword-
+          // searches, and whatever the search misses goes unread — so the
+          // result policy gives it a wider (still bounded) inline ceiling.
+          ...(portableSkillDocument ? { verbatimDocument: true } : {}),
           observations: {
             fileReads: [{
               path: abs,
@@ -456,26 +704,26 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           return {
             content: errText(
               'E_NEED_STAT',
-              `${abs}: ${err.kind} has not been extracted yet. Call stat_file(path=...) first to get total_chars, then call read_file with charStart/charEnd.`,
+              `${displayPath}: ${err.kind} has not been extracted yet. Call stat_file(path=...) first to get total_chars, then call read_file with charStart/charEnd.`,
             ),
             isError: true,
           };
         }
         if (err instanceof NoTextError) {
           log.warn('read_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
+          return { content: errText('E_NO_TEXT', `${displayPath}: image has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
           log.warn('read_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_UNSUPPORTED_FILE',
-              `${abs}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
+              `${displayPath}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
             ),
             isError: true,
           };
         }
-        const msg = (err as Error).message;
+        const msg = displayErrorMessage(err, abs, displayPath);
         log.warn('read_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_READ_FAILED', msg), isError: true };
       }
@@ -491,14 +739,19 @@ const READ_FILES_DEFAULT_SLICE_CHARS = 24_000;
  * request to the normal read tool so scope checks, rich-file handling,
  * line-number rendering, skill attribution, and OCC stamps stay identical. */
 function createReadFilesTool(opts: FileToolsOpts): AgentTool {
-  const readFile = createReadFileTool(opts);
+  // Ordinary batch reads default to a bounded slice. Portable skill documents
+  // are the exception: the delegated read_file classifies them only after its
+  // normal access gate and reads them whole, so a skill never silently becomes
+  // a valid-looking prefix.
+  const readFile = createReadFileTool(opts, { defaultCharLimit: READ_FILES_DEFAULT_SLICE_CHARS });
   return {
     name: 'read_files',
     executionMode: 'parallel',
     description:
-      'Read several related files or bounded ranges after search/grep. Each request accepts path plus lineStart/lineEnd or charStart/charEnd. Results retain line numbers, hashes, scope checks, and rich-file behavior.',
+      'Read several related files or bounded exact tagged ranges after search/grep. Each request accepts path plus optional range {unit:"line"|"char",start,end}. Results retain line numbers, hashes, scope checks, and rich-file behavior.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         files: {
           type: 'array',
@@ -506,12 +759,10 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           maxItems: READ_FILES_MAX_ITEMS,
           items: {
             type: 'object',
+            additionalProperties: false,
             properties: {
-              path: { type: 'string', description: 'Absolute path inside the visible conversation scope.' },
-              charStart: { type: 'number', description: '0-based start char (inclusive). Default 0.' },
-              charEnd: { type: 'number', description: '0-based end char (exclusive). Default charStart + 24000.' },
-              lineStart: { type: 'number', description: '1-based start line (inclusive).' },
-              lineEnd: { type: 'number', description: '1-based end line (inclusive).' },
+              path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
+              range: taggedReadRangeSchema(),
             },
             required: ['path'],
           },
@@ -540,32 +791,37 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           isError: true,
         };
       }
-      if (requests.some((entry) => (
-        (typeof entry.lineStart === 'number' || typeof entry.lineEnd === 'number')
-        && (typeof entry.charStart === 'number' || typeof entry.charEnd === 'number')
-      ))) {
+      const parsedAddresses = requests.map((entry) => parseReadAddress(entry));
+      const invalidAddressIndex = parsedAddresses.findIndex((entry) => entry.error !== undefined);
+      if (invalidAddressIndex >= 0) {
         return {
-          content: errText('E_BAD_INPUT', 'each read_files item must use either line or character ranges, not both'),
+          content: errText(
+            'E_BAD_INPUT',
+            `read_files item ${invalidAddressIndex + 1}: ${parsedAddresses[invalidAddressIndex].error}`,
+          ),
           isError: true,
         };
       }
 
-      const normalized = requests.map((request) => {
-        const hasLineRange = typeof request.lineStart === 'number' || typeof request.lineEnd === 'number';
+      const normalized = requests.map((request, index) => {
+        const address = parsedAddresses[index].address!;
+        const hasLineRange = address.lineStart !== undefined || address.lineEnd !== undefined;
         if (hasLineRange) {
-          const lineStart = typeof request.lineStart === 'number' && Number.isFinite(request.lineStart)
-            ? Math.max(1, Math.trunc(request.lineStart))
+          const lineStart = address.lineStart !== undefined && Number.isFinite(address.lineStart)
+            ? Math.max(1, Math.trunc(address.lineStart))
             : 1;
-          const lineEnd = typeof request.lineEnd === 'number' && Number.isFinite(request.lineEnd)
-            ? Math.max(lineStart, Math.trunc(request.lineEnd))
+          const lineEnd = address.lineEnd !== undefined && Number.isFinite(address.lineEnd)
+            ? Math.max(lineStart, Math.trunc(address.lineEnd))
             : lineStart + 399;
           return { path: request.path, lineStart, lineEnd };
         }
-        const start = typeof request.charStart === 'number' && Number.isFinite(request.charStart)
-          ? Math.max(0, Math.trunc(request.charStart))
+        const hasCharacterRange = address.charStart !== undefined || address.charEnd !== undefined;
+        if (!hasCharacterRange) return { path: request.path };
+        const start = address.charStart !== undefined && Number.isFinite(address.charStart)
+          ? Math.max(0, Math.trunc(address.charStart))
           : 0;
-        const explicitEnd = typeof request.charEnd === 'number' && Number.isFinite(request.charEnd)
-          ? Math.max(start, Math.trunc(request.charEnd))
+        const explicitEnd = address.charEnd !== undefined && Number.isFinite(address.charEnd)
+          ? Math.max(start, Math.trunc(address.charEnd))
           : undefined;
         return {
           path: request.path,
@@ -575,7 +831,12 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
       });
       const results = await Promise.all(normalized.map((request) => readFile.execute(request, ctx)));
       const images = results.flatMap((result) => result.images || []);
-      let remaining = READ_FILES_MAX_OUTPUT_CHARS;
+      const includesVerbatimDocument = results.some((result) => !result.isError && result.verbatimDocument);
+      // Skill documents must remain lossless. AgentRunner's final result cap
+      // persists an oversized aggregate and charges the round ledger; applying
+      // this older character truncation first would destroy the omitted bytes
+      // before that policy can act.
+      let remaining = includesVerbatimDocument ? Number.POSITIVE_INFINITY : READ_FILES_MAX_OUTPUT_CHARS;
       let truncated = false;
       const blocks = results.map((result, index) => {
         const prefix =
@@ -599,6 +860,7 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           + `${blocks.join('\n')}\n</read-files>`,
         ...(images.length ? { images } : {}),
         ...(errors === results.length ? { isError: true } : {}),
+        ...(includesVerbatimDocument ? { verbatimDocument: true } : {}),
         observations: {
           fileReads: results.flatMap((result) => result.observations?.fileReads ?? []),
         },
@@ -617,14 +879,16 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
+        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
       },
       required: ['path'],
     },
     async execute(input, ctx) {
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const abs = resolveAbs(ctx, raw);
+      const resolvedPath = resolveRequestedPath(opts, ctx, raw);
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      const { abs, displayPath } = resolvedPath;
 
       const scopeErr = await gatePathAccess(opts, abs, 'stat_file', ctx);
       if (scopeErr) {
@@ -640,7 +904,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
       try { fs.statSync(abs); }
       catch (err) {
         log.warn('stat_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`), isError: true };
+        return { content: errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`), isError: true };
       }
 
       const kind = kindOf(abs);
@@ -656,24 +920,24 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
           extraction_empty: !!meta.extractionEmpty,
         });
         return {
-          content: `<file path="${abs}" kind="${kind}" total_chars="${total}"${emptyAttr}/>`,
+          content: `<file path="${displayPath}" kind="${kind}" total_chars="${total}"${emptyAttr}/>`,
         };
       } catch (err) {
         if (err instanceof NoTextError) {
           log.warn('stat_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
+          return { content: errText('E_NO_TEXT', `${displayPath}: image has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
           log.warn('stat_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_UNSUPPORTED_FILE',
-              `${abs}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
+              `${displayPath}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
             ),
             isError: true,
           };
         }
-        const msg = (err as Error).message;
+        const msg = displayErrorMessage(err, abs, displayPath);
         log.warn('stat_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_STAT_FAILED', msg), isError: true };
       }
@@ -692,7 +956,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
+        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
         pages: { type: 'string', description: 'Optional PDF pages, e.g. "1-3,5". Omit to OCR all pages.' },
       },
       required: ['path'],
@@ -700,7 +964,9 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
     async execute(input, ctx) {
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const abs = resolveAbs(ctx, raw);
+      const resolvedPath = resolveRequestedPath(opts, ctx, raw);
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      const { abs, displayPath } = resolvedPath;
 
       const scopeErr = await gatePathAccess(opts, abs, 'ocr_file', ctx);
       if (scopeErr) {
@@ -715,7 +981,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
       try { fs.statSync(abs); }
       catch (err) {
         log.warn('ocr_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`), isError: true };
+        return { content: errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`), isError: true };
       }
 
       const kind = kindOf(abs);
@@ -751,7 +1017,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
             const image = await readImageAsGrayJpeg(opts.userId, abs);
             return {
               content:
-                `<ocr-vision-fallback path="${abs}" reason="${result.errorCode}" action="inspect_attached_image">\n`
+                `<ocr-vision-fallback path="${displayPath}" reason="${result.errorCode}" action="inspect_attached_image">\n`
                 + 'Local OCR is unavailable. Continue once from the attached model-visible image; do not call OCR or shell repair commands.\n'
                 + `</ocr-vision-fallback>${processBlock}`,
               images: [{ data: image.base64, mediaType: image.mediaType }],
@@ -768,7 +1034,10 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
           ? '\n\n<ocr-vision-fallback action="pdf_render" retry_ocr="false">Render only the needed PDF pages, one page per call, and inspect the returned images. Do not use shell extraction or package installation.</ocr-vision-fallback>'
           : '';
         return {
-          content: errText(result.errorCode, `${result.message}${processBlock}${visionFallback}${repairHint}`),
+          content: errText(
+            result.errorCode,
+            displayErrorMessage(`${result.message}${processBlock}${visionFallback}${repairHint}`, abs, displayPath),
+          ),
           isError: true,
         };
       }
@@ -779,7 +1048,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
         cached: !!result.cached,
         text_chars: result.content.length,
       });
-      return { content: result.content };
+      return { content: displayErrorMessage(result.content, abs, displayPath) };
     },
   };
 }
@@ -827,9 +1096,16 @@ function walkFiles(
   catch { return { files: out }; }
   if (!rootStat.isDirectory()) return { files: out };
 
-  const stack: string[] = [root];
+  // Ignore files are honoured here too, not just by the `rg` backend: the tool
+  // promises repository scans respect them, and a machine without ripgrep must
+  // not start surfacing ignored build output and local config.
+  const honourIgnores = opts.includeIgnored !== true;
+  const rootScope = honourIgnores ? readIgnoreScope(root) : null;
+  const stack: Array<{ dir: string; scopes: readonly IgnoreScope[] }> = [
+    { dir: root, scopes: rootScope ? [rootScope] : [] },
+  ];
   while (stack.length && out.length < max) {
-    const dir = stack.pop()!;
+    const { dir, scopes } = stack.pop()!;
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
     catch { continue; }
@@ -837,8 +1113,12 @@ function walkFiles(
       if (e.name === '.git') continue;
       if (e.isDirectory() && fallbackDirectoryExcluded(e.name)) continue;
       const p = path.join(dir, e.name);
-      if (e.isDirectory()) stack.push(p);
-      else if (e.isFile()) {
+      if (honourIgnores && isIgnoredByScopes(p, e.isDirectory(), scopes)) continue;
+      if (e.isDirectory()) {
+        // A nested `.gitignore` governs its own subtree, as in git.
+        const nested = honourIgnores ? readIgnoreScope(p) : null;
+        stack.push({ dir: p, scopes: nested ? [...scopes, nested] : scopes });
+      } else if (e.isFile()) {
         if (fallbackFileExcluded(e.name)) continue;
         out.push(p);
         if (out.length >= max) break;
@@ -878,7 +1158,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Substring or glob. Omit to list everything.' },
-        root: { type: 'string', description: 'Optional visible directory to search instead of all visible roots.' },
+        root: { type: 'string', description: 'Optional visible directory or @skill/<read-ref>[/relative-path] to search instead of all visible roots.' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional include globs matched against root-relative paths or basenames.' },
         exclude_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional exclude globs.' },
         include_ignored: { type: 'boolean', description: 'Include ignored files when explicitly needed; dependency/build directories remain bounded.' },
@@ -903,19 +1183,31 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
         if (root) rootKinds.push({ root, source: 'extra' });
       }
-      const requestedRoot = typeof input.root === 'string' && input.root.trim()
-        ? resolveAbs(ctx, input.root.trim())
-        : '';
+      const requestedRootInput = typeof input.root === 'string' ? input.root.trim() : '';
+      const requestedRootResolution = requestedRootInput
+        ? resolveRequestedPath(opts, ctx, requestedRootInput, { bareSkillRefTarget: 'root' })
+        : null;
+      if (requestedRootResolution?.error) {
+        return { content: requestedRootResolution.error, isError: true };
+      }
+      const requestedRoot = requestedRootResolution?.abs || '';
+      const requestedRootDisplay = requestedRootResolution?.displayPath || requestedRoot;
       if (requestedRoot) {
         const scopeErr = await gatePathAccess(opts, requestedRoot, 'search_files', ctx);
         if (scopeErr) return { content: scopeErr, isError: true };
         let st: fs.Stats;
         try { st = fs.statSync(requestedRoot); }
         catch (err) {
-          return { content: errText('E_NOT_FOUND', `${requestedRoot}: ${(err as Error).message}`), isError: true };
+          return {
+            content: errText(
+              'E_NOT_FOUND',
+              `${requestedRootDisplay}: ${displayErrorMessage(err, requestedRoot, requestedRootDisplay)}`,
+            ),
+            isError: true,
+          };
         }
         if (!st.isDirectory()) {
-          return { content: errText('E_NOT_DIRECTORY', `${requestedRoot}: not a directory`), isError: true };
+          return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true };
         }
         const source = rootKinds.find(({ root }) => isInsideRoot(root, requestedRoot))?.source ?? 'extra';
         rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
@@ -953,7 +1245,9 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
           catch { continue; }
           const ext = path.extname(name).toLowerCase();
           const hit: SearchHit = {
-            path: abs,
+            path: requestedRootResolution?.skillRef
+              ? displayDescendantPath(abs, requestedRoot, requestedRootDisplay)
+              : abs,
             name,
             size: st.size,
             mtime: Math.floor(st.mtimeMs),
@@ -1139,7 +1433,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Pattern to search for.' },
-        root: { type: 'string', description: 'Optional visible directory to search instead of all visible roots.' },
+        root: { type: 'string', description: 'Optional visible directory or @skill/<read-ref>[/relative-path] to search instead of all visible roots.' },
         regex: { type: 'boolean', description: 'Default false — treat pattern as a case-insensitive substring.' },
         glob: { type: 'string', description: 'Optional file glob. No "/" matches basenames; with "/" matches relative paths, e.g. "src/**/*.ts".' },
         include_glob: { type: 'array', items: { type: 'string' }, maxItems: 16, description: 'Optional additional include globs. A file may match any include glob.' },
@@ -1196,19 +1490,31 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
         if (root) rootKinds.push({ root, source: 'extra' });
       }
-      const requestedRoot = typeof input.root === 'string' && input.root.trim()
-        ? resolveAbs(ctx, input.root.trim())
-        : '';
+      const requestedRootInput = typeof input.root === 'string' ? input.root.trim() : '';
+      const requestedRootResolution = requestedRootInput
+        ? resolveRequestedPath(opts, ctx, requestedRootInput, { bareSkillRefTarget: 'root' })
+        : null;
+      if (requestedRootResolution?.error) {
+        return { content: requestedRootResolution.error, isError: true };
+      }
+      const requestedRoot = requestedRootResolution?.abs || '';
+      const requestedRootDisplay = requestedRootResolution?.displayPath || requestedRoot;
       if (requestedRoot) {
         const scopeErr = await gatePathAccess(opts, requestedRoot, 'grep_files', ctx);
         if (scopeErr) return { content: scopeErr, isError: true };
         let st: fs.Stats;
         try { st = fs.statSync(requestedRoot); }
         catch (err) {
-          return { content: errText('E_NOT_FOUND', `${requestedRoot}: ${(err as Error).message}`), isError: true };
+          return {
+            content: errText(
+              'E_NOT_FOUND',
+              `${requestedRootDisplay}: ${displayErrorMessage(err, requestedRoot, requestedRootDisplay)}`,
+            ),
+            isError: true,
+          };
         }
         if (!st.isDirectory()) {
-          return { content: errText('E_NOT_DIRECTORY', `${requestedRoot}: not a directory`), isError: true };
+          return { content: errText('E_NOT_DIRECTORY', `${requestedRootDisplay}: not a directory`), isError: true };
         }
         const source = rootKinds.find(({ root }) => isInsideRoot(root, requestedRoot))?.source ?? 'extra';
         rootKinds.splice(0, rootKinds.length, { root: requestedRoot, source });
@@ -1277,7 +1583,12 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         if (!repositoryResult.available) continue;
         if (repositoryResult.error) {
           return {
-            content: errText('E_GREP_FAILED', repositoryResult.error),
+            content: errText(
+              'E_GREP_FAILED',
+              requestedRootResolution?.skillRef
+                ? displayErrorMessage(repositoryResult.error, requestedRoot, requestedRootDisplay)
+                : repositoryResult.error,
+            ),
             isError: true,
           };
         }
@@ -1378,22 +1689,28 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       const tail =
         `  scanned=${scanned} extracted=${extracted} skipped=${skipped} `
         + `backend=${rgHandledRoots.size ? 'rg' : [...enumerationBackends].join('+') || 'walk'}`;
-      const capped = hits.length >= maxResults;
+      const visibleHits = requestedRootResolution?.skillRef
+        ? hits.map((hit) => ({
+          ...hit,
+          path: displayDescendantPath(hit.path, requestedRoot, requestedRootDisplay),
+        }))
+        : hits;
+      const capped = visibleHits.length >= maxResults;
       if (mode === 'files') {
-        const files = [...new Set(hits.map((h) => h.path))];
+        const files = [...new Set(visibleHits.map((h) => h.path))];
         const header = `${files.length} file(s) with matches`
           + (capped ? ` (capped — narrow with glob)` : '') + tail;
         return { content: `${header}\n${files.map((f) => `  ${f}`).join('\n')}` };
       }
       if (mode === 'count') {
         const counts = new Map<string, number>();
-        for (const h of hits) counts.set(h.path, (counts.get(h.path) || 0) + 1);
+        for (const h of visibleHits) counts.set(h.path, (counts.get(h.path) || 0) + 1);
         const body = [...counts.entries()].map(([p, n]) => `  ${p}: ${n}`).join('\n');
         const header = `${counts.size} file(s), ${hits.length} match(es)`
           + (capped ? ` (capped at ${maxResults})` : '') + tail;
         return { content: `${header}\n${body}` };
       }
-      const lines = hits.flatMap((h) => [
+      const lines = visibleHits.flatMap((h) => [
         ...h.before.map((entry) => `  ${h.path}-${entry.line}-  ${entry.text}`),
         `  ${h.path}:${h.line}:${h.column}  ${h.snippet}`,
         ...h.after.map((entry) => `  ${h.path}+${entry.line}+  ${entry.text}`),
@@ -1454,14 +1771,16 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute directory path. Must be inside the conversation\'s visible scope.' },
+        path: { type: 'string', description: 'Visible absolute directory, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
       },
       required: ['path'],
     },
     async execute(input, ctx) {
       const raw = String(input.path ?? '');
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const abs = resolveAbs(ctx, raw);
+      const resolvedPath = resolveRequestedPath(opts, ctx, raw, { bareSkillRefTarget: 'root' });
+      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
+      const { abs, displayPath } = resolvedPath;
 
       const scopeErr = await gatePathAccess(opts, abs, 'list_files', ctx);
       if (scopeErr) {
@@ -1479,8 +1798,21 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
         const lines = entries.map((e) => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`);
         return { content: lines.join('\n') };
       } catch (err) {
+        // Conversation workspaces are intentionally materialised only by the
+        // first producing tool. Listing that not-yet-created cwd is therefore
+        // semantically the same as listing an empty directory, not a failed
+        // filesystem operation. Keep genuine typos/missing child paths as
+        // errors so the model still gets useful path feedback.
+        const code = (err as NodeJS.ErrnoException).code;
+        const workingDir = ctx.workingDir ? path.resolve(ctx.workingDir) : '';
+        if (code === 'ENOENT' && workingDir && abs === workingDir) {
+          return { content: '(empty directory)' };
+        }
         log.warn('list_files failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_LIST_FAILED', `${abs}: ${(err as Error).message}`), isError: true };
+        return {
+          content: errText('E_LIST_FAILED', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`),
+          isError: true,
+        };
       }
     },
   };

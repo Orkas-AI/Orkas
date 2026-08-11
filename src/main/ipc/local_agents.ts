@@ -6,7 +6,7 @@
  *                                      (`validate:false` does path-only discovery)
  *   - `localAgents.detect`           → single-CLI re-probe (bypasses cache;
  *                                      callers may run types concurrently)
- *   - `localAgents.listModels`       → static model catalog for a CLI type
+ *   - `localAgents.runtimeOptions`   → Agent-scoped model/thinking metadata
  *   - `localAgents.readToolResult`   → read a spilled CLI tool_result file
  *                                       (renderer click-to-expand)
  *   - `bridge.permission_response`   → renderer answer to a `bridge:permission`
@@ -20,6 +20,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { detectAll, detectOne, findAllInstalled, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
+import { getLocalCliRuntimeOptions } from '../features/local_agents/runtime_options.js';
+import * as agents from '../features/agents.js';
 import * as bridgePermissions from '../features/local_agents/bridge_permissions.js';
 import * as bashPermissions from '../model/core-agent/bash-permissions.js';
 import {
@@ -28,7 +30,6 @@ import {
   readInteractiveCliSession,
   sendInteractiveCliInput,
 } from '../model/core-agent/interactive-cli-sessions.js';
-import { listModels } from '../features/local_agents/models.js';
 import { getActiveUserId } from '../features/users.js';
 import { userToolResultsDir } from '../paths.js';
 import { createLogger } from '../logger.js';
@@ -97,12 +98,36 @@ export const invokeHandlers = {
   },
 
   /**
-   * Static model catalog for a CLI. Empty array signals the UI to
-   * render a free-text input (openclaw / opencode / hermes for now).
+   * Resolve only the selected Agent's configured CLI and effective cwd, then
+   * return sanitized model/thinking metadata. The renderer cannot probe an
+   * arbitrary executable or directory through this channel.
    */
-  'localAgents.listModels': async ({ type }: { type?: unknown }) => {
-    if (!isLocalCliType(type)) throw new Error('invalid CLI type');
-    return { models: listModels(type) };
+  'localAgents.runtimeOptions': async (
+    { agent_id, force = false }: { agent_id?: unknown; force?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    const agent = await agents.getAgent(String(agent_id));
+    if (!agent) throw new Error('agent not found');
+    if (agent.runtime?.kind !== 'cli' || !isLocalCliType(agent.runtime.cli)) {
+      throw new Error('agent is not backed by a supported CLI');
+    }
+    const cli = agent.runtime.cli;
+    const [entries, projectDir] = await Promise.all([
+      detectAll(),
+      agents.getAgentCliProjectDirInfo(ctx.userId, agent.agent_id),
+    ]);
+    const entry = entries.find(candidate => candidate.type === cli);
+    if (!entry) throw new Error('CLI entry not found');
+    const cwd = projectDir?.effective_path || process.cwd();
+    const options = await getLocalCliRuntimeOptions(entry, cwd, { force: force === true });
+    const observedModel = agents.getAgentCliResolvedModelInfo(ctx.userId, agent.agent_id);
+    return {
+      options: {
+        ...options,
+        ...(observedModel?.cli === cli ? { last_resolved_model: observedModel } : {}),
+      },
+    };
   },
 
   /**
@@ -133,8 +158,11 @@ export const invokeHandlers = {
   ) => {
     if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
     if (typeof payload?.allow !== 'boolean') throw new Error('invalid allow flag');
-    const handled = bridgePermissions.respond(payload.request_id, payload.allow, payload?.always === true);
-    return { handled };
+    return bridgePermissions.respondWithOutcome(
+      payload.request_id,
+      payload.allow,
+      payload?.always === true,
+    );
   },
 
   /** Renderer answer to a `bash:permission` push event (sensitive approval modes).

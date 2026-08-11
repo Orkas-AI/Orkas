@@ -18,9 +18,64 @@
 // detail-page actions). Category is NO LONGER asked — it lives in the spec now (agent.json
 // `category` field / SKILL.md `category` frontmatter).
 
+const _marketplaceLog = (typeof createLogger === 'function')
+  ? createLogger('marketplace')
+  : { warn() {} };
+const _MP_FAILURE_DEDUPE_MS = 60 * 1000;
+const _MP_FAILURE_MAX_KEYS = 32;
+const _MP_FAILURE_MAX_PER_SESSION = 40;
+const _MP_LOAD_STAGES = new Set([
+  'categories_refresh',
+  'installed_state',
+  'categories',
+  'listings',
+  'oss_listings',
+  'skill_detail',
+  'detail',
+  'skill_file',
+  'post_action_refresh',
+]);
+const _mpFailureState = new Map();
+let _mpFailureReportCount = 0;
 let _mpState = null;
 let _mpBound = false;
 let _mpReturnView = 'agents';
+
+function _mpLogSafe(level, message, data) {
+  try {
+    if (_marketplaceLog && typeof _marketplaceLog[level] === 'function') {
+      _marketplaceLog[level](message, data || {});
+    }
+  } catch (_) { /* diagnostics must not alter marketplace behavior */ }
+}
+
+function _mpLoadStage(stage) {
+  return _MP_LOAD_STAGES.has(stage) ? stage : 'unknown';
+}
+
+function _mpReportLoadFailure(stage, err, fallbackCode = 'load_failed') {
+  const safeStage = _mpLoadStage(stage);
+  const errorCode = _mpActionErrorCode(err, fallbackCode);
+  let key = `${safeStage}|${errorCode}`;
+  if (!_mpFailureState.has(key) && _mpFailureState.size >= _MP_FAILURE_MAX_KEYS) {
+    key = 'unknown|load_failed';
+  }
+  const now = Date.now();
+  const previous = _mpFailureState.get(key);
+  if (previous && now - previous.at < _MP_FAILURE_DEDUPE_MS) {
+    previous.suppressed += 1;
+    return;
+  }
+  const suppressed = previous?.suppressed || 0;
+  _mpFailureState.set(key, { at: now, suppressed: 0 });
+  _mpLogSafe('warn', 'marketplace load failed', {
+    stage: safeStage,
+    error_code: errorCode,
+    ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
+  });
+  if (_mpFailureReportCount >= _MP_FAILURE_MAX_PER_SESSION) return;
+  _mpFailureReportCount += 1;
+}
 
 // Renderer-side in-memory cache of the category registry. Main also caches in-memory + on disk
 // + boots with a local-only primeCategoryCache so the first openMarketplace avoids startup
@@ -129,14 +184,14 @@ function _mpMaybeRefreshCategoriesForCodes(codes) {
         }
       })
       .catch((err) => {
-        console.warn('marketplace categories forced refresh failed:', err);
+        _mpReportLoadFailure('categories_refresh', err, 'categories_refresh_failed');
       })
       .finally(() => {
         _mpUnknownCategoryRefreshInFlight = null;
       });
   } catch (err) {
     _mpUnknownCategoryRefreshInFlight = null;
-    console.warn('marketplace categories forced refresh failed:', err);
+    _mpReportLoadFailure('categories_refresh', err, 'categories_refresh_failed');
   }
 }
 
@@ -198,27 +253,8 @@ function _mpMinAppVersion(row) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-// Renderer-local mirror of util/app-version-compat; classic scripts cannot import it.
-function _mpVersionTokens(value) {
-  const text = typeof value === 'string' ? value.trim() : '';
-  if (!text) return [];
-  return text.replace(/^v/i, '').split(/[.+_-]/).filter(Boolean)
-    .map((p) => (/^\d+$/.test(p) ? Number(p) : p.toLowerCase()));
-}
-
 function _mpCompareVersions(a, b) {
-  const aa = _mpVersionTokens(a);
-  const bb = _mpVersionTokens(b);
-  if (!aa.length || !bb.length) return 0;
-  const n = Math.max(aa.length, bb.length);
-  for (let i = 0; i < n; i++) {
-    const x = aa[i] ?? 0;
-    const y = bb[i] ?? 0;
-    if (x === y) continue;
-    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
-    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
-  }
-  return 0;
+  return orkasSemver.compareVersions(a, b);
 }
 /** True when the item has no minimum or this client is known to meet it. */
 function _mpItemAppCompatible(item) {
@@ -226,7 +262,8 @@ function _mpItemAppCompatible(item) {
   if (!min) return true;
   const current = _mpState && _mpState.appVersion;
   if (!current) return false;
-  return _mpCompareVersions(current, min) >= 0;
+  const compared = _mpCompareVersions(current, min);
+  return compared !== null && compared >= 0;
 }
 
 function _mpInstallMetaRows(kind) {
@@ -315,8 +352,10 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
   // boot-time default-install progress before the user opens Marketplace.
   _mpInitReconcileWatch();
 
-  _mpReturnView = (typeof currentView === 'string' && currentView !== 'marketplace')
-    ? currentView : 'agents';
+  const requestedReturnView = String((opts && opts.returnView) || '');
+  _mpReturnView = requestedReturnView && requestedReturnView !== 'marketplace'
+    ? requestedReturnView
+    : ((typeof currentView === 'string' && currentView !== 'marketplace') ? currentView : 'agents');
 
   _mpState = {
     view: 'grid',
@@ -387,6 +426,14 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
   // feedback. `_mpLoadAll` then hydrates the listings cache, paints cached rows when present,
   // and overlays fresh data — all via its own `_mpRender` calls.
   if (typeof setView === 'function') setView('marketplace');
+  if (opts && opts.preserveReturnTab === true) {
+    const returnTabId = {
+      'new-chat': 'new-chat-btn',
+      agents: 'agents-btn',
+      skills: 'skills-btn',
+    }[_mpReturnView];
+    if (returnTabId) document.getElementById(returnTabId)?.classList.add('active');
+  }
   _mpShowGridView();
   _mpRender();
 
@@ -744,7 +791,7 @@ async function _mpRefreshInstalledState() {
     _mpPersistInstalled();
     _mpRender();
   } catch (err) {
-    console.warn('marketplace installed-state refresh failed:', err);
+    _mpReportLoadFailure('installed_state', err, 'installed_state_failed');
   }
 }
 function _mpInstalledSource(source) {
@@ -766,7 +813,7 @@ async function _mpRefreshCategoriesIfMissing() {
     _mpPersistCategoriesCache(list);
     _mpRender();
   } catch (err) {
-    console.warn('marketplace categories refresh failed:', err);
+    _mpReportLoadFailure('categories', err, 'categories_failed');
   }
 }
 
@@ -1069,7 +1116,7 @@ async function _mpLoadListingsPage(kind, { append, page }) {
     _mpPersistListingsCache();
   } catch (err) {
     if (_mpState._loadGen[kind] !== myGen) return;
-    console.warn('marketplace listings fetch failed:', err);
+    _mpReportLoadFailure('listings', err, 'listings_failed');
     if (_mpState.agents.length === 0 && _mpState.skills.length === 0) {
       _mpState.error = (err && err.message) || String(err);
     }
@@ -1256,6 +1303,7 @@ async function _mpLoadOss(opts = {}) {
     _mpState.ossLoadKey = loadKey;
   } catch (err) {
     if (!_mpState || _mpState._ossLoadGen !== myGen) return;
+    _mpReportLoadFailure('oss_listings', err, 'oss_listings_failed');
     _mpState.ossError = (err && err.message) || 'load failed';
   } finally {
     if (!_mpState || _mpState._ossLoadGen !== myGen) return;
@@ -1372,7 +1420,7 @@ function _mpCardHtml(item, lang) {
   const avatar = kind === 'agent'
     ? renderAvatarHtml(item.icon, item.color, { size: 32, seed: item.id, extraClass: 'marketplace-card-avatar' })
     : '';
-  const appCompatible = status.installed || status.updateAvailable || _mpItemAppCompatible(item);
+  const appCompatible = _mpItemAppCompatible(item);
   let btnClass = 'btn btn-sm btn-primary';
   let btnLabel = t('marketplace.install');
   let btnAttrs = `data-mp-install="${escapeHtml(kind)}" data-mp-id="${escapeHtml(item.id)}"`;
@@ -1382,7 +1430,7 @@ function _mpCardHtml(item, lang) {
     btnLabel = status.updateAvailable ? t('marketplace.updating') : t('marketplace.installing');
     btnAttrs = 'disabled';
     btnSpinner = '<span class="marketplace-btn-spinner"></span>';
-  } else if (!appCompatible) {
+  } else if (!appCompatible && (!status.installed || status.updateAvailable)) {
     btnClass = 'btn btn-sm is-disabled';
     btnLabel = t('marketplace.requires_app').replace('{version}', _mpMinAppVersion(item));
     btnAttrs = 'disabled title="' + escapeHtml(btnLabel) + '"';
@@ -1472,10 +1520,12 @@ async function _mpOpenDetail(kind, item, opts = {}) {
           _mpState.detailSkillFileText = (r && r.content) || '';
         }
       } catch (err) {
+        _mpReportLoadFailure('skill_detail', err, 'detail_failed');
         _mpState.detailSkillLoadError = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
       }
     }
   } catch (err) {
+    _mpReportLoadFailure('detail', err, 'detail_failed');
     _mpState.detailError = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
   } finally {
     _mpState.detailLoading = false;
@@ -1537,6 +1587,14 @@ function _mpRenderDetail() {
       : (status.updateAvailable ? t('marketplace.updating') : t('marketplace.installing'));
     installBtn.innerHTML = `${spinnerHtml}${escapeHtml(label)}`;
     installBtn.classList.add('is-disabled'); installBtn.disabled = true;
+    installBtn.dataset.action = '';
+  } else if (status.updateAvailable && !_mpItemAppCompatible(item)) {
+    const label = t('marketplace.requires_app').replace('{version}', _mpMinAppVersion(item));
+    installBtn.textContent = label;
+    installBtn.title = label;
+    installBtn.classList.remove('btn-primary', 'btn-danger');
+    installBtn.classList.add('is-disabled');
+    installBtn.disabled = true;
     installBtn.dataset.action = '';
   } else if (status.updateAvailable) {
     installBtn.textContent = t('marketplace.update');
@@ -1601,6 +1659,7 @@ function _mpRenderDetail() {
           const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file });
           _mpState.detailSkillFileText = (r && r.content) || '';
         } catch (err) {
+          _mpReportLoadFailure('skill_file', err, 'skill_file_failed');
           _mpState.detailSkillFileText = `// load failed: ${_mpUserErrorMessage(err, 'marketplace.action_failed_retry_later')}`;
         }
         _mpRenderDetail();
@@ -1878,23 +1937,102 @@ function _mpInstallErrorFromResponse(r) {
 }
 
 function _mpActionErrorCode(err, fallback = 'operation_failed') {
-  const raw = String(err?.marketplaceReason || err?.code || '').trim();
-  return /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : fallback;
+  const raw = String(err?.marketplaceReason || err?.code || '').trim().toLowerCase();
+  if (raw === 'account_changed') return 'account_changed';
+  if (raw.includes('not_found')) return 'not_found';
+  if (raw.startsWith('status_not_approved')) return 'status_not_approved';
+  if (err?.marketplaceAppUpdateRequired || raw.includes('requires orkas')) return 'app_update_required';
+  if (raw.includes('quality')) return 'quality_rejected';
+  if (/timeout|timed out/.test(raw)) return 'timeout';
+  if (/network|fetch|econn|enet|eai_again|socket/.test(raw)) return 'network_failed';
+  const allowed = new Set([
+    'account_changed',
+    'not_found',
+    'status_not_approved',
+    'app_update_required',
+    'quality_rejected',
+    'validation_cancelled',
+    'network_failed',
+    'timeout',
+    'operation_failed',
+  ]);
+  const safeFallback = allowed.has(String(fallback || '').toLowerCase())
+    ? String(fallback).toLowerCase()
+    : 'operation_failed';
+  return allowed.has(raw) ? raw : safeFallback;
+}
+
+function _mpActionErrorType(errorCode) {
+  const code = String(errorCode || '').toLowerCase();
+  if (/timeout|timed_out/.test(code)) return 'timeout';
+  if (/network|fetch|econn|enet|eai_again|socket/.test(code)) return 'network';
+  if (/account_changed|auth|login|unauthorized|forbidden/.test(code)) return 'auth';
+  if (/validation|quality|invalid|not_found|status_not_approved|requires_app|app_update|required_version/.test(code)) return 'validation';
+  if (/ipc|bridge|invoke/.test(code)) return 'ipc';
+  return 'runtime';
+}
+
+function _mpActionName(action) {
+  return action === 'update' || action === 'uninstall' ? action : 'install';
+}
+
+function _mpResourceKind(kind) {
+  return kind === 'skill' ? 'skill' : 'agent';
+}
+
+function _mpActionResult(result) {
+  return result === 'success' || result === 'cancelled' ? result : 'failure';
 }
 
 function _mpTrackActionResult(startedAt, action, kind, result, errorCode = '') {
-  try {
-    if (!window.Monitor || !_mpIsMissingDependencySkillError(kind, err)) return;
-    (() => {})('marketplace_dependency_skill_missing', {
-      surface,
-      requested_kind: kind,
-      requested_id: item?.id || '',
-      requested_name: item?.name || '',
-      dependency_skill_id: err?.marketplaceId || '',
-      dependency_skill_name: err?.marketplaceName || '',
-      reason: err?.marketplaceReason || err?.message || String(err || ''),
+  const safeAction = _mpActionName(action);
+  const safeKind = _mpResourceKind(kind);
+  const safeResult = _mpActionResult(result);
+  const safeErrorCode = _mpActionErrorCode({ code: errorCode }, 'operation_failed');
+  if (safeResult === 'failure') {
+    _mpLogSafe('warn', 'marketplace action failed', {
+      action: safeAction,
+      resource_kind: safeKind,
+      error_type: _mpActionErrorType(safeErrorCode),
+      error_code: safeErrorCode,
     });
-  } catch (_) { /* telemetry must never affect install UX */ }
+  }
+}
+
+async function _mpRefreshAfterAction(kind) {
+  try {
+    if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
+    if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
+  } catch (err) {
+    _mpReportLoadFailure('post_action_refresh', err, 'post_action_refresh_failed');
+  }
+}
+
+function _mpApplyInstalledState(kind, item, installed) {
+  try {
+    _mpMarkInstalled(kind, { ...item, ...(installed || {}) });
+    _mpPersistInstalled();
+  } catch (_) {
+    _mpLogSafe('warn', 'marketplace installed state refresh failed', {
+      stage: 'post_action_state',
+      error_code: 'installed_state_refresh_failed',
+    });
+  }
+}
+
+function _mpApplyUninstalledState(kind, id) {
+  try {
+    if (kind === 'agent') _mpState.installedAgentIds.delete(id);
+    else _mpState.installedSkillIds.delete(id);
+    if (kind === 'agent') _mpState.installedAgentMeta?.delete(id);
+    else _mpState.installedSkillMeta?.delete(id);
+    _mpPersistInstalled();
+  } catch (_) {
+    _mpLogSafe('warn', 'marketplace uninstalled state refresh failed', {
+      stage: 'post_action_state',
+      error_code: 'uninstalled_state_refresh_failed',
+    });
+  }
 }
 
 async function _mpInstall(kind, id, itemOverride = null) {
@@ -1923,17 +2061,15 @@ async function _mpInstall(kind, id, itemOverride = null) {
       ...(force ? { force: true } : {}),
     });
     if (!r || r.ok === false) throw _mpInstallErrorFromResponse(r);
-  };
-  const markInstalled = async () => {
-    _mpMarkInstalled(kind, item);
-    _mpPersistInstalled();
-    if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
-    if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
+    return r;
   };
   try {
-    await invokeInstall(false);
-    await markInstalled();
+    const installed = await invokeInstall(false);
+    // Main's completed install response is the durable boundary. Local cache,
+    // list refresh, alerts, and rendering cannot reverse this success.
     trackResult('success');
+    _mpApplyInstalledState(kind, item, installed);
+    await _mpRefreshAfterAction(kind);
     // Success: no toast — the button flips to "Installed" + state set above is the signal.
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
@@ -1955,9 +2091,10 @@ async function _mpInstall(kind, id, itemOverride = null) {
         const action = await showValidationReport({ title, report, forceLabel });
         if (action === 'force') {
           try {
-            await invokeInstall(true);
-            await markInstalled();
+            const installed = await invokeInstall(true);
             trackResult('success');
+            _mpApplyInstalledState(kind, item, installed);
+            await _mpRefreshAfterAction(kind);
           } catch (forceErr) {
             trackResult('failure', _mpActionErrorCode(forceErr));
             uiAlert(_mpInstallFailedText(kind, item, forceErr));
@@ -1995,27 +2132,29 @@ async function _mpUninstall(kind, id) {
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
   const startedAt = Date.now();
+  let resultTracked = false;
+  const trackResult = (result, errorCode = '') => {
+    if (resultTracked) return;
+    resultTracked = true;
+    _mpTrackActionResult(startedAt, 'uninstall', kind, result, errorCode);
+  };
   _mpState.installing.add(key);
   _mpState.uninstalling.add(key);
   _mpRender();
   try {
     const channel = kind === 'agent' ? 'marketplace.uninstallAgent' : 'marketplace.uninstallSkill';
     const r = await window.orkas.invoke(channel, { id });
-    if (!r || r.ok === false) throw new Error((r && r.error) || 'uninstall failed');
-    if (kind === 'agent') _mpState.installedAgentIds.delete(id);
-    else _mpState.installedSkillIds.delete(id);
-    if (kind === 'agent') _mpState.installedAgentMeta?.delete(id);
-    else _mpState.installedSkillMeta?.delete(id);
-    _mpPersistInstalled();
-    if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
-    if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
-    _mpTrackActionResult(startedAt, 'uninstall', kind, 'success');
+    if (!r || r.ok === false) throw _mpErrorFromResponse(r, 'uninstall failed');
+    trackResult('success');
+    _mpApplyUninstalledState(kind, id);
+    await _mpRefreshAfterAction(kind);
     // Success: button flips back to "Install" — no toast needed. (Failures still alert.)
   } catch (err) {
-    _mpTrackActionResult(startedAt, 'uninstall', kind, 'failure', _mpActionErrorCode(err));
+    trackResult('failure', _mpActionErrorCode(err));
     const msg = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
     uiAlert(t('marketplace.uninstall_failed').replace('{reason}', msg));
   } finally {
+    if (!resultTracked) trackResult('failure', 'operation_failed');
     _mpState.installing.delete(key);
     _mpState.uninstalling.delete(key);
     _mpRender();
@@ -2048,31 +2187,7 @@ function _mpInstallStatus(kind, item) {
 
 function _mpMarketplaceItemIsNewer(item, local) {
   if (!item || !local) return false;
-  const versionCmp = _mpCompareVersions(item.version, local.version);
-  if (versionCmp > 0) return true;
-  const remoteFresh = _mpFreshnessAt(item);
-  const localFresh = _mpFreshnessAt(local);
-  return Number.isFinite(remoteFresh) && Number.isFinite(localFresh) && remoteFresh > localFresh;
-}
-
-function _mpFreshnessAt(row) {
-  const v = row?.updated_at ?? row?.marketplace_updated_at ?? row?.published_at ?? row?.marketplace_published_at;
-  return typeof v === 'number' ? v : NaN;
-}
-
-function _mpCompareVersions(a, b) {
-  const aa = _mpVersionTokens(a);
-  const bb = _mpVersionTokens(b);
-  if (!aa.length || !bb.length) return 0;
-  const n = Math.max(aa.length, bb.length);
-  for (let i = 0; i < n; i++) {
-    const x = aa[i] ?? 0;
-    const y = bb[i] ?? 0;
-    if (x === y) continue;
-    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
-    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
-  }
-  return 0;
+  return _mpCompareVersions(item.version, local.version) > 0;
 }
 
 function _mpCompareMarketplaceName(a, b) {
@@ -2086,12 +2201,6 @@ function _mpCompareMarketplaceName(a, b) {
 function _mpMarketplaceNameSortKey(item) {
   const name = String(item?.name || item?.id || '');
   return (typeof pinyinSortKey === 'function') ? pinyinSortKey(name) : name.toLowerCase();
-}
-
-function _mpVersionTokens(v) {
-  const s = String(v || '').trim().replace(/^v/i, '');
-  if (!s) return [];
-  return (s.match(/\d+|[a-zA-Z]+/g) || []).map((part) => (/^\d+$/.test(part) ? Number(part) : part.toLowerCase()));
 }
 
 // Dev-only `_mpDeleteFromDetail` moved to marketplace_dev.js.

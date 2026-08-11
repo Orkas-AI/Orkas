@@ -526,16 +526,17 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
       const pageNumber = finiteNumber(input.page, 1, 1, 100_000, 'page');
       if (!Number.isInteger(pageNumber)) return errResult('E_BAD_INPUT', 'page must be an integer');
       const scale = finiteNumber(input.scale, 1.5, 0.5, 3, 'scale');
+      let loadingTask: any;
       let document: any;
       try {
         const pdfjs = await loadPdfJs();
         const bytes = fs.readFileSync(abs);
-        const task = pdfjs.getDocument({
+        loadingTask = pdfjs.getDocument({
           data: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),
           isEvalSupported: false,
           useSystemFonts: true,
         });
-        document = await task.promise;
+        document = await loadingTask.promise;
         if (document.numPages > MAX_PAGE_COUNT) {
           return errResult('E_PDF_LIMIT', `PDF exceeds the ${MAX_PAGE_COUNT}-page rendering limit`);
         }
@@ -576,7 +577,7 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
         log.warn('PDF render failed', { path: logPathRef(abs), error: logErrorRef(err) });
         return errResult('E_PDF_RENDER_FAILED', (err as Error).message || String(err));
       } finally {
-        try { await document?.destroy?.(); } catch { /* best effort */ }
+        try { await loadingTask?.destroy?.(); } catch { /* best effort */ }
       }
     },
   };

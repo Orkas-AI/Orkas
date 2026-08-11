@@ -31,6 +31,17 @@ vi.mock('../../../../src/main/logger', () => ({
   }),
 }));
 
+const bridgeConnectorMock = vi.hoisted(() => ({
+  resolveVisibleConnectors: vi.fn(async () => [] as any[]),
+}));
+vi.mock('../../../../src/main/features/connectors', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/features/connectors')>();
+  return {
+    ...actual,
+    resolveVisibleConnectors: bridgeConnectorMock.resolveVisibleConnectors,
+  };
+});
+
 // orkas-bridge host: socket auth + skills surface + KB scope + permission gate.
 // Connector methods are covered by their own feature tests; here we pin the
 // bridge-specific contracts (token, path discipline, scope plumbing, gating).
@@ -88,6 +99,8 @@ beforeEach(async () => {
   process.env.HOME = path.join(tmpDir, 'home');
   fs.mkdirSync(path.join(tmpDir, 'home'), { recursive: true });
   vi.resetModules();
+  bridgeConnectorMock.resolveVisibleConnectors.mockReset();
+  bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([]);
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
@@ -108,11 +121,13 @@ async function startTestBridge(opts: { projectId?: string } = {}) {
     cid: 'c1',
     agentId: 'a1',
     agentName: 'Agent One',
+    currentMessageId: 'current-message',
     ...(opts.projectId ? { projectId: opts.projectId } : {}),
     runId: `t${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`,
     configDir: path.join(tmpDir, 'rundir'),
     sandboxEnv: {
       ORKAS_NODE: TEST_NODE,
+      ORKAS_BUNDLED_NODE: TEST_NODE,
       ORKAS_PC_DIR: process.cwd(),
       ORKAS_WORKSPACE_ROOT: tmpDir,
       ELECTRON_RUN_AS_NODE: '1',
@@ -132,6 +147,49 @@ async function seedGlobalKbFile(relPath: string, content = `${relPath} body`): P
     sha1: `sha-${relPath}`,
     chunks: [{ title: relPath, content, embedding }],
   });
+}
+
+async function seedCurrentConversation(): Promise<void> {
+  const chats = await import('../../../../src/main/features/chats');
+  const layout = await import('../../../../src/main/util/project-layout');
+  await chats.createConversation(TEST_UID, {
+    conversationId: 'c1',
+    title: 'Current bridge chat',
+  });
+  const file = layout.conversationMessageFile(TEST_UID, 'c1');
+  fs.writeFileSync(file, [
+    {
+      id: 'prior',
+      ts: '2026-07-30T01:00:00.000Z',
+      from: 'user',
+      to: ['a1'],
+      text: 'PUBLIC_PRIOR_CONTEXT',
+      model_text: 'PRIVATE_MODEL_TEXT',
+      process: [{ type: 'progress', text: 'PRIVATE_PROCESS_TEXT' }],
+    },
+    {
+      id: 'hidden-dispatch',
+      ts: '2026-07-30T01:01:00.000Z',
+      from: 'commander',
+      to: ['a1'],
+      text: 'PRIVATE_DISPATCH_TEXT',
+      dispatch: true,
+    },
+    {
+      id: 'current-message',
+      ts: '2026-07-30T01:02:00.000Z',
+      from: 'user',
+      to: ['a1'],
+      text: 'CURRENT_TRIGGER_TEXT',
+    },
+    {
+      id: 'later',
+      ts: '2026-07-30T01:03:00.000Z',
+      from: 'commander',
+      to: ['user'],
+      text: 'LATER_CONCURRENT_TEXT',
+    },
+  ].map((row) => JSON.stringify(row)).join('\n') + '\n');
 }
 
 describe('local_agents/bridge › auth + skills', () => {
@@ -157,6 +215,25 @@ describe('local_agents/bridge › auth + skills', () => {
       const read = await rpcOnce(bridge.socketPath, { id: 2, token: bridge.token, method: 'skills.read', params: { id: 'my-skill' } });
       expect((read.reply as any).ok).toBe(true);
       expect((read.reply as any).result.skill_md).toContain('the body');
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('repairs a legacy disabled name before exposing canonical marketplace skills', async () => {
+    const marketplaceRoot = path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'skills');
+    writeSkill(marketplaceRoot, '74e05fe08cc5', 'agent-browser');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(TEST_UID, 'agent-browser', false);
+
+    const bridge = await startTestBridge();
+    try {
+      const list = await rpcOnce(bridge.socketPath, {
+        id: 21, token: bridge.token, method: 'skills.list', params: {},
+      });
+
+      expect((list.reply as any).result.skills.map((skill: any) => skill.id)).not.toContain('74e05fe08cc5');
+      expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ '74e05fe08cc5': false });
     } finally {
       await bridge.close();
     }
@@ -210,6 +287,9 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(server.env.ORKAS_BRIDGE_TOKEN).toBeUndefined();
       expect(server.env.ORKAS_BRIDGE_SOCKET).toBeUndefined();
       expect(server.env.ORKAS_BRIDGE_ENV_FILE).toBe(bridge.serverEnv.ORKAS_BRIDGE_ENV_FILE);
+      expect(server.env.ORKAS_NODE).toBe(TEST_NODE);
+      expect(server.env.ORKAS_BUNDLED_NODE).toBe(TEST_NODE);
+      expect(server.env.ELECTRON_RUN_AS_NODE).toBeUndefined();
       envFilePath = server.env.ORKAS_BRIDGE_ENV_FILE;
 
       const secretEnv = JSON.parse(fs.readFileSync(envFilePath, 'utf8'));
@@ -217,6 +297,11 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(secretEnv.ORKAS_BRIDGE_SOCKET).toBe(bridge.socketPath);
       expect(secretEnv.ORKAS_UID).toBe(TEST_UID);
       expect(secretEnv.ORKAS_AGENT_ID).toBe('a1');
+      expect(secretEnv.ORKAS_BRIDGE_CAPABILITIES).toContain('commander.handoff');
+      expect(secretEnv.ORKAS_BRIDGE_CAPABILITIES).not.toContain('connectors');
+      expect(secretEnv.ORKAS_NODE).toBe(TEST_NODE);
+      expect(secretEnv.ORKAS_BUNDLED_NODE).toBe(TEST_NODE);
+      expect(secretEnv.ELECTRON_RUN_AS_NODE).toBeUndefined();
       expect(bridge.serverEnv.ORKAS_BRIDGE_TOKEN).toBeUndefined();
       expect(bridge.serverEnv.ORKAS_BRIDGE_SOCKET).toBeUndefined();
     } finally {
@@ -231,6 +316,77 @@ describe('local_agents/bridge › auth + skills', () => {
       const r = await rpcOnce(bridge.socketPath, { id: 4, token: bridge.token, method: 'nope', params: {} });
       expect((r.reply as any).ok).toBe(false);
       expect((r.reply as any).error).toContain('unknown method');
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('removes connector RPC methods when ordinary group-chat visibility has no connectors', async () => {
+    const bridge = await startTestBridge();
+    try {
+      expect(bridge.capabilities).not.toContain('connectors');
+      const denied = await rpcOnce(bridge.socketPath, {
+        id: 41, token: bridge.token, method: 'connectors.list', params: {},
+      });
+      expect((denied.reply as any).ok).toBe(false);
+      expect((denied.reply as any).error).toContain('unknown method');
+      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID, undefined);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('registers connector methods from ordinary group-chat Agent visibility', async () => {
+    bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
+      instance: { id: 'slack', display_name: 'Slack' },
+      tools: [{ name: 'search', description: 'Search', input_schema: {} }],
+    }] as any);
+    const bridge = await startTestBridge();
+    try {
+      expect(bridge.capabilities).toContain('connectors');
+      const listed = await rpcOnce(bridge.socketPath, {
+        id: 42, token: bridge.token, method: 'connectors.list', params: {},
+      });
+      expect((listed.reply as any).ok).toBe(true);
+      expect((listed.reply as any).result.connectors[0].id).toBe('slack');
+      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID, undefined);
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  it('records only the first bounded Commander handoff request', async () => {
+    const bridge = await startTestBridge();
+    try {
+      const first = await rpcOnce(bridge.socketPath, {
+        id: 43,
+        token: bridge.token,
+        method: 'commander.handoff',
+        params: { reason: 'Automation mutation is Commander-only.', context: 'Create a daily 08:00 task.' },
+      });
+      expect((first.reply as any).result).toEqual({ accepted: true });
+      expect(bridge.getCommanderHandoff()).toEqual({
+        reason: 'Automation mutation is Commander-only.',
+        context: 'Create a daily 08:00 task.',
+      });
+
+      const duplicate = await rpcOnce(bridge.socketPath, {
+        id: 44,
+        token: bridge.token,
+        method: 'commander.handoff',
+        params: { reason: 'Replace the first request.' },
+      });
+      expect((duplicate.reply as any).result).toEqual({ accepted: false, already_requested: true });
+      expect(bridge.getCommanderHandoff()?.reason).toBe('Automation mutation is Commander-only.');
+
+      const invalid = await rpcOnce(bridge.socketPath, {
+        id: 45,
+        token: bridge.token,
+        method: 'commander.handoff',
+        params: { reason: '' },
+      });
+      expect((invalid.reply as any).ok).toBe(false);
+      expect((invalid.reply as any).error).toContain('reason required');
     } finally {
       await bridge.close();
     }
@@ -312,6 +468,49 @@ describe('local_agents/bridge › KB project scope', () => {
   });
 });
 
+describe('local_agents/bridge › current conversation history', () => {
+  it('binds reads to the current chat and stops before the triggering message', async () => {
+    await seedCurrentConversation();
+    const bridge = await startTestBridge();
+    try {
+      const read = await rpcOnce(bridge.socketPath, {
+        id: 40,
+        token: bridge.token,
+        method: 'chat.read',
+        params: { scope: 'current', limit: 20 },
+      });
+      expect((read.reply as any).ok).toBe(true);
+      const text = (read.reply as any).result.text;
+      expect(text).toContain('PUBLIC_PRIOR_CONTEXT');
+      expect(text).not.toContain('PRIVATE_MODEL_TEXT');
+      expect(text).not.toContain('PRIVATE_PROCESS_TEXT');
+      expect(text).not.toContain('PRIVATE_DISPATCH_TEXT');
+      expect(text).not.toContain('CURRENT_TRIGGER_TEXT');
+      expect(text).not.toContain('LATER_CONCURRENT_TEXT');
+
+      const paged = await rpcOnce(bridge.socketPath, {
+        id: 41,
+        token: bridge.token,
+        method: 'chat.read',
+        params: { scope: 'current', before_msg_index: 1, limit: 20 },
+      });
+      expect((paged.reply as any).ok).toBe(true);
+      expect((paged.reply as any).result.text).toContain('PUBLIC_PRIOR_CONTEXT');
+
+      const denied = await rpcOnce(bridge.socketPath, {
+        id: 42,
+        token: bridge.token,
+        method: 'chat.read',
+        params: { scope: 'all', cid: 'c1' },
+      });
+      expect((denied.reply as any).ok).toBe(false);
+      expect((denied.reply as any).error).toContain('not allowed for this agent');
+    } finally {
+      await bridge.close();
+    }
+  });
+});
+
 describe('local_agents/bridge_permissions', () => {
   it('always-allow store grants without a dialog and respond() persists it', async () => {
     const perms = await import('../../../../src/main/features/local_agents/bridge_permissions');
@@ -357,8 +556,8 @@ describe('local_agents/bridge_permissions', () => {
 
   it('cancelForCid denies every pending request of that conversation', async () => {
     const perms = await import('../../../../src/main/features/local_agents/bridge_permissions');
-    const pushed: any[] = [];
-    perms._setBroadcastForTest((_ch, payload) => pushed.push(payload));
+    const pushed: Array<{ channel: string; payload: any }> = [];
+    perms._setBroadcastForTest((channel, payload) => pushed.push({ channel, payload }));
     try {
       const p = perms.requestPermission({
         uid: TEST_UID, cid: 'c9', agentId: 'a1', agentName: 'A',
@@ -366,6 +565,11 @@ describe('local_agents/bridge_permissions', () => {
       });
       perms.cancelForCid('c9');
       await expect(p).resolves.toBe(false);
+      expect(pushed).toHaveLength(2);
+      expect(pushed[1]).toEqual({
+        channel: 'bridge:permission_cancelled',
+        payload: expect.objectContaining({ request_ids: [expect.any(String)], cid: 'c9' }),
+      });
     } finally {
       perms._setBroadcastForTest(null);
     }

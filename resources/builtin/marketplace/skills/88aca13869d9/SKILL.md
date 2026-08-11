@@ -12,8 +12,15 @@ Use `gh` as the primary interface for GitHub data and actions. Keep this skill f
 - Confirm `gh` exists and is authenticated when live GitHub data is required.
 - Prefer `--repo owner/repo` unless the current directory is clearly inside the intended GitHub repository.
 - Use `--json` and `--jq` when the result will be summarized or filtered.
-- Preview write actions before executing them when the user did not explicitly ask for the exact write.
-- Do not close issues, merge pull requests, rerun CI, delete branches, publish releases, or edit repository settings without explicit user approval.
+- Read-only inspection never needs approval. Resolve the repository, exact object, current state, policy, and relational targets before a write.
+- A current user request authorizes the exact write, direct target, relational target, and stated conditions it specifies. Do not add a second confirmation after preflight succeeds.
+- If the repository or target is unresolved, ask only for the missing target and retain the action authority already granted by the request.
+- When owner/repository itself is missing, ask directly for `owner/repo`; do not substitute a local checkout path, account hint, account switch, or organization search for that canonical target.
+- Bound target discovery to supplied references and the current repository remote. If those do not resolve owner/repository, ask immediately; do not enumerate accounts, organizations, or unrelated repositories.
+- Ask for new approval only when execution requires a material scope expansion, such as a different repository or object, an extra write, force mode, or admin override. For force/admin/policy-bypass decisions, leave the choice unselected or default to stopping with state unchanged; do not offer a speculative retry or preselect escalation.
+- Honor authentication, permission, deletion, billing, or other platform-required confirmation gates exactly once; do not duplicate them in prose.
+- For a finite maintainer request, batch independent preflight reads in one tool round, authorized independent writes in the next, and final state verification in one last read round. Do not interleave narrative plan updates or repeat unchanged reads.
+- Choose exactly one remote branch-deletion mechanism. If `gh pr merge --delete-branch` is used, verify absence afterward instead of issuing another delete; otherwise merge without that flag and delete the resolved head ref once.
 
 ## Common Commands
 
@@ -30,9 +37,10 @@ gh run list --repo owner/repo --limit 20
 gh run view RUN_ID --repo owner/repo --log-failed
 gh release list --repo owner/repo --limit 20
 gh api repos/owner/repo/pulls/55 --jq '{title, state, user: .user.login}'
+gh api --method DELETE repos/owner/repo/git/refs/heads/feature-branch
 ```
 
-For write actions, show the intended command first and wait for approval unless the user explicitly asked for that exact action.
+For a write not authorized by the current request, show the exact repository, object, command, and effect before asking. For an authorized write, execute once target resolution and preconditions succeed; pause only for a material scope expansion or a platform-required gate. Independent commands may run in parallel, but never parallelize actions whose target or safety depends on another command's result.
 
 ## Default Output
 

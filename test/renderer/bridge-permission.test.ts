@@ -8,14 +8,17 @@ function loadBridge(
   invokeImpl: (channel: string, payload: any) => Promise<any> = async () => ({ handled: true }),
 ) {
   let push: ((info: any) => void) | null = null;
+  let cancel: ((info: any) => void) | null = null;
   const dialogs: any[] = [];
   const invoke = vi.fn(invokeImpl);
   const warn = vi.fn();
+  const monitor = { event: vi.fn(), error: vi.fn() };
   const sandbox: any = {
     console,
     Promise,
     String,
     Array,
+    AbortController,
     createLogger: () => ({ warn, info() {}, error() {} }),
     t: (key: string, vars: Record<string, unknown> = {}) => {
       if (key === 'bridge.permission.message') {
@@ -28,20 +31,24 @@ function loadBridge(
       return choose(args);
     }),
     window: {
+      Monitor: true,
       orkas: {
         invoke,
         onPushEvent: vi.fn((name: string, handler: (info: any) => void) => {
           if (name === 'bridge:permission') push = handler;
+          if (name === 'bridge:permission_cancelled') cancel = handler;
         }),
       },
     },
+    Monitor: monitor,
   };
   sandbox.window.window = sandbox.window;
   vm.createContext(sandbox);
   const source = readFileSync(resolve(__dirname, '../../src/renderer/modules/bridge.js'), 'utf8');
   vm.runInContext(source, sandbox, { filename: 'bridge.js' });
   if (!push) throw new Error('bridge:permission handler was not registered');
-  return { push, dialogs, invoke, warn };
+  if (!cancel) throw new Error('bridge:permission_cancelled handler was not registered');
+  return { push, cancel, dialogs, invoke, warn, monitor };
 }
 
 async function flushQueue(): Promise<void> {
@@ -65,6 +72,13 @@ describe('renderer connector bridge permission queue', () => {
       ['bridge.permission_response', { request_id: 'r2', allow: true, always: true }],
       ['bridge.permission_response', { request_id: 'r3', allow: false, always: false }],
     ]);
+    expect(harness.monitor.event.mock.calls.map((call) => [call[0], call[1].decision, call[1].result]))
+      .toEqual([
+        ['connector_bridge_permission_result', 'allow_once', 'success'],
+        ['connector_bridge_permission_result', 'allow_always', 'success'],
+        ['connector_bridge_permission_result', 'deny', 'success'],
+      ]);
+    expect(JSON.stringify(harness.monitor.event.mock.calls)).not.toContain('request_id');
   });
 
   it('shows concurrent requests in FIFO order without overlapping dialogs', async () => {
@@ -115,6 +129,99 @@ describe('renderer connector bridge permission queue', () => {
       ['bridge.permission_response', { request_id: 'broken', allow: false, always: false }],
       ['bridge.permission_response', { request_id: 'next', allow: true, always: false }],
     ]);
+    expect(harness.monitor.event).toHaveBeenNthCalledWith(
+      1,
+      'connector_bridge_permission_result',
+      expect.objectContaining({
+        result: 'failure',
+        decision: 'deny',
+        effective_decision: 'deny',
+        error_code: 'dialog_failed',
+        error_type: 'ui',
+      }),
+    );
     expect(JSON.stringify(harness.warn.mock.calls)).not.toContain('/Users/alice');
+  });
+
+  it('closes a request cancelled by main without sending a stale response or blocking the queue', async () => {
+    let call = 0;
+    const harness = loadBridge(async (args) => {
+      call += 1;
+      if (call > 1) return 'allow_once';
+      return new Promise<string | null>((resolve) => {
+        args.signal.addEventListener('abort', () => resolve(null), { once: true });
+      });
+    });
+
+    harness.push({ request_id: 'cancelled', agent_name: 'A', connector_name: 'C', tool_name: 'one' });
+    harness.push({ request_id: 'next', agent_name: 'B', connector_name: 'C', tool_name: 'two' });
+    await Promise.resolve();
+    harness.cancel({ request_ids: ['cancelled'], cid: 'c1' });
+    await flushQueue();
+
+    expect(harness.invoke.mock.calls).toEqual([
+      ['bridge.permission_response', { request_id: 'next', allow: true, always: false }],
+    ]);
+    expect(harness.monitor.event).toHaveBeenCalledOnce();
+    expect(harness.monitor.event).toHaveBeenCalledWith(
+      'connector_bridge_permission_result',
+      expect.objectContaining({ result: 'success', decision: 'allow_once' }),
+    );
+  });
+
+  it('reports remember-for-connector persistence failure without claiming durable authorization', async () => {
+    const harness = loadBridge(
+      async () => 'allow_always',
+      async () => ({ handled: true, always_saved: false }),
+    );
+
+    harness.push({ request_id: 'remember', agent_name: 'A', connector_name: 'C', tool_name: 'one' });
+    await flushQueue();
+
+    expect(harness.monitor.event).toHaveBeenCalledWith(
+      'connector_bridge_permission_result',
+      expect.objectContaining({
+        result: 'failure',
+        decision: 'allow_always',
+        effective_decision: 'allow_once',
+        error_code: 'remember_failed',
+        error_type: 'storage',
+      }),
+    );
+  });
+
+  it('reports one bounded terminal row when response delivery fails', async () => {
+    const harness = loadBridge(
+      async () => 'allow_once',
+      async () => { throw new Error('/Users/test/private/bridge-token.json'); },
+    );
+
+    harness.push({
+      request_id: 'private-request-id',
+      agent_name: 'Private Agent',
+      connector_name: 'Private Connector',
+      tool_name: 'private_tool',
+    });
+    await flushQueue();
+
+    expect(harness.monitor.event).toHaveBeenCalledOnce();
+    expect(harness.monitor.event).toHaveBeenCalledWith(
+      'connector_bridge_permission_result',
+      expect.objectContaining({
+        result: 'failure',
+        decision: 'allow_once',
+        error_code: 'response_failed',
+        error_type: 'ipc',
+      }),
+    );
+    expect(harness.monitor.error).not.toHaveBeenCalled();
+    const diagnostics = JSON.stringify([
+      harness.monitor.event.mock.calls,
+      harness.monitor.error.mock.calls,
+      harness.warn.mock.calls,
+    ]);
+    expect(diagnostics).not.toContain('/Users/alice');
+    expect(diagnostics).not.toContain('private-request-id');
+    expect(diagnostics).not.toContain('Private Connector');
   });
 });

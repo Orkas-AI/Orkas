@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   buildDocxBatch, buildXlsxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, columnLetter,
-  serializeOfficeBatch,
+  serializeOfficeBatch, OfficeEditInputError,
   type DocxParagraphSpec, type XlsxCell, type EditOp,
 } from '../../../../src/main/model/core-agent/office-batch';
 
@@ -267,6 +267,51 @@ describe('buildPptxBatch', () => {
     ]);
   });
 
+  it('drops orphan shape opacity modifiers but preserves them with explicit carriers', () => {
+    const ops = buildPptxBatch([{
+      shapes: [
+        { text: 'No fill', opacity: 0, lineOpacity: 0 },
+        { text: 'Filled', fill: '#FFFFFF', opacity: 0, line: '#111827', lineOpacity: 25 },
+        { text: 'Gradient', gradient: '#111827-#334155-0', opacity: 80 },
+      ],
+    }]);
+
+    expect(ops.slice(1)).toEqual([
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'No fill' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Filled', fill: '#FFFFFF', opacity: '0', line: '#111827', lineOpacity: '25' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Gradient', gradient: '#111827-#334155-0', opacity: '80' },
+      },
+    ]);
+  });
+
+  it('normalizes the legacy outer shadow preset to OfficeCLI default shadow', () => {
+    const ops = buildPptxBatch([{
+      shapes: [
+        { text: 'Legacy card', shadow: 'outer' },
+        { text: 'Explicit shadow', shadow: '#808080' },
+      ],
+    }]);
+
+    expect(ops.slice(1)).toEqual([
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Legacy card', shadow: 'true' },
+      },
+      {
+        command: 'add', parent: '/slide[1]', type: 'shape',
+        props: { text: 'Explicit shadow', shadow: '#808080' },
+      },
+    ]);
+  });
+
   it('adds pictures and tables (with per-cell text, no /p[1]) under the slide', () => {
     const ops = buildPptxBatch([
       {
@@ -283,6 +328,68 @@ describe('buildPptxBatch', () => {
       { command: 'set', path: '/slide[1]/table[1]/tr[2]/tc[1]', props: { text: 'c' } },
       { command: 'set', path: '/slide[1]/table[1]/tr[2]/tc[2]', props: { text: 'd' } },
     ]);
+  });
+
+  it('adds native editable charts and passes visual chart props through', () => {
+    const ops = buildPptxBatch([
+      {
+        charts: [{
+          type: 'column',
+          data: '营收:32,48,66;利润:8,14,21',
+          categories: 'Q1,Q2,Q3',
+          title: '业务增长',
+          x: '0.8in', y: '1.5in', width: '7.4in', height: '4.5in',
+          colors: '#5B5BD6,#22A06B', legend: 'bottom', dataLabels: 'value',
+        }],
+      },
+    ]);
+    expect(ops).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      {
+        command: 'add', parent: '/slide[1]', type: 'chart',
+        props: {
+          chartType: 'column', data: '营收:32,48,66;利润:8,14,21', categories: 'Q1,Q2,Q3',
+          title: '业务增长', x: '0.8in', y: '1.5in', width: '7.4in', height: '4.5in',
+          colors: '#5B5BD6,#22A06B', legend: 'bottom', dataLabels: 'value',
+        },
+      },
+    ]);
+  });
+
+  it('accepts chartType alias and skips charts without a type', () => {
+    expect(buildPptxBatch([{
+      charts: [
+        { data: 'A:1,2' },
+        { chartType: 'line', data: 'A:1,2', categories: '一,二' },
+      ],
+    }])).toEqual([
+      { command: 'add', parent: '/', type: 'slide', props: {} },
+      {
+        command: 'add', parent: '/slide[1]', type: 'chart',
+        props: { chartType: 'line', data: 'A:1,2', categories: '一,二' },
+      },
+    ]);
+  });
+
+  it('passes advanced picture and table styling props through', () => {
+    const ops = buildPptxBatch([{
+      images: [{ src: '/abs/hero.png', crop: 'cover', opacity: 92, alt: '产品界面' }],
+      tables: [{
+        rows: [['指标', '结果']], width: '5in', headerFill: '#111827', bodyFill: '#F8FAFC',
+        style: 'Medium2', 'border.horizontal': '#D7DEE8', firstRow: true,
+      }],
+    }]);
+    expect(ops[1]).toEqual({
+      command: 'add', parent: '/slide[1]', type: 'picture',
+      props: { src: '/abs/hero.png', crop: 'cover', opacity: '92', alt: '产品界面' },
+    });
+    expect(ops[2]).toEqual({
+      command: 'add', parent: '/slide[1]', type: 'table',
+      props: {
+        rows: '1', cols: '2', width: '5in', headerFill: '#111827', bodyFill: '#F8FAFC',
+        style: 'Medium2', 'border.horizontal': '#D7DEE8', firstRow: 'true',
+      },
+    });
   });
 
   it('skips a picture without a src', () => {
@@ -322,5 +429,62 @@ describe('buildEditBatch', () => {
       { command: 'remove', path: '/body/p[9]' },
       { command: 'set', path: '/ok', props: { c: '0' } },
     ]);
+  });
+
+  it('seeds table grids on each add without guessing existing table indexes', () => {
+    const ops = buildEditBatch([
+      {
+        action: 'add',
+        parent: '/body',
+        type: 'table',
+        props: {
+          rows: [['参数', 'Overall'], ['记录数', 57_750], ['完整', true], ['备注', null]],
+          style: 'medium2',
+        },
+      },
+      {
+        action: 'add',
+        parent: '/body',
+        type: 'table',
+        props: { rows: [['第二张'], ['表格']] },
+      },
+    ]);
+
+    expect(ops).toEqual([
+      {
+        command: 'add',
+        parent: '/body',
+        type: 'table',
+        props: {
+          rows: '4', cols: '2', style: 'medium2',
+          r1c1: '参数', r1c2: 'Overall', r2c1: '记录数', r2c2: '57750',
+          r3c1: '完整', r3c2: 'true', r4c1: '备注',
+        },
+      },
+      {
+        command: 'add',
+        parent: '/body',
+        type: 'table',
+        props: { rows: '2', cols: '1', r1c1: '第二张', r2c1: '表格' },
+      },
+    ]);
+  });
+
+  it('rejects ragged/conflicting table grids and other nested props instead of stringifying them', () => {
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [] },
+    }])).toThrow(/at least one row/);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [['A', 'B'], ['C']] },
+    }])).toThrow(/must be rectangular/);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [['A']], cols: 1 },
+    }])).toThrow(/cannot be combined/);
+    expect(() => buildEditBatch([{
+      action: 'set', path: '/body/p[1]', props: { font: { color: 'FF0000' } },
+    }])).toThrow(OfficeEditInputError);
+    expect(() => buildEditBatch([{
+      action: 'add', parent: '/body', type: 'table', props: { rows: [[{ text: 'nested' }]] },
+    }])).toThrow(/table cell at row 1, column 1/);
   });
 });

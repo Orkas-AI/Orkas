@@ -4,6 +4,7 @@ import { isIP } from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import { prepareFeedbackUploadImage } from '../util/image-transform';
 import { fetchWithTimeout, throwIfAborted } from '../util/abort';
@@ -16,6 +17,7 @@ const log = createLogger('generation-reference-assets');
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 12 * 1024 * 1024;
+const MAX_REFERENCE_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 const VIDEO_COMPRESS_TRIGGER_BYTES = 8 * 1024 * 1024;
 const REFERENCE_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 const VIDEO_COMPRESS_TIMEOUT_MS = 10 * 60 * 1000;
@@ -429,6 +431,86 @@ function normalizeUrl(value?: string): string {
   throw new Error('reference URL must be an HTTPS public URL or asset:// provider URL');
 }
 
+function validateDirectUploadTarget(
+  uploadValue: string,
+  fileValue: string,
+  apiBase: string,
+): { uploadUrl: string; fileUrl: string } {
+  const fileUrl = normalizeUrl(fileValue);
+  let upload: URL;
+  let file: URL;
+  let api: URL;
+  try {
+    upload = new URL(uploadValue);
+    file = new URL(fileUrl);
+    api = new URL(apiBase);
+  } catch {
+    throw new Error('COS direct upload authorization returned an invalid URL');
+  }
+  if (upload.username || upload.password || upload.hash) {
+    throw new Error('COS direct upload authorization returned an unsafe URL');
+  }
+
+  const publicCosTarget = upload.protocol === 'https:'
+    && !isPrivateReferenceHost(upload.hostname)
+    && upload.origin === file.origin
+    && upload.pathname === file.pathname;
+  const localTestTarget = isLoopbackReferenceHost(api.hostname)
+    && isLoopbackReferenceHost(upload.hostname)
+    && upload.protocol === api.protocol
+    && upload.port === api.port;
+  if (!publicCosTarget && !localTestTarget) {
+    throw new Error('COS direct upload authorization returned an unsafe target');
+  }
+  return { uploadUrl: upload.toString(), fileUrl };
+}
+
+function validateDirectUploadHeaders(
+  value: unknown,
+  contentType: string,
+  contentLength: number,
+  contentMd5: string,
+): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('COS direct upload authorization returned invalid headers');
+  }
+  const allowed = new Set([
+    'content-type',
+    'content-length',
+    'content-md5',
+    'content-disposition',
+    'x-cos-acl',
+    'x-cos-server-side-encryption',
+  ]);
+  const normalized = new Map<string, string>();
+  const output: Record<string, string> = {};
+  for (const [name, raw] of Object.entries(value as Record<string, unknown>)) {
+    const lowerName = name.trim().toLowerCase();
+    const headerValue = String(raw);
+    if (!allowed.has(lowerName) || normalized.has(lowerName) || /[\r\n]/.test(headerValue)) {
+      throw new Error('COS direct upload authorization returned unsafe headers');
+    }
+    normalized.set(lowerName, headerValue);
+    output[name] = headerValue;
+  }
+  const expected = new Map<string, string>([
+    ['content-type', contentType],
+    ['content-length', String(contentLength)],
+    ['content-md5', contentMd5],
+    ['x-cos-acl', 'private'],
+    ['x-cos-server-side-encryption', 'AES256'],
+  ]);
+  for (const [name, expectedValue] of expected) {
+    if (normalized.get(name) !== expectedValue) {
+      throw new Error('COS direct upload authorization returned mismatched headers');
+    }
+  }
+  if (!normalized.get('content-disposition')?.startsWith('attachment;')) {
+    throw new Error('COS direct upload authorization returned invalid content disposition');
+  }
+  return output;
+}
+
 function localFileIdentity(absPath: string): string {
   if (!absPath) return '';
   try {
@@ -475,6 +557,12 @@ function isPrivateReferenceHost(hostname: string): boolean {
       || /^::ffff:(?:0\.|10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host);
   }
   return false;
+}
+
+function isLoopbackReferenceHost(hostname: string): boolean {
+  const host = hostname.trim().replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1') return true;
+  return isIP(host) === 4 && host.split('.')[0] === '127';
 }
 
 function detectImageMime(buf: Buffer, fileName = ''): 'image/png' | 'image/jpeg' | 'image/webp' | null {

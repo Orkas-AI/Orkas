@@ -24,8 +24,12 @@ const {
   verifyEmbeddingModelRoot,
   verifyMacLocalizedMetadataRoot,
 } = require('../bin/packaged-resource-gate.cjs');
-const { verifyPackagedEntrypointPayload } = require('../bin/packaged-entrypoint-gate.cjs');
+const {
+  verifyPackagedConnectorRuntime,
+  verifyPackagedEntrypointPayload,
+} = require('../bin/packaged-entrypoint-gate.cjs');
 const { verifyBuiltinRoot } = require('../bin/builtin-resource-gate.cjs');
+const { verifyPackagedDependencyGraph } = require('../bin/packaged-dependency-gate.cjs');
 
 const ARCH_NAMES = {
   0: 'ia32',
@@ -558,12 +562,34 @@ function verifyPackedResourcePayload(context, appPath, targetPlatform) {
 }
 
 function verifyPackedEntrypointPayload(context, appPath) {
-  return verifyPackagedEntrypointPayload(
-    context.__orkasTestEntrypointRoot || appUnpackedRoot(context, appPath),
-    {
-      projectRoot: path.join(__dirname, '..'),
-    },
-  );
+  const unpackedRoot = context.__orkasTestEntrypointRoot || appUnpackedRoot(context, appPath);
+  return [
+    ...verifyPackagedEntrypointPayload(
+      unpackedRoot,
+      {
+        projectRoot: path.join(__dirname, '..'),
+      },
+    ),
+    ...verifyPackagedConnectorRuntime(unpackedRoot),
+  ];
+}
+
+function verifyPackedDependencyPayload(context, appPath, targetPlatform, targetArch) {
+  const projectRoot = path.join(__dirname, '..');
+  const options = {
+    appAsar: path.join(appResourcesDir(context, appPath), 'app.asar'),
+    packageJsonFile: path.join(projectRoot, 'package.json'),
+    packageLockFile: path.join(projectRoot, 'package-lock.json'),
+    platform: targetPlatform,
+    arch: targetArch,
+  };
+  const result = context.__orkasTestDependencyGate
+    ? context.__orkasTestDependencyGate(options)
+    : verifyPackagedDependencyGraph(options);
+  if (!result || typeof result.verificationEntry !== 'string' || !result.verificationEntry) {
+    throw new Error('[native-deps-gate] packaged dependency gate returned no verification entry');
+  }
+  return [result.verificationEntry];
 }
 
 function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) {
@@ -684,6 +710,7 @@ async function afterPack(context) {
   verified.push(...verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch));
   verified.push(...verifyPackedResourcePayload(context, appPath, targetPlatform));
   verified.push(...verifyPackedEntrypointPayload(context, appPath));
+  verified.push(...verifyPackedDependencyPayload(context, appPath, targetPlatform, targetArch));
   writeNativeGateMarker(context, targetPlatform, targetArch, verified);
   console.log(`[native-deps-gate] verified: ${verified.join(', ')}`);
   console.log('[native-deps-gate] result=passed; signing may continue');

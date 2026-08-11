@@ -66,8 +66,10 @@ export function chatMediaLocalPathFromUrl(raw: string, platform = process.platfo
   return decoded;
 }
 
-const CHAT_MEDIA_LOCAL_URL_IN_TEXT = /chat-media:\/\/local\/[^\s<>"'`]+/gi;
-const CHAT_MEDIA_TRAILING_DELIMITER = /[)\]},.;:!]+$/;
+// Generated local URLs percent-encode filename punctuation, so raw CJK
+// sentence delimiters are always prose boundaries rather than path bytes.
+const CHAT_MEDIA_LOCAL_URL_IN_TEXT = /chat-media:\/\/local\/[^\s<>"'`\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+/gi;
+const CHAT_MEDIA_TRAILING_DELIMITER = /[)\]},.;:!\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+$/;
 
 function _versionLocalUrlCandidate(candidate: string): string {
   const absPath = chatMediaLocalPathFromUrl(candidate);
@@ -120,4 +122,59 @@ export function versionChatMediaLocalUrlsInText(text: string): string {
     }
     return versioned ? versioned + suffix : raw;
   });
+}
+
+/** Split one matched URL into the longest candidate whose target file exists,
+ *  plus the Markdown/sentence punctuation peeled off its end.
+ *
+ *  A local path may legitimately end in `)` or `.`, so the exact filename is
+ *  tried first and delimiters are peeled only while nothing resolves. Shared so
+ *  the versioner and the existence check agree on where the URL ends — a
+ *  checker with its own peeling would report links the versioner had already
+ *  resolved. */
+function _splitResolvableCandidate(raw: string): { candidate: string; suffix: string; absPath: string } {
+  let candidate = raw;
+  let suffix = '';
+  if (/[?#]/.test(candidate)) {
+    const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
+    if (trailing) {
+      candidate = candidate.slice(0, -trailing.length);
+      suffix = trailing;
+    }
+  }
+  for (;;) {
+    const absPath = chatMediaLocalPathFromUrl(candidate);
+    if (absPath && _chatMediaLocalVersionToken(absPath)) return { candidate, suffix, absPath };
+    const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
+    if (!trailing) return { candidate, suffix, absPath: absPath || '' };
+    const last = trailing.slice(-1);
+    candidate = candidate.slice(0, -1);
+    suffix = last + suffix;
+  }
+}
+
+/**
+ * Local media URLs in assistant prose whose target file does not exist.
+ *
+ * The versioner above already walks every one of these and already discovers
+ * which cannot be versioned, because a missing file yields no version token —
+ * and then drops that knowledge on the floor. This returns it.
+ *
+ * 2026-08-07: an agent closed a run with `<agent-result status="success" />`, a
+ * "成片确认", and a `[video](chat-media://local/…/orkas-promo-v1.mp4)` link. That
+ * turn made no tool calls at all, the file never existed, and the renderer
+ * logged `chat-media/local: reject … not_found` about 300ms later. Every fact
+ * needed to catch it was already in the host's hands.
+ */
+export function unresolvedChatMediaLocalUrls(text: string): string[] {
+  const missing: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of String(text || '').match(CHAT_MEDIA_LOCAL_URL_IN_TEXT) || []) {
+    const { candidate, absPath } = _splitResolvableCandidate(raw);
+    if (absPath && _chatMediaLocalVersionToken(absPath)) continue;
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    missing.push(candidate);
+  }
+  return missing;
 }

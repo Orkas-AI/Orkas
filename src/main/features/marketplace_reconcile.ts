@@ -43,8 +43,11 @@ import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
 import { downloadMarketplaceBundle, parseMarketplaceBundle } from './marketplace_bundle';
 import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
 import {
+  compareVersions,
   minAppVersionFrom,
+  parseSemver,
   satisfiesMinAppVersion,
   type MinAppVersionSource,
 } from '../util/app-version-compat';
@@ -68,6 +71,12 @@ function _isInstallRowAppCompatible(row: ({ id?: string } & MinAppVersionSource)
   const min = minAppVersionFrom(row);
   if (!min || _isAppCompatible(min)) return true;
   log.info(`skip ${kind} ${row.id || ''}; requires Orkas >= ${min} (current ${_currentAppVersion() || 'unknown'})`);
+  return false;
+}
+
+function _isInstallRowVersionValid(row: { id?: string; version?: unknown }, kind: 'agent' | 'skill'): boolean {
+  if (parseSemver(row.version)) return true;
+  log.warn(`skip ${kind} ${row.id || ''}; invalid marketplace version`);
   return false;
 }
 
@@ -190,10 +199,11 @@ export function setDefaultInstallSeedStatus(active: boolean): void {
   }
 }
 
-/** Pre-reconcile step: sync the local cloud manifest against the server catalog. For every
- *  installed item, look up the server's current (version, updated_at/published_at). When the server has
- *  newer values, write them back into the manifest — the subsequent `reconcileInstalls` pass
- *  then detects the mismatch against per-machine `_install.json` and re-pulls the blob.
+/** Pre-reconcile step: sync the local cloud manifest against the server catalog. Content is
+ *  eligible for automatic replacement only when the server version is strictly newer. Catalog
+ *  timestamps remain descriptive metadata and must never turn a same-version republish or stale
+ *  server row into an automatic update. The subsequent `reconcileInstalls` pass detects the newer
+ *  manifest version against per-machine `_install.json` and re-pulls the blob.
  *
  *  Side effects: at most one `addAgentInstall` / `addSkillInstall` write per changed row,
  *  each going through the same per-uid lock as user-initiated installs. Items absent from the
@@ -249,32 +259,36 @@ export async function checkServerUpdatesForInstalls(
     if (!_isInstallRowAppCompatible({ id: a.id, min_app_version: server.min_app_version }, 'agent')) {
       continue;
     }
-    const contentChanged = server.version !== a.version || _freshnessAt(server) !== _freshnessAt(a);
+    const contentUpgrade = compareVersions(server.version, a.version) === 1;
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && a.default_install !== server.default_install;
     const currentStatus = a.status || a.state;
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
-    const privateSkillsUrlChanged = typeof server.agent_skills_bundle_url === 'string'
-      && a.agent_skills_bundle_url !== server.agent_skills_bundle_url;
     const minAppVersionChanged = typeof server.min_app_version === 'string'
       && a.min_app_version !== server.min_app_version;
-    if (contentChanged || defaultInstallChanged || statusChanged || privateSkillsUrlChanged || minAppVersionChanged) {
-      log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (freshness ${_freshnessAt(a)} → ${_freshnessAt(server)})`);
+    if (contentUpgrade || defaultInstallChanged || statusChanged || minAppVersionChanged) {
+      if (contentUpgrade) {
+        log.info(`server-update agent ${a.id}: v${a.version} → v${server.version}`);
+      }
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
-      // Replace the row in the manifest; reconcile will detect the version/freshness
-      // mismatch against `_install.json` and re-pull. agent_json_url is reused (server
+      // Replace content identity only for a strict version upgrade. agent_json_url is reused (server
       // overwrites the same COS key on republish — see Server `api/marketplace.py::upload_agent`).
       await addAgentInstall(uid, {
-        id: a.id, version: server.version, published_at: server.published_at,
-        updated_at: server.updated_at, agent_json_url: a.agent_json_url, create_uid: a.create_uid,
-        ...(typeof server.agent_skills_bundle_url === 'string'
+        id: a.id,
+        version: contentUpgrade ? server.version : a.version,
+        published_at: contentUpgrade ? server.published_at : a.published_at,
+        ...((contentUpgrade ? server.updated_at : a.updated_at) !== undefined
+          ? { updated_at: contentUpgrade ? server.updated_at : a.updated_at }
+          : {}),
+        agent_json_url: a.agent_json_url,
+        ...(contentUpgrade && typeof server.agent_skills_bundle_url === 'string'
           ? { agent_skills_bundle_url: server.agent_skills_bundle_url }
           : (typeof a.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: a.agent_skills_bundle_url } : {})),
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
         ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
       });
-      if (!contentChanged && !privateSkillsUrlChanged && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
+      if (!contentUpgrade && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'agent', a.id, async () => {
           await _patchInstallMeta(userMarketplaceAgentDir(uid, a.id), {
             ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
@@ -298,24 +312,32 @@ export async function checkServerUpdatesForInstalls(
     if (!_isInstallRowAppCompatible({ id: s.id, min_app_version: server.min_app_version }, 'skill')) {
       continue;
     }
-    const contentChanged = server.version !== s.version || _freshnessAt(server) !== _freshnessAt(s);
+    const contentUpgrade = compareVersions(server.version, s.version) === 1;
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && s.default_install !== server.default_install;
     const currentStatus = s.status || s.state;
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
     const minAppVersionChanged = typeof server.min_app_version === 'string'
       && s.min_app_version !== server.min_app_version;
-    if (contentChanged || defaultInstallChanged || statusChanged || minAppVersionChanged) {
-      log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (freshness ${_freshnessAt(s)} → ${_freshnessAt(server)})`);
+    if (contentUpgrade || defaultInstallChanged || statusChanged || minAppVersionChanged) {
+      if (contentUpgrade) {
+        log.info(`server-update skill ${s.id}: v${s.version} → v${server.version}`);
+      }
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       await addSkillInstall(uid, {
-        id: s.id, version: server.version, published_at: server.published_at,
-        updated_at: server.updated_at, bundle_url: s.bundle_url, create_uid: s.create_uid,
+        id: s.id,
+        version: contentUpgrade ? server.version : s.version,
+        published_at: contentUpgrade ? server.published_at : s.published_at,
+        ...((contentUpgrade ? server.updated_at : s.updated_at) !== undefined
+          ? { updated_at: contentUpgrade ? server.updated_at : s.updated_at }
+          : {}),
+        bundle_url: s.bundle_url,
+        create_uid: s.create_uid,
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
         ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
       });
-      if (!contentChanged && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
+      if (!contentUpgrade && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'skill', s.id, async () => {
           await _patchInstallMeta(userMarketplaceSkillDir(uid, s.id), {
             ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
@@ -397,7 +419,8 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]):
     const list = r.list || [];
     for (const row of list) {
       if (typeof row.id !== 'string' || !wanted.has(row.id)) continue;
-      if (typeof row.version === 'string' && typeof row.published_at === 'number') {
+      if (typeof row.version === 'string' && typeof row.published_at === 'number'
+          && _isInstallRowVersionValid(row, kind === 'agents' ? 'agent' : 'skill')) {
         out.set(row.id, {
           version: row.version,
           published_at: row.published_at,
@@ -446,8 +469,10 @@ export async function reconcileInstalls(
   }
   // Filter pull-needed up front so the banner's total is meaningful (it counts work the user
   // will actually see, not entries that short-circuit).
-  const agentsNeedingPull = manifest.agents.filter((r) => _isInstallRowAppCompatible(r, 'agent') && _agentNeedsPull(uid, r));
-  const skillsNeedingPull = manifest.skills.filter((r) => _isInstallRowAppCompatible(r, 'skill') && _skillNeedsPull(uid, r));
+  const agentsNeedingPull = manifest.agents.filter((r) => _isInstallRowVersionValid(r, 'agent')
+    && _isInstallRowAppCompatible(r, 'agent') && _agentNeedsPull(uid, r));
+  const skillsNeedingPull = manifest.skills.filter((r) => _isInstallRowVersionValid(r, 'skill')
+    && _isInstallRowAppCompatible(r, 'skill') && _skillNeedsPull(uid, r));
   const agentPullIds = new Set(agentsNeedingPull.map((r) => r.id));
   const skillPullIds = new Set(skillsNeedingPull.map((r) => r.id));
   let metadataPatches: MetadataPatchCounts;
@@ -689,7 +714,7 @@ async function _patchLocalMetadataForManifest(
     if (_builtinSyncBlocksServerPull(dir, row)) continue;
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
-    const patch = _installMetaFromAgentRow(row);
+    const patch = _mutableInstallMetaFromAgentRow(row);
     if (!_installMetaMatches(meta, patch)) {
       _assertContinue(opts);
       await _writeInstallMeta(dir, { ...meta, ...patch });
@@ -705,7 +730,7 @@ async function _patchLocalMetadataForManifest(
     if (_builtinSyncBlocksServerPull(dir, row)) continue;
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
-    const patch = _installMetaFromSkillRow(row);
+    const patch = _mutableInstallMetaFromSkillRow(row);
     if (!_installMetaMatches(meta, patch)) {
       _assertContinue(opts);
       await _writeInstallMeta(dir, { ...meta, ...patch });
@@ -724,16 +749,16 @@ function _localInstallIds(root: string): string[] {
   } catch { return []; }
 }
 
-/** Need-pull check: missing dir / missing agent.json / `_install.json::version` mismatch.
- *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback).
+/** Need-pull check: missing content or a manifest version that is strictly newer than the
+ *  installed version. Marketplace timestamps do not authorize content replacement.
  *
  *  **Dev-mode local-edit guard**: when running under `false` and the meta
  *  carries a `content_sha` (= sha256 of the descriptive file at install/upload
  *  time), compare against disk. If they differ, the dev edited the spec locally
  *  and we must NOT clobber the change — return false + log. Production users
  *  don't hand-edit install dirs, so this branch is dev-only. Pre-feature
- *  installs (no `content_sha`) fall through to the legacy version+freshness
- *  comparison, which is the same behaviour as before.
+ *  installs (no `content_sha`) still follow the same strict version gate,
+ *  but cannot receive the additional local-edit protection.
  */
 function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
   if (!_agentContentExists(uid, row.id)) return true;
@@ -743,6 +768,8 @@ function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
   if (_builtinSyncBlocksServerPull(dir, row, meta)) return false;
+  const versionCompare = compareVersions(row.version, meta.version);
+  if (versionCompare === null || versionCompare < 0) return false;
   if (typeof row.agent_skills_bundle_url === 'string') {
     if (meta.agent_skills_bundle_url !== row.agent_skills_bundle_url) return true;
     if (row.agent_skills_bundle_url && !_agentPrivateSkillsExist(uid, row.id)) return true;
@@ -761,7 +788,8 @@ function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
       return false;
     }
   }
-  return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
+  if (versionCompare > 0) return true;
+  return !!row.agent_skills_bundle_url && !_agentPrivateSkillsExist(uid, row.id);
 }
 
 function _agentPrivateSkillsExist(uid: string, id: string): boolean {
@@ -780,6 +808,8 @@ function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
   if (_builtinSyncBlocksServerPull(dir, row, meta)) return false;
+  const versionCompare = compareVersions(row.version, meta.version);
+  if (versionCompare === null || versionCompare <= 0) return false;
   if (false && typeof meta.content_sha === 'string') {
     const diskSha = sha256OfFile(skillMdFile);
     if (diskSha && diskSha !== meta.content_sha) {
@@ -794,7 +824,7 @@ function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
       return false;
     }
   }
-  return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
+  return true;
 }
 
 function _agentContentExists(uid: string, id: string): boolean {
@@ -921,39 +951,25 @@ function _readResourceSyncManifest(dir: string): { resource_hash?: string; resou
   }
 }
 
+/**
+ * A builtin-seeded install newer than the server's published version must not
+ * be pulled back down. This is the runtime half of the builtin_marketplace
+ * contract ("a newer packaged builtin overlays the same-id marketplace
+ * install") — without it, the next reconcile immediately reverts the overlay
+ * to the older server package, which shipped agents whose skills predate the
+ * host tool contract (observed in production as a VideoStudio downgrade of
+ * 25 versions minutes after seeding). Applies in every environment; a server
+ * version that is genuinely newer still pulls normally.
+ */
 function _builtinSyncBlocksServerPull(
   dir: string,
   row: AgentInstall | SkillInstall,
   meta = _readInstallMeta(dir),
 ): boolean {
-  if (!false) return false;
   if (meta?.seed_source !== 'builtin') return false;
-  return _compareVersions(meta.version, row.version) > 0;
-}
-
-function _versionTokens(value: unknown): Array<number | string> {
-  const text = typeof value === 'string' ? value.trim() : '';
-  if (!text) return [];
-  return text
-    .replace(/^v/i, '')
-    .split(/[.+_-]/)
-    .filter(Boolean)
-    .map((part) => (/^\d+$/.test(part) ? Number(part) : part.toLowerCase()));
-}
-
-function _compareVersions(a: unknown, b: unknown): number {
-  const aa = _versionTokens(a);
-  const bb = _versionTokens(b);
-  if (!aa.length || !bb.length) return 0;
-  const n = Math.max(aa.length, bb.length);
-  for (let i = 0; i < n; i++) {
-    const x = aa[i] ?? 0;
-    const y = bb[i] ?? 0;
-    if (x === y) continue;
-    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
-    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
-  }
-  return 0;
+  if (compareVersions(meta.version, row.version) !== 1) return false;
+  log.info(`builtin ${row.id} v${meta.version} newer than server v${row.version}; keeping local content`);
+  return true;
 }
 
 interface InstallMeta {
@@ -1011,14 +1027,8 @@ function _canRestoreSkillInstall(meta: InstallMeta | null): meta is InstallMeta 
     && typeof meta.installed_at === 'number' && meta.installed_at > 0;
 }
 
-function _installMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
+function _mutableInstallMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
   return {
-    version: row.version,
-    published_at: row.published_at,
-    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
-    agent_json_url: row.agent_json_url,
-    ...(typeof row.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: row.agent_skills_bundle_url } : {}),
-    installed_at: row.installed_at,
     create_uid: row.create_uid || '',
     ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
     ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
@@ -1026,13 +1036,8 @@ function _installMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
   };
 }
 
-function _installMetaFromSkillRow(row: SkillInstall): Partial<InstallMeta> {
+function _mutableInstallMetaFromSkillRow(row: SkillInstall): Partial<InstallMeta> {
   return {
-    version: row.version,
-    published_at: row.published_at,
-    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
-    bundle_url: row.bundle_url,
-    installed_at: row.installed_at,
     create_uid: row.create_uid || '',
     ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
     ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
@@ -1120,6 +1125,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       min_app_version?: string;
       minAppVersion?: string;
     }>('/marketplace/agents/detail', { id: row.id });
+    _assertRefreshedVersion('agent', row.id, row.version, fresh.version);
     const minAppVersion = _normalizeMinAppVersion(fresh, fresh.agent_json);
     current = {
       ...row,
@@ -1133,8 +1139,6 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
       min_app_version: minAppVersion || '',
     };
-    _assertContinue(opts);
-    await addAgentInstall(uid, current);
     res = await fetchWithRetry(`marketplace:pull-agent:${row.id}:fresh`, current.agent_json_url, undefined, {
       timeoutMs: MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS,
     });
@@ -1148,7 +1152,6 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   const minAppVersion = _normalizeMinAppVersion(current, parsed);
   if (minAppVersion && current.min_app_version !== minAppVersion) {
     current = { ...current, min_app_version: minAppVersion };
-    await addAgentInstall(uid, current);
   }
   if (!_isAppCompatible(minAppVersion)) {
     throw new Error(`agent ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
@@ -1163,39 +1166,40 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   );
 
   const dir = userMarketplaceAgentDir(uid, row.id);
-  _assertContinue(opts);
-  await fsp.rm(dir, { recursive: true, force: true });
-  _assertContinue(opts);
-  await fsp.mkdir(dir, { recursive: true });
-  const agentJsonFile = path.join(dir, 'agent.json');
-  _assertContinue(opts);
-  await fsp.writeFile(agentJsonFile, text, 'utf8');
-  if (privateSkillsZip) {
+  await replaceDirectoryAtomically(dir, async (staged) => {
     _assertContinue(opts);
-    const privateSkillsDir = userMarketplaceAgentSkillsDir(uid, row.id);
-    await fsp.mkdir(privateSkillsDir, { recursive: true });
-    extractBundleSafely(privateSkillsZip, privateSkillsDir);
-  }
-  _assertContinue(opts);
-  await _writeInstallMeta(dir, {
-    version: current.version, published_at: current.published_at,
-    ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
-    agent_json_url: current.agent_json_url,
-    agent_skills_bundle_url: current.agent_skills_bundle_url || '',
-    installed_at: current.installed_at,
-    create_uid: current.create_uid || '',
-    ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
-    ...((current.status || current.state) ? { status: current.status || current.state } : {}),
-    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-    ...(((): { content_sha?: string } => {
-      const sha = sha256OfFile(agentJsonFile);
-      return sha ? { content_sha: sha } : {};
-    })()),
-    ...(((): { content_tree_hash?: string } => {
-      const hash = marketplaceContentTreeHash(dir);
-      return hash ? { content_tree_hash: hash } : {};
-    })()),
-  });
+    const agentJsonFile = path.join(staged, 'agent.json');
+    await fsp.writeFile(agentJsonFile, text, 'utf8');
+    if (privateSkillsZip) {
+      _assertContinue(opts);
+      const privateSkillsDir = path.join(staged, 'skills');
+      await fsp.mkdir(privateSkillsDir, { recursive: true });
+      extractBundleSafely(privateSkillsZip, privateSkillsDir);
+    }
+    _assertContinue(opts);
+    await _writeInstallMeta(staged, {
+      version: current.version, published_at: current.published_at,
+      ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
+      agent_json_url: current.agent_json_url,
+      agent_skills_bundle_url: current.agent_skills_bundle_url || '',
+      installed_at: current.installed_at,
+      create_uid: current.create_uid || '',
+      ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
+      ...((current.status || current.state) ? { status: current.status || current.state } : {}),
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
+      ...(((): { content_sha?: string } => {
+        const sha = sha256OfFile(agentJsonFile);
+        return sha ? { content_sha: sha } : {};
+      })()),
+      ...(((): { content_tree_hash?: string } => {
+        const hash = marketplaceContentTreeHash(staged);
+        return hash ? { content_tree_hash: hash } : {};
+      })()),
+    });
+  }, async () => {
+    _assertContinue(opts);
+    await addAgentInstall(uid, current);
+  }, { assertReady: () => _assertContinue(opts) });
 }
 
 /** Fetch the skill bundle zip from cloud URL + extract. Same wipe-and-replace semantics.
@@ -1226,6 +1230,7 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       min_app_version?: string;
       minAppVersion?: string;
     }>('/marketplace/skills/bundle', { id: row.id });
+    _assertRefreshedVersion('skill', row.id, row.version, fresh.version);
     const minAppVersion = _normalizeMinAppVersion(fresh);
     current = {
       ...row,
@@ -1238,8 +1243,6 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
       min_app_version: minAppVersion || '',
     };
-    _assertContinue(opts);
-    await addSkillInstall(uid, current);
     downloaded = await downloadMarketplaceBundle(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url, {
       assertContinue: () => _assertContinue(opts),
     });
@@ -1255,35 +1258,50 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
   }
 
   const dir = userMarketplaceSkillDir(uid, row.id);
-  _assertContinue(opts);
-  await fsp.rm(dir, { recursive: true, force: true });
-  _assertContinue(opts);
-  await fsp.mkdir(dir, { recursive: true });
+  await replaceDirectoryAtomically(dir, async (staged) => {
+    _assertContinue(opts);
+    extractBundleSafely(zip, staged);
+    // Sanity: SKILL.md must end up in place (zip empty / corrupt would silently skip everything).
+    const skillMdFile = path.join(staged, 'SKILL.md');
+    if (!fs.existsSync(skillMdFile)) throw new Error('bundle missing SKILL.md');
+    _assertContinue(opts);
+    await _writeInstallMeta(staged, {
+      version: current.version, published_at: current.published_at,
+      ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
+      bundle_url: current.bundle_url,
+      installed_at: current.installed_at,
+      create_uid: current.create_uid || '',
+      ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
+      ...((current.status || current.state) ? { status: current.status || current.state } : {}),
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
+      ...(((): { content_sha?: string } => {
+        const sha = sha256OfFile(skillMdFile);
+        return sha ? { content_sha: sha } : {};
+      })()),
+      ...(((): { content_tree_hash?: string } => {
+        const hash = marketplaceContentTreeHash(staged);
+        return hash ? { content_tree_hash: hash } : {};
+      })()),
+    });
+  }, async () => {
+    _assertContinue(opts);
+    await addSkillInstall(uid, current);
+  }, { assertReady: () => _assertContinue(opts) });
+}
 
-  _assertContinue(opts);
-  extractBundleSafely(zip, dir);
-  // Sanity: SKILL.md must end up in place (zip empty / corrupt would silently skip everything).
-  const skillMdFile = path.join(dir, 'SKILL.md');
-  if (!fs.existsSync(skillMdFile)) throw new Error('bundle missing SKILL.md');
-  _assertContinue(opts);
-  await _writeInstallMeta(dir, {
-    version: current.version, published_at: current.published_at,
-    ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
-    bundle_url: current.bundle_url,
-    installed_at: current.installed_at,
-    create_uid: current.create_uid || '',
-    ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
-    ...((current.status || current.state) ? { status: current.status || current.state } : {}),
-    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-    ...(((): { content_sha?: string } => {
-      const sha = sha256OfFile(skillMdFile);
-      return sha ? { content_sha: sha } : {};
-    })()),
-    ...(((): { content_tree_hash?: string } => {
-      const hash = marketplaceContentTreeHash(dir);
-      return hash ? { content_tree_hash: hash } : {};
-    })()),
-  });
+function _assertRefreshedVersion(
+  kind: 'agent' | 'skill',
+  id: string,
+  requestedVersion: string,
+  refreshedVersion: string,
+): void {
+  const compared = compareVersions(refreshedVersion, requestedVersion);
+  if (compared === null) {
+    throw new Error(`${kind} ${id} detail returned an invalid version`);
+  }
+  if (compared < 0) {
+    throw new Error(`${kind} ${id} detail version ${refreshedVersion} is older than requested ${requestedVersion}`);
+  }
 }
 
 async function _fetchAgentPrivateSkillsBundle(

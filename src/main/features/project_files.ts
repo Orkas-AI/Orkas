@@ -18,7 +18,11 @@ import { t } from '../i18n';
 import { invalidateFileCache } from './file_indexer';
 import { projectExists } from './projects';
 import * as projectLibraryIndexer from './project_library_indexer';
-import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
+import {
+  officeFileToPreviewHtml,
+  officePreviewKindForExt,
+  type OfficePreviewResult,
+} from '../util/office-preview';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
@@ -871,14 +875,14 @@ export async function readProjectOfficeHtml(
   userId: string,
   projectId: string,
   name: string,
-): Promise<Result<{ html: string; kind: 'word' | 'spreadsheet' | 'presentation'; previewHeight?: number }>> {
+): Promise<Result<OfficePreviewResult>> {
   const r = await resolveProjectFileAbsPath(userId, projectId, name);
   if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
   const kind = officePreviewKindForExt(path.extname(r.absPath).toLowerCase());
   if (!kind) return { ok: false, error: 'not a supported office file' };
   try {
     const buf = fs.readFileSync(r.absPath);
-    const preview = await officeBufferToPreviewHtml(kind, path.basename(r.absPath), buf);
+    const preview = await officeFileToPreviewHtml(kind, path.basename(r.absPath), r.absPath, buf);
     return { ok: true, ...preview };
   } catch (err) {
     log.warn(`project office→html ${projectId}/${name}: ${(err as Error).message}`);

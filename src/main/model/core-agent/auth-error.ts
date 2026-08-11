@@ -54,21 +54,29 @@
  * rely on those exclusively.
  */
 
+import { isProviderSafetyError } from '../../../core-agent/src/shared/errors';
+
 export type KeyFailureKind = 'auth' | 'permission' | 'rate_limit' | 'balance' | 'network';
 
 // ─── Message patterns ────────────────────────────────────────────────────
 
 const AUTH_RE =
-  /invalid[_\s-]?api[_\s-]?key|incorrect[_\s-]?api[_\s-]?key|authentication[_\s-]?error|\bunauthorized\b|api[_\s-]?key[_\s-]?(invalid|incorrect|expired|missing|not[_\s-]?found|appears)|\bauth[_\s-]?failed\b|appears to be invalid|\bno[_\s-]?such[_\s-]?api[_\s-]?key\b|\bsk-[a-z0-9\-_]{4,}\b.*?(invalid|incorrect|expired)/i;
+  /invalid[_\s-]?api[_\s-]?key|incorrect[_\s-]?api[_\s-]?key|authentication[_\s-]?error|\bunauthorized\b|api[_\s-]?key[_\s-]?(invalid|incorrect|expired|missing|not[_\s-]?found|appears)|\bauth[_\s-]?failed\b|invalidated[_\s-]+oauth[_\s-]+token|oauth[_\s-]+token.{0,80}\b(invalid|invalidated|expired|revoked)\b|appears to be invalid|\bno[_\s-]?such[_\s-]?api[_\s-]?key\b|\bsk-[a-z0-9\-_]{4,}\b.*?(invalid|incorrect|expired)/i;
+
+// Provider error codes are a stronger signal than prose. Keep this exact-ish
+// so generic words such as "invalid" do not turn request/config failures into
+// credential failures.
+const AUTH_CODE_RE =
+  /^(token_invalidated|invalid_token|invalid_api_key|authentication_error|unauthorized|oauth_token_(invalid|invalidated|expired|revoked))$/i;
 
 const PERM_RE =
   /permission[_\s-]?error|\bforbidden\b|plan[_\s-]?required|subscription[_\s-]?(expired|required|invalid|canceled)|access[_\s-]?denied/i;
 
 const RATE_RE =
-  /rate[_\s-]?limit|too[_\s-]?many[_\s-]?requests|quota[_\s-]?exceeded|requests[_\s-]?per[_\s-]?minute|throttled/i;
+  /rate[_\s-]?limit|too[_\s-]?many[_\s-]?requests|quota[_\s-]?exceeded|usage[_\s-]?limit|requests[_\s-]?per[_\s-]?minute|throttled/i;
 
 const BALANCE_RE =
-  /insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|out of credits|credit[_\s-]?exhausted/i;
+  /insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|积分不足|out of credits|credit[_\s-]?exhausted|requires?\s+more\s+credits?|can\s+only\s+afford/i;
 
 // Explicit non-key failures — patterns that MUST NOT be classified as key
 // failure even if they overlap the above (e.g. "invalid request" contains
@@ -107,6 +115,11 @@ function collectMessages(err: unknown, maxDepth = 5): string {
     } else if (typeof cur === 'string') {
       parts.push(cur);
       break;
+    } else if (typeof cur === 'object') {
+      const rec = cur as { message?: unknown; error?: unknown; cause?: unknown };
+      if (typeof rec.message === 'string' && rec.message) parts.push(rec.message);
+      if (typeof rec.error === 'string' && rec.error) parts.push(rec.error);
+      cur = rec.cause;
     } else {
       break;
     }
@@ -159,33 +172,45 @@ function collectCodes(err: unknown, maxDepth = 5): string[] {
 export function classifyKeyFailure(err: unknown): KeyFailureKind | null {
   if (!err) return null;
 
+  // A provider safety decision belongs to the selected provider's response,
+  // never to a credential. Keep this ahead of incidental balance/auth words
+  // so rotation cannot bypass a structured safety code.
+  if (isProviderSafetyError(err)) return null;
+
   const msg = collectMessages(err);
   const status = collectStatus(err);
+  const codes = collectCodes(err);
+  const hasBalanceSignal = BALANCE_RE.test(msg) || codes.some((c) => BALANCE_RE.test(c));
+  const structuredCodeKind: KeyFailureKind | null = codes.some((c) => BALANCE_RE.test(c))
+    ? 'balance'
+    : codes.some((c) => AUTH_CODE_RE.test(c))
+      ? 'auth'
+      : codes.some((c) => RATE_RE.test(c))
+        ? 'rate_limit'
+        : codes.some((c) => PERM_RE.test(c))
+          ? 'permission'
+          : null;
 
-  // Explicit exclusion first — some "invalid" messages are request-side,
-  // not key-side. Also covers context-overflow / timeout which carry
-  // matching keywords in their messages (e.g. "context_length_exceeded",
-  // "request timed out"), so we don't need instanceof checks for those.
-  if (NON_KEY_RE.test(msg)) return null;
+  if (status === 402) return 'balance';
+  if (structuredCodeKind) return structuredCodeKind;
 
-  // Status-code fast path (most reliable signal).
   if (status === 401) return 'auth';
   if (status === 403) return /rate|throttl|quota/i.test(msg) ? 'rate_limit' : 'permission';
-  if (status === 429) return 'rate_limit';
-  if (status === 402) return 'balance';
+  if (status === 429) return hasBalanceSignal ? 'balance' : 'rate_limit';
 
-  // Message-pattern fallback. Order matters: balance BEFORE auth because
-  // some "insufficient credits" messages mention "invalid" as side text.
-  if (BALANCE_RE.test(msg)) return 'balance';
+  if (status === 400 || status === 404 || (typeof status === 'number' && status >= 500)) return null;
+
+  if (hasBalanceSignal) return 'balance';
   if (RATE_RE.test(msg))    return 'rate_limit';
   if (PERM_RE.test(msg))    return 'permission';
   if (AUTH_RE.test(msg))    return 'auth';
+
+  if (NON_KEY_RE.test(msg)) return null;
 
   // Network-layer last — checked after auth-style classifications so a
   // "fetch failed" wrapping a 401 (rare but possible) still ends up as auth.
   // Two-pass: cause-chain `code` first (Node's reliable signal), then a
   // message regex for cases where the code didn't propagate.
-  const codes = collectCodes(err);
   if (codes.some((c) => NETWORK_CODE_SET.has(c))) return 'network';
   if (NETWORK_RE.test(msg)) return 'network';
 

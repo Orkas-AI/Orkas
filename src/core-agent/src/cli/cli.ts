@@ -361,8 +361,8 @@ const loginCommand: CLICommand = {
       console.error("");
       // List available OAuth providers
       try {
-        const { getOAuthProviders } = await import("@earendil-works/pi-ai/oauth");
-        const oauthProviders = getOAuthProviders();
+        const { getOAuthProviders } = await import("../auth/oauth-compat.js");
+        const oauthProviders = await getOAuthProviders();
         if (oauthProviders.length > 0) {
           console.error("Available OAuth providers:");
           for (const p of oauthProviders) {
@@ -403,14 +403,14 @@ const loginCommand: CLICommand = {
 
     // OAuth flow
     try {
-      const { getOAuthProvider } = await import("@earendil-works/pi-ai/oauth");
-      const oauthProvider = getOAuthProvider(provider);
+      const { getOAuthProvider } = await import("../auth/oauth-compat.js");
+      const oauthProvider = await getOAuthProvider(provider);
 
       if (!oauthProvider) {
         console.error(`Error: No OAuth provider found for "${provider}".`);
         console.error("");
-        const { getOAuthProviders } = await import("@earendil-works/pi-ai/oauth");
-        const available = getOAuthProviders();
+        const { getOAuthProviders } = await import("../auth/oauth-compat.js");
+        const available = await getOAuthProviders();
         if (available.length > 0) {
           console.error("Available OAuth providers:");
           for (const p of available) {

@@ -383,15 +383,24 @@ export function extractFormFromFinal(text: string, defaultAgentId?: string): Ext
   return { cleanText, form: { agent_id: agentId, fields } };
 }
 
-// Hand-back marker: an agent emits `<handback />` to return control to the
-// commander after an interactive handoff completes or when a directly addressed
-// task crosses its capability boundary. Display-only markup; stripped from the
-// visible bubble. Tolerant of attributes /
+// Hand-back marker: an agent emits a reason-bearing marker to return control
+// after a dispatched handoff or to escalate an explicit capability boundary.
+// Legacy bare markers remain parseable for ledger/floor compatibility, but the
+// bus must never infer a direct capability boundary from their presence alone.
+// Display-only markup; stripped from the visible bubble. Tolerant of
 // self-closing vs paired form, same as the plan-interaction marker.
 const HANDBACK_RE =
-  /<handback\b[^>]*\/>|<handback\b[^>]*>\s*<\/handback>/gi;
+  /<handback\b([^>]*)\/>|<handback\b([^>]*)>\s*<\/handback>/gi;
+const HANDBACK_REASON_RE = /(?:^|\s)reason\s*=\s*(?:"([^"]*)"|'([^']*)')/i;
+const HANDBACK_REASON_ASSIGNMENT_RE = /(?:^|\s)reason\s*=/gi;
 
-export interface ExtractHandbackResult { cleanText: string; handback?: true }
+export type HandbackReason = 'completed_handoff' | 'capability_boundary';
+
+export interface ExtractHandbackResult {
+  cleanText: string;
+  handback?: true;
+  reason?: HandbackReason;
+}
 
 /** Strip a `<handback />` marker from an agent's visible text and report
  *  whether it was present. The caller owns floor reset and any guarded
@@ -404,9 +413,32 @@ export function extractHandbackFromFinal(text: string): ExtractHandbackResult {
   // should count as a real hand-back, otherwise control is wrongly returned to
   // the commander. (`g`-flag regex is stateful, so reset lastIndex before test.)
   HANDBACK_RE.lastIndex = 0;
-  if (!HANDBACK_RE.test(text)) return { cleanText: text };
+  const matches = Array.from(text.matchAll(HANDBACK_RE));
+  if (!matches.length) return { cleanText: text };
+  const reasons = new Set<HandbackReason>();
+  let hasBareOrInvalidReason = false;
+  for (const match of matches) {
+    const attrs = match[1] ?? match[2] ?? '';
+    const reasonAssignments = attrs.match(HANDBACK_REASON_ASSIGNMENT_RE)?.length ?? 0;
+    const reasonMatch = HANDBACK_REASON_RE.exec(attrs);
+    const rawReason = (reasonMatch?.[1] ?? reasonMatch?.[2] ?? '').trim();
+    if (
+      reasonAssignments === 1
+      && (rawReason === 'completed_handoff' || rawReason === 'capability_boundary')
+    ) {
+      reasons.add(rawReason);
+    } else {
+      hasBareOrInvalidReason = true;
+    }
+  }
   const cleanText = text.replace(HANDBACK_RE, '\n').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText, handback: true };
+  // Multiple conflicting markers, or an explicit marker mixed with a legacy /
+  // invalid one, are ambiguous. Strip them, but leave the reason undefined so
+  // a direct turn fails closed instead of fabricating a capability boundary.
+  const reason = !hasBareOrInvalidReason && reasons.size === 1
+    ? reasons.values().next().value
+    : undefined;
+  return { cleanText, handback: true, ...(reason ? { reason } : {}) };
 }
 
 const PLAN_INTERACTION_RE =

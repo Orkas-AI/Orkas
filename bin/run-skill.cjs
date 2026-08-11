@@ -56,10 +56,13 @@
  *                           available.
  *   ORKAS_VENV_ROOT       — optional shared venv root. Defaults to
  *                           `<ORKAS_WORKSPACE_ROOT>/venv`.
- *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
+ *   ORKAS_NODE / ORKAS_BUNDLED_NODE — bundled stock Node executable used for
+ *                           JavaScript and TypeScript skill entrypoints.
  *
  * This file is CommonJS so it can be required directly without import-hook
- * gymnastics. .ts skill scripts use ESM-style default export.
+ * gymnastics. .ts skill scripts use ESM-style default export. Module scripts
+ * may return a top-level `{ ok: false }` result to report a semantic failure;
+ * the runner preserves that JSON on stdout and exits non-zero.
  */
 
 'use strict';
@@ -91,6 +94,17 @@ function parseArgs(argv) {
     die(64, 'usage: run-skill.cjs <skill-id> <script-basename> [-- <script args>]');
   }
   const [skillId, scriptBase, ...rest] = args;
+  if (
+    !skillId
+    || skillId !== skillId.trim()
+    || skillId === '.'
+    || skillId === '..'
+    || skillId.includes('/')
+    || skillId.includes('\\')
+    || skillId.includes('\0')
+  ) {
+    die(64, 'skill id/name must be one non-path segment');
+  }
   if (scriptBase.includes('/') || scriptBase.includes('\\') || scriptBase === '.' || scriptBase === '..') {
     die(64, 'script basename must not contain path separators');
   }
@@ -334,19 +348,36 @@ function locateSkillScript(skillId, scriptBase) {
   const scriptExts = scriptExtsForPlatform();
   const candidates = [];
   for (const dir of skillDirs) {
+    let realScriptsDir;
+    try {
+      realScriptsDir = fs.realpathSync(path.join(fs.realpathSync(dir), 'scripts'));
+      const expectedScriptsDir = path.join(fs.realpathSync(dir), 'scripts');
+      const lhs = process.platform === 'win32' ? realScriptsDir.toLowerCase() : realScriptsDir;
+      const rhs = process.platform === 'win32' ? expectedScriptsDir.toLowerCase() : expectedScriptsDir;
+      // A symlinked scripts/ directory can redirect execution outside the
+      // admitted Skill root. Treat it as unavailable rather than following it.
+      if (lhs !== rhs) continue;
+    } catch {
+      continue;
+    }
     for (const ext of scriptExts) {
       candidates.push(path.join(dir, 'scripts', `${scriptBase}.${ext}`));
     }
-  }
-  for (const p of candidates) {
-    try {
-      if (fs.statSync(p).isFile()) return p;
-    } catch {
-      /* next */
+    for (const ext of scriptExts) {
+      const p = path.join(dir, 'scripts', `${scriptBase}.${ext}`);
+      try {
+        if (!fs.statSync(p).isFile()) continue;
+        const realCandidate = fs.realpathSync(p);
+        const relative = path.relative(realScriptsDir, realCandidate);
+        if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+        return p;
+      } catch {
+        /* next */
+      }
     }
   }
   die(66, `skill script not found: ${skillId}/${scriptBase}.{${scriptExts.join(',')}}`, {
-    searched: candidates,
+    searched: candidates.map((candidate) => `${skillId}/scripts/${path.basename(candidate)}`),
     hint: 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
   });
 }
@@ -786,15 +817,20 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
   } else {
     die(75, `unsupported subprocess extension: ${ext}`);
   }
-  trySpawn(cmd, [...argv0Args, scriptPath, ...scriptArgs], skillDir, skillId, true);
+  // Keep the caller's workspace cwd for relative input/output arguments.
+  // Bundled resources are addressed through ORKAS_SKILL_DIR, so changing cwd
+  // to the installation directory would make documented commands such as
+  // `--input caps_input.json --out caps_plan.json` miss conversation files.
+  trySpawn(cmd, [...argv0Args, scriptPath, ...scriptArgs], process.cwd(), skillDir, skillId, true);
 }
 
-function trySpawn(cmd, argv, skillDir, skillId, fatalOnEnoent = false) {
+function trySpawn(cmd, argv, executionCwd, skillDir, skillId, fatalOnEnoent = false) {
   let child;
   try {
     child = spawn(cmd, argv, {
       stdio: 'inherit',
       env: { ...process.env, ORKAS_SKILL_ID: skillId, ORKAS_SKILL_DIR: skillDir },
+      cwd: executionCwd,
       windowsHide: true,
     });
   } catch (e) {
@@ -859,7 +895,15 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
 
   // If the script already printed structured output, respect that and skip
   // appending a duplicate payload. Convention: non-undefined return => we
-  // JSON.stringify it to stdout (trailing newline).
+  // JSON.stringify it to stdout (trailing newline). A top-level `ok: false`
+  // is the module contract for a semantic failure, so callers receive both
+  // the structured report and a failing process status.
+  const exitCode = (
+    result !== null
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && result.ok === false
+  ) ? 1 : 0;
   if (result !== undefined) {
     try {
       process.stdout.write(JSON.stringify(result) + '\n');
@@ -867,7 +911,7 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
       die(73, `failed to serialize result: ${e && e.message}`);
     }
   }
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 async function main() {

@@ -32,7 +32,6 @@ export interface RunMeta {
   agentId: string;
   cid: string;
   cli: string;
-  model?: string;
   startedAt: string;
   endedAt?: string;
   status?: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'missing_cli';
@@ -72,7 +71,6 @@ export async function start(uid: string, init: Omit<RunMeta, 'runId' | 'startedA
     agentId: init.agentId,
     cid: init.cid,
     cli: init.cli,
-    model: init.model,
     cliPath: init.cliPath,
     startedAt: new Date().toISOString(),
   };

@@ -63,4 +63,5 @@ describe('settings model whitelist', () => {
       modelAvailable: true,
     })).toBe('');
   });
+
 });

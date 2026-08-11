@@ -83,6 +83,10 @@ export async function requestInstallConfirm(opts: {
     const timer = setTimeout(() => {
       _pending.delete(requestId);
       log.warn('install confirm timed out → declined', { requestId });
+      _broadcast('connectors:install-confirm-cancelled', {
+        request_ids: [requestId],
+        cid: opts.cid,
+      });
       resolve(false);
     }, RESPONSE_TIMEOUT_MS);
     if (typeof timer.unref === 'function') timer.unref();
@@ -105,10 +109,15 @@ export function respond(requestId: string, approved: boolean): boolean {
 }
 
 export function cancelForCid(cid: string): void {
+  const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
     if (pending.cid !== cid) continue;
     _pending.delete(id);
     clearTimeout(pending.timer);
+    requestIds.push(id);
     pending.resolve(false);
+  }
+  if (requestIds.length) {
+    _broadcast('connectors:install-confirm-cancelled', { request_ids: requestIds, cid });
   }
 }

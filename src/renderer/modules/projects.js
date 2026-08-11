@@ -23,8 +23,44 @@ function _projectsTrackEvent(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
-function _projectsTrackError(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+function _projectsLogFailure(action, data) {
+  _projectsLog.warn('project operation failed', { action, ...(data || {}) });
+}
+
+const _PROJECTS_STABLE_ERROR_CODES = new Set([
+  'name_dup',
+  'name_empty',
+  'has_running_conv',
+  'recycle_archive_failed',
+  'cascade_failed',
+  'cascade_recovery_incomplete',
+  'not_found',
+]);
+
+function _projectsFailureCode(errLike, fallback) {
+  const rawMessage = String((errLike && (errLike.error || errLike.message)) || '').trim();
+  if (_PROJECTS_STABLE_ERROR_CODES.has(rawMessage)) return rawMessage;
+  const rawCode = errLike && (errLike.error_code || errLike.code);
+  if (typeof rawCode === 'string' && /^E_[A-Z0-9_]{1,64}$/.test(rawCode) && rawCode !== 'E_UNKNOWN') {
+    return rawCode;
+  }
+  return fallback;
+}
+
+function _projectsFailureType(errLike, code) {
+  const text = `${code || ''} ${String((errLike && (errLike.error || errLike.message)) || '')}`.toLowerCase();
+  if (/name_dup|name_empty|invalid/.test(text)) return 'validation';
+  if (/has_running_conv|conflict|target_exists/.test(text)) return 'conflict';
+  if (/recycle_archive_failed|storage|disk|enospc/.test(text)) return 'storage';
+  if (/timeout|timed out/.test(text)) return 'timeout';
+  if (/network|fetch failed|econnreset|econnrefused|eai_again|enotfound/.test(text)) return 'network';
+  if (/auth|not_logged_in|unauthor/.test(text)) return 'auth';
+  return 'exception';
+}
+
+function _projectsFailureDetail(errLike, fallback) {
+  const errorCode = _projectsFailureCode(errLike, fallback);
+  return { error_code: errorCode, error_type: _projectsFailureType(errLike, errorCode) };
 }
 
 function _projectUiIconHtml(name, className) {
@@ -158,6 +194,7 @@ function renderProjectsSection() {
     // section header is the entry point). Avoid an empty-state row to keep
     // the sidebar compact when the user hasn't adopted the feature.
     container.innerHTML = '';
+    if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators();
     return;
   }
 
@@ -257,10 +294,24 @@ function _renderProjectRow(p, convs) {
               value="${escapeHtml(_projectsInlineRenameDraft)}" autocomplete="off" spellcheck="false"${renameSubmittingState} />
        ${renameErrorHint}`
     : `<span class="project-name" title="${safeName}">${safeName}</span>`;
+  // Runtime counts are painted by conversation.js from the same live state
+  // that drives task-row streaming badges. Keep the mount present while idle
+  // so starting a task does not need to rebuild the project tree.
+  const runningChip = editing
+    ? ''
+    : `<span class="sidebar-btn-running-chip project-running-chip"
+             data-project-running-chip="${escapeHtml(p.project_id)}" hidden></span>`;
+  const unreadDot = `<span class="task-unread-dot project-unread-dot"
+             data-project-unread-dot="${escapeHtml(p.project_id)}" hidden aria-hidden="true"></span>`;
+  const nameWithUnread = `<span class="project-name-unread-group">
+        ${nameNode}
+        ${unreadDot}
+      </span>`;
   let html = `
     <div class="project-row${selected ? ' active' : ''}" data-pid="${escapeHtml(p.project_id)}">
       <span class="project-icon">${folderIcon}</span>
-      ${nameNode}
+      ${nameWithUnread}
+      ${runningChip}
       <button type="button" class="ctx-row-menu-btn project-row-menu-btn" data-project-menu
               data-pid="${escapeHtml(p.project_id)}"
               title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
@@ -271,7 +322,7 @@ function _renderProjectRow(p, convs) {
     if (!convs.length) {
       html += `<div class="project-conv-empty">${escapeHtml(t('sidebar.project_conv_empty'))}</div>`;
     } else if (typeof _renderConversationTimeBucketList === 'function') {
-      html += _renderConversationTimeBucketList(convs, { nested: true, bucketScope: `project:${p.project_id}` });
+      html += _renderConversationTimeBucketList(convs, { nested: true });
     } else {
       for (const c of convs) {
         html += (typeof _renderConversationSidebarItem === 'function')
@@ -304,6 +355,7 @@ function primeProjectDetailShell(pid) {
   const title = document.getElementById('project-detail-title');
   const content = document.getElementById('project-detail-content');
   if (title) title.textContent = project?.name || '';
+  if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators(pid);
   if (content) {
     content.classList.add('is-loading');
     content.setAttribute('aria-busy', 'true');
@@ -329,9 +381,15 @@ function _bindProjectsHandlers(container) {
       const pid = button.dataset.projectConvMore || '';
       if (!pid || button.disabled) return;
       button.disabled = true;
+      button.setAttribute('aria-busy', 'true');
       try { await loadConversationProject(pid, { append: true }); }
       catch (err) { _projectsLog.warn('load more project conversations failed', err); }
-      finally { if (button.isConnected) button.disabled = false; }
+      finally {
+        if (button.isConnected) {
+          button.disabled = false;
+          button.removeAttribute('aria-busy');
+        }
+      }
     });
   });
 
@@ -351,7 +409,7 @@ function _bindProjectsHandlers(container) {
         return;
       }
       if (!_isProjectSelected(pid)) {
-        _projectsTrackClick('project_open', { project_id: pid });
+        _projectsTrackClick('project_open', {});
         if (typeof setView === 'function') setView('project', pid);
         renderProjectsSection();
         return;
@@ -363,7 +421,6 @@ function _bindProjectsHandlers(container) {
   if (typeof _bindConversationSidebarItems === 'function') {
     _bindConversationSidebarItems(container, {
       selector: '.conv-item-nested',
-      onBucketToggle: renderProjectsSection,
       async afterDelete() {
         // Project conv counts changed → refresh project cache so future reads
         // (delete confirm body, etc.) see the right number.
@@ -381,20 +438,27 @@ function _bindProjectsHandlers(container) {
 async function _toggleProjectExpand(pid) {
   const expanding = !_projectsExpanded[pid];
   _projectsExpanded[pid] = expanding;
-  _projectsTrackClick('project_expand_toggle', {
-    project_id: pid,
-    expanded: !!_projectsExpanded[pid],
-  });
   _saveProjectsExpanded();
   if (expanding && typeof loadConversationProject === 'function') {
     try {
-      await loadConversationProject(pid);
+      await loadConversationProject(pid, { reset: true });
     } catch (err) {
       _projectsLog.warn('load project conversations failed', err);
     }
   }
   renderProjectsSection();
 }
+
+window.addEventListener('sidebar-section-toggle', (event) => {
+  if (event?.detail?.name !== 'projects' || event.detail.collapsed !== false) return;
+  const expandedProjectIds = Object.keys(_projectsExpanded).filter((pid) => _projectsExpanded[pid]);
+  Promise.all(expandedProjectIds.map((pid) => loadConversationProject(pid, {
+    reset: true,
+    render: false,
+  }))).catch((err) => {
+    _projectsLog.warn('reset expanded project conversations failed', err);
+  }).finally(() => renderProjectsSection());
+});
 
 // ── Inline create ───────────────────────────────────────────────────────
 
@@ -447,15 +511,18 @@ function _bindInlineCreateInput(input) {
     _projectsInlineCreateError = '';
     const requestId = ++_projectsInlineCreateRequestId;
     const startedAt = performance.now();
-    _projectsTrackClick('project_create_submit', { name_length: name.length });
+    _projectsTrackClick('project_create_submit', {});
     try {
       const res = await window.orkas.invoke('projects.create', { name });
       if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
       if (!res || !res.ok) {
+        const failure = _projectsFailureDetail(res, 'create_failed');
         _projectsTrackEvent('project_create_result', {
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
+        _projectsLogFailure('project_create', failure);
         _projectsInlineCreateSubmitting = false;
         _showProjectInlineCreateError(res && res.error);
         return;
@@ -466,7 +533,6 @@ function _bindInlineCreateInput(input) {
       const pid = res.project && res.project.project_id;
       _projectsTrackEvent('project_create_result', {
         result: 'success',
-        project_id: pid || '',
         duration_ms: Math.round(performance.now() - startedAt),
       });
       if (pid) {
@@ -483,13 +549,13 @@ function _bindInlineCreateInput(input) {
       }
     } catch (err) {
       if (requestId !== _projectsInlineCreateRequestId || !_projectsInlineCreate) return;
+      const failure = _projectsFailureDetail(err, 'create_exception');
       _projectsTrackEvent('project_create_result', {
         result: 'failure',
         duration_ms: Math.round(performance.now() - startedAt),
+        ...failure,
       });
-      _projectsTrackError('project_create', {
-        error_type: 'exception',
-      });
+      _projectsLogFailure('project_create', failure);
       _projectsInlineCreateSubmitting = false;
       _showProjectInlineCreateError(err && err.message);
     }
@@ -573,8 +639,7 @@ function _bindInlineRenameInput(input) {
     const requestId = ++_projectsInlineRenameRequestId;
     const startedAt = performance.now();
     _projectsTrackClick('project_rename_submit', {
-      project_id: pid,
-      name_length: next.length,
+      source: 'sidebar',
     });
     try {
       const res = await window.orkas.invoke('projects.rename', { projectId: pid, name: next });
@@ -583,18 +648,21 @@ function _bindInlineRenameInput(input) {
         || _projectsInlineRenamePid !== pid
       ) return;
       if (!res || !res.ok) {
+        const failure = _projectsFailureDetail(res, 'rename_failed');
         _projectsTrackEvent('project_rename_result', {
-          project_id: pid,
           result: 'failure',
+          source: 'sidebar',
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
+        _projectsLogFailure('project_rename', { source: 'sidebar', ...failure });
         _projectsInlineRenameSubmitting = false;
         _showProjectInlineRenameError(res && res.error);
         return;
       }
       _projectsTrackEvent('project_rename_result', {
-        project_id: pid,
         result: 'success',
+        source: 'sidebar',
         duration_ms: Math.round(performance.now() - startedAt),
       });
       _projectsInlineRenamePid = null;
@@ -608,15 +676,14 @@ function _bindInlineRenameInput(input) {
         requestId !== _projectsInlineRenameRequestId
         || _projectsInlineRenamePid !== pid
       ) return;
+      const failure = _projectsFailureDetail(err, 'rename_exception');
       _projectsTrackEvent('project_rename_result', {
-        project_id: pid,
         result: 'failure',
+        source: 'sidebar',
         duration_ms: Math.round(performance.now() - startedAt),
+        ...failure,
       });
-      _projectsTrackError('project_rename', {
-        project_id: pid,
-        error_type: 'exception',
-      });
+      _projectsLogFailure('project_rename', { source: 'sidebar', ...failure });
       _projectsInlineRenameSubmitting = false;
       _showProjectInlineRenameError(err && err.message);
     }
@@ -787,7 +854,7 @@ function _goToProjectDeleteFallback(target) {
   else setView('new-chat', null, opts);
 }
 
-async function _confirmDeleteProject(pid) {
+async function _confirmDeleteProject(pid, source = 'sidebar') {
   const project = (_projectsCache || []).find((p) => p.project_id === pid);
   if (!project) return;
   const name = project.name || '';
@@ -833,18 +900,20 @@ async function _confirmDeleteProject(pid) {
 
   const startedAt = performance.now();
   _projectsTrackClick('project_delete', {
-    project_id: pid,
-    conversation_count: count,
-    auto_count: autoCount,
+    source,
   });
+  let deleted = false;
   try {
     const res = await window.orkas.invoke('projects.delete', { projectId: pid });
     if (!res || !res.ok) {
+      const failure = _projectsFailureDetail(res, 'delete_failed');
       _projectsTrackEvent('project_delete_result', {
-        project_id: pid,
         result: 'failure',
+        source,
         duration_ms: Math.round(performance.now() - startedAt),
+        ...failure,
       });
+      _projectsLogFailure('project_delete', { source, ...failure });
       const code = res && res.error;
       if (code === 'has_running_conv') {
         await uiAlert(t('project.has_running_conv'));
@@ -856,10 +925,28 @@ async function _confirmDeleteProject(pid) {
       return;
     }
     _projectsTrackEvent('project_delete_result', {
-      project_id: pid,
       result: 'success',
+      source,
       duration_ms: Math.round(performance.now() - startedAt),
     });
+    deleted = true;
+  } catch (err) {
+    const failure = _projectsFailureDetail(err, 'delete_exception');
+    _projectsTrackEvent('project_delete_result', {
+      result: 'failure',
+      source,
+      duration_ms: Math.round(performance.now() - startedAt),
+      ...failure,
+    });
+    _projectsLogFailure('project_delete', { source, ...failure });
+    _projectsLog.error('delete project failed', err);
+    await uiAlert(t('project.delete_failed_generic'));
+    return;
+  }
+
+  if (!deleted) return;
+  if (typeof _forgetUnreadProject === 'function') _forgetUnreadProject(pid);
+  try {
     // Drop expanded entry.
     if (_projectsExpanded[pid]) {
       delete _projectsExpanded[pid];
@@ -879,17 +966,9 @@ async function _confirmDeleteProject(pid) {
       ));
     }
   } catch (err) {
-    _projectsTrackEvent('project_delete_result', {
-      project_id: pid,
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
-    _projectsTrackError('project_delete', {
-      project_id: pid,
-      error_type: 'exception',
-    });
-    _projectsLog.error('delete project failed', err);
-    await uiAlert(t('project.delete_failed_generic'));
+    // The delete already committed and its terminal success was emitted. A presentation refresh
+    // failure is local diagnostics only and must not turn the mutation into a second failure row.
+    _projectsLog.warn('refresh after project delete failed', err);
   }
 }
 

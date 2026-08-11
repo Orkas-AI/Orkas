@@ -76,7 +76,14 @@ function _applyKbStatusResult(data) {
     _kbUnavailableReportedCode = '';
     return true;
   }
-  const code = String((data && data.code) || 'E_LIBRARY_STATUS_UNAVAILABLE').slice(0, 80);
+  const rawCode = String((data && data.code) || '').trim().toUpperCase();
+  const rawError = String((data && data.error) || '');
+  const code = rawCode === 'E_STORAGE_FULL'
+    || rawCode === 'ENOSPC'
+    || rawCode === 'SQLITE_FULL'
+    || /no space left on device|database or disk is full|disk (?:is )?full/i.test(rawError)
+    ? 'E_STORAGE_FULL'
+    : 'E_LIBRARY_STATUS_UNAVAILABLE';
   _kbUnavailableCode = code;
   if (_kbUnavailableReportedCode !== code) {
     _kbUnavailableReportedCode = code;
@@ -764,7 +771,10 @@ function _ctxCreateEntryActionTracker(action) {
         action,
         duration_ms: Math.max(0, Date.now() - startedAt),
       };
-      if (result !== 'success') payload.error_code = errorCode || 'unknown';
+      if (result !== 'success') {
+        payload.error_code = errorCode || 'unknown';
+        payload.error_type = _ctxFailureType(payload.error_code);
+      }
       Monitor.event('library_entry_action_result', payload);
     } catch (_) {}
   };
@@ -772,6 +782,11 @@ function _ctxCreateEntryActionTracker(action) {
 
 async function reprocessCtxKbFile(rel) {
   const trackResult = _ctxCreateEntryActionTracker('reprocess');
+  const failedStatus = { ...(_kbStatusByPath[rel] || {}), status: 'failed' };
+  const restoreFailedStatus = () => {
+    _kbStatusByPath[rel] = failedStatus;
+    _updateCtxKbChip(rel);
+  };
   try {
     _kbStatusByPath[rel] = { ...(_kbStatusByPath[rel] || {}), status: 'pending' };
     _updateCtxKbChip(rel);
@@ -783,12 +798,14 @@ async function reprocessCtxKbFile(rel) {
     });
     const data = await res.json();
     if (!data.ok) {
+      restoreFailedStatus();
       trackResult('failure', 'reprocess_failed');
       await uiAlert(t('contexts.kb.reprocess_failed'));
       return;
     }
     trackResult('success');
   } catch (_) {
+    restoreFailedStatus();
     trackResult('failure', 'request_failed');
     await uiAlert(t('contexts.kb.reprocess_failed'));
   }
@@ -815,14 +832,24 @@ async function deleteCtxEntry(rel, kind) {
     : t('contexts.file.del_confirm', { name });
   if (!(await uiConfirm(prompt))) return;
   const trackResult = _ctxCreateEntryActionTracker('delete');
+  let data;
   try {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
-    const data = await res.json();
-    if (!data.ok) {
-      trackResult('failure', 'delete_failed');
-      await uiAlert(t('contexts.delete_failed'));
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'request_failed');
+    _contextsLog.warn('library entry delete failed', { error_code: 'request_failed' });
+    await uiAlert(t('contexts.delete_failed'));
+    return;
+  }
+  if (!data?.ok) {
+    trackResult('failure', 'delete_failed');
+    _contextsLog.warn('library entry delete failed', { error_code: 'delete_failed' });
+    await uiAlert(t('contexts.delete_failed'));
+    return;
+  }
+  trackResult('success');
+  try {
     if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
       _clearCtxViewer();
     }
@@ -834,10 +861,8 @@ async function deleteCtxEntry(rel, kind) {
       if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
     }
     await loadContexts();
-    trackResult('success');
-  } catch (_) {
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('contexts.delete_failed'));
+  } catch (err) {
+    _contextsLog.warn('refresh after library entry delete failed', err);
   }
 }
 
@@ -1088,33 +1113,38 @@ async function _handleCtxMove(srcRel, targetDir) {
     await uiAlert(t('contexts.dnd.invalid_self'));
     return;
   }
+  let data;
   try {
     const res = await apiFetch('/api/contexts/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ src: srcRel, dst }),
     });
-    const data = await res.json();
-    if (!data.ok) {
-      const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
-      trackResult('failure', errorCode);
-      const message = errorCode === 'target_exists'
-        ? t('contexts.dnd.target_exists', { name: base })
-        : t('contexts.dnd.move_failed');
-      await uiAlert(message);
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'move_failed');
+    await uiAlert(t('contexts.dnd.move_failed'));
+    return;
+  }
+  if (!data?.ok) {
+    const errorCode = data.error === 'destination already exists' ? 'target_exists' : 'move_failed';
+    trackResult('failure', errorCode);
+    const message = errorCode === 'target_exists'
+      ? t('contexts.dnd.target_exists', { name: base })
+      : t('contexts.dnd.move_failed');
+    await uiAlert(message);
+    return;
+  }
+  trackResult('success');
+  try {
     _applyCtxPathChange(srcRel, dst, targetDir);
     await loadContexts();
     _ctxFlashMovedEntry(dst);
     if (typeof uiToast === 'function') {
       uiToast(t('contexts.dnd.moved_to', { target: _ctxMoveTargetLabel(targetDir) }), { variant: 'success' });
     }
-    trackResult('success');
-  } catch (e) {
-    trackResult('failure', 'move_failed');
-    _contextsLog.warn('move library entry failed', e);
-    await uiAlert(t('contexts.dnd.move_failed'));
+  } catch (err) {
+    _contextsLog.warn('refresh after library file move failed', err);
   }
 }
 
@@ -1154,19 +1184,33 @@ async function _commitInlineRename(rel, nextBase) {
   const dst = dir ? `${dir}/${cleaned}` : cleaned;
   if (dst === rel) { renderCtxTree(); return; }
   const trackResult = _ctxCreateEntryActionTracker('rename');
+  let data;
   try {
     const res = await apiFetch('/api/contexts/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ src: rel, dst }),
     });
-    const data = await res.json();
-    if (!data.ok) {
-      trackResult('failure', 'rename_failed');
-      await uiAlert(_ctxRenameFailureMessage(data.error));
-      await loadContexts();
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'request_failed');
+    _contextsLog.warn('library entry rename failed', { error_code: 'request_failed' });
+    await uiAlert(t('contexts.entry.rename_failed'));
+    try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
+    return;
+  }
+  if (!data?.ok) {
+    const errorCode = data.error === 'destination already exists' || data.error === 'target_exists'
+      ? 'target_exists'
+      : 'rename_failed';
+    trackResult('failure', errorCode);
+    _contextsLog.warn('library entry rename failed', { error_code: errorCode });
+    await uiAlert(_ctxRenameFailureMessage(data.error));
+    try { await loadContexts(); } catch (refreshErr) { _contextsLog.warn('refresh after library entry rename failure failed', refreshErr); }
+    return;
+  }
+  trackResult('success');
+  try {
     if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
     // Re-key any drafts (file rename: one entry; dir rename: every entry
     // under the old prefix) so the draft survives the rename. Iterate a
@@ -1182,11 +1226,8 @@ async function _commitInlineRename(rel, nextBase) {
     }
     _retargetCtxViewerAfterRename(rel, dst);
     await loadContexts();
-    trackResult('success');
-  } catch (_) {
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('contexts.entry.rename_failed'));
-    await loadContexts();
+  } catch (err) {
+    _contextsLog.warn('refresh after library entry rename failed', err);
   }
 }
 
@@ -1235,30 +1276,39 @@ async function saveCtxNew() {
   }
   const joined = _ctxNewTargetDir ? `${_ctxNewTargetDir}/${nameRaw}` : nameRaw;
   const trackResult = _ctxCreateEntryActionTracker('create_directory');
+  let data;
   try {
     const res = await apiFetch('/api/contexts/mkdir', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: joined }),
     });
-    const data = await res.json();
-    if (!data.ok) {
-      msg.textContent = data.error === 'path exists and is not a directory'
-        ? t('contexts.entry.name_exists')
-        : t('contexts.dir.create_failed');
-      msg.className = 'form-msg err';
-      trackResult('failure', 'create_failed');
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'request_failed');
+    _contextsLog.warn('library directory create failed', { error_code: 'request_failed' });
+    msg.textContent = t('contexts.dir.create_failed');
+    msg.className = 'form-msg err';
+    return;
+  }
+  if (!data?.ok) {
+    msg.textContent = data.error === 'path exists and is not a directory'
+      ? t('contexts.entry.name_exists')
+      : t('contexts.dir.create_failed');
+    msg.className = 'form-msg err';
+    const errorCode = data.error === 'path exists and is not a directory' ? 'target_exists' : 'create_failed';
+    trackResult('failure', errorCode);
+    _contextsLog.warn('library directory create failed', { error_code: errorCode });
+    return;
+  }
+  trackResult('success');
+  try {
     _ctxExpanded.add(joined);
     closeCtxNewModal();
     if (_ctxNewTargetDir) _ctxExpanded.add(_ctxNewTargetDir);
     await loadContexts();
-    trackResult('success');
-  } catch (_) {
-    trackResult('failure', 'request_failed');
-    msg.textContent = t('contexts.dir.create_failed');
-    msg.className = 'form-msg err';
+  } catch (err) {
+    _contextsLog.warn('refresh after library directory create failed', err);
   }
 }
 window.saveCtxNew = saveCtxNew;
@@ -1277,18 +1327,28 @@ async function createCtxNewTextFile(parentDir = '') {
   const name = `${stem}.md`;
   const fullPath = parentDir ? `${parentDir}/${name}` : name;
   const trackResult = _ctxCreateEntryActionTracker('create_text');
+  let data;
   try {
     const res = await apiFetch('/api/contexts/write', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: fullPath, content: '' }),
     });
-    const data = await res.json();
-    if (!data.ok) {
-      trackResult('failure', 'create_failed');
-      await uiAlert(t('contexts.file.create_failed'));
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'request_failed');
+    _contextsLog.warn('library text create failed', { error_code: 'request_failed' });
+    await uiAlert(t('contexts.file.create_failed'));
+    return;
+  }
+  if (!data?.ok) {
+    trackResult('failure', 'create_failed');
+    _contextsLog.warn('library text create failed', { error_code: 'create_failed' });
+    await uiAlert(t('contexts.file.create_failed'));
+    return;
+  }
+  trackResult('success');
+  try {
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
@@ -1297,10 +1357,8 @@ async function createCtxNewTextFile(parentDir = '') {
     // next renderCtxTree() call.
     _showCtxTextViewer(fullPath, '');
     _enterCtxEdit();
-    trackResult('success');
-  } catch (_) {
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('contexts.file.create_failed'));
+  } catch (err) {
+    _contextsLog.warn('open created library text failed', err);
   }
 }
 
@@ -1320,27 +1378,35 @@ async function createCtxNewTodoFile(parentDir = '') {
   const heading = t('contexts.new.todo_template_heading');
   const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
   const trackResult = _ctxCreateEntryActionTracker('create_todo');
+  let data;
   try {
     const res = await apiFetch('/api/contexts/write', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: fullPath, content: template }),
     });
-    const data = await res.json();
-    if (!data.ok) {
-      trackResult('failure', 'create_failed');
-      await uiAlert(t('contexts.file.create_failed'));
-      return;
-    }
+    data = await res.json();
+  } catch (err) {
+    trackResult('failure', 'request_failed');
+    _contextsLog.warn('library todo create failed', { error_code: 'request_failed' });
+    await uiAlert(t('contexts.file.create_failed'));
+    return;
+  }
+  if (!data?.ok) {
+    trackResult('failure', 'create_failed');
+    _contextsLog.warn('library todo create failed', { error_code: 'create_failed' });
+    await uiAlert(t('contexts.file.create_failed'));
+    return;
+  }
+  trackResult('success');
+  try {
     if (parentDir) _ctxExpanded.add(parentDir);
     _ctxPendingRename = { path: fullPath };
     await loadContexts();
     _showCtxTextViewer(fullPath, template);
     _enterCtxEdit();
-    trackResult('success');
-  } catch (_) {
-    trackResult('failure', 'request_failed');
-    await uiAlert(t('contexts.file.create_failed'));
+  } catch (err) {
+    _contextsLog.warn('open created library todo failed', err);
   }
 }
 
@@ -1378,6 +1444,35 @@ function _ctxExtOf(name) {
 
 function _ctxHasHiddenPathSegment(name) {
   return String(name || '').split('/').some(part => part.startsWith('.'));
+}
+
+const _CTX_STABLE_FAILURE_CODES = new Set([
+  'create_failed',
+  'delete_failed',
+  'duplicate_content',
+  'ext',
+  'hidden',
+  'invalid_target',
+  'move_failed',
+  'picker_failed',
+  'rename_failed',
+  'reprocess_failed',
+  'request_failed',
+  'target_exists',
+  'upload_failed',
+  'EACCES',
+  'ENOSPC',
+]);
+
+function _ctxFailureType(code) {
+  const value = String(code || '').toLowerCase();
+  if (/invalid|hidden|\bext\b|unsupported/.test(value)) return 'validation';
+  if (/target_exists|duplicate|conflict/.test(value)) return 'conflict';
+  if (/enospc|storage|disk/.test(value)) return 'storage';
+  if (/eacces|permission|forbidden/.test(value)) return 'permission';
+  if (/timeout|timed_out/.test(value)) return 'timeout';
+  if (/network|econn|enotfound|eai_again/.test(value)) return 'network';
+  return 'operation';
 }
 
 function _ctxUploadErrorCode(reason) {
@@ -1486,8 +1581,6 @@ async function handleCtxUpload(fileList, targetDir = '') {
   let results;
   try {
     results = await jobs;
-    // Single post-upload refresh picks up all new rows at once.
-    await loadContexts();
   } finally {
     if (statusEl) statusEl.style.display = 'none';
   }
@@ -1496,6 +1589,10 @@ async function handleCtxUpload(fileList, targetDir = '') {
   for (const r of rejected) {
     const errorCode = _ctxUploadErrorCode(r.code || r.reason);
     _contextsLog.warn(`upload failed: ${errorCode}`);
+  }
+  if (results.some((row) => row && row.ok)) {
+    try { await loadContexts(); }
+    catch (err) { _contextsLog.warn('refresh after library upload failed', err); }
   }
   const extRejected = rejected.filter((r) => r.reason === 'ext');
   const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
@@ -1540,7 +1637,6 @@ async function handleCtxNativeUpload(targetDir = '') {
   let data;
   try {
     data = await window.orkas.invoke('contexts.pickAndUpload', { targetDir });
-    await loadContexts();
   } catch (err) {
     _contextsLog.warn('native upload failed', err);
     await uiAlert(t('contexts.upload_picker_failed'));
@@ -1548,7 +1644,28 @@ async function handleCtxNativeUpload(targetDir = '') {
   } finally {
     if (statusEl) statusEl.style.display = 'none';
   }
+  if (!data?.ok) {
+    const errorCode = _ctxUploadErrorCode(data && (data.code || data.error));
+    _contextsLog.warn('native upload rejected', {
+      error_code: errorCode,
+      error_type: _ctxFailureType(errorCode),
+    });
+    await uiAlert(t('contexts.upload_picker_failed'));
+    return;
+  }
+  if (data.cancelled) {
+    return;
+  }
   const files = Array.isArray(data && data.files) ? data.files : [];
+  if (!files.length) {
+    _contextsLog.warn('native upload returned no files');
+    await uiAlert(t('contexts.upload_picker_failed'));
+    return;
+  }
+  if (files.some((row) => row && row.ok)) {
+    try { await loadContexts(); }
+    catch (err) { _contextsLog.warn('refresh after native library upload failed', err); }
+  }
   const extRejected = files.filter((r) => r && r.ok === false && r.reason === 'ext');
   if (extRejected.length) {
     await uiAlert(t('contexts.upload_rejected', {
@@ -1695,26 +1812,43 @@ function _showCtxDocxViewer(rel, html) {
   els.bodyEl.scrollTop = 0;
 }
 
+function _ctxOfficePreviewLoadingHtml() {
+  return `<div class="office-preview-loading" role="status" aria-live="polite">
+    <span class="office-preview-loading-spinner" aria-hidden="true"></span>
+    <span class="office-preview-loading-label">${escapeHtml(t('common.loading'))}</span>
+  </div>`;
+}
+
 async function _showCtxOfficeViewer(rel) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
-  els.bodyEl.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
-  const res = await apiFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
-  const data = await res.json();
-  if (!data.ok) { await uiAlert(t('contexts.read_failed')); return; }
-  if (_ctxOfficeBlobUrl) {
-    try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
+  els.bodyEl.setAttribute('aria-busy', 'true');
+  els.bodyEl.innerHTML = _ctxOfficePreviewLoadingHtml();
+  els.actionsEl.innerHTML = '';
+  try {
+    const res = await apiFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'read_failed');
+    if (_ctxOfficeBlobUrl) {
+      try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
+    }
+    _ctxOfficeBlobUrl = URL.createObjectURL(new Blob([String(data.html || '')], { type: 'text/html;charset=utf-8' }));
+    const style = data.previewHeight ? ` style="height:${Math.max(120, Number(data.previewHeight) || 0)}px"` : '';
+    const sandbox = data.allowScripts === true ? 'allow-scripts' : '';
+    els.bodyEl.innerHTML = `<iframe class="ctx-viewer-office" sandbox="${sandbox}" src="${_ctxOfficeBlobUrl}"${style} title="${escapeHtml(rel)}"></iframe>`;
+    els.actionsEl.innerHTML = `
+      <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+      <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+    `;
+    els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
+    els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
+    els.bodyEl.scrollTop = 0;
+  } catch (err) {
+    els.bodyEl.innerHTML = `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.read_failed'))}</div>`;
+    throw err;
+  } finally {
+    els.bodyEl.removeAttribute('aria-busy');
   }
-  _ctxOfficeBlobUrl = URL.createObjectURL(new Blob([String(data.html || '')], { type: 'text/html;charset=utf-8' }));
-  const style = data.previewHeight ? ` style="height:${Math.max(120, Number(data.previewHeight) || 0)}px"` : '';
-  els.bodyEl.innerHTML = `<iframe class="ctx-viewer-office" sandbox="" src="${_ctxOfficeBlobUrl}"${style} title="${escapeHtml(rel)}"></iframe>`;
-  els.actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
-  `;
-  els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
-  els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
-  els.bodyEl.scrollTop = 0;
 }
 
 async function revealCtxFile(rel) {

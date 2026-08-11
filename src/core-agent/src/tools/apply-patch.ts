@@ -115,6 +115,39 @@ function patchPathFromHeader(line: string, prefix: string): string | null {
   return value;
 }
 
+/**
+ * Say what is wrong with a header instead of only that something is.
+ *
+ * 2026-08-08: a caller wrote `*** Update File /path` and read back "expected
+ * Add File, Delete File, or Update File; received: *** Update File /path".
+ * Expected and received are word-for-word identical there — the difference is
+ * one colon — so it could not self-correct, abandoned apply_patch, and spent
+ * three more round trips failing at a different tool. A near miss must name
+ * the character that is wrong.
+ */
+function patchHeaderHint(header: string): string {
+  // Section verbs only. `*** Move to:` is a sub-header inside an Update
+  // section, so pointing a caller at its punctuation here would answer a
+  // question it did not ask — its real error is the position, not the colon.
+  for (const verb of ["Add File", "Delete File", "Update File"] as const) {
+    if (!header.startsWith(`*** ${verb}`) || header.startsWith(`*** ${verb}:`)) continue;
+    const rest = header.slice(`*** ${verb}`.length);
+    return rest.trim()
+      ? ` — this looks like \`*** ${verb}:\` with the \`:\` missing`
+      : ` — \`*** ${verb}:\` needs a path on the same line`;
+  }
+  const lower = header.toLowerCase();
+  for (const verb of ["add file", "delete file", "update file"] as const) {
+    if (lower.startsWith(`*** ${verb}`)) {
+      return ` — the header verb is case-sensitive: \`*** ${verb.replace(/\b\w/g, (c) => c.toUpperCase())}:\``;
+    }
+  }
+  if (/^(---|\+\+\+|@@|diff --git|index )/.test(header)) {
+    return " — this is a unified diff; apply_patch takes `*** Update File: <path>` sections whose lines are prefixed with a space, `-`, or `+`";
+  }
+  return "";
+}
+
 /** Parse the file-oriented patch envelope used by Codex-style apply_patch.
  * It is intentionally a general text transaction, not a coding-mode protocol. */
 export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult {
@@ -205,7 +238,8 @@ export function parseApplyPatch(patch: unknown): ParsedPatchFile[] | ToolResult 
       return {
         content: patchError(
           "E_PATCH_FORMAT",
-          `expected Add File, Delete File, or Update File; received: ${header}`,
+          `expected \`*** Add File: <path>\`, \`*** Delete File: <path>\`, or \`*** Update File: <path>\`;`
+            + ` received: ${header}${patchHeaderHint(header)}`,
         ),
         isError: true,
       };

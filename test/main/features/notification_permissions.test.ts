@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('electron', () => ({
   app: { isPackaged: true },
@@ -11,19 +11,47 @@ vi.mock('../../../src/main/logger', () => ({
 }));
 
 import {
+  markSystemNotificationDelivered,
+  markSystemNotificationFailed,
   permissionFromMacNativeState,
   permissionFromWindowsSetting,
+  resolveMacPermissionState,
   systemNotificationSettingsUrl,
   windowsNotificationPermissionProbe,
 } from '../../../src/main/features/notification_permissions';
 
 describe('system notification permission helpers', () => {
+  afterEach(() => {
+    // Reset process-local delivery evidence between cases.
+    markSystemNotificationFailed();
+  });
+
   it('normalizes the macOS native authorization state', () => {
     expect(permissionFromMacNativeState('granted')).toBe('granted');
     expect(permissionFromMacNativeState('denied')).toBe('denied');
+    expect(permissionFromMacNativeState('presentation_disabled')).toBe('presentation_disabled');
     expect(permissionFromMacNativeState('not_determined')).toBe('not_determined');
     expect(permissionFromMacNativeState('unexpected')).toBe('unknown');
     expect(permissionFromMacNativeState(null)).toBe('unknown');
+  });
+
+  it('does not fabricate a denial when delivery fails before permission is requested', () => {
+    markSystemNotificationDelivered();
+    expect(resolveMacPermissionState('unknown')).toBe('granted');
+
+    markSystemNotificationFailed();
+    expect(resolveMacPermissionState('not_determined')).toBe('not_determined');
+    expect(resolveMacPermissionState('unknown')).toBe('unknown');
+  });
+
+  it.each([
+    'granted',
+    'denied',
+    'presentation_disabled',
+    'not_determined',
+  ] as const)('keeps concrete macOS state %s authoritative over delivery evidence', (state) => {
+    markSystemNotificationDelivered();
+    expect(resolveMacPermissionState(state)).toBe(state);
   });
 
   it('maps Windows ToastNotifier settings to granted or denied', () => {

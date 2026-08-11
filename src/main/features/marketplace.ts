@@ -48,10 +48,13 @@ import * as path from 'node:path';
 import { sha256OfFile } from '../util/sha256';
 import { marketplaceContentTreeHash } from '../util/marketplace-tree-hash';
 import { logPathRef } from '../util/log-redact';
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
 import { fetchWithRetry } from '../util/retry';
 import {
+  compareVersions,
   minAppVersionFrom,
   normalizeMinAppVersion,
+  parseSemver,
   satisfiesMinAppVersion,
   type MinAppVersionSource,
 } from '../util/app-version-compat';
@@ -73,7 +76,8 @@ import {
   writeAgentCache, writeSkillCache,
 } from './marketplace_cache';
 import {
-  addAgentInstall, addSkillInstall, readInstalls, removeAgentInstall, removeSkillInstall,
+  addAgentInstall, addSkillInstall, findAgentInstall, findSkillInstall,
+  readInstalls, removeAgentInstall, removeSkillInstall,
 } from './marketplace_installs';
 import { withMarketplaceCacheLock, withMarketplaceInstallLock } from './marketplace_locks';
 import { agentPrivateSkillIdsFromBundle } from './marketplace_private_skills';
@@ -106,6 +110,8 @@ function _assertSafeMarketplaceId(id: unknown): asserts id is string {
 const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
 
 export function apiBase(): string {
+  const e2eBase = String(process.env.ORKAS_E2E_MARKETPLACE_API_BASE || '').trim();
+  if (process.env.ORKAS_E2E_USER_DATA_DIR && e2eBase) return e2eBase.replace(/\/$/, '');
   return GLOBAL_PROD_API_BASE;
 }
 
@@ -233,6 +239,22 @@ export interface SkillDetail {
   status?: string;
   min_app_version?: string;
 }
+
+type SkillBundleResponse = {
+  bundle_url: string;
+  version: string;
+  category: string;
+  published_at: number;
+  updated_at?: number;
+  create_uid: string;
+  default_install?: boolean;
+  is_open_source?: boolean;
+  name?: string;
+  status?: string;
+  state?: string;
+  min_app_version?: string;
+  minAppVersion?: string;
+};
 
 // ── listing ───────────────────────────────────────────────────────────────
 export async function listMarketplaceAgents(
@@ -439,6 +461,14 @@ type MarketplaceFreshness = {
 } & MinAppVersionSource;
 type MarketplaceInstallKind = 'agent' | 'skill';
 type MarketplaceInstallOpts = { force?: boolean; name?: string };
+export interface MarketplaceInstallResult {
+  ok: true;
+  id: string;
+  version: string;
+  published_at: number;
+  updated_at?: number;
+  min_app_version?: string;
+}
 
 function _currentAppVersion(): string {
   try { return app.getVersion(); } catch { return ''; }
@@ -464,6 +494,60 @@ function _assertMarketplaceAppCompatible(kind: MarketplaceInstallKind, id: strin
 
 function _isMarketplaceAppCompatible(minAppVersion: string): boolean {
   return satisfiesMinAppVersion(_currentAppVersion(), minAppVersion);
+}
+
+function _readLocalMarketplaceVersion(target: string): string {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(target, '_install.json'), 'utf8')) as { version?: unknown };
+    return parseSemver(parsed.version)?.normalized || '';
+  } catch {
+    return '';
+  }
+}
+
+async function _marketplaceInstallDisposition(
+  uid: string,
+  kind: MarketplaceInstallKind,
+  id: string,
+  remoteVersion: string,
+): Promise<'install' | 'upgrade' | 'repair' | 'noop'> {
+  const remote = parseSemver(remoteVersion);
+  if (!remote) throw new Error(`marketplace ${kind} returned an invalid version`);
+  const target = kind === 'agent' ? userMarketplaceAgentDir(uid, id) : userMarketplaceSkillDir(uid, id);
+  const contentFile = path.join(target, kind === 'agent' ? 'agent.json' : 'SKILL.md');
+  const manifestRow = kind === 'agent'
+    ? await findAgentInstall(uid, id)
+    : await findSkillInstall(uid, id);
+  const knownVersions = [
+    _readLocalMarketplaceVersion(target),
+    parseSemver(manifestRow?.version)?.normalized || '',
+  ].filter(Boolean);
+  let installedVersion = '';
+  for (const candidate of knownVersions) {
+    if (!installedVersion || compareVersions(candidate, installedVersion) === 1) installedVersion = candidate;
+  }
+  if (!installedVersion) return 'install';
+  const compared = compareVersions(remote.normalized, installedVersion);
+  if (compared === null) throw new Error(`marketplace ${kind} version comparison failed`);
+  if (compared < 0) {
+    throw new Error(`refusing marketplace ${kind} downgrade ${installedVersion} → ${remote.normalized}`);
+  }
+  if (compared > 0) return 'upgrade';
+  return fs.existsSync(contentFile) ? 'noop' : 'repair';
+}
+
+function _marketplaceInstallResult(
+  id: string,
+  detail: { version: string; published_at: number; updated_at?: number; min_app_version?: string },
+): MarketplaceInstallResult {
+  return {
+    ok: true,
+    id,
+    version: detail.version,
+    published_at: detail.published_at,
+    ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
+    ...(detail.min_app_version ? { min_app_version: detail.min_app_version } : {}),
+  };
 }
 
 export class MarketplaceInstallError extends Error {
@@ -669,7 +753,7 @@ export async function getSkillDetail(
     };
   }
   // Miss → fetch + write.
-  const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
+  const meta = await postJson<SkillBundleResponse>(
     '/marketplace/skills/bundle', { id: skillId },
   );
   await _fetchAndCacheSkill(skillId, meta, uid);
@@ -733,7 +817,7 @@ function _bundleHost(bundleUrl: string): string {
 // ── install ───────────────────────────────────────────────────────────────
 export async function installMarketplaceAgent(
   agentId: string, expect: MarketplaceFreshness, opts: MarketplaceInstallOpts = {},
-): Promise<{ ok: true; id: string }> {
+): Promise<MarketplaceInstallResult> {
   _assertSafeMarketplaceId(agentId);
   const uid = getActiveUserId();
   return withMarketplaceInstallLock(
@@ -749,7 +833,7 @@ async function _installMarketplaceAgentLocked(
   agentId: string,
   expect: MarketplaceFreshness,
   opts: MarketplaceInstallOpts = {},
-): Promise<{ ok: true; id: string }> {
+): Promise<MarketplaceInstallResult> {
   _assertSafeMarketplaceId(agentId);
   let agentName = opts.name || '';
   try {
@@ -779,7 +863,9 @@ async function _installMarketplaceAgentLocked(
       };
       agentName = agentName || _agentJsonName(detail.agent_json);
     }
+    const disposition = await _marketplaceInstallDisposition(uid, 'agent', agentId, detail.version);
     _assertMarketplaceAppCompatible('agent', agentId, agentName, detail.min_app_version || '');
+    if (disposition === 'noop') return _marketplaceInstallResult(agentId, detail);
 
     // 1. Download the private bundle first so ids materialized by that bundle are not
     //    misclassified as standalone marketplace dependencies. `skill_list` doubles as the
@@ -850,7 +936,7 @@ async function _installMarketplaceAgentLocked(
     _assertMarketplaceInstallUser(uid, 'agent', agentId, agentName);
     const target = userMarketplaceAgentDir(uid, agentId);
     const installedAt = Date.now();
-    await _replaceMarketplaceInstallDir(target, async (staged) => {
+    await replaceDirectoryAtomically(target, async (staged) => {
       const agentJsonFile = path.join(staged, 'agent.json');
       await fsp.writeFile(agentJsonFile, JSON.stringify(detail.agent_json, null, 2), 'utf8');
       if (privateSkillsZip) {
@@ -859,8 +945,8 @@ async function _installMarketplaceAgentLocked(
         extractBundleSafely(privateSkillsZip, privateSkillsDir);
       }
       // `_install.json` stores everything the in-app UI needs without re-hitting the network:
-      // version/freshness timestamp for reconcile; create_uid for the author badge on the
-      // agent detail page; `content_sha` for the dev-mode local-edit guard in
+      // version pin for reconcile; freshness timestamps for catalog/cache metadata;
+      // create_uid for the author badge on the agent detail page; `content_sha` for the dev-mode local-edit guard in
       // `marketplace_reconcile._agentNeedsPull` (see that function's header).
       const installContentSha = sha256OfFile(agentJsonFile);
       const installTreeHash = marketplaceContentTreeHash(staged);
@@ -894,12 +980,18 @@ async function _installMarketplaceAgentLocked(
         ...(detail.status ? { status: detail.status } : {}),
         min_app_version: detail.min_app_version || '',
       });
-    }, () => _assertMarketplaceInstallUser(uid, 'agent', agentId, agentName));
+    }, {
+      assertReady: () => _assertMarketplaceInstallUser(uid, 'agent', agentId, agentName),
+      onCleanupError: (err) => log.warn('marketplace install backup cleanup failed', {
+        target: logPathRef(target),
+        error: (err as Error)?.message || String(err),
+      }),
+    });
     await touchCacheEntry('agent', agentId, uid);
     invalidateCoreAgentSkills();
     log.info('installed marketplace agent', { agentId, version: detail.version, target: logPathRef(target) });
 
-    return { ok: true, id: agentId };
+    return _marketplaceInstallResult(agentId, detail);
   } catch (err) {
     throw _wrapMarketplaceInstallError('agent', agentId, agentName, err);
   }
@@ -907,7 +999,7 @@ async function _installMarketplaceAgentLocked(
 
 export async function installMarketplaceSkill(
   skillId: string, expect: MarketplaceFreshness, opts: MarketplaceInstallOpts = {},
-): Promise<{ ok: true; id: string }> {
+): Promise<MarketplaceInstallResult> {
   _assertSafeMarketplaceId(skillId);
   return _installMarketplaceSkillForUser(getActiveUserId(), skillId, expect, opts);
 }
@@ -917,7 +1009,7 @@ function _installMarketplaceSkillForUser(
   skillId: string,
   expect: MarketplaceFreshness,
   opts: MarketplaceInstallOpts = {},
-): Promise<{ ok: true; id: string }> {
+): Promise<MarketplaceInstallResult> {
   _assertSafeMarketplaceId(skillId);
   return withMarketplaceInstallLock(
     uid,
@@ -932,40 +1024,47 @@ async function _installMarketplaceSkillLocked(
   skillId: string,
   expect: MarketplaceFreshness,
   opts: MarketplaceInstallOpts = {},
-): Promise<{ ok: true; id: string }> {
+): Promise<MarketplaceInstallResult> {
   _assertSafeMarketplaceId(skillId);
   let skillName = opts.name || '';
   try {
     _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName);
-    let detail = await getSkillDetail(skillId, expect, uid);
+    const fresh = await postJson<SkillBundleResponse>(
+      '/marketplace/skills/bundle', { id: skillId },
+    );
     _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName);
-    skillName = skillName || detail.name || '';
-    if (!detail.bundle_url) {
-      const fresh = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; create_uid: string; default_install?: boolean; is_open_source?: boolean; name?: string; status?: string; state?: string; min_app_version?: string; minAppVersion?: string }>(
-        '/marketplace/skills/bundle', { id: skillId },
-      );
-      _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName);
-      skillName = skillName || fresh.name || '';
-      const minAppVersion = _normalizeMarketplaceMinAppVersion(fresh);
-      detail = {
-        ...detail,
-        name: fresh.name || detail.name,
-        published_at: fresh.published_at,
-        updated_at: fresh.updated_at,
-        bundle_url: fresh.bundle_url,
-        create_uid: fresh.create_uid || '',
-        default_install: fresh.default_install === true,
-        is_open_source: fresh.is_open_source === true,
-        status: fresh.status || fresh.state || '',
-        ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
-      };
-    }
+    skillName = skillName || fresh.name || '';
+    const minAppVersion = _normalizeMarketplaceMinAppVersion(fresh);
+    const detail: SkillDetail = {
+      id: skillId,
+      name: fresh.name || '',
+      version: fresh.version,
+      category: fresh.category,
+      published_at: fresh.published_at,
+      updated_at: fresh.updated_at,
+      cache_dir: getSkillCacheDir(skillId, uid),
+      bundle_url: fresh.bundle_url,
+      create_uid: fresh.create_uid || '',
+      default_install: fresh.default_install === true,
+      is_open_source: fresh.is_open_source === true,
+      status: fresh.status || fresh.state || '',
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
+    };
+    const disposition = await _marketplaceInstallDisposition(uid, 'skill', skillId, detail.version);
     _assertMarketplaceAppCompatible('skill', skillId, skillName, detail.min_app_version || '');
+    if (disposition === 'noop') return _marketplaceInstallResult(skillId, detail);
+
+    if (await isCacheFresh('skill', skillId, detail, uid)) {
+      await touchCacheEntry('skill', skillId, uid);
+    } else {
+      await _fetchAndCacheSkill(skillId, detail, uid);
+    }
+    _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName);
 
     const cacheDir = getSkillCacheDir(skillId, uid);
     const target = userMarketplaceSkillDir(uid, skillId);
     const installedAt = Date.now();
-    await _replaceMarketplaceInstallDir(target, async (staged) => {
+    await replaceDirectoryAtomically(target, async (staged) => {
       await withMarketplaceCacheLock(uid, 'skill', skillId, async () => {
         await _copyDirSkippingCacheMeta(cacheDir, staged);
       });
@@ -1012,12 +1111,18 @@ async function _installMarketplaceSkillLocked(
         ...(detail.status ? { status: detail.status } : {}),
         min_app_version: detail.min_app_version || '',
       });
-    }, () => _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName));
+    }, {
+      assertReady: () => _assertMarketplaceInstallUser(uid, 'skill', skillId, skillName),
+      onCleanupError: (err) => log.warn('marketplace install backup cleanup failed', {
+        target: logPathRef(target),
+        error: (err as Error)?.message || String(err),
+      }),
+    });
     await touchCacheEntry('skill', skillId, uid);
     invalidateCoreAgentSkills();
 
     log.info('installed marketplace skill', { skillId, version: detail.version, target: logPathRef(target) });
-    return { ok: true, id: skillId };
+    return _marketplaceInstallResult(skillId, detail);
   } catch (err) {
     throw _wrapMarketplaceInstallError('skill', skillId, skillName, err);
   }
@@ -1069,73 +1174,6 @@ async function _copyDirSkippingCacheMeta(src: string, dst: string): Promise<void
     } else if (e.isFile()) {
       await fsp.copyFile(s, d);
     }
-  }
-}
-
-/**
- * Prepare an install in a sibling directory and only swap it into place once
- * validation has succeeded. If activation or the cloud-manifest write fails,
- * restore the previous working directory so an update failure never turns an
- * installed item into a missing one.
- */
-async function _replaceMarketplaceInstallDir(
-  target: string,
-  prepare: (staged: string) => Promise<void>,
-  commitManifest: () => Promise<void>,
-  beforeCommit: () => void,
-): Promise<void> {
-  const parent = path.dirname(target);
-  await fsp.mkdir(parent, { recursive: true });
-  const staged = await fsp.mkdtemp(path.join(parent, `.${path.basename(target)}.install-`));
-  const backup = `${staged}.previous`;
-  let previousMoved = false;
-  let stagedActivated = false;
-
-  try {
-    await prepare(staged);
-    beforeCommit();
-
-    if (fs.existsSync(target)) {
-      await fsp.rename(target, backup);
-      previousMoved = true;
-    }
-
-    try {
-      await fsp.rename(staged, target);
-      stagedActivated = true;
-      beforeCommit();
-      await commitManifest();
-    } catch (err) {
-      if (stagedActivated) {
-        await fsp.rm(target, { recursive: true, force: true });
-        stagedActivated = false;
-      }
-      if (previousMoved) {
-        await fsp.rename(backup, target);
-        previousMoved = false;
-      }
-      throw err;
-    }
-
-    if (previousMoved) {
-      try {
-        await fsp.rm(backup, { recursive: true, force: true });
-        previousMoved = false;
-      } catch (err) {
-        log.warn('marketplace install backup cleanup failed', {
-          target: logPathRef(target),
-          error: (err as Error)?.message || String(err),
-        });
-      }
-    }
-  } catch (err) {
-    if (!stagedActivated) {
-      await fsp.rm(staged, { recursive: true, force: true }).catch(() => undefined);
-    }
-    if (previousMoved && !fs.existsSync(target)) {
-      await fsp.rename(backup, target).catch(() => undefined);
-    }
-    throw err;
   }
 }
 

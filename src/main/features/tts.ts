@@ -22,7 +22,7 @@ import * as path from 'node:path';
 import type { TtsProfile } from './auth';
 import {
   DOUBAO_DEFAULT_VOICE,
-  listTtsProfiles,
+  listUsableTtsProfiles,
 } from './tts_auth';
 import { probeMediaDurationSec } from '../util/media_probe';
 import { redactPaths } from '../util/redact';
@@ -87,6 +87,27 @@ export interface NarrationFit {
 function round2(n: number): number { return Math.round((Number.isFinite(n) ? n : 0) * 100) / 100; }
 function clamp(n: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, n)); }
 
+/** Ratio band applied to MEASURED narration audio. Separate from the estimate
+ *  band in `narrationDurationBand`: an estimate carries the estimator's own
+ *  error (up to ±20% against this repo's own fixtures), so judging a script
+ *  before synthesis needs the wider allowance. A measured duration has no such
+ *  error, and every consumer of a measurement must read it the same way. */
+export const NARRATION_MEASURED_OVER_RATIO = 1.05;
+export const NARRATION_MEASURED_UNDER_RATIO = 0.85;
+
+/** Whether synthesized audio runs past the window it was written for. The one
+ *  predicate behind both the post-synthesis warning and the authorization for
+ *  the bounded fit repair that answers it. They were separate before: the
+ *  warning used this ratio while the authorization used the ±5s estimate band,
+ *  so a 6.84s line in a 6.125s window was reported `over` and then refused a
+ *  repair for having "no matching measured overrun" (2026-08-10 AUTO run). The
+ *  model reverted its correct shortening, and `mix` truncated the closing line
+ *  0.72s into the delivered video. Pure → unit-tested. */
+export function narrationMeasurementOverruns(measuredSec: number, targetSec: number): boolean {
+  if (!(measuredSec > 0) || !(targetSec > 0)) return false;
+  return measuredSec / targetSec > NARRATION_MEASURED_OVER_RATIO;
+}
+
 /** Compare a synthesized narration's measured duration to a target clip length.
  *  Returns null when either duration is unusable. Pure → unit-tested. */
 export function assessNarrationFit(input: { measuredSec: number; targetSec: number; wordCount: number; unit?: 'words' | 'characters' }): NarrationFit | null {
@@ -104,8 +125,8 @@ export function assessNarrationFit(input: { measuredSec: number; targetSec: numb
   const suggestedSpeed = round2(clamp(ratio, 0.5, 2.0));
   const deltaSec = round2(measured - target);
   // ±tolerance band around the target: comfortably inside ⇒ "fits".
-  const OVER = 1.05;
-  const UNDER = 0.85;
+  const OVER = NARRATION_MEASURED_OVER_RATIO;
+  const UNDER = NARRATION_MEASURED_UNDER_RATIO;
   let status: NarrationFit['status'] = 'fits';
   let message = `Narration is ${round2(measured)}s for a ${round2(target)}s clip — fits.`;
   if (ratio > OVER) {
@@ -159,6 +180,11 @@ export interface EstimatedNarrationFit {
   genericEstimatedSec: number;
   estimatedSec: number;
   targetSec: number;
+  toleranceRatio: number;
+  toleranceFloorSec: number;
+  toleranceSec: number;
+  minDurationSec: number;
+  maxDurationSec: number;
   durationScale: number;
   unit: 'words' | 'characters';
   units: number;
@@ -177,10 +203,49 @@ export function narrationDurationCalibrationScale(input: {
   return Math.round(clamp(input.measuredSec / input.genericEstimatedSec, 0.5, 2) * 10_000) / 10_000;
 }
 
-/** Apply the exact VideoStudio delivery band to either a generic estimate or a
- *  measured-voice-calibrated estimate. The same policy is used before billing
- *  and after media probing: narration may finish up to 10% early and may
- *  overrun the immutable target by at most 150ms. */
+export const NARRATION_DURATION_TOLERANCE_RATIO = 0.05;
+export const NARRATION_DURATION_TOLERANCE_FLOOR_SEC = 5;
+
+/** A requested duration is an editorial target, not a frame-exact speech cap.
+ *  Use the same symmetric band for estimates and measured audio so a candidate
+ *  cannot pass the free check and then fail under a contradictory delivery
+ *  threshold. */
+export function narrationDurationBand(targetSec: number): {
+  toleranceRatio: number;
+  toleranceFloorSec: number;
+  toleranceSec: number;
+  minDurationSec: number;
+  maxDurationSec: number;
+} {
+  const toleranceSec = Math.max(
+    NARRATION_DURATION_TOLERANCE_FLOOR_SEC,
+    targetSec * NARRATION_DURATION_TOLERANCE_RATIO,
+  );
+  return {
+    toleranceRatio: NARRATION_DURATION_TOLERANCE_RATIO,
+    toleranceFloorSec: NARRATION_DURATION_TOLERANCE_FLOOR_SEC,
+    toleranceSec: round2(toleranceSec),
+    minDurationSec: round2(Math.max(0, targetSec - toleranceSec)),
+    maxDurationSec: round2(targetSec + toleranceSec),
+  };
+}
+
+/** @deprecated Use narrationDurationBand so callers retain both boundaries. */
+export function estimatedNarrationOverrunToleranceSec(targetSec: number): number {
+  return narrationDurationBand(targetSec).toleranceSec;
+}
+
+/** Whether a narration fit verdict may block production.
+ *
+ *  Both sides of the approved delivery band are actionable. The five-second
+ *  floor deliberately keeps ordinary short-form editorial variation inside
+ *  the band; `under` now means the narration fell outside even that allowance. */
+export function narrationFitBlocksProduction(status: EstimatedNarrationFit['status']): boolean {
+  return status !== 'fits';
+}
+
+/** Apply the VideoStudio delivery band to either a generic estimate or a
+ *  measured-voice-calibrated estimate, before billing. */
 export function assessEstimatedNarrationFit(input: {
   estimate: NarrationDurationEstimate;
   targetSec: number;
@@ -192,16 +257,19 @@ export function assessEstimatedNarrationFit(input: {
     : 1;
   const rawEstimatedSec = input.estimate.estimatedSec * durationScale;
   const estimatedSec = round2(rawEstimatedSec);
-  const status: EstimatedNarrationFit['status'] = rawEstimatedSec > input.targetSec + 0.15
-    ? 'over'
-    : rawEstimatedSec < input.targetSec * 0.9
-      ? 'under'
-      : 'fits';
+  const band = narrationDurationBand(input.targetSec);
+  const status: EstimatedNarrationFit['status'] =
+    rawEstimatedSec > band.maxDurationSec
+      ? 'over'
+      : rawEstimatedSec < band.minDurationSec
+        ? 'under'
+        : 'fits';
   return {
     status,
     genericEstimatedSec: input.estimate.estimatedSec,
     estimatedSec,
     targetSec: round2(input.targetSec),
+    ...band,
     durationScale: Math.round(durationScale * 10_000) / 10_000,
     unit: input.estimate.unit,
     units: input.estimate.units,
@@ -595,7 +663,7 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
     });
   }
   let profiles: TtsProfile[] = [];
-  try { profiles = listTtsProfiles(); } catch (err) { log.warn(`listTtsProfiles: ${(err as Error).message}`); }
+  try { profiles = listUsableTtsProfiles(); } catch (err) { log.warn(`listUsableTtsProfiles: ${(err as Error).message}`); }
   const p = routeRef ? profiles.find((profile) => profile.id === routeRef) : profiles[0];
   if (p) {
     if (p.provider === 'doubao') {
@@ -615,7 +683,7 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
 /** True when a BYO TTS provider is configured (env or saved profile). */
 export function hasConfiguredTtsProvider(): boolean {
   if (process.env.ORKAS_TTS_BASE_URL && process.env.ORKAS_TTS_API_KEY && process.env.ORKAS_TTS_MODEL) return true;
-  try { return listTtsProfiles().length > 0; } catch { return false; }
+  try { return listUsableTtsProfiles().length > 0; } catch { return false; }
 }
 
 /** Non-secret active backend identity used to scope persisted duration
@@ -635,13 +703,20 @@ export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
     ...(p.signal ? { signal: p.signal } : {}),
   });
   if (resolved.ok === false) {
+    const requiresUserAction = [
+      'E_TTS_USER_DISABLED',
+      'E_TTS_SERVICE_DISABLED',
+      'E_TTS_SIGN_IN_REQUIRED',
+      'E_TTS_NO_PROVIDER',
+      'E_TTS_NOT_CONFIGURED',
+    ].includes(resolved.errorCode);
     return {
       ok: false,
       errorCode: resolved.errorCode,
       message: resolved.message,
       requestDisposition: 'rejected_preflight',
       chargeStatus: 'not_charged',
-      retryPolicy: 'safe_after_plan_fix',
+      retryPolicy: requiresUserAction ? 'requires_user_action' : 'safe_after_plan_fix',
     };
   }
   if (p.signal?.aborted) {

@@ -24,6 +24,8 @@ describe('project to-do controls', () => {
   });
 
   it('toggles a row directly between open and done while keeping delete isolated', async () => {
+    expect(source).not.toContain("_projectTrackClick('project_todo_toggle'");
+    expect(source).toContain("_projectTrackEvent('project_todo_toggle_result'");
     const invocations: Array<{ channel: string; payload: Record<string, unknown> }> = [];
     const listeners: Record<string, (event: any) => Promise<void>> = {};
     const elements: Record<string, any> = {
@@ -100,10 +102,11 @@ describe('project to-do controls', () => {
 
   it('restores the send control when project conversation creation fails', async () => {
     const events: any[] = [];
+    const clicks: any[] = [];
     const input = { value: 'project question' };
     const button = { disabled: false };
     const Monitor = {
-      click() {},
+      click(name: string, payload: any) { clicks.push({ name, payload }); },
       event(name: string, payload: any) { events.push({ name, payload }); },
     };
     const context = vm.createContext({
@@ -123,6 +126,10 @@ describe('project to-do controls', () => {
       Monitor,
       t: (key: string) => key,
       ensureModelConfigured: () => true,
+      _chatModelTelemetryContext: () => ({
+        provider: 'deepseek',
+        model: 'deepseek-v4-pro',
+      }),
       _getQuotes: () => [],
       _referenceSnapshotsForQuotes: () => [],
       consumeChatUseSelections: () => [],
@@ -230,7 +237,17 @@ describe('project to-do controls', () => {
       Monitor,
       t: (key: string) => key,
       ensureModelConfigured: () => false,
+      _chatModelTelemetryContext: () => ({
+        provider: 'deepseek',
+        model: 'deepseek-v4-pro',
+      }),
       _getQuotes: () => [],
+      getChatUseSelections: () => [
+        { kind: 'skill', id: 'review' },
+        { kind: 'connector', id: 'notion' },
+      ],
+      getChatRecipient: () => ({ kind: 'agent', id: 'reviewer' }),
+      _chatAttachList: () => [{ name: 'brief.pdf', status: 'ready' }],
       apiFetch,
       setTimeout,
       clearTimeout,

@@ -30,17 +30,34 @@ function removeDarwinOutputs(exceptArch = null, root = outputDir) {
   }
 }
 
-function findNodeHeaders() {
+/**
+ * The addon is pure N-API (`-DNAPI_VERSION=8`), so any N-API headers build a
+ * binary that loads in Electron. `process.execPath` is the only source that
+ * fails under the mandated `npm test` runner: it points at the Electron
+ * binary, whose dist ships no headers. `npm_node_execpath` is the Node that
+ * launched the npm script, which is where a nvm/fnm install keeps its headers
+ * — without it, a machine with no Homebrew or system Node cannot build at all.
+ */
+function findNodeHeaders({
+  env = process.env,
+  execPath = process.execPath,
+  exists = fs.existsSync,
+} = {}) {
+  const includeDirOf = (binary) => path.resolve(path.dirname(binary), '..', 'include', 'node');
   const candidates = [
-    process.env.npm_config_nodedir && path.join(process.env.npm_config_nodedir, 'include', 'node'),
-    path.resolve(path.dirname(process.execPath), '..', 'include', 'node'),
+    env.npm_config_nodedir && path.resolve(env.npm_config_nodedir, 'include', 'node'),
+    includeDirOf(execPath),
+    env.npm_node_execpath && includeDirOf(env.npm_node_execpath),
     '/opt/homebrew/include/node',
     '/usr/local/include/node',
     '/usr/include/node',
   ].filter(Boolean);
-  const found = candidates.find((candidate) => fs.existsSync(path.join(candidate, 'node_api.h')));
+  const found = candidates.find((candidate) => exists(path.join(candidate, 'node_api.h')));
   if (!found) {
-    throw new Error(`node_api.h not found (checked: ${candidates.join(', ')})`);
+    throw new Error(
+      `node_api.h not found (checked: ${candidates.join(', ')}). `
+      + 'Set npm_config_nodedir to a Node install that ships headers.',
+    );
   }
   return found;
 }
@@ -87,7 +104,7 @@ function build({
   try {
     result = spawn('xcrun', [
       'clang++',
-      '-std=c++17',
+      '-std=c++20',
       '-bundle',
       '-undefined', 'dynamic_lookup',
       '-fblocks',

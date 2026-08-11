@@ -34,7 +34,11 @@ import * as kbVector from './kb_vector';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { getActiveUserId } from './users';
-import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
+import {
+  officeFileToPreviewHtml,
+  officePreviewKindForExt,
+  type OfficePreviewResult,
+} from '../util/office-preview';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
@@ -297,10 +301,11 @@ export async function readContextDocxHtml(relpath: string): Promise<Result<{ htm
 }
 
 /** Convert a modern Office file to a full, sandbox-friendly HTML preview.
- *  This is a lightweight content preview, not a high-fidelity layout render. */
+ *  Word, spreadsheet, and presentation files use the bundled layout renderer
+ *  with a lightweight content fallback. */
 export async function readContextOfficeHtml(
   relpath: string,
-): Promise<Result<{ html: string; kind: 'word' | 'spreadsheet' | 'presentation'; previewHeight?: number }>> {
+): Promise<Result<OfficePreviewResult>> {
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -309,7 +314,7 @@ export async function readContextOfficeHtml(
   if (!kind) return { ok: false, error: 'not a supported office file' };
   try {
     const buf = fs.readFileSync(p);
-    const preview = await officeBufferToPreviewHtml(kind, path.basename(p), buf);
+    const preview = await officeFileToPreviewHtml(kind, path.basename(p), p, buf);
     return { ok: true, ...preview };
   } catch (err) {
     log.warn(`office→html ${relpath}: ${(err as Error).message}`);

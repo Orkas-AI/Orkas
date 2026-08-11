@@ -80,6 +80,7 @@ export interface LegacyAccountLocalIdMigrationResult {
     | 'no_migration_needed'
     | 'no_stored_account'
     | 'target_exists'
+    | 'rekey_failed'
     | 'rename_failed';
   error?: string;
 }
@@ -89,6 +90,20 @@ export interface LegacyAccountLocalIdMigrationResult {
 let ACTIVE_UID: string | null = null;
 type CurrentUserField = 'current_user_id' | 'dev_current_user_id';
 let CURRENT_USER_FIELD: CurrentUserField = 'current_user_id';
+
+function rollbackUserRootAfterRekeyFailure(toRoot: string, fromRoot: string): void {
+  try {
+    fs.renameSync(toRoot, fromRoot);
+  } catch (err) {
+    const failure = new Error('auth profiles rekey directory rollback failed') as Error & {
+      code: string;
+      cause?: unknown;
+    };
+    failure.code = 'AUTH_PROFILES_REKEY_ROLLBACK_FAILED';
+    failure.cause = err;
+    throw failure;
+  }
+}
 
 /**
  * Select which persisted pointer this process owns. `index.ts` calls this
@@ -265,7 +280,34 @@ export function migrateLegacyLoggedInLocalIdToAccountLocalId(): LegacyAccountLoc
 
   try {
     fs.renameSync(fromRoot, toRoot);
-    rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: from, toLocalId: to, accountUserId });
+    try {
+      rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: from, toLocalId: to, accountUserId });
+    } catch (err) {
+      // Rekey writes atomically, so a failed rekey leaves the original-owner
+      // payload intact. Put the whole directory back before boot activates any
+      // account-scoped paths; otherwise the account would become ready with a
+      // credential file it can never decrypt.
+      try {
+        rollbackUserRootAfterRekeyFailure(toRoot, fromRoot);
+      } catch (rollbackErr) {
+        return {
+          migrated: false,
+          from,
+          to,
+          accountUserId,
+          reason: 'rekey_failed',
+          error: (rollbackErr as Error).message,
+        };
+      }
+      return {
+        migrated: false,
+        from,
+        to,
+        accountUserId,
+        reason: 'rekey_failed',
+        error: (err as Error).message,
+      };
+    }
     writeRegistry(replaceCurrentLocalId(reg, from, to));
     log.info('legacy logged-in directory migrated to account uid', { from: maskId(from), to: maskId(to) });
     return { migrated: true, from, to, accountUserId };
@@ -420,22 +462,29 @@ export function switchToAccountLocalId(accountUserId: string): UserRecord {
     notifyUserSwitch(current, localId);
   }
   if (current && current !== localId && isAnonymousLocalId(current) && !localIdRootExists(localId)) {
-    const reg = readRegistry();
     const fromRoot = localRoot(current);
     const toRoot = localRoot(localId);
     try {
       if (fs.existsSync(fromRoot)) {
         fs.renameSync(fromRoot, toRoot);
-        rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: current, toLocalId: localId, accountUserId });
-        if (reg) writeRegistry(replaceCurrentLocalId(reg, current, localId));
+        try {
+          rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: current, toLocalId: localId, accountUserId });
+        } catch (err) {
+          rollbackUserRootAfterRekeyFailure(toRoot, fromRoot);
+          throw err;
+        }
         log.info('anonymous directory adopted by account uid', { from: maskId(current), to: maskId(localId) });
       }
     } catch (err) {
-      log.warn('anonymous directory adoption failed; falling back to account uid activation', {
+      const isRekeyFailure = (err as { code?: string }).code?.startsWith('AUTH_PROFILES_REKEY_') === true;
+      log.warn(isRekeyFailure
+        ? 'anonymous directory adoption blocked by credential rekey failure'
+        : 'anonymous directory adoption failed; falling back to account uid activation', {
         from: maskId(current),
         to: maskId(localId),
         error: (err as Error).message,
       });
+      if (isRekeyFailure) throw err;
     }
   }
   activateUserInternal(localId, true);

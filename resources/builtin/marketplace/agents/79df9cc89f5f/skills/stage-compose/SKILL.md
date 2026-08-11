@@ -1,7 +1,7 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-compose
-min_app_version: "1.6.0"
+min_app_version: "1.6.5"
 description_zh: Orkas HTML 视频合成的编写知识——如何写一个 composition（index.html）、用时间线驱动动画、声明画幅与时长，再渲染成 mp4；解说/动画/动态图形/字幕叠加的核心技能。
 description_en: Authoring knowledge for Orkas HTML video compositions — how to write an index.html composition, drive animation from a timeline, declare canvas + duration, then render to mp4; core skill for explainer/animation/motion-graphics/caption work.
 category: creation
@@ -11,26 +11,16 @@ category: creation
 
 How to author an Orkas HTML composition and turn it into a video. Host-neutral: this skill describes the artifact you produce and the outcome you want (a rendered mp4). In Orkas, composition lint/inspect/draft/render runs through the built-in `video_studio` tool. Compatibility is enforced before install by the marketplace `min_app_version` field on the agent/skill.
 
-For visual direction, apply `frontend-design` before writing `manifest.art_direction`. If the user provides a reference image, reference video, DESIGN.md, brand guide, screenshot, design notes, or explicit named style, apply `design-system-importer` to convert it into intent-bound VideoStudio media constraints and compact tokens. `composition-design-review` is a bounded pre-preview visual check whenever snapshot evidence exists, with a post-draft fallback only when no reviewed preview was required; it must not replace native draft QA or create an open-ended redesign loop.
+For visual direction, apply `frontend-design` before writing `manifest.art_direction`. If the user provides a reference image, reference video, DESIGN.md, brand guide, screenshot, design notes, or explicit named style, apply `design-system-importer` to convert it into intent-bound VideoStudio media constraints and compact tokens. `composition-design-review` is an advisory visual checklist you apply yourself to snapshot evidence before showing a preview; nothing is submitted to the host and no gate depends on it. It must not replace native draft QA or create an open-ended redesign loop.
 
-COMPOSE gate forms and authorization transitions are host protocol owned only by `gate-control`. This skill supplies the script, shotlist, manifest, contact sheet, draft, QA evidence, and production readiness state; pass those facts to `gate-control` and obey its returned form or operation instead of restating field ids or approval ordering here.
+COMPOSE gate stops and authorization transitions are host protocol owned only by `gate-control`. This skill supplies the manifest, contact sheet, draft, QA evidence, and production readiness state; pass those facts to `gate-control` and obey its returned stop or operation instead of restating field ids or approval ordering here.
 
 ## No-runtime advisory package
 
-When production tools or the gate UI are unavailable, preserve authorization: do not advance state, fabricate approval, or claim a rendered artifact. If the brief is otherwise clear, do not stop at route selection or a generic checklist. Return one explicitly unexecuted candidate package containing:
-
-- locked audience, aspect ratio, duration, language, audio mode, and assumptions;
-- final-form script or narration plus a timed shotlist/storyboard;
-- on-screen copy, captions, music/SFX direction, and a rights-safe asset fallback with intended provenance;
-- target export settings and concrete QA checks for duration, aspect ratio, safe zones, readability, audio mix, and encoding.
-
-For a general-audience explainer, connect every abstract trend to at least one concrete everyday use, consequence, or decision. Routine direction or preview confirmations do not justify withholding this complete candidate package. Only actual gated generation, render, or export remains unauthorized.
-
-If the plan needs no external media, explicitly record the visuals as self-authored HTML/CSS/SVG in the asset ledger; for any later replacement, require source, creator/license, permitted use, and local filename. This package is advisory evidence, not approval and not authority to generate, render, or export.
-
-Before ending the advisory package, include a separate target-export block (container, pixel dimensions, frame rate, video/audio codec intent) and a checkable final-QA list. The list must cover duration tolerance, nonblank first frame and hook timing, safe-zone/readability, caption timing, loudness and music ducking, blank/frozen-frame sampling, encoding validity, and playback of the intended final file.
-
-AUTO child compositions are the one Gate B inheritance path. They must use local `script.md`/`shotlist.json`/manifest artifacts derived from the signed parent segment's `composition_plan`. Ask `gate-control` to resolve parent-plan inheritance with the owning `plan_path` and `segment_id`; on success continue with the returned production operation, and on mismatch return to the single parent EDL review instead of inventing a child confirmation.
+When production tools cannot run in this transport, return the complete unexecuted candidate package without advancing state, fabricating approval, or claiming a rendered artifact — and do not stop at routing either. `gate-control`'s no-runtime branch owns the package's protocol, and
+`references/no-runtime-package.md` holds what COMPOSE adds to it. Read that
+file only when the runtime is actually unavailable; the ordinary path never
+needs it.
 
 Visual QA repair is an evidence-driven workflow, not a rigid state machine or
 general redesign prompt. Recorded facts identify completed work and current
@@ -39,45 +29,55 @@ Only final delivery has a strict quality boundary; intermediate failures must
 remain editable and recoverable. `gate-control` alone owns any user
 authorization transition:
 
-Every QA failure or recovery handoff must carry the current reviewable artifact
-package, not only a reason or status: name/link the returned
+Every QA failure or recovery handoff must carry the current reviewable
+artifact package, not only a reason or status: name/link the returned
 `current_candidate`, contact sheet or sampled frames, failed draft when one
 exists, and `findings_path`/inline findings. Label the package as current but
-unapproved, then state the bounded repair and next cheap check. If a field was
-not returned, omit that field rather than inventing it. A blocker message that
-hides available artifacts is incomplete. Treat native
-`review_package.presentation_required:true` as a response contract, not
-optional metadata: show its `primary_artifact`, summarize its `conclusion`,
-and use its other artifact paths as supporting evidence. If no preview or
-draft exists yet, show the current script, shotlist, manifest, or authored HTML
-returned in the package so the user can still judge the actual work. State
-whether automatic recovery is continuing. Ask the user only for a genuine
-creative/cost decision; when one is required, derive two or three concrete
-options from the visible artifact and findings instead of asking a context-free
-“how should I proceed?” question.
+unapproved, then state the bounded repair and next cheap check. Omit a field
+that was not returned rather than inventing it. A blocker message that hides
+available artifacts is incomplete. Treat
+`review_package.presentation_required:true` as a response contract: show its
+`primary_artifact`, summarize its `conclusion`, use the other paths as
+supporting evidence. If no media exists yet, show the returned script,
+manifest, or authored HTML so the user can still judge the work. Ask the user
+only for a genuine creative/cost decision, and derive two or three concrete
+options from the visible artifact and findings instead of asking a context-free "how should I proceed?" question.
 
-Do not expose native error identifiers such as `E_GATE_B_*`, “Gate B”, repair
-budgets, signatures, or schema terminology in normal user-facing prose.
-Translate the result into three compact parts in the user's UI language:
-**what happened** (which current artifact or field needs work), **what remains
-safe** (the user's confirmation and preserved artifacts), and **what happens
-next** (the concrete repair plus the next check). An “approval validation”
-artifact error is not a bad user confirmation: use returned `artifact_issues`
-to distinguish a missing file from invalid JSON or an invalid manifest field.
-When `review_package.conclusion.automatic_recovery_expected:true`, do not end
-the turn after promising recovery. Read the named current artifacts, repair
-only structure/fields that preserve the confirmed meaning, and retry the
-returned operation in the same turn. Ask for confirmation again only if that
-repair would change the approved script, duration, delivery contract, or other
-creative intent.
+Do not expose native error identifiers such as `E_GATE_B_*`, "Gate B", repair
+budgets, signatures, or schema terminology in normal user-facing prose. In Chinese output use "生成旁白音频", "将旁白音频加入视频", and "旁白音频生成失败"; never use "旁白物化". In any UI language, translate
+`composition.materialize_narration` as generating or adding narration audio
+rather than "materialize". Translate every result into three compact parts in
+the user's UI language: **what happened** (which artifact or field needs
+work), **what remains safe** (their confirmation and preserved artifacts), and
+**what happens next** (the concrete repair plus the next check). An "approval
+validation" artifact error is not a bad user confirmation: use the returned
+`artifact_issues` to distinguish a missing file from invalid JSON or an
+invalid manifest field. When
+`review_package.conclusion.automatic_recovery_expected:true`, do not end the
+turn after promising recovery — read the named artifacts, repair only
+structure that preserves the confirmed meaning, and retry the returned
+operation in the same turn. Ask again only if that repair would change the
+approved script, duration, delivery contract, or other creative intent.
 
-- **Fatal inspect blocker:** repair the reported runtime/structural contract and rerun `composition.inspect`. Until the fatal count is zero, do not call snapshot, preview approval, or draft.
-- **Visual review required:** when inspect returns `ok:true`, `visual_review_required:true`, and `preview_capture_allowed:true`, call `composition.snapshot` before editing so the user and the repair loop receive contact-sheet evidence. High-confidence visual blockers may produce a preview but cannot mint preview approval or advance to draft; advisories continue normally.
-- **Passing snapshot awaiting design review:** inspect every returned `frame_paths` item in one pass, not only the contact sheet or one representative scene. Batch all concrete visible blockers into one verdict. Repair only the affected scenes, then rerun inspect + snapshot; do not show, draft, or approve the stale preview. Other scenes and the approved direction remain frozen.
-- **Snapshot semantic failure:** keep the returned `current_candidate`, `preview_qa`, and `frame_evidence` visible as an unapproved version; repair the implicated frame/scene so the canonical manifest or HTML signature changes, then rerun inspect + snapshot. Never retry an unchanged signature or treat failed evidence as review-ready. If the current repair strategy no longer converges, use the recorded evidence to start an internal visual revision and choose a materially different repair without asking the user for technical authorization.
-- **Exhausted visual QA cycle:** pass the exact native result to `gate-control`, follow its internal restart action, and continue with a new candidate revision. This is recorded recovery evidence, not a user gate.
+The top-level continuation fields take precedence over a prose error message.
+`next_step_owner:agent` plus `execution.continue_in_current_turn:true` means the
+result is nonterminal: execute the named file mutation, retry the validator,
+and continue production. Do not merely tell the user what the model should do.
+`next_step_owner:user` requires the current artifact and two or three concrete
+form choices in the same response. `next_step_owner:external` stops safely at
+the preserved artifact without claiming that automatic recovery is underway.
+
+- **Fatal inspect blocker:** repair the reported runtime/structural contract and rerun `composition.inspect`. Until the fatal count is zero, do not call snapshot or draft, and do not present the keyframe preview.
+- **Visual review required:** when inspect returns `ok:true`, `visual_review_required:true`, and `preview_capture_allowed:true`, call `composition.snapshot` before editing so the user and the repair loop receive contact-sheet evidence. High-confidence visual blockers may produce frames but cannot reach the keyframe preview stop or advance to draft; advisories continue normally.
+- **Passing snapshot, before showing the preview:** inspect every returned `frame_paths` item in one pass, not only the contact sheet or one representative scene. Batch all concrete visible blockers into one verdict. Repair only the affected scenes, then rerun inspect + snapshot; do not show, draft, or approve the stale preview. Other scenes and the approved direction remain frozen.
+- **Snapshot semantic failure:** keep returned `current_candidate`, `preview_qa`, and `frame_evidence` visible as unapproved; change the implicated frame/scene signature, then rerun inspect + snapshot. Never retry unchanged input or treat failed evidence as review-ready. While passes remain, choose a materially different repair from the evidence; once exhausted, stop editing that turn.
+- **Exhausted visual QA cycle:** show current evidence/findings and let the user choose from the returned options — redirect, simplify, waive the named check, or another materially different attempt — then end. Never start another internal cycle as the silent default. A later real reply grants the next cycle; the host opens it before that turn's first native call. No recovery operation exists.
 
 Each QA repair step has one next operation and one bounded repair target. A later passing snapshot may open the preview gate; prohibitions above apply while the reported blocker or stale signature still exists.
+
+**A retime moves every scene window — re-time the motion inside them.** When `composition.materialize_narration` returns `scaffold_retimed:true`, read its `scene_retiming` entries: each shifted scene's tweens must move to the new window. An entrance still positioned at its pre-retime time leaves that scene blank at the frame QA samples, which reports as a blank/scene-not-visible finding rather than as the stale tween it is. Fix the choreography before rerunning inspect/snapshot; a silent scene keeps a real designed duration, so do not treat a shortened window as permission to drop its beat.
+
+**A passing snapshot ends the turn — until the current visual identity's go-ahead.** Present the complete frame set with exact paths plus one line inviting changes, and stop — do not call `composition.draft` in the same turn; the host refuses it and no wording gets past that. Writing the stop yourself is the only way the user gets a message they can act on. Render on the next turn, after their reply. A recapture of identical visual bytes inherits that reply. A change to visible copy, layout, assets, scene windows, or motion creates a new visual identity, so show the changed complete frame set once before rendering it. Narration/audio-only work inherits the prior preview when the scene windows and pixels remain unchanged. `gate-control` owns the wording of that stop.
 
 ## Post-gate authorization and revisions
 
@@ -85,7 +85,7 @@ Each QA repair step has one next operation and one bounded repair target. A late
 
 For COMPOSE scope classification, styling-only changes to HTML/CSS/SVG/layout/motion/palette/assets stay `visual_only`. Changes to signed delivery fields, approved copy, narration, timing, language, source mappings, semantic roles, or narration intent are `gate_b_payload`. When uncertain, inspect the requested files and resolve scope without asking a technical confirmation.
 
-For a `visual_only` change after a draft or final already exists, the source edit stays localized but the encoded artifact does not: after the new preview is approved, `composition.draft` re-encodes the complete composition as one mp4, and a later approved `composition.export` re-encodes that same complete composition at delivery quality. Never describe export as the only final encode, imply that only the changed scene can be encoded, or skip the new whole-composition draft and its QA/confirmation.
+For a `visual_only` change after a draft or final already exists, the source edit stays localized but the encoded artifact does not: re-capture and show the changed complete frame set, end that preview turn, then on the user's reply `composition.draft` re-encodes the complete composition as one mp4. A later approved `composition.export` re-encodes that same complete composition at delivery quality. The changed draft re-opens the final video confirmation. Never describe export as the only final encode, imply that only the changed scene can be encoded, or skip the new whole-composition draft and its QA/confirmation.
 
 After the resolver authorizes a normal revision, edit only the bounded files and follow its returned reconcile/QA operation. This skill never infers recovery authority or substitutes a different transition.
 
@@ -93,114 +93,94 @@ After the resolver authorizes a normal revision, edit only the bounded files and
 
 Before Gate B, make the candidate plan internally executable; after approval, keep the production turn narrow:
 
-1. On every new or resumed COMPOSE turn, re-read the currently installed copy of this skill; an online Marketplace update supersedes any older copy already present in session history. Then read only `project/script.md` and `project/shotlist.json`. Also read `frontend-design`; read `design-system-importer` only when a concrete style source or explicit named reference exists. Read `composition-design-review` after a successful snapshot returns `preview_design_review_required:true`; if preview was skipped, read it only when a successful draft returns `design_review_required:true`.
-2. Gate B `shotlist.json` must lock `target_duration_seconds`, `video_language`, `audio_mode`, `caption_mode`, and `music_mode`; silence, no captions, and no music must be explicit values rather than omissions. For narration, first call `video_studio` with `op:"speech.capabilities"`, choose only one returned `route_ref` + `voice_ref` whose native or verified supported locale matches `video_language`, and copy its `display_name` with the exact BCP-47 `language` and a natural `speed` into the manifest—never use a candidate non-native language and never invent or recall a provider voice id. Before showing Gate B, write the candidate schema-version 2 source of truth `project/composition/composition-manifest.json` from the same script/shotlist. It owns canvas, immutable target duration, fps, video language, scene windows, complete approved `source_shots` mappings, semantic roles, the narration intent, audio ownership, and `art_direction`. For standalone narrated work, put the complete candidate words in each scene's `narration_text` and keep pre-production audio at `owner:"none"`, `tracks:[]`, plus the selected `narration_intent`. For visual-only/SFX-only COMPOSE, keep `narration_text` empty and say at the gate that no voiceover will be generated. Do not create an audio file or a second structural contract yet.
-3. For standalone narration, run the free `composition.check_narration_fit` against that candidate manifest before opening Gate B. Open Gate B only when it returns `gate_b_ready:true`. When it returns `over` or `under`, revise `script.md`, `shotlist.json`, and matching scene `narration_text` together to the returned `suggested_units`, then run the free check again without asking the user. After a measured TTS mismatch, the check automatically uses the persisted voice/speed calibration; never let a later generic estimate reverse that measured recommendation. This is an internal timing repair, not a new creative gate: when the free check returns `approval_inherited:true` and `gate_b_required:false`, the native state has carried the existing Gate B approval to the bounded revision, archived stale audio, and returned to `manifest_ready`; call `composition.prepare` and continue without showing Gate B again. If it returns `repair_authorization_status:"rejected"`, only then treat the change as a new plan requiring Gate B. After two non-converging free checks, stop repeating the same wording strategy, diagnose the measured difference, make a materially different timing-focused edit within the authorized scope, and recheck. Never open Gate B or send another speech request merely because the prior timing edits did not converge.
-4. On every new/resumed production turn, call canonical `composition.status`; if files and recorded evidence disagree, pass that evidence through `gate-control` and follow the returned recovery. Gate B identity is the normalized approved-intent hash, not the raw hash of `composition-manifest.json`: raw script/shotlist/manifest hashes remain artifact and concurrency evidence, while implementation-only `art_direction`, formatting, HTML, CSS, SVG, and motion edits create a new candidate without reopening Gate B. Only a changed approved-intent hash is a plan amendment. Once the plan signature is current, run canonical `composition.doctor` before any paid operation and fix missing required capabilities, then call `composition.prepare`. `stage` and `next_allowed_ops` are compatibility hints, not an operation whitelist; native operations enforce their own current-fact preconditions. If standalone narration is needed, call `composition.materialize_narration` after prepare and before presenting a complete draft or final delivery. An incomplete visual snapshot may be produced and revised while narration recovery is pending. If materialization reports an unresolved charge or a user decision for another paid request, do not terminate with a narration form while visual evidence is still missing: preserve the transaction, continue visual authoring, lint, inspect, and snapshot, deliver the current incomplete candidate, then surface the narrowly scoped retry decision. A narration failure blocks narration and complete delivery only; it does not block visual evidence or internal repair. Materialization reuses the same calibrated fit policy, synthesizes once, persists a recoverable transaction plus measured voice calibration, records hashes/measured duration, writes per-scene `narration-map.json`, and retimes the canonical manifest. If visual HTML was already authored, the operation preserves model DOM/CSS/SVG and reconciles only protected timing/audio bindings. A resumed call recovers matching audio without another paid request. Never use generic `generate_speech` for standalone COMPOSE narration.
-5. Model-author the visual content, CSS, SVG, and deterministic tweens inside the prepared scaffold. Visual work, lint, inspect, snapshot, design review, and visual-preview revision may proceed while narration recovery is pending; keep the candidate explicitly incomplete. Required narration blocks only a complete draft/final delivery, not inspection or editing. Use the HyperFrames-style discipline from `frontend-design`: first confirm the visual identity, dedicated `art_direction.cover`, any concrete `reference_fidelity` contract, and `VisualDirectionV1`; then author each scene's resolved/hero frame as static HTML/CSS/SVG using the declared video scale, depth layers, typography register, motion verbs, and rhythm pattern. Treat the exact 0s state of the first scene as a separately designed cover, not whatever happens to remain before the first tween: combine approved headline copy, a dominant hero, and at least two topic-specific content signals. Only after the resolved layout and frame-0 cover are readable add GSAP entrances, reveals, and transitions into that layout. Do not begin with hidden/offscreen animated start states, generic placeholder diagrams, decorative emoji/icons, centered equal-weight layouts, or web-scale type. Then run `composition.inspect`; if it reports blocking design-contract errors, repair the manifest art direction first and rerun inspect before snapshot or draft. Inspect findings are always host-persisted. Retry only after the canonical manifest or HTML signature changes, and allow at most two distinct repair passes across the shared inspect/snapshot QA cycle; advisory or duplicated findings do not consume a pass. `E_INSPECT_RETRY_NO_CHANGE` blocks only the unchanged probe. When the current visual repair cycle does not converge, pass the native recovery evidence to `gate-control`, follow its internal restart action, choose a materially different fix, and continue without a user form. `E_INSPECT_ALREADY_PASSED` means follow the prior next action without rerunning inspect. Do not recreate root timing, media playback, vendor setup, or timeline registration with ad-hoc code. Never install dependencies or start a browser, HTTP server, watcher, Puppeteer, Playwright, or headless Chrome for QA; native `video_studio` operations own that runtime. QA repair is internal work and never creates a technical user gate.
+1. Read the currently installed copy of this skill once per conversation; re-read it only when the runtime announces an updated installation, not on every resumed turn — the copy already in session history stays authoritative until then. Then read `project/composition/composition-manifest.json` if one already exists. Also read `frontend-design`; read `design-system-importer` only when a concrete style source or explicit named reference exists. Read `composition-design-review` after a successful snapshot, as the checklist for your own frame pass.
+2. **Stop for the direction before writing anything.** End that turn with two or three genuinely different concepts for this brief plus the locked facts, and let the user pick — `gate-control` owns the wording. Nothing below happens until they reply: authoring a manifest, a narration line, or an art direction against an unchosen direction is work that gets thrown away, and on 2026-08-07 a run spent eleven minutes doing exactly that before the user saw anything.
 
-Treat each returned `current_candidate.revision_id` as an immutable content
-snapshot: edits create a new candidate instead of overwriting the meaning of a
-previous preview or approval. The model may choose a different repair, but a
-given content hash must keep the same local assets, timeline inputs, and
-runtime fingerprint. Canonical files are resolved from their recorded
-path-and-hash facts and do not have to live in one expected authoring
-directory; the private content-addressed snapshot path is storage evidence,
-not a directory restriction or an edit target. Rendering never downloads or
-regenerates media. A failed
-inspect, snapshot, or draft still returns the current candidate; present its
-contact sheet, sampled frame, draft, or findings as “current version, not yet
-approved” and continue repair. Only the strict final export gate may prevent
-delivery of a final video; intermediate failures must not prevent inspection,
-editing, reconciliation, or a new candidate revision.
+3. **The plan is one file**: the canonical `project/composition/composition-manifest.json`. Duration, language, audio ownership, scene windows, approved copy and the words each scene speaks all live there. There is no shotlist and no separate script: a second file restating any of it only creates two copies to reconcile, and reconciling copies is what produced `shotlist.shots.missing` and `script.narration_missing`. The approval result returns `plan_script` — the same plan rendered as readable prose — so show that at the confirmation instead of writing a script file. Declare captions with `composition.caption_mode` when the delivery has them; absent means none. For narration, first call `video_studio` with `op:"speech.capabilities"`, choose only one returned `route_ref` + `voice_ref` whose native or verified supported locale matches `video_language`, and copy its `display_name` with the exact BCP-47 `language` and a natural `speed` into the manifest—never use a candidate non-native language and never invent or recall a provider voice id. Before showing Gate B, write the candidate schema-version 2 source of truth `project/composition/composition-manifest.json`. It owns canvas, immutable target duration, fps, video language, scene windows, complete approved `source_shots` mappings, semantic roles, the narration intent, audio ownership, and `art_direction`. For standalone narrated work, put the complete candidate words in each scene's `narration_text` and keep pre-production audio at `owner:"none"`, `tracks:[]`, plus the selected `narration_intent`. For visual-only/SFX-only COMPOSE, keep `narration_text` empty and say at the gate that no voiceover will be generated. Do not create an audio file or a second structural contract yet.
+4. For standalone narration, run the free `composition.check_narration_fit` against that candidate manifest before opening Gate B. Open Gate B only when it returns `gate_b_ready:true`. Only `over` withholds it: revise the affected scenes' `narration_text` to the returned `suggested_units`, then run the free check again without asking the user. `under` means narration finishes before the clip does, which is an accepted delivery — carry it into Gate B as planned and pad it only when the trailing silence is not the edit you intended. After a measured TTS mismatch, the check automatically uses the persisted voice/speed calibration; never let a later generic estimate reverse that measured recommendation. This is an internal timing repair, not a new creative gate: when the free check returns `approval_inherited:true` and `gate_b_required:false`, the native state has carried the existing Gate B approval to the bounded revision, archived stale audio, and returned to `manifest_ready`; call `composition.prepare` and continue without showing Gate B again. If it returns `repair_authorization_status:"rejected"`, only then treat the change as a new plan requiring Gate B. After two non-converging free checks, stop repeating the same wording strategy, diagnose the measured difference, make a materially different timing-focused edit within the authorized scope, and recheck. Never open Gate B or send another speech request merely because the prior timing edits did not converge.
+5. On every new/resumed production turn, call canonical `composition.status`; if files and recorded evidence disagree, pass that evidence through `gate-control` and follow the returned recovery. Gate B identity is the normalized approved-intent hash, not the raw hash of `composition-manifest.json`: raw script/manifest hashes remain artifact and concurrency evidence, while implementation-only `art_direction`, formatting, HTML, CSS, SVG, and motion edits create a new candidate without reopening Gate B. Only a changed approved-intent hash is a plan amendment. Once the plan signature is current, run canonical `composition.doctor` before any paid operation and fix missing required capabilities, then call `composition.prepare`. `doctor` reports this MACHINE's capabilities (bundled ffmpeg, speech runtime); its answer cannot change because a plan was re-signed or a file was edited, so run it once per turn and never repeat it after an amendment or a QA repair. `stage` and `next_allowed_ops` are compatibility hints, not an operation whitelist; native operations enforce their own current-fact preconditions. If standalone narration is needed, call `composition.materialize_narration` after prepare and before presenting a complete draft or final delivery — the Narration / audio track section below owns what that operation does, what it preserves, and how its failures are handled.
 
-On repeated user revisions, preserve the complete accepted delta chain. If
-revision 2 shortens scene 2 and revision 3 changes scene 5, revision 3 must
-contain both changes; do not rebuild from revision 1 or silently drop the
-earlier edit. After every changed signature, rerun inspect/snapshot against
-the complete composition, review every new `frame_paths` entry, and publish
-the new full contact sheet. The user-visible preview must come from the
-current candidate's locators and must identify its current revision; never
-reuse an earlier contact sheet or present `first_frame` as the whole preview.
-Only that current candidate may open or consume Visual preview confirmation.
-A delayed reply or old-session form that refers to a superseded preview is
-acknowledged but not applied; show the latest contact sheet and keep its
-decision pending.
+6. Model-author the visual content, CSS, SVG, and deterministic tweens inside the prepared scaffold, following `frontend-design`'s discipline and the `art_direction` you already wrote: confirm the visual identity, cover, any `reference_fidelity` contract and `VisualDirectionV1`, author each scene's resolved frame first, then add GSAP entrances into that layout. The HTML visual quality floor below states the render-contract rules this step must satisfy. An incomplete visual snapshot may be produced and revised while narration recovery is pending — visual work, lint, inspect, snapshot and preview revision all continue; keep the candidate explicitly incomplete. Required narration blocks only a complete draft/final delivery, not inspection or editing. Keep each scene's tweens inside its scaffold `// ORKAS-SCENE-MOTION-BEGIN:<scene-id>` … `END` block and target only elements inside that scene's own section. This is attribution, not a gate: code outside the blocks or cross-scene targets still render and pass QA, but they mark the composition non-attributable, so unchanged scenes lose incremental-render reuse and every visual edit re-renders the full video.
 
-The same rule applies after a draft: a visual-only edit preserves the signed
-plan, narration, assets, and unaffected scene work, but creates a new preview
-candidate, then a new complete draft. A script, timing, language, narration,
-source, or reference-contract change returns through the signed-plan
-amendment path. Final video confirmation and export always bind to the latest
-complete draft signature; an older draft approval cannot authorize the new
-draft.
-6. Open the HTML Preview Gate before rendering when target duration >= 20s or scene count >= 3; the native tool enforces this so short multi-scene work cannot pass only structural QA. Also use it for shorter work when render rework is likely expensive because of dense text, complex SVG/GSAP, many branded/supplied assets, or a prior draft failure. Skip it only for genuinely short/simple work: target duration < 20s, scene count <= 2, no narration/timing complexity, and no obvious visual-risk signal.
-7. If HTML preview evidence is required, run `composition.inspect` and `composition.snapshot` to `project/composition/preview/first-frame.png`. Snapshot runs the same fail-closed preflight first, captures at least one semantic midpoint for every scene plus hook/payoff evidence, and returns distinct `first_frame`, raster `contact_sheet`, and `frame_paths` fields. The published contact sheet must contain every recorded frame in one visible image; `first_frame` is compatibility/cover evidence and must never be presented as if it were the complete preview. Before handing readiness to `gate-control`, read `composition-design-review`, inspect every returned frame path at usable scale, compare concrete references side-by-side when `reference_fidelity` exists, and call `composition.submit_design_review` with the complete `reviewed_frame_paths` list plus `quality_scores`. `cover_communication` is always scored; `reference_fidelity` is additionally scored for concrete visual references and must meet the manifest threshold. The contact sheet is an index, not a substitute for checking individual frames. Collect all visible blockers across all frames before editing; submit one `repair` verdict, make one batched localized repair, then rerun inspect/snapshot and review the complete new frame set. A failed result may publish its contact sheet and findings only as the current unapproved candidate; only a scored `passed` result opens the Preview Gate and authorizes progress toward a complete draft. On native failure, use `preview_qa`, `frame_evidence`, or `findings_path`; never retry the same signature. Pass the final readiness/error result and any later user decision to `gate-control`, then perform only its returned edit, reconcile, QA, or production operation.
-8. Run `composition.draft`. The production path reuses the canonical manifest, fail-closed preflight, runtime seek probe, render, audio/media QA, semantic sampled-frame QA, and one report. Structural errors never spend a full-render attempt.
-9. If draft fails, repair the highest structural source (`composition-manifest.json` first, then its art direction/mapped content, then visual HTML). Do not repeat a draft for the same input signature; use the returned evidence, make a materially different canonical edit, run cheap checks, and retry after the signature changes. Internal retry limits never create a user confirmation.
-10. After draft, keep native render-specific QA—encoding, media duration, audio stream/loudness, semantic frame coverage, blank/frozen frames, and timing. When the result says `design_review_inherited_from_preview:true`, do not repeat static layout review; proceed when `gate_d_ready:true`. Only when preview was skipped and draft returns `design_review_required:true`, use `composition-design-review` as the fallback, inspect its evidence, and submit a structured verdict. A fallback `repair`/`blocked` verdict is signature-bound: repair, reconcile, and render a new draft before it can pass. A successful draft or pending internal design review is not terminal: keep the production step in progress and never close with only the draft link. When `gate_d_ready:true`, freeze the manifest, HTML, assets, and narration; show the existing draft mp4 plus the QA headline and pass that readiness state to `gate-control` so it opens Final video confirmation.
+   Then run `composition.inspect`. If it reports blocking design-contract errors, repair every one of them in one message — they are independent findings, and fixing them one per message spends a full round trip each — starting from the manifest art direction, then rerun inspect once before snapshot or draft. A failed inspect can still carry layout evidence: when it returns `runtime_probe_ran:true` the page was measured despite the block, so repair those findings in the same pass instead of waiting for the next cycle. Advisory (`warning`) findings are read and judged, never repaired in a loop — taste checks such as casing style, cover composition, thesis specificity and reference ambition report without blocking, so weigh them against the frames and move on. Only `error` findings stop the line. Retry only after the canonical manifest or HTML signature changes; at most two distinct repair passes across the shared inspect/snapshot cycle, and advisory or duplicated findings do not consume one. `E_INSPECT_RETRY_NO_CHANGE` blocks only the unchanged probe; `E_INSPECT_ALREADY_PASSED` means follow the prior next action. A non-converging cycle follows the exhausted-cycle rule above. Never install dependencies or start a browser, HTTP server, watcher, Puppeteer, Playwright, or headless Chrome for QA — native `video_studio` operations own that runtime — and never recreate root timing, media playback, vendor setup, or timeline registration with ad-hoc code. QA repair is internal work and never creates a technical user gate.
 
-The default path is **candidate script/shotlist/manifest -> free calibrated narration fit -> one Gate B -> artifact signature -> doctor -> native scaffold -> recoverable narration materialization (when needed) -> VisualDirectionV1 and visual identity check -> resolved-frame HTML authoring -> GSAP motion into those layouts -> per-scene preview/draft evidence**. `VideoProductionStateV1` is the durable domain-state source for this sequence; Agent plan/completed-work state stores its state reference/revision and must call status/reconcile rather than inventing or skipping a VideoStudio stage. Do not write or compile `spec.json`; fixed visual templates are not part of the COMPOSE path because visual quality and extensibility still belong to the model.
+   Treat each returned `current_candidate.revision_id` as an immutable content snapshot: edits create a new candidate instead of overwriting the meaning of a previous preview or approval. Canonical files resolve from their recorded path-and-hash facts, so the private content-addressed snapshot path is storage evidence, not an edit target. A failed inspect, snapshot, or draft still returns the current candidate — present its contact sheet, frame, draft, or findings as "current version, not yet approved" and continue repair. On repeated user revisions preserve the complete accepted delta chain: if revision 2 shortened scene 2 and revision 3 changes scene 5, revision 3 carries both. After every changed signature rerun inspect/snapshot over the whole composition, review the newly attached complete contact sheet and only its QA-named or visibly risky `frame_paths`, and publish only the current candidate's locators — never an earlier contact sheet, and never `first_frame` as if it were the whole preview.
+
+7. Open the HTML Preview Gate before rendering when target duration >= 20s or scene count >= 3; the native tool enforces this so short multi-scene work cannot pass only structural QA. Also use it for shorter work when render rework is likely expensive because of dense text, complex SVG/GSAP, many branded/supplied assets, or a prior draft failure. Skip it only for genuinely short/simple work: target duration < 20s, scene count <= 2, no narration/timing complexity, and no obvious visual-risk signal.
+8. If HTML preview evidence is required, run `composition.inspect` and `composition.snapshot` to `project/composition/preview/first-frame.png`. Snapshot runs the same fail-closed preflight first, captures at least one semantic midpoint for every scene plus hook/payoff evidence, and returns distinct `first_frame`, raster `contact_sheet`, and `frame_paths` fields. The published contact sheet must contain every recorded frame in one visible image; `first_frame` is compatibility/cover evidence and must never be presented as if it were the complete preview. Before handing readiness to `gate-control`, read `composition-design-review` and run your own frame pass economically: read the contact sheet as the complete index, then open at full scale only the frame-0 cover, every frame a QA finding names, and frames whose sheet cell shows risk (dense or doubtful text, suspected overlap or blankness); compare concrete references side-by-side when `reference_fidelity` exists. Reading every frame file individually costs minutes per pass and repeats what deterministic QA already sampled — drill in where evidence points, not everywhere. The review is advisory: nothing is submitted to the host, and the host publishes the contact sheet with the passing snapshot. Collect all visible blockers across all frames before editing, make one batched localized repair, then rerun inspect/snapshot and re-check the complete new frame set; when the frames read well, the preview review is already open. On native failure, use `preview_qa`, `frame_evidence`, or `findings_path`; never retry the same signature. Pass the final readiness/error result and any later user decision to `gate-control`, then perform only its returned edit, reconcile, QA, or production operation.
+9. Run `composition.draft`. The production path reuses the canonical manifest, fail-closed preflight, runtime seek probe, render, audio/media QA, semantic sampled-frame QA, and one report. Structural errors never spend a full-render attempt.
+10. If draft fails, repair the highest structural source (`composition-manifest.json` first, then its art direction/mapped content, then visual HTML). Do not repeat a draft for the same input signature; use the returned evidence, make a materially different canonical edit, run cheap checks, and retry after the signature changes. Internal retry limits never create a user confirmation.
+11. After draft, keep native render-specific QA—encoding, media duration, audio stream/loudness, semantic frame coverage, blank/frozen frames, and timing. Do not repeat static layout review after rendering; proceed when `gate_d_ready:true`. A successful draft is not terminal: keep the production step in progress and never close with only the draft link. When `gate_d_ready:true`, freeze the manifest, HTML, assets, and narration; show the existing draft mp4 plus the QA headline and pass that readiness state to `gate-control` so it opens Final video confirmation.
+
+The default path is **direction stop -> candidate manifest -> free calibrated narration fit -> one Gate B -> artifact signature -> doctor -> native scaffold -> recoverable narration materialization (when needed) -> VisualDirectionV1 and visual identity check -> resolved-frame HTML authoring -> GSAP motion into those layouts -> per-scene preview/draft evidence**. `VideoProductionStateV1` is the durable domain-state source for this sequence; Agent plan/completed-work state stores its state reference/revision and must call status/reconcile rather than inventing or skipping a VideoStudio stage. Do not write or compile `spec.json`; fixed visual templates are not part of the COMPOSE path because visual quality and extensibility still belong to the model.
 
 ## How to call the render path
-
-Use the Orkas-native tool call:
 
 ```json
 {"op":"composition.draft","composition_dir":"project/composition","output_path":"project/render/draft.mp4","quality":"draft","report_path":"project/render/draft-report.json","findings_path":"project/composition/qa/inspect.json"}
 ```
 
-The tool returns JSON. A tool error means a structural/render-safety issue or Orkas runtime issue must be fixed before continuing.
-For draft output, the report includes contract/source alignment, lint, inspect, media probe, loudness, audio timing, video-frame QA, real render throughput, optional visual-regression status, and compact `design_review_inputs`. Video QA samples the first frame and scene starts/mids so an empty hook frame, blank scene boundary, or long frozen sampled run blocks Gate D. It also writes a contact sheet and per-sample evidence frames for design review when available.
-Use the draft command's lint and inspect gates before rendering. Lint blocks render-contract errors such as unregistered timelines, missing clip timing, invalid root timing, and imperative media control. Semantic visual defects on readable content—small text, overflow, occlusion, overlap, low contrast, safe-area violations, and primary elements outside canvas—are blockers. Decorative out-of-canvas accents plus palette/layout-variety findings remain advisory design feedback.
-When using `findings_path`, the full QA payload is saved to disk; read the file only when the summary points to a specific issue that needs detail.
-Stop and repair when `draft_disposition.blocking_error_count > 0`, lint/contract/audio/source/video QA fails, or the renderer cannot produce media. A passed approved-preview review is inherited, so do not repeat static layout review after rendering. Only when preview was skipped and the draft requests fallback design review must that verdict pass before Gate D; advisory-only palette/variety findings travel in the Gate D note.
+Draft runs lint and inspect before rendering, then reports contract/source
+alignment, media probe, loudness, audio timing, video-frame QA, render
+throughput, and optional visual-regression status, writing a contact sheet and
+per-sample evidence frames. Lint blocks render-contract errors — unregistered
+timelines, missing clip timing, invalid root timing, imperative media control.
+Semantic defects on readable content (small text, overflow, occlusion,
+overlap, low contrast, safe-area violations, primary elements outside canvas)
+are blockers; decorative out-of-canvas accents and palette/variety findings are
+advisory. Video QA samples frame 0 and each scene start/mid, so an empty hook
+or blank scene boundary blocks Gate D; a frozen sampled run blocks earlier, at
+the visual preview, because a motionless stretch is invisible in a contact
+sheet. With `findings_path` the full payload goes to disk — read it only when
+the summary points at a specific issue. Stop and repair when
+`draft_disposition.blocking_error_count > 0` or any of those QA phases fails.
 
-Raw `composition.render` is not exposed to the agent because it would bypass video QA. Give the frozen draft signature and user submission to `gate-control`; only an export transition returned by that policy may call the QA-gated high export:
+Raw `composition.render` is not exposed: it would bypass video QA. Give the
+frozen draft signature and the user's submission to `gate-control`; only an
+export transition it returns may call the QA-gated high export:
 
 ```json
 {"op":"composition.export","composition_dir":"project/composition","output_path":"project/render/final.mp4","report_path":"project/render/final-report.json"}
 ```
 
-`composition.export` is allowed only when the composition inputs still match the successful draft and the native approval state is current. It reruns render, media QA, and video-frame QA at high quality, exports the exact frame-0 cover beside the video as `<video-name>-cover.png`, then returns `next_action: "deliver_final"`. The system publishes both the mp4 and its cover; the final response must include the video and mention the cover artifact, or a clear blocker.
-
-For an export authorized by `gate-control`, call `composition.export` once and let the host choose the highest safe fps for the current machine; a `render_profile.degraded_fps` fallback is internal execution, has `confirmation_required:false`, and must continue directly to delivery. Never modify `composition-manifest.json`, call `composition.reconcile`/`composition.draft`/`composition.snapshot`, or reopen Preview/Gate D solely because the host lowered fps or another non-content encoder setting. Set `strict_render_settings:true` only when the user explicitly required exact technical settings. If strict settings or an extremely heavy composition have no safe fallback, report the export constraint as a blocker without inventing another content approval gate.
+Export is allowed only while the inputs still match the successful draft and
+the native approval is current. It reruns render, media and frame QA at high
+quality, writes the frame-0 cover beside the video as `<video-name>-cover.png`,
+and returns `next_action:"deliver_final"`; the final response must include the
+video and mention the cover, or a clear blocker. Call it once and let the host
+pick the highest safe fps; a `render_profile.degraded_fps` fallback is internal execution with `confirmation_required:false`, and continues straight to delivery. Never modify `composition-manifest.json`, call `composition.reconcile`/`composition.draft`/`composition.snapshot`, or reopen Preview/Gate D because the host lowered fps or another non-content encoder setting. Set
+`strict_render_settings:true` only when the user required exact technical
+settings; if that leaves no safe fallback, report the constraint as a blocker
+rather than inventing another approval gate.
 
 ## HTML Preview Gate
 
-Use the HTML Preview Gate to avoid expensive mp4 rerenders when visual rework is likely. It is a cost-control gate, not a new creative milestone, and it is only for the COMPOSE line. Decide from expected rework cost:
-
-- **Preview first (hard gate)** when duration >= 20s or scene count >= 3. `composition.draft` rejects missing, stale, failed, or not-explicitly-approved previews.
-- **Preview first** for shorter pieces with dense text, multiple chapters, supplied/brand assets, complex SVG/GSAP motion, tight narration timing, or a prior draft/repair failure.
-- **Skip preview** only when duration < 20s, scene count <= 2, and the HTML is simple enough that rendering the draft is cheaper than asking for another confirmation.
-- Do not use product/promo/version-update labels alone as the trigger. Those labels only contribute to risk when the piece is long, visually dense, or expensive to rerender.
-
-When preview is triggered:
-
-1. Run inspect and write findings:
+A cost-control gate, not a creative milestone, and only for COMPOSE: it exists
+so visual rework happens before an expensive mp4 rerender. **Preview first (hard gate)** when duration >= 20s or scene count >= 3 — the host enforces it, and `composition.draft` rejects a missing, stale, failed, or not-yet-approved preview. Runbook step 6 owns the judgement calls below that threshold.
 
 ```json
 {"op":"composition.inspect","composition_dir":"project/composition","findings_path":"project/composition/qa/inspect-preview.json"}
-```
-
-2. Run the keyframe snapshot. `output_path` remains the first-frame PNG for compatibility; the result also contains a contact sheet and semantic evidence for every scene:
-
-```json
 {"op":"composition.snapshot","composition_dir":"project/composition","output_path":"project/composition/preview/first-frame.png"}
 ```
 
-3. Read `composition-design-review`, inspect every path in `frame_paths`, and submit one complete verdict with the exact `reviewed_frame_paths`. Do not expose the preview while this internal review is pending. If any frame has a blocker, list all blockers found across the full set, repair them together, then rerun inspect + snapshot; a changed snapshot requires review of its full new frame set.
+`output_path` stays the first-frame PNG for compatibility; the result also
+carries the contact sheet and semantic evidence for every scene. Run the
+economical frame pass from step 7, repair all blockers together, and rerun
+inspect + snapshot — a changed snapshot requires re-checking its full new frame
+set. When the frames read well, hand `gate-control` the published contact
+sheet, the `index.html` path, and a compact readiness note: why preview applied
+(duration / scene count / complexity / prior failure), the inspect headline,
+and what approval means (render the mp4 draft next). Then obey the transition
+it returns. Keep preview revisions lightweight; do not synthesize new narration or render mp4 while the preview artifact is still under review.
 
-4. Only after `composition.submit_design_review` returns `preview_gate_ready:true`, hand `gate-control` the now-published contact sheet, the `index.html` path, and a compact readiness note:
-   - reason for preview: duration / scene count / complexity / prior failure
-   - inspect headline: blocking count or main advisory
-   - what approval means: render mp4 draft next
+Use `update_visual_baseline:true` only when the user or an explicit project
+workflow promotes an approved preview to a golden baseline; later snapshots
+compare matching frames and report changes as advisories, never as an automatic
+rerender loop.
 
-5. After the user responds, obey the edit or production transition returned by `gate-control`. Keep preview revisions lightweight; do not synthesize new narration or render mp4 while the preview artifact is still under review.
-
-Use `update_visual_baseline: true` only when the user or an explicit project workflow promotes an approved preview to a golden baseline. Later snapshots/drafts compare matching sampled frames and report changes as advisories; baseline drift never starts an automatic rerender loop.
-
-The HTML Preview Gate does not replace the mp4 draft. It cannot validate audio muxing, final encoded video quality, sampled-frame video QA, or exact narration pacing. After approval, always run `composition.draft` and open Gate D with the video.
+The preview does not replace the mp4 draft — it cannot validate audio muxing,
+final encoded quality, sampled-frame video QA, or exact narration pacing. After
+approval, always run `composition.draft` and open Gate D with the video.
 
 ## Canonical composition manifest
 
@@ -238,7 +218,7 @@ Write `project/composition/composition-manifest.json` before `composition.prepar
 
 This is the planned pre-production form. Gate B signs `narration_intent`; `composition.materialize_narration` reads it without execution-time overrides, changes `audio.owner` to `composition`, writes the narration track, preserves the intent, and replaces estimated timing with measured timing. Schema version 1 is accepted only for legacy recovery.
 
-Every scene needs canonical numeric `start` and `duration`; do not invent `start_s`/`duration_s`. Use `source_shots` for approved-shot mapping and `narration_text`/`narration_refs` for voice alignment. A manifest reference may use the approved `shot.id` or a source alias uniquely owned by that shot through `shot.source_shots`; native QA and Gate B content addressing canonicalize those two representations to the same approved beat. Do not rewrite a unique alias merely to satisfy QA or reopen Production plan confirmation. An unknown alias or one owned by multiple shots is a real mapping error and must be repaired from the explicit native evidence. Use audio owner `assembler` for AUTO segments that must render silent.
+Every scene needs canonical numeric `start` and `duration`; do not invent `start_s`/`duration_s`. Use `source_shots` to name the approved beat each scene renders and `narration_text`/`narration_refs` for voice alignment. Those ids are canonical — with no shotlist to alias them, a `source_shots` change is a change of approved intent and reopens the plan confirmation. Use audio owner `assembler` for AUTO segments that must render silent.
 
 `composition.materialize_narration` writes `project/composition/narration-map.json` automatically from the measured audio and approved per-scene narration. For externally supplied narration only, provide a compatible map before draft:
 
@@ -264,7 +244,7 @@ Author visual DOM inside the generated scene roots and add motion to `window.__O
 - **Scenes**: declare one canonical scene window per storyboard beat in the manifest. Do not independently retime generated clip attributes.
 - **On-screen text**: keep it inside the frame with padding; large, high-contrast type; one idea per scene.
 - **Assets**: reference images/footage produced upstream by relative path inside the composition dir (e.g. `./assets/shot1.png`).
-- **Timing**: position every tween on the generated paused GSAP timeline with an explicit time; manifest duration is final.
+- **Timing**: position every tween on the generated paused GSAP timeline from the scaffold's `S("<scene-id>")`, never a literal second (see the render contract below); manifest duration is final.
 - **SVG-first visual layer**: prefer inline SVG for non-text motion graphics such as diagrams, connectors, nodes, progress paths, charts, orbit lines, icon-like marks, and background geometry. Keep readable prose in normal HTML text boxes unless the SVG text is large, simple, and verified.
 - **Use GSAP only when time-based motion is needed**: static SVG, CSS layout, and simple held states do not need GSAP. When animation is needed, keep GSAP as the timeline/orchestration layer that animates SVG groups or a small set of HTML containers. Do not build dozens of absolutely positioned HTML nodes/cards/lines when one SVG graph can carry the visual.
 - **No remote runtime resources**: `index.html` must not load CDN scripts, remote fonts, remote images, or remote CSS during render. Fetch or copy required runtime files into `project/composition/assets/` during authoring, then reference them with relative paths such as `./assets/vendor/gsap.min.js`. Draft QA blocks `http://` and `https://` references.
@@ -272,105 +252,140 @@ Author visual DOM inside the generated scene roots and add motion to `window.__O
 
 ## HTML visual quality floor
 
-The common failure mode is technically valid HTML that looks like a low-effort web mockup. Before writing code, convert the approved beat into a video-frame grammar:
+The common failure mode is technically valid HTML that looks like a low-effort
+web mockup. `frontend-design` owns the cure — scene grammar, depth, type
+register, anti-template defaults — and you have already written it into
+`art_direction`. Author from that contract. Four rules belong to the render
+contract itself and are enforced here:
 
-- Pick one scene grammar from the brief: full-bleed object/texture, kinetic typography, diagram build, data mark, map/flow, editorial argument, product surface, or before/after comparison. Do not default to a centered card, bento grid, purple/blue gradient, or generic SaaS dashboard.
-- Design frame 0 as a dedicated cover with its own manifest contract: one approved headline, one dominant hero, and at least two concrete signals of what the viewer will learn or see. A beautiful generic title card fails when it could front an unrelated video. Put `data-role="visual" data-cover-hero` on the topic-specific dominant visual group and `data-cover-signal="<exact content_signals value>"` on at least two matching visible elements; generic backgrounds, decoration, and the title do not qualify. Native QA compares those visible frame-0 hooks and hero bounds with `art_direction.cover`. Do not tween the entire first scene from opacity zero or start with a blank fade-in unless the user explicitly asked for that.
-- Use one dominant visual plus one readable text zone per scene. Give the frame a topic-derived background field, a meaningful midground, and foreground accents/metadata so the composition has depth rather than a small cluster in a large empty canvas. If the beat needs three or more text zones, split the scene or turn details into SVG labels/diagram nodes.
-- Author opening, explanation, and resolved states before writing tweens. Build the resolved composition first, then reveal or transform only the structures that communicate the beat; a container fade is not a scene idea.
-- Reuse one content-specific carrier across adjacent scenes when possible, transforming it between document, path, chart, interface, map, or convergence states instead of resetting to a title slide.
-- Give every scene a different framing move or visual state. Three consecutive title/card/list scenes with only copy changes is a design failure, even when it renders correctly.
-- Keep text in real HTML, but give important elements QA hooks such as `data-scene-id` on scene clips and `data-role="title|body|label|caption|visual"` on major text/visual groups.
-- Use SVG for the signature device and meaningful structure. Rows of identical cards, tiny badges, and decorative boxes are not a substitute for a visual idea.
-- Let the contract's colors and type roles drive CSS variables. Extra colors are allowed only when they carry brand, hierarchy, data meaning, or scene variation.
+- **Every composition must render something at t=0** — each AUTO segment too,
+  not just the cover. Native QA samples frame 0 of every composition it checks,
+  so a scene tweened from `opacity: 0` or opened with a fade-in captures blank
+  and returns `EMPTY_HOOK_FRAME` plus `EXPECTED_SCENE_NOT_VISIBLE`. In an
+  assembled video a blank first frame is also a visible gap at the cut. Author
+  the resolved frame first and animate FROM a visible state — the scene AND the
+  elements carrying its cover: a container that renders while its
+  `data-role="title"` starts at `opacity: 0` returns
+  `HOOK_PROMISE_NOT_VISIBLE`. A deliberate fade-from-black opening is the one
+  exception and needs the user to have asked for it.
+- **Frame 0 of the delivered opening is a dedicated cover**: one approved
+  headline, one dominant hero, and at least two concrete signals of what the
+  viewer will learn. Put `data-role="visual" data-cover-hero` on the
+  topic-specific dominant group and render at least two `content_signals` as
+  visible frame-0 copy (`data-cover-signal="<value>"` when the element carries
+  no readable text of its own). A signal that only restates the headline is not
+  a second signal.
+- **Give QA its hooks**: `data-scene-id` on scene clips and
+  `data-role="title|body|label|caption|visual"` on major text/visual groups.
+  Keep readable text as real HTML text, not baked into images.
+- **Never write a timeline position as a literal second.** Scene visibility is
+  runtime-owned — leave it alone — and position every tween you author from the
+  scaffold helpers `S("<scene-id>")`/`D("<scene-id>")`, which read that
+  section's `data-start`/`data-duration`. The narration audio is measured after
+  you author, a retry can reach that step on an already-authored file, and
+  every scene window shifts then, so a literal plays against the wrong scene.
+  `inspect` returns `AUTHORED_ABSOLUTE_TIMELINE_SECONDS` with the line and the
+  `S()` expression that replaces it.
 
-Native QA blocks semantic readability failures including small text, unsafe text, overflow, overlap, occlusion, clipping, and low contrast. Thin art direction, repeated layout grammar, one-note palettes, and decorative complexity remain advisories unless design review ties them to a concrete broken promise.
+Native QA blocks semantic readability failures: small text, unsafe text,
+overflow, overlap, occlusion, clipping, low contrast. Thin art direction,
+repeated layout grammar, one-note palettes, and decorative complexity remain
+advisories unless they break a concrete approved promise in a specific frame.
 
 ## Manifest art direction before HTML
 
 Before styling the generated scaffold, write `art_direction` inside `project/composition/composition-manifest.json`. It is an internal visual contract, not a user gate and not a second structural artifact.
+
+`frontend-design` owns this contract's field list and the pre-code anti-template check that must run before any HTML is written — name the first generic design move you rejected and the brief-specific replacement; if you cannot name that replacement, the contract is not ready. It catches the lazy defaults before HTML: purple/blue neon, glowing black-background circles, centered equal-weight layouts, identical cards, decorative emoji/icons, tiny badges, web-dashboard fragments, pure black/white, and web-scale type. When `style_source` exists, also name what was adapted, simplified, and not copied. Its field list — `aesthetic`,
+`visual_direction` (VisualDirectionV1), `cover`, `typography_tokens`, `anti_template_check` (legacy `anti_template` is still accepted by native QA, but new manifests write the longer name),
+`color_tokens`, per-scene `depth_layers`/`motion_verbs`, and the rest — is
+written from that skill, not from a second copy here. Two additions this line
+owns:
+
+- `style_source`: from `design-system-importer` when a DESIGN.md, brand guide,
+  screenshot, reference site, Figma notes, existing app UI, or explicit named
+  style was used. Omit when there is no external style source.
+- `references` + `reference_fidelity`: required for every concrete reference image or video. Declare each item's `media_type`, reproduce/edit/guide `intent`, user/inferred `intent_basis`, roles, composition-local `path`, required state, `preserve`/`may_change`, and target scenes; explicit user requirements override defaults, and an unspecified reference defaults to `intent:guide,intent_basis:inferred`. Composition/structure roles need normalized `layout_anchors`; video reproduce/edit/motion/timing roles need source-time-to-target-scene `temporal_anchors`. Declare `mode:exact|close|adapt` and `verification.minimum_score`; exact mode preserves at least three axes with a score floor of at least 85.
 
 ## Video language vs chat language
 
 Keep two language concepts separate:
 
 - **User UI language** comes from system context. Use it for chat replies, gate summaries, status text, form labels, and any explanation addressed to the user.
-- **Video language** comes from the VideoStudio `language` input and `manifest.composition.language`. It is the primary language for the deliverable: Gate B script/shotlist content, `approved_copy`, `narration_text`, captions, titles, subtitles, CTAs, and visible HTML text.
+- **Video language** comes from the VideoStudio `language` input and `manifest.composition.language`. It is the primary language for the deliverable: Gate B script and manifest content, `approved_copy`, `narration_text`, captions, titles, subtitles, CTAs, and visible HTML text.
 
-Use the video language locked during direction confirmation under `gate-control`; do not infer a second default in this line skill. After direction confirmation locks video language, do not introduce bilingual copy unless the user explicitly requested it or approved it with the production plan. Proper nouns, product/model/API names, code identifiers, and non-approved decorative texture text may remain in their original language. If the user deliberately selects English in a Chinese UI, explain the plan in Chinese while making the video copy English. If the selected video language is Chinese, do not add unapproved decorative English HUD slogans merely to create a tech mood.
+Use the video language locked at the plan confirmation under `gate-control`; do not infer a second default in this line skill. After the plan confirmation locks video language, do not introduce bilingual copy unless the user explicitly requested it or approved it with the production plan. Proper nouns, product/model/API names, code identifiers, and non-approved decorative texture text may remain in their original language. If the user deliberately selects English in a Chinese UI, explain the plan in Chinese while making the video copy English. If the selected video language is Chinese, do not add unapproved decorative English HUD slogans merely to create a tech mood.
 
-The contract must declare these budgets compactly:
-- `aesthetic`: from `frontend-design`: subject world, audience, one job, tone, signature device, aesthetic risk, and `anti_template_check` (legacy `anti_template` is accepted by native QA, but new manifests should write `anti_template_check`).
-- `visual_direction`: `VisualDirectionV1` from `frontend-design`: real design tradition/reference, composition behavior, lazy defaults rejected, video scale, depth-layer rule, motion-verb rule, typography register, and rhythm pattern. This is the P0/P1 front-loaded aesthetic director for HTML authoring, not a fixed template.
-- `style_source`: from `design-system-importer` when a DESIGN.md, brand guide, screenshot, reference site, Figma notes, existing app UI, or explicit named style was used. Omit when there is no external style source.
-- `cover`: `{scene_id, headline, content_signals, hero_visual, composition_strategy, frame_time_sec:0}`. `scene_id` must be the first canonical scene and `headline` must already be approved scene copy. `content_signals` names at least two visible topic-specific objects, results, or relationships that make the cover truthful without audio.
-- `references` + `reference_fidelity`: required for every concrete reference image or video. Explicit user requirements override defaults; an otherwise unspecified reference safely defaults to `intent:guide,intent_basis:inferred`. Declare each media item's `media_type`, reproduce/edit/guide `intent`, user/inferred `intent_basis`, roles, composition-local `path`, required state, `preserve`/`may_change`, and target scenes. Composition/structure roles require normalized `layout_anchors`; video reproduce/edit/motion/timing roles require source-time-to-target-scene `temporal_anchors`. Declare `mode:exact|close|adapt` and `verification.minimum_score`; exact mode preserves at least three axes and uses a score floor of at least 85. Origin or authoring format does not change this contract.
-- `scenes`: visual focus and layout type only. Structural start/duration, approved copy, source shots, and narration refs stay exclusively in the manifest. Designed scenes may include `scene_world`, `hero_visual`, `composition`, `depth_layers`, `motion_verbs`, `opening_state`, `resolved_state`, `continuity_in`, `continuity_out`, and selected `primitive_refs`.
-- `layout_boxes`: safe text box, visual box, caption box, and maximum label count per scene.
-- `typography_tokens`: title/body/caption/label floors plus type roles and register. Default floors for 1920x1080: title >=72px, body/supporting text 28-42px, label/caption 18-26px, safe margin >=96px, no more than two text blocks and about 12-16 English words per scene. Preserve the same readability intent for 9:16 and 1:1. Preserve approved English casing: sentence/natural title case for titles and sentence case for body, captions, subtitles, and CTAs. Existing all caps may remain only when that exact casing appears in approved user copy or an external brand/source, and then only for one short metadata label, acronym, or code. A model-authored art direction, design tradition, typography register, or generic tech/editorial mood never authorizes converting copy to all caps; never use a broad `text-transform: uppercase` rule. Avoid default two-sans pairings unless the external style source explicitly requires them; use scale, weight, width, color, spacing, mono/data roles, or serif/sans contrast to make hierarchy visible while preserving approved casing.
-- `color_tokens`: named baseline values with rationale: background, surface, text, muted, primary accent, and any purposeful supporting accents the approved visual idea needs.
-- `motion_budget`: max animated groups per scene, allowed transitions, easing, rhythm pattern, which SVG/HTML groups move, what each motion communicates, and the concrete motion verbs assigned to primary elements.
-- `scene_variation`: how the sequence avoids three near-identical layouts, transitions, or card/title scenes in a row.
 
-The palette is a design contract, not a mechanical hue cap. The HTML/CSS/SVG should derive its main system from `color_tokens` through CSS variables or equivalent structured constants, but do not flatten or recolor a scene just to reduce a static color count. Add purposeful local colors when they improve hierarchy, brand fidelity, data meaning, or scene variation, and keep them named or easy to audit.
+The unified preflight enforces the manifest, scaffold, and art direction before snapshot or rendering. It blocks when `composition-manifest.json` is missing, unversioned, invalid, overlapping, or incomplete; when `manifest.art_direction` lacks the preview-required aesthetic thesis, dedicated cover contract, `VisualDirectionV1`, motion budget, scene variation budget, per-scene depth layers, or per-scene motion verbs; when a concrete reference lacks a local executable fidelity contract, its source asset is missing, or an exact reference declares an inadequate preservation floor; when root/scene/audio attributes differ from the canonical manifest; when scene timing falls outside the composition duration or overlaps unintentionally; when declared scene headline/title/on-screen copy is missing from `index.html`; when HTML references a missing local asset, an absolute path, an asset outside the composition directory, or a remote runtime URL; or when HTML calls `gsap.*` without the generated local vendor and paused registered timeline, or controls media imperatively. It warns without blocking when scenes repeat the same layout grammar or the palette is one-note.
 
-The unified preflight enforces the manifest, scaffold, and art direction before snapshot or rendering. It blocks when:
-- `composition-manifest.json` is missing, unversioned, invalid, overlapping, or incomplete.
-- `manifest.art_direction` lacks the preview-required aesthetic thesis, dedicated cover contract, `VisualDirectionV1`, motion budget, scene variation budget, per-scene depth layers, or per-scene motion verbs needed to guide model-authored HTML.
-- A concrete reference lacks a local, executable fidelity contract; its source asset is missing; or an exact reference declares an inadequate preservation/review floor.
-- Root/scene/audio attributes differ from the canonical manifest.
-- Scene timing falls outside the composition duration or overlaps unintentionally.
-- Declared scene headline/title/on-screen copy is missing from `index.html`.
-- HTML references a missing local asset, an absolute path, an asset outside the composition directory, or a remote runtime URL.
-- HTML calls `gsap.*` without the generated local vendor/paused registered timeline, or controls media imperatively.
+Preserve approved English casing: sentence/natural title case for titles and
+sentence case for body, captions, subtitles, and CTAs. Existing all caps may
+remain only when that exact casing appears in approved user copy or an
+external brand/source, and then only for one short metadata label, acronym, or
+code. A model-authored art direction, design tradition, typography register, or generic tech/editorial mood never authorizes converting copy to all caps; never use a broad `text-transform: uppercase` rule.
 
-It warns, without blocking, when scenes repeat the same layout grammar or the palette is one-note. Sampled DOM findings on readable content—safe-zone, contrast, overlap, clipping, overflow, and small type—are blocking; decorative accents may extend outside canvas when clearly marked as non-semantic.
-
-Typography and layout budgets are binding for every readable element, including badges, pills, labels, captions, cards, nodes, and microcopy. Do not put long labels in circles or small decorative nodes; use larger cards, capsules, or nearby labels. If approved copy cannot fit safely, shorten on-screen text without changing meaning. Ask the user only when the message would change.
-
-Run a pre-code anti-template check from `frontend-design`: name the first generic design move you rejected and the brief-specific replacement. If you cannot name that replacement, the contract is not ready. The check should catch lazy defaults before HTML: purple/blue neon, glowing black-background circles, centered equal-weight layouts, identical cards, decorative emoji/icons, tiny badges, web-dashboard fragments, pure black/white, and web-scale type. When `style_source` exists, also name what was adapted, simplified, and not copied from the reference.
+Typography and layout budgets bind every readable element, including badges,
+pills, labels, captions, cards, nodes, and microcopy. Do not put long labels in
+circles or small decorative nodes. If approved copy cannot fit safely, shorten
+on-screen text without changing meaning; ask the user only when the message
+would change.
 
 ## Inspect and repair policy
 
-Before any user-facing HTML preview, complete snapshot design review across every returned frame. After preview approval (or when preview is legitimately skipped), run the draft command. If lint, contract/source/audio timing, media/video-frame QA, or inspect `draft_disposition.blocking_error_count` is not OK, repair once and run the draft command again. A second repair pass is allowed only when the remaining blockers are fewer and clearly localized. If the script returns `E_REPAIR_BUDGET_EXCEEDED`, do not delete the repair record or repeat the unchanged draft. Read the last error and evidence, make a materially different localized edit to the canonical manifest/HTML/assets, run the relevant cheap checks, and retry after the input signature changes. This is internal non-billable recovery and creates no user form.
+The draft repair budget mirrors the inspect/snapshot one: after a failing
+draft, repair once and re-run; a second pass only when the remaining blockers
+are fewer and clearly localized. `E_REPAIR_BUDGET_EXCEEDED` does not mean stop
+working — read the last error and evidence, make a materially different
+localized edit, run the cheap checks, and retry once the input signature
+changes. It blocks another draft for the same signature only, never editing,
+reconciliation, lint, inspect, or a later draft. Regenerating `index.html`
+counts as one strategy; do it only for a structural failure. If only visual
+advisories remain and draft returned `ok: true`, present the mp4 with QA notes
+instead of looping. This is internal non-billable recovery and creates no user
+form.
 
-Repairs should address the cause, not just the symptom:
-- `FONT_TOO_SMALL`: reduce text density, shorten copy, enlarge/reflow containers, or move labels out of small shapes. Do not simply increase every font size if that creates overflow.
-- `missing_timeline_registry`, `gsap_timeline_not_registered`: register a paused GSAP timeline on `window.__timelines[compositionId]`, using the exact root `data-composition-id`.
-  - `timed_element_missing_clip_class`, `root_composition_missing_data_start`, `media_missing_data_start`, `imperative_media_control`: let the renderer own timing and media playback through `data-start`, `data-duration`, `.clip`, and media data attributes. Do not drive render-critical timing with custom `play()`, `pause()`, `currentTime`, timers, or a custom `seekTo` API.
-- `text_occluded`, `text_box_overflow`, `content_overlap`: restructure the scene layout or regenerate the affected scene from the contract's boxes. Do not rely on small numeric nudges.
-- `STATIC_FRAME_RUN`: fix the timeline registration, scene clip timing, or scene variation; do not deliver a draft whose sampled frames are identical across multiple scenes.
+Repair the cause, not the symptom:
+- `FONT_TOO_SMALL`: reduce text density, shorten copy, enlarge/reflow
+  containers, or move labels out of small shapes — do not simply scale every
+  font up and create overflow.
+- `missing_timeline_registry`, `gsap_timeline_not_registered`: register a
+  paused GSAP timeline on `window.__timelines[compositionId]` using the exact
+  root `data-composition-id`.
+- `timed_element_missing_clip_class`, `root_composition_missing_data_start`,
+  `media_missing_data_start`, `imperative_media_control`: let the renderer own
+  timing and playback through `data-start`, `data-duration`, `.clip`, and
+  media data attributes — never custom `play()`/`pause()`/`currentTime`,
+  timers, or a `seekTo` API.
+- `text_occluded`, `text_box_overflow`, `content_overlap`: restructure the
+  scene layout or regenerate that scene from the contract's boxes; numeric
+  nudges do not fix it.
+- `STATIC_FRAME_RUN`: fix timeline registration, clip timing, or scene
+  variation; never deliver a draft whose sampled frames repeat across scenes.
 
-If repair makes blocking errors worse, or if structural/render-safety blockers remain after the allowed repair passes, stop repeating that repair strategy, preserve the evidence, and choose a materially different localized recovery. The limit blocks only another draft for the same input signature; it never blocks editing, reconciliation, lint, inspect, or a later draft after the inputs change. Regenerating `index.html` counts as one repair strategy; do it only when the failure is structural, not as an open-ended loop. If only visual advisories remain and `--op draft` returned `ok: true`, present the mp4 draft with QA notes instead of silently looping. Repair `composition-manifest.json`, its art direction, mapped content, or visual HTML directly; do not introduce `spec.json` as a workaround.
-
-Use `composition-design-review` before the Preview Gate whenever snapshot returns `preview_design_review_required:true`; inspect every returned frame path and submit the exact full path set. After draft, run it only as a fallback when the result still says `design_review_required:true`. A review blocker must be visible in a specific scene/frame and break readability, the approved promise, required brand/style tokens, motion timing, or asset safety. Treat minor polish as Gate D notes, but never skip a required structured verdict.
+Repair `composition-manifest.json`, its art direction, mapped content, or
+visual HTML directly; never introduce `spec.json` as a workaround.
 
 ## Narration / audio track
 
-**WHO OWNS NARRATION — decide this first:**
-- **Standalone COMPOSE deliverable** (the composition IS the finished video, no assemble step): plan with `audio.owner="none"`, then let `composition.materialize_narration` change the validated manifest to `audio.owner="composition"` and generate the `<audio>` scaffold element that the renderer muxes.
-- **Composition is a SEGMENT in an AUTO/assemble pipeline** (the assembler will mix narration in its mix tier — `stage-assemble` step 3): render this composition **SILENT — do NOT add a narration `<audio>` track**. If you bake narration in here AND the assembler mixes it, narration is added twice and you get two overlapping, drifting voices (the "two voices" defect). The mix step now refuses a non-silent base (`E_EDIT_BASE_HAS_AUDIO`) precisely to catch this. Background music inside the composition is also best left to the assembler so it can duck consistently under the one narration.
+**Decide ownership first.** A standalone COMPOSE deliverable owns its voice:
+plan with `audio.owner:"none"`, then let `composition.materialize_narration`
+change the validated manifest to `audio.owner:"composition"` and write the
+`<audio>` element the renderer muxes. A composition that is a SEGMENT of an
+AUTO production renders **SILENT** — no narration track — because the
+assembler mixes the one narration in its own tier; baking it here too gives
+the finished video two overlapping drifting voices, and the mix step refuses a
+non-silent base (`E_EDIT_BASE_HAS_AUDIO`) to catch exactly that. Use
+`audio.owner:"assembler"` whenever such a segment carries `narration_text`,
+and `"none"` only when it has no narration at all.
 
-To give a STANDALONE explainer a voiceover: approve its words at Gate B, write those exact words as scene `narration_text`, prepare the planned manifest, then call `composition.materialize_narration`. Do not call generic `generate_speech`, manually patch the resulting track, instantiate `Audio`, call `.play()`/`.pause()`, assign `.currentTime`, or use a GSAP callback to control media.
+A narration failure blocks narration and complete delivery only — never visual evidence or internal repair. Do not terminate with a narration form while visual evidence is still missing: preserve the transaction, keep authoring, lint, inspect and snapshot, deliver the current incomplete candidate, then surface the narrowly scoped retry decision.
 
-```json
-"audio": {
-  "owner": "composition",
-  "tracks": [
-    { "id": "narration", "kind": "narration", "src": "assets/narration.mp3", "start": 0, "duration": 60, "volume": 1 }
-  ]
-}
-```
-
-- `composition.target_duration` and the final scene end remain equal to the Gate B delivery target. The narration track records its measured spoken length and may leave a short intentional tail for music/visual payoff; it must never silently shorten the composition.
-- `composition.materialize_narration` uses the manifest's approved total duration as its target automatically. Its free mixed-language preflight counts CJK characters, Latin words/initialisms, numbers/versions, punctuation pauses, and speed. `E_TTS_TEXT_TOO_LONG` returns before billing and requires returning to the Gate B script instead of silently shortening approved words.
-- Always pass the approved manifest duration as the narration `target_duration` through `composition.materialize_narration` rather than calling generic speech synthesis with an implicit or guessed target.
-- After one successful synthesis, the operation records `measured_duration_sec`, allocates scene windows within the immutable target, writes `narration-map.json`, and rebuilds the untouched scaffold. If measured speech is longer than target or more than 10% short, the recoverable transaction and a bounded timing-repair authorization are preserved. Revise the synchronized narration copies and run the free fit check; when it returns `approval_inherited:true`, continue from `composition.prepare` without re-opening Gate B. A structural change or narration rewrite beyond the authorized edit scope still requires a new Gate B approval.
-- If `composition.materialize_narration` fails, never silently continue: respect its production state and error code, then either fix the approved narration input or explicitly proceed silent with that stated at the gate. Draft QA flags a contract that declares narration while the composition has no audio (`NARRATION_DECLARED_BUT_SILENT`) — do not present such a draft as if it were complete.
-- Narration output is fixed at `project/composition/assets/narration.mp3`, keeping the composition self-contained and making successful synthesis idempotent across resumed Agent turns.
-- Add background music only after narration timing is materialized, keep its volume low (e.g. 0.2), update the manifest track, then call `composition.reconcile` so protected audio markup stays synchronized without replacing visual HTML. Do not make music part of narration duration fitting.
-- Keep narration audio inside the composition dir so the render is self-contained.
-- **Talking-head caveat:** when this composition is being overlaid onto AI-generated talking-head footage that already has **lip-synced built-in speech** (generation line), do NOT add a narration `<audio>` track. The renderer's muxed audio replaces the clip's own voice, so a synthesized narration would desync from the mouth. Use this composition for captions / lower-thirds only and let the clip's built-in audio stand (background music at low volume is fine; spoken narration is not).
+When this composition does speak, read
+`references/narration.md` before calling
+`composition.materialize_narration`: it owns the approved-words rule, the
+track shape, the measured-duration and retiming behavior, the music and
+talking-head caveats, and what a failed materialization means.
 
 ## Render (the outcome)
 
@@ -378,18 +393,25 @@ Produce the finished video from the composition **directory**. Iterate with `com
 
 ## Director judgment (compose line)
 
-Craft calls specific to designed/animated explainers, on top of the shared craft reference (video-craft):
+`video-craft` owns the shared craft. These are the calls specific to designed
+and animated explainers:
 
-- **One concept per visual chapter** — don't stack two ideas in one scene; give each its own build.
-- **Concrete before abstract** — real data, diagrams, steps before a metaphor; the metaphor only lands once the concrete version is understood.
-- **Aesthetic thesis before styling** — use `frontend-design` to choose one signature visual device that comes from the subject matter; spend distinctiveness there and keep the rest disciplined.
-- **Reference styles become tokens** — use `design-system-importer` for DESIGN.md/brand/reference input, then adapt the tokens to video safe zones and motion. Do not clone protected layouts or assets.
-- **Design review happens before costly rendering** — when snapshot requests it, inspect the complete frame set and submit the verdict before exposing the Preview Gate. Use post-draft review only as a no-preview fallback. Block only on concrete visible failures; template feel, hierarchy, and polish issues that do not break the promise go to the later review note.
-- **Render exact text as real text** — stats, names, CTAs are typed into the composition, never baked into AI imagery (which hallucinates numbers and can't be corrected).
-- **Build to the narration words**, not arbitrary beats; hold a fully-built scene/chart ≥ 2–3 s before moving on.
-- **Vary scene types** — no three near-identical layouts in a row; alternate full-frame / split / diagram / quote.
-- **Spoken/readable captions live in the plan's `tracks.captions.lines` (data), NOT burned into this composition** — the assembler burns them via `burnsubs` at the end, so a later typo fix is a one-line edit, not a re-render of the whole composition. Only a PURELY DECORATIVE caption treatment that IS the visual design (kinetic highlight sweeps, word-by-word reveals) may live inside the composition — and when it does, tell the user that styled caption is part of the picture and not separately editable later. Keep ordinary subtitles as caption-track data, synced to the voice.
-- The host blocks undersized or unreadable semantic text before draft; oversized palette and decorative complexity remain advisories judged against the design thesis, brand, and scene clarity. (Orkas: use `video_studio` `op: "composition.draft"`.)
+- **One concept per visual chapter** — don't stack two ideas in one scene.
+- **Concrete before abstract** — real data, diagrams, steps before a metaphor.
+- **Aesthetic thesis before styling** — pick one signature device from the
+  subject matter (`frontend-design`) and spend distinctiveness there.
+- **Render exact text as real text** — stats, names, CTAs are typed into the
+  composition, never baked into AI imagery, which hallucinates numbers and
+  cannot be corrected.
+- **Build to the narration words**, not arbitrary beats; hold a fully-built
+  scene or chart 2–3s before moving on.
+- **Vary scene types** — no three near-identical layouts in a row.
+- **Ordinary subtitles are caption-track data, not burned into this
+  composition**: the assembler burns them at the end, so a later typo fix is a
+  one-line edit instead of a whole re-render. Only a purely decorative caption
+  treatment that IS the visual design (kinetic highlight sweeps, word-by-word
+  reveals) may live inside the composition — and when it does, tell the user
+  that styled caption is part of the picture and not separately editable.
 
 ## Constraints
 

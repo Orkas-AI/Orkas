@@ -25,6 +25,7 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
+import { Mutex } from 'async-mutex';
 
 import { projectTasksDir, projectTaskFile } from '../paths';
 import { nowIso, readJson, writeJson } from '../storage';
@@ -73,6 +74,7 @@ export type TaskError =
   | 'delete_failed';
 
 const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
+const _createLocks = new Map<string, Mutex>();
 
 function genTaskId(): string {
   return 't_' + crypto.randomBytes(6).toString('hex');
@@ -83,6 +85,21 @@ function clampStr(v: unknown, max: number): string | undefined {
   const s = v.trim();
   if (!s) return undefined;
   return s.length > max ? s.slice(0, max) : s;
+}
+
+function canonicalOpenTaskTitle(title: string): string {
+  return title.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+async function withCreateLock<T>(uid: string, pid: string, fn: () => Promise<T>): Promise<T> {
+  const key = `${uid}\0${pid}`;
+  const lock = _createLocks.get(key) || new Mutex();
+  _createLocks.set(key, lock);
+  try {
+    return await lock.runExclusive(fn);
+  } finally {
+    if (_createLocks.get(key) === lock && !lock.isLocked()) _createLocks.delete(key);
+  }
 }
 
 /** Coerce a persisted (possibly hand-edited / synced / older-shape) record into
@@ -324,7 +341,7 @@ export interface CreateTaskInput {
 
 export async function createTask(
   uid: string, pid: string, input: CreateTaskInput,
-): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
+): Promise<{ ok: true; task: ProjectTask; alreadyExists: boolean } | { ok: false; error: TaskError }> {
   if (!(await projects.projectExists(uid, pid))) return { ok: false, error: 'project_not_found' };
   const title = clampStr(input.title, TASK_TITLE_MAX + 1);
   if (!title) return { ok: false, error: 'title_empty' };
@@ -338,22 +355,37 @@ export async function createTask(
     ? [...new Set(input.depends_on.filter((dependency) => TASK_ID_RE.test(dependency)))]
     : [];
 
-  const now = nowIso();
-  const task: ProjectTask = {
-    id: genTaskId(),
-    title,
-    status: input.status || 'todo',
-    created_by: clampStr(input.created_by, 200) || 'user',
-    created_at: now,
-    updated_at: now,
-    ...(detail ? { detail } : {}),
-    ...owner,
-    ...(dependsOn.length ? { depends_on: dependsOn } : {}),
-    ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
-  };
-  await _writeTask(uid, pid, task);
-  log.info(`created user=${uid} pid=${pid} tid=${task.id} status=${task.status}`);
-  return { ok: true, task };
+  const requestedStatus = input.status || 'todo';
+  return withCreateLock(uid, pid, async () => {
+    if (OPEN_STATUSES.has(requestedStatus)) {
+      const canonicalTitle = canonicalOpenTaskTitle(title);
+      const existing = (await listTasks(uid, pid)).find((task) => (
+        OPEN_STATUSES.has(task.status)
+        && canonicalOpenTaskTitle(task.title) === canonicalTitle
+      ));
+      if (existing) {
+        log.info(`reused open task user=${uid} pid=${pid} tid=${existing.id}`);
+        return { ok: true, task: existing, alreadyExists: true };
+      }
+    }
+
+    const now = nowIso();
+    const task: ProjectTask = {
+      id: genTaskId(),
+      title,
+      status: requestedStatus,
+      created_by: clampStr(input.created_by, 200) || 'user',
+      created_at: now,
+      updated_at: now,
+      ...(detail ? { detail } : {}),
+      ...owner,
+      ...(dependsOn.length ? { depends_on: dependsOn } : {}),
+      ...(typeof input.origin_cid === 'string' && input.origin_cid ? { origin_cid: input.origin_cid } : {}),
+    };
+    await _writeTask(uid, pid, task);
+    log.info(`created user=${uid} pid=${pid} tid=${task.id} status=${task.status}`);
+    return { ok: true, task, alreadyExists: false };
+  });
 }
 
 export interface UpdateTaskPatch {

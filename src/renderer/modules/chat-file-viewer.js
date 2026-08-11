@@ -6,7 +6,7 @@
 // would just be two co-located if-trees.
 //
 // Render strategies:
-//   image (.png/.jpg/.jpeg/.webp/.gif/.svg) → delegate to openChatImageLightbox
+//   image (browser-native raster formats and SVG) → delegate to openChatImageLightbox
 //   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
 //   audio (.mp3/.wav/.ogg/.opus/.m4a/.aac/.flac) → <audio controls>
 //   pdf   (.pdf)                       → <iframe> + Chromium PDFium
@@ -79,8 +79,69 @@ function _viewerTrackEvent(action, data) {
   void data;
 }
 
-function _viewerTrackError(action, data) {
-  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+function _viewerStableFailure(value, fallback, fallbackType = 'operation') {
+  const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
+  const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+  let errorCode = fallback;
+  if (rawCode === 'not_found' || /not found|does not exist/.test(message)) errorCode = 'source_not_found';
+  else if (rawCode === 'forbidden' || /outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+  else if (/unsupported|no html entry/.test(message)) errorCode = 'unsupported_source';
+  else if (!value) errorCode = 'invalid_response';
+  let errorType = fallbackType;
+  if (errorCode === 'invalid_response' || errorCode === 'unsupported_source') errorType = 'validation';
+  else if (errorCode === 'permission_denied') errorType = 'authorization';
+  else if (errorCode === 'source_not_found') errorType = 'operation';
+  return { error_type: errorType, error_code: errorCode };
+}
+
+function _viewerLogFailure(action, failure) {
+  _viewerLog.warn('file viewer operation failed', { action, ...(failure || {}) });
+}
+
+function _viewerDurationSince(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
+}
+
+async function _viewerShowAlert(message, action) {
+  if (typeof uiAlert !== 'function') return;
+  try {
+    await uiAlert(message);
+  } catch (_) {
+    _viewerLogFailure(action, {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  }
+}
+
+function _scheduleAddLibraryButtonRestore(original) {
+  setTimeout(() => {
+    try {
+      if (!_viewerAddLibraryBtn) return;
+      _viewerAddLibraryBtn.innerHTML = original;
+      _viewerAddLibraryBtn.disabled = false;
+    } catch (_) {
+      _viewerLogFailure('file_preview_add_library_presentation', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }, 1500);
+}
+
+function _scheduleSaveAppButtonRestore(path, original) {
+  setTimeout(() => {
+    try {
+      if (!_viewerSaveAppBtn) return;
+      _viewerSaveAppBtn.innerHTML = original;
+      _refreshSaveAppButton(path);
+    } catch (_) {
+      _viewerLogFailure('file_preview_save_app_presentation', {
+        error_type: 'presentation',
+        error_code: 'file_viewer_presentation_failed',
+      });
+    }
+  }, 1500);
 }
 
 // Extensions we'll try to render inline. Anything else falls through to the
@@ -89,9 +150,12 @@ function _viewerTrackError(action, data) {
 // something useful to do with it; otherwise the fallback is the better UX.
 // Local SVG is safe on this path: chat-media://local validates passive SVG
 // markup and materializes relative contact-sheet images before serving it.
-const _IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg']);
+const _IMAGE_EXTS = new Set([
+  '.png', '.apng', '.jpg', '.jpeg', '.jpe', '.jfif', '.webp', '.gif',
+  '.avif', '.bmp', '.ico', '.svg',
+]);
 const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
-const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
+const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.oga', '.opus', '.weba', '.m4a', '.aac', '.flac']);
 const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
@@ -181,6 +245,14 @@ function _viewerLabelVars(key, fallback, vars) {
   } catch (_) {
     return fallback;
   }
+}
+
+function _chatOfficePreviewLoadingHtml() {
+  const label = _viewerLabel('common.loading', 'Loading…');
+  return `<div class="office-preview-loading" role="status" aria-live="polite">
+    <span class="office-preview-loading-spinner" aria-hidden="true"></span>
+    <span class="office-preview-loading-label">${escapeHtml(label)}</span>
+  </div>`;
 }
 
 function _viewerUiIconHtml(name, className) {
@@ -341,7 +413,10 @@ function _teardownViewerContent() {
     catch (_) { /* non-fatal */ }
     _viewerBlobUrl = null;
   }
-  if (_viewerBody) _viewerBody.innerHTML = '';
+  if (_viewerBody) {
+    _viewerBody.removeAttribute('aria-busy');
+    _viewerBody.innerHTML = '';
+  }
   if (_viewerMdActions) _viewerMdActions.innerHTML = '';
   if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office', 'is-office-fit', 'is-html-canvas');
 }
@@ -360,12 +435,16 @@ async function _onRevealClick() {
     if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
     const res = await window.orkas.invoke('workspace.revealPath', payload);
     if (!res || !res.ok) {
-      _viewerTrackError('file_preview_reveal', { kind: _kindOf(p), error_message: res && res.error || 'failed' });
-      _viewerLog.warn('reveal failed', { path: p, error: res && res.error });
+      _viewerLogFailure(
+        'file_preview_reveal',
+        _viewerStableFailure(res, 'reveal_failed', 'operation'),
+      );
     }
   } catch (err) {
-    _viewerTrackError('file_preview_reveal', { kind: _kindOf(p), error_message: String(err && err.message || err) });
-    _viewerLog.warn('reveal threw', { path: p, error: String(err && err.message || err) });
+    _viewerLogFailure(
+      'file_preview_reveal',
+      _viewerStableFailure(err, 'reveal_failed', 'ipc'),
+    );
   }
 }
 
@@ -373,46 +452,79 @@ async function _onAddLibraryClick() {
   const p = _viewerCurrentPath;
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
   if (!_viewerCanAddToLibrary(p, { projectScoped: _viewerLibraryProjectScoped })) return;
+  const startedAt = Date.now();
   _viewerTrack('file_preview_add_library', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
   const original = _viewerAddLibraryButtonHtml(label);
   _viewerAddLibraryBtn.disabled = true;
+  let res;
   try {
     const payload = { path: p };
     if (_viewerCurrentCid) payload.cid = _viewerCurrentCid;
     if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
-    const res = await window.orkas.invoke('library.importProduced', payload);
-    if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_add_library_result', { result: 'success', kind: _kindOf(p), scope: res.scope || '' });
+    res = await window.orkas.invoke('library.importProduced', payload);
+  } catch (err) {
+    const failure = _viewerStableFailure(err, 'library_import_failed', 'ipc');
+    const reason = String(err && err.message || err);
+    _viewerTrackEvent('file_preview_add_library_result', {
+      result: 'failure',
+      kind: _kindOf(p),
+      duration_ms: _viewerDurationSince(startedAt),
+      ...failure,
+    });
+    _viewerLogFailure('file_preview_add_library', failure);
+    let message = `Add to Library failed: ${reason}`;
+    if (typeof t === 'function') {
+      try {
+        const got = t('chat.preview_add_library_failed_with', { reason });
+        if (got && got !== 'chat.preview_add_library_failed_with') message = got;
+      } catch (_) { /* keep fallback */ }
+    }
+    await _viewerShowAlert(message, 'file_preview_add_library_presentation');
+    return;
+  } finally {
+    if (!res || !res.ok) {
+      _scheduleAddLibraryButtonRestore(original);
+    }
+  }
+
+  if (!res || !res.ok) {
+    const failure = _viewerStableFailure(res, 'library_import_failed', 'operation');
+    const reason = String((res && res.error) || 'failed');
+    _viewerTrackEvent('file_preview_add_library_result', {
+      result: 'failure',
+      kind: _kindOf(p),
+      duration_ms: _viewerDurationSince(startedAt),
+      ...failure,
+    });
+    _viewerLogFailure('file_preview_add_library', failure);
+    await _viewerShowAlert(`Add to Library failed: ${reason}`, 'file_preview_add_library_presentation');
+    return;
+  }
+
+  const scope = res.scope === 'project' ? 'project' : (res.scope === 'global' ? 'global' : 'unknown');
+  _viewerTrackEvent('file_preview_add_library_result', {
+    result: 'success',
+    kind: _kindOf(p),
+    scope,
+    duration_ms: _viewerDurationSince(startedAt),
+  });
+  try {
     _viewerAddLibraryBtn.innerHTML = _viewerAddLibraryButtonHtml(doneLabel, 'check');
-    if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
+    if (scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') {
       loadContexts();
     }
-    if (res.scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
+    if (scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
       loadProjectDetail(res.projectId).catch(() => {});
     }
-  } catch (err) {
-    const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_add_library_result', { result: 'failure', kind: _kindOf(p) });
-    _viewerTrackError('file_preview_add_library', { kind: _kindOf(p), error_message: reason });
-    _viewerLog.warn('add to library failed', { path: p, error: reason });
-    if (typeof uiAlert === 'function') {
-      let message = `Add to Library failed: ${reason}`;
-      if (typeof t === 'function') {
-        try {
-          const got = t('chat.preview_add_library_failed_with', { reason });
-          if (got && got !== 'chat.preview_add_library_failed_with') message = got;
-        } catch (_) { /* keep fallback */ }
-      }
-      await uiAlert(message);
-    }
+  } catch (_) {
+    _viewerLogFailure('file_preview_add_library_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
   } finally {
-    setTimeout(() => {
-      if (!_viewerAddLibraryBtn) return;
-      _viewerAddLibraryBtn.innerHTML = original;
-      _viewerAddLibraryBtn.disabled = false;
-    }, 1500);
+    _scheduleAddLibraryButtonRestore(original);
   }
 }
 
@@ -442,41 +554,83 @@ async function _refreshSaveAppButton(path) {
 async function _onSaveAppClick() {
   const p = _viewerCurrentPath;
   if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
-  _viewerTrack('file_preview_save_app', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
+  const startedAt = Date.now();
   if (_viewerDirty) {
-    _viewerTrackEvent('file_preview_save_app_result', { result: 'failure', kind: _kindOf(p), error_code: 'unsaved_changes' });
+    _viewerTrackEvent('file_preview_save_app_result', {
+      result: 'failure',
+      surface: 'file_preview',
+      kind: _kindOf(p),
+      duration_ms: _viewerDurationSince(startedAt),
+      error_type: 'validation',
+      error_code: 'unsaved_changes',
+    });
     const message = _viewerLabel('apps.save_from_file_dirty', 'Save the file changes before saving it as an app.');
-    if (typeof uiAlert === 'function') await uiAlert(message);
+    await _viewerShowAlert(message, 'file_preview_save_app_presentation');
     return;
   }
   const label = _viewerLabel('apps.save_from_file_action', 'Save as app');
   const doneLabel = _viewerLabel('apps.saved_toast', 'Saved to My Apps');
   const original = _viewerSaveAppButtonHtml(label);
-  _setSaveAppVisible(false);
+  try { _setSaveAppVisible(false); } catch (_) {
+    _viewerLogFailure('file_preview_save_app_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
+  }
+  let res;
   try {
-    const res = await window.orkas.invoke('savedApps.saveFromPath', _viewerFileActionPayload(p));
-    if (!res || res.ok === false) throw new Error((res && res.error) || 'failed');
-    _viewerTrackEvent('file_preview_save_app_result', { result: 'success', kind: _kindOf(p) });
+    res = await window.orkas.invoke('savedApps.saveFromPath', _viewerFileActionPayload(p));
+  } catch (err) {
+    const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
+    const reason = String(err && err.message || err);
+    _viewerTrackEvent('file_preview_save_app_result', {
+      result: 'failure',
+      surface: 'file_preview',
+      kind: _kindOf(p),
+      duration_ms: _viewerDurationSince(startedAt),
+      ...failure,
+    });
+    _viewerLogFailure('file_preview_save_app', failure);
+    const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
+    await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
+    _scheduleSaveAppButtonRestore(p, original);
+    return;
+  }
+  if (!res || res.ok === false) {
+    const failure = _viewerStableFailure(res, 'saved_app_save_failed', 'operation');
+    const reason = String((res && res.error) || 'failed');
+    _viewerTrackEvent('file_preview_save_app_result', {
+      result: 'failure',
+      surface: 'file_preview',
+      kind: _kindOf(p),
+      duration_ms: _viewerDurationSince(startedAt),
+      ...failure,
+    });
+    _viewerLogFailure('file_preview_save_app', failure);
+    const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
+    await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
+    _scheduleSaveAppButtonRestore(p, original);
+    return;
+  }
+
+  _viewerTrackEvent('file_preview_save_app_result', {
+    result: 'success',
+    surface: 'file_preview',
+    kind: _kindOf(p),
+    duration_ms: _viewerDurationSince(startedAt),
+  });
+  try {
     _viewerSaveAppBtn.innerHTML = _viewerSaveAppButtonHtml(doneLabel, 'check');
     if (typeof uiToast === 'function') uiToast(doneLabel, { variant: 'success' });
     else if (typeof uiAlert === 'function') await uiAlert(doneLabel);
-    try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-  } catch (err) {
-    const reason = String(err && err.message || err);
-    _viewerTrackEvent('file_preview_save_app_result', { result: 'failure', kind: _kindOf(p) });
-    _viewerTrackError('file_preview_save_app', { kind: _kindOf(p), error_message: reason });
-    _viewerLog.warn('save as app failed', { path: p, error: reason });
-    if (typeof uiAlert === 'function') {
-      const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
-      await uiAlert(`${prefix}: ${reason}`);
-    }
-  } finally {
-    setTimeout(() => {
-      if (!_viewerSaveAppBtn) return;
-      _viewerSaveAppBtn.innerHTML = original;
-      _refreshSaveAppButton(p);
-    }, 1500);
+    if (typeof loadSavedApps === 'function') loadSavedApps(true);
+  } catch (_) {
+    _viewerLogFailure('file_preview_save_app_presentation', {
+      error_type: 'presentation',
+      error_code: 'file_viewer_presentation_failed',
+    });
   }
+  _scheduleSaveAppButtonRestore(p, original);
 }
 
 async function _openViewerShell(displayName, opts) {
@@ -633,7 +787,8 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
 async function _renderOfficeBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'office', absPath, cid, projectId });
   if (!seq) return;
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  _viewerBody.setAttribute('aria-busy', 'true');
+  _viewerBody.innerHTML = _chatOfficePreviewLoadingHtml();
   try {
     const payload = { path: absPath };
     if (cid) payload.cid = cid;
@@ -665,7 +820,9 @@ async function _renderOfficeBody(absPath, displayName, cid, projectId) {
     const fitHeight = _officeFitFrameHeight(res);
     if (fitHeight) _viewerEl.classList.add('is-office-fit');
     const style = fitHeight ? ` style="height:${fitHeight}px"` : '';
-    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="" src="${_viewerBlobUrl}"${style} title="${escapeHtml(displayName || '')}"></iframe>`;
+    const sandbox = res.allowScripts === true ? 'allow-scripts' : '';
+    _viewerBody.removeAttribute('aria-busy');
+    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="${sandbox}" src="${_viewerBlobUrl}"${style} title="${escapeHtml(displayName || '')}"></iframe>`;
   } catch (err) {
     if (seq !== _viewerRenderSeq) return;
     _viewerLog.warn('office preview threw', { path: absPath, error: String(err && err.message || err) });

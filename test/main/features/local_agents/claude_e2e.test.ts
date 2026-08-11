@@ -7,13 +7,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { claudeBackend } from '../../../../src/main/features/local_agents/backends/claude';
 
 const isWindows = process.platform === 'win32';
+const itPosix = isWindows ? it.skip : it;
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 function writeNodeExecutable(dir: string, name: string, source: string): string {
@@ -43,17 +43,18 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-claude-e2e-'));
     tmpDirs.push(tmpDir);
   });
-  afterAll(() => {
-    if (isWindows) {
-      const cleanup = spawnSync(TEST_NODE, [
-        '-e',
-        'const fs=require("node:fs");for(const p of process.argv.slice(1))fs.rmSync(p,{recursive:true,force:true,maxRetries:20,retryDelay:100});',
-        ...tmpDirs,
-      ], { encoding: 'utf8', windowsHide: true });
-      if (cleanup.status !== 0) throw new Error(`Windows temp cleanup failed: ${cleanup.stderr}`);
-      return;
+  afterAll(async () => {
+    for (const dir of tmpDirs) {
+      // Async retries yield to the child-process close callbacks that release
+      // Windows .cmd and working-directory handles. A synchronous retry loop
+      // can keep those callbacks starved for its entire retry window.
+      await fs.promises.rm(dir, {
+        recursive: true,
+        force: true,
+        maxRetries: isWindows ? 50 : 0,
+        retryDelay: isWindows ? 100 : 0,
+      });
     }
-    for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('parses a minimal completed conversation', async () => {
@@ -88,6 +89,204 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     expect(done.sessionId).toBe('sess-fake');
   });
 
+  it('classifies non-JSON stdout before and after session initialization', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+process.stdin.once('data', () => {
+  process.stdout.write('startup banner\\n');
+  process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-diagnostics","cwd":"/x"}\\n');
+  process.stdout.write('post-init diagnostic\\n');
+  process.stdout.write('{"type":"result","subtype":"success","result":"done"}\\n');
+});
+`);
+    const events: any[] = [];
+
+    await claudeBackend.run({
+      binPath: fake,
+      prompt: 'diagnose',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+      timeoutMs: 3_000,
+    });
+
+    expect(events).toContainEqual({
+      type: 'text-delta',
+      text: 'startup banner\n',
+    });
+    expect(events).toContainEqual({
+      type: 'raw-line',
+      line: 'post-init diagnostic',
+    });
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      output: 'done',
+    });
+  });
+
+  itPosix('settles on the result record even when background work keeps the CLI alive', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+process.stdin.once('data', () => {
+  process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-linger","cwd":"/x"}\\n');
+  process.stdout.write('{"type":"system","subtype":"api_retry","attempt":2,"max_retries":4,"retry_delay_ms":100,"error_status":503,"error":"temporary outage"}\\n');
+  process.stdout.write('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"shell","description":"watching files"}\\n');
+  process.stdout.write('{"type":"system","subtype":"task_progress","task_id":"bg-1","subagent_type":"shell","summary":"still watching"}\\n');
+  process.stdout.write('{"type":"tool_progress","tool_use_id":"tool-1","tool_name":"Bash","task_id":"bg-1","elapsed_time_seconds":1.5}\\n');
+  process.stdout.write('{"type":"assistant","message":{"content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"file":"a.md"}},{"type":"tool_use","id":"bash-1","name":"Bash","input":{"command":"npm test"}}]}}\\n');
+  process.stdout.write('{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"read-1","content":"read ok"},{"type":"tool_result","tool_use_id":"bash-1","content":"tests ok"}]}}\\n');
+  process.stdout.write('{"type":"system","subtype":"hook_started","hook_id":"hook-1","hook_name":"lint","hook_event":"PostToolUse"}\\n');
+  process.stdout.write('{"type":"system","subtype":"hook_response","hook_id":"hook-1","hook_name":"lint","stdout":"ok"}\\n');
+  process.stdout.write('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"watch complete"}\\n');
+  process.stdout.write('{"type":"result","subtype":"success","result":"finished"}\\n');
+  setInterval(() => {}, 1_000);
+});
+`);
+    const events: any[] = [];
+    let pid = -1;
+    const startedAt = Date.now();
+
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'start background work',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        timeoutMs: 5_000,
+      });
+
+      // Process startup is noisy under the parallel Electron test runner.
+      // The old close-driven behavior waits for the 5s watchdog; resolving
+      // comfortably below that still proves the protocol terminal settled it.
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'background-started',
+        taskId: 'bg-1',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'retrying',
+        attempt: 2,
+        errorStatus: 503,
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'background-running',
+        message: 'still watching',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'tool-progress',
+        tool: 'Bash',
+        elapsedSeconds: 1.5,
+      }));
+      expect(events.filter(event => (
+        event.type === 'tool-event'
+        && event.phase === 'use'
+        && (event.callId === 'read-1' || event.callId === 'bash-1')
+      ))).toHaveLength(2);
+      expect(events.filter(event => (
+        event.type === 'tool-event'
+        && event.phase === 'result'
+        && (event.callId === 'read-1' || event.callId === 'bash-1')
+      ))).toHaveLength(2);
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'tool-event',
+        tool: 'hook:lint',
+        phase: 'use',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'tool-event',
+        tool: 'hook:lint',
+        phase: 'result',
+        output: 'ok',
+      }));
+      expect(events).toContainEqual(expect.objectContaining({
+        type: 'status',
+        status: 'background-completed',
+        message: 'watch complete',
+      }));
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'completed',
+        output: 'finished',
+      });
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  itPosix('settles a failed result before a lingering CLI process exits', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `
+process.stdin.once('data', () => {
+  process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-failed","cwd":"/x"}\\n');
+  process.stdout.write('{"type":"result","subtype":"error_during_execution","errors":["network failed","retry limit reached"]}\\n');
+  setInterval(() => {}, 1_000);
+});
+`);
+    const events: any[] = [];
+    let pid = -1;
+    const startedAt = Date.now();
+
+    try {
+      await claudeBackend.run({
+        binPath: fake,
+        prompt: 'fail after retrying',
+        cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: event => {
+          events.push(event);
+          if (event.type === 'process-info') pid = Number(event.pid);
+        },
+        timeoutMs: 5_000,
+      });
+
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+      expect(events.at(-1)).toMatchObject({
+        type: 'done',
+        status: 'failed',
+        error: 'network failed\nretry limit reached',
+      });
+      expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+      await expectProcessToExit(pid, 2_000);
+    } finally {
+      if (pid > 0) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
+      }
+    }
+  });
+
+  it('captures a session id carried only by the terminal result record', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', emitAfterPrompt([
+      '{"type":"result","subtype":"success","session_id":"sess-result-only","result":"done"}',
+    ]));
+    const events: any[] = [];
+
+    await claudeBackend.run({
+      binPath: fake,
+      prompt: 'finish',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+      timeoutMs: 3_000,
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'completed',
+      sessionId: 'sess-result-only',
+      output: 'done',
+    });
+  });
+
   it('reports failed status when the CLI exits non-zero', async () => {
     const fake = writeNodeExecutable(tmpDir, 'claude', `
 process.stderr.write('boom: model unavailable\\n');
@@ -106,6 +305,26 @@ process.exit(7);
     expect(done.error).toMatch(/exited with code 7|reported error/);
   });
 
+  it('reports a spawn failure as one terminal event', async () => {
+    const events: any[] = [];
+
+    await claudeBackend.run({
+      binPath: path.join(tmpDir, 'missing-claude-binary'),
+      prompt: 'hi',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+      timeoutMs: 3_000,
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'failed',
+      error: expect.stringMatching(/ENOENT|not found/i),
+    });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+  });
+
   it('cancels mid-run via AbortSignal (SIGTERM)', async () => {
     const fake = writeNodeExecutable(tmpDir, 'claude', `setInterval(() => {}, 1_000);\n`);
     const events: any[] = [];
@@ -121,6 +340,26 @@ process.exit(7);
     await promise;
     const done = events[events.length - 1];
     expect(done.status).toBe('cancelled');
+  });
+
+  it('reports timeout when Claude never emits a terminal result', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', `setInterval(() => {}, 1_000);\n`);
+    const events: any[] = [];
+
+    await claudeBackend.run({
+      binPath: fake,
+      prompt: 'hi',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: event => events.push(event),
+      timeoutMs: 100,
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: 'done',
+      status: 'timeout',
+    });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
   });
 
   it('accumulates assistant.message.usage and emits running status:usage events', async () => {
@@ -141,7 +380,7 @@ process.exit(7);
       cwd: tmpDir,
       signal: new AbortController().signal,
       onEvent: e => events.push(e),
-      timeoutMs: 3000,
+      timeoutMs: 10_000,
     });
     const usageEvents = events.filter(e => e.type === 'status' && e.status === 'usage');
     expect(usageEvents).toHaveLength(2);
@@ -160,7 +399,7 @@ process.exit(7);
     });
     const done = events[events.length - 1];
     expect(done.status).toBe('completed');
-  });
+  }, 15_000);
 
   it('auto-responds to control_request and surfaces a permission-request event', async () => {
     // fake CLI: reads the prompt, emits init + a control_request, then
@@ -214,4 +453,91 @@ input.on('line', (line) => {
     const done = events[events.length - 1];
     expect(done.status).toBe('completed');
   });
+
+  itPosix('steers a second rich user record through the live ordered stream-json writer', async () => {
+    const tracePath = path.join(tmpDir, 'stdin-records.json');
+    const fake = writeNodeExecutable(tmpDir, 'claude-steer', `
+const fs = require('node:fs');
+const readline = require('node:readline');
+const tracePath = ${JSON.stringify(tracePath)};
+const records = [];
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', (line) => {
+  const record = JSON.parse(line);
+  records.push(record);
+  fs.writeFileSync(tracePath, JSON.stringify(records, null, 2));
+  if (records.length === 1) {
+    process.stdout.write('{"type":"system","subtype":"init","session_id":"sess-steer","cwd":"/x"}\\n');
+    process.stdout.write('{"type":"control_request","request_id":"req-steer","request":{"subtype":"can_use_tool","tool_name":"Read","input":{"file_path":"/tmp/a"}}}\\n');
+  } else if (records.length === 3) {
+    process.stdout.write('{"type":"assistant","message":{"content":[{"type":"text","text":"updated"}]}}\\n');
+    process.stdout.write('{"type":"result","subtype":"success","result":"updated"}\\n');
+    input.close();
+  }
 });
+`);
+    const ingressStates: any[] = [];
+    let resolveIngress!: (value: any) => void;
+    const ingressReady = new Promise<any>((resolve) => { resolveIngress = resolve; });
+    const run = claudeBackend.run({
+      binPath: fake,
+      prompt: 'initial task',
+      cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      timeoutMs: 3_000,
+      onActiveRunIngress: (ingress) => {
+        ingressStates.push(ingress);
+        if (ingress) resolveIngress(ingress);
+      },
+    });
+
+    const ingress = await ingressReady;
+    const result = await ingress.submit({
+      id: 'queue-claude-1',
+      text: 'Use /verified/brief.pdf and the selected Skill now.',
+      localImages: [{ path: '/verified/chart.png', mediaType: 'image/png' }],
+    });
+    await run;
+
+    expect(result).toEqual({ mode: 'steered', acceptedId: 'queue-claude-1' });
+    const records = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+    expect(records).toHaveLength(3);
+    expect(records[0]).toMatchObject({
+      type: 'user',
+      message: { content: [{ type: 'text', text: 'initial task' }] },
+    });
+    const controlRecord = records.slice(1).find((record: any) => record.type === 'control_response');
+    const steerRecord = records.slice(1).find((record: any) => record.type === 'user');
+    expect(controlRecord).toMatchObject({
+      type: 'control_response',
+      response: { request_id: 'req-steer' },
+    });
+    expect(steerRecord).toEqual({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: 'Use /verified/brief.pdf and the selected Skill now.',
+        }],
+      },
+    });
+    expect(ingressStates[0]).toBeTruthy();
+    expect(ingressStates.at(-1)).toBeNull();
+  });
+});
+
+async function expectProcessToExit(pid: number, timeoutMs: number): Promise<void> {
+  expect(pid).toBeGreaterThan(0);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error(`Claude child process ${pid} is still alive after protocol completion`);
+}

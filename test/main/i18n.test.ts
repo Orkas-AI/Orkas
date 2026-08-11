@@ -86,6 +86,24 @@ describe('i18n › t() lookup', () => {
       .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
   });
 
+  it('localizes the managed Pro fallback notice in every supported language', () => {
+    const vars = { from: 'Orkas-1.5 Pro', to: 'Orkas-1.5' };
+    expect(t('model.server_model_fallback', vars, 'zh'))
+      .toBe('Orkas-1.5 Pro 暂不可用，已由 Orkas-1.5 处理。');
+    expect(t('model.server_model_fallback', vars, 'en'))
+      .toBe('Orkas-1.5 Pro is temporarily unavailable. Orkas-1.5 handled the request.');
+    expect(t('model.server_model_fallback', vars, 'ja'))
+      .toBe('Orkas-1.5 Pro は一時的に利用できないため、Orkas-1.5 が処理しました。');
+    expect(t('model.server_model_fallback', vars, 'pt'))
+      .toBe('Orkas-1.5 Pro está temporariamente indisponível. Orkas-1.5 processou a solicitação.');
+  });
+
+  it('provides the development-only marker in every supported language', () => {
+    for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
+      expect(t('model.dev_marker', undefined, lang)).toBe('[DEV]');
+    }
+  });
+
   it('localizes actionable external-agent terminal states', () => {
     setCurrentLang('zh');
     expect(t('cli_agent.run_failed_detail', { name: 'Codex' }))

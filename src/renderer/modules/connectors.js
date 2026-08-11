@@ -12,12 +12,15 @@
 // OAuth flow UX: clicking Connect asks main to open the system browser, then the IPC returns
 // immediately. The custom-scheme callback finishes exchange + provisioning independently and
 // pushes `connectors:oauth-callback` when the user returns and `connectors:oauth-result` when the
-// network work finishes. **The card does NOT stay busy while the user is in the browser**. It shows
-// loading only after the callback, while exchange + provisioning is actually running.
+// network work finishes. The card shows launch feedback until window blur, independently of the
+// two-second duplicate-click throttle. When the throttle expires the spinner remains but the button
+// becomes clickable, so a browser launch that did not navigate can be retried. A callback starts a
+// second busy phase until exchange + provisioning completes.
 
 const _connectorsLog = createLogger('connectors');
 const _CONNECTORS_RENDER_CACHE_VERSION = 2;
 const _CONNECTORS_RENDER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const _OAUTH_LAUNCH_THROTTLE_MS = 2000;
 let _connectorsLegacyCachePurged = false;
 
 function _connectorsTrackClick(action, data) {
@@ -32,9 +35,13 @@ function _connectorsTrackError(action, data) {
 function _connectorTrackPayload(entry, instance) {
   const e = entry || {};
   const inst = instance || {};
+  const rawId = String(e.id || inst.id || '');
+  const origin = inst.origin === 'custom' || e._custom || rawId.startsWith('custom-') ? 'custom' : 'catalog';
   return {
-    connector_id: String(e.id || inst.id || ''),
-    origin: inst.origin === 'custom' || e._custom ? 'custom' : 'catalog',
+    // Custom ids are derived from a user-authored display name. Keep that value out of analytics;
+    // `origin` is the useful product dimension and `custom` is a stable low-cardinality bucket.
+    connector_id: origin === 'custom' ? 'custom' : rawId,
+    origin,
     is_bundle: !!(Array.isArray(e.bundle_member_ids) && e.bundle_member_ids.length),
   };
 }
@@ -46,6 +53,23 @@ function _connectorTrackErrorType(err) {
   if (/cancelled|canceled|superseded/.test(msg)) return 'cancelled';
   if (/auth|grant|scope|oauth/.test(msg)) return 'auth';
   return 'exception';
+}
+
+function _connectorOperationErrorCode(errLike, fallback) {
+  const raw = errLike && (errLike.error_code || errLike.code);
+  if (typeof raw === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(raw)) return raw;
+  return fallback;
+}
+
+function _connectorFailureDetail(errLike, fallbackCode) {
+  return {
+    error_code: _connectorOperationErrorCode(errLike, fallbackCode),
+    error_type: _connectorTrackErrorType(errLike),
+  };
+}
+
+function _logConnectorOperationFailure(action, detail) {
+  _connectorsLog.warn('connector operation failed', { action, ...(detail || {}) });
 }
 
 const CONNECT_CANCEL_CODES = new Set(['user_cancelled', 'superseded']);
@@ -81,6 +105,11 @@ let _connectorsState = {
 // intentionally remain when no callback arrives so a foreign result cannot
 // mutate the card state.
 const _pendingConnectAttempts = new Map();
+// `catalog_id → { token, attemptId, timeoutId, throttled }` for browser-launch feedback. Feedback
+// remains until blur, launch failure, callback, or result; `throttled` independently blocks another
+// click for two seconds. Clearing either concern never cancels main-process OAuth/result tracking.
+const _oauthLaunchAttempts = new Map();
+let _oauthLaunchToken = 0;
 // `catalog_id → attempt_id` only while a provider callback is being exchanged/provisioned.
 // Keeping the attempt id prevents a late result from an older superseded flow from clearing a
 // newer callback's spinner on the same card.
@@ -267,6 +296,7 @@ function _isReconnectableError(entry, instance) {
     && instance
     && instance.status
     && instance.status.kind === 'error'
+    && !/connector_secrets_unavailable/i.test(String(instance.status.message || ''))
   );
 }
 
@@ -294,11 +324,19 @@ function _connectorErrorFallback(kind) {
     if (ja) return '認証の有効期限が切れました。再接続してください';
     return 'Authorization expired. Please reconnect.';
   }
+  if (kind === 'secrets') {
+    if (zh) return '此设备暂时无法读取连接器密钥；请更新应用并重新登录后重试';
+    if (ja) return 'このデバイスではコネクターのキーを読み取れません。アプリを更新して再ログインしてください';
+    return 'This device cannot read the connector keys. Update the app and sign in again.';
+  }
   return '';
 }
 
 function _formatConnectorStatusError(message) {
   const msg = String(message || '');
+  if (/connector_secrets_unavailable/i.test(msg)) {
+    return _connectorErrorFallback('secrets');
+  }
   if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated|\brefresh_failed\b|刷新授权失败|failed to refresh authorization|認証の更新に失敗|Falha ao atualizar a autorização/i.test(msg)) {
     return _connectorErrorFallback('network');
   }
@@ -505,17 +543,21 @@ function _renderCatalogCard(entry, instance) {
     : '';
 
   // Bottom-row action:
-  //   - connecting: show a spinner only for an in-app retry or after an OAuth deep-link callback
-  //     returns to the app. The initial Connect click and time spent in the browser stay unchanged.
+  //   - connecting: retry/callback finalization stays disabled until completion.
+  //   - browser launch: keep the spinner until blur, but disable only during the 2s throttle.
   //   - connected: use in the Commander composer; enable / disable lives in the ⋯ menu
   //   - errored:   disconnect (recover from a stuck error state)
   //   - oauth_pending: disabled unavailable button
   //   - default (uninstalled): connect (start OAuth)
   let action = '';
+  const launchAttempt = _oauthLaunchAttempts.get(e.id) || null;
   const isConnecting = (_connectorsState.connecting && _connectorsState.connecting.has(e.id))
     || _oauthCallbackAttempts.has(e.id);
   if (isConnecting) {
-    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect">${escapeHtml(t('connectors.action.connecting'))}</button>`;
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" disabled aria-disabled="true" aria-busy="true">${escapeHtml(t('connectors.action.connecting'))}</button>`;
+  } else if (launchAttempt) {
+    const throttleAttrs = launchAttempt.throttled ? ' disabled aria-disabled="true"' : '';
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect" aria-busy="true"${throttleAttrs}>${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (isOAuthPending) {
     action = `<button class="btn btn-sm" disabled>${escapeHtml(t('connectors.action.unavailable'))}</button>`;
   } else if (isVisibleDisabled) {
@@ -675,7 +717,7 @@ function _useConnector(entry, instance) {
   const id = String((instance && instance.id) || (entry && entry.id) || '').trim();
   const name = String((instance && instance.display_name) || (entry && entry.display_name) || id).trim();
   if (!id && !name) return;
-  _connectorsTrackClick('connector_use', { ..._connectorTrackPayload(entry, instance), connector_id: id || name });
+  _connectorsTrackClick('connector_use', _connectorTrackPayload(entry, instance));
   setView('new-chat');
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
@@ -700,11 +742,14 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
     for (const id of ids) {
       const res = await window.orkas.invoke('connectors.set_enabled', { id, enabled: nextEnabled });
       if (!res || !res.ok) {
+        const failure = _connectorFailureDetail(res, 'set_enabled_failed');
         _connectorsTrackEvent('connector_enable_result', {
           ...payload,
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
+        _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
         uiAlert((res && res.error) || t('component.toggle_failed'));
         return;
       }
@@ -714,19 +759,21 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
       result: 'success',
       duration_ms: Math.round(performance.now() - startedAt),
     });
-    await loadConnectors();
   } catch (err) {
+    const failure = _connectorFailureDetail(err, 'set_enabled_exception');
     _connectorsTrackEvent('connector_enable_result', {
       ...payload,
       result: 'failure',
       duration_ms: Math.round(performance.now() - startedAt),
+      ...failure,
     });
-    _connectorsTrackError('connector_enable', {
-      ...payload,
-      error_type: _connectorTrackErrorType(err),
-    });
+    _logConnectorOperationFailure('connector_enable', { ...payload, ...failure });
     uiAlert((err && err.message) || t('component.toggle_failed'));
+    return;
   }
+  // Refresh is presentation work after the mutation committed. It must never overwrite the
+  // operation's terminal success with a second failure result.
+  await loadConnectors();
 }
 
 function _entryFromInstance(instance) {
@@ -771,11 +818,14 @@ async function _quickDisconnect(entry, instance) {
     for (const id of ids) {
       const res = await window.orkas.invoke('connectors.remove', { id });
       if (!res || (!res.ok && !/not found/i.test(res.error || ''))) {
+        const failure = _connectorFailureDetail(res, 'disconnect_failed');
         _connectorsTrackEvent('connector_disconnect_result', {
           ...payload,
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
+        _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
         uiAlert((res && res.error) || t('connectors.errors.remove_failed'));
         return;
       }
@@ -785,19 +835,19 @@ async function _quickDisconnect(entry, instance) {
       result: 'success',
       duration_ms: Math.round(performance.now() - startedAt),
     });
-    await loadConnectors();
   } catch (err) {
+    const failure = _connectorFailureDetail(err, 'disconnect_exception');
     _connectorsTrackEvent('connector_disconnect_result', {
       ...payload,
       result: 'failure',
       duration_ms: Math.round(performance.now() - startedAt),
+      ...failure,
     });
-    _connectorsTrackError('connector_disconnect', {
-      ...payload,
-      error_type: _connectorTrackErrorType(err),
-    });
+    _logConnectorOperationFailure('connector_disconnect', { ...payload, ...failure });
     uiAlert((err && err.message) || t('connectors.errors.remove_failed'));
+    return;
   }
+  await loadConnectors();
 }
 
 async function _runConnect(entry) {
@@ -805,13 +855,42 @@ async function _runConnect(entry) {
     _showConnectorUnsupportedToast();
     return;
   }
+  // The disabled button is the primary guard during the 2s launch throttle; this state guard also
+  // closes the same-tick gap before re-render and protects programmatic/double invocations.
+  const activeLaunch = _oauthLaunchAttempts.get(entry.id);
+  if ((_connectorsState.connecting && _connectorsState.connecting.has(entry.id))
+      || (activeLaunch && activeLaunch.throttled)
+      || _oauthCallbackAttempts.has(entry.id)) return;
+
   const payload = _connectorTrackPayload(entry, null);
   const startedAt = performance.now();
+  const launchToken = ++_oauthLaunchToken;
+  const launchAttempt = {
+    token: launchToken,
+    attemptId: '',
+    timeoutId: null,
+    throttled: true,
+  };
+  _oauthLaunchAttempts.set(entry.id, launchAttempt);
+  launchAttempt.timeoutId = setTimeout(() => {
+    const current = _oauthLaunchAttempts.get(entry.id);
+    if (!current || current.token !== launchToken) return;
+    current.throttled = false;
+    current.timeoutId = null;
+    if (currentView === 'connectors') _renderConnectorsGrid();
+  }, _OAUTH_LAUNCH_THROTTLE_MS);
+  _renderConnectorsGrid();
   _connectorsTrackClick('connector_connect', payload);
+  let accepted = false;
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
     if (res && res.ok && res.started && typeof res.attempt_id === 'string' && res.attempt_id) {
+      accepted = true;
       _pendingConnectAttempts.set(res.attempt_id, { payload, startedAt });
+      const launch = _oauthLaunchAttempts.get(entry.id);
+      // The browser can take focus before IPC returns. Do not recreate feedback already cleared by
+      // that blur; only correlate a launch phase that is still visible.
+      if (launch && launch.token === launchToken) launch.attemptId = res.attempt_id;
     } else if (res && !res.ok) {
       _handleConnectFailure(payload, startedAt, res);
     } else {
@@ -819,7 +898,23 @@ async function _runConnect(entry) {
     }
   } catch (err) {
     _handleConnectFailure(payload, startedAt, err);
+  } finally {
+    if (!accepted) {
+      const launch = _oauthLaunchAttempts.get(entry.id);
+      if (launch && launch.token === launchToken) {
+        clearTimeout(launch.timeoutId);
+        _oauthLaunchAttempts.delete(entry.id);
+        _renderConnectorsGrid();
+      }
+    }
   }
+}
+
+function _clearOAuthLaunchFeedback() {
+  if (!_oauthLaunchAttempts.size) return;
+  for (const launch of _oauthLaunchAttempts.values()) clearTimeout(launch.timeoutId);
+  _oauthLaunchAttempts.clear();
+  if (currentView === 'connectors') _renderConnectorsGrid();
 }
 
 function _handleOAuthCallback(info) {
@@ -827,16 +922,29 @@ function _handleOAuthCallback(info) {
   // Ignore stale or foreign callbacks. Every renderer-initiated flow records its attempt as soon as
   // main accepts the launch, before an external browser can return to this process.
   if (!_pendingConnectAttempts.has(info.attempt_id)) return;
+  const launch = _oauthLaunchAttempts.get(info.catalog_id);
+  if (launch && launch.attemptId === info.attempt_id) {
+    clearTimeout(launch.timeoutId);
+    _oauthLaunchAttempts.delete(info.catalog_id);
+  }
   _oauthCallbackAttempts.set(info.catalog_id, info.attempt_id);
   _renderConnectorsGrid();
 }
 
 function _handleOAuthConnectResult(info) {
   if (!info || typeof info.attempt_id !== 'string' || typeof info.catalog_id !== 'string') return;
+  let busyChanged = false;
+  const launch = _oauthLaunchAttempts.get(info.catalog_id);
+  if (launch && launch.attemptId === info.attempt_id) {
+    clearTimeout(launch.timeoutId);
+    _oauthLaunchAttempts.delete(info.catalog_id);
+    busyChanged = true;
+  }
   if (_oauthCallbackAttempts.get(info.catalog_id) === info.attempt_id) {
     _oauthCallbackAttempts.delete(info.catalog_id);
-    _renderConnectorsGrid();
+    busyChanged = true;
   }
+  if (busyChanged) _renderConnectorsGrid();
   const pending = _pendingConnectAttempts.get(info.attempt_id) || null;
   if (pending) _pendingConnectAttempts.delete(info.attempt_id);
   const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
@@ -880,19 +988,34 @@ async function _retryConnect(entry, event) {
         const res = await window.orkas.invoke('connectors.refresh', { id });
         const status = res && res.instance && res.instance.status;
         if (res && res.ok && status && status.kind === 'connected') return null;
-        return (res && (res.error || (status && status.message))) || t('connectors.errors.connect_failed');
+        const error = (res && (res.error || (status && status.message))) || t('connectors.errors.connect_failed');
+        return {
+          error,
+          ..._connectorFailureDetail({ ...(res || {}), error }, 'refresh_failed'),
+        };
       } catch (err) {
-        return (err && err.message) || t('connectors.errors.connect_failed');
+        return {
+          error: (err && err.message) || t('connectors.errors.connect_failed'),
+          ..._connectorFailureDetail(err, 'refresh_exception'),
+        };
       }
     }));
     const failures = results.filter(Boolean);
     if (failures.length) {
+      const firstFailure = failures[0];
       _connectorsTrackEvent(`${event}_result`, {
         ...payload,
         result: 'failure',
         duration_ms: Math.round(performance.now() - startedAt),
+        error_code: firstFailure.error_code,
+        error_type: firstFailure.error_type,
       });
-      uiAlert(_formatConnectorStatusError(failures[0]));
+      _logConnectorOperationFailure(event, {
+        ...payload,
+        error_code: firstFailure.error_code,
+        error_type: firstFailure.error_type,
+      });
+      uiAlert(_formatConnectorStatusError(firstFailure.error));
     } else {
       _connectorsTrackEvent(`${event}_result`, {
         ...payload,
@@ -901,15 +1024,14 @@ async function _retryConnect(entry, event) {
       });
     }
   } catch (err) {
+    const failure = _connectorFailureDetail(err, 'refresh_exception');
     _connectorsTrackEvent(`${event}_result`, {
       ...payload,
       result: 'failure',
       duration_ms: Math.round(performance.now() - startedAt),
+      ...failure,
     });
-    _connectorsTrackError(event, {
-      ...payload,
-      error_type: _connectorTrackErrorType(err),
-    });
+    _logConnectorOperationFailure(event, { ...payload, ...failure });
     uiAlert(_formatConnectorStatusError((err && err.message) || ''));
   } finally {
     _connectorsState.connecting.delete(entry.id);
@@ -1020,10 +1142,23 @@ function _openAddCustomDialog() {
   const okBtn = overlay.querySelector('[data-act="ok"]');
   okBtn.addEventListener('click', async () => {
     const kind = f('kind').value;
+    const payload = { entry_point: 'form', transport_kind: kind };
+    const startedAt = performance.now();
+    _connectorsTrackClick('connector_custom_add', payload);
     let transport;
     if (kind === 'stdio') {
       const env = _parseEnvLines(f('env').value);
-      if (env === null) { uiAlert(t('connectors.custom.bad_env')); return; }
+      if (env === null) {
+        _connectorsTrackEvent('connector_custom_add_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+          error_code: 'invalid_env',
+          error_type: 'validation',
+        });
+        uiAlert(t('connectors.custom.bad_env'));
+        return;
+      }
       transport = {
         kind: 'stdio',
         command: f('command').value.trim(),
@@ -1032,14 +1167,22 @@ function _openAddCustomDialog() {
       };
     } else {
       const headers = _parseHeaderLines(f('headers').value);
-      if (headers === null) { uiAlert(t('connectors.custom.bad_headers')); return; }
+      if (headers === null) {
+        _connectorsTrackEvent('connector_custom_add_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+          error_code: 'invalid_headers',
+          error_type: 'validation',
+        });
+        uiAlert(t('connectors.custom.bad_headers'));
+        return;
+      }
       transport = { kind: 'streamable-http', url: f('url').value.trim(), headers };
     }
     okBtn.disabled = true;
     okBtn.textContent = t('connectors.action.connecting');
-    const payload = { transport_kind: kind };
-    const startedAt = performance.now();
-    _connectorsTrackClick('connector_custom_add', payload);
+    let added = false;
     try {
       const res = await window.orkas.invoke('connectors.add_custom', {
         display_name: f('name').value.trim(),
@@ -1051,6 +1194,7 @@ function _openAddCustomDialog() {
           result: 'success',
           duration_ms: Math.round(performance.now() - startedAt),
         });
+        added = true;
         close();
         const st = res.instance.status || {};
         if (st.kind === 'connected') {
@@ -1062,30 +1206,32 @@ function _openAddCustomDialog() {
           // (the old if/else-if pair had no branch for this and showed nothing at all).
           uiAlert(`${t('connectors.status.unverified')}: ${_formatConnectorStatusError(st.message)}`);
         }
-        await loadConnectors();
       } else {
+        const failure = _connectorFailureDetail(res, 'custom_add_failed');
         _connectorsTrackEvent('connector_custom_add_result', {
           ...payload,
           result: 'failure',
           duration_ms: Math.round(performance.now() - startedAt),
+          ...failure,
         });
+        _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
         uiAlert((res && res.error) || t('connectors.errors.connect_failed'));
       }
     } catch (err) {
+      const failure = _connectorFailureDetail(err, 'custom_add_exception');
       _connectorsTrackEvent('connector_custom_add_result', {
         ...payload,
         result: 'failure',
         duration_ms: Math.round(performance.now() - startedAt),
+        ...failure,
       });
-      _connectorsTrackError('connector_custom_add', {
-        ...payload,
-        error_type: _connectorTrackErrorType(err),
-      });
+      _logConnectorOperationFailure('connector_custom_add', { ...payload, ...failure });
       uiAlert((err && err.message) || t('connectors.errors.connect_failed'));
     } finally {
       okBtn.disabled = false;
       okBtn.textContent = t('connectors.custom.submit');
     }
+    if (added) await loadConnectors();
   });
   setTimeout(() => f('name').focus(), 0);
 }
@@ -1114,6 +1260,7 @@ function escapeHtml(s) {
 window.addEventListener('i18n-change', () => {
   if (currentView === 'connectors') _renderConnectorsGrid();
 });
+window.addEventListener('blur', _clearOAuthLaunchFeedback);
 
 // Refresh the grid when a connector or client-config push arrives. Right now the
 // only consumer is the connectors panel itself, but registering at module load lets future
@@ -1137,11 +1284,31 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
       _connectorInstallQueue.push(info);
       _drainConnectorInstallQueue();
     });
+    window.orkas.onPushEvent('connectors:install-confirm-cancelled', (payload) => {
+      const ids = Array.isArray(payload && payload.request_ids)
+        ? payload.request_ids.filter((id) => typeof id === 'string')
+        : [];
+      for (const id of ids) {
+        _connectorInstallCancelled.add(id);
+        const controller = _connectorInstallControllers.get(id);
+        if (controller) controller.abort();
+      }
+      if (ids.length) {
+        const cancelled = new Set(ids);
+        for (let i = _connectorInstallQueue.length - 1; i >= 0; i -= 1) {
+          if (cancelled.has(_connectorInstallQueue[i] && _connectorInstallQueue[i].request_id)) {
+            _connectorInstallQueue.splice(i, 1);
+          }
+        }
+      }
+    });
   } catch (_err) { /* event not supported; harmless */ }
 }
 
 const _connectorInstallQueue = [];
 let _connectorInstallDialogOpen = false;
+const _connectorInstallCancelled = new Set();
+const _connectorInstallControllers = new Map();
 
 async function _drainConnectorInstallQueue() {
   if (_connectorInstallDialogOpen) return;
@@ -1149,23 +1316,55 @@ async function _drainConnectorInstallQueue() {
   try {
     while (_connectorInstallQueue.length) {
       const info = _connectorInstallQueue.shift();
+      const requestId = String(info.request_id || '');
+      if (_connectorInstallCancelled.delete(requestId)) continue;
       const warn = info.kind === 'stdio' ? `\n\n${t('connectors.install_confirm.stdio_warning')}` : '';
-      const ok = await uiConfirm({
-        message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${info.summary}${warn}`,
-        okLabel: t('connectors.install_confirm.approve'),
-        cancelLabel: t('connectors.install_confirm.decline'),
-      });
+      const startedAt = performance.now();
+      let ok = false;
+      let dialogFailed = false;
+      const controller = typeof AbortController === 'function' ? new AbortController() : null;
+      if (controller) _connectorInstallControllers.set(requestId, controller);
       try {
-        _connectorsTrackClick('connector_install_confirm_response', {
-          approved: !!ok,
-          transport_kind: info.kind || '',
+        ok = await uiConfirm({
+          message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${info.summary}${warn}`,
+          okLabel: t('connectors.install_confirm.approve'),
+          cancelLabel: t('connectors.install_confirm.decline'),
+          ...(controller ? { signal: controller.signal } : {}),
         });
-        await window.orkas.invoke('connectors.install_confirm_response', {
+      } catch (_err) {
+        // A broken consent surface must fail closed and immediately unblock the Agent request.
+        dialogFailed = true;
+        _connectorsLog.warn('install confirm dialog failed; denying request');
+      }
+      _connectorInstallControllers.delete(requestId);
+      if (_connectorInstallCancelled.delete(requestId)) continue;
+      const payload = {
+        decision: ok ? 'approved' : 'denied',
+        transport_kind: info.kind || '',
+      };
+      try {
+        const response = await window.orkas.invoke('connectors.install_confirm_response', {
           request_id: info.request_id,
           approved: !!ok,
         });
-        if (ok && currentView === 'connectors') loadConnectors();
+        const stale = response && response.handled === false;
+        _connectorsTrackEvent('connector_install_confirmation_result', {
+          ...payload,
+          result: dialogFailed ? 'failure' : (stale ? 'cancelled' : 'success'),
+          duration_ms: Math.round(performance.now() - startedAt),
+          ...(dialogFailed
+            ? { error_code: 'dialog_failed', error_type: 'ui' }
+            : (stale ? { error_code: 'request_stale' } : {})),
+        });
+        if (ok && !stale && currentView === 'connectors') loadConnectors();
       } catch (err) {
+        _connectorsTrackEvent('connector_install_confirmation_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+          error_code: 'response_failed',
+          error_type: 'ipc',
+        });
         _connectorsLog.warn('install confirm response failed', { error: err && err.message });
       }
     }

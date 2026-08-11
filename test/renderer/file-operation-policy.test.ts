@@ -7,7 +7,6 @@ import { ALLOWED_EXTENSIONS as CHAT_ATTACHMENT_EXTENSIONS } from '../../src/main
 const policy = require('../../src/renderer/modules/file-operation-policy.js') as {
   canAddToChat: (name: string) => boolean;
   canAddToLibrary: (name: string, options?: { projectScoped?: boolean }) => boolean;
-  canShare: (name: string) => boolean;
 };
 
 describe('file operation policy', () => {
@@ -21,7 +20,7 @@ describe('file operation policy', () => {
 
   it.each([
     'note.md', 'data.json', 'report.pdf', 'document.docx', 'sheet.xlsx', 'slides.pptx',
-    'photo.png', 'clip.mp4', 'voice.mp3',
+    'photo.png', 'clip.mp4', 'voice.mp3', 'skills.zip',
   ])('allows supported chat attachment %s', (name) => {
     expect(policy.canAddToChat(name)).toBe(true);
   });
@@ -33,7 +32,7 @@ describe('file operation policy', () => {
   });
 
   it.each([
-    'page.html', 'style.css', 'script.js', 'source.py', 'archive.zip', 'legacy.doc',
+    'page.html', 'style.css', 'script.js', 'source.py', 'legacy.doc',
     'vector.svg', 'font.woff2', 'module.wasm',
   ])('does not advertise Add to chat for unsupported %s', (name) => {
     expect(policy.canAddToChat(name)).toBe(false);
@@ -59,20 +58,9 @@ describe('file operation policy', () => {
     },
   );
 
-  it('shares UTF-8 text/code families only', () => {
-    expect(policy.canShare('note.md')).toBe(true);
-    expect(policy.canShare('page.html')).toBe(true);
-    expect(policy.canShare('style.css')).toBe(true);
-    expect(policy.canShare('source.py')).toBe(true);
-    expect(policy.canShare('photo.png')).toBe(false);
-    expect(policy.canShare('report.pdf')).toBe(false);
-    expect(policy.canShare('clip.mp4')).toBe(false);
-  });
-
-  it('is case-insensitive and does not infer a type without an extension', () => {
+  it('is case-insensitive', () => {
     expect(policy.canAddToChat('REPORT.PDF')).toBe(true);
     expect(policy.canAddToLibrary('PHOTO.PNG')).toBe(true);
-    expect(policy.canShare('SOURCE.TS')).toBe(true);
     expect(policy.canAddToChat('README')).toBe(false);
   });
 });

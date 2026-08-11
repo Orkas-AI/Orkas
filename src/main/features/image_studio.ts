@@ -23,6 +23,14 @@ export type ImageStudioRegionDepth = 'background' | 'midground' | 'foreground';
 export type ImageStudioRegionRole = 'hero' | 'support' | 'copy' | 'decoration' | 'background';
 export type ImageStudioControlType = 'image_prompt' | 'canny' | 'depth' | 'pose' | 'mask';
 
+export interface ImageStudioAdditionalQualityDimension {
+  id: string;
+  label: string;
+  reason: string;
+  evidence: string;
+  score: number;
+}
+
 export interface ImageStudioQualityScorecard {
   intent_alignment: number;
   composition: number;
@@ -31,6 +39,7 @@ export interface ImageStudioQualityScorecard {
   defect_freedom: number;
   specificity: number;
   reference_fidelity?: number;
+  additional_dimensions: ImageStudioAdditionalQualityDimension[];
   overall: number;
   pass_threshold: number;
   dimension_floor: number;
@@ -118,6 +127,36 @@ export interface ImageStudioIssue {
   message: string;
 }
 
+export interface ImageStudioRequiredCopyLayout {
+  copy: string;
+  lineGlyphCounts: number[];
+  explicitBreak: boolean;
+  writingMode: string;
+}
+
+export function requiredCopyLayoutIssues(
+  layouts: readonly ImageStudioRequiredCopyLayout[],
+): ImageStudioIssue[] {
+  return layouts.flatMap((layout) => {
+    const lineGlyphCounts = layout.lineGlyphCounts.filter((count) => count > 0);
+    const totalGlyphs = lineGlyphCounts.reduce((sum, count) => sum + count, 0);
+    const isHorizontal = !layout.writingMode || layout.writingMode.startsWith('horizontal');
+    if (
+      layout.explicitBreak
+      || !isHorizontal
+      || totalGlyphs < 4
+      || lineGlyphCounts.length < 2
+      || !lineGlyphCounts.some((count) => count === 1)
+    ) {
+      return [];
+    }
+    return [{
+      code: 'E_REQUIRED_COPY_ORPHAN_LINE',
+      message: `Required copy wraps with a one-glyph orphan line (${lineGlyphCounts.join('+')}): ${layout.copy}. Widen the text box, reduce the type size, or add an intentional balanced line break.`,
+    }];
+  });
+}
+
 export interface ImageStudioInspection {
   ok: boolean;
   route?: ImageStudioRoute;
@@ -159,6 +198,12 @@ const REGION_DEPTHS = new Set<ImageStudioRegionDepth>(['background', 'midground'
 const REGION_ROLES = new Set<ImageStudioRegionRole>(['hero', 'support', 'copy', 'decoration', 'background']);
 const CONTROL_TYPES = new Set<ImageStudioControlType>(['image_prompt', 'canny', 'depth', 'pose', 'mask']);
 const QUALITY_SCORE_KEYS = ['intent_alignment', 'composition', 'craft', 'text_legibility', 'defect_freedom', 'specificity'] as const;
+const RESERVED_QUALITY_DIMENSION_IDS = new Set([
+  ...QUALITY_SCORE_KEYS,
+  'reference_fidelity',
+  'overall',
+]);
+const MAX_ADDITIONAL_QUALITY_DIMENSIONS = 8;
 const QUALITY_PASS_THRESHOLD = 80;
 const QUALITY_DIMENSION_FLOOR = 70;
 const REQUIRED_ART_DIRECTION = [
@@ -218,7 +263,61 @@ function pushIssue(issues: ImageStudioIssue[], code: string, message: string): v
   issues.push({ code, message });
 }
 
-export function compileImageQualityScorecard(value: unknown, requireReferenceFidelity = false): ImageStudioQualityScorecard {
+function compileAdditionalQualityDimensions(value: unknown): ImageStudioAdditionalQualityDimension[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error('E_IMAGE_REVIEW_ADDITIONAL_DIMENSIONS_INVALID: additional_dimensions must be an array.');
+  }
+  if (value.length > MAX_ADDITIONAL_QUALITY_DIMENSIONS) {
+    throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSIONS_LIMIT: additional_dimensions accepts at most ${MAX_ADDITIONAL_QUALITY_DIMENSIONS} task-specific dimensions.`);
+  }
+  const seen = new Set<string>();
+  return value.map((raw, index) => {
+    if (!isRecord(raw)) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_INVALID: additional_dimensions[${index}] must be an object.`);
+    }
+    const id = typeof raw.id === 'string' ? raw.id.trim() : '';
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(id)) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_ID: additional_dimensions[${index}].id must be a lowercase snake_case identifier.`);
+    }
+    if (RESERVED_QUALITY_DIMENSION_IDS.has(id)) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_RESERVED: additional_dimensions[${index}].id duplicates a mandatory quality dimension.`);
+    }
+    if (seen.has(id)) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_DUPLICATE: duplicate additional dimension id ${id}.`);
+    }
+    seen.add(id);
+    const label = typeof raw.label === 'string' ? raw.label.trim() : '';
+    const reason = typeof raw.reason === 'string' ? raw.reason.trim() : '';
+    const evidence = typeof raw.evidence === 'string' ? raw.evidence.trim() : '';
+    if (!label || label.length > 120) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_LABEL: additional_dimensions[${index}].label must contain 1 to 120 characters.`);
+    }
+    if (!reason || reason.length > 500) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_REASON: additional_dimensions[${index}].reason must contain 1 to 500 characters.`);
+    }
+    if (!evidence || evidence.length > 1_000) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_EVIDENCE: additional_dimensions[${index}].evidence must contain 1 to 1000 characters.`);
+    }
+    const score = Number(raw.score);
+    if (!Number.isFinite(score) || score < 0 || score > 100) {
+      throw new Error(`E_IMAGE_REVIEW_ADDITIONAL_DIMENSION_SCORE: additional_dimensions[${index}].score must be from 0 to 100.`);
+    }
+    return {
+      id,
+      label,
+      reason,
+      evidence,
+      score: Math.round(score * 10) / 10,
+    };
+  });
+}
+
+export function compileImageQualityScorecard(
+  value: unknown,
+  requireReferenceFidelity = false,
+  additionalDimensions?: unknown,
+): ImageStudioQualityScorecard {
   if (!isRecord(value)) throw new Error('E_IMAGE_REVIEW_SCORES_REQUIRED: quality_scores must be an object.');
   const scores: Record<string, number> = {};
   for (const key of QUALITY_SCORE_KEYS) {
@@ -235,6 +334,10 @@ export function compileImageQualityScorecard(value: unknown, requireReferenceFid
     }
     scores.reference_fidelity = Math.round(score * 10) / 10;
   }
+  const compiledAdditionalDimensions = compileAdditionalQualityDimensions(additionalDimensions);
+  // Task-specific dimensions are pass/fail gates, not bonus points. Keep the
+  // mandatory baseline comparable across reviews and prevent easy extra scores
+  // from diluting a weak core result.
   const values = Object.values(scores);
   const overall = Math.round((values.reduce((sum, score) => sum + score, 0) / values.length) * 10) / 10;
   return {
@@ -245,6 +348,7 @@ export function compileImageQualityScorecard(value: unknown, requireReferenceFid
     defect_freedom: scores.defect_freedom,
     specificity: scores.specificity,
     ...(scores.reference_fidelity !== undefined ? { reference_fidelity: scores.reference_fidelity } : {}),
+    additional_dimensions: compiledAdditionalDimensions,
     overall,
     pass_threshold: QUALITY_PASS_THRESHOLD,
     dimension_floor: QUALITY_DIMENSION_FLOOR,
@@ -266,6 +370,7 @@ export function assertImageQualityVerdict(
     scorecard.defect_freedom,
     scorecard.specificity,
     ...(scorecard.reference_fidelity === undefined ? [] : [scorecard.reference_fidelity]),
+    ...scorecard.additional_dimensions.map((dimension) => dimension.score),
   ];
   if (verdict === 'passed' && findings.some((item) => item.trim())) {
     throw new Error('E_IMAGE_REVIEW_PASS_FINDINGS: a passing review cannot retain blocker or fix findings.');
@@ -869,7 +974,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
   });
 }
 
-async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string): Promise<ReturnType<typeof analyzeNativeImage>> {
+async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string): Promise<{
+  image: ReturnType<typeof analyzeNativeImage>;
+  layoutBlockers: ImageStudioIssue[];
+}> {
   const electron = await import('electron');
   if (!electron.BrowserWindow) throw new Error('E_IMAGE_STUDIO_BROWSER_UNAVAILABLE: Electron BrowserWindow is unavailable.');
   const partition = `image-studio-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -888,7 +996,8 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
   try {
     const entryAbs = path.resolve(projectDirAbs, manifest.entry || 'index.html');
     await withTimeout(win.loadURL(pathToFileURL(entryAbs).toString()), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_LOAD_TIMEOUT: HTML entry did not finish loading.');
-    await withTimeout(win.webContents.executeJavaScript(`(async () => {
+    const requiredCopyLiteral = JSON.stringify(JSON.stringify(manifest.brief.required_copy));
+    const requiredCopyLayouts = await withTimeout(win.webContents.executeJavaScript(`(async () => {
       if (document.fonts && document.fonts.ready) await document.fonts.ready;
       const images = Array.from(document.images || []);
       await Promise.all(images.map((img) => img.complete ? Promise.resolve() : new Promise((resolve) => {
@@ -896,12 +1005,82 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
         img.addEventListener('error', resolve, { once: true });
       })));
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      return true;
+      const requiredCopy = JSON.parse(${requiredCopyLiteral});
+      const visibleText = (element) => Array.from(String(element.innerText || ''))
+        .filter((char) => !/\\s/u.test(char));
+      const elements = [document.body, ...Array.from(document.body.querySelectorAll('*'))];
+      return requiredCopy.map((copy) => {
+        const copyChars = Array.from(String(copy)).filter((char) => !/\\s/u.test(char));
+        const candidates = elements.filter((element) => {
+          const style = getComputedStyle(element);
+          if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+          const chars = visibleText(element);
+          if (chars.length < copyChars.length) return false;
+          return chars.join('').includes(copyChars.join(''));
+        }).sort((left, right) => visibleText(left).length - visibleText(right).length);
+        const element = candidates[0];
+        if (!element) return { copy, lineGlyphCounts: [], explicitBreak: false, writingMode: '' };
+        const glyphs = [];
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode();
+        while (node) {
+          const value = String(node.data || '');
+          for (let offset = 0; offset < value.length;) {
+            const codePoint = value.codePointAt(offset);
+            const char = String.fromCodePoint(codePoint);
+            const width = char.length;
+            if (!/\\s/u.test(char)) glyphs.push({ node, start: offset, end: offset + width, char });
+            offset += width;
+          }
+          node = walker.nextNode();
+        }
+        let start = -1;
+        for (let index = 0; index <= glyphs.length - copyChars.length; index += 1) {
+          if (copyChars.every((char, offset) => glyphs[index + offset].char === char)) {
+            start = index;
+            break;
+          }
+        }
+        if (start < 0) {
+          return {
+            copy,
+            lineGlyphCounts: [],
+            explicitBreak: Boolean(element.querySelector('br')),
+            writingMode: getComputedStyle(element).writingMode || '',
+          };
+        }
+        const lineTops = [];
+        for (const glyph of glyphs.slice(start, start + copyChars.length)) {
+          const range = document.createRange();
+          range.setStart(glyph.node, glyph.start);
+          range.setEnd(glyph.node, glyph.end);
+          const rect = range.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) lineTops.push(rect.top);
+        }
+        lineTops.sort((left, right) => left - right);
+        const lines = [];
+        for (const top of lineTops) {
+          const line = lines.find((candidate) => Math.abs(candidate.top - top) <= 2);
+          if (line) line.count += 1;
+          else lines.push({ top, count: 1 });
+        }
+        return {
+          copy,
+          lineGlyphCounts: lines.map((line) => line.count),
+          explicitBreak: Boolean(element.querySelector('br')),
+          writingMode: getComputedStyle(element).writingMode || '',
+        };
+      });
     })()`, true), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_READY_TIMEOUT: fonts or local images did not become ready.');
     const image = await withTimeout(win.webContents.capturePage(), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
     await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
     await fs.writeFile(outputAbsPath, image.toPNG());
-    return analyzeNativeImage(image);
+    return {
+      image: analyzeNativeImage(image),
+      layoutBlockers: requiredCopyLayoutIssues(
+        Array.isArray(requiredCopyLayouts) ? requiredCopyLayouts : [],
+      ),
+    };
   } finally {
     try { win.destroy(); } catch { /* best effort */ }
   }
@@ -921,11 +1100,43 @@ export async function readImageStudioEvidenceState(stateAbsPath: string): Promis
   } catch { return null; }
 }
 
+/** Preserve a completed review when recapturing did not prove a material
+ * repair. A rejected candidate needs both a changed source signature and
+ * changed rendered pixels before it becomes eligible for another review.
+ * This prevents a no-op source edit or a fresh output filename from erasing
+ * the finding. A passing review is stricter: it survives only an exact
+ * recapture of the same source and pixels. */
+function reviewForRecapturedEvidence(input: {
+  previous: ImageStudioEvidenceState | null;
+  projectDirAbs: string;
+  signature: string;
+  evidencePath: string;
+  imageHash: string;
+}): ImageStudioEvidenceState['review'] | undefined {
+  const previous = input.previous;
+  const review = previous?.review;
+  if (!previous || !review) return undefined;
+  if (path.resolve(previous.project_dir) !== path.resolve(input.projectDirAbs)) return undefined;
+  if (review.signature !== previous.signature) return undefined;
+  const sourceChanged = previous.signature !== input.signature;
+  const pixelsChanged = previous.image_hash !== input.imageHash;
+  const rejected = review.verdict === 'repair' || review.verdict === 'blocked';
+  const materialRepairProven = sourceChanged && pixelsChanged;
+  const exactRecapture = !sourceChanged && !pixelsChanged;
+  if ((rejected && materialRepairProven) || (!rejected && !exactRecapture)) return undefined;
+  return {
+    ...review,
+    signature: input.signature,
+    evidence_path: path.resolve(input.evidencePath),
+  };
+}
+
 export async function snapshotImageStudioProject(input: {
   projectDirAbs: string;
   outputAbsPath: string;
   stateAbsPath: string;
 }): Promise<ImageStudioInspection> {
+  const previous = await readImageStudioEvidenceState(input.stateAbsPath);
   const inspection = await inspectImageStudioProject(input.projectDirAbs);
   if (!inspection.ok || !inspection.manifest || !inspection.signature) return inspection;
   if (inspection.route !== 'compose' && inspection.route !== 'hybrid') {
@@ -935,17 +1146,38 @@ export async function snapshotImageStudioProject(input: {
       blockers: [...inspection.blockers, { code: 'E_SNAPSHOT_ROUTE', message: 'project.snapshot is only for COMPOSE and HYBRID; inspect the generated raster directly.' }],
     };
   }
-  const image = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath));
+  const rendered = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath));
+  const image = rendered.image;
+  const evidencePath = path.resolve(input.outputAbsPath);
+  const review = rendered.layoutBlockers.length
+    ? undefined
+    : reviewForRecapturedEvidence({
+      previous,
+      projectDirAbs: input.projectDirAbs,
+      signature: inspection.signature,
+      evidencePath,
+      imageHash: image.hash,
+    });
   const state: ImageStudioEvidenceState = {
     schema_version: 1,
     project_dir: path.resolve(input.projectDirAbs),
     route: inspection.route,
     signature: inspection.signature,
-    evidence_path: path.resolve(input.outputAbsPath),
+    evidence_path: evidencePath,
     image_hash: image.hash,
     captured_at: new Date().toISOString(),
+    ...(review ? { review } : {}),
   };
   await writeEvidenceState(input.stateAbsPath, state);
+  if (rendered.layoutBlockers.length) {
+    return {
+      ...inspection,
+      ok: false,
+      evidence_path: evidencePath,
+      image,
+      blockers: [...inspection.blockers, ...rendered.layoutBlockers],
+    };
+  }
   return { ...inspection, evidence_path: state.evidence_path, image };
 }
 
@@ -954,18 +1186,28 @@ export async function recordRasterEvidence(input: {
   rasterAbsPath?: string;
   stateAbsPath: string;
 }): Promise<ImageStudioInspection> {
+  const previous = await readImageStudioEvidenceState(input.stateAbsPath);
   const inspection = await inspectImageStudioProject(input.projectDirAbs, input.rasterAbsPath);
   if (!inspection.ok || !inspection.signature || !inspection.evidence_path || !inspection.image || !inspection.route) return inspection;
   if (inspection.route === 'compose' || inspection.route === 'hybrid') return inspection;
+  const evidencePath = path.resolve(inspection.evidence_path);
+  const review = reviewForRecapturedEvidence({
+    previous,
+    projectDirAbs: input.projectDirAbs,
+    signature: inspection.signature,
+    evidencePath,
+    imageHash: inspection.image.hash,
+  });
   await writeEvidenceState(input.stateAbsPath, {
     schema_version: 1,
     project_dir: path.resolve(input.projectDirAbs),
     route: inspection.route,
     signature: inspection.signature,
-    evidence_path: inspection.evidence_path,
+    evidence_path: evidencePath,
     source_path: inspection.source_path,
     image_hash: inspection.image.hash,
     captured_at: new Date().toISOString(),
+    ...(review ? { review } : {}),
   });
   return inspection;
 }
@@ -991,6 +1233,7 @@ export async function submitImageStudioDesignReview(input: {
   scope: string;
   findings: string[];
   qualityScores: unknown;
+  additionalDimensions?: unknown;
 }): Promise<ImageStudioEvidenceState> {
   const { state, inspection } = await assertCurrentEvidence(input.stateAbsPath);
   if (path.resolve(input.evidenceAbsPath) !== path.resolve(state.evidence_path)) {
@@ -1000,7 +1243,17 @@ export async function submitImageStudioDesignReview(input: {
   if (input.verdict !== 'passed' && input.findings.length === 0) {
     throw new Error('E_IMAGE_REVIEW_FINDINGS_REQUIRED: repair and blocked verdicts require concrete findings.');
   }
-  const qualityScorecard = compileImageQualityScorecard(input.qualityScores, !!inspection.manifest?.references?.length);
+  if (state.review?.verdict === 'repair' || state.review?.verdict === 'blocked') {
+    throw new Error('E_IMAGE_REVIEW_REPAIR_REQUIRED: change both the candidate sources and the rendered pixels before reviewing again.');
+  }
+  if (state.review?.verdict === 'passed') {
+    throw new Error('E_IMAGE_REVIEW_ALREADY_SUBMITTED: this exact visual evidence already has a passing review.');
+  }
+  const qualityScorecard = compileImageQualityScorecard(
+    input.qualityScores,
+    !!inspection.manifest?.references?.length,
+    input.additionalDimensions,
+  );
   assertImageQualityVerdict(
     input.verdict,
     input.findings,
@@ -1008,9 +1261,6 @@ export async function submitImageStudioDesignReview(input: {
     inspection.manifest?.reference_intent?.minimum_score ?? QUALITY_DIMENSION_FLOOR,
     inspection.advisories,
   );
-  if ((state.review?.verdict === 'repair' || state.review?.verdict === 'blocked') && input.verdict === 'passed') {
-    throw new Error('E_IMAGE_REVIEW_REPAIR_REQUIRED: change the image sources and capture or inspect new evidence before submitting a passing review.');
-  }
   const next: ImageStudioEvidenceState = {
     ...state,
     review: {

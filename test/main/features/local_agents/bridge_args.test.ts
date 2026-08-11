@@ -66,11 +66,12 @@ describe('codex bridge overrides', () => {
     const overrides = buildCodexBridgeOverrides({
       command: '/usr/local/bin/node',
       args: ['/pc/bin/orkas-bridge.cjs'],
-      // Real serverEnv shape: env-file pointer + run-as-node + paths, with the
+      // Real macOS serverEnv shape: env-file pointer + bundled Node + paths, with the
       // secret token/socket present to prove they are filtered out of argv.
       env: {
         ORKAS_BRIDGE_ENV_FILE: '/runs/r1/orkas-bridge-env.json',
-        ELECTRON_RUN_AS_NODE: '1',
+        ORKAS_NODE: '/usr/local/bin/node',
+        ORKAS_BUNDLED_NODE: '/usr/local/bin/node',
         ORKAS_PC_DIR: '/pc',
         ORKAS_BRIDGE_TOKEN: 'tok',
         ORKAS_BRIDGE_SOCKET: '/tmp/b.sock',
@@ -82,7 +83,9 @@ describe('codex bridge overrides', () => {
     // Non-secret env IS injected — Codex does not inherit the parent env, so
     // without these the bridge MCP server exits "env required".
     expect(overrides).toContain('mcp_servers.orkas.env.ORKAS_BRIDGE_ENV_FILE="/runs/r1/orkas-bridge-env.json"');
-    expect(overrides).toContain('mcp_servers.orkas.env.ELECTRON_RUN_AS_NODE="1"');
+    expect(overrides).toContain('mcp_servers.orkas.env.ORKAS_NODE="/usr/local/bin/node"');
+    expect(overrides).toContain('mcp_servers.orkas.env.ORKAS_BUNDLED_NODE="/usr/local/bin/node"');
+    expect(overrides.join('\n')).not.toContain('ELECTRON_RUN_AS_NODE');
     expect(overrides).toContain('mcp_servers.orkas.env.ORKAS_PC_DIR="/pc"');
     // Token/socket must never reach argv.
     expect(overrides.join('\n')).not.toContain('ORKAS_BRIDGE_TOKEN');

@@ -68,8 +68,44 @@
     void data;
   }
 
-  function _trackError(action, data) {
-    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+  function _logArtifactFailure(action, data) {
+    try { _convLog.warn('chat artifact operation failed', { action, ...(data || {}) }); } catch (_) {}
+  }
+
+  function _artifactSaveFailure(value, fallbackType = 'operation') {
+    const message = String((value && (value.error || value.message)) || value || '').toLowerCase();
+    let errorCode = 'artifact_save_failed';
+    if (/not found/.test(message)) errorCode = 'artifact_not_found';
+    else if (/outside .*workspace|path traversal|forbidden/.test(message)) errorCode = 'permission_denied';
+    else if (!value) errorCode = 'invalid_response';
+    let errorType = fallbackType;
+    if (errorCode === 'invalid_response') errorType = 'validation';
+    else if (errorCode === 'permission_denied') errorType = 'authorization';
+    else if (errorCode === 'artifact_not_found') errorType = 'operation';
+    return { error_type: errorType, error_code: errorCode };
+  }
+
+  function _artifactSaveSourceView(cid) {
+    try {
+      return (typeof _projectIdForConversation === 'function' && _projectIdForConversation(cid))
+        ? 'project'
+        : 'conversation';
+    } catch (_) {
+      return 'conversation';
+    }
+  }
+
+  function _trackArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
+    if (result === 'success') return;
+    _logArtifactFailure('artifact_save', {
+      source_view: sourceView,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+      ...failure,
+    });
+  }
+
+  function _logArtifactSaveFailure(failure) {
+    _logArtifactFailure('artifact_save', failure);
   }
   let _viewerEl = null;
   let _viewerFrame = null;
@@ -328,10 +364,10 @@
     panel.innerHTML = '';
     const title = document.createElement('div');
     title.className = 'chat-artifact-unavailable-title';
-    title.textContent = _t('artifact.unavailable_title', 'Historical content placeholder');
+    title.textContent = _t('artifact.unavailable_title', 'App content incomplete');
     const detail = document.createElement('div');
     detail.className = 'chat-artifact-unavailable-detail';
-    detail.textContent = _t('artifact.unavailable_detail', 'This saved app contains compacted conversation history, not full artifact content. Regenerate the artifact content to preview it.');
+    detail.textContent = _t('artifact.unavailable_detail', 'This saved app only retains a summarized conversation record, not the complete app. Regenerate the app to preview it.');
     panel.appendChild(title);
     panel.appendChild(detail);
     if (reason) panel.title = String(reason);
@@ -357,7 +393,7 @@
         _clearArtifactUnavailable(frame);
       }
     } catch (err) {
-      _trackError('artifact_inspect', { error_message: String(err && err.message || err) });
+      _logArtifactFailure('artifact_inspect', { error_message: String(err && err.message || err) });
     }
   }
 
@@ -375,28 +411,45 @@
 
   function _doOpen(ctx) {
     try { _openViewer(ctx); }
-    catch (err) { _trackError('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
+    catch (err) { _logArtifactFailure('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
-    _track('artifact_save', { surface: 'conversation' });
+    const startedAt = Date.now();
+    const sourceView = _artifactSaveSourceView(ctx?.cid);
+    _track('artifact_save', { surface: 'conversation', source_view: sourceView });
+    let r;
     try {
-      const r = await window.orkas.invoke('conversations.artifacts.save', {
+      r = await window.orkas.invoke('conversations.artifacts.save', {
         cid: String(ctx.cid), artifactId: String(ctx.artifactId),
       });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'save failed');
-      _trackEvent('artifact_save_result', { result: 'success', surface: 'conversation' });
-      try {
-        const message = _t('apps.saved_toast', 'Saved to My Apps');
-        if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
-        else if (typeof uiAlert === 'function') uiAlert(message);
-      } catch (_) {}
-      // Refresh the "My Apps" tab if its module is loaded.
-      try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
     } catch (err) {
-      _trackEvent('artifact_save_result', { result: 'failure', surface: 'conversation' });
-      _trackError('artifact_save', { error_message: String(err && err.message || err) });
+      const failure = _artifactSaveFailure(err, 'ipc');
+      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), err);
+      return;
+    }
+    if (!r || r.ok === false) {
+      const failure = _artifactSaveFailure(r, 'operation');
+      _trackArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+      _logArtifactSaveFailure(failure);
+      _notifyFail(_t('apps.save_failed', 'Could not save the app'), { message: (r && r.error) || 'save failed' });
+      return;
+    }
+
+    _trackArtifactSaveResult(startedAt, 'success', sourceView);
+    try {
+      const message = _t('apps.saved_toast', 'Saved to My Apps');
+      if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
+      else if (typeof uiAlert === 'function') uiAlert(message);
+      // Refresh the "My Apps" tab if its module is loaded.
+      if (typeof loadSavedApps === 'function') loadSavedApps(true);
+    } catch (_) {
+      _logArtifactSaveFailure({
+        error_type: 'presentation',
+        error_code: 'artifact_save_presentation_failed',
+      });
     }
   }
 

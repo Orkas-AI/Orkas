@@ -112,17 +112,21 @@ describe('preload bridge', () => {
     const bashHandler = vi.fn(() => { throw new Error('renderer callback failed'); });
     const bashCancelledHandler = vi.fn();
     const bridgeHandler = vi.fn();
+    const interactiveCliHandler = vi.fn();
 
     api.onPushEvent('bash:permission', bashHandler);
     api.onPushEvent('bash:permission_cancelled', bashCancelledHandler);
     api.onPushEvent('bridge:permission', bridgeHandler);
+    api.onPushEvent('interactive-cli:event', interactiveCliHandler);
 
     expect(() => emit('bash:permission', { request_id: 'bash-1' })).not.toThrow();
     emit('bash:permission_cancelled', { request_ids: ['bash-1'] });
     emit('bridge:permission', { request_id: 'bridge-1' });
+    emit('interactive-cli:event', { session_id: 'session-1', kind: 'prompt' });
     expect(bashHandler).toHaveBeenCalledOnce();
     expect(bashCancelledHandler).toHaveBeenCalledWith({ request_ids: ['bash-1'] });
     expect(bridgeHandler).toHaveBeenCalledWith({ request_id: 'bridge-1' });
+    expect(interactiveCliHandler).toHaveBeenCalledWith({ session_id: 'session-1', kind: 'prompt' });
   });
 
   it('delivers stream events, resolves on done, and cleans the listener', async () => {

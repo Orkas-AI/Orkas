@@ -33,13 +33,15 @@ export type CompletionParams = {
   stopSequences?: string[];
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
+  /** Optional per-call first usable stream-event deadline. Rotating wrappers
+   * use this only before a candidate is committed; ordinary adapters ignore
+   * it and continue to honor `signal` for the whole request. */
+  firstEventTimeoutMs?: number;
   /** Thinking/reasoning level.
    *  - `"off"` explicitly disables thinking even if the provider has a
    *    `defaultReasoning` configured (used to opt out per-call).
-   *  - `undefined` falls back to the provider's `defaultReasoning` (e.g.
-   *    DeepSeek V4 Pro factories set `'low'` because the API errors 400 if
-   *    `reasoning_effort` is missing while assistant history carries
-   *    `reasoning_content`).
+   *  - `undefined` falls back to the provider's `defaultReasoning`, when one
+   *    is configured; otherwise the request omits an explicit effort.
    *  - `"minimal"`/`"low"`/`"medium"`/`"high"` map directly to pi-ai's
    *    `ThinkingLevel` for the provider's reasoner channel. */
   reasoning?: "off" | "minimal" | "low" | "medium" | "high";

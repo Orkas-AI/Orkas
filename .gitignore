@@ -13,4 +13,8 @@
 /resources/runtime/whisper
 /resources/runtime/vc
 /src/main/native/build/
+/playwright-report/
+/test-results/
+*.pyc
+__pycache__/
 /userWorkSpace

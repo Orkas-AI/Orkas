@@ -50,7 +50,7 @@ describe('floating layer ordering', () => {
     const labelDotBlock = css.match(/#settings-btn\.has-dot \.sidebar-footer-label::after\s*\{[\s\S]*?\}/)?.[0] || '';
     expect(buttonBadgeBlock).toContain('content: attr(data-sidebar-status)');
     expect(labelDotBlock).toContain("content: ''");
-    expect(labelDotBlock).toContain('width: 6px');
+    expect(labelDotBlock).toContain('width: 4px');
     expect(labelDotBlock).toContain('margin-left: 6px');
     expect(css).toContain('.has-dot:not(.sidebar-footer-btn)::after');
     expect(css).not.toMatch(/(^|[,\n]\s*)\.has-dot::after\s*\{/);

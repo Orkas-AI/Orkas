@@ -53,6 +53,16 @@ async function loadAgents() {
   return import('../../../src/main/features/agents');
 }
 
+async function failNextBlockingAgentChat(text: string, error: string): Promise<void> {
+  const client = await import('../../../src/main/model/client');
+  vi.mocked(client.chatWithModel).mockResolvedValueOnce({
+    ok: false,
+    text,
+    error,
+    aborted: false,
+  });
+}
+
 // New layout: custom agents live under <uid>/cloud/agents (no more shared/
 // prefix, no more custom/ subdir — the loader distinguishes builtin vs
 // custom by source root).
@@ -284,16 +294,34 @@ describe('agents › normalizeAgent', () => {
     }
   });
 
-  it('passes through a valid CLI runtime', async () => {
+  it('keeps new per-Agent overrides while ignoring the removed legacy model field', async () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({
       agent_id: 'x', name: 'N',
-      runtime: { kind: 'cli', cli: 'claude', model: 'claude-opus-4-7', custom_args: ['--debug'] },
+      runtime: {
+        kind: 'cli', cli: 'claude',
+        model: 'stale-legacy-model',
+        model_override: 'claude-opus-4-7',
+        thinking_level: 'high',
+        custom_args: ['--debug'],
+      },
     } as any, 'custom');
     expect(norm?.runtime).toEqual({
-      kind: 'cli', cli: 'claude', model: 'claude-opus-4-7', custom_args: ['--debug'],
+      kind: 'cli', cli: 'claude',
+      model_override: 'claude-opus-4-7',
+      thinking_level: 'high',
+      custom_args: ['--debug'],
     });
     expect(a.isCliAgent(norm)).toBe(true);
+  });
+
+  it('drops unsafe CLI runtime override values instead of persisting control text', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      runtime: { kind: 'cli', cli: 'claude', model_override: 'safe\n--flag', thinking_level: 'x'.repeat(201) },
+    } as any, 'custom');
+    expect(norm?.runtime).toEqual({ kind: 'cli', cli: 'claude' });
   });
 
   it('drops malformed runtime entries (no field set)', async () => {
@@ -420,6 +448,50 @@ describe('agents › CLI project directory settings', () => {
     fs.mkdirSync(customDir);
     await expect(a.setAgentCliProjectDir(TEST_UID, 'general-cli', customDir))
       .rejects.toMatchObject({ code: 'E_AGENT_NOT_CODING_CLI' });
+  });
+});
+
+describe('agents › CLI resolved model observations', () => {
+  it('upgrades the local runtime config and keeps observations scoped to an Agent and account', async () => {
+    const configFile = path.join(tmpDir, TEST_UID, 'local', 'config', 'agent-runtime.json');
+    const projectDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(path.dirname(configFile), { recursive: true });
+    fs.writeFileSync(configFile, JSON.stringify({
+      version: 1,
+      project_dirs: { 'claude-agent': { path: projectDir } },
+    }));
+    const a = await loadAgents();
+
+    const observed = a.recordAgentCliResolvedModel(
+      TEST_UID,
+      'claude-agent',
+      'claude',
+      'sonnet',
+      'claude-sonnet-4-6',
+    );
+
+    expect(observed).toMatchObject({
+      cli: 'claude',
+      requested_model: 'sonnet',
+      resolved_model: 'claude-sonnet-4-6',
+    });
+    expect(observed?.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(a.getAgentCliResolvedModelInfo(TEST_UID, 'claude-agent')).toEqual(observed);
+    expect(a.getAgentCliResolvedModelInfo('another-account', 'claude-agent')).toBeNull();
+
+    const persisted = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    expect(persisted.version).toBe(2);
+    expect(persisted.project_dirs['claude-agent'].path).toBe(projectDir);
+    expect(persisted.resolved_models['claude-agent']).toEqual(observed);
+
+    expect(a.recordAgentCliResolvedModel(
+      TEST_UID,
+      'claude-agent',
+      'claude',
+      'opus',
+      'unsafe\n--flag',
+    )).toBeNull();
+    expect(a.getAgentCliResolvedModelInfo(TEST_UID, 'claude-agent')).toEqual(observed);
   });
 });
 
@@ -1663,6 +1735,27 @@ describe('agents › custom agent memory', () => {
   });
 });
 
+describe('agents › blocking edit-chat failure recovery', () => {
+  it.each([
+    ['积分不足', '已完成的智能体说明。'],
+    ['fetch failed', '已生成的配置预览。'],
+  ])('persists partial model text before %s', async (error, partial) => {
+    writeCustomAgent('abc', { name: 'Agent A', workflow: 'Do the work.' });
+    await failNextBlockingAgentChat(partial, error);
+    const a = await loadAgents();
+
+    const result = await a.sendToAgentEditChat('u1', 'abc', '更新智能体');
+    expect(result).toMatchObject({ ok: false, error });
+    expect(result.message).toContain(partial);
+    expect(result.message).toContain(error);
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.at(-1)?.content).toContain(partial);
+    expect(rows.at(-1)?.content).toContain(error);
+  });
+});
+
 describe('agents › streamSendToAgentEditChat synthesized progress', () => {
   beforeEach(async () => {
     const { setLanguage } = await import('../../../src/main/features/config');
@@ -1686,8 +1779,8 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     }
 
     const progressTexts = events.filter((e) => e.type === 'progress').map((e) => e.text);
-    expect(progressTexts).toContain('▶ 更新 workflow');
-    expect(progressTexts).toContain('▶ 更新 skills · alpha');
+    expect(progressTexts).toContain('▶ 更新 工作流程');
+    expect(progressTexts).toContain('▶ 更新技能 · alpha');
 
     // Synthesized events must land in the persisted process field too, so
     // history reload paints the same rail.
@@ -1697,8 +1790,8 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(assistantMsg.role).toBe('assistant');
     expect(Array.isArray(assistantMsg.process)).toBe(true);
     const persistedTexts = assistantMsg.process.map((p: any) => p.text);
-    expect(persistedTexts).toContain('▶ 更新 workflow');
-    expect(persistedTexts).toContain('▶ 更新 skills · alpha');
+    expect(persistedTexts).toContain('▶ 更新 工作流程');
+    expect(persistedTexts).toContain('▶ 更新技能 · alpha');
   });
 
   it('emits a clear-skills line when workflow declares zero skills', async () => {
@@ -1713,7 +1806,7 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
       events.push(ev);
     }
     expect(events.filter((e) => e.type === 'progress').map((e) => e.text))
-      .toContain('▶ 清空 skills');
+      .toContain('▶ 清空技能');
   });
 
   it('does not synthesize progress events when no field blocks are present', async () => {
@@ -1729,6 +1822,78 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     }
     // Only the final event should fire — no progress noise.
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
+  });
+
+  it('normalizes and persists terminal runtime for live and restored edit chat', async () => {
+    streamImpl.current = async function* () {
+      yield { type: 'final', text: 'done' };
+      yield {
+        type: 'event',
+        event: {
+          stream: 'agent_run_result',
+          data: {
+            result: 'success',
+            terminal_status: 'completed',
+            duration_ms: 42_000,
+            provider_ms: 40_000,
+            tool_ms: 2_000,
+          },
+        },
+      };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+
+    const a = await loadAgents();
+    const events: any[] = [];
+    for await (const ev of a.streamSendToAgentEditChat('u1', 'abc', 'hi')) {
+      events.push(ev);
+    }
+
+    expect(events).not.toContainEqual(expect.objectContaining({
+      event: expect.objectContaining({ stream: 'agent_run_result' }),
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'event',
+      event: expect.objectContaining({
+        stream: 'runtime',
+        data: expect.objectContaining({ phase: 'end', duration_ms: 42_000, status: 'success' }),
+      }),
+    }));
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const runtime = rows.at(-1)?.process?.find((item: any) => item.event?.stream === 'runtime');
+    expect(runtime?.event?.data).toMatchObject({ phase: 'end', duration_ms: 42_000, status: 'success' });
+  });
+
+  it('persists an aborted fallback runtime when no terminal receipt arrives', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    streamImpl.current = async function* () {
+      yield { type: 'delta', text: 'partial reply' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+
+    const a = await loadAgents();
+    for await (const _ev of a.streamSendToAgentEditChat('u1', 'abc', 'hi', {
+      abortSignal: controller.signal,
+    })) {
+      // drain
+    }
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const rows = fs.readFileSync(chatPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const assistant = rows.at(-1);
+    const runtime = assistant?.process?.find((item: any) => item.event?.stream === 'runtime');
+    expect(assistant?.content).toContain('partial reply');
+    expect(assistant?.content).toContain('(reply interrupted)');
+    expect(runtime?.event?.data).toMatchObject({
+      phase: 'end',
+      status: 'error',
+      aborted: true,
+      errored: false,
+    });
+    expect(runtime?.event?.data?.duration_ms).toBeGreaterThanOrEqual(0);
   });
 
   it('uses modelText for the model while persisting short visible content', async () => {
@@ -1871,10 +2036,24 @@ describe('agents › deleteCustomAgent', () => {
       fs.writeFileSync(memory, 'private preference');
       fs.mkdirSync(path.dirname(runtime), { recursive: true });
       fs.writeFileSync(runtime, JSON.stringify({
-        version: 1,
+        version: 2,
         project_dirs: {
           victim: { path: path.join(tmpDir, 'project') },
           keep: { path: path.join(tmpDir, 'keep') },
+        },
+        resolved_models: {
+          victim: {
+            cli: 'claude',
+            requested_model: 'sonnet',
+            resolved_model: 'claude-sonnet-4-6',
+            updated_at: '2026-08-04T00:00:00.000Z',
+          },
+          keep: {
+            cli: 'claude',
+            requested_model: 'opus',
+            resolved_model: 'claude-opus-4-6',
+            updated_at: '2026-08-04T00:00:00.000Z',
+          },
         },
       }));
     }
@@ -1887,10 +2066,13 @@ describe('agents › deleteCustomAgent', () => {
     expect(fs.existsSync(currentAgentMemory)).toBe(false);
     expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).project_dirs.victim).toBeUndefined();
     expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).project_dirs.keep).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).resolved_models.victim).toBeUndefined();
+    expect(JSON.parse(fs.readFileSync(currentRuntime, 'utf8')).resolved_models.keep).toBeDefined();
     expect(fs.existsSync(otherChat)).toBe(true);
     expect(fs.existsSync(otherSession)).toBe(true);
     expect(fs.existsSync(otherAgentMemory)).toBe(true);
     expect(JSON.parse(fs.readFileSync(otherRuntime, 'utf8')).project_dirs.victim).toBeDefined();
+    expect(JSON.parse(fs.readFileSync(otherRuntime, 'utf8')).resolved_models.victim).toBeDefined();
   });
 
   it('does not delete existing tasks that reference the agent legacy field', async () => {

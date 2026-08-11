@@ -3,6 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('electron', () => ({
   app: { isPackaged: false },
 }));
+vi.mock('../../../../src/main/util/bundled-runtime', () => ({
+  bundledNodeExecutable: () => '/opt/orkas/runtime/node',
+}));
 
 import { PC_ROOT } from '../../../../src/main/paths';
 import { applyTemplate } from '../../../../src/main/features/connectors/apply-template';
@@ -48,7 +51,7 @@ describe('connector OAuth transport materialization', () => {
     });
   });
 
-  it('resolves app-owned adapter placeholders and supplies Electron-as-Node context', () => {
+  it('resolves app-owned adapter placeholders to bundled Node without an Electron marker', () => {
     expect(applyTemplate(entry({
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -57,12 +60,12 @@ describe('connector OAuth transport materialization', () => {
       proxy_target_url: 'https://api.service.test/',
     }), grant)).toEqual({
       kind: 'stdio',
-      command: process.execPath,
+      command: '/opt/orkas/runtime/node',
       args: [`${PC_ROOT}/bin/service-mcp.cjs`],
       env: {
         SERVICE_ACCESS_TOKEN: 'access-token',
-        ELECTRON_RUN_AS_NODE: '1',
-        ORKAS_NODE: process.execPath,
+        ORKAS_NODE: '/opt/orkas/runtime/node',
+        ORKAS_BUNDLED_NODE: '/opt/orkas/runtime/node',
         ORKAS_PC_DIR: PC_ROOT,
       },
       proxyTargetUrl: 'https://api.service.test/',

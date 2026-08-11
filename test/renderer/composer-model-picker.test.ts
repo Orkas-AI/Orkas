@@ -21,9 +21,9 @@ describe('open-source composer model picker', () => {
       'utf8',
     );
 
-    expect(source).toContain("window.orkas.invoke('auth.listEntries')");
+    expect(source).toContain("window.orkas.invoke('auth.listComposerEntries')");
     expect(source).toContain("entry.profileType !== 'managed'");
-    expect(source).toContain("window.orkas.invoke('auth.reorderEntries'");
+    expect(source).toContain("window.orkas.invoke('auth.selectEntry'");
     expect(source).not.toContain('getSubscription');
     expect(source).not.toContain('credits_remaining');
     expect(source).not.toContain('group_official');

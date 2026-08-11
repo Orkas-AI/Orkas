@@ -3,13 +3,17 @@ import { describe, expect, it } from 'vitest';
 import { buildMixFilter, escapeFfmpegFilterValue } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit';
 
 const SR = 48000;
+// Every tail pins `aformat=channel_layouts=stereo` after the resample: a
+// TTS-only mix is all-mono, and without a known stereo layout the draft it
+// writes dies later in normalize_loudness's layout negotiation (the
+// 2026-08-05 delivery blocker).
 const LN = 'loudnorm=I=-14:TP=-1:LRA=11';
 
 describe('buildMixFilter — single segment', () => {
   it('lays a no-offset voiceover over a SILENT base (no adelay, base audio untouched)', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0], baseHasAudio: false, mode: 'mix', padWholeDurSec: 30, loudnorm: LN });
     expect(f).toContain('[1:a]aresample=48000[seg0]');
-    expect(f).toContain('[seg0]apad=whole_dur=30.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]');
+    expect(f).toContain('[seg0]apad=whole_dur=30.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
     expect(f).not.toContain('adelay');   // 0s start ⇒ no delay
     expect(f).not.toContain('[0:a]');     // silent base ⇒ base audio never referenced
     expect(f).not.toContain('amix');      // single segment ⇒ no amix
@@ -23,7 +27,7 @@ describe('buildMixFilter — single segment', () => {
   it('omits apad when the clip duration is unknown (null) — avoids the -shortest hang path', () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0], baseHasAudio: false, mode: 'mix', padWholeDurSec: null, loudnorm: LN });
     expect(f).not.toContain('apad');
-    expect(f).toContain('[seg0]loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]');
+    expect(f).toContain('[seg0]loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
   });
 });
 
@@ -40,7 +44,7 @@ describe('buildMixFilter — per-line placement (the desync fix)', () => {
     expect(f).toContain('[2:a]aresample=48000,adelay=4200:all=1[seg1]');
     expect(f).toContain('[3:a]aresample=48000,adelay=10000:all=1[seg2]');
     expect(f).toContain('[seg0][seg1][seg2]amix=inputs=3:duration=longest:normalize=0[vobed]');
-    expect(f).toContain('[vobed]apad=whole_dur=30.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]');
+    expect(f).toContain('[vobed]apad=whole_dur=30.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
     expect(f).not.toContain('[0:a]'); // silent base
   });
 
@@ -54,14 +58,14 @@ describe('buildMixFilter — existing base audio (the "two voices" guard outcome
   it("mode 'mix' layers the bed over the base audio (talking-head / music-under-voice)", () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0], baseHasAudio: true, mode: 'mix', padWholeDurSec: 12, loudnorm: LN });
     expect(f).toContain('[0:a]aresample=48000[base]');
-    expect(f).toContain('[base][seg0]amix=inputs=2:duration=longest:normalize=0,apad=whole_dur=12.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]');
+    expect(f).toContain('[base][seg0]amix=inputs=2:duration=longest:normalize=0,apad=whole_dur=12.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
   });
 
   it("mode 'replace' drops the base audio entirely (no [0:a] in the graph)", () => {
     const f = buildMixFilter({ sr: SR, segmentStartSec: [0], baseHasAudio: true, mode: 'replace', padWholeDurSec: 12, loudnorm: LN });
     expect(f).not.toContain('[0:a]');
     expect(f).not.toContain('[base]');
-    expect(f).toContain('[seg0]apad=whole_dur=12.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000[aout]');
+    expect(f).toContain('[seg0]apad=whole_dur=12.000,loudnorm=I=-14:TP=-1:LRA=11,aresample=48000,aformat=channel_layouts=stereo[aout]');
   });
 
   it("mode 'mix' with multiple lines amixes the placed bed, then amixes that over the base", () => {

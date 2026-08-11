@@ -351,6 +351,23 @@ describe('features/users › account uid', () => {
     expect(json).toContain('sk-anon-owner-xxxxxxxx');
   });
 
+  it('rolls back account-directory adoption when auth-profiles cannot be rekeyed', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    users.initActiveUser({ defaultLocalId: users.ANONYMOUS_LOCAL_ID });
+    const anonymousFile = paths.userAuthProfilesFile(users.ANONYMOUS_LOCAL_ID);
+    const corrupt = 'ORKLSEC1:cannot-be-decrypted';
+    fs.writeFileSync(anonymousFile, corrupt, 'utf8');
+    const accountUid = 'A0653F11-9F05-4A8B-89CE-0026D809EAFC';
+
+    expect(() => users.switchToAccountLocalId(accountUid)).toThrow(/rekey|decrypt/i);
+
+    expect(users.getActiveUserId()).toBe(users.ANONYMOUS_LOCAL_ID);
+    expect(fs.readFileSync(anonymousFile, 'utf8')).toBe(corrupt);
+    expect(fs.existsSync(path.join(tmpDir, accountUid))).toBe(false);
+    expect(readUsersJson().current_user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+  });
+
   it('creates a fresh anonymous directory after logout', async () => {
     const users = await import('../../../src/main/features/users');
     users.initActiveUser({ defaultLocalId: users.ANONYMOUS_LOCAL_ID });

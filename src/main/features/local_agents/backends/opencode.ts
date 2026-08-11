@@ -5,11 +5,11 @@
  * `_text.ts` template was wrong — opencode doesn't take stdin and
  * `--print` isn't a flag):
  *
- *   opencode run --format json [--model <provider/model>]
- *                [--session <id>] <prompt>
+ *   opencode run --format json [--session <id>] <prompt>
  *
  * Notes:
  *   - Prompt is passed as the LAST positional argv (NOT stdin).
+ *   - Model selection is left to OpenCode's own configuration.
  *   - Resume: `--session <id>` (different flag name from claude).
  *   - Output: NDJSON events on stdout. We care about:
  *       step_start, text (part.text), tool_use (part.tool/callID/state),
@@ -141,10 +141,13 @@ export const opencodeBackend: LocalBackend = {
   },
 };
 
-export function buildOpencodeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs' | 'prompt'>): string[] {
+export function buildOpencodeArgs(opts: Pick<BackendRunOptions,
+  'resumeSessionId' | 'customArgs' | 'prompt' | 'modelOverride' | 'thinkingLevel'
+>): string[] {
   const args = ['run', '--format', 'json', '--dangerously-skip-permissions'];
-  if (opts.model) args.push('--model', opts.model);
   if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
+  if (opts.modelOverride) args.push('--model', opts.modelOverride);
+  if (opts.thinkingLevel) args.push('--variant', opts.thinkingLevel);
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   args.push(opts.prompt);
   return args;

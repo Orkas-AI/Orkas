@@ -2,10 +2,10 @@ import { describe, it, expect } from "vitest";
 import {
   Session,
   ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING,
-  ACTIVE_CHECKPOINT_ERROR_RESULT_MAX_CHARS,
+  ACTIVE_CHECKPOINT_BODY_MAX_CHARS,
+  ACTIVE_CHECKPOINT_META_MAX_CHARS,
   ACTIVE_PROCESS_TRIGGER_TOKENS,
-  ACTIVE_CHECKPOINT_TOOL_INPUT_MAX_CHARS,
-  ACTIVE_CHECKPOINT_TOOL_RESULT_MAX_CHARS,
+  ACTIVE_RETAIN_TOKEN_BUDGET,
   ARCHIVED_TOOL_RESULT_MARKER,
   COMPLETED_WORK_MAX_ENTRIES,
   COMPLETED_WORK_MODEL_MAX_CHARS,
@@ -13,6 +13,9 @@ import {
   EXECUTION_PLAN_AUDIT_MAX_ENTRIES,
   HISTORY_EXACT_FACTS_HEADING,
   HISTORY_EXACT_FACTS_MAX_ITEMS,
+  HISTORY_RAW_RETAIN_TOKEN_BUDGET,
+  DEFAULT_CONTEXT_BUDGET,
+  contextBudget,
 } from "../src/agent/session.js";
 
 describe("Session", () => {
@@ -58,14 +61,75 @@ describe("Session", () => {
   it("appends image user message when addToolResult carries images", () => {
     const session = new Session();
     session.addToolResult("tool-img", "Image loaded.", [
-      { data: "aGVsbG8=", mediaType: "image/jpeg" },
+      { data: "aGVsbG8=", mediaType: "image/jpeg", analysisMode: "quality_review" },
     ]);
 
     const msgs = session.getMessages();
     expect(msgs).toHaveLength(2);
     expect(msgs[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "tool-img" });
     expect(msgs[1].role).toBe("user");
-    expect(msgs[1].content[0]).toEqual({ type: "image", data: "aGVsbG8=", mediaType: "image/jpeg" });
+    expect(msgs[1].content[0]).toEqual({
+      type: "image",
+      data: "aGVsbG8=",
+      mediaType: "image/jpeg",
+      analysisMode: "quality_review",
+    });
+  });
+
+  it("shows ordered desktop/mobile preview images for exactly the next model call", () => {
+    const session = new Session();
+    session.beginUserTurn([{
+      type: "text",
+      text: "Build a responsive poster and verify it visually.",
+    }]);
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-preview",
+      name: "html_preview",
+      input: { path: "poster.html" },
+    }]);
+    session.addToolResult(
+      "call-preview",
+      JSON.stringify({
+        ok: false,
+        blockers: ["mobile: horizontal overflow is 28px"],
+        viewports: [{ name: "desktop" }, { name: "mobile" }],
+      }),
+      [
+        { data: "desktop-preview", mediaType: "image/png" },
+        { data: "mobile-preview", mediaType: "image/png" },
+      ],
+      true,
+    );
+
+    let modelMessages = session.getMessagesForModel();
+    expect(modelMessages[2].content[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call-preview",
+      isError: true,
+      content: expect.stringContaining("horizontal overflow"),
+    });
+    expect(modelMessages[3].content).toEqual([
+      { type: "image", data: "desktop-preview", mediaType: "image/png" },
+      { type: "image", data: "mobile-preview", mediaType: "image/png" },
+    ]);
+
+    session.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-fix",
+      name: "edit_file",
+      input: { path: "poster.html" },
+    }]);
+    modelMessages = session.getMessagesForModel();
+
+    expect(modelMessages.flatMap((message) => message.content))
+      .not.toContainEqual(expect.objectContaining({ type: "image" }));
+    expect(modelMessages.flatMap((message) => message.content))
+      .toContainEqual(expect.objectContaining({
+        type: "tool_result",
+        toolUseId: "call-preview",
+        isError: true,
+      }));
   });
 
   it("keeps pending images in the model view until the assistant has seen them", () => {
@@ -269,6 +333,42 @@ describe("Session", () => {
     expect(session.getPendingHistoryArchive()?.turnIds).toEqual(candidate.turnIds);
   });
 
+  it("builds shared history input from canonical turns without private session context", () => {
+    const session = new Session();
+    for (let i = 0; i < 3; i++) {
+      session.beginUserTurn([{ type: "text", text: `Canonical user ${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Canonical answer ${i}` }]);
+      session.completeActiveTurn();
+    }
+    session.applyHistorySummary(
+      `PRIVATE_SESSION_SUMMARY\n\n${HISTORY_EXACT_FACTS_HEADING}\n- private_nonce=secret`,
+      [1],
+      "canonical-message-1",
+    );
+    session.addHistoryResource({
+      kind: "final_output",
+      path: "/private/agent/output.txt",
+      name: "PRIVATE_RESOURCE",
+    });
+
+    const input = JSON.stringify(session.buildSharedHistoryArchiveMessages(0, 2));
+    expect(input).toContain("Canonical user 0");
+    expect(input).toContain("Canonical answer 1");
+    expect(input).not.toContain("PRIVATE_SESSION_SUMMARY");
+    expect(input).not.toContain("private_nonce=secret");
+    expect(input).not.toContain("PRIVATE_RESOURCE");
+
+    session.applyHistorySummary("Shared canonical summary", [1, 2], "canonical-message-2");
+    const state = session.getSerializedContextState()!;
+    expect(state.summaryThroughTurnId).toBe(2);
+    expect(state.summaryThroughMessageId).toBe("canonical-message-2");
+
+    const restored = new Session();
+    restored.restoreContextState(state);
+    expect(restored.getSerializedContextState()?.summaryThroughMessageId)
+      .toBe("canonical-message-2");
+  });
+
   it("accumulates exact history facts outside probabilistic rolling summaries", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Remember the deployment facts" }]);
@@ -296,8 +396,45 @@ describe("Session", () => {
     restored.beginUserTurn([{ type: "text", text: "What next?" }]);
     const view = JSON.stringify(restored.getMessagesForModel());
     expect(view).toContain("History retained facts");
+    expect(view).toContain("Private runtime context for task continuation only.");
     expect(view).toContain("release_id=rel-123");
     expect(view).toContain("checksum=sha256:abc");
+  });
+
+  it("replaces stale keyed exact facts while retaining cumulative audit facts", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Run narrated production" }]);
+    session.applyActiveCheckpointSummary(
+      `Initial\n\n${ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING}\n- text_sha256=old-hash\n- provider charged request req-1`,
+      0,
+    );
+    session.applyActiveCheckpointSummary(
+      `Revised\n\n${ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING}\n- text_sha256=new-hash\n- provider charged request req-2`,
+      0,
+    );
+
+    const activeView = JSON.stringify(session.getMessagesForModel());
+    expect(activeView).not.toContain("text_sha256=old-hash");
+    expect(activeView).toContain("text_sha256=new-hash");
+    expect(activeView).toContain("provider charged request req-1");
+    expect(activeView).toContain("provider charged request req-2");
+
+    session.addAssistantMessage([{ type: "text", text: "Paused." }]);
+    session.completeActiveTurn();
+    session.applyHistorySummary(
+      `First\n\n${HISTORY_EXACT_FACTS_HEADING}\n- text_sha256=history-old`,
+      [1],
+    );
+    session.applyHistorySummary(
+      `Second\n\n${HISTORY_EXACT_FACTS_HEADING}\n- text_sha256=history-new`,
+      [1],
+    );
+
+    expect(session.getSerializedContextState()!.historyExactFacts).toEqual([
+      "provider charged request req-1",
+      "provider charged request req-2",
+      "text_sha256=history-new",
+    ]);
   });
 
   it("retains the newest facts when the bounded history ledger is full", () => {
@@ -374,6 +511,7 @@ describe("Session", () => {
     const view = session.getMessagesForModel();
     const serialized = JSON.stringify(view);
     expect(serialized).toContain("Earlier tool calls/results in this same user turn have been summarized");
+    expect(serialized).toContain("Never quote, summarize, acknowledge, or mention this block");
     expect(serialized).toContain("Do not re-read files, logs, screenshots, or skill documents merely to regain omitted context");
     expect(serialized).toContain("prefer narrow ranges, grep/search/stat, or the existing artifact path over full-file reads");
     expect(serialized).toContain("Older tool work summarized");
@@ -450,9 +588,11 @@ describe("Session", () => {
     expect(projection).toContain("ERROR_HEAD_1");
     expect(projection).toContain("ERROR_TAIL_1");
     expect(projection).toContain("chars omitted]");
-    expect(projection).not.toContain("i".repeat(ACTIVE_CHECKPOINT_TOOL_INPUT_MAX_CHARS + 1));
-    expect(projection).not.toContain("r".repeat(ACTIVE_CHECKPOINT_TOOL_RESULT_MAX_CHARS + 1));
-    expect(projection).not.toContain("e".repeat(ACTIVE_CHECKPOINT_ERROR_RESULT_MAX_CHARS + 1));
+    // Tool input and error output are metadata-shaped and cut at the shorter
+    // cap; successful tool output keeps the body cap.
+    expect(projection).not.toContain("i".repeat(ACTIVE_CHECKPOINT_META_MAX_CHARS + 1));
+    expect(projection).not.toContain("r".repeat(ACTIVE_CHECKPOINT_BODY_MAX_CHARS + 1));
+    expect(projection).not.toContain("e".repeat(ACTIVE_CHECKPOINT_META_MAX_CHARS + 1));
     expect(rawBefore).toContain("i".repeat(5_000));
     expect(rawBefore).toContain("r".repeat(10_000));
     expect(rawBefore).toContain("e".repeat(10_000));
@@ -508,6 +648,240 @@ describe("Session", () => {
     expect(projected).toBeLessThan(session.estimateModelTokens());
     expect(JSON.stringify(session.getSerializedContextState())).toBe(beforeState);
     expect(JSON.stringify(session.getMessages())).toBe(beforeRaw);
+  });
+
+  // Retention used to carry a fixed step cap alongside the token budget. With
+  // small steps the cap always bound first — measured at 2 kept while the
+  // budget had room for 16 — so it discarded exactly the recent raw output the
+  // model would otherwise still have, and then had to re-read.
+  it("keeps recent tool steps up to the token budget rather than a fixed count", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Many small steps" }]);
+    const STEP_CHARS = 2_000;
+    const TOTAL_STEPS = 40;
+    for (let i = 0; i < TOTAL_STEPS; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `s-${i}`, name: "grep", input: { pattern: `p-${i}` } }]);
+      session.addToolResult(`s-${i}`, `hit-${i}\n${"x".repeat(STEP_CHARS)}`, undefined, false);
+    }
+
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).toBeTruthy();
+    const retainedSteps = TOTAL_STEPS - candidate!.groups.length;
+
+    // Well past the old fixed cap of 2, and bounded by the token budget: each
+    // step is ~STEP_CHARS/4 tokens, so the budget cannot hold more than this.
+    expect(retainedSteps).toBeGreaterThan(2);
+    expect(retainedSteps).toBeLessThanOrEqual(Math.ceil(ACTIVE_RETAIN_TOKEN_BUDGET / (STEP_CHARS / 4)));
+
+    // The budget bound still holds where it matters: applying the checkpoint
+    // must drop the live tail below the trigger so it cannot immediately refire.
+    session.applyActiveCheckpointSummary("Older small steps summarized", candidate!.checkpointThroughMessageIndex);
+    expect(session.estimateActiveProcessTokens()).toBeLessThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
+    expect(session.getPendingActiveCheckpoint()).toBeNull();
+  });
+
+  it("keeps recent completed turns up to the token budget rather than a fixed count", () => {
+    const session = new Session();
+    const REPLY_CHARS = 2_000;
+    const TOTAL_TURNS = 30;
+    for (let turn = 0; turn < TOTAL_TURNS; turn++) {
+      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
+      session.addAssistantMessage([{ type: "text", text: `answer ${turn}\n${"y".repeat(REPLY_CHARS)}` }]);
+      session.completeActiveTurn();
+    }
+
+    const candidate = session.getPendingHistoryArchive();
+    expect(candidate).toBeTruthy();
+    const retainedTurns = TOTAL_TURNS - candidate!.turnIds.length;
+
+    expect(retainedTurns).toBeGreaterThan(2);
+    expect(retainedTurns).toBeLessThanOrEqual(Math.ceil(HISTORY_RAW_RETAIN_TOKEN_BUDGET / (REPLY_CHARS / 4)));
+  });
+
+  // The parameterized path must not change anything for callers that have no
+  // model in scope (reflection, summarization, every test above).
+  it("uses the historical thresholds when no budget is supplied", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Default budget task" }]);
+    for (let i = 0; i < 6; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `d-${i}`, name: "bash", input: { command: `c-${i}` } }]);
+      session.addToolResult(`d-${i}`, `out-${i}\n${"x".repeat(12_000)}`, undefined, false);
+    }
+    expect(JSON.stringify(session.getPendingActiveCheckpoint()))
+      .toBe(JSON.stringify(session.getPendingActiveCheckpoint(DEFAULT_CONTEXT_BUDGET)));
+  });
+
+  it("compacts later on a wide window and earlier on a narrow one", () => {
+    const build = () => {
+      const session = new Session();
+      session.beginUserTurn([{ type: "text", text: "Window-sensitive task" }]);
+      for (let i = 0; i < 10; i++) {
+        session.addAssistantMessage([{ type: "tool_use", id: `w-${i}`, name: "bash", input: { command: `c-${i}` } }]);
+        session.addToolResult(`w-${i}`, `out-${i}\n${"x".repeat(8_000)}`, undefined, false);
+      }
+      return session;
+    };
+    const overhead = { fixedOverheadTokens: 30_000 };
+    const wide = contextBudget({ usableInputTokens: 1_000_000, ...overhead });
+    const narrow = contextBudget({ usableInputTokens: 21_760, ...overhead });
+
+    // ~20K tokens of live tool traffic: past the narrow window's trigger, well
+    // inside the wide one's.
+    expect(build().getPendingActiveCheckpoint(wide)).toBeNull();
+    expect(build().getPendingActiveCheckpoint(narrow)).toBeTruthy();
+  });
+
+  // Used by the emergency path, which runs when summarization is unavailable
+  // and space matters more than the verbatim tail.
+  it("offers every foldable tool step, retaining none, on group boundaries", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Emergency task" }]);
+    expect(session.getFoldableActiveProcess()).toBeNull();
+
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `e-${i}`, name: "bash", input: { cmd: `c-${i}` } }]);
+      session.addToolResult(`e-${i}`, `out-${i}\n${"y".repeat(3_000)}`, undefined, false);
+    }
+
+    const foldable = session.getFoldableActiveProcess()!;
+    // Nothing is held back, unlike the normal checkpoint which keeps a tail.
+    expect(foldable.groups).toHaveLength(5);
+    const normal = session.getPendingActiveCheckpoint();
+    expect(foldable.groups.length).toBeGreaterThan(normal?.groups.length ?? 0);
+
+    session.applyActiveCheckpointSummary("[reduced without summarization]", foldable.checkpointThroughMessageIndex);
+
+    // A cut between a tool_use and its tool_result would leave the request
+    // malformed for the provider, so every remaining pair must still match.
+    const view = session.getMessagesForModel();
+    const useIds = new Set<string>();
+    const resultIds = new Set<string>();
+    for (const message of view) {
+      for (const part of message.content as Array<{ type: string; id?: string; toolUseId?: string }>) {
+        if (part.type === "tool_use" && part.id) useIds.add(part.id);
+        if (part.type === "tool_result" && part.toolUseId) resultIds.add(part.toolUseId);
+      }
+    }
+    expect([...resultIds].every((id) => useIds.has(id))).toBe(true);
+    expect([...useIds].every((id) => resultIds.has(id))).toBe(true);
+
+    // Raw payloads are gone and the notice took their place.
+    const serialized = JSON.stringify(view);
+    expect(serialized).not.toContain("y".repeat(500));
+    expect(serialized).toContain("reduced without summarization");
+
+    // Everything foldable is folded, so a second pass has nothing to offer.
+    expect(session.getFoldableActiveProcess()).toBeNull();
+  });
+
+  // The merge machinery keeps only the exact-facts section of a replaced
+  // summary. The normal path survives that because the summarizer receives the
+  // prior prose as input and rewrites it forward; the emergency path bypasses
+  // the summarizer, so without explicit embedding an emergency fold would
+  // silently erase every earlier checkpoint's prose — far more than the "N
+  // steps dropped" its notice admits to.
+  it("emergency fold keeps prior checkpoint prose and records the drop durably", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Long build task" }]);
+    for (let i = 0; i < 3; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `pre-${i}`, name: "bash", input: { cmd: `c-${i}` } }]);
+      session.addToolResult(`pre-${i}`, `out-${i}\n${"x".repeat(2_000)}`, undefined, false);
+    }
+    // A successful LLM checkpoint earlier in the turn, with prose and a fact.
+    const llmCheckpoint = [
+      "Important observations and decisions:",
+      "- API returns timestamps in UTC; downstream must not localize.",
+      "",
+      "Exact facts and identifiers required for continuation/final output (cumulative):",
+      "- deploy_token=tok_9f2a",
+    ].join("\n");
+    const first = session.getPendingActiveCheckpoint()!;
+    session.applyActiveCheckpointSummary(llmCheckpoint, first?.checkpointThroughMessageIndex ?? 4);
+
+    for (let i = 3; i < 6; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `post-${i}`, name: "bash", input: { cmd: `c-${i}` } }]);
+      session.addToolResult(`post-${i}`, `out-${i}\n${"y".repeat(2_000)}`, undefined, false);
+    }
+
+    const foldable = session.getFoldableActiveProcess()!;
+    const notice = [
+      "[Context reduced without summarization]",
+      "Raw output dropped.",
+      "",
+      "Exact facts and identifiers required for continuation/final output (cumulative):",
+      "- context_reduction: raw output of 3 tool step(s) in this turn was dropped without a summary",
+    ].join("\n");
+    session.applyEmergencyActiveFold(notice, foldable.checkpointThroughMessageIndex);
+
+    const afterEmergency = JSON.stringify(session.getMessagesForModel());
+    // The notice, the prior prose, and BOTH facts must all still be visible.
+    expect(afterEmergency).toContain("Context reduced without summarization");
+    expect(afterEmergency).toContain("Prior checkpoint retained verbatim");
+    expect(afterEmergency).toContain("timestamps in UTC");
+    expect(afterEmergency).toContain("deploy_token=tok_9f2a");
+    expect(afterEmergency).toContain("context_reduction: raw output of 3 tool step(s)");
+    // The embedded prose was stripped of its facts section, so the merged
+    // summary carries each fact exactly once.
+    expect(afterEmergency.split("deploy_token=tok_9f2a").length - 1).toBe(1);
+
+    // Summarization recovers: a later normal checkpoint replaces prose, but
+    // the drop record must survive as a fact — the hole does not close just
+    // because the service came back.
+    for (let i = 6; i < 9; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `late-${i}`, name: "bash", input: { cmd: `c-${i}` } }]);
+      session.addToolResult(`late-${i}`, `out-${i}\n${"z".repeat(2_000)}`, undefined, false);
+    }
+    const recovered = session.getFoldableActiveProcess()!;
+    session.applyActiveCheckpointSummary("Fresh summary after recovery.", recovered.checkpointThroughMessageIndex);
+    const afterRecovery = JSON.stringify(session.getMessagesForModel());
+    expect(afterRecovery).toContain("Fresh summary after recovery.");
+    expect(afterRecovery).toContain("context_reduction: raw output of 3 tool step(s)");
+    expect(afterRecovery).toContain("deploy_token=tok_9f2a");
+  });
+
+  it("emergency history fold keeps the prior rolling summary verbatim", () => {
+    const session = new Session();
+    for (let turn = 0; turn < 3; turn++) {
+      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
+      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
+      session.completeActiveTurn();
+    }
+    session.applyHistorySummary(
+      "User is migrating the billing stack; prefers Stripe test-mode fixtures.",
+      session.getArchivableHistoryTurns(),
+    );
+    for (let turn = 3; turn < 5; turn++) {
+      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
+      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
+      session.completeActiveTurn();
+    }
+
+    session.applyEmergencyHistoryFold(
+      "[Earlier turns dropped without summarization]",
+      session.getArchivableHistoryTurns(),
+    );
+
+    const view = JSON.stringify(session.getMessagesForModel());
+    expect(view).toContain("Earlier turns dropped without summarization");
+    expect(view).toContain("Prior history summary retained verbatim");
+    expect(view).toContain("prefers Stripe test-mode fixtures");
+  });
+
+  it("offers every unarchived completed turn for emergency archiving", () => {
+    const session = new Session();
+    expect(session.getArchivableHistoryTurns()).toEqual([]);
+
+    for (let turn = 0; turn < 3; turn++) {
+      session.beginUserTurn([{ type: "text", text: `question ${turn}` }]);
+      session.addAssistantMessage([{ type: "text", text: `answer ${turn}` }]);
+      session.completeActiveTurn();
+    }
+
+    const archivable = session.getArchivableHistoryTurns();
+    expect(archivable).toHaveLength(3);
+
+    session.applyHistorySummary("[earlier turns dropped]", archivable);
+    expect(session.getArchivableHistoryTurns()).toEqual([]);
   });
 
   it("active checkpoint trigger tracks only the live tail, not cumulative raw", () => {
@@ -929,6 +1303,7 @@ describe("Session getMessagesForModel turnContext (P2 per-turn ephemeral)", () =
     // Ephemeral block is prepended before the real user text.
     expect(t).toContain("ORCH-LEDGER-XYZ");
     expect(t).toContain("do the task");
+    expect(t).toContain("Private runtime context for task continuation only.");
     expect(t.indexOf("ORCH-LEDGER-XYZ")).toBeLessThan(t.indexOf("do the task"));
 
     // No turnContext → no injection anywhere in the view.
@@ -971,6 +1346,7 @@ describe("Session execution plan anchor", () => {
     const view = session.getMessagesForModel();
     const tail = JSON.stringify(view[view.length - 1]);
     expect(tail).toContain("Execution plan anchor");
+    expect(tail).toContain("Never quote, summarize, acknowledge, or mention this block");
     expect(tail).toContain("Implement the long-running import safely");
     expect(tail).toContain("Implement bounded streaming");
     expect(tail).toContain("in_progress");
@@ -1017,7 +1393,12 @@ describe("Session execution plan anchor", () => {
     });
     expect(session.getExecutionPlan()?.objective).toContain("Original task");
     expect(session.getExecutionPlan()?.objective).toContain("Actually switch to the replacement task");
-    expect(session.getExecutionPlan()?.objective).toContain("Newer user instruction — authoritative");
+    expect(session.getExecutionPlan()?.objective).toMatch(
+      /^\[Latest user instruction — authoritative; replaces conflicting earlier requirements\]\n\nActually switch to the replacement task/,
+    );
+    expect(session.getExecutionPlan()?.objective).toContain(
+      "[Earlier objective — retain only non-conflicting requirements]",
+    );
 
     session.updateExecutionPlan({
       replaceObjective: true,
@@ -1041,7 +1422,9 @@ describe("Session execution plan anchor", () => {
     expect(view).toContain("Reconciliation: current");
     expect(session.getExecutionPlan()?.objective).toContain("Initial in-flight goal");
     expect(session.getExecutionPlan()?.objective).toContain("Pause that and account for this new constraint");
-    expect(session.getExecutionPlan()?.objective).toContain("Newer user instruction — authoritative");
+    expect(session.getExecutionPlan()?.objective).toContain(
+      "Latest user instruction — authoritative; replaces conflicting earlier requirements",
+    );
   });
 
   it("rejects milestone removal or renaming under the same user instruction", () => {
@@ -1091,16 +1474,43 @@ describe("Session execution plan anchor", () => {
 
     expect(initial.steps.map((step) => step.id)).toEqual([1, 2]);
     expect(updated.steps).toEqual([
-      {
-        id: 1,
-        step: "Inspect callers",
-        status: "completed",
-        completionEvidence: { verification: "unverified", workEntryIds: [] },
-      },
+      { id: 1, step: "Inspect callers", status: "completed" },
       { id: 2, step: "Migrate storage", status: "in_progress" },
       { id: 3, step: "Verify restart recovery", status: "pending" },
     ]);
     expect(updated.nextStepId).toBe(4);
+  });
+
+  // The anchor used to append "observed work #12,#13" to completed steps, from a
+  // window-level scan that shared one id list across every step marked complete
+  // in that window and counted read-only calls. Window data cannot answer a
+  // step-level question, so the claim was removed rather than re-derived: the
+  // workspace and completed-work ledgers already state the same facts without
+  // asserting which step they belong to.
+  it("states plan step status without claiming completion evidence", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Ship the migration" }]);
+    session.recordCompletedWork({
+      tool: "read_file",
+      inputDigest: "r:1",
+      inputSummary: "read src/a.ts",
+      status: "succeeded",
+    });
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Inspect callers", status: "completed" },
+        { step: "Migrate storage", status: "in_progress" },
+      ],
+    });
+
+    const anchor = JSON.stringify(session.getMessagesForModel());
+    expect(anchor).toContain("Execution plan anchor");
+    expect(anchor).toContain("[completed] Inspect callers");
+    expect(anchor).not.toContain("observed work");
+    expect(anchor).not.toContain("unverified");
+    expect(anchor).not.toContain("Tool-ledger evidence");
+    // The deterministic ledgers still carry what actually ran.
+    expect(anchor).toContain("Completed work ledger");
   });
 
   it("does not regress completed milestones under the same user instruction", () => {
@@ -1193,9 +1603,37 @@ describe("Session execution plan anchor", () => {
     })]);
     const view = JSON.stringify(session.getMessagesForModel());
     expect(view).toContain("Completed work ledger");
+    expect(view).toContain("Private runtime context for task continuation only.");
     expect(view).toContain("skill_manage");
     expect(view).toContain("x2");
     expect(JSON.stringify(session.getMessages())).not.toContain("Completed work ledger");
+  });
+
+  it("marks workspace observations as private model-only runtime context", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Update the workspace file" }]);
+    session.recordToolObservations({
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/example.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:before",
+          afterHash: "sha256:after",
+          coverage: "hash",
+        }],
+      },
+    });
+
+    const workspaceContext = session.getMessagesForModel()
+      .flatMap((message) => message.content)
+      .find((content) => content.type === "text" && content.text.startsWith("[Workspace changes"));
+    expect(workspaceContext?.type).toBe("text");
+    if (workspaceContext?.type !== "text") throw new Error("missing workspace projection");
+    expect(workspaceContext.text).toContain("Private runtime context for task continuation only.");
+    expect(JSON.stringify(session.getMessages())).not.toContain("[Workspace changes");
   });
 
   it("bounds the sidecar ledger and its model projection independently", () => {
@@ -1226,91 +1664,6 @@ describe("Session execution plan anchor", () => {
       .toBeLessThanOrEqual(COMPLETED_WORK_MODEL_MAX_ENTRIES);
     expect(ledgerText.text).toContain(`#${COMPLETED_WORK_MAX_ENTRIES + 14}`);
     expect(ledgerText.text).not.toContain("#14 ");
-  });
-
-  it("attaches observed or unverified ledger evidence to completed plan steps", () => {
-    const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Implement and verify the migration" }]);
-    session.updateExecutionPlan({
-      steps: [
-        { step: "Implement migration", status: "in_progress" },
-        { step: "Verify migration", status: "pending" },
-      ],
-    });
-    session.recordCompletedWork({
-      tool: "bash",
-      inputDigest: "20:def",
-      inputSummary: '{"command":"npm test"}',
-      status: "succeeded",
-      resultSummary: "tests passed",
-      checkpointEpoch: 0,
-    });
-
-    const observed = session.updateExecutionPlan({
-      steps: [
-        { step: "Implement migration", status: "completed" },
-        { step: "Verify migration", status: "in_progress" },
-      ],
-    });
-    expect(observed.steps[0].completionEvidence).toEqual({
-      verification: "observed",
-      workEntryIds: [1],
-    });
-
-    const unverified = session.updateExecutionPlan({
-      steps: [
-        { step: "Implement migration", status: "completed" },
-        { step: "Verify migration", status: "completed" },
-      ],
-    });
-    expect(unverified.steps[0].completionEvidence?.verification).toBe("observed");
-    expect(unverified.steps[1].completionEvidence).toEqual({
-      verification: "unverified",
-      workEntryIds: [],
-    });
-    expect(JSON.stringify(session.getMessagesForModel())).toContain("completion unverified by tool ledger");
-  });
-
-  it("treats an exact repeated call as fresh evidence without duplicating its ledger row", () => {
-    const session = new Session();
-    session.beginUserTurn([{ type: "text", text: "Verify both migration stages" }]);
-    session.updateExecutionPlan({
-      steps: [
-        { step: "Verify stage one", status: "in_progress" },
-        { step: "Verify stage two", status: "pending" },
-      ],
-    });
-    const work = {
-      tool: "bash",
-      inputDigest: "sha256:same-verification",
-      inputSummary: '{"command":"npm test"}',
-      status: "succeeded" as const,
-      resultSummary: "tests passed",
-    };
-    session.recordCompletedWork(work);
-    session.updateExecutionPlan({
-      steps: [
-        { step: "Verify stage one", status: "completed" },
-        { step: "Verify stage two", status: "in_progress" },
-      ],
-    });
-    session.recordCompletedWork(work);
-    const final = session.updateExecutionPlan({
-      steps: [
-        { step: "Verify stage one", status: "completed" },
-        { step: "Verify stage two", status: "completed" },
-      ],
-    });
-
-    expect(session.getCompletedWorkLedger()).toEqual([expect.objectContaining({
-      id: 1,
-      lastObservationId: 2,
-      repeatCount: 2,
-    })]);
-    expect(final.steps[1].completionEvidence).toEqual({
-      verification: "observed",
-      workEntryIds: [1],
-    });
   });
 
   it("retains bounded plan revisions and a clear tombstone", () => {
@@ -1350,14 +1703,15 @@ describe("Session execution plan anchor", () => {
     expect(audit.at(-1)?.revision).toBe(EXECUTION_PLAN_AUDIT_MAX_ENTRIES + 4);
   });
 
-  it("rejects ambiguous concurrent in-progress milestones", () => {
+  it("normalizes ambiguous concurrent in-progress milestones in plan order", () => {
     const session = new Session();
     session.beginUserTurn([{ type: "text", text: "Long task" }]);
-    expect(() => session.updateExecutionPlan({
+    const plan = session.updateExecutionPlan({
       steps: [
         { step: "A", status: "in_progress" },
         { step: "B", status: "in_progress" },
       ],
-    })).toThrow("at most one in_progress");
+    });
+    expect(plan.steps.map((step) => step.status)).toEqual(["in_progress", "pending"]);
   });
 });

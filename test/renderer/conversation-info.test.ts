@@ -149,6 +149,8 @@ describe('ConversationInfo files tab', () => {
     expect(html).not.toContain('deleted.md');
     expect(html).toContain('draggable="true"');
     expect(html).toContain('conversation-info-file-menu-btn');
+    expect(html).toContain('ctx-row-menu-btn conversation-info-file-menu-btn');
+    expect(html).toContain('[more-horizontal]');
     expect(html).toContain('data-entry-kind="dir"');
     expect(html).toContain('data-entry-kind="text"');
     expect(html).not.toMatch(/<details[^>]*\sopen(?:\s|>|=)/);

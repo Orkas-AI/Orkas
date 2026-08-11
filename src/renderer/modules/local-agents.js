@@ -96,6 +96,7 @@ let _localCliEntriesInFlight = null;
 let _localCliPresenceEntries = null;
 let _localCliPresenceInFlight = null;
 let _externalCliVisibleEntries = [];
+let _externalCliDetectionTelemetryInFlight = false;
 
 /** Bounded telemetry/UI state for the current renderer-side discovery cache.
  * A background refresh never hides a completed cache; `detecting` is reserved
@@ -420,8 +421,11 @@ async function mountExternalCliSelect(onChange) {
   const cachedEntries = _localCliEntries;
   // Concurrent mounts share the same two discovery requests. Only the mount
   // that starts the path lookup owns the aggregate telemetry row.
-  const ownsDetectionTelemetry = !_localCliPresenceInFlight;
+  const ownsDetectionTelemetry = !_externalCliDetectionTelemetryInFlight;
+  if (ownsDetectionTelemetry) _externalCliDetectionTelemetryInFlight = true;
   const detectionStartedAt = Date.now();
+
+  try {
 
   // Cold entry: put the progress copy in the menu itself and keep the title
   // clean. Cached entry: immediately select its first available CLI and use
@@ -513,7 +517,10 @@ async function mountExternalCliSelect(onChange) {
       errorCode: validated.ok ? '' : (hasFallback ? 'validation_failed' : 'invoke_failed'),
     });
   }
-  return _extCliSelectApi;
+    return _extCliSelectApi;
+  } finally {
+    if (ownsDetectionTelemetry) _externalCliDetectionTelemetryInFlight = false;
+  }
 }
 
 /** Read the currently-selected CLI type from the External tab, or null when

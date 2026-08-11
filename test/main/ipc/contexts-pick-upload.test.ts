@@ -64,6 +64,12 @@ async function invoke(channel: string, payload: any): Promise<any> {
 }
 
 describe('contexts.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('contexts.pickAndUpload', {});
+
+    expect(res).toMatchObject({ ok: true, cancelled: true, files: [] });
+  });
+
   it('rejects dot-prefixed and unsupported files returned by the native picker', async () => {
     const sourceDir = path.join(tmpDir, 'source');
     fs.mkdirSync(sourceDir, { recursive: true });
@@ -89,6 +95,7 @@ describe('contexts.pickAndUpload', () => {
       path.resolve(path.join(tmpDir, '..', 'userWorkSpace')),
     ]).toContain(path.resolve(defaultPath));
     expect(res.ok).toBe(true);
+    expect(res.cancelled).toBe(false);
     expect(res.files).toEqual(expect.arrayContaining([
       expect.objectContaining({ ok: false, name: '.orkas-native-deps-verified.json', reason: 'hidden' }),
       expect.objectContaining({ ok: false, name: 'tool.exe', reason: 'ext' }),
@@ -136,5 +143,51 @@ describe('contexts.pickAndUpload', () => {
       if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
       else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
     }
+  });
+});
+
+describe('projects.files.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(TEST_UID, 'Picker cancellation project');
+    expect(created.ok).toBe(true);
+    if (!created.ok) throw new Error('project setup failed');
+
+    const res = await invoke('projects.files.pickAndUpload', {
+      projectId: created.project.project_id,
+      targetDir: '',
+    });
+
+    expect(res).toMatchObject({ ok: true, cancelled: true, files: [] });
+  });
+});
+
+describe('autoTasks.attachments.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('autoTasks.attachments.pickAndUpload', {
+      taskId: 'at_picker_cancel',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: true,
+      items: [],
+      failed: [],
+    });
+  });
+});
+
+describe('conversations.attachments.pickAndUpload', () => {
+  it('returns an explicit cancelled outcome when the native picker closes', async () => {
+    const res = await invoke('conversations.attachments.pickAndUpload', {
+      cid: 'chat_picker_cancel',
+    });
+
+    expect(res).toMatchObject({
+      ok: true,
+      cancelled: true,
+      items: [],
+      failed: [],
+    });
   });
 });

@@ -409,6 +409,32 @@ describe('global recycle bin', () => {
     },
   );
 
+  it('fails an incomplete generic app-delete snapshot before the caller can remove the file', async () => {
+    const paths = await import('../../../src/main/paths');
+    const {
+      createAppRecycleBatchForCloudEntry,
+      listRecycleBatches,
+    } = await import('../../../src/main/features/recycle_bin');
+    const relPath = 'cloud/contexts/locked.txt';
+    const target = path.join(paths.userCloudRoot(UID), 'contexts', 'locked.txt');
+    await fsp.mkdir(path.dirname(target), { recursive: true });
+    await fsp.writeFile(target, 'must stay recoverable');
+    const lockChild = process.platform === 'win32'
+      ? await acquireExclusiveWindowsLock(target)
+      : null;
+    if (!lockChild) await fsp.chmod(target, 0o000);
+
+    try {
+      await expect(createAppRecycleBatchForCloudEntry(UID, relPath, 'context'))
+        .rejects.toMatchObject({ code: 'recycle_archive_failed' });
+      expect(await listRecycleBatches(UID)).toEqual([]);
+    } finally {
+      if (lockChild) await releaseExclusiveWindowsLock(lockChild);
+      else await fsp.chmod(target, 0o600).catch(() => {});
+    }
+    expect(await fsp.readFile(target, 'utf8')).toBe('must stay recoverable');
+  });
+
   it('labels cloud-sync recycle batches with deleted object titles, not file counts', async () => {
     const paths = await import('../../../src/main/paths');
     const {

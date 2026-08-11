@@ -43,7 +43,8 @@ const _writeMutex = new Mutex();
 
 const EMPTY: ConnectorsFile = { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
 const CONNECTOR_SECRET_NAMESPACE = 'connectors.instance';
-const SECRETS_UNAVAILABLE_MESSAGE = 'connector_reconnect_required';
+export const SECRETS_UNAVAILABLE_MESSAGE = 'connector_secrets_unavailable';
+const _readCache = new Map<string, { file: string; mtimeMs: number; size: number; data: ConnectorsFile }>();
 
 // On-disk shape: ConnectorInstance with all token-bearing fields collapsed into one
 // locally encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
@@ -61,13 +62,21 @@ type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'tr
 interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; transport?: Transport }
 
 const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
+const UNAVAILABLE_SECRETS = Symbol('unavailableConnectorSecrets');
 interface PreservedSecrets {
   ciphertext: string;
   /** Canonical plaintext that produced `ciphertext`. Missing means decryption
    * failed; the blob may only be reused while no replacement secrets exist. */
   plaintext?: string;
 }
-type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: PreservedSecrets };
+interface UnavailableSecretsState {
+  /** Status read from disk before the device-local error projection was applied. */
+  persistedStatus: ConnectorInstance['status'];
+}
+type ConnectorInstanceWithLocalSecretState = ConnectorInstance & {
+  [PRESERVED_SECRETS]?: PreservedSecrets;
+  [UNAVAILABLE_SECRETS]?: UnavailableSecretsState;
+};
 
 // Secret-owner resolver. The open-source build stores connector secrets under the local uid.
 function _secretOwner(uid: string): string {
@@ -99,6 +108,59 @@ function _notifyChanged(): void {
   _notifyRendererChanged();
 }
 
+function _cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function _cloneInstance(inst: ConnectorInstance): ConnectorInstance {
+  const out = _cloneJson(inst);
+  const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
+  if (preserved) {
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ...preserved };
+  }
+  const unavailable = (inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+  if (unavailable) {
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = _cloneJson(unavailable);
+  }
+  return out;
+}
+
+export function hasUnavailableSecrets(inst: ConnectorInstance | null | undefined): boolean {
+  return !!inst && !!(inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+}
+
+function _cloneFile(data: ConnectorsFile): ConnectorsFile {
+  const connections: Record<string, ConnectorInstance> = {};
+  for (const [id, inst] of Object.entries(data.connections || {})) {
+    connections[id] = _cloneInstance(inst);
+  }
+  return {
+    version: data.version || 2,
+    connections,
+    oauth_hints: _cloneJson(data.oauth_hints || {}),
+    _deleted_at: _cloneJson(data._deleted_at || {}),
+  };
+}
+
+function _cacheKey(uid: string, file: string): string {
+  return `${uid}\0${file}`;
+}
+
+function _cacheRead(uid: string, file: string, st: fs.Stats): ConnectorsFile | null {
+  const cached = _readCache.get(_cacheKey(uid, file));
+  if (!cached || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) return null;
+  return _cloneFile(cached.data);
+}
+
+function _cacheWrite(uid: string, file: string, st: fs.Stats, data: ConnectorsFile): void {
+  _readCache.set(_cacheKey(uid, file), {
+    file,
+    mtimeMs: st.mtimeMs,
+    size: st.size,
+    data: _cloneFile(data),
+  });
+}
+
 function _legacySeeds(uid: string): string[] {
   const primary = _secretOwner(uid);
   return primary === uid ? [uid] : [primary, uid];
@@ -117,6 +179,12 @@ function _tryDecrypt(uid: string, instanceId: string, payload: string): { json: 
   }
 }
 
+function _persistedStatusBeforeSecretError(inst: ConnectorInstance): ConnectorInstance['status'] {
+  // Synced rows should always have status, but tolerate older/malformed metadata so one bad row
+  // cannot make the entire connector registry unreadable while handling a decrypt failure.
+  return inst.status ? _cloneJson(inst.status) : { kind: 'connecting' };
+}
+
 function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: ConnectorInstance; migrated: boolean } {
   const { secrets_enc, ...rest } = disk;
   // transport is required on ConnectorInstance but absent from the disk shape — it lives in the
@@ -127,8 +195,10 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
   const dec = _tryDecrypt(uid, disk.id, secrets_enc);
   if (dec === null) {
     log.warn('decrypt secrets_enc failed (known formats) — instance left without transport/grant', { id: disk.id });
+    const persistedStatus = _persistedStatusBeforeSecretError(out);
     out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
-    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = { persistedStatus };
     return { instance: out, migrated: false };
   }
   try {
@@ -140,15 +210,17 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
     // value when its plaintext is unchanged so status/tool-cache updates do
     // not repeatedly invoke the local secret backend.
     if (!dec.migrated) {
-      (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = {
+      (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = {
         ciphertext: secrets_enc,
         plaintext: dec.json,
       };
     }
   } catch (err) {
     log.warn('parse secrets_enc payload failed', { id: disk.id, error: (err as Error).message });
+    const persistedStatus = _persistedStatusBeforeSecretError(out);
     out.status = { kind: 'error', message: SECRETS_UNAVAILABLE_MESSAGE, at: Date.now() };
-    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext: secrets_enc };
+    (out as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS] = { persistedStatus };
     return { instance: out, migrated: false };
   }
   return { instance: out, migrated: dec.migrated };
@@ -157,20 +229,22 @@ function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: Connect
 function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk {
   const { oauth_grant, dcr_client, transport, ...rest } = inst;
   const onDisk = { ...rest } as InstanceOnDisk;
+  const unavailable = (inst as ConnectorInstanceWithLocalSecretState)[UNAVAILABLE_SECRETS];
+  if (unavailable) onDisk.status = _cloneJson(unavailable.persistedStatus);
   if (oauth_grant || dcr_client || transport) {
     const blob: SecretsBlob = {};
     if (oauth_grant) blob.oauth_grant = oauth_grant;
     if (dcr_client) blob.dcr_client = dcr_client;
     if (transport) blob.transport = transport;
     const plaintext = JSON.stringify(blob);
-    const preserved = (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS];
+    const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
     const ciphertext = preserved?.plaintext === plaintext
       ? preserved.ciphertext
       : localSecrets.encryptLocalSecret(_secretContext(uid, inst.id), plaintext);
     onDisk.secrets_enc = ciphertext;
-    (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = { ciphertext, plaintext };
+    (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS] = { ciphertext, plaintext };
   } else {
-    const preserved = (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS];
+    const preserved = (inst as ConnectorInstanceWithLocalSecretState)[PRESERVED_SECRETS];
     if (preserved && preserved.plaintext === undefined) onDisk.secrets_enc = preserved.ciphertext;
   }
   return onDisk;
@@ -178,6 +252,16 @@ function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk
 
 function _readSync(uid: string): ConnectorsFile {
   const file = userConnectorsConfigFile(uid);
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(file);
+    const cached = _cacheRead(uid, file, st);
+    if (cached) return cached;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') log.warn('stat connectors.json failed', { error: (err as Error).message });
+    return _cloneFile(EMPTY);
+  }
   let raw: string;
   try {
     raw = fs.readFileSync(file, 'utf8');
@@ -209,7 +293,11 @@ function _readSync(uid: string): ConnectorsFile {
         _writeSync(uid, data);
         _notifyChanged();
       }
-      return data;
+      try {
+        st = fs.statSync(file);
+        _cacheWrite(uid, file, st, data);
+      } catch { /* best-effort cache */ }
+      return _cloneFile(data);
     }
   } catch (err) {
     log.warn('parse connectors.json failed', { error: (err as Error).message });
@@ -247,6 +335,7 @@ function _writeSync(uid: string, data: ConnectorsFile): void {
         mtime_ms: st.mtimeMs,
         secrets_enc_prefix: fingerprints,
       });
+      _cacheWrite(uid, file, st, data);
     } catch (verifyErr) {
       log.warn('write verify (stat) failed', { error: (verifyErr as Error).message });
     }
@@ -257,7 +346,7 @@ function _writeSync(uid: string, data: ConnectorsFile): void {
 }
 
 export function load(uid: string): ConnectorsFile {
-  if (!uid) return EMPTY;
+  if (!uid) return _cloneFile(EMPTY);
   return _readSync(uid);
 }
 

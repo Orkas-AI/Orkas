@@ -4,8 +4,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
 
+const loggerMocks = vi.hoisted(() => ({
+  warn: vi.fn(),
+}));
+
 vi.mock('../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: loggerMocks.warn, error: vi.fn() }),
 }));
 
 // Mock the model client so the autoTitle integration test below can
@@ -34,6 +38,7 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  loggerMocks.warn.mockReset();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
@@ -225,6 +230,130 @@ describe('chats › message history tombstones', () => {
       TEST_UID, conv.conversation_id, 10, undefined, null);
 
     expect(page.history.map((row) => row.id)).toEqual(['global-msg']);
+  });
+});
+
+describe('chats › conversation turn navigation index', () => {
+  it('pages every user turn fifteen at a time without loading transcript bodies', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'turn pages' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const rows = Array.from({ length: 23 }, (_, turn) => ([
+      {
+        id: `u${turn + 1}`,
+        client_msg_id: `client-${turn + 1}`,
+        from: 'user',
+        text: `User turn ${turn + 1}`,
+      },
+      {
+        id: `a${turn + 1}`,
+        from: 'commander',
+        text: `Assistant reply ${turn + 1}`,
+      },
+    ])).flat();
+    fs.writeFileSync(file, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
+
+    const latest = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    expect(latest.pageSize).toBe(15);
+    expect(latest.total).toBe(23);
+    expect(latest.turns.map((turn) => turn.turnNo)).toEqual([
+      9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+    ]);
+    expect(latest.turns[0]).toMatchObject({
+      messageId: 'u9',
+      clientMessageId: 'client-9',
+      messageIndex: 16,
+      userPreview: 'User turn 9',
+      assistantPreview: 'Assistant reply 9',
+    });
+    expect(latest.nextCursor).toBe(8);
+
+    const oldest = await chats.getConversationTurnPage(
+      TEST_UID, conv.conversation_id, latest.nextCursor,
+    );
+    expect(oldest.turns.map((turn) => turn.turnNo)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+    expect(oldest.nextCursor).toBeNull();
+  });
+
+  it('lazily builds a compact legacy index and rebuilds it after the source changes', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'legacy turn index' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const longUser = `## [Useful link](https://example.com) ${'用'.repeat(60)}`;
+    const longReply = `> ${'答'.repeat(110)}`;
+    fs.writeFileSync(file, [
+      JSON.stringify({ role: 'user', content: longUser }),
+      '{malformed',
+      JSON.stringify({ role: 'assistant', content: longReply }),
+      JSON.stringify({ from: 'commander', text: 'hidden dispatch', dispatch: true }),
+    ].join('\n') + '\n');
+
+    const first = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    expect(first.total).toBe(1);
+    expect(Array.from(first.turns[0].userPreview)).toHaveLength(40);
+    expect(first.turns[0].userPreview).toContain('Useful link');
+    expect(Array.from(first.turns[0].assistantPreview)).toHaveLength(80);
+    expect(first.turns[0].assistantPreview).not.toContain('hidden dispatch');
+    expect(first.turns[0].messageIndex).toBe(0);
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      'conversation turn index skipped malformed records',
+      expect.objectContaining({
+        file: expect.objectContaining({ path_hash: expect.any(String) }),
+        error: expect.objectContaining({
+          name: 'SyntaxError',
+          message_hash: expect.any(String),
+          message_chars: expect.any(Number),
+        }),
+      }),
+    );
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain('{malformed');
+
+    const indexFile = path.join(
+      tmpDir, TEST_UID, 'local', 'search', 'conversation-turns',
+      `${conv.conversation_id}.idx.json`,
+    );
+    expect(fs.existsSync(indexFile)).toBe(true);
+    const persisted = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    expect(persisted.turns).toEqual([{
+      messageId: '',
+      clientMessageId: '',
+      messageIndex: 0,
+      userPreview: first.turns[0].userPreview,
+      assistantPreview: first.turns[0].assistantPreview,
+    }]);
+
+    fs.appendFileSync(file, `${JSON.stringify({ id: 'u2', from: 'user', text: 'second' })}\n`);
+    fs.appendFileSync(file, `${JSON.stringify({ id: 'a2', from: 'commander', text: 'second reply' })}\n`);
+    const rebuilt = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    expect(rebuilt.total).toBe(2);
+    expect(rebuilt.turns.at(-1)).toMatchObject({
+      turnNo: 2,
+      messageId: 'u2',
+      messageIndex: 3,
+      userPreview: 'second',
+      assistantPreview: 'second reply',
+    });
+    await expect(chats.findMessageIndexById(
+      TEST_UID, conv.conversation_id, 'u2',
+    )).resolves.toBe(3);
+  });
+
+  it('purges the local derived turn index with its conversation', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'turn purge' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    fs.writeFileSync(file, `${JSON.stringify({ id: 'u1', from: 'user', text: 'one' })}\n`);
+    await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
+    const indexFile = path.join(
+      tmpDir, TEST_UID, 'local', 'search', 'conversation-turns',
+      `${conv.conversation_id}.idx.json`,
+    );
+    expect(fs.existsSync(indexFile)).toBe(true);
+
+    expect(await chats.deleteConversation(TEST_UID, conv.conversation_id)).toBe(true);
+    expect(fs.existsSync(indexFile)).toBe(false);
   });
 });
 
@@ -532,7 +661,7 @@ describe('chats › renameConversation', () => {
 });
 
 describe('chats › index repair', () => {
-  it('limits startup enrichment to visible age buckets and expanded projects', async () => {
+  it('limits startup enrichment to the first unprojected page and expanded projects', async () => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
     const expanded = await projects.createProject(TEST_UID, 'Expanded');
@@ -562,19 +691,19 @@ describe('chats › index repair', () => {
     });
     const startupIds = startup.conversations.map((c) => c.conversation_id);
     expect(startupIds).toContain(recent.conversation_id);
+    expect(startupIds).toContain(old.conversation_id);
     expect(startupIds).toContain(expandedConv.conversation_id);
-    expect(startupIds).not.toContain(old.conversation_id);
     expect(startupIds).not.toContain(collapsedConv.conversation_id);
-    expect(startup.deferred_unprojected.older).toBe(1);
+    expect(startup.unprojected_pagination).toEqual({ total: 2, next_offset: null });
     expect(startup.loaded_project_ids).toEqual([expanded.project.project_id]);
 
-    expect((await chats.listOldUnprojectedConversations(TEST_UID)).map((c) => c.conversation_id))
-      .toEqual([old.conversation_id]);
+    expect((await chats.listUnprojectedConversationPage(TEST_UID, 0)).conversations
+      .map((c) => c.conversation_id)).toEqual([recent.conversation_id, old.conversation_id]);
     expect((await chats.listProjectConversations(TEST_UID, collapsed.project.project_id))
       .map((c) => c.conversation_id)).toEqual([collapsedConv.conversation_id]);
   });
 
-  it('pages expanded projects and old buckets in independent 10-row slices', async () => {
+  it('pages project and unprojected tasks in chronological 10-row slices', async () => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
     const project = await projects.createProject(TEST_UID, 'Paged project');
@@ -625,7 +754,8 @@ describe('chats › index repair', () => {
     });
     expect(startup.conversations.filter((c) => c.project_id === pid)).toHaveLength(10);
     expect(startup.project_pagination[pid]).toEqual({ total: 15, next_offset: 10 });
-    expect(startup.deferred_unprojected).toEqual({ last30: 12, older: 13 });
+    expect(startup.conversations.filter((c) => !c.project_id)).toHaveLength(10);
+    expect(startup.unprojected_pagination).toEqual({ total: 25, next_offset: 10 });
 
     const restored = await chats.listStartupConversations(TEST_UID, {
       activeConversationId: projectRows[14].conversation_id,
@@ -643,14 +773,24 @@ describe('chats › index repair', () => {
     expect(new Set([...projectFirst.conversations, ...projectSecond.conversations]
       .map((c) => c.conversation_id)).size).toBe(15);
 
-    const last30 = await chats.listOldUnprojectedConversationPage(TEST_UID, 'last30', 0);
-    const older = await chats.listOldUnprojectedConversationPage(TEST_UID, 'older', 0);
-    expect(last30).toMatchObject({ total: 12, next_offset: 10 });
-    expect(last30.conversations).toHaveLength(10);
-    expect(last30.conversations.every((c) => c.title.startsWith('last30-'))).toBe(true);
-    expect(older).toMatchObject({ total: 13, next_offset: 10 });
-    expect(older.conversations).toHaveLength(10);
-    expect(older.conversations.every((c) => c.title.startsWith('older-'))).toBe(true);
+    const unprojectedFirst = await chats.listUnprojectedConversationPage(TEST_UID, 0);
+    const unprojectedSecond = await chats.listUnprojectedConversationPage(TEST_UID, 10);
+    const unprojectedThird = await chats.listUnprojectedConversationPage(TEST_UID, 20);
+    expect(unprojectedFirst).toMatchObject({ total: 25, next_offset: 10 });
+    expect(unprojectedFirst.conversations).toHaveLength(10);
+    expect(unprojectedFirst.conversations.every((c) => c.title.startsWith('last30-'))).toBe(true);
+    expect(unprojectedSecond).toMatchObject({ total: 25, next_offset: 20 });
+    expect(unprojectedSecond.conversations).toHaveLength(10);
+    expect(unprojectedSecond.conversations.filter((c) => c.title.startsWith('last30-'))).toHaveLength(2);
+    expect(unprojectedSecond.conversations.filter((c) => c.title.startsWith('older-'))).toHaveLength(8);
+    expect(unprojectedThird).toMatchObject({ total: 25, next_offset: null });
+    expect(unprojectedThird.conversations).toHaveLength(5);
+    expect(unprojectedThird.conversations.every((c) => c.title.startsWith('older-'))).toBe(true);
+    expect(new Set([
+      ...unprojectedFirst.conversations,
+      ...unprojectedSecond.conversations,
+      ...unprojectedThird.conversations,
+    ].map((c) => c.conversation_id)).size).toBe(25);
   });
 
   it('loads the owning project slice when restoring its active conversation', async () => {
@@ -705,7 +845,7 @@ describe('chats › index repair', () => {
 
     expect((await chats.listProjectConversations(TEST_UID, first.project.project_id))
       .map((row) => row.conversation_id)).toEqual([projected.conversation_id]);
-    expect((await chats.listOldUnprojectedConversations(TEST_UID))
+    expect((await chats.listUnprojectedConversationPage(TEST_UID, 0)).conversations
       .map((row) => row.conversation_id)).toEqual([oldGlobal.conversation_id]);
   });
 
@@ -1212,8 +1352,12 @@ describe('chats › deleteConversation', () => {
 });
 
 describe('chats › autoTitle on first send', () => {
-  it('groupChat.send updates the placeholder title to message text on first user msg', async () => {
+  it('groupChat.send updates the placeholder title locally without credit-server synchronization', async () => {
     vi.resetModules();
+    const syncCreditConversationTitle = vi.fn(async () => true);
+    vi.doMock('../../../src/main/features/account/subscription', () => ({
+      syncCreditConversationTitle,
+    }));
     const groupChat = await import('../../../src/main/features/group_chat');
     const chats = await loadChats();
     // Pass the zh placeholder explicitly so the test exercises the
@@ -1229,9 +1373,29 @@ describe('chats › autoTitle on first send', () => {
 
     const after = await chats.getConversation(TEST_UID, conv.conversation_id);
     expect(after?.title).toBe('这是用户的第一条消息');
+    expect(syncCreditConversationTitle).not.toHaveBeenCalled();
     // Cleanup so the worker doesn't leak; chat send fires a commander
     // worker that tries to do an LLM call (no model configured here →
     // turn errors immediately, but the worker is still spawned).
+    const { dropConv } = await import('../../../src/main/features/group_chat/bus');
+    await dropConv(TEST_UID, conv.conversation_id);
+  });
+
+  it('does not fail the first send when credit-title synchronization fails', async () => {
+    vi.resetModules();
+    vi.doMock('../../../src/main/features/account/subscription', () => ({
+      syncCreditConversationTitle: vi.fn(async () => { throw new Error('offline'); }),
+    }));
+    const groupChat = await import('../../../src/main/features/group_chat');
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: '新对话' });
+
+    const res = await groupChat.send({
+      userId: TEST_UID, cid: conv.conversation_id, text: '离线时仍应发送',
+    });
+
+    expect(res.ok).toBe(true);
+    expect((await chats.getConversation(TEST_UID, conv.conversation_id))?.title).toBe('离线时仍应发送');
     const { dropConv } = await import('../../../src/main/features/group_chat/bus');
     await dropConv(TEST_UID, conv.conversation_id);
   });
@@ -1254,6 +1418,47 @@ describe('chats › autoTitle on first send', () => {
     const after = await chats.getConversation(TEST_UID, conv.conversation_id);
     expect(after?.title).toBe('制作一条面向普通用户的科普视频');
     expect(after?.title).not.toContain('@VideoStudio');
+
+    const { dropConv } = await import('../../../src/main/features/group_chat/bus');
+    await dropConv(TEST_UID, conv.conversation_id);
+  });
+
+  it('uses only the user-authored body for a referenced first message', async () => {
+    vi.resetModules();
+    const groupChat = await import('../../../src/main/features/group_chat');
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: '新对话' });
+
+    const res = await groupChat.send({
+      userId: TEST_UID,
+      cid: conv.conversation_id,
+      text: '> 被引用消息中的旧任务标题\n\n总结正文里的三个结论',
+      title_text: '总结正文里的三个结论',
+    });
+
+    expect(res.ok).toBe(true);
+    expect((await chats.getConversation(TEST_UID, conv.conversation_id))?.title)
+      .toBe('总结正文里的三个结论');
+
+    const { dropConv } = await import('../../../src/main/features/group_chat/bus');
+    await dropConv(TEST_UID, conv.conversation_id);
+  });
+
+  it('keeps the placeholder title when references have no user-authored body', async () => {
+    vi.resetModules();
+    const groupChat = await import('../../../src/main/features/group_chat');
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: '新对话' });
+
+    const res = await groupChat.send({
+      userId: TEST_UID,
+      cid: conv.conversation_id,
+      text: '请参考这些消息。',
+      title_text: '',
+    });
+
+    expect(res.ok).toBe(true);
+    expect((await chats.getConversation(TEST_UID, conv.conversation_id))?.title).toBe('新对话');
 
     const { dropConv } = await import('../../../src/main/features/group_chat/bus');
     await dropConv(TEST_UID, conv.conversation_id);
@@ -1337,7 +1542,69 @@ describe('chats › sweepStaleProcessing', () => {
     )).toBe('');
   });
 
-  it('uses the indexed active-user fallback once when the journal is missing', async () => {
+  it('does not recover synced running state absent from this machine journal', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const stateFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id, 'state.json');
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    fs.writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      status: 'running',
+      last_active_at: staleActiveAt(),
+      in_flight: ['79df9cc89f5f'],
+    }));
+    const paths = await import('../../../src/main/paths');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({ version: 1, items: [] }));
+
+    expect((await chats.sweepStaleProcessing()).swept).toBe(0);
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
+    expect(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`),
+      'utf8',
+    )).toBe('');
+    expect(JSON.parse(fs.readFileSync(journal, 'utf8')))
+      .toEqual({ version: 1, items: [] });
+  });
+
+  it('maintenance recovery processes only locally journaled running state', async () => {
+    const chats = await loadChats();
+    const tracked = await chats.createConversation(TEST_UID);
+    const synced = await chats.createConversation(TEST_UID);
+    for (const cid of [tracked.conversation_id, synced.conversation_id]) {
+      const stateFile = path.join(tmpDir, TEST_UID, 'cloud', 'chats', cid, 'state.json');
+      fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+      fs.writeFileSync(stateFile, JSON.stringify({
+        version: 1,
+        status: 'running',
+        last_active_at: staleActiveAt(),
+        in_flight: ['commander'],
+      }));
+    }
+    const paths = await import('../../../src/main/paths');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({
+      version: 1,
+      items: [{ conversation_id: tracked.conversation_id }],
+    }));
+
+    expect((await chats.sweepStaleProcessing()).swept).toBe(1);
+    expect(JSON.parse(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', tracked.conversation_id, 'state.json'),
+      'utf8',
+    )).status).toBe('idle');
+    expect(JSON.parse(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', synced.conversation_id, 'state.json'),
+      'utf8',
+    )).status).toBe('running');
+    expect(JSON.parse(fs.readFileSync(journal, 'utf8')))
+      .toEqual({ version: 1, items: [] });
+  });
+
+  it('does not claim unowned running state when establishing a missing journal', async () => {
     const chats = await loadChats();
     const active = await chats.createConversation(TEST_UID);
     const otherUid = 'other-user';
@@ -1353,12 +1620,12 @@ describe('chats › sweepStaleProcessing', () => {
       }));
     }
 
-    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(1);
+    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(0);
     const activeState = JSON.parse(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', active.conversation_id, 'state.json'), 'utf8'));
     const otherState = JSON.parse(fs.readFileSync(
       path.join(tmpDir, otherUid, 'cloud', 'chats', other.conversation_id, 'state.json'), 'utf8'));
-    expect(activeState.status).toBe('idle');
+    expect(activeState.status).toBe('running');
     expect(otherState.status).toBe('running');
     const paths = await import('../../../src/main/paths');
     expect(JSON.parse(fs.readFileSync(
@@ -1396,7 +1663,110 @@ describe('chats › sweepStaleProcessing', () => {
       .toEqual({ version: 1, items: [] });
   });
 
-  it('repairs a corrupt journal through the indexed migration fallback', async () => {
+  it('reconciles stale running state silently when the durable tail already completed', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const paths = await import('../../../src/main/paths');
+    const layoutDir = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id,
+    );
+    const stateFile = path.join(layoutDir, 'state.json');
+    const messageFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`,
+    );
+    const userMessage = {
+      id: 'user-message',
+      ts: new Date(Date.now() - 62_000).toISOString(),
+      from: 'user',
+      to: ['commander'],
+      text: 'finish this task',
+    };
+    const terminalReply = {
+      id: 'terminal-reply',
+      ts: new Date(Date.now() - 61_000).toISOString(),
+      from: '79df9cc89f5f',
+      to: ['user'],
+      text: 'finished',
+      source_message_id: userMessage.id,
+    };
+    fs.writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      status: 'running',
+      last_active_at: staleActiveAt(),
+      in_flight: ['79df9cc89f5f'],
+    }));
+    fs.writeFileSync(
+      messageFile,
+      `${JSON.stringify(userMessage)}\n${JSON.stringify(terminalReply)}\n`,
+    );
+    fs.mkdirSync(path.dirname(paths.userRunningConversationsFile(TEST_UID)), { recursive: true });
+    fs.writeFileSync(paths.userRunningConversationsFile(TEST_UID), JSON.stringify({
+      version: 1,
+      items: [{ conversation_id: conv.conversation_id }],
+    }));
+
+    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(0);
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('idle');
+    expect(JSON.parse(fs.readFileSync(
+      paths.userRunningConversationsFile(TEST_UID), 'utf8',
+    ))).toEqual({ version: 1, items: [] });
+    expect(fs.readFileSync(messageFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line)))
+      .toEqual([userMessage, terminalReply]);
+  });
+
+  it('still records interruption when a newer user turn has no terminal reply', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID);
+    const paths = await import('../../../src/main/paths');
+    const layoutDir = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id,
+    );
+    const stateFile = path.join(layoutDir, 'state.json');
+    const messageFile = path.join(
+      tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`,
+    );
+    const completedReply = {
+      id: 'older-terminal',
+      ts: new Date(Date.now() - 63_000).toISOString(),
+      from: 'commander',
+      to: ['user'],
+      text: 'older result',
+      source_message_id: 'older-user',
+    };
+    const unfinishedUserMessage = {
+      id: 'unfinished-user',
+      ts: new Date(Date.now() - 62_000).toISOString(),
+      from: 'user',
+      to: ['commander'],
+      text: 'start another task',
+    };
+    fs.writeFileSync(stateFile, JSON.stringify({
+      version: 1,
+      status: 'running',
+      last_active_at: staleActiveAt(),
+      in_flight: ['commander'],
+    }));
+    fs.writeFileSync(
+      messageFile,
+      `${JSON.stringify(completedReply)}\n${JSON.stringify(unfinishedUserMessage)}\n`,
+    );
+    fs.mkdirSync(path.dirname(paths.userRunningConversationsFile(TEST_UID)), { recursive: true });
+    fs.writeFileSync(paths.userRunningConversationsFile(TEST_UID), JSON.stringify({
+      version: 1,
+      items: [{ conversation_id: conv.conversation_id }],
+    }));
+
+    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(1);
+    const messages = fs.readFileSync(messageFile, 'utf8').trim().split('\n')
+      .map((line) => JSON.parse(line));
+    expect(messages).toHaveLength(3);
+    expect(messages.at(-1)).toMatchObject({
+      from: 'commander',
+      system_kind: 'reply_interrupted',
+    });
+  });
+
+  it('repairs a corrupt journal without claiming unowned running state', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID);
     const stateFile = path.join(
@@ -1412,8 +1782,8 @@ describe('chats › sweepStaleProcessing', () => {
       version: 1, items: [{ conversation_id: '../invalid' }],
     }));
 
-    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(1);
-    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('idle');
+    expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(0);
+    expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).status).toBe('running');
     expect(JSON.parse(fs.readFileSync(journal, 'utf8')))
       .toEqual({ version: 1, items: [] });
   });
@@ -1439,6 +1809,13 @@ describe('chats › sweepStaleProcessing', () => {
     const searchIndexer = await import('../../../src/main/features/search/indexer');
     await searchIndexer.reconcileChatsIndex(TEST_UID);
     expect(searchIndexer.isChatsIndexTrusted(TEST_UID)).toBe(true);
+    const paths = await import('../../../src/main/paths');
+    const journal = paths.userRunningConversationsFile(TEST_UID);
+    fs.mkdirSync(path.dirname(journal), { recursive: true });
+    fs.writeFileSync(journal, JSON.stringify({
+      version: 1,
+      items: [{ conversation_id: conv.conversation_id }],
+    }));
 
     const res = await chats.sweepStaleProcessing();
     expect(res.swept).toBe(1);
@@ -1457,7 +1834,6 @@ describe('chats › sweepStaleProcessing', () => {
         model_text: expect.stringContaining('interrupted'),
       }),
     ]);
-    const paths = await import('../../../src/main/paths');
     const searchEntry = await searchIndexer.getEntry(paths.userChatsIndexPath(TEST_UID), 'chat');
     expect(searchEntry.idx.docs[`chat:${conv.conversation_id}:0`]).toMatchObject({
       role: '79df9cc89f5f',

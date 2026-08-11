@@ -20,9 +20,13 @@ How to intelligently edit **real user-supplied footage** while keeping the sourc
 Write `project/plan.json::edit_strategy` whenever VideoStudio decides what to change rather than merely executing user-supplied timecodes:
 
 - `mode`: `deterministic` for transcript/OCR/scene/silence/quality/vision-driven timeline decisions, `semantic` for AI pixel changes, or `mixed` when both are necessary.
-- `objectives`: the exact editorial or pixel-level changes requested.
+All four fields below are non-empty arrays of strings — one entry per item,
+never a single sentence. `objectives` is the one most often written as prose;
+the validator rejects a bare string with `E_EDIT_STRATEGY_BOUNDARY`.
+
+- `objectives`: the exact editorial or pixel-level changes requested, one per entry.
 - `decision_signals`: only evidence actually used (`timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model`).
-- `preserve` and `may_change`: non-empty, non-overlapping boundaries.
+- `preserve` and `may_change`: non-overlapping boundaries. `may_change` must name every class of change the user authorized — omitting one silently narrows the plan's declared authority below what they asked for.
 
 Declare every source/reference image or video in top-level `references` with `media_type`, reproduce/edit/guide intent, `intent_basis`, roles, required state, preserve/may-change, and target segment ids. This applies to deterministic trims/highlights as well as semantic edits: `spec.input_id` and `edit_strategy` do not replace the top-level source contract. User-declared requirements override defaults; only an unspecified reference defaults to guide/inferred. Video reproduce/edit/motion/timing contracts need one `{source_start_sec,source_end_sec,target_segment_id}` temporal anchor for every targeted segment. A semantic video edit is represented as `source:"generate"`, `media_kind:"video"`, `operation:"edit"`, with the original in `reference_video_paths`/`reference_video_urls`; it still belongs to the EDIT workflow and its count enters Gate C.
 
@@ -113,7 +117,7 @@ When the user wants highlights / clips "about X" or a localized version, transcr
 1. **Analyze the video FIRST — never narrate from topic knowledge.** Probe duration, then: `stage-edit analyze_media --op ocr` for on-screen text AND `video_studio` `op: "speech.transcribe"` for spoken audio. A title-card / slideshow / screen-recording is the on-screen-text case → OCR is **mandatory, not the fallback**. Do NOT jump to reading frames-as-vision while OCR is available, and do NOT describe the product from memory.
 2. **Author `project/plan.json` NOW (plan-first, not at the end) as the segments EDL** (copy `stage-plan`'s exact JSON skeleton — `source` is the method enum `edit`, NOT a file path (the clip goes in `spec.input_id`); use `target_sec`; `tracks` is an object), carrying ONLY what the user asked for — keep the picture, add narration — and nothing else:
    - one **primary `edit` segment** for the source spanning the whole timeline (`source:"edit"`, `layer:"primary"`, `target_sec` = clip length, `spec.input_id`/`in_sec`/`out_sec` covering the clip). Source-led keep — do NOT add crop/scale/reframe; you weren't asked to.
-   - a **`tracks.narration`** track whose `synthesis:{route_ref,voice_ref,display_name,language,speed}` is copied from `video_studio speech.capabilities`, with ONE LINE per on-screen beat: `{ text, start_sec, target_sec }`. Use the exact BCP-47 deliverable language and select a matching native or verified supported locale; candidate non-native support is not production-ready. Derive every window and line from the OCR/transcript table before any TTS. Never invent a voice id and never use one paragraph for the whole clip.
+   - a **`tracks.narration`** track whose `synthesis:{route_ref,voice_ref,display_name,language,speed}` is copied from `video_studio speech.capabilities` called with the deliverable's exact BCP-47 `language`, with ONE LINE per on-screen beat: `{ text, start_sec, target_sec }`. Derive every window and line from the OCR/transcript table before any TTS. Never invent a voice id and never use one paragraph for the whole clip.
    - `delivery_promise:{ type:"source_led", source_required:true }`; set `aspect` from the SOURCE's real probed dimensions (a landscape source is `16:9`, not the portrait default).
    Each narration line stays its own entry, so a later edit can re-voice ONE line without touching the rest.
 3. **Generate each beat FROM the plan, then record its `produced_path`.** `generate_speech` per narration line with `target_duration` = its `target_sec`; save the mp3 and write that line's `produced_path`. If the words don't fit at a natural pace, SHORTEN that line in the plan — never speed up past natural or let it run long/short. Coverage must span ~0→clip-end, not stop at the halfway mark.

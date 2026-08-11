@@ -1,13 +1,17 @@
 import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 import {
   bindAbort,
   killProcessTree,
   levelOrInfo,
   LineSplitter,
+  reapCliAfterProtocolTerminal,
   StderrTail,
   stripAnsi,
 } from '../../../../src/main/features/local_agents/backends/base';
+
+const itPosix = process.platform === 'win32' ? it.skip : it;
 
 describe('local_agents/backends/base', () => {
   it('keeps only the bounded stderr tail', () => {
@@ -113,5 +117,35 @@ describe('local_agents/backends/base', () => {
     });
 
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  itPosix('reaps a CLI asynchronously after an authoritative protocol terminal', () => {
+    vi.useFakeTimers();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const child = Object.assign(new EventEmitter(), {
+      pid: 24680,
+      stdin: { end: vi.fn() },
+      kill: vi.fn(),
+    });
+
+    try {
+      reapCliAfterProtocolTerminal(child as any, 50);
+      expect(child.stdin.end).toHaveBeenCalledOnce();
+      expect(processKill).not.toHaveBeenCalled();
+
+      vi.advanceTimersByTime(50);
+      expect(processKill).toHaveBeenCalledWith(-24680, 'SIGTERM');
+
+      vi.advanceTimersByTime(10_000);
+      expect(processKill).toHaveBeenCalledWith(-24680, 'SIGKILL');
+
+      child.emit('close', 0);
+      const callsAtClose = processKill.mock.calls.length;
+      vi.advanceTimersByTime(20_000);
+      expect(processKill).toHaveBeenCalledTimes(callsAtClose);
+    } finally {
+      processKill.mockRestore();
+      vi.useRealTimers();
+    }
   });
 });

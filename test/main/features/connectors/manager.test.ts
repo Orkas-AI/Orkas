@@ -72,6 +72,14 @@ vi.mock('../../../../src/main/features/connectors/oauth-events', () => ({
   broadcastOAuthConnectOutcome: (...args: any[]) => mocks.events.broadcastOAuthConnectOutcome(...args),
 }));
 
+vi.mock('../../../../src/main/util/bundled-runtime', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../../src/main/util/bundled-runtime')>();
+  return {
+    ...actual,
+    bundledNodeExecutable: () => '/opt/orkas/runtime/node',
+  };
+});
+
 /** Restore default (passthrough) behavior for every mock slot. Fresh spies each
  *  test so call history / queued implementations never leak across tests. */
 function resetMockBehaviors() {
@@ -883,6 +891,127 @@ describe('features/connectors/manager authorization recovery', () => {
       code: 'connector_reconnect_required',
       message: expect.stringContaining('授权已失效'),
     });
+  });
+
+  it('repairs the legacy bootstrap auth marker caused by a device-local decrypt failure', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = notionInstance();
+    (inst as any).status = {
+      kind: 'error',
+      message: 'connector_reconnect_required',
+      at: Date.now(),
+    };
+    (inst as any).auth_error = {
+      code: 'connector_reconnect_required',
+      message: 'connector_reconnect_required',
+      reason: 'bootstrap_dcr_auth_error',
+      at: Date.now(),
+    };
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.bootstrap(TEST_UID);
+
+    const repaired = registry.load(TEST_UID).connections.notion;
+    expect(repaired.auth_error).toBeUndefined();
+    expect(repaired.status.kind).toBe('connected');
+    expect(mocks.mcp.connect).toHaveBeenCalled();
+  });
+
+  it('replaces a repaired legacy marker with the real provider auth failure when validation fails', async () => {
+    mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
+      const err = new Error('Authorization expired at provider. Please reconnect') as Error & {
+        code?: string;
+        retryable?: boolean;
+      };
+      err.code = 'connector_reconnect_required';
+      err.retryable = false;
+      throw err;
+    });
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = notionInstance();
+    inst.oauth_grant.expires_at = Date.now() - 1;
+    (inst as any).status = {
+      kind: 'error',
+      message: 'connector_reconnect_required',
+      at: Date.now(),
+    };
+    (inst as any).auth_error = {
+      code: 'connector_reconnect_required',
+      message: 'connector_reconnect_required',
+      reason: 'bootstrap_dcr_auth_error',
+      at: Date.now(),
+    };
+    await registry.upsert(TEST_UID, inst);
+
+    await manager.bootstrap(TEST_UID);
+
+    expect(mocks.dcr.refreshDcrIfStale).toHaveBeenCalledTimes(1);
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    const failed = registry.load(TEST_UID).connections.notion;
+    expect(failed.status).toMatchObject({
+      kind: 'error',
+      message: 'Authorization expired at provider. Please reconnect',
+    });
+    expect(failed.auth_error).toMatchObject({
+      code: 'connector_reconnect_required',
+      message: 'Authorization expired at provider. Please reconnect',
+      reason: 'dcr_auth_refresh_failed',
+    });
+  });
+
+  it('does not persist or reconnect a connector whose secrets are unavailable on this device', async () => {
+    const connectorPaths = await import('../../../../src/main/paths');
+    const file = connectorPaths.userConnectorsConfigFile(TEST_UID);
+    const source = notionInstance();
+    const metadata: Record<string, unknown> = { ...source };
+    delete metadata.oauth_grant;
+    delete metadata.dcr_client;
+    delete metadata.transport;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      connections: {
+        notion: {
+          ...metadata,
+          status: { kind: 'connected', since: 1 },
+          secrets_enc: 'ORKLSEC1.unavailable-on-this-device',
+        },
+      },
+      oauth_hints: {},
+      _deleted_at: {},
+    }, null, 2));
+
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const listed = manager.getInstance(TEST_UID, 'notion');
+    expect(listed?.status).toMatchObject({
+      kind: 'error',
+      message: 'connector_secrets_unavailable',
+    });
+
+    await expect(manager.refreshTools(TEST_UID, 'notion')).rejects.toMatchObject({
+      code: 'connector_secrets_unavailable',
+      retryable: false,
+    });
+    await expect(manager.callTool(TEST_UID, 'notion', 'search', {})).rejects.toMatchObject({
+      code: 'connector_secrets_unavailable',
+      retryable: false,
+    });
+    await manager.setEnabledSubtools(TEST_UID, 'notion', ['search']);
+    await manager.bootstrap(TEST_UID);
+
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(persisted.connections.notion.status).toEqual({ kind: 'connected', since: 1 });
+    expect(persisted.connections.notion.enabled_subtools).toEqual(['search']);
+    expect(persisted.connections.notion.auth_error).toBeUndefined();
+    expect(persisted.connections.notion.secrets_enc).toBe('ORKLSEC1.unavailable-on-this-device');
+    expect(mocks.mcp.connect).not.toHaveBeenCalled();
+    expect(mocks.mcp.callTool).not.toHaveBeenCalled();
+    expect(mocks.dcr.refreshDcrIfStale).not.toHaveBeenCalled();
   });
 
   it('removes the connector row if a refresh response no longer includes required scopes', async () => {

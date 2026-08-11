@@ -122,6 +122,7 @@ describe('local_agents/backends/openclaw › buildOpenclawArgs', () => {
 
     expect(args).toContain('--timeout');
     expect(args[args.indexOf('--timeout') + 1]).toBe('3600');
+    expect(args).not.toContain('--agent');
     expect(args.slice(-2)).toEqual(['--message', 'do work']);
   });
 
@@ -134,5 +135,16 @@ describe('local_agents/backends/openclaw › buildOpenclawArgs', () => {
 
     expect(args.filter((arg) => arg === '--timeout')).toHaveLength(1);
     expect(args[args.indexOf('--timeout') + 1]).toBe('120');
+  });
+
+  it('passes supported per-Agent model and thinking overrides', () => {
+    const args = buildOpenclawArgs({
+      prompt: 'do work',
+      timeoutMs: 60_000,
+      modelOverride: 'openai/gpt-5.4',
+      thinkingLevel: 'high',
+    }, 'session-1');
+    expect(args[args.indexOf('--model') + 1]).toBe('openai/gpt-5.4');
+    expect(args[args.indexOf('--thinking') + 1]).toBe('high');
   });
 });

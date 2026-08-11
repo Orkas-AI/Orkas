@@ -248,7 +248,7 @@ function dedupeSkillsByDisplayName<T extends SkillAllowlistRef>(
 
 // Render the system-prompt block listing every skill the LLM can use.
 //
-// Format:
+// Legacy format (callers without a run-scoped binding map):
 //   `## Available skills (skills)\n\n` +
 //   `\`read_file(<ROOT>/<id>/SKILL.md)\` — ROOT by Source:\n` +
 //   `- builtin: <abs path>\n` +
@@ -277,9 +277,85 @@ function dedupeSkillsByDisplayName<T extends SkillAllowlistRef>(
  *  `external2`, …) because a tier can span several dirs. */
 interface PromptRootEntry { label: string; root: string }
 
+/** Host-only, run-scoped target for an `@skill/<ref>` read. The map that
+ * contains these bindings is created once per AgentRunner build and is never
+ * persisted into conversation history. */
+export interface SkillRuntimeBinding {
+  id: string;
+  name: string;
+  root: string;
+  entry: string;
+  source: string;
+}
+
+function isPortableRuntimeRef(value: string): boolean {
+  const ref = String(value || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:@+-]*$/u.test(ref);
+}
+
+function sameRuntimeBinding(a: SkillRuntimeBinding, b: SkillRuntimeBinding): boolean {
+  return path.resolve(a.root) === path.resolve(b.root)
+    && path.resolve(a.entry) === path.resolve(b.entry);
+}
+
+/** Reserve human-readable refs before internal ids, so an unrelated skill id
+ * can never steal another skill's display-name alias. Same-name skills remain
+ * supported: the first keeps the readable alias and later entries fall back
+ * to their unique id (or a source-qualified id in the pathological case). */
+function bindRuntimeSkillRefs(
+  specs: SkillSpec[],
+  labelOf: (s: SkillSpec) => string,
+  bindings: Map<string, SkillRuntimeBinding>,
+): Map<SkillSpec, string> {
+  const refBySpec = new Map<SkillSpec, string>();
+  const bindingBySpec = new Map<SkillSpec, SkillRuntimeBinding>();
+  const reserve = (ref: string, binding: SkillRuntimeBinding): boolean => {
+    if (!isPortableRuntimeRef(ref)) return false;
+    const existing = bindings.get(ref);
+    if (existing) return sameRuntimeBinding(existing, binding);
+    bindings.set(ref, binding);
+    return true;
+  };
+
+  for (const spec of specs) {
+    const binding: SkillRuntimeBinding = {
+      id: spec.id,
+      name: spec.name || spec.id,
+      root: path.resolve(spec.dir),
+      entry: path.resolve(spec.skillFile),
+      source: labelOf(spec),
+    };
+    bindingBySpec.set(spec, binding);
+    const preferred = binding.name.trim();
+    if (reserve(preferred, binding)) refBySpec.set(spec, preferred);
+  }
+
+  for (const [index, spec] of specs.entries()) {
+    if (refBySpec.has(spec)) continue;
+    const binding = bindingBySpec.get(spec)!;
+    const candidates = [binding.id, `${binding.source}:${binding.id}`, `skill-${index + 1}`];
+    let fallback = candidates.find((candidate) => reserve(candidate, binding));
+    let suffix = 2;
+    while (!fallback) {
+      const candidate = `skill-${index + 1}-${suffix++}`;
+      if (reserve(candidate, binding)) fallback = candidate;
+    }
+    refBySpec.set(spec, fallback);
+  }
+
+  // Keep id lookup as a compatibility alias when it does not conflict with a
+  // display-name ref. Prompt entries still advertise the human-readable ref.
+  for (const spec of specs) {
+    const binding = bindingBySpec.get(spec)!;
+    reserve(binding.id, binding);
+  }
+  return refBySpec;
+}
+
 async function renderSkillLines(
   specs: SkillSpec[],
   rootEntries: PromptRootEntry[],
+  runtimeBindings?: Map<string, SkillRuntimeBinding>,
 ): Promise<string> {
   if (!specs.length) return '';
   const lang = descriptionLang(getLanguage());
@@ -299,28 +375,34 @@ async function renderSkillLines(
   };
   for (const s of specs) usedLabels.add(labelOf(s));
 
-  // Each entry shows the human `name` (what the model uses to decide *whether* to reach
-  // for the skill) plus the raw `id` (what goes into the read_file path). They DIVERGE for
-  // marketplace installs whose dir name = 12-hex server id but whose authored name is a
-  // readable string — see core-agent loader.ts comment on the dir-id ≠ name split.
-  const lines: string[] = [
-    '## Available skills (skills)',
-    '',
-    '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
-  ];
-  for (const r of rootEntries) {
-    // builtin + platform + custom rows always render (stable prompt prefix);
-    // other tiers render only when referenced. `custom:` keeps its historical
-    // two-space alignment.
-    if (r.label === 'builtin' || r.label === 'platform' || r.label === 'custom' || usedLabels.has(r.label)) {
-      lines.push(`- ${r.label}:${r.label === 'custom' ? '  ' : ' '}${r.root}`);
+  const runtimeRefBySpec = runtimeBindings
+    ? bindRuntimeSkillRefs(specs, labelOf, runtimeBindings)
+    : null;
+  const lines: string[] = ['## Available skills (skills)', ''];
+  if (runtimeRefBySpec) {
+    lines.push(
+      '`read_file("@skill/<read-ref>")` loads that skill\'s SKILL.md for this run.',
+      '`read_file("@skill/<read-ref>/<relative-path>")` loads a referenced file, template, asset, or script inside the same skill.',
+      'Use the exact read ref shown on the matching entry. Do not discover or reconstruct physical skill paths.',
+      'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
+      '',
+    );
+  } else {
+    lines.push('`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:');
+    for (const r of rootEntries) {
+      // builtin + platform + custom rows always render (stable prompt prefix);
+      // other tiers render only when referenced. `custom:` keeps its historical
+      // two-space alignment.
+      if (r.label === 'builtin' || r.label === 'platform' || r.label === 'custom' || usedLabels.has(r.label)) {
+        lines.push(`- ${r.label}:${r.label === 'custom' ? '  ' : ' '}${r.root}`);
+      }
     }
+    lines.push(
+      'Use these ROOT values verbatim. `<id>` is the internal read id for read_file paths only, even when it differs from display name.',
+      'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
+      '',
+    );
   }
-  lines.push(
-    'Use these ROOT values verbatim. `<id>` is the internal read id for read_file paths only, even when it differs from display name.',
-    'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
-    '',
-  );
   for (const s of specs) {
     const source = labelOf(s);
     const description = compactPromptDescription(pick(s, lang));
@@ -329,7 +411,10 @@ async function renderSkillLines(
     // differ (marketplace installs), keep the id explicitly internal so the model can read by
     // path without being primed to repeat the id in user-facing prose.
     const displayName = s.name || s.id;
-    const internal = displayName !== s.id ? `; internal read id: ${s.id}` : '';
+    const runtimeRef = runtimeRefBySpec?.get(s);
+    const internal = runtimeRef
+      ? `; read ref: @skill/${runtimeRef}`
+      : displayName !== s.id ? `; internal read id: ${s.id}` : '';
     lines.push(`- **${displayName}** (Source: ${source}${internal})${desc}`);
   }
   return lines.join('\n');
@@ -729,6 +814,11 @@ export interface SystemPromptBlockOptions {
    * or adding anything to the model prompt.
    */
   displayNameById?: Map<string, string>;
+  /** Optional per-run logical-path table. When supplied, this exact filtered
+   * render populates it and advertises stable `@skill/<ref>` reads instead of
+   * physical roots. Omit for standalone prompt fragments that do not share a
+   * live Runner (they retain the legacy absolute-path contract). */
+  runtimeBindings?: Map<string, SkillRuntimeBinding>;
   /**
    * Group-chat task sessions (`gconv` commander + `gmember` in-process agents)
    * and agent-edit authoring sessions only. Inlines enabled EXTERNAL-package
@@ -943,7 +1033,7 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     }
   }
 
-  const block = await renderSkillLines(rendered, rootEntries);
+  const block = await renderSkillLines(rendered, rootEntries, opts.runtimeBindings);
   // Task/authoring hint that GLOBAL-folder skills exist behind `skill_search`
   // (external packages are inlined above). Constant (no count) so global-folder
   // changes don't churn the cache prefix. Skipped under an allowlist — pinned
@@ -954,7 +1044,10 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   return block;
 }
 
-export async function getSystemSkillsPromptBlock(uid?: string): Promise<string> {
+export async function getSystemSkillsPromptBlock(
+  uid?: string,
+  runtimeBindings?: Map<string, SkillRuntimeBinding>,
+): Promise<string> {
   const resolvedUid = uid || getActiveUserId();
   const root = path.resolve(userSystemSkillsDir(resolvedUid));
   const loaderMod = await import('#core-agent');
@@ -963,6 +1056,10 @@ export async function getSystemSkillsPromptBlock(uid?: string): Promise<string> 
   if (!specs.length) return '';
   const lang = descriptionLang(getCurrentLang());
   const pick = await getPickDescription();
+  const labelOf = () => 'system';
+  const runtimeRefBySpec = runtimeBindings
+    ? bindRuntimeSkillRefs(specs, labelOf, runtimeBindings)
+    : null;
   const lines = [
     '## System skills',
     '',
@@ -971,17 +1068,18 @@ export async function getSystemSkillsPromptBlock(uid?: string): Promise<string> 
     'When the task or the work you decide to perform clearly matches a description below, use that system skill by reading its SKILL.md. Do not load system skills that do not match.',
     '',
     'Read with:',
-    '`read_file(<SYSTEM_SKILLS_ROOT>/<id>/SKILL.md)`',
-    '',
-    'SYSTEM_SKILLS_ROOT:',
-    root,
+    runtimeRefBySpec
+      ? '`read_file("@skill/<read-ref>")` using the exact read ref on the matching entry.'
+      : '`read_file(<SYSTEM_SKILLS_ROOT>/<id>/SKILL.md)`',
+    ...(runtimeRefBySpec ? [] : ['', 'SYSTEM_SKILLS_ROOT:', root]),
     '',
   ];
   for (const s of specs) {
     const displayName = s.name || s.id;
     const description = compactPromptDescription(pick(s, lang));
     const desc = description ? ` — ${description}` : '';
-    lines.push(`- **${displayName}**${desc}`);
+    const runtimeRef = runtimeRefBySpec?.get(s);
+    lines.push(`- **${displayName}**${runtimeRef ? ` (read ref: @skill/${runtimeRef})` : ''}${desc}`);
   }
   return lines.join('\n');
 }

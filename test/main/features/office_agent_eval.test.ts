@@ -18,6 +18,7 @@ const excelSkillPath = path.join(
 describe('OfficeWorker built-in agent evaluation', () => {
   it('requires one built-in creation route with native charts for a new workbook', () => {
     const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')) as {
+      workflow: string;
       standards: string[];
       skill_list: string[];
     };
@@ -25,6 +26,13 @@ describe('OfficeWorker built-in agent evaluation', () => {
     const standards = agent.standards.join('\n');
 
     expect(agent.skill_list).toContain('081c15ffbab4');
+    expect(agent.workflow).toContain('Resolve existing inputs before asking for files');
+    expect(agent.workflow).toContain('call `search_files` once with a narrow extension/name query');
+    expect(agent.workflow).toContain('Never show a file-upload form or claim the source is missing before this lookup');
+    expect(agent.workflow).toContain('do not call `publish_outputs`, including with an empty `paths` list');
+    expect(standards).toContain('one literal extension-glob search');
+    expect(standards).toContain('not semantic topic words such as contract or business data');
+    expect(standards).toContain('`query: "*"` plus `include_glob`');
     expect(standards).toContain('calling the matching built-in create tool is mandatory');
     expect(standards).toContain('must not construct, rewrite, or patch the final Office package');
     expect(standards).toContain('Create one file per requested artifact');

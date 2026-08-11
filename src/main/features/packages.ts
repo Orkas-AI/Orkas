@@ -49,6 +49,11 @@ import {
 import { createLogger } from '../logger';
 import { companionSkillFileExists } from './package_skills';
 import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../util/bundled-runtime';
+import {
+  resolveBackgroundNodeRuntime,
+  withBackgroundNodeEnv,
+  type BackgroundNodeRuntime,
+} from '../util/background-node';
 import { killProcessTree } from '../../core-agent/src/sandbox/executor';
 
 const log = createLogger('packages');
@@ -307,11 +312,16 @@ export function runPackageProcessForTest(
   });
 }
 
-function buildPackageCommandEnv(uid: string, pcDir: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
+export function buildPackageCommandEnv(
+  uid: string,
+  pcDir: string,
+  nodeRuntime: BackgroundNodeRuntime,
+): NodeJS.ProcessEnv {
+  const env = withBackgroundNodeEnv({
+    ...Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    ),
     ...bundledRuntimeEnv(),
-    ELECTRON_RUN_AS_NODE: '1',
     ORKAS_UID: uid,
     ORKAS_PC_DIR: pcDir,
     ORKAS_WORKSPACE_ROOT: WS_ROOT,
@@ -321,7 +331,7 @@ function buildPackageCommandEnv(uid: string, pcDir: string): NodeJS.ProcessEnv {
     NPM_CONFIG_FUND: 'false',
     NPM_CONFIG_AUDIT: 'false',
     NPM_CONFIG_UPDATE_NOTIFIER: 'false',
-  };
+  }, nodeRuntime);
   const pathEntries = bundledRuntimePathEntries();
   try {
     if (fs.statSync(NODE_NPM_GLOBAL_BIN_DIR).isDirectory()) {
@@ -381,13 +391,16 @@ export function runPackageCommand(uid: string, command: string, name: string): P
       const { app } = require('electron') as typeof import('electron');
       if (app && app.isPackaged) pcDir = PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked');
     } catch { /* not in electron (tests) */ }
-    // Vitest itself runs under Electron-as-Node for native ABI parity, but
-    // standalone JS helpers should use the outer Node executable so tests do
-    // not create extra Orkas-named Electron processes.
-    const node = process.env.ORKAS_TEST_NODE || process.execPath;
+    // Vitest can provide its outer stock Node explicitly. Production always
+    // resolves the bundled runtime and never launches the GUI Electron binary
+    // for this headless package helper.
+    const testNode = process.env.ORKAS_TEST_NODE;
+    const nodeRuntime = testNode
+      ? { executable: testNode, electronAsNode: false }
+      : resolveBackgroundNodeRuntime();
     const script = path.join(pcDir, 'bin', 'orkas-pkg.cjs');
-    void runPackageProcessForTest(node, [script, command, name], {
-      env: buildPackageCommandEnv(uid, pcDir),
+    void runPackageProcessForTest(nodeRuntime.executable, [script, command, name], {
+      env: buildPackageCommandEnv(uid, pcDir, nodeRuntime),
     }).then((result) => {
       if (result.error) {
         finish({ ok: false, stdout: result.stdout, error: result.error });

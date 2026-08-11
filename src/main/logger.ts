@@ -88,8 +88,8 @@ function datePrefixOf(name: string): string | null {
 
 // Keys that may carry secrets or PII — redacted regardless of nesting depth.
 // Matched case-insensitively against property names. `name` is intentionally
-// NOT here (too broad: agent.name / connector.name / project.name / filename
-// are all legit business values).
+// NOT here (too broad: agent.name / connector.name / project.name are
+// legitimate business values). File/path fields use the separate path mask.
 const REDACT_KEYS = new Set([
   'key', 'apikey', 'api_key',
   'access', 'refresh',
@@ -112,7 +112,14 @@ const MASK_ID_KEYS = new Set([
   'uid', 'userid', 'user_id',
 ]);
 
+const PRIVATE_FILE_KEYS = new Set([
+  'path', 'abspath', 'abs_path', 'relpath', 'rel_path',
+  'filepath', 'file_path', 'filename', 'file_name',
+  'workingdir', 'working_dir', 'cwd',
+]);
+
 const MASK = '***REDACTED***';
+const PATH_MASK = '***REDACTED_PATH***';
 
 /**
  * Return a deep-cloned version of `v` with sensitive-looking fields masked.
@@ -140,6 +147,8 @@ export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unkno
       const key = k.toLowerCase();
       if (REDACT_KEYS.has(key)) {
         (out as Error & Record<string, unknown>)[k] = MASK;
+      } else if (PRIVATE_FILE_KEYS.has(key) && typeof val === 'string') {
+        (out as Error & Record<string, unknown>)[k] = PATH_MASK;
       } else if (MASK_ID_KEYS.has(key)) {
         (out as Error & Record<string, unknown>)[k] = maskLogId(val);
       } else {
@@ -155,6 +164,8 @@ export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unkno
   for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
     if (REDACT_KEYS.has(k.toLowerCase())) {
       out[k] = MASK;
+    } else if (PRIVATE_FILE_KEYS.has(k.toLowerCase()) && typeof val === 'string') {
+      out[k] = PATH_MASK;
     } else if (MASK_ID_KEYS.has(k.toLowerCase())) {
       out[k] = maskLogId(val);
     } else {

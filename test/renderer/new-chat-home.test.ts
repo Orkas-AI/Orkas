@@ -15,16 +15,30 @@ function quickStartOrder(source: string, declaration: string) {
 }
 
 describe('new chat home surface', () => {
-  it('keeps the external agent entry while filtering voice input', () => {
+  it('keeps the commercial external-agent entry fixed above Settings in the sidebar footer', () => {
+    const html = read('src/renderer/index.html');
+    const sidebarFooter = html.slice(
+      html.indexOf('<div class="sidebar-footer-actions">'),
+      html.indexOf('<div class="sidebar-resize-handle"'),
+    );
+    const landing = html.slice(html.indexOf('<section class="panel active" id="panel-new-chat">'), html.indexOf('<!-- Conversation Detail -->'));
+
+    expect(sidebarFooter).toContain('class="sb-connect" id="new-chat-external-agent-btn"');
+    expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent"');
+    expect(sidebarFooter).toContain('data-i18n="sidebar.connect_agent_sub"');
+    expect(sidebarFooter.indexOf('id="new-chat-external-agent-btn"'))
+      .toBeLessThan(sidebarFooter.indexOf('id="settings-btn"'));
+    expect(landing).not.toContain('new-chat-external-agent-btn');
+  });
+
+  it('keeps voice input filtered from the open-source composer', () => {
     const html = read('src/renderer/index.html');
 
-    expect(html).toContain('id="new-chat-external-agent-btn"');
-    expect(html).toContain('data-i18n="new_chat.external_agent_entry"');
     expect(html).not.toContain('id="new-chat-mic-btn"');
     expect(html).not.toContain('data-ui-icon="mic"');
   });
 
-  it('opens the homepage external-agent flow in place and restores composer focus on cancel', () => {
+  it('uses the commercial sidebar external-agent handler contract', () => {
     const state = read('src/renderer/modules/state.js');
     const agents = read('src/renderer/modules/agents.js');
     const handler = state.slice(
@@ -35,6 +49,8 @@ describe('new chat home surface', () => {
     expect(handler).toContain("initialTab: 'external'");
     expect(handler).toContain('externalOnly: true');
     expect(handler).toContain("returnFocusId: 'new-chat-input'");
+    expect(handler).toContain("entryPoint: 'new_chat_external_agent'");
+    expect(handler).toContain("_trackAgentCreateOpen('new_chat_external_agent', { agent_type: 'cli' })");
     expect(handler).not.toContain("setView('agents'");
     expect(agents).toContain('if (tabBar) tabBar.hidden = externalOnly;');
     expect(agents).toContain('closeAgentModal({ restoreFocus: true });');
@@ -46,11 +62,12 @@ describe('new chat home surface', () => {
     const clientConfig = read('src/main/features/client_config.ts');
     const expected = [
       'data',
-      'video',
-      'image',
-      'ui_design',
       'office',
+      'ppt',
       'creation',
+      'image',
+      'video',
+      'ui_design',
       'rnd',
       'seo_geo',
     ];
@@ -75,8 +92,11 @@ describe('new chat home surface', () => {
     const css = read('src/renderer/style.css');
 
     expect(css).toMatch(/#panel-new-chat\s*{[\s\S]*?position:\s*relative;/);
-    expect(css).toContain('.new-chat-center > .oss-entry');
-    expect(css).toContain('.new-chat-external-agent-btn');
+    expect(css).toContain('.quick-panel-more');
+    expect(css).toContain('.sb-connect');
+    expect(css).not.toContain('.sidebar-external-agent-btn');
+    expect(css).not.toContain('.new-chat-external-agent-btn');
+    expect(css).toMatch(/\.sidebar-footer-actions\s*{[\s\S]*?flex-direction:\s*column;[\s\S]*?align-items:\s*stretch;/);
     expect(css).toMatch(/\.new-chat-input-area \.chat-rich-editor\s*{[\s\S]*?min-height:\s*80px;[\s\S]*?font-size:\s*16px;/);
     expect(css).toMatch(/\.new-chat-input-area \.chat-input-rich-wrap textarea\.chat-rich-source\s*{[\s\S]*?position:\s*absolute;[\s\S]*?width:\s*1px;[\s\S]*?opacity:\s*0;[\s\S]*?pointer-events:\s*none;/);
     expect(css).toMatch(/\.chat-rich-editor\s*{[\s\S]*?outline:\s*none;/);

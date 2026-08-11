@@ -24,6 +24,7 @@ import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
 import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
+import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 import { registerUserSwitchHook } from '../user-switch-hooks';
 import { broadcastOAuthConnectOutcome } from './oauth-events';
 import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
@@ -168,6 +169,52 @@ function _storedAuthorizationProblem(inst: ConnectorInstance): { message: string
     return { message: statusError, reason: 'dcr_auth_error' };
   }
   return null;
+}
+
+const LEGACY_LOCAL_SECRET_POISON_REASON = 'bootstrap_dcr_auth_error';
+
+/** Older builds projected a device-local decrypt failure as a bare reconnect-required status.
+ * Bootstrap then persisted that projection as an auth_error and cloud sync spread it to every
+ * device. This exact marker is safe to retry when this device can decrypt the row: a genuinely
+ * revoked grant will fail the validation attempt and be written back with the real provider error. */
+function _isLegacyLocalSecretAuthPoison(inst: ConnectorInstance): boolean {
+  const entry = findCatalogEntry(inst.id);
+  return entry?.auth_mode === 'mcp_dcr'
+    && !registry.hasUnavailableSecrets(inst)
+    && inst.auth_error?.reason === LEGACY_LOCAL_SECRET_POISON_REASON
+    && inst.auth_error.message.trim() === 'connector_reconnect_required';
+}
+
+async function _clearLegacyLocalSecretAuthPoison(
+  uid: string,
+  inst: ConnectorInstance,
+): Promise<ConnectorInstance> {
+  const repaired = await registry.update(uid, inst.id, (cur) => {
+    if (!_isLegacyLocalSecretAuthPoison(cur)) return cur;
+    return {
+      ...cur,
+      auth_error: undefined,
+      status: { kind: 'connecting' },
+      updated_at: _nowIso(),
+    };
+  });
+  if (repaired) {
+    log.warn('cleared legacy device-local secret failure misclassified as authorization error', {
+      id: inst.id,
+    });
+  }
+  return repaired || inst;
+}
+
+function _secretsUnavailableError(id: string): Error & { code: string; retryable: boolean } {
+  return Object.assign(new Error(`connector ${id}: ${registry.SECRETS_UNAVAILABLE_MESSAGE}`), {
+    code: registry.SECRETS_UNAVAILABLE_MESSAGE,
+    retryable: false,
+  });
+}
+
+function _isSecretsUnavailableError(err: unknown): boolean {
+  return _connectorErrorCode(err) === registry.SECRETS_UNAVAILABLE_MESSAGE;
 }
 
 function _hasStatusError(inst: ConnectorInstance, message: string): boolean {
@@ -446,6 +493,7 @@ async function _refreshGrantIfStale(
     try {
       const inst = registry.load(uid).connections[instId];
       if (!inst) throw new Error('instance not found');
+      if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(inst.id);
       if (!inst.oauth_grant) throw new Error('no oauth_grant');
       if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_refresh')) {
         const err = new Error('missing_required_scopes') as Error & { code?: string };
@@ -617,6 +665,14 @@ async function _connectAndCacheTools(
   inst: ConnectorInstance,
   statusPatches?: StatusPatchCollector,
 ): Promise<ConnectorInstance> {
+  // A decrypt failure is local to this device. Never turn it into a metadata patch: doing so
+  // syncs a false authorization failure to devices that can still open and use the same grant.
+  if (registry.hasUnavailableSecrets(inst)) {
+    log.warn('skipping connector connect because encrypted secrets are unavailable on this device', {
+      id: inst.id,
+    });
+    return inst;
+  }
   const runtimeEpoch = _runtimeEpoch;
   const runtimeKey = _runtimeKey(uid, inst.id);
   const entry = findCatalogEntry(inst.id);
@@ -636,6 +692,9 @@ async function _connectAndCacheTools(
     }
     transport = resolved.transport;
   } catch (err) {
+    if (_isSecretsUnavailableError(err)) {
+      return registry.load(uid).connections[inst.id] || inst;
+    }
     const entry = findCatalogEntry(inst.id);
     if (_isMissingRequiredScopesError(err) || (entry && !_isTransientConnectorFailure(err) && _isGoogleAuthFailure(entry, err))) {
       return inst;
@@ -793,10 +852,25 @@ export async function bootstrap(uid: string): Promise<void> {
   const connectCandidates: ConnectorInstance[] = [];
   let reusedCached = 0;
   for (const id of ids) {
-    const inst = file.connections[id];
+    let inst = file.connections[id];
     if (_isUnknownCatalogInstance(inst)) {
       log.warn('skipping synced connector unsupported by this app version', { id });
       continue;
+    }
+    if (registry.hasUnavailableSecrets(inst)) {
+      log.warn('skipping connector bootstrap because encrypted secrets are unavailable on this device', { id });
+      continue;
+    }
+    if (_isLegacyLocalSecretAuthPoison(inst)) {
+      try {
+        inst = await _clearLegacyLocalSecretAuthPoison(uid, inst);
+      } catch (err) {
+        log.warn('failed to clear legacy connector authorization misclassification', {
+          id,
+          error: (err as Error).message,
+        });
+        continue;
+      }
     }
     try {
       if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_bootstrap')) continue;
@@ -855,12 +929,14 @@ export function listInstances(uid: string): ConnectorInstance[] {
   const file = registry.load(uid);
   return Object.values(file.connections).filter((inst) => {
     if (_isUnknownCatalogInstance(inst)) return false;
+    if (registry.hasUnavailableSecrets(inst)) return true;
     if (_hasMissingRequiredScopes(inst)) {
       _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_list');
       return false;
     }
     return true;
   }).map((inst) => {
+    if (registry.hasUnavailableSecrets(inst)) return inst;
     const problem = _storedAuthorizationProblem(inst);
     if (problem) {
       if (!inst.auth_error?.message || !_hasStatusError(inst, problem.message)) {
@@ -886,6 +962,7 @@ export function getInstance(uid: string, id: string): ConnectorInstance | null {
   const inst = file.connections[id] || null;
   if (inst) {
     if (_isUnknownCatalogInstance(inst)) return null;
+    if (registry.hasUnavailableSecrets(inst)) return inst;
     if (_hasMissingRequiredScopes(inst)) {
       _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_get');
       return null;
@@ -1152,6 +1229,7 @@ export async function refreshTools(uid: string, id: string): Promise<ToolSchema[
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
+  if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(id);
   // Force refresh-token check by tearing the live conn down and reconnecting through
   // _connectAndCacheTools (which re-resolves transport with a fresh access_token).
   const runtimeKey = _runtimeKey(uid, id);
@@ -1216,6 +1294,7 @@ export async function callTool(
   assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
+  if (registry.hasUnavailableSecrets(inst)) throw _secretsUnavailableError(id);
   const runtimeKey = _runtimeKey(uid, id);
   const liveConn = _conns.get(runtimeKey);
   const grantForCooldown = inst.oauth_grant;

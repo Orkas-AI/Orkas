@@ -24,6 +24,7 @@ const execFileAsync = promisify(execFile);
 export type SystemNotificationPermissionState =
   | 'granted'
   | 'denied'
+  | 'presentation_disabled'
   | 'not_determined'
   | 'unsupported'
   | 'unknown';
@@ -37,7 +38,7 @@ interface MacNotificationPermissionAddon {
   getPermissionState: () => Promise<unknown> | unknown;
 }
 
-let observedDeliveryState: 'granted' | 'denied' | null = null;
+let observedDeliveryState: 'granted' | null = null;
 let lastLoggedPermissionState: SystemNotificationPermissionState | null = null;
 let lastPermissionQueryFailure = '';
 
@@ -50,9 +51,14 @@ export function markSystemNotificationDelivered(): void {
   observedDeliveryState = 'granted';
 }
 
-/** Electron emits `failed` when the OS rejects a notification. */
+/**
+ * A failed delivery is not an authorization decision. In particular, macOS
+ * reports a failed delivery while permission is still `not_determined`.
+ * Discard stale positive evidence and let the platform probe decide whether
+ * the user denied notifications.
+ */
 export function markSystemNotificationFailed(): void {
-  observedDeliveryState = 'denied';
+  observedDeliveryState = null;
 }
 
 function logPermissionQueryFailure(kind: string, err: unknown): void {
@@ -75,9 +81,19 @@ function permissionObserved(state: SystemNotificationPermissionState): void {
 
 /** Normalize the small, stable contract exposed by the macOS native addon. */
 export function permissionFromMacNativeState(value: unknown): SystemNotificationPermissionState {
-  return ['granted', 'denied', 'not_determined', 'unknown'].includes(String(value))
+  return ['granted', 'denied', 'presentation_disabled', 'not_determined', 'unknown'].includes(String(value))
     ? String(value) as SystemNotificationPermissionState
     : 'unknown';
+}
+
+/**
+ * Native authorization is authoritative whenever macOS returns a concrete
+ * state. A successful delivery may only fill an inconclusive `unknown`; it
+ * must never turn `not_determined` into `denied` or `granted`.
+ */
+export function resolveMacPermissionState(value: unknown): SystemNotificationPermissionState {
+  const state = permissionFromMacNativeState(value);
+  return state === 'unknown' ? (observedDeliveryState || state) : state;
 }
 
 export function permissionFromWindowsSetting(value: unknown): SystemNotificationPermissionState {
@@ -141,11 +157,8 @@ async function queryMacPermission(): Promise<SystemNotificationPermissionState> 
     // that UNUserNotificationCenter uses for the per-app authorization row.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const addon = require(macAddonPath()) as MacNotificationPermissionAddon;
-    const state = permissionFromMacNativeState(await addon.getPermissionState());
+    const state = resolveMacPermissionState(await addon.getPermissionState());
     lastPermissionQueryFailure = '';
-    if (state === 'unknown' || state === 'not_determined') {
-      return observedDeliveryState || state;
-    }
     return state;
   } catch (err) {
     logPermissionQueryFailure('macOS native', err);

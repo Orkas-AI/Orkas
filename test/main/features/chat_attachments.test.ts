@@ -149,6 +149,28 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(siblings).toEqual([]);
   });
 
+  it('stores ZIP archives as opaque path-only attachments', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, CID, 'skills.zip', Buffer.from('PK\u0003\u0004fixture'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.kind).toBe('archive');
+    expect(r.info.bytes).toBeGreaterThan(0);
+  });
+
+  it('rejects a Skill ZIP above the native importer limit without leaving a file', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(
+      UID,
+      CID,
+      'oversized-skills.zip',
+      Buffer.alloc(8 * 1024 * 1024 + 1, 0x61),
+    );
+
+    expect(r.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'oversized-skills.zip'))).toBe(false);
+  });
+
   it('rejects legacy Office binary formats before they enter the attachment pool', async () => {
     const m = await loadMod();
     const doc = await m.uploadAttachment(UID, CID, 'old.doc', Buffer.from('legacy'));
@@ -541,6 +563,47 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     expect(fs.existsSync(path.join(cloudAttDir(CID), 'kept.txt'))).toBe(true);
     expect(fs.existsSync(path.join(cloudAttDir(CID), 'new.txt'))).toBe(true);
     expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
+  it('rolls back earlier moves when merging the whole draft fails midway', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('kept'));
+    await m.uploadAttachment(UID, DRAFT, 'first.txt', Buffer.from('first'));
+    await m.uploadAttachment(UID, DRAFT, 'second.txt', Buffer.from('second'));
+
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    let forwardMove = 0;
+    const isForwardMove = (from: fs.PathLike, to: fs.PathLike) => (
+      String(from).startsWith(draftAttDir(DRAFT) + path.sep)
+      && String(to).startsWith(cloudAttDir(CID) + path.sep)
+    );
+    const renameSync = vi.fn((from: fs.PathLike, to: fs.PathLike) => {
+      if (isForwardMove(from, to)) {
+        forwardMove += 1;
+        if (forwardMove === 2) throw new Error('forced rename failure');
+      }
+      return actualFs.renameSync(from, to);
+    });
+    const copyFileSync = vi.fn((from: fs.PathLike, to: fs.PathLike, mode?: number) => {
+      if (isForwardMove(from, to) && forwardMove === 2) {
+        throw new Error('forced copy failure');
+      }
+      return actualFs.copyFileSync(from, to, mode);
+    });
+    vi.resetModules();
+    vi.doMock('node:fs', () => ({ ...actualFs, renameSync, copyFileSync }));
+
+    try {
+      const moduleWithFailingMove = await loadMod();
+      const result = moduleWithFailingMove.adoptDraftAttachments(UID, DRAFT, CID);
+
+      expect(result.ok).toBe(false);
+      expect(fs.readdirSync(draftAttDir(DRAFT)).sort()).toEqual(['first.txt', 'second.txt']);
+      expect(fs.readdirSync(cloudAttDir(CID))).toEqual(['kept.txt']);
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.resetModules();
+    }
   });
 
   it('preserves both files when a draft name collides with the target conversation', async () => {
@@ -939,6 +1002,21 @@ describe('chat_attachments › mediaMimeFor (preview docs)', () => {
 });
 
 describe('chat_attachments › buildAttachmentManifest', () => {
+  it('surfaces a ZIP by path without parsing archive bytes into model context', async () => {
+    const m = await loadMod();
+    const opaqueBytes = Buffer.from('PK\u0003\u0004private-package-body');
+    await m.uploadAttachment(UID, CID, 'skills.zip', opaqueBytes);
+    const r = await m.buildAttachmentManifest(UID, CID, ['skills.zip']);
+
+    expect(r.manifest).toMatch(/<file[^>]*name="skills\.zip"[^>]*kind="archive"[^>]*model_readable="false"/);
+    expect(r.manifest).toMatch(/path="[^"]+"/);
+    expect(r.manifest).toContain('task-specific host import tool');
+    expect(r.manifest).not.toContain('private-package-body');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['archive'] });
+  });
+
   it('emits text entry with total_chars (cheap stat, no body leak)', async () => {
     const m = await loadMod();
     const body = 'hello world';

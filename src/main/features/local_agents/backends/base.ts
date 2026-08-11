@@ -45,7 +45,10 @@ export interface LocalEvent {
    *  each emit site; a minimal index:
    *    process-info:       { pid, cwd, cmd, args, sessionId? }
    *    text-delta:         { text, phase?: 'commentary'|'final_answer', itemId? }
-   *    thinking:           { text } backend-side; { chars } after the runner boundary
+   *    thinking:           { text?, summary? } backend-side;
+   *                        { chars, summary?, itemId?, heartbeat?, synthetic? } after the
+   *                        runner boundary (summary is bounded; raw reasoning
+   *                        text never crosses)
    *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputPath? }
    *    stderr-line:        { line }
    *    status:             { status, usage? }   // usage carried for status:'usage' running counters
@@ -78,8 +81,11 @@ export interface BackendRunOptions {
    * on resume, but must restore it if resume falls back to a fresh session. */
   reuseSessionInstructions?: boolean;
   cwd: string;
-  model?: string;
   customArgs?: string[];
+  /** Per-Agent overrides. Missing values deliberately leave selection to the
+   * CLI/account configuration. */
+  modelOverride?: string;
+  thinkingLevel?: string;
   /** When set, ask the CLI to resume a prior session by id (claude:
    *  `--resume <id>`). The group-chat caller consults the registry's resume
    *  capability first, so backends without resume support receive no stale
@@ -88,6 +94,12 @@ export interface BackendRunOptions {
   /** Cancellation; backend wires this to SIGTERM (10s) → SIGKILL. */
   signal: AbortSignal;
   onEvent: (e: LocalEvent) => void;
+  /** Publish the exact ingress owned by the currently active native CLI turn.
+   * Backends call this with a handle only after their protocol has exposed an
+   * addressable running turn, and clear it before/at every terminal boundary.
+   * The host removes a durable queue item only when `submit` returns
+   * `steered`; every other result is a safe ordinary follow-up. */
+  onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
   /** Hard wall-clock cap — zombie insurance, NOT the hang detector
    *  (that's `idleKillMs`). Backends arm `armKillWatchdog` with both and
    *  emit `done({status:'timeout'})` when either fires before exit. */
@@ -96,9 +108,9 @@ export interface BackendRunOptions {
    *  0 disables idle-kill — the runner disables it for backends with no
    *  mid-run event stream (openclaw), where silence is normal. */
   idleKillMs?: number;
-  /** Activity clock maintained by the runner (ms epoch of the last
-   *  non-idle backend event). Read by the idle-kill watchdog; unset
-   *  means no activity tracking and idle-kill stays off. */
+  /** Activity clock maintained by the runner (ms epoch of the last real
+   *  backend event). Events explicitly marked `synthetic` do not slide it. Read by the
+   *  idle-kill watchdog; unset means no tracking and idle-kill stays off. */
   lastEventAt?: () => number;
   /** Per-backend idle threshold override (ms). Read by `runner.ts`'s
    *  idle-heartbeat to decide when to emit `{type:'idle'}` events. When
@@ -119,6 +131,27 @@ export interface BackendRunOptions {
     server: { command: string; args: string[]; env: Record<string, string> };
     appendSystemPrompt?: string;
   };
+}
+
+/** Host-resolved user input for a running local CLI turn. Text contains the
+ * complete rich-message frame (references, attachment paths, selected Skill
+ * instructions and Connector routing). Codex can additionally consume
+ * verified local images natively; other backends keep using the paths in the
+ * text frame and their normal file tools. */
+export interface LocalActiveRunInput {
+  /** Stable host identity for acknowledgement/idempotency. */
+  id: string;
+  text: string;
+  localImages?: Array<{ path: string; mediaType?: string }>;
+}
+
+export type LocalActiveRunIngressResult =
+  | { mode: 'steered'; acceptedId?: string }
+  | { mode: 'queued_followup'; reason?: string }
+  | { mode: 'rejected'; reason: string };
+
+export interface LocalActiveRunIngress {
+  submit(input: LocalActiveRunInput): Promise<LocalActiveRunIngressResult>;
 }
 
 export interface LocalBackend {
@@ -249,6 +282,32 @@ export function killProcessTree(
     }
   }
   try { child.kill(signal); } catch { /* already gone */ }
+}
+
+/**
+ * A one-shot CLI's protocol terminal event is authoritative for the UI. Close
+ * stdin immediately, then reap a process that fails to exit on its own without
+ * holding the backend promise (and therefore the conversation loading state)
+ * open. Descendants that inherited stdio are included via killProcessTree.
+ */
+export function reapCliAfterProtocolTerminal(
+  child: ChildProcessWithoutNullStreams,
+  graceMs = 1_000,
+): void {
+  try { child.stdin.end(); } catch { /* already closed */ }
+
+  let hardKill: NodeJS.Timeout | null = null;
+  const gracefulKill = setTimeout(() => {
+    killProcessTree(child, 'SIGTERM');
+    hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
+    if (typeof hardKill.unref === 'function') hardKill.unref();
+  }, Math.max(0, graceMs));
+  if (typeof gracefulKill.unref === 'function') gracefulKill.unref();
+
+  child.once('close', () => {
+    clearTimeout(gracefulKill);
+    if (hardKill) clearTimeout(hardKill);
+  });
 }
 
 /**

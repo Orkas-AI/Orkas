@@ -34,6 +34,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  const proxy = await import('../../../src/main/util/proxy-dispatcher');
+  proxy._resetProxyRoutingForTests();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   await fs.rm(tmpDir, { recursive: true, force: true });
 });

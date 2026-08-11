@@ -74,6 +74,21 @@ function sha256(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
+/**
+ * `readInstalls` prunes uninstall tombstones older than the wall-clock
+ * retention window, so a fixed calendar date silently expires: the tombstone
+ * vanishes, the content reseeds, and the case stops exercising the
+ * `reseed_if_deleted_before` cutoff at all — the "respected" cases start
+ * failing and the "re-seeds" cases start passing for the wrong reason. Anchor
+ * both the cutoff and the tombstone to now, well inside the window.
+ */
+const RESEED_CUTOFF_MS = Date.now() - 5 * 24 * 60 * 60 * 1000;
+const RESEED_CUTOFF_ISO = new Date(RESEED_CUTOFF_MS).toISOString();
+/** Uninstalled before the cutoff -> packaged metadata supersedes the tombstone. */
+const DELETED_BEFORE_CUTOFF_MS = RESEED_CUTOFF_MS - 1_000;
+/** Uninstalled at the cutoff -> the boundary is exclusive, so it stays respected. */
+const DELETED_AT_CUTOFF_MS = RESEED_CUTOFF_MS;
+
 function writeResourceSeedManifest(dir: string, kind: 'agent' | 'skill', id: string): void {
   fs.writeFileSync(path.join(dir, MARKETPLACE_RESOURCE_MANIFEST_NAME), JSON.stringify({
     schemaVersion: 1,
@@ -205,7 +220,7 @@ describe('builtin marketplace seed', () => {
     });
   });
 
-  it('refreshes builtin agent content when version is equal but packaged updated_at is newer', async () => {
+  it('does not refresh builtin agent content without a version bump', async () => {
     writeBuiltinAgent(TEST_AGENT_ID, {
       agent_id: TEST_AGENT_ID,
       version: '1.0.0',
@@ -231,12 +246,12 @@ describe('builtin marketplace seed', () => {
     });
 
     await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_agents: 1,
+      seeded_agents: 0,
       manifest_agents: 0,
     });
 
     const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'), 'utf8'));
-    expect(agentJson.workflow).toBe('Write revised.');
+    expect(agentJson.workflow).toBe('Write old.');
   });
 
   it('refreshes builtin agent content when the local install has no version', async () => {
@@ -517,7 +532,7 @@ describe('builtin marketplace seed', () => {
     fs.mkdirSync(path.join(builtinRoot, 'scripts'), { recursive: true });
     fs.writeFileSync(path.join(builtinRoot, 'scripts', 'guard.py'), 'print("ok")\n', 'utf8');
     writeBuiltinSkillMeta('ee99fbb42964', {
-      version: '1.0.1',
+      version: '1.0.2',
       updated_at: '2026-01-02T00:00:00Z',
     });
 
@@ -530,14 +545,14 @@ describe('builtin marketplace seed', () => {
     expect(fs.readFileSync(path.join(localRoot, 'runtime-note.txt'), 'utf8')).toBe('keep me\n');
     const meta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
     expect(meta.seed_source).toBe('builtin');
-    expect(meta.version).toBe('1.0.1');
+    expect(meta.version).toBe('1.0.2');
     expect(meta.updated_at).toBe(Date.parse('2026-01-02T00:00:00Z'));
     expect(meta.content_tree_hash).toEqual(expect.any(String));
     expect(meta.builtin_files).toContain('scripts/guard.py');
     const manifest = await installs.readInstalls('u1');
     expect(manifest.skills[0]).toMatchObject({
       id: 'ee99fbb42964',
-      version: '1.0.1',
+      version: '1.0.2',
       updated_at: Date.parse('2026-01-02T00:00:00Z'),
       seed_source: 'builtin',
     });
@@ -684,7 +699,7 @@ describe('builtin marketplace seed', () => {
     writeBuiltinSkill(skillId, 'deep-research');
     writeBuiltinSkillMeta(skillId, {
       version: '1.0.1',
-      reseed_if_deleted_before: '2026-07-03T00:00:00Z',
+      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
     });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
@@ -695,7 +710,7 @@ describe('builtin marketplace seed', () => {
       agents: [],
       skills: [],
       _deleted_at: {
-        skills: { [skillId]: Date.parse('2026-07-02T23:59:59Z') },
+        skills: { [skillId]: DELETED_BEFORE_CUTOFF_MS },
       },
     });
 
@@ -727,7 +742,7 @@ describe('builtin marketplace seed', () => {
       updated_at: '2026-07-04T00:00:00Z',
     });
     writeBuiltinAgentMeta(agentId, {
-      reseed_if_deleted_before: '2026-07-05T00:00:00Z',
+      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
     });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
@@ -738,7 +753,7 @@ describe('builtin marketplace seed', () => {
       agents: [],
       skills: [],
       _deleted_at: {
-        agents: { [agentId]: Date.parse('2026-07-04T23:59:59Z') },
+        agents: { [agentId]: DELETED_BEFORE_CUTOFF_MS },
       },
     });
 
@@ -771,18 +786,22 @@ describe('builtin marketplace seed', () => {
       updated_at: '2026-07-04T00:00:00Z',
     });
     writeBuiltinAgentMeta(agentId, {
-      reseed_if_deleted_before: '2026-07-05T00:00:00Z',
+      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
     });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
+    const retention = await import('../../../src/main/util/tombstone_retention');
+    // Precondition, not the oracle: an expired tombstone would be pruned on
+    // read and the agent would reseed for a reason this case is not testing.
+    expect(retention.isExpiredMsTombstone(DELETED_AT_CUTOFF_MS)).toBe(false);
     await installs.writeInstalls('u1', {
       version: installs.CURRENT_VERSION,
       agents: [],
       skills: [],
       _deleted_at: {
-        agents: { [agentId]: Date.parse('2026-07-05T00:00:00Z') },
+        agents: { [agentId]: DELETED_AT_CUTOFF_MS },
       },
     });
 
@@ -793,7 +812,7 @@ describe('builtin marketplace seed', () => {
 
     expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir('u1', agentId), 'agent.json'))).toBe(false);
     const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.agents?.[agentId]).toEqual(Date.parse('2026-07-05T00:00:00Z'));
+    expect(manifest._deleted_at?.agents?.[agentId]).toEqual(DELETED_AT_CUTOFF_MS);
     expect(manifest.agents).toEqual([]);
   });
 
@@ -802,18 +821,22 @@ describe('builtin marketplace seed', () => {
     writeBuiltinSkill(skillId, 'deep-research');
     writeBuiltinSkillMeta(skillId, {
       version: '1.0.1',
-      reseed_if_deleted_before: '2026-07-03T00:00:00Z',
+      reseed_if_deleted_before: RESEED_CUTOFF_ISO,
     });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
+    const retention = await import('../../../src/main/util/tombstone_retention');
+    // Precondition, not the oracle: an expired tombstone would be pruned on
+    // read and the skill would reseed for a reason this case is not testing.
+    expect(retention.isExpiredMsTombstone(DELETED_AT_CUTOFF_MS)).toBe(false);
     await installs.writeInstalls('u1', {
       version: installs.CURRENT_VERSION,
       agents: [],
       skills: [],
       _deleted_at: {
-        skills: { [skillId]: Date.parse('2026-07-03T00:00:00Z') },
+        skills: { [skillId]: DELETED_AT_CUTOFF_MS },
       },
     });
 
@@ -824,7 +847,7 @@ describe('builtin marketplace seed', () => {
 
     expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', skillId), 'SKILL.md'))).toBe(false);
     const manifest = await installs.readInstalls('u1');
-    expect(manifest._deleted_at?.skills?.[skillId]).toEqual(Date.parse('2026-07-03T00:00:00Z'));
+    expect(manifest._deleted_at?.skills?.[skillId]).toEqual(DELETED_AT_CUTOFF_MS);
     expect(manifest.skills).toEqual([]);
   });
 
@@ -1195,7 +1218,9 @@ describe('builtin marketplace seed', () => {
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
+    const enabled = await import('../../../src/main/features/component_enabled');
     await seed.seedBuiltinMarketplaceForUser('u1');
+    enabled.setAgentEnabled('u1', TEST_AGENT_ID, false);
 
     postJsonMock.mockImplementation(async (p: string, body: any) => {
       if (p === '/marketplace/agents/list' && Array.isArray(body?.ids)) {
@@ -1249,6 +1274,60 @@ describe('builtin marketplace seed', () => {
       }),
     ]);
     expect((manifest.agents[0] as any).seed_source).toBeUndefined();
+    expect(enabled.readEnabledMap('u1').agents).toEqual({ abc123def456: false });
+  });
+
+  it('moves a disabled preference when a builtin skill resolves to a replacement id', async () => {
+    writeBuiltinSkill('legacy-skill', 'Legacy Skill');
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const enabled = await import('../../../src/main/features/component_enabled');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    enabled.setSkillEnabled('u1', 'legacy-skill', false);
+
+    postJsonMock.mockImplementation(async (p: string, body: any) => {
+      if (p === '/marketplace/skills/list' && Array.isArray(body?.ids)) {
+        return {
+          list: [{
+            id: 'abc123def456',
+            name: 'Legacy Skill',
+            version: '2.0.0',
+            published_at: 100,
+            updated_at: 200,
+            create_uid: '0',
+            default_install: true,
+            status: 'approved',
+          }],
+          total: 1,
+        };
+      }
+      if (p === '/marketplace/skills/bundle' && body?.id === 'abc123def456') {
+        return {
+          bundle_url: 'https://cdn.test/abc123def456.zip',
+          version: '2.0.0',
+          published_at: 100,
+          updated_at: 200,
+          create_uid: '0',
+          default_install: true,
+          status: 'approved',
+        };
+      }
+      throw new Error(`unexpected ${p}`);
+    });
+
+    await expect(seed.resolveBuiltinMarketplaceInstalls('u1')).resolves.toMatchObject({
+      resolved_skills: 1,
+      migrated_skills: 1,
+      failed: [],
+    });
+
+    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'legacy-skill'), 'SKILL.md'))).toBe(false);
+    expect(fs.existsSync(path.join(paths.userMarketplaceSkillDir('u1', 'abc123def456'), 'SKILL.md'))).toBe(true);
+    expect((await installs.readInstalls('u1')).skills).toEqual([
+      expect.objectContaining({ id: 'abc123def456' }),
+    ]);
+    expect(enabled.readEnabledMap('u1').skills).toEqual({ abc123def456: false });
   });
 
   it('does not delete a builtin agent seed when id migration destination already exists', async () => {
@@ -1329,7 +1408,9 @@ describe('builtin marketplace seed', () => {
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
+    const enabled = await import('../../../src/main/features/component_enabled');
     await seed.seedBuiltinMarketplaceForUser('u1');
+    enabled.setSkillEnabled('u1', 'legacy-skill', false);
 
     const officialDir = paths.userMarketplaceSkillDir('u1', 'official-skill');
     fs.mkdirSync(officialDir, { recursive: true });
@@ -1381,6 +1462,7 @@ describe('builtin marketplace seed', () => {
         seed_source: 'builtin',
       }),
     ]);
+    expect(enabled.readEnabledMap('u1').skills).toEqual({ 'legacy-skill': false });
   });
 
   it('renders installed agent-private builtin skills only for the owning agent', async () => {

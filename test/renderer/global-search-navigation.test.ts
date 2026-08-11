@@ -32,6 +32,37 @@ function extractFunction(source: string, name: string): string {
 }
 
 describe('global search conversation navigation', () => {
+  it('tracks the bounded entry that opened global search', () => {
+    const events: Array<{ action: string; data: Record<string, unknown> }> = [];
+    const input: any = { value: 'old query', focus: vi.fn() };
+    const overlay: any = { style: { display: 'none' } };
+    const context: any = {
+      _searchResults: [{ kind: 'chat' }],
+      _searchActiveIdx: 2,
+      _searchLastQuery: 'old query',
+      _searchSeq: 0,
+      document: {
+        getElementById: (id: string) => (id === 'search-overlay' ? overlay : (id === 'search-input' ? input : null)),
+      },
+      _setSearchTab: vi.fn(),
+      _setSearchTabsVisible: vi.fn(),
+      _renderSearchEmptyState: vi.fn(),
+      setTimeout: (fn: () => void) => { fn(); return 1; },
+      window: { Monitor: true },
+      Monitor: {
+        click: (action: string, data: Record<string, unknown>) => events.push({ action, data }),
+      },
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, 'openGlobalSearch'), context);
+
+    context.openGlobalSearch('sidebar');
+
+    expect(overlay.style.display).toBe('');
+    expect(input.value).toBe('');
+    expect(input.focus).toHaveBeenCalledOnce();
+  });
+
   it('derives Library scope from the active project page or project conversation', () => {
     const context: any = {
       currentView: 'project',
@@ -221,6 +252,47 @@ describe('global search conversation navigation', () => {
     expect(context._searchActiveIdx).toBe(-1);
   });
 
+  it('invalidates an in-flight query when the search overlay closes', async () => {
+    let rejectFetch!: (reason: Error) => void;
+    const reportFailure = vi.fn();
+    const renderError = vi.fn();
+    const overlay: any = { style: { display: '' } };
+    const input: any = { value: 'private query' };
+    const context: any = {
+      _SEARCH_FETCH_LIMIT: 200,
+      _searchSeq: 0,
+      _searchTimer: null,
+      document: {
+        getElementById: (id: string) => (id === 'search-overlay' ? overlay : (id === 'search-input' ? input : null)),
+      },
+      _saveSearchHistoryEntry: vi.fn(),
+      _activeProjectIdForSearch: () => '',
+      _setSearchTabsVisible: vi.fn(),
+      _renderSearchEmptyState: vi.fn(),
+      _renderSearchResults: vi.fn(),
+      _renderSearchError: renderError,
+      _reportGlobalSearchFailure: reportFailure,
+      apiFetch: () => new Promise((_resolve, reject) => { rejectFetch = reject; }),
+      clearTimeout,
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      extractFunction(searchSource, 'closeGlobalSearch'),
+      extractFunction(searchSource, '_runSearchNow'),
+    ].join('\n'), context);
+
+    const pending = context._runSearchNow('private query');
+    await Promise.resolve();
+    context.closeGlobalSearch();
+    rejectFetch(new Error('late failure with private query'));
+    await pending;
+
+    expect(overlay.style.display).toBe('none');
+    expect(context._searchSeq).toBe(2);
+    expect(reportFailure).not.toHaveBeenCalled();
+    expect(renderError).not.toHaveBeenCalled();
+  });
+
   it('keeps search history isolated between local user accounts', () => {
     const values = new Map<string, string>();
     const context: any = {
@@ -295,6 +367,9 @@ describe('global search conversation navigation', () => {
     );
     expect(context._historyRequestUrl('c1', null, 10, 23)).toBe(
       '/api/conversations/c1/history?limit=10&around_index=23&project_id=p1',
+    );
+    expect(context._historyRequestUrl('c1', null, 10, 23, 'm23')).toBe(
+      '/api/conversations/c1/history?limit=10&around_index=23&around_message_id=m23&project_id=p1',
     );
     expect(conversationSource).not.toContain('HISTORY_SEARCH_PAGE_SIZE');
   });

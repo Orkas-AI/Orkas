@@ -63,7 +63,8 @@ describe('connectors/install_confirm', () => {
 
   it('stale / unknown respond ids are ignored, cancelForCid declines pending', async () => {
     const ic = await import('../../../../src/main/features/connectors/install_confirm');
-    ic._setBroadcastForTest(() => {});
+    const pushed: Array<{ channel: string; payload: any }> = [];
+    ic._setBroadcastForTest((channel, payload) => pushed.push({ channel, payload }));
     try {
       expect(ic.respond('nope', true)).toBe(false);
       const p = ic.requestInstallConfirm({
@@ -71,6 +72,11 @@ describe('connectors/install_confirm', () => {
       });
       ic.cancelForCid('c9');
       await expect(p).resolves.toBe(false);
+      expect(pushed).toHaveLength(2);
+      expect(pushed[1]).toEqual({
+        channel: 'connectors:install-confirm-cancelled',
+        payload: expect.objectContaining({ request_ids: [expect.any(String)], cid: 'c9' }),
+      });
     } finally {
       ic._setBroadcastForTest(null);
     }

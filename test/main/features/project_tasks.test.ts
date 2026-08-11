@@ -61,6 +61,48 @@ describe('project_tasks › createTask', () => {
     expect(onDisk.title).toBe('do the thing');
   });
 
+  it('reuses an open task with the same normalized title without changing it', async () => {
+    const { pt, pid } = await setup();
+    const first = await pt.createTask(TEST_UID, pid, {
+      title: 'Ship   Payment Webhook',
+      detail: 'original detail',
+      created_by: 'user',
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const before = fs.readFileSync(taskFile(pid, first.task.id), 'utf-8');
+
+    const duplicate = await pt.createTask(TEST_UID, pid, {
+      title: '  ship payment webhook  ',
+      detail: 'must not overwrite the original',
+      created_by: 'agent',
+    });
+
+    expect(duplicate).toEqual({ ok: true, task: first.task, alreadyExists: true });
+    expect(fs.readFileSync(taskFile(pid, first.task.id), 'utf-8')).toBe(before);
+    expect((await pt.listTasks(TEST_UID, pid)).map((task) => task.id)).toEqual([first.task.id]);
+  });
+
+  it('serializes concurrent same-title creates and allows reuse after completion', async () => {
+    const { pt, pid } = await setup();
+    const [left, right] = await Promise.all([
+      pt.createTask(TEST_UID, pid, { title: 'Concurrent task' }),
+      pt.createTask(TEST_UID, pid, { title: 'concurrent   task' }),
+    ]);
+    expect(left.ok && right.ok).toBe(true);
+    if (!left.ok || !right.ok) return;
+    expect(left.task.id).toBe(right.task.id);
+    expect([left.alreadyExists, right.alreadyExists].sort()).toEqual([false, true]);
+    expect((await pt.listTasks(TEST_UID, pid))).toHaveLength(1);
+
+    await pt.completeTask(TEST_UID, pid, left.task.id);
+    const reopened = await pt.createTask(TEST_UID, pid, { title: 'CONCURRENT TASK' });
+    expect(reopened.ok).toBe(true);
+    if (!reopened.ok) return;
+    expect(reopened.alreadyExists).toBe(false);
+    expect(reopened.task.id).not.toBe(left.task.id);
+  });
+
   it('rejects empty / too-long title, bad status, unknown project', async () => {
     const { pt, pid } = await setup();
     expect((await pt.createTask(TEST_UID, pid, { title: '   ' })).ok).toBe(false);

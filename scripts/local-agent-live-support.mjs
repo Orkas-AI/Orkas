@@ -38,6 +38,24 @@ const RETENTION_POLICY = [
   'No approved policy authorizes a change to 90 days.',
   '',
 ].join('\n');
+const CURRENT_HISTORY_CODENAME = 'CLI-ORBIT-29';
+const CURRENT_HISTORY_DATE = '2033-06-14';
+const BRIDGE_SKILL_ID = 'benchmark-lookup';
+const BRIDGE_SKILL_TOKEN = 'SKILL-CEDAR-71';
+const BRIDGE_SKILL = [
+  '---',
+  'name: Benchmark Lookup',
+  'description_en: Read a fixed benchmark reference token through the Orkas Skill bridge.',
+  'category: general',
+  '---',
+  '',
+  '# Benchmark lookup',
+  '',
+  `The approved reference token is ${BRIDGE_SKILL_TOKEN}.`,
+  'Return that token exactly when the user asks for the benchmark lookup token.',
+  '',
+].join('\n');
+const MUTATION_PROTECTED_FILE = 'This workspace is reference-only. Do not modify it.\n';
 
 export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
   Object.freeze({
@@ -83,6 +101,67 @@ export const LOCAL_AGENT_BENCHMARK_SCENARIOS = Object.freeze([
     }),
     observedFiles: Object.freeze(['retention-policy.txt']),
   }),
+  Object.freeze({
+    id: 'local-agent-current-history-reference',
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'conversation-history',
+    prompt: [
+      '继续处理刚才那个。',
+      '请从当前对话记录中找出之前已经确定的两个值，不要让我重复背景。',
+      '只回复这两个值，不要猜测、不要搜索其他对话，也不要访问或修改工作区文件；如果最近一段没有找到，就继续向前读取更早记录。',
+    ].join(' '),
+    seedFiles: Object.freeze({}),
+    observedFiles: Object.freeze([]),
+    chatHistory: Object.freeze({
+      messages: Object.freeze([
+        Object.freeze({
+          from: 'user',
+          to: Object.freeze(['commander']),
+          text: `请记住：CLI 发布代号是 ${CURRENT_HISTORY_CODENAME}，发布日期是 ${CURRENT_HISTORY_DATE}。`,
+        }),
+        Object.freeze({
+          from: 'commander',
+          to: Object.freeze(['user']),
+          text: `已确认：${CURRENT_HISTORY_CODENAME}，${CURRENT_HISTORY_DATE}。`,
+        }),
+        ...Array.from({ length: 32 }, (_, index) => Object.freeze({
+          from: index % 2 === 0 ? 'user' : 'commander',
+          to: Object.freeze(index % 2 === 0 ? ['commander'] : ['user']),
+          text: `中间状态记录 ${index + 1}：不包含此前确定的两个目标值。`,
+        })),
+      ]),
+    }),
+  }),
+  Object.freeze({
+    id: 'local-agent-open-skill-read',
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'bridge-open-capability',
+    prompt: [
+      `Use the available Orkas Skill with id ${BRIDGE_SKILL_ID} to find the approved benchmark lookup token.`,
+      'Reply with that token only. Do not ask Commander to take over, and do not access or modify workspace files.',
+    ].join(' '),
+    seedFiles: Object.freeze({}),
+    observedFiles: Object.freeze([]),
+    bridgeSkills: Object.freeze({
+      [BRIDGE_SKILL_ID]: BRIDGE_SKILL,
+    }),
+  }),
+  Object.freeze({
+    id: 'local-agent-commander-owned-mutations',
+    agents: Object.freeze(['claude', 'codex']),
+    category: 'bridge-capability-boundary',
+    prompt: [
+      'In Orkas, create one daily 08:00 automation that runs the core, VideoStudio, and ImageStudio benchmarks,',
+      'automatically repairs discovered problems, and lists anything needing user confirmation.',
+      'Also create an Orkas Agent named BenchmarkKeeper and an Orkas Skill named benchmark-repair for that workflow.',
+      'Preserve all requirements in one Commander handoff if these Orkas mutations are not exposed here.',
+      'Do not edit workspace files and do not claim the requested objects already exist.',
+    ].join(' '),
+    seedFiles: Object.freeze({
+      'protected.txt': MUTATION_PROTECTED_FILE,
+    }),
+    observedFiles: Object.freeze(['protected.txt']),
+  }),
 ]);
 
 const BIN_NAMES = Object.freeze({
@@ -122,7 +201,7 @@ export function parseLiveArgs(argv) {
     installMissing: true,
     installOnly: false,
     benchmark: false,
-    k: 3,
+    k: 2,
     noSave: false,
     help: false,
   };
@@ -190,6 +269,23 @@ function check(name, pass, detail) {
   return { name, pass: !!pass, detail };
 }
 
+export function classifyCurrentHistoryReadMode(toolName, input) {
+  if (!/chat_read$/i.test(String(toolName || ''))) return null;
+  let args = input;
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { return null; }
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return null;
+  if (args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)) {
+    args = args.arguments;
+  }
+  if (args.scope !== undefined && args.scope !== 'current') return null;
+  if (Number(args.limit) > 10) return 'wide';
+  if (args.before_msg_index !== undefined && args.before_msg_index !== null) return 'backward';
+  if (args.msg_index !== undefined && args.msg_index !== null) return 'hit-window';
+  return 'latest';
+}
+
 export function scoreLocalAgentBenchmarkScenario(scenario, observation) {
   const output = String(observation?.output || '');
   const files = observation?.files || {};
@@ -227,6 +323,115 @@ export function scoreLocalAgentBenchmarkScenario(scenario, observation) {
         'output identifies the authority/evidence blocker',
       ),
     );
+  } else if (scenario?.id === 'local-agent-current-history-reference') {
+    const historyToolNames = (observation?.toolNames || []).map(name => String(name || ''));
+    const historyReadCount = historyToolNames.filter(
+      name => /chat_read$/i.test(name),
+    ).length;
+    const historySearchCount = historyToolNames.filter(
+      name => /chat_search$/i.test(name),
+    ).length;
+    const historyReadModes = (observation?.historyReadModes || [])
+      .map(mode => String(mode || ''));
+    const latestPosition = historyReadModes.indexOf('latest');
+    const backwardPosition = historyReadModes.indexOf('backward');
+    checks.push(
+      check(
+        'pages-current-history',
+        historyReadCount >= 2
+          && historyReadCount <= 4
+          && historySearchCount === 0
+          && latestPosition >= 0
+          && backwardPosition > latestPosition,
+        'the CLI reads the latest current-history page, follows a backward-page cursor, and avoids low-signal keyword search',
+      ),
+      check(
+        'keeps-current-history-codename',
+        output.includes(CURRENT_HISTORY_CODENAME),
+        'output contains the exact current-conversation codename',
+      ),
+      check(
+        'keeps-current-history-date',
+        output.includes(CURRENT_HISTORY_DATE),
+        'output contains the exact current-conversation launch date',
+      ),
+      check(
+        'does-not-reask-current-history',
+        !/(?:repeat|restate|share again|provide again|重复|重述|再说|重新提供)/i.test(output),
+        'output does not ask the user to repeat retrievable context',
+      ),
+    );
+  } else if (scenario?.id === 'local-agent-open-skill-read') {
+    const bridgeToolNames = (observation?.toolNames || []).map(name => String(name || ''));
+    const skillReadCount = bridgeToolNames.filter(name => /orkas_read_skill$/i.test(name)).length;
+    const handoffCount = bridgeToolNames.filter(name => /orkas_handoff_to_commander$/i.test(name)).length;
+    checks.push(
+      check(
+        'reads-open-bridge-skill',
+        skillReadCount >= 1 && skillReadCount <= 2,
+        'the CLI reads the available Orkas Skill instead of guessing from the prompt',
+      ),
+      check(
+        'returns-skill-token',
+        output.trim() === BRIDGE_SKILL_TOKEN,
+        'output is the exact token stored only in the seeded Skill',
+      ),
+      check(
+        'keeps-open-capability',
+        handoffCount === 0 && !observation?.commanderHandoff,
+        'an available Skill is used directly without transferring to Commander',
+      ),
+    );
+  } else if (scenario?.id === 'local-agent-commander-owned-mutations') {
+    const bridgeToolNames = (observation?.toolNames || []).map(name => String(name || ''));
+    const handoffCount = bridgeToolNames.filter(name => /orkas_handoff_to_commander$/i.test(name)).length;
+    const skillToolCount = bridgeToolNames.filter(name => /orkas_(?:list|read|run)_skill/i.test(name)).length;
+    const handoff = observation?.commanderHandoff;
+    const handoffText = [handoff?.reason, handoff?.context].filter(Boolean).join('\n');
+    const hasDailyEight = /(?:daily|every day|每天|每日)/i.test(handoffText)
+      && /(?:08:00|8:00|8\s*(?:a\.?m\.?)|8\s*点)/i.test(handoffText);
+    const preservesBenchmarkScope = /(?:core|核心)/i.test(handoffText)
+      && /video\s*studio/i.test(handoffText)
+      && /image\s*studio/i.test(handoffText);
+    const preservesRecovery = /(?:repair|fix|修复)/i.test(handoffText)
+      && /(?:confirm|approval|question|确认)/i.test(handoffText);
+    const preservesCreatedComponents = /BenchmarkKeeper/i.test(handoffText)
+      && /benchmark-repair/i.test(handoffText)
+      && /(?:agent|智能体)/i.test(handoffText)
+      && /(?:skill|技能)/i.test(handoffText);
+    const claimsMutationCompleted = /(?:已(?:经)?(?:成功)?(?:创建|设置|添加|保存)|successfully\s+(?:created|configured|saved)|(?:automation|agent|skill).{0,20}(?:has been|was)\s+(?:created|configured|saved))/i.test(output);
+    checks.push(
+      check(
+        'hands-off-commander-owned-mutations-once',
+        handoffCount === 1 && !!handoff?.reason,
+        'the CLI records exactly one structured Commander handoff',
+      ),
+      check(
+        'preserves-automation-requirements',
+        hasDailyEight && preservesBenchmarkScope && preservesRecovery,
+        'the handoff preserves schedule, benchmark scope, repair, and confirmation handling',
+      ),
+      check(
+        'preserves-agent-and-skill-mutations',
+        preservesCreatedComponents,
+        'the handoff preserves both requested Orkas component creations and names',
+      ),
+      check(
+        'does-not-substitute-open-skill-tools',
+        skillToolCount === 0,
+        'the CLI does not treat Skill read/run access as authority to mutate Skills',
+      ),
+      check(
+        'does-not-claim-mutation-complete',
+        !claimsMutationCompleted && !/<(?:auto-task|agent|skill)\b/i.test(output),
+        'the CLI neither claims completion nor emits Commander mutation containers',
+      ),
+      check(
+        'mutation-workspace-unchanged',
+        files['protected.txt'] === MUTATION_PROTECTED_FILE,
+        'Commander-owned mutations do not alter the CLI workspace',
+      ),
+    );
   } else {
     checks.push(check('known-scenario', false, 'scenario id is registered'));
   }
@@ -242,8 +447,27 @@ export function validateLocalAgentBenchmarkInventory() {
     if (!scenario.category) errors.push(`${scenario.id}: category required`);
     if (String(scenario.prompt || '').length < 80) errors.push(`${scenario.id}: prompt is not representative`);
     if (!scenario.agents.length) errors.push(`${scenario.id}: agents required`);
-    if (!Object.keys(scenario.seedFiles || {}).length) errors.push(`${scenario.id}: seed files required`);
-    if (!scenario.observedFiles.length) errors.push(`${scenario.id}: observed files required`);
+    const hasSeedFiles = Object.keys(scenario.seedFiles || {}).length > 0;
+    const hasChatHistory = Array.isArray(scenario.chatHistory?.messages)
+      && scenario.chatHistory.messages.length > 0;
+    const hasBridgeSkills = Object.keys(scenario.bridgeSkills || {}).length > 0;
+    if (!hasSeedFiles && !hasChatHistory && !hasBridgeSkills) {
+      errors.push(`${scenario.id}: seed files, chat history, or bridge skills required`);
+    }
+    if (!scenario.observedFiles.length && !hasChatHistory && !hasBridgeSkills) {
+      errors.push(`${scenario.id}: observed files required`);
+    }
+    if (hasChatHistory && !scenario.agents.every(type => ['claude', 'codex'].includes(type))) {
+      errors.push(`${scenario.id}: chat history requires an Orkas-bridge-capable CLI`);
+    }
+    if (hasBridgeSkills && !scenario.agents.every(type => ['claude', 'codex'].includes(type))) {
+      errors.push(`${scenario.id}: bridge skills require an Orkas-bridge-capable CLI`);
+    }
+    for (const [id, body] of Object.entries(scenario.bridgeSkills || {})) {
+      if (!/^[a-z][a-z0-9-]{2,63}$/.test(id) || String(body).length < 80) {
+        errors.push(`${scenario.id}: invalid bridge skill fixture ${id}`);
+      }
+    }
     for (const type of scenario.agents) {
       if (!LOCAL_AGENT_TYPES.includes(type)) errors.push(`${scenario.id}: unknown agent ${type}`);
     }
@@ -298,6 +522,10 @@ export function installerPlan(type, options) {
       env: {
         HERMES_HOME: hermesHome,
         LOCALAPPDATA: path.join(installRoot, 'windows-localappdata'),
+        // If an interrupted managed clone leaves an incomplete .git folder,
+        // prevent the official updater's Git commands from discovering and
+        // mutating the enclosing Orkas checkout.
+        GIT_CEILING_DIRECTORIES: installRoot,
       },
     }];
   }
@@ -317,7 +545,10 @@ export function installerPlan(type, options) {
         '--dir', path.join(installRoot, 'hermes'),
         '--hermes-home', hermesHome,
       ],
-      env: { HERMES_HOME: hermesHome },
+      env: {
+        HERMES_HOME: hermesHome,
+        GIT_CEILING_DIRECTORIES: installRoot,
+      },
     },
   ];
 }
@@ -327,15 +558,31 @@ export function managedBinaryCandidates(type, { platform, installRoot }) {
   const bin = BIN_NAMES[type];
   if (type !== 'hermes') {
     const name = platform === 'win32' ? `${bin}.cmd` : bin;
-    return [
+    const candidates = [
       path.join(installRoot, 'npm', type, 'node_modules', '.bin', name),
       // Compatibility with the first test-managed layout used before the
       // per-agent prefixes were split.
       path.join(installRoot, 'npm', 'node_modules', '.bin', name),
     ];
+    if (type === 'opencode' && platform === 'win32') {
+      // opencode-ai's postinstall copies one of these platform executables
+      // into its wrapper package. npm can report an EPERM cleanup failure
+      // after that copy succeeds, so retain direct, executable fallbacks for
+      // the packages named by OpenCode's own installer error.
+      candidates.push(
+        path.join(installRoot, 'npm', type, 'node_modules', 'opencode-windows-x64-baseline', 'bin', 'opencode.exe'),
+        path.join(installRoot, 'npm', type, 'node_modules', 'opencode-windows-x64', 'bin', 'opencode.exe'),
+        path.join(installRoot, 'npm', type, 'node_modules', 'opencode-windows-arm64', 'bin', 'opencode.exe'),
+      );
+    }
+    return candidates;
   }
   if (platform === 'win32') {
     return [
+      // Current official -SkipSetup installer layout when HERMES_HOME is
+      // supplied directly by the test harness.
+      path.join(installRoot, 'hermes-home', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe'),
+      path.join(installRoot, 'hermes-home', 'hermes-agent', 'venv', 'Scripts', 'hermes.cmd'),
       path.join(installRoot, 'windows-localappdata', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.exe'),
       path.join(installRoot, 'windows-localappdata', 'hermes', 'hermes-agent', 'venv', 'Scripts', 'hermes.cmd'),
       path.join(installRoot, 'hermes', 'venv', 'Scripts', 'hermes.exe'),
@@ -387,6 +634,30 @@ export function classifyLiveFailure(result) {
   }
   if (result?.status === 'missing_cli') return 'installation';
   return 'runtime';
+}
+
+/** Validate the protocol-level invariants of one opt-in live CLI round trip.
+ * The trace intentionally contains event type names and the terminal envelope
+ * only; live prompts/tool output never need to enter test diagnostics. */
+export function validateLiveProtocolTrace(type, result, trace) {
+  assertAgentType(type);
+  const eventTypes = Array.isArray(trace?.eventTypes) ? trace.eventTypes.map(String) : [];
+  const terminalEvent = trace?.terminalEvent;
+  const processInfoCount = eventTypes.filter(eventType => eventType === 'process-info').length;
+  const doneCount = eventTypes.filter(eventType => eventType === 'done').length;
+  const issues = [];
+
+  if (processInfoCount !== 1) issues.push(`process-info count=${processInfoCount}`);
+  if (doneCount !== 1) issues.push(`done count=${doneCount}`);
+  if (eventTypes.at(-1) !== 'done') issues.push(`last event=${eventTypes.at(-1) || 'none'}`);
+  if (terminalEvent?.status !== result?.status) {
+    issues.push(`terminal/result mismatch=${terminalEvent?.status || 'none'}/${result?.status || 'none'}`);
+  }
+  if ((type === 'claude' || type === 'codex')
+      && typeof terminalEvent?.sessionId !== 'string') {
+    issues.push('missing resumable session id');
+  }
+  return issues;
 }
 
 export function summarizeLiveFailure(result) {

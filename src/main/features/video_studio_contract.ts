@@ -36,7 +36,16 @@ const ManifestSceneSchema = z.object({
   narration_text: z.string().trim().optional(),
   source_shots: z.array(z.string().trim().min(1)).default([]),
   roles: z.array(z.string().trim().min(1)).default([]),
-}).strict();
+}).strict().transform((scene) => (
+  // An explicitly empty narration field means this scene is intentionally
+  // silent. Clear stale implementation refs while parsing so a repaired id or
+  // generated placeholder cannot alter the approved intent or make audio QA
+  // treat the scene as narrated. Omitted narration_text remains compatible
+  // with legacy ref-only manifests whose words live in narration-map.json.
+  scene.narration_text !== undefined && !scene.narration_text.trim()
+    ? { ...scene, narration_refs: [] }
+    : scene
+));
 
 const NarrationIntentSchema = z.object({
   route_ref: z.string().trim().min(1),
@@ -58,6 +67,11 @@ export const CompositionManifestSchema = z.object({
     target_duration: z.number().finite().positive().max(600).optional(),
     fps: z.number().int().positive().max(60),
     language: z.string().trim().min(1).optional(),
+    /** Whether the delivered video carries captions, and how. Absent means
+     * none. This is the one delivery fact the manifest could not already
+     * state: duration, language, and audio ownership are declared above and
+     * in `audio`, so the retired shotlist.json only restated them. */
+    caption_mode: z.string().trim().min(1).optional(),
   }).strict(),
   scenes: z.array(ManifestSceneSchema).min(1),
   audio: z.object({
@@ -589,6 +603,7 @@ export function manifestAsSceneMap(manifest: CompositionManifest): Record<string
       duration: manifest.composition.duration,
       fps: manifest.composition.fps,
       ...(manifest.composition.language ? { language: manifest.composition.language } : {}),
+      ...(manifest.composition.caption_mode ? { caption_mode: manifest.composition.caption_mode } : {}),
     },
     audio: {
       owner: manifest.audio.owner,
@@ -643,31 +658,80 @@ export function retimeCompositionManifestForNarration(
   sceneWeights: number[] = [],
 ): CompositionManifest {
   const narrationDuration = Math.round(measuredDurationSec * 1000) / 1000;
-  const duration = Math.round((manifest.composition.target_duration ?? narrationDuration) * 1000) / 1000;
-  const weights = manifest.scenes.map((scene, index) => {
-    const supplied = Number(sceneWeights[index]);
-    return Number.isFinite(supplied) && supplied > 0 ? supplied : Math.max(0.001, scene.duration);
-  });
-  const totalWeight = weights.reduce((sum, value) => sum + value, 0);
-  let cursor = 0;
-  const scenes = manifest.scenes.map((scene, index) => {
-    const start = Math.round(cursor * 1000) / 1000;
-    cursor = index === manifest.scenes.length - 1
-      ? duration
-      : cursor + (duration * weights[index] / totalWeight);
-    const end = Math.round(cursor * 1000) / 1000;
-    return { ...scene, start, duration: Math.max(0.001, Math.round((end - start) * 1000) / 1000) };
-  });
+  const narratedIndexes = manifest.scenes.flatMap((scene, index) => (
+    scene.narration_text?.trim() ? [index] : []
+  ));
+  const firstNarrated = narratedIndexes[0] ?? 0;
+  const narrationStart = Math.round(
+    manifest.scenes.slice(0, firstNarrated).reduce((sum, scene) => sum + scene.duration, 0) * 1000,
+  ) / 1000;
   const tracks = manifest.audio.tracks
     .filter((track) => track.kind !== 'narration')
     .concat([{
       id: 'narration',
       kind: 'narration' as const,
       src: 'assets/narration.mp3',
-      start: 0,
+      start: narrationStart,
       duration: narrationDuration,
       volume: 1,
     }]);
+  const narratedSceneCapacity = manifest.scenes.reduce((sum, scene) => (
+    scene.narration_text?.trim() ? sum + scene.duration : sum
+  ), 0);
+  // A shorter take fits inside the already-authored visual windows. Preserve
+  // those windows exactly and leave the remainder as a visual hold/silence;
+  // redistributing it would turn an audio-only edit into a visual change and
+  // invalidate a preview whose pixels did not need to move.
+  if (narratedIndexes.length > 0 && narrationDuration <= narratedSceneCapacity + 0.001) {
+    return {
+      ...manifest,
+      audio: {
+        owner: 'composition',
+        tracks,
+        ...(manifest.audio.narration_intent ? { narration_intent: manifest.audio.narration_intent } : {}),
+      },
+    };
+  }
+  const silentDuration = manifest.scenes.reduce((sum, scene) => (
+    scene.narration_text?.trim() ? sum : sum + scene.duration
+  ), 0);
+  // `target_duration` is the approved delivery target. Measured speech and
+  // explicitly silent scene windows are different pieces of that timeline;
+  // scaling them together made a 48s narration appear to end at 31s when a
+  // silent payoff carried a large authored weight. Reserve the complete
+  // measured narration first, preserve silent beats, and expand rather than
+  // truncate when their combined duration exceeds the target.
+  const duration = Math.round(Math.max(
+    manifest.composition.target_duration ?? narrationDuration + silentDuration,
+    narrationDuration + silentDuration,
+  ) * 1000) / 1000;
+  const narrationWeights = manifest.scenes.map((scene, index) => {
+    if (!scene.narration_text?.trim()) return 0;
+    const supplied = Number(sceneWeights[index]);
+    return Number.isFinite(supplied) && supplied > 0 ? supplied : Math.max(0.001, scene.duration);
+  });
+  const totalNarrationWeight = narrationWeights.reduce((sum, value) => sum + value, 0);
+  const deliveryHold = Math.max(0, duration - narrationDuration - silentDuration);
+  let cursor = 0;
+  const scenes = manifest.scenes.map((scene, index) => {
+    const start = Math.round(cursor * 1000) / 1000;
+    let sceneDuration: number;
+    if (scene.narration_text?.trim()) {
+      sceneDuration = narrationDuration * narrationWeights[index] / Math.max(0.001, totalNarrationWeight);
+      // Keep a short-read delivery target as a visual hold after the final
+      // spoken line. Never fold that hold into a silent scene: its authored
+      // duration is the stable reservation used by later fit/materialization
+      // calls, while narration-map timing still ends at the measured audio.
+      if (index === narratedIndexes.at(-1)) {
+        sceneDuration += deliveryHold;
+      }
+    } else {
+      sceneDuration = scene.duration;
+    }
+    cursor = index === manifest.scenes.length - 1 ? duration : cursor + sceneDuration;
+    const end = Math.round(cursor * 1000) / 1000;
+    return { ...scene, start, duration: Math.max(0.001, Math.round((end - start) * 1000) / 1000) };
+  });
   return {
     ...manifest,
     composition: { ...manifest.composition, duration },
@@ -682,17 +746,35 @@ export function retimeCompositionManifestForNarration(
 
 export function buildCompositionNarrationMap(
   manifest: CompositionManifest,
-  input: { textSha256: string; audioSha256: string; method: 'scene_estimate_scaled' | 'forced_alignment' },
+  input: {
+    textSha256: string;
+    audioSha256: string;
+    method: 'scene_estimate_scaled' | 'forced_alignment';
+    /** Measured length of the audio these lines are claimed to cover. Every
+     *  timing below is copied from the manifest, so without this the map
+     *  asserts a span nobody checked against the take it names — a 200s claim
+     *  sat beside a 175s file on 2026-08-09 and nothing compared them. */
+    audioDurationSec?: number;
+  },
 ): Record<string, unknown> {
+  const narrationTrack = manifest.audio.tracks.find((track) => track.kind === 'narration');
+  const narrationStart = narrationTrack?.start ?? 0;
+  const narrationDuration = input.audioDurationSec ?? narrationTrack?.duration ?? 0;
+  const narrationEnd = narrationStart + narrationDuration;
+  const narratedScenes = manifest.scenes.filter((scene) => !!scene.narration_text?.trim());
   const lines = manifest.scenes.flatMap((scene) => {
     const text = scene.narration_text?.trim() || '';
     if (!text) return [];
     const ids = scene.narration_refs.length ? scene.narration_refs : [`narration-${scene.id}`];
+    const sceneIndex = narratedScenes.findIndex((candidate) => candidate.id === scene.id);
+    const nextNarratedStart = narratedScenes[sceneIndex + 1]?.start ?? narrationEnd;
+    const lineStart = Math.max(narrationStart, scene.start);
+    const lineEnd = Math.min(narrationEnd, nextNarratedStart);
     return ids.map((id) => ({
       id,
       scene_id: scene.id,
-      start: scene.start,
-      duration: scene.duration,
+      start: Math.round(lineStart * 1000) / 1000,
+      duration: Math.max(0.001, Math.round((lineEnd - lineStart) * 1000) / 1000),
       text,
     }));
   });
@@ -703,6 +785,17 @@ export function buildCompositionNarrationMap(
     narration_text_sha256: input.textSha256,
     narration_audio_sha256: input.audioSha256,
     total_duration: manifest.composition.duration,
+    narration_audio_start: Math.round(narrationStart * 1000) / 1000,
+    ...(typeof input.audioDurationSec === 'number'
+      ? { narration_audio_duration: Math.round(input.audioDurationSec * 1000) / 1000 }
+      : {}),
+    narration_audio_end: Math.round(narrationEnd * 1000) / 1000,
+    timing_evidence: {
+      audio_duration: 'measured_media_probe',
+      line_timing: input.method === 'forced_alignment'
+        ? 'forced_alignment'
+        : 'scene_projection_over_measured_audio',
+    },
     lines,
   };
 }
@@ -769,17 +862,39 @@ export function reconcileCompositionHtml(
     next = `${next.slice(0, match.index)}${tag}${next.slice(match.index + match[0].length)}`;
   }
 
-  // Patch only the runtime-generated visibility setters. Authored motion
-  // remains intact and is still validated by inspect after a timing change.
+  // Scaffolds generated since the data-driven visibility loop landed carry no
+  // per-scene setter here: the loop reads the data-start/data-duration this
+  // function just rewrote, so those compositions are already retimed. The
+  // per-scene rewrite below is the legacy path for compositions scaffolded
+  // before that, and it is why `reconciledSceneIds` exists — a file that
+  // matched SOME scenes and not others is half-retimed, which renders the
+  // wrong scene at the sampled second and used to pass silently, because a
+  // String.replace that matches nothing returns the input unchanged.
+  const reconciledSceneIds: string[] = [];
   for (const [index, scene] of manifest.scenes.entries()) {
     const selector = JSON.stringify(`#scene-${scene.id.replace(/(["\\])/g, '\\$1')}`);
     const selectorPattern = escapeRegExp(selector);
     const showRe = new RegExp(`tl\\.set\\(\\s*${selectorPattern}\\s*,\\s*\\{\\s*autoAlpha\\s*:\\s*1\\s*\\}\\s*,\\s*-?[0-9.]+\\s*\\);`);
+    if (!showRe.test(next)) continue;
     next = next.replace(showRe, `tl.set(${selector}, { autoAlpha: 1 }, ${scene.start});`);
+    reconciledSceneIds.push(scene.id);
     if (index < manifest.scenes.length - 1) {
       const hideRe = new RegExp(`tl\\.set\\(\\s*${selectorPattern}\\s*,\\s*\\{\\s*autoAlpha\\s*:\\s*0\\s*\\}\\s*,\\s*-?[0-9.]+\\s*\\);`);
       next = next.replace(hideRe, `tl.set(${selector}, { autoAlpha: 0 }, ${scene.start + scene.duration});`);
     }
+  }
+  if (reconciledSceneIds.length && reconciledSceneIds.length < manifest.scenes.length) {
+    const unreconciled = manifest.scenes
+      .map((scene) => scene.id)
+      .filter((id) => !reconciledSceneIds.includes(id));
+    issues.push({
+      code: 'COMPOSITION_VISIBILITY_TIMING_UNRECONCILED',
+      severity: 'error',
+      selector: 'index.html',
+      message: `Measured scene timing was applied to ${reconciledSceneIds.length} of ${manifest.scenes.length} scene visibility setters; ${unreconciled.slice(0, 6).join(', ')} still play on their pre-measurement window.`,
+      fixHint: 'Let the runtime own scene visibility: drive it from each section\'s data-start/data-duration instead of writing the seconds into the timeline.',
+      source: 'orkas-native-composition-reconcile',
+    });
   }
 
   // Declarative audio elements are runtime-owned. Rebuild only these tags and
@@ -812,6 +927,117 @@ export function reconcileCompositionHtml(
   };
 }
 
+/**
+ * Timeline calls whose POSITION argument is a timeline second, by arity.
+ * `tl.to(target, vars)` has no position; only a call that actually reaches the
+ * index below is carrying one, which is what keeps `duration: 4` inside a vars
+ * object from reading as an absolute second. `call(callback, params, position)`
+ * carries its position third — reading params as the position would flag their
+ * values with a bogus replacement while missing the real literal.
+ */
+const TIMELINE_POSITION_ARG_INDEX: Record<string, number> = {
+  set: 2, to: 2, from: 2, fromTo: 3, add: 1, addLabel: 1, call: 2,
+};
+
+/** Timing tolerance shared with the scene-window checks in inspect. */
+const TIMELINE_POSITION_TOLERANCE_SEC = 0.15;
+
+export type AuthoredAbsolutePosition = {
+  method: string;
+  seconds: number;
+  line: number;
+  suggestion: string;
+  /** The scene whose window contains the literal — the one `suggestion`
+   *  offsets from. `scenes` is non-empty by the guard, so there is always one. */
+  scene_id: string;
+};
+
+/** Split one call's top-level arguments, respecting nesting and strings. */
+function splitCallArguments(source: string, openIndex: number): { args: string[]; endIndex: number } | null {
+  const args: string[] = [];
+  let depth = 0;
+  let quote = '';
+  let current = '';
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      current += ch;
+      if (ch === '\\') { current += source[++i] ?? ''; continue; }
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; current += ch; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') {
+      depth++;
+      if (depth === 1) continue;
+    } else if (ch === ')' || ch === ']' || ch === '}') {
+      depth--;
+      if (depth === 0) { args.push(current.trim()); return { args, endIndex: i }; }
+    } else if (ch === ',' && depth === 1) {
+      args.push(current.trim());
+      current = '';
+      continue;
+    }
+    if (depth >= 1) current += ch;
+  }
+  return null;
+}
+
+/**
+ * Timeline positions written as absolute seconds instead of `S(id)` offsets.
+ *
+ * The scene windows these literals encode are recomputed from the measured
+ * narration audio, and that can happen after the HTML is authored — a TTS
+ * retry reaches `materialize_narration` on an already-authored file. On
+ * 2026-08-08 that left 46 literals pointing one scene off; the model spent 11
+ * minutes and 13 round trips transcribing new ones by hand and did not finish.
+ * The host knows every window, so it can hand back the exact replacement
+ * expression rather than only the complaint.
+ */
+export function authoredAbsoluteTimelinePositions(
+  html: string,
+  scenes: { id: string; start: number; duration: number }[],
+): AuthoredAbsolutePosition[] {
+  const found: AuthoredAbsolutePosition[] = [];
+  if (!scenes.length) return found;
+  const scriptRe = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+  let scriptMatch: RegExpExecArray | null;
+  while ((scriptMatch = scriptRe.exec(html)) !== null) {
+    const script = scriptMatch[1];
+    const scriptOffset = scriptMatch.index + scriptMatch[0].indexOf(script);
+    const callRe = /\btl\s*\.\s*(set|to|from|fromTo|add|addLabel|call)\s*\(/g;
+    let call: RegExpExecArray | null;
+    while ((call = callRe.exec(script)) !== null) {
+      const parsed = splitCallArguments(script, call.index + call[0].length - 1);
+      if (!parsed) continue;
+      callRe.lastIndex = parsed.endIndex;
+      const method = call[1];
+      const position = parsed.args[TIMELINE_POSITION_ARG_INDEX[method]];
+      if (!position) continue;
+      // `S(id) + 0.2` is the offset form this check exists to promote, and a
+      // string position ("+=1", "<", a label) is relative to another tween
+      // rather than to the timeline, so both survive a retime unchanged.
+      if (/\b[SD]\s*\(/.test(position) || /^["'`]/.test(position)) continue;
+      const literals = (position.match(/(?<![\w.])\d+(?:\.\d+)?/g) || []).map(Number);
+      const seconds = literals.find((value) => value > TIMELINE_POSITION_TOLERANCE_SEC);
+      if (seconds === undefined) continue;
+      const owner = scenes.find((scene) => seconds >= scene.start && seconds < scene.start + scene.duration)
+        || scenes[scenes.length - 1];
+      const offset = Math.round((seconds - owner.start) * 1000) / 1000;
+      found.push({
+        method,
+        seconds,
+        line: html.slice(0, scriptOffset + call.index).split('\n').length,
+        suggestion: offset === 0
+          ? `S(${JSON.stringify(owner.id)})`
+          : `S(${JSON.stringify(owner.id)}) + ${offset}`,
+        scene_id: owner.id,
+      });
+    }
+  }
+  return found;
+}
+
 export function buildCompositionScaffold(manifest: CompositionManifest): string {
   const { composition } = manifest;
   const clips = manifest.scenes.map((scene) => {
@@ -828,13 +1054,6 @@ export function buildCompositionScaffold(manifest: CompositionManifest): string 
   const audio = manifest.audio.owner === 'composition'
     ? manifest.audio.tracks.map((track, index) => `    <audio id="audio-${escapeHtml(track.id)}" src="./${escapeHtml(track.src.replace(/^\.\//, ''))}" data-start="${track.start}" data-duration="${track.duration}" data-track-index="${index + 10}" data-volume="${track.volume}"></audio>`).join('\n')
     : '';
-  const visibilityTimeline = manifest.scenes.map((scene, index) => {
-    const selector = `#scene-${scene.id.replace(/(["\\])/g, '\\$1')}`;
-    return [
-      `      tl.set(${JSON.stringify(selector)}, { autoAlpha: 1 }, ${scene.start});`,
-      ...(index < manifest.scenes.length - 1 ? [`      tl.set(${JSON.stringify(selector)}, { autoAlpha: 0 }, ${scene.start + scene.duration});`] : []),
-    ].join('\n');
-  }).join('\n');
   return `<!doctype html>
 <html lang="${escapeHtml(composition.language || 'en')}">
 <head>
@@ -862,8 +1081,40 @@ ${audio}
       const tl = gsap.timeline({ paused: true });
       window.__timelines[${JSON.stringify(composition.id)}] = tl;
       window.__ORKAS_COMPOSITION_TIMELINE__ = tl;
-${visibilityTimeline}
+      // Scene windows live on each section's data-start/data-duration. They are
+      // re-measured from the generated narration audio, which can happen AFTER
+      // this file is authored, so a timeline second written as a literal here
+      // points at the wrong scene from that moment on. Position every tween
+      // with S(id)/D(id) and it survives any retiming untouched.
+      const sceneEl = (id) => document.querySelector('[data-scene-id="' + id + '"]');
+      const S = (id) => Number(sceneEl(id).dataset.start);      // scene start, seconds
+      const D = (id) => Number(sceneEl(id).dataset.duration);   // scene duration, seconds
+
+      // Scene visibility is runtime-owned: it reads the same attributes and is
+      // already correct after a retime. Do not author, move, or replace it.
+      // Keyed on start rather than DOM order, so moving a section in the markup
+      // cannot decide which scene holds to the end.
+      const sceneNodes = Array.from(document.querySelectorAll('[data-scene-id]'));
+      const lastStart = Math.max(...sceneNodes.map((node) => Number(node.dataset.start)));
+      sceneNodes.forEach((node) => {
+        const start = Number(node.dataset.start);
+        tl.set(node, { autoAlpha: 1 }, start);
+        if (start < lastStart) {
+          tl.set(node, { autoAlpha: 0 }, start + Number(node.dataset.duration));
+        }
+      });
+
       // Add deterministic scene motion to tl. Do not control audio/video imperatively.
+      // Keep each scene's tweens inside its own marked block below and target
+      // only elements inside that scene's section; that keeps the composition
+      // scene-attributable so unchanged scenes can skip re-rendering.
+${manifest.scenes.map((scene) => [
+    `      // ORKAS-SCENE-MOTION-BEGIN:${scene.id}`,
+    `      // Tweens for scene "${scene.id}" only, positioned from S(${JSON.stringify(scene.id)}) — for example:`,
+    `      //   tl.from('[data-scene-id="${scene.id}"] [data-role="title"]', { y: 40, duration: 0.6 }, S(${JSON.stringify(scene.id)}) + 0.2);`,
+    `      //   tl.to('[data-scene-id="${scene.id}"] [data-role="visual"]', { x: 240, duration: D(${JSON.stringify(scene.id)}) }, S(${JSON.stringify(scene.id)}));`,
+    `      // ORKAS-SCENE-MOTION-END:${scene.id}`,
+  ].join('\n')).join('\n')}
     })();
   </script>
 </body>
@@ -911,5 +1162,180 @@ export async function prepareCompositionScaffold(compositionDirAbs: string): Pro
     html_path: htmlPath,
     scaffold_created: scaffoldCreated,
     issues: loaded.issues,
+  };
+}
+
+/**
+ * Visual-identity normalization.
+ *
+ * The preview (a silent contact sheet) attests visual content only, but its
+ * gate entry historically bound the full composition signature — including
+ * narration text and audio bytes. Any narration change therefore invalidated
+ * a visually identical preview and cost the user a duplicate confirmation.
+ *
+ * These two functions produce the visual projection of the composition:
+ * everything the silent preview can show, nothing it cannot. The HTML
+ * Scene windows remain visual: moving them changes which pixels appear at a
+ * sampled time. Only narration/audio bindings are neutralized. A shorter take
+ * now preserves the existing windows, so it keeps identity without hiding a
+ * real timeline change.
+ */
+
+export function visualProjectionOfCompositionManifest(raw: unknown): string {
+  const canonical = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (!value || typeof value !== 'object') return value;
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonical((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return JSON.stringify(raw ?? null);
+  const manifest = raw as Record<string, unknown>;
+  const projected: Record<string, unknown> = { ...manifest };
+  delete projected.audio;
+  if (manifest.composition && typeof manifest.composition === 'object' && !Array.isArray(manifest.composition)) {
+    const composition = { ...(manifest.composition as Record<string, unknown>) };
+    delete composition.target_duration;
+    projected.composition = composition;
+  }
+  if (Array.isArray(manifest.scenes)) {
+    projected.scenes = manifest.scenes.map((scene) => {
+      if (!scene || typeof scene !== 'object' || Array.isArray(scene)) return scene;
+      const visual = { ...(scene as Record<string, unknown>) };
+      delete visual.narration_text;
+      delete visual.narration_refs;
+      return visual;
+    });
+  }
+  return JSON.stringify(canonical(projected));
+}
+
+export function normalizeCompositionHtmlForVisualIdentity(html: string): string {
+  let next = html;
+  // The protected composition root always starts at zero. Older authored
+  // files may omit that default and reconciliation materializes it; absence
+  // versus explicit zero cannot change a frame.
+  next = next.replace(
+    /<([a-z][\w:-]*)\b[^>]*\bdata-composition-id=(?:"[^"]*"|'[^']*')[^>]*>/gi,
+    (tag) => setOpeningTagAttribute(tag, 'data-start', '0'),
+  );
+  // Declarative audio elements are runtime-owned and invisible to the preview.
+  // Reconcile inserts them with their own indentation, so the element and its
+  // surrounding whitespace reduce to one newline, and whitespace-only line
+  // runs collapse afterwards — identity must not hinge on insertion residue.
+  next = next.replace(/\s*<audio\b[^>]*\bdata-start=(?:"[^"]*"|'[^']*')[^>]*>(?:\s*<\/audio>)?\s*/gi, '\n');
+  next = next.replace(/\n[ \t]*(?:\n[ \t]*)+/g, '\n');
+  return next;
+}
+
+/** P3c R1: scene attribution. Decomposes a composition page into a shared
+ * surface plus per-scene (subtree, motion region) pairs so later renders can
+ * attribute changes to individual scenes. Attribution is advisory: any
+ * malformed or ambiguous structure yields attributable:false and the
+ * composition simply keeps rendering the whole-page way — never an error. */
+export type SceneAttributionDecomposition = {
+  attributable: boolean;
+  reasons: string[];
+  scene_subtrees: Record<string, string>;
+  scene_motion_regions: Record<string, string>;
+  shared_surface: string;
+};
+
+function extractBalancedElement(html: string, openTagMatch: RegExpExecArray, tagName: string): string | null {
+  const openRe = new RegExp(`<${tagName}\\b`, 'gi');
+  const closeRe = new RegExp(`</${tagName}\\s*>`, 'gi');
+  let depth = 1;
+  let cursor = openTagMatch.index + openTagMatch[0].length;
+  while (depth > 0) {
+    openRe.lastIndex = cursor;
+    closeRe.lastIndex = cursor;
+    const nextOpen = openRe.exec(html);
+    const nextClose = closeRe.exec(html);
+    if (!nextClose) return null;
+    if (nextOpen && nextOpen.index < nextClose.index) {
+      depth += 1;
+      cursor = nextOpen.index + nextOpen[0].length;
+    } else {
+      depth -= 1;
+      cursor = nextClose.index + nextClose[0].length;
+    }
+  }
+  return html.slice(openTagMatch.index, cursor);
+}
+
+export function decomposeCompositionSceneAttribution(
+  html: string,
+  manifest: CompositionManifest,
+): SceneAttributionDecomposition {
+  const reasons: string[] = [];
+  const sceneSubtrees: Record<string, string> = {};
+  const sceneMotionRegions: Record<string, string> = {};
+  let shared = html;
+
+  for (const scene of manifest.scenes) {
+    const escapedId = escapeRegExp(scene.id);
+    const sectionRe = new RegExp(`<([a-z][\\w:-]*)\\b[^>]*\\bdata-scene-id=(?:"${escapedId}"|'${escapedId}')[^>]*>`, 'gi');
+    const first = sectionRe.exec(html);
+    if (!first) {
+      reasons.push(`scene "${scene.id}" has no [data-scene-id] element`);
+      continue;
+    }
+    if (sectionRe.exec(html)) {
+      reasons.push(`scene "${scene.id}" has more than one [data-scene-id] element`);
+      continue;
+    }
+    const subtree = extractBalancedElement(html, first, first[1]);
+    if (!subtree) {
+      reasons.push(`scene "${scene.id}" section never closes`);
+      continue;
+    }
+    sceneSubtrees[scene.id] = subtree;
+
+    const beginMarker = `// ORKAS-SCENE-MOTION-BEGIN:${scene.id}`;
+    const endMarker = `// ORKAS-SCENE-MOTION-END:${scene.id}`;
+    const beginAt = html.indexOf(beginMarker);
+    const endAt = html.indexOf(endMarker);
+    if (beginAt < 0 || endAt < 0) {
+      reasons.push(`scene "${scene.id}" has no motion region markers`);
+      continue;
+    }
+    if (endAt < beginAt
+      || html.indexOf(beginMarker, beginAt + beginMarker.length) >= 0
+      || html.indexOf(endMarker, endAt + endMarker.length) >= 0) {
+      reasons.push(`scene "${scene.id}" motion region markers are duplicated or out of order`);
+      continue;
+    }
+    const region = html.slice(beginAt + beginMarker.length, endAt);
+    if (manifest.scenes.some((other) => other.id !== scene.id
+      && (region.includes(`// ORKAS-SCENE-MOTION-BEGIN:${other.id}`) || region.includes(`// ORKAS-SCENE-MOTION-END:${other.id}`)))) {
+      reasons.push(`scene "${scene.id}" motion region nests another scene's markers`);
+      continue;
+    }
+    sceneMotionRegions[scene.id] = region;
+  }
+
+  const attributable = reasons.length === 0
+    && manifest.scenes.length > 0
+    && manifest.scenes.every((scene) => scene.id in sceneSubtrees && scene.id in sceneMotionRegions);
+  if (attributable) {
+    for (const scene of manifest.scenes) {
+      shared = shared.replace(sceneSubtrees[scene.id], `<!--orkas-scene:${scene.id}-->`);
+      const beginMarker = `// ORKAS-SCENE-MOTION-BEGIN:${scene.id}`;
+      const endMarker = `// ORKAS-SCENE-MOTION-END:${scene.id}`;
+      const beginAt = shared.indexOf(beginMarker);
+      const endAt = shared.indexOf(endMarker);
+      if (beginAt >= 0 && endAt > beginAt) {
+        shared = `${shared.slice(0, beginAt + beginMarker.length)}/*orkas-scene-motion:${scene.id}*/${shared.slice(endAt)}`;
+      }
+    }
+  }
+  return {
+    attributable,
+    reasons,
+    scene_subtrees: sceneSubtrees,
+    scene_motion_regions: sceneMotionRegions,
+    shared_surface: attributable ? normalizeCompositionHtmlForVisualIdentity(shared) : '',
   };
 }

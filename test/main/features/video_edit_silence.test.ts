@@ -117,6 +117,111 @@ describe('assessVoiceoverCoverage', () => {
     expect(cv.trailingGapSec).toBeCloseTo(6, 5); // 20 - 14
     expect(cv.warnings.join(' ')).toMatch(/silent tail|uncovered/i);
   });
+
+  it('reports interior dead air instead of scoring how far the last line reached (the 95% lie)', () => {
+    // The 2026-08-05 draft: seven lines pinned to scene starts on a 60 s cut,
+    // 29.7 s of it silent in holes up to 6.9 s — and the old ratio still said
+    // 0.95 because the last line ended at 56.8 s. The report has to carry the
+    // holes, the honest voiced share, and a status QA can fail on.
+    const lines: Array<[number, number]> = [
+      [0, 3.52], [6.15, 10.55], [14.24, 19.41], [26.29, 31.97],
+      [37.30, 42.16], [47.32, 51.56], [54.29, 56.78],
+    ];
+    const cv = assessVoiceoverCoverage({
+      referenceDurationSec: 60.07,
+      offsetSec: 0,
+      audioDurationSec: 56.78,
+      voicedStartSec: 0,
+      voicedEndSec: 56.78,
+      voicedSpans: lines.map(([startSec, endSec]) => ({ startSec, endSec })),
+    });
+    expect(cv.status).toBe('gapped');
+    // The old number stays high — that is the point of keeping both.
+    expect(cv.coverageRatio).toBeGreaterThan(0.9);
+    expect(cv.voicedRatio).toBeLessThan(0.55);
+    expect(cv.maxInteriorGapSec).toBeCloseTo(6.88, 1);
+    expect(cv.interiorGaps.length).toBe(6);
+    expect(cv.interiorGaps[0]).toMatchObject({ startSec: 19.41, endSec: 26.29 });
+    expect(cv.warnings.join(' ')).toMatch(/dead air/i);
+    expect(cv.warnings.join(' ')).toMatch(/music bed|re-time|shorten/i);
+  });
+
+  it('reports two lines speaking at once — the 2026-08-06 double-narration mix', () => {
+    // The plan wrote target_sec as end times, every line's audio outran its
+    // window, and three pairs collided (up to 1.48 s at n4→n5). Merged spans
+    // hide a collision, so the raw spans are what the check reads.
+    const cv = assessVoiceoverCoverage({
+      referenceDurationSec: 40,
+      offsetSec: 0,
+      audioDurationSec: 43.46,
+      voicedStartSec: 0,
+      voicedEndSec: 43.46,
+      voicedSpans: [
+        { startSec: 0, endSec: 6.26 },
+        { startSec: 11, endSec: 18.87 },
+        { startSec: 20, endSec: 26.46 },
+        { startSec: 26, endSec: 32.84 },
+        { startSec: 32, endSec: 38.48 },
+        { startSec: 37, endSec: 43.46 },
+      ],
+    });
+    expect(cv.overlapCount).toBe(3);
+    expect(cv.maxOverlapSec).toBeCloseTo(1.48, 2);
+    // Truncation past the clip is destructive and keeps status priority; the
+    // overlap still lands in the warnings with its own remediation.
+    expect(cv.status).toBe('over');
+    expect(cv.warnings.join(' ')).toMatch(/speak at once/i);
+    expect(cv.warnings.join(' ')).toMatch(/DURATION, not its end time/);
+  });
+
+  it('flags overlap as the status when nothing is truncated', () => {
+    const cv = assessVoiceoverCoverage({
+      referenceDurationSec: 20,
+      offsetSec: 0,
+      audioDurationSec: 19,
+      voicedStartSec: 0,
+      voicedEndSec: 19,
+      voicedSpans: [
+        { startSec: 0, endSec: 9.5 },
+        { startSec: 9, endSec: 19 },
+      ],
+    });
+    expect(cv.status).toBe('overlapped');
+    expect(cv.overlapCount).toBe(1);
+  });
+
+  it('does not call natural phrasing gaps dead air', () => {
+    // Densely-timed lines with sub-threshold pauses must stay 'ok' — flagging
+    // every breath would make the gapped status meaningless.
+    const cv = assessVoiceoverCoverage({
+      referenceDurationSec: 20,
+      offsetSec: 0,
+      audioDurationSec: 19.5,
+      voicedStartSec: 0,
+      voicedEndSec: 19.2,
+      voicedSpans: [
+        { startSec: 0, endSec: 4.8 }, { startSec: 5.6, endSec: 9.9 },
+        { startSec: 10.9, endSec: 14.7 }, { startSec: 16.2, endSec: 19.2 },
+      ],
+    });
+    expect(cv.status).toBe('ok');
+    expect(cv.maxInteriorGapSec).toBeLessThanOrEqual(1.5);
+    expect(cv.voicedRatio).toBeGreaterThan(0.75);
+    expect(cv.warnings).toHaveLength(0);
+  });
+
+  it('keeps the legacy no-spans call shape working for single-file callers', () => {
+    // trim_silence-style callers pass no spans; the report degrades to the
+    // head/tail view without inventing interior data.
+    const cv = assessVoiceoverCoverage({
+      referenceDurationSec: 23.9, offsetSec: 0, audioDurationSec: 16.25,
+      voicedStartSec: 0, voicedEndSec: 16.25,
+    });
+    expect(cv.status).toBe('under');
+    expect(cv.interiorGaps).toEqual([]);
+    expect(cv.maxInteriorGapSec).toBe(0);
+    expect(cv.voicedRatio).toBeCloseTo(0.68, 2);
+  });
 });
 
 describe('mapWithConcurrencyLimit', () => {

@@ -100,12 +100,26 @@ describe('local_agents/backends/opencode › extractOpencodeUsage', () => {
 
 describe('local_agents/backends/opencode › trusted local permissions', () => {
   it('runs OpenCode with non-interactive permission auto-approval', () => {
-    expect(buildOpencodeArgs({ prompt: 'hi' })).toEqual([
+    const args = buildOpencodeArgs({ prompt: 'hi' });
+    expect(args).not.toContain('--model');
+    expect(args).toEqual([
       'run',
       '--format',
       'json',
       '--dangerously-skip-permissions',
       'hi',
+    ]);
+  });
+
+  it('maps per-Agent model and thinking overrides to model and variant flags', () => {
+    const args = buildOpencodeArgs({
+      prompt: 'hi',
+      modelOverride: 'openai/gpt-5.4',
+      thinkingLevel: 'high',
+    });
+    expect(args).toEqual([
+      'run', '--format', 'json', '--dangerously-skip-permissions',
+      '--model', 'openai/gpt-5.4', '--variant', 'high', 'hi',
     ]);
   });
 });

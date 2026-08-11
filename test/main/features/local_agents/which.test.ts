@@ -98,14 +98,24 @@ describe('local_agents/which › whichBin', () => {
       expect((await whichBin('fallback'))?.toLowerCase()).toBe(binPath.toLowerCase());
     });
 
-    it('prefers an exact bare Windows command before PATHEXT variants', async () => {
+    it('prefers a PATHEXT command over a sibling bare POSIX shim', async () => {
       const bare = path.join(tmpDir, 'tool');
+      const cmd = path.join(tmpDir, 'tool.CMD');
       fs.writeFileSync(bare, 'bare');
-      fs.writeFileSync(path.join(tmpDir, 'tool.CMD'), '@echo cmd\r\n');
+      fs.writeFileSync(cmd, '@echo cmd\r\n');
       process.env.PATH = tmpDir;
       process.env.PATHEXT = '.CMD';
 
-      expect((await whichBin('tool'))?.toLowerCase()).toBe(bare.toLowerCase());
+      expect((await whichBin('tool'))?.toLowerCase()).toBe(cmd.toLowerCase());
+    });
+
+    it('falls back to an exact bare Windows command when no PATHEXT variant exists', async () => {
+      const bare = path.join(tmpDir, 'bare-tool');
+      fs.writeFileSync(bare, 'bare');
+      process.env.PATH = tmpDir;
+      process.env.PATHEXT = '.EXE;.CMD';
+
+      expect((await whichBin('bare-tool'))?.toLowerCase()).toBe(bare.toLowerCase());
     });
 
     it('accepts forward-slash explicit paths on Windows', async () => {

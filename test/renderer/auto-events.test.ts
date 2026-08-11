@@ -87,7 +87,7 @@ describe('automation event subscription', () => {
     vi.useRealTimers();
   });
 
-  it('refreshes user-visible state and reports success only for the active account', async () => {
+  it('refreshes user-visible state only for the active account', async () => {
     const harness = createHarness();
     harness.window.startAutoEventsSubscription();
     expect(harness.stream).toHaveBeenCalledWith(
@@ -99,6 +99,7 @@ describe('automation event subscription', () => {
     harness.streamRecords[0].callback({
       event: {
         type: 'conv_created',
+        source: 'scheduled',
         user_id: 'account-b',
         task_id: 'foreign-task',
         cid: 'foreign-conversation',
@@ -107,6 +108,7 @@ describe('automation event subscription', () => {
     harness.streamRecords[0].callback({
       event: {
         type: 'conv_created',
+        source: 'scheduled',
         task_id: 'missing-owner',
         cid: 'missing-owner-conversation',
       },
@@ -117,6 +119,7 @@ describe('automation event subscription', () => {
     harness.streamRecords[0].callback({
       event: {
         type: 'conv_created',
+        source: 'scheduled',
         user_id: 'account-a',
         task_id: 'task-a',
         cid: 'conversation-a',
@@ -127,20 +130,16 @@ describe('automation event subscription', () => {
 
     expect(harness.loadConversations).toHaveBeenCalledTimes(1);
     expect(harness.loadAutoList).toHaveBeenCalledWith(true);
-    expect(harness.monitorEvent).toHaveBeenCalledWith('auto_task_fire_result', {
-      result: 'success',
-      task_id: 'task-a',
-      conversation_id: 'conversation-a',
-      duration_ms: 42,
-    });
+    expect(harness.monitorEvent).not.toHaveBeenCalled();
   });
 
-  it('bounds failure telemetry and never forwards an arbitrary runtime error string', () => {
+  it('never reports telemetry from the best-effort UI stream', () => {
     const harness = createHarness();
     harness.window.startAutoEventsSubscription();
     harness.streamRecords[0].callback({
       event: {
         type: 'fire_failed',
+        source: 'manual',
         user_id: 'account-a',
         task_id: 't'.repeat(200),
         cid: 'c'.repeat(200),
@@ -149,20 +148,9 @@ describe('automation event subscription', () => {
       },
     });
 
-    expect(harness.monitorEvent).toHaveBeenCalledWith('auto_task_fire_result', {
-      result: 'failure',
-      task_id: 't'.repeat(128),
-      conversation_id: 'c'.repeat(128),
-      duration_ms: 0,
-      error_code: 'unknown',
-    });
-    expect(harness.monitorError).toHaveBeenCalledWith('auto_task_fire', {
-      task_id: 't'.repeat(128),
-      conversation_id: 'c'.repeat(128),
-      error_type: 'runtime',
-      error_code: 'unknown',
-      error_message: 'unknown',
-    });
+    expect(harness.loadAutoList).toHaveBeenCalledWith(true);
+    expect(harness.monitorEvent).not.toHaveBeenCalled();
+    expect(harness.monitorError).not.toHaveBeenCalled();
   });
 
   it('reconnects after an unexpected stream end without opening duplicates', async () => {

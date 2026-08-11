@@ -64,6 +64,7 @@ The preview must still be a good UIDesigner artifact:
 - Include source/provenance cues only where they help trust; do not clutter the main workflow.
 - Separate UI actions from data refresh actions.
 - Implement visible, reachable stale, partial, loading, failed-refresh, empty, and last-updated states in DOM/rendering logic; a prose inventory is not sufficient. Keep those canonical state names directly inspectable in the HTML/JS (for example `data-live-state="loading|empty|failed-refresh|stale|partial"` and `<time data-field="lastUpdated">`) even when the visible labels are localized.
+- Run the existing `ui-design-executor validate-html-artifact` command with `--expect live-ready`. If it reports a missing canonical state, make one focused repair and rerun once; do not add an approval question or an open-ended QA loop.
 - Use `ui-design-executor` for baseline visual quality. Add a contract, reference, system, or deep renderer skill only when its specialist trigger is present.
 
 ## Connector Boundaries

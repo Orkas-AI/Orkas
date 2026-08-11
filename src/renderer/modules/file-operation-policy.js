@@ -20,7 +20,7 @@
   const officeExts = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
   const libraryExts = new Set([...textExts, ...imageExts, ...officeExts, '.pdf']);
   const chatExts = new Set([
-    ...chatTextExts, ...imageExts, ...videoExts, ...audioExts, ...officeExts, '.pdf',
+    ...chatTextExts, ...imageExts, ...videoExts, ...audioExts, ...officeExts, '.pdf', '.zip',
   ]);
 
   function extensionOf(name) {
@@ -38,11 +38,7 @@
     return libraryExts.has(ext) || (options.projectScoped === true && videoExts.has(ext));
   }
 
-  function canShare(name) {
-    return textExts.has(extensionOf(name));
-  }
-
-  const policy = Object.freeze({ extensionOf, canAddToChat, canAddToLibrary, canShare });
+  const policy = Object.freeze({ extensionOf, canAddToChat, canAddToLibrary });
   if (root) root.FileOperationPolicy = policy;
   if (typeof module !== 'undefined' && module.exports) module.exports = policy;
 })(typeof window !== 'undefined' ? window : null);

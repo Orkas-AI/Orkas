@@ -26,7 +26,7 @@
         </span>
       </button>
       <div class="sidebar-actions">
-        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">Commander</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
+        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New Task</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
         <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
         <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
         <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
@@ -37,7 +37,12 @@
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-projects-section">
           <div class="sidebar-section-title-row">
-            <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+            <button class="sidebar-section-toggle" id="projects-section-toggle" type="button"
+                    aria-controls="projects-list" aria-expanded="true">
+              <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
+              <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+              <span class="task-unread-dot" id="projects-unread-dot" hidden aria-hidden="true"></span>
+            </button>
             <button class="sidebar-section-add" id="projects-add-btn"
                     data-i18n-title="sidebar.project_create_title"
                     data-i18n-aria-label="sidebar.project_create_title"
@@ -46,17 +51,35 @@
           <div class="projects-list" id="projects-list"></div>
         </div>
         <div class="sidebar-section sidebar-conversations-section">
-          <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
+          <div class="sidebar-section-title-row">
+            <button class="sidebar-section-toggle" id="tasks-section-toggle" type="button"
+                    aria-controls="conversation-list" aria-expanded="true">
+              <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
+              <span class="sidebar-section-title" data-i18n="sidebar.conversations">Tasks</span>
+              <span class="task-unread-dot" id="tasks-unread-dot" hidden aria-hidden="true"></span>
+              <span class="sidebar-btn-running-chip" id="tasks-running-chip" hidden></span>
+            </button>
+          </div>
           <div class="conversation-list" id="conversation-list">
             <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
           </div>
         </div>
       </div>
       <div class="sidebar-footer-actions">
-        <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
-          <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
-          <span data-i18n="sidebar.settings">Settings</span>
+        <button type="button" class="sb-connect" id="new-chat-external-agent-btn">
+          <span class="sb-connect-ic"><span data-ui-icon="terminal" data-ui-icon-class="sb-connect-icon"></span></span>
+          <span class="sb-connect-tx">
+            <b data-i18n="sidebar.connect_agent">Connect agents</b>
+            <small data-i18n="sidebar.connect_agent_sub">Claude Code · Codex &amp; more</small>
+          </span>
+          <span data-ui-icon="plus" data-ui-icon-class="sb-connect-plus"></span>
         </button>
+        <div class="sidebar-footer-action-row">
+          <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
+            <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
+            <span class="sidebar-footer-label" data-i18n="sidebar.settings">Settings</span>
+          </button>
+        </div>
       </div>
       <div class="sidebar-resize-handle" id="sidebar-resize-handle"
            role="separator" aria-orientation="vertical" tabindex="0"
@@ -73,14 +96,6 @@
            The heading is filled in by JS lifecycle hooks; see
            _refreshEmptyStateHeading. -->
       <section class="panel active" id="panel-new-chat">
-        <button type="button" class="new-chat-external-agent-btn" id="new-chat-external-agent-btn"
-                data-i18n-aria-label="new_chat.external_agent_entry" aria-label="Connect Codex, Claude Code &amp; other AI tools">
-          <span data-ui-icon="terminal" data-ui-icon-class="new-chat-external-agent-icon"></span>
-          <span class="new-chat-external-agent-label">
-            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other AI tools</span>
-            <span data-ui-icon="arrow-right" data-ui-icon-class="new-chat-external-agent-arrow"></span>
-          </span>
-        </button>
         <div class="new-chat-center">
           <div class="new-chat-header">
             <h1 class="new-chat-greeting" id="new-chat-greeting" data-i18n="new_chat.title_fallback">Friend, what do you want to accomplish?</h1>
@@ -102,7 +117,7 @@
                    [skill] | spacer | [send]. The open-source build strips
                    voice input, so send owns the right spacer. -->
               <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                 <span class="chat-composer-divider" aria-hidden="true"></span>
                 <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
@@ -131,31 +146,14 @@
             <div class="quick-panel-head">
               <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
               <span class="quick-panel-rule" aria-hidden="true"></span>
+              <!-- Opens the marketplace Open Source list (wired by modules/oss.js). -->
+              <button type="button" class="quick-panel-more" id="quick-panel-oss-more">
+                <span data-i18n="new_chat.quick.oss_more">Add more open-source tool capabilities</span>
+                <span data-ui-icon="chevron-right" data-ui-icon-class="quick-panel-more-arrow" aria-hidden="true"></span>
+              </button>
             </div>
             <div class="quick-grid" id="new-chat-scenario-grid"></div>
           </section>
-          <!-- Open-source-driven optional extension rail. Tool cards are
-               rendered + wired by modules/oss.js::initOssEntry() (data from the
-               curated marketplace projects catalog). The home subset excludes
-               capabilities already covered by Quick start agents. Cards show project name,
-               category and the distinct extension it adds; repo/star/driver detail lives in the marketplace
-               「开源项目」专区. -->
-          <div class="oss-entry" id="oss-entry" style="display:none">
-            <div class="oss-entry-head">
-              <span class="oss-entry-title" data-i18n="oss.title">Open-source tools</span>
-              <span class="oss-entry-sub">
-                <span data-i18n="oss.subtitle">Extend Commander’s capabilities</span>
-                <span class="oss-entry-sub-divider" aria-hidden="true">·</span>
-                <span data-i18n="oss.optional">Install as needed</span>
-              </span>
-              <span class="oss-entry-rule" aria-hidden="true"></span>
-              <button type="button" class="oss-entry-more" id="oss-entry-more">
-                <span data-i18n="oss.more">More</span>
-                <span data-ui-icon="chevron-right" data-ui-icon-class="oss-entry-more-arrow" aria-hidden="true"></span>
-              </button>
-            </div>
-            <div class="oss-entry-grid" id="oss-entry-grid"></div>
-          </div>
         </div>
       </section>
 
@@ -180,6 +178,12 @@
                 <button type="button" class="chat-header-menu-btn" id="chat-header-menu-btn"
                         title="More actions" aria-label="More actions">
                   <span data-ui-icon="more-horizontal" data-ui-icon-class="chat-header-menu-icon"></span>
+                </button>
+                <button type="button" class="chat-header-details-btn" id="video-review-toggle" hidden
+                        data-i18n-title="video_review.toggle_title"
+                        data-i18n-aria-label="video_review.toggle_title"
+                        title="Video review" aria-label="Video review" aria-expanded="false">
+                  <span data-ui-icon="film" data-ui-icon-class="chat-header-details-icon"></span>
                 </button>
                 <button type="button" class="chat-header-details-btn" id="conversation-info-toggle"
                         data-i18n-title="conversation_info.toggle_title"
@@ -214,11 +218,20 @@
             <div id="chat-history" class="chat-history">
               <div class="empty" data-i18n="chat.empty">No messages yet...</div>
             </div>
+            <nav id="chat-turn-nav" class="chat-turn-nav"
+                 data-i18n-aria-label="chat.turn_nav_label"
+                 aria-label="Conversation turns" hidden>
+              <div id="chat-turn-nav-markers" class="chat-turn-nav-markers"></div>
+              <div id="chat-turn-nav-preview" class="chat-turn-nav-preview" role="tooltip" hidden>
+                <div id="chat-turn-nav-preview-title" class="chat-turn-nav-preview-title"></div>
+                <div id="chat-turn-nav-preview-body" class="chat-turn-nav-preview-body"></div>
+              </div>
+            </nav>
             <div class="chat-input-wrapper">
               <div class="chat-queue" id="chat-queue" style="display:none">
                 <div class="chat-queue-header">
                   <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
-                  <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
+                  <span class="chat-queue-hint" data-i18n="chat.queue_hint_send_now">Drag to reorder · Send now · Edit · Delete</span>
                 </div>
                 <div class="chat-queue-list" id="chat-queue-list"></div>
               </div>
@@ -237,7 +250,7 @@
                      P11: [+] | divider | [To] | [workspace - JS-injected] |
                      [skill] | spacer | [send].                      by `chat-send-btn { margin-left: auto }`. -->
                 <div class="chat-bottom-bar">
-                  <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                  <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                   <span class="chat-composer-divider" aria-hidden="true"></span>
                   <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                     <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
@@ -249,8 +262,14 @@
                     <span class="chip-label"></span>
                     <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                   </div>
+                  <button type="button" class="chat-queue-edit-delete-btn" id="chat-queue-edit-delete-btn"
+                          data-i18n-title="chat.queue_delete_editing" data-i18n-aria-label="chat.queue_delete_editing"
+                          title="Delete queued message" aria-label="Delete queued message" hidden>
+                    <span data-ui-icon="trash" data-ui-icon-class="queue-delete-icon"></span>
+                  </button>
                   <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                     <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                    <span data-ui-icon="check" data-ui-icon-class="queue-save-icon"></span>
                     <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
                   </button>
                 </div>
@@ -304,6 +323,24 @@
                       title="Close" aria-label="Close">×</button>
             </div>
             <div class="chat-md-drawer-body markdown-body" id="chat-md-drawer-body"></div>
+          </aside>
+          <!-- Host-owned VideoStudio review panel (P2): renders scenes,
+               preview evidence, and narration audition for the CURRENT
+               production straight from production state. Read-only; its
+               action buttons only prefill the composer.
+               See modules/video-review-panel.js. -->
+          <aside class="chat-md-drawer-panel video-review-panel" id="video-review-panel" hidden>
+            <div class="chat-md-drawer-header">
+              <div class="chat-md-drawer-title" data-i18n="video_review.title">Video production</div>
+              <div class="chat-md-drawer-actions detail-actions">
+                <button type="button" class="btn btn-sm" id="video-review-panel-refresh"
+                        data-i18n="video_review.refresh">Refresh</button>
+              </div>
+              <button type="button" class="chat-md-drawer-close" id="video-review-panel-close"
+                      data-i18n-title="common.close" data-i18n-aria-label="common.close"
+                      title="Close" aria-label="Close">×</button>
+            </div>
+            <div class="chat-md-drawer-body" id="video-review-panel-body"></div>
           </aside>
         </div>
       </section>
@@ -404,7 +441,7 @@
             </div>
             <div class="skills-chat-input-area">
               <div class="chat-attachments edit-chat-attachments" id="skills-chat-attachments" style="display:none"></div>
-              <button type="button" class="chat-attach-btn edit-chat-attach-btn" id="skills-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+              <button type="button" class="chat-attach-btn edit-chat-attach-btn" id="skills-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
               <textarea id="skills-chat-input" data-i18n-placeholder="skills.chat_input_placeholder" placeholder="Describe what to change..." rows="1"></textarea>
               <button id="skills-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                 <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
@@ -462,10 +499,6 @@
               </div>
               <div class="agents-detail-body">
                 <div class="agents-detail-hero">
-                  <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
-                    <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
-                    <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
-                  </div>
                   <div class="agents-detail-section agents-detail-intro-section" id="agents-detail-intro-section">
                     <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
                     <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
@@ -473,6 +506,18 @@
                   <div class="agents-detail-section agents-detail-stats-section" id="agents-detail-stats-section" style="display:none">
                     <div class="agents-detail-label" data-i18n="agents.label_runtime_stats">Runtime data</div>
                     <div class="agents-detail-stats" id="agents-detail-stats"></div>
+                  </div>
+                  <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
+                    <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
+                    <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
+                  </div>
+                  <div class="agents-detail-section" id="agents-detail-cli-settings-section" style="display:none">
+                    <div class="agents-detail-label" data-i18n="agents.label_cli_settings">Model selection</div>
+                    <div class="agents-detail-cli-settings" id="agents-detail-cli-settings"></div>
+                  </div>
+                  <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
+                    <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
+                    <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
                   </div>
                 </div>
                 <div class="agents-detail-section" id="agents-detail-memory-section" style="display:none">
@@ -484,10 +529,6 @@
                   <div class="agents-detail-label" data-i18n="agents.label_knowhow">Know-how</div>
                   <p class="agents-detail-section-desc" data-i18n="agents.knowhow_desc">Task areas this agent is better at.</p>
                   <div class="agents-detail-list" id="agents-detail-knowhow"></div>
-                </div>
-                <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
-                  <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
-                  <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
                 </div>
                 <div class="agents-detail-section" id="agents-detail-output-standards-section" style="display:none">
                   <div class="agents-detail-label" data-i18n="agents.label_delivery_standards">Delivery standards</div>
@@ -529,7 +570,7 @@
             </div>
             <div class="agents-chat-input-area">
               <div class="chat-attachments edit-chat-attachments" id="agents-chat-attachments" style="display:none"></div>
-              <button type="button" class="chat-attach-btn edit-chat-attach-btn" id="agents-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+              <button type="button" class="chat-attach-btn edit-chat-attach-btn" id="agents-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
               <textarea id="agents-chat-input" data-i18n-placeholder="agents.chat_input_placeholder" placeholder="Describe what to adjust..." rows="1"></textarea>
               <button id="agents-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                 <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
@@ -611,7 +652,7 @@
                   <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
                   <!-- Bottom bar: attach | divider | recipient | workspace (JS-injected) | skill | spacer | mic | send. -->
                   <div class="chat-bottom-bar">
-                    <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="project.files.add" title="Add file">+</button>
+                    <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
                     <span class="chat-composer-divider" aria-hidden="true"></span>
                     <button type="button" class="chat-recipient-chip" id="project-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                       <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
@@ -999,7 +1040,7 @@
               <div class="settings-group">
                 <div class="settings-group-head">
                   <div class="settings-group-title" data-i18n="settings.task_notifications.title">任务通知</div>
-                  <div class="settings-group-sub" data-i18n="settings.task_notifications.sub">当 Orkas 不在前台时，在任务完成、失败或需要输入时发送系统通知。</div>
+                  <div class="settings-group-sub" data-i18n="settings.task_notifications.sub">当 Orkas 不在前台时，在任务完成、失败或需要你操作时发送系统通知。</div>
                 </div>
                 <div class="settings-row">
                   <label class="settings-toggle">
@@ -1008,15 +1049,15 @@
                   </label>
                 </div>
                 <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
-                  <span class="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
+                  <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
                   <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
                 </div>
               </div>
 
               <div class="settings-group">
                 <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.localexec.title">Tool Execution Access</div>
-                  <div class="settings-group-sub" data-i18n="settings.localexec.sub">Controls whether agents can run terminal commands, create or edit workspace files, and generate PDFs, images, and interactive apps. Read-only tools are always available.</div>
+                  <div class="settings-group-title" data-i18n="settings.localexec.title">Local operation permissions</div>
+                  <div class="settings-group-sub" data-i18n="settings.localexec.sub">Control which files agents can access and whether they must ask before running sensitive commands, deleting files, accessing sensitive folders, or performing administrator-level actions.</div>
                 </div>
                 <div class="settings-row settings-mode-list" id="settings-localexec-modes">
                   <label class="settings-mode-opt">
@@ -1045,8 +1086,8 @@
 
               <div class="settings-group">
                 <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
-                  <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time.</div>
+                  <div class="settings-group-title" data-i18n="settings.metacognition.title">Automatic agent review</div>
+                  <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When enabled, agents periodically review recent performance, learn from it, and adjust how they work. Disable it to stop automatic reviews.</div>
                 </div>
                 <div class="settings-row">
                   <label class="settings-toggle">
@@ -1060,12 +1101,12 @@
 
             <!-- ───────────────────────── 配置 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="credentials" hidden>
-              <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
+              <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and authorization data are stored only on this device — never synced or sent elsewhere.</div>
 
               <div class="settings-group settings-model-auth-group">
                 <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
-                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Choose a listed model or enter a custom endpoint, then add authorization.</div>
+                  <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model account</div>
+                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Choose a model or enter a custom endpoint, then sign in or add an API key.</div>
                 </div>
                 <div class="settings-row">
                   <label data-i18n="settings.provider">Provider</label>
@@ -1094,7 +1135,7 @@
               <div class="settings-group">
                 <div class="settings-group-head">
                   <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
-                  <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
+                  <div class="settings-group-sub" data-i18n="settings.search.sub">Search uses these in order: configured search services, the model's built-in search, then free local search.</div>
                 </div>
                 <div class="settings-row">
                   <label data-i18n="settings.search.provider">Provider</label>
@@ -1182,7 +1223,7 @@
                   <input type="text" class="form-input" id="settings-tts-model-input" autocomplete="off" spellcheck="false" />
                 </div>
                 <div class="settings-row tts-row-doubao-res" hidden>
-                  <label><span data-i18n="settings.tts.doubao_resource">Resource ID</span> <span class="form-hint" data-i18n="settings.tts.doubao_resource_hint">Auto-detected from the voice; set only to override.</span></label>
+                  <label><span data-i18n="settings.tts.doubao_resource">Voice resource ID</span> <span class="form-hint" data-i18n="settings.tts.doubao_resource_hint">Filled in automatically when you select a voice. You can also edit it manually.</span></label>
                   <input type="text" class="form-input" id="settings-tts-doubao-resource" placeholder="auto (seed-tts-2.0 / 1.0 / icl-2.0)" autocomplete="off" spellcheck="false" />
                 </div>
                 <div class="settings-row">
@@ -1321,7 +1362,7 @@
       <!-- Dir import panel: name/summary are produced by the model during the import chat -->
       <div class="skill-modal-panel" data-skill-panel="dir">
         <div class="form-row">
-          <label><span data-i18n="skill_modal.dir">Source folder</span><span class="form-hint" data-i18n="skill_modal.dir_hint">Max 200 files / 10M total</span></label>
+          <label><span data-i18n="skill_modal.dir">Folder to import</span><span class="form-hint" data-i18n="skill_modal.dir_hint">Up to 200 files, 10 MB total</span></label>
           <div class="skill-dir-pick-row">
             <button type="button" class="btn btn-sm" id="skill-dir-pick-btn" onclick="pickSkillImportDir()" data-i18n="skill_modal.dir_pick_btn">Pick folder</button>
             <span class="skill-dir-selected" id="skill-dir-selected" data-i18n="skill_modal.dir_none">(not picked)</span>
@@ -1344,6 +1385,7 @@
       <button type="button" class="skill-picker-tab active" data-agent-picker-tab="agents" data-i18n="agent_picker.tab_agents">Agents</button>
       <button type="button" class="skill-picker-tab" data-agent-picker-tab="skills" data-i18n="agent_picker.tab_skills">Skills</button>
       <button type="button" class="skill-picker-tab" data-agent-picker-tab="connectors" data-i18n="agent_picker.tab_connectors">Connectors</button>
+      <button type="button" class="skill-picker-tab" data-agent-picker-tab="library" data-i18n="agent_picker.tab_library">Library</button>
     </div>
     <div class="skill-picker-header">
       <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="Search agents..." autocomplete="off" />
@@ -1399,7 +1441,7 @@
                       data-i18n-placeholder="auto.content_placeholder"
                       placeholder="Type @ to choose agents, skills, connectors, Library files."></textarea>
             <div class="chat-bottom-bar">
-              <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+              <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (documents, spreadsheets, presentations, archives, images, audio, and video)">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
               <button type="button" class="chat-recipient-chip" id="auto-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                 <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
@@ -1448,7 +1490,7 @@
         </div>
 
         <div class="form-row" id="auto-row-run-device" hidden>
-          <label data-i18n="auto.run_label">Run</label>
+          <label data-i18n="auto.run_label">Run on</label>
           <div id="auto-run-device-select"></div>
         </div>
 
@@ -1558,6 +1600,7 @@
   -->
   <script src="./modules/logger.js"></script>
   <script src="./modules/state.js"></script>
+  <script src="./modules/task-unread.js"></script>
   <script src="./modules/dialogs.js"></script>
   <script src="./modules/ipc-shim.js"></script>
   <script src="./modules/lazy-features.js"></script>
@@ -1580,11 +1623,13 @@
   <script src="./modules/text-view-edit.js"></script>
   <script src="./modules/context-menu.js"></script>
   <script src="./modules/chat-md-drawer.js"></script>
+  <script src="./modules/video-review-panel.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/name-limit.js"></script>
   <script src="./modules/projects.js"></script>
   <script src="./modules/conv-bucket.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/conversation-turn-nav.js"></script>
   <script src="./modules/artifact-security.js"></script>
   <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>

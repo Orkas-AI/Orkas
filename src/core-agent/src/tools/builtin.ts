@@ -289,13 +289,15 @@ export const bashTool: AgentTool = defineTool({
       stopHeartbeat();
     }
 
-    const status = result.timedOut
-      ? "timed_out" as const
-      : result.outputLimitExceeded
-        ? "output_limit" as const
-        : result.exitCode === 0
-          ? "succeeded" as const
-          : "failed" as const;
+    const status = result.startFailed
+      ? "start_failed" as const
+      : result.timedOut
+        ? "timed_out" as const
+        : result.outputLimitExceeded
+          ? "output_limit" as const
+          : result.exitCode === 0
+            ? "succeeded" as const
+            : "failed" as const;
     const streamedOutput = await aggregateCommandStreams(result);
     return {
       content: renderCommandResult(result, status),
@@ -326,7 +328,7 @@ type CommandCapture = Awaited<ReturnType<SandboxExecutor["execute"]>>;
 
 function renderCommandResult(
   result: CommandCapture,
-  status: "succeeded" | "failed" | "timed_out" | "output_limit",
+  status: "succeeded" | "failed" | "timed_out" | "output_limit" | "start_failed",
 ): string {
   const header =
     `<command-result status="${status}" exit_code="${result.exitCode ?? "null"}" `

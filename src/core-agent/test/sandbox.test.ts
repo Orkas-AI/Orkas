@@ -53,7 +53,49 @@ describe("SandboxExecutor", () => {
     const result = await sandbox.execute("echo hello");
     expect(result.stdout.trim()).toBe("hello");
     expect(result.exitCode).toBe(0);
+    expect(result.startFailed).toBe(false);
     expect(result.timedOut).toBe(false);
+  });
+
+  it("contains synchronous shell start failures as a non-executed command result", async () => {
+    const sandbox = new SandboxExecutor({
+      workingDir: os.tmpdir(),
+      shell: "invalid\0shell",
+    });
+
+    const result = await sandbox.execute("echo must-not-run");
+
+    expect(result).toMatchObject({
+      stdout: "",
+      exitCode: null,
+      startFailed: true,
+      timedOut: false,
+      outputLimitExceeded: false,
+      stdoutBytes: 0,
+    });
+    expect(result.stderr).toContain("Failed to start shell process");
+    expect(result.stderrBytes).toBe(Buffer.byteLength(result.stderr));
+  });
+
+  it("contains asynchronous shell start failures without exposing the shell path", async () => {
+    const missingShell = path.join(os.tmpdir(), `missing-shell-${process.pid}-${Date.now()}`);
+    const sandbox = new SandboxExecutor({
+      workingDir: os.tmpdir(),
+      shell: missingShell,
+    });
+
+    const result = await sandbox.execute("echo must-not-run");
+
+    expect(result).toMatchObject({
+      stdout: "",
+      exitCode: null,
+      startFailed: true,
+      timedOut: false,
+      outputLimitExceeded: false,
+    });
+    expect(result.stderr).toContain("Failed to start shell process (ENOENT)");
+    expect(result.stderr).toContain("The command was not executed");
+    expect(result.stderr).not.toContain(missingShell);
   });
 
   it("captures stderr", async () => {

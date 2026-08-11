@@ -29,6 +29,7 @@ import { conversationLayout, listProjectIds } from '../../util/project-layout';
 import {
   genId12, nowIso, readJson, writeJson, safeId,
 } from '../../storage';
+import { clearConversationHistorySummary } from './history-summary-cache';
 import { createLogger } from '../../logger';
 
 const log = createLogger('group_chat.state');
@@ -906,6 +907,7 @@ export async function purgeGroupDir(uid: string, cid: string): Promise<void> {
       log.warn(`purge group dir failed user=${uid} cid=${cid}: ${(err as Error).message}`);
     }
   }
+  await clearConversationHistorySummary(uid, cid);
   await untrackRunningConversation(uid, cid);
   // Suppress unused import lint when the function body is the only path consumer.
   void path;

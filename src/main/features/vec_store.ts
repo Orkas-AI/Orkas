@@ -153,17 +153,17 @@ function handleFor(dbDir: string): Handle {
   fs.mkdirSync(dbDir, { recursive: true });
 
   const db = new Database(dbPath);
-  db.pragma('journal_mode = DELETE');
-  db.pragma('synchronous = NORMAL');
-  db.pragma('foreign_keys = ON');
-
-  try { loadSqliteVec(db); }
-  catch (err) {
-    db.close();
-    throw new Error(`sqlite-vec load failed: ${(err as Error).message}`);
-  }
-
   try {
+    // Opening a corrupt database can succeed while the first pragma fails.
+    // Keep every initialization step inside the same close-on-failure boundary
+    // so Windows never retains a locked, uncached handle.
+    db.pragma('journal_mode = DELETE');
+    db.pragma('synchronous = NORMAL');
+    db.pragma('foreign_keys = ON');
+    try { loadSqliteVec(db); }
+    catch (err) {
+      throw new Error(`sqlite-vec load failed: ${(err as Error).message}`);
+    }
     ensureSchema(db, dbPath);
     ensureConfig(dbDir);
   } catch (err) {

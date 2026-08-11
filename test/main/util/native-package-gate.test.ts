@@ -102,6 +102,23 @@ describe('native-package-gate', () => {
       .toThrow(/expected exactly one onnxruntime-core/);
   });
 
+  it.each([
+    [
+      'tokenizers binding',
+      '@anush008/tokenizers/node_modules/@anush008/tokenizers-win32-x64-msvc/tokenizers.win32-x64-msvc.node',
+      /expected exactly one tokenizers/,
+    ],
+    [
+      'ONNX Runtime binding',
+      'fastembed/node_modules/onnxruntime-node/bin/napi-v3/win32/x64/onnxruntime_binding.node',
+      /expected exactly one onnxruntime-binding/,
+    ],
+  ])('fails when the Windows %s is missing', (_label, relativePath, expected) => {
+    const root = windowsFixture();
+    fs.rmSync(path.join(root, ...relativePath.split('/')));
+    expect(() => verifyNativePackagePayload(root, 'win32', 'x64')).toThrow(expected);
+  });
+
   it('rejects unused or newly introduced native payloads until registered', () => {
     const root = windowsFixture();
     writePe(

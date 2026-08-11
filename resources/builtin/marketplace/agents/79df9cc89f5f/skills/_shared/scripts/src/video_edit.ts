@@ -19,6 +19,7 @@
  */
 
 import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -72,6 +73,12 @@ const SILENCE_MIN_SEC = 0.5;
 const COVERAGE_TRAILING_GAP_SEC = 2.0; // silent tail after the narration ends
 const COVERAGE_OVERSHOOT_SEC = 0.3;    // narration longer than the clip (gets cut)
 const COVERAGE_LEAD_GAP_SEC = 3.0;     // long silent lead-in before narration starts
+/** An interior hole this long between narration lines reads as dead air on a
+ *  voiceover with no music bed — the 2026-08-05 draft had seven of them (up to
+ *  6.9 s, 29.7 s of a 60 s cut silent) while coverage still reported 95%,
+ *  because the old ratio only measured how FAR the narration reached. */
+const COVERAGE_INTERIOR_GAP_SEC = 2.5;
+const COVERAGE_MAX_REPORTED_GAPS = 12;
 const MIX_COVERAGE_CONCURRENCY = 4;
 const MIN_TRIM_OUTPUT_SEC = 0.1;
 const RUN_PROGRESS_HEARTBEAT_MS = 15_000;
@@ -111,7 +118,20 @@ export interface CoverageReport {
   trailingGapSec: number;  // silence after the narration ends
   overshootSec: number;    // narration length beyond the clip (>0 ⇒ truncated)
   coverageRatio: number;   // how far into the clip the narration reaches (0..1)
-  status: 'ok' | 'under' | 'over' | 'silent';
+  /** Share of the clip that actually carries voice (0..1). `coverageRatio`
+   *  says the narration ENDS near the end; this says how much of the middle
+   *  is dead air. The two disagreeing is exactly the shipped defect. */
+  voicedRatio: number;
+  /** Interior silent holes between voiced spans (clip timeline, ≥0.5 s),
+   *  largest first, capped at COVERAGE_MAX_REPORTED_GAPS. */
+  interiorGaps: Array<{ startSec: number; endSec: number; durationSec: number }>;
+  maxInteriorGapSec: number;
+  /** Seconds two lines speak at once, and how many line pairs collide. A
+   *  line whose audio runs past the next line's start mixes as double
+   *  narration — the 2026-08-06 delivery carried up to 1.48 s of it. */
+  maxOverlapSec: number;
+  overlapCount: number;
+  status: 'ok' | 'under' | 'over' | 'silent' | 'gapped' | 'overlapped';
   warnings: string[];
 }
 
@@ -166,19 +186,35 @@ export type EditResult =
   | { ok: false; errorCode: string; message: string };
 
 /** Parse the `[Parsed_ebur128_…] Summary:` block ffmpeg prints to stderr.
- *  `-inf` (silent source) maps to null. Returns null only when the integrated
- *  line is absent entirely (no measurable summary). */
+ *  `-inf` (silent source) maps to null. Returns null when no summary block is
+ *  present (no measurable result), which fails the caller closed rather than
+ *  reporting a number that is not a measurement.
+ *
+ *  Scoped to the summary on purpose. ebur128 also logs a running line every
+ *  100ms carrying `I:` and `LRA:`, and the first one always reads `I: -70.0
+ *  LUFS  LRA: 0.0 LU` because nothing has been integrated yet. Matching those
+ *  first made every measurement report -70 LUFS / 0 LU: the 2026-08-10 AUTO
+ *  delivery measured -13.8 LUFS and was reported as -70, i.e. silence. True
+ *  peak was right by accident — `Peak:` appears only in the summary. The old
+ *  fixtures held a bare summary with no running lines, so they could not see
+ *  it; the shapes below are real ffmpeg output. */
 export function parseEbur128Summary(stderr: string): LoudnessResult | null {
+  // ffmpeg prints one summary per ebur128 instance. The last one belongs to
+  // the measurement that just finished.
+  const summaryAt = stderr.toLowerCase().lastIndexOf('summary:');
+  if (summaryAt < 0) return null;
+  const summary = stderr.slice(summaryAt);
   const num = (re: RegExp): number | null => {
-    const m = stderr.match(re);
+    const m = summary.match(re);
     if (!m) return null;
     if (/inf/i.test(m[1])) return null; // -inf for a silent source
     const v = Number(m[1]);
     return Number.isFinite(v) ? v : null;
   };
-  // `I:` is unique to the integrated line; LRA/Peak likewise. The values can be
-  // negative or `-inf`. Order in the summary is Integrated → Range → True peak.
-  const hasIntegrated = /\bI:\s*(-?(?:inf|[\d.]+))\s*LUFS/i.test(stderr);
+  // Within the summary `I:` is unique to the integrated line; LRA/Peak
+  // likewise. Values can be negative or `-inf`. Order is Integrated → Range →
+  // True peak.
+  const hasIntegrated = /\bI:\s*(-?(?:inf|[\d.]+))\s*LUFS/i.test(summary);
   if (!hasIntegrated) return null;
   return {
     integratedLufs: num(/\bI:\s*(-?(?:inf|[\d.]+))\s*LUFS/i),
@@ -288,6 +324,11 @@ export function assessVoiceoverCoverage(input: {
   audioDurationSec: number;
   voicedStartSec: number;
   voicedEndSec: number;
+  /** Voiced spans on the clip timeline (already offset-shifted). When
+   *  provided, interior holes between them are measured; without them the
+   *  report can only see the head and tail, which is how a half-silent draft
+   *  once scored 95%. */
+  voicedSpans?: Array<{ startSec: number; endSec: number }>;
 }): CoverageReport {
   const ref = Math.max(0, input.referenceDurationSec);
   const offset = Math.max(0, input.offsetSec ?? 0);
@@ -298,6 +339,48 @@ export function assessVoiceoverCoverage(input: {
   const trailingGapSec = round2(ref - voicedEnd);
   const overshootSec = round2(offset + input.audioDurationSec - ref);
   const coverageRatio = ref > 0 ? round2(clamp(voicedEnd / ref, 0, 1)) : 0;
+  // Merge the spans and measure what sits between them. Only holes ≥0.5 s
+  // count — natural inter-phrase pauses are not dead air.
+  const spans = (input.voicedSpans ?? [])
+    .map((sp) => ({ startSec: Math.max(0, sp.startSec), endSec: Math.min(ref, sp.endSec) }))
+    .filter((sp) => sp.endSec - sp.startSec > 0.05)
+    .sort((a, z) => a.startSec - z.startSec);
+  const merged: Array<{ startSec: number; endSec: number }> = [];
+  for (const sp of spans) {
+    const last = merged[merged.length - 1];
+    if (last && sp.startSec <= last.endSec + 0.05) last.endSec = Math.max(last.endSec, sp.endSec);
+    else merged.push({ ...sp });
+  }
+  // Overlaps are measured on the RAW spans, before merging: merging is what
+  // hides a collision, and a collision is exactly what must be reported.
+  let maxOverlapSec = 0;
+  let overlapCount = 0;
+  for (let i = 1; i < spans.length; i += 1) {
+    const collide = spans[i - 1].endSec - spans[i].startSec;
+    if (collide > 0.05) {
+      overlapCount += 1;
+      maxOverlapSec = Math.max(maxOverlapSec, collide);
+    }
+  }
+  maxOverlapSec = round2(maxOverlapSec);
+  const interiorGaps: CoverageReport['interiorGaps'] = [];
+  for (let i = 1; i < merged.length; i += 1) {
+    const gap = merged[i].startSec - merged[i - 1].endSec;
+    if (gap >= 0.5) {
+      interiorGaps.push({
+        startSec: round2(merged[i - 1].endSec),
+        endSec: round2(merged[i].startSec),
+        durationSec: round2(gap),
+      });
+    }
+  }
+  interiorGaps.sort((a, z) => z.durationSec - a.durationSec);
+  interiorGaps.length = Math.min(interiorGaps.length, COVERAGE_MAX_REPORTED_GAPS);
+  const maxInteriorGapSec = interiorGaps.length ? interiorGaps[0].durationSec : 0;
+  const voicedTotal = merged.reduce((sum, sp) => sum + (sp.endSec - sp.startSec), 0);
+  const voicedRatio = ref > 0
+    ? round2(clamp((merged.length ? voicedTotal : Math.max(0, voicedEnd - voicedStart)) / ref, 0, 1))
+    : 0;
   const warnings: string[] = [];
   let status: CoverageReport['status'] = 'ok';
   if (!hasVoice) {
@@ -316,8 +399,22 @@ export function assessVoiceoverCoverage(input: {
     if (leadingGapSec > COVERAGE_LEAD_GAP_SEC) {
       warnings.push(`Narration only starts at ${leadingGapSec}s — long silent lead-in; reduce the offset or trim the head.`);
     }
+    if (overlapCount > 0 && maxOverlapSec > 0.3) {
+      // Double narration outranks everything except truncation: two voices at
+      // once is broken audio, not a style choice.
+      if (status !== 'over') status = 'overlapped';
+      warnings.push(`${overlapCount} narration line pair(s) overlap by up to ${maxOverlapSec}s — two lines speak at once. A line's audio must end before the next line's start_sec; shorten the colliding lines or move their windows, and check that target_sec is each line's DURATION, not its end time.`);
+    }
+    if (maxInteriorGapSec > COVERAGE_INTERIOR_GAP_SEC) {
+      // Interior dead air outranks a short tail: 'under' describes a missing
+      // ending, 'gapped' a broken middle, and the middle is what listeners
+      // hear first. Truncation ('over') and double voice keep priority.
+      if (status === 'ok' || status === 'under') status = 'gapped';
+      const silentTotal = round2(interiorGaps.reduce((sum, g) => sum + g.durationSec, 0));
+      warnings.push(`Narration has ${interiorGaps.length} interior silent hole(s) totalling ${silentTotal}s (largest ${maxInteriorGapSec}s) — on a track with no music bed this is dead air. Re-time the lines inside their scenes, add the planned music bed, or shorten the over-long scenes; do not pad the script with filler words.`);
+    }
   }
-  return { referenceDurationSec: round2(ref), voicedStartSec: round2(voicedStart), voicedEndSec: round2(voicedEnd), leadingGapSec, trailingGapSec, overshootSec, coverageRatio, status, warnings };
+  return { referenceDurationSec: round2(ref), voicedStartSec: round2(voicedStart), voicedEndSec: round2(voicedEnd), leadingGapSec, trailingGapSec, overshootSec, coverageRatio, voicedRatio, interiorGaps, maxInteriorGapSec, maxOverlapSec, overlapCount, status, warnings };
 }
 
 /** Build the `-filter_complex` for `mix`. ffmpeg input order is FIXED: `[0]` is
@@ -362,7 +459,10 @@ export function buildMixFilter(opts: {
   // Pad bounded to the clip length (never open-ended apad — that would never EOF
   // and `-shortest` + `-c:v copy` would spin forever generating silence), then
   // loudnorm + a trailing resample (loudnorm upsamples to 192 kHz internally).
-  const tail = `${padWholeDurSec && padWholeDurSec > 0 ? `apad=whole_dur=${padWholeDurSec.toFixed(3)},` : ''}${loudnorm},aresample=${sr}`;
+  // The trailing aformat pins stereo with a known layout — see the identical
+  // note on normalize_loudness; without it a TTS-only (all-mono) mix writes a
+  // track its own loudness pass cannot process.
+  const tail = `${padWholeDurSec && padWholeDurSec > 0 ? `apad=whole_dur=${padWholeDurSec.toFixed(3)},` : ''}${loudnorm},aresample=${sr},aformat=channel_layouts=stereo`;
   if (baseHasAudio && mode === 'mix') {
     chains.push(`[0:a]aresample=${sr}[base]`);
     chains.push(`[base]${bed}amix=inputs=2:duration=longest:normalize=0,${tail}[aout]`);
@@ -564,7 +664,65 @@ function fail(errorCode: string, message: string): EditResult {
 }
 
 /** Map a run() result that failed into an EditResult, with a stderr tail. */
-function ffmpegFailure(op: EditOp, r: { code: number | null; stderr: string; timedOut: boolean; aborted: boolean }): EditResult {
+/** Caption font family for `burnsubs`, chosen by the caption text's script.
+ *
+ * Left unset, libass resolves a default family per platform — on macOS that
+ * is a Japanese-coverage font, which renders Simplified-only characters as
+ * tofu boxes: the 2026-08-06 delivery burned 指□官 / □家 / 协作□ into every
+ * caption while shared-with-Japanese characters looked fine, so nothing
+ * failed and the video shipped. The chooser is per-glyph-fallback-free by
+ * design: the bundled libass does not fall back across families, so the ONE
+ * family named here must cover the deliverable script. Kana wins over Han
+ * because Japanese text contains both. Latin-only captions keep the platform
+ * default. Pure → unit-tested. */
+export function captionFontForText(text: string, platform: NodeJS.Platform): string {
+  const hasKana = /[\u3040-\u30ff]/u.test(text);
+  const hasHan = /[\u4e00-\u9fff]/u.test(text);
+  if (hasKana) {
+    if (platform === 'darwin') return 'Hiragino Sans';
+    if (platform === 'win32') return 'Yu Gothic UI';
+    return 'Noto Sans CJK JP';
+  }
+  if (hasHan) {
+    if (platform === 'darwin') return 'PingFang SC';
+    if (platform === 'win32') return 'Microsoft YaHei';
+    return 'Noto Sans CJK SC';
+  }
+  return '';
+}
+
+/** The publish-loudness audio chain. The trailing aformat pins a KNOWN stereo
+ *  layout: a mono input (every TTS-only mix is mono) otherwise dies in layout
+ *  negotiation between aresample and the aac encoder — "Cannot select channel
+ *  layout for the link between Parsed_aresample_1 and format_out_0_1", the
+ *  exact failure that blocked the 2026-08-05 delivery. Stereo is the delivery
+ *  standard and a mono→stereo upmix is lossless channel duplication. */
+export function normalizeLoudnessAudioFilter(): string {
+  return `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA},aresample=${MIX_OUTPUT_SR},aformat=channel_layouts=stereo`;
+}
+
+/** Would `overlay` erase the base instead of compositing over it?
+ *
+ * True exactly when the overlay covers the whole base frame and its pixel
+ *  format carries no alpha — an opaque full-frame layer replaces every pixel.
+ *  Fail-open on missing probe data: a guard that cannot see must not block a
+ *  legitimate edit. Pure → unit-tested. */
+export function overlayWouldEraseBase(
+  base: { width: number; height: number } | null,
+  overlay: { width: number; height: number; hasAlpha: boolean } | null,
+): boolean {
+  if (!base || !overlay) return false;
+  return overlay.width >= base.width && overlay.height >= base.height && !overlay.hasAlpha;
+}
+
+export function ffmpegFailure(op: EditOp, r: { code: number | null; stderr: string; timedOut: boolean; aborted: boolean }, outputAbsPath?: string): EditResult {
+  // A failed run must not leave its partial output behind: ffmpeg creates the
+  // file before the filter graph initializes, and resume logic treats an
+  // existing output newer than its inputs as done — the 2026-08-05 loudness
+  // crash left a 0-byte video.mp4 one resume away from shipping.
+  if (outputAbsPath) {
+    try { fsSync.unlinkSync(outputAbsPath); } catch { /* absent or busy — best effort */ }
+  }
   if (r.aborted) return fail('E_EDIT_ABORTED', `${op} aborted.`);
   if (r.timedOut) return fail('E_EDIT_TIMEOUT', `${op} timed out.`);
   const tail = r.stderr.trim().slice(-1200);
@@ -601,6 +759,83 @@ async function probeDurationSec(ffprobe: string, input: string, signal?: AbortSi
 }
 
 /** Probe duration + whether the file carries an audio stream (one ffprobe). */
+/** Pixel formats that can carry transparency — the only overlays that can sit
+ *  on a full frame without erasing it. */
+const ALPHA_PIX_FMT_RE = /(yuva|argb|abgr|rgba|bgra|ya8|ya16|gbrap)/i;
+
+type ConcatInputSpec = { width: number; height: number; fps: number };
+
+/** What a join had to change about its inputs before they could be joined. */
+export type ConcatConformReport = {
+  applied: true;
+  target: string;
+  conformed_inputs: Array<{ input: string; from: string; to: string }>;
+  note: string;
+};
+
+/** Width/height/frame-rate of an input's first video stream, for deciding
+ *  whether a concat set is uniform enough to join as-is. */
+async function probeConcatInputSpec(
+  ffprobe: string,
+  input: string,
+  signal?: AbortSignal,
+): Promise<ConcatInputSpec | null> {
+  const r = await run(ffprobe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height,r_frame_rate', '-of', 'json', input,
+  ], signal);
+  try {
+    const j = JSON.parse(r.stdout) as {
+      streams?: Array<{ width?: number; height?: number; r_frame_rate?: string }>;
+    };
+    const v = (j.streams ?? [])[0];
+    if (!v || !Number.isFinite(v.width) || !Number.isFinite(v.height)) return null;
+    const [num, den] = String(v.r_frame_rate || '').split('/');
+    const fps = Number(num) / (Number(den) || 1);
+    if (!Number.isFinite(fps) || fps <= 0) return null;
+    return { width: Number(v.width), height: Number(v.height), fps };
+  } catch { return null; }
+}
+
+/** Re-encode one input onto the shared canvas and frame rate, letterboxing
+ *  rather than cropping so a designed frame keeps every pixel it composed. */
+async function conformConcatInput(
+  bins: { ffmpeg: string },
+  input: string,
+  target: ConcatInputSpec,
+  outPath: string,
+  signal?: AbortSignal,
+): Promise<{ code: number; stderr: string }> {
+  const filter = [
+    `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease`,
+    `pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2`,
+    'setsar=1',
+    `fps=${target.fps}`,
+  ].join(',');
+  return run(bins.ffmpeg, [
+    '-y', '-i', input, '-vf', filter,
+    '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', outPath,
+  ], signal);
+}
+
+async function probeVideoStream(
+  ffprobe: string,
+  input: string,
+  signal?: AbortSignal,
+): Promise<{ width: number; height: number; pixFmt: string; hasAlpha: boolean } | null> {
+  const r = await run(ffprobe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height,pix_fmt', '-of', 'json', input,
+  ], signal);
+  try {
+    const j = JSON.parse(r.stdout) as { streams?: Array<{ width?: number; height?: number; pix_fmt?: string }> };
+    const v = (j.streams ?? [])[0];
+    if (!v || !Number.isFinite(v.width) || !Number.isFinite(v.height)) return null;
+    const pixFmt = String(v.pix_fmt || '');
+    return { width: Number(v.width), height: Number(v.height), pixFmt, hasAlpha: ALPHA_PIX_FMT_RE.test(pixFmt) };
+  } catch { return null; }
+}
+
 async function probeBasic(ffprobe: string, input: string, signal?: AbortSignal): Promise<{ durationSec: number; hasAudio: boolean }> {
   const r = await run(ffprobe, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', input], signal);
   let durationSec = 0;
@@ -807,7 +1042,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       '-y', '-i', p.inputAbsPath, '-ss', String(start), '-t', String(duration),
       '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'trim', phase: 'edit', durationSec: duration });
-    if (r.code !== 0) return ffmpegFailure('trim', r);
+    if (r.code !== 0) return ffmpegFailure('trim', r, p.outputAbsPath);
     const checked = await validateTrimOutput(bins.ffprobe, p.outputAbsPath, p.signal);
     if (checked.ok === false) return fail(checked.errorCode, checked.message);
     return { ok: true, op: 'trim', path: p.outputAbsPath, bytes: checked.bytes };
@@ -817,7 +1052,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'normalize_loudness requires input_path');
     const base = await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal);
     if (!base.hasAudio) return fail('E_EDIT_NO_AUDIO', 'normalize_loudness requires an input with an audio stream.');
-    const ln = `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA},aresample=${MIX_OUTPUT_SR}`;
+    const ln = normalizeLoudnessAudioFilter();
     const r = await run(bins.ffmpeg, withFfmpegProgress([
       '-y', '-i', p.inputAbsPath,
       '-map', '0:v?', '-map', '0:a:0',
@@ -826,7 +1061,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       '-c:a', 'aac', '-ar', String(MIX_OUTPUT_SR),
       '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'normalize_loudness', phase: 'edit', durationSec: base.durationSec });
-    if (r.code !== 0) return ffmpegFailure('normalize_loudness', r);
+    if (r.code !== 0) return ffmpegFailure('normalize_loudness', r, p.outputAbsPath);
     const loudnessResult = await measureLoudness(bins.ffmpeg, bins.ffprobe, p.outputAbsPath, p.signal);
     if (loudnessResult.ok === false) return loudnessResult;
     return {
@@ -843,22 +1078,108 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     if (inputs.length < 2) return fail('E_EDIT_ARG', 'concat requires input_paths with at least 2 entries');
     // concat demuxer with a temp list file, re-encoding so differing codecs join cleanly.
     const listPath = path.join(os.tmpdir(), `orkas-concat-${randomUUID()}.txt`);
-    const listBody = inputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
-    await fs.writeFile(listPath, listBody, 'utf8');
+    const scratch: string[] = [];
     try {
-      const inputDurations = await mapWithConcurrencyLimit(inputs, MIX_COVERAGE_CONCURRENCY, (input) =>
-        probeDurationSec(bins.ffprobe, input, p.signal));
+      const [inputDurations, specs] = await Promise.all([
+        mapWithConcurrencyLimit(inputs, MIX_COVERAGE_CONCURRENCY, (input) =>
+          probeDurationSec(bins.ffprobe, input, p.signal)),
+        mapWithConcurrencyLimit(inputs, MIX_COVERAGE_CONCURRENCY, (input) =>
+          probeConcatInputSpec(bins.ffprobe, input, p.signal)),
+      ]);
       const concatDurationSec = inputDurations.every((d) => d > 0)
         ? inputDurations.reduce((sum, d) => sum + d, 0)
         : null;
+
+      // The concat demuxer takes its canvas and time base from the FIRST input
+      // and reinterprets the rest against it. Feeding it a mixed set silently
+      // produced a corrupt timeline: on 2026-08-09 five 1920x1080@15 composed
+      // parts joined to one 1918x1080@24 source cut and 60.03s of material came
+      // out as a 75.04s file (exactly 24/15), so every scene drifted further
+      // behind narration that was still timed to the plan, and the whole video
+      // shrank to the odd 1918 width of one clip. Conform first — letterbox
+      // onto the largest canvas at the highest rate, which upgrades a part and
+      // never crops a designed frame.
+      const known = specs.filter((s): s is ConcatInputSpec => !!s);
+      const uniform = known.length === inputs.length && known.every((s) => (
+        s.width === known[0].width && s.height === known[0].height && s.fps === known[0].fps
+      ));
+      let joinInputs = inputs;
+      // Re-encoding the caller's material to a canvas and frame rate it did
+      // not ask for is a change to the delivery, not an implementation detail.
+      // Reporting only "concat wrote <path>" left the 2026-08-10 AUTO run
+      // unaware that six 15fps parts had been resampled to 24 and its source
+      // padded 1918→1920, so nothing downstream could weigh whether the parts
+      // should have been rendered at delivery quality in the first place.
+      let conform: ConcatConformReport | undefined;
+      if (!uniform && known.length === inputs.length) {
+        const target: ConcatInputSpec = {
+          width: Math.max(...known.map((s) => s.width)) + (Math.max(...known.map((s) => s.width)) % 2),
+          height: Math.max(...known.map((s) => s.height)) + (Math.max(...known.map((s) => s.height)) % 2),
+          fps: Math.max(...known.map((s) => s.fps)),
+        };
+        const conformed_inputs: ConcatConformReport['conformed_inputs'] = [];
+        joinInputs = [];
+        for (let i = 0; i < inputs.length; i += 1) {
+          const spec = known[i];
+          if (spec.width === target.width && spec.height === target.height && spec.fps === target.fps) {
+            joinInputs.push(inputs[i]);
+            continue;
+          }
+          const conformedPath = path.join(os.tmpdir(), `orkas-conform-${randomUUID()}.mp4`);
+          scratch.push(conformedPath);
+          const cr = await conformConcatInput(bins, inputs[i], target, conformedPath, p.signal);
+          if (cr.code !== 0) return ffmpegFailure('concat', cr, p.outputAbsPath);
+          conformed_inputs.push({
+            input: inputs[i],
+            from: `${spec.width}x${spec.height}@${spec.fps}`,
+            to: `${target.width}x${target.height}@${target.fps}`,
+          });
+          joinInputs.push(conformedPath);
+        }
+        conform = {
+          applied: true,
+          target: `${target.width}x${target.height}@${target.fps}`,
+          conformed_inputs,
+          note: 'Inputs did not share one canvas and frame rate, so the mismatched ones were re-encoded onto the'
+            + ' largest canvas at the highest rate before joining. An upscaled part carries the detail of its'
+            + ' original render, not of the target — re-render it at delivery quality if that matters.',
+        };
+      }
+
+      const listBody = joinInputs.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join('\n');
+      await fs.writeFile(listPath, listBody, 'utf8');
       const r = await run(bins.ffmpeg, withFfmpegProgress([
         '-y', '-f', 'concat', '-safe', '0', '-i', listPath,
         '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'aac', '-movflags', '+faststart', p.outputAbsPath,
       ]), p.signal, { op: 'concat', phase: 'edit', durationSec: concatDurationSec });
-      if (r.code !== 0) return ffmpegFailure('concat', r);
-      return { ok: true, op: 'concat', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
+      if (r.code !== 0) return ffmpegFailure('concat', r, p.outputAbsPath);
+
+      // The expected total was already in hand above and went only to the
+      // progress bar. A joined timeline that does not match the material it was
+      // built from is corrupt however it happened, and saying so here costs one
+      // probe instead of a repair loop discovered at the draft.
+      const actualDurationSec = await probeDurationSec(bins.ffprobe, p.outputAbsPath, p.signal);
+      if (concatDurationSec && actualDurationSec > 0) {
+        const driftSec = Math.abs(actualDurationSec - concatDurationSec);
+        if (driftSec > Math.max(0.5, concatDurationSec * 0.02)) {
+          return fail(
+            'E_EDIT_CONCAT_DURATION_DRIFT',
+            `The joined video is ${actualDurationSec.toFixed(2)}s but its parts total ${concatDurationSec.toFixed(2)}s`
+            + ` (off by ${driftSec.toFixed(2)}s). The output was written but does not match its material, so anything`
+            + ` timed against the plan — narration, captions — will drift. Re-check the parts before using it.`,
+          );
+        }
+      }
+      return {
+        ok: true,
+        op: 'concat',
+        path: p.outputAbsPath,
+        bytes: await statSize(p.outputAbsPath),
+        ...(conform ? { conform } : {}),
+      };
     } finally {
       await fs.rm(listPath, { force: true }).catch(() => {});
+      for (const tmp of scratch) await fs.rm(tmp, { force: true }).catch(() => {});
     }
   }
 
@@ -866,12 +1187,17 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'burnsubs requires input_path');
     if (!p.subtitlesAbsPath) return fail('E_EDIT_ARG', 'burnsubs requires subtitles_path (.srt/.ass)');
     const subEsc = escapeFfmpegFilterValue(p.subtitlesAbsPath);
+    const subtitleText = await fs.readFile(p.subtitlesAbsPath, 'utf8').catch(() => '');
+    const fontName = captionFontForText(subtitleText, process.platform);
+    const styleSuffix = fontName
+      ? `:force_style='FontName=${fontName}'`
+      : '';
     const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
     const r = await run(bins.ffmpeg, withFfmpegProgress([
-      '-y', '-i', p.inputAbsPath, '-vf', `subtitles=filename=${subEsc}`,
+      '-y', '-i', p.inputAbsPath, '-vf', `subtitles=filename=${subEsc}${styleSuffix}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'burnsubs', phase: 'edit', durationSec });
-    if (r.code !== 0) return ffmpegFailure('burnsubs', r);
+    if (r.code !== 0) return ffmpegFailure('burnsubs', r, p.outputAbsPath);
     return { ok: true, op: 'burnsubs', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
   }
 
@@ -880,13 +1206,30 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const clampXY = (v: unknown) => Math.round(Math.max(-100000, Math.min(100000, finiteNum(v) ?? 0)));
     const x = clampXY(p.x);
     const y = clampXY(p.y);
+    // A full-frame overlay with no alpha channel does not composite — it
+    // REPLACES every pixel of the base. That is how a branded intro card
+    // silently deleted the user's orca footage on 2026-08-05: the composed
+    // overlay rendered as opaque H.264 and `overlay` laid it over the whole
+    // cut. Fail closed with the real options instead of shipping the loss.
+    // Smaller-than-base opaque overlays (logo boxes, lower thirds) keep
+    // working: they cover only the region they occupy, which is the intent.
+    const [baseInfo, overlayInfo] = await Promise.all([
+      probeVideoStream(bins.ffprobe, p.inputAbsPath, p.signal),
+      probeVideoStream(bins.ffprobe, p.overlayAbsPath, p.signal),
+    ]);
+    if (baseInfo && overlayInfo && overlayWouldEraseBase(baseInfo, overlayInfo)) {
+      return fail(
+        'E_EDIT_OVERLAY_OPAQUE',
+        `overlay covers the full ${baseInfo.width}x${baseInfo.height} base with an opaque ${overlayInfo.width}x${overlayInfo.height} layer (pix_fmt ${overlayInfo.pixFmt || 'unknown'} has no alpha), which would completely replace the base footage instead of compositing over it. Use edge elements smaller than the frame (logo box, lower third), or plan this beat as a composed primary segment without footage underneath; a full-frame brand layer over footage needs an alpha-capable overlay render.`,
+      );
+    }
     const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
     const r = await run(bins.ffmpeg, withFfmpegProgress([
       '-y', '-i', p.inputAbsPath, '-i', p.overlayAbsPath,
       '-filter_complex', `overlay=${x}:${y}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-c:a', 'copy', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'overlay', phase: 'edit', durationSec });
-    if (r.code !== 0) return ffmpegFailure('overlay', r);
+    if (r.code !== 0) return ffmpegFailure('overlay', r, p.outputAbsPath);
     return { ok: true, op: 'overlay', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
   }
 
@@ -898,7 +1241,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const r = await run(bins.ffmpeg, [
       '-y', '-ss', String(at), '-i', p.inputAbsPath, '-frames:v', '1', '-update', '1', p.outputAbsPath,
     ], p.signal);
-    if (r.code !== 0) return ffmpegFailure('extract_frame', r);
+    if (r.code !== 0) return ffmpegFailure('extract_frame', r, p.outputAbsPath);
     return { ok: true, op: 'extract_frame', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath) };
   }
 
@@ -929,7 +1272,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       phase: 'edit',
       durationSec: totalSpanSeconds(kept),
     });
-    if (cut.code !== 0) return ffmpegFailure('trim_silence', cut);
+    if (cut.code !== 0) return ffmpegFailure('trim_silence', cut, p.outputAbsPath);
     const decision = decisionEvidence(removed, kept, `removed ${removed.length} silent span(s) below ${noiseDb ?? SILENCE_NOISE_DB} dB`);
     return { ok: true, op: 'trim_silence', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath), decision };
   }
@@ -964,7 +1307,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       phase: 'edit',
       durationSec: totalSpanSeconds(kept),
     });
-    if (cut.code !== 0) return ffmpegFailure('remove_fillers', cut);
+    if (cut.code !== 0) return ffmpegFailure('remove_fillers', cut, p.outputAbsPath);
     // Evidence must reflect the ACTUAL cut complement, not the padded/unmerged
     // filler spans (which double-count adjacent fillers and ignore sub-minKeep
     // slivers folded into the cut) — mirror trim_silence's complementIntervals.
@@ -1021,7 +1364,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
       '-c:v', 'copy', '-c:a', 'aac', '-ar', String(sr),
       '-shortest', '-movflags', '+faststart', p.outputAbsPath,
     ]), p.signal, { op: 'mix', phase: 'edit', durationSec: base.durationSec });
-    if (r.code !== 0) return ffmpegFailure('mix', r);
+    if (r.code !== 0) return ffmpegFailure('mix', r, p.outputAbsPath);
     // Coverage: silencedetect each SOURCE segment and combine the placed voiced
     // spans on the clip timeline — deterministic and unaffected by the -shortest
     // truncation that would hide an overshoot in the output. (The per-line start
@@ -1030,6 +1373,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const placedStarts: number[] = [];
     const placedEnds: number[] = [];
     const placedAudioEnds: number[] = [];
+    const placedSpans: Array<{ startSec: number; endSec: number }> = [];
     const measurements = await mapWithConcurrencyLimit(segs, MIX_COVERAGE_CONCURRENCY, (s) =>
       measureSilenceCoverage(s.audioAbsPath, p.signal ? { signal: p.signal } : {}));
     const measuredAll = measurements.every((meas) => meas.ok);
@@ -1041,6 +1385,10 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         placedStarts.push(s.startSec + meas.timing.voicedStartSec);
         placedEnds.push(s.startSec + meas.timing.voicedEndSec);
         placedAudioEnds.push(s.startSec + meas.timing.durationSec);
+        placedSpans.push({
+          startSec: s.startSec + meas.timing.voicedStartSec,
+          endSec: s.startSec + meas.timing.voicedEndSec,
+        });
       }
     }
     if (measuredAll && placedEnds.length) {
@@ -1050,7 +1398,30 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
         audioDurationSec: Math.max(...placedAudioEnds),
         voicedStartSec: Math.min(...placedStarts),
         voicedEndSec: Math.max(...placedEnds),
+        voicedSpans: placedSpans,
       });
+    }
+    // Overshoot means `-shortest` already cut words off the end of the last
+    // line: the file was written and does not contain the audio it was given.
+    // That is the same defect class as E_EDIT_CONCAT_DURATION_DRIFT above, and
+    // it is a failure, not a warning — on 2026-08-10 this returned ok with the
+    // truncation stated in `warnings`, the model read past it, and the video
+    // shipped with its closing call-to-action cut 0.72s short.
+    //
+    // Scoped to per-line placement, which is the narration tier by
+    // construction: the assembly skill mixes narration with `audio_segments`
+    // (one entry per line) onto a silent base, then adds a music bed as a
+    // single `audio_path` ducked under it. A bed longer than the clip is meant
+    // to be trimmed, so only the per-line call can be truncated wrongly.
+    // Interior gaps and overlaps stay warnings — those are editorial calls.
+    if (coverage && coverage.status === 'over' && (p.audioSegments?.length ?? 0) > 0) {
+      return fail(
+        'E_EDIT_MIX_NARRATION_TRUNCATED',
+        `The narration runs ${coverage.overshootSec}s past the ${coverage.referenceDurationSec}s video, so that much of the`
+        + ` last line was cut off the end. The file at ${p.outputAbsPath} was written but does not contain all the narration it`
+        + ' was given, so it cannot ship. Shorten the last line so its speech ends before the video does and re-synthesize it,'
+        + ' or extend the video to cover it. Do not raise the speech speed to fit — a rushed read still misses its scene.',
+      );
     }
     return { ok: true, op: 'mix', path: p.outputAbsPath, bytes: await statSize(p.outputAbsPath), ...(coverage ? { coverage } : {}) };
   }

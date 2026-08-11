@@ -10,6 +10,7 @@ type MarkdownEditorExports = {
   _mveOnKey: (state: any, textarea: FakeTextarea, event: any) => void;
   _mveSave: (state: any) => Promise<void>;
   _mveScanTaskLines: (content: string) => Array<{ lineIdx: number; checked: boolean }>;
+  _mveToggleTask: (state: any, lineIdx: number, liEl: any, boxEl: any) => Promise<void>;
   _mveWriteSource: (source: Record<string, unknown>, content: string) => Promise<Record<string, unknown>>;
 };
 
@@ -268,5 +269,26 @@ describe('Markdown view/edit behavior', () => {
       { lineIdx: 0, checked: false },
       { lineIdx: 1, checked: true },
     ]);
+  });
+
+  it('includes direct task-checkbox writes in the editor save denominator', async () => {
+    const monitor = vi.fn();
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const editor = loadMarkdownEditor({ monitor, invoke });
+    const state = {
+      source: { kind: 'workspace', absPath: '/workspace/note.md', cid: 'cid-1' },
+      content: '- [ ] pending',
+    };
+    const liEl = { classList: { toggle: vi.fn() } };
+    const boxEl = { checked: false };
+
+    await editor._mveToggleTask(state, 0, liEl, boxEl);
+
+    expect(invoke).toHaveBeenCalledWith('produced.writeText', {
+      path: '/workspace/note.md',
+      cid: 'cid-1',
+      content: '- [x] pending',
+    });
+    expect(state.content).toBe('- [x] pending');
   });
 });

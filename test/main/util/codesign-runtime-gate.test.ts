@@ -50,6 +50,12 @@ function writeEntrypointPayload(): string {
     PACKAGED_BIN_ENTRYPOINTS: readonly string[];
     PACKAGED_BIN_HELPERS: readonly string[];
     PACKAGED_JS_LOADER_FILES: readonly { packageName: string; entry: string }[];
+    PACKAGED_MCP_RUNTIME_FILES: readonly {
+      lockPath: string;
+      packagedPath?: string;
+      packageName: string;
+      entries: readonly string[];
+    }[];
   };
   const pcRoot = path.join(tmpDir, 'entrypoint-fixture');
   const binRoot = path.join(pcRoot, 'bin');
@@ -70,6 +76,17 @@ function writeEntrypointPayload(): string {
       version: lock.packages[`node_modules/${spec.packageName}`].version,
     }));
     fs.writeFileSync(entry, 'module.exports = {};\n');
+  }
+  for (const spec of gate.PACKAGED_MCP_RUNTIME_FILES) {
+    const sourceDir = path.join(process.cwd(), ...spec.lockPath.split('/'));
+    const packageDir = path.join(pcRoot, ...(spec.packagedPath || spec.lockPath).split('/'));
+    fs.mkdirSync(path.dirname(packageDir), { recursive: true });
+    fs.cpSync(sourceDir, packageDir, { recursive: true });
+    if (spec.packageName === '@modelcontextprotocol/sdk') {
+      // Match electron-builder's flattened packaged layout so the post-pack
+      // smoke cannot fall back to SDK-nested source dependencies.
+      fs.rmSync(path.join(packageDir, 'node_modules'), { recursive: true, force: true });
+    }
   }
   return pcRoot;
 }
@@ -319,6 +336,9 @@ describe('codesign-adhoc runtime gate', () => {
       __orkasTestWindowsVcContract: vc.contract,
       __orkasTestEntrypointRoot: entrypointRoot,
       __orkasTestBuiltinRoot: path.join(process.cwd(), 'resources', 'builtin'),
+      __orkasTestDependencyGate: () => ({
+        verificationEntry: 'dependency:lock-graph:win32-x64:packages=3:edges=2:overrides=0',
+      }),
       packager: {
         appInfo: { productFilename: 'Orkas' },
         config: {},
@@ -339,6 +359,8 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.verified).toContain('resource:builtin:manifest-v1');
     expect(marker.verified).toContain('entrypoint:bin/run-skill.cjs');
     expect(marker.verified).toContain('loader:tsx');
+    expect(marker.verified).toContain('mcp-runtime:node_modules/@modelcontextprotocol/sdk');
+    expect(marker.verified).toContain('dependency:lock-graph:win32-x64:packages=3:edges=2:overrides=0');
   });
 
   it('blocks signing when FFmpeg is absent from the packaged app', async () => {

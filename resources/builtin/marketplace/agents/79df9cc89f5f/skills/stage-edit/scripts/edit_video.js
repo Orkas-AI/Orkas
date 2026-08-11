@@ -59,6 +59,22 @@ function parseJsonOrFile(raw, label) {
   }
 }
 
+/**
+ * The long options this parser accepts, read out of the parser itself.
+ *
+ * A hand-kept list drifts the first time a branch is added; this one cannot,
+ * because it is derived from the code that does the accepting. It runs only on
+ * the failure path. 2026-08-08: a caller sent `--time` to extract_frame and got
+ * back only "unexpected argument: --time", so it could not see that the option
+ * it wanted was `--start`.
+ */
+function acceptedOptions() {
+  const source = String(parseArgs);
+  return [...new Set(source.match(/--[a-z][a-z0-9-]+/g) || [])]
+    .filter((flag) => flag !== '--help')
+    .sort();
+}
+
 function parseArgs(args) {
   const out = { op: '', inputPath: '', inputPaths: [], outputPath: '', help: false, fillers: [] };
   for (let i = 0; i < args.length; i += 1) {
@@ -111,7 +127,7 @@ function parseArgs(args) {
     else if (a.startsWith('--fillers=')) out.fillers.push(...parseList(a.slice('--fillers='.length), '--fillers'));
     else if (!out.op) out.op = a;
     else if (!out.inputPath) out.inputPath = a;
-    else fail('E_ARGS', `unexpected argument: ${a}`);
+    else fail('E_ARGS', `unexpected argument: ${a}; accepted options are ${acceptedOptions().join(' ')}`);
   }
   return out;
 }

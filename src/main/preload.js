@@ -96,7 +96,10 @@ function logRecord(record) {
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
 const PUSH_EVENT_CHANNELS = new Set();
-const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'client-config:', 'delete_file.', 'bridge:', 'bash:'];
+// Interactive CLI sessions are local-only and remain part of the open build;
+// their scoped lifecycle events must cross the same narrow push bridge as
+// bash and connector permission events.
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'client-config:', 'delete_file.', 'bridge:', 'bash:', 'interactive-cli:'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
   return PUSH_EVENT_CHANNELS.has(channel) || PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));

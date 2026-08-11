@@ -218,6 +218,14 @@ describe('validateEdl — per-source spec requirements', () => {
 
     p.references[0].roles = ['invented-role'];
     expect(codes(p).errors).toContain('E_REFERENCE_ROLE');
+    // 2026-08-08: a real run wrote six plausible-sounding roles ("opening
+    // motion", "brand atmosphere", "CTA"), got seven "unknown role" errors that
+    // named none of the eight legal values, and spent a round trip searching the
+    // skill document for the list the validator was holding. Three lines above
+    // this, E_SEG_ROLE already states its own set — the convention existed, it
+    // just was not applied here.
+    expect(validateEdl(p).errors.find((e) => e.code === 'E_REFERENCE_ROLE')?.message)
+      .toContain('must be one of content | identity | composition | structure | style | motion | timing | audio');
 
     p.references[0].roles = ['composition'];
     p.references[0].intent_basis = 'file-origin' as never;
@@ -590,6 +598,38 @@ describe('validateEdl — editable caption/narration data (language-driven separ
     const p2 = validPlan() as unknown as { tracks: { narration: unknown } };
     p2.tracks.narration = { voice: 'v', segments: [{ start_sec: 0 }] };
     expect(codes(p2).errors).toContain('E_NARRATION_LINE_TEXT');
+  });
+
+  it('rejects overlapping narration line windows — the end-time-as-target misuse', () => {
+    // 2026-08-06: the plan wrote target_sec as each line\'s END time, so the
+    // windows swallowed their successors ([11, +20] over a line at 20), TTS
+    // bindings churned 23 calls, and the shipped mix had up to 1.48 s of two
+    // voices at once. The free validator has to catch this before synthesis.
+    const p = validPlan() as unknown as { tracks: { narration: unknown } };
+    p.tracks.narration = {
+      voice: 'v',
+      segments: [
+        { text: 'a', start_sec: 0, target_sec: 11 },
+        { text: 'b', start_sec: 11, target_sec: 20 },
+        { text: 'c', start_sec: 20, target_sec: 6 },
+      ],
+    };
+    const r = codes(p);
+    expect(r.errors).toContain('E_NARRATION_WINDOWS_OVERLAP');
+  });
+
+  it('accepts adjacent windows written as durations', () => {
+    const p = validPlan() as unknown as { tracks: { narration: unknown } };
+    p.tracks.narration = {
+      voice: 'v',
+      segments: [
+        { text: 'a', start_sec: 0, target_sec: 4 },
+        { text: 'b', start_sec: 4, target_sec: 7 },
+        { text: 'c', start_sec: 11, target_sec: 9 },
+      ],
+    };
+    const r = codes(p);
+    expect(r.errors).not.toContain('E_NARRATION_WINDOWS_OVERLAP');
   });
 
   it('warns (does not block) on a non-string narration produced_path', () => {

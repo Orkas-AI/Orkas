@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 
 import AdmZip from 'adm-zip';
 import officeCliPin from './fetch-officecli.cjs';
+import officeCliPolicy from '../bin/officecli-policy-gate.cjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pcRoot = path.resolve(here, '..');
@@ -38,8 +39,17 @@ function asciiJson(value) {
   );
 }
 
+function guardedOfficeCliInvocation(binary, args) {
+  if (process.platform !== 'darwin') return { command: binary, args };
+  return {
+    command: '/usr/bin/sandbox-exec',
+    args: ['-p', officeCliPolicy.MAC_OFFICECLI_SANDBOX_PROFILE, binary, ...args],
+  };
+}
+
 function run(binary, args, options = {}) {
-  const result = spawnSync(binary, args, {
+  const launch = guardedOfficeCliInvocation(binary, args);
+  const result = spawnSync(launch.command, launch.args, {
     cwd: options.cwd,
     input: options.input,
     encoding: 'utf8',
@@ -60,8 +70,9 @@ function run(binary, args, options = {}) {
 async function batch(binary, file, operations, options = {}) {
   const payload = asciiJson(operations);
   const args = ['batch', file, '--stop-on-error', '--json'];
+  const launch = guardedOfficeCliInvocation(binary, args);
   const result = await new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
+    const child = spawn(launch.command, launch.args, {
       cwd: options.cwd,
       env: { ...process.env, OFFICECLI_SKIP_UPDATE: '1' },
       windowsHide: true,
@@ -93,20 +104,25 @@ function assertContains(output, expected, label) {
   assert(output.includes(expected), `${label} did not contain ${JSON.stringify(expected)}:\n${output}`);
 }
 
-function assertPng(file, label) {
-  const bytes = fs.readFileSync(file);
-  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  assert(bytes.length > 1_000, `${label} PNG is unexpectedly small (${bytes.length} bytes)`);
-  assert(bytes.subarray(0, signature.length).equals(signature), `${label} is not a PNG`);
+function assertRenderedHtml(file, officeFile) {
+  const html = fs.readFileSync(file, 'utf8');
+  assert(html.length > 1_000, `${path.basename(officeFile)} rendered HTML is unexpectedly small (${html.length} chars)`);
+  const ext = path.extname(officeFile).toLowerCase();
+  const marker = ext === '.docx'
+    ? /class=["'][^"']*\bpage\b/
+    : ext === '.xlsx'
+      ? /class=["'][^"']*\bsheet-content\b/
+      : /class=["'][^"']*\bslide\b/;
+  assert(marker.test(html), `${path.basename(officeFile)} rendered HTML is missing its layout marker`);
 }
 
-function validateAndInspect(binary, file, expectedText, screenshot, renderArgs = []) {
+function validateAndInspect(binary, file, expectedText, renderedHtml, renderArgs = []) {
   run(binary, ['validate', file, '--json']);
   run(binary, ['view', file, 'issues', '--json']);
   const text = commandText(run(binary, ['view', file, 'text']));
   assertContains(text, expectedText, `${path.basename(file)} text view`);
-  run(binary, ['view', file, 'screenshot', '--page', '1', ...renderArgs, '-o', screenshot]);
-  assertPng(screenshot, `${path.basename(file)} screenshot`);
+  run(binary, ['view', file, 'html', '--page', '1', ...renderArgs, '-o', renderedHtml]);
+  assertRenderedHtml(renderedHtml, file);
   closeFile(binary, file);
 }
 
@@ -244,20 +260,20 @@ try {
     binary,
     workingDocx,
     '中文内容：进展符合计划。',
-    path.join(tempDir, 'report-page-1.png'),
+    path.join(tempDir, 'report-page-1.html'),
     ['--render', 'html'],
   );
   validateAndInspect(
     binary,
     workbook,
     '00123',
-    path.join(tempDir, 'workbook-sheet-1.png'),
+    path.join(tempDir, 'workbook-sheet-1.html'),
   );
   validateAndInspect(
     binary,
     deck,
     '项目简报',
-    path.join(tempDir, 'brief-slide-1.png'),
+    path.join(tempDir, 'brief-slide-1.html'),
     ['--render', 'html'],
   );
 
@@ -282,7 +298,7 @@ try {
     );
   }
 
-  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true tool-copy=true source-preserved=true atomic-rollback=true renders=3`);
+  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
 } catch (error) {
   failed = true;
   console.error(`[office-artifact-smoke] FAIL: ${error instanceof Error ? error.message : String(error)}`);

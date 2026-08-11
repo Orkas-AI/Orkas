@@ -124,6 +124,29 @@ describe('TTS provider request-to-file lifecycle', () => {
     expect(JSON.stringify(result)).not.toContain('provider-secret');
   });
 
+  it('does not replay the synthesis POST after a transport failure with unknown charge state', async () => {
+    const fetchStub = vi.fn(async () => {
+      throw new Error('connection closed after request upload');
+    });
+    vi.stubGlobal('fetch', fetchStub);
+    const outputPath = path.join(tempRoot, 'unknown-provider-outcome.mp3');
+
+    const result = await generateSpeech({
+      text: 'This request must not be sent twice automatically.',
+      outputAbsPath: outputPath,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      errorCode: 'E_TTS_NETWORK',
+      requestDisposition: 'sent',
+      chargeStatus: 'unknown',
+      retryPolicy: 'unknown',
+    });
+    expect(fetchStub).toHaveBeenCalledOnce();
+    expect(existsSync(outputPath)).toBe(false);
+  });
+
   it('does not dispatch an already-aborted synthesis request', async () => {
     const fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);

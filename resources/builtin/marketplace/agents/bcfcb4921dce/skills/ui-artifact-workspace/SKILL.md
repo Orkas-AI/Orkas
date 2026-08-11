@@ -18,7 +18,7 @@ Every revision response must preserve all three proof groups together; missing a
 
 1. **Canonical reuse**: read the current manifest/entry/assets and patch the same directory in place.
 2. **Preservation**: explicitly say `fork/v2: forbidden` and preserve named user edits plus unrelated hooks, interactions, tokens, and asset paths.
-3. **Revision acceptance**: requested-change result plus non-blank first render, primary workflow, responsive behavior, and local asset/reference resolution; increment the manifest once only after all pass.
+3. **Revision acceptance**: requested visual change or state plus non-blank first render, requested viewport behavior, and local asset/reference resolution; increment the manifest once only after all pass.
 
 When tools are off, emit the Revision Executor Contract near the start of the response. Every check remains `not run` but still includes its future action and concrete pass criterion. Do not output a replacement manifest with guessed fields or a reduced `files` list; describe the pending revision delta until the existing manifest has been read.
 
@@ -91,7 +91,7 @@ Keep the fenced manifest strict JSON. Put a path label before the fence; never p
 Rules:
 
 - Keep `artifact_id`, directory name, `created_at`, and entry path stable across normal revisions.
-- Increment `revision`, update `updated_at`, and refresh `files` after every successful change.
+- A new artifact starts at revision 1 in its first valid manifest; initial validation and preview keep it at revision 1. For a follow-up, keep baseline revision N while editing, then move exactly once to N+1 after acceptance; update `updated_at` and refresh `files` with that transition.
 - Treat `files` as the complete sorted package inventory. It must include `artifact.json` itself, the entry, and every shipped relative asset/source file; omit only generated ZIPs and temporary QA files.
 - Record only compact design continuity facts. Do not store full prompts, chat transcripts, secrets, credentials, cookies, auth headers, or raw provider responses.
 - Prefer relative paths. Do not embed machine-specific absolute paths in the deliverable or manifest when a workspace-relative reference is sufficient.
@@ -107,12 +107,12 @@ When the user asks to adjust, polish, fix, restyle, extend, or review-and-apply 
 4. Translate the request into a compact change set: requested changes, invariants to preserve, affected files, and acceptance checks.
 5. Patch the smallest coherent set of existing files. Preserve unrelated user edits, content, interactions, stable DOM hooks, relative asset paths, design tokens, and accepted layout decisions.
 6. Do not regenerate the whole artifact or reset it to a generic template for a local change. Broader restructuring is valid only when required by the request or by a blocking craft failure; state that reason.
-7. Validate the changed files, then run focused checks for the requested area plus four explicit smoke checks: non-blank first render, existing primary workflow, responsive behavior, and local asset/reference resolution. When `html_preview` is available, desktop and mobile preview evidence is mandatory; the source-only validator cannot satisfy rendered or responsive checks.
+7. Validate the changed files first, then run focused checks for the requested visual change or state plus non-blank first render, requested viewport behavior, and local asset/reference resolution. When `html_preview` is available, run it with `interactions:false`; its runtime, resource, layout, and keyboard-focus diagnostics must pass before screenshots are evaluated. Use `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit it for desktop or use mobile for an explicitly mobile artifact. `screenshots` defaults to false and returns no model images; set `screenshots:true` only for the final visual review. Failed diagnostics never return model images. The source-only validator cannot satisfy rendered checks, and visual review is not proof of business behavior.
 8. Update `artifact.json` only after those checks pass. Increment the revision exactly once, run the final package validation, and publish. If a required available preview was skipped, leave the revision pending rather than claiming completion.
 
-Before completing a revision, record a compact revision proof with the baseline revision and files inspected, files changed, user/manual edits preserved, requested-change result, the four smoke-check results, and the resulting manifest revision. A generic sentence such as “verified successfully” is not sufficient evidence. If a check could not run, name it as unverified instead of implying success.
+Before completing a revision, record a compact revision proof with the baseline revision and files inspected, files changed, user/manual edits preserved, requested visual result, rendered checks, and the resulting manifest revision. A generic sentence such as “verified successfully” is not sufficient evidence. If a check could not run, name it as unverified instead of implying success.
 
-When tools are unavailable, do not drop this protocol. Provide the exact in-place executor plan against the canonical directory, including manifest read/increment, preserved manual edits, no-v2 rule, requested-change check, and all four regression checks. For every unexecuted check, state both the future action and its concrete pass criterion; a bare list of `not run` labels is not a sufficient executor plan. Mark every unexecuted step `not run`; future-tense plans are not claims of completed work.
+When tools are unavailable, do not drop this protocol. Provide the exact in-place executor plan against the canonical directory, including manifest read/increment, preserved manual edits, no-v2 rule, requested visual check, and rendered regression checks. For every unexecuted check, state both the future action and its concrete pass criterion; a bare list of `not run` labels is not a sufficient executor plan. Mark every unexecuted step `not run`; future-tense plans are not claims of completed work.
 
 Use this compact **Revision Executor Contract** so none of those invariants disappear in free-form prose:
 
@@ -121,7 +121,7 @@ Use this compact **Revision Executor Contract** so none of those invariants disa
 - `Continuity:` patch in place; `fork/v2: forbidden`; preserve the named manual edits plus unrelated hooks, interactions, tokens, and asset paths.
 - `Change set:` only requested files/regions.
 - `Revision transition:` current → next, applied exactly once only after every acceptance check passes.
-- `Acceptance checks:` requested change, non-blank first render, primary workflow, responsive behavior, and local asset/reference resolution. Give each future action, concrete pass criterion, and `not run` status.
+- `Acceptance checks:` requested visual change or state, non-blank first render, requested viewport behavior, and local asset/reference resolution. Give each future action, concrete pass criterion, and `not run` status.
 
 If the prior artifact has no manifest, adopt it in place: create `artifact.json` beside the existing entry file and treat the current files as revision 1 before applying the requested revision. Do not move a user-owned artifact merely to satisfy the preferred folder name.
 

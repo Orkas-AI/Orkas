@@ -22,6 +22,10 @@ import {
   type ImageWorkflowEngine,
 } from '../../features/image_workflow_adapter';
 import {
+  inspectImageAssetBuffer,
+  prepareLosslessModelImage,
+} from '../../features/image_assets';
+import {
   exportImageStudioProject,
   inspectImageStudioProject,
   readImageStudioEvidenceState,
@@ -65,6 +69,7 @@ const DENY_MESSAGE = 'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is
 export interface ImageStudioToolOpts {
   userId: string;
   cid?: string;
+  turnId?: string;
   agentId?: string;
   projectId?: string;
   extraRoots?: readonly string[];
@@ -119,6 +124,97 @@ function jsonResult(value: Record<string, unknown>, renameNote = ''): ToolResult
   return { content: `${JSON.stringify(value, null, 2)}${renameNote}`, isError: value.ok === false };
 }
 
+async function jsonResultWithVisualEvidence(
+  value: Record<string, unknown>,
+  evidence: Array<{ absPath: string; role: string }>,
+  renameNote = '',
+): Promise<ToolResult> {
+  if (value.ok === false) return jsonResult(value, renameNote);
+  const uniqueEvidence = evidence.filter((entry, index, list) => (
+    list.findIndex((candidate) => path.resolve(candidate.absPath) === path.resolve(entry.absPath)) === index
+  ));
+  const preparedEvidence = await Promise.all(uniqueEvidence.map(async (entry, index) => {
+    const source = await fs.readFile(entry.absPath);
+    const inspected = await inspectImageAssetBuffer(source);
+    const prepared = inspected.format === 'png'
+      ? await prepareLosslessModelImage(source)
+      : {
+          buf: source,
+          mediaType: inspected.format === 'jpeg'
+            ? 'image/jpeg' as const
+            : inspected.format === 'webp'
+              ? 'image/webp' as const
+              : undefined,
+        };
+    if (!prepared.mediaType) {
+      throw new Error(`E_IMAGE_VISUAL_EVIDENCE_FORMAT: unsupported model evidence format ${inspected.format}.`);
+    }
+    return { entry, index, inspected, prepared };
+  }));
+  const candidate = preparedEvidence[0];
+  if (!candidate) throw new Error('E_IMAGE_VISUAL_EVIDENCE_MISSING: no candidate image was provided.');
+  const payload = {
+    ...value,
+    visual_evidence: {
+      attached: true,
+      analysis_mode: 'quality_review',
+      role: 'candidate',
+      path: candidate.entry.absPath,
+      width: candidate.inspected.width,
+      height: candidate.inspected.height,
+      media_type: candidate.prepared.mediaType,
+      image_count: preparedEvidence.length,
+      images: preparedEvidence.map((item) => ({
+        order: item.index + 1,
+        role: item.entry.role,
+        analysis_mode: item.index === 0 ? 'quality_review' : 'understand',
+        path: item.entry.absPath,
+        width: item.inspected.width,
+        height: item.inspected.height,
+        media_type: item.prepared.mediaType,
+      })),
+      policy: 'attached_only_after_deterministic_inspection_passed',
+      review_gate: {
+        scope: 'candidate_only',
+        max_submissions_per_evidence: 1,
+        recheck_requires: ['source_signature_changed', 'candidate_pixels_changed'],
+        required_checks: [
+          'contrast',
+          'clipping',
+          'overlap',
+          'duplicate_text',
+          'alignment',
+          'placeholder_residue',
+        ],
+        passing_rule: 'All required candidate visual-context checks must be pass. A fail or uncertain check requires repair or another inspection before the design review can pass.',
+      },
+    },
+  };
+  return {
+    content: `${JSON.stringify(payload, null, 2)}${renameNote}`,
+    images: preparedEvidence.map((item) => ({
+      data: item.prepared.buf.toString('base64'),
+      mediaType: item.prepared.mediaType,
+      analysisMode: item.index === 0 ? 'quality_review' : 'understand',
+    })),
+  };
+}
+
+function imageStudioVisualEvidence(
+  projectDirAbs: string,
+  inspection: Awaited<ReturnType<typeof inspectImageStudioProject>>,
+): Array<{ absPath: string; role: string }> {
+  if (!inspection.evidence_path) return [];
+  const references = (inspection.manifest?.references || []).map((reference) => ({
+    absPath: resolveProjectAsset(projectDirAbs, reference.path),
+    role: `reference:${reference.id}`,
+  }));
+  return [
+    { absPath: inspection.evidence_path, role: 'candidate' },
+    ...references,
+  ];
+}
+
 function errorCodeFromMessage(message: string): string {
   return message.match(/^([A-Z][A-Z0-9_]+):/)?.[1] || 'E_IMAGE_STUDIO_FAILED';
 }
@@ -152,6 +248,7 @@ async function buildImageStudioRecoveryHandoff(input: {
   projectDirAbs: string;
   stateAbsPath: string;
   generationStateAbsPath: string;
+  turnId: string;
   inspection?: Awaited<ReturnType<typeof inspectImageStudioProject>>;
   generation?: Awaited<ReturnType<typeof readImageGenerationControlState>>;
 }): Promise<Record<string, unknown>> {
@@ -162,7 +259,7 @@ async function buildImageStudioRecoveryHandoff(input: {
     ? await readImageGenerationControlState(input.generationStateAbsPath)
     : input.generation;
   const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
-  const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0);
+  const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, input.turnId);
   const evidenceAvailable = await existingFile(state?.evidence_path);
   const evidenceCurrent = evidenceAvailable
     && !!state
@@ -233,6 +330,7 @@ async function reportWritten(opts: ImageStudioToolOpts, absPath: string): Promis
 }
 
 export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
+  const currentTurnId = String(opts.turnId || '').trim();
   return {
     name: 'image_studio',
     description: 'Minimal ImageStudio security kernel for BYO/local provider availability quotes, local HTML/SVG capture, project inspection, host-configured image workflow execution, signature-bound visual review, and approved PNG/JPEG export. Evolving authoring and asset operations live in private skills.',
@@ -249,7 +347,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Final project.export format. Defaults from output_path, otherwise PNG.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
-        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Required for project.submit_design_review and must be sent in the same call as review_scope, review_findings, and the complete quality_scores object.' },
+        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Required for project.submit_design_review and must be sent in the same call as review_scope, review_findings, and the complete quality_scores object. One submission is allowed per exact evidence; after repair, both the source signature and rendered pixels must change before another review.' },
         review_scope: { type: 'string', description: 'Required for project.submit_design_review: concise statement of what was visually inspected.' },
         review_findings: { type: 'array', items: { type: 'string' }, description: 'Required for every project.submit_design_review call. Send [] for passed; send concrete non-empty findings for repair or blocked.' },
         quality_scores: {
@@ -266,12 +364,29 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           },
           required: ['intent_alignment', 'composition', 'craft', 'text_legibility', 'defect_freedom', 'specificity'],
         },
+        additional_dimensions: {
+          type: 'array',
+          maxItems: 8,
+          description: 'Optional open-ended task-specific review dimensions not already covered by the mandatory scores. Add every materially applicable dimension with a stable id, user-facing label, why it applies, concrete visual evidence, and a 0-100 score. High extra scores never raise the mandatory overall; every extra score must still meet the native dimension floor for passed.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', pattern: '^[a-z][a-z0-9_]{1,63}$' },
+              label: { type: 'string', maxLength: 120 },
+              reason: { type: 'string', maxLength: 500 },
+              evidence: { type: 'string', maxLength: 1000 },
+              score: { type: 'number', minimum: 0, maximum: 100 },
+            },
+            required: ['id', 'label', 'reason', 'evidence', 'score'],
+            additionalProperties: false,
+          },
+        },
         workflow_engine: { type: 'string', enum: ['comfyui', 'invokeai', 'automatic1111', 'iopaint'], description: 'Host-configured external workflow engine. The agent cannot supply an endpoint or token.' },
         workflow_path: { type: 'string', description: 'Project-local engine request/workflow JSON. Private skills own reusable templates.' },
         output_node_id: { type: 'string', description: 'Optional engine node id whose image output should be selected.' },
         output_index: { type: 'number', description: 'Zero-based image index within the selected workflow output. Defaults to 0.' },
         timeout_ms: { type: 'number', description: 'workflow.run terminal wait timeout from 1000 to 1800000 ms.' },
-        image_request_id: { type: 'string', description: 'Stable ImageStudio generation intent id. Required by workflow.run and generate_image; optional label for generation.quote.' },
+        image_request_id: { type: 'string', description: 'Stable ImageStudio generation intent id within the current user turn. Required by workflow.run and generate_image; optional label for generation.quote.' },
         size: { type: 'string', description: 'generation.quote only: exact provider size that will be passed to generate_image.' },
         reference_count: { type: 'number', description: 'generation.quote only: number of local and URL references that will be passed to generate_image, from 0 to 4.' },
       },
@@ -328,6 +443,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             projectDirAbs,
             requestId,
             outputAbsPath: unique.finalPath,
+            ...(currentTurnId ? { turnId: currentTurnId } : {}),
           });
           if (begun.status === 'reused') {
             const reusedPath = begun.transaction.output_path!;
@@ -391,11 +507,12 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
                 countsTowardBudget: workflowError ? workflowError.dispatched : true,
               });
             }
-            const usage = summarizeImageGenerationBudget(generation, begun.maxCalls);
+            const usage = summarizeImageGenerationBudget(generation, begun.maxCalls, currentTurnId);
             const handoff = await buildImageStudioRecoveryHandoff({
               projectDirAbs,
               stateAbsPath,
               generationStateAbsPath,
+              turnId: currentTurnId,
               generation,
             });
             return jsonResult({
@@ -421,6 +538,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               projectDirAbs,
               stateAbsPath,
               generationStateAbsPath,
+              turnId: currentTurnId,
               inspection,
             });
             return jsonResult({ ok: false, op, inspection, ...handoff });
@@ -429,12 +547,13 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             generationStateAbsPath,
           );
           const maxCalls = generation?.max_calls ?? inspection.manifest.generation_budget.max_calls;
-          const usage = summarizeImageGenerationBudget(generation, maxCalls);
+          const usage = summarizeImageGenerationBudget(generation, maxCalls, currentTurnId);
           if (usage.calls_started >= maxCalls) {
             const handoff = await buildImageStudioRecoveryHandoff({
               projectDirAbs,
               stateAbsPath,
               generationStateAbsPath,
+              turnId: currentTurnId,
               inspection,
               generation,
             });
@@ -442,7 +561,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
               ok: false,
               op,
               error_code: 'E_IMAGE_GENERATION_BUDGET_EXHAUSTED',
-              message: 'The planned image-generation calls have been used. Keep the current candidate visible and continue any useful zero-call repair before asking the user about another paid generation.',
+              message: 'The planned image-generation calls for the current user turn have been used. Keep the current candidate visible, continue any useful zero-call repair, and then end this turn. Do not request a quota-increase form or raise manifest max_calls; a later direct user message receives a fresh turn allowance.',
               generation: { ...usage, max_calls: maxCalls },
               ...handoff,
             });
@@ -486,7 +605,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
           ]);
           const inspection = await inspectImageStudioProject(projectDirAbs, state?.source_path);
           const maxCalls = generation?.max_calls ?? inspection.manifest?.generation_budget.max_calls ?? null;
-          const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0);
+          const usage = summarizeImageGenerationBudget(generation, maxCalls ?? 0, currentTurnId);
           let creditQuote: Record<string, unknown> | undefined;
           if (
             inspection.manifest
@@ -510,6 +629,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
+            turnId: currentTurnId,
             inspection,
             generation,
           });
@@ -550,9 +670,19 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
+            turnId: currentTurnId,
             inspection,
           });
-          return jsonResult({ ok: inspection.ok, op, inspection, ...handoff });
+          const result = { ok: inspection.ok, op, inspection, ...handoff };
+          if (inspection.ok
+            && (inspection.route === 'generate' || inspection.route === 'edit')
+            && inspection.evidence_path) {
+            return jsonResultWithVisualEvidence(
+              result,
+              imageStudioVisualEvidence(projectDirAbs, inspection),
+            );
+          }
+          return jsonResult(result);
         }
 
         if (op === 'project.snapshot') {
@@ -569,15 +699,24 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
+            turnId: currentTurnId,
             inspection,
           });
-          return jsonResult({
+          const result = {
             ok: inspection.ok,
             op,
             inspection,
             ...(inspection.ok ? { media: versionedChatMediaLocalUrl(unique.finalPath) } : {}),
             ...handoff,
-          }, unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '');
+          };
+          if (inspection.ok && inspection.evidence_path) {
+            return jsonResultWithVisualEvidence(
+              result,
+              imageStudioVisualEvidence(projectDirAbs, inspection),
+              unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '',
+            );
+          }
+          return jsonResult(result, unique.renamed ? renderRenameSignal(requested, unique.finalPath) : '');
         }
 
         if (op === 'project.submit_design_review') {
@@ -601,11 +740,13 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             scope: String(input.review_scope || ''),
             findings,
             qualityScores: input.quality_scores,
+            additionalDimensions: input.additional_dimensions,
           });
           const handoff = await buildImageStudioRecoveryHandoff({
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
+            turnId: currentTurnId,
           });
           return jsonResult({
             ok: true,
@@ -624,7 +765,17 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         if (!isPathAllowed(requested, roots)) {
           return { content: `E_PATH_OUT_OF_SCOPE: output_path is outside scope: ${requested}`, isError: true } as ToolResult;
         }
-        const unique = await uniquifyPath(requested, (candidate) => !!opts.hasProducedPath?.(candidate));
+        // Ownership is deliberately *not* consulted here. `project.export` is the
+        // delivery gate: each export is a finished artefact the user has already
+        // been shown, not scratch space. The conversation-scoped
+        // `hasProducedPath` used by snapshot / workflow.run treats "produced this
+        // turn or earlier" as a refinement and overwrites in place, so a revision
+        // requested in a *later* turn would silently replace the version already
+        // attached to an earlier chat message. `() => false` keeps every revision
+        // on disk as `-2 / -3 / ...` and makes uniquify emit `<file-renamed>` so
+        // the model can tell the user where the new version landed. Same reasoning
+        // as the document export in `office-tools.ts`.
+        const unique = await uniquifyPath(requested, () => false);
         const exported = await exportImageStudioProject({ stateAbsPath, outputAbsPath: unique.finalPath, format });
         await finalizeProducedFile(unique.finalPath, {
           userId: opts.userId,
@@ -648,6 +799,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             projectDirAbs,
             stateAbsPath,
             generationStateAbsPath,
+            turnId: currentTurnId,
           });
         } catch { /* retain the original failure when recovery inspection is unavailable */ }
         return jsonResult({

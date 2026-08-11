@@ -316,8 +316,12 @@ describe('search › searchAll', () => {
       }];
     });
     const s = await loadSearch(provider);
+    const degradations: string[] = [];
 
-    const results = await s.searchLibraryContents('u1', 'marker', { limit: 10 });
+    const results = await s.searchLibraryContents('u1', 'marker', {
+      limit: 10,
+      onDegraded: (code) => degradations.push(code),
+    });
 
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({
@@ -325,6 +329,10 @@ describe('search › searchAll', () => {
       project_id: 'healthy-project',
       path: 'healthy.md',
     });
+    expect(new Set(degradations)).toEqual(new Set([
+      'library_global_content_unavailable',
+      'library_project_content_unavailable',
+    ]));
   });
 
   it('falls back to filename results when query embedding is unavailable', async () => {
@@ -335,11 +343,12 @@ describe('search › searchAll', () => {
     const ix = await import('../../../../src/main/features/search/indexer');
     await ix.reconcileContextsIndex();
 
-    const { results } = await s.searchAll('u1', 'embedding-fallback', {
+    const searchResult = await s.searchAll('u1', 'embedding-fallback', {
       scope: 'context',
     });
 
-    expect(results.map((row) => row.path)).toEqual(['embedding-fallback.md']);
+    expect(searchResult.results.map((row) => row.path)).toEqual(['embedding-fallback.md']);
+    expect(searchResult.degradation_code).toBe('library_content_embedding_unavailable');
     expect(provider.searchGlobal).not.toHaveBeenCalled();
     expect(provider.listProjects).not.toHaveBeenCalled();
   });

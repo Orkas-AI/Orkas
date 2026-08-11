@@ -17,9 +17,22 @@ let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'kbidx';
 
+const embedFaults = vi.hoisted(() => ({
+  nativeOnnxFailuresRemaining: 0,
+}));
+
 // Mocks are module-scoped — they apply to every dynamic import below.
 vi.mock('../../../src/main/features/kb_embed', () => ({
   embedTexts: async (texts: string[]) => {
+    if (
+      embedFaults.nativeOnnxFailuresRemaining > 0
+      && texts.some((t) => t.includes('__FAIL_NATIVE_ONNX_ONCE__'))
+    ) {
+      embedFaults.nativeOnnxFailuresRemaining -= 1;
+      throw Object.assign(new Error('onnxruntime native module failed to load'), {
+        code: 'E_LIBRARY_NATIVE_ONNX_LOAD',
+      });
+    }
     // Sentinel makes extraction fail — simpler than re-mocking per-test.
     if (texts.some((t) => t.includes('__FAIL_EMBED__'))) {
       throw new Error('mocked embed failure');
@@ -57,6 +70,7 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-kbidx-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  embedFaults.nativeOnnxFailuresRemaining = 0;
   chatWithModelMock.mockReset();
   chatWithModelMock.mockResolvedValue({
     ok: true,
@@ -223,6 +237,46 @@ describe('kb_indexer › enqueue + processJob', () => {
     const row = kb.getFileByPath(TEST_UID, 'a.md');
     expect(row?.status).toBe('failed');
     expect(row?.error).toMatch(/mocked embed failure/);
+  });
+
+  it('keeps a native ONNX load failure actionable and reaches ready after retry', async () => {
+    embedFaults.nativeOnnxFailuresRemaining = 1;
+    writeCtx('windows-native.md', '__FAIL_NATIVE_ONNX_ONCE__ searchable after retry');
+    const idx = await import('../../../src/main/features/kb_indexer');
+    const kb = await import('../../../src/main/features/kb_vector');
+    const events = collectEvents(idx.kbEvents) as Array<{
+      relPath: string;
+      status: string;
+      stage?: string;
+      errorCode?: string;
+    }>;
+
+    idx.enqueue(TEST_UID, 'windows-native.md');
+    await idx.drain(TEST_UID);
+
+    expect(kb.getFileByPath(TEST_UID, 'windows-native.md')).toMatchObject({
+      status: 'failed',
+      error: 'onnxruntime native module failed to load',
+    });
+    expect(events).toContainEqual(expect.objectContaining({
+      relPath: 'windows-native.md',
+      status: 'failed',
+      stage: 'embed',
+      errorCode: 'E_LIBRARY_NATIVE_ONNX_LOAD',
+    }));
+
+    const retryStart = events.length;
+    idx.enqueue(TEST_UID, 'windows-native.md', 'upsert', { reason: 'manual' });
+    await idx.drain(TEST_UID);
+
+    expect(kb.getFileByPath(TEST_UID, 'windows-native.md')).toMatchObject({
+      status: 'ready',
+      chunks: 1,
+    });
+    const retryStatuses = events.slice(retryStart).map((event) => event.status);
+    expect(retryStatuses).toContain('pending');
+    expect(retryStatuses).toContain('processing');
+    expect(retryStatuses.at(-1)).toBe('ready');
   });
 
   it('times out one stuck embedding and still processes the next queued file', async () => {

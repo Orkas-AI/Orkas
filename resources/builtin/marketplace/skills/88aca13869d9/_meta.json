@@ -1,12 +1,11 @@
 {
-  "version": "1.0.1",
-  "updated_at": "2026-07-28T13:32:31.000Z",
-  "min_app_version": "1.6.2",
+  "version": "1.0.7",
+  "updated_at": "2026-08-08T06:00:00.000Z",
   "reseed_if_deleted_before": "2026-07-28T13:32:31Z",
   "category": "rnd",
   "descriptions": {
-    "zh": "用于读取 GitHub issue、PR、CI、release 与仓库元数据，并在明确授权后执行对应维护操作。",
-    "en": "Read GitHub issues, pull requests, CI, releases, and repository metadata, and perform maintenance writes only with explicit approval."
+    "zh": "读取 GitHub issue、PR、CI、release 与仓库元数据；当前请求明确指定时执行对应写操作，目标或范围变化时再确认。",
+    "en": "Read GitHub issues, pull requests, CI, releases, and repository metadata; perform exact writes authorized by the current request and reconfirm target or scope changes."
   },
   "routing": {
     "applicable_domain": [
@@ -16,7 +15,7 @@
     "negative_examples": [
       "edit local repository source without requiring GitHub state",
       "infer live issue, pull request, or CI status from stale local text",
-      "perform GitHub writes without explicit user approval"
+      "perform writes outside the exact current request or after a material scope expansion without approval"
     ],
     "prerequisites": [
       "a GitHub repository or concrete GitHub object is in scope",

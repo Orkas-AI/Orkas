@@ -42,7 +42,7 @@ export async function runtimeStatus(
   userId: string,
   cid: string,
   projectIdHint?: string | null,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; started_at_ms: number }>; active_recipient?: string }> {
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string; steerable: boolean; started_at_ms: number }>; active_recipient?: string }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     const state = await readState(userId, cid, projectIdHint);
@@ -88,6 +88,7 @@ import {
 } from './router';
 import type { MarketplaceInstallRequest } from './visibility';
 import * as marketplace from '../marketplace';
+import { clearConversationHistorySummary } from './history-summary-cache';
 
 const log = createLogger('group_chat.facade');
 
@@ -101,9 +102,13 @@ export interface SendInput {
   userId: string;
   cid: string;
   text: string;
+  /** Renderer-generated identity for the optimistic user bubble. */
+  client_msg_id?: string;
   /** User-visible first-message text used only for automatic task titles.
    *  Callers that inject transport routing such as `@Agent` into `text`
-   *  should pass the pre-routing text here. */
+   *  should pass the pre-routing text here. An explicitly empty string means
+   *  the new task has references but no user-authored body, so its placeholder
+   *  title must remain unchanged. */
   title_text?: string;
   model_text?: string;
   attachments?: string[];
@@ -237,10 +242,12 @@ export async function send(
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
   const {
     userId, cid, text, title_text, model_text, attachments, use_selections, references,
+    client_msg_id,
   } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
-  const titleText = typeof title_text === 'string' ? title_text.trim() : '';
+  const hasTitleText = typeof title_text === 'string';
+  const titleText = hasTitleText ? title_text.trim() : '';
   await seedReservedActors(userId, cid);
   // Auto-title: the first real user message in a fresh / unnamed
   // conversation overwrites the placeholder title so the sidebar item
@@ -248,11 +255,12 @@ export async function send(
   try {
     const chats = await import('../chats');
     const conv = await chats.getConversation(userId, cid);
-    if (conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
+    const titleSeed = hasTitleText ? titleText : text;
+    if (titleSeed && conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
       await chats.updateConversation(
         userId,
         cid,
-        { title: chats.autoTitle(titleText || text) },
+        { title: chats.autoTitle(titleSeed) },
         conv.project_id || null,
       );
     }
@@ -265,6 +273,9 @@ export async function send(
       uid: userId, cid,
       fromActorId: USER_ID,
       text,
+      ...(typeof client_msg_id === 'string' && client_msg_id.trim()
+        ? { client_msg_id: client_msg_id.trim() }
+        : {}),
       ...(model_text && model_text.trim() ? { model_text } : {}),
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
       ...(use_selections && use_selections.length ? { use_selections } : {}),
@@ -286,6 +297,10 @@ export interface RetryFailedTurnInput {
   /** Short localized text rendered in the user's bubble (for example,
    * "Continue"). The model receives host-owned text below. */
   visibleText: string;
+  /** Same contract as `SendInput.client_msg_id`. A retry paints an optimistic
+   * bubble exactly like a normal send, so it must echo an identity back or the
+   * renderer cannot tell that bubble is this record. */
+  client_msg_id?: string;
 }
 
 export interface ResolvedFailedTurnRetry {
@@ -379,6 +394,7 @@ export async function resolveFailedTurnRetry(
 ): Promise<{ ok: true; value: ResolvedFailedTurnRetry } | { ok: false; error: string }> {
   const { userId, cid, failedMessageId } = input;
   const visibleText = String(input.visibleText || '').trim();
+  const clientMsgId = String(input.client_msg_id || '').trim();
   if (!safeId(cid) || !safeId(failedMessageId)) return { ok: false, error: 'invalid retry target' };
   if (!visibleText) return { ok: false, error: 'empty retry message' };
 
@@ -568,6 +584,7 @@ export async function resolveFailedTurnRetry(
         cid,
         fromActorId: USER_ID,
         text: visibleText,
+        ...(clientMsgId ? { client_msg_id: clientMsgId } : {}),
         model_text: mode === 'resume'
           ? [
               RETRY_RESUME_MODEL_TEXT,
@@ -1127,6 +1144,7 @@ export async function deleteMessages(
 
   const deletedAt = nowIso();
   await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
+  await clearConversationHistorySummary(userId, cid);
   const layout = conversationLayout(userId, cid);
   try {
     const entries = await fsp.readdir(layout.visibilityDir, { withFileTypes: true });

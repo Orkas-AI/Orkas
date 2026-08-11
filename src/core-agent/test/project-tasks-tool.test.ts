@@ -48,6 +48,23 @@ describe('project_tasks tool', () => {
     expect(calls[0][1]).toMatchObject({ title: 'do X', owner: 'Researcher', status: 'in_progress' });
   });
 
+  it('returns the host idempotency receipt for an existing open task', async () => {
+    const { handler } = stubHandler();
+    handler.create = async (input) => ({
+      ok: true,
+      task: { id: 't_existing', title: input.title, status: 'todo' },
+      alreadyExists: true,
+    });
+    const res = await createProjectTasksTool(handler).execute(
+      { action: 'create', title: 'do X' }, ctx);
+    expect(res.isError).toBeFalsy();
+    expect(JSON.parse(res.content)).toMatchObject({
+      ok: true,
+      alreadyExists: true,
+      task: { id: 't_existing' },
+    });
+  });
+
   it('update and complete require task_id', async () => {
     const { handler } = stubHandler();
     const tool = createProjectTasksTool(handler);

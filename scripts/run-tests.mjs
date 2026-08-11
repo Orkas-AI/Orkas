@@ -11,6 +11,15 @@ import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withWindowsGitOnPath } from './test-runtime-env.mjs';
+import { formatDriftReport, installedDependencyDrift } from './check-installed-dependencies.mjs';
+
+// A merge that advanced the lockfile leaves stale packages installed, and the
+// resulting failures name the wrong culprit. Say so before Vitest starts.
+const { drifted } = installedDependencyDrift();
+if (drifted.length) {
+  process.stderr.write(formatDriftReport(drifted));
+  process.exit(1);
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const require_ = createRequire(import.meta.url);

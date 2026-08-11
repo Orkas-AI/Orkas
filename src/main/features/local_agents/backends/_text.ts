@@ -32,7 +32,7 @@ export interface TextBackendDef {
   /** Logger scope name, e.g. `'local-agents:codex'`. */
   logName: string;
   /** Build the argv passed to the CLI. Receives the full opts so it
-   *  can inject `--model`, append `customArgs`, etc. */
+   *  can append `customArgs` and encode backend-specific flags. */
   buildArgs(opts: BackendRunOptions): string[];
   /** When true, the prompt is written to stdin (then stdin closes);
    *  when false the caller already encoded it into argv. */

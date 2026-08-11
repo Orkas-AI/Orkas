@@ -26,6 +26,7 @@ function extractFunction(name: string): string {
 function loadEventProcessKind(): (evt: Record<string, unknown>, text?: string) => string {
   return vm.runInNewContext(`
     function _processKindOf() { return 'meta'; }
+    function _isProcessPlanEvent() { return false; }
     (${extractFunction('_eventProcessKind')});
   `, {});
 }

@@ -49,6 +49,7 @@ export type LocalCliResumeStrategy = 'native' | 'session-id' | 'none';
 
 export type LocalCliInstructionChannel = 'native' | 'user-message';
 export type LocalCliDurableInstructionScope = 'invocation' | 'session';
+export type LocalCliActiveRunIngress = 'codex-app-server' | 'stream-json' | 'none';
 
 export interface LocalCliCapabilities {
   resume: LocalCliResumeStrategy;
@@ -64,6 +65,10 @@ export interface LocalCliCapabilities {
   codingProjectDirectory: boolean;
   /** Whether the runner can attach the per-run Orkas MCP bridge. */
   orkasBridge: boolean;
+  /** Transport contract for accepting another user message before the current
+   * native CLI process/turn finishes. This is a framework capability, not a
+   * model allowlist. */
+  activeRunIngress: LocalCliActiveRunIngress;
 }
 
 /** Canonical CLI inventory and context/session contract. */
@@ -74,6 +79,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'invocation',
     codingProjectDirectory: true,
     orkasBridge: true,
+    activeRunIngress: 'stream-json',
   },
   codex: {
     resume: 'native',
@@ -81,6 +87,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'session',
     codingProjectDirectory: true,
     orkasBridge: true,
+    activeRunIngress: 'codex-app-server',
   },
   openclaw: {
     resume: 'session-id',
@@ -88,6 +95,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'session',
     codingProjectDirectory: false,
     orkasBridge: false,
+    activeRunIngress: 'none',
   },
   opencode: {
     resume: 'native',
@@ -95,6 +103,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'session',
     codingProjectDirectory: false,
     orkasBridge: false,
+    activeRunIngress: 'none',
   },
   hermes: {
     resume: 'none',
@@ -102,6 +111,7 @@ export const LOCAL_CLI_CAPABILITIES = {
     durableInstructionScope: 'invocation',
     codingProjectDirectory: false,
     orkasBridge: false,
+    activeRunIngress: 'none',
   },
 } as const satisfies Record<string, LocalCliCapabilities>;
 
@@ -118,6 +128,7 @@ const UNKNOWN_CLI_CAPABILITIES: Readonly<LocalCliCapabilities> = Object.freeze({
   durableInstructionScope: 'invocation',
   codingProjectDirectory: false,
   orkasBridge: false,
+  activeRunIngress: 'none',
 });
 
 export function localCliCapabilities(cli: string | undefined): Readonly<LocalCliCapabilities> {

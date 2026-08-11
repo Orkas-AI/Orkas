@@ -10,6 +10,12 @@ import { validateImageStudioManifest, type ImageStudioRoute } from './image_stud
 export interface ImageGenerationTransaction {
   transaction_id: string;
   request_id: string;
+  /**
+   * Host-owned user-turn scope for call admission and request-id idempotency.
+   * Missing records predate per-turn accounting and remain available as audit
+   * history without consuming a later named turn.
+   */
+  turn_id?: string;
   status: 'pending' | 'completed' | 'failed';
   /**
    * Missing means counted for compatibility with existing fail-closed state.
@@ -50,8 +56,16 @@ export function imageGenerationCountsTowardBudget(transaction: ImageGenerationTr
 export function summarizeImageGenerationBudget(
   state: ImageGenerationControlState | null,
   maxCalls: number,
+  turnId?: string,
 ): ImageGenerationBudgetUsage {
-  const transactions = state?.transactions || [];
+  const normalizedTurnId = String(turnId || '').trim();
+  const allTransactions = state?.transactions || [];
+  // Callers without a host turn id retain the legacy project-wide fail-closed
+  // behavior. Normal production calls always provide a turn id and therefore
+  // ignore earlier turns while preserving their transactions for audit.
+  const transactions = normalizedTurnId
+    ? allTransactions.filter((item) => item.turn_id === normalizedTurnId)
+    : allTransactions;
   const counted = transactions.filter(imageGenerationCountsTowardBudget);
   return {
     attempts_recorded: transactions.length,
@@ -93,17 +107,22 @@ export function assertImageGenerationRequestId(requestId: string): void {
 export async function findReusableImageStudioGeneration(
   stateAbsPath: string,
   requestId: string,
+  turnId?: string,
 ): Promise<ImageGenerationTransaction | null> {
   assertImageGenerationRequestId(requestId);
   const state = await readImageGenerationControlState(stateAbsPath);
-  const existing = state?.transactions.find((item) => item.request_id === requestId);
+  const normalizedTurnId = String(turnId || '').trim();
+  const existing = state?.transactions.find((item) => (
+    item.request_id === requestId
+    && (!normalizedTurnId || item.turn_id === normalizedTurnId)
+  ));
   if (!existing) return null;
   if (existing.status === 'completed' && existing.output_path) {
     try {
       if ((await fs.stat(existing.output_path)).isFile()) return existing;
     } catch { /* completed output disappeared; fail closed below */ }
   }
-  throw new Error(`E_IMAGE_GENERATION_REQUEST_ALREADY_USED: ${requestId} is ${existing.status}; use its completed output or a new request id within the remaining budget.`);
+  throw new Error(`E_IMAGE_GENERATION_REQUEST_ALREADY_USED: ${requestId} is ${existing.status}; use its completed output or a new request id within this turn's remaining budget.`);
 }
 
 async function writeState(stateAbsPath: string, state: ImageGenerationControlState): Promise<void> {
@@ -132,6 +151,7 @@ export async function beginImageStudioGeneration(input: {
   projectDirAbs: string;
   requestId: string;
   outputAbsPath: string;
+  turnId?: string;
 }): Promise<{ status: 'started' | 'reused'; transaction: ImageGenerationTransaction; callCount: number; maxCalls: number }> {
   return fileEditLock(path.resolve(input.stateAbsPath)).runExclusive(async () => {
     const projectDirAbs = path.resolve(input.projectDirAbs);
@@ -153,9 +173,13 @@ export async function beginImageStudioGeneration(input: {
     state.project_dir = projectDirAbs;
     state.route = budget.route;
     state.max_calls = budget.maxCalls;
-    const usage = summarizeImageGenerationBudget(state, budget.maxCalls);
+    const normalizedTurnId = String(input.turnId || '').trim();
+    const usage = summarizeImageGenerationBudget(state, budget.maxCalls, normalizedTurnId);
 
-    const existing = state.transactions.find((item) => item.request_id === input.requestId);
+    const existing = state.transactions.find((item) => (
+      item.request_id === input.requestId
+      && (!normalizedTurnId || item.turn_id === normalizedTurnId)
+    ));
     if (existing) {
       if (existing.status === 'completed' && existing.output_path) {
         try {
@@ -164,14 +188,15 @@ export async function beginImageStudioGeneration(input: {
           }
         } catch { /* completed output disappeared; fail closed below */ }
       }
-      throw new Error(`E_IMAGE_GENERATION_REQUEST_ALREADY_USED: ${input.requestId} is ${existing.status}; use its completed output or a new request id within the remaining budget.`);
+      throw new Error(`E_IMAGE_GENERATION_REQUEST_ALREADY_USED: ${input.requestId} is ${existing.status}; use its completed output or a new request id within this turn's remaining budget.`);
     }
     if (usage.calls_started >= budget.maxCalls) {
-      throw new Error(`E_IMAGE_GENERATION_BUDGET_EXHAUSTED: ${budget.route.toUpperCase()} allows ${budget.maxCalls} image-generation call(s), and ${usage.calls_started} dispatched or uncertain call(s) count toward the budget.`);
+      throw new Error(`E_IMAGE_GENERATION_BUDGET_EXHAUSTED: ${budget.route.toUpperCase()} allows ${budget.maxCalls} image-generation call(s) in the current turn, and ${usage.calls_started} dispatched or uncertain call(s) count toward this turn's budget.`);
     }
     const transaction: ImageGenerationTransaction = {
       transaction_id: crypto.randomUUID(),
       request_id: input.requestId,
+      ...(normalizedTurnId ? { turn_id: normalizedTurnId } : {}),
       status: 'pending',
       planned_output_path: path.resolve(input.outputAbsPath),
       started_at: now,
@@ -182,7 +207,7 @@ export async function beginImageStudioGeneration(input: {
     return {
       status: 'started',
       transaction,
-      callCount: summarizeImageGenerationBudget(state, budget.maxCalls).calls_started,
+      callCount: summarizeImageGenerationBudget(state, budget.maxCalls, normalizedTurnId).calls_started,
       maxCalls: budget.maxCalls,
     };
   });

@@ -24,6 +24,7 @@ vi.mock('../../../../src/core-agent/src/sandbox/executor', () => ({
 }));
 
 import {
+  MAC_OFFICECLI_SANDBOX_PROFILE,
   OfficeCliError,
   _resetOfficeCliAvailableForTest,
   closeAllOfficeResidents,
@@ -77,7 +78,11 @@ describe('OfficeCLI engine', () => {
     vi.stubEnv('OFFICECLI_SKIP_UPDATE', '0');
 
     const resultPromise = runOfficeCli(['batch', 'book.xlsx'], { cwd: tmpDir, stdin: '{"ops":[]}' });
-    expect(mocks.spawn).toHaveBeenCalledWith(mocks.bin, ['batch', 'book.xlsx'], {
+    const expectedCommand = process.platform === 'darwin' ? '/usr/bin/sandbox-exec' : mocks.bin;
+    const expectedArgs = process.platform === 'darwin'
+      ? ['-p', MAC_OFFICECLI_SANDBOX_PROFILE, mocks.bin, 'batch', 'book.xlsx']
+      : ['batch', 'book.xlsx'];
+    expect(mocks.spawn).toHaveBeenCalledWith(expectedCommand, expectedArgs, {
       cwd: tmpDir,
       detached: process.platform !== 'win32',
       env: expect.objectContaining({ OFFICECLI_SKIP_UPDATE: '1' }),
@@ -92,6 +97,22 @@ describe('OfficeCLI engine', () => {
     child.emit('close', 0);
 
     await expect(resultPromise).resolves.toEqual({ code: 0, stdout: 'done', stderr: 'warning' });
+  });
+
+  it('prevents macOS OfficeCLI children from executing installed app bundles', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    const child = new FakeChild();
+    mocks.spawn.mockReturnValue(child);
+
+    const resultPromise = runOfficeCli(['view', 'deck.pptx', 'html'], { cwd: tmpDir });
+    expect(mocks.spawn).toHaveBeenCalledWith(
+      '/usr/bin/sandbox-exec',
+      ['-p', expect.stringContaining('(deny process-exec (subpath "/Applications"))'), mocks.bin,
+        'view', 'deck.pptx', 'html'],
+      expect.any(Object),
+    );
+    child.emit('close', 0);
+    await expect(resultPromise).resolves.toMatchObject({ code: 0 });
   });
 
   it('rejects a timeout immediately and terminates the entire process tree', async () => {

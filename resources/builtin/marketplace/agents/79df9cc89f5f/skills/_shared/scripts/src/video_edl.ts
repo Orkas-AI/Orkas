@@ -366,7 +366,11 @@ export function validateEdl(obj: unknown): EdlValidation {
         else if (referenceIds.has(reference.id)) err(`${at}.id`, 'E_REFERENCE_ID_DUP', `duplicate reference id "${reference.id}"`);
         else referenceIds.add(reference.id);
         if (!VIDEO_REFERENCE_MEDIA_TYPES.includes(reference.media_type as VideoReferenceMediaType)) {
-          err(`${at}.media_type`, 'E_REFERENCE_MEDIA_TYPE', 'media_type must be image or video');
+          err(
+          `${at}.media_type`,
+          'E_REFERENCE_MEDIA_TYPE',
+          `media_type must be one of ${VIDEO_REFERENCE_MEDIA_TYPES.join(' | ')}`,
+        );
         }
         if (!isStr(reference.source)) err(`${at}.source`, 'E_REFERENCE_SOURCE', 'reference source path or URL is required');
         else referenceSources.set(reference.source, reference);
@@ -387,7 +391,11 @@ export function validateEdl(obj: unknown): EdlValidation {
         if (Array.isArray(reference.roles)) {
           for (const role of reference.roles) {
             if (!VIDEO_REFERENCE_ROLES.includes(role as VideoReferenceRole)) {
-              err(`${at}.roles`, 'E_REFERENCE_ROLE', `unknown reference role "${String(role)}"`);
+              err(
+                `${at}.roles`,
+                'E_REFERENCE_ROLE',
+                `unknown reference role "${String(role)}"; must be one of ${VIDEO_REFERENCE_ROLES.join(' | ')}`,
+              );
             }
           }
         }
@@ -446,7 +454,7 @@ export function validateEdl(obj: unknown): EdlValidation {
       if (Array.isArray(editStrategy.decision_signals)) {
         for (const signal of editStrategy.decision_signals) {
           if (!VIDEO_EDIT_DECISION_SIGNALS.includes(signal as VideoEditDecisionSignal)) {
-            err('edit_strategy.decision_signals', 'E_EDIT_STRATEGY_SIGNAL', `unknown decision signal "${String(signal)}"`);
+            err('edit_strategy.decision_signals', 'E_EDIT_STRATEGY_SIGNAL', `unknown decision signal "${String(signal)}"; must be one of ${VIDEO_EDIT_DECISION_SIGNALS.join(' | ')}`);
           }
         }
       }
@@ -572,6 +580,28 @@ export function validateEdl(obj: unknown): EdlValidation {
               warn(`tracks.narration.segments[${i}].produced_path`, 'W_NARRATION_PRODUCED', 'produced_path should be a string path when present');
             }
           });
+          // Overlapping line windows produce two voices at once at mix time.
+          // The 2026-08-06 run wrote `target_sec` as each line's END time
+          // instead of its duration — windows like [11, +20] swallowed their
+          // successors, TTS bindings failed repeatedly (23 calls for 6 lines),
+          // and the shipped mix had up to 1.5 s of double narration. Catch it
+          // at free validation, before any synthesis is attempted.
+          const windows = nar.segments
+            .map((ln, i) => ({ i, start: isObject(ln) ? Number(ln.start_sec) : NaN, dur: isObject(ln) ? Number(ln.target_sec) : NaN }))
+            .filter((w) => Number.isFinite(w.start) && Number.isFinite(w.dur) && w.dur > 0)
+            .sort((a, z) => a.start - z.start);
+          for (let k = 1; k < windows.length; k += 1) {
+            const prev = windows[k - 1];
+            const cur = windows[k];
+            const overlapSec = prev.start + prev.dur - cur.start;
+            if (overlapSec > 0.05) {
+              err(
+                `tracks.narration.segments[${prev.i}]`,
+                'E_NARRATION_WINDOWS_OVERLAP',
+                `line window [${prev.start}s +${prev.dur}s] runs ${overlapSec.toFixed(2)}s into the next line at ${cur.start}s — target_sec is the line DURATION, not its end time; two overlapping windows mix as two voices speaking at once`,
+              );
+            }
+          }
         } else {
           warn(
             'tracks.narration',

@@ -183,13 +183,15 @@ function _ensureLightbox() {
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
       <img class="chat-lightbox-img" alt="" draggable="false" data-monitor-resource="chat-image-lightbox" />
-      <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
-        ${libraryIcon}
-      </button>
-      <button type="button" class="chat-lightbox-reveal" aria-label="${revealLabel}" title="${revealLabel}" hidden>
-        ${folderIcon}
-      </button>
-      <button type="button" class="modal-close-btn chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">${closeIcon}</button>
+      <div class="chat-lightbox-actions">
+        <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
+          ${libraryIcon}
+        </button>
+        <button type="button" class="chat-lightbox-reveal" aria-label="${revealLabel}" title="${revealLabel}" hidden>
+          ${folderIcon}
+        </button>
+        <button type="button" class="modal-close-btn chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">${closeIcon}</button>
+      </div>
     </div>
   `;
   document.body.appendChild(root);
@@ -340,6 +342,14 @@ function openChatImageLightbox(src, alt, opts) {
   }
 }
 
+function _releaseLightboxImage(image) {
+  if (!image) return;
+  // `image.src = ''` resolves to the current document URL in Chromium and
+  // emits a false resource-load failure. Removing the attribute releases the
+  // protocol/blob handle without starting another image request.
+  image.removeAttribute('src');
+}
+
 function closeChatImageLightbox() {
   if (!_lightboxEl) return;
   _lightboxEl.classList.remove('is-open');
@@ -347,7 +357,7 @@ function closeChatImageLightbox() {
   // Drop the <img> src so the browser can release the blob / protocol
   // handle — keeps memory tidy if user opens many large images.
   if (_lightboxImg) {
-    _lightboxImg.src = '';
+    _releaseLightboxImage(_lightboxImg);
     // Defensively restore the transition in case close fires during an
     // active pan (mouseup never came). Otherwise the next open would
     // start with transition:none stuck on the element.

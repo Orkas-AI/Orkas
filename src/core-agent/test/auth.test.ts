@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -39,12 +39,45 @@ describe("Auth Store", () => {
     } else {
       try { fs.unlinkSync(storePath); } catch { /* ignore */ }
     }
+    vi.restoreAllMocks();
   });
 
   it("returns empty store when no file exists", () => {
     const store = loadAuthStore();
     expect(store.version).toBe(1);
     expect(Object.keys(store.profiles)).toHaveLength(0);
+  });
+
+  it("treats a host-managed encrypted store as opaque without a parse warning", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, "ORKLSEC1:encrypted-envelope", "utf-8");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(loadAuthStore()).toEqual({ version: 1, profiles: {} });
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a host-managed encrypted store", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    const encrypted = "ORKLSEC1:encrypted-envelope";
+    fs.writeFileSync(storePath, encrypted, "utf-8");
+
+    expect(() => saveAuthStore({ version: 1, profiles: {} }))
+      .toThrow("auth store is managed by the embedding host");
+    expect(fs.readFileSync(storePath, "utf-8")).toBe(encrypted);
+  });
+
+  it("still warns for malformed plaintext JSON", () => {
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, "not-json", "utf-8");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(loadAuthStore()).toEqual({ version: 1, profiles: {} });
+    expect(warn).toHaveBeenCalledWith(
+      "[auth-store]",
+      "failed to load auth store",
+      expect.objectContaining({ error: expect.any(String) }),
+    );
   });
 
   it("resolves auth dir under home directory", () => {

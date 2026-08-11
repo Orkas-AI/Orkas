@@ -3,6 +3,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const loggerMocks = vi.hoisted(() => ({
+  warn: vi.fn(),
+}));
+
+vi.mock('../../../src/main/logger', () => ({
+  createLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: loggerMocks.warn, error: vi.fn() }),
+}));
+
 // auth.ts has two layers:
 //   - pure helpers (maskKey, FEATURED_PROVIDERS, getConfig, saveConfig)
 //   - core-agent integration (listProviders, listModels, saveApiKey,
@@ -20,6 +28,7 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  loggerMocks.warn.mockReset();
   // auth.ts goes through `getActiveUserId()` for every file path, so we
   // must pin an active uid before any dynamic import of auth-related modules.
   const users = await import('../../../src/main/features/users');
@@ -27,6 +36,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.doUnmock('node:fs');
   vi.doUnmock('@earendil-works/pi-ai/oauth');
   vi.doUnmock('#core-agent');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
@@ -317,6 +327,7 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
       apiKey: 'sk-custom-runtime-xxxxxxxx',
       contextWindow: 262_144,
       maxTokens: 16_384,
+      reasoningEffort: 'medium',
     });
 
     expect(added.profileId).toBe('custom:公司网关');
@@ -340,9 +351,25 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
           baseUrl: 'https://gateway.example.test/v1',
           contextWindow: 262_144,
           maxTokens: 16_384,
+          reasoningEffort: 'medium',
         },
       }),
     ]);
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(persisted.profiles['custom:公司网关']).toMatchObject({
+      maxTokens: 16_384,
+      reasoningEffort: 'medium',
+    });
+    expect(persisted.profiles['custom:公司网关']).not.toHaveProperty('maxTokensSource');
 
     const custom = (await a.listProviders()).providers.find((provider) => provider.id === 'custom');
     expect(custom).toMatchObject({
@@ -394,7 +421,7 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
       customConfig: {
         baseUrl: 'https://gateway.example.test/v1',
         contextWindow: 131_072,
-        maxTokens: 8_192,
+        maxTokens: 32_768,
       },
     });
     await expect(a.addCustomModelEntry({
@@ -413,7 +440,7 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
     ]);
   });
 
-  it('uses conservative runtime limits when optional advanced fields are blank', async () => {
+  it('uses the 32K runtime default without persisting an omitted maxTokens field', async () => {
     const a = await import('../../../src/main/features/auth');
     await a.addCustomModelEntry({
       label: 'local',
@@ -421,14 +448,68 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
       model: 'local-model',
       apiKey: 'local-development-key',
       contextWindow: '',
-      maxTokens: '',
+      maxTokens: '   ',
     });
 
     expect((await a.pickChatEntryGroup())[0]?.customConfig).toEqual({
       baseUrl: 'http://127.0.0.1:11434/v1',
       contextWindow: 131_072,
-      maxTokens: 8_192,
+      maxTokens: 32_768,
     });
+
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(persisted.profiles['custom:local']).not.toHaveProperty('maxTokens');
+  });
+
+  it('removes the legacy generated 8K custom cap during the v6 profile migration', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 5,
+      profiles: {
+        'custom:legacy': {
+          type: 'api_key',
+          provider: 'custom',
+          label: 'legacy',
+          key: 'sk-legacy-custom-xxxxxxxx',
+          baseUrl: 'https://legacy.example.test/v1',
+          contextWindow: 131_072,
+          maxTokens: 8_192,
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [{
+        entryId: 'legacy-entry',
+        provider: 'custom',
+        model: 'legacy-model',
+        profileId: 'custom:legacy',
+        createdAt: 1,
+        lastUsed: 0,
+      }],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    expect((await a.pickChatEntryGroup())[0]?.customConfig?.maxTokens).toBe(32_768);
+
+    const rewritten = JSON.parse(localSecrets.decryptLocalSecret(
+      ctx,
+      fs.readFileSync(file, 'utf8'),
+      { legacySeeds: [TEST_UID] },
+    ));
+    expect(rewritten.version).toBe(6);
+    expect(rewritten.profiles['custom:legacy']).not.toHaveProperty('maxTokens');
   });
 
   it('keeps same-model custom endpoints as ordered fallbacks instead of rotating them as keys', async () => {
@@ -827,6 +908,7 @@ describe('auth › listModels', () => {
       'gpt-5.6-terra',
       'gpt-5.6-luna',
       'gpt-5.5',
+      'gpt-5.4',
     ]);
   });
 });
@@ -886,7 +968,7 @@ describe('auth › getConfig', () => {
     const a = await import('../../../src/main/features/auth');
     const profiles = await a.saveApiKey('anthropic', 'sk-test', 'acc1');
     expect(profiles.profileId).toBeTruthy();
-    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profiles.profileId });
-    expect(await a.getConfig()).toEqual({ provider: 'anthropic', model: 'claude-opus-4-8' });
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profiles.profileId });
+    expect(await a.getConfig()).toEqual({ provider: 'anthropic', model: 'claude-opus-5' });
   });
 });

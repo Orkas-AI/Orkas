@@ -115,4 +115,5 @@ describe('generate_image tool in the open build', () => {
       referenceImagePaths: [reference],
     }));
   });
+
 });

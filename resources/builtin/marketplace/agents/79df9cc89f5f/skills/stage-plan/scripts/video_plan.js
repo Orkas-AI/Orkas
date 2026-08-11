@@ -187,14 +187,22 @@ module.exports = async function videoPlan({ args }) {
 
   if (opts.op === 'validate') {
     const valid = result.ok;
+    // A valid plan is about to be shown to the user, and this is the last
+    // thing the model reads before showing it. Twice on 2026-08-08 the model
+    // read "plan VALID", wrote its own six-line abstract, and asked for
+    // approval of an EDL the user never saw. The summary is the same one the
+    // summarize op already produces, under the same instruction — it just was
+    // not where the decision to present gets made.
+    const summary = valid ? summarizeEdl(plan) : '';
     const text = [
       valid
         ? `plan VALID${result.warnings.length ? ` with ${result.warnings.length} warning(s)` : ''}.`
         : `plan INVALID: ${result.errors.length} error(s) must be fixed before gate B.`,
       result.errors.length ? `Errors:\n${fmtIssues(result.errors)}` : '',
       result.warnings.length ? `Warnings:\n${fmtIssues(result.warnings)}` : '',
+      valid ? `Gate B - plan summary (present this to the user in their language):\n${summary}` : '',
     ].filter(Boolean).join('\n');
-    const payload = { ok: valid, op: opts.op, plan_path: planPath, valid, errors: result.errors, warnings: result.warnings, text };
+    const payload = { ok: valid, op: opts.op, plan_path: planPath, valid, errors: result.errors, warnings: result.warnings, ...(valid ? { summary } : {}), text };
     if (!valid) {
       process.stderr.write(JSON.stringify(payload) + '\n');
       process.exit(1);

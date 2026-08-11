@@ -23,6 +23,17 @@ description: Use for repository-aware product engineering from an accepted requi
 - 如果用户明确要一次性、可丢弃、用于理解度或想法验证的 demo，不生成实现工件，也不套用生产研发流程；把时间盒、可点击性、可丢弃性和验证问题原样交给原型验证能力。
 - 只有当行为或工程问题明确到可以从仓库继续求证时，才进入下面的研发主线。
 
+## Finite Input Fast Path
+
+当任务只有用户明确列出的有限输入文件、确定的输出路径，且不要求代码或仓库行为变更时，按材料处理快速路径执行：
+
+1. 读取一次本 skill 后，直接按工具上限批量读取全部指定输入；多个独立批次尽量在同一模型轮并行发出。
+2. 写入指定交付物，只回读该交付物一次做聚焦验证，然后结束。
+3. Skip generic repository discovery：不搜索仓库规则、manifest/CI，不运行 Git/分支/基线/diff 探测，也不扩展到未指定文件。
+4. 不用 `manage_execution_plan` 叙述有限批次的进度；只有存在真实依赖链、跨边界实现或高风险决策时才建计划。
+
+这个快速路径只减少与任务无关的工程仪式，不跳过用户指定输入、输出验证或安全边界。
+
 ## 执行主线
 
 1. **建立工程合同**：区分 feature、bug/test failure、refactor、review-only、performance、decision/spike、CI/build；明确目标、非目标、不变量和完成证据。
@@ -57,6 +68,8 @@ description: Use for repository-aware product engineering from an accepted requi
 - **静态支持**：代码、类型或配置检查支持，但未执行真实行为。
 - **未验证**：缺环境、凭据、设备、服务或时间，写明阻塞和剩余风险。
 - **失败**：检查真实失败，不用重试次数掩盖，也不改写为“基本通过”。
+
+证据只证明它所对应的代码与配置版本。后续任何可能影响该验收项的修改都会使既有测试、构建、trace、渲染、截图或交互证据失效；最后一次相关修改后必须重跑同一验证链并检查新输出。无法重跑时把该项标为未验证，不沿用修改前的成功证据。
 
 ## 质量门槛
 

@@ -44,7 +44,7 @@ describe('local_agents/sessions', () => {
       terminalStatus: 'failed',
       durableContextHash: 'durable-hash',
       cwdFingerprint: 'cwd-hash',
-      contextProtocolVersion: 2,
+      contextProtocolVersion: 3,
     });
     expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
       sessionId: 'sess-1',
@@ -54,8 +54,29 @@ describe('local_agents/sessions', () => {
       terminalStatus: 'failed',
       durableContextHash: 'durable-hash',
       cwdFingerprint: 'cwd-hash',
-      contextProtocolVersion: 2,
+      contextProtocolVersion: 3,
     });
+  });
+
+  it('advances history only through a persisted successful reply and preserves it on the same native session', async () => {
+    const s = await loadSessions();
+    await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'sess-1');
+    await s.markHistorySyncedThrough(TEST_UID, TEST_CID, 'agent-x', 'codex', 'reply-1');
+    expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
+      historySyncedThroughMessageId: 'reply-1',
+    });
+
+    await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'sess-1', {
+      terminalStatus: 'failed',
+    });
+    expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
+      terminalStatus: 'failed',
+      historySyncedThroughMessageId: 'reply-1',
+    });
+
+    await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'replacement-session');
+    expect((await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex'))
+      ?.historySyncedThroughMessageId).toBeUndefined();
   });
 
   it('invalidates the binding when the CLI changes (runtime swap)', async () => {

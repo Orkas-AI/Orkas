@@ -34,11 +34,16 @@ import { codexBackend } from './backends/codex.js';
 import { openclawBackend } from './backends/openclaw.js';
 import { opencodeBackend } from './backends/opencode.js';
 import { hermesBackend } from './backends/hermes.js';
-import { type LocalBackend, type LocalEvent } from './backends/base.js';
+import {
+  type LocalActiveRunIngress,
+  type LocalBackend,
+  type LocalEvent,
+} from './backends/base.js';
 import * as persist from './persist.js';
 import { sessionToolResultsDir } from '../../paths.js';
 import { maybeSpillToolResult } from '../../util/tool-result-cap.js';
 import { isCliResumeRejectedMessage } from './context.js';
+import type { BridgeCapability, CommanderHandoffRequest } from './bridge.js';
 
 const log = createLogger('local-agents:runner');
 
@@ -150,11 +155,24 @@ const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
 };
 
 const MAX_PUBLIC_DIAGNOSTIC_CHARS = 4_096;
+const MAX_PUBLIC_THINKING_SUMMARY_CHARS = 2_048;
 
 function sanitizePublicDiagnostic(value: unknown): string {
   const sanitized = redactPaths(sanitizeLogTextForUpload(String(value ?? '')));
   return sanitized.length > MAX_PUBLIC_DIAGNOSTIC_CHARS
     ? `${sanitized.slice(0, MAX_PUBLIC_DIAGNOSTIC_CHARS)}…`
+    : sanitized;
+}
+
+/** Reasoning summaries are model-authored progress descriptions, distinct from
+ * raw chain-of-thought. Keep the useful summary while applying the same secret
+ * and absolute-path filtering as other public CLI diagnostics. */
+export function sanitizePublicThinkingSummary(value: unknown): string {
+  const sanitized = redactPaths(sanitizeLogTextForUpload(String(value ?? '')))
+    .replace(/\s+/g, ' ')
+    .trim();
+  return sanitized.length > MAX_PUBLIC_THINKING_SUMMARY_CHARS
+    ? `${sanitized.slice(0, MAX_PUBLIC_THINKING_SUMMARY_CHARS)}…`
     : sanitized;
 }
 
@@ -168,7 +186,18 @@ export function redactPrivateLocalAgentEvent(event: LocalEvent): LocalEvent {
   if (event.type === 'thinking') {
     const rawChars = typeof event.text === 'string' ? event.text.length : Number(event.chars);
     const chars = Number.isFinite(rawChars) && rawChars > 0 ? Math.round(rawChars) : 0;
-    return { type: 'thinking', chars };
+    const itemId = typeof event.itemId === 'string' && event.itemId
+      ? event.itemId
+      : undefined;
+    const summary = sanitizePublicThinkingSummary(event.summary);
+    return {
+      type: 'thinking',
+      chars,
+      ...(summary ? { summary } : {}),
+      ...(itemId ? { itemId } : {}),
+      ...(event.heartbeat === true ? { heartbeat: true } : {}),
+      ...(event.synthetic === true ? { synthetic: true } : {}),
+    };
   }
   if (event.type === 'process-info') {
     const rawCommand = typeof event.cmd === 'string' ? event.cmd : '';
@@ -208,16 +237,47 @@ function _bridgeSupported(cli: LocalCliType): boolean {
 }
 
 /** Appended to the CLI agent's system prompt when the bridge is live.
- *  Runtime-generated (not a tracked prompt md); keep it to capability
- *  discovery — the tool descriptions carry the details. */
-const BRIDGE_SYSTEM_PROMPT =
-  'You are running inside Orkas, the user\'s agent workspace. An MCP server named "orkas" is '
-  + 'connected: it lists and reads the user\'s Orkas skills (orkas_list_skills / orkas_read_skill / '
-  + 'orkas_run_skill), reaches their connected services (orkas_list_connector_tools / '
-  + 'orkas_call_connector_tool — calls may wait for the user to approve a permission prompt in '
-  + 'Orkas), and browses/searches their knowledge base (orkas_kb_list / orkas_kb_search / '
-  + 'orkas_kb_read). Prefer these '
-  + 'tools when the task involves the user\'s skills, services, or library content.';
+ * Runtime-generated (not a tracked prompt md). It is compiled from the exact
+ * per-run capability manifest so an unavailable category is neither advertised
+ * nor left to fail only after the model selects it. */
+export function buildBridgeSystemPrompt(capabilities: readonly BridgeCapability[]): string {
+  const granted = new Set(capabilities);
+  const sentences = [
+    'You are running inside Orkas, the user\'s agent workspace. An MCP server named "orkas" is connected with a run-scoped capability allowlist.',
+  ];
+  if (granted.has('skills.read') || granted.has('skills.run')) {
+    sentences.push(
+      'It lists and reads the user\'s granted Orkas skills (orkas_list_skills / orkas_read_skill)'
+      + `${granted.has('skills.run') ? ' and can run their packaged scripts (orkas_run_skill)' : ''}.`,
+    );
+  }
+  if (granted.has('connectors')) {
+    sentences.push(
+      'It reaches the same connected services available to an ordinary Orkas group-chat Agent '
+      + '(orkas_list_connector_tools / orkas_call_connector_tool); calls may wait for the user to approve a permission prompt in Orkas.',
+    );
+  }
+  if (granted.has('kb.read')) {
+    sentences.push('It browses and searches the granted knowledge base (orkas_kb_list / orkas_kb_search / orkas_kb_read).');
+  }
+  if (granted.has('chat.read')) {
+    sentences.push(
+      'It exposes chat_search / chat_read for quoted history from this conversation only. '
+      + 'Use the conversation context supplied in the current prompt before these tools. Query only when exact needed context was omitted by the bounded '
+      + 'history block or the user explicitly asks for a lookup. Use small 10-message pages: omit limit for the latest page, then page backward with '
+      + 'before_msg_index. Use chat_search only when a useful name, phrase, id, or fact is available.',
+    );
+  }
+  if (granted.has('commander.handoff')) {
+    sentences.push(
+      'For Commander-only work—Orkas automation CRUD, Orkas Agent or Skill mutation, cross-Agent orchestration, or a user decision outside this CLI capability— '
+      + 'call orkas_handoff_to_commander with the concrete reason and continuation context, then end the turn. '
+      + 'Do not emit Commander-only <auto-task>, <agent>, or <skill> mutation containers from a CLI reply.',
+    );
+  }
+  sentences.push('Use only the registered bridge tools and prefer them when the task involves a granted Orkas capability or referenced context.');
+  return sentences.join(' ');
+}
 
 type LocalToolRunCounter = {
   use: number;
@@ -564,7 +624,6 @@ export function localAgentRunContextForLog(opts: {
   agentId?: string;
   projectId?: string;
   cli?: LocalCliType;
-  model?: string;
   customArgs?: readonly string[];
   resumeSessionId?: string;
   prompt?: string;
@@ -587,7 +646,6 @@ export function localAgentRunContextForLog(opts: {
     agent_id: maskId(opts.agentId),
     project_id: maskId(opts.projectId),
     cli: opts.cli,
-    model: opts.model || undefined,
     cli_available: opts.cliAvailable,
     cli_version: opts.cliVersion || undefined,
     bridge_supported: opts.bridgeSupported,
@@ -611,11 +669,14 @@ export interface RunCliAgentOpts {
   agentId: string;
   /** Display name for permission dialogs; falls back to agentId. */
   agentName?: string;
+  /** Inbound conversation message that triggered this run. */
+  currentMessageId: string;
   /** Conversation project scope, when the CLI turn belongs to a project. */
   projectId?: string;
   cli: LocalCliType;
-  model?: string;
   customArgs?: string[];
+  modelOverride?: string;
+  thinkingLevel?: string;
   /** If set, the dispatch resumes a CLI-side session (claude
    *  `--resume <id>`) and the caller has already trimmed the prompt
    *  to "just the new turn" content — the CLI provides the prior
@@ -630,6 +691,9 @@ export interface RunCliAgentOpts {
   signal: AbortSignal;
   /** Forwarded each backend event verbatim, after persistence. */
   onEvent: (e: LocalEvent) => void;
+  /** Active native-turn ingress lifecycle. The runner forwards backend
+   * readiness and guarantees a final clear even when a backend throws. */
+  onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
 }
 
 export interface RunCliAgentResult {
@@ -640,6 +704,7 @@ export interface RunCliAgentResult {
   cliError?: LocalCliEntry['error'];
   cliPath?: string;
   cliVersion?: string;
+  commanderHandoff?: CommanderHandoffRequest;
 }
 
 export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
@@ -650,7 +715,6 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     agentId: opts.agentId,
     projectId: opts.projectId,
     cli: opts.cli,
-    model: opts.model,
     customArgs: opts.customArgs,
     resumeSessionId: opts.resumeSessionId,
     prompt: opts.prompt,
@@ -682,7 +746,6 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     agentId: opts.agentId,
     cid: opts.cid,
     cli: opts.cli,
-    model: opts.model,
     cliPath: entry.path,
     prompt: opts.prompt,
   });
@@ -695,7 +758,6 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     agentId: opts.agentId,
     projectId: opts.projectId,
     cli: opts.cli,
-    model: opts.model,
     customArgs: opts.customArgs,
     resumeSessionId: opts.resumeSessionId,
     prompt: opts.prompt,
@@ -721,6 +783,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // this so sweep / read paths can find the file again.
   const cliSessionId = `cli-${opts.cli}-${handle.runId}`;
   const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
+  const toolStartedAtByCallId = new Map<string, number>();
   let lastEventAt = Date.now();
   let inspectResumeAttempt = !!(opts.resumeSessionId && opts.resumeFallbackPrompt);
   let resumeRejected = false;
@@ -735,10 +798,31 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     };
   };
   const commitEvent = (e: LocalEvent) => {
-    // Self-emitted idle pulses don't count as "the CLI did something"
-    // — without this carve-out we'd reset our own deadline and stop
-    // pulsing during a real stall.
-    if (e.type !== 'idle') lastEventAt = Date.now();
+    const eventAtMs = Date.now();
+    // Neither runner-emitted idle rows nor backend-synthesized UI heartbeats
+    // prove that the CLI produced new bytes. Only real protocol/process
+    // activity may slide the hang deadline; otherwise a wedged Codex item can
+    // pulse forever and survive until the two-hour wall cap.
+    if (e.type !== 'idle' && e.synthetic !== true) lastEventAt = eventAtMs;
+    if (e.type === 'tool-event') {
+      const callId = String(e.callId || '').trim();
+      const phase = String(e.phase || '').toLowerCase();
+      if (callId && phase === 'use' && !toolStartedAtByCallId.has(callId)) {
+        toolStartedAtByCallId.set(callId, eventAtMs);
+      } else if (callId && phase === 'result') {
+        const startedAt = toolStartedAtByCallId.get(callId);
+        const suppliedDuration = Number(e.durationMs);
+        const hasSuppliedDuration = e.durationMs != null
+          && Number.isFinite(suppliedDuration)
+          && suppliedDuration >= 0;
+        if (!hasSuppliedDuration && startedAt != null) {
+          // Normalize per-call timing once at the runner boundary so every CLI
+          // adapter gets the same live and persisted process presentation.
+          e.durationMs = Math.max(0, eventAtMs - startedAt);
+        }
+        toolStartedAtByCallId.delete(callId);
+      }
+    }
     // Tool-event result phase: spill oversized output to disk before
     // it lands in events.jsonl / the renderer stream. Above the estimated
     // inline-token budget the raw output bloats the persistence log and the
@@ -833,6 +917,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         cid: opts.cid,
         agentId: opts.agentId,
         agentName: opts.agentName || opts.agentId,
+        currentMessageId: opts.currentMessageId,
         ...(opts.projectId ? { projectId: opts.projectId } : {}),
         runId: handle.runId,
         configDir: handle.dir,
@@ -860,27 +945,30 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         resumeFallbackPrompt: opts.resumeFallbackPrompt,
         reuseSessionInstructions: attempt.reuseSessionInstructions,
         cwd: opts.cwd,
-        model: opts.model,
         customArgs: opts.customArgs,
+        modelOverride: opts.modelOverride,
+        thinkingLevel: opts.thinkingLevel,
         resumeSessionId: attempt.resumeSessionId,
         signal: opts.signal,
         onEvent,
+        onActiveRunIngress: opts.onActiveRunIngress,
         timeoutMs,
         idleKillMs,
         // Activity clock for the backend's idle-kill watchdog. Reads the
-        // same `lastEventAt` the idle heartbeat uses (self-emitted idle
-        // pulses excluded), so heartbeat rows always precede a kill.
+        // same `lastEventAt` the idle heartbeat uses (self-emitted idle rows
+        // and synthetic backend heartbeats excluded), so progress rows can
+        // remain visible without extending a wedged process indefinitely.
         lastEventAt: () => lastEventAt,
         idleMs: BACKEND_IDLE_MS[opts.cli],
         ...(bridge ? {
           bridge: {
             mcpConfigPath: bridge.mcpConfigPath,
             server: {
-              command: bridge.serverEnv.ORKAS_NODE || process.execPath,
+              command: bridge.serverEnv.ORKAS_NODE,
               args: [`${bridge.serverEnv.ORKAS_PC_DIR}/bin/orkas-bridge.cjs`],
               env: bridge.serverEnv,
             },
-            appendSystemPrompt: BRIDGE_SYSTEM_PROMPT,
+            appendSystemPrompt: buildBridgeSystemPrompt(bridge.capabilities),
           },
         } : {}),
       });
@@ -890,9 +978,15 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       if (!terminal) {
         onEvent({ type: 'done', status: 'failed', error: msg });
       }
+    } finally {
+      // Fail closed on every path. Backends also clear at their authoritative
+      // terminal event so the UI updates promptly; this covers throws, process
+      // crashes, and future adapters that forget the lifecycle callback.
+      try { opts.onActiveRunIngress?.(null); } catch { /* host already gone */ }
     }
   };
 
+  let commanderHandoff: CommanderHandoffRequest | null = null;
   try {
     await runBackendAttempt({
       prompt: opts.prompt,
@@ -924,6 +1018,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     }
   } finally {
     if (bridge) {
+      commanderHandoff = bridge.getCommanderHandoff();
       try { await bridge.close(); }
       catch (err) { log.warn('bridge close failed', { ...runLogContext, error: logErrorRef(err) }); }
     }
@@ -957,11 +1052,18 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     status: terminal.status,
     output_chars: finalOutput?.length ?? 0,
     has_error: !!terminal.error,
+    commander_handoff: !!commanderHandoff,
     error: terminal.error ? logErrorRef(new Error(terminal.error)) : undefined,
     duration_ms: endedAtMs - startedAtMs,
     diagnostics: summarizeLocalAgentRunForLog(runDiagnostics, endedAtMs),
   });
-  return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
+  return {
+    runId: handle.runId,
+    status: terminal.status,
+    output: finalOutput,
+    error: terminal.error,
+    ...(commanderHandoff ? { commanderHandoff } : {}),
+  };
 }
 
 async function _missing(opts: RunCliAgentOpts, entry: LocalCliEntry): Promise<RunCliAgentResult> {
@@ -973,7 +1075,6 @@ async function _missing(opts: RunCliAgentOpts, entry: LocalCliEntry): Promise<Ru
       agentId: opts.agentId,
       projectId: opts.projectId,
       cli: opts.cli,
-      model: opts.model,
       customArgs: opts.customArgs,
       resumeSessionId: opts.resumeSessionId,
       prompt: opts.prompt,

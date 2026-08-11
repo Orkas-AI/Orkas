@@ -79,6 +79,24 @@ if (process.platform === 'win32') {
         return false;
       }
     };
+    const makeTreeWritable = (root: string): void => {
+      const pending = [root];
+      while (pending.length) {
+        const current = pending.pop()!;
+        let stat: fs.Stats;
+        try {
+          stat = fs.lstatSync(current);
+        } catch {
+          continue;
+        }
+        if (stat.isSymbolicLink()) continue;
+        try { fs.chmodSync(current, stat.isDirectory() ? 0o777 : 0o666); } catch { /* retry reports the real failure */ }
+        if (!stat.isDirectory()) continue;
+        try {
+          for (const name of fs.readdirSync(current)) pending.push(path.join(current, name));
+        } catch { /* retry reports the real failure */ }
+      }
+    };
     mutableFs.rmSync = ((target: fs.PathLike, options?: fs.RmDirOptions) => {
       const rawTarget = String(target);
       // fs.realpathSync.native() returns Win32 extended-length paths. Normalize
@@ -99,16 +117,29 @@ if (process.platform === 'win32') {
         try {
           return originalRmSync(target, removalOptions);
         } catch (err) {
+          let removalError = err as NodeJS.ErrnoException;
+          const retryable = ['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(String(removalError.code));
+          if (retryable && fs.existsSync(resolved)) {
+            // Git object files can retain the Windows read-only attribute even
+            // after every process has closed them. Clear it only inside the
+            // already-validated OS temp tree, then perform one full retry.
+            makeTreeWritable(resolved);
+            try {
+              return originalRmSync(target, removalOptions);
+            } catch (retryErr) {
+              removalError = retryErr as NodeJS.ErrnoException;
+            }
+          }
           // Some Windows libraries keep a directory handle until the test
           // worker exits. If recursive rm already removed every file and
           // only empty directories remain, retaining that empty shell is
           // harmless and lets the worker release the handle normally. Never
           // tolerate a leftover file or symlink: those remain real cleanup
           // failures.
-          const code = (err as NodeJS.ErrnoException).code;
+          const code = removalError.code;
           if (options.force && ['EPERM', 'EBUSY', 'ENOTEMPTY'].includes(String(code))
             && fs.existsSync(resolved) && containsDirectoriesOnly(resolved)) return;
-          throw err;
+          throw removalError;
         }
       }
       return originalRmSync(target, options);

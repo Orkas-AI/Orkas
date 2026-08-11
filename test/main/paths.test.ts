@@ -23,10 +23,9 @@ afterEach(() => {
 });
 
 describe('paths › roots', () => {
-  it('PC_ROOT points at the flattened app root and APP_ROOT aliases it', async () => {
+  it('PC_ROOT names the application root and APP_ROOT aliases it', async () => {
     const p = await import('../../src/main/paths');
-    expect(fs.existsSync(path.join(p.PC_ROOT, 'package.json'))).toBe(true);
-    expect(fs.existsSync(path.join(p.PC_ROOT, 'src'))).toBe(true);
+    expect(p.PC_ROOT).toBe(path.resolve(__dirname, '../..'));
     expect(p.APP_ROOT).toBe(p.PC_ROOT);
   });
 
@@ -41,10 +40,15 @@ describe('paths › roots', () => {
   });
 });
 
-describe('paths › top-level (users.json / logs / venv)', () => {
+describe('paths › top-level (users.json / device.json / logs / venv)', () => {
   it('USERS_FILE sits at the data root', async () => {
     const p = await import('../../src/main/paths');
     expect(p.USERS_FILE).toBe(path.join(p.WS_ROOT, 'users.json'));
+  });
+
+  it('DEVICE_FILE sits at the data root', async () => {
+    const p = await import('../../src/main/paths');
+    expect(p.DEVICE_FILE).toBe(path.join(p.WS_ROOT, 'device.json'));
   });
 
   it('LOGS_DIR is a top-level sibling', async () => {

@@ -43,7 +43,7 @@ describe('synced PC surface regressions', () => {
     expect(html).toContain('class="agent-card-use agent-dialog-btn" id="agent-use-btn"');
   });
 
-  it('keeps synced tab card layout sizing for agent and marketplace chips', () => {
+  it('keeps AI Team, Skills, and Connectors on the commercial card-width breakpoints', () => {
     const css = read('src/renderer/style.css');
 
     const agentCardBlock = cssBlockLast(css, /\.agent-card\s*{([\s\S]*?)}/g);
@@ -69,22 +69,43 @@ describe('synced PC surface regressions', () => {
     expect(chipBlock).toContain('min-height: 20px;');
     expect(chipBlock).toContain('line-height: 1.2;');
 
-    expect(css).toContain('.skills-grid,\n.skills-source-section-grid,\n.agents-grid,\n.agents-source-section-grid,\n.marketplace-grid');
-    expect(css).toContain('--tab-card-min: 240px;');
-    expect(css).toContain('calc((100% - (3 * var(--tab-grid-gap))) / 4)');
+    for (const selector of [
+      'skills-grid',
+      'skills-source-section-grid',
+      'agents-grid',
+      'agents-source-section-grid',
+      'marketplace-grid',
+    ]) {
+      const block = cssBlock(css, new RegExp(`\\.${selector}\\s*{([\\s\\S]*?)}`));
+      expect(block, selector).toContain('grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));');
+      expect(block, selector).toContain('gap: 16px;');
+    }
+
+    const connectorGridBlock = cssBlock(css, /\.connectors-grid\s*{([\s\S]*?)}/);
+    expect(connectorGridBlock).toContain('--connector-card-min: 280px;');
+    expect(connectorGridBlock).toContain('--connector-grid-gap: 16px;');
+    expect(css).not.toContain('--tab-card-min:');
     expect(css).toContain('.agents-grid-header-titles');
     expect(css).toContain('.agents-grid-subtitle');
   });
 
-  it('keeps the external-agent entry copy aligned with the current AI tools wording', () => {
+  it('keeps the sidebar external-agent entry aligned with the commercial copy', () => {
     const html = read('src/renderer/index.html');
-    const en = read('src/renderer/locales/en.json');
-    const zh = read('src/renderer/locales/zh.json');
+    const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((locale) => [
+      locale,
+      JSON.parse(read(`src/renderer/locales/${locale}.json`)) as Record<string, string>,
+    ]));
 
-    expect(html).toContain('other AI tools');
-    expect(en).toContain('other AI tools');
-    expect(zh).toContain('等 AI 编程工具');
-    expect(zh).not.toContain('外部智能体');
+    expect(html).toContain('data-i18n="sidebar.connect_agent"');
+    expect(html).toContain('data-i18n="sidebar.connect_agent_sub"');
+    expect(locales.en['sidebar.connect_agent']).toBe('Connect agents');
+    expect(locales.en['sidebar.connect_agent_sub']).toBe('Claude Code · Codex & more');
+    expect(locales.zh['sidebar.connect_agent']).toBe('接入智能体');
+    expect(locales.zh['sidebar.connect_agent_sub']).toBe('Claude Code · Codex 等');
+    expect(locales.ja['sidebar.connect_agent']).toBe('エージェントを接続');
+    expect(locales.ja['sidebar.connect_agent_sub']).toBe('Claude Code · Codex など');
+    expect(locales.pt['sidebar.connect_agent']).toBe('Conectar agentes');
+    expect(locales.pt['sidebar.connect_agent_sub']).toBe('Claude Code · Codex e mais');
   });
 
   it('exposes the local Commander profile to the renderer', () => {

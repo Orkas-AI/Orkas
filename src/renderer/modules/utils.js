@@ -104,6 +104,18 @@ function _domPurify() {
 function _sanitizeHtmlWithoutPurifier(html) {
   return escapeHtml(html === null || html === undefined ? '' : String(html));
 }
+function _domPurifyConfig(values) {
+  // A null-prototype config prevents unrelated Object.prototype pollution
+  // from silently enabling DOMPurify options. Custom elements stay disabled
+  // explicitly even if the runtime default changes.
+  const config = Object.assign(Object.create(null), values || {});
+  config.CUSTOM_ELEMENT_HANDLING = Object.freeze({
+    tagNameCheck: null,
+    attributeNameCheck: null,
+    allowCustomizedBuiltInElements: false,
+  });
+  return config;
+}
 function sanitizeHtml(html) {
   const s = (html === null || html === undefined) ? '' : String(html);
   const DP = _domPurify();
@@ -128,7 +140,10 @@ function sanitizeHtml(html) {
     });
     _sanitizeHookInstalled = true;
   }
-  return DP.sanitize(s, { ADD_ATTR: ['target'], ALLOWED_URI_REGEXP: _SAFE_URI_RE });
+  return DP.sanitize(s, _domPurifyConfig({
+    ADD_ATTR: ['target'],
+    ALLOWED_URI_REGEXP: _SAFE_URI_RE,
+  }));
 }
 
 function sanitizeSvgIconHtml(svg) {
@@ -142,11 +157,11 @@ function sanitizeSvgIconHtml(svg) {
     }
     return '';
   }
-  const clean = String(DP.sanitize(dirty, {
+  const clean = String(DP.sanitize(dirty, _domPurifyConfig({
     USE_PROFILES: { svg: true, svgFilters: true },
     ALLOWED_URI_REGEXP: _SAFE_URI_RE,
     FORBID_TAGS: ['a', 'embed', 'foreignObject', 'foreignobject', 'iframe', 'image', 'object', 'script', 'style'],
-  }) || '').trim();
+  })) || '').trim();
   return /^<svg(?:\s|>)/i.test(clean) ? clean : '';
 }
 
@@ -1130,11 +1145,22 @@ function _dbXyChart(kind, data) {
 // don't defeat it.
 const _VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i;
 const _AUDIO_EXT_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac)(?:[?#].*)?$/i;
+const _HTML_EXT_RE = /\.html?$/i;
 function _isVideoSrc(src) {
   return _VIDEO_EXT_RE.test(String(src || ''));
 }
 function _isAudioSrc(src) {
   return _AUDIO_EXT_RE.test(String(src || ''));
+}
+function _isHtmlSrc(src) {
+  const raw = String(src || '');
+  const query = raw.indexOf('?');
+  const fragment = raw.indexOf('#');
+  const end = Math.min(
+    query < 0 ? raw.length : query,
+    fragment < 0 ? raw.length : fragment,
+  );
+  return _HTML_EXT_RE.test(raw.slice(0, end));
 }
 
 function _chatMediaLocalPathFromUrl(src) {
@@ -1149,6 +1175,47 @@ function _chatMediaLocalPathFromUrl(src) {
   } catch (_) {
     return '';
   }
+}
+
+// A markdown media src that names a local file the app can serve, rewritten to
+// the protocol that actually serves it. Models write the path they were handed,
+// sometimes under a convention from their own training (`sandbox:/abs/path`) or
+// as a bare absolute path, and the media branches below dispatch on the file
+// extension alone — so an unservable scheme became a <video> that Chromium
+// could not load: controls, 0:00, a black frame, and no request reaching the
+// main process at all. `_safeHref` is no fallback here, since it allows only
+// http(s)/mailto/tel, so those srcs rendered as bare text instead of a player.
+// 2026-08-09: a finished 62s video reached the user this way; the same shape
+// sits in two earlier conversations, so it is a recurring habit, not a fluke.
+//
+// This widens nothing: the main-side `chat-media://local` handler still
+// enforces the active user, the path scope, and the extension whitelist, so an
+// out-of-scope path is refused exactly as before. A relative path is left
+// alone — the renderer has no base directory to resolve it against.
+function _normalizeLocalMediaSrc(src) {
+  const raw = String(src === null || src === undefined ? '' : src).trim();
+  if (!raw) return raw;
+  if (/^(?:chat-media|https?|data|blob|kb-file|chat-app):/i.test(raw)) return raw;
+
+  let abs = '';
+  if (/^file:/i.test(raw)) {
+    try {
+      const decoded = decodeURIComponent(new URL(raw).pathname || '');
+      abs = /^\/[A-Za-z]:[\\/]/.test(decoded) ? decoded.slice(1) : decoded;
+    } catch (_) { return raw; }
+  } else {
+    // `sandbox:` carries a plain path, not a URL — take everything after it.
+    const bare = raw.replace(/^sandbox:/i, '');
+    if (bare.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bare)) abs = bare;
+  }
+  if (!abs) return raw;
+
+  let p = abs.includes('\\') ? abs.replace(/\\/g, '/') : abs;
+  if (p.startsWith('/')) p = p.slice(1);
+  const encoded = p.split('/').map((segment, index) => (
+    index === 0 && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)
+  )).join('/');
+  return `chat-media://local/${encoded}`;
 }
 
 function _markdownVideoOpenFloatingLabel() {
@@ -1205,6 +1272,138 @@ function _markdownAudioHtml(src, label, title) {
   </span>`;
 }
 
+function _markdownHtmlPreviewLabel() {
+  const key = 'chat.produced_preview_title';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Preview';
+}
+
+// Markdown image syntax occasionally carries an HTML deliverable when an
+// agent means "show the preview". An <img> cannot decode HTML. Emit only a
+// sanitizer-safe mount point here; `_hydrateMarkdownHtmlEmbeds` creates the
+// iframe after DOM insertion and re-validates the source. This avoids adding
+// arbitrary iframe support to the untrusted Markdown sanitizer.
+function _markdownHtmlEmbedHtml(src, label, title) {
+  const absPath = _chatMediaLocalPathFromUrl(src);
+  const pathName = absPath ? (absPath.split(/[\\/]/).pop() || 'preview.html') : '';
+  const name = _markdownMediaLabel(src, label, pathName || 'HTML');
+  const previewLabel = _markdownHtmlPreviewLabel();
+  const ariaLabel = `${previewLabel}: ${name}`;
+  const tooltip = title || ariaLabel;
+
+  if (!absPath || !_isHtmlSrc(src)) {
+    const href = _safeHref(src);
+    if (!href) return escapeHtml(name);
+    return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener" aria-label="${escapeHtml(ariaLabel)}" title="${escapeHtml(tooltip)}">${escapeHtml(name)}</a>`;
+  }
+
+  return `<span class="chat-md-html-embed is-loading" data-chat-md-html-embed="1" data-html-src="${escapeHtml(src)}" data-html-title="${escapeHtml(tooltip)}" aria-label="${escapeHtml(ariaLabel)}">
+    <span class="chat-md-html-embed-loading" role="status">${escapeHtml(ariaLabel)}</span>
+  </span>`;
+}
+
+// Mount only local HTML/HTM resources. The frame intentionally matches the
+// existing chat-file-viewer security contract: scripts are allowed for
+// self-contained generated visuals, while same-origin access, forms, popups,
+// downloads and top navigation remain unavailable. `loading=lazy` keeps a
+// message containing several HTML outputs from loading every frame at once.
+function _markdownHtmlLayoutDimensions(layout) {
+  if (!layout || layout.kind !== 'fixed-canvas') return null;
+  const width = Number(layout.width);
+  const height = Number(layout.height);
+  if (!Number.isInteger(width) || !Number.isInteger(height)
+      || width < 16 || width > 7680 || height < 16 || height > 7680
+      || width * height > 16_777_216) return null;
+  return { width, height };
+}
+
+function _fitMarkdownHtmlCanvas(host, frame, layout) {
+  const availableWidth = Number(host?.clientWidth || 0);
+  if (!host || !frame || !layout || !(availableWidth > 0)) return;
+  const scale = Math.min(1, availableWidth / layout.width);
+  if (!frame.style) return;
+  frame.style.width = `${layout.width}px`;
+  frame.style.height = `${layout.height}px`;
+  frame.style.transformOrigin = 'top left';
+  frame.style.transform = `scale(${scale})`;
+}
+
+async function _sizeMarkdownHtmlEmbed(host, frame, src, absPath) {
+  if (typeof window === 'undefined' || !window.orkas || typeof window.orkas.invoke !== 'function') return;
+  try {
+    const payload = { path: absPath, htmlPreviewLayoutOnly: true };
+    const cid = (typeof currentCid === 'string' && currentCid) ? currentCid : '';
+    if (cid) payload.cid = cid;
+    const res = await window.orkas.invoke('produced.readText', payload);
+    if (host.dataset?.htmlEmbedHydrated !== '1' || host.getAttribute?.('data-html-src') !== src) return;
+    const layout = _markdownHtmlLayoutDimensions(res && res.layout);
+    if (!layout || !host.style?.setProperty) return;
+    host.style.setProperty('--chat-html-aspect-ratio', `${layout.width} / ${layout.height}`);
+    host.style.setProperty('--chat-html-source-width', `${layout.width}px`);
+    host.style.setProperty('--chat-html-source-height', `${layout.height}px`);
+    host.dataset.htmlEmbedLayout = `${layout.width}x${layout.height}`;
+    _fitMarkdownHtmlCanvas(host, frame, layout);
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => {
+        if (host.isConnected === false) {
+          observer.disconnect();
+          return;
+        }
+        _fitMarkdownHtmlCanvas(host, frame, layout);
+      });
+      observer.observe(host);
+      host._chatHtmlResizeObserver = observer;
+    }
+    _notifyChatImageSettled(host);
+  } catch (_) { /* the default visual-output ratio remains usable */ }
+}
+
+function _hydrateMarkdownHtmlEmbeds(root) {
+  if (!root || typeof document === 'undefined' || typeof document.createElement !== 'function') return;
+  const selector = '[data-chat-md-html-embed="1"]';
+  const hosts = [];
+  if (typeof root.matches === 'function' && root.matches(selector)) hosts.push(root);
+  if (typeof root.querySelectorAll === 'function') {
+    root.querySelectorAll(selector).forEach((host) => hosts.push(host));
+  }
+  for (const host of hosts) {
+    if (!host || host.dataset?.htmlEmbedHydrated === '1') continue;
+    const src = host.getAttribute?.('data-html-src') || '';
+    const absPath = _chatMediaLocalPathFromUrl(src);
+    if (!absPath || !_isHtmlSrc(src)) {
+      host.classList?.remove('is-loading');
+      host.classList?.add('is-error');
+      continue;
+    }
+    const title = host.getAttribute?.('data-html-title') || absPath.split(/[\\/]/).pop() || 'HTML';
+    const frame = document.createElement('iframe');
+    frame.className = 'chat-md-html-frame';
+    frame.setAttribute('sandbox', 'allow-scripts');
+    frame.setAttribute('loading', 'lazy');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.setAttribute('title', title);
+    frame.setAttribute('src', src);
+    frame.addEventListener('load', () => {
+      host.classList?.remove('is-loading', 'is-error');
+      host.classList?.add('is-loaded');
+      _notifyChatImageSettled(frame);
+    });
+    frame.addEventListener('error', () => {
+      host.classList?.remove('is-loading', 'is-loaded');
+      host.classList?.add('is-error');
+      _notifyChatImageSettled(frame);
+    });
+    host.dataset.htmlEmbedHydrated = '1';
+    host.replaceChildren(frame);
+    _sizeMarkdownHtmlEmbed(host, frame, src, absPath);
+  }
+}
+
 function _markdownImageHtml(src, alt, title) {
   const t = title ? ` title="${escapeHtml(title)}"` : '';
   return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t} data-monitor-resource="chat-markdown-image"></span>`;
@@ -1215,8 +1414,28 @@ function _notifyChatImageSettled(node) {
   node.dispatchEvent(new CustomEvent('chat-image-settled', { bubbles: true }));
 }
 
+function _chatImageIntrinsicStyle(rawWidth, rawHeight) {
+  const width = Number(rawWidth || 0);
+  const height = Number(rawHeight || 0);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return;
+  return {
+    naturalWidth: `${width}px`,
+    aspectRatio: `${width} / ${height}`,
+  };
+}
+
+function _applyChatImageIntrinsicLayout(img) {
+  const layout = _chatImageIntrinsicStyle(img?.naturalWidth, img?.naturalHeight);
+  if (!layout) return;
+  const shell = img.closest?.('.chat-md-img-shell');
+  if (!shell?.style?.setProperty) return;
+  shell.style.setProperty('--chat-image-natural-width', layout.naturalWidth);
+  shell.style.setProperty('--chat-image-aspect-ratio', layout.aspectRatio);
+}
+
 function _settleChatImageLayout(img, state = 'loaded') {
   if (!img || !img.classList) return;
+  if (state !== 'error') _applyChatImageIntrinsicLayout(img);
   const shell = img.closest?.('.chat-image-shell');
   if (shell) {
     shell.classList.remove('is-loading');
@@ -1465,7 +1684,9 @@ function inlineFormat(text) {
     // Media: ![alt](src) — dispatch to <video> when src looks like a video
     // file, else <img>. Must run before link syntax.
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-      (_, alt, src, title) => {
+      (_, alt, rawSrc, title) => {
+        const src = _normalizeLocalMediaSrc(rawSrc);
+        if (_isHtmlSrc(src)) return _markdownHtmlEmbedHtml(src, alt, title);
         if (_isVideoSrc(src)) {
           // `preload=metadata` so listings don't auto-fetch the whole file;
           // controls visible so user can play/seek.
@@ -1476,7 +1697,12 @@ function inlineFormat(text) {
       })
     // Markdown links: [text](url "title")
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-      (_, txt, url, title) => {
+      (_, txt, rawUrl, title) => {
+        // Media links get the same rewrite as `![](…)`: an agent delivering a
+        // finished file writes `[视频成片](<path>)` as often as an embed.
+        const url = _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
+          ? _normalizeLocalMediaSrc(rawUrl)
+          : rawUrl;
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
         if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
@@ -1973,7 +2199,12 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _markdownImageHtml,
     _markdownVideoHtml,
     _markdownAudioHtml,
+    _markdownHtmlEmbedHtml,
+    _isHtmlSrc,
+    _markdownHtmlLayoutDimensions,
+    _chatImageIntrinsicStyle,
     _chatMediaLocalPathFromUrl,
+    _normalizeLocalMediaSrc,
     _chatVideoNativeControlsHit,
     escapeHtml,
     sanitizeHtml,

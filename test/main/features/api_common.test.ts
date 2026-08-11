@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   getVersion: vi.fn(() => '2.0.0'),
   getCurrentLang: vi.fn((): string => 'en'),
-  currentClientChannel: vi.fn(() => 'open'),
+  currentClientChannel: vi.fn(() => 'prod'),
   desktopPlatform: vi.fn(() => 'mac'),
   osVersion: vi.fn(() => '15.5'),
 }));
@@ -22,7 +22,7 @@ describe('api_common client metadata cache', () => {
     vi.clearAllMocks();
     mocks.getVersion.mockReturnValue('2.0.0');
     mocks.getCurrentLang.mockReturnValue('en');
-    mocks.currentClientChannel.mockReturnValue('open');
+    mocks.currentClientChannel.mockReturnValue('prod');
     mocks.desktopPlatform.mockReturnValue('mac');
     mocks.osVersion.mockReturnValue('15.5');
   });
@@ -39,9 +39,10 @@ describe('api_common client metadata cache', () => {
       'Orkas-App-Version': '2.0.0',
       'Orkas-Platform': 'mac',
       'Orkas-OS-Version': '15.5',
-      'Orkas-Channel': 'open',
+      'Orkas-Channel': 'prod',
       'Accept-Language': 'zh',
     });
+    expect(second).not.toHaveProperty('Orkas-Device-Id');
     expect(mocks.getVersion).toHaveBeenCalledTimes(1);
     expect(mocks.currentClientChannel).toHaveBeenCalledTimes(1);
     expect(mocks.desktopPlatform).toHaveBeenCalledTimes(1);

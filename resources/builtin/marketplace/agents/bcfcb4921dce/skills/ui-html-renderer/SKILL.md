@@ -227,7 +227,7 @@ When possible:
 - Inspect the Orkas embedded artifact preview, generated HTML/CSS/JS, DOM structure, screenshots, or equivalent non-external viewport checks.
 - Do not open the system browser by default. Use an external browser only when the user explicitly asks for it or the target app workflow already requires an external browser.
 - Confirm the rendered body is non-blank and contains the primary page region, primary action, and expected visible text.
-- Check desktop and mobile widths.
+- Check the actual requested viewport. Check both desktop and mobile widths only when the user explicitly requests responsive or multi-device behavior.
 - Inspect screenshots for blank areas, overlap, clipped text, broken assets, and unreadable contrast.
 - Interact with tabs, menus, toggles, filters, and primary actions if present.
 - Exercise every critical state branch. For forms, check pristine, dirty/touched invalid, pending, server-error recovery, and success; for data surfaces, check populated, loading, empty, error, and partial/stale.

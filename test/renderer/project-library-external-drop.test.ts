@@ -299,7 +299,7 @@ describe('Project Library external file drag-and-drop', () => {
     context.loadProjectDetail = vi.fn(async () => { throw new Error('refresh failed'); });
     context.uiAlert = vi.fn(async () => undefined);
     context._projectTrackEvent = vi.fn();
-    context._projectTrackError = vi.fn();
+    context._projectLogFailure = vi.fn();
 
     await expect(context._uploadProjectFiles([file, rejected], '', 'drop')).resolves.toBeUndefined();
 
@@ -308,7 +308,11 @@ describe('Project Library external file drag-and-drop', () => {
       uploaded_count: 1,
       rejected_count: 1,
     }));
-    expect(context._projectTrackError).toHaveBeenCalled();
+    expect(context._projectLogFailure).toHaveBeenCalledWith('project_file_upload', expect.objectContaining({
+      error_code: 'files_rejected',
+      error_type: 'validation',
+    }));
+    expect(context._projectTrackEvent.mock.calls[0][1]).not.toHaveProperty('project_id');
     expect(context.uiAlert).toHaveBeenCalledWith(expect.stringContaining('bad.zip'));
   });
 });

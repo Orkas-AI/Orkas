@@ -5,7 +5,9 @@ import {
   activeProxy,
   buildChildProxyEnvironment,
   buildNoProxy,
+  createSystemProxyBinaryFetch,
   createSystemProxyFetch,
+  downloadBinaryWithProxyPolicy,
   envProxyConfig,
   envProxyUrl,
   installEnvProxyDispatcher,
@@ -279,6 +281,177 @@ describe('util/proxy-dispatcher per-request system routing', () => {
     expect(resolveProxy).toHaveBeenCalledTimes(2);
   });
 
+  it('downloads proxied binary bodies without requiring response headers', async () => {
+    const directBytes = Buffer.from('direct-bytes');
+    const proxiedBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    const fallback = vi.fn(async () => ({ status: 200, body: directBytes }));
+    // The raw system transport contract intentionally exposes no Headers
+    // object. This is what keeps non-ByteString CDN metadata (for example a
+    // Chinese lifecycle rule name) outside WHATWG header conversion.
+    const system = vi.fn(async () => ({ status: 200, body: proxiedBytes }));
+    const resolveProxy = vi.fn(async (url: string) => (
+      new URL(url).hostname === 'direct.example'
+        ? 'DIRECT'
+        : 'PROXY 127.0.0.1:7890; DIRECT'
+    ));
+    const routed = createSystemProxyBinaryFetch(fallback, system, resolveProxy, 10_000);
+
+    await expect(routed('https://direct.example/image.png')).resolves.toEqual({
+      status: 200,
+      body: directBytes,
+    });
+    const options = {
+      headers: { Authorization: 'Bearer test' },
+      maxBytes: 1024,
+      redirect: 'error' as const,
+    };
+    await expect(routed('https://cdn.example/image.png', options)).resolves.toEqual({
+      status: 200,
+      body: proxiedBytes,
+    });
+
+    expect(fallback).toHaveBeenCalledOnce();
+    expect(system).toHaveBeenCalledOnce();
+    expect(system).toHaveBeenCalledWith('https://cdn.example/image.png', options);
+    expect(resolveProxy).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries only the idempotent binary GET for transient transport, status, and validation failures', async () => {
+    const validBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+    let attempts = 0;
+    globalThis.fetch = vi.fn(async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('connection reset');
+      if (attempts === 2) return new Response('temporarily unavailable', { status: 503 });
+      if (attempts === 3) return new Response('<html>edge cache warming</html>', { status: 200 });
+      return new Response(validBytes, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const result = await downloadBinaryWithProxyPolicy('https://cdn.example/image.png', {
+      label: 'generated image download',
+      retries: 3,
+      delaysMs: [0],
+      validate: (body) => {
+        if (!body.subarray(0, 4).equals(validBytes)) throw new Error('invalid image bytes');
+      },
+    });
+
+    expect(result.body).toEqual(validBytes);
+    expect(attempts).toBe(4);
+  });
+
+  it.each([404, 408, 409, 425, 429, 500, 502, 503, 504])(
+    'retries a potentially transient HTTP %i and then returns valid bytes',
+    async (status) => {
+      const validBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(new Response('not ready', { status }))
+        .mockResolvedValueOnce(new Response(validBytes, { status: 200 }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      await expect(downloadBinaryWithProxyPolicy('https://cdn.example/eventual.png', {
+        label: 'generated image download',
+        retries: 1,
+        delaysMs: [0],
+      })).resolves.toMatchObject({ status: 200, body: validBytes });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each([400, 401, 403, 410, 422])(
+    'does not retry a definite HTTP %i response',
+    async (status) => {
+      const fetchMock = vi.fn(async () => new Response('rejected', { status }));
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      await expect(downloadBinaryWithProxyPolicy('https://cdn.example/rejected.png', {
+        label: 'generated image download',
+        retries: 2,
+        delaysMs: [0],
+      })).rejects.toThrow(`HTTP ${status}`);
+      expect(fetchMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('stops after the configured total number of attempts', async () => {
+    const fetchMock = vi.fn(async () => new Response('busy', { status: 503 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(downloadBinaryWithProxyPolicy('https://cdn.example/busy.png', {
+      label: 'generated image download',
+      retries: 2,
+      delaysMs: [0],
+    })).rejects.toThrow('HTTP 503');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry or continue reading after the response exceeds its byte cap', async () => {
+    let cancelled = false;
+    const fetchMock = vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3, 4]));
+      },
+      cancel() { cancelled = true; },
+    })));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(downloadBinaryWithProxyPolicy('https://cdn.example/oversized.bin', {
+      label: 'generated media download',
+      retries: 2,
+      delaysMs: [0],
+      maxBytes: 3,
+    })).rejects.toThrow('exceeds 3 bytes');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(cancelled).toBe(true);
+  });
+
+  it('does not start a GET when cancellation is already known', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('cancelled before download'));
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(downloadBinaryWithProxyPolicy('https://cdn.example/cancelled.png', {
+      label: 'generated image download',
+      retries: 2,
+      delaysMs: [0],
+      signal: controller.signal,
+    })).rejects.toThrow('cancelled before download');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves GET headers, redirect policy, byte cap, and signal across retries', async () => {
+    const controller = new AbortController();
+    const calls: RequestInit[] = [];
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      calls.push(init || {});
+      return calls.length === 1
+        ? new Response('no', { status: 503 })
+        : new Response(new Uint8Array([1, 2, 3]), { status: 200 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(downloadBinaryWithProxyPolicy('https://cdn.example/authenticated.bin', {
+      label: 'authenticated media download',
+      retries: 1,
+      delaysMs: [0],
+      headers: { Authorization: 'Bearer test' },
+      redirect: 'error',
+      maxBytes: 3,
+      signal: controller.signal,
+    })).resolves.toMatchObject({ body: Buffer.from([1, 2, 3]) });
+
+    expect(calls).toHaveLength(2);
+    for (const init of calls) {
+      expect(init).toMatchObject({
+        method: 'GET',
+        headers: { Authorization: 'Bearer test' },
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    }
+  });
+
   it('keeps a diagnostic-style outer wrapper intact when phase 2 changes the delegate', async () => {
     const fallback = vi.fn(async () => new Response('fallback')) as unknown as typeof fetch;
     const system = vi.fn(async () => new Response('system')) as unknown as typeof fetch;
@@ -303,5 +476,15 @@ describe('util/proxy-dispatcher per-request system routing', () => {
     process.env.ORKAS_NO_AUTO_PROXY = '1';
     expect(await installSystemProxyDispatcher(system)).toBe(false);
     expect(system).not.toHaveBeenCalled();
+  });
+});
+
+describe('util/proxy-dispatcher startup ordering', () => {
+  it('uses Electron network routing without a hosted account bootstrap', () => {
+    const source = fs.readFileSync(new URL('../../../src/main/index.ts', import.meta.url), 'utf8');
+    expect(source).toContain('setFetchImplementation((input, init) => net.fetch');
+    expect(source).not.toContain('const accountBoot = account.bootstrap();');
+    expect(source).not.toContain('await installSystemProxyDispatcher();');
+    expect(source).not.toContain("registerImmediate('net:system-proxy'");
   });
 });

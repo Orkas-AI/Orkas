@@ -17,6 +17,50 @@ const _bashPermDialogClosers = new Map();
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const _BASH_PERMISSION_DEFAULT_MODE = 'all_files_approval';
+const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path'];
+
+function _bashPermissionVisibilityState() {
+  try {
+    if (typeof document !== 'undefined' && typeof document.visibilityState === 'string') {
+      if (document.visibilityState !== 'visible') return 'hidden';
+      if (typeof document.hasFocus === 'function') {
+        return document.hasFocus() ? 'visible_focused' : 'visible_unfocused';
+      }
+      return 'visible_unknown_focus';
+    }
+  } catch (_) { /* fall through */ }
+  return 'unknown';
+}
+
+function _bashPermissionTelemetry(name, properties) {
+  try {
+    if (window.Monitor) Monitor.event(name, properties);
+  } catch (_) { /* permission delivery must not depend on observability */ }
+}
+
+function _bashPermissionCategories(info) {
+  const reasons = Array.isArray(info && info.reasons) ? info.reasons : [];
+  return [...new Set(reasons.filter((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason)))].join('|');
+}
+
+function _bashPermissionReceivedAt(info, fallback = Date.now()) {
+  const value = Number(info && info._renderer_received_at_ms);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function _bashTrackCancelledPermission(info, currentMode, errorCode = 'request_cancelled') {
+  _bashPermissionTelemetry('bash_risk_prompt_result', {
+    result: 'cancelled',
+    decision: 'none',
+    effective_decision: 'deny',
+    ...(currentMode ? { mode: currentMode } : {}),
+    mode_changed: false,
+    categories: _bashPermissionCategories(info),
+    duration_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info)),
+    error_type: 'state',
+    error_code: errorCode,
+  });
+}
 
 function _bashIsMode(mode) {
   return _BASH_PERMISSION_MODES.includes(mode);
@@ -89,7 +133,7 @@ async function _setBashPermissionMode(mode) {
   }
 }
 
-function _showBashPermissionModeDialog({ title, message, currentMode, requestId }) {
+function _showBashPermissionModeDialog({ title, message, currentMode, requestId, onPresented }) {
   const modes = _bashPermissionModeOptions();
   const safeCurrentMode = _bashIsMode(currentMode) ? currentMode : _BASH_PERMISSION_DEFAULT_MODE;
   const modeTitle = _bashT('bash.permission.mode_title', 'Permission level');
@@ -118,6 +162,7 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId 
             return;
           }
         }
+        try { if (typeof onPresented === 'function') onPresented(); } catch (_) { /* telemetry only */ }
         Promise.resolve(hook({
           title,
           message,
@@ -176,6 +221,7 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId 
       </div>
     `;
     document.body.appendChild(overlay);
+    try { if (typeof onPresented === 'function') onPresented(); } catch (_) { /* telemetry only */ }
 
     const selectedMode = () => {
       return _bashIsMode(selectedModeValue) ? selectedModeValue : safeCurrentMode;
@@ -291,8 +337,12 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId 
 }
 
 async function _showBashPermissionDialog(info) {
+  const startedAt = Date.now();
   const requestId = String(info.request_id || '');
-  if (_bashPermCancelled.delete(requestId)) return;
+  if (_bashPermCancelled.delete(requestId)) {
+    _bashTrackCancelledPermission(info, null);
+    return;
+  }
   const agent = _bashAgentLabel(info);
   const reasonsText = _bashReasonText(info.reasons);
   const command = String(info.command || '');
@@ -308,19 +358,37 @@ async function _showBashPermissionDialog(info) {
     : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + command;
 
   const currentMode = await _getBashPermissionCurrentMode();
-  if (_bashPermCancelled.delete(requestId)) return;
+  if (_bashPermCancelled.delete(requestId)) {
+    _bashTrackCancelledPermission(info, currentMode);
+    return;
+  }
+  let presented = false;
   const result = await _showBashPermissionModeDialog({
     title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
     message,
     currentMode,
     requestId,
+    onPresented: () => {
+      if (presented) return;
+      presented = true;
+      _bashPermissionTelemetry('bash_risk_prompt_presented', {
+        categories: _bashPermissionCategories(info),
+        mode: currentMode,
+        visibility_state: _bashPermissionVisibilityState(),
+        queue_wait_ms: Math.max(0, Date.now() - _bashPermissionReceivedAt(info, startedAt)),
+      });
+    },
   });
   if (result && result.cancelled) {
     _bashPermCancelled.delete(requestId);
+    _bashTrackCancelledPermission(info, currentMode);
     return;
   }
   const choice = result && typeof result === 'object' ? result.choice : result;
   const selectedMode = _bashIsMode(result && result.mode) ? result.mode : currentMode;
+  const requestedDecision = (choice === 'allow_once' || choice === 'allow_run' || choice === 'allow_always')
+    ? choice
+    : 'deny';
   let decision = (choice === 'allow_once' || choice === 'allow_run') ? choice : 'deny';
   let effectiveMode = currentMode;
   if (choice === 'allow_always') {
@@ -337,25 +405,45 @@ async function _showBashPermissionDialog(info) {
     else decision = 'deny';
   }
 
+  const baseResult = {
+    decision: requestedDecision,
+    effective_decision: decision,
+    mode: effectiveMode,
+    mode_changed: effectiveMode !== currentMode,
+    categories: _bashPermissionCategories(info),
+  };
   try {
-    if (window.Monitor) {
-      Monitor.event('bash_risk_prompt_result', {
-        decision: choice === 'allow_always' ? 'allow_always' : decision,
-        mode: effectiveMode,
-        mode_changed: effectiveMode !== currentMode,
-        categories: (info.reasons || []).join('|'),
-      });
-    }
-  } catch (_e) { /* telemetry must not break the gate */ }
-
-  try {
-    await window.orkas.invoke('bash.permission_response', {
+    const response = await window.orkas.invoke('bash.permission_response', {
       request_id: info.request_id,
       decision,
     });
+    const failed = !response || response.ok === false;
+    const stale = !failed && response.handled === false;
+    try {
+      if (window.Monitor) Monitor.event('bash_risk_prompt_result', {
+        ...baseResult,
+        result: failed ? 'failure' : (stale ? 'cancelled' : 'success'),
+        duration_ms: Math.max(0, Date.now() - startedAt),
+        ...(failed
+          ? { error_code: 'response_failed', error_type: 'ipc' }
+          : (stale ? { error_code: 'stale_request', error_type: 'state' } : {})),
+      });
+    } catch (_e) { /* permission delivery must not depend on observability */ }
   } catch (err) {
-    _bashPermLog.warn('bash permission response failed', { error: err && err.message });
+    _bashPermLog.warn('bash permission response failed', {
+      error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
+    });
+    try {
+      if (window.Monitor) Monitor.event('bash_risk_prompt_result', {
+        ...baseResult,
+        result: 'failure',
+        duration_ms: Math.max(0, Date.now() - startedAt),
+        error_type: 'ipc',
+        error_code: 'response_failed',
+      });
+    } catch (_) { /* the permission response must not depend on observability */ }
   }
+  _bashPermCancelled.delete(requestId);
 }
 
 async function _drainBashPermissionQueue() {
@@ -375,7 +463,15 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
   try {
     window.orkas.onPushEvent('bash:permission', (info) => {
       if (!info || typeof info.request_id !== 'string') return;
-      _bashPermQueue.push(info);
+      const queuedInfo = {
+        ...info,
+        _renderer_received_at_ms: Date.now(),
+      };
+      _bashPermissionTelemetry('bash_risk_prompt_requested', {
+        categories: _bashPermissionCategories(info),
+        visibility_state: _bashPermissionVisibilityState(),
+      });
+      _bashPermQueue.push(queuedInfo);
       _drainBashPermissionQueue();
     });
     window.orkas.onPushEvent('bash:permission_cancelled', (payload) => {
@@ -391,7 +487,9 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
         const cancelled = new Set(ids);
         for (let i = _bashPermQueue.length - 1; i >= 0; i -= 1) {
           if (cancelled.has(_bashPermQueue[i] && _bashPermQueue[i].request_id)) {
-            _bashPermQueue.splice(i, 1);
+            const [info] = _bashPermQueue.splice(i, 1);
+            _bashPermCancelled.delete(info.request_id);
+            _bashTrackCancelledPermission(info, null);
           }
         }
       }

@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
-import { getModel } from '@earendil-works/pi-ai';
+import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
 import {
   CATALOG,
   CURATED_MODELS,
@@ -131,33 +131,17 @@ describe('provider_catalog › CURATED_MODELS', () => {
   });
 
   it('exposes the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
-    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'];
+    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4'];
     expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
     expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
   });
 
-  it('resolves GPT-5.6 entries through declared compatibility templates', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const uid = 'modelcfggpt56';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    const catalog = { getPiModel: (provider: string, modelId: string) => getModel(provider, modelId) };
-    try {
-      for (const provider of ['openai', 'openai-codex'] as const) {
-        for (const modelId of ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']) {
-          const resolved = resolveConfiguredPiModel(catalog, provider, modelId);
-          expect(resolved).toMatchObject({
-            requestedModelId: modelId,
-            templateModelId: 'gpt-5.5',
-            isConfiguredFallback: true,
-            needsCustomModel: true,
-            model: { id: modelId, maxTokens: 128000 },
-          });
-        }
+  it('natively resolves the GPT-5.6 family and retained 5.5/5.4 generations', () => {
+    const expected = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4'];
+    for (const provider of ['openai', 'openai-codex'] as const) {
+      for (const modelId of expected) {
+        expect(getBuiltinModel(provider, modelId)).toBeDefined();
       }
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }
   });
 
@@ -172,17 +156,18 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids).toContain('minimax/minimax-m2.7');
   });
 
-  it('openrouter Claude catalog is limited to Opus 4.8 and 4.7', () => {
+  it('openrouter Claude shortcuts keep every Claude 5 variant', () => {
     const claudeIds = (CURATED_MODELS.openrouter || [])
       .map((m) => m.id)
       .filter((id) => id.includes('/claude-'));
     expect(claudeIds).toEqual([
-      'anthropic/claude-opus-4.8',
-      'anthropic/claude-opus-4.7',
+      'anthropic/claude-opus-5',
+      'anthropic/claude-fable-5',
+      'anthropic/claude-sonnet-5',
     ]);
   });
 
-  it('openrouter GPT catalog keeps GPT-5.6 tiers and GPT-5.5 only', () => {
+  it('openrouter GPT shortcuts keep every GPT-5.6 variant', () => {
     const ids = (CURATED_MODELS.openrouter || [])
       .map((m) => m.id)
       .filter((id) => id.startsWith('openai/gpt-'));
@@ -190,7 +175,6 @@ describe('provider_catalog › CURATED_MODELS', () => {
       'openai/gpt-5.6-sol',
       'openai/gpt-5.6-terra',
       'openai/gpt-5.6-luna',
-      'openai/gpt-5.5',
     ]);
   });
 

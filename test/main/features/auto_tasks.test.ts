@@ -709,6 +709,102 @@ describe('scheduler dispatch', () => {
       .toBe(new Date(2026, 4, 22, 9, 0, 1).toISOString());
   });
 
+  it('starts a changed daily schedule at the next boundary instead of back-filling today', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 4, 8, 30, 0));
+    const taskId = 'at_57575757';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run once per scheduled day',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 7, 4, 9, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+    const firstRunAt = new Date(2026, 7, 4, 9, 0, 0).toISOString();
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(firstRunAt);
+
+    vi.setSystemTime(new Date(2026, 7, 4, 12, 32, 27));
+    const updated = await updateTask(TEST_UID, taskId, {
+      schedule: { type: 'daily', hour: 10, minute: 0 },
+    });
+    expect(updated.ok).toBe(true);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(firstRunAt);
+    expect(armedDueAtForTest(taskId))
+      .toBe(new Date(2026, 7, 5, 10, 0, 0).getTime());
+
+    vi.setSystemTime(new Date(2026, 7, 4, 13, 0, 0));
+    const renamed = await updateTask(TEST_UID, taskId, {
+      title: 'Renamed after the schedule change',
+      schedule: { type: 'daily', hour: 10, minute: 0 },
+    });
+    expect(renamed.ok).toBe(true);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(firstRunAt);
+    expect(armedDueAtForTest(taskId))
+      .toBe(new Date(2026, 7, 5, 10, 0, 0).getTime());
+  });
+
+  it('keeps a changed daily schedule on the same day when its boundary is still ahead', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 4, 8, 30, 0));
+    const taskId = 'at_56575757';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run at the newly selected future time',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 7, 4, 8, 45, 0));
+    const updated = await updateTask(TEST_UID, taskId, {
+      schedule: { type: 'daily', hour: 10, minute: 0 },
+    });
+    expect(updated.ok).toBe(true);
+    expect(armedDueAtForTest(taskId))
+      .toBe(new Date(2026, 7, 4, 10, 0, 0).getTime());
+
+    vi.setSystemTime(new Date(2026, 7, 4, 10, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(2026, 7, 4, 10, 0, 0).toISOString());
+  });
+
+  it('preserves an already-due occurrence when a normal edit resubmits the same schedule', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 7, 4, 8, 30, 0));
+    const taskId = 'at_55575757';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'keep the pending occurrence',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    const editAt = new Date(2026, 7, 4, 9, 0, 1);
+    vi.setSystemTime(editAt);
+    const updated = await updateTask(TEST_UID, taskId, {
+      title: 'Renamed without changing the schedule',
+      schedule: { minute: 0, type: 'daily', hour: 9 },
+    });
+    expect(updated.ok).toBe(true);
+    expect(armedDueAtForTest(taskId)).toBe(editAt.getTime());
+
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(editAt.toISOString());
+  });
+
   it('ignores a due task when the computer is sleeping without mutating it', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
@@ -868,6 +964,7 @@ describe('scheduler dispatch', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'conv_created',
+      source: 'manual',
       user_id: TEST_UID,
       cid: 'cid_auto',
       task_id: taskId,
@@ -879,6 +976,34 @@ describe('scheduler dispatch', () => {
       last_run_at: '2026-05-21T09:00:00.000Z',
       schedule: { type: 'one_time', at: '2099-05-22T09:00:00.000Z' },
     });
+  });
+
+  it('emits one manual failure terminal when the requested task is invalid or stale', async () => {
+    const events: any[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, (ev) => events.push(ev));
+
+    expect(await runTaskNow(TEST_UID, 'not-a-task-id')).toEqual({
+      ok: false,
+      error: 'invalid_id',
+    });
+    expect(await runTaskNow(TEST_UID, 'at_12121212')).toEqual({
+      ok: false,
+      error: 'not_found',
+    });
+    unsubscribe();
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'fire_failed',
+        source: 'manual',
+        error_code: 'invalid_id',
+      }),
+      expect.objectContaining({
+        type: 'fire_failed',
+        source: 'manual',
+        error_code: 'not_found',
+      }),
+    ]);
   });
 
   it('fires a due one-time task, copies attachments, emits an event, and disables the task', async () => {
@@ -921,6 +1046,7 @@ describe('scheduler dispatch', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'conv_created',
+      source: 'scheduled',
       user_id: TEST_UID,
       cid: 'cid_auto',
       task_id: taskId,
@@ -983,6 +1109,7 @@ describe('scheduler dispatch', () => {
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({
       type: 'fire_failed',
+      source: 'scheduled',
       user_id: TEST_UID,
       cid: 'cid_auto',
       task_id: taskId,
@@ -1015,6 +1142,7 @@ describe('scheduler dispatch', () => {
     expect(ownEvents).toEqual([
       expect.objectContaining({
         type: 'conv_created',
+        source: 'manual',
         user_id: TEST_UID,
         task_id: taskId,
         cid: 'cid_auto',
@@ -1074,6 +1202,8 @@ describe('scheduler dispatch', () => {
     vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
     const boundary = new Date(2026, 4, 22, 9, 0, 0);
     const claimFile = path.join(userLocalRoot(TEST_UID), 'auto_task_claims', taskId, `${boundary.getTime()}.json`);
+    const events: any[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, (ev) => events.push(ev));
 
     _setMarkRanFailureForTest(new Error('injected persistence failure'));
     await _onTimerFireForTest(TEST_UID, taskId);
@@ -1081,6 +1211,14 @@ describe('scheduler dispatch', () => {
 
     expect(autoRuntime.createConversation).not.toHaveBeenCalled();
     expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'fire_failed',
+        source: 'scheduled',
+        task_id: taskId,
+        error_code: 'mark_ran_failed',
+      }),
+    ]);
     expect(fs.existsSync(claimFile)).toBe(false);
     let task = await getTask(TEST_UID, taskId);
     expect(task?.last_run_at).toBeUndefined();
@@ -1090,6 +1228,13 @@ describe('scheduler dispatch', () => {
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({
+      type: 'conv_created',
+      source: 'scheduled',
+      task_id: taskId,
+    });
     expect(fs.existsSync(claimFile)).toBe(true);
     task = await getTask(TEST_UID, taskId);
     expect(task?.last_run_at).toBe(boundary.toISOString());

@@ -7,7 +7,8 @@
  *
  *   durableInstructions — low-churn agent/project/protocol guidance;
  *   turnPrompt          — only the current task and current-turn runtime data;
- *   recoveryContext     — bounded prior visible context for a fresh session.
+ *   recoveryContext     — bounded canonical context for a fresh session;
+ *   incrementalContext  — bounded canonical delta for a resumed session.
  *
  * Each backend declares its instruction channel and lifetime in the local CLI
  * capability registry. The compiler uses that contract instead of recognizing
@@ -19,13 +20,21 @@ import type { Lang } from '../../i18n.js';
 import { localCliCapabilities } from './registry.js';
 
 export const CLI_RECOVERY_MAX_BYTES = 16 * 1024;
+export const CLI_HISTORY_MAX_TURNS = 20;
+export const CLI_HISTORY_MAX_MESSAGE_BYTES = 8 * 1024;
+
+export interface CliHistoryTurn {
+  id: string;
+  messages: string[];
+}
 
 export interface CliContextPlan {
-  version: 2;
+  version: 3;
   durableInstructions: string;
   durableHash: string;
   turnPrompt: string;
   recoveryContext: string;
+  incrementalContext: string;
   passthrough?: boolean;
 }
 
@@ -94,64 +103,83 @@ export function buildCliTurnPrompt(input: {
   return blocks.join('\n\n');
 }
 
-export function buildCliRecoveryContext(input: {
-  historyLines?: string[];
-  attachmentPaths?: string[];
+/**
+ * Render complete, newest-first-selected conversation turns under both count
+ * and byte limits. The caller supplies canonical-log rows already grouped into
+ * turns; this layer owns only transport limits, so CLI backends all receive the
+ * same bounded semantics.
+ */
+export function buildCliConversationContext(input: {
+  turns: CliHistoryTurn[];
+  mode: 'recovery' | 'incremental';
   maxBytes?: number;
+  maxTurns?: number;
+  maxMessageBytes?: number;
 }): string {
   const maxBytes = Math.max(1024, input.maxBytes || CLI_RECOVERY_MAX_BYTES);
-  const attachments = uniqueNonEmpty(input.attachmentPaths || []);
-  const lines = (input.historyLines || []).map((line) => String(line || '').trim()).filter(Boolean);
-  const keptLines = lines.slice();
-  const keptAttachments = attachments.slice();
-  const render = () => {
-    const blocks: string[] = [];
-    if (keptLines.length) {
-      blocks.push(
-        `## Conversation context recovered by Orkas`
-        + `${keptLines.length < lines.length ? ' (older entries omitted)' : ''}`
-        + `\n${keptLines.join('\n')}`,
-      );
-    }
-    if (keptAttachments.length) {
-      blocks.push(
-        `## Earlier attachments`
-        + `${keptAttachments.length < attachments.length ? ' (older paths omitted)' : ''}`
-        + `\n${keptAttachments.map((p) => `- ${p}`).join('\n')}`,
-      );
-    }
-    return blocks.join('\n\n');
+  const maxTurns = Math.max(1, input.maxTurns || CLI_HISTORY_MAX_TURNS);
+  const maxMessageBytes = Math.max(256, input.maxMessageBytes || CLI_HISTORY_MAX_MESSAGE_BYTES);
+  const allTurns = input.turns
+    .map((turn) => ({
+      id: String(turn.id || '').trim() || 'unknown',
+      messages: turn.messages
+        .map((message) => truncateUtf8(String(message || '').trim(), maxMessageBytes))
+        .filter(Boolean),
+    }))
+    .filter((turn) => turn.messages.length > 0);
+  if (allTurns.length === 0) return '';
+
+  const omittedByCount = Math.max(0, allTurns.length - maxTurns);
+  const kept = allTurns.slice(-maxTurns);
+  const title = input.mode === 'incremental'
+    ? '## Conversation updates since the previous CLI turn'
+    : '## Conversation context recovered by Orkas';
+  let omittedByBytes = 0;
+
+  const render = (turns: typeof kept, oversizedBody?: string) => {
+    const omitted = omittedByCount + omittedByBytes;
+    const marker = omitted > 0 ? `\n[${omitted} older turn${omitted === 1 ? '' : 's'} omitted]` : '';
+    const body = oversizedBody ?? turns
+      .map((turn) => `### Turn ${turn.id}\n${turn.messages.join('\n')}`)
+      .join('\n\n');
+    return `${title}${marker}\n${body}`;
   };
 
-  // Old attachment paths are less valuable than visible dialogue, so trim
-  // them first; both lists remove oldest-first and therefore retain the most
-  // recent recoverable context. Re-rendering includes section headers in the
-  // byte accounting, guaranteeing the whole recovery payload stays bounded.
-  let rendered = render();
-  while (Buffer.byteLength(rendered, 'utf8') > maxBytes && keptAttachments.length) {
-    keptAttachments.shift();
-    rendered = render();
+  let rendered = render(kept);
+  while (Buffer.byteLength(rendered, 'utf8') > maxBytes && kept.length > 1) {
+    kept.shift();
+    omittedByBytes += 1;
+    rendered = render(kept);
   }
-  while (Buffer.byteLength(rendered, 'utf8') > maxBytes && keptLines.length) {
-    keptLines.shift();
-    rendered = render();
-  }
-  return rendered;
+  if (Buffer.byteLength(rendered, 'utf8') <= maxBytes) return rendered;
+
+  // A single pathological turn may itself exceed the transport budget. Keep
+  // its newest bounded representation and make the truncation explicit.
+  const only = kept[0];
+  const prefix = render([{ ...only, messages: [] }], '').replace(/\n$/, '');
+  const available = Math.max(0, maxBytes - Buffer.byteLength(`${prefix}\n`, 'utf8'));
+  const body = truncateUtf8(
+    `### Turn ${only.id}\n${only.messages.join('\n')}`,
+    available,
+  );
+  return `${prefix}\n${body}`;
 }
 
 export function createCliContextPlan(input: {
   durableInstructions: string;
   turnPrompt: string;
   recoveryContext?: string;
+  incrementalContext?: string;
   passthrough?: boolean;
 }): CliContextPlan {
   const durableInstructions = String(input.durableInstructions || '').trim();
   return {
-    version: 2,
+    version: 3,
     durableInstructions,
     durableHash: fingerprintCliContext(durableInstructions),
     turnPrompt: String(input.turnPrompt || '').trim(),
     recoveryContext: String(input.recoveryContext || '').trim(),
+    incrementalContext: String(input.incrementalContext || '').trim(),
     ...(input.passthrough ? { passthrough: true } : {}),
   };
 }
@@ -176,7 +204,8 @@ export function materializeCliContext(
     };
   }
   const recoveryAndTurn = joinBlocks(plan.recoveryContext, plan.turnPrompt);
-  const normalPrompt = resumed ? plan.turnPrompt : recoveryAndTurn;
+  const incrementalAndTurn = joinBlocks(plan.incrementalContext, plan.turnPrompt);
+  const normalPrompt = resumed ? incrementalAndTurn : recoveryAndTurn;
   const sessionOwnsDurableInstructions = resumed
     && capabilities.durableInstructionScope === 'session';
   return {
@@ -215,6 +244,23 @@ function uniqueNonEmpty(values: string[]): string[] {
     out.push(normalized);
   }
   return out;
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return '';
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const marker = '\n[… message truncated by Orkas …]\n';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  if (markerBytes >= maxBytes) {
+    return Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/\uFFFD+$/u, '');
+  }
+  const budget = maxBytes - markerBytes;
+  const headBytes = Math.ceil(budget / 2);
+  const tailBytes = Math.floor(budget / 2);
+  const raw = Buffer.from(value, 'utf8');
+  const head = raw.subarray(0, headBytes).toString('utf8').replace(/\uFFFD+$/u, '');
+  const tail = raw.subarray(Math.max(0, raw.length - tailBytes)).toString('utf8').replace(/^\uFFFD+/u, '');
+  return `${head}${marker}${tail}`;
 }
 
 function joinBlocks(...values: string[]): string {

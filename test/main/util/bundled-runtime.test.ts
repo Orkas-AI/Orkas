@@ -4,15 +4,32 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 let tmpDir: string;
+const RUNTIME_OVERRIDE_ENV = [
+  'ORKAS_BUNDLED_PYTHON',
+  'ORKAS_PYTHON',
+  'ORKAS_BUNDLED_UV',
+  'ORKAS_UV',
+  'ORKAS_BUNDLED_NODE',
+] as const;
+let savedRuntimeEnv: Partial<Record<(typeof RUNTIME_OVERRIDE_ENV)[number], string>>;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bundled-runtime-'));
+  savedRuntimeEnv = {};
+  for (const key of RUNTIME_OVERRIDE_ENV) {
+    if (process.env[key] !== undefined) savedRuntimeEnv[key] = process.env[key];
+    delete process.env[key];
+  }
   process.env.ORKAS_RUNTIME_DIR = path.join(tmpDir, 'runtime');
   process.env.ORKAS_WORKSPACE_ROOT ||= path.join(tmpDir, 'data');
 });
 
 afterEach(() => {
   delete process.env.ORKAS_RUNTIME_DIR;
+  for (const key of RUNTIME_OVERRIDE_ENV) {
+    if (savedRuntimeEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedRuntimeEnv[key];
+  }
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

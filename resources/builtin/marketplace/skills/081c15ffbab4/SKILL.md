@@ -3,7 +3,7 @@ name: office-excel
 description_zh: 使用内置 Office 工具创建、读取、编辑和检查 Excel / XLSX 工作簿，可靠处理公式、日期、数据类型、格式、验证规则、模板、图表和打印设置。适合“做一个 Excel 报表”“把 CSV 整理成带公式的 XLSX”“修改工作簿并保留格式”；触发词：Excel、XLSX、XLS、CSV、TSV、表格、工作簿、公式、数据验证、打印区域
 description_en: Use the built-in Office tools to create, read, edit, and check Excel/XLSX workbooks while protecting formulas, dates, data types, formatting, validations, templates, charts, and print settings. Use for spreadsheet deliverables, workbook cleanup, CSV-to-XLSX conversion, formula models, and Excel-compatible reporting.
 category: office
-min_app_version: 1.7.0
+min_app_version: 1.6.1
 ---
 
 # Office Excel
@@ -18,7 +18,7 @@ Use the bundled Office tools as the default artifact path. Do not install Office
 - Call `create_xlsx` exactly once for one requested workbook. Include the complete initial workbook and chart plan in that call. If QA finds a correction, use `office_read` and `edit_office` on the exact returned path; a file created in this conversation is refined in place. Do not restart with a second `create_xlsx`, create a “可编辑” duplicate, or publish an intermediate workbook.
 - Use `office_read` to inspect sheet/cell paths before editing an existing `.xlsx` workbook.
 - Use `edit_office` for `.xlsx`; it creates a separate working copy when the source was not already produced by this conversation.
-- Run `office_check` after every create or edit, then use `office_render` on representative sheets or ranges when visible layout matters.
+- Run `office_check` after every create or edit, then use `office_render` when visible layout matters. For XLSX, first use `office_read` with `mode:"outline"` to map worksheet names to workbook order, then pass the worksheet's one-based numeric position as `office_render.page`; never pass a worksheet name or cell range as `page`.
 
 Use existing local compute only for transformations the Office tools do not express; do not add package dependencies during a workbook task. The built-in engine supports `.xlsx`, not legacy `.xls`, macro-enabled `.xlsm` editing, or macro execution. Require conversion for `.xls`. An `.xlsm` may be attached for broad read-only inspection through `stat_file`/`read_file` only, but do not pass it to `office_read`, `edit_office`, `office_check`, or `office_render`; preserve the source, never execute its macros, and require target-Excel editing/review with macros disabled when its VBA project, external links, or signature must remain intact.
 
@@ -46,7 +46,7 @@ For KPI reports, monthly reports, dashboards, or sample-driven workbooks:
 - Make the summary decision-ready: show the reporting period, KPI actuals, prior-period or target comparisons, the main driver or exception, and a next action.
 - Give every chart an explicit source table or named range, category field, value series, title, axis labels and units, intentional category order, and a truthful scale. Use native editable chart objects when `create_xlsx` supports them; a source table, text bar, screenshot, or “insert this chart later” instruction does not satisfy a chart request. In a tools-off specification, name these bindings before execution. Bar charts start at zero unless the exception is explained; avoid pie charts when exact comparison matters.
 - Never plot measures with different units or materially different scales on the same primary axis. Prefer separate charts; otherwise use a documented combo/secondary axis and label both axes. For the ecommerce monthly-report default, a single-series sales trend plus a separate channel-sales bar chart is clearer than putting sales and order count on one axis.
-- Bind time trends to a complete ordered period range and category comparisons to a clearly sorted range. After creation, use `office_read` to confirm chart nodes and source bindings, then render every chart-bearing sheet.
+- Bind time trends to a complete ordered period range and category comparisons to a clearly sorted range. After creation, use `office_read` to confirm chart nodes and source bindings, then render every chart-bearing worksheet by its one-based numeric page position.
 - Complete the artifact loop with `create_xlsx` or `edit_office`, `office_check`, representative `office_render`, and `publish_outputs`, including a single final workbook. If a tool is unavailable, name the missing check instead of implying it ran.
 
 Return the final `.xlsx` path, the untouched source or backup path, sheet structure, formula/data checks, assumptions, and any Excel/WPS recalculation or visual review still required. For every requested chart, also report its native chart type, title, category/value source ranges, axis labels/units, and scale or secondary-axis choice so delivery quality is evidenced rather than merely claimed.

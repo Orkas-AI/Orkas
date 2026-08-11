@@ -1,37 +1,27 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: composition-design-review
-min_app_version: "1.6.0"
-description_zh: VideoStudio 的 COMPOSE 设计审查层 - 优先在 HTML 预览展示前完整检查首帧、每镜中点与收束帧；无预览时才在 draft 后兜底，只输出一次汇总的可执行修复。
-description_en: Design review layer for VideoStudio COMPOSE. Prefer a complete first-frame, per-scene midpoint, and payoff review before exposing HTML preview; fall back to post-draft review only when preview was skipped, returning one batched set of actionable fixes.
+min_app_version: "1.6.5"
+description_zh: VideoStudio 的 COMPOSE 视觉自检清单 - 在展示 HTML 预览前，由作者自己完整检查首帧、每镜中点与收束帧，汇总一次可执行修复；不向宿主提交任何审查结果。
+description_en: Advisory visual checklist for VideoStudio COMPOSE. The author reviews the first frame, every scene midpoint, and the payoff frame before exposing the HTML preview, batching actionable fixes; nothing is submitted to the host.
 category: creation
 ---
 
 # composition-design-review
 
-Use this first when `video_studio` `op:"composition.snapshot"` returns `preview_design_review_required:true`, before the preview is shown. Use it after `composition.draft` only when that draft still returns `design_review_required:true`, which is the no-preview fallback. It is a design QA layer, not a renderer, line router, or generic video craft checklist. Submit its verdict through `composition.submit_design_review`; prose alone does not satisfy the host state.
+Apply this checklist yourself after a successful `composition.snapshot`, before the preview is shown. It is advisory: nothing is submitted to the host, no operation records a verdict, and no gate waits on it — the host publishes the contact sheet with the passing snapshot. It is a design QA layer for your own authoring, not a renderer, line router, or generic video craft checklist.
 
-Do not open a new user Gate. For preview review, inspect every returned frame path at usable scale before choosing a verdict; the contact sheet is only an index. Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, submit one `repair` verdict, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot. Submit `passed` only for the complete current snapshot signature. For the no-preview draft fallback, read `steps.inspect.draft_disposition` when present and re-run draft after a repair.
-
-Treat a rejected `composition.submit_design_review` payload as an internal tool-contract error when the evidence and composition signature are still current. Correct the verdict, object shape, required score names, empty passing findings, or frame-path field and retry the complete call immediately with the same evidence. Do not ask the user, open a gate, recapture frames, rerender, or report a production blocker for a parameter-only error.
-
-Even in a planning-only or “do not actually call tools” response, name
-`composition.submit_design_review` explicitly as the step that records the verdict. “Submit a
-passed verdict” or prose review without the canonical operation is not an executable continuation;
-planning-only means describe the host call, not omit its identity.
+Do not open a new user Gate. Native preflight/inspect/sampled-frame QA runs before this pass; a passing snapshot attaches the full-color contact sheet directly as model-visible evidence. Review every frame in that attached complete index, without reopening the sheet through generic `read_file`, and open at full scale only the frame-0 cover, frames named by QA findings, and frames whose sheet cell shows risk (dense or doubtful text, suspected overlap or blankness). Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot; then re-check the complete new frame set.
 
 ## Activation
 
-The host requires this review before showing a captured preview and may require a post-draft fallback for short work that skipped preview. Review when either authoritative result requests it:
-
-- The snapshot result contains `preview_design_review_required:true` (authoritative and preferred).
-- A draft produced without a reviewed preview contains `design_review_required:true` (authoritative fallback).
+Apply the checklist whenever snapshot evidence exists, and give it extra weight when:
 
 - The approved brief is brand, product, promo, launch, version-update, portfolio, or other design-led COMPOSE work.
 - `project/composition/composition-manifest.json::art_direction.style_source` is present.
-- The draft report or sampled frames show a visible design risk that deterministic QA cannot judge, such as a weak first frame, flat hierarchy, repeated scene grammar, or motion that hides the message.
+- Sampled frames show a visible design risk that deterministic QA cannot judge, such as a weak first frame, flat hierarchy, repeated scene grammar, or motion that hides the message.
 
-Do not run this review for non-COMPOSE edit/TTS/clip-selection work. For COMPOSE, always follow the current snapshot/draft result even when the visual concept is otherwise simple. When draft says `design_review_inherited_from_preview:true`, do not repeat the static design review.
+Do not run this review for non-COMPOSE edit/TTS/clip-selection work. Do not repeat the full pass after the draft renders — post-draft QA is native and render-specific.
 
 ## Review Inputs
 
@@ -41,9 +31,9 @@ Read only the relevant artifacts:
 - Every composition-local image/video in `art_direction.references`, including declared roles, reproduce/edit/guide intent, preserve/may-change boundaries, target scenes, and layout/temporal anchors
 - `project/composition/narration-map.json` as read-only evidence when detailed narration-line alignment matters
 - `project/composition/qa/inspect.json`, or `project/render/draft-report.json` only for fallback review
-- For preview review, the snapshot result's `contact_sheet` and every `frame_paths` item: first frame, every scene midpoint, and payoff/closing frame. Open every path individually; do not infer full coverage from a thumbnail sheet.
+- For preview review, the snapshot result's `contact_sheet` covering every `frame_paths` item: first frame, every scene midpoint, and payoff/closing frame. Open individual paths where the activation rule above points — cover, QA-named frames, risky cells.
 - For fallback review, sampled evidence frames from the draft report: `contact_sheet`, `frame_paths`, first frame, one mid-frame per scene, and payoff/closing frame
-- The approved script/shotlist only when a finding depends on message intent
+- The approved script only when a finding depends on message intent
 
 ## Findings Rubric
 
@@ -94,20 +84,10 @@ Do not solve design problems by only nudging pixels. If the issue is "too generi
 
 ## Output Format
 
-Return one compact review object or bullets after the entire evidence set has been inspected, then call the tool with the same evidence:
+Summarize your pass in a few bullets before continuing:
 
-- `verdict`: passed | repair | blocked
-- `review_scope`: why this review was triggered
-- `reviewed_frame_paths`: every current snapshot frame path inspected; required for preview review
-- `design_direction`: one line
-- `quality_scores`: 0-100 `content_alignment`, `cover_communication`, `hierarchy`, `text_legibility`, `motion_readiness`, and `specificity`; add `reference_fidelity` when a concrete reference contract exists
 - `blockers`: all concrete locations + evidence + repair, not only the first finding
-- `fixes`: concrete location + repair
-- `polish`: optional
-- `next_action`: rerun inspect + snapshot, open the existing Preview Gate, rerun draft for fallback review, open Gate D, or surface blocker
+- `fixes`: concrete location + repair applied
+- `polish`: optional notes that travel with the Gate D note
 
-```json
-{"op":"composition.submit_design_review","composition_dir":"project/composition","review_verdict":"passed","review_scope":"cover + every returned scene midpoint/payoff frame, with declared reference comparisons","review_findings":[],"quality_scores":{"content_alignment":92,"cover_communication":90,"hierarchy":88,"text_legibility":94,"motion_readiness":86,"specificity":89,"reference_fidelity":91},"reviewed_frame_paths":["/absolute/path/01-first-frame.png","/absolute/path/02-scene-mid.png","/absolute/path/03-payoff.png"]}
-```
-
-A passing verdict requires overall >=80 and every required dimension >=70. The manifest may set a higher reference-fidelity floor; exact mode uses at least 85. Do not inflate a score to pass: submit `repair` with the concrete mismatch, fix it once, and review the new signature.
+Then repair and re-run inspect + snapshot, or — when the frames read well — hand readiness to `gate-control`. There is no score to compute and nothing to submit: quality is judged by what is visibly broken in a specific frame, never by a number.

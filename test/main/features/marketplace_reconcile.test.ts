@@ -103,20 +103,31 @@ describe('marketplace reconcile', () => {
     fs.writeFileSync(path.join(dir, 'installs.json'), JSON.stringify(data, null, 2), 'utf8');
   }
 
-  it('marks an installed item stale when updated_at changes even if version and published_at do not', async () => {
+  it('marks installed agents and skills stale only when the catalog version is higher', async () => {
     postJsonMock.mockImplementation(async (p: string) => {
       if (p === '/marketplace/agents/list') {
         return {
           list: [{
             id: 'agent1',
-            version: '1.0.0',
-            published_at: 100,
-            updated_at: 200,
+            version: '1.1.0',
+            published_at: 50,
+            updated_at: 50,
+            agent_skills_bundle_url: 'https://example.test/private-v2.zip',
           }],
           total: 1,
         };
       }
-      if (p === '/marketplace/skills/list') return { list: [], total: 0 };
+      if (p === '/marketplace/skills/list') {
+        return {
+          list: [{
+            id: 'skill1',
+            version: '2.0.0',
+            published_at: 50,
+            updated_at: 50,
+          }],
+          total: 1,
+        };
+      }
       throw new Error(`unexpected path ${p}`);
     });
 
@@ -125,15 +136,25 @@ describe('marketplace reconcile', () => {
       id: 'agent1',
       version: '1.0.0',
       published_at: 100,
+      updated_at: 100,
       agent_json_url: 'https://example.test/agent.json',
+      agent_skills_bundle_url: 'https://example.test/private-v1.zip',
+      create_uid: '0',
+    });
+    await installs.addSkillInstall('u1', {
+      id: 'skill1',
+      version: '1.9.0',
+      published_at: 100,
+      updated_at: 100,
+      bundle_url: 'https://example.test/skill.zip',
       create_uid: '0',
     });
 
     const reconcile = await import('../../../src/main/features/marketplace_reconcile');
     const result = await reconcile.checkServerUpdatesForInstalls('u1');
 
-    expect(result).toEqual({ updated_agents: 1, updated_skills: 0 });
-    expect(postJsonMock).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ updated_agents: 1, updated_skills: 1 });
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
     expect(postJsonMock).toHaveBeenCalledWith('/marketplace/agents/list', {
       page: 1,
       size: 100,
@@ -142,14 +163,22 @@ describe('marketplace reconcile', () => {
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: 'agent1',
-      version: '1.0.0',
-      published_at: 100,
-      updated_at: 200,
+      version: '1.1.0',
+      published_at: 50,
+      updated_at: 50,
       agent_json_url: 'https://example.test/agent.json',
+      agent_skills_bundle_url: 'https://example.test/private-v2.zip',
+    });
+    expect(manifest.skills[0]).toMatchObject({
+      id: 'skill1',
+      version: '2.0.0',
+      published_at: 50,
+      updated_at: 50,
+      bundle_url: 'https://example.test/skill.zip',
     });
   });
 
-  it('marks an installed agent stale when its private skills bundle url changes', async () => {
+  it('ignores catalog freshness and private bundle changes without a version bump', async () => {
     postJsonMock.mockImplementation(async (p: string) => {
       if (p === '/marketplace/agents/list') {
         return {
@@ -157,13 +186,23 @@ describe('marketplace reconcile', () => {
             id: 'agent-private',
             version: '1.0.0',
             published_at: 100,
-            updated_at: 100,
+            updated_at: 999,
             agent_skills_bundle_url: 'https://example.test/private-v2.zip',
           }],
           total: 1,
         };
       }
-      if (p === '/marketplace/skills/list') return { list: [], total: 0 };
+      if (p === '/marketplace/skills/list') {
+        return {
+          list: [{
+            id: 'skill-older',
+            version: '0.9.0',
+            published_at: 100,
+            updated_at: 999,
+          }],
+          total: 1,
+        };
+      }
       throw new Error(`unexpected path ${p}`);
     });
 
@@ -177,15 +216,134 @@ describe('marketplace reconcile', () => {
       agent_skills_bundle_url: 'https://example.test/private-v1.zip',
       create_uid: '0',
     });
+    await installs.addSkillInstall('u1', {
+      id: 'skill-older',
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      bundle_url: 'https://example.test/skill.zip',
+      create_uid: '0',
+    });
 
     const reconcile = await import('../../../src/main/features/marketplace_reconcile');
     const result = await reconcile.checkServerUpdatesForInstalls('u1');
 
-    expect(result).toEqual({ updated_agents: 1, updated_skills: 0 });
+    expect(result).toEqual({ updated_agents: 0, updated_skills: 0 });
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: 'agent-private',
-      agent_skills_bundle_url: 'https://example.test/private-v2.zip',
+      version: '1.0.0',
+      updated_at: 100,
+      agent_skills_bundle_url: 'https://example.test/private-v1.zip',
+    });
+    expect(manifest.skills[0]).toMatchObject({
+      id: 'skill-older',
+      version: '1.0.0',
+      updated_at: 100,
+    });
+  });
+
+  it('syncs mutable catalog metadata without changing the installed content pin', async () => {
+    postJsonMock.mockImplementation(async (p: string) => {
+      if (p === '/marketplace/agents/list') {
+        return {
+          list: [{
+            id: 'agent-metadata',
+            version: '1.0.0',
+            published_at: 999,
+            updated_at: 999,
+            agent_skills_bundle_url: 'https://example.test/private-new.zip',
+            default_install: true,
+            status: 'approved',
+            min_app_version: '1.5.0',
+          }],
+          total: 1,
+        };
+      }
+      if (p === '/marketplace/skills/list') {
+        return {
+          list: [{
+            id: 'skill-metadata',
+            version: '1.0.0',
+            published_at: 999,
+            updated_at: 999,
+            default_install: true,
+            status: 'approved',
+            min_app_version: '1.5.0',
+          }],
+          total: 1,
+        };
+      }
+      throw new Error(`unexpected path ${p}`);
+    });
+
+    const agentMeta = {
+      version: '2.0.0',
+      published_at: 200,
+      updated_at: 200,
+      agent_json_url: 'https://example.test/agent.json',
+      agent_skills_bundle_url: 'https://example.test/private-current.zip',
+      installed_at: 300,
+      create_uid: '0',
+      default_install: false,
+      status: 'reviewing',
+      min_app_version: '1.0.0',
+    };
+    const skillMeta = {
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      bundle_url: 'https://example.test/skill.zip',
+      installed_at: 300,
+      create_uid: '0',
+      default_install: false,
+      status: 'reviewing',
+      min_app_version: '1.0.0',
+    };
+    const agentDir = writeLocalAgent('agent-metadata', agentMeta);
+    const skillDir = writeLocalSkill('skill-metadata', skillMeta);
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', { id: 'agent-metadata', ...agentMeta });
+    await installs.addSkillInstall('u1', { id: 'skill-metadata', ...skillMeta });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.checkServerUpdatesForInstalls('u1');
+
+    expect(result).toEqual({ updated_agents: 1, updated_skills: 1 });
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest.agents[0]).toMatchObject({
+      version: '2.0.0',
+      published_at: 200,
+      updated_at: 200,
+      agent_skills_bundle_url: 'https://example.test/private-current.zip',
+      default_install: true,
+      status: 'approved',
+      min_app_version: '1.5.0',
+    });
+    expect(manifest.skills[0]).toMatchObject({
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      default_install: true,
+      status: 'approved',
+      min_app_version: '1.5.0',
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '2.0.0',
+      published_at: 200,
+      updated_at: 200,
+      agent_skills_bundle_url: 'https://example.test/private-current.zip',
+      default_install: true,
+      status: 'approved',
+      min_app_version: '1.5.0',
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(skillDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      default_install: true,
+      status: 'approved',
+      min_app_version: '1.5.0',
     });
   });
 
@@ -388,6 +546,303 @@ describe('marketplace reconcile', () => {
     expect(meta.status).toBe('approved');
   });
 
+  it('does not downgrade local content from an older or same-version manifest row', async () => {
+    const skillZip = new AdmZip();
+    skillZip.addFile('SKILL.md', Buffer.from('---\nname: server-skill\n---\n', 'utf8'));
+    let hits = 0;
+    const base = await listen((req, res) => {
+      hits += 1;
+      if (req.url === '/agent.json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ agent_id: 'agent-local-newer', name: 'Server Agent' }));
+        return;
+      }
+      res.setHeader('Content-Type', 'application/zip');
+      res.end(skillZip.toBuffer());
+    });
+
+    const agentDir = writeLocalAgent('agent-local-newer', {
+      version: '2.0.0',
+      published_at: 200,
+      updated_at: 200,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    const skillDir = writeLocalSkill('skill-same-version', {
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      bundle_url: `${base}/skill.zip`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-local-newer',
+        version: '1.0.0',
+        published_at: 999,
+        updated_at: 999,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+        create_uid: '0',
+      }],
+      skills: [{
+        id: 'skill-same-version',
+        version: '1.0.0',
+        published_at: 999,
+        updated_at: 999,
+        bundle_url: `${base}/skill.zip`,
+        installed_at: 300,
+        create_uid: '0',
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(0);
+    expect(result.pulled_skills).toBe(0);
+    expect(hits).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')).name).toBe('Local Agent');
+    expect(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8')).toContain('local-skill');
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '2.0.0',
+      updated_at: 200,
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(skillDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.0.0',
+      updated_at: 100,
+    });
+  });
+
+  it('pulls strictly higher numeric versions even when their timestamps are older', async () => {
+    const skillZip = new AdmZip();
+    skillZip.addFile('SKILL.md', Buffer.from('---\nname: upgraded-skill\n---\n', 'utf8'));
+    const base = await listen((req, res) => {
+      if (req.url === '/agent.json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ agent_id: 'agent-numeric-version', name: 'Upgraded Agent' }));
+        return;
+      }
+      res.setHeader('Content-Type', 'application/zip');
+      res.end(skillZip.toBuffer());
+    });
+    const agentDir = writeLocalAgent('agent-numeric-version', {
+      version: '1.9.0',
+      published_at: 999,
+      updated_at: 999,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    const skillDir = writeLocalSkill('skill-numeric-version', {
+      version: '1.9.0',
+      published_at: 999,
+      updated_at: 999,
+      bundle_url: `${base}/skill.zip`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-numeric-version',
+        version: '1.10.0',
+        published_at: 100,
+        updated_at: 100,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+        create_uid: '0',
+      }],
+      skills: [{
+        id: 'skill-numeric-version',
+        version: '1.10.0',
+        published_at: 100,
+        updated_at: 100,
+        bundle_url: `${base}/skill.zip`,
+        installed_at: 300,
+        create_uid: '0',
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    expect(result.pulled_skills).toBe(1);
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')).name).toBe('Upgraded Agent');
+    expect(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8')).toContain('upgraded-skill');
+    expect(JSON.parse(fs.readFileSync(path.join(agentDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.10.0',
+      updated_at: 100,
+    });
+    expect(JSON.parse(fs.readFileSync(path.join(skillDir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.10.0',
+      updated_at: 100,
+    });
+  });
+
+  it('metadata-patches an OSS Resource-pending agent without re-pulling its local content', async () => {
+    devtoolsMock.isDev = true;
+    let hits = 0;
+    const base = await listen((_req, res) => {
+      hits += 1;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ agent_id: 'agent-resource', name: 'Server Agent' }));
+    });
+    const dir = writeLocalAgent('agent-resource', {
+      version: '1.1.0',
+      published_at: 100,
+      updated_at: 200,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    writeResourceManifest(dir, 'resource-dev-hash', 'online-prod-hash');
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-resource',
+        version: '1.0.0',
+        published_at: 100,
+        updated_at: 100,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(0);
+    expect(result.patched_agents).toBe(1);
+    expect(hits).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name).toBe('Local Agent');
+  });
+
+  it('does not re-pull a dev builtin-overlaid skill from an older server manifest', async () => {
+    devtoolsMock.isDev = true;
+    let hits = 0;
+    const base = await listen((_req, res) => {
+      hits += 1;
+      res.setHeader('Content-Type', 'application/zip');
+      res.end(Buffer.from('not used'));
+    });
+    const dir = writeLocalSkill('skill-builtin', {
+      version: '1.0.1',
+      published_at: 100,
+      updated_at: 200,
+      bundle_url: `${base}/skill.zip`,
+      installed_at: 300,
+      create_uid: '0',
+      seed_source: 'builtin',
+    });
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'skill-builtin',
+        version: '1.0.0',
+        published_at: 100,
+        updated_at: 100,
+        bundle_url: `${base}/skill.zip`,
+        installed_at: 300,
+      }],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_skills).toBe(0);
+    expect(result.patched_skills).toBe(0);
+    expect(hits).toBe(0);
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'));
+    expect(meta.version).toBe('1.0.1');
+  });
+
+  it('keeps a newer builtin-seeded agent in production when the server manifest is older', async () => {
+    // Production incident 2026-08-02: the app seeded builtin VideoStudio
+    // 1.1.40, then reconcile pulled the server's 25-versions-older package
+    // minutes later because this guard was dev-only. The user's install lost
+    // every skill contract the host enforces and stalled at each gate.
+    let hits = 0;
+    const base = await listen((_req, res) => {
+      hits += 1;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ agent_id: 'agent-builtin', name: 'Old Server Agent' }));
+    });
+    const dir = writeLocalAgent('agent-builtin', {
+      version: '1.1.40',
+      published_at: 100,
+      updated_at: 200,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+      seed_source: 'builtin',
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-builtin',
+        version: '1.1.15',
+        published_at: 100,
+        updated_at: 100,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(0);
+    expect(hits).toBe(0);
+    const local = JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8'));
+    expect(local.name).toBe('Local Agent');
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8')).version).toBe('1.1.40');
+  });
+
+  it('still pulls a genuinely newer server version over a builtin-seeded install in production', async () => {
+    // Negative control for the downgrade guard: the upgrade path must stay
+    // open, otherwise builtin seeding would permanently pin every user.
+    const base = await listen((_req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ agent_id: 'agent-builtin-up', name: 'Newer Server Agent' }));
+    });
+    const dir = writeLocalAgent('agent-builtin-up', {
+      version: '1.1.40',
+      published_at: 100,
+      updated_at: 200,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+      seed_source: 'builtin',
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-builtin-up',
+        version: '1.2.0',
+        published_at: 100,
+        updated_at: 300,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    const pulled = JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8'));
+    expect(pulled.name).toBe('Newer Server Agent');
+  });
+
   it('still re-pulls a dev Resource agent after the Resource hash matches the online baseline', async () => {
     devtoolsMock.isDev = true;
     const base = await listen((_req, res) => {
@@ -541,8 +996,208 @@ describe('marketplace reconcile', () => {
     expect(result.pulled_agents).toBe(1);
     expect(extractBundleSafelyMock).toHaveBeenCalledWith(
       expect.anything(),
-      paths.userMarketplaceAgentSkillsDir('u1', 'agent-private'),
+      expect.stringContaining('.agent-private.install-'),
     );
+    expect(fs.existsSync(path.join(paths.userMarketplaceAgentSkillsDir('u1', 'agent-private'), 'private-helper', 'SKILL.md'))).toBe(true);
+  });
+
+  it('repairs missing private skills without requiring a same-version content update', async () => {
+    const privateZip = new AdmZip();
+    privateZip.addFile('private-helper/SKILL.md', Buffer.from('---\nname: private-helper\n---\n'));
+    const base = await listen((req, res) => {
+      if (req.url === '/agent.json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          agent_id: 'agent-private-repair',
+          name: 'Repaired Agent',
+          skill_list: ['private-helper'],
+        }));
+        return;
+      }
+      res.setHeader('Content-Type', 'application/zip');
+      res.end(privateZip.toBuffer());
+    });
+    const dir = writeLocalAgent('agent-private-repair', {
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      agent_json_url: `${base}/agent.json`,
+      agent_skills_bundle_url: `${base}/agent-skills.zip`,
+      installed_at: 200,
+      create_uid: '0',
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-private-repair',
+        version: '1.0.0',
+        published_at: 999,
+        updated_at: 999,
+        agent_json_url: `${base}/agent.json`,
+        agent_skills_bundle_url: `${base}/agent-skills.zip`,
+        installed_at: 200,
+        create_uid: '0',
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const paths = await import('../../../src/main/paths');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name).toBe('Repaired Agent');
+    expect(extractBundleSafelyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.stringContaining('.agent-private-repair.install-'),
+    );
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '1.0.0',
+      updated_at: 999,
+    });
+  });
+
+  it('keeps the previous skill active when automatic update extraction fails', async () => {
+    const zip = new AdmZip();
+    zip.addFile('SKILL.md', Buffer.from('---\nname: replacement\n---\n'));
+    const base = await listen((_req, res) => {
+      res.setHeader('Content-Type', 'application/zip');
+      res.end(zip.toBuffer());
+    });
+    const dir = writeLocalSkill('atomic-skill', {
+      version: '1.0.0', published_at: 100, bundle_url: `${base}/skill.zip`, installed_at: 100,
+    });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), '---\nname: working-version\n---\n', 'utf8');
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'atomic-skill', version: '2.0.0', published_at: 200,
+        bundle_url: `${base}/skill.zip`, installed_at: 100,
+      }],
+    });
+    extractBundleSafelyMock.mockImplementationOnce((_bundle: AdmZip, staged: string) => {
+      fs.writeFileSync(path.join(staged, 'partial.txt'), 'partial');
+      throw new Error('injected extraction failure');
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1');
+
+    expect(result).toMatchObject({ pulled_skills: 0, failed: ['skill:atomic-skill'] });
+    expect(fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8')).toContain('working-version');
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'))).toMatchObject({ version: '1.0.0' });
+    expect(fs.existsSync(path.join(dir, 'partial.txt'))).toBe(false);
+  });
+
+  it('rejects an older agent detail returned while refreshing a stale 404 URL', async () => {
+    const base = await listen((_req, res) => {
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    const dir = writeLocalAgent('refresh-agent', {
+      version: '1.0.0', published_at: 100, agent_json_url: `${base}/old.json`, installed_at: 100,
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'refresh-agent', version: '2.0.0', published_at: 200,
+        agent_json_url: `${base}/old.json`, installed_at: 100,
+      }],
+      skills: [],
+    });
+    postJsonMock.mockResolvedValueOnce({
+      agent_json: { agent_id: 'refresh-agent', name: 'Old' },
+      version: '1.5.0', published_at: 150, agent_json_url: `${base}/fresh.json`, create_uid: '0',
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const result = await reconcile.reconcileInstalls('u1');
+
+    expect(result).toMatchObject({ pulled_agents: 0, failed: ['agent:refresh-agent'] });
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'))).toMatchObject({ version: '1.0.0' });
+    expect((await installs.readInstalls('u1')).agents[0]).toMatchObject({
+      version: '2.0.0', agent_json_url: `${base}/old.json`,
+    });
+  });
+
+  it('rejects an invalid skill detail returned while refreshing a stale 404 URL', async () => {
+    const base = await listen((_req, res) => {
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    const dir = writeLocalSkill('refresh-skill', {
+      version: '1.0.0', published_at: 100, bundle_url: `${base}/old.zip`, installed_at: 100,
+    });
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'refresh-skill', version: '2.0.0', published_at: 200,
+        bundle_url: `${base}/old.zip`, installed_at: 100,
+      }],
+    });
+    postJsonMock.mockResolvedValueOnce({
+      bundle_url: `${base}/fresh.zip`, version: 'latest', published_at: 300, create_uid: '0',
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const result = await reconcile.reconcileInstalls('u1');
+
+    expect(result).toMatchObject({ pulled_skills: 0, failed: ['skill:refresh-skill'] });
+    expect(fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8')).toContain('local-skill');
+    expect((await installs.readInstalls('u1')).skills[0]).toMatchObject({
+      version: '2.0.0', bundle_url: `${base}/old.zip`,
+    });
+  });
+
+  it('accepts an equal-version refreshed skill URL and commits it only after activation', async () => {
+    const zip = new AdmZip();
+    zip.addFile('SKILL.md', Buffer.from('---\nname: refreshed-skill\n---\n'));
+    const base = await listen((req, res) => {
+      if (req.url === '/old.zip') {
+        res.statusCode = 404;
+        res.end('not found');
+        return;
+      }
+      if (req.url === '/fresh.zip') {
+        res.setHeader('Content-Type', 'application/zip');
+        res.end(zip.toBuffer());
+        return;
+      }
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    const dir = writeLocalSkill('refresh-equal-skill', {
+      version: '1.0.0', published_at: 100, bundle_url: `${base}/old.zip`, installed_at: 100,
+    });
+    writeManifest({
+      version: 1,
+      agents: [],
+      skills: [{
+        id: 'refresh-equal-skill', version: '2.0.0', published_at: 200,
+        bundle_url: `${base}/old.zip`, installed_at: 100,
+      }],
+    });
+    postJsonMock.mockResolvedValueOnce({
+      bundle_url: `${base}/fresh.zip`, version: '2.0.0', published_at: 200,
+      updated_at: 250, create_uid: '0',
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const result = await reconcile.reconcileInstalls('u1');
+
+    expect(result).toMatchObject({ pulled_skills: 1, failed: [] });
+    expect(fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8')).toContain('refreshed-skill');
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '_install.json'), 'utf8'))).toMatchObject({
+      version: '2.0.0', bundle_url: `${base}/fresh.zip`, updated_at: 250,
+    });
+    expect((await installs.readInstalls('u1')).skills[0]).toMatchObject({
+      version: '2.0.0', bundle_url: `${base}/fresh.zip`, updated_at: 250,
+    });
   });
 
   it('rejects an oversized skill bundle before reconcile parses or extracts it', async () => {

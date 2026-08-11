@@ -18,6 +18,13 @@ const log = createLogger('local-secret-rekey');
 const AUTH_SECRET_NAMESPACE = 'auth.profiles';
 const AUTH_SECRET_RECORD_ID = 'auth-profiles.json';
 
+function rekeyFailure(operation: string, code: string, cause?: unknown): Error & { code: string; cause?: unknown } {
+  const failure = new Error(`auth profiles rekey ${operation} failed`) as Error & { code: string; cause?: unknown };
+  failure.code = code;
+  if (cause !== undefined) failure.cause = cause;
+  return failure;
+}
+
 function authSecretContext(ownerId: string): localSecrets.LocalSecretContext {
   return {
     namespace: AUTH_SECRET_NAMESPACE,
@@ -76,7 +83,7 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
       targetOwner: maskId(targetOwner),
       error: logErrorSummary(err),
     });
-    return;
+    throw rekeyFailure('read', 'AUTH_PROFILES_REKEY_READ_FAILED', err);
   }
 
   let dec: { plaintext: string; ownerId: string; needsRewrite: boolean } | null = null;
@@ -87,19 +94,26 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
       targetOwner: maskId(targetOwner),
       error: logErrorSummary(err),
     });
-    return;
+    throw rekeyFailure('parse', 'AUTH_PROFILES_REKEY_PARSE_FAILED', err);
   }
   if (!dec) {
     log.warn('failed to decrypt auth profiles for rekey', {
       owners: candidateOwners.map(maskId),
     });
-    return;
+    throw rekeyFailure('decrypt', 'AUTH_PROFILES_REKEY_DECRYPT_FAILED');
   }
   if (dec.ownerId === targetOwner && !dec.needsRewrite) return;
 
   try {
     const out = localSecrets.encryptLocalSecret(authSecretContext(targetOwner), dec.plaintext);
-    fs.writeFileSync(file, out, { encoding: 'utf8', mode: 0o600 });
+    const tmp = `${file}.rekey.tmp`;
+    try {
+      fs.writeFileSync(tmp, out, { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort temp cleanup */ }
+      throw err;
+    }
     log.info('auth profiles rekeyed after uid directory change', {
       fromLocalId: maskId(opts.fromLocalId),
       toLocalId: maskId(opts.toLocalId),
@@ -111,5 +125,6 @@ export function rekeyUserLocalSecretsAfterLocalIdChange(opts: {
       targetOwner: maskId(targetOwner),
       error: logErrorSummary(err),
     });
+    throw rekeyFailure('write', 'AUTH_PROFILES_REKEY_WRITE_FAILED', err);
   }
 }

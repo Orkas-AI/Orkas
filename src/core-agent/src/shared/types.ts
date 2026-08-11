@@ -9,6 +9,8 @@ export type ImageContent = {
   /** Base64-encoded image data or URL. */
   data: string;
   mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+  /** Generic semantic intent preserved for provider-side visual routing. */
+  analysisMode?: "understand" | "quality_review";
 };
 
 export type ToolUseContent = {
@@ -74,16 +76,61 @@ export type Usage = {
 /** Stop reasons from LLM API calls. */
 export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
 
+/**
+ * Low-cardinality interpretation of the provider's native terminal marker.
+ * Keep this separate from `StopReason`: the latter is the agent-loop control
+ * signal, while this value preserves enough evidence to decide whether an
+ * otherwise empty response is safe to recover.
+ */
+export type ProviderTerminationCategory =
+  | "normal"
+  | "length"
+  | "safety"
+  | "error"
+  | "unknown";
+
+/** Empty-response classes used by recovery and sampled diagnostics. */
+export type ProviderEmptyKind =
+  | "transport_empty"
+  | "normal_end_empty"
+  | "safety_filtered_empty"
+  | "unknown_empty";
+
+/** Closed-world Server reason for an Orkas Pro → Orkas 1.5 fallback. */
+export type ServerModelFallbackReason =
+  | "rate_limited"
+  | "transport_error"
+  | "configuration_error"
+  | "not_configured"
+  | "upstream_error"
+  | "empty_response"
+  | "unavailable"
+  | "unknown";
+
 /** Streaming event types. */
 export type StreamEvent =
   | { type: "text_delta"; text: string }
   | { type: "retry"; attempt: number; reason: string }
   | {
       type: "provider_fallback";
-      reason: "auth" | "no_first_event_timeout";
+      reason: "auth" | "no_first_event_timeout" | "server_model_fallback";
       providerId: string;
       candidateIndex?: number;
       candidateCount?: number;
+      fromModel?: string;
+      toModel?: string;
+      serverFallbackReason?: ServerModelFallbackReason;
+    }
+  | {
+      type: "provider_empty";
+      kind: ProviderEmptyKind;
+      providerId: string;
+      candidateIndex: number;
+      candidateCount: number;
+      /** Whether a provider terminal event was observed before emptiness. */
+      terminalEventSeen: boolean;
+      /** Usage charged by a terminal empty request, when reported upstream. */
+      usage?: Partial<Usage>;
     }
   | { type: "tool_use_start"; id: string; name: string }
   | { type: "tool_use_delta"; id: string; input: string }
@@ -102,5 +149,15 @@ export type StreamEvent =
       content?: MessageContent[];
       /** Model id echoed back so CompletionResult callers can record it. */
       model?: string;
+      /** Bounded Orkas Server fallback reason recovered from response metadata. */
+      serverFallbackReason?: ServerModelFallbackReason;
+      /** Provider-native terminal classification for empty-response recovery. */
+      providerTermination?: { category: ProviderTerminationCategory };
     }
-  | { type: "error"; error: Error };
+  | {
+      type: "error";
+      error: Error;
+      /** Present when Orkas Server switched models before the terminal error. */
+      model?: string;
+      serverFallbackReason?: ServerModelFallbackReason;
+    };

@@ -44,6 +44,7 @@ import {
   chatArtifactRelPath,
 } from '../util/project-layout';
 import { createLogger } from '../logger';
+import { logErrorSummary, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
 
 const log = createLogger('chat_artifacts');
@@ -423,6 +424,51 @@ export function resolveArtifactDir(
     return { ok: false, code: 'not_found', error: 'artifact not found' };
   }
   return { ok: true, dirPath: dir };
+}
+
+/** Remove one newly-created artifact before it becomes user-visible. Used by
+ *  create_artifact when post-processing or interaction smoke checks fail. */
+export function discardArtifact(
+  userId: string,
+  cid: string,
+  artifactId: string,
+): Result<{ deleted: boolean }> {
+  let safeConvId: string;
+  let safeId: string;
+  try { safeConvId = safeCid(cid); safeId = safeArtifactId(artifactId); }
+  catch (err) {
+    log.warn('discardArtifact rejected invalid identity', {
+      user_id: maskId(userId),
+      cid: maskId(cid),
+      artifact_id: maskId(artifactId),
+      error: logErrorSummary(err),
+    });
+    return { ok: false, error: 'invalid artifact identity' };
+  }
+  const resolved = resolveArtifactDir(userId, safeConvId, safeId);
+  if (!resolved.ok) {
+    const error = (resolved as { error?: string }).error || 'artifact not found';
+    log.warn('discardArtifact resolve failed', {
+      user_id: maskId(userId),
+      cid: maskId(safeConvId),
+      artifact_id: maskId(safeId),
+    });
+    return { ok: false, error };
+  }
+  const deletedFiles = listArtifactFilesRel(resolved.dirPath);
+  try {
+    fs.rmSync(resolved.dirPath, { recursive: true, force: false });
+  } catch (err) {
+    log.warn('discardArtifact delete failed', {
+      user_id: maskId(userId),
+      cid: maskId(safeConvId),
+      artifact_id: maskId(safeId),
+      error: logErrorSummary(err),
+    });
+    return { ok: false, error: 'failed to discard artifact' };
+  }
+  for (const rel of deletedFiles) notifyArtifactDeleted(userId, safeConvId, safeId, rel);
+  return { ok: true, deleted: true };
 }
 
 /** Read an artifact's metadata, if present. Best-effort (returns undefined on

@@ -124,7 +124,7 @@ const DEFAULT_PERMANENT_PROVIDER_STATUS = [
 ] as const;
 
 const TRANSIENT_CODE_RE =
-  /^(UND_ERR_|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE)/i;
+  /^(UND_ERR_|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE|PROVIDER_EMPTY_TRANSPORT)/i;
 
 const TRANSIENT_MESSAGE_REASON_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
   [
@@ -160,7 +160,7 @@ const DEFAULT_PERMANENT_MESSAGE_PATTERNS = [
 ];
 
 const DEFAULT_PERMANENT_CODE_PATTERNS = [
-  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
+  /^(AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)|ABORT_ERR|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|ERR_INVALID_|INVALID_REQUEST|INVALID_ARGUMENT|INVALID_SCHEMA|MODEL_NOT_FOUND|UNSUPPORTED_MODEL|E_PATH_OUT_OF_SCOPE)/i.source,
 ];
 
 export const DEFAULT_RETRY_ERROR_POLICY: RetryErrorPolicyConfig = Object.freeze({
@@ -299,7 +299,7 @@ function errorCauseOf(err: unknown): unknown {
 }
 
 const PROVIDER_SAFETY_CODE_RE =
-  /^(?:CONTENT[_\s-]?(?:FILTER|POLICY(?:[_\s-]?VIOLATION)?)|SAFETY(?:[_\s-]?VIOLATION)?|RESPONSIBLE[_\s-]?AI[_\s-]?POLICY[_\s-]?VIOLATION|RESPONSIBLEAIPOLICYVIOLATION|PROHIBITED[_\s-]?CONTENT|PROMPT[_\s-]?(?:FILTER|BLOCKED)|MODERATION[_\s-]?(?:BLOCKED|REJECTED)|BLOCKED[_\s-]?BY[_\s-]?POLICY|BLOCKLIST|IMAGE[_\s-]?SAFETY)$/i;
+  /^(?:PROVIDER_EMPTY_SAFETY|CONTENT[_\s-]?(?:FILTER|POLICY(?:[_\s-]?VIOLATION)?)|SAFETY(?:[_\s-]?VIOLATION)?|RESPONSIBLE[_\s-]?AI[_\s-]?POLICY[_\s-]?VIOLATION|RESPONSIBLEAIPOLICYVIOLATION|PROHIBITED[_\s-]?CONTENT|PROMPT[_\s-]?(?:FILTER|BLOCKED)|MODERATION[_\s-]?(?:BLOCKED|REJECTED)|BLOCKED[_\s-]?BY[_\s-]?POLICY|BLOCKLIST|IMAGE[_\s-]?SAFETY)$/i;
 
 const PROVIDER_SAFETY_MESSAGE_RE =
   /content[_\s-]?(?:policy|filter|moderation)|content management policy|responsible[_\s-]?ai[_\s-]?policy|prohibited[_\s-]?content|(?:prompt|request|response|candidate).{0,100}(?:blocked|filtered).{0,100}(?:safety|policy|moderation)|(?:prompt|request|response|candidate).{0,100}rejected.{0,100}(?:safety (?:policy|filter|reason)|content (?:policy|filter)|moderation)|(?:safety|moderation) (?:policy|filter).{0,100}(?:blocked|filtered|rejected|violation)|safety[_\s-]?violation|blocked (?:by|due to|for|because of).{0,40}(?:safety|content) (?:policy|filter|reasons?)/i;
@@ -396,7 +396,7 @@ function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknow
     // either it exhausted its safe candidates/retries or deliberately stopped
     // on an ambiguous empty response. Retrying at AgentRunner level would
     // repeat that decision regardless of server-supplied policy overrides.
-    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
+    if (/^PROVIDER_(NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED)$/.test(code)) return true;
     if (code && policy.permanentCodePatterns.some((pattern) => pattern.test(code))) return true;
 
     cur = errorCauseOf(cur);

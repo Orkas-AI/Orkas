@@ -24,6 +24,7 @@ function loadStatusHint() {
   vm.runInContext(source, context, { filename: 'local-agents.js' });
   return {
     hint: windowObject.getLocalCliUnavailableHint as (entry: Record<string, unknown> | undefined) => string,
+    isCodingAgent: windowObject.cliIsCodingAgent as (cli: string) => boolean,
     calls,
   };
 }
@@ -136,8 +137,12 @@ function loadExternalSelectorHarness() {
     availability: windowObject.getLocalCliAvailabilityState as () => 'none' | 'detecting' | 'available',
     load: windowObject.loadLocalCliEntries as (options?: { force?: boolean }) => Promise<unknown>,
     mount: windowObject.mountExternalCliSelect as (onChange?: (value: string | null) => void) => Promise<unknown>,
-    resolveList: (value: unknown) => takePendingInvoke().resolve(value),
-    rejectList: (reason?: unknown) => takePendingInvoke().reject(reason),
+    resolveList: (value: unknown) => takePendingInvoke(
+      pending => pending.channel === 'localAgents.list',
+    ).resolve(value),
+    rejectList: (reason?: unknown) => takePendingInvoke(
+      pending => pending.channel === 'localAgents.list',
+    ).reject(reason),
     resolveDetect: (type: string, value: unknown) => takePendingInvoke(
       pending => pending.channel === 'localAgents.detect'
         && (pending.payload as { type?: unknown })?.type === type,
@@ -179,6 +184,16 @@ describe('external-agent unavailable status copy', () => {
     });
   });
 
+  it('limits project-directory controls to Claude Code and Codex', () => {
+    const { isCodingAgent } = loadStatusHint();
+
+    expect(isCodingAgent('claude')).toBe(true);
+    expect(isCodingAgent('codex')).toBe(true);
+    expect(isCodingAgent('openclaw')).toBe(false);
+    expect(isCodingAgent('opencode')).toBe(false);
+    expect(isCodingAgent('hermes')).toBe(false);
+  });
+
   it('ships recovery and detection messages in every renderer locale', () => {
     const detectingCopy = {
       en: 'Detecting…',
@@ -194,7 +209,7 @@ describe('external-agent unavailable status copy', () => {
     };
     const prerequisiteCopy = {
       en: 'Supports Claude Code, Codex, OpenClaw, OpenCode, and Hermes. Install and configure one to connect.',
-      zh: '支持 Claude Code、Codex、OpenClaw、OpenCode 和 Hermes，安装并配置后即可接入。',
+      zh: '快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode 和 Hermes。',
       ja: 'Claude Code、Codex、OpenClaw、OpenCode、Hermes に対応しています。インストールして設定すると接続できます。',
       pt: 'Compatível com Claude Code, Codex, OpenClaw, OpenCode e Hermes. Instale e configure um deles para conectar.',
     };
@@ -476,6 +491,31 @@ describe('external-agent unavailable status copy', () => {
       'claude',
     ]);
     expect(harness.selectState.value).toBe('claude');
+    expect(harness.monitorCalls.filter(
+      ([kind, name]) => kind === 'event' && name === 'external_cli_detect_result',
+    )).toHaveLength(1);
+  });
+
+  it('keeps one telemetry owner when another mount starts during version validation', async () => {
+    const harness = loadExternalSelectorHarness();
+    const first = harness.mount();
+    harness.resolveList({
+      entries: [{ type: 'codex', available: true, version: null, validation: 'pending' }],
+    });
+    await flushPromises();
+    expect(harness.getInvokeCount()).toBe(2);
+
+    const second = harness.mount();
+    expect(harness.getInvokeCount()).toBe(3);
+    harness.resolveList({
+      entries: [{ type: 'codex', available: true, version: null, validation: 'pending' }],
+    });
+    await flushPromises();
+    harness.resolveDetect('codex', {
+      entry: { type: 'codex', available: true, version: '0.146.0' },
+    });
+    await Promise.all([first, second]);
+
     expect(harness.monitorCalls.filter(
       ([kind, name]) => kind === 'event' && name === 'external_cli_detect_result',
     )).toHaveLength(1);

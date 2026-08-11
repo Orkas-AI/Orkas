@@ -12,7 +12,7 @@ Read this skill only after route lock when the task needs original art direction
 
 ## Art-direction pass
 
-Define all of the following in `image-manifest.json`:
+Populate all of the following inside the canonical `image-manifest.json` template's `art_direction` object; never place them at the manifest top level:
 
 1. `subject_world`: the concrete subject, setting, era, material culture, and audience expectation.
 2. `one_job`: the single thing the image must communicate at thumbnail size.
@@ -24,6 +24,8 @@ Define all of the following in `image-manifest.json`:
 8. `must_avoid`: visual clichés, unwanted objects, misleading claims, garbled text, and style failures.
 
 Reject vague defaults such as “modern, premium, cinematic” unless each word is translated into visible choices. Prefer one strong thesis over a collage of styles.
+
+For a multi-image set, define this art direction once for the set instead of independently re-expanding the style for every member. Treat the first image that passes design review as the style anchor. Later images may change their subject-specific content and local composition, but must carry forward the anchor's palette roles, typography roles, spacing/grid rhythm, shape and icon language, material treatment, and signature device unless the user explicitly requests a variation.
 
 ## Prompt compiler
 

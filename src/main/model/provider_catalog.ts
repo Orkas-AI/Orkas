@@ -13,11 +13,12 @@
  *   EXTRA_LABELS     — friendly labels for providers that aren't in
  *                      CATALOG but may show up via legacy saved profiles.
  *
- * ## Fallbacks
+ * ## Selection policy
  *
- * When a CATALOG provider has no `CURATED_MODELS` entry, `listModels()`
- * falls back to `pickLatestGenerations()` over pi-ai's raw model list,
- * which keeps the last 2 (major, minor) version bands.
+ * The shipped catalog generally favors the two newest useful version
+ * generations, but this is a curation guideline rather than a runtime cap.
+ * Keep older models when capability or product coverage justifies them.
+ * Runtime SDK discovery never makes an unlisted provider/model selectable.
  *
  * Runtime override:
  *   Server remote-config can override model_catalog; the desktop cache is
@@ -25,10 +26,9 @@
  *
  * ## OAuth
  *
- * OAuth capability is detected at runtime via pi-ai's `getOAuthProviders()`
- * — we don't maintain a parallel list here. `oauthOnly: true` on a catalog
- * entry tells the UI not to offer the API-key path (e.g. OpenAI Codex, the
- * Google CLI/Antigravity backends).
+ * OAuth capability is part of the shipped product catalog. The implementation
+ * module is still validated and loaded only when the user starts an OAuth
+ * flow. `oauthOnly: true` tells the UI not to offer the API-key path.
  */
 
 import {
@@ -50,6 +50,7 @@ export interface CatalogEntry {
   docsUrl?: string;           // where to create an API key (shown in the add-key form)
   region?: 'cn';              // 'cn' marks providers whose primary endpoint is in China
   oauthOnly?: boolean;        // if true, hide the API-key path entirely
+  managedByOrkas?: boolean;   // if true, Orkas Server brokers the model; no user API key is needed
   customOpenAICompatible?: boolean; // user supplies base URL + model metadata
   /** Per-provider prerequisite note shown on the card + the add-key form.
    *  Used when the same "brand" has two independent billing/auth surfaces
@@ -78,7 +79,7 @@ export interface CatalogEntry {
 export const CATALOG: readonly CatalogEntry[] = [
   // DeepSeek direct (not in pi-ai 0.68.1; routed through the
   // openai-completions adapter in external-providers.ts).
-  { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys', recommended: true },
+  { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys' },
 
   { id: 'openai-codex', label: 'OpenAI Codex',  oauthOnly: true },
   { id: 'openai',       label: 'OpenAI',        docsUrl: 'https://platform.openai.com/api-keys' },
@@ -124,16 +125,17 @@ export const CATALOG: readonly CatalogEntry[] = [
 // Order in the array = order shown to the user — put the flagship first.
 // Ids must match pi-ai's `listPiModels(provider)` exactly.
 //
-// Providers without an entry here fall through to `pickLatestGenerations`
-// which keeps the last 2 version bands from pi-ai's raw list.
+// Providers without an entry here expose no selectable chat models.
 
 export const CURATED_MODELS = DEFAULT_PROVIDER_MODELS;
 
 export function curatedModelsFor(providerId: string): ProviderModelEntry[] {
   const configured = getConfiguredProviderModels(providerId);
-  if (configured) return configured.models;
-  const list = CURATED_MODELS[providerId];
-  return list ? list.map((m) => ({ ...m })) : [];
+  const list = configured?.models || CURATED_MODELS[providerId];
+  return list ? list.map((model) => ({
+    ...model,
+    ...(model.includedModels ? { includedModels: [...model.includedModels] } : {}),
+  })) : [];
 }
 
 /** Product boundary for image blocks in one chat-model request. Attachment
@@ -146,9 +148,9 @@ export const DEFAULT_MODEL_INPUT_IMAGE_LIMIT = 5;
  * Resolve the image count for one concrete provider/model candidate.
  *
  * Model protocol metadata is authoritative for whether images are supported
- * at all. The configurable catalog may then declare the provider's exact
- * per-request count. Unknown multimodal models retain the conservative
- * five-image behavior instead of risking an upstream request rejection.
+ * at all. The remotely configurable catalog may then declare the provider's
+ * exact per-request count. Unknown multimodal models retain the old,
+ * conservative five-image behavior instead of risking an upstream 400.
  */
 export function modelInputImageLimit(
   providerId: string,
@@ -174,6 +176,147 @@ export const PI_MODEL_PROVIDER_ALIAS: Readonly<Record<string, string>> = {
   'minimax-portal-cn': 'minimax-cn',
   'minimax-portal':    'minimax',
 };
+
+const PI_MODEL_TEMPLATE_ALIAS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  'kimi-coding': {
+    k2p7: 'kimi-for-coding',
+    k2p6: 'kimi-for-coding',
+  },
+};
+
+const PI_MODEL_TEMPLATE_ALIAS_LABEL: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  'kimi-coding': {
+    k2p7: 'Kimi K2.7 Code',
+    k2p6: 'Kimi K2.6',
+  },
+};
+
+const MODEL_UPGRADE_ALIAS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  anthropic: {
+    'claude-opus-4-7': 'claude-opus-5',
+    'claude-opus-4-8': 'claude-opus-5',
+    'claude-sonnet-5': 'claude-fable-5',
+  },
+  'openai-codex': {
+    'gpt-5.6-luna': 'gpt-5.6-terra',
+    'gpt-5.5': 'gpt-5.6-sol',
+  },
+  openai: {
+    'gpt-5.6-luna': 'gpt-5.6-terra',
+    'gpt-5.5': 'gpt-5.6-sol',
+  },
+  google: {
+    'gemini-3-flash-preview': 'gemini-3.6-flash',
+    'gemini-3.5-flash': 'gemini-3.6-flash',
+    'gemini-3-pro-preview': 'gemini-3.6-flash',
+    'gemini-3.1-pro-preview': 'gemini-3.6-flash',
+    'gemini-3.1-flash-lite-preview': 'gemini-3.5-flash-lite',
+    'gemini-3.1-flash-lite': 'gemini-3.5-flash-lite',
+  },
+  moonshot: {
+    'kimi-k2.5': 'kimi-k2.7-code',
+  },
+  'kimi-coding': {
+    k2p6: 'k2p7',
+    'kimi-k2-thinking': 'k2p7',
+  },
+  'minimax-cn': {
+    'MiniMax-M2.7-highspeed': 'MiniMax-M3',
+  },
+  'minimax-portal': {
+    'MiniMax-M2.7-highspeed': 'MiniMax-M3',
+  },
+  'minimax-portal-cn': {
+    'MiniMax-M2.7-highspeed': 'MiniMax-M3',
+  },
+  doubao: {
+    'doubao-seed-2-0-lite-260215': 'doubao-seed-2-0-lite-260428',
+  },
+  openrouter: {
+    'anthropic/claude-opus-4.7': 'anthropic/claude-opus-5',
+    'anthropic/claude-opus-4.8': 'anthropic/claude-opus-5',
+    'anthropic/claude-sonnet-5': 'anthropic/claude-fable-5',
+    'openai/gpt-5.5': 'openai/gpt-5.6-sol',
+    'openai/gpt-5.6-luna': 'openai/gpt-5.6-terra',
+    'google/gemini-3-flash-preview': 'google/gemini-3.6-flash',
+    'google/gemini-3.5-flash': 'google/gemini-3.6-flash',
+    'google/gemini-3-pro-preview': 'google/gemini-3.6-flash',
+    'google/gemini-3.1-pro-preview': 'google/gemini-3.6-flash',
+    'google/gemini-3.1-flash-lite-preview': 'google/gemini-3.5-flash-lite',
+    'google/gemini-3.1-flash-lite': 'google/gemini-3.5-flash-lite',
+    'deepseek/deepseek-v4-flash': 'deepseek/deepseek-v4-flash-0731',
+    'moonshotai/kimi-k2.5': 'moonshotai/kimi-k3',
+    'moonshotai/kimi-k2.6': 'moonshotai/kimi-k3',
+    'moonshotai/kimi-k2.7-code': 'moonshotai/kimi-k3',
+    'qwen/qwen3-max': 'qwen/qwen3.7-max',
+    'qwen/qwen3-coder': 'qwen/qwen3.7-max',
+    'qwen/qwen3-coder-next': 'qwen/qwen3.7-max',
+    'qwen/qwen3.7-flash': 'qwen/qwen3.7-plus',
+    'z-ai/glm-5.1': 'z-ai/glm-5.2',
+    'minimax/minimax-m2.7': 'minimax/minimax-m3',
+  },
+};
+
+export interface ModelUpgradeResolution {
+  providerId: string;
+  modelId: string;
+  previousModelId: string;
+  upgraded: boolean;
+}
+
+function isModelInSelectionList(providerId: string, modelId: string): boolean {
+  return curatedModelsFor(providerId).some((m) => m.id === modelId);
+}
+
+/** OpenRouter is a relay over a large, fast-moving catalog. Its public model
+ * ids are deliberately accepted outside our small shortcut list; the list is
+ * navigation, not an authorization boundary. Keep validation shape-only so
+ * aliases such as `:free` and newly released vendor slugs remain usable. */
+function isValidOpenRouterModelId(modelId: string): boolean {
+  return modelId.length > 0
+    && modelId.length <= 200
+    && !/[\s\u0000-\u001f\u007f]/.test(modelId);
+}
+
+export function resolveModelUpgrade(providerId: string, modelId: string): ModelUpgradeResolution {
+  const requestedProviderId = String(providerId || '').trim();
+  const requestedModelId = String(modelId || '').trim();
+  let upgradedModelId = requestedModelId;
+  if (requestedModelId && !isModelInSelectionList(requestedProviderId, requestedModelId)) {
+    const aliasTarget = MODEL_UPGRADE_ALIAS[requestedProviderId]?.[requestedModelId];
+    if (aliasTarget && isModelInSelectionList(requestedProviderId, aliasTarget)) {
+      upgradedModelId = aliasTarget;
+    }
+  }
+  return {
+    providerId: requestedProviderId,
+    modelId: upgradedModelId,
+    previousModelId: requestedModelId,
+    upgraded: !!requestedModelId && upgradedModelId !== requestedModelId,
+  };
+}
+
+/**
+ * Return whether a provider/model pair belongs to the current user-facing
+ * chat-model catalog. This is the single whitelist shared by Settings,
+ * persisted-entry recovery, connection tests, and runtime routing.
+ *
+ * Explicit upgrade aliases are resolved first so a known retired id can be
+ * migrated to its catalog replacement. OpenRouter is the intentional
+ * exception: it accepts validated user-entered ids because its upstream
+ * catalog is much larger and changes faster than our shortcut list.
+ */
+export function isSelectableModel(providerId: string, modelId: string): boolean {
+  const provider = String(providerId || '').trim();
+  const requested = String(modelId || '').trim();
+  if (!provider || !requested || !isKnownModelProvider(provider)) return false;
+  if (provider === 'custom') {
+    return requested.length <= 200 && !/[\u0000-\u001f\u007f]/.test(requested);
+  }
+  const resolved = resolveModelUpgrade(provider, requested);
+  if (provider === 'openrouter') return isValidOpenRouterModelId(resolved.modelId);
+  return isModelInSelectionList(provider, resolved.modelId);
+}
 
 export interface PiModelCatalogLike {
   getPiModel(provider: string, modelId: string): Model<Api> | undefined;
@@ -266,7 +409,7 @@ export function resolveConfiguredPiModel(
   modelId: string,
 ): ConfiguredPiModelResolution | null {
   const requestedProviderId = String(providerId || '').trim();
-  const requestedModelId = String(modelId || '').trim();
+  const requestedModelId = resolveModelUpgrade(requestedProviderId, modelId).modelId;
   if (!requestedProviderId || !requestedModelId) return null;
 
   const catalogProviderId = PI_MODEL_PROVIDER_ALIAS[requestedProviderId] || requestedProviderId;
@@ -285,22 +428,48 @@ export function resolveConfiguredPiModel(
     };
   }
 
-  if (!configured) return null;
-
-  if (configured.template) {
-    const template = safeGetPiModel(catalog, catalogProviderId, configured.template);
+  const templateAlias = configured?.template || PI_MODEL_TEMPLATE_ALIAS[requestedProviderId]?.[requestedModelId];
+  if (templateAlias) {
+    const template = safeGetPiModel(catalog, catalogProviderId, templateAlias);
     if (template) {
+      const name = configured?.name
+        || PI_MODEL_TEMPLATE_ALIAS_LABEL[requestedProviderId]?.[requestedModelId]
+        || requestedModelId;
       return {
-        model: cloneModelWithId(template, requestedModelId, configured.name || requestedModelId, configured),
+        model: cloneModelWithId(template, requestedModelId, name, configured),
         requestedProviderId,
         requestedModelId,
         catalogProviderId,
-        templateModelId: configured.template,
+        templateModelId: templateAlias,
         isConfiguredFallback: true,
         needsCustomModel: true,
       };
     }
   }
+
+  // A manually entered OpenRouter slug may be newer than pi-ai's generated
+  // catalog. Clone only the relay protocol/base URL from Auto Router and keep
+  // the fallback text-only; exact SDK entries above retain their richer image
+  // and token metadata as soon as pi-ai knows the model.
+  if (!configured && requestedProviderId === 'openrouter' && isValidOpenRouterModelId(requestedModelId)) {
+    const template = safeGetPiModel(catalog, catalogProviderId, 'openrouter/auto');
+    if (template) {
+      return {
+        model: {
+          ...cloneModelWithId(template, requestedModelId, requestedModelId),
+          input: ['text'],
+        },
+        requestedProviderId,
+        requestedModelId,
+        catalogProviderId,
+        templateModelId: 'openrouter/auto',
+        isConfiguredFallback: true,
+        needsCustomModel: true,
+      };
+    }
+  }
+
+  if (!configured) return null;
 
   const requestedFamily = modelFamilyKey(requestedModelId);
   const candidates = configuredModels
@@ -322,6 +491,29 @@ export function resolveConfiguredPiModel(
   }
 
   return null;
+}
+
+/**
+ * Map a resolved pi-ai model's window fields to a core-agent `models.catalog`
+ * entry. The host (PC `buildRunner`) feeds this into `createConfig` so the
+ * runner's compaction trigger uses the model's REAL context window — without
+ * it, `config.models.catalog` is empty and the runner falls back to a 200K
+ * window, compacting a 1M-window model at 0.8×200K=160K (G7). pi-ai's `Model`
+ * carries `contextWindow` + `maxTokens`; the catalog field is `maxOutputTokens`.
+ * Returns null when nothing is known (→ runner keeps its 200K fallback).
+ */
+export function modelCatalogEntryFromModel(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): { contextWindow?: number; maxOutputTokens?: number } | null {
+  if (!model) return null;
+  const entry: { contextWindow?: number; maxOutputTokens?: number } = {};
+  if (typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+    entry.contextWindow = model.contextWindow;
+  }
+  if (typeof model.maxTokens === 'number' && model.maxTokens > 0) {
+    entry.maxOutputTokens = model.maxTokens;
+  }
+  return Object.keys(entry).length ? entry : null;
 }
 
 // ── Labels for providers outside CATALOG ────────────────────────────────
@@ -360,6 +552,23 @@ export function isVisibleProvider(id: string): boolean {
   return CATALOG_ORDER.has(id);
 }
 
+/** Providers understood by the runtime but intentionally absent from the
+ * user-addable provider picker. */
+export const OFFICIAL_MODEL_PROVIDERS: readonly string[] = [];
+
+export function isOfficialModelProvider(id: string): boolean {
+  return OFFICIAL_MODEL_PROVIDERS.includes(String(id || '').trim());
+}
+
+export function isUserAddableProvider(id: string): boolean {
+  return isVisibleProvider(String(id || '').trim());
+}
+
+export function isKnownModelProvider(id: string): boolean {
+  const normalized = String(id || '').trim();
+  return isUserAddableProvider(normalized) || isOfficialModelProvider(normalized);
+}
+
 export interface ProviderMeta {
   id: string;
   label: string;
@@ -376,8 +585,8 @@ export const FEATURED_API_PROVIDERS: readonly ProviderMeta[] = CATALOG
 
 /**
  * Back-compat: providers that primarily exist as an OAuth backend. This
- * is the pi-ai-facing list; actual OAuth capability per visible provider
- * is resolved at runtime via `getOAuthProviders()` in `features/auth.ts`.
+ * is the pi-ai-facing list used to advertise OAuth capability without loading
+ * the OAuth implementation during startup or settings-shell rendering.
  */
 export const OAUTH_PROVIDERS: readonly ProviderMeta[] = [
   { id: 'anthropic',          label: 'Anthropic (Claude Pro/Max)' },
@@ -419,6 +628,10 @@ export function providerLabel(id: string): string {
   return id;
 }
 
+export function providerLabelKey(id: string): string | undefined {
+  return CATALOG.find((p) => p.id === id)?.labelKey;
+}
+
 export function providerDocsUrl(id: string): string | undefined {
   return CATALOG.find((p) => p.id === id)?.docsUrl;
 }
@@ -431,8 +644,9 @@ export function providerRecommended(id: string): boolean {
   return CATALOG.find((p) => p.id === id)?.recommended === true;
 }
 
-export function providerLabelKey(id: string): string | undefined {
-  return CATALOG.find((p) => p.id === id)?.labelKey;
+export function providerManagedByOrkas(id: string): boolean {
+  if (isOfficialModelProvider(id)) return true;
+  return CATALOG.find((p) => p.id === id)?.managedByOrkas === true;
 }
 
 export function providerUsesCustomOpenAIConfig(id: string): boolean {
@@ -443,16 +657,8 @@ export interface CustomOpenAICompatibleRuntimeConfig {
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;
-}
-
-export function isSelectableModel(providerId: string, modelId: string): boolean {
-  const provider = String(providerId || '').trim();
-  const requested = String(modelId || '').trim();
-  if (!provider || !requested || !CATALOG.some((entry) => entry.id === provider)) return false;
-  if (provider === 'custom') {
-    return requested.length <= 200 && !/[\u0000-\u001f\u007f]/.test(requested);
-  }
-  return curatedModelsFor(provider).some((model) => model.id === requested);
+  /** Optional OpenAI-compatible reasoning effort for curated relay profiles. */
+  reasoningEffort?: "low" | "medium" | "high";
 }
 
 /**
@@ -517,7 +723,7 @@ export function sortProviderIds(ids: string[]): string[] {
   });
 }
 
-// ── Version-based model picker (fallback for uncurated providers) ───────
+// ── Version-based model picker (catalog maintenance utility) ────────────
 
 export interface RawModel { id: string; name?: string }
 

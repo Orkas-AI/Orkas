@@ -25,11 +25,13 @@
  * included). `Session.getMessagesForModel()` applies a transient model-facing
  * view: completed history is projected to summary + bounded user/final-
  * assistant I/O, while the active turn keeps recent tool process messages.
- * For group-chat Commander, the host synchronizes completed dialogue from
- * `<uid>/cloud/chats/<cid>.jsonl` before each normal turn so Agent replies in
- * the canonical conversation are ordinary history. A persisted checkpoint
- * replaces only the newest mutable tail after the first/full recovery pass;
- * Agent sessions remain scoped to their authorized slices.
+ * For group-chat Commander and every named in-process Agent, the host
+ * synchronizes completed dialogue from `<uid>/cloud/chats/<cid>.jsonl` before
+ * each normal turn. A per-session persisted checkpoint replaces only the
+ * newest mutable tail after the first/full recovery pass. Once a session
+ * reaches the ordinary history-compaction threshold, its canonical dialogue
+ * summary may be reused from the conversation-level derived cache; active
+ * checkpoints and all other execution state remain private.
  */
 
 import * as path from 'node:path';

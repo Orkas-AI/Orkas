@@ -57,7 +57,20 @@ async function buildPlan(projectId?: string, slice: any[] = []) {
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
   const bus = await import('../../../../src/main/features/group_chat/bus');
-  return bus._buildCliContextPlanForTest(TEST_UID, CID, AGENT, ITEM, slice, projectId);
+  const layout = await import('../../../../src/main/util/project-layout');
+  const file = layout.conversationMessageFile(TEST_UID, CID);
+  const canonicalRows = fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line))
+    : [];
+  return bus._buildCliContextPlanForTest(
+    TEST_UID,
+    CID,
+    AGENT,
+    ITEM,
+    slice,
+    projectId,
+    { canonicalRows },
+  );
 }
 
 async function seedConversation(rows: any[]) {
@@ -118,7 +131,7 @@ describe('CLI context › durable project instructions', () => {
     expect(plan.turnPrompt).not.toContain('### Delivery standards');
   });
 
-  it('bridges a bounded static handoff when a CLI agent first enters an existing conversation', async () => {
+  it('bridges bounded canonical conversation history when a CLI agent first enters', async () => {
     await seedConversation([
       {
         id: 'prior-user',
@@ -146,7 +159,7 @@ describe('CLI context › durable project instructions', () => {
 
     const plan = await buildPlan(undefined);
 
-    expect(plan.recoveryContext).toContain('<agent-handoff source="orkas-static">');
+    expect(plan.recoveryContext).toContain('## Conversation context recovered by Orkas');
     expect(plan.recoveryContext).toContain('PRIOR_USER_GOAL');
     expect(plan.recoveryContext).toContain('PRIOR_COMMANDER_RESULT');
     expect(plan.recoveryContext).toContain('/workspace/decision.md');
@@ -154,14 +167,21 @@ describe('CLI context › durable project instructions', () => {
     expect(plan.turnPrompt).toBe('查一下 Orkas 仓库当前的版本分支');
   });
 
-  it('prefers the agent visibility slice and does not duplicate a static handoff', async () => {
+  it('uses canonical history instead of a compatibility-slice-only row', async () => {
     await seedConversation([
       {
-        id: 'prior-commander-only',
+        id: 'prior-user-canonical',
         ts: '2026-07-27T01:00:00.000Z',
+        from: 'user',
+        to: ['commander'],
+        text: 'CANONICAL_USER_CONTEXT',
+      },
+      {
+        id: 'prior-commander-canonical',
+        ts: '2026-07-27T01:01:00.000Z',
         from: 'commander',
         to: ['user'],
-        text: 'STATIC_CONTEXT_SHOULD_NOT_DUPLICATE',
+        text: 'CANONICAL_COMMANDER_CONTEXT',
       },
       {
         id: ITEM.msgId,
@@ -179,9 +199,9 @@ describe('CLI context › durable project instructions', () => {
       text: 'DIRECT_AGENT_CONTEXT',
     }]);
 
-    expect(plan.recoveryContext).toContain('DIRECT_AGENT_CONTEXT');
-    expect(plan.recoveryContext).not.toContain('<agent-handoff source="orkas-static">');
-    expect(plan.recoveryContext).not.toContain('STATIC_CONTEXT_SHOULD_NOT_DUPLICATE');
+    expect(plan.recoveryContext).toContain('CANONICAL_USER_CONTEXT');
+    expect(plan.recoveryContext).toContain('CANONICAL_COMMANDER_CONTEXT');
+    expect(plan.recoveryContext).not.toContain('DIRECT_AGENT_CONTEXT');
   });
 
   it('sends a clean current task and excludes routing/catalog/date/intent boilerplate', async () => {

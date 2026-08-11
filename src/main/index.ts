@@ -29,7 +29,6 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { Readable } from 'node:stream';
 import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
@@ -39,8 +38,13 @@ import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, prot
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
-import { desktopPlatform, osVersion } from './system_info';
-import { hardenedWebPreferences, installExternalNavigationGuard } from './util/window-security';
+import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
+import {
+  hardenedWebPreferences,
+  installExternalNavigationGuard,
+  installOfflineHtmlPreviewNavigationGuard,
+  withOfflineHtmlPreviewPolicy,
+} from './util/window-security';
 import { resolveContainedProtocolFile } from './util/protocol-path';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
@@ -113,7 +117,7 @@ protocol.registerSchemesAsPrivileged([
 ]);
 
 import * as paths from './paths';
-import { parseByteRange } from './util/http-range';
+import { serveFileRange as serveFileRangeCore } from './util/http-range';
 import {
   configureBootAdmission,
   noteBootUserActivity,
@@ -126,12 +130,11 @@ import { getBootDeviceProfile } from './util/boot-device-profile';
 // (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
 // re-reads the env on every call so switching at runtime is safe.
 
-// Skill runner env vars (ORKAS_NODE / ORKAS_PC_DIR / ELECTRON_RUN_AS_NODE)
+// Skill runner env vars (ORKAS_NODE / ORKAS_BUNDLED_NODE / ORKAS_PC_DIR)
 // are injected per-call into the bash-tool sandbox by
 // `model/core-agent/client.ts::buildSkillSandboxEnv()`. Do NOT set them on
-// `process.env` here: the sandbox strips parent env anyway, and
-// `ELECTRON_RUN_AS_NODE` would leak to Electron's own GPU/Renderer/Utility
-// helpers (crashing the app at boot: "GPU process isn't usable. Goodbye.").
+// `process.env` here: the sandbox strips parent env anyway, and runtime
+// overrides must never leak to Electron's own GPU/Renderer/Utility helpers.
 
 import * as storage from './storage';
 import { initLogger, createLogger } from './logger';
@@ -261,6 +264,7 @@ function createWindow(): BrowserWindow {
     (url) => shell.openExternal(url),
     (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
   );
+  installOfflineHtmlPreviewNavigationGuard(win.webContents);
 
   // Hijack Cmd/Ctrl+R / F5 uniformly:
   //   - Packaged: refresh disabled (the App doesn't need reload).
@@ -320,7 +324,7 @@ function registerIpc(): void {
 
   if (IS_PACKAGED_LAUNCH_SMOKE) {
     let recorded = false;
-    ipcMain.handle('orkas.packagedLaunchSmokeReady', (event, payload) => {
+    ipcMain.handle('orkas.packagedLaunchSmokeReady', async (event, payload) => {
       if (recorded) return { ok: true };
       const owner = BrowserWindow.fromWebContents(event.sender);
       const readyState = String(payload?.rendererReadyState || '');
@@ -372,6 +376,25 @@ function registerIpc(): void {
   ipcMain.handle('orkas.env', () => {
     const systemVersion = osVersion();
     const platform = desktopPlatform();
+    let appLanguage = 'und';
+    let systemLanguage = 'und';
+    const autoUpdateEnabled = false;
+    let taskNotificationsEnabled = true;
+    try {
+      appLanguage = appConfig.getLanguage();
+    } catch (err) {
+      log.warn('app language lookup failed', { error: logErrorSummary(err) });
+    }
+    try {
+      systemLanguage = preferredSystemLanguage(app.getPreferredSystemLanguages());
+    } catch (err) {
+      log.warn('system language lookup failed', { error: logErrorSummary(err) });
+    }
+    try {
+      taskNotificationsEnabled = appConfig.getTaskNotificationsEnabled();
+    } catch (err) {
+      log.warn('task notification preference lookup failed', { error: logErrorSummary(err) });
+    }
     return {
       ok: true,
       isDev: !app.isPackaged,
@@ -380,7 +403,11 @@ function registerIpc(): void {
       platform,
       osVersion: systemVersion,
       arch: process.arch,
-      isE2E: false,
+      appLanguage,
+      systemLanguage,
+      autoUpdateEnabled,
+      taskNotificationsEnabled,
+      isE2E: !!E2E_USER_DATA_DIR,
     };
   });
 
@@ -772,68 +799,25 @@ const _KB_FILE_MIME: Record<string, string> = {
   '.json': 'application/json',
 };
 
-/**
- * Stream a file on disk back through a `protocol.handle` callback with HTTP
- * Range support — shared by `kb-file://` and `chat-media://`.
- *
- * Why this exists: a `protocol.handle` reply that returns `200` + a
- * `Content-Length` but no `Accept-Ranges` makes Chromium treat the resource
- * as non-seekable. For `<video preload="metadata">` that is fatal — Chromium's
- * metadata probe fetches only the head of the file and then *cancels* its
- * request; when playback later runs past that prefetched head buffer it has no
- * way to resume (the resource is "not range-capable" and the original request
- * is gone), so the `<video>` freezes a few seconds in with no error in the UI.
- * Advertising `Accept-Ranges: bytes` + honouring `206` requests is the fix; it
- * also makes seeking work and lets PDFium fetch only the pages it shows.
- *
- * Also switches the body from `fs.readFileSync` — the old handlers buffered the
- * whole file into memory, so a 200 MB video spiked RSS by 200 MB — to a lazy
- * `fs.createReadStream`.
- *
- * `totalSize` is the caller's already-statted byte length, so we don't `stat`
- * the file a second time.
- */
+// Thin wrapper over `util/http-range.serveFileRange` that injects this
+// module's logger for the (best-effort) mid-stream read-error warning. The
+// Range/cache/ETag/304 logic + its fixtures live in the util module so they're
+// unit-testable without booting Electron.
 function serveFileRange(
   request: Request,
   absPath: string,
   contentType: string,
   totalSize: number,
+  mtimeMs?: number,
 ): Response {
-  const baseHeaders: Record<string, string> = {
-    'Content-Type': contentType,
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, max-age=60',
-  };
-  const range = parseByteRange(request.headers.get('Range'), totalSize);
-
-  if (range === 'unsatisfiable') {
-    return new Response('requested range not satisfiable', {
-      status: 416,
-      headers: { ...baseHeaders, 'Content-Range': `bytes */${totalSize}` },
-    });
-  }
-
-  const nodeStream = range
-    ? fs.createReadStream(absPath, { start: range.start, end: range.end })
-    : fs.createReadStream(absPath);
-  nodeStream.on('error', (err) => {
-    log.warn('media stream error', { absPath, error: (err as Error).message });
-  });
-  const body = Readable.toWeb(nodeStream) as unknown as ReadableStream;
-
-  if (range) {
-    return new Response(body, {
-      status: 206,
-      headers: {
-        ...baseHeaders,
-        'Content-Range': `bytes ${range.start}-${range.end}/${totalSize}`,
-        'Content-Length': String(range.end - range.start + 1),
-      },
-    });
-  }
-  return new Response(body, {
-    headers: { ...baseHeaders, 'Content-Length': String(totalSize) },
-  });
+  return serveFileRangeCore(
+    request,
+    absPath,
+    contentType,
+    totalSize,
+    mtimeMs,
+    (err) => { log.warn('media stream error', { absPath, error: err.message }); },
+  );
 }
 
 function registerKbFileProtocol(): void {
@@ -856,7 +840,7 @@ function registerKbFileProtocol(): void {
       log.info('kb-file: serving', { reqUrl, abs, bytes: st.size });
       const ext = path.extname(abs).toLowerCase();
       const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
-      return serveFileRange(request, abs, contentType, st.size);
+      return serveFileRange(request, abs, contentType, st.size, st.mtimeMs);
     } catch (err) {
       log.warn('kb-file serve failed', { reqUrl, error: (err as Error).message });
       return new Response('error', { status: 500 });
@@ -929,7 +913,7 @@ function registerChatMediaProtocol(): void {
         }
         const st = fs.statSync(resolved.absPath);
         log.info('chat-media/cid: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
-        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(name), st.size);
+        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(name), st.size, st.mtimeMs);
       }
 
       if (host === 'local') {
@@ -959,7 +943,32 @@ function registerChatMediaProtocol(): void {
         }
         const st = fs.statSync(resolved.absPath);
         log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
-        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(resolved.absPath), st.size);
+        if (path.extname(resolved.absPath).toLowerCase() === '.svg') {
+          const materialized = chatAttachments.materializeLocalDisplaySvg(resolved.absPath);
+          if (!materialized.ok) {
+            const err = materialized as { code?: string; error?: string };
+            log.warn('chat-media/local: SVG materialize rejected', { reqUrl, code: err.code, error: err.error });
+            return new Response(String(err.error || ''), { status: _statusFor(err.code) });
+          }
+          const bytes = Buffer.byteLength(materialized.body, 'utf8');
+          return new Response(materialized.body, {
+            headers: {
+              'Content-Type': chatAttachments.localMediaMimeFor(resolved.absPath),
+              'Content-Length': String(bytes),
+              'Cache-Control': 'no-cache',
+            },
+          });
+        }
+        const response = serveFileRange(
+          request,
+          resolved.absPath,
+          chatAttachments.localMediaMimeFor(resolved.absPath),
+          st.size,
+          st.mtimeMs,
+        );
+        return resolved.kind === 'html'
+          ? withOfflineHtmlPreviewPolicy(response)
+          : response;
       }
 
       log.warn('chat-media: unknown host', { reqUrl, host });
@@ -1033,7 +1042,7 @@ function registerChatAppProtocol(): void {
         }
         const st = fs.statSync(resolved.absPath);
         log.info('chat-app/saved: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
-        return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size));
+        return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size, st.mtimeMs));
       }
 
       if (host !== 'cid') {
@@ -1064,7 +1073,7 @@ function registerChatAppProtocol(): void {
       }
       const st = fs.statSync(resolved.absPath);
       log.info('chat-app: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
-      return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size));
+      return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size, st.mtimeMs));
     } catch (err) {
       log.warn('chat-app serve failed', { reqUrl, error: (err as Error).message });
       return new Response('error', { status: 500 });
@@ -1116,6 +1125,7 @@ if (!gotLock) {
         !win.isDestroyed() && win.isFocused()
       )),
       isSupported: () => Notification.isSupported(),
+      resolveLanguageForUser: (userId) => appConfig.resolveLanguageForUser(userId),
       setBadgeCount: setTaskNotificationBadgeCount,
       onDidFocus: (listener) => {
         const onFocus = () => listener();
@@ -1124,14 +1134,33 @@ if (!gotLock) {
       },
       createNotification: (options) => {
         const notification = new Notification(options);
-        notification.on('show', () => notificationPermissions.markSystemNotificationDelivered());
+        notification.on('show', () => {
+          notificationPermissions.markSystemNotificationDelivered();
+          log.info('native task notification accepted by OS');
+        });
         notification.on('failed', (_event, error) => {
           notificationPermissions.markSystemNotificationFailed();
           log.warn('native task notification rejected by OS', { error: error || 'unknown' });
         });
+        void notificationPermissions.getSystemNotificationPermission().then((permission) => {
+          if (permission.state === 'denied' || permission.state === 'presentation_disabled') {
+            log.warn('native task notification presentation blocked by system settings', {
+              permission_state: permission.state,
+            });
+          }
+        }).catch((error) => {
+          log.warn('native task notification permission check failed', {
+            error: (error as Error)?.message || String(error),
+          });
+        });
         return {
           onClick: (listener) => { notification.on('click', listener); },
+          onClose: (listener) => {
+            notification.once('close', (details) => listener(details.reason));
+          },
+          onFailed: (listener) => { notification.once('failed', () => listener()); },
           show: () => { notification.show(); },
+          close: () => { notification.close(); },
         };
       },
       openConversation: openConversationFromTaskNotification,

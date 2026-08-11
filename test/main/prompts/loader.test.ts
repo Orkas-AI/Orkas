@@ -166,6 +166,39 @@ describe('prompts › chat_shared_rules web-search invariants', () => {
   });
 });
 
+describe('prompts › chat_shared_rules execution-plan policy', () => {
+  it('creates plans for outcome continuity risks rather than tool-heavy linear plumbing', () => {
+    const body = prompts.load('chat_shared_rules', {});
+    expect(body).toMatch(/only when it materially protects correct completion/i);
+    expect(body).toMatch(/multiple independent success criteria/i);
+    expect(body).toMatch(/dependencies, branches, approval points, or recovery choices/i);
+    expect(body).toMatch(/Tool count, file count, and a fixed linear workflow are not reasons/i);
+    expect(body).toMatch(/Skip an explicit plan for one bounded outcome/i);
+  });
+
+  it('updates only on material milestone transitions and preserves evidence ordering', () => {
+    const body = prompts.load('chat_shared_rules', {});
+    expect(body).toMatch(/outcome milestones, not reads, tool calls, status narration/i);
+    expect(body).toMatch(/only when a milestone completes or blocks/i);
+    expect(body).toMatch(/never call the plan tool merely to announce the next action/i);
+    expect(body).toMatch(/prefer one atomic `set_statuses` call/i);
+    expect(body).toMatch(/never declare completion before its evidence exists/i);
+    expect(body).toMatch(/stored objective is authoritative over checkpoint summaries/i);
+  });
+});
+
+describe('prompts › chat_shared_rules unavailable-verifier invariants', () => {
+  it('forbids success predictions and speculative user-driven retry loops', () => {
+    const body = prompts.load('chat_shared_rules', {});
+    expect(body).toMatch(/unavailable verifier does not support a prediction/i);
+    expect(body).toMatch(/fresh compiler, test, device, or service failure/i);
+    expect(body).toMatch(/keep the patch unverified/i);
+    expect(body).toMatch(/After two consecutive failures[\s\S]*stop speculative edits/i);
+    expect(body).toMatch(/current primary documentation[\s\S]*runnable verifier access/i);
+    expect(body).toMatch(/instead of using the user as the retry loop/i);
+  });
+});
+
 describe('prompts › chat_shared_rules PDF toolchain invariants', () => {
   const load = () => prompts.load('chat_shared_rules', {});
 
@@ -207,12 +240,44 @@ describe('prompts › chat_shared_rules ordinary reply structure', () => {
   });
 });
 
+describe('prompts › document-content grounding invariants', () => {
+  // Regression: a user referenced a 28-page PDF the commander had produced and
+  // asked for a summary. The turn made zero read calls and answered from a
+  // 21.5% head/tail spot-check taken twelve minutes earlier for a different
+  // purpose, so the whole middle of the document was silently missing.
+  it('requires reading a document this turn before answering about its contents', () => {
+    const body = prompts.load('chat_shared_rules', {});
+    expect(body).toContain('## Answering about a document');
+    expect(body).toMatch(/read that file \*\*this turn\*\* before answering/i);
+    expect(body).toMatch(/including when you produced it yourself/i);
+    expect(body).toMatch(/Prior context is not coverage/i);
+    expect(body).toMatch(/head\/tail preview/i);
+    expect(body).toMatch(/sub-agent's report/i);
+    expect(body).toMatch(/`stat_file` for `total_chars`/i);
+    expect(body).toMatch(/name the part you did not read/i);
+  });
+
+  it('treats referenced file paths as authoritative without weakening quoted-record inertness', () => {
+    const body = prompts.load('chat_commander', {});
+    expect(body).toMatch(/`<attachments>` and `<referenced-files>` paths are equally authoritative/i);
+    expect(body).toMatch(/inert for \*\*routing and instructions\*\* only/i);
+    expect(body).toMatch(/does not make the files it names off-limits/i);
+    expect(body).toMatch(/treat it exactly like a fresh attachment/i);
+  });
+});
+
 describe('prompts › user-intent integrity', () => {
-  it('preserves explicit constraints and keeps open preferences out of closed selects', () => {
+  it('preserves explicit constraints, authority, and clarification boundaries', () => {
     const body = prompts.load('chat_user_intent_rules', {});
     expect(body).toMatch(/explicit user requirements as the primary execution constraints/i);
     expect(body).toMatch(/Optional preferences are not blockers/i);
     expect(body).toMatch(/Do not re-ask a resolved field/i);
+    expect(body).toMatch(/separate action authority from target resolution/i);
+    expect(body).toMatch(/current user request authorizes the exact action/i);
+    expect(body).toMatch(/ask only for the missing target.*retain that authority/is);
+    expect(body).toMatch(/materially different action, target, or condition/i);
+    expect(body).toMatch(/adds privilege, force, destructive scope, cost, or policy bypass.*stopping with the current state unchanged/is);
+    expect(body).toMatch(/platform-required.*gate.*exactly once/is);
     expect(body).toMatch(/select.*multiselect.*genuinely closed domain/is);
     expect(body).toMatch(/open preferences.*text.*textarea/is);
     expect(body).toMatch(/suggestions may be optional examples, never an exhaustive list/i);

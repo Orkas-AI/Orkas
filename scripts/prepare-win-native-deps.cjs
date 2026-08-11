@@ -76,6 +76,8 @@ function allFilesExist(files) {
 function extractTarballInTarget(targetDir, tarball, deps = {}) {
   const fsImpl = deps.fsImpl || fs;
   const runImpl = deps.runImpl || run;
+  // This helper always prepares a Windows target, including when its behavior
+  // is validated from a non-Windows host.
   const archiveName = path.win32.basename(tarball);
   const localTarball = path.win32.join(targetDir, archiveName);
   fsImpl.copyFileSync(tarball, localTarball);

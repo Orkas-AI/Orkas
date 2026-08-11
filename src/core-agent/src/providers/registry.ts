@@ -3,7 +3,6 @@ import { createLogger } from "../shared/logger.js";
 import type { LLMProvider, ProviderFactory } from "./base.js";
 import { createPiProvider, createAnthropicProvider, createOpenAIProvider, listPiProviders } from "./pi-provider.js";
 import { resolveApiKeyFromStore, getOAuthCredential } from "../auth/store.js";
-import type { OAuthProviderInterface } from "@earendil-works/pi-ai";
 
 const log = createLogger("providers");
 
@@ -73,8 +72,8 @@ export class ProviderRegistry {
     const oauthCred = getOAuthCredential(id);
     if (oauthCred && Date.now() >= oauthCred.expires) {
       try {
-        const { getOAuthProvider } = await import("@earendil-works/pi-ai/oauth");
-        const oauthProvider = getOAuthProvider(id);
+        const { getOAuthProvider } = await import("../auth/oauth-compat.js");
+        const oauthProvider = await getOAuthProvider(id);
         if (oauthProvider) {
           const { refreshOAuthCredential } = await import("../auth/oauth-flow.js");
           const refreshedKey = await refreshOAuthCredential(oauthProvider);

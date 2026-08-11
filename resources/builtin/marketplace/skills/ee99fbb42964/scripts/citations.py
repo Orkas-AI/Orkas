@@ -74,8 +74,6 @@ _ALIGN_CJK_STOP = {
     "研究", "报告", "论文", "来源", "结果", "显示", "指出", "认为", "相关",
     "这个", "那个", "一种", "一个", "以及", "对于", "进行",
 }
-_OBSERVED_DATE_RE = re.compile(r"\b(?:19|20)\d{2}(?:-\d{2}(?:-\d{2})?)?\b")
-_EVIDENCE_ID_RE = re.compile(r"\bE\d+\b", re.IGNORECASE)
 _STRUCTURED_EVIDENCE_RE = re.compile(
     r"^\s*-\s*field=([a-z_]+);\s*exact_quote=(.+?)\s*$",
     re.MULTILINE,
@@ -117,15 +115,24 @@ _COMPARISON_COLUMNS = (
     ("candidate", "Candidate"),
     ("best_for", "Best for"),
     ("os", "OS"),
-    ("installation", "Installation"),
-    ("local_model_path", "Local-model path"),
-    ("privacy", "Privacy"),
-    ("license_open_source", "License/open source"),
-    ("project_activity", "Project activity (observed date)"),
-    ("hardware_constraints", "Hardware/constraints"),
+    ("setup_ease", "Setup/ease"),
+    ("model_capabilities", "Model capabilities"),
+    ("local_offline", "Local/offline"),
+    ("privacy_data_handling", "Privacy/data handling"),
+    ("pricing_cost", "Pricing/cost"),
+    ("key_limitations", "Key limitations"),
     ("ideal_user", "Ideal user"),
     ("evidence", "Evidence"),
 )
+
+_COMPARISON_INFERENCE_FIELDS = {"best_for", "ideal_user"}
+_STRUCTURED_COMPARISON_FIELDS = {
+    "os": "os",
+    "installation": "setup_ease",
+    "local_model_path": "local_offline",
+    "privacy": "privacy_data_handling",
+    "hardware_constraints": "key_limitations",
+}
 
 
 def _normalize_text(s: str) -> str:
@@ -302,7 +309,7 @@ def _render_evidence_markdown(rows: list) -> str:
             order.append(key)
         grouped[key].append(row)
 
-    lines = []
+    lines = ["## Evidence used"] if rows else []
     for key in order:
         source_rows = grouped[key]
         first = source_rows[0]
@@ -439,16 +446,22 @@ def _source_ids(value) -> list:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
+def _is_not_verified(value: str) -> bool:
+    return bool(re.match(r"^not verified(?:\s*:|$)", value, re.IGNORECASE))
+
+
 def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, list]:
     """Normalize a model-supplied comparison into one complete, stable table.
 
     The model still decides the candidates and field values. This formatter only
     guarantees the delivery contract: every retained candidate gets every
-    column, missing facts are explicit, activity has an observed date, and the
-    Evidence cell can reference only citation rows that actually verified.
+    column, missing facts are explicit, and each factual cell can survive only
+    when its declared claim ID produced verified evidence from that candidate's
+    source. Row-level source attribution is not enough to verify every cell.
     """
     rows = payload_rows if isinstance(payload_rows, list) else []
-    evidence_by_source: dict = {}
+    evidence_by_claim: dict = {}
+    structured_by_source_field: dict = {}
     valid_evidence_ids = set()
     for evidence in evidence_rows:
         evidence_id = str(evidence.get("evidence_id") or "").upper()
@@ -456,8 +469,16 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
             continue
         valid_evidence_ids.add(evidence_id)
         source_id = evidence.get("source_id")
-        if source_id is not None:
-            evidence_by_source.setdefault(str(source_id), []).append(evidence_id)
+        claim_id = evidence.get("claim_id")
+        if claim_id is not None and str(claim_id).strip():
+            evidence_by_claim.setdefault(str(claim_id), []).append(evidence)
+        structured_field = _STRUCTURED_COMPARISON_FIELDS.get(
+            str(evidence.get("field") or "")
+        )
+        if source_id is not None and structured_field:
+            structured_by_source_field.setdefault(
+                (str(source_id), structured_field), []
+            ).append(evidence)
 
     normalized_rows = []
     warnings = []
@@ -482,6 +503,10 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
             })
         normalized["candidate"] = name
 
+        candidate_source_ids = set(_source_ids(candidate.get("evidence_sources")))
+        field_claims = candidate.get("field_claims")
+        field_claims = field_claims if isinstance(field_claims, dict) else {}
+        row_evidence_ids = []
         for key, label in _COMPARISON_COLUMNS[1:-1]:
             value = _inline_markdown(candidate.get(key))
             if not value:
@@ -492,35 +517,52 @@ def _render_comparison(payload_rows, evidence_rows: list) -> tuple[list, str, li
                     "field": key,
                     "issue": "comparison_field_missing",
                 })
-            normalized[key] = value
+                normalized[key] = value
+                continue
+            if key in _COMPARISON_INFERENCE_FIELDS or _is_not_verified(value):
+                normalized[key] = value
+                continue
 
-        activity = normalized["project_activity"]
-        if not activity.startswith("Not verified:") and not _OBSERVED_DATE_RE.search(activity):
-            observed_at = _inline_markdown(candidate.get("activity_observed_at"))
-            if observed_at and _OBSERVED_DATE_RE.search(observed_at):
-                activity = "{} (observed {})".format(activity, observed_at)
-            else:
-                activity = "{}; Not verified: observed date".format(activity)
+            field_evidence = []
+            for claim_id in _source_ids(field_claims.get(key)):
+                for evidence in evidence_by_claim.get(claim_id, []):
+                    cell_alignment, _ = _claim_quote_alignment(
+                        value, str(evidence.get("claim") or "")
+                    )
+                    if (
+                        str(evidence.get("source_id") or "") in candidate_source_ids
+                        and cell_alignment == "aligned"
+                    ):
+                        field_evidence.append(evidence)
+            for source_id in candidate_source_ids:
+                field_evidence.extend(
+                    structured_by_source_field.get((source_id, key), [])
+                )
+            field_evidence_ids = list(dict.fromkeys(
+                str(evidence.get("evidence_id") or "").upper()
+                for evidence in field_evidence
+                if str(evidence.get("evidence_id") or "").upper() in valid_evidence_ids
+            ))
+            if not field_evidence_ids:
+                normalized[key] = "Not verified: {}".format(label)
                 warnings.append({
                     "row": index,
                     "candidate": name,
-                    "field": "project_activity",
-                    "issue": "comparison_activity_date_missing",
+                    "field": key,
+                    "issue": "comparison_field_evidence_missing",
+                    "detail": (
+                        "a factual comparison value requires a supported, lexically "
+                        "aligned field_claims entry from one of the candidate's "
+                        "evidence_sources"
+                    ),
                 })
-            normalized["project_activity"] = activity
+                continue
+            normalized[key] = value
+            row_evidence_ids.extend(field_evidence_ids)
 
-        evidence_ids = []
-        for source_id in _source_ids(candidate.get("evidence_sources")):
-            evidence_ids.extend(evidence_by_source.get(source_id, []))
-        for evidence_id in _EVIDENCE_ID_RE.findall(
-            _inline_markdown(candidate.get("evidence"))
-        ):
-            normalized_id = evidence_id.upper()
-            if normalized_id in valid_evidence_ids:
-                evidence_ids.append(normalized_id)
-        evidence_ids = list(dict.fromkeys(evidence_ids))
-        if evidence_ids:
-            normalized["evidence"] = ", ".join(evidence_ids)
+        row_evidence_ids = list(dict.fromkeys(row_evidence_ids))
+        if row_evidence_ids:
+            normalized["evidence"] = ", ".join(row_evidence_ids)
         else:
             normalized["evidence"] = "Not verified: no verified Evidence ID"
             warnings.append({
@@ -629,6 +671,7 @@ def verify(payload: dict) -> dict:
         if not isinstance(claim, dict):
             continue
         cits = claim.get("citations") or []
+        claim_id = _inline_markdown(claim.get("id")) or "claim_{}".format(ci + 1)
         classified = []
         for cj, cit in enumerate(cits):
             if not isinstance(cit, dict):
@@ -681,6 +724,7 @@ def verify(payload: dict) -> dict:
                 if info["verdict"] == "verified" and info["alignment_status"] == "aligned":
                     evidence_rows.append({
                         "evidence_id": "E{}".format(len(evidence_rows) + 1),
+                        "claim_id": claim_id,
                         "ref": info["ref"],
                         "source_id": src.get("id"),
                         "title": src.get("title"),
@@ -707,6 +751,7 @@ def verify(payload: dict) -> dict:
             n_supported += 1
         has_usable_attribution = any(c["verdict"] != "flagged" for c in classified)
         out_claims.append({
+            "id": claim_id,
             "text": claim.get("text"),
             "supported": supported,
             "support_status": (
@@ -759,6 +804,9 @@ def verify(payload: dict) -> dict:
             existing_atoms.add(atom_key)
             evidence_rows.append({
                 "evidence_id": "E{}".format(len(evidence_rows) + 1),
+                "claim_id": "structured:{}:{}".format(
+                    source.get("id") or "source", atom["field"]
+                ),
                 "ref": ref,
                 "source_id": source.get("id"),
                 "title": source.get("title"),
@@ -937,6 +985,33 @@ def main(argv):
     return result
 
 
+def _cli_stdout(result: dict, argv: list[str]) -> dict:
+    """Keep persisted verifier output out of the model's tool-result context."""
+    if "--out" not in argv:
+        return result
+    out_index = argv.index("--out") + 1
+    output_path = argv[out_index] if out_index < len(argv) else None
+    data = result.get("data") if isinstance(result, dict) else None
+    data = data if isinstance(data, dict) else {}
+    summary = data.get("summary")
+    return {
+        "ok": bool(result.get("ok")),
+        "output": output_path,
+        "abstain": bool(data.get("abstain")),
+        "summary": summary if isinstance(summary, dict) else {},
+        "flags": len(data.get("flags") or []),
+        "warnings": len(data.get("warnings") or []),
+        "flag_details": (data.get("flags") or [])[:20],
+        "warning_details": (data.get("warnings") or [])[:20],
+        "comparison_warnings": len(data.get("comparison_warnings") or []),
+        "comparison_warning_details": (data.get("comparison_warnings") or [])[:20],
+        "comparison_rows": len(data.get("comparison_rows") or []),
+        "evidence_rows": len(data.get("evidence_rows") or []),
+        "comparison_markdown": data.get("comparison_markdown") or "",
+        "evidence_markdown": data.get("evidence_markdown") or "",
+    }
+
+
 if __name__ == "__main__":
     try:
         out = main(sys.argv[1:])
@@ -945,4 +1020,4 @@ if __name__ == "__main__":
         sys.exit(1)
     # Keep stdout ASCII-safe so Windows shells cannot mojibake JSON when a
     # caller captures it. Delivery files use --out and remain normal UTF-8.
-    print(json.dumps(out, ensure_ascii=True))
+    print(json.dumps(_cli_stdout(out, sys.argv[1:]), ensure_ascii=True))

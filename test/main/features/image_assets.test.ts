@@ -3,9 +3,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import sharp from 'sharp';
 
 import {
   inspectImageAssetBuffer,
+  prepareLosslessModelImage,
   writeImageAssetBuffer,
 } from '../../../src/main/features/image_assets';
 
@@ -65,6 +67,76 @@ describe('image asset materialization', () => {
     });
     expect(fs.readFileSync(output).subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
     expect(fs.readdirSync(path.dirname(output))).toEqual(['result.jpg']);
+  });
+
+  it('creates a smaller pixel-identical lossless model copy without changing the source', async () => {
+    const source = await sharp({
+      create: {
+        width: 320,
+        height: 200,
+        channels: 4,
+        background: { r: 24, g: 96, b: 180, alpha: 1 },
+      },
+    }).png({ compressionLevel: 0 }).toBuffer();
+    const sourceSnapshot = Buffer.from(source);
+
+    const result = await prepareLosslessModelImage(source);
+    const sourcePixels = await sharp(source).ensureAlpha().raw().toBuffer();
+    const resultPixels = await sharp(result.buf).ensureAlpha().raw().toBuffer();
+
+    expect(result).toMatchObject({
+      mediaType: 'image/webp',
+      width: 320,
+      height: 200,
+      sourceBytes: source.length,
+      encodedBytes: result.buf.length,
+      transcoded: true,
+    });
+    expect(result.buf.length).toBeLessThan(source.length);
+    expect(resultPixels).toEqual(sourcePixels);
+    expect(source).toEqual(sourceSnapshot);
+  });
+
+  it('keeps the original PNG when lossless WebP would increase payload size', async () => {
+    let state = 123_456_789;
+    const pixels = Buffer.alloc(4 * 4 * 4);
+    for (let index = 0; index < pixels.length; index += 1) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      pixels[index] = state & 0xff;
+    }
+    const source = await sharp(pixels, {
+      raw: { width: 4, height: 4, channels: 4 },
+    }).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer();
+
+    const result = await prepareLosslessModelImage(source);
+
+    expect(result).toMatchObject({
+      mediaType: 'image/png',
+      width: 4,
+      height: 4,
+      sourceBytes: source.length,
+      encodedBytes: source.length,
+      transcoded: false,
+    });
+    expect(result.buf).toBe(source);
+  });
+
+  it('rejects invalid or non-PNG model inputs instead of bypassing lossless preprocessing', async () => {
+    const jpeg = await sharp({
+      create: {
+        width: 8,
+        height: 8,
+        channels: 3,
+        background: { r: 255, g: 255, b: 255 },
+      },
+    }).jpeg().toBuffer();
+
+    await expect(prepareLosslessModelImage(Buffer.from('not-an-image')))
+      .rejects.toThrow('not a readable image');
+    await expect(prepareLosslessModelImage(jpeg))
+      .rejects.toThrow('requires PNG input');
   });
 
   it('rejects paths and arguments before publishing an output', async () => {

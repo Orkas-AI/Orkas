@@ -5,6 +5,8 @@ import * as vm from 'node:vm';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
 const styleSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+const skillsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/skills.js'), 'utf8');
+const agentsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/agents.js'), 'utf8');
 
 function extractFunction(name: string): string {
   const marker = `function ${name}`;
@@ -60,6 +62,7 @@ describe('conversation failed assistant retry actions', () => {
 
     expect(isFailed('⚠️ 模型调用失败：503 系统繁忙，请稍后重试')).toBe(true);
     expect(isFailed('Model call failed: 503 service unavailable')).toBe(true);
+    expect(isFailed('Model response failed: aborted')).toBe(true);
     expect(isFailed('<span style="color:var(--danger)">⚠️ 模型调用失败：503</span>')).toBe(true);
     expect(isFailed('普通回复，没有失败状态')).toBe(false);
   });
@@ -88,6 +91,22 @@ describe('conversation failed assistant retry actions', () => {
     expect(source).toContain("retryBtn.className = 'bubble-action-btn bubble-retry-btn';");
   });
 
+  it('reveals shared message actions only on message hover or keyboard focus', () => {
+    expect(styleSource).toMatch(
+      /\.chat-bubble-actions\s*\{[^}]*opacity:\s*0;[^}]*pointer-events:\s*none;/s,
+    );
+    expect(styleSource).toContain('.chat-message:hover .chat-bubble-actions');
+    expect(styleSource).toContain('.chat-message:focus-within .chat-bubble-actions');
+    expect(styleSource).toContain('.chat-bubble-actions:has(.bubble-more-btn[aria-expanded="true"])');
+    expect(styleSource).toMatch(
+      /\.chat-message:hover \.chat-bubble-actions,[^{]+\{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;/s,
+    );
+    expect(styleSource).toMatch(
+      /@media \(hover:\s*none\)\s*\{\s*\.chat-bubble-actions\s*\{[^}]*opacity:\s*1;[^}]*pointer-events:\s*auto;/s,
+    );
+    expect(styleSource).not.toMatch(/\.chat-msg-actions\s*\{[^}]*opacity:\s*0;/s);
+  });
+
   it('routes live failed and interrupted placeholders through retry actions', () => {
     const finalizeBody = extractFunction('_finalizeActorPlaceholder');
 
@@ -103,7 +122,7 @@ describe('conversation failed assistant retry actions', () => {
     expect(failedActionsBody).toContain('archive: false');
     expect(failedActionsBody).toContain('retry: true');
     expect(failedActionsBody).not.toContain('report: true');
-    expect(source).toContain("const mode = includeRetry\n    ? (includeArchive ? 'assistant-retry' : 'failed')");
+    expect(source).toContain("const mode = compact\n    ? 'failure-only'\n    : includeRetry");
     expect(source).toContain('class="chat-bubble-more-wrap"');
     expect(source).toContain('_attachBubbleRetryBtn(directActions, msgDiv)');
 

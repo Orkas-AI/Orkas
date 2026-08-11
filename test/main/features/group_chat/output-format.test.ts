@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 
 import {
   _buildOutputFormatHintForTest,
+  _buildInputChannelBlocksForTest,
+  _buildAgentInGroupSystemPromptForTest,
   _buildPlanInteractionHintForTest,
   _redactDispatchToolResult,
   _resolveAgentInputsForRuntimeForTest,
@@ -10,6 +12,26 @@ import {
   buildCliDurableInstructions,
   buildCliTurnPrompt,
 } from '../../../../src/main/features/local_agents/context';
+
+describe('group-chat response language', () => {
+  it('keeps the selected turn language after an English-authored agent workflow', async () => {
+    const prompt = await _buildAgentInGroupSystemPromptForTest({
+      agent_id: 'language-contract-agent',
+      name: 'LanguageContractAgent',
+      description_zh: '仅中文运行说明',
+      description_en: 'ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER',
+      workflow: 'This workflow is intentionally authored in English.',
+    }, '/tmp/language-contract-agent', 'zh');
+
+    expect(prompt).toContain('仅中文运行说明');
+    expect(prompt).not.toContain('ENGLISH_DESCRIPTION_SHOULD_NOT_RENDER');
+    expect(prompt).toContain('User UI language: **Chinese (简体中文)**');
+    expect(prompt.lastIndexOf('## User language'))
+      .toBeGreaterThan(prompt.lastIndexOf('## Runtime injection'));
+    expect(prompt.lastIndexOf('## User language'))
+      .toBeGreaterThan(prompt.lastIndexOf('This workflow is intentionally authored in English.'));
+  });
+});
 
 describe('dispatch tool-result redaction in the process rail', () => {
   // Assert the worker OUTPUT is gone (robust to the i18n'd replacement wording),
@@ -200,5 +222,56 @@ describe('group_chat plan interaction prompt hints', () => {
     expect(hint).toMatch(/at most 2-3 focused fields/i);
     expect(hint).toMatch(/recommendation, diagnosis, plan, report/i);
     expect(hint).toMatch(/form fields are the questions/i);
+  });
+
+  it('keeps the pause protocol for a prose-channel agent but asks in plain language', () => {
+    // The pause signal is the plan-interaction marker, which every consumer
+    // accepts on its own (`!!form || planInteraction === 'open'`), so a
+    // formless agent still pauses a plan step correctly.
+    const hint = _buildPlanInteractionHintForTest(true, 'prose');
+    expect(hint).toContain('### Plan interaction');
+    expect(hint).toContain('<plan-interaction status="open" />');
+    expect(hint).toMatch(/at most 2-3 focused questions in plain prose/i);
+    expect(hint).not.toMatch(/agent-input-form/i);
+  });
+});
+
+describe('group_chat agent input-channel prompt blocks', () => {
+  it('renders the platform default byte-identical to the pre-template text', () => {
+    // Nine agents minus one keep the form mandate; any drift here silently
+    // rewrites every default agent's asking protocol.
+    const blocks = _buildInputChannelBlocksForTest('form');
+    expect(blocks.ask_channel_rule).toBe(
+      'Ask for the smallest useful missing set (at most 2-3 focused fields) via `<agent-input-form>` and stop.',
+    );
+    expect(blocks.need_input_rule).toBe(
+      'If you need user input, send an `<agent-input-form>` and stop; do not wait in prose.',
+    );
+    expect(blocks.input_channel_protocol).toContain('### Form protocol (only input channel)');
+    expect(blocks.input_channel_protocol).toContain('Plain text questions, numbered lists, and "please confirm/tell me" prose are not input channels.');
+    expect(blocks.input_channel_protocol).toContain('### Form lifecycle');
+    expect(blocks.input_channel_protocol).toContain('Do not replace a form with a "need these details" section.');
+  });
+
+  it('teaches a prose-channel agent to ask in plain language and never emit the form tag', () => {
+    // The 2026-08-05 evening regression: VideoStudio's skill forbade forms
+    // while this platform prompt mandated them, and the model followed the
+    // platform. The prose channel removes the contradiction at its source.
+    const blocks = _buildInputChannelBlocksForTest('prose');
+    expect(blocks.ask_channel_rule).toMatch(/in plain prose and stop/i);
+    expect(blocks.need_input_rule).toMatch(/ordinary message is the input channel/i);
+    expect(blocks.input_channel_protocol).toContain('### Input channel (plain prose)');
+    expect(blocks.input_channel_protocol).toMatch(/retired protocol, not an example/i);
+    // The tag may appear only inside "never emit" phrasing — every mention
+    // must be a prohibition, and none of the form-mandate sentences survive.
+    for (const value of Object.values(blocks)) {
+      for (const line of value.split('\n')) {
+        if (line.includes('<agent-input-form>')) {
+          expect(line, line).toMatch(/never emit/i);
+        }
+      }
+    }
+    expect(JSON.stringify(blocks)).not.toContain('only input channel');
+    expect(JSON.stringify(blocks)).not.toContain('are not input channels');
   });
 });

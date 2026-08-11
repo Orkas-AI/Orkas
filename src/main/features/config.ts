@@ -45,6 +45,9 @@ export interface UserPreferences {
    * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
    * Reads go through `features/metacognition.isFeatureEnabled`. */
   metacognition_enabled?: boolean;
+  /** Native task-terminal notifications. Defaults to enabled; explicit false
+   * suppresses every completion/failure/input-needed OS notification. */
+  task_notifications_enabled?: boolean;
   /** Whether machine-global skill roots such as ~/.codex/skills are visible
    * to commander open-tier skill search. Missing means enabled, preserving
    * the historical open-source behavior. */

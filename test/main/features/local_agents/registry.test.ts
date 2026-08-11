@@ -30,6 +30,7 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'invocation',
         codingProjectDirectory: true,
         orkasBridge: true,
+        activeRunIngress: 'stream-json',
       },
       codex: {
         resume: 'native',
@@ -37,6 +38,7 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'session',
         codingProjectDirectory: true,
         orkasBridge: true,
+        activeRunIngress: 'codex-app-server',
       },
       openclaw: {
         resume: 'session-id',
@@ -44,6 +46,7 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'session',
         codingProjectDirectory: false,
         orkasBridge: false,
+        activeRunIngress: 'none',
       },
       opencode: {
         resume: 'native',
@@ -51,6 +54,7 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'session',
         codingProjectDirectory: false,
         orkasBridge: false,
+        activeRunIngress: 'none',
       },
       hermes: {
         resume: 'none',
@@ -58,6 +62,7 @@ describe('local CLI context capabilities', () => {
         durableInstructionScope: 'invocation',
         codingProjectDirectory: false,
         orkasBridge: false,
+        activeRunIngress: 'none',
       },
     });
   });
@@ -69,6 +74,7 @@ describe('local CLI context capabilities', () => {
       durableInstructionScope: 'invocation',
       codingProjectDirectory: false,
       orkasBridge: false,
+      activeRunIngress: 'none',
     });
     expect(localCliResumeStrategy('unknown')).toBe('none');
   });
@@ -218,18 +224,23 @@ function writeArgAwareMockCli(
   return binPath;
 }
 
+// Logs the probe argument, then answers after a delay so concurrent
+// discoveries genuinely overlap. NB: this case clears `PATH`, so the POSIX
+// script must not use a `#!/usr/bin/env node` shebang — env would have no PATH
+// to resolve `node` from, every probe would produce no output, and the CLIs
+// would all report `version_unknown` instead of exercising coalescing. The
+// Windows branch is unaffected because it invokes `process.execPath` directly.
 function writeCountingMockCli(basePath: string, logPath: string): string {
-  const scriptPath = `${basePath}.js`;
-  const script = [
-    '#!/usr/bin/env node',
-    "const fs = require('node:fs');",
-    `fs.appendFileSync(${JSON.stringify(logPath)}, String(process.argv[2] || '') + '\\n');`,
-    "setTimeout(() => process.stdout.write('2.1.0\\n'), 120);",
-    '',
-  ].join('\n');
-  fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
-  fs.writeFileSync(scriptPath, script);
   if (isWindows) {
+    const scriptPath = `${basePath}.js`;
+    const script = [
+      "const fs = require('node:fs');",
+      `fs.appendFileSync(${JSON.stringify(logPath)}, String(process.argv[2] || '') + '\\n');`,
+      "setTimeout(() => process.stdout.write('2.1.0\\n'), 120);",
+      '',
+    ].join('\n');
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, script);
     const binPath = `${basePath}.cmd`;
     fs.writeFileSync(
       binPath,
@@ -237,8 +248,17 @@ function writeCountingMockCli(basePath: string, logPath: string): string {
     );
     return binPath;
   }
-  fs.chmodSync(scriptPath, 0o755);
-  return scriptPath;
+  const binPath = basePath;
+  fs.mkdirSync(path.dirname(binPath), { recursive: true });
+  fs.writeFileSync(binPath, [
+    '#!/bin/sh',
+    `printf '%s\\n' "$1" >> ${JSON.stringify(logPath)}`,
+    'sleep 0.12',
+    "printf '2.1.0\\n'",
+    '',
+  ].join('\n'));
+  fs.chmodSync(binPath, 0o755);
+  return binPath;
 }
 
 describe('local_agents/registry', () => {
@@ -286,7 +306,7 @@ describe('local_agents/registry', () => {
     invalidateCache();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
     process.env.PATH = savedPath;
     if (savedHome === undefined) delete process.env.HOME;
@@ -301,7 +321,14 @@ describe('local_agents/registry', () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    // Version probes run concurrent .cmd children on Windows. Yield between
+    // retries so their close callbacks can release the fixture directory.
+    await fs.promises.rm(tmpDir, {
+      recursive: true,
+      force: true,
+      maxRetries: isWindows ? 50 : 0,
+      retryDelay: isWindows ? 100 : 0,
+    });
     invalidateCache();
   });
 
@@ -524,7 +551,7 @@ describe('local_agents/registry', () => {
     ]);
 
     expect(second).toBe(first);
-    expect(first.every(entry => entry.available)).toBe(true);
+    expect(first.filter(e => !e.available).map(e => ({ type: e.type, error: e.error, path: e.path }))).toEqual([]);
     const probes = fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/).sort();
     // Four single-probe CLIs plus Hermes `version` and `--version`.
     expect(probes).toEqual([

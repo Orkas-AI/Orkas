@@ -30,11 +30,14 @@ import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
+  type LocalActiveRunIngress,
+  type LocalActiveRunInput,
   type BackendRunOptions,
   type LocalEvent,
   StderrTail,
   spawnCli,
   killProcessTree,
+  reapCliAfterProtocolTerminal,
   bindAbort,
   armKillWatchdog,
   LineSplitter,
@@ -57,14 +60,97 @@ const CODEX_DROP_TO_DEBUG = new Set<string>([
   'mcpServer/startupStatus/updated',
 ]);
 
-/** App-server host metadata is unrelated to the active task and may contain
- *  machine-private installation ids or host names. Never surface it in the
- *  process rail, logs, or task-turn samples. */
+/** Notifications that must not cross into the process rail or persisted
+ * history. Host metadata may contain machine-private identifiers. Streaming
+ * command/file/reasoning deltas can arrive once per progress character, such
+ * as unittest's "." output, so forwarding them as unknown info logs creates
+ * hundreds of noisy rows. Command deltas and raw reasoning text are consumed
+ * separately as content-free liveness below. Model-authored reasoning summaries
+ * use their own bounded public event path; the remaining notifications drop. */
 const CODEX_IGNORED_NOTIFICATIONS = new Set<string>([
   'remoteControl/status/changed',
+  'item/commandExecution/outputDelta',
+  'item/fileChange/outputDelta',
+  'item/fileChange/patchUpdated',
+  'item/plan/delta',
+  'item/reasoning/summaryTextDelta',
+  'item/reasoning/summaryPartAdded',
+  'item/reasoning/textDelta',
 ]);
 
 const log = createLogger('local-agents:codex');
+
+/** Keep a quiet-but-active Codex item below the runner's 90s idle-warning
+ * window without putting every token or stdout byte into history. Heartbeats
+ * carry no reasoning/command content and are excluded from persisted chat
+ * process items by the group-chat bridge. */
+export const CODEX_ACTIVITY_HEARTBEAT_MS = 30_000;
+
+interface CodexReasoningState {
+  itemSummary: string;
+  streamedSummary: string;
+  partSummaries: string[];
+  rawChars: number;
+}
+
+function codexReasoningSummaryText(value: unknown): string {
+  if (typeof value === 'string') return value.trim();
+  if (Array.isArray(value)) {
+    return value
+      .map(part => codexReasoningSummaryText(part))
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+  if (value && typeof value === 'object') {
+    const part = value as Record<string, unknown>;
+    if (typeof part.text === 'string') return part.text.trim();
+  }
+  return '';
+}
+
+export class CodexActivityHeartbeat {
+  private readonly reasoning = new Set<string>();
+  private readonly commands = new Set<string>();
+
+  startReasoning(itemId: string): boolean {
+    if (!itemId || this.reasoning.has(itemId)) return false;
+    this.reasoning.add(itemId);
+    return true;
+  }
+
+  startCommand(itemId: string): boolean {
+    if (!itemId || this.commands.has(itemId)) return false;
+    this.commands.add(itemId);
+    return true;
+  }
+
+  complete(itemId: string): void {
+    if (!itemId) return;
+    this.reasoning.delete(itemId);
+    this.commands.delete(itemId);
+  }
+
+  pulseEvents(): LocalEvent[] {
+    return [
+      ...Array.from(this.reasoning, itemId => ({
+        type: 'thinking' as const,
+        chars: 0,
+        itemId,
+        heartbeat: true,
+        synthetic: true,
+      })),
+      ...Array.from(this.commands, callId => ({
+        type: 'status' as const,
+        status: 'tool-progress',
+        tool: 'exec_command',
+        callId,
+        heartbeat: true,
+        synthetic: true,
+      })),
+    ];
+  }
+}
 
 const TRUSTED_LOCAL_APPROVAL_POLICY = 'never';
 const TRUSTED_LOCAL_SANDBOX_MODE = 'danger-full-access';
@@ -138,6 +224,83 @@ export class CodexAgentMessageAccumulator {
   }
 }
 
+/** Translate Codex item variants that represent observable work into the
+ * common tool lifecycle. Agent text/reasoning and command/file items retain
+ * their dedicated handlers; this covers MCP, dynamic tools, collaboration,
+ * background agents, search/media work, sleeps and context compaction. */
+export function mapCodexItemToolEvent(
+  raw: unknown,
+  phase: 'use' | 'result',
+): LocalEvent | null {
+  const item = raw && typeof raw === 'object' ? raw as Record<string, any> : {};
+  const type = String(item.type || '');
+  const callId = String(item.id || '');
+  let tool = '';
+  let input: unknown;
+  let output: unknown;
+
+  switch (type) {
+    case 'mcpToolCall':
+      tool = [String(item.server || 'mcp'), String(item.tool || 'tool')].join('.');
+      input = item.arguments ?? {};
+      output = item.error ?? item.result ?? item.status ?? '';
+      break;
+    case 'dynamicToolCall':
+      tool = [item.namespace, item.tool].filter(Boolean).map(String).join('.') || 'dynamic_tool';
+      input = item.arguments ?? {};
+      output = item.contentItems ?? item.success ?? item.status ?? '';
+      break;
+    case 'collabAgentToolCall':
+      tool = `collaboration:${String(item.tool || 'agent')}`;
+      input = {
+        receiverCount: Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.length : 0,
+        ...(typeof item.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}),
+      };
+      output = item.agentsStates ?? item.status ?? '';
+      break;
+    case 'subAgentActivity':
+      tool = 'background_agent';
+      input = { kind: item.kind || 'started' };
+      output = item.kind || '';
+      break;
+    case 'webSearch':
+      tool = 'web_search';
+      input = { query: String(item.query || '') };
+      output = item.results ?? item.action ?? '';
+      break;
+    case 'imageView':
+      tool = 'view_image';
+      input = { path: String(item.path || '') };
+      output = item.status ?? '';
+      break;
+    case 'imageGeneration':
+      tool = 'image_generation';
+      input = item.prompt ? { prompt: String(item.prompt) } : {};
+      output = item.result ?? item.status ?? '';
+      break;
+    case 'sleep':
+      tool = 'background_wait';
+      input = { durationMs: Number(item.durationMs) || 0 };
+      output = item.status ?? '';
+      break;
+    case 'contextCompaction':
+      tool = 'context_compaction';
+      input = {};
+      output = item.status ?? '';
+      break;
+    default:
+      return null;
+  }
+
+  return {
+    type: 'tool-event',
+    tool,
+    callId,
+    phase,
+    ...(phase === 'use' ? { input } : { output }),
+  };
+}
+
 export const codexBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildCodexArgs(opts);
@@ -169,16 +332,26 @@ export const codexBackend: LocalBackend = {
     let nextRpcId = 1;
     const pending = new Map<number, { method: string; resolve: (r: any) => void; reject: (e: Error) => void }>();
     let threadId: string | undefined;
+    let activeTurnId: string | undefined;
     let turnStarted = false;
     let turnAborted = false;
     let turnCompleted = false;
+    let retryAttempt = 0;
     const seenTurnIds = new Set<string>();
     const agentMessages = new CodexAgentMessageAccumulator();
+    const activity = new CodexActivityHeartbeat();
+    const reasoningByItem = new Map<string, CodexReasoningState>();
     let turnError: string | undefined;
     // Latest usage snapshot from `thread/tokenUsage/updated` —
     // each notification is a cumulative state (not an increment),
     // so we just overwrite. Threaded into the done event below.
     let lastUsage: Record<string, number | string> | undefined;
+
+    const activityTimer = setInterval(() => {
+      if (exited) return;
+      for (const event of activity.pulseEvents()) opts.onEvent(event);
+    }, CODEX_ACTIVITY_HEARTBEAT_MS);
+    if (typeof activityTimer.unref === 'function') activityTimer.unref();
 
     const sendLine = (msg: object) => {
       try { child.stdin.write(JSON.stringify(msg) + '\n'); }
@@ -194,6 +367,65 @@ export const codexBackend: LocalBackend = {
 
     const notify = (method: string, params?: Record<string, unknown>) => {
       sendLine({ jsonrpc: '2.0', method, ...(params ? { params } : {}) });
+    };
+
+    const publishActiveIngress = (turnId: string | null): void => {
+      activeTurnId = turnId || undefined;
+      if (!turnId || !threadId || exited || turnCompleted) {
+        try { opts.onActiveRunIngress?.(null); } catch { /* host already gone */ }
+        return;
+      }
+      const ingressThreadId = threadId;
+      const ingressTurnId = turnId;
+      const ingress: LocalActiveRunIngress = {
+        submit: async (input: LocalActiveRunInput) => {
+          if (
+            exited
+            || turnCompleted
+            || threadId !== ingressThreadId
+            || activeTurnId !== ingressTurnId
+          ) {
+            return { mode: 'queued_followup', reason: 'codex turn is no longer active' };
+          }
+          const richInput: Array<Record<string, unknown>> = [];
+          const text = String(input.text || '').trim();
+          if (text) richInput.push({ type: 'text', text });
+          for (const image of input.localImages || []) {
+            const imagePath = String(image?.path || '').trim();
+            if (imagePath) richInput.push({ type: 'localImage', path: imagePath });
+          }
+          if (!richInput.length) {
+            return { mode: 'rejected', reason: 'empty active-turn input' };
+          }
+          try {
+            const result = await rpc('turn/steer', {
+              threadId: ingressThreadId,
+              expectedTurnId: ingressTurnId,
+              clientUserMessageId: input.id,
+              input: richInput,
+            });
+            const acceptedTurnId = typeof result?.turnId === 'string' ? result.turnId : '';
+            if (acceptedTurnId !== ingressTurnId) {
+              return {
+                mode: 'queued_followup',
+                reason: acceptedTurnId
+                  ? 'codex acknowledged a different active turn'
+                  : 'codex did not acknowledge the active turn',
+              };
+            }
+            return { mode: 'steered', acceptedId: input.id };
+          } catch (err) {
+            // ActiveTurnNotSteerable, a completed/mismatched expectedTurnId,
+            // transport shutdown and version-skew all degrade to the durable
+            // worker FIFO. Never acknowledge a message on an uncertain RPC.
+            return {
+              mode: 'queued_followup',
+              reason: (err as Error).message || String(err),
+            };
+          }
+        },
+      };
+      try { opts.onActiveRunIngress?.(ingress); } catch { /* host already gone */ }
     };
 
     const closePending = (err: Error) => {
@@ -215,7 +447,7 @@ export const codexBackend: LocalBackend = {
           // line here means the binary logged something directly to
           // stdout (rare, but diagnostic-worthy when it happens — we
           // were swallowing these before).
-          opts.onEvent({ type: 'raw-line', line: trimmed });
+          if (!exited) opts.onEvent({ type: 'raw-line', line: trimmed });
           return;
         }
         // Response (matches a pending request by id).
@@ -238,6 +470,7 @@ export const codexBackend: LocalBackend = {
 
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
+      if (exited) return;
       const clean = stripAnsi(chunk);
       tail.push(clean);
       for (const line of clean.split(/\r?\n/)) {
@@ -248,6 +481,48 @@ export const codexBackend: LocalBackend = {
     function emitTextDelta(chunk: { text: string; itemId?: string; phase?: LocalTextPhase } | null) {
       if (!chunk?.text) return;
       opts.onEvent({ type: 'text-delta', ...chunk });
+    }
+
+    function reasoningState(itemId: string): CodexReasoningState {
+      let state = reasoningByItem.get(itemId);
+      if (!state) {
+        state = { itemSummary: '', streamedSummary: '', partSummaries: [], rawChars: 0 };
+        reasoningByItem.set(itemId, state);
+      }
+      return state;
+    }
+
+    function currentReasoningSummary(state: CodexReasoningState): string {
+      return state.itemSummary || state.streamedSummary || state.partSummaries.join('\n').trim();
+    }
+
+    function emitReasoningActivity(itemId: string, state: CodexReasoningState): void {
+      const summary = currentReasoningSummary(state);
+      opts.onEvent({
+        type: 'thinking',
+        chars: summary.length || state.rawChars,
+        itemId,
+        heartbeat: true,
+        ...(summary ? { summary } : {}),
+      });
+    }
+
+    function completeReasoning(itemId: string, rawItem: unknown): void {
+      const item = rawItem && typeof rawItem === 'object'
+        ? rawItem as Record<string, unknown>
+        : {};
+      const state = reasoningState(itemId);
+      const completedSummary = codexReasoningSummaryText(item.summary);
+      if (completedSummary) state.itemSummary = completedSummary;
+      if (typeof item.text === 'string') state.rawChars = Math.max(state.rawChars, item.text.length);
+      const summary = currentReasoningSummary(state);
+      opts.onEvent({
+        type: 'thinking',
+        chars: summary.length || state.rawChars,
+        itemId,
+        ...(summary ? { summary } : {}),
+      });
+      reasoningByItem.delete(itemId);
     }
 
     // Codex 0.125+ uses fine-grained notifications:
@@ -262,9 +537,51 @@ export const codexBackend: LocalBackend = {
     // best-effort handler for that shape too in case older codex builds
     // are encountered.
     function handleNotification(method: string, params: Record<string, any>) {
-      if (CODEX_IGNORED_NOTIFICATIONS.has(method)) return;
+      if (exited) return;
       const eventThreadId = typeof params.threadId === 'string' ? params.threadId : '';
       if (threadId && eventThreadId && eventThreadId !== threadId) return;
+
+      // Newer Codex builds stream public reasoning summaries separately from
+      // raw reasoning text. Summary pulses may update the live activity label,
+      // but only the completed aggregate becomes a persisted process row.
+      if (method === 'item/reasoning/summaryTextDelta') {
+        const itemId = String(params.itemId || 'reasoning');
+        activity.startReasoning(itemId);
+        const state = reasoningState(itemId);
+        if (typeof params.delta === 'string') state.streamedSummary += params.delta;
+        emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/reasoning/summaryPartAdded') {
+        const itemId = String(params.itemId || 'reasoning');
+        activity.startReasoning(itemId);
+        const state = reasoningState(itemId);
+        const part = codexReasoningSummaryText(params.part);
+        if (part && !state.partSummaries.includes(part)) state.partSummaries.push(part);
+        emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/reasoning/textDelta') {
+        const itemId = String(params.itemId || 'reasoning');
+        const state = reasoningState(itemId);
+        if (typeof params.delta === 'string') state.rawChars += params.delta.length;
+        if (activity.startReasoning(itemId)) emitReasoningActivity(itemId, state);
+        return;
+      }
+      if (method === 'item/commandExecution/outputDelta') {
+        const itemId = String(params.itemId || 'command');
+        if (activity.startCommand(itemId)) {
+          opts.onEvent({
+            type: 'status',
+            status: 'tool-progress',
+            tool: 'exec_command',
+            callId: itemId,
+            heartbeat: true,
+          });
+        }
+        return;
+      }
+      if (CODEX_IGNORED_NOTIFICATIONS.has(method)) return;
 
       // ── Streaming agent text (the important one) ─────────────────
       if (method === 'item/agentMessage/delta') {
@@ -275,6 +592,10 @@ export const codexBackend: LocalBackend = {
       // ── Lifecycle ────────────────────────────────────────────────
       if (method === 'turn/started') {
         turnStarted = true;
+        const startedTurnId = typeof params?.turn?.id === 'string'
+          ? params.turn.id
+          : (typeof params?.turnId === 'string' ? params.turnId : '');
+        if (startedTurnId) publishActiveIngress(startedTurnId);
         opts.onEvent({ type: 'status', status: 'running' });
         return;
       }
@@ -282,6 +603,7 @@ export const codexBackend: LocalBackend = {
         const turn = params?.turn || {};
         const turnId: string = typeof turn?.id === 'string' ? turn.id : '';
         const status: string = typeof turn?.status === 'string' ? turn.status : '';
+        if (status === 'inProgress') return;
         if (turnId && seenTurnIds.has(turnId)) return;
         if (turnId) seenTurnIds.add(turnId);
         if (status === 'failed') {
@@ -296,12 +618,14 @@ export const codexBackend: LocalBackend = {
       // ── item/* — surface tool-equivalent events; fallback final text ──
       if (method === 'item/started') {
         const item = params.item || {};
+        const itemId = String(item.id || '');
         agentMessages.rememberItem(item);
         if (item.type === 'commandExecution') {
+          activity.startCommand(itemId);
           opts.onEvent({
             type: 'tool-event',
             tool: 'exec_command',
-            callId: String(item.id || ''),
+            callId: itemId,
             phase: 'use',
             input: { command: item.command || item.script || '' },
           });
@@ -312,23 +636,35 @@ export const codexBackend: LocalBackend = {
             callId: String(item.id || ''),
             phase: 'use',
           });
-        } else if (item.type === 'agentReasoning') {
-          // Reasoning chunks — surface as thinking. Some codex versions
-          // include text directly on item.text, others stream via a
-          // dedicated reasoning/delta we don't see today.
-          const text = typeof item.text === 'string' ? item.text : '';
-          if (text) opts.onEvent({ type: 'thinking', text });
+        } else if (item.type === 'agentReasoning' || item.type === 'reasoning') {
+          // Older Codex builds place a user-facing summary on item/started.
+          // Raw item.text remains private and contributes only a character
+          // count. The completed event below publishes one durable row.
+          const reasoningId = itemId || 'reasoning';
+          const state = reasoningState(reasoningId);
+          const summary = codexReasoningSummaryText(item.summary);
+          if (summary) state.itemSummary = summary;
+          if (typeof item.text === 'string') state.rawChars = Math.max(state.rawChars, item.text.length);
+          activity.startReasoning(reasoningId);
+          emitReasoningActivity(reasoningId, state);
+        } else {
+          const event = mapCodexItemToolEvent(item, 'use');
+          if (event) opts.onEvent(event);
         }
         return;
       }
       if (method === 'item/completed') {
         const item = params.item || {};
+        const itemId = String(item.id || '');
+        activity.complete(itemId || (item.type === 'reasoning' || item.type === 'agentReasoning'
+          ? 'reasoning'
+          : (item.type === 'commandExecution' ? 'command' : '')));
         agentMessages.rememberItem(item);
         if (item.type === 'commandExecution') {
           opts.onEvent({
             type: 'tool-event',
             tool: 'exec_command',
-            callId: String(item.id || ''),
+            callId: itemId,
             phase: 'result',
             output: typeof item.output === 'string' ? item.output : (item.aggregatedOutput ?? ''),
           });
@@ -341,6 +677,11 @@ export const codexBackend: LocalBackend = {
           });
         } else if (item.type === 'agentMessage') {
           emitTextDelta(agentMessages.appendCompletedFallback(item));
+        } else if (item.type === 'agentReasoning' || item.type === 'reasoning') {
+          completeReasoning(itemId || 'reasoning', item);
+        } else {
+          const event = mapCodexItemToolEvent(item, 'result');
+          if (event) opts.onEvent(event);
         }
         return;
       }
@@ -350,14 +691,114 @@ export const codexBackend: LocalBackend = {
         const willRetry = !!params.willRetry;
         const errMsg = (params.error?.message && String(params.error.message))
                     || (typeof params.message === 'string' ? params.message : '');
-        if (errMsg && !willRetry) turnError = errMsg;
+        if (willRetry) {
+          retryAttempt += 1;
+          opts.onEvent({
+            type: 'status',
+            status: 'retrying',
+            attempt: retryAttempt,
+            ...(errMsg ? { message: errMsg } : {}),
+          });
+          return;
+        }
+        turnError = errMsg || 'codex turn failed';
+        finishTurn(false);
         return;
       }
 
       // ── Idle fallback when turn/completed never arrives ─────────
       if (method === 'thread/status/changed') {
         const statusType = params?.status?.type;
-        if (statusType === 'idle' && turnStarted) finishTurn(false);
+        if (statusType === 'idle' && turnStarted) {
+          finishTurn(false);
+        } else if (statusType === 'systemError') {
+          turnError = 'codex thread entered a system error state';
+          finishTurn(false);
+        } else if (statusType === 'active') {
+          const flags = Array.isArray(params?.status?.activeFlags)
+            ? params.status.activeFlags
+            : [];
+          if (flags.includes('waitingOnApproval')) {
+            opts.onEvent({ type: 'status', status: 'waiting-approval' });
+          } else if (flags.includes('waitingOnUserInput')) {
+            opts.onEvent({ type: 'status', status: 'waiting-input' });
+          }
+        }
+        return;
+      }
+
+      if (method === 'turn/plan/updated') {
+        const plan = Array.isArray(params?.plan) ? params.plan : [];
+        opts.onEvent({
+          type: 'status',
+          status: 'plan-updated',
+          steps: plan.map((step: any) => ({
+            step: String(step?.step || ''),
+            status: String(step?.status || ''),
+          })),
+          ...(typeof params?.explanation === 'string' && params.explanation
+            ? { message: params.explanation }
+            : {}),
+        });
+        return;
+      }
+
+      if (method === 'item/mcpToolCall/progress') {
+        opts.onEvent({
+          type: 'status',
+          status: 'tool-progress',
+          callId: String(params?.itemId || ''),
+          message: String(params?.message || ''),
+        });
+        return;
+      }
+
+      if (method === 'hook/started' || method === 'hook/completed') {
+        const run = params?.run || {};
+        const name = String(run?.eventName || run?.handlerType || 'hook');
+        const completed = method === 'hook/completed';
+        const entries = Array.isArray(run?.entries)
+          ? run.entries.map((entry: any) => String(entry?.text || '')).filter(Boolean).join('\n')
+          : '';
+        opts.onEvent({
+          type: 'tool-event',
+          tool: `hook:${name}`,
+          callId: String(run?.id || ''),
+          phase: completed ? 'result' : 'use',
+          ...(completed
+            ? { output: entries || String(run?.statusMessage || run?.status || '') }
+            : { input: { status: run?.status || 'running' } }),
+        });
+        return;
+      }
+
+      if (method === 'thread/compacted') {
+        opts.onEvent({ type: 'status', status: 'compacted' });
+        return;
+      }
+
+      if (method === 'model/rerouted') {
+        opts.onEvent({
+          type: 'status',
+          status: 'model-rerouted',
+          fromModel: String(params?.fromModel || ''),
+          toModel: String(params?.toModel || ''),
+          reason: String(params?.reason || ''),
+        });
+        return;
+      }
+
+      if (method === 'warning' || method === 'guardianWarning'
+          || method === 'deprecationNotice' || method === 'configWarning') {
+        const message = typeof params?.message === 'string'
+          ? params.message
+          : JSON.stringify(params || {});
+        opts.onEvent({ type: 'log', level: 'warn', message, source: 'codex' });
+        return;
+      }
+
+      if (method === 'thread/closed') {
+        if (turnStarted) finishTurn(false);
         return;
       }
 
@@ -462,15 +903,27 @@ export const codexBackend: LocalBackend = {
     function finishTurn(aborted: boolean) {
       if (turnCompleted) return;
       turnCompleted = true;
+      publishActiveIngress(null);
       if (aborted) turnAborted = true;
-      // Close stdin so codex shuts down cleanly. The `close` handler
-      // below resolves the outer promise once the process exits.
-      try { child.stdin.end(); } catch { /* */ }
+      const output = agentMessages.output();
+      if (turnAborted) {
+        finish('cancelled', { output });
+      } else if (turnError) {
+        finish('failed', { error: turnError, output, stderrTail: tail.toString() });
+      } else {
+        finish('completed', { output });
+      }
+      // Resolve the run from the authoritative protocol terminal event.
+      // Process reaping is deliberately asynchronous so an inherited pipe or
+      // background terminal cannot leave the conversation spinner running.
+      reapCliAfterProtocolTerminal(child);
     }
 
     function finish(status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) {
       if (exited) return;
+      publishActiveIngress(null);
       exited = true;
+      clearInterval(activityTimer);
       watchdog.disarm();
       detachAbort();
       closePending(new Error('codex shutting down'));
@@ -540,12 +993,13 @@ export const codexBackend: LocalBackend = {
             type: 'text',
             text: selectCodexTurnPrompt(opts, prepared.resumed),
           }],
+          ...buildCodexTurnRuntimeOverrides(opts),
           ...buildCodexTurnPermissionOverrides(opts.cwd),
         });
         // After turn/start succeeds we wait passively — turn end is
-        // driven by `turn/completed` / `task_complete` notifications,
-        // which call finishTurn → child.stdin.end → process exits →
-        // close handler resolves outerPromise.
+        // driven by `turn/completed` / `task_complete` notifications.
+        // Their protocol terminal immediately resolves outerPromise;
+        // process cleanup continues asynchronously.
       } catch (err) {
         const msg = (err as Error).message || String(err);
         log.warn('codex protocol error', { error: logErrorSummary(err) });
@@ -561,7 +1015,6 @@ export const codexBackend: LocalBackend = {
           const r = await rpc('thread/resume', {
             threadId: o.resumeSessionId,
             cwd: o.cwd,
-            model: o.model || null,
             ...buildCodexThreadPermissionOverrides(),
             ...codexThreadDeveloperInstructionParams(o, true),
           });
@@ -573,7 +1026,6 @@ export const codexBackend: LocalBackend = {
         }
       }
       const r = await rpc('thread/start', {
-        model: o.model || null,
         modelProvider: null,
         profile: null,
         cwd: o.cwd,
@@ -637,6 +1089,17 @@ export function selectCodexTurnPrompt(
 ): string {
   if (resumed || !opts.resumeSessionId) return opts.prompt;
   return opts.resumeFallbackPrompt || opts.prompt;
+}
+
+/** Optional per-turn overrides. Omitting keys is significant: Codex then
+ * resolves the account/profile default and keeps existing sessions portable. */
+export function buildCodexTurnRuntimeOverrides(
+  opts: Pick<BackendRunOptions, 'modelOverride' | 'thinkingLevel'>,
+): { model?: string; effort?: string } {
+  return {
+    ...(opts.modelOverride ? { model: opts.modelOverride } : {}),
+    ...(opts.thinkingLevel ? { effort: opts.thinkingLevel } : {}),
+  };
 }
 
 function buildCodexArgs(opts: BackendRunOptions): string[] {

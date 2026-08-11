@@ -22,10 +22,11 @@
  * overwrites core-agent's builtin (last-write-wins).
  */
 
-import type { AgentTool } from '#core-agent';
-import { pickActiveSearchProfile } from '../../features/search_auth';
-import { runSearchAdapter, SEARCH_PROVIDER_LABEL } from './search-adapters';
+import type { AgentTool, ToolResult } from '#core-agent';
+import { listSearchProfiles } from '../../features/search_auth';
+import { runSearchAdapter, SEARCH_PROVIDER_LABEL, SearchAccountError } from './search-adapters';
 import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
 
 // core-agent is ESM; main is CJS. Static import would yank pi-ai into the
 // CJS load graph and crash with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Same
@@ -41,6 +42,17 @@ const log = createLogger('search-tools');
 
 const DEFAULT_COUNT = 8;
 const MAX_COUNT = 20;
+const PAID_SEARCH_COOLDOWN_MS = 10 * 60_000;
+let paidSearchDisabledUntil = 0;
+
+export interface SearchExecutionContext {
+  conversationId?: string;
+  conversationTitle?: string;
+  conversationTitleUpdatedAt?: number;
+  turnId?: string;
+  agentId?: string;
+  agentName?: string;
+}
 
 function formatPaidResults(query: string, providerLabel: string, results: { title: string; url: string; snippet: string }[]): string {
   if (!results.length) {
@@ -57,10 +69,44 @@ function formatPaidResults(query: string, providerLabel: string, results: { titl
   return lines.join('\n');
 }
 
-export async function createWebSearchOverrideTool(): Promise<AgentTool> {
+export async function createWebSearchOverrideTool(context?: SearchExecutionContext): Promise<AgentTool> {
   const mod = await ca();
+  const runKeylessFallback = async (
+    query: string,
+    count: number,
+    errors: string[],
+    accountErr: string | null,
+  ): Promise<ToolResult> => {
+    try {
+      const fallback = await mod.runBuiltinWebSearch(query, count);
+      if (fallback.isError) {
+        const head = accountErr
+          ? `Paid search unavailable (account: ${accountErr}); automatically switched to free search, which returned no results for this query. Try a broader/different query — the account quota/auth issue itself needs the user, retrying paid search will not help.`
+          : `Configured search providers failed:\n${errors.join('\n')}\nKeyless fallback also failed: ${fallback.content}`;
+        return {
+          content: head,
+          isError: true,
+          ...(fallback.displayName ? { displayName: fallback.displayName } : {}),
+        };
+      }
+      const note = accountErr
+        ? `(paid search unavailable — account quota/auth: ${accountErr}; automatically using free search)`
+        : `(configured search providers failed; falling back to keyless built-in)\n${errors.join('\n')}`;
+      return {
+        content: `${note}\n\n${fallback.content}`,
+        ...(fallback.displayName ? { displayName: fallback.displayName } : {}),
+      };
+    } catch (err) {
+      const tail = (err as Error).message || String(err);
+      const head = accountErr
+        ? `Paid search unavailable (account: ${accountErr}); free search fallback also crashed: ${tail}`
+        : `Configured search providers failed:\n${errors.join('\n')}\nKeyless fallback crashed: ${tail}`;
+      return { content: head, isError: true };
+    }
+  };
   return mod.defineTool({
     name: 'web_search',
+    executionMode: 'parallel',
     description:
       'Search the web for information. Returns a list of search results with titles, URLs, and snippets. ' +
       'Use this when you need to find current information, news, documentation, or any web content. ' +
@@ -79,33 +125,39 @@ export async function createWebSearchOverrideTool(): Promise<AgentTool> {
       const count = Math.min(Math.max(1, requested), MAX_COUNT);
       if (!query) return { content: 'Error: query is required', isError: true };
 
-      const profile = pickActiveSearchProfile();
-      if (profile) {
-        const label = SEARCH_PROVIDER_LABEL[profile.provider] || profile.provider;
-        log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
-        try {
-          const res = await runSearchAdapter(profile, query, count);
-          log.info('web_search paid API ok', { provider: profile.provider, results: res.results.length });
-          const text = formatPaidResults(query, label, res.results);
-          return res.results.length ? { content: text } : { content: text, isError: true };
-        } catch (err) {
-          const msg = (err as Error).message || String(err);
-          log.warn(`paid search failed (${profile.provider}); falling back to built-in: ${msg}`);
-          // Fall through to the keyless built-in — better degraded answer
-          // than a hard error when the user typed a real query.
-          const fallback = await mod.runBuiltinWebSearch(query, count);
-          if (fallback.isError) {
-            return {
-              content: `Paid search via ${label} failed: ${msg}\nKeyless fallback also failed: ${fallback.content}`,
-              isError: true,
-            };
+      const profiles = listSearchProfiles();
+      const paidOnCooldown = Date.now() < paidSearchDisabledUntil;
+      if (profiles.length && !paidOnCooldown) {
+        const errors: string[] = [];
+        let accountErr: string | null = null;
+        for (const profile of profiles) {
+          const label = SEARCH_PROVIDER_LABEL[profile.provider] || profile.provider;
+          log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
+          try {
+            const res = await runSearchAdapter(profile, query, count, context);
+            log.info('web_search paid API ok', { provider: profile.provider, results: res.results.length });
+            const text = formatPaidResults(query, label, res.results);
+            return res.results.length
+              ? { content: text, displayName: label }
+              : { content: text, displayName: label, isError: true };
+          } catch (err) {
+            const msg = (err as Error).message || String(err);
+            errors.push(`${label}: ${msg}`);
+            if (err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg)) accountErr = msg;
+            log.warn('paid search failed; trying next provider', {
+              provider: profile.provider,
+              account_error: err instanceof SearchAccountError || /(^|\s)(401|402|403):/.test(msg),
+              error: logErrorSummary(err),
+            });
           }
-          return {
-            content: `(paid search via ${label} failed: ${msg} — falling back to keyless built-in)\n\n${fallback.content}`,
-          };
         }
+        if (accountErr) paidSearchDisabledUntil = Date.now() + PAID_SEARCH_COOLDOWN_MS;
+        return runKeylessFallback(query, count, errors, accountErr);
       }
 
+      if (paidOnCooldown) {
+        return runKeylessFallback(query, count, [], 'paid search temporarily unavailable (account quota/auth)');
+      }
       log.info('web_search via builtin keyless (no paid profile configured)', { query_len: query.length, count });
       return mod.runBuiltinWebSearch(query, count);
     },

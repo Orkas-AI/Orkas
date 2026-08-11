@@ -171,10 +171,6 @@ describe('skills renderer frontmatter parsing', () => {
         creation_method: 'url',
         result: 'success',
         duration_ms: 25,
-        skill_id: 'url-skill',
-        resource_kind: 'skill',
-        resource_id: 'url-skill',
-        resource_name: 'URL Skill',
         skill_count: 1,
       }],
     ]);
@@ -185,6 +181,163 @@ describe('skills renderer frontmatter parsing', () => {
       'after:url-skill:true',
       'busy:false',
     ]);
+  });
+
+  it('tracks manual, URL, and directory client validation as blocked terminals', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    let now = 100;
+    context.performance = { now: () => { now += 25; return now; } };
+    context.window.Monitor = {
+      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    vm.runInContext(`
+      document = {
+        getElementById: () => ({ value: '', textContent: '', className: '', focus() {} }),
+      };
+    `, context);
+    const msgEl = { textContent: '', className: '' };
+
+    await context._saveSkillManual({ editId: '', msgEl });
+    await context._saveSkillFromUrl({ msgEl });
+    await context._saveSkillFromDir({ msgEl });
+
+    expect(monitorCalls).toEqual([
+      ['click', 'skill_create_submit', { creation_method: 'manual' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'manual', result: 'blocked', duration_ms: 25, error_code: 'no_name',
+      }],
+      ['click', 'skill_create_submit', { creation_method: 'url' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'url', result: 'blocked', duration_ms: 25, error_code: 'url_invalid',
+      }],
+      ['click', 'skill_create_submit', { creation_method: 'dir' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'dir', result: 'blocked', duration_ms: 25, error_code: 'dir_missing',
+      }],
+    ]);
+  });
+
+  it('keeps Skill create success authoritative and omits raw refresh errors', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    let now = 100;
+    context.performance = { now: () => { now += 25; return now; } };
+    context.window.Monitor = {
+      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: true, skill: { id: 'created', name: 'Private name' } }),
+    });
+    vm.runInContext(`
+      document = { getElementById: () => ({ value: 'https://example.com/private', focus() {} }) };
+      _setSkillModalBusy = () => {};
+      _waitForSkillModalBusyPaint = async () => {};
+      _afterSkillCreated = async () => { throw new Error('private refresh detail'); };
+    `, context);
+
+    await context._saveSkillFromUrl({ msgEl: { textContent: '', className: '' } });
+
+    expect(monitorCalls).toEqual([
+      ['click', 'skill_create_submit', { creation_method: 'url' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'url', result: 'success', duration_ms: 25, skill_count: 1,
+      }],
+    ]);
+    expect(JSON.stringify(monitorCalls)).not.toContain('Private name');
+    expect(JSON.stringify(monitorCalls)).not.toContain('private refresh detail');
+  });
+
+  it('reports Skill create failures with a stable result code only', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    let now = 100;
+    context.performance = { now: () => { now += 25; return now; } };
+    context.window.Monitor = {
+      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: false, error: 'failed to import private-user/private-skill' }),
+    });
+    vm.runInContext(`
+      document = { getElementById: () => ({ value: 'https://example.com/private', focus() {} }) };
+      _setSkillModalBusy = () => {};
+      _waitForSkillModalBusyPaint = async () => {};
+    `, context);
+
+    await context._saveSkillFromUrl({ msgEl: { textContent: '', className: '' } });
+
+    expect(monitorCalls).toEqual([
+      ['click', 'skill_create_submit', { creation_method: 'url' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'url', result: 'failure', duration_ms: 25, error_code: 'import_failed',
+      }],
+    ]);
+    expect(JSON.stringify(monitorCalls)).not.toContain('private-user');
+  });
+
+  it('keeps Skill toggle and package mutation success authoritative across refresh failures', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    context.window.Monitor = {
+      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    context.Monitor = context.window.Monitor;
+    context.window.orkas = { invoke: async () => ({ ok: true }) };
+    context.uiAlert = async () => {};
+    vm.runInContext(`
+      _skillsCache = [];
+      _selectedSkill = null;
+      loadSkills = async () => { throw new Error('refresh failed'); };
+    `, context);
+
+    await expect(context._flipSkillEnabled('skill-one', false)).resolves.toBe(true);
+    await context._runOpenPackageAction('update', 'pkg-private', null, 'Private package');
+
+    const skillResults = monitorCalls.filter(
+      ([kind, name]) => kind === 'event' && name === 'skill_manage_result',
+    );
+    const packageResults = monitorCalls.filter(
+      ([kind, name]) => kind === 'event' && name === 'package_action_result',
+    );
+    expect(skillResults).toHaveLength(0);
+    expect(packageResults).toHaveLength(0);
+    expect(monitorCalls.some(([kind]) => kind === 'error')).toBe(false);
+  });
+
+  it('keeps a successful Skill delete authoritative when refresh fails', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    context.window.Monitor = {
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    context.Monitor = context.window.Monitor;
+    context.uiConfirm = async () => true;
+    context.uiAlert = async () => {};
+    context.apiFetch = async () => ({ json: async () => ({ ok: true }) });
+    vm.runInContext(`
+      _selectedSkill = { id: 'skill-one', source: 'custom' };
+      _skillsCache = [{ id: 'skill-one', source: 'custom', name: 'Private Skill' }];
+      loadSkills = async () => { throw new Error('refresh failed'); };
+    `, context);
+
+    await context.deleteSelectedSkill();
+
+    const results = monitorCalls.filter(
+      ([kind, name]) => kind === 'event' && name === 'skill_manage_result',
+    );
+    expect(results).toHaveLength(0);
+    expect(vm.runInContext('_selectedSkill', context)).toBeNull();
+    expect(JSON.stringify(monitorCalls)).not.toContain('Private Skill');
   });
 
   it('sends forced import auto-seed even when edit chat history is not empty', async () => {

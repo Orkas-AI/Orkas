@@ -56,7 +56,7 @@ function _iclSessionTitle(session) {
   if (purpose) return purpose;
   const prompt = _iclPromptLabel(session.prompt_kind);
   if (prompt) return prompt;
-  return _iclT('interactive_cli.title', 'CLI operation');
+  return _iclT('interactive_cli.title', 'Action required');
 }
 
 function _iclUpdateLinks(session) {
@@ -236,10 +236,10 @@ function _iclRevealSession(session) {
     <pre class="interactive-cli-output" data-icl-output></pre>
     <div class="interactive-cli-links" data-icl-links hidden></div>
     <form class="interactive-cli-form" data-icl-form>
-      <input class="interactive-cli-input" data-icl-input type="text" autocomplete="off" spellcheck="false" placeholder="${_iclEsc(_iclT('interactive_cli.input_placeholder', 'Input for the CLI'))}" />
+      <input class="interactive-cli-input" data-icl-input type="text" autocomplete="off" spellcheck="false" placeholder="${_iclEsc(_iclT('interactive_cli.input_placeholder', 'Enter here'))}" />
       <label class="interactive-cli-sensitive">
         <input type="checkbox" data-icl-sensitive />
-        <span>${_iclEsc(_iclT('interactive_cli.sensitive', 'Sensitive'))}</span>
+        <span>${_iclEsc(_iclT('interactive_cli.sensitive', 'Hide input'))}</span>
       </label>
       <button type="submit" class="btn btn-primary btn-sm interactive-cli-send" data-icl-send>${_iclEsc(_iclT('interactive_cli.send', 'Send'))}</button>
     </form>

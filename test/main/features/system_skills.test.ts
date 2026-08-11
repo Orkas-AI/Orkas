@@ -239,6 +239,19 @@ describe('system creator skill contracts', () => {
     }
   });
 
+  it('authors one shared action-authority boundary instead of blanket reconfirmation', () => {
+    const agentCreator = packagedSystemSkill('agent-creator');
+    const skillCreator = packagedSystemSkill('skill-creator');
+
+    for (const body of [agentCreator, skillCreator]) {
+      expect(body).toContain('current user request authorizes that exact action');
+      expect(body).toContain('unresolved target');
+      expect(body).toContain('scope expansion');
+      expect(body).toContain('platform-required confirmation');
+      expect(body).not.toContain('confirm step before irreversible operations');
+    }
+  });
+
   it('pins skill-creator import behavior to explicit intent and faithful restoration', () => {
     const md = packagedSystemSkill('skill-creator');
     expect(md).toContain('Explicit creation intent required');
@@ -250,6 +263,8 @@ describe('system creator skill contracts', () => {
     expect(md).toContain('If files besides `SKILL.md` are present, inspect the file tree and read the likely source docs first');
     expect(md).toContain('Do **not** ask the user whether the imported document should be used as a reference or merged into the skill');
     expect(md).toContain('Do **not** show source provenance by default');
+    expect(md).toContain('`import_skill_package`');
+    expect(md).toContain('Do not re-emit unchanged package files');
   });
 
   it('pins agent-creator descriptions to current-language defaults and hidden provenance', () => {

@@ -94,15 +94,6 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (predicate()) return;
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-  expect(predicate()).toBe(true);
-}
-
 describe('ipc › conversations.sendStream', () => {
   it('passes the pre-routing title text separately from the routed message', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
@@ -126,6 +117,37 @@ describe('ipc › conversations.sendStream', () => {
       cid: 'c123abc',
       text: '@VideoStudio Draft the launch video',
       title_text: 'Draft the launch video',
+    }]);
+
+    groupChatMock.quiescent = true;
+    groupChatMock.releaseSend?.();
+    await run;
+  });
+
+  it('preserves an explicitly empty title body for a reference-only new task', async () => {
+    if (!streamStartHandler) throw new Error('stream handler not registered');
+    const sender = trustedIpcSender({ isDestroyed: () => false, send: vi.fn() });
+    const run = streamStartHandler(
+      { sender },
+      {
+        requestId: 'reference-only-title',
+        channel: 'conversations.sendStream',
+        payload: {
+          cid: 'c123abc',
+          content: 'Please use these messages as reference.',
+          title_text: '',
+          references: [{ source_cid: 'source123abc', source_msg_id: 'msg123abc' }],
+        },
+      },
+    );
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      text: 'Please use these messages as reference.',
+      title_text: '',
+      references: [{ source_cid: 'source123abc', source_msg_id: 'msg123abc' }],
     }]);
 
     groupChatMock.quiescent = true;
@@ -243,7 +265,14 @@ describe('ipc › conversations.sendStream', () => {
     groupChatMock.releaseSend?.();
   });
 
-  it('relays group bus events before groupChat.send resolves', async () => {
+  // This is the renderer's PRIMARY event source, and the reason is timing: the
+  // subscription is established synchronously before `groupChat.send`, so it
+  // cannot miss a turn's opening events. The `groupChat.events` observer is
+  // asynchronous and tear-down-prone; relying on it alone dropped a whole
+  // turn's events when its abort raced a new send, and the persisted reply was
+  // never rendered. Duplicate delivery is safe because the renderer addresses
+  // rows by render key.
+  it('relays bus events and stays open until the bus is quiescent', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sent: Array<{ channel: string; payload: any }> = [];
     const sender = trustedIpcSender({
@@ -267,9 +296,17 @@ describe('ipc › conversations.sendStream', () => {
       actor: 'agent1',
       data: { type: 'delta', text: 'live' },
     };
+    // Subscribed before `send` resolves — that ordering is the whole point.
+    expect(groupChatMock.subscribers.size).toBe(1);
     for (const cb of groupChatMock.subscribers) cb(liveEvent);
+    await new Promise((resolve) => setTimeout(resolve, 20));
 
-    await waitFor(() => sent.some((item) => item.channel === 'stream:req1' && item.payload?.event?.data === liveEvent));
+    expect(
+      sent.some((item) => item.channel === 'stream:req1' && item.payload?.event?.data === liveEvent),
+      'a bus event emitted while send is still in flight must reach the renderer',
+    ).toBe(true);
+    // Still open: a turn that ended here would clear the composer's busy state
+    // while the agent is mid-run.
     expect(sent.some((item) => item.payload?.type === 'done')).toBe(false);
 
     groupChatMock.quiescent = true;
@@ -279,7 +316,7 @@ describe('ipc › conversations.sendStream', () => {
     expect(sent.at(-1)).toEqual({ channel: 'stream:req1', payload: { type: 'done' } });
   });
 
-  it('keeps relaying group bus events after groupChat.send resolves while the bus is still active', async () => {
+  it('keeps relaying after groupChat.send resolves while the bus is still active', async () => {
     if (!streamStartHandler) throw new Error('stream handler not registered');
     const sent: Array<{ channel: string; payload: any }> = [];
     const sender = trustedIpcSender({
@@ -310,8 +347,13 @@ describe('ipc › conversations.sendStream', () => {
       data: { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: 't1', name: 'web_search' } } },
     };
     for (const cb of groupChatMock.subscribers) cb(liveEvent);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(
+      sent.some((item) => item.channel === 'stream:req2' && item.payload?.event?.data === liveEvent),
+      'events emitted after send resolves must still reach the renderer',
+    ).toBe(true);
+    expect(sent.some((item) => item.payload?.type === 'done')).toBe(false);
 
-    await waitFor(() => sent.some((item) => item.channel === 'stream:req2' && item.payload?.event?.data === liveEvent));
     groupChatMock.quiescent = true;
     for (const cb of groupChatMock.subscribers) cb({ type: 'state_changed', cid: 'c123abc', state: { status: 'idle', in_flight: [] } });
     await run;

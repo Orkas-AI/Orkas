@@ -27,7 +27,7 @@ Use these as channel-aware defaults after the working brief is established. Pres
 
 ## Social post
 
-When the user gives only a goal, choose a platform-neutral default and write the post directly. Do not ask the user to provide a detailed brief unless the missing information would materially change the artifact.
+When the user gives only a goal, choose a platform-neutral default and write the post directly. Never ask which publishing platform to use or present a list of platforms. If the user explicitly names a platform, apply its special constraints or conventions only when they materially change the artifact; otherwise retain the platform-neutral default. This is direct drafting: do not call `manage_execution_plan` or replace the post with a status/completion summary. Do not ask for a detailed brief unless other missing information would materially change the artifact.
 
 - Write a distinct, benefit-specific headline. Follow with an opening that names a recognizable tension, decision, or moment; do not open with a generic definition of the topic.
 - Develop two to four concrete situations. Show what the reader is doing, what becomes easier, and what still requires judgment. A comma-separated feature list is not development.
