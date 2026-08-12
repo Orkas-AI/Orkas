@@ -1758,6 +1758,80 @@ describe('local-tools › write_file', () => {
 });
 
 describe('local-tools › append_file', () => {
+  it('carries a read_file revision across the model round that must separate the two calls', async () => {
+    // 2026-08-11 research-resume-durable-ledger: the agent read fetch_ledger.jsonl
+    // and evidence_ledger.jsonl, quoted the revisions the host had issued for
+    // them, and every append came back E_REVISION_UNKNOWN — four times, then the
+    // no-progress nudge. The tokens were genuine; the store was not.
+    // AgentRunner rebuilds ToolContext.state after every model round, and the
+    // model cannot form an append until it has seen the read result, so the two
+    // calls never share a round. Keeping the revisions on `state` made this
+    // handoff impossible in production while passing a test that reused one
+    // context — which is exactly what the previous regression here did.
+    const { lt, perm } = await loadModules();
+    const ft = await import('../../../src/main/model/core-agent/file-tools');
+    perm.grantLocalExec();
+    await setTmpWorkspace();
+    const tools = lt.createLocalTools({ userId: 'u1' });
+    const append = tools.find((tool) => tool.name === 'append_file')!;
+    const read = ft.createFileTools({ userId: 'u1', cid: 'c1' }).find((t) => t.name === 'read_file')!;
+
+    // The runner injects this one map by reference into every round's state.
+    const runScopedLedger = new Map<string, unknown>();
+    const round = () => {
+      const ctx = makeCtx();
+      ctx.state.runScopedLedger = runScopedLedger;
+      return ctx;
+    };
+
+    const absolutePath = path.join(tmpDir, 'fetch_ledger.jsonl');
+    fs.writeFileSync(absolutePath, '{"kind":"fetch","n":1}\n', 'utf8');
+
+    const readBack = await read.execute({ path: absolutePath }, round());
+    const revision = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(readBack.content)?.[1];
+    expect(revision, 'read_file must hand back a revision').toBeTruthy();
+
+    // A different round object, as production always gives it.
+    const appended = await append.execute({
+      path: 'fetch_ledger.jsonl',
+      content: '{"kind":"fetch","n":2}\n',
+      base_revision: revision,
+    }, round());
+    expect(appended.isError, appended.content).toBeFalsy();
+    expect(fs.readFileSync(absolutePath, 'utf8'))
+      .toBe('{"kind":"fetch","n":1}\n{"kind":"fetch","n":2}\n');
+
+    // The refusal's own revision must survive the next round too: that is the
+    // recovery path the message tells the caller to take.
+    const other = path.join(tmpDir, 'evidence_ledger.jsonl');
+    fs.writeFileSync(other, 'x\n', 'utf8');
+    const refused = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'y\n',
+      base_revision: 'file_rev_neverIssuedAAAA',
+    }, round());
+    expect(refused.isError).toBe(true);
+    expect(refused.content).toContain('E_REVISION_UNKNOWN');
+    const offered = /revision="(file_rev_[A-Za-z0-9_-]{16})"/.exec(refused.content)?.[1];
+    expect(offered).toBeTruthy();
+    const retried = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'y\n',
+      base_revision: offered,
+    }, round());
+    expect(retried.isError, retried.content).toBeFalsy();
+    expect(fs.readFileSync(other, 'utf8')).toBe('x\ny\n');
+
+    // A token from one run must not resolve in another.
+    const foreign = await append.execute({
+      path: 'evidence_ledger.jsonl',
+      content: 'z\n',
+      base_revision: revision,
+    }, makeCtx());
+    expect(foreign.isError).toBe(true);
+    expect(foreign.content).toContain('E_REVISION_UNKNOWN');
+  });
+
   it('rejects empty content or a missing concurrency baseline without changing the file', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
