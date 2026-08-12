@@ -4,8 +4,13 @@
  * Models should copy a revision token instead of translating read_file's
  * character offsets into write_file/append_file byte offsets. The token is an
  * opaque lookup key; the host retains the path, byte size, and content hash.
- * Tokens deliberately expire with ToolContext.state, so a later run must read
- * the file again and cannot accidentally rely on stale process memory.
+ * Tokens deliberately expire with the run, so a later run must read the file
+ * again and cannot accidentally rely on stale process memory. Within a run they
+ * must outlive a model round: the model has to see a read result before it can
+ * form the append that quotes its revision, so those two calls always land in
+ * different rounds and AgentRunner rebuilds ToolContext.state between them. The
+ * tokens therefore live in the `runScopedLedger` map the runner injects by
+ * reference, the same place web_fetch keeps its run cache.
  */
 
 import * as crypto from 'node:crypto';
@@ -38,6 +43,14 @@ type FileRevisionState = {
   appendReplayByInput: Map<string, AppendReplayRecord>;
 };
 
+function newState(): FileRevisionState {
+  return {
+    byToken: new Map(),
+    tokenByIdentity: new Map(),
+    appendReplayByInput: new Map(),
+  };
+}
+
 function stateFor(ctx: ToolContext, create: boolean): FileRevisionState | null {
   // A few direct/legacy tool callers omit `state`; production runners always
   // provide one. Creating it here preserves the useful receipt for those
@@ -47,14 +60,24 @@ function stateFor(ctx: ToolContext, create: boolean): FileRevisionState | null {
     if (!create) return null;
     toolContext.state = {};
   }
+  // Prefer the runner's run-scoped map. `state` itself is rebuilt after every
+  // model round, so a token issued by read_file would otherwise be gone by the
+  // time append_file quotes it — the read and the append can never share a
+  // round. Keeping it on `state` alone made that handoff fail every time in
+  // production while passing any test that reused one context object.
+  const ledger = toolContext.state.runScopedLedger;
+  if (ledger instanceof Map) {
+    const shared = ledger.get(FILE_REVISION_STATE_KEY);
+    if (shared && typeof shared === 'object') return shared as FileRevisionState;
+    if (!create) return null;
+    const created = newState();
+    ledger.set(FILE_REVISION_STATE_KEY, created);
+    return created;
+  }
   const existing = toolContext.state[FILE_REVISION_STATE_KEY];
   if (existing && typeof existing === 'object') return existing as FileRevisionState;
   if (!create) return null;
-  const created: FileRevisionState = {
-    byToken: new Map(),
-    tokenByIdentity: new Map(),
-    appendReplayByInput: new Map(),
-  };
+  const created = newState();
   toolContext.state[FILE_REVISION_STATE_KEY] = created;
   return created;
 }
