@@ -6054,10 +6054,15 @@ function _bindConversationSidebarItems(container, opts = {}) {
     el.addEventListener('click', (e) => {
       if (e.target.closest('.conv-item-title-input')) return;
       if (e.target.closest('.conv-item-action')) return;
+      const cid = el.dataset.cid;
+      // The selected task is already mounted. Re-entering it would rebuild
+      // the transcript, reset its scroll position, refresh attachments, and
+      // steal composer focus even though the user's destination did not change.
+      if (currentView === 'conversation' && currentCid === cid) return;
       _convTrackClick('sidebar_conversation_open', {
         scope: selector.includes('nested') ? 'project' : 'unprojected',
       });
-      setView('conversation', el.dataset.cid);
+      setView('conversation', cid);
     });
   });
   container.querySelectorAll('.conv-item-menu').forEach(btn => {

@@ -412,6 +412,37 @@ describe('conversation run observer cleanup', () => {
 });
 
 describe('conversation sidebar task row actions', () => {
+  it('keeps the selected task mounted while other task rows still navigate', () => {
+    const context = loadConversationRenderer();
+    const navigations: Array<[string, string]> = [];
+    let rowClick: ((event: any) => void) | null = null;
+    const row: any = {
+      dataset: { cid: 'c1' },
+      addEventListener(type: string, listener: (event: any) => void) {
+        if (type === 'click') rowClick = listener;
+      },
+    };
+    const container: any = {
+      querySelectorAll(selector: string) {
+        return selector === '.conv-item' ? [row] : [];
+      },
+    };
+    const event = { target: { closest: () => null } };
+    context.currentView = 'conversation';
+    context.currentCid = 'c1';
+    context.setView = (view: string, cid: string) => { navigations.push([view, cid]); };
+
+    context._bindConversationSidebarItems(container);
+    expect(rowClick).not.toBeNull();
+
+    rowClick!(event);
+    expect(navigations).toEqual([]);
+
+    row.dataset.cid = 'c2';
+    rowClick!(event);
+    expect(navigations).toEqual([['conversation', 'c2']]);
+  });
+
   it('renders a single menu button after the title', () => {
     const context = loadConversationRenderer();
     const html = context._renderConversationSidebarItem({
