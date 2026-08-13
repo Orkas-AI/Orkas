@@ -445,10 +445,11 @@ export const LOOP_HARD = 5;
  *  are identical except for volatile id/timestamp
  *  fields. Strictly above LOOP_HARD so the exact detector always acts first on
  *  byte-identical repeats; this tier catches the "same call, fresh
- *  request-id/uuid each time" spin that exact matching misses. A deliberately
- *  higher hard threshold bounds the run if the warning is ignored. */
+ *  request-id/uuid each time" spin that exact matching misses. WARN-only by
+ *  design: normalized matching is fuzzier than the exact tier, so a false
+ *  positive must stay a benign one-time nudge, never a stop. An ignored nudge
+ *  is bounded by the tool-round cap like any other unproductive work. */
 export const NEAR_DUP_LOOP_WARN = 6;
-export const NEAR_DUP_LOOP_HARD = 12;
 
 /** Compaction skips a pass that would free less than this fraction of the context
  *  window — when the verbatim-kept tail dominates the window, summarising the
@@ -2186,9 +2187,10 @@ export class AgentRunner {
           // modulo volatile id/timestamp fields. The exact streak above resets on
           // any real arg change, so this is the only tier that catches a "same
           // call, fresh request-id/uuid each time" spin. Threshold is above
-          // LOOP_HARD, so exact repeats are already stopped before this fires;
-          // the high hard threshold stops an ignored warning before this can
-          // consume the full 100+ round actor budget.
+          // LOOP_HARD, so exact repeats are already stopped before this fires.
+          // WARN-only: normalized matching is fuzzier than the exact tier, so a
+          // false positive must stay a benign nudge; an ignored nudge is bounded
+          // by the tool-round cap like any other unproductive work.
           const nsig = normalizedToolCallSignature(call);
           if (nsig === normSig) {
             normRepeat += 1;
@@ -2204,21 +2206,12 @@ export class AgentRunner {
               + `(only volatile fields such as ids or timestamps differ). This is likely not making progress. `
               + `Change the target or your approach, or stop and report what you have so far.`;
           }
-          if (normRepeat >= NEAR_DUP_LOOP_HARD) {
-            loopHardTripped = true;
-            break;
-          }
         }
         if (loopHardTripped) {
           repetitiveToolCallsDetected = true;
-          const nearDuplicateHardStop = normRepeat >= NEAR_DUP_LOOP_HARD && loopRepeat < LOOP_HARD;
-          log.warn(nearDuplicateHardStop
-            ? `loop_detection: effectively identical tool call repeated ${NEAR_DUP_LOOP_HARD}x — stopping run`
-            : `loop_detection: identical tool call repeated ${LOOP_HARD}x — stopping run`);
+          log.warn(`loop_detection: identical tool call repeated ${LOOP_HARD}x — stopping run`);
           const final: AgentRunResult = {
-            text: turnText || (nearDuplicateHardStop
-              ? "(Stopped: effectively the same tool call was repeated too many times without progress.)"
-              : "(Stopped: the same tool call was repeated too many times without progress.)"),
+            text: turnText || "(Stopped: the same tool call was repeated too many times without progress.)",
             content: result.content,
             meta: {
               durationMs: Date.now() - startTime,

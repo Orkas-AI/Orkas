@@ -13,7 +13,6 @@ import {
   CONTEXT_COMPACTION_TIMEOUT_MS,
   LOOP_HARD,
   NEAR_DUP_LOOP_WARN,
-  NEAR_DUP_LOOP_HARD,
   RUN_DISCOVERY_NUDGE_ROUNDS,
   RUN_DISCOVERY_STOP_ROUNDS,
   RUN_NO_PROGRESS_NUDGE_ROUNDS,
@@ -4586,11 +4585,16 @@ describe("AgentRunner", () => {
     expect(JSON.stringify(runner.getSession().getMessages())).not.toContain("effectively the same arguments");
   });
 
-  it("loop_detection: hard-stops an ignored near-duplicate warning", async () => {
-    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
+  it("loop_detection: an ignored near-duplicate warning nudges once and never hard-stops", async () => {
+    // The normalized signature deliberately ignores volatile tracking fields,
+    // so this fuzzier tier must warn without terminating a potentially valid
+    // run. Exact repeats and the independent no-progress governor still stop.
+    const ROUNDS = NEAR_DUP_LOOP_WARN * 2;
+    const requests: CompletionParams[] = [];
+    const toolRounds: CompletionResult[] = Array.from({ length: ROUNDS }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
-        id: `near-dup-hard-${index}`,
+        id: `near-dup-ignored-${index}`,
         name: "web_fetch",
         input: { url: "https://example.test/report", request_id: `request-${index}` },
       }],
@@ -4598,7 +4602,15 @@ describe("AgentRunner", () => {
       usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
       model: "mock-model",
     }));
-    const provider = createMockProvider(toolRounds);
+    const provider = createMockProvider([
+      ...toolRounds,
+      {
+        content: [{ type: "text", text: "Finished after the fetch spin." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
     let executions = 0;
@@ -4615,14 +4627,20 @@ describe("AgentRunner", () => {
 
     const result = await runner.run({ message: "fetch the report without spinning" });
 
-    expect(result.text).toContain("Stopped");
-    expect(executions).toBe(NEAR_DUP_LOOP_HARD - 1);
+    expect(executions).toBe(ROUNDS);
+    expect(result.text).toBe("Finished after the fetch spin.");
+    expect(result.meta.toolLoops).toBe(ROUNDS);
+    const controls = requests.flatMap((request) => request.messages)
+      .flatMap((message) => message.content)
+      .filter((content) => content.type === "text" && content.text.includes("effectively the same arguments"));
+    expect(controls).toHaveLength(1);
     expect(result.meta.convergenceSignals).toContain("repetitive_tool_calls");
   });
 
-  it("loop_detection: legitimate pagination can cross the hard threshold without a false stop", async () => {
+  it("loop_detection: legitimate pagination stays distinct far past the warn threshold", async () => {
+    const PAGES = NEAR_DUP_LOOP_WARN * 2;
     const requests: CompletionParams[] = [];
-    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
+    const toolRounds: CompletionResult[] = Array.from({ length: PAGES }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
         id: `page-${index}`,
@@ -4658,7 +4676,7 @@ describe("AgentRunner", () => {
     const result = await runner.run({ message: "read every page" });
 
     expect(result.text).toBe("All distinct pages were read.");
-    expect(result.meta.toolLoops).toBe(NEAR_DUP_LOOP_HARD);
+    expect(result.meta.toolLoops).toBe(PAGES);
     expect(JSON.stringify(requests)).not.toContain("effectively the same arguments");
   });
 
