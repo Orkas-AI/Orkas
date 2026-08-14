@@ -14,6 +14,7 @@ import {
   HISTORY_EXACT_FACTS_HEADING,
   HISTORY_EXACT_FACTS_MAX_ITEMS,
   HISTORY_RAW_RETAIN_TOKEN_BUDGET,
+  IMAGE_BLOCK_ESTIMATE_TOKENS,
   DEFAULT_CONTEXT_BUDGET,
   contextBudget,
 } from "../src/agent/session.js";
@@ -1219,6 +1220,41 @@ describe("Session", () => {
     const flat = msgs.flatMap((m) => m.content);
     expect(flat.some((c) => (c as { type?: string }).type === "tool_use" && (c as { id?: string }).id === "call-Z")).toBe(true);
     expect(flat.some((c) => (c as { type?: string }).type === "tool_result" && (c as { toolUseId?: string }).toolUseId === "call-Z")).toBe(true);
+  });
+
+  // Image blocks cost real tokens (provider caps sit around 1,600 per image)
+  // but the estimator priced them at zero, so image-heavy turns — frame
+  // screenshots from browser/video tools — were invisible to every derived
+  // trigger and budget until the provider refused the request.
+  it("prices image blocks instead of estimating them at zero", () => {
+    const textOnly = new Session();
+    textOnly.addUserMessage("inspect the frames");
+    const withImages = new Session();
+    withImages.addMessage("user", [
+      { type: "text", text: "inspect the frames" },
+      { type: "image", data: "aW1n", mediaType: "image/png" },
+      { type: "image", data: "aW1n", mediaType: "image/png" },
+    ]);
+    expect(withImages.estimateTokens() - textOnly.estimateTokens())
+      .toBe(2 * IMAGE_BLOCK_ESTIMATE_TOKENS);
+  });
+
+  it("image-heavy tool steps reach the active checkpoint trigger", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "render the video frames" }]);
+    // 14 steps, each returning one screenshot: ~22K estimated tokens of
+    // images against the 18K default trigger. With images priced at zero
+    // this turn estimated as a few hundred tokens and never produced a
+    // checkpoint candidate while the real request kept growing.
+    for (let i = 0; i < 14; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `frame-${i}`, name: "screenshot", input: { frame: i } }]);
+      session.addToolResult(`frame-${i}`, `frame ${i} captured`, [
+        { data: "aW1n", mediaType: "image/png" },
+      ]);
+    }
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).not.toBeNull();
+    expect(candidate!.tokensBefore).toBeGreaterThan(ACTIVE_PROCESS_TRIGGER_TOKENS);
   });
 
   // estimateKeptTailTokens powers the runner's "skip a no-progress compaction"
