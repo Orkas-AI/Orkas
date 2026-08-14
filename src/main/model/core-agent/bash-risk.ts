@@ -10,7 +10,7 @@
  *
  * Four categories (see Common/docs/plans/agent-bash-risk-prompt.md §1):
  *   - network_egress  — UPLOAD / exfil shapes only; plain downloads pass.
- *   - destructive     — shell delete commands (`rm`, `Remove-Item`, `del`),
+ *   - destructive     — shell delete and process-termination commands,
  *                       plus dd / mkfs / disk tools / fork bombs.
  *   - priv_esc        — sudo / su / doas / pkexec / Windows elevation.
  *   - sensitive_path  — credential & key files (any access), persistence /
@@ -331,12 +331,85 @@ function matchPipeToShell(seg: Segment): boolean {
 }
 
 const RAW_DEVICE_RE = /^\/dev\/(sd|hd|nvme|disk|rdisk|mapper)/i;
+const POSIX_PROCESS_TERMINATORS = new Set(['kill', 'pkill', 'killall']);
+const SIGNAL_NAME_RE = /^-(?:sig)?(?:abrt|alrm|bus|chld|cld|cont|emt|fpe|hup|ill|info|int|io|iot|kill|lost|pipe|poll|prof|pwr|quit|segv|stkflt|stop|sys|term|trap|tstp|ttin|ttou|urg|usr1|usr2|vtalrm|winch|xcpu|xfsz)$/i;
 
 function hasRecursiveFlag(args: string[]): boolean {
   return args.some((a) => a === '--recursive' || (/^-[A-Za-z]+$/.test(a) && /[rR]/.test(a)));
 }
 
+/** Return the last explicit POSIX signal selector, if any. Later selectors
+ *  win in the common implementations, so `kill -0 -TERM 1234` must not be
+ *  mistaken for a read-only signal-zero probe. */
+function explicitProcessSignal(args: string[]): string | null {
+  let signal: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const lower = arg.toLowerCase();
+    if (lower === '-s' || lower === '--signal') {
+      if (i + 1 < args.length) signal = args[++i].toLowerCase().replace(/^sig/, '');
+      continue;
+    }
+    if (lower.startsWith('--signal=')) {
+      signal = lower.slice('--signal='.length).replace(/^sig/, '');
+      continue;
+    }
+    if (/^-\d+$/.test(lower) || SIGNAL_NAME_RE.test(lower)) {
+      signal = lower.slice(1).replace(/^sig/, '');
+    }
+  }
+  return signal;
+}
+
+/** Find actual POSIX process selectors while excluding signal syntax. Other
+ *  option values deliberately count: e.g. `pkill -u alice` really does select
+ *  and terminate processes even without a trailing pattern. */
+function processTerminationTargets(args: string[]): string[] {
+  const targets: string[] = [];
+  let endOfFlags = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const lower = arg.toLowerCase();
+    if (!endOfFlags && arg === '--') { endOfFlags = true; continue; }
+    if (!endOfFlags && (lower === '-s' || lower === '--signal')) { i++; continue; }
+    if (!endOfFlags && (lower.startsWith('--signal=') || /^-\d+$/.test(lower) || SIGNAL_NAME_RE.test(lower))) {
+      continue;
+    }
+    if (!endOfFlags && isFlag(arg)) continue;
+    targets.push(arg);
+  }
+  return targets;
+}
+
+function matchProcessTermination(cmd: string, args: string[]): boolean {
+  const lower = args.map((arg) => arg.toLowerCase());
+  const hasHelp = lower.some((arg) => arg === '--help' || arg === '--version' || arg === '-?' || arg === '/?');
+  if (hasHelp) return false;
+
+  if (cmd === 'taskkill' || cmd === 'taskkill.exe') {
+    return lower.some((arg, index) => (
+      ((arg === '/pid' || arg === '/im') && Boolean(args[index + 1]) && !args[index + 1].startsWith('/'))
+      || /^\/(?:pid|im):.+/i.test(arg)
+    ));
+  }
+
+  if (cmd === 'stop-process') {
+    if (lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true')) return false;
+    // Like Remove-Item, Stop-Process accepts pipeline input and may therefore
+    // terminate a process even without an explicit operand in this stage.
+    return true;
+  }
+
+  if (!POSIX_PROCESS_TERMINATORS.has(cmd)) return false;
+  if (lower.some((arg) => arg === '-l' || arg === '--list')) return false;
+  const targets = processTerminationTargets(args);
+  if (!targets.length) return false;
+  const signal = explicitProcessSignal(args);
+  return signal === null || !/^0+$/.test(signal);
+}
+
 function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
+  if (matchProcessTermination(cmd, args)) return true;
   if (cmd === 'rm') {
     if (args.some((a) => a === '--help' || a === '--version')) return false;
     const targets = commandOperands(args);
