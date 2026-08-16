@@ -97,9 +97,9 @@ Yes — MIT licensed. Bring your own model keys; you only ever pay your model pr
 
 Packaged installers are currently available for macOS and Windows. Linux users should follow the source instructions below.
 
-- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&os=mac&arch=arm64&download=1)
-- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&os=mac&arch=x64&download=1)
-- **Windows x64** -> [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&os=win&download=1)
+- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
+- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
+- **Windows x64** -> [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
 
 To run from source:
 

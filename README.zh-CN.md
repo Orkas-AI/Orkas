@@ -97,9 +97,9 @@ Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架�
 
 目前 macOS 和 Windows 提供安装包；Linux 用户请按照下方步骤从源码运行。
 
-- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&os=mac&arch=arm64&download=1)
-- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&os=mac&arch=x64&download=1)
-- **Windows x64** → [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&os=win&download=1)
+- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
+- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
+- **Windows x64** → [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
 
 从源码运行：
 
