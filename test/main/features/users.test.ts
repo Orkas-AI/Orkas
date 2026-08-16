@@ -149,7 +149,7 @@ describe('features/users › initActiveUser', () => {
   it('first boot: generates a uid and writes users.json', async () => {
     const users = await import('../../../src/main/features/users');
     const rec = users.initActiveUser();
-    expect(/^\d{8}$/.test(rec.user_id)).toBe(true);
+    expect(/^[0-9a-f]{32}$/.test(rec.user_id)).toBe(true);
     expect(users.getActiveUserId()).toBe(rec.user_id);
     expect(fs.existsSync(path.join(tmpDir, 'users.json'))).toBe(true);
   });
@@ -162,18 +162,18 @@ describe('features/users › initActiveUser', () => {
     expect(fs.existsSync(path.join(tmpDir, 'anonymous', 'local', 'config'))).toBe(true);
   });
 
-  it('subsequent boot: reuses current_user_id from users.json', async () => {
+  it('subsequent boot: preserves an existing legacy 8-digit uid', async () => {
     fs.writeFileSync(
       path.join(tmpDir, 'users.json'),
       JSON.stringify({
-        current_user_id: 'u1',
-        users: [{ user_id: 'u1', created_at: '2026-01-01T00:00:00' }],
+        current_user_id: '12345678',
+        users: [{ user_id: '12345678', created_at: '2026-01-01T00:00:00' }],
       }),
       'utf-8',
     );
     const users = await import('../../../src/main/features/users');
     const rec = users.initActiveUser();
-    expect(rec.user_id).toBe('u1');
+    expect(rec.user_id).toBe('12345678');
     expect(rec.created_at).toBe('2026-01-01T00:00:00');
   });
 });

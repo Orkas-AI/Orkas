@@ -12,7 +12,7 @@
  *   - the server account uid while logged in.
  *
  * the open-source build still calls `initActiveUser()` without options, so first boot
- * keeps the original 8-digit local id.
+ * creates a random 32-character local id.
  *
  * Boot sequence:
  *   1. Read users.json; if absent, create the first profile id and point the
@@ -66,7 +66,7 @@ interface UsersRegistry {
 }
 
 export interface InitActiveUserOptions {
-  /** Hosted Orkas passes `anonymous`; the open-source build omits this and gets a generated 8-digit uid. */
+  /** Hosted Orkas passes `anonymous`; the open-source build omits this and gets a generated 32-character uid. */
   defaultLocalId?: string;
 }
 
@@ -430,7 +430,7 @@ export function activateUser(uid: string): void {
 /**
  * Boot-time entrypoint — read users.json and activate this environment's
  * current-user pointer. If none exists, activate `defaultLocalId` (hosted:
- * anonymous) or generate the legacy 8-digit uid (the open-source build).
+ * anonymous) or generate a random 32-character uid (the open-source build).
  */
 export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
   const reg = readRegistry();

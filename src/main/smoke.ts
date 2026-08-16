@@ -51,7 +51,7 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
     console.log('[smoke] storage');
     await section('nowIso matches YYYY-MM-DDTHH:MM:SS', () =>
       assert.ok(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(storage.nowIso())));
-    await section('genUserId is 8 digits', () => assert.ok(/^\d{8}$/.test(storage.genUserId())));
+    await section('genUserId is 32 lowercase hex characters', () => assert.ok(/^[0-9a-f]{32}$/.test(storage.genUserId())));
     await section('genId12 is 12 hex', () => assert.ok(/^[0-9a-f]{12}$/.test(storage.genId12())));
     await section('safeId rejects traversal', () => assert.ok(!storage.safeId('../evil')));
     await section('safeId accepts normal', () => assert.ok(storage.safeId('abc-123_XYZ')));

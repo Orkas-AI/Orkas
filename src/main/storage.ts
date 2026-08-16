@@ -22,11 +22,9 @@ export function nowIso(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-/** 8-digit numeric user id. */
+/** UUID v4 local user id: 32 lowercase hexadecimal characters without hyphens. */
 export function genUserId(): string {
-  let out = '';
-  for (let i = 0; i < 8; i++) out += Math.floor(Math.random() * 10);
-  return out;
+  return crypto.randomUUID().replace(/-/g, '');
 }
 
 /** 12-hex-char id (agents + conversations). */

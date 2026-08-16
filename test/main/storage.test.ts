@@ -30,9 +30,9 @@ describe('storage › timestamps & ids', () => {
     expect(nowIso()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/);
   });
 
-  it('genUserId returns 8 decimal digits', () => {
+  it('genUserId returns a lowercase UUID v4 without hyphens', () => {
     for (let i = 0; i < 50; i++) {
-      expect(genUserId()).toMatch(/^\d{8}$/);
+      expect(genUserId()).toMatch(/^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$/);
     }
   });
 

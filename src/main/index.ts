@@ -192,6 +192,7 @@ import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as taskNotifications from './features/task_notifications';
 import * as notificationPermissions from './features/notification_permissions';
+import { startOpenLifecycleTracking } from './features/open_lifecycle';
 import {
   consumeColdLaunchConnectorCallback,
   registerConnectorProtocol,
@@ -1193,6 +1194,17 @@ if (!gotLock) {
     }, CONNECTORS_BOOTSTRAP_DELAY_MS);
     connectorsTimer.unref?.();
     createWindow();
+    const stopOpenLifecycleTracking = startOpenLifecycleTracking({
+      app,
+      getActiveUserId: () => users.getActiveUserId(),
+      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
+        !win.isDestroyed() && win.isFocused()
+      )),
+      // Test and packaged-smoke launches use synthetic workspaces and must not
+      // write production analytics. Normal source and packaged runs behave alike.
+      enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
+    });
+    app.once('will-quit', stopOpenLifecycleTracking);
     await consumeColdLaunchConnectorCallback();
 
     // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
