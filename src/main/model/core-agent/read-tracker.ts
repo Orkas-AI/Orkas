@@ -78,8 +78,15 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  * Decide whether `edit_file` may proceed on `abs`, given its current stat.
  * Returns null when the edit is allowed (or when the run-scoped map is absent,
  * i.e. the host opted out — see module header), otherwise the block reason:
- *   - never read this run            → E_NOT_READ (read it first)
- *   - read, but mtime/size changed   → E_STALE   (re-read; it moved under you)
+ *   - never read this run            → E_NOT_READ
+ *   - read, but mtime/size changed   → E_STALE
+ *
+ * Message contract: every consumer (edit_file, apply_patch) appends a
+ * recovery block with the current bytes and a fresh file_hash, and refreshes
+ * the read baseline on rejection — so the messages steer the model at that
+ * returned context first. A bare "call read_file again" here made models pay
+ * a full re-read round the trailer had already made unnecessary
+ * (2026-08-16 latency review P0-4).
  */
 export function checkEditFreshness(
   ctx: ToolContext,
@@ -102,7 +109,7 @@ export function checkEditFreshness(
   if (!seen) {
     return {
       code: 'E_NOT_READ',
-      msg: `${abs}: read the file with read_file before editing it, so old_string matches the real current contents.`,
+      msg: `${abs}: not read in this run, so old_string cannot be checked against the real current contents. Use the current context and file_hash returned below to retry (pass expected_hash); use read_file with a bounded range only if that window misses your target.`,
     };
   }
   if (
@@ -112,7 +119,7 @@ export function checkEditFreshness(
   ) {
     return {
       code: 'E_STALE',
-      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Call read_file again, then redo the edit against the current contents.`,
+      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Retry against the current context and file_hash returned below (pass expected_hash); re-read only the affected region with read_file range if that window is insufficient.`,
     };
   }
   return null;

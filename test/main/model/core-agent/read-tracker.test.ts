@@ -53,6 +53,12 @@ describe('read-tracker › checkEditFreshness', () => {
     const st = fs.statSync(file);
     const block = checkEditFreshness(ctx, file, st);
     expect(block?.code).toBe('E_NOT_READ');
+    // The refusal steers at the recovery block every consumer appends, not at
+    // a bare full re-read: a "call read_file" instruction here made models pay
+    // a whole re-read round the returned context had already made unnecessary.
+    expect(block?.msg).toContain('expected_hash');
+    expect(block?.msg).toContain('bounded range');
+    expect(block?.msg).not.toMatch(/read the file with read_file before/);
   });
 
   it('allows the edit after a read records the baseline', () => {
@@ -80,6 +86,11 @@ describe('read-tracker › checkEditFreshness', () => {
     fs.writeFileSync(file, 'a much longer body than before', 'utf8'); // size changes
     const block = checkEditFreshness(ctx, file, fs.statSync(file));
     expect(block?.code).toBe('E_STALE');
+    // Same recovery-first contract as E_NOT_READ: retry against the returned
+    // context/hash, bounded range re-read only as the fallback.
+    expect(block?.msg).toContain('expected_hash');
+    expect(block?.msg).toContain('read_file range');
+    expect(block?.msg).not.toMatch(/Call read_file again/);
   });
 
   it('blocks with E_STALE when only mtime changed (same size)', () => {
