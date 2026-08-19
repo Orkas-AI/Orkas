@@ -416,8 +416,7 @@ function setView(view, cid, opts = {}) {
   }
   if (view === 'conversation' && cid) {
     currentCid = cid;
-    // Opening the task is the read boundary for its completed reply. This also
-    // runs when the already-selected row is clicked again.
+    // Opening the task is the read boundary for its completed reply.
     if (typeof _markConversationRead === 'function') _markConversationRead(cid);
     // Bind the video review drawer to the conversation being shown, here rather
     // than inside loadConversationHistory. Only one of the three branches below
