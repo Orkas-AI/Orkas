@@ -175,7 +175,7 @@ Nested runs deliberately skip `globalSlots`: the parent turn already holds a slo
 
 ### Context budget: derived from the model, not a fixed number
 
-Compaction used to fire at fixed token counts — 18K within a turn, 12K across turns — tuned back when 200K was the ceiling. That number meant nothing to a 1M-window model, and it was actively dangerous on a 32K one: its ~25K of usable input never reached an 18K trigger with enough room left to act, so the guard failed exactly the model that needed it most. The budget is now derived top-down ([`context-budget.ts`](./src/core-agent/src/agent/context-budget.ts)):
+Every compaction threshold is derived from the model in use, so one policy fits a 32K window and a 1M one alike ([`context-budget.ts`](./src/core-agent/src/agent/context-budget.ts)):
 
 ```
 usableInput   = contextWindow − maxOutputTokens − safety
@@ -184,7 +184,7 @@ messageBudget = max(usableInput × 0.2, usableInput − systemPrompt − toolDef
 
 Every trigger is a share of `messageBudget` — 0.3 for the in-turn layer, 0.2 for cross-turn history, 0.1 for one round's inline tool results — and everything else derives from its trigger, so the shares are the only tunable surface. They sum to well under 1, leaving room for injected runtime state and for the growth that happens between a trigger firing and its summary landing. The `max` is a fuse: when a large tool set would otherwise swallow the window, messages keep a floor share instead of computing a negative budget.
 
-There is deliberately **no cap on how many times a run may compact successfully**. That ceiling existed twice and failed the same way both times: once reached, context can only grow, the inline-result allowance falls to zero, and the agent keeps calling tools whose output it can no longer see — silently, until the request finally overflows. What gets bounded instead is wasted work: a fingerprint check refuses to compact identical state twice, a minimum-savings threshold rejects passes that would free too little, and three consecutive failures stop LLM-backed compaction.
+A run compacts as many times as it needs to — there is deliberately **no ceiling on successful passes**. What is bounded is wasted work instead: a fingerprint check refuses to compact identical state twice, a minimum-savings threshold rejects passes that would free too little, and three consecutive failures stop LLM-backed compaction.
 
 Summarization loses detail, so what an agent must not forget is kept as structure rather than prose. A workspace ledger of files written, files read, and commands run survives compaction ([`workspace-state.ts`](./src/core-agent/src/agent/workspace-state.ts)), and a spin detector — two or more compactions plus 75% of the tool budget consumed — nudges the agent once to re-anchor on that ledger instead of re-deriving work it just summarized away.
 
