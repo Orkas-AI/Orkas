@@ -37,6 +37,14 @@ export {
   type ContextBudget,
 } from "./context-budget.js";
 
+/** Flat per-image estimate. Real cost is dimension-dependent — Anthropic caps
+ *  around 1,600 tokens per image and OpenAI high-detail lands nearby — but the
+ *  estimator only needs to stop pricing a thousand-token block at zero: the
+ *  request-token anchor corrects to provider truth at the next completed call,
+ *  overestimating merely compacts a little early, and underestimating is an
+ *  overflow. Dimension-aware costing is deliberately not attempted. */
+export const IMAGE_BLOCK_ESTIMATE_TOKENS = 1_600;
+
 export const HISTORY_SUMMARY_MAX_TOKENS = 2_048;
 export const HISTORY_EXACT_FACTS_HEADING =
   "Exact facts and identifiers required across turns (cumulative):";
@@ -2868,6 +2876,7 @@ function sumMessageTokens(messages: Message[]): number {
       if (c.type === "text") total += estimateTextTokens(c.text);
       else if (c.type === "tool_result") total += estimateTextTokens(c.content);
       else if (c.type === "tool_use") total += estimateTextTokens(JSON.stringify(c.input));
+      else if (c.type === "image") total += IMAGE_BLOCK_ESTIMATE_TOKENS;
     }
   }
   return total;
