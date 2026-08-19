@@ -155,28 +155,40 @@ run.cmd            # Windows
 
 > Full design and hard constraints → [`CLAUDE.md`](./CLAUDE.md)
 
-### Group chat: visibility slicing + a single scheduling primitive
+### Three dispatch verbs, and the rule for choosing between them
 
-In one chat there's the Commander, N specialist agents, and you — but **each agent does not see the same conversation**.
+The Commander is the only actor holding dispatch tools — workers and agents have none. Which verb it picks decides who the user hears from and whether the Commander stays in the loop:
 
-- **Visibility slicing** — the main conversation is one full jsonl; each agent only gets a slice (`from==me ∨ to∋me ∨ mentions∋me`). A worker never reads the full main conversation — saves tokens and prevents private context from leaking across agents.
-- **One scheduling primitive** — every dispatch (the Commander's `dispatch_to`, the user's `@`, plan steps) funnels into the same `enqueue` primitive. No parallel routing paths.
-- **Shared plan** — when agents collaborate, the Commander writes progress into one `plan.md`, visible to every member.
+| Verb | User sees the agent's reply | Result returns to the Commander | Commander's turn |
+| --- | --- | --- | --- |
+| `hand_off_to({ to, message })` | yes | no | ends — the agent's reply stands as the answer |
+| `dispatch_to({ to, message })` | yes | yes | continues with a named next step |
+| `run_worker({ to, task })` | no — private input | yes | continues |
 
-### Agent dispatch: structured channels, not `@` in prose
+The Commander has to name its concrete next action *before* it may choose `dispatch_to`; if all that remains is restating the agent's reply, the rule forces `hand_off_to`. That single constraint is what stops a multi-agent chat from ending in a redundant re-summary of what you already read. Emitting several `run_worker` calls in one response runs them concurrently.
 
-- **Structured dispatch** — Commander-to-agent dispatches go through the `dispatch_to({to, message})` tool call; `@` in prose is not treated as a dispatch signal (the user's `@` is still recognized — UX unchanged).
-- **Deferred wake-up** — a `dispatch_to` only stages; the recipient wakes only after the Commander's turn finishes, preventing premature execution.
-- **Turn-based safety stop** — the runaway guard counts turns (`MAX_WORKER_TURNS=100`), not wall-clock time, so a slow-but-progressing LLM isn't killed.
+### Visibility slicing: no agent reads the whole conversation
 
-### Self-evolution: `meta/` + self-managed skills
+The conversation is one canonical jsonl. You and the Commander read it in full; **every agent gets only a slice** — the messages where it appears in `from`, `to`, or `mentions` ([`visibility.ts`](./src/main/features/group_chat/visibility.ts)). The slice is an authorization boundary rather than a replay buffer: agents pull what they need through scope-bounded history tools instead of replaying someone else's context. Fewer tokens, and one agent's private context never leaks into another's.
 
-Each agent maintains, in its own directory:
+### One runtime, bounded fan-out
 
-- **`meta/COMPETENCE.md`** — what it's good / not good at.
-- **`meta/LEARNING_STRATEGIES.md`** — methods that have worked for it.
+Each conversation has a single FIFO runtime, and top-level turns run through it serially; parallelism happens *inside* a turn as nested in-process dispatch ([`bus.ts`](./src/main/features/group_chat/bus.ts)). Two separate semaphores bound it — `globalSlots = 10` across all users, and `dispatchSlots = 4` for nested dispatches (`ORKAS_MAX_DISPATCH_CONCURRENCY`).
 
-After each task the agent reflects and updates these; on the next task `meta/` is fed back into the system prompt, so experience shapes the next run. Via the `skill_manage` tool an agent can also crystallize "how I solved X" into a **private** skill, reused directly next time.
+Nested runs deliberately skip `globalSlots`: the parent turn already holds a slot, so a nested acquire would deadlock as parent-waits-on-child. That shortcut is safe only because dispatch tools belong to the Commander alone, so the semaphore is never acquired re-entrantly — the deadlock is ruled out by construction, not by a timeout.
+
+### Four independent runaway guards
+
+- **Turn ceiling** — `MAX_WORKER_TURNS = 100` counts turns, not wall-clock time, so a slow-but-progressing model isn't killed.
+- **Per-turn tool rounds** — Commander 120, named agent 100, ephemeral worker the schema default ([`actor-budgets.ts`](./src/main/features/group_chat/actor-budgets.ts)), pinned by unit tests so they can't silently drift.
+- **`loop_detection`** — nudges the model after N consecutive identical or near-duplicate tool calls.
+- **Tool-idle watchdog** — for turns that stall rather than loop.
+
+### Self-evolution: signal-triggered, not after every task
+
+Each agent keeps `meta/COMPETENCE.md` (what it is and isn't good at) and `meta/LEARNING_STRATEGIES.md` (methods that have worked for it), both fed back into its system prompt on the next run.
+
+Reflection is not a fixed counter. A weighted trigger scores six signals — `error_recovery`, `user_correction`, `complexity`, `known_weakness`, `weakness_succeeded`, `skill_ineffective` — and reviews only when the total clears a threshold, generating the review prompt from whichever signal dominated ([`metacognition.ts`](./src/core-agent/src/evolution/metacognition.ts)). Through `skill_manage` an agent can also crystallize "how I solved X" into a **private** `SKILL.md` that it can use from the next turn on.
 
 ---
 
