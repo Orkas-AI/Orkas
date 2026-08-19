@@ -48,7 +48,7 @@ Installed and ready the first time you launch Orkas — each with its own skills
 - **Drives the open-source ecosystem** — plug in external CLI coding agents (Claude Code, Codex, OpenCode, Cline) and onboard open-source projects like HyperFrames as local tools, all coordinated by the same Commander.
 - **Local-first by design** — conversations, files, API keys, knowledge bases, and custom agents all stay on your disk. Model calls go straight from your machine to the provider — never through Orkas servers.
 - **No vendor lock-in** — mix providers across agents: one on Claude, another on DeepSeek, another on a local endpoint.
-- **Self-evolving workforce** — each agent has its own private skills and memory, and improves through reflection after each task.
+- **Agents that get better** — each agent has its own private skills and memory, and improves through reflection after each task.
 
 > ⭐ If Orkas is useful to you, a star helps more people find the project.
 
@@ -79,13 +79,13 @@ Packaged installers for macOS and Windows. Linux runs from source today — see 
 
 | Tool | What it is | How Orkas differs |
 | --- | --- | --- |
-| **LangChain** | A developer framework/library for building LLM apps and agents — code-first, embedded in your own Python/JS app. | Orkas is a local-first AI workforce you direct through chat, not by writing orchestration code. Data and keys stay local by default. |
+| **LangChain** | A developer framework/library for building LLM apps and agents — code-first, embedded in your own Python/JS app. | Orkas is a local-first multi-agent desktop app you direct through chat, not by writing orchestration code. Data and keys stay local by default. |
 | **CrewAI** | A Python framework for orchestrating role-playing autonomous agents — you define crews and agents in code. | Orkas brings multi-agent orchestration into a desktop app, with **local-first storage** and per-agent self-evolution built in. |
 | **Cloud agent platforms** (SaaS orchestrators) | Server-hosted; conversations, files, and API keys live on the vendor's infrastructure. | Orkas is **local-first**: everything stays on your machine, and model API calls go straight to the provider — never archived by Orkas. |
-| **OpenClaw** | A single always-on personal assistant reaching you across messaging channels. | Orkas gives you a local-first AI workforce: the Commander coordinates specialist agents from one desktop chat, and OpenClaw plugs in as an Orkas CLI backend. |
-| **Hermes-Agent** | Nous Research's self-improving personal agent (TUI + multi-channel gateway). | Orkas is a desktop GUI for a local-first AI workforce, with per-agent private skills and meta-cognition — and Hermes-Agent plugs in as an Orkas CLI backend. |
+| **OpenClaw** | A single always-on personal assistant reaching you across messaging channels. | Orkas gives you a team rather than one assistant: the Commander coordinates specialist agents from one desktop chat, and OpenClaw plugs in as an Orkas CLI backend. |
+| **Hermes-Agent** | Nous Research's self-improving personal agent (TUI + multi-channel gateway). | Orkas is a local-first multi-agent desktop app, with per-agent private skills and meta-cognition — and Hermes-Agent plugs in as an Orkas CLI backend. |
 
-**Orkas is for you if** you want a local-first AI workforce (not one assistant), a desktop GUI with file drop-in and visual agent management, and your data, keys, and agents on your own disk rather than a vendor cloud.
+**Orkas is for you if** you want a team of agents rather than one assistant, a desktop GUI with file drop-in and visual agent management, and your data, keys, and agents on your own disk rather than a vendor cloud.
 
 **Not for you if** you just want a single all-purpose chatbot, a fully hosted/cloud team where your data lives on a vendor's servers, or a pure code library to embed in your own app.
 
@@ -96,7 +96,7 @@ Packaged installers for macOS and Windows. Linux runs from source today — see 
 ## FAQ
 
 **What is Orkas?**
-Orkas is an open-source, local-first AI workforce. A super-powered Commander coordinates specialist agents to complete complex work together — not a single chatbot, not a code framework, not a hosted SaaS.
+Orkas is an open-source, local-first multi-agent desktop app. A super-powered Commander plans your goal and coordinates specialist agents to complete it together — nine of them ship with the app. Not a single chatbot, not a code framework, not a hosted SaaS.
 
 **Is Orkas a local LLM?**
 No. Orkas runs on your machine but calls the models you choose through your own API keys (or a local model endpoint). It orchestrates agents and tools — it is not itself a model.
@@ -111,7 +111,7 @@ The app is fully offline-capable — only the model calls need network. Point ag
 Yes. Beyond its own Commander and specialist agents, Orkas can drive external CLI coding agents — Claude Code, Codex, OpenCode, Cline — as local subprocesses, and onboard open-source projects like HyperFrames, all directed from the same chat.
 
 **How is Orkas different from Claude Desktop / CrewAI / LangChain?**
-Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first AI workforce: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
+Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first multi-agent desktop app: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
 
 **Is Orkas free and open source?**
 Yes — the app is MIT licensed and free to use. Bring your own model keys and you pay only your model providers; Orkas never takes a cut. Optionally, the desktop app also offers a built-in **Orkas model** for people who don't want to manage API keys — that one is billed by Orkas in credits (membership or credit packs). It is entirely opt-in, and every other feature works on your own keys. [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
