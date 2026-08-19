@@ -167,15 +167,32 @@ The Commander is the only actor holding dispatch tools — workers and agents ha
 
 The Commander has to name its concrete next action *before* it may choose `dispatch_to`; if all that remains is restating the agent's reply, the rule forces `hand_off_to`. That single constraint is what stops a multi-agent chat from ending in a redundant re-summary of what you already read. Emitting several `run_worker` calls in one response runs them concurrently.
 
-### Visibility slicing: no agent reads the whole conversation
-
-The conversation is one canonical jsonl. You and the Commander read it in full; **every agent gets only a slice** — the messages where it appears in `from`, `to`, or `mentions` ([`visibility.ts`](./src/main/features/group_chat/visibility.ts)). The slice is an authorization boundary rather than a replay buffer: agents pull what they need through scope-bounded history tools instead of replaying someone else's context. Fewer tokens, and one agent's private context never leaks into another's.
-
 ### One runtime, bounded fan-out
 
 Each conversation has a single FIFO runtime, and top-level turns run through it serially; parallelism happens *inside* a turn as nested in-process dispatch ([`bus.ts`](./src/main/features/group_chat/bus.ts)). Two separate semaphores bound it — `globalSlots = 10` across all users, and `dispatchSlots = 4` for nested dispatches (`ORKAS_MAX_DISPATCH_CONCURRENCY`).
 
 Nested runs deliberately skip `globalSlots`: the parent turn already holds a slot, so a nested acquire would deadlock as parent-waits-on-child. That shortcut is safe only because dispatch tools belong to the Commander alone, so the semaphore is never acquired re-entrantly — the deadlock is ruled out by construction, not by a timeout.
+
+### Context budget: derived from the model, not a fixed number
+
+Compaction used to fire at fixed token counts — 18K within a turn, 12K across turns — tuned back when 200K was the ceiling. That number meant nothing to a 1M-window model, and it was actively dangerous on a 32K one: its ~25K of usable input never reached an 18K trigger with enough room left to act, so the guard failed exactly the model that needed it most. The budget is now derived top-down ([`context-budget.ts`](./src/core-agent/src/agent/context-budget.ts)):
+
+```
+usableInput   = contextWindow − maxOutputTokens − safety
+messageBudget = max(usableInput × 0.2, usableInput − systemPrompt − toolDefs)
+```
+
+Every trigger is a share of `messageBudget` — 0.3 for the in-turn layer, 0.2 for cross-turn history, 0.1 for one round's inline tool results — and everything else derives from its trigger, so the shares are the only tunable surface. They sum to well under 1, leaving room for injected runtime state and for the growth that happens between a trigger firing and its summary landing. The `max` is a fuse: when a large tool set would otherwise swallow the window, messages keep a floor share instead of computing a negative budget.
+
+There is deliberately **no cap on how many times a run may compact successfully**. That ceiling existed twice and failed the same way both times: once reached, context can only grow, the inline-result allowance falls to zero, and the agent keeps calling tools whose output it can no longer see — silently, until the request finally overflows. What gets bounded instead is wasted work: a fingerprint check refuses to compact identical state twice, a minimum-savings threshold rejects passes that would free too little, and three consecutive failures stop LLM-backed compaction.
+
+Summarization loses detail, so what an agent must not forget is kept as structure rather than prose. A workspace ledger of files written, files read, and commands run survives compaction ([`workspace-state.ts`](./src/core-agent/src/agent/workspace-state.ts)), and a spin detector — two or more compactions plus 75% of the tool budget consumed — nudges the agent once to re-anchor on that ledger instead of re-deriving work it just summarized away.
+
+### Memory: hybrid retrieval over a local index
+
+A knowledge base is a SQLite index built on your machine — FTS5 for full text, stored vectors for similarity ([`memory/`](./src/core-agent/src/memory)). Documents are chunked at 512 lines with 64 lines of overlap; a query runs both ways and the two ranked lists merge by reciprocal rank fusion, weighted 0.7 vector to 0.3 keyword. Agents reach it through `memory_search` and `memory_read`, over stored documents and past sessions alike.
+
+Embeddings are computed **on device** by a bundled ONNX model (`bge-small-zh-v1.5`, ~95 MB, fetched once during install), so indexing a knowledge base sends nothing anywhere. Cloud embedding providers — OpenAI, Gemini, Voyage, Mistral — are available if you prefer them.
 
 ### Four independent runaway guards
 
