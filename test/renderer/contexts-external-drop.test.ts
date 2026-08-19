@@ -102,6 +102,14 @@ function dropEvent(dataTransfer: any, closestEntry: any = null) {
 }
 
 describe('Library external file drag-and-drop', () => {
+  it('accepts the successful KB status snapshot returned by the IPC handler', () => {
+    const context = loadContextsScript();
+
+    expect(context._applyKbStatusResult({ summary: { ready: 0 }, files: [] })).toBe(true);
+    expect(context._kbUnavailableHtml()).toBe('');
+    expect(context.__monitorError).not.toHaveBeenCalled();
+  });
+
   it('keeps files usable and exposes storage-full recovery guidance when KB startup fails', () => {
     const context = loadContextsScript();
 
