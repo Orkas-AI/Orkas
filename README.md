@@ -6,6 +6,7 @@ Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; i
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
+[![Release](https://img.shields.io/github/v/release/Orkas-AI/Orkas?color=blue)](https://github.com/Orkas-AI/Orkas/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai?source=gh-orkas)
 [![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai?source=gh-orkas)
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
@@ -18,7 +19,7 @@ Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; i
 
 **Orkas:** the Commander breaks the goal into steps and runs them across specialists — **DeepResearcher** gathers and verifies the sources, **ContentWriter** drafts the report, **PptMaker** builds the slides. One chat, one shared plan, finished files on your disk.
 
-![Orkas demo](./resources/app-ui/demo.gif)
+![Orkas demo: the Commander turns a goal into a step-by-step plan, dispatches it to specialist agents, and delivers the finished file](./resources/app-ui/demo.gif)
 
 ---
 
@@ -101,17 +102,26 @@ Orkas is an open-source, local-first multi-agent desktop app. A super-powered Co
 **Is Orkas a local LLM?**
 No. Orkas runs on your machine but calls the models you choose through your own API keys (or a local model endpoint). It orchestrates agents and tools — it is not itself a model.
 
+**Can I use local models like Ollama or LM Studio?**
+Yes. Add them under **Settings → AI Providers → Custom (OpenAI-compatible)** and point the base URL at your local endpoint. You can run one agent on a local model and another on a hosted one in the same chat.
+
 **Where are my API keys and data stored?**
 On your disk. Conversations, files, knowledge bases, agents, and keys stay local; model calls go straight from your machine to the provider and are never proxied or archived by Orkas.
 
 **Does Orkas work offline?**
 The app is fully offline-capable — only the model calls need network. Point agents at a local model endpoint and you can run without the cloud.
 
+**Do I need an Orkas account?**
+The packaged desktop app asks you to sign in when you first launch it. The source build in this repository has no account layer at all — it boots straight into the app. Either way your model keys are your own and stay on your machine.
+
 **Can Orkas drive Claude Code and other CLI coding agents?**
 Yes. Beyond its own Commander and specialist agents, Orkas can drive external CLI coding agents — Claude Code, Codex, OpenCode, Cline — as local subprocesses, and onboard open-source projects like HyperFrames, all directed from the same chat.
 
 **How is Orkas different from Claude Desktop / CrewAI / LangChain?**
 Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first multi-agent desktop app: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
+
+**Which platforms does Orkas support?**
+macOS (Apple Silicon and Intel) and Windows 10+ have packaged installers. Linux runs from source today — same app, no installer yet. The source build needs Node 20+ and Python 3.
 
 **Is Orkas free and open source?**
 Yes — the app is MIT licensed and free to use. Bring your own model keys and you pay only your model providers; Orkas never takes a cut. Optionally, the desktop app also offers a built-in **Orkas model** for people who don't want to manage API keys — that one is billed by Orkas in credits (membership or credit packs). It is entirely opt-in, and every other feature works on your own keys. [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -137,7 +147,7 @@ run.cmd            # Windows
 
 ## Screenshots
 
-![Orkas home screen](./resources/app-ui/home-en.jpg)
+![Orkas home screen: sidebar with Commander, Agents, Skills, Connectors and Library, and a task box with quick-start templates](./resources/app-ui/home-en.jpg)
 
 ---
 

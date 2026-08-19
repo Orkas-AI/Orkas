@@ -6,6 +6,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
+[![Release](https://img.shields.io/github/v/release/Orkas-AI/Orkas?color=blue)](https://github.com/Orkas-AI/Orkas/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai?source=gh-orkas)
 [![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai?source=gh-orkas)
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
@@ -18,7 +19,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 
 **Orkas：** 指挥官把目标拆成步骤，分派给专业智能体 —— **DeepResearcher** 检索并核验来源，**ContentWriter** 撰写报告，**PptMaker** 制作幻灯片。同一个对话、同一份计划，成品文件落在你的硬盘上。
 
-![Orkas 演示](./resources/app-ui/demo.gif)
+![Orkas 演示：指挥官把目标拆成分步计划，分派给专业智能体，并交付成品文件](./resources/app-ui/demo.gif)
 
 ---
 
@@ -101,17 +102,26 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。一个超强�
 **Orkas 是本地大模型吗？**
 不是。Orkas 运行在你的机器上，但通过你自己的 API key（或本地模型端点）调用你选择的模型。它编排智能体与工具，本身不是模型。
 
+**能用 Ollama、LM Studio 这类本地模型吗？**
+可以。在 **设置 → AI 服务商 → 自定义（OpenAI 兼容）** 中添加，把 base URL 指向你的本地端点即可。同一个对话里，一个智能体用本地模型、另一个用云端模型也没问题。
+
 **我的 API key 和数据存在哪里？**
 在你的硬盘上。对话、文件、知识库、智能体和 key 都留在本地；模型调用从你的机器直连服务商，绝不被 Orkas 代理或归档。
 
 **Orkas 能离线用吗？**
 应用本身可完全离线运行 —— 只有模型调用需要网络。把智能体指向本地模型端点，就能脱离云端运行。
 
+**需要注册 Orkas 账号吗？**
+安装包版本在首次启动时会要求登录。本仓库的源码版本完全没有账号模块，启动后直接进入应用。两种方式下，模型 key 都是你自己的，并且留在本机。
+
 **Orkas 能驱动 Claude Code 等 CLI 编程智能体吗？**
 能。除了自己的指挥官与专业智能体，Orkas 还能把外部 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline）作为本地子进程驱动，并接入 HyperFrames 等开源项目，全部在同一个对话里指挥。
 
 **Orkas 和 Claude Desktop / CrewAI / LangChain 有什么不同？**
 Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架。Orkas 是一个本地优先的多智能体桌面应用：指挥官协调多个专业智能体，数据与 key 留在本地，每个智能体拥有私有技能与记忆。见[逐项对比](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas)。
+
+**支持哪些平台？**
+macOS（Apple 芯片与 Intel）和 Windows 10+ 提供安装包。Linux 目前从源码运行 —— 功能相同，只是还没有安装包。源码运行需要 Node 20+ 与 Python 3。
 
 **Orkas 免费且开源吗？**
 是的 —— 应用本身 MIT 许可证、免费使用。自带模型 key 时，你只需为你的模型服务商付费，Orkas 不抽成。此外，桌面版还提供一个可选的内置 **Orkas 模型**，供不想自己配置 key 的用户使用 —— 这部分由 Orkas 按 credits 计费（会员或 credits 包）。它完全可选，其余所有功能用你自己的 key 即可。[价格 →](https://orkas.ai/pricing/?source=gh-orkas)
@@ -137,7 +147,7 @@ run.cmd            # Windows
 
 ## 截图
 
-![Orkas 主界面](./resources/app-ui/home-zh.jpg)
+![Orkas 主界面：左侧为指挥官、智能体、技能、连接器与资料库，中间是任务输入框与快捷模板](./resources/app-ui/home-zh.jpg)
 
 ---
 
