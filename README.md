@@ -89,7 +89,7 @@ Yes. Beyond its own Commander and specialist agents, Orkas can drive external CL
 Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a local-first AI workforce: the Commander coordinates specialist agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=gh-orkas).
 
 **Is Orkas free and open source?**
-Yes — MIT licensed. Bring your own model keys; you only ever pay your model providers.
+Yes — the app is MIT licensed and free to use. Bring your own model keys and you pay only your model providers; Orkas never takes a cut. Optionally, the desktop app also offers a built-in **Orkas model** for people who don't want to manage API keys — that one is billed by Orkas in credits (membership or credit packs). It is entirely opt-in, and every other feature works on your own keys. [Pricing →](https://orkas.ai/pricing/?source=gh-orkas)
 
 ---
 
