@@ -1,8 +1,8 @@
 # Orkas
 
-**开源、本地优先的 AI 工作团队，用来协同完成复杂工作。**
+**在一个桌面对话里指挥一支 AI 智能体团队 —— 而不是单个聊天机器人。**
 
-Orkas 是一个开源、本地优先的 AI 工作团队。一个超强**指挥官**会协调多个专业智能体，共同完成复杂工作。它是运行在 macOS、Windows、Linux 上的桌面应用；你的对话、文件、智能体配置和模型 key 默认留在本机，模型调用直连你选择的服务商。
+Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目标，**指挥官**规划路径、亲自完成通用部分，并调度专业智能体并行或串行执行。**9 个专业智能体随应用内置**，启动即可用，marketplace 中共有 30 个。自带模型 key —— Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao。支持 macOS · Windows · Linux。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -12,23 +12,55 @@ Orkas 是一个开源、本地优先的 AI 工作团队。一个超强**指挥�
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
-![Orkas 演示](./resources/app-ui/demo.gif)
+---
 
-> 一个超强指挥官会把你的目标转成可执行路径，亲自处理通用工作，并在任务需要团队时协调专业智能体。无需流程图、无需编排代码。你的对话、文件和 API key 始终不离开本机。
+**你：**“调研这个领域的 5 个竞品，写成报告，再做成一份 PPT。”
+
+**Orkas：** 指挥官把目标拆成步骤，分派给专业智能体 —— **DeepResearcher** 检索并核验来源，**ContentWriter** 撰写报告，**PptMaker** 制作幻灯片。同一个对话、同一份计划，成品文件落在你的硬盘上。
+
+![Orkas 演示](./resources/app-ui/demo.gif)
 
 ---
 
-## Orkas 是什么？
+## 随应用内置的智能体
 
-- **开源、本地优先的 AI 工作团队** —— 一个桌面 GUI，让你在同一个对话里指挥多个协同工作的专业智能体。不是单个聊天机器人，不是代码框架，也不是托管 SaaS。
-- **超强指挥官** —— 指挥官理解上下文、拆解目标、选择合适的智能体、技能、连接器和工具；当没有更合适的专家时，也能直接处理分析、写作、调研、文件处理和自动化。
-- **专业智能体共同完成复杂工作** —— 智能体可以并行或串行执行，每个智能体都有自己的技能、记忆和任务上下文，复杂工作可以跨代码、研究、数据、视频和幻灯片推进。
-- **本地编排开源生态** —— 接入外部 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline），并把 HyperFrames 等开源项目作为本地工具接入，全部由同一个指挥官协调。
+首次启动 Orkas 即已安装可用，每个都有自己的技能、记忆和工具。
+
+| 智能体 | 能做什么 |
+| --- | --- |
+| **DeepResearcher** | 证据型深度研究 —— 拆解问题、检索多源、核验引用、标注矛盾点，输出可复核的带引用报告 |
+| **ContentWriter** | 把一句目标、资料或草稿写成可发布内容 —— 社媒成稿、文章、newsletter、教程、案例 |
+| **PptMaker** | 把主题、提纲或文档做成好看、实用、可编辑、可复核的 PPTX |
+| **ProductDeveloper** | 仓库级研发 —— 把 PRD、issue、bug 报告落成最小代码变更、工程测试与可审计验证 |
+| **OfficeWorker** | 创建、编辑、检查并交付 Word / Excel / PowerPoint / PDF，单个或批量处理 |
+| **VideoStudio** | 做视频也剪视频 —— 解说动画、AI 口播数字人、字幕配音、高光切片、本地化 |
+| **ImageStudio** | 海报、封面、社媒图、信息图 —— 优先用 HTML/CSS/SVG 生成，需要时再调用图片模型 |
+| **UIDesigner** | 把产品目标、PRD、截图或 Figma 材料转成以 HTML 呈现、可连续修改的 UI 设计产物 |
+| **SeoGeoAgent** | 给一个 URL —— 技术审计、内容质量、核心网页指标、GEO 可引用性评分、健康分与分级行动清单 |
+
+**了解内置智能体 →** [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas) · **浏览全部 30 个 →** [智能体 marketplace](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas) · 或者直接描述你的需求，让指挥官为你定制一个。
+
+---
+
+## 为什么选 Orkas
+
+- **超强指挥官** —— 理解上下文、拆解目标、选择合适的智能体、技能、连接器和工具；当没有更合适的专家时，也能直接处理分析、写作、调研、文件处理和自动化。
+- **驱动开源生态** —— 接入外部 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline），并把 HyperFrames 等开源项目作为本地工具接入，全部由同一个指挥官协调。
 - **本地优先设计** —— 对话、文件、API key、知识库、自定义智能体全部留在你的硬盘上。模型调用从你的机器直连服务商，绝不经过 Orkas 服务器。
-- **自带大模型 key** —— 接入 Claude、OpenAI、Gemini、DeepSeek、Kimi、GLM、Qwen、MiniMax、Doubao，不同智能体可混用不同服务商，无厂商锁定。
+- **无厂商锁定** —— 不同智能体可混用不同服务商：一个用 Claude，一个用 DeepSeek，一个接本地模型端点。
 - **自我进化的工作团队** —— 每个智能体拥有自己私有的技能与记忆，并在每次任务后通过复盘自我改进。
 
 > ⭐ 如果 Orkas 对你有用，点个 star 能帮助更多人发现这个项目。
+
+---
+
+## 下载
+
+macOS 和 Windows 提供安装包。Linux 目前需从源码运行 —— 见 [快速开始](#快速开始)。
+
+- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
+- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
+- **Windows x64** → [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
 
 ---
 
@@ -40,13 +72,6 @@ Orkas 是一个开源、本地优先的 AI 工作团队。一个超强**指挥�
 - **不止于代码 —— 视频、幻灯片等** —— 指挥官可驱动 HyperFrames 等开源工具，并把任务交接给 CLI 编程智能体（Claude Code、Codex、OpenCode、Cline）及其他本地智能体，于是一个对话就能产出代码、研究、视频与幻灯片。
 
 **查看使用场景 →** [研究工作流](https://orkas.ai/use/researchers?source=gh-orkas) · [数据分析](https://orkas.ai/use/data-analysis?source=gh-orkas) · [与文档对话](https://orkas.ai/use/chat-with-documents?source=gh-orkas) · [面向开发者](https://orkas.ai/use/developers?source=gh-orkas) · [自动化你的工作区](https://orkas.ai/use/automate-workspace?source=gh-orkas)
-
----
-
-## 下载
-
-- **获取应用** → [orkas.ai](https://orkas.ai?source=gh-orkas)（macOS · Windows 安装包）
-- **从源码运行** → 见下方 [快速开始](#快速开始)（Linux 当前需使用此方式）
 
 ---
 
@@ -95,13 +120,7 @@ Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架�
 
 ## 快速开始
 
-目前 macOS 和 Windows 提供安装包；Linux 用户请按照下方步骤从源码运行。
-
-- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
-- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
-- **Windows x64** → [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
-
-从源码运行：
+想直接用安装包？见上方 [下载](#下载)。以下是从源码运行的方式 —— 也是目前在 Linux 上运行 Orkas 的方式：
 
 **环境要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 较新的 Linux
 

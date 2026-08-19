@@ -1,8 +1,8 @@
 # Orkas
 
-**An open-source, local-first AI workforce for complex work.**
+**Command a team of AI agents from one desktop chat — not one chatbot.**
 
-Orkas is an open-source, local-first AI workforce. A super-powered **Commander** coordinates specialist agents to complete complex work together. It runs as a desktop app on macOS, Windows, and Linux; your conversations, files, agent configs, and model keys stay local, and model calls go straight to your provider.
+Orkas is an open-source, local-first multi-agent desktop app. Describe a goal; its **Commander** plans the work, handles the general parts itself, and coordinates specialist agents in parallel or in sequence. **Nine specialist agents ship with the app**, ready the moment you launch it, out of 30 in the marketplace. Bring your own model keys — Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao. macOS · Windows · Linux.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -12,23 +12,55 @@ Orkas is an open-source, local-first AI workforce. A super-powered **Commander**
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
-![Orkas demo](./resources/app-ui/demo.gif)
+---
 
-> One super-powered Commander turns your goal into an executable path, does the general work itself, and coordinates specialist agents when the job needs a team. No flowcharts, no orchestration code. Your conversations, files, and API keys never leave your machine.
+**You:** *"Research the top 5 competitors, write it up, and turn it into a deck."*
+
+**Orkas:** the Commander breaks the goal into steps and runs them across specialists — **DeepResearcher** gathers and verifies the sources, **ContentWriter** drafts the report, **PptMaker** builds the slides. One chat, one shared plan, finished files on your disk.
+
+![Orkas demo](./resources/app-ui/demo.gif)
 
 ---
 
-## What is Orkas?
+## Agents that ship with the app
 
-- **Open-source, local-first AI workforce** — a desktop GUI where you direct a coordinated workforce of specialist AI agents through one chat. Not a single chatbot, not a code framework, not a hosted SaaS.
-- **A super-powered Commander** — the Commander understands context, breaks down goals, chooses the right agents, skills, connectors, and tools, and directly handles general analysis, writing, research, file work, and automation when no specialist is a better fit.
-- **Specialist agents that work together** — agents can run in parallel or in sequence, each with focused skills, memory, and task context, so complex work can move across coding, research, data, video, and slides.
-- **Open-source ecosystem, locally orchestrated** — plug in external CLI coding agents (Claude Code, Codex, OpenCode, Cline) and onboard open-source projects like HyperFrames as local tools, all coordinated by the same Commander.
+Installed and ready the first time you launch Orkas — each with its own skills, memory, and tools.
+
+| Agent | What it does |
+| --- | --- |
+| **DeepResearcher** | Evidence-grounded research — plans the investigation, verifies sources, flags contradictions, ships an auditable report with citations |
+| **ContentWriter** | Turns a goal, source material, or a rough draft into publish-ready posts, articles, newsletters, and case studies |
+| **PptMaker** | Turns a topic, outline, or document into an attractive, editable, reviewable PPTX deck |
+| **ProductDeveloper** | Repo-aware engineering — implement a PRD, fix bugs, refactor, review code, with verifiable results |
+| **OfficeWorker** | Create, edit, check, and deliver Word / Excel / PowerPoint / PDF files, one at a time or in batches |
+| **VideoStudio** | Make and edit video — narration, AI presenters, captions and dubbing, highlight clips, localization |
+| **ImageStudio** | Posters, covers, social images, infographics — HTML/CSS/SVG first, image models when the shot needs them |
+| **UIDesigner** | Product goals, PRDs, screenshots, or Figma material into editable, HTML-first UI deliverables |
+| **SeoGeoAgent** | Give it a URL — technical audit, content quality, Core Web Vitals, GEO citability, health score, ranked fix list |
+
+**More on the built-in agents →** [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas) · **Browse all 30 →** [agent marketplace](https://orkas.ai/views/marketplace/gs/agents/?source=gh-orkas) · or just describe what you need and the Commander builds a custom agent for you.
+
+---
+
+## Why Orkas
+
+- **A super-powered Commander** — understands context, breaks down goals, chooses the right agents, skills, connectors, and tools, and directly handles analysis, writing, research, file work, and automation when no specialist is a better fit.
+- **Drives the open-source ecosystem** — plug in external CLI coding agents (Claude Code, Codex, OpenCode, Cline) and onboard open-source projects like HyperFrames as local tools, all coordinated by the same Commander.
 - **Local-first by design** — conversations, files, API keys, knowledge bases, and custom agents all stay on your disk. Model calls go straight from your machine to the provider — never through Orkas servers.
-- **Bring your own LLM keys** — plug in Claude, OpenAI, Gemini, DeepSeek, Kimi, GLM, Qwen, MiniMax, or Doubao. Mix providers across agents. No vendor lock-in.
+- **No vendor lock-in** — mix providers across agents: one on Claude, another on DeepSeek, another on a local endpoint.
 - **Self-evolving workforce** — each agent has its own private skills and memory, and improves through reflection after each task.
 
 > ⭐ If Orkas is useful to you, a star helps more people find the project.
+
+---
+
+## Download
+
+Packaged installers for macOS and Windows. Linux runs from source today — see [Quick start](#quick-start).
+
+- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
+- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
+- **Windows x64** -> [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
 
 ---
 
@@ -40,13 +72,6 @@ Orkas is an open-source, local-first AI workforce. A super-powered **Commander**
 - **Go beyond code — video, slides, and more** — the Commander drives open-source tools like HyperFrames and hands off to CLI coding agents (Claude Code, Codex, OpenCode, Cline) and other local agents, so one chat produces code, research, video, and slide decks.
 
 **Explore use cases →** [research workflows](https://orkas.ai/use/researchers?source=gh-orkas) · [data analysis](https://orkas.ai/use/data-analysis?source=gh-orkas) · [chat with documents](https://orkas.ai/use/chat-with-documents?source=gh-orkas) · [for developers](https://orkas.ai/use/developers?source=gh-orkas) · [automate your workspace](https://orkas.ai/use/automate-workspace?source=gh-orkas)
-
----
-
-## Download
-
-- **Get the app** → [orkas.ai](https://orkas.ai?source=gh-orkas) (macOS · Windows installers)
-- **Run from source** → see [Quick start](#quick-start) below (currently required on Linux)
 
 ---
 
@@ -95,13 +120,7 @@ Yes — the app is MIT licensed and free to use. Bring your own model keys and y
 
 ## Quick start
 
-Packaged installers are currently available for macOS and Windows. Linux users should follow the source instructions below.
-
-- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
-- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
-- **Windows x64** -> [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
-
-To run from source:
+Want a packaged installer instead? See [Download](#download) above. To run from source — currently the way to run Orkas on Linux:
 
 **Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / recent Linux
 
