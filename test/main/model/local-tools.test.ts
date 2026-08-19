@@ -1170,6 +1170,31 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     }
   });
 
+  it('prompts before terminating a user process and leaves later shell segments unexecuted on denial', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const sentinel = path.join(tmpDir, 'process-termination-command-ran.txt');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const writeSentinel = `${JSON.stringify(process.execPath)} -e "require('fs').writeFileSync(process.argv[1], 'ran')" ${JSON.stringify(sentinel)}`;
+      const command = `taskkill /F /IM orkas-risk-sentinel-process.exe & ${writeSentinel}`;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.existsSync(sentinel)).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(sentinel, { force: true });
+    }
+  });
+
   it('checks the target after force flags and blocks deletion outside workspace scope', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('workspace_approval');
