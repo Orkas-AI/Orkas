@@ -53,6 +53,10 @@ describe('read-tracker › checkEditFreshness', () => {
     const st = fs.statSync(file);
     const block = checkEditFreshness(ctx, file, st);
     expect(block?.code).toBe('E_NOT_READ');
+    // The shared refusal points at each consumer's own recovery block instead
+    // of prescribing edit_file-only parameters or a redundant read round.
+    expect(block?.msg).toContain('current-context recovery guidance');
+    expect(block?.msg).not.toMatch(/expected_hash|read_file/);
   });
 
   it('allows the edit after a read records the baseline', () => {
@@ -80,6 +84,9 @@ describe('read-tracker › checkEditFreshness', () => {
     fs.writeFileSync(file, 'a much longer body than before', 'utf8'); // size changes
     const block = checkEditFreshness(ctx, file, fs.statSync(file));
     expect(block?.code).toBe('E_STALE');
+    // Same consumer-neutral contract as E_NOT_READ.
+    expect(block?.msg).toContain('current-context recovery guidance');
+    expect(block?.msg).not.toMatch(/expected_hash|read_file/);
   });
 
   it('blocks with E_STALE when only mtime changed (same size)', () => {

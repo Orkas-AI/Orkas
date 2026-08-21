@@ -987,6 +987,47 @@ describe('local-tools › apply_patch › transactional text changes', () => {
     expect(fs.readFileSync(source, 'utf8')).toBe('const value = 2;\n');
   });
 
+  it('returns apply_patch-compatible recovery after E_NOT_READ and accepts a rebuilt patch', async () => {
+    await grant();
+    const { applyPatch, wsDir } = await buildPatchTool();
+    const source = path.join(wsDir, 'source.ts');
+    fs.writeFileSync(source, 'const value = 1;\nconst label = "before";\n');
+    const ctx = { workingDir: wsDir, state: { readFileState: new Map() } } as any;
+
+    const blocked = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        '-const label = "before";',
+        '+const label = "after";',
+        '*** End Patch',
+      ].join('\n'),
+    }, ctx);
+
+    expect(blocked.isError).toBe(true);
+    expect(blocked.content).toContain('E_NOT_READ');
+    expect(blocked.content).toContain('<patch-recovery file_hash=');
+    expect(blocked.content).toContain('rebuild the patch against these bytes');
+    expect(blocked.content).not.toContain('expected_hash');
+    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "before";\n');
+
+    const retried = await applyPatch.execute({
+      patch: [
+        '*** Begin Patch',
+        `*** Update File: ${source}`,
+        '@@',
+        ' const value = 1;',
+        '-const label = "before";',
+        '+const label = "after";',
+        '*** End Patch',
+      ].join('\n'),
+    }, ctx);
+
+    expect(retried.isError).toBeFalsy();
+    expect(fs.readFileSync(source, 'utf8')).toBe('const value = 1;\nconst label = "after";\n');
+  });
+
   it('moves an updated file while preserving its mode and reporting the destination', async () => {
     await grant();
     const { applyPatch, wsDir } = await buildPatchTool();

@@ -78,8 +78,14 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  * Decide whether `edit_file` may proceed on `abs`, given its current stat.
  * Returns null when the edit is allowed (or when the run-scoped map is absent,
  * i.e. the host opted out — see module header), otherwise the block reason:
- *   - never read this run            → E_NOT_READ (read it first)
- *   - read, but mtime/size changed   → E_STALE   (re-read; it moved under you)
+ *   - never read this run            → E_NOT_READ
+ *   - read, but mtime/size changed   → E_STALE
+ *
+ * Message contract: every consumer (edit_file, apply_patch) appends bounded
+ * current context plus its own executable recovery instruction, and refreshes
+ * the read baseline on rejection. Keep these shared messages limited to the
+ * failure reason so they cannot prescribe a parameter or workflow that one
+ * consumer does not support (2026-08-16 latency review P0-4).
  */
 export function checkEditFreshness(
   ctx: ToolContext,
@@ -102,7 +108,7 @@ export function checkEditFreshness(
   if (!seen) {
     return {
       code: 'E_NOT_READ',
-      msg: `${abs}: read the file with read_file before editing it, so old_string matches the real current contents.`,
+      msg: `${abs}: not read in this run, so the proposed change cannot be checked against the real current contents. Follow the current-context recovery guidance returned below.`,
     };
   }
   if (
@@ -112,7 +118,7 @@ export function checkEditFreshness(
   ) {
     return {
       code: 'E_STALE',
-      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Call read_file again, then redo the edit against the current contents.`,
+      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Follow the current-context recovery guidance returned below.`,
     };
   }
   return null;
