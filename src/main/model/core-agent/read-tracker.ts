@@ -81,12 +81,11 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  *   - never read this run            → E_NOT_READ
  *   - read, but mtime/size changed   → E_STALE
  *
- * Message contract: every consumer (edit_file, apply_patch) appends a
- * recovery block with the current bytes and a fresh file_hash, and refreshes
- * the read baseline on rejection — so the messages steer the model at that
- * returned context first. A bare "call read_file again" here made models pay
- * a full re-read round the trailer had already made unnecessary
- * (2026-08-16 latency review P0-4).
+ * Message contract: every consumer (edit_file, apply_patch) appends bounded
+ * current context plus its own executable recovery instruction, and refreshes
+ * the read baseline on rejection. Keep these shared messages limited to the
+ * failure reason so they cannot prescribe a parameter or workflow that one
+ * consumer does not support (2026-08-16 latency review P0-4).
  */
 export function checkEditFreshness(
   ctx: ToolContext,
@@ -109,7 +108,7 @@ export function checkEditFreshness(
   if (!seen) {
     return {
       code: 'E_NOT_READ',
-      msg: `${abs}: not read in this run, so old_string cannot be checked against the real current contents. Use the current context and file_hash returned below to retry (pass expected_hash); use read_file with a bounded range only if that window misses your target.`,
+      msg: `${abs}: not read in this run, so the proposed change cannot be checked against the real current contents. Follow the current-context recovery guidance returned below.`,
     };
   }
   if (
@@ -119,7 +118,7 @@ export function checkEditFreshness(
   ) {
     return {
       code: 'E_STALE',
-      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Retry against the current context and file_hash returned below (pass expected_hash); re-read only the affected region with read_file range if that window is insufficient.`,
+      msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Follow the current-context recovery guidance returned below.`,
     };
   }
   return null;
