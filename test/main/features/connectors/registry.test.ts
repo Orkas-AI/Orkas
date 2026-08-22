@@ -1,7 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+
+const loggerMocks = vi.hoisted(() => ({
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => loggerMocks,
+}));
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -35,6 +47,7 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-connectors-registry-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.clearAllMocks();
   vi.resetModules();
 });
 
@@ -45,6 +58,24 @@ afterEach(() => {
 });
 
 describe('features/connectors/registry', () => {
+  it('logs a stable hash without exposing encrypted connector grant bytes', async () => {
+    const uid = 'uid-log-fingerprint';
+    const file = path.join(tmpDir, uid, 'cloud', 'config', 'connectors.json');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+
+    await registry.upsert(uid, sampleInstance('github'));
+
+    const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const ciphertext = String(persisted.connections.github.secrets_enc);
+    const expectedHash = crypto.createHash('sha256').update(ciphertext).digest('hex').slice(0, 8);
+    const writeLog = loggerMocks.info.mock.calls.find(([message]) => message === 'connectors.json write ok');
+    const fields = writeLog?.[1] as Record<string, unknown> | undefined;
+
+    expect(fields).toMatchObject({ secrets_enc_hash: { github: expectedHash } });
+    expect(fields).not.toHaveProperty('secrets_enc_prefix');
+    expect(JSON.stringify(fields)).not.toContain(ciphertext.slice(0, 16));
+  });
+
   it('writes a tombstone on remove and clears it when reconnecting the same id', async () => {
     const uid = 'uid-delete';
     const file = path.join(tmpDir, uid, 'cloud', 'config', 'connectors.json');
