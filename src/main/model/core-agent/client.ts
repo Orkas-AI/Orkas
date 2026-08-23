@@ -1480,12 +1480,25 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   };
   addActiveSessionAbort(userId, sessionId, activeAbortEntry);
 
+  // Keep the session-level tool tier strictly behind the per-tool watchdog
+  // for every configured idleTimeout; both derive from the same base value.
+  const TOOL_PHASE_BACKSTOP_RATIO = 1.15;
+  const toolIdleTimeoutMs = Math.max(1, Math.round(idleTimeout * 1000));
+  const toolPhaseBackstopMs = Math.max(
+    toolIdleTimeoutMs + 1,
+    Math.ceil(toolIdleTimeoutMs * TOOL_PHASE_BACKSTOP_RATIO),
+  );
   const resetIdle = () => {
     if (controller.signal.aborted) return;
     if (idleTimer) clearTimeout(idleTimer);
     const assemblingToolCall = assemblingToolCallIds.size > 0;
-    const inToolPhase = toolDepth > 0 || assemblingToolCall;
-    const window = !inToolPhase && modelTextStreamActive ? streamIdleTimeout : idleTimeout;
+    const toolExecuting = toolDepth > 0;
+    // Only an executing tool has a core-agent watchdog to own the base window;
+    // the host may then wait longer as a session backstop. Argument assembly
+    // happens before tool_start, so the host keeps the base idle deadline there.
+    const window = toolExecuting
+      ? toolPhaseBackstopMs / 1000
+      : (!assemblingToolCall && modelTextStreamActive ? streamIdleTimeout : idleTimeout);
     const phase: NonNullable<StreamEvent['failurePhase']> = toolDepth > 0
       ? 'tool'
       : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'provider_wait'));
@@ -1551,6 +1564,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(resumeActiveTurn ? { resumeActiveTurn: true } : {}),
       ...(agentName ? { agentName } : {}),
       ...(maxToolLoops ? { maxToolLoops } : {}),
+      toolIdleTimeoutMs,
       ...(elapsedConvergenceMs != null ? { elapsedConvergenceMs } : {}),
       providerFirstEventTimeoutMs: Math.max(1, streamIdleTimeout * 1000),
       ...(cid ? { cid } : {}),
