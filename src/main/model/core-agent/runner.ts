@@ -236,6 +236,9 @@ export interface BuildRunnerParams {
   /** Max tool-call rounds per turn before force-end. Undefined → core-agent
    *  default (100). Group chat raises it for the commander's long builds. */
   maxToolLoops?: number;
+  /** Per-tool stall watchdog. The host derives this from the session idle
+   * timeout so the session-level tool-phase timer remains a later backstop. */
+  toolIdleTimeoutMs?: number;
   /** Optional one-time soft convergence threshold. Undefined preserves the
    *  core-agent default; this does not change the hard tool-loop limit. */
   elapsedConvergenceMs?: number;
@@ -1248,6 +1251,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       defaultModel: modelId,
       ...(resolvedSystemPrompt ? { systemPrompt: resolvedSystemPrompt } : {}),
       ...(params.maxToolLoops ? { maxToolLoops: params.maxToolLoops } : {}),
+      ...(params.toolIdleTimeoutMs ? { toolIdleTimeoutMs: params.toolIdleTimeoutMs } : {}),
     },
     evolution: evolutionConfig,
     ...(Object.keys(modelCatalog).length ? { models: { catalog: modelCatalog } } : {}),

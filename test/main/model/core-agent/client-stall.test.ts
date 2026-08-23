@@ -178,6 +178,51 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(ms).toBeGreaterThanOrEqual(550);
   }, 8000);
 
+  it('tool-phase backstop stays behind the recoverable per-tool watchdog it configures', async () => {
+    // Production regression: both watchdogs shared the same 1800s deadline, so
+    // the session timer won and killed the whole turn instead of letting the
+    // per-tool watchdog return one recoverable tool error. The host must pass
+    // the base timeout to the runtime and keep its own backstop strictly later.
+    h.makeStream = () =>
+      (async function* () {
+        yield { type: 'tool_start', id: 't1', name: 'video_studio', input: {} };
+        await new Promise(() => {}); // tool never returns and never heartbeats
+      })();
+
+    const { events, ms } = await drain({ streamIdleTimeout: 0.2, idleTimeout: 2 });
+    expect(h.lastBuildRunnerParams?.toolIdleTimeoutMs).toBe(2000);
+    const failure = events.find((event) => event.type === 'error');
+    expect(failure).toMatchObject({
+      failureCode: 'idle_timeout',
+      failurePhase: 'tool',
+    });
+    // The mocked runner cannot emit its own tool-stall result, so the host
+    // fallback fires at 2.3s (2s x 1.15), not at the shared 2s deadline.
+    expect(failure?.text || '').toContain('2.3');
+    expect(ms).toBeGreaterThanOrEqual(2200);
+    expect(events.map((event) => event.type).at(-1)).toBe('done');
+  }, 10000);
+
+  it('keeps the tool-phase backstop strictly later at a sub-centisecond boundary', async () => {
+    h.makeStream = () =>
+      (async function* () {
+        yield { type: 'tool_start', id: 't1', name: 'video_studio', input: {} };
+        await new Promise(() => {});
+      })();
+
+    const { events } = await drain({ streamIdleTimeout: 0.001, idleTimeout: 0.01 });
+    expect(h.lastBuildRunnerParams?.toolIdleTimeoutMs).toBe(10);
+    const failure = events.find((event) => event.type === 'error');
+    expect(failure).toMatchObject({
+      failureCode: 'idle_timeout',
+      failurePhase: 'tool',
+    });
+    // A 10 ms runtime watchdog gets a 12 ms host backstop. The previous
+    // centisecond rounding collapsed both deadlines to the same 10 ms value.
+    expect(failure?.text || '').toContain('0.012');
+    expect(events.map((event) => event.type).at(-1)).toBe('done');
+  });
+
   it('post-tool model thinking is NOT false-killed by the short window', async () => {
     // Once a tool finishes, the next provider call can legitimately spend a
     // while thinking before the first text token. That post-tool cold-start
@@ -227,6 +272,25 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(types[types.length - 1]).toBe('done');
     expect(ms).toBeGreaterThanOrEqual(550);
   }, 8000);
+
+  it('keeps the base idle deadline while tool-call arguments are still assembling', async () => {
+    h.makeStream = () =>
+      (async function* () {
+        yield { type: 'tool_delta', id: 't1', name: 'write_file', inputDelta: '{', inputBytes: 1 };
+        await new Promise(() => {});
+      })();
+
+    const { events } = await drain({ streamIdleTimeout: 0.01, idleTimeout: 0.1 });
+    const failure = events.find((event) => event.type === 'error');
+    expect(failure).toMatchObject({
+      failureCode: 'idle_timeout',
+      failurePhase: 'tool_input',
+    });
+    // Core-agent cannot start a per-tool watchdog until complete arguments
+    // produce tool_start, so the host still owns the original 100 ms deadline.
+    expect(failure?.text || '').toContain('0.1s');
+    expect(events.map((event) => event.type).at(-1)).toBe('done');
+  });
 
   it('a fully silent (cold-start) stall still terminates cleanly — no wedge', async () => {
     // Regression guard for the main-side wedge: even with ZERO events the turn
