@@ -14,6 +14,15 @@ test.describe('settings modules and model guard', () => {
     await expect(appPage.locator('#settings-data-root-btn')).toBeVisible();
     await expect(appPage.locator('#settings-recycle-group')).toBeVisible();
     await expect(appPage.locator('#settings-recycle-body')).toBeVisible();
+    const recycleViewport = appPage.locator('#settings-recycle-body .settings-recycle-scroll');
+    await expect(recycleViewport).toBeVisible();
+    const recycleLayout = await recycleViewport.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { overflowY: style.overflowY, maxHeight: Number.parseFloat(style.maxHeight) };
+    });
+    expect(recycleLayout.overflowY).toBe('auto');
+    expect(recycleLayout.maxHeight).toBeGreaterThan(0);
+    expect(recycleLayout.maxHeight).toBeLessThanOrEqual(320);
 
     await openSettingsTab(appPage, 'credentials');
     await expect(appPage.locator('#settings-add-entry-btn')).toBeVisible();

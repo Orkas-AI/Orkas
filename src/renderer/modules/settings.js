@@ -381,40 +381,210 @@ function _settingsRecycleAvailable() {
   );
 }
 
+let _settingsRecycleActiveSource = 'cloud_sync';
+let _settingsRecycleSourceTouched = false;
+const _settingsRecycleExpandedIds = new Set();
+const _SETTINGS_RECYCLE_SOURCE_CONFIG = [
+  {
+    source: 'cloud_sync',
+    tabKey: 'settings.recycle.tab_cloud',
+    emptyKey: 'settings.recycle.empty_cloud',
+  },
+  {
+    source: 'app',
+    tabKey: 'settings.recycle.tab_local',
+    emptyKey: 'settings.recycle.empty_local',
+  },
+];
+
+function _settingsRecycleCategoryKey(category) {
+  const value = String(category || '').replace(/[^A-Za-z0-9_]/g, '');
+  return value || 'other';
+}
+
+function _settingsRecyclePathTitle(pathValue) {
+  const clean = String(pathValue || '').replace(/\\/g, '/').replace(/^cloud\//, '');
+  const parts = clean.split('/').filter(Boolean);
+  return parts[parts.length - 1] || clean || t('settings.recycle.display_unknown');
+}
+
+function _settingsRecycleCoreId(item, category) {
+  if (_settingsRecycleCategoryKey(item?.category) !== category) return '';
+  const id = String(item?.id || '').trim();
+  if (/^[A-Za-z0-9_.-]+$/.test(id)) return id;
+  const pathValue = String(item?.path || '').replace(/\\/g, '/');
+  const match = new RegExp(`^cloud/${category}s/([^/]+)/`).exec(pathValue);
+  if (match && /^[A-Za-z0-9_.-]+$/.test(match[1])) return match[1];
+  const title = String(item?.title || '').trim();
+  return /^[A-Za-z0-9_.-]+$/.test(title) ? title : '';
+}
+
+function _settingsRecycleAssociatedTarget(item) {
+  const category = _settingsRecycleCategoryKey(item?.category);
+  if (category === 'edit_conversation') {
+    const match = /^(agent|skill):(.+)$/.exec(String(item?.id || ''));
+    if (match && /^[A-Za-z0-9_.-]+$/.test(match[2])) {
+      return { kind: match[1], id: match[2] };
+    }
+  }
+  if (category === 'conversation') {
+    const raw = String(item?.id || item?.title || _settingsRecyclePathTitle(item?.path || '')).trim();
+    const match = /^(agent|skill)-(.+)\.jsonl$/.exec(raw);
+    if (match && /^[A-Za-z0-9_.-]+$/.test(match[2])) {
+      return { kind: match[1], id: match[2] };
+    }
+  }
+  return null;
+}
+
+function _settingsRecycleDisplayItems(batch) {
+  const items = Array.isArray(batch?.display_items) ? batch.display_items : [];
+  const agentIds = new Set();
+  const skillIds = new Set();
+  for (const item of items) {
+    const agentId = _settingsRecycleCoreId(item, 'agent');
+    if (agentId) agentIds.add(agentId);
+    const skillId = _settingsRecycleCoreId(item, 'skill');
+    if (skillId) skillIds.add(skillId);
+  }
+  const collapsed = items.filter((item) => {
+    const target = _settingsRecycleAssociatedTarget(item);
+    if (!target) return true;
+    return target.kind === 'skill' ? !skillIds.has(target.id) : !agentIds.has(target.id);
+  });
+  const supplemental = new Set(['file', 'settings', 'marketplace', 'other']);
+  const hasCore = collapsed.some((item) => !supplemental.has(_settingsRecycleCategoryKey(item?.category)));
+  return hasCore
+    ? collapsed.filter((item) => !supplemental.has(_settingsRecycleCategoryKey(item?.category)))
+    : collapsed;
+}
+
+function _settingsRecycleListJoin(items) {
+  const values = Array.from(new Set((items || []).map((item) => String(item || '').trim()).filter(Boolean)));
+  if (values.length <= 1) return values[0] || '';
+  const lang = (typeof getLang === 'function' ? getLang() : '')
+    || document.documentElement?.lang
+    || (typeof navigator !== 'undefined' ? navigator.language : '')
+    || '';
+  if (/^ja/i.test(lang)) return values.join('、');
+  if (/^en/i.test(lang)) return values.join(', ');
+  return values.join('，');
+}
+
 function _settingsRecycleTitle(batch) {
-  const direct = String(batch?.display_title || batch?.label || '').trim();
+  const groups = new Map();
+  for (const item of _settingsRecycleDisplayItems(batch)) {
+    const title = String(item?.title || '').trim();
+    if (!title) continue;
+    const category = _settingsRecycleCategoryKey(item?.category);
+    const titles = groups.get(category) || [];
+    if (!titles.includes(title)) titles.push(title);
+    groups.set(category, titles);
+  }
+  if (groups.size > 0) {
+    const joinerKey = t('settings.recycle.display_group_joiner');
+    const joiner = joinerKey === 'settings.recycle.display_group_joiner' ? '；' : joinerKey;
+    return Array.from(groups.entries()).map(([category, titles]) => {
+      const visibleTitles = titles.slice(0, 3);
+      if (titles.length > visibleTitles.length) visibleTitles.push(`+${titles.length - visibleTitles.length}`);
+      return t('settings.recycle.display_group')
+        .replace('{type}', t(`settings.recycle.display_${category}`))
+        .replace('{items}', _settingsRecycleListJoin(visibleTitles));
+    }).join(joiner);
+  }
+  const direct = String(batch?.label || batch?.display_title || '').trim();
   if (direct) return direct;
-  const displayItems = Array.isArray(batch?.display_items) ? batch.display_items : [];
-  const titles = displayItems
-    .map((item) => String(item?.title || '').trim())
-    .filter(Boolean);
-  if (titles.length) return titles.join('; ');
   const paths = Array.isArray(batch?.paths_preview) ? batch.paths_preview : [];
-  const names = paths
-    .map((item) => String(item || '').split('/').filter(Boolean).pop() || '')
-    .filter(Boolean);
-  return names.join('; ') || t('settings.recycle.display_unknown');
+  return _settingsRecycleListJoin(paths.map(_settingsRecyclePathTitle))
+    || t('settings.recycle.display_unknown');
+}
+
+function _settingsRecycleCategoryLabel(category) {
+  const key = _settingsRecycleCategoryKey(category);
+  const labelKey = `settings.recycle.display_${key}`;
+  const label = t(labelKey);
+  return label === labelKey ? t('settings.recycle.display_other') : label;
+}
+
+function _settingsRecycleItemTitle(item) {
+  const title = String(item?.title || '').trim() || t('settings.recycle.display_unknown');
+  const detail = String(item?.detail || '').trim();
+  if (!detail) return title;
+  return t('settings.recycle.display_with_detail')
+    .replace('{title}', title)
+    .replace('{detail}', detail);
+}
+
+function _settingsRecycleDetailsHtml(batch) {
+  const rows = [];
+  const seen = new Set();
+  for (const item of _settingsRecycleDisplayItems(batch)) {
+    const title = _settingsRecycleItemTitle(item);
+    const category = _settingsRecycleCategoryLabel(item?.category);
+    const pathValue = String(item?.path || '').replace(/^cloud\//, '');
+    const key = `${category}\n${title}\n${pathValue}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ category, title, path: pathValue });
+  }
+  if (!rows.length) {
+    for (const item of Array.isArray(batch?.items) ? batch.items : []) {
+      const pathValue = String(item?.path || '').replace(/^cloud\//, '');
+      if (!pathValue || seen.has(pathValue)) continue;
+      seen.add(pathValue);
+      rows.push({
+        category: _settingsRecycleCategoryLabel('file'),
+        title: _settingsRecyclePathTitle(pathValue),
+        path: pathValue,
+      });
+    }
+  }
+  if (!rows.length) return '';
+  return `
+    <div class="settings-recycle-details">
+      ${rows.map((row) => `
+        <div class="settings-recycle-detail-row">
+          <span class="settings-recycle-detail-category">${escapeHtml(row.category)}</span>
+          <span class="settings-recycle-detail-title">${escapeHtml(row.title)}</span>
+          ${row.path ? `<span class="settings-recycle-detail-path" title="${escapeHtml(row.path)}">${escapeHtml(row.path)}</span>` : ''}
+        </div>
+      `).join('')}
+    </div>
+  `;
 }
 
 function _settingsRecycleRowHtml(batch) {
   const id = escapeHtml(String(batch?.id || ''));
   const title = escapeHtml(_settingsRecycleTitle(batch));
   const timestamp = Number(batch?.created_at_ms) || 0;
-  const deletedAt = timestamp ? new Date(timestamp).toLocaleString() : '';
+  const date = timestamp ? new Date(timestamp).toLocaleString() : '';
+  const deletedAt = t('settings.recycle.deleted_at').replace('{date}', date);
+  const expanded = _settingsRecycleExpandedIds.has(String(batch?.id || ''));
   return `
-    <div class="settings-recycle-row">
+    <div class="settings-recycle-row${expanded ? ' is-expanded' : ''}">
       <div class="settings-recycle-row-head">
         <div class="settings-recycle-main">
           <div class="settings-recycle-name">${title}</div>
           <div class="settings-recycle-meta">${escapeHtml(deletedAt)}</div>
         </div>
         <div class="settings-recycle-actions">
+          <button class="btn btn-sm" type="button" data-recycle-view="${id}" aria-expanded="${expanded ? 'true' : 'false'}">${escapeHtml(t(expanded ? 'settings.recycle.collapse' : 'settings.recycle.view'))}</button>
           <button class="btn btn-sm" type="button" data-recycle-restore="${id}">${escapeHtml(t('settings.recycle.restore'))}</button>
           <button class="btn btn-sm btn-danger" type="button" data-recycle-delete="${id}">${escapeHtml(t('settings.recycle.delete'))}</button>
         </div>
       </div>
+      ${expanded ? _settingsRecycleDetailsHtml(batch) : ''}
     </div>
   `;
+}
+
+function _settingsRecycleSourceGroups(batches) {
+  return _SETTINGS_RECYCLE_SOURCE_CONFIG.map((config) => ({
+    ...config,
+    items: batches.filter((batch) => (
+      config.source === 'app' ? batch?.source === 'app' : batch?.source !== 'app'
+    )),
+  }));
 }
 
 async function _settingsRefreshRecycleBin() {
@@ -423,9 +593,42 @@ async function _settingsRefreshRecycleBin() {
   try {
     const res = await window.orkas.recycleBin.list();
     const batches = Array.isArray(res?.batches) ? res.batches : [];
-    body.innerHTML = batches.length
-      ? batches.map(_settingsRecycleRowHtml).join('')
-      : `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
+    const groups = _settingsRecycleSourceGroups(batches);
+    let selectedGroup = groups.find((group) => group.source === _settingsRecycleActiveSource) || groups[0];
+    if (!_settingsRecycleSourceTouched && selectedGroup.items.length === 0) {
+      const firstNonEmpty = groups.find((group) => group.items.length > 0);
+      if (firstNonEmpty) {
+        _settingsRecycleActiveSource = firstNonEmpty.source;
+        selectedGroup = firstNonEmpty;
+      }
+    }
+    const tabsHtml = groups.map((group) => {
+      const active = group.source === selectedGroup.source;
+      return `
+        <button
+          class="settings-recycle-tab${active ? ' is-active' : ''}"
+          type="button"
+          role="tab"
+          aria-selected="${active ? 'true' : 'false'}"
+          tabindex="${active ? '0' : '-1'}"
+          data-recycle-tab="${escapeHtml(group.source)}"
+        >
+          <span>${escapeHtml(t(group.tabKey))}</span>
+          <span class="settings-recycle-tab-count">${escapeHtml(String(group.items.length))}</span>
+        </button>
+      `;
+    }).join('');
+    const rowsHtml = selectedGroup.items.length
+      ? selectedGroup.items.map(_settingsRecycleRowHtml).join('')
+      : `<div class="settings-empty">${escapeHtml(t(selectedGroup.emptyKey))}</div>`;
+    body.innerHTML = `
+      <div class="settings-recycle-tabs" role="tablist" aria-label="${escapeHtml(t('settings.recycle.tabs_aria'))}">
+        ${tabsHtml}
+      </div>
+      <div class="settings-recycle-scroll" role="tabpanel" data-recycle-source="${escapeHtml(selectedGroup.source)}">
+        ${rowsHtml}
+      </div>
+    `;
   } catch (err) {
     _settingsLog.warn('recycle bin refresh failed', {
       error: (err && err.message) || String(err),
@@ -440,6 +643,24 @@ function _settingsBindRecycleBinOnce() {
   if (!body) return;
   _settingsState.recycleBound = true;
   body.addEventListener('click', async (event) => {
+    const tab = event.target?.closest?.('[data-recycle-tab]');
+    if (tab) {
+      const source = tab.getAttribute('data-recycle-tab') || '';
+      if (!_SETTINGS_RECYCLE_SOURCE_CONFIG.some((config) => config.source === source)) return;
+      _settingsRecycleActiveSource = source;
+      _settingsRecycleSourceTouched = true;
+      await _settingsRefreshRecycleBin();
+      return;
+    }
+    const viewButton = event.target?.closest?.('[data-recycle-view]');
+    if (viewButton) {
+      const id = viewButton.getAttribute('data-recycle-view') || '';
+      if (!id) return;
+      if (_settingsRecycleExpandedIds.has(id)) _settingsRecycleExpandedIds.delete(id);
+      else _settingsRecycleExpandedIds.add(id);
+      await _settingsRefreshRecycleBin();
+      return;
+    }
     const button = event.target?.closest?.('[data-recycle-restore], [data-recycle-delete]');
     if (!button || !_settingsRecycleAvailable()) return;
     const deleting = button.hasAttribute('data-recycle-delete');
@@ -461,6 +682,7 @@ function _settingsBindRecycleBinOnce() {
       if (deleting) {
         const res = await window.orkas.recycleBin.delete(id);
         if (!res?.deleted) throw new Error(t('settings.recycle.delete_not_found'));
+        _settingsRecycleExpandedIds.delete(id);
       } else {
         await window.orkas.recycleBin.restore(id);
         if (typeof loadProjects === 'function') await loadProjects(true);

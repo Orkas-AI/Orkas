@@ -12751,75 +12751,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   max-height: min(320px, 42vh);
   min-height: 72px;
   overflow-y: auto;
-  padding-right: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.settings-recycle-section {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.settings-recycle-section-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--muted);
-}
-.settings-recycle-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.settings-recycle-tabs {
-  display: flex;
-  gap: 18px;
-  border-bottom: 1px solid var(--border);
-}
-.settings-recycle-tab {
-  min-width: 0;
-  border: none;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: var(--text-2);
-  font-family: inherit;
-  font-size: 12.5px;
-  font-weight: 500;
-  padding: 7px 2px 9px;
-  margin-bottom: -1px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-.settings-recycle-tab:hover {
-  color: var(--text);
-}
-.settings-recycle-tab.is-active {
-  color: var(--text);
-  border-bottom-color: var(--primary);
-  font-weight: 600;
-}
-.settings-recycle-tab-count {
-  min-width: 18px;
-  height: 18px;
-  border-radius: 99px;
-  padding: 0 6px;
-  background: var(--surface-2);
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 18px;
-  text-align: center;
-}
-.settings-recycle-tab.is-active .settings-recycle-tab-count {
-  background: var(--primary-soft);
-  color: var(--primary-text);
-}
-.settings-recycle-scroll {
-  max-height: min(320px, 42vh);
-  min-height: 72px;
-  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding-right: 4px;
   display: flex;
   flex-direction: column;
@@ -12870,6 +12803,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-weight: 500;
   color: var(--text);
   line-height: 1.4;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
   overflow-wrap: anywhere;
 }
 .settings-recycle-meta,
