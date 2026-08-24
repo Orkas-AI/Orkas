@@ -1,9 +1,9 @@
 // Sensitive-operation prompts — under approval access modes, when an
 // in-process agent wants to run a command or access a path the classifier
 // flagged as sensitive, main pushes `bash:permission` and this module shows an
-// exact-command allow-once / deny choice. Waiting for a human click is kept
-// alive on the main side with progress heartbeats. Legacy task-level choices
-// are narrowed to one command here and again in main (defense in depth).
+// allow-once / deny choice, plus a task-scoped choice only when main marks the
+// category and actor eligible. Waiting for a human click is kept alive on the
+// main side with progress heartbeats; Renderer never widens main's boundary.
 //
 // Requests queue FIFO so concurrent workers can't stack overlapping dialogs.
 
@@ -398,15 +398,16 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   let presented = false;
-  const requiresPerCommandApproval = Array.isArray(info.reasons)
+  const isSensitiveApproval = Array.isArray(info.reasons)
     && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason));
+  const canAllowRun = !isSensitiveApproval || info.can_allow_run === true;
   const result = await _showBashPermissionModeDialog({
     title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
     message,
     currentMode,
     requestId,
-    allowRun: !requiresPerCommandApproval,
-    showModeControl: !requiresPerCommandApproval,
+    allowRun: canAllowRun,
+    showModeControl: !isSensitiveApproval,
     onPresented: () => {
       if (presented) return;
       presented = true;
@@ -424,16 +425,16 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   const choice = result && typeof result === 'object' ? result.choice : result;
-  const selectedMode = !requiresPerCommandApproval && _bashIsMode(result && result.mode)
+  const selectedMode = !isSensitiveApproval && _bashIsMode(result && result.mode)
     ? result.mode
     : currentMode;
   const requestedDecision = (choice === 'allow_once' || choice === 'allow_run' || choice === 'allow_always')
     ? choice
     : 'deny';
   let decision = (choice === 'allow_once' || choice === 'allow_run') ? choice : 'deny';
-  if (requiresPerCommandApproval && decision === 'allow_run') decision = 'allow_once';
+  if (!canAllowRun && decision === 'allow_run') decision = 'allow_once';
   let effectiveMode = currentMode;
-  if (choice === 'allow_always' && requiresPerCommandApproval) {
+  if (choice === 'allow_always' && isSensitiveApproval) {
     decision = 'allow_once';
   } else if (choice === 'allow_always') {
     const ok = currentMode === 'all_files_auto' || await _setBashPermissionMode('all_files_auto');

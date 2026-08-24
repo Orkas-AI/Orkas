@@ -177,30 +177,30 @@ describe('prompts › chat_shared_rules web-search invariants', () => {
 });
 
 describe('prompts › chat_shared_rules execution-plan policy', () => {
-  it('uses Codex-style semantic admission for meaningfully multi-step work', () => {
+  it('admits Plan only when the current actor needs a durable milestone anchor', () => {
     const body = prompts.load('chat_shared_rules', {});
-    expect(body).toMatch(/user asks or next work is meaningfully multi-step/i);
-    expect(body).toMatch(/outcome milestones span extended execution/i);
-    expect(body).toMatch(/sequence, ambiguity, or intermediate validation matters/i);
+    expect(body).toMatch(/user asks or this actor needs durable milestones/i);
+    expect(body).toMatch(/across extended execution, tool loops, compaction, or interruption/i);
+    expect(body).toMatch(/sequence, unresolved evidence, or validation can change remaining work/i);
     expect(body).toMatch(/substantial phases emerge/i);
-    expect(body).toMatch(/Skip simple\/single-step work/i);
-    expect(body).toMatch(/counts alone never decide/i);
-    expect(body).toMatch(/through tool loops and compaction/i);
+    expect(body).toMatch(/Skip simple work or work clear in live context/i);
+    expect(body).toMatch(/tool, file, and step counts never decide/i);
+    expect(body).toMatch(/Plans anchor goals and remaining work/i);
   });
 
   it('keeps Plan current without turning routine progress into bookkeeping rounds', () => {
     const body = prompts.load('chat_shared_rules', {});
-    expect(body).toMatch(/outcome milestones, not reads, calls, narration/i);
-    expect(body).toMatch(/refresh only when remaining outcomes, order, scope, or blockers materially change/i);
-    expect(body).toMatch(/handoff\/recovery needs a current anchor/i);
-    expect(body).toMatch(/not merely to mark routine progress/i);
-    expect(body).toMatch(/Prefer co-emitting creation and later changes with the related non-Plan business tool/i);
-    expect(body).toMatch(/If none is ready, defer the Plan while execution remains clear/i);
-    expect(body).toMatch(/standalone Plan call only when the anchor itself is needed before continuing/i);
-    expect(body).toMatch(/Batch adjacent statuses with `set_statuses`/i);
-    expect(body).toMatch(/final-status bookkeeping is not required before the final reply/i);
-    expect(body).toMatch(/working memory, never a completion gate/i);
-    expect(body).toMatch(/return the final reply without another Plan call/i);
+    expect(body).toMatch(/outcome milestones, not reads, calls, or narration/i);
+    expect(body).toMatch(/update only when stale Plan state could mislead execution or recovery/i);
+    expect(body).toMatch(/outcomes, order, scope, or blockers changed/i);
+    expect(body).toMatch(/not for routine progress/i);
+    expect(body).toMatch(/Prefer co-emitting necessary Plan changes with the related business tool/i);
+    expect(body).toMatch(/defer while execution is clear/i);
+    expect(body).toMatch(/standalone Plan call only when the anchor is needed before continuing/i);
+    expect(body).toMatch(/Batch adjacent statuses in a necessary update with `set_statuses`/i);
+    expect(body).toMatch(/no final bookkeeping is required/i);
+    expect(body).toMatch(/working memory, not a completion gate/i);
+    expect(body).toMatch(/after tools, reply without another Plan call/i);
     expect(body).toMatch(/Never complete before evidence/i);
     expect(body).toMatch(/objective stays authoritative until the user changes, cancels, or supersedes it/i);
   });

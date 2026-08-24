@@ -391,7 +391,7 @@ describe('locale resource contract', () => {
     expect(rendererLocales).toEqual(mainLocales);
   });
 
-  it('keeps locale key sets, value types and placeholders identical', () => {
+  it('keeps locale key sets, value types and supported placeholders identical', () => {
     const allowedEmpty = new Set([
       'force_update.status_error',
       'memory.export_sub',
@@ -411,6 +411,8 @@ describe('locale resource contract', () => {
             expect(allowedEmpty.has(key), `${side}/${lang}:${key} unexpected empty value`)
               .toBe(true);
           }
+          expect(value, `${side}/${lang}:${key} unsupported double-brace placeholder`)
+            .not.toMatch(/\{\{\w+\}\}/);
           expect(placeholders(value), `${side}/${lang}:${key} placeholders`)
             .toEqual(placeholders(tables.en[key]));
         }
@@ -471,6 +473,18 @@ describe('locale resource contract', () => {
       expect(tables[lang]['kb_picker.title_project'].toLocaleLowerCase(), `${lang}: Project Library picker`)
         .toContain(tables[lang]['contexts.transfer.project_library'].toLocaleLowerCase());
     }
+  });
+
+  it('keeps parameterized translations out of static DOM bindings', () => {
+    const rendererEnglish = localeTables('renderer').en;
+    const html = fs.readFileSync(path.join(rendererRoot, 'index.html'), 'utf8');
+    const parameterizedBindings = [
+      ...html.matchAll(/\b(data-i18n(?:-placeholder|-title|-aria-label)?)="([^"]+)"/g),
+    ]
+      .map((match) => ({ attribute: match[1], key: match[2] }))
+      .filter(({ key }) => placeholders(rendererEnglish[key] || '').length > 0);
+
+    expect(parameterizedBindings).toEqual([]);
   });
 
   it('defines every literal Renderer translation key referenced by HTML or JS', () => {

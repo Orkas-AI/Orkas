@@ -66,19 +66,68 @@ describe('bash-permissions', () => {
   it.each([
     'network_egress',
     'destructive',
-    'priv_esc',
     'sensitive_path',
     'system_package_change',
-    'external_mutation',
-  ] as const)('downgrades stale allow_run for %s and prompts again next time', async (reason) => {
+  ] as const)('allows %s for the current task and skips later same-scope prompts', async (reason) => {
     const first = ask({ reasons: [reason] });
+    expect(permissionPushes()[0].payload.can_allow_run).toBe(true);
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    const second = ask({ reasons: [reason] });
+    expect(await second).toBe('allow_run');
+    expect(permissionPushes()).toHaveLength(1);
+  });
+
+  it('allows the top-level Commander to use a task grant despite its empty wire agent id', async () => {
+    const first = ask({ agentId: '', agentName: 'Commander', reasons: ['destructive'] });
+    expect(permissionPushes()[0].payload.agent_id).toBe('');
+    expect(permissionPushes()[0].payload.can_allow_run).toBe(true);
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    const second = ask({ agentId: '', agentName: 'Commander', reasons: ['destructive'] });
+    expect(await second).toBe('allow_run');
+    expect(permissionPushes()).toHaveLength(1);
+  });
+
+  it('does not widen an unidentified anonymous actor into a task grant', async () => {
+    const first = ask({ agentId: '', agentName: '', reasons: ['destructive'] });
+    expect(permissionPushes()[0].payload.can_allow_run).toBe(false);
     bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
     expect(await first).toBe('allow_once');
 
-    const second = ask({ reasons: [reason] });
+    const second = ask({ agentId: '', agentName: '', reasons: ['destructive'] });
     expect(permissionPushes()).toHaveLength(2);
     bp.respond(permissionPushes()[1].payload.request_id, 'deny');
     expect(await second).toBe('deny');
+  });
+
+  it.each(['priv_esc', 'external_mutation'] as const)(
+    'keeps %s exact-command only and narrows a stale allow_run response',
+    async (reason) => {
+      const first = ask({ reasons: [reason] });
+      expect(permissionPushes()[0].payload.can_allow_run).toBe(false);
+      bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+      expect(await first).toBe('allow_once');
+
+      const second = ask({ reasons: [reason] });
+      expect(permissionPushes()).toHaveLength(2);
+      bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+      expect(await second).toBe('deny');
+    },
+  );
+
+  it('requires a new prompt when a task-granted command adds a stricter category', async () => {
+    const first = ask({ reasons: ['network_egress'] });
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    const stricter = ask({ reasons: ['network_egress', 'external_mutation'] });
+    expect(permissionPushes()).toHaveLength(2);
+    expect(permissionPushes()[1].payload.can_allow_run).toBe(false);
+    bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+    expect(await stricter).toBe('deny');
   });
 
   it('keeps structured external mutation details while enforcing one-time approval', async () => {
@@ -95,7 +144,7 @@ describe('bash-permissions', () => {
 
   });
 
-  it('does not settle an already queued same-category request from stale allow_run', async () => {
+  it('does not settle an already queued same-category request when a task grant is created', async () => {
     const first = ask({
       command: 'rm first.txt',
       reasons: ['destructive'],
@@ -109,7 +158,7 @@ describe('bash-permissions', () => {
     second.then(() => { secondSettled = true; });
 
     bp.respond(requests[0].payload.request_id, 'allow_run');
-    expect(await first).toBe('allow_once');
+    expect(await first).toBe('allow_run');
     await Promise.resolve();
     expect(secondSettled).toBe(false);
 
@@ -148,6 +197,32 @@ describe('bash-permissions', () => {
     await p3;
   });
 
+  it('cancelForCid clears task grants', async () => {
+    const first = ask({ reasons: ['network_egress'] });
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    bp.cancelForCid('c1');
+    const afterCancel = ask({ reasons: ['network_egress'] });
+    expect(permissionPushes()).toHaveLength(2);
+    bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+    expect(await afterCancel).toBe('deny');
+  });
+
+  it('does not share task grants with another agent or conversation', async () => {
+    const first = ask({ reasons: ['network_egress'] });
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    const otherAgent = ask({ agentId: 'a2', reasons: ['network_egress'] });
+    const otherConversation = ask({ cid: 'c2', reasons: ['network_egress'] });
+    expect(permissionPushes()).toHaveLength(3);
+    bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+    bp.respond(permissionPushes()[2].payload.request_id, 'deny');
+    expect(await otherAgent).toBe('deny');
+    expect(await otherConversation).toBe('deny');
+  });
+
   it('cancelForCid leaves another conversation pending', async () => {
     const p1 = ask({ cid: 'c1' });
     const p2 = ask({ cid: 'c2' });
@@ -184,6 +259,18 @@ describe('bash-permissions', () => {
     expect(await pendingU2).toBe('allow_once');
     bp.respond(permissionPushes()[2].payload.request_id, 'deny');
     expect(await afterCancel).toBe('deny');
+  });
+
+  it('cancelForUid clears task grants for the previous account', async () => {
+    const first = ask({ reasons: ['sensitive_path'] });
+    bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+    expect(await first).toBe('allow_run');
+
+    bp.cancelForUid('u1');
+    const afterSwitch = ask({ reasons: ['sensitive_path'] });
+    expect(permissionPushes()).toHaveLength(2);
+    bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+    expect(await afterSwitch).toBe('deny');
   });
 
   it('does not auto-deny while waiting for user action', async () => {

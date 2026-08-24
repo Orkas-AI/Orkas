@@ -65,6 +65,9 @@ describe('Commander resident prompt surface', () => {
     expect(routing).toMatch(/that Agent uses its own authorized Skill surface/i);
     expect(routing).toMatch(/default to `hand_off_to\(\{ to, message, resume\? \}\)`/i);
     expect(routing).toMatch(/one Agent owns the remaining user-visible outcome/i);
+    expect(routing).toMatch(/same response as the owner decision/i);
+    expect(routing).toMatch(/target Agent owns input sufficiency and any execution Plan/i);
+    expect(routing).toMatch(/do not read a target's `agent\.json`[\s\S]{0,180}solely to prepare a terminal hand-off/i);
     expect(routing).toMatch(/use `dispatch_to\(\{ to, message, resume\? \}\)`/i);
     expect(routing).toMatch(/synthesis across at least two distinct results/i);
     expect(routing).toMatch(/Follow the tool schemas for lifecycle and recovery details/i);

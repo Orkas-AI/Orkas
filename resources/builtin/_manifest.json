@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "626920532b0c66d390110feb03de8c2df42f944bb75fbb0af6472ce148c948f7",
+  "content_tree_sha256": "d9031626322133bc758ef086eacf147f3bd2d82ec9509e80922814f3ee249607",
   "files": [
     {
       "path": "marketplace/agents/173d4235a431/_meta.json",
@@ -625,12 +625,12 @@
     {
       "path": "marketplace/skills/081c15ffbab4/_meta.json",
       "bytes": 178,
-      "sha256": "e93570275b20b807231c26fcb8caad89f2d25be24e994e2e998d8354a7809feb"
+      "sha256": "5c8776eb9a15ad1d452c261faa90c665769d19a0139a4e371d11329df15ee35c"
     },
     {
       "path": "marketplace/skills/081c15ffbab4/SKILL.md",
-      "bytes": 8450,
-      "sha256": "1f843b0a576e08d87593fe171d9097eae4bba0520ce8ad4ecaabfbda68c00dde"
+      "bytes": 8686,
+      "sha256": "7c2d66bead6f8d629f799b34842313c33127e3c1a3acfab070d9e40120034de6"
     },
     {
       "path": "marketplace/skills/36bd44ae956c/_meta.json",
@@ -1680,8 +1680,8 @@
       {
         "id": "081c15ffbab4",
         "name": "office-excel",
-        "version": "1.0.12",
-        "updated_at": "2026-08-23T09:48:36.000Z"
+        "version": "1.0.13",
+        "updated_at": "2026-08-24T12:00:00.000Z"
       },
       {
         "id": "36bd44ae956c",

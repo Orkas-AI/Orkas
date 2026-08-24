@@ -717,10 +717,24 @@ describe('prompts ↔ code contract', () => {
 
     expect(commanderPrompt).toMatch(/required inputs, files, context, or user decisions/i);
     expect(commanderPrompt).toMatch(/must not be fabricated/i);
+    expect(commanderPrompt).toMatch(/own input schema/i);
+    expect(commanderPrompt).toMatch(/target Agent owns input sufficiency and any execution Plan/i);
+    expect(commanderPrompt).toMatch(/do not read a target's `agent\.json`, inspect or list workspace files, or create\/update a Commander Plan solely to prepare a terminal hand-off/i);
+    expect(commanderPrompt).toMatch(/read an Agent spec only when Commander must resolve a concrete non-terminal dependency or the user explicitly asks about that spec/i);
+    expect(commanderPrompt).not.toContain('inputs: read agent.json before dispatch');
     expect(commanderPrompt).toMatch(/shared Plan rule when the remaining sequence is meaningfully multi-step/i);
     expect(commanderPrompt).toMatch(/otherwise keep it in the live execution context/i);
     expect(commanderPrompt).toMatch(/Session recovery and the orchestration ledger preserve continuity independently of Plan/i);
     expect(commanderPrompt).not.toMatch(/milestone plan may preserve the goal\/progress/i);
+  });
+
+  it('commander starts a single-owner terminal hand-off without preparatory control rounds', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    expect(commanderPrompt).toMatch(/when one Agent owns the remaining user-visible outcome/i);
+    expect(commanderPrompt).toMatch(/default to `hand_off_to\(\{ to, message, resume\? \}\)` in the same response as the owner decision/i);
+    expect(commanderPrompt).toMatch(/without preparatory control calls unless a concrete dependency must first be resolved/i);
+    expect(commanderPrompt).toMatch(/use `dispatch_to\(\{ to, message, resume\? \}\)` only when Commander must consume the result/i);
   });
 
   it('agent prompt keeps generated input forms minimal', () => {

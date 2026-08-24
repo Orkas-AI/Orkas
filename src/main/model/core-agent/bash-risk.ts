@@ -5,9 +5,9 @@
  *
  * Design principle — match command structure, not broad keywords. This runs on
  * a default-on surface, so we avoid text-only matches that would flag routine
- * commands like `npm ls`; however, dependency changes and actual shell delete
- * commands are sensitive because they can execute untrusted code or mutate
- * durable state directly.
+ * commands like `npm ls`; however, host/global package changes and actual
+ * shell delete commands are sensitive because they mutate durable state
+ * outside the active workspace.
  *
  * Six categories:
  *   - network_egress  — explicit shell network access, including downloads.
@@ -18,8 +18,8 @@
  *                       autostart locations (writes), /etc writes. Excludes
  *                       `.env`, broad `~/.config`, /etc reads, and the macOS
  *                       user dirs (Documents/Desktop/Downloads).
- *   - system_package_change — native system package and project dependency
- *                       changes. Read-only discovery operations pass.
+ *   - system_package_change — native system packages and explicit user/global
+ *                       toolchain changes. Project-local dependencies pass.
  *   - external_mutation — writes to databases, remote hosts/files, deployed
  *                       services, external APIs, registries, or control planes.
  *
@@ -842,8 +842,10 @@ function matchSystemPackageChange(cmd: string, args: string[]): boolean {
   const lower = args.map((arg) => arg.toLowerCase());
   if (hasHelpOrVersion(args) || lower[0] === 'help') return false;
 
-  // Project-local installers are included: install hooks and build backends
-  // can execute code even when the resulting dependency stays in a workspace.
+  // This category protects durable host/user toolchain state, not ordinary
+  // workspace dependency work. Install hooks can execute code, but so can any
+  // project command; treating every local install/runner as a system change
+  // made the approval surface much broader than the category name promised.
   // `python -m pip` is the common cross-platform spelling for pip.
   if (/^(?:python(?:3(?:\.\d+)?)?|py)$/.test(command)
     && lower[0] === '-m' && (lower[1] === 'pip' || lower[1] === 'pip3')) {
@@ -856,7 +858,12 @@ function matchSystemPackageChange(cmd: string, args: string[]): boolean {
       actions,
       new Set(['list', 'show', 'check', 'freeze', 'download', 'index', 'inspect', 'help']),
     );
-    return action !== null && actions.has(action);
+    return action !== null && actions.has(action) && lower.some((arg) => (
+      arg === '--user'
+      || arg === '--break-system-packages'
+      || arg.startsWith('--user=')
+      || arg.startsWith('--break-system-packages=')
+    ));
   }
 
   if (command === 'npm' || command === 'pnpm') {
@@ -865,53 +872,63 @@ function matchSystemPackageChange(cmd: string, args: string[]): boolean {
       : new Set(['install', 'i', 'add', 'update', 'up', 'uninstall', 'remove', 'rm', 'prune', 'dedupe', 'link', 'import', 'deploy']);
     const readonly = new Set(['list', 'ls', 'why', 'view', 'info', 'show', 'search', 'audit', 'outdated', 'ping', 'config', 'help', 'run']);
     const action = firstRecognizedAction(args, actions, readonly);
-    if (action !== null && actions.has(action)) return true;
-    if (command === 'npm') return lower[0] === 'exec';
-    return lower[0] === 'dlx';
+    if (command === 'pnpm' && lower[0] === 'self-update') return true;
+    if (command === 'npm' && action === 'link') return true;
+    const global = lower.some((arg, index) => (
+      arg === '-g'
+      || arg === '--global'
+      || arg.startsWith('--global=')
+      || arg === '--location=global'
+      || (arg === '--location' && lower[index + 1] === 'global')
+    ));
+    return global && action !== null && actions.has(action);
   }
   if (command === 'yarn') {
-    return new Set(['install', 'add', 'remove', 'upgrade', 'up', 'dedupe', 'import', 'dlx']).has(lower[0] || '')
-      || (lower[0] === 'global' && ['add', 'remove', 'upgrade'].includes(lower[1] || ''));
+    return lower[0] === 'global' && ['add', 'remove', 'upgrade'].includes(lower[1] || '');
   }
   if (command === 'bun') {
-    return new Set(['install', 'i', 'add', 'remove', 'rm', 'update', 'link']).has(lower[0] || '');
+    if (lower[0] === 'upgrade') return true;
+    const global = lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+    return global && new Set(['install', 'i', 'add', 'remove', 'rm', 'update', 'link']).has(lower[0] || '');
   }
   if (command === 'uv') {
     const toolIndex = lower.indexOf('tool');
     const pythonIndex = lower.indexOf('python');
+    const selfIndex = lower.indexOf('self');
     const actions = new Set(['install', 'uninstall', 'upgrade']);
     if (toolIndex >= 0) return actions.has(lower[toolIndex + 1] || '');
     if (pythonIndex >= 0) return actions.has(lower[pythonIndex + 1] || '');
-    if (lower[0] === 'pip') return new Set(['install', 'uninstall', 'sync']).has(lower[1] || '');
-    return new Set(['add', 'remove', 'sync', 'lock']).has(lower[0] || '');
+    if (selfIndex >= 0) return lower[selfIndex + 1] === 'update';
+    return false;
   }
-  if (command === 'npx' || command === 'bunx' || command === 'uvx') {
-    if (!args.length || lower.some((arg) => arg === '-v' || arg === '--version')) return false;
-    return lower.some((arg) => !arg.startsWith('-') || arg.startsWith('--package='));
+  if (command === 'poetry') {
+    return lower[0] === 'self' && new Set(['add', 'remove', 'update']).has(lower[1] || '');
   }
-  if (command === 'poetry') return new Set(['add', 'remove', 'install', 'update', 'sync', 'lock']).has(lower[0] || '');
-  if (command === 'pipenv') return new Set(['install', 'uninstall', 'update', 'sync', 'lock']).has(lower[0] || '');
   if (command === 'conda' || command === 'mamba' || command === 'micromamba') {
     return new Set(['create', 'install', 'remove', 'uninstall', 'update', 'upgrade']).has(lower[0] || '');
   }
   if (command === 'cargo') {
     if (lower[0] === 'install' && lower.includes('--list')) return false;
-    return new Set(['install', 'uninstall', 'add', 'remove', 'update', 'fetch']).has(lower[0] || '');
+    return new Set(['install', 'uninstall']).has(lower[0] || '');
   }
-  if (command === 'go') return lower[0] === 'get'
-    || (lower[0] === 'mod' && new Set(['tidy', 'download', 'vendor', 'edit']).has(lower[1] || ''));
-  if (command === 'bundle' || command === 'bundler') {
-    return new Set(['install', 'update', 'add', 'remove', 'lock', 'clean']).has(lower[0] || '');
+  if (command === 'go') {
+    return lower[0] === 'install'
+      || (lower[0] === 'env' && lower.some((arg) => arg === '-w' || arg === '-u'));
   }
   if (command === 'gem') return new Set(['install', 'uninstall', 'update', 'cleanup']).has(lower[0] || '');
-  if (command === 'composer') return new Set(['install', 'update', 'require', 'remove']).has(lower[0] || '');
-  if (command === 'dotnet') {
-    return lower[0] === 'restore'
-      || (new Set(['add', 'remove']).has(lower[0] || '') && lower[1] === 'package')
-      || (lower[0] === 'tool' && new Set(['install', 'update', 'uninstall', 'restore']).has(lower[1] || ''));
+  if (command === 'composer') {
+    return lower[0] === 'global' && new Set(['install', 'update', 'require', 'remove']).has(lower[1] || '');
   }
-  if (command === 'swift') return lower[0] === 'package' && new Set(['resolve', 'update']).has(lower[1] || '');
-  if (command === 'corepack') return new Set(['enable', 'disable', 'install', 'prepare', 'use', 'up']).has(lower[0] || '');
+  if (command === 'dotnet') {
+    return lower[0] === 'tool'
+      && new Set(['install', 'update', 'uninstall']).has(lower[1] || '')
+      && lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+  }
+  if (command === 'corepack') {
+    if (lower[0] === 'enable' || lower[0] === 'disable' || lower[0] === 'prepare') return true;
+    return lower[0] === 'install'
+      && lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+  }
   if (command === 'pacman') return matchPacmanPackageChange(args);
   if (command === 'winget' || command === 'choco' || command === 'chocolatey') {
     const upgradeIndex = lower.indexOf('upgrade');

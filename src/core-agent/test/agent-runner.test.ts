@@ -6598,6 +6598,16 @@ describe("AgentRunner", () => {
       msgs.some((m) => m.role === "user"
         && m.content.some((c) => c.type === "text" && c.text.includes("approaching the tool loop round limit"))));
     expect(nudged).toBe(true);
+    const nudgeText = capturedStreamMessages
+      .flatMap((messages) => messages)
+      .filter((message) => message.role === "user")
+      .flatMap((message) => message.content)
+      .find((content) => content.type === "text"
+        && content.text.includes("approaching the tool loop round limit"));
+    expect(nudgeText?.type === "text" ? nudgeText.text : "")
+      .toContain("verify it once, and then respond");
+    expect(nudgeText?.type === "text" ? nudgeText.text : "")
+      .not.toContain("update the execution plan");
     expect(completeMessages.some((m) => m.role === "user"
       && m.content.some((c) => c.type === "text" && c.text.includes("No more tool calls are available")))).toBe(true);
     expect(completeMessages.some((m) => m.role === "user"

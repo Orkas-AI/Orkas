@@ -3,9 +3,9 @@ import { classifyBashCommand, type RiskCategory } from '../../../../src/main/mod
 
 // The classifier runs on a default-on surface, so the SAFE (look-alike) table
 // matters as much as the RISKY one: a false positive here means prompting the
-// user on read-only package queries or dry runs. Actual dependency changes,
-// network access, and shell deletes are sensitive because they cross durable
-// host or external boundaries.
+// user on routine workspace dependency work or dry runs. Host/global package
+// changes, network access, and shell deletes remain sensitive because they
+// cross durable workspace, host, or external boundaries.
 
 // [command, expected category that MUST be present]
 const RISKY: Array<[string, RiskCategory]> = [
@@ -90,41 +90,32 @@ const RISKY: Array<[string, RiskCategory]> = [
   ['snap install postgresql-client', 'system_package_change'],
   ['flatpak remote-add flathub https://flathub.org/repo/flathub.flatpakrepo', 'system_package_change'],
   ['npm install --global pnpm', 'system_package_change'],
+  ['npm --global install pnpm', 'system_package_change'],
+  ['npm install --location=global pnpm', 'system_package_change'],
+  ['npm --location global install pnpm', 'system_package_change'],
+  ['npm link', 'system_package_change'],
   ['pnpm add -g typescript', 'system_package_change'],
+  ['pnpm self-update', 'system_package_change'],
   ['yarn global add serve', 'system_package_change'],
+  ['bun add --global typescript', 'system_package_change'],
+  ['bun upgrade', 'system_package_change'],
   ['python -m pip install --user poetry', 'system_package_change'],
   ['pip install --user poetry', 'system_package_change'],
+  ['pip install --break-system-packages poetry', 'system_package_change'],
   ['pipx install poetry', 'system_package_change'],
   ['uv tool install ruff', 'system_package_change'],
   ['uv python install 3.13', 'system_package_change'],
-  ['cargo install ripgrep', 'system_package_change'],
-
-  // Project dependency changes are still host code changes: lifecycle hooks
-  // and build backends can execute even when the install target is local.
-  ['npm ci', 'system_package_change'],
-  ['npm install typescript', 'system_package_change'],
-  ['npm rm old-package', 'system_package_change'],
-  ['pnpm add react', 'system_package_change'],
-  ['yarn remove lodash', 'system_package_change'],
-  ['bun install', 'system_package_change'],
-  ['pip install requests', 'system_package_change'],
-  ['python -m pip install -r requirements.txt', 'system_package_change'],
-  ['uv pip install requests', 'system_package_change'],
-  ['uv sync', 'system_package_change'],
-  ['poetry add requests', 'system_package_change'],
-  ['pipenv sync', 'system_package_change'],
+  ['uv self update', 'system_package_change'],
+  ['poetry self add poetry-plugin-export', 'system_package_change'],
   ['conda install numpy', 'system_package_change'],
-  ['cargo add serde', 'system_package_change'],
-  ['cargo update', 'system_package_change'],
-  ['go get golang.org/x/text', 'system_package_change'],
-  ['go mod tidy', 'system_package_change'],
-  ['bundle install', 'system_package_change'],
+  ['cargo install ripgrep', 'system_package_change'],
+  ['go install golang.org/x/tools/gopls@latest', 'system_package_change'],
+  ['go env -w GOPROXY=https://proxy.example', 'system_package_change'],
   ['gem uninstall rake', 'system_package_change'],
-  ['composer require monolog/monolog', 'system_package_change'],
-  ['dotnet restore', 'system_package_change'],
-  ['dotnet add package Newtonsoft.Json', 'system_package_change'],
-  ['swift package resolve', 'system_package_change'],
-  ['npx prettier --write src/app.ts', 'system_package_change'],
+  ['composer global require friendsofphp/php-cs-fixer', 'system_package_change'],
+  ['dotnet tool install --global dotnet-ef', 'system_package_change'],
+  ['corepack enable', 'system_package_change'],
+  ['corepack install --global pnpm@latest', 'system_package_change'],
 
   // external_mutation — concrete writes to shared/remote state. This category
   // is per-command because a prior SSH/network approval must not authorize a
@@ -202,6 +193,38 @@ const RISKY: Array<[string, RiskCategory]> = [
 
 // commands that MUST NOT be flagged (risky === false)
 const SAFE: string[] = [
+  // Project-local execution and dependency changes remain routine workspace
+  // operations; pair these against the explicit user/global cases above.
+  'npm ci',
+  'npm install typescript',
+  'npm rm old-package',
+  'npm exec prettier -- --write src/app.ts',
+  'pnpm add react',
+  'pnpm dlx prettier --write src/app.ts',
+  'yarn remove lodash',
+  'yarn dlx prettier --write src/app.ts',
+  'bun install',
+  'bunx prettier --write src/app.ts',
+  'pip install requests',
+  'python -m pip install -r requirements.txt',
+  'uv pip install requests',
+  'uv sync',
+  'uvx ruff check .',
+  'poetry add requests',
+  'pipenv sync',
+  'cargo add serde',
+  'cargo update',
+  'cargo fetch',
+  'go get golang.org/x/text',
+  'go mod tidy',
+  'bundle install',
+  'composer require monolog/monolog',
+  'dotnet restore',
+  'dotnet add package Newtonsoft.Json',
+  'dotnet tool install --local dotnet-ef',
+  'swift package resolve',
+  'npx prettier --write src/app.ts',
+  'corepack use pnpm@latest',
   // Local execution and dependency/package discovery remain routine.
   'npm run build',
   'npm ls',
@@ -349,6 +372,15 @@ describe('bash-risk › structure / edge cases', () => {
     expect(classifyBashCommand(
       'cmd.exe /d /c "choco install postgresql -y"',
     ).reasons).toContain('system_package_change');
+  });
+
+  it('keeps project-local dependency changes routine inside Windows shell wrappers', () => {
+    expect(classifyBashCommand(
+      'powershell -NoProfile -Command "npm install react"',
+    ).reasons).not.toContain('system_package_change');
+    expect(classifyBashCommand(
+      'cmd.exe /d /c "python -m pip install requests"',
+    ).reasons).not.toContain('system_package_change');
   });
 
   it('does not classify package-manager words that are only printed or queried', () => {

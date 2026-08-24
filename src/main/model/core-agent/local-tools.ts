@@ -1480,7 +1480,7 @@ async function gateSensitiveLocalPathDetailed(
   ctx?: ToolContext,
 ): Promise<BashPathGateResult> {
   if (!localAccessRequiresSensitiveApproval()) return { error: null, approvedReasons: [] };
-  const reasons = sensitivePathReasons(abs, access);
+  const reasons = sensitivePathReasons(abs, access, { trustedRoots: allowedRootsFor(opts) });
   if (!reasons.length) return { error: null, approvedReasons: [] };
   const decision = await requestBashDecision({
     uid: opts.userId ?? '',
@@ -1732,12 +1732,17 @@ function bashHeredocSpecs(line: string): BashHeredocSpec[] {
   return specs;
 }
 
-/** Preserve shell command lines/newlines while blanking heredoc payload and
- * terminator lines. This surface is only for shell path syntax analysis; the
- * original command still goes through protected-root checks, risk approval,
- * configured command policies, and the OS write sandbox. */
-function maskBashHeredocBodies(command: string): string {
-  const pending: BashHeredocSpec[] = [];
+type BashHeredocAnalysis = { shellSurface: string; nonShellPayloads: string[] };
+
+/** Preserve shell command lines/newlines while blanking non-shell heredoc
+ * payloads and terminator lines. Python/Node/etc. payloads are source code,
+ * not shell syntax, so parsing calls such as Python's `open(...)` as macOS
+ * `open` would create false external-launch approvals. Shell-receiver payloads
+ * remain on the shell surface, while non-shell source is returned separately
+ * for the external-mutation script scanner. */
+function analyzeBashHeredocs(command: string): BashHeredocAnalysis {
+  const pending: Array<BashHeredocSpec & { bodyLines: string[] }> = [];
+  const nonShellPayloads: string[] = [];
   let out = '';
   let offset = 0;
   while (offset < command.length) {
@@ -1760,14 +1765,29 @@ function maskBashHeredocBodies(command: string): string {
       const comparable = current.stripTabs ? line.replace(/^\t+/, '') : line;
       const isTerminator = comparable === current.delimiter;
       out += (current.shellPayload && !isTerminator ? line : ' '.repeat(line.length)) + newline;
-      if (isTerminator) pending.shift();
+      if (!current.shellPayload && !isTerminator) current.bodyLines.push(line);
+      if (isTerminator) {
+        if (!current.shellPayload && current.bodyLines.length) {
+          nonShellPayloads.push(current.bodyLines.join('\n'));
+        }
+        pending.shift();
+      }
     } else {
       out += line + newline;
-      pending.push(...bashHeredocSpecs(line));
+      pending.push(...bashHeredocSpecs(line).map((spec) => ({ ...spec, bodyLines: [] })));
     }
     offset = end;
   }
-  return out;
+  for (const current of pending) {
+    if (!current.shellPayload && current.bodyLines.length) {
+      nonShellPayloads.push(current.bodyLines.join('\n'));
+    }
+  }
+  return { shellSurface: out, nonShellPayloads };
+}
+
+function maskBashHeredocBodies(command: string): string {
+  return analyzeBashHeredocs(command).shellSurface;
 }
 
 function tokenizeBashPathGuard(input: string): BashPathToken[] {
@@ -2202,17 +2222,42 @@ function simpleFileDeleteOperands(cmd: string, args: string[]): string[] | null 
   return null;
 }
 
-function isLiteralOwnedDeleteTarget(
+function isLiteralAcceptedDeleteTarget(
   raw: string,
   workingDir: string,
   env: Record<string, string>,
-  hasProducedPath: (absPath: string) => boolean,
+  acceptsPath: (absPath: string) => boolean,
 ): boolean {
   if (!raw || /[$`*?\[\]{}]/.test(raw) || /%[A-Za-z_][A-Za-z0-9_]*%/.test(raw) || /^@\(/.test(raw)) {
     return false;
   }
   const resolved = resolveBashCandidate(raw, workingDir, env);
-  return !!resolved?.abs && !resolved.dynamic && hasProducedPath(resolved.abs);
+  return !!resolved?.abs && !resolved.dynamic && acceptsPath(resolved.abs);
+}
+
+function bashDestructiveRiskIsOnlyAcceptedFileDeletion(
+  command: string,
+  workingDir: string,
+  env: Record<string, string>,
+  acceptsPath: (absPath: string) => boolean,
+): boolean {
+  if (!command.trim()) return false;
+  let sawAcceptedFileDelete = false;
+  for (const { segment, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+    if (segment.redirectTargets.length || segment.inputTargets.length) return false;
+    const effective = bashEffectiveCommand(segment.words);
+    if (!effective) continue;
+    const operands = simpleFileDeleteOperands(effective.cmd, effective.args);
+    if (operands !== null) {
+      if (!operands.length || !operands.every((raw) => (
+        isLiteralAcceptedDeleteTarget(raw, workingDir, segmentEnv, acceptsPath)
+      ))) return false;
+      sawAcceptedFileDelete = true;
+      continue;
+    }
+    if (classifyBashCommand(segment.words.join(' ')).reasons.includes('destructive')) return false;
+  }
+  return sawAcceptedFileDelete;
 }
 
 /**
@@ -2228,25 +2273,29 @@ export function bashDestructiveRiskIsOnlyProducedFileDeletion(
   hasProducedPath: ((absPath: string) => boolean) | undefined,
 ): boolean {
   if (!hasProducedPath || !command.trim()) return false;
-  let sawOwnedFileDelete = false;
-  for (const { segment, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
-    if (segment.redirectTargets.length || segment.inputTargets.length) return false;
-    const effective = bashEffectiveCommand(segment.words);
-    if (!effective) continue;
-    const operands = simpleFileDeleteOperands(effective.cmd, effective.args);
-    if (operands !== null) {
-      if (!operands.length || !operands.every((raw) => (
-        isLiteralOwnedDeleteTarget(raw, workingDir, segmentEnv, hasProducedPath)
-      ))) return false;
-      sawOwnedFileDelete = true;
-      continue;
-    }
-    if (classifyBashCommand(segment.words.join(' ')).reasons.includes('destructive')) return false;
-  }
-  return sawOwnedFileDelete;
+  return bashDestructiveRiskIsOnlyAcceptedFileDeletion(command, workingDir, env, hasProducedPath);
 }
 
-function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<string, string> {
+function bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
+  command: string,
+  workingDir: string,
+  env: Record<string, string>,
+  opts: LocalToolsOpts,
+): boolean {
+  if (!opts.userId) return false;
+  let workspaceRoot = '';
+  try { workspaceRoot = getWorkspacePath(opts.userId, opts.projectId); }
+  catch { return false; }
+  if (!workspaceRoot) return false;
+  return bashDestructiveRiskIsOnlyAcceptedFileDeletion(
+    command,
+    workingDir,
+    env,
+    (candidate) => isPathAllowed(candidate, [workspaceRoot]),
+  );
+}
+
+function bashEnvForPathResolution(ctx: ToolContext | undefined, workingDir: string): Record<string, string> {
   const hostPathEnv: Record<string, string> = {};
   for (const name of ['HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR']) {
     const value = process.env[name];
@@ -2254,7 +2303,7 @@ function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<
   }
   return {
     ...hostPathEnv,
-    ...(ctx.state.sandboxEnv as Record<string, string> | undefined),
+    ...(ctx?.state.sandboxEnv as Record<string, string> | undefined),
     ORKAS_OUTPUT_DIR: workingDir,
     ORKAS_OUTPUT_MANIFEST: path.join(workingDir, BASH_OUTPUT_MANIFEST_NAME),
     PWD: workingDir,
@@ -2557,8 +2606,16 @@ function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly Lo
 const EXTERNAL_MUTATION_SCRIPT_MAX_BYTES = 512 * 1024;
 
 async function classifyBashRiskIncludingScripts(command: string, workingDir: string) {
-  const base = classifyBashCommand(command);
+  const heredocs = analyzeBashHeredocs(command);
+  const base = classifyBashCommand(heredocs.shellSurface);
   const externalMutations: ExternalMutationFinding[] = [...base.externalMutations];
+  for (const source of heredocs.nonShellPayloads) {
+    for (const finding of classifyExternalMutationScript(source)) {
+      if (!externalMutations.some((item) => (
+        item.kind === finding.kind && item.action === finding.action && item.target === finding.target
+      ))) externalMutations.push(finding);
+    }
+  }
   for (const scriptRef of referencedExecutableScripts(command)) {
     const abs = path.isAbsolute(scriptRef) ? path.resolve(scriptRef) : path.resolve(workingDir, scriptRef);
     try {
@@ -2577,7 +2634,13 @@ async function classifyBashRiskIncludingScripts(command: string, workingDir: str
   }
   const reasons = [...base.reasons];
   if (externalMutations.length && !reasons.includes('external_mutation')) reasons.push('external_mutation');
-  return { ...base, reasons, risky: reasons.length > 0, externalMutations };
+  return {
+    ...base,
+    reasons,
+    risky: reasons.length > 0,
+    externalMutations,
+    shellSurface: heredocs.shellSurface,
+  };
 }
 
 async function guardBashPathCandidates(
@@ -3367,9 +3430,9 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       const workingDirForGuard = path.resolve(ctx.workingDir ?? '.');
       const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDirForGuard);
       if (filesystemGate.result) return filesystemGate.result;
-      // Approval modes prompt for configured sensitive categories. System
-      // package changes are always per-command approvals, including in the
-      // otherwise non-prompting all_files_auto mode.
+      // Approval modes prompt for configured sensitive categories. Host/global
+      // package changes still enter approval in the otherwise non-prompting
+      // all_files_auto mode; project-local dependencies are not in that class.
       if (command.trim()) {
         const base = await classifyBashRiskIncludingScripts(command, workingDirForGuard);
         const approvalMode = localAccessRequiresSensitiveApproval(mode);
@@ -3380,16 +3443,24 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         if (pathApprovalCoveredSensitive) {
           baseReasons = baseReasons.filter((reason) => reason !== 'sensitive_path');
         }
-        if (baseReasons.includes('destructive') && bashDestructiveRiskIsOnlyProducedFileDeletion(
-          command,
-          workingDirForGuard,
-          bashEnvForPathResolution(ctx, workingDirForGuard),
-          opts.hasProducedPath,
-        )) {
-          baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
+        if (baseReasons.includes('destructive')) {
+          const pathEnv = bashEnvForPathResolution(ctx, workingDirForGuard);
+          if (bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
+            command,
+            workingDirForGuard,
+            pathEnv,
+            opts,
+          ) || bashDestructiveRiskIsOnlyProducedFileDeletion(
+            command,
+            workingDirForGuard,
+            pathEnv,
+            opts.hasProducedPath,
+          )) {
+            baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
+          }
         }
         const reasons = approvalMode
-          ? classifyConfiguredBashCommand(command, baseReasons, {
+          ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
             includePathPatterns: !pathApprovalCoveredSensitive,
           })
           : baseReasons;
@@ -3544,11 +3615,24 @@ async function gateInteractiveCliStart(
     const base = await classifyBashRiskIncludingScripts(command, path.resolve(settings?.workingDir ?? '.'));
     const approvalMode = localAccessRequiresSensitiveApproval(mode);
     const approvedReasons = settings?.approvedReasons ?? [];
-    const baseReasons = (approvalMode ? base.reasons : base.reasons.filter(
+    let baseReasons = (approvalMode ? base.reasons : base.reasons.filter(
       (reason) => reason === 'system_package_change' || reason === 'external_mutation',
     )).filter((reason) => !approvedReasons.includes(reason));
+    const workingDir = path.resolve(settings?.workingDir ?? '.');
+    if (baseReasons.includes('destructive')) {
+      const pathEnv = bashEnvForPathResolution(ctx, workingDir);
+      if (bashDestructiveRiskIsOnlyWorkspaceFileDeletion(command, workingDir, pathEnv, opts)
+        || bashDestructiveRiskIsOnlyProducedFileDeletion(
+          command,
+          workingDir,
+          pathEnv,
+          opts.hasProducedPath,
+        )) {
+        baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
+      }
+    }
     const reasons = approvalMode
-      ? classifyConfiguredBashCommand(command, baseReasons, {
+      ? classifyConfiguredBashCommand(base.shellSurface, baseReasons, {
         includePathPatterns: !approvedReasons.includes('sensitive_path'),
       })
       : baseReasons;
@@ -3557,12 +3641,12 @@ async function gateInteractiveCliStart(
         uid: opts.userId ?? '',
         cid: opts.cid ?? '',
         agentId: opts.agentId ?? '',
-            agentName: opts.agentName ?? opts.agentId ?? '',
-            command,
-            reasons,
-            externalMutations: base.externalMutations,
-            onWaiting: permissionWaitProgress(ctx, 'interactive_cli_start'),
-          });
+        agentName: opts.agentName ?? opts.agentId ?? '',
+        command,
+        reasons,
+        externalMutations: base.externalMutations,
+        onWaiting: permissionWaitProgress(ctx, 'interactive_cli_start'),
+      });
       if (decision === 'deny') {
         log.warn('interactive_cli_start risk denied', {
           user_id: maskId(opts.userId),

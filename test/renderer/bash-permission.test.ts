@@ -117,7 +117,7 @@ describe('renderer bash permission prompt', () => {
     expect(code).toContain('${caretHtml}');
   });
 
-  it('shows an exact-command decision without task-level or permission-mode controls', async () => {
+  it('offers task-level approval when main marks the risk category eligible', async () => {
     const h = loadHarness({ choice: 'allow_once', mode: 'all_files_auto' });
 
     h.pushHandler({
@@ -126,12 +126,13 @@ describe('renderer bash permission prompt', () => {
       agent_name: 'Commander',
       command: 'curl https://example.com',
       reasons: ['network_egress'],
+      can_allow_run: true,
     });
     await flush();
 
     expect(h.dialogArgs[0]).toMatchObject({
       currentMode: 'all_files_approval',
-      allowRun: false,
+      allowRun: true,
       showModeControl: false,
     });
     expect(h.dialogArgs[0].message).toContain('Commander wants network:');
@@ -218,11 +219,9 @@ describe('renderer bash permission prompt', () => {
   it.each([
     'network_egress',
     'destructive',
-    'priv_esc',
     'sensitive_path',
     'system_package_change',
-    'external_mutation',
-  ] as const)('narrows a stale task-level approval to one command for %s', async (reason) => {
+  ] as const)('returns task-level approval for eligible %s prompts', async (reason) => {
     const h = loadHarness({ choice: 'allow_run', mode: 'workspace_approval' });
 
     h.pushHandler({
@@ -230,25 +229,48 @@ describe('renderer bash permission prompt', () => {
       agent_name: 'Agent',
       command: 'sensitive command',
       reasons: [reason],
+      can_allow_run: true,
     });
     await flush();
 
-    expect(h.dialogArgs[0]).toMatchObject({ allowRun: false, showModeControl: false });
+    expect(h.dialogArgs[0]).toMatchObject({ allowRun: true, showModeControl: false });
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
-      { channel: 'bash.permission_response', payload: { request_id: `req-${reason}`, decision: 'allow_once' } },
+      { channel: 'bash.permission_response', payload: { request_id: `req-${reason}`, decision: 'allow_run' } },
     ]);
     expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
       result: 'success',
       decision: 'allow_run',
-      effective_decision: 'allow_once',
+      effective_decision: 'allow_run',
       mode: 'all_files_approval',
       mode_changed: false,
     }));
   });
 
+  it.each(['priv_esc', 'external_mutation'] as const)(
+    'narrows a stale task-level approval to one command for strict %s prompts',
+    async (reason) => {
+      const h = loadHarness({ choice: 'allow_run', mode: 'workspace_approval' });
+
+      h.pushHandler({
+        request_id: `req-${reason}`,
+        agent_name: 'Agent',
+        command: 'sensitive command',
+        reasons: [reason],
+        can_allow_run: false,
+      });
+      await flush();
+
+      expect(h.dialogArgs[0]).toMatchObject({ allowRun: false, showModeControl: false });
+      expect(h.invokeCalls).toContainEqual({
+        channel: 'bash.permission_response',
+        payload: { request_id: `req-${reason}`, decision: 'allow_once' },
+      });
+    },
+  );
+
   it.each(['allow_run', 'allow_always'])(
-    'offers only one-time approval for system package changes even when a stale UI returns %s',
+    'supports task approval but not persistent mode changes for system package changes when UI returns %s',
     async (legacyChoice) => {
       const h = loadHarness({ choice: legacyChoice, mode: 'all_files_auto' });
 
@@ -257,17 +279,24 @@ describe('renderer bash permission prompt', () => {
         agent_name: 'Agent',
         command: 'winget install PostgreSQL.PostgreSQL',
         reasons: ['system_package_change'],
+        can_allow_run: true,
       });
       await flush();
 
       expect(h.dialogArgs[0]).toMatchObject({
-        allowRun: false,
+        allowRun: true,
         showModeControl: false,
       });
       expect(h.dialogArgs[0].message).toContain('changes system packages');
       expect(h.invokeCalls).toEqual([
         { channel: 'permissions.getLocalExec', payload: undefined },
-        { channel: 'bash.permission_response', payload: { request_id: 'req-system-package', decision: 'allow_once' } },
+        {
+          channel: 'bash.permission_response',
+          payload: {
+            request_id: 'req-system-package',
+            decision: legacyChoice === 'allow_run' ? 'allow_run' : 'allow_once',
+          },
+        },
       ]);
     },
   );

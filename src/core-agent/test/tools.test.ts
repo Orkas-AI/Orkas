@@ -66,17 +66,19 @@ describe("Tools", () => {
       });
 
       const properties = tool.inputSchema.properties as Record<string, Record<string, unknown>>;
-      expect(tool.description).toContain("Co-emit changes with the related non-Plan business tool");
+      expect(tool.description).toContain("when a durable anchor is needed");
+      expect(tool.description).toContain("skip work clear in live context");
+      expect(tool.description).toContain("Co-emit necessary changes with a related business tool when available");
       expect(tool.description).toContain("never ends the run");
-      expect(tool.description).toContain("set_statuses to batch transitions");
-      expect(tool.description).toContain("skip simple/single-step work");
+      expect(tool.description).toContain("set_statuses only when stale status could mislead execution or recovery");
       expect(tool.description).toContain("project_tasks");
       expect(properties.action.enum).toEqual(["update", "set_statuses"]);
       expect(properties.action.description).toContain("Legacy operations remain accepted");
       expect(properties.replace_objective.description).toContain("latest user text");
-      expect(properties.updates.description).toContain("applied atomically");
-      expect(properties.updates.description).toContain("start the next one");
+      expect(properties.updates.description).toContain("keep the Plan accurate for execution or recovery");
+      expect(properties.updates.description).toContain("Apply them atomically and batch adjacent transitions");
       expect(properties.plan.description).toContain("Preserve existing step text exactly");
+      expect(properties.plan.description).toContain("only for necessary status-only changes");
       expect(tool.inputSchema.required).toEqual(["action"]);
       expect(properties).not.toHaveProperty("finish");
       expect(properties).not.toHaveProperty("step_id");

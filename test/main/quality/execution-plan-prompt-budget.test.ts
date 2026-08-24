@@ -34,18 +34,19 @@ describe('execution-plan resident request surface', () => {
   it('uses one general necessity rule instead of business-category heuristics', () => {
     const body = fs.readFileSync(SHARED_PROMPT, 'utf8');
     const policy = planningPolicy(body);
-    expect(policy).toContain('user asks or next work is meaningfully multi-step');
-    expect(policy).toContain('outcome milestones span extended execution');
+    expect(policy).toContain('user asks or this actor needs durable milestones');
+    expect(policy).toContain('across extended execution, tool loops, compaction, or interruption');
+    expect(policy).toContain('unresolved evidence');
     expect(policy).toContain('substantial phases emerge');
-    expect(policy).toContain('Skip simple/single-step work');
-    expect(policy).toContain('counts alone never decide');
-    expect(policy).toContain('tool loops and compaction');
-    expect(policy).toContain('not merely to mark routine progress');
-    expect(policy).toContain('Prefer co-emitting creation and later changes');
-    expect(policy).toContain('defer the Plan while execution remains clear');
-    expect(policy).toContain('standalone Plan call only when the anchor itself is needed');
-    expect(policy).toContain('working memory, never a completion gate');
-    expect(policy).toContain('return the final reply without another Plan call');
+    expect(policy).toContain('Skip simple work or work clear in live context');
+    expect(policy).toContain('tool, file, and step counts never decide');
+    expect(policy).toContain('stale Plan state could mislead execution or recovery');
+    expect(policy).toContain('not for routine progress');
+    expect(policy).toContain('Prefer co-emitting necessary Plan changes');
+    expect(policy).toContain('defer while execution is clear');
+    expect(policy).toContain('standalone Plan call only when the anchor is needed');
+    expect(policy).toContain('working memory, not a completion gate');
+    expect(policy).toContain('after tools, reply without another Plan call');
     expect(policy).not.toMatch(/office|research|travel|content|software|spreadsheet/i);
   });
 

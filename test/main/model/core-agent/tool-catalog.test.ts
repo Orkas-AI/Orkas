@@ -410,7 +410,7 @@ describe('tool-catalog', () => {
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('5cd31e300793e207bc49fe4fa43595f49e61f52b6bc3a40b48b9a6a899407e73');
+    ).toBe('2a3e714b9c485eccabf1da1c0af75dd279fa62f5a959f4fead1f68461a3622bc');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {
@@ -508,7 +508,7 @@ describe('tool-catalog', () => {
     const officeRead = toolByName('office_read');
     expect(officeRead.description).not.toContain('text returns');
     expect(propertyDescription(officeRead, 'mode')).toContain('text (default)');
-    expect(propertyDescription(officeRead, 'mode')).toContain('query applies a selector');
+    expect(propertyDescription(officeRead, 'mode')).toContain('query applies selectors');
 
     const officeReview = toolByName('office_review');
     expect(officeReview.description).not.toContain('check scans');

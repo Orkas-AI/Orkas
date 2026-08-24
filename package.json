@@ -14,7 +14,7 @@
     "start": "electron .",
     "prestart:electron": "node scripts/ensure-dev-dependencies.cjs",
     "start:electron": "electron .",
-    "stop": "pkill -9 -f \"$PWD/node_modules/electron/dist\" || true",
+    "stop": "pkill -TERM -f \"^$PWD/node_modules/electron/dist/Orkas\\.app/Contents/MacOS/Electron $PWD\" || true",
     "smoke": "tsx src/main/smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "npm run test:js && npm run test:resources",

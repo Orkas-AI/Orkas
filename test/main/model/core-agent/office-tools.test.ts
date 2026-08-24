@@ -495,16 +495,32 @@ describe('Office built-in tools', () => {
 
     const text = await read.execute({ path: file }, ctx());
     const outline = await read.execute({ path: file, mode: 'outline' }, ctx());
-    const get = await read.execute({ path: file, mode: 'get', target: '/body/p[1]' }, ctx());
-    const query = await read.execute({ path: file, mode: 'query', target: 'p.title' }, ctx());
-    const injected = await read.execute({ path: file, mode: 'get', target: '--save=escaped.bin' }, ctx());
+    const get = await read.execute({ path: file, mode: 'get', targets: ['/body/p[1]'] }, ctx());
+    const query = await read.execute({ path: file, mode: 'query', targets: ['p.title'] }, ctx());
+    const injected = await read.execute({ path: file, mode: 'get', targets: ['--save=escaped.bin'] }, ctx());
+    const legacy = await read.execute({ path: file, mode: 'get', target: '/body/p[1]' }, ctx());
+    const tooMany = await read.execute({
+      path: file,
+      mode: 'get',
+      targets: Array.from({ length: 33 }, (_, index) => `/body/p[${index + 1}]`),
+    }, ctx());
 
     expect(text.content).toBe('ok');
     expect(outline.content).toBe('ok');
-    expect(get.content).toBe('ok');
-    expect(query.content).toBe('ok');
+    expect(JSON.parse(get.content)).toEqual({
+      status: 'complete',
+      results: [{ target: '/body/p[1]', ok: true, data: 'ok' }],
+    });
+    expect(JSON.parse(query.content)).toEqual({
+      status: 'complete',
+      results: [{ target: 'p.title', ok: true, data: 'ok' }],
+    });
     expect(injected).toMatchObject({ isError: true });
     expect(injected.content).toContain('must not start with');
+    expect(legacy).toMatchObject({ isError: true });
+    expect(legacy.content).toContain('use `targets`');
+    expect(tooMany).toMatchObject({ isError: true });
+    expect(tooMany.content).toContain('1 to 32');
     expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
       ['view', file, 'text'],
       ['view', file, 'outline'],
@@ -512,6 +528,67 @@ describe('Office built-in tools', () => {
       ['query', file, 'p.title', '--json'],
     ]);
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(4);
+    const schema = read.inputSchema as any;
+    expect(schema.properties.target).toBeUndefined();
+    expect(schema.properties.targets).toMatchObject({ type: 'array', minItems: 1, maxItems: 32 });
+  });
+
+  it('returns successful formula evidence when one batched target fails', async () => {
+    const file = path.join(h.workspace, 'formula-audit.xlsx');
+    fs.writeFileSync(file, 'fixture');
+    h.runOfficeCli.mockImplementation(async (args: string[]) => {
+      if (args[2] === '/Summary/B3') {
+        return {
+          code: 0,
+          stdout: '{"success":false,"error":{"code":"not_found","error":"cell not found"}}',
+          stderr: '',
+        };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: {
+            text: '15390',
+            format: { formula: 'SUM(Data!D2:D13)' },
+            cachedValue: 15390,
+            computedValue: 15390,
+            evaluated: true,
+          },
+        }),
+        stderr: '',
+      };
+    });
+
+    const result = await getTool('office_read').execute({
+      path: file,
+      mode: 'get',
+      targets: ['/Summary/B2', '/Summary/B3'],
+    }, ctx());
+    const payload = JSON.parse(result.content);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      status: 'partial',
+      results: [
+        {
+          target: '/Summary/B2',
+          ok: true,
+          data: {
+            format: { formula: 'SUM(Data!D2:D13)' },
+            cachedValue: 15390,
+            computedValue: 15390,
+            evaluated: true,
+          },
+        },
+        { target: '/Summary/B3', ok: false, error: { code: 'not_found', error: 'cell not found' } },
+      ],
+    });
+    expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
+      ['get', file, '/Summary/B2', '--json'],
+      ['get', file, '/Summary/B3', '--json'],
+    ]);
+    expect(h.closeOfficeFile).toHaveBeenCalledTimes(1);
   });
 
   it('edits a pre-existing Office source through a validated copy and leaves the source byte-identical', async () => {
@@ -742,13 +819,13 @@ describe('Office built-in tools', () => {
     const invalid = await read.execute({
       path: workbook,
       mode: 'get',
-      target: '/订单核对/cell[A2]',
+      targets: ['/订单核对/cell[A2]'],
     }, ctx());
     expect(invalid).toMatchObject({ isError: true });
     expect(invalid.content).toContain('/Sheet1/A2');
     expect(h.runOfficeCli).not.toHaveBeenCalled();
 
-    const docx = await read.execute({ path: document, mode: 'get', target: '/body/p[1]' }, ctx());
+    const docx = await read.execute({ path: document, mode: 'get', targets: ['/body/p[1]'] }, ctx());
     expect(docx.isError).toBeUndefined();
     expect(h.runOfficeCli).toHaveBeenCalledWith(
       ['get', document, '/body/p[1]', '--json'],
@@ -1005,8 +1082,72 @@ describe('Office built-in tools', () => {
     expect(JSON.parse(warningOnly.content)).toMatchObject({
       valid: true,
       issue_count: 18,
+      issue_severity_counts: { blocker: 0, warning: 1, info: 0, unknown: 17 },
+      structural_review_status: 'indeterminate',
       artifact_revision: artifactSha256.slice('sha256:'.length, 'sha256:'.length + 16),
       issues: { data: { count: 18, issues: [{ severity: 'warning' }] } },
+    });
+  });
+
+  it('adds compact XLSX statistics and keeps incomplete issue severity explicit', async () => {
+    const file = path.join(h.workspace, 'formula-review.xlsx');
+    fs.writeFileSync(file, 'fixture');
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({
+        code: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: {
+            count: 4,
+            issues: [
+              { subtype: 'formula_eval_error' },
+              { subtype: 'formula_cache_stale' },
+              { type: 'format' },
+            ],
+          },
+        }),
+        stderr: '',
+      })
+      .mockResolvedValueOnce({
+        code: 0,
+        stdout: JSON.stringify({
+          success: true,
+          data: { sheets: 2, totalCells: 48, emptyCells: 4, formulaCells: 6, errorCells: 1 },
+        }),
+        stderr: '',
+      });
+
+    const result = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+    const payload = JSON.parse(result.content);
+
+    expect(result.isError).toBeUndefined();
+    expect(payload).toMatchObject({
+      valid: true,
+      issue_count: 4,
+      issue_severity_counts: { blocker: 1, warning: 1, info: 0, unknown: 2 },
+      structural_review_status: 'blockers_found',
+      xlsx_stats_scan_ok: true,
+      xlsx_stats: { sheet_count: 2, total_cells: 48, formula_cells: 6, error_cells: 1 },
+    });
+    expect(h.runOfficeCli.mock.calls.map(([args]) => args)).toEqual([
+      ['validate', file, '--json'],
+      ['view', file, 'issues', '--json'],
+      ['view', file, 'stats', '--json'],
+    ]);
+
+    h.runOfficeCli.mockReset();
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: '{"success":true,"data":{"count":0,"issues":[]}}', stderr: '' })
+      .mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'stats unavailable' });
+    const incomplete = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+    expect(incomplete.isError).toBeUndefined();
+    expect(JSON.parse(incomplete.content)).toMatchObject({
+      valid: true,
+      issue_count: 0,
+      structural_review_status: 'indeterminate',
+      xlsx_stats_scan_ok: false,
     });
   });
 

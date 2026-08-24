@@ -744,7 +744,7 @@ function buildToolLoopLimitNudge(input: {
   return [
     `You are approaching the tool loop round limit (${input.toolLoops}/${input.maxToolLoops}; ${remaining} round(s) left).`,
     "Stop exploratory/retry tool calls now unless one final tool call is strictly necessary.",
-    "Finish the smallest valid deliverable now, verify it once, update the execution plan, and then respond.",
+    "Finish the smallest valid deliverable now, verify it once, and then respond.",
     "If completion is impossible within the remaining budget, summarize current status, completed files/artifacts, the last blocking error, and the concrete next step for the user.",
     input.toolNames.length ? `Tools used so far: ${input.toolNames.join(", ")}.` : "",
     successes.length ? `Recent successful results:\n${successes.join("\n")}` : "",

@@ -58,6 +58,10 @@ describe('OfficeWorker built-in agent evaluation', () => {
     expect(excelSkill).toContain('`artifact_path` in the latest create/edit `<office-artifact>` receipt');
     expect(excelSkill).toContain('Do not repeat `office_review` for an unchanged `artifact_revision`');
     expect(excelSkill).toContain('concrete blocking defect and a targeted repair');
+    expect(excelSkill).toContain('Pass `preview:false` when the required `office_review` will provide the visual evidence');
+    expect(excelSkill).toContain('with one `targets` array to batch-check representative formulas');
+    expect(excelSkill).toContain('`mode:"text"` exposes displayed values, not formula definitions');
+    expect(excelSkill).toContain('For a new workbook, reuse the sheet order supplied to `create_xlsx`');
     expect(excelSkill).toContain('Retry publication once with an exact `eligible_current_turn_paths` entry');
     expect(excelSkill).toContain('do not edit, review, or regenerate the workbook');
   });

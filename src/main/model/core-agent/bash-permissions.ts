@@ -7,10 +7,10 @@
  * differences:
  *
  *   1. THREE outcomes — `allow_once`, `allow_run`, `deny` — not a boolean.
- *   2. NO persistent store. Every classified sensitive operation requires an
- *      exact-command decision. A stale renderer may still send `allow_run`,
- *      but main always narrows it to `allow_once`; broad run-scoped approval
- *      is not a safe substitute for reviewing the concrete command.
+ *   2. NO persistent store. A task-scoped grant is memory-only and bounded to
+ *      one (user, conversation, agent) plus the risk categories the user saw.
+ *      Privilege/security weakening and external-system mutations always stay
+ *      exact-command decisions.
  *
  * Never throws: a broken push channel degrades to deny, so a risky command can
  * never silently run because the dialog failed to show. Once the prompt is
@@ -30,6 +30,13 @@ import type { ExternalMutationFinding } from './external-mutation-risk';
 const log = createLogger('bash-permissions');
 
 export type BashDecision = 'allow_once' | 'allow_run' | 'deny';
+
+const TASK_GRANTABLE_REASONS = new Set<RiskCategory>([
+  'network_egress',
+  'destructive',
+  'sensitive_path',
+  'system_package_change',
+]);
 
 // Keep watchdogs alive while the tool is waiting for a human to click the
 // renderer dialog. This is not a safety timeout: it only drives optional
@@ -51,6 +58,8 @@ export interface BashPermissionInfo {
   /** Optional subject for non-shell operations, typically a path. */
   subject?: string;
   reasons: RiskCategory[];
+  /** Main-process eligibility decision; stale renderers cannot widen it. */
+  can_allow_run: boolean;
   /** Structured, bounded external actions detected inside the command/script. */
   external_mutations?: ExternalMutationFinding[];
   cid: string;
@@ -59,11 +68,44 @@ export interface BashPermissionInfo {
 interface Pending {
   uid: string;
   cid: string;
+  agentId: string;
+  reasons: RiskCategory[];
+  canAllowRun: boolean;
   resolve: (d: BashDecision) => void;
   heartbeat?: NodeJS.Timeout;
 }
 
 const _pending = new Map<string, Pending>();
+type RunGrant = { uid: string; cid: string; agentId: string; reasons: Set<RiskCategory> };
+const _runGrants = new Map<string, RunGrant>();
+
+function runGrantKey(uid: string, cid: string, agentId: string): string {
+  return JSON.stringify([uid, cid, agentId]);
+}
+
+const COMMANDER_GRANT_ACTOR = '__orkas_commander__';
+
+function grantActorId(agentId: string, agentName: string): string {
+  const explicit = String(agentId || '').trim();
+  if (explicit) return explicit;
+  const name = String(agentName || '').trim().toLowerCase();
+  // The top-level Commander is represented by an empty agent_id in the real
+  // chat pipeline. Give only that known actor a stable internal scope key;
+  // arbitrary anonymous agents remain ineligible for task-wide grants.
+  if (name === 'commander' || name === 'orkas_chat') return COMMANDER_GRANT_ACTOR;
+  return '';
+}
+
+function canAllowRun(uid: string, cid: string, agentId: string, reasons: readonly RiskCategory[]): boolean {
+  return !!uid && !!cid && !!agentId && reasons.length > 0
+    && reasons.every((reason) => TASK_GRANTABLE_REASONS.has(reason));
+}
+
+function isCoveredByRunGrant(uid: string, cid: string, agentId: string, reasons: readonly RiskCategory[]): boolean {
+  if (!canAllowRun(uid, cid, agentId, reasons)) return false;
+  const grant = _runGrants.get(runGrantKey(uid, cid, agentId));
+  return !!grant && reasons.every((reason) => grant.reasons.has(reason));
+}
 
 // Lazy ipc lookup — avoids a static model→ipc import cycle and degrades
 // cleanly in tests / headless builds (same pattern as bridge_permissions).
@@ -77,6 +119,7 @@ export function _resetForTest(): void {
     if (p.heartbeat) clearInterval(p.heartbeat);
   }
   _pending.clear();
+  _runGrants.clear();
 }
 
 function _broadcast(channel: string, payload: unknown): boolean {
@@ -93,9 +136,9 @@ function _broadcast(channel: string, payload: unknown): boolean {
 }
 
 /**
- * Gate one risky bash command. Resolves to the user's exact-command decision.
- * Deny on a broken push channel; otherwise wait for the explicit renderer
- * response.
+ * Gate one risky local operation. A matching task grant resolves immediately;
+ * otherwise wait for the explicit renderer response. Deny on a broken push
+ * channel.
  */
 export async function requestBashDecision(opts: {
   uid: string;
@@ -109,7 +152,18 @@ export async function requestBashDecision(opts: {
   externalMutations?: ExternalMutationFinding[];
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
-  const reasons = opts.reasons.slice();
+  const reasons = [...new Set(opts.reasons)];
+  const actorId = grantActorId(opts.agentId, opts.agentName);
+  if (isCoveredByRunGrant(opts.uid, opts.cid, actorId, reasons)) {
+    log.info('bash permission covered by task grant', {
+      cid: maskId(opts.cid),
+      agent_id: maskId(opts.agentId),
+      reasons,
+      command_chars: opts.command.length,
+    });
+    return 'allow_run';
+  }
+  const taskGrantEligible = canAllowRun(opts.uid, opts.cid, actorId, reasons);
   const requestId = crypto.randomBytes(8).toString('hex');
   const command = opts.command.length > COMMAND_PREVIEW_MAX
     ? `${opts.command.slice(0, COMMAND_PREVIEW_MAX)}…`
@@ -122,6 +176,7 @@ export async function requestBashDecision(opts: {
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
+    can_allow_run: taskGrantEligible,
     ...(opts.externalMutations?.length ? { external_mutations: opts.externalMutations.slice(0, 8) } : {}),
     cid: opts.cid,
   };
@@ -145,6 +200,9 @@ export async function requestBashDecision(opts: {
     const pending: Pending = {
       uid: opts.uid,
       cid: opts.cid,
+      agentId: actorId,
+      reasons,
+      canAllowRun: taskGrantEligible,
       resolve,
     };
     _pending.set(requestId, pending);
@@ -171,13 +229,28 @@ export function respond(requestId: string, decision: BashDecision): boolean {
   if (!pending) return false;
   _pending.delete(requestId);
   if (pending.heartbeat) clearInterval(pending.heartbeat);
-  const effectiveDecision = decision === 'allow_run' ? 'allow_once' : decision;
+  let effectiveDecision = decision;
+  if (decision === 'allow_run') {
+    if (!pending.canAllowRun) {
+      effectiveDecision = 'allow_once';
+    } else {
+      const key = runGrantKey(pending.uid, pending.cid, pending.agentId);
+      const grant = _runGrants.get(key) ?? {
+        uid: pending.uid,
+        cid: pending.cid,
+        agentId: pending.agentId,
+        reasons: new Set<RiskCategory>(),
+      };
+      for (const reason of pending.reasons) grant.reasons.add(reason);
+      _runGrants.set(key, grant);
+    }
+  }
   pending.resolve(effectiveDecision);
   return true;
 }
 
-/** Abandon every pending request for a conversation. Pending requests resolve
- *  to `deny`. */
+/** Abandon every pending request and task grant for a conversation. Pending
+ *  requests resolve to `deny`. */
 export function cancelForCid(cid: string): void {
   const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
@@ -190,10 +263,13 @@ export function cancelForCid(cid: string): void {
   if (requestIds.length) {
     _broadcast('bash:permission_cancelled', { request_ids: requestIds, cid });
   }
+  for (const [key, grant] of _runGrants) {
+    if (grant.cid === cid) _runGrants.delete(key);
+  }
 }
 
-/** Account-switch boundary: pending dialogs owned by the previous user must
- * not survive into the next active account, even if ids happen to collide. */
+/** Account-switch boundary: pending dialogs and task grants owned by the
+ * previous user must not survive into the next active account. */
 export function cancelForUid(uid: string): void {
   const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
@@ -205,6 +281,9 @@ export function cancelForUid(uid: string): void {
   }
   if (requestIds.length) {
     _broadcast('bash:permission_cancelled', { request_ids: requestIds, uid });
+  }
+  for (const [key, grant] of _runGrants) {
+    if (grant.uid === uid) _runGrants.delete(key);
   }
 }
 

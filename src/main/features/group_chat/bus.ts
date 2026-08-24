@@ -5794,8 +5794,7 @@ export async function _buildCommanderSystemPromptForTest(
 //   `- platform: <abs path>\n` +
 //   `- custom:  <abs path>\n` +
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
-//   per-entry lines `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc` + optional marker lines:
-//   `  inputs: read agent.json before dispatch`
+//   per-entry lines `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc` + optional marker:
 //   `  interactive: true`
 //
 // Why expose id and ROOT inline (changed 2026-05): the prior layout hid
@@ -5849,11 +5848,7 @@ async function buildAgentsIndexBlock(
       const desc = description ? ` — ${description}` : '';
       const source = agentsFeat.agentPrioritySource(a);
       const head = `- ${buildMention(name)} (Source: ${source}, id: ${a.agent_id})${desc}`;
-      const inputs = Array.isArray(a.inputs) ? a.inputs : null;
       const markers: string[] = [];
-      if (inputs && inputs.length) {
-        markers.push('inputs: read agent.json before dispatch');
-      }
       if (a.interactive === true) {
         markers.push('interactive: true');
       }

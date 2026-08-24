@@ -8,7 +8,6 @@
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.`
 //   ``
 //   `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc`
-//   `  inputs: read agent.json before dispatch`   ← optional, only when inputs[] non-empty
 //   `  interactive: true`                         ← optional, only when interactive=true
 //
 // Why these fixtures matter (added 2026-05): the prior format hid agent_id
@@ -100,7 +99,7 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).toContain('@Reviewer (Source: custom, id: a1b2c3d4e5f6)');
   });
 
-  it('marks agents with inputs so commander reads agent.json before dispatch', async () => {
+  it('keeps declared inputs private to the target agent instead of requiring a commander pre-read', async () => {
     writeAgent(customAgentsDir(), 'agent-with-inputs', {
       name: 'WithInputs',
       description_zh: 'I',
@@ -119,7 +118,7 @@ describe('agents_index block — header + per-entry shape', () => {
     });
     const text = await buildBlock(TEST_UID);
     expect(text).toContain('@WithInputs (Source: custom, id: agent-with-inputs) — I');
-    expect(text).toContain('inputs: read agent.json before dispatch');
+    expect(text).not.toContain('inputs: read agent.json before dispatch');
     expect(text).not.toContain('inputs_schema:');
     expect(text).not.toContain('"topic"');
     expect(text).not.toContain('"should be stripped"');
@@ -130,7 +129,7 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).not.toContain('"max"');
   });
 
-  it('does not mark agents without inputs, so commander can dispatch directly', async () => {
+  it('allows agents without inputs to use the same direct-dispatch roster shape', async () => {
     writeAgent(customAgentsDir(), 'agent-no-inputs', {
       name: 'NoInputs',
       description_zh: 'N',

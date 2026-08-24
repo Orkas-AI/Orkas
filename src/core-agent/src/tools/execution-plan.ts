@@ -181,7 +181,7 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
   return defineTool({
     name: "manage_execution_plan",
     description:
-      "Maintain current-task outcome milestones. Co-emit changes with the related non-Plan business tool; the Plan records progress but never ends the run. Use update only to create or materially revise milestones and set_statuses to batch transitions; skip simple/single-step work and use project_tasks for a cross-conversation backlog.",
+      "Maintain current-task milestones only when a durable anchor is needed; skip work clear in live context and use project_tasks for a cross-conversation backlog. Use update to create or materially revise them, and set_statuses only when stale status could mislead execution or recovery. Co-emit necessary changes with a related business tool when available; the Plan records progress but never ends the run.",
     inputSchema: {
       type: "object",
       properties: {
@@ -189,7 +189,7 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
           type: "string",
           enum: ["update", "set_statuses"],
           description:
-            "update creates or materially revises the full plan; set_statuses atomically advances existing milestones. Legacy operations remain accepted but are not advertised.",
+            "update creates or materially revises the full plan; set_statuses atomically applies necessary status changes. Legacy operations remain accepted but are not advertised.",
         },
         explanation: {
           type: "string",
@@ -204,7 +204,7 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
         updates: {
           type: "array",
           description:
-            "All status transitions at the current milestone boundary, applied atomically. Complete the old active milestone and start the next one in this single array.",
+            "Necessary status changes that keep the Plan accurate for execution or recovery. Apply them atomically and batch adjacent transitions.",
           minItems: 1,
           maxItems: EXECUTION_PLAN_MAX_STEPS,
           items: {
@@ -227,7 +227,7 @@ export function createExecutionPlanTool(controller: ExecutionPlanController): Ag
         plan: {
           type: "array",
           description:
-            "Complete ordered milestone plan for creation or material revision. Preserve existing step text exactly; use set_statuses for ordinary progress.",
+            "Complete ordered milestone plan for creation or material revision. Preserve existing step text exactly; use set_statuses only for necessary status-only changes.",
           maxItems: EXECUTION_PLAN_MAX_STEPS,
           items: {
             type: "object",

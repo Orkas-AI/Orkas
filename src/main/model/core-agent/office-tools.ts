@@ -70,6 +70,104 @@ function officeIssueCount(value: unknown): number | null {
   return officeIssueCount(record.data);
 }
 
+type OfficeIssueSeverity = 'blocker' | 'warning' | 'info' | 'unknown';
+
+const BLOCKING_OFFICE_ISSUE_SUBTYPES = new Set([
+  'formula_ref_missing_sheet',
+  'formula_eval_error',
+  'chart_series_ref_missing_sheet',
+  'definedname_broken',
+  'definedname_target_missing',
+  'broken_part_ref',
+]);
+
+const WARNING_OFFICE_ISSUE_SUBTYPES = new Set([
+  'formula_not_evaluated',
+  'formula_cache_stale',
+  'field_not_evaluated',
+  'field_cache_stale',
+  'slide_field_not_evaluated',
+  'notes_unresolved_rid',
+  'chart_cache_stale',
+]);
+
+function parseOfficeCliOutput(stdout: string, stderr: string): unknown {
+  const raw = (stdout || stderr || '').trim();
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
+function unwrapOfficeCliResult(value: unknown): { ok: true; data: unknown } | { ok: false; error: unknown } {
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    if (record.success === false) {
+      return { ok: false, error: record.error ?? 'OfficeCLI returned success=false' };
+    }
+    if (record.success === true && Object.prototype.hasOwnProperty.call(record, 'data')) {
+      return { ok: true, data: record.data };
+    }
+  }
+  return { ok: true, data: value };
+}
+
+function officeIssueEntries(value: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object');
+  }
+  if (!value || typeof value !== 'object') return [];
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.issues)) return officeIssueEntries(record.issues);
+  return officeIssueEntries(record.data);
+}
+
+function officeIssueSeverity(issue: Record<string, unknown>): OfficeIssueSeverity {
+  const upstream = typeof issue.severity === 'string' ? issue.severity.trim().toLowerCase() : '';
+  if (['blocker', 'error', 'fatal', 'critical'].includes(upstream)) return 'blocker';
+  if (['warning', 'warn', 'advisory'].includes(upstream)) return 'warning';
+  if (['info', 'information'].includes(upstream)) return 'info';
+
+  const subtype = [issue.subtype, issue.type, issue.code]
+    .find((value): value is string => typeof value === 'string' && !!value.trim())
+    ?.trim().toLowerCase();
+  if (subtype && BLOCKING_OFFICE_ISSUE_SUBTYPES.has(subtype)) return 'blocker';
+  if (subtype && WARNING_OFFICE_ISSUE_SUBTYPES.has(subtype)) return 'warning';
+  return 'unknown';
+}
+
+function summarizeOfficeIssueSeverities(value: unknown, count: number | null): Record<OfficeIssueSeverity, number> {
+  const entries = officeIssueEntries(value);
+  const summary: Record<OfficeIssueSeverity, number> = {
+    blocker: 0,
+    warning: 0,
+    info: 0,
+    unknown: 0,
+  };
+  for (const entry of entries) summary[officeIssueSeverity(entry)] += 1;
+  if (count !== null && count > entries.length) summary.unknown += count - entries.length;
+  return summary;
+}
+
+function compactXlsxStats(value: unknown): {
+  sheet_count: number;
+  total_cells: number;
+  formula_cells: number;
+  error_cells: number;
+} | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const data = record.data && typeof record.data === 'object'
+    ? record.data as Record<string, unknown>
+    : record;
+  const fields = [data.sheets, data.totalCells, data.formulaCells, data.errorCells];
+  if (!fields.every((field) => Number.isFinite(field) && Number(field) >= 0)) return null;
+  return {
+    sheet_count: Math.trunc(Number(data.sheets)),
+    total_cells: Math.trunc(Number(data.totalCells)),
+    formula_cells: Math.trunc(Number(data.formulaCells)),
+    error_cells: Math.trunc(Number(data.errorCells)),
+  };
+}
+
 export interface OfficeToolsOpts {
   /** Active uid — used to resolve the workspace + attachment sandbox roots. */
   userId?: string;
@@ -1053,11 +1151,6 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
 
       const cwd = path.dirname(abs);
-      const normalizeOutput = (stdout: string, stderr: string): unknown => {
-        const raw = (stdout || stderr || '').trim();
-        if (!raw) return null;
-        try { return JSON.parse(raw); } catch { return raw; }
-      };
       try {
         const validate = await runOfficeCli(['validate', abs, '--json'], {
           cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
@@ -1065,7 +1158,7 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
         const issues = await runOfficeCli(['view', abs, 'issues', '--json'], {
           cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
         });
-        let normalizedIssues = normalizeOutput(issues.stdout, issues.stderr);
+        let normalizedIssues = parseOfficeCliOutput(issues.stdout, issues.stderr);
         let contrastScanOk: boolean | undefined;
         let contrastFindings: number | undefined;
         let contrastTextRuns: number | undefined;
@@ -1077,17 +1170,38 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
           if (contrastScanOk) {
             const audit = auditPptxContrast(
               normalizedIssues,
-              normalizeOutput(tree.stdout, tree.stderr),
+              parseOfficeCliOutput(tree.stdout, tree.stderr),
             );
             normalizedIssues = audit.issues;
             contrastFindings = audit.findingCount;
             contrastTextRuns = audit.scannedTextCount;
           }
         }
+        const isXlsx = path.extname(abs).toLowerCase() === '.xlsx';
+        let xlsxStats: ReturnType<typeof compactXlsxStats> = null;
+        let xlsxStatsScanOk: boolean | undefined;
+        if (isXlsx) {
+          const stats = await runOfficeCli(['view', abs, 'stats', '--json'], {
+            cwd, ...(ctx.signal ? { signal: ctx.signal } : {}),
+          });
+          xlsxStats = compactXlsxStats(parseOfficeCliOutput(stats.stdout, stats.stderr));
+          xlsxStatsScanOk = stats.code === 0 && xlsxStats !== null;
+        }
         const artifactSha256 = sha256File(abs);
+        const issueCount = officeIssueCount(normalizedIssues);
+        const issueSeverities = summarizeOfficeIssueSeverities(normalizedIssues, issueCount);
+        const reviewStatus = validate.code !== 0
+          ? 'invalid'
+          : issueSeverities.blocker > 0 || (xlsxStats?.error_cells ?? 0) > 0
+            ? 'blockers_found'
+            : issues.code !== 0 || issueCount === null || xlsxStatsScanOk === false || issueSeverities.unknown > 0
+              ? 'indeterminate'
+              : 'reviewed';
         const payload = {
           valid: validate.code === 0,
-          issue_count: officeIssueCount(normalizedIssues),
+          issue_count: issueCount,
+          issue_severity_counts: issueSeverities,
+          structural_review_status: reviewStatus,
           artifact_revision: shortRevision(artifactSha256),
           issue_scan_ok: issues.code === 0,
           validation_exit_code: validate.code,
@@ -1097,9 +1211,13 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
             contrast_findings: contrastFindings ?? 0,
             contrast_text_runs: contrastTextRuns ?? 0,
           }),
+          ...(xlsxStatsScanOk === undefined ? {} : {
+            xlsx_stats_scan_ok: xlsxStatsScanOk,
+            ...(xlsxStats ? { xlsx_stats: xlsxStats } : {}),
+          }),
           path: abs,
           artifact_sha256: artifactSha256,
-          validation: normalizeOutput(validate.stdout, validate.stderr),
+          validation: parseOfficeCliOutput(validate.stdout, validate.stderr),
           issues: normalizedIssues,
         };
         return {
@@ -1241,8 +1359,14 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
       additionalProperties: false,
       properties: {
         path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx; absolute or workspace-relative.' },
-        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'text (default) returns path-prefixed content; outline returns structure; get reads one target; query applies a selector.' },
-        target: { type: 'string', description: 'Path for get or selector for query; get defaults to "/".' },
+        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'text (default) returns displayed content; outline returns structure; get reads paths with formula/value metadata; query applies selectors.' },
+        targets: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 32,
+          items: { type: 'string' },
+          description: 'Paths for get or selectors for query, batched in one call; get defaults to ["/"].',
+        },
       },
       required: ['path'],
     },
@@ -1259,23 +1383,58 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
       if (!fs.existsSync(abs)) return errResult('E_NOT_FOUND', `${abs}: file not found`);
 
       const mode = typeof input.mode === 'string' ? input.mode : 'text';
-      const target = typeof input.target === 'string' && input.target ? input.target : '';
-      const targetErr = officeArgError(target, 'target');
-      if (targetErr) return errResult('E_BAD_INPUT', targetErr);
-      if (path.extname(abs).toLowerCase() === '.xlsx' && mode === 'get') {
-        const xlsxPathError = xlsxTargetPathError(target);
-        if (xlsxPathError) return errResult('E_BAD_INPUT', xlsxPathError);
+      if (Object.prototype.hasOwnProperty.call(input, 'target')) {
+        return errResult('E_BAD_INPUT', '`target` is not supported; use `targets` with one or more entries');
+      }
+      const targets = input.targets === undefined
+        ? (mode === 'get' ? ['/'] : [])
+        : Array.isArray(input.targets)
+          ? input.targets
+          : null;
+      if (targets === null || targets.length > 32 || targets.some((target) => typeof target !== 'string' || !target.trim())) {
+        return errResult('E_BAD_INPUT', '`targets` must contain 1 to 32 non-empty strings');
+      }
+      if ((mode === 'get' || mode === 'query') && targets.length === 0) {
+        return errResult('E_BAD_INPUT', `mode "${mode}" requires at least one entry in \`targets\``);
+      }
+      for (const target of targets) {
+        const targetErr = officeArgError(target as string, 'target');
+        if (targetErr) return errResult('E_BAD_INPUT', targetErr);
+        if (path.extname(abs).toLowerCase() === '.xlsx' && mode === 'get') {
+          const xlsxPathError = xlsxTargetPathError(target);
+          if (xlsxPathError) return errResult('E_BAD_INPUT', xlsxPathError);
+        }
       }
       let args: string[];
-      if (mode === 'get') args = ['get', abs, target || '/', '--json'];
-      else if (mode === 'query') {
-        if (!target) return errResult('E_BAD_INPUT', 'mode "query" requires a `target` selector');
-        args = ['query', abs, target, '--json'];
-      } else if (mode === 'outline') args = ['view', abs, 'outline'];
+      if (mode === 'outline') args = ['view', abs, 'outline'];
       else args = ['view', abs, 'text'];
 
       const cwd = path.dirname(abs);
       try {
+        if (mode === 'get' || mode === 'query') {
+          const results: Array<Record<string, unknown>> = [];
+          for (const target of targets) {
+            const targetArgs = mode === 'get'
+              ? ['get', abs, target as string, '--json']
+              : ['query', abs, target as string, '--json'];
+            const result = await runOfficeCli(targetArgs, { cwd, ...(ctx.signal ? { signal: ctx.signal } : {}) });
+            const parsed = parseOfficeCliOutput(result.stdout, result.stderr);
+            const unwrapped = unwrapOfficeCliResult(parsed);
+            if (result.code !== 0) {
+              results.push({ target, ok: false, error: result.stderr || result.stdout || `exit ${result.code}` });
+            } else if ('error' in unwrapped) {
+              results.push({ target, ok: false, error: unwrapped.error });
+            } else {
+              results.push({ target, ok: true, data: unwrapped.data });
+            }
+          }
+          const succeeded = results.filter((result) => result.ok === true).length;
+          const payload = {
+            status: succeeded === results.length ? 'complete' : succeeded > 0 ? 'partial' : 'failed',
+            results,
+          };
+          return { content: JSON.stringify(payload), ...(succeeded === 0 ? { isError: true } : {}) };
+        }
         const r = await runOfficeCli(args, { cwd, ...(ctx.signal ? { signal: ctx.signal } : {}) });
         if (r.code !== 0) return errResult('E_OFFICE_READ_FAILED', r.stderr || r.stdout || `exit ${r.code}`);
         return { content: r.stdout || '(empty)' };

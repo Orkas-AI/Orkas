@@ -121,13 +121,17 @@ test.describe('long-task context continuity', () => {
   }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = modelOrkas.page;
-    const sources = contextSources('KEEP', ['ALPHA', 'BETA', 'GAMMA']).map(({ label, fact }) => ({
-      path: modelOrkas.createWorkspaceFile(
-        `context-pressure/${label.toLowerCase()}.txt`,
-        contextPressureFixture(label, fact),
-      ),
-      fact,
-    }));
+    const sources = contextSources('KEEP', ['ALPHA', 'BETA', 'GAMMA']).map(({ label, fact }) => {
+      const content = contextPressureFixture(label, fact);
+      return {
+        path: modelOrkas.createWorkspaceFile(
+          `context-pressure/${label.toLowerCase()}.txt`,
+          content,
+        ),
+        fact,
+        charEnd: content.length,
+      };
+    });
     const finalReply = `Context survived: ${sources.map((source) => source.fact).join('; ')}`;
     modelOrkas.setContextCompactionScenario(sources, finalReply);
 
@@ -206,13 +210,17 @@ test.describe('long-task context continuity', () => {
   }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     let page = modelOrkas.page;
-    const sources = contextSources('STOP', ['cedar', 'iris', 'quartz']).map(({ label, fact }) => ({
-      path: modelOrkas.createWorkspaceFile(
-        `context-cancel/${label.toLowerCase()}.txt`,
-        contextPressureFixture(label, fact),
-      ),
-      fact,
-    }));
+    const sources = contextSources('STOP', ['cedar', 'iris', 'quartz']).map(({ label, fact }) => {
+      const content = contextPressureFixture(label, fact);
+      return {
+        path: modelOrkas.createWorkspaceFile(
+          `context-cancel/${label.toLowerCase()}.txt`,
+          content,
+        ),
+        fact,
+        charEnd: content.length,
+      };
+    });
     const forbiddenFinal = 'This final response must never appear after cancellation.';
     modelOrkas.setContextCompactionScenario(sources, forbiddenFinal, {
       stallCompaction: true,

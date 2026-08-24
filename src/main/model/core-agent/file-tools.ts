@@ -348,7 +348,7 @@ async function gateSensitivePathAccess(
   ctx?: ToolContext,
 ): Promise<string | null> {
   if (!localAccessRequiresSensitiveApproval()) return null;
-  const reasons = sensitivePathReasons(abs, 'read');
+  const reasons = sensitivePathReasons(abs, 'read', { trustedRoots: allowedRoots(opts) });
   if (!reasons.length) return null;
   const decision = await requestBashDecision({
     uid: opts.userId,

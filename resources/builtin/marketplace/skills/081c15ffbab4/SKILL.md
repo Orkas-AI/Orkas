@@ -11,12 +11,12 @@ description_en: "Create, read, edit, and check Excel/XLSX workbooks while protec
 Use the bundled Office tools as the default artifact path. Do not install OfficeCLI, pandas, or openpyxl when the built-in tools cover the task.
 
 - Use `read_files` with one `paths` item for a broad workbook read; use `metadata_only:true` when only prepared metadata is needed.
-- Use `create_xlsx` for a new `.xlsx`, including multiple sheets, live formulas, number formats, widths, common cell styling, and native editable charts in each sheet's `charts` array.
+- Use `create_xlsx` for a new `.xlsx`, including multiple sheets, live formulas, number formats, widths, common cell styling, and native editable charts in each sheet's `charts` array. Pass `preview:false` when the required `office_review` will provide the visual evidence.
 - Calling `create_xlsx` is mandatory for a supported new workbook. Bash or local code may prepare input rows or perform calculations that the tool cannot express, but must not construct, rewrite, or patch the final `.xlsx` package.
 - Call `create_xlsx` exactly once for one requested workbook. Include the complete initial workbook and chart plan in that call. If QA finds a correction, use `office_read` and `edit_office` on the exact returned path; a file created in this conversation is refined in place. Do not restart with a second `create_xlsx`, create a “可编辑” duplicate, or publish an intermediate workbook.
-- Use `office_read` to inspect sheet/cell paths before editing an existing `.xlsx` workbook.
+- Use `office_read` `mode:"get"` with one `targets` array to batch-check representative formulas and computed/cached values; `mode:"text"` exposes displayed values, not formula definitions.
 - Use `edit_office` for `.xlsx`; it creates a separate working copy when the source was not already produced by this conversation.
-- After every create or edit, use `office_review` with `action:"check_and_render"` when visible layout matters, or `action:"check"` for structural-only validation. For XLSX, first use `office_read` with `mode:"outline"` to map worksheet names to workbook order, then pass one-based worksheet positions in `office_review.pages`; never pass a worksheet name or cell range as a page.
+- After every create or edit, use `office_review` with `action:"check_and_render"` when visible layout matters, or `action:"check"` for structural-only validation. For a new workbook, reuse the sheet order supplied to `create_xlsx`; use `office_read` `mode:"outline"` when inspecting an existing workbook or after structural edits. Pass one-based worksheet positions in `office_review.pages`, never a worksheet name or cell range.
 
 ### Artifact identity and convergence
 

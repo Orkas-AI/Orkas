@@ -210,7 +210,7 @@ type ModelToolScenario =
   }
   | {
     kind: 'context-compaction';
-    sources: Array<{ path: string; fact: string }>;
+    sources: Array<{ path: string; fact: string; charEnd: number }>;
     nextSourceIndex: number;
     finalText: string;
     stallCompaction: boolean;
@@ -1647,14 +1647,19 @@ export class OrkasTestApp {
   }
 
   setContextCompactionScenario(
-    sources: Array<{ path: string; fact: string }>,
+    sources: Array<{ path: string; fact: string; charEnd: number }>,
     finalText: string,
     options: { stallCompaction?: boolean } = {},
   ): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     if (
       sources.length < 3
-      || sources.some((source) => !source.path.trim() || !source.fact.trim())
+      || sources.some((source) => (
+        !source.path.trim()
+        || !source.fact.trim()
+        || !Number.isInteger(source.charEnd)
+        || source.charEnd <= 0
+      ))
       || new Set(sources.map((source) => source.path)).size !== sources.length
       || !finalText.trim()
     ) {
@@ -2813,7 +2818,12 @@ export class OrkasTestApp {
             finishImmediately(toolCallsEvents(batch.map((source, offset) => ({
               callId: `call-e2e-context-source-${startIndex + offset + 1}`,
               name: 'read_files',
-              args: { paths: [{ path: source.path }] },
+              args: {
+                paths: [{
+                  path: source.path,
+                  range: { unit: 'char', start: 0, end: source.charEnd },
+                }],
+              },
             }))));
           } else {
             const missingFacts = scenario.sources

@@ -1365,6 +1365,27 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       : `rm ${recursive ? '-rf' : '-f'} ${targets.map((target) => JSON.stringify(target)).join(' ')}`
   );
 
+  it.each(['interactive_cli', 'process_session'])
+  ('lets %s delete an explicit non-recursive workspace file without prompting', async (toolName) => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const target = path.join(tmpDir, `${toolName}-workspace-cleanup.txt`);
+    fs.writeFileSync(target, 'temporary workspace file');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const tool = lt.createLocalTools(OPTS).find((item) => item.name === toolName)!;
+      const res = await tool.execute({ action: 'start', command: deleteCommand([target]) }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      await vi.waitFor(() => expect(fs.existsSync(target)).toBe(false));
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(target, { force: true });
+    }
+  });
+
   it('runs a non-risky command without prompting under workspace_approval', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('workspace_approval');
@@ -1379,8 +1400,71 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     } finally { bashPerms._setBroadcastForTest(null); }
   });
 
+  it('treats a Python heredoc as source code instead of shell commands', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    const fakeBin = path.join(tmpDir, 'fake-python-bin');
+    writeFakeCommand(fakeBin, 'python3', [
+      "let source = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', (chunk) => { source += chunk; });",
+      "process.stdin.on('end', () => process.stdout.write(source.includes('open(p)') ? 'OK' : 'BAD'));",
+    ].join('\n'));
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const command = [
+      "python3 - <<'PY'",
+      'import json',
+      `p=${JSON.stringify(path.join(tmpDir, 'composition-manifest.json'))}`,
+      "d=json.load(open(p)); print('OK', d.keys())",
+      'PY',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx({
+        ORKAS_PATH_PREPEND: `${fakeBin}${path.delimiter}${path.dirname(TEST_NODE)}`,
+      }));
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain('OK');
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
+  it('still detects an external write inside a non-shell heredoc', async () => {
+    if (process.platform === 'win32') return;
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('workspace_approval');
+    await setTmpWorkspace();
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    const command = [
+      "python3 - <<'PY'",
+      'import requests',
+      "requests.post('https://api.example.com/items', json={'active': True})",
+      'PY',
+    ].join('\n');
+    try {
+      const bash = lt.createLocalTools(OPTS).find((item) => item.name === 'bash')!;
+      const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toContain('external_mutation');
+      expect(prompted?.can_allow_run).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+    }
+  });
+
   it.each([
-    ['project dependency install', 'all_files_auto', 'npm install definitely-not-a-real-orkas-package', 'system_package_change'],
     ['network download', 'workspace_approval', 'curl https://example.invalid/orkas-sensitive-case', 'network_egress'],
     ['destructive Git rollback', 'workspace_approval', 'git reset --hard HEAD~1', 'destructive'],
     ['security-boundary weakening', 'workspace_approval', 'NODE_TLS_REJECT_UNAUTHORIZED=0 npm view react version', 'priv_esc'],
@@ -1533,34 +1617,30 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     }
   });
 
-  it('prompts and preserves a same-workspace file that the conversation did not produce', async () => {
+  it('deletes an explicit non-recursive workspace file without requiring conversation provenance', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
     const target = path.join(tmpDir, 'user-owned.txt');
     fs.writeFileSync(target, 'must remain');
-    let prompted: any = null;
-    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
-      prompted = info;
-      bashPerms.respond(info.request_id, 'deny');
-    });
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
     try {
       const bash = lt.createLocalTools({
         ...OPTS,
         hasProducedPath: () => false,
       }).find((tool) => tool.name === 'bash')!;
-      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: 5000 }, makeCtx());
-      expect(res.isError).toBe(true);
-      expect(res.content).toContain('E_BASH_RISK_DENIED');
-      expect(prompted?.reasons).toEqual(['destructive']);
-      expect(fs.readFileSync(target, 'utf8')).toBe('must remain');
+      const res = await bash.execute({ command: deleteCommand([target]), timeoutMs: SHELL_SUCCESS_TIMEOUT_MS }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(target)).toBe(false);
     } finally {
       bashPerms._setBroadcastForTest(null);
       fs.rmSync(target, { force: true });
     }
   });
 
-  it('prompts once and preserves every target when produced and foreign files are mixed', async () => {
+  it('deletes mixed produced and pre-existing files when all targets are explicit workspace files', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('workspace_approval');
     await setTmpWorkspace();
@@ -1568,11 +1648,8 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     const foreign = path.join(tmpDir, 'user-mixed.txt');
     fs.writeFileSync(produced, 'generated');
     fs.writeFileSync(foreign, 'user');
-    let prompts = 0;
-    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
-      prompts += 1;
-      bashPerms.respond(info.request_id, 'deny');
-    });
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
     try {
       const bash = lt.createLocalTools({
         ...OPTS,
@@ -1580,13 +1657,12 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       }).find((tool) => tool.name === 'bash')!;
       const res = await bash.execute({
         command: deleteCommand([produced, foreign]),
-        timeoutMs: 5000,
+        timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
       }, makeCtx());
-      expect(res.isError).toBe(true);
-      expect(res.content).toContain('E_BASH_RISK_DENIED');
-      expect(prompts).toBe(1);
-      expect(fs.readFileSync(produced, 'utf8')).toBe('generated');
-      expect(fs.readFileSync(foreign, 'utf8')).toBe('user');
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(prompted).toBe(false);
+      expect(fs.existsSync(produced)).toBe(false);
+      expect(fs.existsSync(foreign)).toBe(false);
     } finally {
       bashPerms._setBroadcastForTest(null);
       fs.rmSync(produced, { force: true });
@@ -1771,7 +1847,7 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     } finally { bashPerms._setBroadcastForTest(null); }
   });
 
-  it('still requires confirmation for each system package change in all_files_auto', async () => {
+  it('still requires confirmation for a host package change in all_files_auto', async () => {
     const { lt, perm, bashPerms } = await loadWithBashPerms();
     perm.setLocalExecMode('all_files_auto');
     let prompted: any = null;

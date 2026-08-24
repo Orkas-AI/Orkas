@@ -48,7 +48,7 @@ describe('named Agent execution-plan ownership', () => {
     expect(prompt).toContain('your current-task execution Plan follows Shared rules.');
     expect(prompt).not.toContain('Plan/upstream/downstream state belongs to the bus/commander.');
     expect(sharedAdmission).toBeGreaterThan(ownership);
-    expect(prompt).toContain('Skip simple/single-step work; counts alone never decide.');
+    expect(prompt).toContain('Skip simple work or work clear in live context; tool, file, and step counts never decide.');
     expect(prompt.match(/- Use an execution plan when the user asks/g)).toHaveLength(1);
   });
 });
@@ -317,6 +317,8 @@ describe('group_chat agent input-channel prompt blocks', () => {
     }, '/tmp/input-flow-agent', 'en');
 
     expect(prompt.match(/## Input decision and channel/g)).toHaveLength(1);
+    expect(prompt).toContain('"id":"product"');
+    expect(prompt).toContain('"id":"audience"');
     expect(prompt).not.toContain('## Information sufficiency');
     expect(prompt).not.toContain('### Handling `inputs_schema`');
     expect(prompt).toMatch(/1\. If `inputs_schema`[\s\S]+2\. Make your own sufficiency decision[\s\S]+3\. If required inputs and context are sufficient[\s\S]+4\. Otherwise request only the smallest useful missing set/);
