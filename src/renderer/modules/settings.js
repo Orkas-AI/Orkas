@@ -381,21 +381,7 @@ function _settingsRecycleAvailable() {
   );
 }
 
-let _settingsRecycleActiveSource = 'cloud_sync';
-let _settingsRecycleSourceTouched = false;
 const _settingsRecycleExpandedIds = new Set();
-const _SETTINGS_RECYCLE_SOURCE_CONFIG = [
-  {
-    source: 'cloud_sync',
-    tabKey: 'settings.recycle.tab_cloud',
-    emptyKey: 'settings.recycle.empty_cloud',
-  },
-  {
-    source: 'app',
-    tabKey: 'settings.recycle.tab_local',
-    emptyKey: 'settings.recycle.empty_local',
-  },
-];
 
 function _settingsRecycleCategoryKey(category) {
   const value = String(category || '').replace(/[^A-Za-z0-9_]/g, '');
@@ -578,54 +564,20 @@ function _settingsRecycleRowHtml(batch) {
   `;
 }
 
-function _settingsRecycleSourceGroups(batches) {
-  return _SETTINGS_RECYCLE_SOURCE_CONFIG.map((config) => ({
-    ...config,
-    items: batches.filter((batch) => (
-      config.source === 'app' ? batch?.source === 'app' : batch?.source !== 'app'
-    )),
-  }));
-}
-
 async function _settingsRefreshRecycleBin() {
   const body = document.getElementById('settings-recycle-body');
   if (!body || !_settingsRecycleAvailable()) return;
   try {
     const res = await window.orkas.recycleBin.list();
     const batches = Array.isArray(res?.batches) ? res.batches : [];
-    const groups = _settingsRecycleSourceGroups(batches);
-    let selectedGroup = groups.find((group) => group.source === _settingsRecycleActiveSource) || groups[0];
-    if (!_settingsRecycleSourceTouched && selectedGroup.items.length === 0) {
-      const firstNonEmpty = groups.find((group) => group.items.length > 0);
-      if (firstNonEmpty) {
-        _settingsRecycleActiveSource = firstNonEmpty.source;
-        selectedGroup = firstNonEmpty;
-      }
-    }
-    const tabsHtml = groups.map((group) => {
-      const active = group.source === selectedGroup.source;
-      return `
-        <button
-          class="settings-recycle-tab${active ? ' is-active' : ''}"
-          type="button"
-          role="tab"
-          aria-selected="${active ? 'true' : 'false'}"
-          tabindex="${active ? '0' : '-1'}"
-          data-recycle-tab="${escapeHtml(group.source)}"
-        >
-          <span>${escapeHtml(t(group.tabKey))}</span>
-          <span class="settings-recycle-tab-count">${escapeHtml(String(group.items.length))}</span>
-        </button>
-      `;
-    }).join('');
-    const rowsHtml = selectedGroup.items.length
-      ? selectedGroup.items.map(_settingsRecycleRowHtml).join('')
-      : `<div class="settings-empty">${escapeHtml(t(selectedGroup.emptyKey))}</div>`;
+    // This build does not create remote-deletion batches. Keep older batches
+    // readable, but present every snapshot through one local recycle-bin
+    // surface instead of exposing the hosted product's source split.
+    const rowsHtml = batches.length
+      ? batches.map(_settingsRecycleRowHtml).join('')
+      : `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
     body.innerHTML = `
-      <div class="settings-recycle-tabs" role="tablist" aria-label="${escapeHtml(t('settings.recycle.tabs_aria'))}">
-        ${tabsHtml}
-      </div>
-      <div class="settings-recycle-scroll" role="tabpanel" data-recycle-source="${escapeHtml(selectedGroup.source)}">
+      <div class="settings-recycle-scroll" data-recycle-source="local">
         ${rowsHtml}
       </div>
     `;
@@ -643,15 +595,6 @@ function _settingsBindRecycleBinOnce() {
   if (!body) return;
   _settingsState.recycleBound = true;
   body.addEventListener('click', async (event) => {
-    const tab = event.target?.closest?.('[data-recycle-tab]');
-    if (tab) {
-      const source = tab.getAttribute('data-recycle-tab') || '';
-      if (!_SETTINGS_RECYCLE_SOURCE_CONFIG.some((config) => config.source === source)) return;
-      _settingsRecycleActiveSource = source;
-      _settingsRecycleSourceTouched = true;
-      await _settingsRefreshRecycleBin();
-      return;
-    }
     const viewButton = event.target?.closest?.('[data-recycle-view]');
     if (viewButton) {
       const id = viewButton.getAttribute('data-recycle-view') || '';

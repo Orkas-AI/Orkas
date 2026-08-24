@@ -10,11 +10,7 @@ const settingsSource = readFileSync(
 const styleSource = readFileSync(resolve(__dirname, '../../src/renderer/style.css'), 'utf8');
 
 const translations: Record<string, string> = {
-  'settings.recycle.tab_cloud': '历史',
-  'settings.recycle.tab_local': '本地',
-  'settings.recycle.tabs_aria': '删除记录来源',
-  'settings.recycle.empty_cloud': '暂无历史删除记录',
-  'settings.recycle.empty_local': '暂无本地删除记录',
+  'settings.recycle.empty': '暂无可恢复数据',
   'settings.recycle.deleted_at': '{date}',
   'settings.recycle.view': '查看',
   'settings.recycle.collapse': '收起',
@@ -100,9 +96,26 @@ describe('Settings recycle bin', () => {
     await sandbox._settingsRefreshRecycleBin();
 
     expect(body.innerHTML).toContain('class="settings-recycle-scroll"');
-    expect(body.innerHTML).toContain('data-recycle-source="app"');
-    expect(body.innerHTML).toContain('data-recycle-tab="cloud_sync"');
-    expect(body.innerHTML).toContain('data-recycle-tab="app"');
+    expect(body.innerHTML).toContain('data-recycle-source="local"');
+    expect(body.innerHTML).not.toContain('data-recycle-tab=');
+  });
+
+  it('combines legacy sync and local batches into one local list', async () => {
+    const legacyBatch = {
+      ...batch,
+      id: 'batch-legacy',
+      source: 'cloud_sync',
+      display_items: [
+        { category: 'conversation', id: 'gconv-legacy', title: '旧删除任务', path: 'cloud/chats/gconv-legacy.jsonl' },
+      ],
+    };
+    const { sandbox, body } = loadHarness([legacyBatch, batch]);
+
+    await sandbox._settingsRefreshRecycleBin();
+
+    expect(body.innerHTML).toContain('旧删除任务');
+    expect(body.innerHTML).toContain(repeatedTitle);
+    expect(body.innerHTML).not.toContain('data-recycle-tab=');
   });
 
   it('uses structured display items, removes duplicate titles, and bounds the summary', async () => {

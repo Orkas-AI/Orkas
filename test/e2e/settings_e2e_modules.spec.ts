@@ -16,6 +16,8 @@ test.describe('settings modules and model guard', () => {
     await expect(appPage.locator('#settings-recycle-body')).toBeVisible();
     const recycleViewport = appPage.locator('#settings-recycle-body .settings-recycle-scroll');
     await expect(recycleViewport).toBeVisible();
+    await expect(recycleViewport).toHaveAttribute('data-recycle-source', 'local');
+    await expect(appPage.locator('#settings-recycle-body [data-recycle-tab]')).toHaveCount(0);
     const recycleLayout = await recycleViewport.evaluate((element) => {
       const style = getComputedStyle(element);
       return { overflowY: style.overflowY, maxHeight: Number.parseFloat(style.maxHeight) };
