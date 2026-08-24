@@ -1137,15 +1137,19 @@ function _dbXyChart(kind, data) {
   </div>`;
 }
 
-// Detect playable media src by extension. Dispatches markdown ![](src) /
-// [text](src) to a native player for video/audio instead of a generic link
-// — covers chat-media://local/...mp4, https://..../clip.webm, local .mp3
+// Detect renderable media src by extension. Dispatches markdown ![](src) /
+// [text](src) to an inline image or native player instead of a generic link
+// — covers chat-media://local/...png, https://..../clip.webm, local .mp3
 // outputs, and user-authored markdown pointing at a media file. The match is
 // against the last extension-looking segment so query strings / fragments
 // don't defeat it.
+const _IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|svg)(?:[?#].*)?$/i;
 const _VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i;
 const _AUDIO_EXT_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac)(?:[?#].*)?$/i;
 const _HTML_EXT_RE = /\.html?$/i;
+function _isImageSrc(src) {
+  return _IMAGE_EXT_RE.test(String(src || ''));
+}
 function _isVideoSrc(src) {
   return _VIDEO_EXT_RE.test(String(src || ''));
 }
@@ -1700,9 +1704,10 @@ function inlineFormat(text) {
       (_, txt, rawUrl, title) => {
         // Media links get the same rewrite as `![](…)`: an agent delivering a
         // finished file writes `[视频成片](<path>)` as often as an embed.
-        const url = _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
+        const url = _isImageSrc(rawUrl) || _isVideoSrc(rawUrl) || _isAudioSrc(rawUrl)
           ? _normalizeLocalMediaSrc(rawUrl)
           : rawUrl;
+        if (_isImageSrc(url)) return _markdownImageHtml(url, txt, title);
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
         if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
@@ -2200,6 +2205,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _markdownVideoHtml,
     _markdownAudioHtml,
     _markdownHtmlEmbedHtml,
+    _isImageSrc,
     _isHtmlSrc,
     _markdownHtmlLayoutDimensions,
     _chatImageIntrinsicStyle,

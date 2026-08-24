@@ -27,6 +27,7 @@ const {
   _markdownVideoHtml,
   _markdownAudioHtml,
   _markdownHtmlEmbedHtml,
+  _isImageSrc,
   _isHtmlSrc,
   _chatMediaLocalPathFromUrl,
   _normalizeLocalMediaSrc,
@@ -39,6 +40,7 @@ const {
   _markdownVideoHtml: (src: string, label: string, title?: string) => string;
   _markdownAudioHtml: (src: string, label: string, title?: string) => string;
   _markdownHtmlEmbedHtml: (src: string, label: string, title?: string) => string;
+  _isImageSrc: (src: string) => boolean;
   _isHtmlSrc: (src: string) => boolean;
   _chatMediaLocalPathFromUrl: (src: string) => string;
   _normalizeLocalMediaSrc: (src: string) => string;
@@ -173,6 +175,34 @@ describe('markdown media links', () => {
     expect(out).toContain('src="https://x.test/a.png?x=&quot;y&quot;"');
     expect(out).toContain('alt="&lt;car&gt;"');
     expect(out).toContain('title="&quot;preview&quot;"');
+  });
+
+  it('renders a normal Markdown link to a versioned local image inline', () => {
+    const src = 'chat-media://local/Users/test/.codex/generated_images/session/result.png?v=1-2-3';
+    const out = inlineFormat(`[查看并下载图片](${src})`);
+    expect(_isImageSrc(src)).toBe(true);
+    expect(out).toContain('<span class="chat-image-shell chat-md-img-shell is-loading">');
+    expect(out).toContain('<img class="chat-md-img"');
+    expect(out).toContain(`src="${src}"`);
+    expect(out).toContain('alt="查看并下载图片"');
+    expect(out).not.toContain('<a ');
+  });
+
+  it.each([
+    '/Users/test/.codex/generated_images/session/result.png',
+    'file:///Users/test/.codex/generated_images/session/result.webp',
+    'sandbox:/Users/test/.codex/generated_images/session/result.jpg',
+  ])('renders a normal Markdown link to local image alias %s inline', (src) => {
+    const out = inlineFormat(`[下载生成的图片](${src})`);
+    expect(out).toContain('<img class="chat-md-img"');
+    expect(out).toContain('src="chat-media://local/Users/test/.codex/generated_images/session/result.');
+    expect(out).not.toContain('<a ');
+  });
+
+  it('keeps a normal non-image Markdown link as an anchor', () => {
+    const out = inlineFormat('[下载文件](https://example.test/result.zip)');
+    expect(out).toContain('<a href="https://example.test/result.zip"');
+    expect(out).not.toContain('<img ');
   });
 
   it.each([
