@@ -19,7 +19,7 @@
  *
  * Selection: by default fetches the CURRENT platform/arch. Multi-arch release
  * builds pass explicit --platform targets, just like ensure-runtime. Flags:
- *   --all                 every shippable target (mac + win, both arches)
+ *   --all                 every shippable target (linux + mac + win, both arches)
  *   --root=<dir>          destination root (default: PC/resources/officecli)
  *   --platform=<key>      a specific `${platform}-${arch}` (repeatable)
  *   --force               re-download even if a valid copy exists
@@ -53,9 +53,11 @@ const STALL_TIMEOUT_MS = Number(process.env.OFFICECLI_FETCH_STALL_MS || 120_000)
 const pcRoot = path.resolve(__dirname, '..');
 let destDir = path.join(pcRoot, 'resources', 'officecli');
 
-// `${process.platform}-${process.arch}` -> release asset name. Desktop targets
-// only (mac + win); linux assets exist upstream but we do not ship them.
+// `${process.platform}-${process.arch}` -> release asset name. Linux assets are
+// the upstream glibc builds (the *-alpine-* musl variants are not shipped).
 const ASSETS = {
+  'linux-x64': 'officecli-linux-x64',
+  'linux-arm64': 'officecli-linux-arm64',
   'darwin-arm64': 'officecli-mac-arm64',
   'darwin-x64': 'officecli-mac-x64',
   'win32-x64': 'officecli-win-x64.exe',
@@ -64,6 +66,8 @@ const ASSETS = {
 
 // Pinned sha256 for VERSION (from the release SHA256SUMS). Update with VERSION.
 const SHA256 = {
+  'officecli-linux-x64': 'da07d4f787d7c85724104294ac023c89971ddfaee93ebb183b289282b8f869cc',
+  'officecli-linux-arm64': '39008c7f76d202858637810553ef14e2cd3e7f61485fdcf2011f26967a7babd1',
   'officecli-mac-arm64': '393874f79db58222bdbede7f4f942f2536580386923857d1b5ad9754efe80c19',
   'officecli-mac-x64': '6a931d424975dded6ae413c8c1f63d00dfb30a4bd4bd50352964782d13299f5c',
   'officecli-win-x64.exe': '864e0580c8e8c91a6aa4a4c1e8900551c8d4aa648ff10136ceed3a6ba5310888',

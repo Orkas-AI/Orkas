@@ -689,8 +689,11 @@ export function runtimeResourcesDir(): string {
 }
 
 /** `${process.platform}-${process.arch}` → vendored OfficeCLI asset name.
- *  Mirrors `scripts/fetch-officecli.cjs`. Desktop targets only (mac + win). */
+ *  Mirrors `scripts/fetch-officecli.cjs` (linux assets are the upstream glibc
+ *  builds; the *-alpine-* musl variants are not shipped). */
 const OFFICECLI_ASSETS: Readonly<Record<string, string>> = {
+  'linux-x64': 'officecli-linux-x64',
+  'linux-arm64': 'officecli-linux-arm64',
   'darwin-arm64': 'officecli-mac-arm64',
   'darwin-x64': 'officecli-mac-x64',
   'win32-x64': 'officecli-win-x64.exe',
@@ -702,7 +705,7 @@ const OFFICECLI_ASSETS: Readonly<Record<string, string>> = {
  *  `extraResources`:
  *    dev:    PC/resources/officecli/
  *    packed: <app>/Contents/Resources/officecli/   (darwin)
- *            <app>/resources/officecli/             (win)
+ *            <app>/resources/officecli/             (win/linux)
  */
 export function officeCliBinaryPath(): string | null {
   const asset = OFFICECLI_ASSETS[`${process.platform}-${process.arch}`];
