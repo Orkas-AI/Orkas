@@ -34,7 +34,9 @@ const REQUIRED_BUILTIN_INVENTORY = Object.freeze({
   system_skills: Object.freeze([
     'agent-creator',
     'autotask-creator',
+    'memory-manager',
     'package-installer',
+    'project-tasks',
     'skill-creator',
   ]),
   marketplace_agents: Object.freeze([

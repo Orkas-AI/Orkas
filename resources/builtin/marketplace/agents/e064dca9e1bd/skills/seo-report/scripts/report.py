@@ -76,8 +76,33 @@ def build_dashboard(audit_obj: dict, opportunities_obj: dict | None = None,
     url = meta.get("url") or meta.get("final_url") or ""
 
     children = []
+    # An unassessed dimension has no score, so the headline number covers only
+    # what ran. Say so beside the number rather than leaving a bare 100 that
+    # reads as a clean live site.
+    not_assessed = d.get("not_assessed") or []
+    source = (meta.get("source") or "fetch").lower()
     children.append({"type": "Metric", "props": {
         "label": "SEO Health", "value": str(health), "tone": _health_tone(health)}})
+    if not_assessed:
+        blind_dims = sorted({_DIM_LABEL.get(e.get("dimension"), e.get("dimension", "")) for e in not_assessed})
+        children.append({"type": "Alert", "props": {
+            "level": "warning",
+            "title": "Not assessed: {}".format(", ".join(blind_dims)),
+            "body": (
+                "This run read a local file, so no response was observed. "
+                "{} could not be checked and {} not scored; the health score covers "
+                "the remaining checks only. Crawl the live URL to assess them."
+            ).format(
+                ", ".join(sorted({str(e.get("check", "")) for e in not_assessed})),
+                "is" if len(blind_dims) == 1 else "are",
+            ) if source == "file" else (
+                "{} could not be checked, so {} not scored; the health score covers "
+                "the remaining checks only."
+            ).format(
+                ", ".join(sorted({str(e.get("check", "")) for e in not_assessed})),
+                "it is" if len(blind_dims) == 1 else "they are",
+            ),
+        }})
     geo = d.get("geo_score")
     if geo is not None:
         children.append({"type": "Metric", "props": {
@@ -95,13 +120,20 @@ def build_dashboard(audit_obj: dict, opportunities_obj: dict | None = None,
     ]})
 
     if dims:
-        chart_data = [{"x": _DIM_LABEL.get(k, k), "y": int(v)} for k, v in dims.items()]
-        children.append({"type": "Chart", "props": {"kind": "bar", "data": chart_data}})
+        # A None score is absent from the chart on purpose: plotting it as 0
+        # would show a failing dimension and plotting 100 a clean one, and it is
+        # neither. The Alert above names what is missing and why.
+        chart_data = [{"x": _DIM_LABEL.get(k, k), "y": int(v)}
+                      for k, v in dims.items() if v is not None]
+        if chart_data:
+            children.append({"type": "Chart", "props": {"kind": "bar", "data": chart_data}})
 
     geo_dims = d.get("geo_dimensions")
     if geo_dims:
-        gdata = [{"x": _GEO_DIM_LABEL.get(k, k), "y": int(v)} for k, v in geo_dims.items()]
-        children.append({"type": "Chart", "props": {"kind": "bar", "data": gdata}})
+        gdata = [{"x": _GEO_DIM_LABEL.get(k, k), "y": int(v)}
+                 for k, v in geo_dims.items() if v is not None]
+        if gdata:
+            children.append({"type": "Chart", "props": {"kind": "bar", "data": gdata}})
 
     crit_high = [f for f in findings if f["severity"] in ("critical", "high")]
     if crit_high:
@@ -218,17 +250,30 @@ def build_action_plan(audit_obj: dict, crawl_obj: dict | None = None,
     url = meta.get("url") or meta.get("final_url") or ""
     fetched = meta.get("fetched_at") or ""
 
+    not_assessed = d.get("not_assessed") or []
+    source = (meta.get("source") or "fetch").lower()
     lines = [
         "# SEO/GEO Action Plan",
         "",
         "- URL: {}".format(url),
-        "- Health score: {}/100".format(health),
+        # "Fetched" alone read as a live request even when the run had parsed a
+        # local file, which is how a never-contacted page came back scored 100
+        # on security and labelled Measured.
+        "- Evidence: {}".format(
+            "local file parsed under this URL; the live page was not requested"
+            if source == "file" else "live fetch"),
+        "- Health score: {}/100{}".format(
+            health, " (covers assessed checks only)" if not_assessed else ""),
         "- Findings: {} critical · {} high · {} medium · {} low".format(
             summary.get("critical", 0), summary.get("high", 0),
             summary.get("medium", 0), summary.get("low", 0)),
         "- Fetched: {}".format(fetched),
-        "",
     ]
+    if not_assessed:
+        lines.append("- Not assessed: {}".format("; ".join(
+            "{} ({}) — {}".format(e.get("check", ""), e.get("dimension", ""), e.get("reason", ""))
+            for e in not_assessed)))
+    lines.append("")
     by_sev = {"critical": [], "high": [], "medium": [], "low": []}
     for f in findings:
         by_sev.setdefault(f["severity"], []).append(f)
@@ -374,11 +419,13 @@ def merge_audits(primary: dict, adds: list) -> dict:
 
     pdata = data_of(primary)
     findings = list(pdata.get("findings") or [])
+    not_assessed = list(pdata.get("not_assessed") or [])
     geo_score = pdata.get("geo_score")
     geo_dimensions = pdata.get("geo_dimensions")
     for a in adds:
         ad = data_of(a)
         findings.extend(ad.get("findings") or [])
+        not_assessed.extend(ad.get("not_assessed") or [])
         if ad.get("geo_score") is not None:
             geo_score = ad.get("geo_score")
             geo_dimensions = ad.get("geo_dimensions") or geo_dimensions
@@ -394,9 +441,17 @@ def merge_audits(primary: dict, adds: list) -> dict:
         dim_pen[dim] = dim_pen.get(dim, 0) + w
     rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda f: rank.get(f.get("severity"), 9))
+    # Same disclosure contract as audit.py::_score: a dimension named in
+    # not_assessed keeps a None score (100 would claim it was examined and
+    # found clean), and not_assessed itself survives the merge so the
+    # dashboard/action-plan disclosure layer still fires on the --add path.
+    blind = {e.get("dimension") for e in not_assessed}
+    dim_scores = {d: (None if d in blind else max(0, 100 - p)) for d, p in dim_pen.items()}
     merged = {
         "health_score": max(0, min(100, 100 - total_pen)),
-        "dimension_scores": {d: max(0, 100 - p) for d, p in dim_pen.items()},
+        "assessed_dimensions": sorted(d for d in dim_scores if dim_scores[d] is not None),
+        "not_assessed": not_assessed,
+        "dimension_scores": dim_scores,
         "summary": {**counts, "total": len(findings)},
         "findings": findings,
         "meta": pdata.get("meta", {}),

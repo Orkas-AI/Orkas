@@ -57,15 +57,29 @@ export async function seedBuiltinMarketplaceForActiveUser(
     log.warn('skip builtin marketplace seed: no active user', { reason: opts.reason });
     return null;
   }
+  const recoverActiveSeedFailure = (
+    promise: Promise<BuiltinMarketplaceSeedResult>,
+  ): Promise<BuiltinMarketplaceSeedResult | null> => promise.catch((err) => {
+    log.warn('builtin marketplace seed for active user failed', {
+      reason: opts.reason,
+      uid: maskId(uid),
+      error: (err as Error).message,
+    });
+    return null;
+  });
   const existing = inFlightByUid.get(uid);
-  if (existing) return existing;
+  // `seedBuiltinMarketplaceForUser` deliberately exposes failures to callers
+  // that own their retry policy. The active-user startup boundary does not: it
+  // has always degraded a failed refresh to null. Preserve that boundary even
+  // when this trigger joins a raw in-flight refresh started elsewhere.
+  if (existing) return recoverActiveSeedFailure(existing);
 
   const shouldContinue = (): boolean => {
     if (opts.shouldContinue && !opts.shouldContinue()) return false;
     return _activeUidOrNull() === uid;
   };
 
-  return (async () => {
+  return recoverActiveSeedFailure((async () => {
     const result = await seedBuiltinMarketplaceForUser(uid, {
       reason: opts.reason,
       shouldContinue,
@@ -79,12 +93,5 @@ export async function seedBuiltinMarketplaceForActiveUser(
       opts.onChanged?.(result);
     }
     return result;
-  })().catch((err) => {
-    log.warn('builtin marketplace seed for active user failed', {
-      reason: opts.reason,
-      uid: maskId(uid),
-      error: (err as Error).message,
-    });
-    return null;
-  });
+  })());
 }

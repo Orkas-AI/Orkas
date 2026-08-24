@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Deterministic readiness gate for a ContentWriter research ledger.
+"""Deterministic coverage gate for a ContentWriter research ledger.
 
-The gate checks collection completeness only. It does not verify that a URL was
-fetched, that quoted text is authentic, or that a source entails a claim.
+The gate checks that every required evidence family has usable collection
+coverage and reports undated coverage as an advisory. It does not impose a
+research recipe or arbitrary source target, and it cannot verify that a URL was
+fetched, that a recorded date is real, that sources are independent, whether a
+date is required for a particular claim, or that a source entails a claim.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import json
 import re
 import sys
 import unicodedata
+from datetime import date
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -21,7 +25,7 @@ from urllib.parse import urlsplit, urlunsplit
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_FAMILIES = 50
 MAX_SOURCES = 100
-MAX_FETCH_ATTEMPTS = 6
+_ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
 def _normalize_family(value: Any) -> str:
@@ -58,7 +62,27 @@ def _normalize_url(value: Any) -> str:
     )
 
 
-def evaluate_ledger(payload: Any, min_sources: int = 3) -> dict[str, Any]:
+def _published_date(value: Any) -> str:
+    """The page's stated publication date, or "" when the row does not carry one.
+
+    A row that reports no date is honest and still counts toward completeness;
+    it just cannot be what makes a time-sensitive family dated. Rejecting the
+    whole row instead would push a writer toward supplying a date it does not
+    have, which is the opposite of the point.
+    """
+    raw = str(value or "").strip()
+    match = _ISO_DATE.match(raw)
+    if not match:
+        return ""
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        date(year, month, day)
+    except ValueError:
+        return ""
+    return raw
+
+
+def evaluate_ledger(payload: Any, min_sources: int = 1) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("ledger root must be a JSON object")
     if not 1 <= min_sources <= 20:
@@ -76,13 +100,9 @@ def evaluate_ledger(payload: Any, min_sources: int = 3) -> dict[str, Any]:
         raise ValueError("sources must be an array")
     if len(raw_sources) > MAX_SOURCES:
         raise ValueError(f"sources exceeds {MAX_SOURCES}")
-    raw_fetch_attempts = payload.get("fetch_attempts", len(raw_sources))
-    if isinstance(raw_fetch_attempts, bool) or not isinstance(raw_fetch_attempts, int):
-        raise ValueError("fetch_attempts must be an integer")
-    if not 0 <= raw_fetch_attempts <= MAX_FETCH_ATTEMPTS:
-        raise ValueError(f"fetch_attempts must be between 0 and {MAX_FETCH_ATTEMPTS}")
-
     usable_by_url: dict[str, set[str]] = {}
+    dated_families: set[str] = set()
+    undated_source_rows = 0
     rejected_rows = 0
     disallowed_source_rows = 0
     malformed_source_rows = 0
@@ -105,26 +125,36 @@ def evaluate_ledger(payload: Any, min_sources: int = 3) -> dict[str, Any]:
             malformed_source_rows += 1
             continue
         usable_by_url.setdefault(url, set()).update(families)
+        if _published_date(row.get("published")):
+            dated_families.update(families)
+        else:
+            undated_source_rows += 1
 
     covered = set().union(*usable_by_url.values()) if usable_by_url else set()
     missing = [family for family in required_families if family not in covered]
+    undated = [
+        family for family in required_families
+        if family in covered and family not in dated_families
+    ]
     success_count = len(usable_by_url)
-    if raw_fetch_attempts < success_count:
-        raise ValueError("fetch_attempts cannot be lower than usable independent sources")
-    remaining_fetch_attempts = MAX_FETCH_ATTEMPTS - raw_fetch_attempts
-    ready = success_count >= min_sources and not missing
+    gate_eligible = success_count >= min_sources
+    ready = gate_eligible and not missing
 
     reasons: list[str] = []
-    gate_eligible = raw_fetch_attempts >= min_sources
+    advisories: list[str] = []
     if not gate_eligible:
         reasons.append(
-            f"first gate is premature; make at least {min_sources - raw_fetch_attempts} "
-            "more exact search-result fetch attempt(s)"
+            f"need {min_sources - success_count} more distinct usable source(s) "
+            "for the requested evidence standard"
         )
-    if success_count < min_sources:
-        reasons.append(f"need {min_sources - success_count} more independent usable source(s)")
     if missing:
         reasons.append("missing evidence families: " + ", ".join(missing))
+    if undated:
+        advisories.append(
+            "families whose sources state no publication date: "
+            + ", ".join(undated)
+            + "; assess whether each retained claim needs a dated source"
+        )
     if disallowed_source_rows:
         reasons.append(
             f"ignored {disallowed_source_rows} disallowed or generic source row(s)"
@@ -133,29 +163,29 @@ def evaluate_ledger(payload: Any, min_sources: int = 3) -> dict[str, Any]:
         reasons.append(
             f"ignored {malformed_source_rows} malformed usable source row(s)"
         )
-    if not ready and remaining_fetch_attempts == 0:
-        reasons.append("fetch budget exhausted; deliver explicit gaps")
-
     return {
         "ok": True,
         "ready": ready,
         "decision": "READY_TO_DRAFT" if ready else "CONTINUE_RESEARCH",
         "gate_eligible": gate_eligible,
-        "minimum_sources": min_sources,
-        "successful_independent_sources": success_count,
-        "fetch_attempts": raw_fetch_attempts,
-        "maximum_fetch_attempts": MAX_FETCH_ATTEMPTS,
-        "remaining_fetch_attempts": remaining_fetch_attempts,
+        "minimum_distinct_sources": min_sources,
+        "usable_source_count": success_count,
         "required_families": required_families,
         "covered_families": [family for family in required_families if family in covered],
         "missing_families": missing,
+        "undated_families": undated,
+        "undated_source_rows": undated_source_rows,
         "ignored_nonusable_rows": rejected_rows,
         "ignored_disallowed_source_rows": disallowed_source_rows,
         "ignored_malformed_source_rows": malformed_source_rows,
         "reasons": reasons,
+        "advisories": advisories,
         "limits": (
-            "Collection gate only; separately verify fetch success, source quality, "
-            "quote provenance, claim entailment, independence, and freshness."
+            "Collection coverage only; a recorded date is taken at face value and an "
+            "undated row is not automatically blocking. Separately decide whether the "
+            "claim needs dated evidence and verify fetch success, source quality, quote "
+            "provenance, claim entailment, independence, and freshness. Distinct URLs "
+            "do not prove independent evidence."
         ),
     }
 
@@ -163,13 +193,15 @@ def evaluate_ledger(payload: Any, min_sources: int = 3) -> dict[str, Any]:
 def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         f"Research gate: **{report['decision']}**",
-        f"- Independent usable sources: {report['successful_independent_sources']} / {report['minimum_sources']}",
-        f"- Fetch attempts remaining: {report['remaining_fetch_attempts']} / {report['maximum_fetch_attempts']}",
+        f"- Distinct usable sources: {report['usable_source_count']} / {report['minimum_distinct_sources']}",
         "- Covered families: " + (", ".join(report["covered_families"]) or "none"),
         "- Missing families: " + (", ".join(report["missing_families"]) or "none"),
+        "- Undated families: " + (", ".join(report["undated_families"]) or "none"),
     ]
     for reason in report["reasons"]:
         lines.append(f"- Required action: {reason}")
+    for advisory in report["advisories"]:
+        lines.append(f"- Advisory: {advisory}")
     lines.append(f"- Limit: {report['limits']}")
     return "\n".join(lines)
 
@@ -195,7 +227,12 @@ def _read_payload(source: str) -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Research ledger JSON file, or - for stdin")
-    parser.add_argument("--min-sources", type=int, default=3)
+    parser.add_argument(
+        "--min-sources",
+        type=int,
+        default=1,
+        help="optional minimum distinct-source floor; this does not prove independence",
+    )
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     args = parser.parse_args(argv)
     try:

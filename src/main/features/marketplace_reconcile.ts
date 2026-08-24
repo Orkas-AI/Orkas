@@ -22,7 +22,6 @@ import {
   userMarketplaceAgentDir, userMarketplaceAgentSkillsDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
   marketplaceReconcileStateFile,
-  userSkillsDir,
 } from '../paths';
 import { sha256OfFile } from '../util/sha256';
 import {
@@ -835,12 +834,10 @@ function _skillContentExists(uid: string, id: string): boolean {
   return fs.existsSync(path.join(userMarketplaceSkillDir(uid, id), 'SKILL.md'));
 }
 
-function _customSkillContentExists(uid: string, id: string): boolean {
-  return fs.existsSync(path.join(userSkillsDir(uid), id, 'SKILL.md'));
-}
-
 function _skillDependencySatisfied(uid: string, id: string): boolean {
-  return _customSkillContentExists(uid, id) || _skillContentExists(uid, id);
+  // Agent skill_list dependency ids are marketplace references. A custom
+  // same-id Skill must not suppress the platform copy during reconciliation.
+  return _skillContentExists(uid, id);
 }
 
 function _skillListFromAgentJson(agentJson: Record<string, unknown>): string[] {

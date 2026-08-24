@@ -40,6 +40,22 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
     expect(r?.text).toBe('first\nsecond');
   });
 
+  it('extracts and deduplicates mediaUrl/mediaUrls, including a media-only reply', () => {
+    const stderr = JSON.stringify({
+      payloads: [
+        { text: '', mediaUrl: 'https://cdn.example/one.png' },
+        { mediaUrls: ['https://cdn.example/two.webp', 'https://cdn.example/one.png'] },
+      ],
+      meta: { agentMeta: { sessionId: 'media-session' } },
+    });
+    const r = parseOpenclawReply(stderr);
+    expect(r).toMatchObject({
+      text: '',
+      media: ['https://cdn.example/one.png', 'https://cdn.example/two.webp'],
+      sessionId: 'media-session',
+    });
+  });
+
   it('strips ANSI color escapes before parsing', () => {
     // Real openclaw injects ANSI on log prefixes; the JSON envelope
     // doesn't usually have them, but the function must not break if

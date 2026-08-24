@@ -32,6 +32,7 @@ function statsHasData(stats: AgentRuntimeStatsFile): boolean {
     stats.attempts
     || stats.successes
     || stats.deliveries
+    || stats.execution_failures
     || stats.failures
     || stats.errors
     || stats.total_duration_ms

@@ -74,6 +74,16 @@ export function formatError(err: unknown): string {
   return String(err);
 }
 
+/** Return only a bounded machine error code for logs. Error messages commonly
+ * embed credentials, provider payloads, or local paths and are not log-safe. */
+export function errorCodeForLog(err: unknown): string {
+  if (!err || typeof err !== "object") return "UNKNOWN";
+  const code = (err as Record<string, unknown>).code;
+  return typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)
+    ? code
+    : "UNKNOWN";
+}
+
 export type RetryableErrorKind =
   | "rate_limit"
   | "timeout"
@@ -296,6 +306,19 @@ function errorCauseOf(err: unknown): unknown {
   if ("cause" in rec) return rec.cause;
   if (rec.error && typeof rec.error === "object") return rec.error;
   return null;
+}
+
+/** HTTP status of the provider response, searched through the wrapper/cause
+ * chain (SDK adapters wrap the original response inconsistently). Used to
+ * attribute terminal run failures to an endpoint-level HTTP rejection. */
+export function providerHttpStatusOf(err: unknown): number | undefined {
+  let current: unknown = err;
+  for (let depth = 0; current && depth < 8; depth++) {
+    const status = errorStatusOf(current);
+    if (typeof status === "number" && status >= 100 && status <= 599) return status;
+    current = errorCauseOf(current);
+  }
+  return undefined;
 }
 
 const PROVIDER_SAFETY_CODE_RE =

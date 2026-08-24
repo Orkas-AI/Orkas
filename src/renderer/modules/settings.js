@@ -60,6 +60,22 @@ function _settingsTrackError(action, payload) {
   void payload;
 }
 
+function _settingsTrackOperationResult(eventAction, startedAt, result, data, errorCode = '', errorType = 'operation') {
+  const payload = {
+    result,
+    duration_ms: Math.max(0, Date.now() - startedAt),
+    ...(data || {}),
+  };
+  if (result !== 'success') {
+    payload.error_code = errorCode || 'unknown';
+    payload.error_type = errorType;
+  }
+  const level = result === 'failure' ? 'warn' : 'info';
+  _settingsLog[level]('settings operation result', { operation: eventAction, ...payload });
+}
+
+function _settingsTrackModelProviderSelect() {}
+
 // The open build keeps the settings flow intact but intentionally has no
 // internal model-configuration telemetry sink.
 function _settingsTrackModelConfigResult() {}
@@ -489,7 +505,7 @@ function _settingsRenderLocalExec() {
     radios.forEach((radio) => {
       radio.addEventListener('change', async () => {
         if (!radio.checked) return;
-        _settingsState.localExecToggleEpoch += 1;
+        _settingsState.localExecModeEpoch += 1;
         const startedAt = Date.now();
         const next = radio.value;
         const prev = (_settingsState.localExec && _settingsState.localExec.mode) || 'all_files_approval';
@@ -1127,6 +1143,7 @@ function _settingsCustomModelError(code, fallback) {
     CUSTOM_BASE_URL_INVALID: 'settings.custom.error_base_url_invalid',
     CUSTOM_MODEL_REQUIRED: 'settings.custom.error_model',
     CUSTOM_API_KEY_REQUIRED: 'settings.custom.error_api_key',
+    CUSTOM_API_KEY_INVALID: 'settings.custom.error_api_key_invalid',
     CUSTOM_TOKEN_LIMIT_INVALID: 'settings.custom.error_token_limits',
   })[String(code || '')];
   return key ? t(key) : (fallback || t('settings.save_failed'));
@@ -1138,6 +1155,7 @@ function _settingsModelConfigValidationCode(code) {
     CUSTOM_BASE_URL_INVALID: 'base_url_invalid',
     CUSTOM_MODEL_REQUIRED: 'model_required',
     CUSTOM_API_KEY_REQUIRED: 'api_key_required',
+    CUSTOM_API_KEY_INVALID: 'api_key_invalid',
     CUSTOM_TOKEN_LIMIT_INVALID: 'token_limit_invalid',
   })[String(code || '')] || 'validation_failed';
 }

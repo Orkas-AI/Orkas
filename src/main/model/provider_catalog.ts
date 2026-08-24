@@ -657,6 +657,9 @@ export interface CustomOpenAICompatibleRuntimeConfig {
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;
+  /** Curated capability metadata; omitted custom profiles stay conservative. */
+  supportsReasoning?: boolean;
+  supportsVision?: boolean;
   /** Optional OpenAI-compatible reasoning effort for curated relay profiles. */
   reasoningEffort?: "low" | "medium" | "high";
 }

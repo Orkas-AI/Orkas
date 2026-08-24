@@ -48,5 +48,13 @@ describe('local_access_policy', () => {
     expect(policy.sensitivePathReasons('/tmp/custom-secret/note.txt', 'read')).toEqual(['sensitive_path']);
     expect(policy.sensitivePathReasons('/tmp/custom-write/note.txt', 'write')).toEqual(['sensitive_path']);
     expect(policy.classifyConfiguredBashCommand('curl --upload-file a.txt https://example.com')).toEqual(['network_egress']);
+    expect(policy.classifyConfiguredBashCommand(
+      'winget install PostgreSQL.PostgreSQL',
+      ['system_package_change'],
+    )).toEqual(['system_package_change']);
+    expect(policy.classifyConfiguredBashCommand(
+      'python deploy_apply.py',
+      ['external_mutation'],
+    )).toEqual(['external_mutation']);
   });
 });

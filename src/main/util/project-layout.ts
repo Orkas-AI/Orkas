@@ -263,6 +263,26 @@ export function cloudSessionToolResultsDirFor(uid: string, sessionId: string): s
   return pid ? projectSessionCloudToolResultsDir(uid, pid, sessionId) : sessionCloudToolResultsDir(uid, sessionId);
 }
 
+/** Every cloud-side `<sid>.tool-results` spill dir for this user: main-chat
+ *  sessions plus each project's sessions. Consumed by the activation-time
+ *  retention sweep (`util/tool-result-cap.ts::sweepExpiredCloudToolResults`). */
+export function listCloudSessionToolResultsDirs(uid: string): string[] {
+  const out: string[] = [];
+  const collect = (sessionsDir: string): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(sessionsDir, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      if (entry.isDirectory() && entry.name.endsWith('.tool-results')) {
+        out.push(path.join(sessionsDir, entry.name));
+      }
+    }
+  };
+  collect(userSessionsDir(uid));
+  for (const pid of listProjectIds(uid)) collect(projectSessionsDir(uid, pid));
+  return out;
+}
+
 export function projectSessionRoots(uid: string, cid: string): string[] {
   const pid = findProjectIdForConversation(uid, cid);
   return pid ? [projectSessionsDir(uid, pid), userSessionsDir(uid)] : [userSessionsDir(uid)];

@@ -23,38 +23,6 @@ export const ModelConfigSchema = z.object({
   supportsStreaming: z.boolean().optional(),
 });
 
-/** Memory configuration schema. */
-export const MemoryConfigSchema = z.object({
-  enabled: z.boolean().default(true),
-  provider: z.enum(["openai", "gemini", "voyage", "mistral", "local", "auto"]).default("auto"),
-  model: z.string().optional(),
-  /** Directory containing memory markdown files. */
-  memoryDir: z.string().optional(),
-  /** Maximum number of search results to return. */
-  maxResults: z.number().int().positive().default(10),
-  /** Minimum relevance score for search results. */
-  minScore: z.number().min(0).max(1).default(0.3),
-  /** Full-text search configuration. */
-  fts: z
-    .object({
-      enabled: z.boolean().default(true),
-    })
-    .default({}),
-  /** Vector search configuration. */
-  vector: z
-    .object({
-      enabled: z.boolean().default(true),
-    })
-    .default({}),
-  /** Embedding cache configuration. */
-  cache: z
-    .object({
-      enabled: z.boolean().default(true),
-      maxEntries: z.number().int().positive().optional(),
-    })
-    .default({}),
-});
-
 /** Agent configuration schema. */
 export const AgentConfigSchema = z.object({
   /** Default model to use for the agent. */
@@ -69,16 +37,14 @@ export const AgentConfigSchema = z.object({
   toolIdleTimeoutMs: z.number().int().positive().default(1_800_000),
   /** System prompt override or additions. */
   systemPrompt: z.string().optional(),
-  /** Thinking/reasoning level: off, low, high. */
-  thinkingLevel: z.enum(["off", "low", "high"]).default("off"),
+  /** Explicit thinking/reasoning override. Omission preserves the model/provider default. */
+  thinkingLevel: z.enum(["off", "low", "high"]).optional(),
 });
 
 /** Metacognition (intrinsic self-improvement) configuration schema. */
 export const MetacognitionConfigSchema = z.object({
   /** Whether metacognitive self-improvement is enabled. */
   enabled: z.boolean().default(true),
-  /** Minimum weighted signal score to trigger reflection (0–1 scale). */
-  reflectThreshold: z.number().min(0).max(2).default(0.7),
   /** Character limit for COMPETENCE.md (agent self-assessment). */
   competenceCharLimit: z.number().int().positive().default(3000),
   /** Character limit for LEARNING_STRATEGIES.md. */
@@ -107,13 +73,14 @@ export const CoreAgentConfigSchema = z.object({
       catalog: z.record(z.string(), ModelConfigSchema).default({}),
     })
     .default({}),
-  memory: MemoryConfigSchema.default({}),
+  // The `memory` retrieval-engine section was removed with the unwired
+  // OpenClaw-ported engine (2026-08-16); the non-strict schema strips the key
+  // from older config files.
   evolution: EvolutionConfigSchema.default({}),
 });
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 export type ModelConfig = z.infer<typeof ModelConfigSchema>;
-export type MemoryConfig = z.infer<typeof MemoryConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 export type MetacognitionConfig = z.infer<typeof MetacognitionConfigSchema>;
 export type EvolutionConfig = z.infer<typeof EvolutionConfigSchema>;

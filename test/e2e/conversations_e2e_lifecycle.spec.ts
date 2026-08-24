@@ -90,6 +90,96 @@ test.describe('conversations and resource picker', () => {
     await expect(relaunchedPage.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
   });
 
+  test('keeps an unsaved task rename draft during a background list refresh', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const originalTitle = 'E2E Task Rename Refresh Original';
+    const draftTitle = 'E2E Task Rename Refresh Draft';
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: originalTitle,
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+
+    const row = page.locator(`.conv-item[data-cid="${cid}"]`);
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="rename"]').click();
+    let renameInput = page.locator(`input[data-conv-rename-cid="${cid}"]`);
+    await renameInput.fill(draftTitle);
+    await expect(renameInput).toBeFocused();
+    await renameInput.evaluate((element: any) => { element.__e2eRenameInputIdentity = true; });
+
+    await page.evaluate(async () => {
+      await (window as any).loadConversations();
+    });
+
+    renameInput = page.locator(`input[data-conv-rename-cid="${cid}"]`);
+    await expect(renameInput).toHaveValue(draftTitle);
+    await expect(renameInput).toBeFocused();
+    expect(await renameInput.evaluate((element: any) => element.__e2eRenameInputIdentity)).toBe(true);
+    const listed = await orkas.invoke<{
+      conversations: Array<{ conversation_id: string; title: string }>;
+    }>('conversations.list');
+    expect(listed.conversations.find((item) => item.conversation_id === cid)?.title).toBe(originalTitle);
+
+    await renameInput.press('Enter');
+    await expect(row.locator('.conv-item-title')).toHaveText(draftTitle);
+  });
+
+  test('keeps an unsaved nested task rename draft during a project refresh', async ({ orkas }) => {
+    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    const page = orkas.page;
+    const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'E2E Nested Task Rename Project',
+    });
+    const projectId = project.project.project_id;
+    const originalTitle = 'E2E Nested Task Rename Original';
+    const draftTitle = 'E2E Nested Task Rename Draft';
+    const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
+      title: originalTitle,
+      projectId,
+    });
+    const cid = created.conversation.conversation_id;
+    await page.evaluate(async () => {
+      const app = window as any;
+      await app.loadProjects(true);
+      await app.loadConversations({ full: true });
+    });
+
+    let projectRow = page.locator(`.project-row[data-pid="${projectId}"]`);
+    await projectRow.click();
+    projectRow = page.locator(`.project-row[data-pid="${projectId}"]`);
+    await projectRow.click();
+    const row = page.locator(`.project-conv-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toBeVisible();
+    await row.hover();
+    await row.locator('.conv-item-menu').click();
+    await page.locator('#conversation-action-menu [data-action="rename"]').click();
+    let renameInput = row.locator(`input[data-conv-rename-cid="${cid}"]`);
+    await renameInput.fill(draftTitle);
+    await expect(renameInput).toBeFocused();
+    await renameInput.evaluate((element: any) => { element.__e2eRenameInputIdentity = true; });
+
+    await page.evaluate(async () => {
+      await (window as any).loadProjects(true);
+    });
+
+    renameInput = page.locator(
+      `.project-conv-list .conv-item[data-cid="${cid}"] input[data-conv-rename-cid="${cid}"]`,
+    );
+    await expect(renameInput).toHaveValue(draftTitle);
+    await expect(renameInput).toBeFocused();
+    expect(await renameInput.evaluate((element: any) => element.__e2eRenameInputIdentity)).toBe(true);
+    const listed = await orkas.invoke<{
+      conversations: Array<{ conversation_id: string; title: string }>;
+    }>('conversations.list');
+    expect(listed.conversations.find((item) => item.conversation_id === cid)?.title).toBe(originalTitle);
+
+    await renameInput.press('Enter');
+    await expect(row.locator('.conv-item-title')).toHaveText(draftTitle);
+  });
+
   test('keeps a conversation visible when deletion fails and lets the user retry', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;

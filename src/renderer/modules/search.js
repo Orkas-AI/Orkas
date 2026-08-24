@@ -19,10 +19,9 @@ let _searchActiveIdx = -1;
 let _searchLastQuery = '';
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
-const _SEARCH_FAILURE_MAX_PER_SESSION = 30;
 const _SEARCH_FAILURE_STAGES = new Set(['request', 'response', 'partial']);
 const _searchFailureState = new Map();
-let _searchFailureReportCount = 0;
+const _SEARCH_RESULT_STAGES = new Set(['request', 'response', 'partial', 'complete', 'superseded']);
 const _SEARCH_DEGRADATION_CODES = new Set([
   'library_content_embedding_unavailable',
   'library_global_content_unavailable',
@@ -61,7 +60,7 @@ function _reportGlobalSearchFailure(stage, error, fallbackCode) {
   const previous = _searchFailureState.get(key);
   if (previous && now - previous.at < _SEARCH_FAILURE_DEDUPE_MS) {
     previous.suppressed += 1;
-    return;
+    return { stage: safeStage, error_code: errorCode };
   }
   const suppressed = previous?.suppressed || 0;
   _searchFailureState.set(key, { at: now, suppressed: 0 });
@@ -71,6 +70,14 @@ function _reportGlobalSearchFailure(stage, error, fallbackCode) {
     error,
     ...(suppressed > 0 ? { suppressed_count: suppressed } : {}),
   });
+  return { stage: safeStage, error_code: errorCode };
+}
+
+// Search-result telemetry is commercial-only. Keep a stable local hook so
+// shared control flow can report outcomes without coupling OSS search to the
+// private Monitor runtime.
+function _trackGlobalSearchResult() {
+  // Intentionally empty in the open build.
 }
 
 function _bindGlobalSearch() {
@@ -195,8 +202,9 @@ async function _runSearchNow(queryArg) {
     return;
   }
   const seq = ++_searchSeq;
+  const startedAt = Date.now();
+  const projectId = _activeProjectIdForSearch();
   try {
-    const projectId = _activeProjectIdForSearch();
     const res = await apiFetch('/api/search/global', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -208,14 +216,25 @@ async function _runSearchNow(queryArg) {
       }),
     });
     const data = await res.json();
-    if (seq !== _searchSeq) return;     // a newer query arrived; drop this
+    if (seq !== _searchSeq) {
+      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
+        has_project: !!projectId,
+      });
+      return;     // a newer query arrived; drop this
+    }
     if (!data.ok) {
-      _reportGlobalSearchFailure('response', data, 'search_rejected');
+      const failure = _reportGlobalSearchFailure('response', data, 'search_rejected');
+      _trackGlobalSearchResult('failure', failure.stage, startedAt, {
+        has_project: !!projectId,
+        error_type: 'http',
+        error_code: failure.error_code,
+      });
       _renderSearchError(data.error);
       return;
     }
+    let degradation = null;
     if (data.degradation_code) {
-      _reportGlobalSearchFailure('partial', {
+      degradation = _reportGlobalSearchFailure('partial', {
         code: _searchDegradationErrorCode(data.degradation_code),
       }, 'search_degraded');
     }
@@ -223,9 +242,32 @@ async function _runSearchNow(queryArg) {
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
     _renderSearchResults(query);
+    _trackGlobalSearchResult(
+      degradation ? 'partial_failure' : 'success',
+      degradation ? 'partial' : 'complete',
+      startedAt,
+      {
+        item_count: _searchResults.length,
+        has_project: !!projectId,
+        ...(degradation ? {
+          error_type: 'runtime',
+          error_code: degradation.error_code,
+        } : {}),
+      },
+    );
   } catch (e) {
-    if (seq !== _searchSeq) return;
-    _reportGlobalSearchFailure('request', e, 'search_request_failed');
+    if (seq !== _searchSeq) {
+      _trackGlobalSearchResult('cancelled', 'superseded', startedAt, {
+        has_project: !!projectId,
+      });
+      return;
+    }
+    const failure = _reportGlobalSearchFailure('request', e, 'search_request_failed');
+    _trackGlobalSearchResult('failure', failure.stage, startedAt, {
+      has_project: !!projectId,
+      error_type: 'network',
+      error_code: failure.error_code,
+    });
     _renderSearchError(e.message || String(e));
   }
 }

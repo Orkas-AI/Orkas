@@ -30,6 +30,7 @@ export type LocalEventType =
   | 'text-delta'
   | 'thinking'
   | 'tool-event'
+  | 'media-output'
   | 'stderr-line'
   | 'status'
   | 'file-change'
@@ -49,16 +50,21 @@ export interface LocalEvent {
    *                        { chars, summary?, itemId?, heartbeat?, synthetic? } after the
    *                        runner boundary (summary is bounded; raw reasoning
    *                        text never crosses)
-   *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputPath? }
+   *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputRef?, skill_name?, connector_name? }
+   *    media-output:       { source, callId?, items: [{ data?, uri?, mediaType?, name?, localName? }] }
+   *                        // private adapter payload; runner materializes or sanitizes it;
+   *                        // normalized remote items retain uri and may name a stable background cache target
    *    stderr-line:        { line }
    *    status:             { status, usage? }   // usage carried for status:'usage' running counters
-   *    file-change:        { paths: string[] }   // files reported by CLI-native diff/tool metadata
+   *    file-change:        { paths: string[], scope?: 'conversation-media', source?: string }
+   *                        // CLI-native file metadata, or host-materialized media output
    *    log:                { level: 'debug'|'info'|'warn'|'error', message, source? }
    *    raw-line:           { line }             // stdout line we couldn't parse as our protocol
    *    permission-request: { id, tool?, input?, autoDecided: 'allow'|'deny', reason }
    *    idle:               { stalledMs }        // runner-emitted heartbeat on prolonged silence
    *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
-   *                                  'missing_cli', error?, durationMs?, sessionId?, usage? }
+   *                                  'missing_cli', error?, durationMs?, sessionId?, usage?,
+   *                                  timeoutPhase?: 'foreground'|'background' }
    */
   [key: string]: unknown;
 }
@@ -100,6 +106,18 @@ export interface BackendRunOptions {
    * The host removes a durable queue item only when `submit` returns
    * `steered`; every other result is a safe ordinary follow-up. */
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
+  /** Register a running background phase so app shutdown can stop and await
+   *  the process. This does not end or transfer the host turn: all background
+   *  and resumed-foreground events keep flowing through `onEvent`. */
+  onBackgroundRun?: (handle: {
+    untilProcessExit: Promise<void>;
+    /** How many background tasks are running right now. Read at hand-off for
+     *  diagnostics. */
+    liveTasks: () => number;
+    /** End the run: let the CLI settle and write a clean session state, then
+     *  reap. The background work does stop. */
+    stop: (reason: string) => void;
+  }) => void;
   /** Hard wall-clock cap — zombie insurance, NOT the hang detector
    *  (that's `idleKillMs`). Backends arm `armKillWatchdog` with both and
    *  emit `done({status:'timeout'})` when either fires before exit. */
@@ -112,12 +130,13 @@ export interface BackendRunOptions {
    *  backend event). Events explicitly marked `synthetic` do not slide it. Read by the
    *  idle-kill watchdog; unset means no tracking and idle-kill stays off. */
   lastEventAt?: () => number;
-  /** Per-backend idle threshold override (ms). Read by `runner.ts`'s
-   *  idle-heartbeat to decide when to emit `{type:'idle'}` events. When
-   *  unset the runner uses its own default (90 s; configurable via
-   *  ORKAS_LOCAL_AGENT_IDLE_MS). Backends with no streaming (today:
-   *  openclaw) should pass a smaller value so users get an early "still
-   *  alive" pulse instead of staring at a blank rail for the full run. */
+  /** Per-backend visible-idle threshold override (ms). Read by `runner.ts`'s
+   *  idle-heartbeat to decide when to emit `{type:'idle'}` events. Synthetic
+   *  reasoning/tool heartbeats suppress this UI state while the item remains
+   *  active without advancing the separate idle-kill watchdog. When unset the
+   *  runner uses its own default (90 s; configurable via
+   *  ORKAS_LOCAL_AGENT_IDLE_MS). Backends with no streaming (today: openclaw)
+   *  may override the cadence for their product-specific behavior. */
   idleMs?: number;
   /** orkas-bridge injection (plan §D — set by runner.ts when a bridge
    *  host is live for this run). Backends that support adding an MCP
@@ -215,10 +234,17 @@ export function spawnCli(
   cwd: string,
   env?: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
-  const childEnv = buildCliSpawnEnv(binPath, env ?? process.env);
+  const resolvedCwd = path.resolve(cwd);
+  const childEnv = buildCliSpawnEnv(
+    binPath,
+    env ?? process.env,
+    process.platform,
+    undefined,
+    resolvedCwd,
+  );
   const launch = resolveCliCommand(binPath, args, process.platform, childEnv);
   const child = spawn(launch.command, launch.args, {
-    cwd,
+    cwd: resolvedCwd,
     env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,

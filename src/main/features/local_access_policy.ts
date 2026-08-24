@@ -3,7 +3,13 @@ import * as path from 'node:path';
 
 import { clientConfig } from './client_config';
 
-export type LocalAccessRiskCategory = 'network_egress' | 'destructive' | 'priv_esc' | 'sensitive_path';
+export type LocalAccessRiskCategory =
+  | 'network_egress'
+  | 'destructive'
+  | 'priv_esc'
+  | 'sensitive_path'
+  | 'system_package_change'
+  | 'external_mutation';
 
 export interface SensitiveCommandPattern {
   category: LocalAccessRiskCategory;
@@ -17,7 +23,14 @@ export interface LocalAccessSensitivePolicy {
   sensitive_command_patterns: SensitiveCommandPattern[];
 }
 
-const RISK_CATEGORIES: readonly LocalAccessRiskCategory[] = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path'];
+const RISK_CATEGORIES: readonly LocalAccessRiskCategory[] = [
+  'network_egress',
+  'destructive',
+  'priv_esc',
+  'sensitive_path',
+  'system_package_change',
+  'external_mutation',
+];
 
 const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
   enabled_categories: [...RISK_CATEGORIES],
@@ -167,7 +180,12 @@ export function classifyConfiguredBashCommand(
   const policy = getLocalAccessSensitivePolicy();
   const enabled = new Set(policy.enabled_categories);
   const reasons = new Set<LocalAccessRiskCategory>();
-  for (const r of baseReasons) if (enabled.has(r)) reasons.add(r);
+  // Host dependency and external-system changes are product safety invariants
+  // rather than remotely tunable heuristics. Preserve those base classifier
+  // results even while an older server payload omits newly introduced categories.
+  for (const r of baseReasons) {
+    if (r === 'system_package_change' || r === 'external_mutation' || enabled.has(r)) reasons.add(r);
+  }
 
   const text = String(command || '');
   if (text.trim()) {

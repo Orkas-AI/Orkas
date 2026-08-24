@@ -113,12 +113,17 @@ def make_snapshot(crawl_obj: dict, health: float | None = None, geo: float | Non
     return {
         "url": page.get("url"),
         "fetched_at": site.get("fetched_at") or page.get("fetched_at"),
+        # None travels through as None: a snapshot taken from a local file did
+        # not observe a response, and a drift rule must not read that as 200.
         "status_code": page.get("status_code"),
+        "source": page.get("source") or site.get("source") or "fetch",
         "title": page.get("title"),
         "meta_description": page.get("meta_description"),
         "canonical": page.get("canonical"),
         "noindex": bool(page.get("noindex")),
-        "is_indexable": bool(page.get("is_indexable", True)),
+        "is_indexable": (
+            None if page.get("is_indexable") is None else bool(page.get("is_indexable"))
+        ),
         "h1s": page.get("h1s") or [],
         "h2_count": page.get("h2_count", 0),
         "og_title": page.get("og_title"),
@@ -188,6 +193,28 @@ def compare(baseline: dict, current: dict) -> dict:
                          "failure_criterion": fail, "data_tier": "Measured"})
 
     b, c = baseline, current
+    # A snapshot with no observed response cannot be compared on response facts.
+    # The rules below simply would not fire, and a monitor that reports nothing
+    # is read as "nothing regressed" — the exact regression this mode exists to
+    # catch would go unmentioned. Name what could not be compared instead.
+    not_compared: list[dict] = []
+    for field, label in (("status_code", "response status"), ("is_indexable", "indexability")):
+        missing = [
+            side for side, snap in (("baseline", b), ("current", c))
+            if snap.get(field) is None
+        ]
+        if missing:
+            not_compared.append({
+                "check": label,
+                "reason": "{} snapshot observed no response (source={})".format(
+                    " and ".join(missing),
+                    ", ".join(sorted({
+                        str((b if side == "baseline" else c).get("source") or "unknown")
+                        for side in missing
+                    })),
+                ),
+            })
+
     # status / indexability
     if b.get("status_code") == 200 and (c.get("status_code") or 0) >= 400:
         add("status_code_error", "critical", "Page went from 200 to an error",
@@ -197,7 +224,9 @@ def compare(baseline: dict, current: dict) -> dict:
         add("noindex_added", "critical", "noindex was added",
             False, True, "Remove the noindex if this page should stay indexed.",
             "noindex removed; page re-eligible", "still noindex")
-    if b.get("is_indexable") and not c.get("is_indexable"):
+    # `not None` is true, so an unmeasured current snapshot would otherwise be
+    # reported as a page that lost indexability.
+    if b.get("is_indexable") and c.get("is_indexable") is False:
         add("indexability_lost", "critical", "Page is no longer indexable",
             True, False, "Investigate what made the page non-indexable.",
             "indexable again", "still blocked")
@@ -283,6 +312,7 @@ def compare(baseline: dict, current: dict) -> dict:
     return {
         "changed": bool(findings),
         "drift_findings": findings,
+        "not_compared": not_compared,
         "summary": {**counts, "total": len(findings)},
         "baseline_at": b.get("fetched_at"), "current_at": c.get("fetched_at"),
         "url": c.get("url") or b.get("url"),

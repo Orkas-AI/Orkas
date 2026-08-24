@@ -20,7 +20,6 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
-import { getLocalExecGranted } from '../../features/permissions';
 import { generateImage } from '../../features/image_gen';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
@@ -29,11 +28,6 @@ import { chatAttachmentDir } from '../../paths';
 import { createLogger } from '../../logger';
 
 const log = createLogger('image-gen-tool');
-
-const DENY_MESSAGE =
-  'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so command execution, file writes, PDFs, images, and local artifacts were not created. ' +
-  'Ask the user to open Settings > Tool Execution Access and enable "Enable Tool Execution Access", then retry. ' +
-  'Do not claim any file, PDF, image, or interactive app has already been created.';
 
 export interface ImageGenToolOpts {
   userId: string;
@@ -74,12 +68,7 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
   return {
     name: 'generate_image',
     description:
-      'Generate an image from a text prompt and save it to a file. '
-      + 'Uses whichever provider in the user\'s configured API keys supports image generation '
-      + '(currently OpenAI gpt-image, Google Gemini image, or Doubao Seedream). '
-      + 'Optionally accepts reference images for editing or variations. '
-      + 'After a successful call, present the result to the user with markdown: '
-      + '`![<short alt>](chat-media://local/<absolute path returned>)`.',
+      'Generate or edit an image from a prompt and save it locally.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -113,10 +102,6 @@ export function createImageGenTool(opts: ImageGenToolOpts): AgentTool {
       required: ['prompt', 'output_path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) {
-        return { content: DENY_MESSAGE, isError: true } as ToolResult;
-      }
-
       const prompt = String(input.prompt ?? '').trim();
       const outputPathRaw = String(input.output_path ?? '').trim();
       if (!prompt)         return { content: 'prompt is required', isError: true } as ToolResult;

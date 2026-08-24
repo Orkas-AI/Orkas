@@ -85,16 +85,14 @@ describe('migrate-session-ids', () => {
     expect(fs.readFileSync(path.join(dir, 'gconv-ac5559863d42.jsonl'), 'utf8')).toBe('real-archive-sample');
   });
 
-  it('handles dashed kind keywords (extract-img / memory-extract) without splitting them', async () => {
+  it('handles the dashed kind keyword (extract-img) without splitting it', async () => {
     const dir = cloudSessionsDir(TEST_UID);
     touch(path.join(dir, '99999999-extract-img-deadbeef.jsonl'),  'a');
-    touch(path.join(dir, '99999999-memory-extract-1234.jsonl'),    'b');
 
     const { migrateLegacySessionIds } = await import('../../../src/main/util/migrate-session-ids');
     migrateLegacySessionIds(TEST_UID);
 
     expect(fs.existsSync(path.join(dir, 'extract-img-deadbeef.jsonl'))).toBe(true);
-    expect(fs.existsSync(path.join(dir, 'memory-extract-1234.jsonl'))).toBe(true);
   });
 
   it('preserves legacy kinds (organizer / sub / conv) — strips prefix, keeps body shape', async () => {

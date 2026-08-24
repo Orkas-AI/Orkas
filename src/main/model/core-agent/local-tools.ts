@@ -26,11 +26,11 @@
  *                       success fires `onFileWritten` so the UI can show
  *                       the green chip. Companion to `write_file` for
  *                       cheap targeted edits without a full overwrite.
- *   - `markdown_to_pdf` — built-in PDF channel (no pandoc/wkhtmltopdf
+ *   - `create_pdf`      — built-in PDF channel (no pandoc/wkhtmltopdf
  *                       dependency). Renders via util/md-to-pdf +
  *                       Electron's webContents.printToPDF.
- *   - `html_to_pdf`   — same, for hand-crafted HTML input.
- *   - `interactive_cli_*` — live stdin/stdout sessions for CLIs that need
+ *                        dependency) for Markdown or hand-crafted HTML input.
+ *   - `interactive_cli`   — live stdin/stdout sessions for CLIs that need
  *                       user interaction such as OAuth codes or setup prompts.
  *
  * Permission gate: every execute() re-reads the local access mode so a
@@ -84,13 +84,17 @@ import {
   type CapturedProcessOutput,
 } from '../../../core-agent/src/sandbox/output-capture';
 import {
-  getLocalExecGranted,
   getLocalExecMode,
   localAccessAllowsOutsideWorkspace,
   localAccessRequiresSensitiveApproval,
 } from '../../features/permissions';
 import { classifyConfiguredBashCommand, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
 import { classifyBashCommand } from './bash-risk';
+import {
+  classifyExternalMutationScript,
+  referencedExecutableScripts,
+  type ExternalMutationFinding,
+} from './external-mutation-risk';
 import { requestBashDecision } from './bash-permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
@@ -98,11 +102,17 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
 import {
+  agentPrivateSkillsDir,
+  globalSkillRoots,
+  userAgentsDir,
   userMarketplaceAgentsDir,
+  userMarketplaceAgentSkillsDir,
   userMarketplaceSkillsDir,
   userSystemSkillsDir,
   userSkillsDir,
 } from '../../paths';
+import { enabledPackageSkillRoots } from '../../features/packages';
+import { getGlobalSkillRootsEnabledForUser } from '../../features/config';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
@@ -139,10 +149,16 @@ import {
 } from './interactive-cli-sessions';
 import type { InteractiveCliSessionView } from './interactive-cli-sessions';
 import { IMAGE_STUDIO_AGENT_ID, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
+import type { SkillRuntimeBinding } from './skill-registry';
 import {
   browserAutomationHitWaf,
   browserRuntimeInstallRequiresExplicitRequest,
 } from './browser-automation-guard';
+import {
+  DEEP_RESEARCH_EVIDENCE_ENV,
+  DEEP_RESEARCH_EVIDENCE_STATE_KEY,
+  DEEP_RESEARCH_SKILL_ID,
+} from './deep-research-evidence';
 
 const log = createLogger('local-tools');
 
@@ -195,13 +211,20 @@ export interface LocalToolsOpts {
   /** Mutable deny-only roots admitted after runner construction. File tools
    * may read them; local write/delete/bash paths must never mutate them. */
   runtimeReadOnlyRoots?: readonly string[];
+  /** Exact logical Skill namespace already advertised to this runner. When
+   * present, run-skill.cjs execution is confined to the matching bound root;
+   * standalone callers that omit it retain the CLI's legacy discovery mode. */
+  skillRuntimeBindings?: ReadonlyMap<string, SkillRuntimeBinding>;
   /** Fires with absolute path after every successful write (write_file,
-   * append_file, edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
+   * append_file, edit_file, create_pdf). Lets chats.ts surface
    * produced files to the UI. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Validates and records the complete list declared through
    * `publish_outputs`; returns only paths accepted by the active turn. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** Returns existing current-turn files that are eligible for publication.
+   * Used only to make a rejected declaration recoverable without guessing. */
+  getPublishableOutputPaths?: () => string[];
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
@@ -218,15 +241,6 @@ export interface LocalToolsOpts {
    *  collision and uniquify (`-2 / -3 / ...`) kicks in. `edit_file` ignores
    *  it because its semantics is explicitly to modify an existing file. */
   hasProducedPath?: (absPath: string) => boolean;
-}
-
-const DENY_MESSAGE =
-  'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so command execution, file writes, PDFs, images, and local artifacts were not created. ' +
-  'Ask the user to open Settings > Tool Execution Access and enable "Enable Tool Execution Access", then retry. ' +
-  'Do not claim any file, PDF, image, or interactive app has already been created.';
-
-function deniedResult(): ToolResult {
-  return { content: DENY_MESSAGE, isError: true };
 }
 
 function resolveAbs(ctx: ToolContext, p: string): string {
@@ -514,17 +528,57 @@ function _uniqueResolvedRoots(input: readonly string[]): string[] {
   return out;
 }
 
+/** Agent/skill package roots. The structured agent/skill edit flow is the only
+ *  sanctioned mutation channel for these packages, so they stay protected even
+ *  when an unusually broad workspace contains the Orkas data directory. The
+ *  same list also decides which supplied roots {@link retainedReadOnlyRoots}
+ *  must retain. */
+function resourceProtectedRoots(opts: LocalToolsOpts): string[] {
+  if (!opts.userId) return [];
+  return _uniqueResolvedRoots([
+    userMarketplaceAgentsDir(opts.userId),
+    userMarketplaceSkillsDir(opts.userId),
+    userSystemSkillsDir(opts.userId),
+    userAgentsDir(opts.userId),
+    userSkillsDir(opts.userId),
+  ]);
+}
+
+/** Keep a caller-supplied read-only root only when it cannot revoke writes the
+ *  workspace sandbox already grants.
+ *
+ *  `readOnlyExtraRoots` / `runtimeReadOnlyRoots` exist to widen READ access
+ *  beyond {@link allowedRootsFor} — agent/skill specs, referenced attachments,
+ *  and files produced by another conversation all live outside the workspace.
+ *  Inside the workspace that grant is redundant (the workspace is already
+ *  readable), but the same list is also the write blocklist, so admitting a
+ *  workspace-overlapping root silently turns the agent's own workspace
+ *  read-only. Group chat derives a reference root from `path.dirname()` of each
+ *  referenced file, so referencing one file stored at the workspace root used to
+ *  lock the whole workspace — every write tool and any bash command naming that
+ *  path — for the rest of the run. Package roots are exempt so an unusual
+ *  workspace selection cannot unlock them. */
+function retainedReadOnlyRoots(opts: LocalToolsOpts, supplied: readonly string[]): string[] {
+  const candidates = _uniqueResolvedRoots(supplied);
+  if (!candidates.length) return [];
+  const writable = _uniqueResolvedRoots(workspaceScopedRootsFor(opts));
+  if (!writable.length) return candidates;
+  const packages = resourceProtectedRoots(opts);
+  return candidates.filter((root) => (
+    packages.some((pkg) => _sameOrInside(pkg, root))
+    || !writable.some((allowed) => _sameOrInside(root, allowed) || _sameOrInside(allowed, root))
+  ));
+}
+
 function protectedWriteRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
-    roots.push(
-      userMarketplaceAgentsDir(opts.userId),
-      userMarketplaceSkillsDir(opts.userId),
-      userSystemSkillsDir(opts.userId),
-    );
+    roots.push(...resourceProtectedRoots(opts));
   }
-  if (opts.readOnlyExtraRoots?.length) roots.push(...opts.readOnlyExtraRoots);
-  if (opts.runtimeReadOnlyRoots?.length) roots.push(...opts.runtimeReadOnlyRoots);
+  const supplied: string[] = [];
+  if (opts.readOnlyExtraRoots?.length) supplied.push(...opts.readOnlyExtraRoots);
+  if (opts.runtimeReadOnlyRoots?.length) supplied.push(...opts.runtimeReadOnlyRoots);
+  roots.push(...retainedReadOnlyRoots(opts, supplied));
   return _uniqueResolvedRoots(roots);
 }
 
@@ -1316,9 +1370,15 @@ async function executeCoreBashWithOutputTracking(
 ): Promise<ToolResult> {
   const outputDir = workingDir;
   const command = String(input.command ?? '');
+  const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
+  if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
   const manifestPath = path.join(outputDir, BASH_OUTPUT_MANIFEST_NAME);
   try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort stale cleanup */ }
   const before = collectBashFileSnapshot(outputDir);
+  const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(
+    ctx,
+    skillRuntime.binding,
+  );
   const restoreEnv = withBashOutputEnv(ctx, outputDir, manifestPath);
   const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
   try {
@@ -1350,7 +1410,26 @@ async function executeCoreBashWithOutputTracking(
     try { fs.rmSync(manifestPath, { force: true }); } catch { /* best-effort */ }
     restoreWritableRoots();
     restoreEnv();
+    restoreSkillRuntimeEnv();
   }
+}
+
+/** The workspace-scoped half of {@link allowedRootsFor}: the roots this turn may
+ *  write to before `extraRoots` widens the scope. Split out so
+ *  {@link retainedReadOnlyRoots} can tell a read-widening root apart from the
+ *  scope that grant would otherwise revoke. */
+function workspaceScopedRootsFor(opts: LocalToolsOpts): string[] {
+  const roots: string[] = [];
+  if (!opts.userId) return roots;
+  try {
+    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    if (ws) roots.push(ws);
+  } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
+  if (opts.cid) {
+    try { roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
+    catch (err) { log.warn('edit_file resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
+  }
+  return roots;
 }
 
 /** Assemble the workspace-scoped writable roots for the current (uid, cid).
@@ -1358,17 +1437,7 @@ async function executeCoreBashWithOutputTracking(
  *  roots remain the default safe scope and the macOS write sandbox scope for
  *  `workspace_approval`. */
 function allowedRootsFor(opts: LocalToolsOpts): string[] {
-  const roots: string[] = [];
-  if (opts.userId) {
-    try {
-      const ws = getWorkspacePath(opts.userId, opts.projectId);
-      if (ws) roots.push(ws);
-    } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
-    if (opts.cid) {
-      try { roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid)); }
-      catch (err) { log.warn('edit_file resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
-    }
-  }
+  const roots = workspaceScopedRootsFor(opts);
   if (opts.extraRoots?.length) {
     for (const r of opts.extraRoots) if (r) roots.push(r);
   }
@@ -1833,8 +1902,9 @@ function bashLiteralAssignmentValue(value: string): string | null {
 
 /** Resolve only assignments whose value is already a literal in a completed
  * shell statement. Temporary command assignments, pipelines, background jobs,
- * loop variables, substitutions, and calculated PowerShell expressions remain
- * unresolved and fail closed. */
+ * general loop variables, substitutions, and calculated PowerShell expressions
+ * remain unresolved and fail closed. A narrow finite-loop case is expanded by
+ * bashGuardCommandVariants before candidate collection. */
 function bashPersistentLiteralAssignments(segment: BashPathSegment): Record<string, string | null> | null {
   if (!segment.separatorAfter || !BASH_LITERAL_ASSIGNMENT_PERSIST_SEPARATORS.has(segment.separatorAfter)) return null;
   if (segment.words.length > 0 && segment.words.every((word) => BASH_PATH_ASSIGN_WORD_RE.test(word))) {
@@ -1895,6 +1965,25 @@ function updateBashPathEnv(env: Record<string, string>, assignments: Record<stri
   }
 }
 
+const BASH_PATH_LOOP_EXPANSION_MAX = 256;
+
+function powershellLiteralLoopValues(raw: string): string[] | null {
+  const compact = raw.replace(/\s+/g, '');
+  const range = /^(-?\d+)\.\.(-?\d+)$/.exec(compact);
+  if (range) {
+    const start = Number(range[1]);
+    const end = Number(range[2]);
+    const length = Math.abs(end - start) + 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)
+      || length > BASH_PATH_LOOP_EXPANSION_MAX) return null;
+    const step = start <= end ? 1 : -1;
+    return Array.from({ length }, (_, index) => String(start + index * step));
+  }
+  if (!/^-?\d+(?:,-?\d+)*$/.test(compact)) return null;
+  const values = compact.split(',');
+  return values.length <= BASH_PATH_LOOP_EXPANSION_MAX ? values : null;
+}
+
 function bashPathSegmentsWithEnv(
   command: string,
   baseEnv: Record<string, string>,
@@ -1907,6 +1996,63 @@ function bashPathSegmentsWithEnv(
     if (assignments) updateBashPathEnv(env, assignments);
   }
   return out;
+}
+
+type BashGuardCommandVariant = { command: string; env: Record<string, string> };
+
+function finiteLoopBodyIsSingleCommand(body: string): boolean {
+  const segments = bashPathSegments(body);
+  return segments.length === 1 && !segments[0].separatorAfter;
+}
+
+function bashGuardCommandVariants(
+  command: string,
+  baseEnv: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+): BashGuardCommandVariant[] {
+  if (hostPlatform === 'win32') {
+    const match = /^\s*foreach\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([\s\S]+)\)\s*\{\s*([\s\S]*?)\s*\}\s*$/i.exec(command);
+    if (match && finiteLoopBodyIsSingleCommand(match[3])) {
+      const values = powershellLiteralLoopValues(match[2]);
+      if (values) return values.map((value) => ({
+        command: match[3],
+        env: { ...baseEnv, [match[1]]: value },
+      }));
+      const env = { ...baseEnv };
+      updateBashPathEnv(env, { [match[1]]: null });
+      return [{ command: match[3], env }];
+    }
+  } else {
+    const match = /^\s*for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\r\n]+)\s*(?:;|\r?\n)\s*do\s+([\s\S]*?)(?:;|\r?\n)\s*done\s*$/i.exec(command);
+    if (match && finiteLoopBodyIsSingleCommand(match[3])) {
+      const tokens = tokenizeBashPathGuard(match[2]);
+      const values = tokens.every((token) => token.type === 'word')
+        ? tokens.map((token) => token.value)
+        : [];
+      if (values.length > 0
+        && values.length <= BASH_PATH_LOOP_EXPANSION_MAX
+        && values.every((value) => bashLiteralAssignmentValue(value) !== null)) {
+        return values.map((value) => ({
+          command: match[3],
+          env: { ...baseEnv, [match[1]]: value },
+        }));
+      }
+      const env = { ...baseEnv };
+      updateBashPathEnv(env, { [match[1]]: null });
+      return [{ command: match[3], env }];
+    }
+  }
+  return [{ command, env: baseEnv }];
+}
+
+function bashGuardPathSegments(
+  command: string,
+  baseEnv: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+): Array<{ segment: BashPathSegment; env: Record<string, string> }> {
+  return bashGuardCommandVariants(command, baseEnv, hostPlatform).flatMap((variant) => (
+    bashPathSegmentsWithEnv(variant.command, variant.env)
+  ));
 }
 
 function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } | null {
@@ -2248,7 +2394,7 @@ function collectBashMutationCandidates(
   hostPlatform: NodeJS.Platform,
 ): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+  for (const { segment: seg, env: segmentEnv } of bashGuardPathSegments(command, env, hostPlatform)) {
     for (const target of seg.redirectTargets) {
       if (hostPlatform === 'win32' && target.toLowerCase() === '$null') continue;
       addBashCandidate(out, target, 'redirection', workingDir, segmentEnv);
@@ -2315,9 +2461,14 @@ function collectBashMutationCandidates(
   return out;
 }
 
-function collectBashReadCandidates(command: string, workingDir: string, env: Record<string, string>): BashPathCandidate[] {
+function collectBashReadCandidates(
+  command: string,
+  workingDir: string,
+  env: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+): BashPathCandidate[] {
   const out: BashPathCandidate[] = [];
-  for (const { segment: seg, env: segmentEnv } of bashPathSegmentsWithEnv(command, env)) {
+  for (const { segment: seg, env: segmentEnv } of bashGuardPathSegments(command, env, hostPlatform)) {
     for (const target of seg.inputTargets) addBashCandidate(out, target, 'input redirection', workingDir, segmentEnv);
     const eff = bashEffectiveCommand(seg.words);
     if (!eff) continue;
@@ -2403,6 +2554,32 @@ function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly Lo
   for (const reason of source) if (!target.includes(reason)) target.push(reason);
 }
 
+const EXTERNAL_MUTATION_SCRIPT_MAX_BYTES = 512 * 1024;
+
+async function classifyBashRiskIncludingScripts(command: string, workingDir: string) {
+  const base = classifyBashCommand(command);
+  const externalMutations: ExternalMutationFinding[] = [...base.externalMutations];
+  for (const scriptRef of referencedExecutableScripts(command)) {
+    const abs = path.isAbsolute(scriptRef) ? path.resolve(scriptRef) : path.resolve(workingDir, scriptRef);
+    try {
+      const stat = await fs.promises.stat(abs);
+      if (!stat.isFile() || stat.size <= 0 || stat.size > EXTERNAL_MUTATION_SCRIPT_MAX_BYTES) continue;
+      const source = await fs.promises.readFile(abs, 'utf8');
+      for (const finding of classifyExternalMutationScript(source)) {
+        if (!externalMutations.some((item) => (
+          item.kind === finding.kind && item.action === finding.action && item.target === finding.target
+        ))) externalMutations.push(finding);
+      }
+    } catch {
+      // Missing/unreadable scripts are not evidence of a specific mutation;
+      // the execution layer will surface the canonical launch/read failure.
+    }
+  }
+  const reasons = [...base.reasons];
+  if (externalMutations.length && !reasons.includes('external_mutation')) reasons.push('external_mutation');
+  return { ...base, reasons, risky: reasons.length > 0, externalMutations };
+}
+
 async function guardBashPathCandidates(
   opts: LocalToolsOpts,
   ctx: ToolContext,
@@ -2424,7 +2601,7 @@ async function guardBashPathCandidates(
             `The ${c.reason} target "${truncateForMessage(c.raw)}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
             + (access === 'write'
               ? 'Use an explicit path inside the workspace, or use write_file/edit_file/delete_file for file changes.'
-              : 'Use an explicit path inside the workspace, or ask the user to switch to an all-files access mode.'),
+              : 'Resolve it to explicit readable paths before retrying.'),
           ),
           isError: true,
         },
@@ -2477,7 +2654,7 @@ async function guardBashFilesystemTargets(
     opts,
     ctx,
     workingDir,
-    collectBashReadCandidates(command, workingDir, env),
+    collectBashReadCandidates(command, workingDir, env, opts.hostPlatform ?? process.platform),
     'read',
   );
   mergeRiskReasons(approvedReasons, read.approvedReasons);
@@ -2641,13 +2818,82 @@ function editRecoveryContext(body: string, needle: string, fileHash: string): st
 
 function extractRunSkillRefs(command: string): string[] {
   const out: string[] = [];
-  const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))/g;
+  const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9._:@+-]+))/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(command)) !== null) {
     const ref = (m[1] || m[2] || m[3] || '').trim();
     if (ref) out.push(ref);
   }
   return out;
+}
+
+type RunSkillRuntimeResolution = {
+  binding?: SkillRuntimeBinding;
+  error?: string;
+};
+
+function resolveRunSkillRuntimeBinding(
+  opts: LocalToolsOpts,
+  command: string,
+): RunSkillRuntimeResolution {
+  const refs = extractRunSkillRefs(command);
+  if (!refs.length || opts.skillRuntimeBindings === undefined) return {};
+  if (new RegExp(
+    `\\b(?:ORKAS_RUN_SKILL_DIR|${DEEP_RESEARCH_EVIDENCE_ENV})\\b`,
+  ).test(command)) {
+    return {
+      error: errText(
+        'E_SKILL_RUNTIME_ENV_RESERVED',
+        'run-scoped Skill environment is host-managed and cannot be read, set, or unset by the command.',
+      ),
+    };
+  }
+  const roots = new Set<string>();
+  const bindings: SkillRuntimeBinding[] = [];
+  for (const ref of refs) {
+    const binding = opts.skillRuntimeBindings.get(ref);
+    if (!binding) {
+      return {
+        error: errText(
+          'E_SKILL_NOT_AVAILABLE',
+          `@skill/${ref} is not bound for this run. Read and use the exact read ref from the current Available skills entry.`,
+        ),
+      };
+    }
+    roots.add(path.resolve(binding.root));
+    bindings.push(binding);
+  }
+  if (roots.size > 1) {
+    return {
+      error: errText(
+        'E_SKILL_MULTI_ROOT',
+        'one shell command cannot execute scripts from multiple run-scoped Skills; run each Skill command separately.',
+      ),
+    };
+  }
+  return { binding: bindings[0] };
+}
+
+function withRunSkillRuntimeEnv(
+  ctx: ToolContext,
+  binding?: SkillRuntimeBinding,
+): () => void {
+  if (!binding) return () => {};
+  const original = ctx.state.sandboxEnv as Record<string, string> | undefined;
+  const evidenceFile = ctx.state[DEEP_RESEARCH_EVIDENCE_STATE_KEY];
+  ctx.state.sandboxEnv = {
+    ...(original ?? {}),
+    ORKAS_RUN_SKILL_DIR: binding.root,
+    ...(binding.id === DEEP_RESEARCH_SKILL_ID
+      && typeof evidenceFile === 'string'
+      && evidenceFile ? {
+        [DEEP_RESEARCH_EVIDENCE_ENV]: evidenceFile,
+      } : {}),
+  };
+  return () => {
+    if (original) ctx.state.sandboxEnv = original;
+    else delete ctx.state.sandboxEnv;
+  };
 }
 
 function readSkillDisplayNameForDisabledGuard(skillDir: string): string {
@@ -2676,14 +2922,35 @@ function readSkillDisplayNameForDisabledGuard(skillDir: string): string {
   return '';
 }
 
+/** Roots the standalone runner may resolve for this actor, in the same
+ * precedence order. Component disable checks must inspect this complete set;
+ * otherwise an open Skill whose directory id differs from its authored name
+ * can be invoked by alias after the UI marks its canonical id disabled. */
+function installedSkillRootsForDisabledGuard(opts: LocalToolsOpts): string[] {
+  const uid = opts.userId || '';
+  if (!uid) return [];
+  const roots = [userMarketplaceSkillsDir(uid), userSkillsDir(uid)];
+  const agentId = String(opts.agentId || '').trim();
+  if (agentId && agentId !== '.' && agentId !== '..' && !/[\\/\0]/.test(agentId)) {
+    roots.push(
+      userMarketplaceAgentSkillsDir(uid, agentId),
+      agentPrivateSkillsDir(uid, agentId),
+    );
+  }
+  try { roots.push(...enabledPackageSkillRoots(uid)); }
+  catch { /* unreadable package registry → runner cannot resolve it either */ }
+  if (getGlobalSkillRootsEnabledForUser(uid)) roots.push(...globalSkillRoots());
+  return [...new Set(roots.map((root) => path.resolve(root)))];
+}
+
 /**
  * Resolve only an unambiguous authored-name alias. Exact directory ids take
  * precedence (matching run-skill.cjs), and ambiguous names are left alone so
  * an enabled custom skill cannot be blocked by a disabled platform namesake.
  */
-function uniqueInstalledSkillAliasId(uid: string, ref: string): string | null {
+function uniqueInstalledSkillAliasId(opts: LocalToolsOpts, ref: string): string | null {
   if (!ref || ref === '.' || ref === '..' || /[\\/\0]/.test(ref)) return null;
-  const roots = [userSkillsDir(uid), userMarketplaceSkillsDir(uid)];
+  const roots = installedSkillRootsForDisabledGuard(opts);
   for (const root of roots) {
     try {
       if (fs.statSync(path.join(root, ref)).isDirectory()) return null;
@@ -2705,11 +2972,10 @@ function uniqueInstalledSkillAliasId(uid: string, ref: string): string | null {
   return ids.size === 1 ? [...ids][0] : null;
 }
 
-function commandMentionsSkillRoot(command: string, uid: string, skillId: string): boolean {
+function commandMentionsSkillRoot(command: string, opts: LocalToolsOpts, skillId: string): boolean {
   const unescaped = command.replace(/\\([\\ "'$`])/g, '$1');
   const roots = [
-    path.resolve(userSkillsDir(uid), skillId),
-    path.resolve(userMarketplaceSkillsDir(uid), skillId),
+    ...installedSkillRootsForDisabledGuard(opts).map((root) => path.resolve(root, skillId)),
     path.posix.join('cloud', 'skills', skillId),
     path.posix.join('local', 'marketplace', 'skills', skillId),
   ];
@@ -2724,13 +2990,23 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
   if (!disabled.size) return null;
 
   for (const ref of extractRunSkillRefs(command)) {
+    const bound = opts.skillRuntimeBindings?.get(ref);
+    if (bound) {
+      if (disabled.has(bound.id)) {
+        return errText(
+          'E_SKILL_DISABLED',
+          `skill "${bound.id}" (invoked as "${ref}") is disabled for this user; re-enable it before running its workflow.`,
+        );
+      }
+      continue;
+    }
     if (disabled.has(ref)) {
       return errText(
         'E_SKILL_DISABLED',
         `skill "${ref}" is disabled for this user; re-enable it before running its workflow.`,
       );
     }
-    const aliasId = uniqueInstalledSkillAliasId(uid, ref);
+    const aliasId = uniqueInstalledSkillAliasId(opts, ref);
     if (aliasId && disabled.has(aliasId)) {
       return errText(
         'E_SKILL_DISABLED',
@@ -2740,7 +3016,7 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
   }
 
   for (const skillId of disabled) {
-    if (commandMentionsSkillRoot(command, uid, skillId)) {
+    if (commandMentionsSkillRoot(command, opts, skillId)) {
       return errText(
         'E_SKILL_DISABLED',
         `skill "${skillId}" is disabled for this user; re-enable it before running its workflow.`,
@@ -2769,7 +3045,7 @@ function guardUnsupportedAuthCodeFlow(command: string): string | null {
     'E_INTERACTIVE_AUTH_CODE_UNSUPPORTED',
     'this command starts a one-time browser verification-code flow that cannot be completed reliably through chat. '
     + 'Do not ask the user to paste verification codes into the conversation or keep a background process waiting. '
-    + 'Use interactive_cli_start for commands that need live user input, use a browser/callback OAuth flow that completes on its own, '
+    + 'Use interactive_cli with action="start" for commands that need live user input, use a browser/callback OAuth flow that completes on its own, '
     + 'use an Orkas connector OAuth flow, or stop and give the user a one-time terminal command to run.',
   );
 }
@@ -2973,37 +3249,27 @@ export function windowsPowerShellCompatibilityError(
 function createBashTool(opts: LocalToolsOpts): AgentTool {
   const wafBlockedCommands = new Set<string>();
   const windowsShellDescription = process.platform === 'win32'
-    ? 'This tool is the host shell (PowerShell on Windows), despite its compatibility name `bash`. ' +
-      'Use `$env:NAME` for environment variables, `;` for sequencing, and PowerShell-native ' +
-      'pipelines. Do not use POSIX-only `&&`, heredocs, `source`/`export`, `/dev/null`, `head`, ' +
-      '`mktemp`, or `mkdir -p`. Invoke a quoted executable with `&`, for example ' +
-      '`& "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/run-skill.cjs" ...`. '
+    ? ' On Windows this compatibility-named tool runs PowerShell; use PowerShell syntax and invoke quoted executables with `&`.'
     : '';
   const outputDirDescription = process.platform === 'win32'
-    ? 'Use the absolute `$env:ORKAS_OUTPUT_DIR` path for final generated outputs. ' +
-      'Complex scripts may append one final output path per line to `$env:ORKAS_OUTPUT_MANIFEST`. '
-    : 'Use the absolute `$ORKAS_OUTPUT_DIR` path for final generated outputs. ' +
-      'Complex scripts may append one final output path per line to `$ORKAS_OUTPUT_MANIFEST`. ';
+    ? '`$env:ORKAS_OUTPUT_DIR`'
+    : '`$ORKAS_OUTPUT_DIR`';
 
   return {
     name: 'bash',
     description:
-      'Execute a shell command on the user\'s local machine and return its output. ' +
-      'Use for installing CLIs (brew, npm, pip), running builds, converting files, ' +
-      'inspecting the filesystem, and any other host-side work. The shell runs in ' +
-      'the user\'s current workspace directory. Files generated under the conversation ' +
-      'workspace are surfaced as produced-file chips, except for files clearly created ' +
-      'by external download/clone commands such as git clone, gh repo clone, curl, or wget. ' +
-      outputDirDescription +
-      windowsShellDescription +
-      'Scratch/cache files should stay in temporary or cache directories. ' +
-      'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
-      'background with `&`, set run_in_background=true instead of shell-backgrounding it; ' +
-      'inherited stdout/stderr can otherwise keep the tool waiting.',
+      'Run one shell command on the user\'s local machine and return its output. ' +
+      'Use process_session for persistent processes and interactive_cli for user-entered secrets or OAuth.',
     inputSchema: {
       ...(coreBashTool.inputSchema as Record<string, unknown>),
       properties: {
         ...(((coreBashTool.inputSchema as Record<string, unknown>).properties || {}) as Record<string, unknown>),
+        command: {
+          type: 'string',
+          description:
+            `Shell command. Write final script-generated deliverables under ${outputDirDescription}.`
+            + windowsShellDescription,
+        },
         allow_browser_runtime_install: {
           type: 'boolean',
           description: 'Set true only when the user explicitly requested installing Playwright/Puppeteer or another browser automation runtime. Leave false for ordinary web research or one-off page actions.',
@@ -3062,6 +3328,14 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         });
         return { content: unmanagedRuntimeErr, isError: true };
       }
+      const disabledSkillErr = guardDisabledSkillBash(opts, command);
+      if (disabledSkillErr) {
+        log.warn('bash disabled skill reject', {
+          user_id: maskId(opts.userId),
+          command_chars: command.length,
+        });
+        return { content: disabledSkillErr, isError: true };
+      }
       const protectedMention = protectedRootMentionedByCommand(opts, command);
       if (protectedMention && !bashProtectedRootMentionIsProvablyReadOnly(command)) {
         log.warn('bash protected root reject', {
@@ -3082,14 +3356,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         });
         return { content: oauthClientMismatchErr, isError: true };
       }
-      const disabledSkillErr = guardDisabledSkillBash(opts, command);
-      if (disabledSkillErr) {
-        log.warn('bash disabled skill reject', {
-          user_id: maskId(opts.userId),
-          command_chars: command.length,
-        });
-        return { content: disabledSkillErr, isError: true };
-      }
       const unsupportedAuthErr = guardUnsupportedAuthCodeFlow(command);
       if (unsupportedAuthErr) {
         log.warn('bash unsupported auth-code flow reject', {
@@ -3101,14 +3367,19 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       const workingDirForGuard = path.resolve(ctx.workingDir ?? '.');
       const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDirForGuard);
       if (filesystemGate.result) return filesystemGate.result;
-      // Approval modes: classify the command and block on user confirmation
-      // when it trips a sensitive category. all_files_auto skips this.
-      if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
-        const base = classifyBashCommand(command);
+      // Approval modes prompt for configured sensitive categories. System
+      // package changes are always per-command approvals, including in the
+      // otherwise non-prompting all_files_auto mode.
+      if (command.trim()) {
+        const base = await classifyBashRiskIncludingScripts(command, workingDirForGuard);
+        const approvalMode = localAccessRequiresSensitiveApproval(mode);
         const pathApprovalCoveredSensitive = filesystemGate.approvedReasons.includes('sensitive_path');
-        let baseReasons = pathApprovalCoveredSensitive
-          ? base.reasons.filter((reason) => reason !== 'sensitive_path')
-          : base.reasons;
+        let baseReasons = approvalMode ? base.reasons : base.reasons.filter(
+          (reason) => reason === 'system_package_change' || reason === 'external_mutation',
+        );
+        if (pathApprovalCoveredSensitive) {
+          baseReasons = baseReasons.filter((reason) => reason !== 'sensitive_path');
+        }
         if (baseReasons.includes('destructive') && bashDestructiveRiskIsOnlyProducedFileDeletion(
           command,
           workingDirForGuard,
@@ -3117,9 +3388,11 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
         )) {
           baseReasons = baseReasons.filter((reason) => reason !== 'destructive');
         }
-        const reasons = classifyConfiguredBashCommand(command, baseReasons, {
-          includePathPatterns: !pathApprovalCoveredSensitive,
-        });
+        const reasons = approvalMode
+          ? classifyConfiguredBashCommand(command, baseReasons, {
+            includePathPatterns: !pathApprovalCoveredSensitive,
+          })
+          : baseReasons;
         if (reasons.length) {
           const decision = await requestBashDecision({
             uid: opts.userId ?? '',
@@ -3128,6 +3401,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
+            externalMutations: base.externalMutations,
             onWaiting: permissionWaitProgress(ctx, 'bash'),
           });
           if (decision === 'deny') {
@@ -3170,7 +3444,17 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       //               bash on same cwd, ENOTEMPTY, EACCES) is silently
       //               swallowed.
       if (!ctx.workingDir) {
-        return finalizeBrowserResult(translateFixedBashError(await coreBashTool.execute(input, ctx)));
+        const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
+        if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
+        const restoreSkillRuntimeEnv = withRunSkillRuntimeEnv(
+          ctx,
+          skillRuntime.binding,
+        );
+        try {
+          return finalizeBrowserResult(translateFixedBashError(await coreBashTool.execute(input, ctx)));
+        } finally {
+          restoreSkillRuntimeEnv();
+        }
       }
       const workingDir = path.resolve(ctx.workingDir);
       if (fs.existsSync(workingDir)) {
@@ -3206,6 +3490,14 @@ async function gateInteractiveCliStart(
   if (shellMismatch) return { content: shellMismatch, isError: true };
   const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, settings?.workingDir);
   if (unmanagedRuntimeErr) return { content: unmanagedRuntimeErr, isError: true };
+  const disabledSkillErr = guardDisabledSkillBash(opts, command);
+  if (disabledSkillErr) {
+    log.warn('interactive_cli_start disabled skill reject', {
+      user_id: maskId(opts.userId),
+      command_chars: command.length,
+    });
+    return { content: disabledSkillErr, isError: true };
+  }
   const protectedMention = protectedRootMentionedByCommand(opts, command);
   if (protectedMention) {
     log.warn('interactive_cli_start protected root reject', {
@@ -3237,21 +3529,29 @@ async function gateInteractiveCliStart(
     });
     return { content: unsupportedNoBrowserAuthErr, isError: true };
   }
-  const disabledSkillErr = guardDisabledSkillBash(opts, command);
-  if (disabledSkillErr) {
-    log.warn('interactive_cli_start disabled skill reject', {
-      user_id: maskId(opts.userId),
-      command_chars: command.length,
-    });
-    return { content: disabledSkillErr, isError: true };
+  const skillRuntime = resolveRunSkillRuntimeBinding(opts, command);
+  if (skillRuntime.error) return { content: skillRuntime.error, isError: true };
+  if (skillRuntime.binding) {
+    return {
+      content: errText(
+        'E_SKILL_EXECUTION_MODE',
+        'run-scoped Skill scripts must use the one-shot bash tool so the host can bind the exact Skill root for that command.',
+      ),
+      isError: true,
+    };
   }
-  if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
-    const base = classifyBashCommand(command);
+  if (command.trim()) {
+    const base = await classifyBashRiskIncludingScripts(command, path.resolve(settings?.workingDir ?? '.'));
+    const approvalMode = localAccessRequiresSensitiveApproval(mode);
     const approvedReasons = settings?.approvedReasons ?? [];
-    const baseReasons = base.reasons.filter((reason) => !approvedReasons.includes(reason));
-    const reasons = classifyConfiguredBashCommand(command, baseReasons, {
-      includePathPatterns: !approvedReasons.includes('sensitive_path'),
-    });
+    const baseReasons = (approvalMode ? base.reasons : base.reasons.filter(
+      (reason) => reason === 'system_package_change' || reason === 'external_mutation',
+    )).filter((reason) => !approvedReasons.includes(reason));
+    const reasons = approvalMode
+      ? classifyConfiguredBashCommand(command, baseReasons, {
+        includePathPatterns: !approvedReasons.includes('sensitive_path'),
+      })
+      : baseReasons;
     if (reasons.length) {
       const decision = await requestBashDecision({
         uid: opts.userId ?? '',
@@ -3260,6 +3560,7 @@ async function gateInteractiveCliStart(
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
+            externalMutations: base.externalMutations,
             onWaiting: permissionWaitProgress(ctx, 'interactive_cli_start'),
           });
       if (decision === 'deny') {
@@ -3327,7 +3628,7 @@ function interactiveCliUserActionState(view: InteractiveCliSessionView): {
   return {
     userActionRequired: false,
     nextStep:
-      'Use interactive_cli_read only after meaningful progress is expected, such as after waiting or after the user has acted. Do not repeat identical reads in a tight loop.',
+      'Use interactive_cli with action="read" only after meaningful progress is expected, such as after waiting or after the user has acted. Do not repeat identical reads in a tight loop.',
   };
 }
 
@@ -3440,7 +3741,6 @@ function createInteractiveCliReadTool(opts: LocalToolsOpts): AgentTool {
       required: ['session_id'],
     },
     async execute(input) {
-      if (!getLocalExecGranted()) return deniedResult();
       const sessionId = String(input.session_id ?? '').trim();
       if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
       try {
@@ -3475,7 +3775,6 @@ function createInteractiveCliSendTool(opts: LocalToolsOpts): AgentTool {
       required: ['session_id', 'input'],
     },
     async execute(input) {
-      if (!getLocalExecGranted()) return deniedResult();
       const sessionId = String(input.session_id ?? '').trim();
       if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
       try {
@@ -3513,7 +3812,6 @@ function createInteractiveCliCloseTool(opts: LocalToolsOpts): AgentTool {
       required: ['session_id'],
     },
     async execute(input) {
-      if (!getLocalExecGranted()) return deniedResult();
       const sessionId = String(input.session_id ?? '').trim();
       if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
       try {
@@ -3541,6 +3839,59 @@ function createInteractiveCliCloseTool(opts: LocalToolsOpts): AgentTool {
       } catch (err) {
         return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
       }
+    },
+  };
+}
+
+function createInteractiveCliTool(opts: LocalToolsOpts): AgentTool {
+  const start = createInteractiveCliStartTool(opts);
+  const read = createInteractiveCliReadTool(opts);
+  const send = createInteractiveCliSendTool(opts);
+  const close = createInteractiveCliCloseTool(opts);
+  return {
+    name: 'interactive_cli',
+    description:
+      'Manage a local CLI session that needs live user input such as OAuth, passwords, confirmations, or setup. Send only agent-known non-secret input; users enter secrets in the interactive panel. Never close a waiting session unless the user cancelled and force=true.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['start', 'read', 'send', 'close'],
+          description: 'Lifecycle operation.',
+        },
+        command: { type: 'string', description: 'Start only. Shell command to launch.' },
+        max_lifetime_ms: {
+          type: 'number',
+          description: 'Start only. Default 30 minutes; minimum 10 minutes; maximum 2 hours.',
+        },
+        purpose: { type: 'string', description: 'Start only. Short user-facing panel title, not the raw command.' },
+        allow_no_browser_auth: {
+          type: 'boolean',
+          description: 'Start only. True only when the user explicitly says browser OAuth cannot be used.',
+        },
+        session_id: { type: 'string', description: 'Required for read, send, and close.' },
+        input: { type: 'string', description: 'Send only. Agent-known non-secret stdin.' },
+        add_newline: { type: 'boolean', description: 'Send only. Append a newline; default true.' },
+        force: {
+          type: 'boolean',
+          description: 'Close only. Required when a running session is waiting for user action; use only after explicit cancellation.',
+        },
+        reason: { type: 'string', description: 'Close only. Brief reason for a forced close.' },
+      },
+      required: ['action'],
+    },
+    async execute(input, ctx) {
+      const action = String(input.action ?? '');
+      if (action === 'start') return start.execute(input, ctx);
+      if (action === 'read') return read.execute(input, ctx);
+      if (action === 'send') return send.execute(input, ctx);
+      if (action === 'close') return close.execute(input, ctx);
+      return {
+        content: errText('E_BAD_INPUT', '`action` must be start, read, send, or close'),
+        isError: true,
+      };
     },
   };
 }
@@ -3617,8 +3968,8 @@ function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
   return getProcessSessionTools().map((coreTool) => ({
     ...coreTool,
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
-      if (coreTool.name === 'process_start') {
+      const action = String(input.action ?? '');
+      if (action === 'start') {
         const command = String(input.command ?? '').trim();
         if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
         const workingDir = path.resolve(ctx.workingDir ?? '.');
@@ -3647,7 +3998,7 @@ function createHostProcessTools(opts: LocalToolsOpts): AgentTool[] {
         return result;
       }
       const result = await coreTool.execute(input, processSessionContext(opts, ctx));
-      if (coreTool.name !== 'process_read' && coreTool.name !== 'process_stop') return result;
+      if (action !== 'read' && action !== 'stop') return result;
       const payload = parseProcessToolPayload(result);
       if (!processPayloadIsTerminal(payload)) return result;
       const sessionId = String(payload?.session_id ?? input.session_id ?? '').trim();
@@ -3664,10 +4015,9 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'write_file',
     description:
-      'Write a kept workspace artifact such as source, notes, markdown, or CSV. Creates parents. If a long new file does not fit in one complete model response, write its first complete chunk, then use append_file with the returned final path and opaque revision token for later chunks. Prefer edit_file or apply_patch for existing files. On collision with a file not written by you this turn, the basename is auto-suffixed and reported in <file-renamed>; use that final path afterward.',
+      'Create a UTF-8 text file in the workspace, including parent directories, and return its final path and revision. Foreign path collisions are auto-suffixed. Use edit_file or apply_patch for existing files, or append_file to continue a long new file.',
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(String(input.content ?? ''));
       if (oauthClientMismatchErr) {
         log.warn('write_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId) });
@@ -3688,7 +4038,7 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       const result = await coreWriteFileTool.execute(rewritten, ctx);
       if (!result.isError) {
         // Stamp the just-written bytes so a follow-up edit_file accepts an edit
-        // without an intervening read_file (the model already knows the content
+        // without an intervening read_files call (the model already knows the content
         // it wrote), and so OCC compares against this write, not a stale read.
         recordRead(ctx, finalPath);
       }
@@ -3738,7 +4088,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'append_file',
     description:
-      'Append one complete UTF-8 text chunk. For a long new file, use write_file once, then copy each returned revision into append_file.base_revision. This validates exact file state without byte/character math; if model output truncates, retry only the unfinished chunk. expected_size is legacy. Exact replay is idempotent; stale or foreign revisions fail without writing and return the current revision. Prefer edit_file or apply_patch for existing files.',
+      'Append one complete UTF-8 chunk to an existing text file with optimistic concurrency and replay-safe behavior. Use edit_file or apply_patch for targeted changes.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -3752,7 +4102,7 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
         },
         base_revision: {
           type: 'string',
-          description: 'Preferred opaque revision token from the preceding read_file, write_file, or append_file result.',
+          description: 'Opaque revision from the preceding read_files, write_file, or append_file result. Required unless legacy expected_size is provided; stale revisions fail without writing and exact replay is idempotent.',
           pattern: '^file_rev_[A-Za-z0-9_-]{16}$',
         },
         expected_size: {
@@ -3764,7 +4114,6 @@ function createAppendFileTool(opts: LocalToolsOpts): AgentTool {
       required: ['path', 'content'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const rawPath = String(input.path ?? '');
       const content = typeof input.content === 'string' ? input.content : null;
       const baseRevision = typeof input.base_revision === 'string' ? input.base_revision.trim() : '';
@@ -3986,9 +4335,17 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
       });
       if (!freshness) return undefined;
       recordRead(ctx, snapshot.path, snapshot.stat, snapshot.hash);
+      // checkEditFreshness also serves edit_file, whose retry accepts an
+      // expected_hash parameter. apply_patch has no such parameter: its safe
+      // recovery is to rebuild the patch against the returned current bytes.
+      // Keep the shared failure classification while avoiding an impossible
+      // instruction in this tool-specific response.
+      const patchFreshnessMessage = freshness.code === 'E_NOT_READ'
+        ? `${snapshot.path}: not read in this run, so the proposed patch cannot be checked against the real current contents.`
+        : `${snapshot.path}: file changed on disk since you read it (another worker, a command, or an external edit).`;
       return {
         content:
-          `${errText(freshness.code, freshness.msg)}\n`
+          `${errText(freshness.code, patchFreshnessMessage)}\n`
           + patchRecoveryContext(snapshot.content, snapshot.hash),
         isError: true,
       };
@@ -4010,7 +4367,6 @@ function createHostApplyPatchTool(opts: LocalToolsOpts): AgentTool {
   return {
     ...coreTool,
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       return coreTool.execute(input, ctx);
     },
   };
@@ -4023,25 +4379,23 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. An exact match is tried first; if that fails, one fallback ignores trailing whitespace at line breaks and is used only when it resolves to a single span (the receipt then carries match="whitespace_relaxed"). Leading indentation is never relaxed. Pass read_file\'s file_hash as expected_hash for explicit optimistic concurrency. E_NOT_READ/E_STALE/E_NO_MATCH return bounded current context and a fresh hash for one safe retry. Cannot edit PDF/Office/image sources in place.',
+      'Replace text in an existing UTF-8 file. Use write_file to create files and apply_patch for multi-file edits.',
     inputSchema: {
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Absolute or workspace-relative path to an existing file.' },
-        old_string: { type: 'string', description: 'Exact text to find. Must be unique unless replace_all=true.' },
+        old_string: { type: 'string', description: 'Exact text to find; must be unique unless replace_all=true. If exact matching fails, one unique trailing-whitespace-insensitive match is accepted.' },
         new_string: { type: 'string', description: 'Replacement text. May be empty.' },
         replace_all: { type: 'boolean', description: 'Default false. When true, every occurrence of old_string is replaced.' },
         expected_hash: {
           type: 'string',
-          description: 'Optional sha256 file_hash returned by read_file or a prior edit recovery response.',
+          description: 'Optional sha256 file_hash from read_files or a prior edit recovery response. Enables optimistic concurrency: the call fails without writing if current content differs.',
           pattern: '^sha256:[a-f0-9]{64}$',
         },
       },
       required: ['path', 'old_string', 'new_string'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
-
       const rawPath = String(input.path ?? '');
       if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const oldStr = typeof input.old_string === 'string' ? input.old_string : null;
@@ -4219,10 +4573,7 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'publish_outputs',
     description:
-      'Declare the complete final deliverable list for this turn after all file generation is finished. ' +
-      'Include every file the user should see in the message footer; exclude source assets, previews, caches, logs, and other working files. ' +
-      'Use an empty paths list only when this turn created working files, has no user-facing deliverable, and the active Agent workflow permits an explicit empty declaration; do not call this tool at a capability boundary when that workflow forbids publication. ' +
-      'Only files actually written in this turn are accepted. A later call replaces the earlier declaration.',
+      'Declare the complete user-facing file deliverables created by this actor in the current turn.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4230,7 +4581,7 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
           type: 'array',
           items: { type: 'string' },
           maxItems: 50,
-          description: 'Complete list of final file paths, absolute or relative to $working_dir; empty means no file deliverable.',
+          description: 'Complete final file paths, absolute or relative to $working_dir. Exclude previews, caches, logs, and working files; empty means none, and each call replaces the prior declaration.',
         },
       },
       required: ['paths'],
@@ -4260,10 +4611,18 @@ function createPublishOutputsTool(opts: LocalToolsOpts): AgentTool {
         const acceptedSet = new Set(Array.isArray(accepted) ? accepted.map((p) => path.resolve(p)) : []);
         const acceptedCount = normalized.filter((p) => acceptedSet.has(p)).length;
         if (normalized.length > 0 && !acceptedCount) {
+          const eligiblePaths = [...new Set(
+            (opts.getPublishableOutputPaths?.() ?? [])
+              .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+              .map((item) => path.resolve(item)),
+          )].slice(0, 50);
+          const recovery = eligiblePaths.length
+            ? ` Retry publish_outputs once with an exact path from eligible_current_turn_paths=${JSON.stringify(eligiblePaths)}; do not edit, review, or regenerate the artifact.`
+            : ' No eligible current-turn output exists; do not guess another path or claim delivery.';
           return {
             content: errText(
               'E_OUTPUT_NOT_PRODUCED',
-              'none of the requested paths were written in this turn; publish only successful current-turn outputs',
+              `none of the requested paths were written in this turn.${recovery}`,
             ),
             isError: true,
           };
@@ -4306,7 +4665,6 @@ function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
       required: ['path', 'markdown'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const rawPath = String(input.path ?? '');
       if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const inputAbs = resolveAbs(ctx, rawPath);
@@ -4363,7 +4721,6 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
       required: ['path', 'html'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const rawPath = String(input.path ?? '');
       if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const inputAbs = resolveAbs(ctx, rawPath);
@@ -4393,6 +4750,42 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
       } catch (err) {
         return { content: `Error generating PDF: ${(err as Error).message}`, isError: true };
       }
+    },
+  };
+}
+
+function createPdfTool(opts: LocalToolsOpts): AgentTool {
+  const markdown = createMarkdownToPdfTool(opts);
+  const html = createHtmlToPdfTool(opts);
+  return {
+    name: 'create_pdf',
+    description:
+      'Create a CJK-capable PDF from Markdown or complete HTML and return its collision-safe saved path. Use this built-in path exclusively; if it fails, report the failure instead of substituting reportlab, pdfkit, wkhtmltopdf, or LaTeX, which do not preserve its CJK/font behavior.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        path: { type: 'string', description: 'Output .pdf path; absolute or workspace-relative.' },
+        source_type: { type: 'string', enum: ['markdown', 'html'], description: 'Use markdown for ordinary prose or html for custom layout, tables, and CSS.' },
+        content: { type: 'string', description: 'Markdown text or complete HTML matching source_type.' },
+        title: { type: 'string', description: 'Markdown only. Optional PDF metadata title.' },
+        pageSize: { type: 'string', description: 'A4 | A3 | Letter | Legal | Tabloid. Default A4.' },
+        landscape: { type: 'boolean', description: 'Default false.' },
+      },
+      required: ['path', 'source_type', 'content'],
+    },
+    async execute(input, ctx) {
+      const sourceType = String(input.source_type ?? '');
+      if (sourceType === 'markdown') {
+        return markdown.execute({ ...input, markdown: String(input.content ?? '') }, ctx);
+      }
+      if (sourceType === 'html') {
+        return html.execute({ ...input, html: String(input.content ?? '') }, ctx);
+      }
+      return {
+        content: errText('E_BAD_INPUT', '`source_type` must be markdown or html'),
+        isError: true,
+      };
     },
   };
 }
@@ -4446,9 +4839,7 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'html_preview',
     description:
-      'Render local .html in the isolated browser. target defaults to desktop; use mobile for a mobile-only artifact or responsive only on a user multi-device request. ' +
-      'Always checks runtime, resources, overflow, images, and keyboard focus. interactions defaults to true for compatibility; set it false for visual-only UI review so controls and forms are not exercised. screenshots defaults to false and only controls whether passing screenshots are returned as model-visible image blocks; it never invokes a separate vision API. ' +
-      'Failed checks never return images. Network and host permissions are blocked.',
+      'Audit a local HTML entry in an isolated, network-blocked browser and return runtime, resource, overflow, layout, focus, and interaction findings.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4492,7 +4883,6 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const rawPath = String(input.path ?? '').trim();
       if (!rawPath) {
         return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
@@ -4623,10 +5013,14 @@ function createHtmlPreviewTool(opts: LocalToolsOpts): AgentTool {
           })),
         };
       } catch (error) {
+        const detail = (error as Error).message || String(error);
+        const code = /^E_HTML_PREVIEW_BROWSER_UNAVAILABLE\b/.test(detail)
+          ? 'E_HTML_PREVIEW_BROWSER_UNAVAILABLE'
+          : 'E_HTML_PREVIEW_FAILED';
         return {
           content: errText(
-            'E_HTML_PREVIEW_FAILED',
-            (error as Error).message || String(error),
+            code,
+            detail,
           ),
           isError: true,
         };
@@ -4645,14 +5039,14 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'create_artifact',
     description:
-      'Create an offline interactive HTML/CSS/JS artifact rendered live in chat. Use for calculators, dashboards, filters, simulations, quizzes, mini-games; prefer :::dashboard for static summaries. Input files: [{path, content, encoding?}], including top-level index.html; no network/CDN, use relative sibling files. Optional __orkas/bridge.js provides send(payload)/resize. Before success the host loads the app and requires an operable control plus an observable state change, artifact submission, or download. Do not paste HTML after calling.',
+      'Create and validate a self-contained offline interactive HTML/CSS/JS app rendered in chat; use a dashboard for static summaries. Remote and out-of-directory URLs are blocked: bundle authorized assets in files or use data/blob URLs. The app must expose an operable control with an observable effect.',
     inputSchema: {
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Short title shown above the embedded app. Optional; defaults to "Interactive app".' },
         files: {
           type: 'array',
-          description: 'The app files. Must include a top-level "index.html". Max 20 files, 256KB/file, 1MB total.',
+          description: 'Relative local app files with a top-level index.html. Maximum 20 files, 256KB each and 1MB total. Apps may load __orkas/bridge.js for send and resize.',
           items: {
             type: 'object',
             properties: {
@@ -4667,7 +5061,6 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       required: ['files'],
     },
     async execute(input) {
-      if (!getLocalExecGranted()) return deniedResult();
       const uid = opts.userId;
       const cid = opts.cid;
       if (!uid || !cid) {
@@ -4745,6 +5138,18 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       }
       if (!smoke.ok) {
         const blockers = smoke.blockers.slice(0, 3).join('; ') || 'no observable interaction completed';
+        const hasBlockedExternalAsset = smoke.blockers.some((blocker) => (
+          /(?:external|remote|out[- ]of[- ]directory|network).{0,48}(?:block|denied|unavailable)|(?:image|resource).{0,48}(?:failed|blocked|unavailable)/i
+            .test(blocker)
+        ));
+        const recovery = hasBlockedExternalAsset
+          ? [
+            'Remote and out-of-directory resources cannot load inside the artifact sandbox.',
+            'If the user explicitly supplied or required an asset, acquire it through an available authorized tool and bundle it under files (base64 for binary content).',
+            'Otherwise replace model-chosen remote assets with local CSS/SVG or data/blob content.',
+            'Do not retry the same remote URLs; repair the bundle and call create_artifact again.',
+          ].join(' ')
+          : 'Repair the app behavior and call create_artifact again.';
         const discarded = chatArtifacts.discardArtifact(uid, cid, r.artifactId);
         log.warn('create_artifact interaction smoke rejected artifact', {
           user_id: maskId(uid),
@@ -4757,7 +5162,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         return {
           content: errText(
             'E_ARTIFACT_INTERACTION_INCOMPLETE',
-            `${blockers}. Repair the app behavior and call create_artifact again.`,
+            `${blockers}. ${recovery}`,
           ),
           isError: true,
         };
@@ -4832,8 +5237,6 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
-
       const rawPath = String(input.path ?? '');
       if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const token = typeof input.confirmation_token === 'string' && input.confirmation_token.trim()
@@ -4989,17 +5392,13 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   const tools: AgentTool[] = [
     createBashTool(opts),
     ...createHostProcessTools(opts),
-    createInteractiveCliStartTool(opts),
-    createInteractiveCliReadTool(opts),
-    createInteractiveCliSendTool(opts),
-    createInteractiveCliCloseTool(opts),
+    createInteractiveCliTool(opts),
     createWriteFileTool(opts),
     createAppendFileTool(opts),
     createHostApplyPatchTool(opts),
     createEditFileTool(opts),
     createDeleteFileTool(opts),
-    createMarkdownToPdfTool(opts),
-    createHtmlToPdfTool(opts),
+    createPdfTool(opts),
     createHtmlPreviewTool(opts),
   ];
   if (opts.onOutputsPublished) tools.push(createPublishOutputsTool(opts));
@@ -5012,6 +5411,3 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
 }
 
 export { createFileTools } from './file-tools';
-
-/** Exposed for tests / diagnostics. */
-export { DENY_MESSAGE };

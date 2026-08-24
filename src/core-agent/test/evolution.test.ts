@@ -22,7 +22,6 @@ const DEFAULT_EVOLUTION_CONFIG: EvolutionConfig = {
   maxSkillContentLength: 100_000,
   metacognition: {
     enabled: false,
-    reflectThreshold: 0.7,
     competenceCharLimit: 3000,
     strategiesCharLimit: 2500,
   },
@@ -300,6 +299,52 @@ describe("Evolution: SkillStore", () => {
       store.create({ id: "UPPER CASE", name: "Bad", description: "Bad", body: "Body" }),
     ).rejects.toThrow("Invalid skill id");
   });
+
+  it.each(["read", "patch", "delete", "touch"] as const)(
+    "rejects traversal ids for %s without touching a sibling directory",
+    async (action) => {
+      const siblingDir = path.join(path.dirname(skillsDir), "outside");
+      const siblingFile = path.join(siblingDir, "SKILL.md");
+      await fs.mkdir(siblingDir, { recursive: true });
+      await fs.writeFile(siblingFile, "outside sentinel", "utf8");
+
+      const call = action === "read"
+        ? store.read("../outside")
+        : action === "patch"
+          ? store.patch("../outside", "outside", "changed")
+          : action === "delete"
+            ? store.delete("../outside")
+            : store.touch("../outside");
+
+      await expect(call).rejects.toThrow("Invalid skill id");
+      expect(await fs.readFile(siblingFile, "utf8")).toBe("outside sentinel");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "rejects a symlinked learned-skill directory before read or patch",
+    async () => {
+      const outsideDir = path.join(path.dirname(skillsDir), "outside-target");
+      await fs.mkdir(outsideDir, { recursive: true });
+      await fs.writeFile(
+        path.join(outsideDir, "SKILL.md"),
+        serializeFrontmatter({
+          name: "Outside",
+          description: "Outside fixture",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          patchCount: 0,
+        }) + "outside body",
+        "utf8",
+      );
+      await fs.symlink(outsideDir, path.join(skillsDir, "linked"), "dir");
+
+      await expect(store.read("linked")).rejects.toThrow("symbolic links are not allowed");
+      await expect(store.patch("linked", "outside", "changed"))
+        .rejects.toThrow("symbolic links are not allowed");
+      expect(await fs.readFile(path.join(outsideDir, "SKILL.md"), "utf8")).toContain("outside body");
+    },
+  );
 
   it("rejects empty name", async () => {
     await expect(

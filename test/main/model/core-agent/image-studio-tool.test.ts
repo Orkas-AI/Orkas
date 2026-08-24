@@ -11,7 +11,7 @@ const productionCredits = vi.hoisted(() => ({
 
 const electronImage = vi.hoisted(() => {
   const makeImage = (bitmap: Buffer, png: Buffer) => ({
-    getSize: () => ({ width: 2, height: 2 }),
+    getSize: () => ({ width: 128, height: 128 }),
     toBitmap: () => bitmap,
     toPNG: () => png,
     toJPEG: () => png,
@@ -61,15 +61,14 @@ vi.mock('electron', () => ({
   },
 }));
 
-vi.mock('../../../../src/main/features/permissions', () => ({
-  getLocalExecGranted: () => true,
-}));
-
 vi.mock('../../../../src/main/features/image_production_credits', () => ({
   estimateImageProductionCredits: (...args: unknown[]) => productionCredits.estimate(...args),
 }));
 
-import { createImageStudioTool } from '../../../../src/main/model/core-agent/image-studio-tool';
+import {
+  createImageStudioTool,
+  imageStudioStatePath,
+} from '../../../../src/main/model/core-agent/image-studio-tool';
 
 const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 const USER_ID = 'u-image-studio';
@@ -260,10 +259,11 @@ describe('image_studio tool', () => {
     ]);
     expect((tool.inputSchema as any).properties.operations).toBeUndefined();
     expect((tool.inputSchema as any).properties.composite_layers).toBeUndefined();
+    expect((tool.inputSchema as any).properties.quality_review).toBeUndefined();
     expect((tool.inputSchema as any).properties.review_verdict.description)
-      .toContain('same call as review_scope, review_findings, and the complete quality_scores object');
+      .toContain('same call as review_scope, review_findings, and complete quality_scores');
     expect((tool.inputSchema as any).properties.review_verdict.description)
-      .toContain('One submission is allowed per exact evidence');
+      .toContain('One submission per exact evidence');
     expect((tool.inputSchema as any).properties.quality_scores.description)
       .toContain('Required as one complete object in every project.submit_design_review call');
     expect((tool.inputSchema as any).properties.quality_scores.required).toEqual([
@@ -320,6 +320,354 @@ describe('image_studio tool', () => {
     });
   });
 
+  it('requires an exact generated-raster canvas before export without visual review', async () => {
+    const generatedPath = path.join(projectDir, 'generated.png');
+    fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.route = 'generate';
+    manifest.raster_source = 'generated.png';
+    manifest.generation_budget.max_calls = 1;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const tool = createImageStudioTool({
+      userId: USER_ID,
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    });
+    const ctx = { workingDir: root } as any;
+
+    const mismatched = await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+      input_path: generatedPath,
+    }, ctx);
+    expect(mismatched.isError).toBe(true);
+    expect(JSON.parse(mismatched.content)).toMatchObject({
+      ok: false,
+      inspection: {
+        blockers: [expect.objectContaining({ code: 'E_RASTER_CANVAS_SIZE_MISMATCH' })],
+      },
+      recovery_context: { next_operation: 'repair_project_then_project.inspect' },
+    });
+    expect((await tool.execute({
+      op: 'project.export',
+      project_dir: projectDir,
+      output_path: path.join(root, 'final', 'mismatched.png'),
+    }, ctx)).isError).toBe(true);
+
+    manifest.canvas = { width: 128, height: 128 };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const inspected = await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+      input_path: generatedPath,
+    }, ctx);
+
+    expect(inspected.isError).not.toBe(true);
+    expect(inspected.images).toBeUndefined();
+    expect(JSON.parse(inspected.content)).toMatchObject({
+      ok: true,
+      current_candidate: {
+        status: 'validated',
+        path: generatedPath,
+        review_required: false,
+      },
+      recovery_context: {
+        review_required: false,
+        next_operation: 'project.export',
+      },
+    });
+
+    const unrequestedReview = await tool.execute({
+      op: 'project.submit_design_review',
+      project_dir: projectDir,
+      evidence_path: generatedPath,
+      review_verdict: 'passed',
+      review_scope: 'This should not be accepted without attached visual evidence.',
+      review_findings: [],
+      quality_scores: {
+        intent_alignment: 90,
+        composition: 90,
+        craft: 90,
+        text_legibility: 90,
+        defect_freedom: 90,
+        specificity: 90,
+      },
+    }, ctx);
+    expect(JSON.parse(unrequestedReview.content)).toMatchObject({
+      ok: false,
+      error_code: 'E_IMAGE_REVIEW_NOT_APPLICABLE',
+    });
+
+    const finalPath = path.join(root, 'final', 'generated.png');
+    const exported = await tool.execute({
+      op: 'project.export',
+      project_dir: projectDir,
+      output_path: finalPath,
+    }, ctx);
+    expect(exported.isError).not.toBe(true);
+    expect(fs.existsSync(finalPath)).toBe(true);
+  });
+
+  it('keeps technical raster validation fail-closed without falling back to visual review', async () => {
+    const missingPath = path.join(projectDir, 'missing.png');
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.route = 'generate';
+    manifest.canvas = { width: 128, height: 128 };
+    manifest.raster_source = 'missing.png';
+    manifest.generation_budget.max_calls = 1;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const tool = createImageStudioTool({
+      userId: USER_ID,
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    });
+    const ctx = { workingDir: root } as any;
+
+    const inspected = await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+      input_path: missingPath,
+      quality_review: true,
+    }, ctx);
+    expect(inspected.isError).toBe(true);
+    expect(inspected.images).toBeUndefined();
+    expect(inspected.content).not.toContain('visual_evidence');
+    expect(JSON.parse(inspected.content)).toMatchObject({
+      ok: false,
+      inspection: {
+        ok: false,
+        route: 'generate',
+        blockers: [expect.objectContaining({ code: 'E_RASTER_SOURCE_INVALID' })],
+      },
+      current_candidate: null,
+      recovery_context: {
+        next_operation: 'repair_project_then_project.inspect',
+      },
+    });
+
+    const blockedExport = await tool.execute({
+      op: 'project.export',
+      project_dir: projectDir,
+      output_path: path.join(root, 'final', 'missing.png'),
+    }, ctx);
+    expect(blockedExport.isError).toBe(true);
+    expect(JSON.parse(blockedExport.content)).toMatchObject({
+      ok: false,
+      error_code: 'E_IMAGE_REVIEW_EVIDENCE_REQUIRED',
+    });
+  });
+
+  it.each([
+    {
+      name: 'strict reference reproduction',
+      route: 'generate',
+      reference: {
+        id: 'composition-source',
+        path: 'assets/composition-source.png',
+        role: 'composition',
+        strength: 1,
+        required: true,
+        preserve: ['subject', 'crop', 'palette'],
+        may_change: [],
+        region_ids: [],
+      },
+      referenceIntent: {
+        mode: 'reproduce',
+        basis: 'user',
+        instructions: ['Reproduce the declared composition and subject exactly.'],
+        minimum_score: 90,
+      },
+    },
+    {
+      name: 'semantic edit fidelity',
+      route: 'edit',
+      reference: {
+        id: 'edit-source',
+        path: 'assets/edit-source.png',
+        role: 'edit_source',
+        strength: 1,
+        required: true,
+        preserve: ['subject identity', 'foreground geometry'],
+        may_change: ['background'],
+        region_ids: [],
+      },
+      referenceIntent: {
+        mode: 'edit',
+        basis: 'user',
+        instructions: ['Replace only the background.'],
+        minimum_score: 88,
+      },
+    },
+    {
+      name: 'generated set consistency',
+      route: 'generate',
+      reference: {
+        id: 'set-anchor',
+        path: 'assets/set-anchor.png',
+        role: 'style',
+        strength: 1,
+        required: true,
+        preserve: ['palette roles', 'lighting', 'material treatment'],
+        may_change: ['subject content', 'local composition'],
+        region_ids: [],
+      },
+      referenceIntent: {
+        mode: 'guide',
+        basis: 'user',
+        instructions: ['Keep this member consistent with the generated set anchor.'],
+        minimum_score: 85,
+      },
+    },
+  ])('keeps $name provider-owned without ImageStudio visual review', async ({
+    route,
+    reference,
+    referenceIntent,
+  }) => {
+    const generatedPath = path.join(projectDir, 'provider-result.png');
+    const referencePath = path.join(projectDir, reference.path);
+    fs.mkdirSync(path.dirname(referencePath), { recursive: true });
+    fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
+    fs.writeFileSync(referencePath, electronImage.changedImage.toPNG());
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.route = route;
+    manifest.canvas = { width: 128, height: 128 };
+    manifest.raster_source = 'provider-result.png';
+    manifest.generation_budget.max_calls = 1;
+    manifest.references = [reference];
+    manifest.reference_intent = referenceIntent;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const tool = createImageStudioTool({
+      userId: USER_ID,
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    });
+    const ctx = { workingDir: root } as any;
+
+    const inspected = await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+      input_path: generatedPath,
+      quality_review: true,
+    }, ctx);
+    expect(inspected.isError).not.toBe(true);
+    expect(inspected.images).toBeUndefined();
+    expect(inspected.content).not.toContain('visual_evidence');
+    expect(JSON.parse(inspected.content)).toMatchObject({
+      inspection: {
+        route,
+        manifest: {
+          reference_intent: referenceIntent,
+          references: [reference],
+        },
+      },
+      current_candidate: {
+        status: 'validated',
+        path: generatedPath,
+        review_required: false,
+      },
+      recovery_context: {
+        review_required: false,
+        next_operation: 'project.export',
+      },
+    });
+
+    const ungroundedReview = await tool.execute({
+      op: 'project.submit_design_review',
+      project_dir: projectDir,
+      evidence_path: generatedPath,
+      review_verdict: 'passed',
+      review_scope: 'A generated raster cannot enter the ImageStudio review gate.',
+      review_findings: [],
+      quality_scores: {
+        intent_alignment: 90,
+        composition: 90,
+        craft: 90,
+        text_legibility: 90,
+        defect_freedom: 90,
+        specificity: 90,
+      },
+    }, ctx);
+    expect(JSON.parse(ungroundedReview.content)).toMatchObject({
+      ok: false,
+      error_code: 'E_IMAGE_REVIEW_NOT_APPLICABLE',
+    });
+
+    const exported = await tool.execute({
+      op: 'project.export',
+      project_dir: projectDir,
+      output_path: path.join(root, 'final', `${route}-provider-result.png`),
+    }, ctx);
+    expect(exported.isError).not.toBe(true);
+  });
+
+  it('ignores a legacy rejected review when resuming generated raster evidence', async () => {
+    const generatedPath = path.join(projectDir, 'legacy.png');
+    fs.writeFileSync(generatedPath, electronImage.baseImage.toPNG());
+    const manifestPath = path.join(projectDir, 'image-manifest.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    manifest.route = 'generate';
+    manifest.canvas = { width: 128, height: 128 };
+    manifest.raster_source = 'legacy.png';
+    manifest.generation_budget.max_calls = 1;
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    const toolOpts = {
+      userId: USER_ID,
+      agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root],
+    };
+    const tool = createImageStudioTool(toolOpts);
+    const ctx = { workingDir: root } as any;
+    expect((await tool.execute({
+      op: 'project.inspect',
+      project_dir: projectDir,
+      input_path: generatedPath,
+    }, ctx)).isError).not.toBe(true);
+
+    const statePath = imageStudioStatePath(toolOpts, projectDir);
+    const legacyState = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    delete legacyState.review_required;
+    legacyState.review = {
+      verdict: 'repair',
+      scope: 'Legacy automatic visual review.',
+      findings: ['Legacy crop finding must no longer gate generated output.'],
+      quality_scorecard: {},
+      signature: legacyState.signature,
+      evidence_path: legacyState.evidence_path,
+      reviewed_at: new Date().toISOString(),
+    };
+    fs.writeFileSync(statePath, JSON.stringify(legacyState, null, 2));
+
+    const status = await tool.execute({
+      op: 'project.status',
+      project_dir: projectDir,
+    }, ctx);
+    expect(JSON.parse(status.content)).toMatchObject({
+      current_candidate: {
+        status: 'validated',
+        review_required: false,
+        review_current: false,
+        review_verdict: null,
+        review_findings: [],
+      },
+      recovery_context: {
+        review_required: false,
+        review_current: false,
+        review_verdict: null,
+        next_operation: 'project.export',
+      },
+    });
+
+    const exported = await tool.execute({
+      op: 'project.export',
+      project_dir: projectDir,
+      output_path: path.join(root, 'final', 'legacy.png'),
+    }, ctx);
+    expect(exported.isError).not.toBe(true);
+  });
+
   it('runs the COMPOSE snapshot, scored review, and export gate through the production tool path', async () => {
     const published: string[][] = [];
     const tool = createImageStudioTool({
@@ -347,7 +695,7 @@ describe('image_studio tool', () => {
       ok: true,
       route: 'compose',
       evidence_path: snapshotPath,
-      image: { width: 2, height: 2 },
+      image: { width: 128, height: 128 },
     });
     expect(snapshotPayload.visual_evidence).toMatchObject({
       attached: true,
@@ -422,7 +770,7 @@ describe('image_studio tool', () => {
     }, ctx);
     expect(exported.isError).not.toBe(true);
     expect(fs.existsSync(finalPath)).toBe(true);
-    expect(JSON.parse(exported.content)).toMatchObject({ ok: true, output_path: finalPath, image: { width: 2, height: 2 } });
+    expect(JSON.parse(exported.content)).toMatchObject({ ok: true, output_path: finalPath, image: { width: 128, height: 128 } });
     expect(published).toEqual([[finalPath]]);
 
     fs.appendFileSync(path.join(projectDir, 'index.html'), '<!-- source changed -->');
@@ -810,6 +1158,7 @@ describe('image_studio tool', () => {
   it('runs a host-configured workflow through the current-turn budget, reuses its request id, and resets on the next turn', async () => {
     const manifest = JSON.parse(fs.readFileSync(path.join(projectDir, 'image-manifest.json'), 'utf8'));
     manifest.route = 'generate';
+    manifest.canvas = { width: 128, height: 128 };
     manifest.generation_budget.max_calls = 1;
     fs.writeFileSync(path.join(projectDir, 'image-manifest.json'), JSON.stringify(manifest));
     fs.writeFileSync(path.join(projectDir, 'workflow.json'), JSON.stringify({
@@ -876,33 +1225,17 @@ describe('image_studio tool', () => {
       input_path: generatedPath,
     }, { workingDir: root } as any);
     expect(inspected.isError).not.toBe(true);
-    expect(inspected.images).toHaveLength(1);
-    expect(inspected.images![0]).toMatchObject({ analysisMode: 'quality_review' });
+    expect(inspected.images).toBeUndefined();
     expect(JSON.parse(inspected.content)).toMatchObject({
-      visual_evidence: {
-        attached: true,
-        analysis_mode: 'quality_review',
-        role: 'candidate',
+      current_candidate: {
+        status: 'validated',
         path: generatedPath,
-        policy: 'attached_only_after_deterministic_inspection_passed',
+        review_required: false,
+      },
+      recovery_context: {
+        next_operation: 'project.export',
       },
     });
-    await tool.execute({
-      op: 'project.submit_design_review',
-      project_dir: projectDir,
-      evidence_path: generatedPath,
-      review_verdict: 'repair',
-      review_scope: 'Reviewed the generated candidate and its delivery constraints.',
-      review_findings: ['The subject crop needs a more stable focal balance.'],
-      quality_scores: {
-        intent_alignment: 82,
-        composition: 64,
-        craft: 78,
-        text_legibility: 90,
-        defect_freedom: 84,
-        specificity: 76,
-      },
-    }, { workingDir: root } as any);
     const exhausted = await tool.execute({
       op: 'generation.quote',
       project_dir: projectDir,
@@ -912,11 +1245,12 @@ describe('image_studio tool', () => {
       ok: false,
       error_code: 'E_IMAGE_GENERATION_BUDGET_EXHAUSTED',
       current_candidate: {
-        status: 'current_unapproved',
+        status: 'validated',
         path: generatedPath,
-        review_findings: ['The subject crop needs a more stable focal balance.'],
+        review_findings: [],
       },
       recovery_context: {
+        next_operation: 'project.export',
         generation: {
           calls_started: 1,
           calls_remaining: 0,

@@ -2,9 +2,77 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
+import * as ts from 'typescript';
 
 
 const source = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.js'), 'utf8');
+
+type PushSubscriptionInspection = {
+  channels: string[];
+  nonLiteralCalls: string[];
+};
+
+function inspectRendererPushSubscriptions(
+  filePath: string,
+  fileSource: string,
+): PushSubscriptionInspection {
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    fileSource,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS,
+  );
+  const channels: string[] = [];
+  const nonLiteralCalls: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isCallExpression(node)
+      && ts.isPropertyAccessExpression(node.expression)
+      && node.expression.name.text === 'onPushEvent'
+    ) {
+      const receiver = node.expression.expression.getText(sourceFile);
+      if (receiver === 'orkas' || receiver === 'window.orkas') {
+        const channel = node.arguments[0];
+        if (channel && ts.isStringLiteralLike(channel)) {
+          channels.push(channel.text);
+        } else {
+          const location = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+          nonLiteralCalls.push(`${filePath}:${location.line + 1}`);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return { channels, nonLiteralCalls };
+}
+
+function productionRendererPushSubscriptions(): PushSubscriptionInspection {
+  const rendererRoot = path.join(process.cwd(), 'src/renderer');
+  const files: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(entryPath);
+      else if (entry.isFile() && entry.name.endsWith('.js')) files.push(entryPath);
+    }
+  };
+  walk(rendererRoot);
+
+  const channels = new Set<string>();
+  const nonLiteralCalls: string[] = [];
+  for (const filePath of files.sort()) {
+    const relativePath = path.relative(rendererRoot, filePath);
+    const inspected = inspectRendererPushSubscriptions(
+      relativePath,
+      fs.readFileSync(filePath, 'utf8'),
+    );
+    for (const channel of inspected.channels) channels.add(channel);
+    nonLiteralCalls.push(...inspected.nonLiteralCalls);
+  }
+  return { channels: [...channels].sort(), nonLiteralCalls };
+}
 
 type Listener = (event: unknown, payload?: unknown) => void;
 
@@ -127,6 +195,56 @@ describe('preload bridge', () => {
     expect(bashCancelledHandler).toHaveBeenCalledWith({ request_ids: ['bash-1'] });
     expect(bridgeHandler).toHaveBeenCalledWith({ request_id: 'bridge-1' });
     expect(interactiveCliHandler).toHaveBeenCalledWith({ session_id: 'session-1', kind: 'prompt' });
+  });
+
+  it('delivers materialized media through the exact preview channel and rejects near misses', () => {
+    const { api, emit } = loadPreload();
+    const handler = vi.fn();
+
+    api.onPushEvent('conversation:media_materialized', handler);
+    expect(() => api.onPushEvent('conversation:media_materialized:private', vi.fn())).toThrow(/not allowed/);
+
+    const payload = {
+      user_id: 'user-1',
+      conversation_id: 'conversation-1',
+      remote_url: 'https://cdn.example/result.png',
+      local_url: 'chat-media://cid/conversation-1/result.png',
+      media_kind: 'image',
+    };
+    emit('conversation:media_materialized', payload);
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith(payload);
+  });
+
+  it('keeps every production renderer push subscription authorized by the real preload policy', () => {
+    const negativeControl = inspectRendererPushSubscriptions(
+      'negative-control.js',
+      [
+        "window.orkas.onPushEvent('known:literal', handler);",
+        'window.orkas.onPushEvent(dynamicChannel, handler);',
+      ].join('\n'),
+    );
+    expect(negativeControl.channels).toEqual(['known:literal']);
+    expect(negativeControl.nonLiteralCalls).toEqual(['negative-control.js:2']);
+
+    const { api } = loadPreload();
+    const inspected = productionRendererPushSubscriptions();
+    expect(inspected.nonLiteralCalls).toEqual([]);
+    expect(inspected.channels).toContain('conversation:media_materialized');
+
+    const rejected: Array<{ channel: string; error: string }> = [];
+    for (const channel of inspected.channels) {
+      try {
+        api.onPushEvent(channel, vi.fn())();
+      } catch (error) {
+        rejected.push({
+          channel,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    expect(rejected).toEqual([]);
   });
 
   it('delivers stream events, resolves on done, and cleans the listener', async () => {

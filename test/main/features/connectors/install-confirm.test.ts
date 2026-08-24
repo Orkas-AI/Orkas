@@ -87,7 +87,11 @@ describe('add_custom_connector tool', () => {
   async function buildTool() {
     const ic = await import('../../../../src/main/features/connectors/install_confirm');
     const metaMod = await import('../../../../src/main/model/core-agent/connector-meta-tools');
-    const tools = await metaMod.createConnectorMetaTools({ userId: TEST_UID, cid: 'c1' }, 'full');
+    const tools = await metaMod.createConnectorMetaTools({
+      userId: TEST_UID,
+      cid: 'c1',
+      allowCustomConnectorInstall: true,
+    }, 'full');
     const tool = tools.find((t) => t.name === 'add_custom_connector');
     return { ic, tool };
   }

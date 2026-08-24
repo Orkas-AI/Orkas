@@ -5,10 +5,6 @@ import * as path from 'node:path';
 import { PDFDocument, StandardFonts, degrees } from 'pdf-lib';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../../../../src/main/features/permissions', () => ({
-  getLocalExecGranted: () => true,
-}));
-
 import { createPdfTools } from '../../../../src/main/model/core-agent/pdf-tools';
 
 let root = '';
@@ -49,6 +45,18 @@ afterEach(() => {
 describe('PDF built-in tools', () => {
   it('exposes edit_pdf and pdf_render', () => {
     expect(createPdfTools({}).map((entry) => entry.name)).toEqual(['edit_pdf', 'pdf_render']);
+  });
+
+  it('keeps heavyweight PDF and canvas runtimes behind execution-time imports', () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, '../../../../src/main/model/core-agent/pdf-tools.ts'),
+      'utf8',
+    );
+    expect(source).toContain("import type { PDFDocument as PdfDocument } from 'pdf-lib';");
+    expect(source).toContain("pdfLibPromise = import('pdf-lib')");
+    expect(source).toContain("canvasPromise = import('@napi-rs/canvas')");
+    expect(source).not.toMatch(/^import\s+\{[^;]+\}\s+from ['"]pdf-lib['"];?$/m);
+    expect(source).not.toMatch(/^import\s+\{[^;]+\}\s+from ['"]@napi-rs\/canvas['"];?$/m);
   });
 
   it('merges PDFs in the requested order and reports the produced file', async () => {

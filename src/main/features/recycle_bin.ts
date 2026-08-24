@@ -24,7 +24,7 @@ import {
   globalAutoTaskLocation,
   listAutoTaskLocations,
 } from '../util/project-layout';
-import { safeId, writeJson } from '../storage';
+import { isAtomicWriteTempPath, safeId, writeJson } from '../storage';
 import { t } from '../i18n';
 import {
   EN_FILLER_RE, TITLE_MAX, ZH_FILLER_RE,
@@ -343,14 +343,27 @@ async function collectCloudFilesUnder(uid: string, relDir: string): Promise<stri
   const out: string[] = [];
   async function walk(absDir: string, relPrefix: string): Promise<void> {
     let entries: fs.Dirent[] = [];
-    try { entries = await fsp.readdir(absDir, { withFileTypes: true }); }
-    catch { return; }
+    try {
+      entries = await fsp.readdir(absDir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw err;
+    }
     await Promise.all(entries.map(async (entry) => {
       const childAbs = path.join(absDir, entry.name);
       const childRel = `${relPrefix}/${entry.name}`;
       if (entry.isDirectory()) {
         await walk(childAbs, childRel);
-      } else if (entry.isFile() && isSafeCloudRelPath(childRel)) {
+        return;
+      }
+      // Atomic writers publish by renaming this sibling away. Treating it as
+      // recoverable data creates a TOCTOU failure when a strict snapshot races
+      // that rename; explicit user-selected files still go through unchanged.
+      if (
+        entry.isFile()
+        && !isAtomicWriteTempPath(entry.name)
+        && isSafeCloudRelPath(childRel)
+      ) {
         out.push(childRel);
       }
     }));
@@ -360,7 +373,8 @@ async function collectCloudFilesUnder(uid: string, relDir: string): Promise<stri
     const st = await fsp.stat(abs);
     if (!st.isDirectory()) return [];
     await walk(abs, safeRelDir);
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return [];
   }
   return out;
@@ -373,7 +387,8 @@ async function collectCloudFilesMatching(uid: string, relDir: string, predicate:
   try {
     const abs = resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
     entries = await fsp.readdir(abs, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return [];
   }
   return entries
@@ -389,7 +404,8 @@ async function collectCloudFilesUnderMatchingDirs(uid: string, relDir: string, p
   try {
     const abs = resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
     entries = await fsp.readdir(abs, { withFileTypes: true });
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return [];
   }
   const batches = await Promise.all(entries
@@ -405,7 +421,8 @@ export async function collectCloudEntryFiles(uid: string, relPath: string): Prom
     const st = await fsp.stat(abs);
     if (st.isFile()) return [relPath];
     if (st.isDirectory()) return collectCloudFilesUnder(uid, relPath);
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
     return [];
   }
   return [];

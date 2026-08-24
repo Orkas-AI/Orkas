@@ -431,7 +431,7 @@ function renderSkillsGrid(skills) {
         e.stopPropagation();
         if (!card.classList.contains('is-disabled')) {
           const skill = _skillsCache?.find(s => s.id === id && s.source === source);
-          useSkill(id, skill?.name || id);
+          useSkill(id, skill?.name || id, source);
         }
         return;
       }
@@ -708,7 +708,7 @@ function _wireOpenSkillCards(gridEl) {
           && (s.source || '') === source
           && (source !== 'external' || String(s.package_name || '') === packageName)
         ));
-        useSkill(id, (row && row.name) || id);
+        useSkill(id, (row && row.name) || id, source);
       });
     }
     const menuBtn = card.querySelector('[data-open-more]');

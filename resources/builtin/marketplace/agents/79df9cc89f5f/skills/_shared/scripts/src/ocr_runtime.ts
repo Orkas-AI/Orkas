@@ -403,7 +403,7 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
     return {
       ok: false,
       errorCode: 'E_OCR_UNSUPPORTED_FILE',
-      message: 'ocr_file currently supports PDF and image files only. Use read_file for normal text/Office files.',
+      message: 'ocr_file currently supports PDF and image files only. Use read_files for normal text/Office files.',
       processLog,
     };
   }

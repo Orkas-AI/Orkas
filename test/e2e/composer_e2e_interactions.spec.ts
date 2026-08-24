@@ -390,7 +390,36 @@ test.describe('new chat composer', () => {
       'Create an AI office assistant product deck',
     );
     await expect(pptCard.locator('.quick-deliver')).toHaveText('Deliverable: PPT');
-    await expect(pptCard.locator('.quick-thumb')).toHaveAttribute('data-thumb', 'presentation');
+    // Each card keeps one visible icon without adding another action layer.
+    await expect(pptCard.locator('.quick-tile svg')).toBeVisible();
+    const restingVisual = await pptCard.evaluate((element) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--text-2)';
+      document.body.appendChild(probe);
+      const neutralColor = getComputedStyle(probe).color;
+      probe.remove();
+      const tile = getComputedStyle(element.querySelector('.quick-tile')!);
+      return {
+        tileColor: tile.color,
+        neutralColor,
+      };
+    });
+    expect(restingVisual.tileColor).toBe(restingVisual.neutralColor);
+    await pptCard.hover();
+    await expect.poll(() => pptCard.evaluate((element) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--primary)';
+      document.body.appendChild(probe);
+      const primaryColor = getComputedStyle(probe).color;
+      probe.remove();
+      const card = getComputedStyle(element);
+      const tile = getComputedStyle(element.querySelector('.quick-tile')!);
+      return {
+        tileUsesPrimary: tile.color === primaryColor,
+        hasTransform: card.transform !== 'none',
+        hasShadow: card.boxShadow !== 'none',
+      };
+    })).toEqual({ tileUsesPrimary: true, hasTransform: true, hasShadow: true });
 
     const input = appPage.locator('#new-chat-input');
     for (const item of cases) {
@@ -438,12 +467,34 @@ test.describe('new chat composer', () => {
         quickCardCount: document.querySelectorAll('.new-chat-scenario-chip').length,
         quickGridColumns: getComputedStyle(document.querySelector('.quick-grid')!).gridTemplateColumns
           .split(' ').length,
-        quickThumbsFit: Array.from(document.querySelectorAll('.quick-thumb'))
+        quickTilesFit: Array.from(document.querySelectorAll('.quick-tile'))
           .every((element) => {
-            const thumb = element.getBoundingClientRect();
+            const tile = element.getBoundingClientRect();
             const card = element.closest('.new-chat-scenario-chip')!.getBoundingClientRect();
-            return thumb.left >= card.left && thumb.right <= card.right
-              && thumb.top >= card.top && thumb.bottom <= card.bottom;
+            return tile.left >= card.left && tile.right <= card.right
+              && tile.top >= card.top && tile.bottom <= card.bottom;
+          }),
+        // The icon stays proportional to the card while retaining a clear
+        // target shape across all server-controlled scenario orders.
+        quickTileSizes: Array.from(document.querySelectorAll('.quick-tile'))
+          .map((element) => {
+            const tile = element.getBoundingClientRect();
+            return [Math.round(tile.width), Math.round(tile.height)].join('x');
+          }),
+        quickIconSizes: Array.from(document.querySelectorAll('.new-chat-scenario-icon'))
+          .map((element) => {
+            const icon = element.getBoundingClientRect();
+            return [Math.round(icon.width), Math.round(icon.height)].join('x');
+          }),
+        quickCardContentFits: Array.from(document.querySelectorAll('.new-chat-scenario-chip'))
+          .every((element) => {
+            const card = element.getBoundingClientRect();
+            return Array.from(element.querySelectorAll('.quick-tile, .quick-copy'))
+              .every((child) => {
+                const box = child.getBoundingClientRect();
+                return box.left >= card.left && box.right <= card.right
+                  && box.top >= card.top && box.bottom <= card.bottom;
+              });
           }),
         // The entry belongs to the header row, not to the grid of runnable tasks.
         ossEntryOnHeaderRow: (() => {
@@ -464,10 +515,14 @@ test.describe('new chat composer', () => {
     expect(layout.greetingFontSize).toBe('32px');
     expect(layout.greetingTextAlign).toBe('center');
     expect(layout.composerHeight).toBeLessThanOrEqual(150);
-    expect(layout.quickCardHeight).toBeGreaterThanOrEqual(112);
+    expect(layout.quickCardHeight).toBeGreaterThanOrEqual(88);
+    expect(layout.quickCardHeight).toBeLessThanOrEqual(94);
     expect(layout.quickCardCount).toBe(9);
     expect(layout.quickGridColumns).toBe(3);
-    expect(layout.quickThumbsFit).toBe(true);
+    expect(layout.quickTilesFit).toBe(true);
+    expect(layout.quickTileSizes).toEqual(Array(9).fill('40x40'));
+    expect(layout.quickIconSizes).toEqual(Array(9).fill('20x20'));
+    expect(layout.quickCardContentFits).toBe(true);
     expect(layout.ossEntryOnHeaderRow).toBe(true);
     expect(layout.landingStartsInBounds).toBe(true);
     expect(layout.flexShrink).toEqual(['0', '0', '0']);
@@ -489,6 +544,29 @@ test.describe('new chat composer', () => {
       };
     });
     expect(shortViewport).toEqual({ overflows: true, startsInBounds: true, endIsReachable: true });
+
+    await appPage.setViewportSize({ width: 1080, height: 800 });
+    await expect.poll(() => appPage.locator('.quick-grid').evaluate((element) => (
+      getComputedStyle(element).gridTemplateColumns.split(' ').length
+    ))).toBe(2);
+
+    await appPage.setViewportSize({ width: 600, height: 800 });
+    const narrowLayout = await appPage.evaluate(() => {
+      const landing = document.querySelector('.new-chat-center')!;
+      const more = document.querySelector('#quick-panel-oss-more')!.getBoundingClientRect();
+      const landingRect = landing.getBoundingClientRect();
+      return {
+        columns: getComputedStyle(document.querySelector('.quick-grid')!).gridTemplateColumns
+          .split(' ').length,
+        noHorizontalOverflow: landing.scrollWidth <= landing.clientWidth + 1,
+        moreEntryInBounds: more.left >= landingRect.left && more.right <= landingRect.right,
+      };
+    });
+    expect(narrowLayout).toEqual({
+      columns: 1,
+      noHorizontalOverflow: true,
+      moreEntryInBounds: true,
+    });
   });
 
   test('prefills a quick scenario and keeps modified Enter as a newline', async ({ appPage }) => {
@@ -664,13 +742,18 @@ test.describe('new chat composer', () => {
     const page = modelOrkas.page;
     const firstName = 'E2E multi brief.md';
     const secondName = 'E2E facts.json';
+    const imageName = 'E2E compact image.png';
     const firstPath = modelOrkas.createFixtureFile(firstName, '# Multi attachment\n\nFirst body.\n');
     const secondPath = modelOrkas.createFixtureFile(secondName, '{"e2e":true,"kind":"second"}\n');
-    await modelOrkas.selectFilesOnNextDialog([firstPath, secondPath]);
+    const imagePath = modelOrkas.createFixtureFile(imageName, Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=',
+      'base64',
+    ));
+    await modelOrkas.selectFilesOnNextDialog([firstPath, secondPath, imagePath]);
 
     await page.locator('#new-chat-attach-btn').click();
-    await expect(page.locator('#new-chat-attachments .chat-attach-chip')).toHaveCount(2);
-    await page.locator('#new-chat-input').fill('Use both deterministic E2E attachments.');
+    await expect(page.locator('#new-chat-attachments .chat-attach-chip')).toHaveCount(3);
+    await page.locator('#new-chat-input').fill('Use all deterministic E2E attachments.');
     await page.locator('#new-chat-send-btn').click();
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
       'Hello from the local E2E model.',
@@ -679,6 +762,12 @@ test.describe('new chat composer', () => {
     const userMessage = page.locator('#chat-history .chat-message.user');
     await expect(userMessage).toContainText(firstName);
     await expect(userMessage).toContainText(secondName);
+    const imageChip = userMessage.locator('.chat-msg-attach', { hasText: imageName });
+    await expect(imageChip).toHaveClass(/\bchat-attach-chip\b/);
+    await expect(imageChip.locator('.chat-attach-thumb')).toBeVisible();
+    await expect(imageChip.locator('.chat-attach-thumb')).toHaveCSS('width', '22px');
+    await expect(imageChip.locator('.chat-attach-thumb')).toHaveCSS('height', '22px');
+    await expect(userMessage.locator('video, audio, .chat-msg-attach-thumb-shell')).toHaveCount(0);
     await userMessage.locator('.chat-msg-attach', { hasText: firstName }).click();
     await expect(page.locator('.chat-file-viewer')).toHaveClass(/\bis-open\b/);
     await expect(page.locator('.chat-file-viewer-title')).toHaveText(firstName);
@@ -693,8 +782,12 @@ test.describe('new chat composer', () => {
       'Edited through the conversation viewer.',
     );
     await page.locator('.chat-file-viewer-close').click();
+    await imageChip.locator('.chat-attach-preview').click();
+    await expect(page.locator('.chat-lightbox')).toHaveClass(/\bis-open\b/);
+    await page.locator('.chat-lightbox-close').click();
     expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(firstName);
     expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(secondName);
+    expect(JSON.stringify(modelOrkas.modelRequests[0])).toContain(imageName);
 
     const conversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
     expect(conversationId).toBeTruthy();
@@ -708,6 +801,8 @@ test.describe('new chat composer', () => {
     const restoredUserMessage = relaunchedPage.locator('#chat-history .chat-message.user');
     await expect(restoredUserMessage).toContainText(firstName);
     await expect(restoredUserMessage).toContainText(secondName);
+    await expect(restoredUserMessage.locator('.chat-msg-attach', { hasText: imageName }))
+      .toHaveClass(/\bchat-attach-chip\b/);
     await expect(relaunchedPage.locator('#chat-history .chat-message.assistant')).toContainText(
       'Hello from the local E2E model.',
     );

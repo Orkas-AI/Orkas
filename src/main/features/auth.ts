@@ -63,6 +63,7 @@ import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
+import { isBearerTokenHeaderSafe } from '../util/http-authorization';
 import { safeExternalUserActionUrl } from '../util/window-security';
 import { getActiveUserId } from './users';
 import {
@@ -181,6 +182,8 @@ interface ApiKeyProfile {
   baseUrl?: string;
   contextWindow?: number;
   maxTokens?: number;
+  supportsReasoning?: boolean;
+  supportsVision?: boolean;
   reasoningEffort?: 'low' | 'medium' | 'high';
   email?: string;
   createdAt: number;
@@ -662,6 +665,8 @@ function customRuntimeConfigFromProfile(
       baseUrl,
       contextWindow,
       maxTokens,
+      ...(profile.supportsReasoning === true ? { supportsReasoning: true } : {}),
+      ...(profile.supportsVision === true ? { supportsVision: true } : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
     };
   } catch {
@@ -1014,6 +1019,9 @@ export interface AddCustomModelEntryInput {
   apiKey: string;
   contextWindow?: number | string | null;
   maxTokens?: number | string | null;
+  /** Internal capability metadata for a curated relay profile. */
+  supportsReasoning?: boolean;
+  supportsVision?: boolean;
   reasoningEffort?: 'low' | 'medium' | 'high' | null;
 }
 
@@ -1025,6 +1033,12 @@ export async function addCustomModelEntry(
   const key = String(input?.apiKey || '').trim();
   if (!model) throw customConfigError('CUSTOM_MODEL_REQUIRED', 'Model ID required');
   if (!key) throw customConfigError('CUSTOM_API_KEY_REQUIRED', 'API key required');
+  if (!isBearerTokenHeaderSafe(key)) {
+    throw customConfigError(
+      'CUSTOM_API_KEY_INVALID',
+      'Invalid API key: it contains characters unsupported by HTTP Authorization headers',
+    );
+  }
   assertModelProviderAllowed(CUSTOM_MODEL_PROVIDER, model);
   if (!isSelectableModel(CUSTOM_MODEL_PROVIDER, model)) {
     throw customConfigError('CUSTOM_MODEL_INVALID', 'Model ID is invalid');
@@ -1078,6 +1092,8 @@ export async function addCustomModelEntry(
     baseUrl,
     contextWindow,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(input.supportsReasoning === true ? { supportsReasoning: true } : {}),
+    ...(input.supportsVision === true ? { supportsVision: true } : {}),
     ...(reasoningEffort
       ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' }
       : {}),

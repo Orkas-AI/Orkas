@@ -16,10 +16,6 @@ const speechRuntime = vi.hoisted(() => ({
   generateSpeech: vi.fn(),
 }));
 
-vi.mock('../../../../src/main/features/permissions', () => ({
-  getLocalExecGranted: () => true,
-}));
-
 vi.mock('../../../../src/main/logger', () => ({
   createLogger: () => ({
     debug: vi.fn(),

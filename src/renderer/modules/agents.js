@@ -15,6 +15,13 @@ function _agentsTrackError(action, data) {
   void data;
 }
 
+function _agentManageErrorCode(value, fallback = 'operation_failed') {
+  const message = String((value && value.message) || '').trim();
+  const raw = String((value && (value.code || value.error_code))
+    || (/^[A-Za-z0-9_.:-]{1,64}$/.test(message) ? message : '')).trim();
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(raw) ? raw : fallback;
+}
+
 let _agentsCache = null;
 // Startup holds a deliberately small identity cache for chat mentions and
 // avatars. The Agents tab upgrades it to the complete listing on first entry.
@@ -344,6 +351,7 @@ function _agentRuntimeStats(agent) {
   const raw = agent && typeof agent === 'object' ? agent.runtime_stats : null;
   const attempts = Math.max(0, Number(raw && raw.attempts) || 0);
   const deliveries = Math.max(0, Number(raw && raw.deliveries) || 0);
+  const executionFailures = Math.max(0, Number(raw && raw.execution_failures) || 0);
   const successes = raw && raw.successes !== undefined
     ? Math.max(0, Number(raw.successes) || 0)
     : deliveries;
@@ -353,6 +361,7 @@ function _agentRuntimeStats(agent) {
     attempts,
     successes,
     deliveries,
+    executionFailures,
     failures: Math.max(0, Number(raw && raw.failures) || 0),
     errors: Math.max(0, Number(raw && raw.errors) || 0),
     totalDurationMs,
@@ -395,10 +404,17 @@ function _agentRoundedSeconds(ms, count) {
   return ms > 0 && avg === 0 ? 1 : avg;
 }
 
+function _agentExecutionSuccessRate(runtime) {
+  const assessed = runtime.successes + runtime.executionFailures;
+  return assessed > 0 ? Math.round((runtime.successes / assessed) * 100) : 0;
+}
+
 function _agentDetailStats(agent) {
   const runtime = _agentRuntimeStats(agent);
-  const assessed = runtime.successes + runtime.failures;
-  const successRate = assessed > 0 ? Math.round((runtime.successes / assessed) * 100) : 0;
+  // Success rate measures host-observed execution health. The legacy
+  // `failures` bucket came from model-authored result markers and is excluded;
+  // cancelled and waiting-input runs increment attempts only.
+  const successRate = _agentExecutionSuccessRate(runtime);
   const avgSource = runtime.deliveries > 0 ? runtime.successfulDurationMs : runtime.totalDurationMs;
   const avgCount = runtime.deliveries > 0 ? runtime.deliveries : runtime.attempts;
   const stats = [
@@ -2260,13 +2276,19 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
     });
     seenModelIds.add(defaultModelId);
   }
-  // Some CLIs (notably Claude Code) intentionally keep the account-selected
-  // model private until a run starts. An empty override already means "use the
-  // CLI default"; represent that as a real selected option instead of the
-  // misleading generic "Please select" placeholder. This also gives users a
-  // way to clear a previously saved override.
+  // An empty override already means "use the CLI default"; represent that as a
+  // real selected option instead of the misleading generic "Please select"
+  // placeholder. This also gives users a way to clear a previously saved
+  // override. CLIs that name the model their default resolves to today show it
+  // here, so the row says which model the default actually runs.
   if (!modelOptions.some(option => option.value === '')) {
-    modelOptions.unshift({ value: '', label: t('agents.cli_default') });
+    const resolvedDefault = String(info.default_model_resolved || '').trim();
+    modelOptions.unshift({
+      value: '',
+      label: resolvedDefault
+        ? `${t('agents.cli_default')} · ${resolvedDefault}`
+        : t('agents.cli_default'),
+    });
   }
   if (currentModel && !seenModelIds.has(currentModel)) {
     modelOptions.push({ value: currentModel, label: currentModel });
@@ -2278,6 +2300,7 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
 
   const activeModelId = currentModel || defaultModelId;
   const activeModel = models.find(model => String(model?.id || '') === activeModelId);
+  const thinkingUnsupported = activeModel?.supports_thinking === false;
   const rawThinkingLevels = Array.isArray(activeModel?.thinking_levels) && activeModel.thinking_levels.length
     ? activeModel.thinking_levels
     : (Array.isArray(info.thinking_levels) ? info.thinking_levels : []);
@@ -2316,6 +2339,14 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
   }
   if (info.allow_custom_thinking) {
     thinkingOptions.push({ value: CUSTOM_THINKING, label: t('agents.cli_custom_thinking') });
+  }
+  // A model the CLI says takes no thinking level must not inherit the levels
+  // its siblings advertise. A value saved before the model changed stays
+  // listed so it remains clearable.
+  if (thinkingUnsupported) {
+    thinkingOptions.length = 0;
+    thinkingOptions.push({ value: '', label: t('agents.cli_thinking_unsupported') });
+    if (currentThinking) thinkingOptions.push({ value: currentThinking, label: currentThinking });
   }
   const selectedThinkingValue = !currentThinking || currentThinking === defaultThinking
     ? ''
@@ -2445,10 +2476,13 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
       }
     },
   });
-  disableSelect(thinkingMount, !canEdit || (!info.can_select_thinking && !currentThinking));
+  disableSelect(
+    thinkingMount,
+    !canEdit || ((!info.can_select_thinking || thinkingUnsupported) && !currentThinking),
+  );
 }
 
-/** Project directory setting for external coding agents (claude / codex).
+/** Project directory setting for external coding agents.
  *  Stored in a local-only main-process config; each conversation copies
  *  the effective value on its first coding-agent dispatch. */
 async function _renderAgentDetailProjectDir(agent) {
@@ -3656,7 +3690,7 @@ async function useAgent(agentId) {
   }
 }
 
-async function useSkill(skillId, skillName) {
+async function useSkill(skillId, skillName, skillSource) {
   if (typeof _skillsCache !== 'undefined'
       && _skillsCache?.some((s) => s.id === skillId && s.enabled === false)) return;
   // Open-tier skills (external packages / global folders) live in their own
@@ -3673,7 +3707,14 @@ async function useSkill(skillId, skillName) {
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
   }
-  setChatUseSelection('new-chat', { kind: 'skill', id: skillId, name: skillName || skillId });
+  setChatUseSelection('new-chat', {
+    kind: 'skill',
+    id: skillId,
+    name: skillName || skillId,
+    ...(['marketplace', 'custom', 'external', 'global'].includes(skillSource)
+      ? { source: skillSource }
+      : {}),
+  });
   setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
 }
 

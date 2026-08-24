@@ -32,6 +32,15 @@ describe('icons.js', () => {
     expect(html).not.toContain('is-info');
   });
 
+  it('renders announcement actions as a bell instead of the info fallback', () => {
+    const { uiIconHtml } = loadIcons();
+    const html = uiIconHtml('bell');
+
+    expect(html).toContain('is-bell');
+    expect(html).toContain('M18 8a6 6 0 0 0-12 0');
+    expect(html).not.toContain('is-info');
+  });
+
   it('routes Library file extensions to distinct SVG icon families', () => {
     const { fileKindForName, fileKindIconHtml } = loadIcons();
 

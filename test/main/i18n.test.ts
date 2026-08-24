@@ -116,6 +116,33 @@ describe('i18n › t() lookup', () => {
       .toContain('需要更高版本');
   });
 
+  it('localizes the 24-hour background timeout recovery in every supported language', () => {
+    const expected = {
+      en: 'The background task reached the 24-hour limit and was stopped. Try again or ask the agent to continue.',
+      zh: '后台任务已达到 24 小时运行上限并停止。请重试，或让智能体继续未完成的工作。',
+      ja: 'バックグラウンドタスクが24時間の実行上限に達したため停止しました。再試行するか、エージェントに未完了の作業の続行を依頼してください。',
+      pt: 'A tarefa em segundo plano atingiu o limite de 24 horas e foi interrompida. Tente novamente ou peça ao agente para continuar o trabalho pendente.',
+    };
+    for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
+      expect(t('cli_agent.background_timeout_detail', undefined, lang)).toBe(expected[lang]);
+    }
+  });
+
+  it('ships privacy-safe task-intervention notification copy in every supported language', () => {
+    const expected = {
+      en: ['Task status updated', 'Open Orkas to view details.'],
+      zh: ['任务状态已更新', '打开 Orkas 查看详情。'],
+      ja: ['タスクのステータスが更新されました', 'Orkas を開いて詳細を確認してください。'],
+      pt: ['Status da tarefa atualizado', 'Abra o Orkas para ver os detalhes.'],
+    } as const;
+    for (const lang of ['en', 'zh', 'ja', 'pt'] as const) {
+      expect([
+        t('notification.task.waiting_input.title', undefined, lang),
+        t('notification.task.waiting_input.body', undefined, lang),
+      ]).toEqual(expected[lang]);
+    }
+  });
+
   it('leaves unknown placeholders untouched', () => {
     expect(t('Ping {unknown} pong', { other: 'x' })).toBe('Ping {unknown} pong');
   });

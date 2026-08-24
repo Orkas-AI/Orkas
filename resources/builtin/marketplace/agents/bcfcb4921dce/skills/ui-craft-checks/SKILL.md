@@ -3,7 +3,6 @@ ownerAgent: bcfcb4921dce
 name: ui-craft-checks
 description_zh: "UIDesigner 的完整 HTML 质量门槛；用于正式 review、QA、上线交接、严格保真或高风险复杂 UI，检查可访问性、状态、表单、排版、响应式、反模板和运行时。普通单页使用快速验证。"
 description_en: "UIDesigner's comprehensive HTML quality gate for formal review, QA, launch handoff, exact fidelity, or high-risk complex UI across accessibility, states, forms, typography, responsive behavior, anti-template quality, and runtime; ordinary single-page work uses the fast validator."
-category: rnd
 ---
 
 # ui-craft-checks
@@ -109,6 +108,7 @@ Use automated checks only when an HTML file/app screen exists and the environmen
 
 - Accessibility: if axe-core, pa11y, Playwright accessibility helpers, or an equivalent existing checker is available, run it and fix actionable violations around labels, names, landmarks, contrast, focus order, and keyboard reachability.
 - Visual regression: when a source screenshot or prior HTML screenshot exists, use screenshot comparison or viewport screenshots to catch blank render, source drift, clipped text, overlap, broken assets, and unintended layout shifts.
+- Multi-source fidelity: when the requested scope promises multiple inspectable screens, audit the complete source-to-target ledger. Every promised screen needs a fresh rendered/source comparison before an all-screens-complete claim; build success, route/link checks, shared tokens, no-overflow checks, and spot checks do not close unreviewed rows.
 - Component stories: when Storybook or a local component preview exists, check the relevant states/stories rather than only the full page.
 - DOM/source inspection: when browser automation is unavailable, inspect the generated HTML/CSS/JS for semantic elements, labels, state markup, media queries, and unsafe persisted data.
 - HTML syntax/runtime: when possible, parse the generated HTML, check inline script syntax, inspect console/runtime errors, and confirm the rendered body is non-blank with the primary region visible.
@@ -124,3 +124,4 @@ Automated tools are evidence, not a substitute for design judgment. If a tool ca
 5. Check P1/P2 according to scope.
 6. Use optional automated checks only when available and relevant.
 7. If verification cannot run, say which checks were reasoned from source/HTML and which still require rendered inspection.
+8. When the user contradicts a prior fidelity claim, invalidate that claim, reopen every affected source row, and run the available full-set comparison before asking for an example already present in the inspectable source set.

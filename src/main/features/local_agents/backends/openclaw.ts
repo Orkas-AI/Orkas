@@ -123,6 +123,7 @@ export const openclawBackend: LocalBackend = {
 
         const parsed = parseOpenclawReply(fullStderr);
         const replyText = parsed?.text || '';
+        const media = parsed?.media || [];
         const sid = parsed?.sessionId || sessionId;
 
         if (replyText) {
@@ -131,12 +132,19 @@ export const openclawBackend: LocalBackend = {
           // arrives at end-of-run, not token-by-token — see file header.)
           opts.onEvent({ type: 'text-delta', text: replyText });
         }
+        if (media.length) {
+          opts.onEvent({
+            type: 'media-output',
+            source: 'openclaw',
+            items: media.map(uri => ({ uri })),
+          });
+        }
 
         const usage = parsed?.usage;
-        if (code === 0 && replyText) {
+        if (code === 0 && (replyText || media.length)) {
           return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
         }
-        if (code === 0 && !replyText) {
+        if (code === 0 && !replyText && !media.length) {
           // Exit clean but no parseable reply → treat as failed so
           // the user sees an error bubble instead of an empty turn.
           return finish('failed', {
@@ -198,7 +206,7 @@ function hasOpenclawTimeoutArg(args: string[] | undefined): boolean {
  */
 export function parseOpenclawReply(stderrText: string):
   | null
-  | { text: string; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
+  | { text: string; media: string[]; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
   if (!stderrText) return null;
   const clean = stripAnsi(stderrText);
 
@@ -222,6 +230,17 @@ export function parseOpenclawReply(stderrText: string):
         .map(p => (p && typeof p.text === 'string') ? p.text : '')
         .filter(s => s.length)
         .join('\n');
+      const media = Array.from(new Set((obj.payloads as any[]).flatMap((payload): string[] => {
+        if (!payload || typeof payload !== 'object') return [];
+        const candidates = [
+          typeof payload.mediaUrl === 'string' ? payload.mediaUrl : '',
+          ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : []),
+        ];
+        return candidates
+          .filter((value): value is string => typeof value === 'string')
+          .map(value => value.trim())
+          .filter(Boolean);
+      })));
       const sessionId = obj.meta?.agentMeta?.sessionId
         || obj.meta?.sessionId
         || undefined;
@@ -229,10 +248,10 @@ export function parseOpenclawReply(stderrText: string):
         obj.meta?.agentMeta?.usage || obj.meta?.usage,
         obj.meta?.agentMeta?.model || obj.meta?.agentMeta?.provider,
       );
-      return { text, sessionId, ...(usage ? { usage } : {}) };
+      return { text, media, sessionId, ...(usage ? { usage } : {}) };
     }
     if (obj && typeof obj === 'object' && typeof obj.error === 'string') {
-      return { text: '', error: String(obj.error) };
+      return { text: '', media: [], error: String(obj.error) };
     }
   }
   return null;

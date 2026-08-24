@@ -366,5 +366,55 @@ class PartialBaselineTest(unittest.TestCase):
         self.assertEqual(compare({}, cur)["drift_findings"], [])
 
 
+class LocalFileComparisonTest(unittest.TestCase):
+    """MONITOR re-tests from local HTML, so it must say what it could not compare.
+
+    The synthesized 200 made `status_code_error` structurally unable to fire on
+    that path: a page that really had gone to 404 produced no drift finding, and
+    a monitor that reports nothing is read as nothing having regressed.
+    """
+
+    LIVE = {"url": "https://orkas.ai/", "fetched_at": "2026-08-01T00:00:00Z",
+            "status_code": 200, "is_indexable": True, "source": "fetch",
+            "noindex": False, "title": "Orkas", "h1s": ["Orkas"], "h2_count": 3,
+            "canonical": "https://orkas.ai/", "structured_data_types": ["Product"]}
+
+    def test_a_local_current_snapshot_reports_what_it_could_not_compare(self):
+        current = dict(self.LIVE, fetched_at="2026-08-09T00:00:00Z",
+                       status_code=None, is_indexable=None, source="file")
+        r = compare(self.LIVE, current)
+        self.assertEqual(
+            sorted(e["check"] for e in r["not_compared"]),
+            ["indexability", "response status"],
+        )
+        for entry in r["not_compared"]:
+            self.assertIn("file", entry["reason"])
+        # And it must not manufacture drift from the unknown: `not None` is
+        # true, which would have reported a page that lost indexability.
+        self.assertNotIn("indexability_lost", {f["id"] for f in r["drift_findings"]})
+        self.assertNotIn("status_code_error", {f["id"] for f in r["drift_findings"]})
+
+    def test_a_local_baseline_cannot_anchor_a_response_comparison(self):
+        baseline = dict(self.LIVE, status_code=None, is_indexable=None, source="file")
+        current = dict(self.LIVE, fetched_at="2026-08-09T00:00:00Z",
+                       status_code=404, is_indexable=False)
+        r = compare(baseline, current)
+        self.assertEqual(
+            sorted(e["check"] for e in r["not_compared"]),
+            ["indexability", "response status"],
+        )
+        # No claim that it "went from 200 to an error": the 200 was never seen.
+        self.assertNotIn("status_code_error", {f["id"] for f in r["drift_findings"]})
+
+    def test_two_real_snapshots_still_detect_the_regression(self):
+        current = dict(self.LIVE, fetched_at="2026-08-09T00:00:00Z",
+                       status_code=404, is_indexable=False)
+        r = compare(self.LIVE, current)
+        ids = {f["id"] for f in r["drift_findings"]}
+        self.assertIn("status_code_error", ids)
+        self.assertIn("indexability_lost", ids)
+        self.assertEqual(r["not_compared"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -659,7 +659,7 @@
       renderChatInputForm(container, message, opts);
     });
 
-    submitBtn.addEventListener('click', () => {
+    submitBtn.addEventListener('click', async () => {
       errEl.textContent = '';
       // Block while any file field is still uploading.
       if (fields.some((f) => !f.isReady())) {
@@ -698,7 +698,7 @@
       // composer would otherwise appear twice on the user message).
       const dedupAttachments = Array.from(new Set(attachmentNames));
       try {
-        opts.onSubmit && opts.onSubmit(encoded, values, dedupAttachments);
+        if (opts.onSubmit) await opts.onSubmit(encoded, values, dedupAttachments);
         // Submission left our hands; once the bubble re-renders as
         // submitted the draft is moot anyway, but drop it now so a fast
         // tab switch before the re-render arrives doesn't re-hydrate the

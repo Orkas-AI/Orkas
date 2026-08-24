@@ -324,12 +324,18 @@ def _raw_anchor_hrefs(html: str) -> list[str]:
     return [unescape(next(v for v in m.groups() if v is not None)) for m in _RAW_ANCHOR_HREF_RE.finditer(html or "")]
 
 
-def extract_fields(html: str, page_url: str, *, status: int = 200,
-                   response_time_ms: int = 0, redirect_chain=None,
-                   headers=None, fetched_at: str = "") -> dict:
-    """Pure extraction of on-page fields from an HTML string."""
+def extract_fields(html: str, page_url: str, *, status: int | None = 200,
+                   response_time_ms: int | None = 0, redirect_chain=None,
+                   headers=None, fetched_at: str = "", measured: bool = True) -> dict:
+    """Pure extraction of on-page fields from an HTML string.
+
+    `measured=False` means no request was made, so every field that describes a
+    response — status, scheme reachability, redirects, timing, indexability —
+    comes back as None rather than a plausible default. A consumer must then
+    decide what it cannot assess instead of reading a default as a clean result.
+    """
     headers = headers or {}
-    redirect_chain = redirect_chain or []
+    redirect_chain = redirect_chain if redirect_chain is not None else ([] if measured else None)
     p = _PageParser()
     try:
         p.feed(html or "")
@@ -394,7 +400,10 @@ def extract_fields(html: str, page_url: str, *, status: int = 200,
     word_count = len(_WORD_RE.findall(text))
 
     noindex = bool(meta_robots and "noindex" in meta_robots.lower())
-    is_indexable = (status == 200) and not noindex
+    # Indexability needs both halves. The directive is in the HTML, but the 200
+    # is a response fact, so without a request this is unknown rather than false:
+    # reporting false here would accuse a page of being blocked on no evidence.
+    is_indexable = None if status is None else ((status == 200) and not noindex)
 
     return {
         "url": page_url,
@@ -403,7 +412,10 @@ def extract_fields(html: str, page_url: str, *, status: int = 200,
         "redirect_chain": redirect_chain,
         "response_time_ms": response_time_ms,
         "fetched_at": fetched_at,
-        "https": urlsplit(page_url).scheme == "https",
+        # Whether the page is really served over TLS is a property of the
+        # connection. With no request, the scheme of the URL the caller typed
+        # says nothing about it.
+        "https": (urlsplit(page_url).scheme == "https") if measured else None,
         "content_type": headers.get("content-type", ""),
         "lang": p.html_lang,
         "title": title,
@@ -505,12 +517,21 @@ def fetch_robots(origin: str, timeout: float, ua: str) -> dict:
 
 def crawl_file(path: str, base_url: str | None = None) -> dict:
     """Extract fields from a LOCAL HTML file (no fetch) — used by apply mode to
-    re-test an edited source file without a running server."""
+    re-test an edited source file without a running server.
+
+    Nothing is requested here, so no response is described. This used to pass
+    status=200, which travelled into the audit as a measured 200 and a measured
+    https=true derived from the base URL's scheme, and the audit scored security
+    and indexability 100 for a page that had never been contacted.
+    """
     fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with open(path, encoding="utf-8", errors="replace") as fh:
         html = fh.read()
     base = base_url or "http://localhost/"
-    page = extract_fields(html, base, status=200, fetched_at=fetched_at)
+    page = extract_fields(
+        html, base, status=None, response_time_ms=None,
+        fetched_at=fetched_at, measured=False,
+    )
     page["requested_url"] = "file://" + path
     page["source"] = "file"
     origin = "{0.scheme}://{0.netloc}".format(urlsplit(base))

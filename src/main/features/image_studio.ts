@@ -179,6 +179,8 @@ export interface ImageStudioEvidenceState {
   source_path?: string;
   image_hash: string;
   captured_at: string;
+  /** Missing means a legacy evidence state and remains review-gated. */
+  review_required?: boolean;
   review?: {
     verdict: ImageStudioReviewVerdict;
     scope: string;
@@ -928,7 +930,7 @@ export async function inspectImageStudioProject(
     const image = await nativeImageFromPath(sourceAbs);
     const analysis = analyzeNativeImage(image);
     if (analysis.width !== manifest.canvas.width || analysis.height !== manifest.canvas.height) {
-      pushIssue(advisories, 'A_CANVAS_SIZE_MISMATCH', `Raster is ${analysis.width}x${analysis.height}; manifest canvas is ${manifest.canvas.width}x${manifest.canvas.height}.`);
+      pushIssue(blockers, 'E_RASTER_CANVAS_SIZE_MISMATCH', `Raster is ${analysis.width}x${analysis.height}; manifest canvas is ${manifest.canvas.width}x${manifest.canvas.height}.`);
     }
     if (analysis.contrast < 8) pushIssue(advisories, 'A_LOW_CONTRAST', 'The raster has unusually low global contrast.');
     const signature = await sha256Files([
@@ -937,7 +939,7 @@ export async function inspectImageStudioProject(
       ...referenceResources.map(({ reference, absPath }) => ({ label: `reference:${reference.id}:${reference.path}`, absPath })),
     ]);
     return {
-      ok: true,
+      ok: blockers.length === 0,
       route: manifest.route,
       signature,
       evidence_path: sourceAbs,
@@ -1100,6 +1102,13 @@ export async function readImageStudioEvidenceState(stateAbsPath: string): Promis
   } catch { return null; }
 }
 
+/** Generated rasters never use ImageStudio visual review. Legacy composed
+ * evidence predates the explicit flag and remains fail-closed. */
+export function imageStudioEvidenceReviewRequired(state: ImageStudioEvidenceState | null): boolean {
+  if (!state || state.route === 'generate' || state.route === 'edit') return false;
+  return state.review_required !== false;
+}
+
 /** Preserve a completed review when recapturing did not prove a material
  * repair. A rejected candidate needs both a changed source signature and
  * changed rendered pixels before it becomes eligible for another review.
@@ -1166,6 +1175,7 @@ export async function snapshotImageStudioProject(input: {
     evidence_path: evidencePath,
     image_hash: image.hash,
     captured_at: new Date().toISOString(),
+    review_required: true,
     ...(review ? { review } : {}),
   };
   await writeEvidenceState(input.stateAbsPath, state);
@@ -1186,18 +1196,10 @@ export async function recordRasterEvidence(input: {
   rasterAbsPath?: string;
   stateAbsPath: string;
 }): Promise<ImageStudioInspection> {
-  const previous = await readImageStudioEvidenceState(input.stateAbsPath);
   const inspection = await inspectImageStudioProject(input.projectDirAbs, input.rasterAbsPath);
   if (!inspection.ok || !inspection.signature || !inspection.evidence_path || !inspection.image || !inspection.route) return inspection;
   if (inspection.route === 'compose' || inspection.route === 'hybrid') return inspection;
   const evidencePath = path.resolve(inspection.evidence_path);
-  const review = reviewForRecapturedEvidence({
-    previous,
-    projectDirAbs: input.projectDirAbs,
-    signature: inspection.signature,
-    evidencePath,
-    imageHash: inspection.image.hash,
-  });
   await writeEvidenceState(input.stateAbsPath, {
     schema_version: 1,
     project_dir: path.resolve(input.projectDirAbs),
@@ -1207,7 +1209,7 @@ export async function recordRasterEvidence(input: {
     source_path: inspection.source_path,
     image_hash: inspection.image.hash,
     captured_at: new Date().toISOString(),
-    ...(review ? { review } : {}),
+    review_required: false,
   });
   return inspection;
 }
@@ -1236,6 +1238,9 @@ export async function submitImageStudioDesignReview(input: {
   additionalDimensions?: unknown;
 }): Promise<ImageStudioEvidenceState> {
   const { state, inspection } = await assertCurrentEvidence(input.stateAbsPath);
+  if (!imageStudioEvidenceReviewRequired(state)) {
+    throw new Error('E_IMAGE_REVIEW_NOT_APPLICABLE: GENERATE and EDIT rasters do not use ImageStudio visual review.');
+  }
   if (path.resolve(input.evidenceAbsPath) !== path.resolve(state.evidence_path)) {
     throw new Error('E_IMAGE_REVIEW_PATH_MISMATCH: review the exact evidence path returned by ImageStudio.');
   }
@@ -1283,7 +1288,8 @@ export async function exportImageStudioProject(input: {
   format: 'png' | 'jpeg';
 }): Promise<{ output_path: string; signature: string; image: ReturnType<typeof analyzeNativeImage> }> {
   const { state } = await assertCurrentEvidence(input.stateAbsPath);
-  if (!state.review || state.review.verdict !== 'passed' || state.review.signature !== state.signature) {
+  if (imageStudioEvidenceReviewRequired(state)
+    && (!state.review || state.review.verdict !== 'passed' || state.review.signature !== state.signature)) {
     throw new Error('E_IMAGE_REVIEW_PASS_REQUIRED: the exact current evidence needs a passing design review before export.');
   }
   const image = await nativeImageFromPath(state.evidence_path);

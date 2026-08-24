@@ -99,6 +99,9 @@ export function runQualityRegression({
     try {
       const report = validate(dir, {
         enforceSkillRunner: !source.startsWith('marketplace-'),
+        ...(kind === 'skill'
+          ? { source: source === 'marketplace-skill' ? 'marketplace' : 'custom' }
+          : {}),
       });
       const { extreme, medium } = reportCounts(report);
       if (extreme.length) {

@@ -1,8 +1,8 @@
 /**
  * Claude Code backend. Runs `claude -p --output-format stream-json
- * --input-format stream-json --verbose` and feeds a single user
- * message on stdin, then closes stdin. Output is one JSON object per
- * line; we recognize:
+ * --input-format stream-json --verbose` and keeps stdin open for permission
+ * responses, explicit active-turn steering, and self-woken background-task
+ * follow-ups. Output is one JSON object per line; we recognize:
  *
  *   {"type":"system","subtype":"init", session_id, cwd, ...}
  *   {"type":"assistant","message":{ "content":[{type:"text", text}, {type:"tool_use",...}, {type:"thinking",...}] }}
@@ -24,7 +24,7 @@ import {
   StderrTail,
   spawnCli,
   reapCliAfterProtocolTerminal,
-  bindAbort,
+  killProcessTree,
   armKillWatchdog,
   LineSplitter,
   levelOrInfo,
@@ -32,17 +32,40 @@ import {
 
 const log = createLogger('local-agents:claude');
 
+/** Hard cap for one continuous background phase. Foreground model/tool work
+ *  keeps the ordinary runner watchdog; only a protocol result with live tasks
+ *  switches to this deliberately wide, non-sliding budget. */
+export const CLAUDE_BACKGROUND_TIMEOUT_MS = 24 * 60 * 60_000;
+/** Grace for the CLI to answer our `interrupt` before stdin closes. */
+const GRACEFUL_STOP_MS = 2_000;
+
+/** Test/probe override for the background hard cap, mirroring
+ *  ORKAS_LOCAL_AGENT_IDLE_KILL_MS. Bounded and read per run so a harness can
+ *  set it without re-importing the module. */
+function backgroundTimeoutMs(): number {
+  const raw = process.env.ORKAS_LOCAL_AGENT_BACKGROUND_TIMEOUT_MS;
+  const fallback = CLAUDE_BACKGROUND_TIMEOUT_MS;
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 100 && n <= 7 * 24 * 60 * 60_000
+    ? Math.round(n)
+    : fallback;
+}
+
 export const claudeBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildClaudeArgs(opts);
     const child = spawnCli(opts.binPath, args, opts.cwd);
-    const detachAbort = bindAbort(child, opts.signal);
     const tail = new StderrTail();
     const startedAt = Date.now();
 
     let sessionId: string | undefined;
     let exited = false;
+    let closingForTerminal = false;
+    let phase: 'foreground' | 'background' = 'foreground';
+    let doneEmitted = false;
     let resultText = '';
+    const completedTurnTexts: string[] = [];
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
     let resultUsage: Record<string, number | string> | undefined;
@@ -73,11 +96,14 @@ export const claudeBackend: LocalBackend = {
       args,
     });
 
-    const watchdog = armKillWatchdog(child, {
-      timeoutMs: opts.timeoutMs,
-      idleKillMs: opts.idleKillMs,
-      lastEventAt: opts.lastEventAt,
-    });
+    const armForegroundWatchdog = (): ReturnType<typeof armKillWatchdog> => {
+      return armKillWatchdog(child, {
+        timeoutMs: opts.timeoutMs,
+        idleKillMs: opts.idleKillMs,
+        lastEventAt: opts.lastEventAt,
+      });
+    };
+    let watchdog = armForegroundWatchdog();
 
     // Serialize user messages and control responses through one writer. Claude
     // Code's stream-json stdin is a multiplexed protocol; concurrent writes
@@ -133,6 +159,203 @@ export const claudeBackend: LocalBackend = {
         },
       };
       try { opts.onActiveRunIngress?.(ingress); } catch { /* host already gone */ }
+    };
+
+    // ---- background tasks inside one continuous host turn ----------------
+    // Closing stdin on Claude's first `result` destroys any task it left in the
+    // background. Ending the host turn there is equally wrong: it clears the
+    // bus AbortController, ends loading, and lets the renderer drain the next
+    // queued message while Claude is still working. Keep one run/turn instead.
+    // A Set is sufficient because Claude may report one retirement twice and
+    // delete is naturally idempotent.
+    const liveTasks = new Set<string>();
+    const liveTaskDetails = new Map<string, { taskType?: string; message?: string }>();
+    const trackTask = (event: LocalEvent): void => {
+      if (event.type !== 'status') return;
+      const status = String(event.status || '');
+      const taskId = String(event.taskId || '').trim();
+      // A record with no id could never be retired and would wait forever.
+      if (!taskId || !status.startsWith('background-')) return;
+      if (status === 'background-started' || status === 'background-running') {
+        liveTasks.add(taskId);
+        const previous = liveTaskDetails.get(taskId) || {};
+        const taskType = String(event.taskType || '').trim();
+        const message = String(event.message || '').trim();
+        liveTaskDetails.set(taskId, {
+          ...(taskType ? { taskType } : previous.taskType ? { taskType: previous.taskType } : {}),
+          ...(message ? { message } : previous.message ? { message: previous.message } : {}),
+        });
+      } else {
+        liveTasks.delete(taskId);
+        liveTaskDetails.delete(taskId);
+      }
+    };
+    let backgroundTimer: NodeJS.Timeout | null = null;
+    let gracefulStopTimer: NodeJS.Timeout | null = null;
+    let stopping = false;
+    let backgroundTimedOut = false;
+    let backgroundRegistered = false;
+
+    const clearBackgroundTimer = (): void => {
+      if (backgroundTimer) {
+        clearTimeout(backgroundTimer);
+        backgroundTimer = null;
+      }
+    };
+
+    let interrupts = 0;
+    const sendInterrupt = (): Promise<void> => {
+      interrupts += 1;
+      return writeInputRecord({
+        type: 'control_request',
+        request_id: `orkas-interrupt-${startedAt}-${interrupts}`,
+        request: { subtype: 'interrupt' },
+      }).catch(() => { /* stdin already gone; callers have their own fallback */ });
+    };
+
+    /** Ask the CLI to settle in-flight inference and persist a clean session
+     *  state, then reap on the existing path. A process SIGTERM'd mid-turn
+     *  leaves a half-written session that swallows the user's next message on
+     *  resume; the interrupt is what avoids that. */
+    const gracefulStop = (reason: string): void => {
+      if (stopping || exited) return;
+      stopping = true;
+      clearBackgroundTimer();
+      watchdog.disarm();
+      log.info('claude background run stopping', {
+        reason, durationMs: Date.now() - startedAt, liveTasks: liveTasks.size,
+      });
+      void sendInterrupt();
+      gracefulStopTimer = setTimeout(
+        () => reapCliAfterProtocolTerminal(child),
+        GRACEFUL_STOP_MS,
+      );
+      if (typeof gracefulStopTimer.unref === 'function') gracefulStopTimer.unref();
+    };
+
+    /** User Stop is stronger than a phase timeout: send Claude its protocol
+     *  interrupt and close stdin, but also terminate the entire process tree so
+     *  a background shell cannot survive after Orkas reports cancellation. */
+    const abortNow = (): void => {
+      if (stopping || exited) return;
+      stopping = true;
+      clearBackgroundTimer();
+      watchdog.disarm();
+      log.info('claude run aborted', {
+        phase, durationMs: Date.now() - startedAt, liveTasks: liveTasks.size,
+      });
+      let interruptGrace: NodeJS.Timeout | null = null;
+      let terminated = false;
+      const terminateTree = (): void => {
+        if (terminated) return;
+        terminated = true;
+        if (interruptGrace) clearTimeout(interruptGrace);
+        try { child.stdin.end(); } catch { /* already closed */ }
+        killProcessTree(child, 'SIGTERM');
+        const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
+        if (typeof hardKill.unref === 'function') hardKill.unref();
+      };
+      // Let the small protocol interrupt reach Claude first so it can persist a
+      // resumable session, but never let stdin backpressure delay Stop beyond a
+      // short bounded grace before the process-tree signal wins.
+      void sendInterrupt().finally(terminateTree);
+      interruptGrace = setTimeout(terminateTree, 100);
+      if (typeof interruptGrace.unref === 'function') interruptGrace.unref();
+    };
+
+    const onAbort = (): void => abortNow();
+    if (opts.signal.aborted) onAbort();
+    else opts.signal.addEventListener('abort', onAbort, { once: true });
+    const detachAbort = (): void => opts.signal.removeEventListener('abort', onAbort);
+
+    /** Exactly one terminal event per run, at the true end of the continuous
+     *  foreground/background turn. */
+    const emitDone = (
+      status: 'completed' | 'failed' | 'cancelled' | 'timeout',
+      extra: Partial<LocalEvent> = {},
+    ): void => {
+      if (doneEmitted) return;
+      doneEmitted = true;
+      opts.onEvent({
+        type: 'done',
+        status,
+        durationMs: Date.now() - startedAt,
+        sessionId,
+        ...extra,
+      });
+    };
+
+    const isForegroundActivity = (event: LocalEvent): boolean => {
+      if (
+        event.type === 'text-delta'
+        || event.type === 'thinking'
+        || event.type === 'tool-event'
+        || event.type === 'permission-request'
+      ) return true;
+      if (event.type !== 'status') return false;
+      const status = String(event.status || '').toLowerCase();
+      return [
+        'running', 'retrying', 'usage', 'authenticating', 'rate-limit',
+        'waiting-approval', 'waiting-input',
+      ].includes(status);
+    };
+
+    const enterForeground = (): void => {
+      if (phase === 'foreground' || stopping || exited) return;
+      phase = 'foreground';
+      clearBackgroundTimer();
+      watchdog.disarm();
+      // This is a new foreground epoch. The old foreground wall-clock and idle
+      // ages are deliberately not inherited from the background wait.
+      watchdog = armForegroundWatchdog();
+      log.info('claude background run resumed foreground', {
+        durationMs: Date.now() - startedAt,
+        liveTasks: liveTasks.size,
+      });
+    };
+
+    const enterBackground = (): void => {
+      if (phase === 'background' || stopping || exited) return;
+      phase = 'background';
+      watchdog.disarm();
+      const timeoutMs = backgroundTimeoutMs();
+      backgroundTimer = setTimeout(() => {
+        backgroundTimedOut = true;
+        gracefulStop('background timeout');
+      }, timeoutMs);
+      if (typeof backgroundTimer.unref === 'function') backgroundTimer.unref();
+      log.info('claude run entered background phase', {
+        timeoutMs,
+        liveTasks: liveTasks.size,
+      });
+      // App shutdown still needs an addressable stop handle. Unlike the old
+      // post-turn handoff, this does not end the host turn or transfer event
+      // ownership; run() remains pending until the real terminal boundary.
+      if (!backgroundRegistered) {
+        backgroundRegistered = true;
+        try {
+          opts.onBackgroundRun?.({
+            untilProcessExit: new Promise<void>(resolve => {
+              child.once('close', () => resolve());
+            }),
+            stop: gracefulStop,
+            liveTasks: () => liveTasks.size,
+          });
+        } catch (err) {
+          log.warn('claude background stop registration rejected by host', {
+            error: logErrorSummary(err),
+          });
+        }
+      }
+    };
+
+    /** Every stream event stays on the same host turn. A real model/tool event
+     *  after a background result is the phase boundary that restores the
+     *  ordinary foreground watchdog with fresh clocks. */
+    const emit = (event: LocalEvent): void => {
+      trackTask(event);
+      opts.onEvent(event);
+      if (phase === 'background' && isForegroundActivity(event)) enterForeground();
     };
 
     // Build and send the single user message, but keep stdin OPEN —
@@ -207,8 +430,8 @@ export const claudeBackend: LocalBackend = {
           //     "Orkas shows less than the terminal" symptom users
           //     reported. Raw-line renders as a kind-meta row in the
           //     process rail.
-          if (!sessionId) opts.onEvent({ type: 'text-delta', text: trimmed + '\n' });
-          else opts.onEvent({ type: 'raw-line', line: trimmed });
+          if (!sessionId) emit({ type: 'text-delta', text: trimmed + '\n' });
+          else emit({ type: 'raw-line', line: trimmed });
           return;
         }
         // Side-channel: control_request needs a stdin write back AND a
@@ -216,7 +439,7 @@ export const claudeBackend: LocalBackend = {
         // stays a pure translator (no I/O, easier to unit-test).
         if (obj?.type === 'control_request') {
           respondToControlRequest(obj);
-          opts.onEvent({
+          emit({
             type: 'permission-request',
             id: String(obj.request_id || ''),
             tool: String(obj?.request?.tool_name || ''),
@@ -237,7 +460,7 @@ export const claudeBackend: LocalBackend = {
           const inc = extractClaudeUsage({ usage: obj.message.usage, message: { model: obj.message.model } });
           if (inc) {
             accUsage = mergeUsage(accUsage, inc);
-            opts.onEvent({ type: 'status', status: 'usage', usage: accUsage });
+            emit({ type: 'status', status: 'usage', usage: accUsage });
           }
         }
         const ev = mapClaudeEvent(obj, sessionId, partialState);
@@ -246,31 +469,74 @@ export const claudeBackend: LocalBackend = {
         if (obj?.session_id && !sessionId) sessionId = String(obj.session_id);
         if (!hadSession && sessionId) publishActiveIngress(true);
         if (ev?.events) {
-          for (const event of ev.events) opts.onEvent(event);
+          for (const event of ev.events) emit(event);
         } else if (ev?.event) {
-          opts.onEvent(ev.event);
+          emit(ev.event);
         }
         if (ev?.terminal) {
           resultStatus = ev.terminal.status;
           resultText = ev.terminal.text;
+          // Preserve each canonical result exactly as Claude returned it. The
+          // multi-phase join adds only the boundary between turns; ordinary
+          // one-result runs must not acquire a whitespace normalization.
+          if (resultText.trim()) completedTurnTexts.push(resultText);
           resultError = ev.terminal.error;
           resultUsage = ev.terminal.usage as typeof resultUsage;
-          finishRun(resultStatus, {
-            output: resultText,
+          const combinedOutput = completedTurnTexts.join('\n\n');
+          const terminalExtra = {
+            output: combinedOutput,
             ...(resultError ? { error: resultError, stderrTail: tail.toString() } : {}),
             ...(resultUsage || accUsage ? { usage: resultUsage || accUsage } : {}),
-          });
-          // The result record is the authoritative terminal boundary. Do not
-          // keep Orkas loading while a background task or inherited stdio pipe
-          // delays the CLI process's close event.
-          reapCliAfterProtocolTerminal(child);
+          };
+          // Partial-message support is turn-scoped inside one long-lived
+          // stream-json process. A later self-woken turn may fall back to full
+          // assistant blocks even when the previous turn streamed deltas.
+          partialState.sawTextStreamEvent = false;
+          if (liveTasks.size > 0) {
+            enterBackground();
+            // `result` would otherwise be the latest activity row. Reassert the
+            // phase after it so the always-visible label tells the user why the
+            // reply remains loading even when Claude emits no task_progress.
+            const activeTaskId = liveTasks.values().next().value as string | undefined;
+            const activeTask = activeTaskId ? liveTaskDetails.get(activeTaskId) : undefined;
+            emit({
+              type: 'status',
+              status: 'background-running',
+              taskId: activeTaskId,
+              ...(activeTask?.taskType ? { taskType: activeTask.taskType } : {}),
+              ...(activeTask?.message ? { message: activeTask.message } : {}),
+            });
+          } else {
+            closingForTerminal = true;
+            if (opts.signal.aborted) {
+              finishRun('cancelled');
+            } else if (backgroundTimedOut) {
+              finishRun('timeout', {
+                error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
+                timeoutPhase: 'background',
+                stderrTail: tail.toString(),
+              });
+            } else if (watchdog.fired()) {
+              finishRun('timeout', {
+                error: `claude ${watchdog.reason()}`,
+                timeoutPhase: 'foreground',
+                stderrTail: tail.toString(),
+              });
+            } else {
+              finishRun(resultStatus, terminalExtra);
+            }
+            // The result record is the authoritative terminal boundary. Do not
+            // keep Orkas loading while an inherited stdio pipe delays the CLI
+            // process's close event.
+            reapCliAfterProtocolTerminal(child);
+          }
         }
       });
     });
     child.stdout.on('end', () => splitter.flush(line => {
       if (exited) return;
       const trimmed = line.trim();
-      if (trimmed) opts.onEvent({ type: 'text-delta', text: trimmed });
+      if (trimmed) emit({ type: 'text-delta', text: trimmed });
     }));
 
     child.stderr.setEncoding('utf8');
@@ -279,7 +545,7 @@ export const claudeBackend: LocalBackend = {
       tail.push(chunk);
       // Emit one event per stderr line so live UI can show progress.
       for (const line of chunk.split(/\r?\n/)) {
-        if (line) opts.onEvent({ type: 'stderr-line', line });
+        if (line) emit({ type: 'stderr-line', line });
       }
     });
 
@@ -288,16 +554,14 @@ export const claudeBackend: LocalBackend = {
         if (exited) return;
         publishActiveIngress(false);
         exited = true;
+        clearBackgroundTimer();
+        if (gracefulStopTimer) {
+          clearTimeout(gracefulStopTimer);
+          gracefulStopTimer = null;
+        }
         watchdog.disarm();
         detachAbort();
-        const durationMs = Date.now() - startedAt;
-        opts.onEvent({
-          type: 'done',
-          status,
-          durationMs,
-          sessionId,
-          ...extra,
-        });
+        emitDone(status, extra);
         resolve();
       };
       finishRun = finish;
@@ -307,15 +571,34 @@ export const claudeBackend: LocalBackend = {
         finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
       });
       child.on('close', code => {
+        if (backgroundRegistered) {
+          log.info('claude background process closed', {
+            code, stopping, durationMs: Date.now() - startedAt, liveTasks: liveTasks.size,
+          });
+        }
         if (opts.signal.aborted) return finish('cancelled');
-        if (watchdog.fired()) return finish('timeout', { error: `claude ${watchdog.reason()}`, stderrTail: tail.toString() });
-        if (code === 0 && resultStatus === 'completed') {
-          return finish('completed', { output: resultText, usage: resultUsage });
+        if (backgroundTimedOut) {
+          return finish('timeout', {
+            error: `claude timed out: exceeded ${backgroundTimeoutMs()}ms background cap`,
+            timeoutPhase: 'background',
+            stderrTail: tail.toString(),
+          });
+        }
+        if (watchdog.fired()) {
+          return finish('timeout', {
+            error: `claude ${watchdog.reason()}`,
+            timeoutPhase: 'foreground',
+            stderrTail: tail.toString(),
+          });
+        }
+        const combinedOutput = completedTurnTexts.join('\n\n');
+        if ((code === 0 || closingForTerminal) && resultStatus === 'completed') {
+          return finish('completed', { output: combinedOutput, usage: resultUsage });
         }
         // Non-zero exit OR result subtype indicated error — surface tail.
         const err = resultError
           || (code !== 0 ? `claude exited with code ${code}` : 'claude reported error in result');
-        finish('failed', { error: err, output: resultText, stderrTail: tail.toString(), usage: resultUsage });
+        finish('failed', { error: err, output: combinedOutput, stderrTail: tail.toString(), usage: resultUsage });
       });
     });
   },
@@ -551,11 +834,16 @@ export function mapClaudeEvent(
     const info = obj.rate_limit_info && typeof obj.rate_limit_info === 'object'
       ? obj.rate_limit_info
       : {};
+    const rateLimitStatus = String(info.status || '').trim().toLowerCase();
     return {
       event: {
         type: 'status',
-        status: 'rate-limit',
-        rateLimitStatus: String(info.status || ''),
+        // Claude emits this event whenever its rate-limit information changes,
+        // including allowed and early-warning states. Only `rejected` means
+        // the current request cannot continue; keep every other state in the
+        // persisted usage stream without painting a user-facing warning.
+        status: rateLimitStatus === 'rejected' ? 'rate-limit' : 'usage',
+        rateLimitStatus,
         resetsAt: finiteNonNegativeNumber(info.resetsAt),
         utilization: finiteNonNegativeNumber(info.utilization),
       },
@@ -654,13 +942,23 @@ export function mapClaudeEvent(
           : Array.isArray(part.content)
             ? part.content.filter((c: any) => c?.type === 'text').map((c: any) => c.text).join('\n')
             : '';
+        const callId = String(part.tool_use_id || '');
         events.push({
             type: 'tool-event',
             tool: 'tool_result',
-            callId: String(part.tool_use_id || ''),
+            callId,
             phase: 'result',
             output: out,
         });
+        const mediaItems = claudeToolResultImages(part.content);
+        if (mediaItems.length) {
+          events.push({
+            type: 'media-output',
+            source: 'claude',
+            callId,
+            items: mediaItems,
+          });
+        }
       }
     }
     return packClaudeEvents(events);
@@ -705,6 +1003,23 @@ function packClaudeEvents(events: LocalEvent[]): undefined | { event: LocalEvent
   return events.length === 1
     ? { event: events[0] }
     : { event: events[0], events };
+}
+
+function claudeToolResultImages(raw: unknown): Array<Record<string, string>> {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((block): Array<Record<string, string>> => {
+    if (!block || typeof block !== 'object' || block.type !== 'image') return [];
+    const source = block.source;
+    if (!source || typeof source !== 'object') return [];
+    const mediaType = typeof source.media_type === 'string' ? source.media_type.trim() : '';
+    if (source.type === 'base64' && typeof source.data === 'string' && source.data.trim()) {
+      return [{ data: source.data.trim(), ...(mediaType ? { mediaType } : {}) }];
+    }
+    if (source.type === 'url' && typeof source.url === 'string' && source.url.trim()) {
+      return [{ uri: source.url.trim(), ...(mediaType ? { mediaType } : {}) }];
+    }
+    return [];
+  });
 }
 
 function finiteNonNegativeNumber(value: unknown): number | undefined {

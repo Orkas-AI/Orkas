@@ -930,6 +930,7 @@ describe('queued message dispatch ownership', () => {
 
     expect(JSON.parse(context.apiFetch.mock.calls[0][1].body)).toEqual({
       ...expected,
+      steer_active_turn: true,
     });
   });
 
@@ -971,15 +972,17 @@ describe('queued message dispatch ownership', () => {
       },
     },
     {
-      label: 'a Skill',
+      label: 'a source-aware Skill',
       item: {
         content: 'use Review',
         recipient: { kind: 'commander', id: '', name: '' },
-        extra: { use_selections: [{ kind: 'skill', id: 'review', name: 'Review' }] },
+        extra: {
+          use_selections: [{ kind: 'skill', id: 'review', name: 'Review', source: 'global' }],
+        },
       },
       expected: {
         content: 'use Review',
-        use_selections: [{ kind: 'skill', id: 'review', name: 'Review' }],
+        use_selections: [{ kind: 'skill', id: 'review', name: 'Review', source: 'global' }],
       },
     },
     {
@@ -1018,6 +1021,7 @@ describe('queued message dispatch ownership', () => {
     await vi.waitFor(() => expect(context.messageQueues.get('conversation-a')).toEqual([]));
     expect(JSON.parse(context.apiFetch.mock.calls[0][1].body)).toEqual({
       ...expected,
+      steer_active_turn: true,
     });
   });
 
@@ -1137,6 +1141,7 @@ describe('queued message dispatch ownership', () => {
     const body = JSON.parse(context.apiFetch.mock.calls[0][1].body);
     expect(body).toEqual({
       content: '@reviewer add this constraint',
+      steer_active_turn: true,
     });
     expect(context._renderOrClaimPersistedUserMessage)
       .toHaveBeenCalledWith('conversation-a', persisted);
@@ -1186,18 +1191,60 @@ describe('queued message dispatch ownership', () => {
     expect(context._trackChatSendResult).not.toHaveBeenCalled();
   });
 
-  it('renders the eligible send action before edit and enforces eligibility again on click', () => {
-    const source = fs.readFileSync(
-      path.join(__dirname, '../../src/renderer/modules/queue-draft.js'),
-      'utf8',
-    );
-    const sendAt = source.indexOf('data-act="send"');
-    const editAt = source.indexOf('data-act="edit"', sendAt);
+  it('keeps a previously eligible row queued when its active turn changes before click', () => {
+    const { context, activeTurnsByCid } = loadQueueDraft();
+    context.currentCid = 'conversation-a';
+    context.isConvPending = vi.fn(() => true);
+    const item = {
+      id: 'q-raced',
+      content: 'apply this to the live review',
+      recipient: { kind: 'agent', id: 'reviewer', name: 'Reviewer' },
+    };
+    context.messageQueues.set('conversation-a', [item]);
+    activeTurnsByCid.set('conversation-a', [{
+      actor: 'reviewer', turn_id: 'turn-before-click', steerable: true,
+    }]);
 
-    expect(sendAt).toBeGreaterThan(-1);
-    expect(editAt).toBeGreaterThan(sendAt);
-    expect(source).toContain("if (!cid || !qid || _isQueueItemEditing(cid) || _queueDispatching.has(cid)) return false;");
-    expect(source).toContain("if (!next || !_canSendQueueItemIntoActiveTurn(cid, next)) return false;");
+    expect(context._canSendQueueItemIntoActiveTurn('conversation-a', item)).toBe(true);
+
+    activeTurnsByCid.set('conversation-a', [{
+      actor: 'writer', turn_id: 'turn-at-click', steerable: true,
+    }]);
+
+    expect(context.sendQueuedMessageNow('conversation-a', 'q-raced')).toBe(false);
+    expect(context.apiFetch).not.toHaveBeenCalled();
+    expect(context.messageQueues.get('conversation-a')).toEqual([item]);
+  });
+
+  it('does not let queued metadata downgrade a successful Send now authorization', async () => {
+    const { context, activeTurnsByCid } = loadQueueDraft();
+    context.currentCid = 'conversation-a';
+    context.isConvPending = vi.fn(() => true);
+    activeTurnsByCid.set('conversation-a', [{
+      actor: 'commander', turn_id: 'turn-live', steerable: true,
+    }]);
+    context.apiFetch = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        ok: true,
+        msg: { id: 'user-now', from: 'user', text: 'apply now', ts: '2026-08-01T12:00:00.000Z' },
+      }),
+    }));
+    context.messageQueues.set('conversation-a', [{
+      id: 'q-stale-control',
+      content: 'apply now',
+      recipient: { kind: 'commander', id: '', name: '' },
+      extra: { steer_active_turn: false },
+    }]);
+
+    expect(context.sendQueuedMessageNow('conversation-a', 'q-stale-control')).toBe(true);
+    await vi.waitFor(() => expect(context.apiFetch).toHaveBeenCalledTimes(1));
+
+    expect(JSON.parse(context.apiFetch.mock.calls[0][1].body)).toEqual({
+      content: 'apply now',
+      steer_active_turn: true,
+    });
   });
 
   it('dispatches an idle background queue to its owning conversation', () => {

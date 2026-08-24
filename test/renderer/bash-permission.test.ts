@@ -41,7 +41,7 @@ function loadHarness(
         'bash.permission.action_message': '{agent} wants {operation}, which {reasons}:',
         'bash.permission.action_fallback': 'local action',
         'bash.permission.mode_title': 'Permission level',
-        'bash.permission.mode_hint': 'You can change this in Settings - General - Tool Execution Access.',
+        'bash.permission.mode_hint': 'You can change this in Settings - General - Local operation permissions.',
         'bash.permission.allow_always': 'Always allow',
         'bash.permission.allow_once': 'Allow once',
         'bash.permission.allow_run': 'Allow for this task',
@@ -49,6 +49,10 @@ function loadHarness(
         'bash.permission.agent_fallback': 'The assistant',
         'chat.from_commander': 'Commander',
         'bash.permission.reason.network_egress': 'network',
+        'bash.permission.reason.system_package_change': 'changes system packages',
+        'bash.permission.reason.external_mutation': 'changes an external system',
+        'bash.permission.external_operations': 'Detected:\n{operations}',
+        'bash.permission.external_kind.service_change': 'Service change',
         'bash.permission.reason_sep': ', ',
         'settings.localexec.mode.workspace_approval': 'Cautious',
         'settings.localexec.mode.workspace_approval_desc': 'Workspace files only, confirm sensitive actions',
@@ -113,7 +117,7 @@ describe('renderer bash permission prompt', () => {
     expect(code).toContain('${caretHtml}');
   });
 
-  it('renders permission levels + settings hint and persists all_files_auto before allowing', async () => {
+  it('shows an exact-command decision without task-level or permission-mode controls', async () => {
     const h = loadHarness({ choice: 'allow_once', mode: 'all_files_auto' });
 
     h.pushHandler({
@@ -127,26 +131,20 @@ describe('renderer bash permission prompt', () => {
 
     expect(h.dialogArgs[0]).toMatchObject({
       currentMode: 'all_files_approval',
-      modeTitle: 'Permission level',
-      modeHint: 'You can change this in Settings - General - Tool Execution Access.',
+      allowRun: false,
+      showModeControl: false,
     });
     expect(h.dialogArgs[0].message).toContain('Commander wants network:');
-    expect(h.dialogArgs[0].modes).toEqual([
-      expect.objectContaining({ mode: 'workspace_approval', label: 'Cautious' }),
-      expect.objectContaining({ mode: 'all_files_approval', label: 'Standard' }),
-      expect.objectContaining({ mode: 'all_files_auto', label: 'Trusted' }),
-    ]);
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
-      { channel: 'permissions.setLocalExecMode', payload: { mode: 'all_files_auto' } },
       { channel: 'bash.permission_response', payload: { request_id: 'req-1', decision: 'allow_once' } },
     ]);
     expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
       result: 'success',
       decision: 'allow_once',
       effective_decision: 'allow_once',
-      mode: 'all_files_auto',
-      mode_changed: true,
+      mode: 'all_files_approval',
+      mode_changed: false,
       categories: 'network_egress',
       duration_ms: expect.any(Number),
     }));
@@ -217,31 +215,89 @@ describe('renderer bash permission prompt', () => {
     });
   });
 
-  it('persists the selected permission level before allowing once', async () => {
-    const h = loadHarness({ choice: 'allow_once', mode: 'workspace_approval' });
+  it.each([
+    'network_egress',
+    'destructive',
+    'priv_esc',
+    'sensitive_path',
+    'system_package_change',
+    'external_mutation',
+  ] as const)('narrows a stale task-level approval to one command for %s', async (reason) => {
+    const h = loadHarness({ choice: 'allow_run', mode: 'workspace_approval' });
 
     h.pushHandler({
-      request_id: 'req-mode',
+      request_id: `req-${reason}`,
       agent_name: 'Agent',
-      operation: 'read_file',
-      subject: '/Users/me/.ssh/id_rsa',
-      reasons: ['network_egress'],
+      command: 'sensitive command',
+      reasons: [reason],
     });
     await flush();
 
+    expect(h.dialogArgs[0]).toMatchObject({ allowRun: false, showModeControl: false });
     expect(h.invokeCalls).toEqual([
       { channel: 'permissions.getLocalExec', payload: undefined },
-      { channel: 'permissions.setLocalExecMode', payload: { mode: 'workspace_approval' } },
-      { channel: 'bash.permission_response', payload: { request_id: 'req-mode', decision: 'allow_once' } },
+      { channel: 'bash.permission_response', payload: { request_id: `req-${reason}`, decision: 'allow_once' } },
     ]);
     expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
       result: 'success',
-      decision: 'allow_once',
+      decision: 'allow_run',
       effective_decision: 'allow_once',
-      mode: 'workspace_approval',
-      mode_changed: true,
+      mode: 'all_files_approval',
+      mode_changed: false,
     }));
   });
+
+  it.each(['allow_run', 'allow_always'])(
+    'offers only one-time approval for system package changes even when a stale UI returns %s',
+    async (legacyChoice) => {
+      const h = loadHarness({ choice: legacyChoice, mode: 'all_files_auto' });
+
+      h.pushHandler({
+        request_id: 'req-system-package',
+        agent_name: 'Agent',
+        command: 'winget install PostgreSQL.PostgreSQL',
+        reasons: ['system_package_change'],
+      });
+      await flush();
+
+      expect(h.dialogArgs[0]).toMatchObject({
+        allowRun: false,
+        showModeControl: false,
+      });
+      expect(h.dialogArgs[0].message).toContain('changes system packages');
+      expect(h.invokeCalls).toEqual([
+        { channel: 'permissions.getLocalExec', payload: undefined },
+        { channel: 'bash.permission_response', payload: { request_id: 'req-system-package', decision: 'allow_once' } },
+      ]);
+    },
+  );
+
+  it.each(['allow_run', 'allow_always'])(
+    'offers only one-time approval for external mutations even when a stale UI returns %s',
+    async (legacyChoice) => {
+      const h = loadHarness({ choice: legacyChoice, mode: 'all_files_auto' });
+
+      h.pushHandler({
+        request_id: 'req-external-mutation',
+        agent_name: 'Agent',
+        command: 'ssh deploy@app "systemctl restart api"',
+        reasons: ['network_egress', 'external_mutation'],
+        external_mutations: [{ kind: 'service_change', action: 'restart', target: 'api' }],
+      });
+      await flush();
+
+      expect(h.dialogArgs[0]).toMatchObject({
+        allowRun: false,
+        showModeControl: false,
+      });
+      expect(h.dialogArgs[0].message).toContain('changes an external system');
+      expect(h.dialogArgs[0].message).toContain('Detected:\nService change · restart · api');
+      expect(h.invokeCalls).toEqual([
+        { channel: 'permissions.getLocalExec', payload: undefined },
+        { channel: 'bash.permission_response', payload: { request_id: 'req-external-mutation', decision: 'allow_once' } },
+      ]);
+    },
+  );
 
   it('does not persist a changed level when the user denies the request', async () => {
     const h = loadHarness({ choice: 'deny', mode: 'all_files_auto' });
@@ -258,34 +314,6 @@ describe('renderer bash permission prompt', () => {
       { channel: 'permissions.getLocalExec', payload: undefined },
       { channel: 'bash.permission_response', payload: { request_id: 'req-deny', decision: 'deny' } },
     ]);
-  });
-
-  it('denies the request when a selected permission level cannot be persisted', async () => {
-    const h = loadHarness({ choice: 'allow_once', mode: 'all_files_auto' }, async (channel) => {
-      if (channel === 'permissions.getLocalExec') return { ok: true, mode: 'all_files_approval' };
-      if (channel === 'permissions.setLocalExecMode') return { ok: false };
-      return { handled: true };
-    });
-
-    h.pushHandler({
-      request_id: 'req-2',
-      agent_name: 'Agent',
-      command: 'curl https://example.com',
-      reasons: ['network_egress'],
-    });
-    await flush();
-
-    expect(h.invokeCalls).toEqual([
-      { channel: 'permissions.getLocalExec', payload: undefined },
-      { channel: 'permissions.setLocalExecMode', payload: { mode: 'all_files_auto' } },
-      { channel: 'bash.permission_response', payload: { request_id: 'req-2', decision: 'deny' } },
-    ]);
-    expect(h.monitorEvent).toHaveBeenCalledWith('bash_risk_prompt_result', expect.objectContaining({
-      result: 'success',
-      decision: 'allow_once',
-      effective_decision: 'deny',
-      mode_changed: false,
-    }));
   });
 
   it('marks a verdict cancelled when main reports that the request is stale', async () => {

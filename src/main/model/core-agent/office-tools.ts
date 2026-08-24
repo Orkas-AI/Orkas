@@ -5,7 +5,7 @@
  * one, zero-config, cross-platform (incl. Windows), no MS Office installed.
  *
  * Tools: `create_docx`, `create_xlsx`, `create_pptx` (create → batch-fill →
- * first-page PNG preview) and `office_render` (preview an existing doc). They
+ * first-page PNG preview) and `office_review` (validate/render an existing doc). They
  * follow the same conventions as `local-tools.ts`: re-read the local-execution
  * permission on every call, path-sandbox to the conversation's scope,
  * uniquify-on-collision, and fire `onFileWritten` so the produced-file chip
@@ -17,7 +17,6 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult, ToolResultImage } from '#core-agent';
-import { getLocalExecGranted } from '../../features/permissions';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
@@ -28,10 +27,10 @@ import { renderOfficePageToPng } from '../../features/office/office_page_rendere
 import {
   buildDocxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, serializeOfficeBatch,
   type DocxParagraphSpec, type DocxTableSpec, type DocxImageSpec,
-  type XlsxCell, type XlsxSheetSpec, type PptxSlideSpec, type PptxImageSpec,
+  buildXlsxCellProps, type XlsxCell, type XlsxCellProperties, type XlsxSheetSpec,
+  type PptxSlideSpec, type PptxImageSpec,
   type EditOp, type OfficeBatchOp, OfficeEditInputError,
 } from './office-batch';
-import { DENY_MESSAGE } from './local-tools';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { auditPptxContrast } from './pptx-contrast';
@@ -48,6 +47,16 @@ function sha256File(file: string): string {
 
 function shortRevision(sha256: string): string {
   return sha256.replace(/^sha256:/, '').slice(0, 16);
+}
+
+/** Stable model-visible identity for the artifact that now exists on disk.
+ * Keep the surrounding prose for older clients while giving every model one
+ * unambiguous path/revision pair to reuse for review, edit, and publication. */
+function renderOfficeArtifactReceipt(file: string): string {
+  return `\n<office-artifact>${JSON.stringify({
+    artifact_path: path.resolve(file),
+    artifact_revision: shortRevision(sha256File(file)),
+  })}</office-artifact>`;
 }
 
 function officeIssueCount(value: unknown): number | null {
@@ -75,10 +84,6 @@ export interface OfficeToolsOpts {
   /** True when the path was already produced by this caller this turn →
    *  overwrite in place instead of uniquifying. */
   hasProducedPath?: (absPath: string) => boolean;
-}
-
-function deniedResult(): ToolResult {
-  return { content: DENY_MESSAGE, isError: true };
 }
 
 function errResult(code: string, msg: string): ToolResult {
@@ -239,6 +244,72 @@ function xlsxTablePlacementError(operations: readonly EditOp[]): string | null {
   return null;
 }
 
+const XLSX_CELL_WRAPPER_PATH = /\/cell\[[^\]]+\](?:\/|$)/i;
+const XLSX_A1_LIKE_TAIL = /^[A-Za-z]+[0-9]+(?::[A-Za-z]+[0-9]+)?$/;
+const XLSX_A1_TAIL = /^([A-Za-z]{1,3})([1-9][0-9]*)(?::([A-Za-z]{1,3})([1-9][0-9]*))?$/;
+const XLSX_MAX_ROW = 1_048_576;
+const XLSX_MAX_COLUMN = 16_384; // XFD
+
+function xlsxColumnNumber(column: string): number {
+  let value = 0;
+  for (const char of column.toUpperCase()) value = value * 26 + char.charCodeAt(0) - 64;
+  return value;
+}
+
+function xlsxA1TailError(tail: string): string | null {
+  if (!XLSX_A1_LIKE_TAIL.test(tail)) return null;
+  const match = tail.match(XLSX_A1_TAIL);
+  if (!match) return `invalid XLSX cell path segment \`${tail}\``;
+  const [, startColumn, startRow, endColumn, endRow] = match;
+  const invalid = xlsxColumnNumber(startColumn) > XLSX_MAX_COLUMN
+    || Number(startRow) > XLSX_MAX_ROW
+    || (!!endColumn && xlsxColumnNumber(endColumn) > XLSX_MAX_COLUMN)
+    || (!!endRow && Number(endRow) > XLSX_MAX_ROW);
+  return invalid ? `XLSX cell path segment \`${tail}\` is outside A1:XFD1048576` : null;
+}
+
+/** Validate only XLSX-specific cell addressing while leaving sheet, table,
+ * chart, picture, row, and column paths to OfficeCLI. Ordinary cell targets
+ * use `/Sheet/A1` (or an A1 range); the XML-like `/cell[A1]` form is never a
+ * valid stable XLSX path. */
+function xlsxTargetPathError(target: unknown): string | null {
+  if (typeof target !== 'string' || !target) return null;
+  if (XLSX_CELL_WRAPPER_PATH.test(target)) {
+    return `XLSX cells use an A1 path such as \`/Sheet1/A2\`; do not use \`/Sheet1/cell[A2]\``;
+  }
+  const tail = target.split('/').filter(Boolean).at(-1) || '';
+  return xlsxA1TailError(tail);
+}
+
+function xlsxEditContractError(operations: readonly EditOp[]): string | null {
+  for (const [index, operation] of operations.entries()) {
+    const target = operation.action === 'add' ? operation.parent : operation.path;
+    const pathError = xlsxTargetPathError(target);
+    if (pathError) return `operations[${index}]: ${pathError}`;
+    if (
+      operation.action === 'add'
+      && operation.type === 'cell'
+      && operation.props
+      && Object.prototype.hasOwnProperty.call(operation.props, 'cell')
+    ) {
+      return `operations[${index}]: XLSX cell placement belongs in the parent A1 path, e.g. \`parent:"/Sheet1/A2"\`; do not use \`props.cell\`. For an ordinary write, prefer \`action:"set"\` with \`path:"/Sheet1/A2"\`.`;
+    }
+  }
+  return null;
+}
+
+function normalizeXlsxCellSetOperations(operations: readonly EditOp[]): EditOp[] {
+  return operations.map((operation) => {
+    if (operation.action !== 'set' || !operation.props) return operation;
+    const tail = operation.path.split('/').filter(Boolean).at(-1) || '';
+    if (!XLSX_A1_TAIL.test(tail)) return operation;
+    return {
+      ...operation,
+      props: buildXlsxCellProps(operation.props as XlsxCellProperties, { allowEmptyValue: true }),
+    };
+  });
+}
+
 function editedCopyPath(source: string): string {
   const ext = path.extname(source);
   return path.join(path.dirname(source), `${path.basename(source, ext)}-edited${ext}`);
@@ -360,7 +431,8 @@ async function runCreate(
 
     const n = args.unitCount;
     const base = `${args.noun} created: ${finalPath} (${n} ${args.unit}${n === 1 ? '' : 's'})`;
-    const content = renamed ? `${base}${renderRenameSignal(args.inputAbs, finalPath)}` : base;
+    const renameSignal = renamed ? renderRenameSignal(args.inputAbs, finalPath) : '';
+    const content = `${base}${renameSignal}${renderOfficeArtifactReceipt(finalPath)}`;
     return { content, ...(preview ? { images: [preview] } : {}) };
   } catch (err) {
     const code = err instanceof OfficeCliError ? err.code : 'E_OFFICE_CREATE_FAILED';
@@ -380,7 +452,6 @@ async function runCreate(
 function prepareOutput(
   opts: OfficeToolsOpts, ctx: ToolContext, input: Record<string, unknown>, ext: string,
 ): { abs: string } | { error: ToolResult } {
-  if (!getLocalExecGranted()) return { error: deniedResult() };
   if (!officeCliAvailable()) {
     return { error: errResult('E_OFFICE_ENGINE_MISSING',
       'the built-in Office engine is not available on this build; nothing was created. Do not claim a file was created.') };
@@ -403,29 +474,30 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_docx',
     description:
-      'Create a .docx with path plus optional title, paragraphs, tables, images, locale, preview. paragraphs: [{text, style?, align?, list?, bold?, italic?, font?, size?, color?}]. tables: [{rows:[[cell]], colWidths?}]. images: [{src,width?,height?,align?}], src in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
+      'Create one editable DOCX from ordered paragraphs, tables, and workspace or attachment images. Returns the saved path and an optional first-page PNG; use edit_office on the returned path for corrections. Name collisions are reported.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Output .docx path (absolute or relative to the workspace).' },
-        title: { type: 'string', description: 'Optional title, added as a Heading 1 paragraph at the top.' },
+        path: { type: 'string', description: 'Output .docx path; absolute or workspace-relative.' },
+        title: { type: 'string', description: 'Optional Heading 1 before the body.' },
         paragraphs: {
           type: 'array',
           description: 'Body paragraphs, in order.',
           items: {
             type: 'object',
             properties: {
-              text: { type: 'string', description: 'Paragraph text.' },
-              style: { type: 'string', description: 'Paragraph style id, e.g. Heading1, Heading2, Normal, Quote.' },
+              text: { type: 'string' },
+              style: { type: 'string', description: 'Style id, e.g. Heading1, Normal, or Quote.' },
               align: { type: 'string', enum: ['left', 'center', 'right', 'justify'] },
               list: { type: 'string', enum: ['bullet', 'ordered'] },
-              bold: { type: 'boolean', description: 'Bold text.' },
-              italic: { type: 'boolean', description: 'Italic text.' },
-              font: { type: 'string', description: 'Font family.' },
-              size: { type: 'string', description: 'Font size, e.g. "14" or "14pt".' },
+              bold: { type: 'boolean' },
+              italic: { type: 'boolean' },
+              font: { type: 'string' },
+              size: { type: 'string', description: 'Font size, e.g. "14pt".' },
               color: { type: 'string', description: 'Text color, e.g. "#1F4E79".' },
-              underline: { type: 'string', description: 'Underline style, e.g. "single".' },
-              highlight: { type: 'string', description: 'Highlight color name, e.g. "yellow".' },
+              underline: { type: 'string', description: 'Underline style.' },
+              highlight: { type: 'string', description: 'Highlight color name.' },
             },
             required: ['text'],
           },
@@ -438,30 +510,30 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
             properties: {
               rows: {
                 type: 'array',
-                description: 'Grid of cell text, top to bottom; each row is an array of cells (left to right).',
+                description: 'Rectangular cell grid.',
                 items: { type: 'array', items: { type: ['string', 'number'] } },
               },
-              colWidths: { type: 'string', description: 'Comma-separated column widths with units, e.g. "2in,3in".' },
+              colWidths: { type: 'string', description: 'Comma-separated widths with units, e.g. "2in,3in".' },
             },
             required: ['rows'],
           },
         },
         images: {
           type: 'array',
-          description: 'Images, appended after the tables. Each src must be a file in this conversation\'s workspace/attachments.',
+          description: 'Images appended after tables; src must be in the workspace or attachments.',
           items: {
             type: 'object',
             properties: {
-              src: { type: 'string', description: 'Image file path (absolute or workspace-relative).' },
+              src: { type: 'string', description: 'Absolute or workspace-relative image path.' },
               width: { type: 'string', description: 'Display width with unit, e.g. "3in".' },
               height: { type: 'string', description: 'Display height with unit.' },
-              align: { type: 'string', description: 'Host paragraph alignment: left/center/right.' },
+              align: { type: 'string', description: 'Host paragraph: left, center, or right.' },
             },
             required: ['src'],
           },
         },
-        locale: { type: 'string', description: 'Locale tag for default fonts, e.g. "zh-CN". Recommended for CJK content.' },
-        preview: { type: 'boolean', description: 'Render a first-page PNG preview. Default true.' },
+        locale: { type: 'string', description: 'Default-font locale, e.g. "zh-CN".' },
+        preview: { type: 'boolean', description: 'Return a first-page PNG; default true.' },
       },
       required: ['path'],
     },
@@ -498,11 +570,38 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
   };
 }
 
+/** One model-visible source for XLSX cell properties. The generic
+ * `edit_office` tool also edits DOCX/PPTX, so these are advertised as the
+ * XLSX-only subset of its otherwise open scalar `props` object. */
+function xlsxCellPropertySchema(): Record<string, unknown> {
+  return {
+    value: { type: ['string', 'number', 'boolean'], description: 'Literal XLSX cell value.' },
+    formula: { type: 'string', description: 'XLSX formula without a leading "="; when present it wins over value.' },
+    format: { type: 'string', description: 'Excel number format, e.g. "#,##0.00", "yyyy-mm-dd", or "@".' },
+    type: {
+      type: 'string',
+      enum: ['string', 'number', 'boolean', 'date', 'error', 'richtext'],
+      description: 'Optional explicit XLSX cell type; normally inferred from value or formula.',
+    },
+    bold: { type: 'boolean' },
+    italic: { type: 'boolean' },
+    fill: { type: 'string', description: 'XLSX cell background fill color.' },
+    'font.name': { type: 'string', description: 'XLSX cell font family.' },
+    'font.color': { type: 'string', description: 'XLSX cell text color; do not use the ambiguous bare color key.' },
+    'font.size': { type: 'string' },
+    underline: { type: 'string', description: 'Underline style.' },
+    halign: { type: 'string', description: 'Horizontal alignment.' },
+    valign: { type: 'string', description: 'Vertical alignment.' },
+    wrap: { type: 'boolean', description: 'Wrap text.' },
+    border: { type: 'string', description: 'Border style on all sides.' },
+    merge: { type: 'string', description: 'Merge range anchored at this cell, e.g. "A1:C1".' },
+  };
+}
+
 function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
   const chartSchema = {
     type: 'object',
-    description:
-      'A native editable Excel chart bound to worksheet cells. Prefer dataRange/categories over inline data so updates remain traceable.',
+    description: 'Native editable chart; prefer cell ranges over inline data.',
     properties: {
       type: {
         type: 'string',
@@ -511,11 +610,10 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
           'stock', 'combo', 'waterfall', 'funnel', 'treemap', 'sunburst', 'boxWhisker',
           'histogram', 'pareto',
         ],
-        description: 'Native chart type. Use line for time trends and bar/column for category comparisons.',
       },
       dataRange: {
         type: 'string',
-        description: 'Worksheet source range, e.g. "Trend!B1:C32". Header cells become series names.',
+        description: 'Source range, e.g. "Trend!B1:C32"; headers name series.',
       },
       categories: {
         type: 'string',
@@ -523,9 +621,9 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
       },
       data: {
         type: 'string',
-        description: 'Inline fallback such as "Sales:10,20,30"; prefer cell ranges for auditable workbooks.',
+        description: 'Inline fallback, e.g. "Sales:10,20,30".',
       },
-      title: { type: 'string', description: 'Chart title.' },
+      title: { type: 'string' },
       anchor: { type: 'string', description: 'Cell anchor rectangle, e.g. "D2:L18".' },
       legend: {
         type: 'string',
@@ -534,24 +632,23 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
       },
       dataLabels: {
         type: 'string',
-        description: 'Labels such as "value", "percent", "value,percent", "outsideEnd", or "none".',
+        description: 'Labels, e.g. "value", "percent", "outsideEnd", or "none".',
       },
       catTitle: { type: 'string', description: 'Category-axis title.' },
       axistitle: { type: 'string', description: 'Value-axis title.' },
-      axismin: { type: 'number', description: 'Value-axis minimum. Bar/column charts normally use 0.' },
+      axismin: { type: 'number', description: 'Value-axis minimum.' },
       axismax: { type: 'number', description: 'Optional value-axis maximum.' },
       axisnumfmt: { type: 'string', description: 'Value-axis number format, e.g. "#,##0" or "0.0%".' },
-      gridlines: { type: ['boolean', 'string'], description: 'Major gridlines or a line style such as "E0E0E0:0.5".' },
+      gridlines: { type: ['boolean', 'string'], description: 'Major gridlines or line style.' },
       colors: { type: 'string', description: 'Comma-separated series colors, e.g. "4472C4,ED7D31".' },
       preset: {
         type: 'string',
         enum: ['minimal', 'dark', 'corporate', 'magazine', 'dashboard', 'colorful', 'monochrome'],
-        description: 'Named chart style preset.',
       },
       style: { type: 'number', description: 'Built-in Excel chart style id (1-48).' },
       labelrotation: { type: 'number', description: 'Axis label rotation in degrees (-90 to 90).' },
-      width: { type: 'string', description: 'Chart width with unit; ignored when anchor is set.' },
-      height: { type: 'string', description: 'Chart height with unit; ignored when anchor is set.' },
+      width: { type: 'string', description: 'Width with unit; anchor takes precedence.' },
+      height: { type: 'string', description: 'Height with unit; anchor takes precedence.' },
       smooth: { type: 'boolean', description: 'Smooth line/scatter series.' },
       marker: { type: 'string', description: 'Line/scatter marker, e.g. "circle:6" or "none".' },
       linewidth: { type: 'number', description: 'Series line width in points.' },
@@ -560,7 +657,7 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
       varyColors: { type: 'boolean', description: 'Vary colors by point for a single-series chart.' },
       secondaryaxis: {
         type: 'string',
-        description: 'Comma-separated 1-based series indices placed on the secondary value axis, e.g. "2".',
+        description: '1-based series indices on the secondary axis, e.g. "2".',
       },
       combotypes: {
         type: 'string',
@@ -569,107 +666,83 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
       combosplit: { type: 'number', description: 'Combo split: first N series use the primary chart type.' },
       referenceline: {
         type: 'string',
-        description: 'Target line as "value:color:label:dash", e.g. "100:FF0000:目标:dash".',
+        description: 'Target line as "value:color:label:dash".',
       },
     },
     required: ['type'],
   };
+  const cellSchema = {
+    oneOf: [
+      { type: 'string' },
+      { type: 'number' },
+      { type: 'boolean' },
+      {
+        type: 'object',
+        properties: xlsxCellPropertySchema(),
+      },
+    ],
+  };
+  const columnSchema = {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'Column letter, e.g. "A".' },
+      width: { type: 'string', description: 'Width in character units.' },
+      hidden: { type: 'boolean' },
+    },
+    required: ['name'],
+  };
   return {
     name: 'create_xlsx',
     description:
-      'Create one .xlsx workbook with rows/sheets and native editable charts. rows is [[cell]]; a cell is a value or {value, formula?, format?, bold?, fill?, font.color?, merge?}. formulas omit "=". sheets: [{name, rows, columns?, charts?}]. Charts bind dataRange/categories with type/title/anchor/axis/legend. Refine the returned path with edit_office instead of calling create_xlsx again. Returns path/preview; collisions return <file-renamed>.',
+      'Create one editable XLSX from sheets with styled or formula cells, column settings, and native charts bound to cell ranges. Returns the saved path and an optional PNG preview; use edit_office on the returned path for corrections. Name collisions are reported.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Output .xlsx path (absolute or relative to the workspace).' },
-        sheet: { type: 'string', description: 'Sheet name. Default "Sheet1".' },
-        rows: {
-          type: 'array',
-          description: 'Rows of cells, top to bottom. Each row is an array of cells (left to right).',
-          items: {
-            type: 'array',
-            items: {
-              oneOf: [
-                { type: 'string' },
-                { type: 'number' },
-                {
-                  type: 'object',
-                  properties: {
-                    value: { type: ['string', 'number'] },
-                    formula: { type: 'string', description: 'Excel formula without leading "=".' },
-                    format: { type: 'string', description: 'Excel number format code, e.g. "#,##0.00", "yyyy-mm-dd".' },
-                    bold: { type: 'boolean' },
-                    italic: { type: 'boolean' },
-                    fill: { type: 'string', description: 'Cell background color, e.g. "#1F4E79".' },
-                    'font.color': { type: 'string', description: 'Text color, e.g. "#FFFFFF".' },
-                    'font.size': { type: 'string', description: 'Font size, e.g. "12".' },
-                    underline: { type: 'string', description: 'Underline style, e.g. "single".' },
-                    halign: { type: 'string', description: 'Horizontal alignment: left/center/right.' },
-                    valign: { type: 'string', description: 'Vertical alignment: top/center/bottom.' },
-                    wrap: { type: 'boolean', description: 'Wrap text in the cell.' },
-                    border: { type: 'string', description: 'Border on all sides, e.g. "thin".' },
-                    merge: { type: 'string', description: 'Merge range anchored at this cell, e.g. "A1:C1".' },
-                  },
-                },
-              ],
-            },
-          },
-        },
-        columns: {
-          type: 'array',
-          description: 'Column widths for the (default) sheet.',
-          items: {
-            type: 'object',
-            properties: {
-              name: { type: 'string', description: 'Column letter, e.g. "A".' },
-              width: { type: 'string', description: 'Column width in character units, e.g. "18".' },
-              hidden: { type: 'boolean' },
-            },
-            required: ['name'],
-          },
-        },
-        charts: {
-          type: 'array',
-          description: 'Native editable charts for the default sheet. Chart ranges may reference any sheet in this workbook.',
-          items: chartSchema,
-        },
+        path: { type: 'string', description: 'Output .xlsx path; absolute or workspace-relative.' },
         sheets: {
           type: 'array',
-          description: 'Multiple worksheets (use instead of top-level `sheet`/`rows`/`columns`/`charts`). The first sheet reuses the default tab.',
+          minItems: 1,
+          description: 'Worksheets in tab order.',
           items: {
             type: 'object',
             properties: {
               name: { type: 'string', description: 'Sheet tab name.' },
-              rows: { type: 'array', description: 'Rows of cells — same cell shape as the top-level `rows`.', items: { type: 'array' } },
+              rows: {
+                type: 'array',
+                description: 'Rows of cells in top-to-bottom order.',
+                items: { type: 'array', items: cellSchema },
+              },
               columns: {
                 type: 'array',
-                description: 'Per-column widths for this sheet.',
-                items: {
-                  type: 'object',
-                  properties: {
-                    name: { type: 'string', description: 'Column letter, e.g. "A".' },
-                    width: { type: 'string', description: 'Column width in character units.' },
-                    hidden: { type: 'boolean' },
-                  },
-                  required: ['name'],
-                },
+                description: 'Column width and visibility settings.',
+                items: columnSchema,
               },
               charts: {
                 type: 'array',
-                description: 'Native editable charts placed on this sheet.',
+                description: 'Native editable charts on this sheet.',
                 items: chartSchema,
               },
             },
+            required: ['name'],
           },
         },
-        preview: { type: 'boolean', description: 'Render a PNG preview. Default true.' },
+        preview: { type: 'boolean', description: 'Return a PNG preview; default true.' },
       },
-      required: ['path'],
+      required: ['path', 'sheets'],
     },
     async execute(input, ctx) {
       const prep = prepareOutput(opts, ctx, input, '.xlsx');
       if ('error' in prep) return prep.error;
-      const sheets: XlsxSheetSpec[] = Array.isArray(input.sheets) && input.sheets.length
+      const hasCanonicalSheets = Array.isArray(input.sheets) && input.sheets.length > 0;
+      const hasLegacyFields = ['sheet', 'rows', 'columns', 'charts']
+        .some((key) => Object.prototype.hasOwnProperty.call(input, key));
+      if (hasCanonicalSheets && hasLegacyFields) {
+        return errResult('E_BAD_INPUT', 'use `sheets` alone; do not mix it with legacy sheet/rows/columns/charts fields');
+      }
+      // Direct execution of persisted historical calls remains supported even
+      // though the public schema now exposes only the canonical sheets form.
+      const sheets: XlsxSheetSpec[] = hasCanonicalSheets
         ? (input.sheets as XlsxSheetSpec[])
         : [{
             name: typeof input.sheet === 'string' && input.sheet ? input.sheet : 'Sheet1',
@@ -698,106 +771,106 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_pptx',
     description:
-      'Create an editable .pptx with designed slides. Supports free-positioned styled shapes, cropped images, native editable charts, styled tables, slide backgrounds, and transitions. Use explicit geometry and a coherent design system; images must be in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
+      'Create one editable PPTX from slides containing positioned text, workspace or attachment images, native editable charts, tables, backgrounds, and transitions. Use edit_office on the returned path for corrections. Returns the collision-safe saved path and optional preview.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Output .pptx path (absolute or relative to the workspace).' },
+        path: { type: 'string', description: 'Output .pptx path; absolute or workspace-relative.' },
         slides: {
           type: 'array',
           description: 'Slides, in order.',
           items: {
             type: 'object',
             properties: {
-              title: { type: 'string', description: 'Slide title (auto-placed title placeholder).' },
-              body: { type: 'string', description: 'Body text (auto-placed body placeholder); use newlines for separate lines.' },
-              layout: { type: 'string', description: 'Slide layout name, e.g. "Title Slide", "Title and Content".' },
-              background: { type: 'string', description: 'Slide background: hex ("#RRGGBB"), scheme color ("accent1"…), or gradient ("C1-C2[-angle]").' },
-              transition: { type: 'string', description: 'Slide transition name, e.g. "fade", "push", "wipe", "morph".' },
+              title: { type: 'string', description: 'Auto-placed title.' },
+              body: { type: 'string', description: 'Auto-placed body; newlines split lines.' },
+              layout: { type: 'string', description: 'Layout name, e.g. "Title and Content".' },
+              background: { type: 'string', description: 'Hex, scheme color, or C1-C2[-angle] gradient.' },
+              transition: { type: 'string', description: 'Transition, e.g. fade, push, wipe, or morph.' },
               shapes: {
                 type: 'array',
-                description: 'Free-positioned text boxes for a designed slide. Added on top of any title/body placeholders.',
+                description: 'Positioned text shapes above title/body placeholders.',
                 items: {
                   type: 'object',
-                  description: 'A text box: position (x/y/width/height) plus any OfficeCLI shape style prop.',
+                  description: 'Text shape with geometry and style properties.',
                   properties: {
-                    text: { type: 'string', description: 'Text content.' },
-                    x: { type: 'string', description: 'Left position with unit, e.g. "0.65in", "120pt".' },
+                    text: { type: 'string' },
+                    x: { type: 'string', description: 'Left position with unit.' },
                     y: { type: 'string', description: 'Top position with unit.' },
                     width: { type: 'string', description: 'Width with unit.' },
                     height: { type: 'string', description: 'Height with unit.' },
-                    fill: { type: 'string', description: 'Fill color, e.g. "#38BDF8" (or gradient).' },
-                    color: { type: 'string', description: 'Text color, e.g. "#FFFFFF".' },
-                    size: { type: 'string', description: 'Font size, e.g. "24" or "24pt".' },
-                    bold: { type: 'boolean', description: 'Bold text.' },
-                    align: { type: 'string', description: 'Text alignment: left/center/right.' },
-                    valign: { type: 'string', description: 'Vertical alignment: top/middle/bottom.' },
-                    font: { type: 'string', description: 'Font family.' },
-                    'font.ea': { type: 'string', description: 'East-Asian font family for CJK text.' },
-                    geometry: { type: 'string', description: 'Preset shape, e.g. "rect", "roundRect", "ellipse". Default rect.' },
-                    opacity: { type: 'number', description: 'Fill opacity from 0 to 100. Use with fill, gradient, or pattern; ignored without a fill carrier.' },
-                    margin: { type: 'string', description: 'Internal text margin, e.g. "0.12in" or "0.08in,0.12in,0.08in,0.12in".' },
-                    line: { type: 'string', description: 'Outline color, e.g. "#D7DEE8".' },
-                    lineWidth: { type: 'string', description: 'Outline width, e.g. "1pt".' },
+                    fill: { type: 'string', description: 'Fill color or gradient.' },
+                    color: { type: 'string' },
+                    size: { type: 'string', description: 'Font size.' },
+                    bold: { type: 'boolean' },
+                    align: { type: 'string', description: 'left, center, or right.' },
+                    valign: { type: 'string', description: 'top, middle, or bottom.' },
+                    font: { type: 'string' },
+                    'font.ea': { type: 'string', description: 'CJK font family.' },
+                    geometry: { type: 'string', description: 'Shape preset; default rect.' },
+                    opacity: { type: 'number', description: 'Fill opacity, 0-100; requires a fill.' },
+                    margin: { type: 'string', description: 'One or four internal margins.' },
+                    line: { type: 'string', description: 'Outline color.' },
+                    lineWidth: { type: 'string', description: 'Outline width.' },
                     lineDash: { type: 'string', description: 'Outline dash style.' },
-                    lineOpacity: { type: 'number', description: 'Outline opacity from 0 to 100.' },
-                    gradient: { type: 'string', description: 'Gradient fill, e.g. "#0F172A-#1E3A5F-25".' },
+                    lineOpacity: { type: 'number', description: 'Outline opacity, 0-100.' },
+                    gradient: { type: 'string', description: 'Gradient fill.' },
                     rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
-                    autoFit: { type: 'boolean', description: 'Auto-fit text to its shape.' },
-                    lineSpacing: { type: 'string', description: 'Line spacing, e.g. "1.15".' },
-                    spaceBefore: { type: 'string', description: 'Paragraph spacing before.' },
-                    spaceAfter: { type: 'string', description: 'Paragraph spacing after.' },
+                    autoFit: { type: 'boolean', description: 'Fit text to the shape.' },
+                    lineSpacing: { type: 'string' },
+                    spaceBefore: { type: 'string' },
+                    spaceAfter: { type: 'string' },
                     shadow: {
                       type: ['string', 'boolean'],
-                      description: 'Outer shadow: true for the default black shadow, "none" to remove it, or a color such as "#808080". Do not use preset names such as "outer".',
+                      description: 'true, "none", or a shadow color; preset names are unsupported.',
                     },
-                    name: { type: 'string', description: 'Stable element name for later inspection/editing.' },
+                    name: { type: 'string', description: 'Stable edit name.' },
                   },
                 },
               },
               images: {
                 type: 'array',
-                description: 'Pictures on the slide. Each src must be a file in this conversation\'s workspace/attachments.',
+                description: 'Pictures; src must be in the workspace or attachments.',
                 items: {
                   type: 'object',
                   properties: {
-                    src: { type: 'string', description: 'Image file path (absolute or workspace-relative).' },
-                    x: { type: 'string', description: 'Left position with unit, e.g. "1in".' },
+                    src: { type: 'string', description: 'Absolute or workspace-relative path.' },
+                    x: { type: 'string', description: 'Left position with unit.' },
                     y: { type: 'string', description: 'Top position with unit.' },
                     width: { type: 'string', description: 'Width with unit.' },
                     height: { type: 'string', description: 'Height with unit.' },
-                    crop: { type: 'string', description: 'Crop mode or crop rectangle supported by OfficeCLI.' },
-                    cropLeft: { type: 'number', description: 'Crop percentage from the left.' },
-                    cropRight: { type: 'number', description: 'Crop percentage from the right.' },
-                    cropTop: { type: 'number', description: 'Crop percentage from the top.' },
-                    cropBottom: { type: 'number', description: 'Crop percentage from the bottom.' },
-                    opacity: { type: 'number', description: 'Image opacity from 0 to 100.' },
+                    crop: { type: 'string', description: 'Crop mode or rectangle.' },
+                    cropLeft: { type: 'number', description: 'Left crop percent.' },
+                    cropRight: { type: 'number', description: 'Right crop percent.' },
+                    cropTop: { type: 'number', description: 'Top crop percent.' },
+                    cropBottom: { type: 'number', description: 'Bottom crop percent.' },
+                    opacity: { type: 'number', description: 'Opacity, 0-100.' },
                     rotation: { type: 'number', description: 'Clockwise rotation in degrees.' },
-                    alt: { type: 'string', description: 'Accessible alternative text.' },
-                    name: { type: 'string', description: 'Stable element name for later inspection/editing.' },
+                    alt: { type: 'string', description: 'Alternative text.' },
+                    name: { type: 'string', description: 'Stable edit name.' },
                   },
                   required: ['src'],
                 },
               },
               charts: {
                 type: 'array',
-                description: 'Native editable PowerPoint charts. Use only verified numeric data and add a visible source note when the data comes from external material.',
+                description: 'Native editable charts; source external data visibly on the slide.',
                 items: {
                   type: 'object',
                   properties: {
                     type: {
                       type: 'string',
                       enum: ['bar', 'column', 'line', 'pie', 'doughnut', 'area', 'scatter', 'bubble', 'radar', 'stock', 'combo', 'waterfall', 'funnel', 'treemap', 'sunburst', 'boxWhisker', 'histogram', 'pareto'],
-                      description: 'Native chart type.',
                     },
-                    data: { type: 'string', description: 'Series data: "Name:1,2,3;Name 2:4,5,6".' },
+                    data: { type: 'string', description: 'Series: "Name:1,2,3;Name 2:4,5,6".' },
                     categories: { type: 'string', description: 'Comma-separated category labels.' },
-                    title: { type: 'string', description: 'Chart title.' },
+                    title: { type: 'string' },
                     x: { type: 'string', description: 'Left position with unit.' },
                     y: { type: 'string', description: 'Top position with unit.' },
                     width: { type: 'string', description: 'Width with unit.' },
                     height: { type: 'string', description: 'Height with unit.' },
-                    anchor: { type: 'string', description: 'Positioning anchor supported by OfficeCLI.' },
+                    anchor: { type: 'string', description: 'Positioning anchor.' },
                     legend: { type: 'string', description: 'Legend position or visibility.' },
                     colors: { type: 'string', description: 'Comma-separated series colors.' },
                     dataLabels: { type: 'string', description: 'Data-label style or visibility.' },
@@ -809,7 +882,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                     gridlines: { type: 'string', description: 'Gridline style or visibility.' },
                     plotFill: { type: 'string', description: 'Plot-area fill color.' },
                     chartFill: { type: 'string', description: 'Chart-area fill color.' },
-                    name: { type: 'string', description: 'Stable chart name for later inspection/editing.' },
+                    name: { type: 'string', description: 'Stable edit name.' },
                   },
                   required: ['type', 'data'],
                 },
@@ -822,7 +895,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                   properties: {
                     rows: {
                       type: 'array',
-                      description: 'Grid of cell text; each row is an array of cells.',
+                      description: 'Cell grid.',
                       items: { type: 'array', items: { type: ['string', 'number'] } },
                     },
                     x: { type: 'string', description: 'Left position with unit.' },
@@ -830,16 +903,16 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
                     width: { type: 'string', description: 'Table width with unit.' },
                     height: { type: 'string', description: 'Table height with unit.' },
                     rowHeight: { type: 'string', description: 'Default row height.' },
-                    colWidths: { type: 'string', description: 'Comma-separated column widths, e.g. "2in,3in".' },
+                    colWidths: { type: 'string', description: 'Comma-separated column widths.' },
                     headerFill: { type: 'string', description: 'Header-row fill color.' },
                     bodyFill: { type: 'string', description: 'Body-row fill color.' },
                     style: { type: 'string', description: 'Native PowerPoint table style name.' },
                     'border.all': { type: 'string', description: 'All-border style/color.' },
                     'border.horizontal': { type: 'string', description: 'Horizontal-border style/color.' },
                     'border.vertical': { type: 'string', description: 'Vertical-border style/color.' },
-                    firstRow: { type: 'boolean', description: 'Apply header-row emphasis.' },
-                    bandedRows: { type: 'boolean', description: 'Apply alternating body-row styling.' },
-                    name: { type: 'string', description: 'Stable table name for later inspection/editing.' },
+                    firstRow: { type: 'boolean', description: 'Emphasize header row.' },
+                    bandedRows: { type: 'boolean', description: 'Alternate body-row styling.' },
+                    name: { type: 'string', description: 'Stable edit name.' },
                   },
                   required: ['rows'],
                 },
@@ -847,7 +920,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
             },
           },
         },
-        preview: { type: 'boolean', description: 'Render a first-slide PNG preview. Default true.' },
+        preview: { type: 'boolean', description: 'Return a first-slide PNG; default true.' },
       },
       required: ['path'],
     },
@@ -911,7 +984,6 @@ function createOfficeRenderTool(opts: OfficeToolsOpts): AgentTool {
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       if (!officeCliAvailable()) {
         return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
       }
@@ -967,7 +1039,6 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       if (!officeCliAvailable()) {
         return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
       }
@@ -1046,6 +1117,88 @@ function createOfficeCheckTool(opts: OfficeToolsOpts): AgentTool {
   };
 }
 
+function createOfficeReviewTool(opts: OfficeToolsOpts): AgentTool {
+  const check = createOfficeCheckTool(opts);
+  const render = createOfficeRenderTool(opts);
+  return {
+    name: 'office_review',
+    description:
+      'Validate or render DOCX, XLSX, or PPTX for structural and visual review.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['check', 'render', 'check_and_render'],
+          description: 'check scans OpenXML; render returns selected images; check_and_render stops before rendering when validation fails.',
+        },
+        path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx path, absolute or workspace-relative.' },
+        pages: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 32,
+          items: { type: 'string' },
+          description: 'Render only: 1-based pages/slides/worksheet positions; default ["1"].',
+        },
+        analysis_mode: {
+          type: 'string',
+          enum: ['understand', 'quality_review'],
+          description: 'Render only; default understand.',
+        },
+      },
+      required: ['action', 'path'],
+    },
+    async execute(input, ctx) {
+      if (!officeCliAvailable()) {
+        return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
+      }
+      const action = String(input.action ?? '');
+      if (action === 'check') return check.execute({ path: input.path }, ctx);
+      if (action !== 'render' && action !== 'check_and_render') {
+        return errResult('E_BAD_INPUT', '`action` must be check, render, or check_and_render');
+      }
+
+      let checkResult: ToolResult | undefined;
+      if (action === 'check_and_render') {
+        checkResult = await check.execute({ path: input.path }, ctx);
+        if (checkResult.isError) return checkResult;
+      }
+
+      const rawPages = Array.isArray(input.pages) && input.pages.length ? input.pages : ['1'];
+      const pages = rawPages.map((page) => String(page));
+      const rendered: ToolResult[] = [];
+      for (const page of pages) {
+        rendered.push(await render.execute({
+          path: input.path,
+          page,
+          analysis_mode: input.analysis_mode,
+        }, ctx));
+      }
+      const blocks = [
+        ...(checkResult ? [`<office-check>\n${checkResult.content}\n</office-check>`] : []),
+        ...rendered.map((result, index) =>
+          `<office-render page="${pages[index]}">\n${result.content}\n</office-render>`),
+      ];
+      const reads = [checkResult, ...rendered]
+        .flatMap((result) => result?.observations?.fileReads ?? []);
+      const seenReads = new Set<string>();
+      const fileReads = reads.filter((read) => {
+        const key = `${read.path}:${read.hash ?? ''}`;
+        if (seenReads.has(key)) return false;
+        seenReads.add(key);
+        return true;
+      });
+      return {
+        content: blocks.join('\n'),
+        images: rendered.flatMap((result) => result.images ?? []),
+        ...(rendered.some((result) => result.isError) ? { isError: true } : {}),
+        ...(fileReads.length ? { observations: { fileReads } } : {}),
+      };
+    },
+  };
+}
+
 /**
  * Validate a model-controlled value before it becomes an OfficeCLI argv token.
  *
@@ -1082,21 +1235,18 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'office_read',
     description:
-      'Read an existing DOCX/XLSX/PPTX with element paths before a precise edit. Modes: "text" (default, path-prefixed ' +
-      'content such as [/body/p[3]] or [/Sheet1/A1]), "outline" (structure), "get" (one `target` path as JSON), and ' +
-      '"query" (CSS-like `target` selector as JSON). Use `office_read` to discover a stable path, then `edit_office`; ' +
-      'use `read_file` instead when plain text without element paths is enough.',
+      'Inspect DOCX, XLSX, or PPTX and return content plus stable element paths for edit_office. Use read_files when edit paths are unnecessary.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Path to an existing .docx/.xlsx/.pptx (absolute or workspace-relative).' },
-        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'Default "text".' },
-        target: { type: 'string', description: 'Element path (mode "get", e.g. "/body/p[3]") or selector (mode "query"). Defaults to "/" for get.' },
+        path: { type: 'string', description: 'Existing .docx/.xlsx/.pptx; absolute or workspace-relative.' },
+        mode: { type: 'string', enum: ['text', 'outline', 'get', 'query'], description: 'text (default) returns path-prefixed content; outline returns structure; get reads one target; query applies a selector.' },
+        target: { type: 'string', description: 'Path for get or selector for query; get defaults to "/".' },
       },
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       if (!officeCliAvailable()) return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build.');
       const rawPath = String(input.path ?? '');
       if (!rawPath) return errResult('E_BAD_INPUT', '`path` is required');
@@ -1112,6 +1262,10 @@ function createOfficeReadTool(opts: OfficeToolsOpts): AgentTool {
       const target = typeof input.target === 'string' && input.target ? input.target : '';
       const targetErr = officeArgError(target, 'target');
       if (targetErr) return errResult('E_BAD_INPUT', targetErr);
+      if (path.extname(abs).toLowerCase() === '.xlsx' && mode === 'get') {
+        const xlsxPathError = xlsxTargetPathError(target);
+        if (xlsxPathError) return errResult('E_BAD_INPUT', xlsxPathError);
+      }
       let args: string[];
       if (mode === 'get') args = ['get', abs, target || '/', '--json'];
       else if (mode === 'query') {
@@ -1136,54 +1290,51 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'edit_office',
     description:
-      'Safely edit DOCX/XLSX/PPTX. Provide source `path`, optional `output_path`, and `operations`: ' +
-      'only {action:"set",path,props}, {action:"add",parent,type,props}, or {action:"remove",path}. ' +
-      'For targeted text replacement use {action:"set",path:"/body/p[2]",props:{find:"old",replace:"new"}}; ' +
-      'Add a table grid with action "add", type "table", parent "/body" (Word) or "/slide[N]" (PowerPoint), ' +
-      'and props {rows:[["Header","Value"],["Records",57750]],style:"medium2"}; it is seeded atomically. ' +
-      'For Excel, use the worksheet parent (for example "/Sheet1") and include the mandatory placement in props, ' +
-      'for example {ref:"A1:B2",rows:[["Header","Value"],["Records",57750]]}; `range` is accepted instead of `ref`. ' +
-      'Preview rendering is opt-in with `preview:true`; normally finish edits, run `office_check`, then call `office_render` ' +
-      'for the pages or worksheets that need visual QA. ' +
-      'There is no replace action or edits field. A pre-existing source becomes a ' +
-      '`-edited` copy and is never overwritten; a conversation-produced file may be refined in place. ' +
-      'Use `office_read` for stable element paths. File-bearing props such as `src` must be sandboxed. The batch is ' +
-      'validated before atomic commit; returns the saved path and an optional requested preview.',
+      'Edit DOCX, XLSX, or PPTX with an ordered atomic batch after discovering stable targets with office_read. Existing user files produce a separate validated copy; files created this turn may be refined in place. Use office_review for final QA.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
-        path: { type: 'string', description: 'Source .docx/.xlsx/.pptx path (absolute or workspace-relative).' },
+        path: { type: 'string', description: 'Source .docx/.xlsx/.pptx; absolute or workspace-relative.' },
         output_path: {
           type: 'string',
-          description: 'Optional output path with the same extension. Required only when a specific working-copy path is desired.',
+          description: 'Optional same-extension working-copy path.',
         },
         operations: {
           type: 'array',
-          description: 'Edit operations, applied in order.',
+          description: 'Atomic operations applied in order: set(path, props), add(parent, type, props), or remove(path).',
           items: {
             type: 'object',
+            additionalProperties: false,
             properties: {
               action: { type: 'string', enum: ['set', 'add', 'remove'] },
-              path: { type: 'string', description: 'Target element path (action set/remove).' },
-              parent: { type: 'string', description: 'Parent element path (action add).' },
+              path: {
+                type: 'string',
+                description: 'Target element path (action set/remove). For XLSX cells use the exact A1 path returned by office_read, e.g. "/Sheet1/A2"; never use "/Sheet1/cell[A2]".',
+              },
+              parent: {
+                type: 'string',
+                description: 'Parent element path (action add). For an XLSX structural cell insertion, put the A1 address here, e.g. "/Sheet1/A2"; ordinary XLSX writes should use set(path, props).',
+              },
               type: {
                 type: 'string',
-                description: 'Element type for action add. Format-specific examples: DOCX "p", "table", "picture"; XLSX "cell", "table", "chart", "picture"; PPTX "shape", "textbox", "picture", "chart", "table", "slide". DOCX "p" is invalid under a PPTX slide; use "textbox" or a text-bearing "shape".',
+                description: 'Add type: DOCX p/table/picture; XLSX cell/table/chart/picture; PPTX shape/textbox/picture/chart/table/slide.',
               },
               props: {
                 type: 'object',
-                description: 'Scalar property key/value pairs. For action add + type table, rows may be a rectangular two-dimensional cell grid; other nested arrays/objects are rejected. An XLSX table also requires ref or range, such as "A1:G6", to place the grid on its parent worksheet.',
+                additionalProperties: true,
+                properties: xlsxCellPropertySchema(),
+                description: 'Scalar props; file values use workspace/attachment paths. XLSX cell set reuses create_xlsx value/formula/format/style. Table rows are a primitive grid; XLSX tables require ref or range, e.g. "A1:G6".',
               },
             },
             required: ['action'],
           },
         },
-        preview: { type: 'boolean', description: 'Render a first-page PNG preview after editing. Default false; use explicit office_render for final visual QA.' },
+        preview: { type: 'boolean', description: 'Return a first-page PNG; default false.' },
       },
       required: ['path', 'operations'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       if (!officeCliAvailable()) {
         return errResult('E_OFFICE_ENGINE_MISSING', 'the built-in Office engine is not available on this build; nothing was changed.');
       }
@@ -1200,13 +1351,17 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
 
       const normalized = normalizeEditOperations(opts, ctx, input.operations);
       if ('error' in normalized) return errResult('E_BAD_INPUT', normalized.error);
+      let normalizedOperations = normalized.operations;
       if (sourceExt === '.xlsx') {
-        const placementError = xlsxTablePlacementError(normalized.operations);
+        const contractError = xlsxEditContractError(normalizedOperations);
+        if (contractError) return errResult('E_BAD_INPUT', contractError);
+        const placementError = xlsxTablePlacementError(normalizedOperations);
         if (placementError) return errResult('E_BAD_INPUT', placementError);
+        normalizedOperations = normalizeXlsxCellSetOperations(normalizedOperations);
       }
       let ops: OfficeBatchOp[];
       try {
-        ops = buildEditBatch(normalized.operations);
+        ops = buildEditBatch(normalizedOperations);
       } catch (err) {
         if (err instanceof OfficeEditInputError) return errResult('E_BAD_INPUT', err.message);
         throw err;
@@ -1273,7 +1428,7 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
           : `; source preserved: ${sourceAbs}`;
         const renameSignal = renamed ? renderRenameSignal(requestedOutput, finalPath) : '';
         return {
-          content: `Edited ${finalPath} (${ops.length} operation${ops.length === 1 ? '' : 's'})${sourceNote}${renameSignal}`,
+          content: `Edited ${finalPath} (${ops.length} operation${ops.length === 1 ? '' : 's'})${sourceNote}${renameSignal}${renderOfficeArtifactReceipt(finalPath)}`,
           ...(preview ? { images: [preview] } : {}),
         };
       } catch (err) {
@@ -1307,7 +1462,6 @@ export function createOfficeTools(opts: OfficeToolsOpts = {}): AgentTool[] {
     createPptxTool(opts),
     createOfficeReadTool(opts),
     createEditOfficeTool(opts),
-    createOfficeCheckTool(opts),
-    createOfficeRenderTool(opts),
+    createOfficeReviewTool(opts),
   ];
 }

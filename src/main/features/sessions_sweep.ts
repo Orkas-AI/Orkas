@@ -10,7 +10,7 @@
  *     cid-bound orphans only — skill / agent orphans are explicitly NOT
  *     touched per user instruction (their per-entity delete already hooks
  *     evictSession + unlink).
- *   - "Ephemeral" kinds (extract-img / reflect / memory-extract / anon)
+ *   - "Ephemeral" kinds (extract-img / reflect / anon)
  *     are routed to `local/sessions/` by `session-store.resolveSessionPath`.
  *     They have no resumer, so we GC by mtime.
  *
@@ -66,15 +66,14 @@ async function yieldForSweep(index: number, signal?: AbortSignal): Promise<boole
 }
 
 // Pull the kind segment out of `<kind>-<tail>` (CLAUDE.md §5; uid is no longer in session_id).
-// Multi-segment kinds (extract-img / memory-extract) are recognized longest-first. Returns
+// The multi-segment kind (extract-img) is recognized longest-first. Returns
 // null when the basename doesn't start with any known kind keyword (caller skips it — usually
 // a leftover from a half-completed legacy migration).
 function classify(baseName: string): { kind: string; cid?: string } | null {
   if (!baseName) return null;
   // Match against multi-segment kinds first (longest match wins) — order matters: `extract-img-abc`
-  // starts with `extract` (a non-kind prefix), and `memory-extract-x` would otherwise match
-  // `memory` (also not a kind).
-  for (const k of ['extract-img', 'memory-extract']) {
+  // starts with `extract` (a non-kind prefix).
+  for (const k of ['extract-img']) {
     if (baseName === k) return { kind: k };
     if (baseName.startsWith(`${k}-`)) return { kind: k };
   }

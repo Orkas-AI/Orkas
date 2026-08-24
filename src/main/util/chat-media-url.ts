@@ -9,6 +9,14 @@ function _strictEncodePathSegment(segment: string): string {
   ));
 }
 
+/** Build the durable per-conversation media route used for attachment-backed
+ * assistant output. Unlike `chatMediaLocalUrl`, this URL survives project
+ * relocation and cloud restore because the protocol resolves the active
+ * conversation's attachment pool instead of an absolute machine path. */
+export function chatMediaCidUrl(cid: string, name: string): string {
+  return `chat-media://cid/${_strictEncodePathSegment(String(cid || ''))}/${_strictEncodePathSegment(String(name || ''))}`;
+}
+
 /**
  * Build a durable `chat-media://local/` URL for an absolute filesystem path.
  *
@@ -70,6 +78,71 @@ export function chatMediaLocalPathFromUrl(raw: string, platform = process.platfo
 // sentence delimiters are always prose boundaries rather than path bytes.
 const CHAT_MEDIA_LOCAL_URL_IN_TEXT = /chat-media:\/\/local\/[^\s<>"'`\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+/gi;
 const CHAT_MEDIA_TRAILING_DELIMITER = /[)\]},.;:!\u3001\u3002\uFF0C\uFF01\uFF1A\uFF1B\uFF1F\uFF09\u3011\u3009\u300D\u300F]+$/;
+// Match the same simple Markdown destination family rendered by
+// renderer/modules/utils.js. Local aliases are normalized only inside a media
+// link/image destination: an absolute path mentioned as prose or code is not a
+// request to rewrite the assistant's text.
+const MARKDOWN_LOCAL_MEDIA_DESTINATION = /((?:!\[[^\]\r\n]*\]|\[[^\]\r\n]+\])\()([^\s)]+)((?:\s+"[^"\r\n]*")?\))/g;
+const MARKDOWN_CODE_REGION = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\r\n]*`)/g;
+const RENDERABLE_LOCAL_MEDIA_EXTS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg',
+  '.mp4', '.webm', '.mov', '.m4v', '.ogv',
+  '.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac',
+  '.html', '.htm',
+]);
+
+function _localMediaAliasPath(raw: string, platform = process.platform): string {
+  const candidate = String(raw || '').trim();
+  if (!candidate || /^chat-media:/i.test(candidate)) return '';
+
+  if (/^file:/i.test(candidate)) {
+    let parsed: URL;
+    try { parsed = new URL(candidate); }
+    catch { return ''; }
+    let decoded = '';
+    try { decoded = decodeURIComponent(parsed.pathname || ''); }
+    catch { return ''; }
+    if (platform === 'win32' && /^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+    return decoded;
+  }
+
+  const bare = candidate.replace(/^sandbox:/i, '');
+  if (bare.startsWith('/') || /^[A-Za-z]:[\\/]/.test(bare)) return bare;
+  return '';
+}
+
+function _isRenderableLocalMediaPath(absPath: string): boolean {
+  const normalized = String(absPath || '').replace(/\\/g, '/');
+  const basename = normalized.slice(normalized.lastIndexOf('/') + 1);
+  const dot = basename.lastIndexOf('.');
+  if (dot < 0) return false;
+  return RENDERABLE_LOCAL_MEDIA_EXTS.has(basename.slice(dot).toLowerCase());
+}
+
+function _normalizeLocalMediaAliasesInMarkdown(text: string): string {
+  const normalizeSegment = (segment: string): string => segment.replace(
+    MARKDOWN_LOCAL_MEDIA_DESTINATION,
+    (full, prefix: string, destination: string, suffix: string) => {
+      const absPath = _localMediaAliasPath(destination);
+      if (!absPath || !_isRenderableLocalMediaPath(absPath)) return full;
+      // Use the canonical route even when the file is currently missing. An
+      // existing file gains its byte-derived version below; a missing target
+      // remains a stable canonical URL for normal renderer error handling.
+      return `${prefix}${chatMediaLocalUrl(absPath)}${suffix}`;
+    },
+  );
+
+  const source = String(text || '');
+  let normalized = '';
+  let cursor = 0;
+  for (const match of source.matchAll(MARKDOWN_CODE_REGION)) {
+    const index = match.index ?? cursor;
+    normalized += normalizeSegment(source.slice(cursor, index));
+    normalized += match[0];
+    cursor = index + match[0].length;
+  }
+  return normalized + normalizeSegment(source.slice(cursor));
+}
 
 function _versionLocalUrlCandidate(candidate: string): string {
   const absPath = chatMediaLocalPathFromUrl(candidate);
@@ -94,7 +167,8 @@ function _versionLocalUrlCandidate(candidate: string): string {
  * at the bytes that exist when the reply is committed.
  */
 export function versionChatMediaLocalUrlsInText(text: string): string {
-  return String(text || '').replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
+  const normalized = _normalizeLocalMediaAliasesInMarkdown(text);
+  return normalized.replace(CHAT_MEDIA_LOCAL_URL_IN_TEXT, (raw) => {
     let candidate = raw;
     let suffix = '';
 
@@ -122,59 +196,4 @@ export function versionChatMediaLocalUrlsInText(text: string): string {
     }
     return versioned ? versioned + suffix : raw;
   });
-}
-
-/** Split one matched URL into the longest candidate whose target file exists,
- *  plus the Markdown/sentence punctuation peeled off its end.
- *
- *  A local path may legitimately end in `)` or `.`, so the exact filename is
- *  tried first and delimiters are peeled only while nothing resolves. Shared so
- *  the versioner and the existence check agree on where the URL ends — a
- *  checker with its own peeling would report links the versioner had already
- *  resolved. */
-function _splitResolvableCandidate(raw: string): { candidate: string; suffix: string; absPath: string } {
-  let candidate = raw;
-  let suffix = '';
-  if (/[?#]/.test(candidate)) {
-    const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
-    if (trailing) {
-      candidate = candidate.slice(0, -trailing.length);
-      suffix = trailing;
-    }
-  }
-  for (;;) {
-    const absPath = chatMediaLocalPathFromUrl(candidate);
-    if (absPath && _chatMediaLocalVersionToken(absPath)) return { candidate, suffix, absPath };
-    const trailing = candidate.match(CHAT_MEDIA_TRAILING_DELIMITER)?.[0] || '';
-    if (!trailing) return { candidate, suffix, absPath: absPath || '' };
-    const last = trailing.slice(-1);
-    candidate = candidate.slice(0, -1);
-    suffix = last + suffix;
-  }
-}
-
-/**
- * Local media URLs in assistant prose whose target file does not exist.
- *
- * The versioner above already walks every one of these and already discovers
- * which cannot be versioned, because a missing file yields no version token —
- * and then drops that knowledge on the floor. This returns it.
- *
- * 2026-08-07: an agent closed a run with `<agent-result status="success" />`, a
- * "成片确认", and a `[video](chat-media://local/…/orkas-promo-v1.mp4)` link. That
- * turn made no tool calls at all, the file never existed, and the renderer
- * logged `chat-media/local: reject … not_found` about 300ms later. Every fact
- * needed to catch it was already in the host's hands.
- */
-export function unresolvedChatMediaLocalUrls(text: string): string[] {
-  const missing: string[] = [];
-  const seen = new Set<string>();
-  for (const raw of String(text || '').match(CHAT_MEDIA_LOCAL_URL_IN_TEXT) || []) {
-    const { candidate, absPath } = _splitResolvableCandidate(raw);
-    if (absPath && _chatMediaLocalVersionToken(absPath)) continue;
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
-    missing.push(candidate);
-  }
-  return missing;
 }

@@ -1,9 +1,7 @@
 ---
 name: material-organizer
-description_zh: "整理用户已提供的链接、PDF、Word、图片、文本片段或本地目录，做要点提取、来源溯源、知识卡沉淀、实体关系、去重归类、异常记录和关键词索引；适合\"整理这些链接\"\"把这些资料整理成研究笔记\"\"从这段内容提取知识卡\"\"帮我整理下载目录\"；触发词：资料整理、批量整理、研究笔记、知识卡、个人知识流、实体关系、关键词索引、目录整理"
-description_en: "Organize user-provided URLs, PDFs, Word documents, images, text snippets, or local folders with extraction, source tracing, knowledge cards, entity links, deduplication, classification, exception logs, and keyword indexes; For: \"organize these links\", \"turn these materials into research notes\", \"extract knowledge cards from this\", \"organize my Downloads folder\"; Triggers: material organization, research notes, knowledge cards, personal knowledge flow, entity links, keyword index, folder cleanup"
-description: "Organize user-provided materials or local folders into traceable notes, knowledge cards, categories, indexes, and cleanup plans. Use this skill whenever the user asks to organize multiple links, files, snippets, research materials, downloads, personal knowledge flow materials, or a local directory."
-category: "data"
+description_zh: "把用户提供的链接、PDF、Word、图片、文本片段或本地目录整理成可溯源的研究笔记、知识卡、实体关系、分类和关键词索引，并记录去重与异常；用于批量资料整理、知识流沉淀和目录清理。"
+description_en: "Organize user-provided URLs, PDFs, Word documents, images, text snippets, or local folders into traceable research notes, knowledge cards, entity links, categories, and keyword indexes, with deduplication and exception logs. Use for material organization, knowledge capture, and folder cleanup."
 ---
 
 # Material Organizer
@@ -37,27 +35,27 @@ Do not use for:
    - More than 30 materials: ask the user to submit batches or split by topic/folder.
 
 3. Extract content:
-   - Use `references/extraction-rules.md` for source fields, core points, excerpts, tags, evidence levels, and exception handling.
+   - Use the [extraction rules](references/extraction-rules.md) for source fields, core points, excerpts, tags, evidence levels, and exception handling.
    - Preserve filenames, URLs, source titles, authors/organizations, dates, and access issues.
    - Mark unreadable or low-confidence inputs instead of filling gaps.
 
 4. Build knowledge cards when needed:
-   - Use `references/knowledge-flow.md` when the user asks for knowledge-base notes, personal knowledge flow, knowledge cards, entity relationships, review prompts, or reusable long-term notes.
+   - Use the [knowledge-flow guide](references/knowledge-flow.md) when the user asks for knowledge-base notes, personal knowledge flow, knowledge cards, entity relationships, review prompts, or reusable long-term notes.
    - Keep each knowledge card traceable to original material. Mark unsourced content as source not provided.
    - Suggest save locations or filenames only as recommendations unless the user has confirmed actual writing.
 
 5. Deduplicate and classify:
-   - Use `references/dedup-strategy.md` to merge duplicates only when the source relationship is clear.
-   - Use `references/classification-rules.md`; user-specified dimensions come first.
+   - Use the [deduplication strategy](references/dedup-strategy.md) to merge duplicates only when the source relationship is clear.
+   - Use the [classification rules](references/classification-rules.md); user-specified dimensions come first.
    - Keep conflicting materials separate and log contradictions.
 
 6. Handle directories safely:
    - First scan and report the directory. Do not move, rename, delete, or overwrite files during the first pass.
-   - Use `references/directory-organizing.md` to identify type distribution, possible duplicates, sensitive files, and cleanup levels.
+   - Use the [directory-organizing guide](references/directory-organizing.md) to identify type distribution, possible duplicates, sensitive files, and cleanup levels.
    - For any operation that changes files or generates an executable organizing script, show the exact plan and obtain explicit confirmation.
 
 7. Return the report:
-   - Use `references/output-schema.md`.
+   - Use the [output schema](references/output-schema.md).
    - Write files only when the user explicitly requests or confirms saving.
    - If saving, return the output path and note what was not processed.
 

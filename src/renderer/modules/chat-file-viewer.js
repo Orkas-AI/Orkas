@@ -65,6 +65,13 @@ let _viewerDiscardConfirmPending = false;
 let _viewerRenderSeq = 0;
 let _viewerBlobUrl = null;
 let _viewerHtmlCanvasResizeHandler = null;
+let _viewerPdfPreviewSeq = 0;
+let _viewerPdfPreviewState = null;
+let _viewerHtmlPreviewSeq = 0;
+let _viewerHtmlPreviewState = null;
+
+const _VIEWER_PDF_SLOW_LOAD_MS = 5000;
+const _VIEWER_HTML_SLOW_LOAD_MS = 5000;
 
 const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
@@ -77,6 +84,183 @@ function _viewerTrack(action, data) {
 function _viewerTrackEvent(action, data) {
   void action;
   void data;
+}
+
+function _viewerClearPdfSlowTimer(state) {
+  if (!state || !state.slowTimer) return;
+  clearTimeout(state.slowTimer);
+  state.slowTimer = null;
+}
+
+function _viewerBeginPdfPreview(cid, projectId) {
+  _viewerPdfPreviewSeq += 1;
+  const state = {
+    previewId: _viewerPdfPreviewSeq,
+    source: projectId ? 'project' : (cid ? 'conversation' : 'workspace'),
+    startedAt: Date.now(),
+    loaded: false,
+    failed: false,
+    slowTimer: null,
+  };
+  _viewerPdfPreviewState = state;
+  _viewerLog.info('pdf preview opened', {
+    preview_id: state.previewId,
+    source: state.source,
+  });
+  state.slowTimer = setTimeout(() => {
+    if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+    state.slowTimer = null;
+    _viewerLog.warn('pdf preview iframe load slow', {
+      preview_id: state.previewId,
+      source: state.source,
+      threshold_ms: _VIEWER_PDF_SLOW_LOAD_MS,
+      duration_ms: _viewerDurationSince(state.startedAt),
+    });
+  }, _VIEWER_PDF_SLOW_LOAD_MS);
+  return state;
+}
+
+function _viewerPdfIframeLoaded(state) {
+  if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+  state.loaded = true;
+  _viewerClearPdfSlowTimer(state);
+  // Chromium's iframe load confirms that PDFium accepted the viewer document;
+  // it does not claim that every page has painted.
+  _viewerLog.info('pdf preview iframe loaded', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerPdfIframeFailed(state, errorCode = 'iframe_load_failed') {
+  if (_viewerPdfPreviewState !== state || state.loaded || state.failed) return;
+  state.failed = true;
+  _viewerClearPdfSlowTimer(state);
+  _viewerLog.warn('pdf preview iframe failed', {
+    preview_id: state.previewId,
+    source: state.source,
+    error_code: errorCode,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerFinishPdfPreview(reason) {
+  const state = _viewerPdfPreviewState;
+  if (!state) return;
+  _viewerClearPdfSlowTimer(state);
+  _viewerLog.info('pdf preview closed', {
+    preview_id: state.previewId,
+    source: state.source,
+    outcome: state.failed ? 'failed' : (state.loaded ? 'loaded' : 'closed_before_load'),
+    reason,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerPdfPreviewState = null;
+}
+
+function _viewerClearHtmlSlowTimer(state) {
+  if (!state || !state.slowTimer) return;
+  clearTimeout(state.slowTimer);
+  state.slowTimer = null;
+}
+
+function _viewerBeginHtmlPreview(cid, projectId) {
+  _viewerHtmlPreviewSeq += 1;
+  const state = {
+    previewId: _viewerHtmlPreviewSeq,
+    source: projectId ? 'project' : (cid ? 'conversation' : 'workspace'),
+    startedAt: Date.now(),
+    layoutFinished: false,
+    iframeLoaded: false,
+    ready: false,
+    failed: false,
+    slowTimer: null,
+  };
+  _viewerHtmlPreviewState = state;
+  _viewerLog.info('html preview opened', {
+    preview_id: state.previewId,
+    source: state.source,
+  });
+  state.slowTimer = setTimeout(() => {
+    if (_viewerHtmlPreviewState !== state || state.ready || state.failed) return;
+    state.slowTimer = null;
+    _viewerLog.warn('html preview load slow', {
+      preview_id: state.previewId,
+      source: state.source,
+      threshold_ms: _VIEWER_HTML_SLOW_LOAD_MS,
+      duration_ms: _viewerDurationSince(state.startedAt),
+      layout_finished: state.layoutFinished,
+      iframe_loaded: state.iframeLoaded,
+    });
+  }, _VIEWER_HTML_SLOW_LOAD_MS);
+  return state;
+}
+
+function _viewerHtmlLayoutFinished(state, layoutKind, errorCode) {
+  if (_viewerHtmlPreviewState !== state || state.layoutFinished || state.failed) return;
+  state.layoutFinished = true;
+  const data = {
+    preview_id: state.previewId,
+    source: state.source,
+    layout_kind: layoutKind === 'fixed-canvas' ? 'fixed_canvas' : 'responsive',
+    duration_ms: _viewerDurationSince(state.startedAt),
+  };
+  if (errorCode) {
+    _viewerLog.warn('html preview layout finished', { ...data, error_code: errorCode });
+  } else {
+    _viewerLog.info('html preview layout finished', data);
+  }
+  _viewerMaybeCompleteHtmlPreview(state);
+}
+
+function _viewerHtmlIframeLoaded(state) {
+  if (_viewerHtmlPreviewState !== state || state.iframeLoaded || state.failed) return;
+  state.iframeLoaded = true;
+  _viewerLog.info('html preview iframe loaded', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerMaybeCompleteHtmlPreview(state);
+}
+
+function _viewerHtmlIframeFailed(state, errorCode = 'iframe_load_failed') {
+  if (_viewerHtmlPreviewState !== state || state.ready || state.failed) return;
+  state.failed = true;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.warn('html preview iframe failed', {
+    preview_id: state.previewId,
+    source: state.source,
+    error_code: errorCode,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerMaybeCompleteHtmlPreview(state) {
+  if (_viewerHtmlPreviewState !== state || state.ready || state.failed
+      || !state.layoutFinished || !state.iframeLoaded) return;
+  state.ready = true;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.info('html preview ready', {
+    preview_id: state.previewId,
+    source: state.source,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+}
+
+function _viewerFinishHtmlPreview(reason) {
+  const state = _viewerHtmlPreviewState;
+  if (!state) return;
+  _viewerClearHtmlSlowTimer(state);
+  _viewerLog.info('html preview closed', {
+    preview_id: state.previewId,
+    source: state.source,
+    outcome: state.failed ? 'failed' : (state.ready ? 'loaded' : 'closed_before_ready'),
+    reason,
+    duration_ms: _viewerDurationSince(state.startedAt),
+  });
+  _viewerHtmlPreviewState = null;
 }
 
 function _viewerStableFailure(value, fallback, fallbackType = 'operation') {
@@ -247,12 +431,33 @@ function _viewerLabelVars(key, fallback, vars) {
   }
 }
 
-function _chatOfficePreviewLoadingHtml() {
+function _viewerLoadingHtml() {
   const label = _viewerLabel('common.loading', 'Loading…');
-  return `<div class="office-preview-loading" role="status" aria-live="polite">
-    <span class="office-preview-loading-spinner" aria-hidden="true"></span>
-    <span class="office-preview-loading-label">${escapeHtml(label)}</span>
+  return `<div class="office-preview-loading chat-file-viewer-loading is-preview-loading" role="status" aria-live="polite">
+    <span class="chat-file-viewer-loading-spinner office-preview-loading-spinner" aria-hidden="true"></span>
+    <span class="chat-file-viewer-loading-label office-preview-loading-label">${escapeHtml(label)}</span>
   </div>`;
+}
+
+function _viewerShowLoading() {
+  if (!_viewerBody) return;
+  _viewerBody.setAttribute('aria-busy', 'true');
+  _viewerBody.innerHTML = _viewerLoadingHtml();
+}
+
+function _viewerAppendLoadingResource(resource) {
+  if (!_viewerBody || !resource) return;
+  resource.classList.add('chat-file-viewer-loading-resource');
+  _viewerBody.appendChild(resource);
+}
+
+function _viewerFinishLoading(resource) {
+  if (!_viewerBody) return;
+  if (resource && !_viewerBody.contains(resource)) return;
+  if (resource) resource.classList.remove('chat-file-viewer-loading-resource');
+  const loading = _viewerBody.querySelector('.chat-file-viewer-loading');
+  if (loading) loading.remove();
+  _viewerBody.removeAttribute('aria-busy');
 }
 
 function _viewerUiIconHtml(name, className) {
@@ -392,7 +597,9 @@ async function _confirmDiscardViewerEdits() {
   }
 }
 
-function _teardownViewerContent() {
+function _teardownViewerContent(reason = 'replaced') {
+  _viewerFinishPdfPreview(reason);
+  _viewerFinishHtmlPreview(reason);
   if (_viewerEditController) {
     try { _viewerEditController.destroy(); }
     catch (err) { _viewerLog.warn('edit controller destroy threw', err); }
@@ -687,7 +894,7 @@ async function closeChatFileViewer(opts) {
   // Drop iframe / blob src so big preview docs can be GC'd promptly when
   // the user closes the overlay. Without this, hidden iframes keep the
   // PDFium / HTML document alive in memory until the next reopen.
-  _teardownViewerContent();
+  _teardownViewerContent('closed');
   _viewerCurrentPath = null;
   _viewerCurrentCid = null;
   _viewerCurrentProjectId = null;
@@ -703,11 +910,31 @@ async function closeChatFileViewer(opts) {
 // ── Per-kind body builders ───────────────────────────────────────────────
 
 async function _renderPdfBody(absPath, displayName, cid, projectId) {
-  if (!(await _openViewerShell(displayName, { kind: 'pdf', absPath, cid, projectId }))) return;
-  const url = _chatMediaLocalUrl(absPath);
+  const seq = await _openViewerShell(displayName, { kind: 'pdf', absPath, cid, projectId });
+  if (!seq) return;
+  const state = _viewerBeginPdfPreview(cid, projectId);
   // `#toolbar=1&navpanes=0` are Chromium PDFium control hints (keep toolbar,
   // hide left sidebar). Same pattern as the KB context PDF viewer.
-  _viewerBody.innerHTML = `<iframe class="chat-file-viewer-pdf" src="${url}#toolbar=1&navpanes=0" title="${escapeHtml(displayName || '')}"></iframe>`;
+  try {
+    const url = _chatMediaLocalUrl(absPath);
+    const iframe = document.createElement('iframe');
+    iframe.className = 'chat-file-viewer-pdf';
+    iframe.title = displayName || '';
+    iframe.addEventListener('load', () => {
+      _viewerPdfIframeLoaded(state);
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    iframe.addEventListener('error', () => {
+      _viewerPdfIframeFailed(state);
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    _viewerShowLoading();
+    _viewerAppendLoadingResource(iframe);
+    iframe.src = `${url}#toolbar=1&navpanes=0`;
+  } catch (err) {
+    _viewerPdfIframeFailed(state, 'iframe_setup_failed');
+    throw err;
+  }
 }
 
 function _htmlCanvasDimensions(layout) {
@@ -743,9 +970,29 @@ function _fitHtmlCanvasFrame() {
   wrap.style.setProperty('--html-canvas-rendered-height', `${fit.renderedHeight}px`);
 }
 
+function _viewerMaybeRevealHtml(state, iframe, resource, seq) {
+  if (!state || state.uiRevealed || !state.ready || state.failed
+      || seq !== _viewerRenderSeq || !_isViewerOpen()
+      || !_viewerBody || !_viewerBody.contains(iframe)) return;
+  state.uiRevealed = true;
+  if (!_viewerEl.classList.contains('is-html-canvas')) {
+    _viewerFinishLoading(resource);
+    return;
+  }
+  requestAnimationFrame(() => {
+    if (seq !== _viewerRenderSeq || !_viewerBody || !_viewerBody.contains(iframe)) return;
+    _fitHtmlCanvasFrame();
+    _viewerFinishLoading(resource);
+    // A tall canvas can introduce a vertical scrollbar and reduce clientWidth.
+    // Refit once after layout so the right edge remains fully visible.
+    requestAnimationFrame(_fitHtmlCanvasFrame);
+  });
+}
+
 async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'html', absPath, cid, projectId });
   if (!seq) return;
+  const state = _viewerBeginHtmlPreview(cid, projectId);
   const url = _chatMediaLocalUrl(absPath);
   // sandbox: allow-scripts ONLY. chat-media:// is a distinct origin from
   // file://, so SOP blocks parent.* access; we additionally forbid
@@ -754,41 +1001,60 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   // redirects). Self-contained LLM-generated HTML still runs its inline
   // scripts and styles.
   const sandbox = 'allow-scripts';
+  const iframe = document.createElement('iframe');
+  iframe.className = 'chat-file-viewer-html';
+  iframe.setAttribute('sandbox', sandbox);
+  iframe.title = displayName || '';
+  const frameHost = document.createElement('div');
+  frameHost.className = 'chat-file-viewer-html-host';
+  frameHost.appendChild(iframe);
+  iframe.addEventListener('load', () => {
+    _viewerHtmlIframeLoaded(state);
+    _viewerMaybeRevealHtml(state, iframe, frameHost, seq);
+  }, { once: true });
+  iframe.addEventListener('error', () => {
+    _viewerHtmlIframeFailed(state);
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(frameHost);
+  }, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(frameHost);
+  // Start streamed navigation before the independent layout IPC. The layout
+  // scan is linear and constant-memory; large HTML therefore does not pay
+  // either phase serially or cross the renderer IPC boundary.
+  iframe.src = url;
+  const payload = { path: absPath, htmlPreviewLayoutOnly: true };
+  if (cid) payload.cid = cid;
+  if (projectId) payload.projectId = projectId;
+
   let canvas = null;
+  let layoutErrorCode = '';
   try {
-    // Ask main for a normalized preview layout without copying the HTML body
-    // across IPC. Responsive pages need no metadata; fixed-canvas artifacts
-    // from any producer use this same width-fit contract.
-    const payload = { path: absPath, htmlPreviewLayoutOnly: true };
-    if (cid) payload.cid = cid;
-    if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('produced.readText', payload);
     if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
     if (res && res.ok) canvas = _htmlCanvasDimensions(res.layout);
-  } catch (err) {
-    _viewerLog.warn('HTML preview layout probe failed', { path: absPath, error: String(err && err.message || err) });
+    else layoutErrorCode = 'layout_probe_failed';
+  } catch (_) {
+    layoutErrorCode = 'layout_probe_failed';
   }
-  if (!canvas) {
-    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-html" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe>`;
-    return;
+  if (seq !== _viewerRenderSeq || !_isViewerOpen() || state.failed) return;
+  if (canvas) {
+    _viewerEl.classList.add('is-html-canvas');
+    frameHost.classList.remove('chat-file-viewer-html-host');
+    frameHost.classList.add('chat-file-viewer-html-canvas-wrap');
+    frameHost.dataset.width = String(canvas.width);
+    frameHost.dataset.height = String(canvas.height);
+    iframe.classList.add('chat-file-viewer-html-canvas-frame');
+    _viewerHtmlCanvasResizeHandler = () => _fitHtmlCanvasFrame();
+    window.addEventListener('resize', _viewerHtmlCanvasResizeHandler);
   }
-  _viewerEl.classList.add('is-html-canvas');
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-html-canvas-wrap" data-width="${canvas.width}" data-height="${canvas.height}"><iframe class="chat-file-viewer-html chat-file-viewer-html-canvas-frame" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe></div>`;
-  _viewerHtmlCanvasResizeHandler = () => _fitHtmlCanvasFrame();
-  window.addEventListener('resize', _viewerHtmlCanvasResizeHandler);
-  requestAnimationFrame(() => {
-    _fitHtmlCanvasFrame();
-    // A tall canvas can introduce a vertical scrollbar and reduce clientWidth.
-    // Refit once after layout so the right edge remains fully visible.
-    requestAnimationFrame(_fitHtmlCanvasFrame);
-  });
+  _viewerHtmlLayoutFinished(state, canvas ? 'fixed-canvas' : 'responsive', layoutErrorCode);
+  _viewerMaybeRevealHtml(state, iframe, frameHost, seq);
 }
 
 async function _renderOfficeBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'office', absPath, cid, projectId });
   if (!seq) return;
-  _viewerBody.setAttribute('aria-busy', 'true');
-  _viewerBody.innerHTML = _chatOfficePreviewLoadingHtml();
+  _viewerShowLoading();
   try {
     const payload = { path: absPath };
     if (cid) payload.cid = cid;
@@ -819,13 +1085,23 @@ async function _renderOfficeBody(absPath, displayName, cid, projectId) {
     _viewerBlobUrl = URL.createObjectURL(blob);
     const fitHeight = _officeFitFrameHeight(res);
     if (fitHeight) _viewerEl.classList.add('is-office-fit');
-    const style = fitHeight ? ` style="height:${fitHeight}px"` : '';
     const sandbox = res.allowScripts === true ? 'allow-scripts' : '';
-    _viewerBody.removeAttribute('aria-busy');
-    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="${sandbox}" src="${_viewerBlobUrl}"${style} title="${escapeHtml(displayName || '')}"></iframe>`;
-  } catch (err) {
+    const iframe = document.createElement('iframe');
+    iframe.className = 'chat-file-viewer-office';
+    iframe.setAttribute('sandbox', sandbox);
+    iframe.title = displayName || '';
+    if (fitHeight) iframe.style.height = `${fitHeight}px`;
+    iframe.addEventListener('load', () => {
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    iframe.addEventListener('error', () => {
+      if (seq === _viewerRenderSeq) _viewerFinishLoading(iframe);
+    }, { once: true });
+    _viewerAppendLoadingResource(iframe);
+    iframe.src = _viewerBlobUrl;
+  } catch (_) {
     if (seq !== _viewerRenderSeq) return;
-    _viewerLog.warn('office preview threw', { path: absPath, error: String(err && err.message || err) });
+    _viewerLog.warn('office preview failed', { error_code: 'office_preview_failed' });
     await closeChatFileViewer({ force: true });
     await _showUnsupportedDialog(absPath, cid, projectId, {
       messageKey: 'chat.preview_read_failed_message',
@@ -900,10 +1176,31 @@ function _applyViewerVideoPlayback(video, opts) {
 }
 
 async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOpts) {
-  if (!(await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId }))) return;
+  const seq = await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId });
+  if (!seq) return;
   const url = _chatMediaLocalUrl(absPath);
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap" data-chat-video-playback-surface="floating_player"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video></div>`;
-  _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), playbackOpts);
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-file-viewer-video-wrap';
+  wrap.dataset.chatVideoPlaybackSurface = 'floating_player';
+  const video = document.createElement('video');
+  video.className = 'chat-file-viewer-video';
+  video.controls = true;
+  video.setAttribute('controlslist', 'nodownload nofullscreen noremoteplayback');
+  video.setAttribute('disablepictureinpicture', '');
+  video.setAttribute('disableremoteplayback', '');
+  video.setAttribute('playsinline', '');
+  video.preload = 'metadata';
+  wrap.appendChild(video);
+  video.addEventListener('loadedmetadata', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  video.addEventListener('error', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(wrap);
+  _applyViewerVideoPlayback(video, playbackOpts);
+  video.src = url;
 }
 
 async function openChatVideoUrlViewer(src, displayName, opts) {
@@ -912,32 +1209,67 @@ async function openChatVideoUrlViewer(src, displayName, opts) {
   const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
-  if (!(await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId }))) return;
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap" data-chat-video-playback-surface="floating_player"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(url)}"></video></div>`;
-  _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), opts);
+  const seq = await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId });
+  if (!seq) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-file-viewer-video-wrap';
+  wrap.dataset.chatVideoPlaybackSurface = 'floating_player';
+  const video = document.createElement('video');
+  video.className = 'chat-file-viewer-video';
+  video.controls = true;
+  video.setAttribute('controlslist', 'nodownload nofullscreen noremoteplayback');
+  video.setAttribute('disablepictureinpicture', '');
+  video.setAttribute('disableremoteplayback', '');
+  video.setAttribute('playsinline', '');
+  video.preload = 'metadata';
+  wrap.appendChild(video);
+  video.addEventListener('loadedmetadata', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  video.addEventListener('error', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(wrap);
+  _applyViewerVideoPlayback(video, opts);
+  video.src = url;
 }
 
 async function _renderAudioBody(absPath, displayName, cid, projectId) {
-  if (!(await _openViewerShell(displayName, { kind: 'audio', absPath, cid, projectId }))) return;
+  const seq = await _openViewerShell(displayName, { kind: 'audio', absPath, cid, projectId });
+  if (!seq) return;
   const url = _chatMediaLocalUrl(absPath);
   const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
     ? window.fileKindIconHtml(displayName || absPath, 'audio')
     : '';
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-audio-wrap">
+  const wrap = document.createElement('div');
+  wrap.className = 'chat-file-viewer-audio-wrap';
+  wrap.innerHTML = `
     <div class="chat-file-viewer-audio-card">
       <span class="chat-file-viewer-audio-icon">${icon}</span>
       <span class="chat-file-viewer-audio-name">${escapeHtml(displayName || '')}</span>
-      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${url}"></audio>
+      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noremoteplayback" preload="metadata"></audio>
     </div>
-  </div>`;
+  `;
+  const audio = wrap.querySelector('.chat-file-viewer-audio');
+  audio.addEventListener('loadedmetadata', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  audio.addEventListener('error', () => {
+    if (seq === _viewerRenderSeq) _viewerFinishLoading(wrap);
+  }, { once: true });
+  _viewerShowLoading();
+  _viewerAppendLoadingResource(wrap);
+  audio.src = url;
 }
 
 async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'markdown', absPath, cid, projectId });
   if (!seq) return;
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  _viewerShowLoading();
   const text = await _readTextFile(absPath, cid, projectId, seq);
   if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return; // _readTextFile already routed to the fallback dialog
+  _viewerFinishLoading();
   if (typeof mountMdViewEdit !== 'function') {
     _viewerLog.warn('mountMdViewEdit missing; falling back to read-only markdown preview');
     const md = (typeof renderMarkdown === 'function') ? renderMarkdown(text) : escapeHtml(text);
@@ -966,13 +1298,14 @@ async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
 async function _renderTextBody(absPath, displayName, cid, projectId) {
   const seq = await _openViewerShell(displayName, { kind: 'text', absPath, cid, projectId });
   if (!seq) return;
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  _viewerShowLoading();
   // Pre-fetch via _readTextFile so the too_large / read-failure path falls
   // back to the "open the folder?" dialog (same UX as the read-only path
   // before). On success, hand the text to mountTextViewEdit; it owns the
   // view ↔ edit transitions, save IPC, and dirty tracking from there.
   const text = await _readTextFile(absPath, cid, projectId, seq);
   if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+  _viewerFinishLoading();
   if (typeof mountTextViewEdit !== 'function') {
     _viewerLog.warn('mountTextViewEdit missing; falling back to read-only text preview');
     _viewerBody.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(text)}</pre>`;

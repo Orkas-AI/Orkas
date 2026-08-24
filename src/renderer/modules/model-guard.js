@@ -72,14 +72,7 @@ function _applyGuardVisuals() {
  * hides this banner on Settings, so only count an impression on a view where
  * the user can actually see it. */
 function syncModelGuardBannerTelemetry() {
-  const visible = !_hasConfiguredModel
-    && _modelGuardSourceView() !== 'settings'
-    && !!_guardBannerEl
-    && _guardBannerEl.style.display !== 'none';
-  if (visible && !_guardBannerTelemetryVisible && window.Monitor) {
-    Monitor.event('model_guard_banner_impression', _modelGuardTelemetryPayload());
-  }
-  _guardBannerTelemetryVisible = visible;
+  // Commercial telemetry is intentionally absent from the open build.
 }
 
 async function refreshModelGuard() {
@@ -93,14 +86,10 @@ async function refreshModelGuard() {
     // actual sends if no entry exists, so we don't lose correctness.
     if (res && res.ok) {
       const configured = !!res.configured;
-      const telemetryContext = configured
-        ? null
-        : await _refreshModelGuardTelemetryContext();
       await refreshModelConfigSnapshot();
       if (refreshSequence !== _modelGuardRefreshSequence) return _hasConfiguredModel;
       _hasConfiguredModel = configured;
       _guardChecked = true;
-      if (telemetryContext) _guardTelemetryContext = telemetryContext;
     } else {
       _guardLog.warn('refresh ipc not-ok', { error: res && res.error });
     }

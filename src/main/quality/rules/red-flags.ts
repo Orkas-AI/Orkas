@@ -35,7 +35,9 @@ export const RED_FLAGS: ReadonlyArray<RuleDef> = [
     level: 'EXTREME',
     appliesTo: ['script', 'skill_md'],
     // eval( / new Function( / Python exec( / shell `eval "$VAR"`
-    pattern: /\b(?:eval|exec)\s*\(\s*(?!['"][^'"]*['"]?\s*\))|new\s+Function\s*\(|eval\s+["']?\$[A-Z_]/,
+    // Exclude method calls such as RegExp#exec. They consume an already-built
+    // object and are not dynamic source evaluation.
+    pattern: /(?<![\w$.])(?:eval|exec)\s*\(\s*(?!['"][^'"]*['"]\s*\))|new\s+Function\s*\(|eval\s+["']?\$[A-Z_]/,
     suggested_fix: 'Avoid eval / exec on non-literal input. Restructure to call specific functions explicitly.',
   },
   {

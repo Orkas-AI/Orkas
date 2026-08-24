@@ -39,7 +39,11 @@ describe('Office preview fidelity contract', () => {
     for (const file of ['chat-file-viewer.js', 'contexts.js', 'project-detail.js']) {
       const source = read(path.join(rendererRoot, file));
       expect(source).toContain("allowScripts === true ? 'allow-scripts' : ''");
-      expect(source).toContain('sandbox="${sandbox}"');
+      if (file === 'chat-file-viewer.js') {
+        expect(source).toContain("iframe.setAttribute('sandbox', sandbox)");
+      } else {
+        expect(source).toContain('sandbox="${sandbox}"');
+      }
       expect(source).not.toContain('allow-scripts allow-same-origin');
     }
   });
@@ -53,7 +57,7 @@ describe('Office preview fidelity contract', () => {
 
     for (const [file, request] of cases) {
       const source = read(path.join(rendererRoot, file));
-      const loadingIndex = source.indexOf('class="office-preview-loading"');
+      const loadingIndex = source.indexOf('office-preview-loading');
       const requestIndex = source.indexOf(request);
       expect(loadingIndex, `${file} loading markup`).toBeGreaterThanOrEqual(0);
       expect(requestIndex, `${file} Office request`).toBeGreaterThan(loadingIndex);

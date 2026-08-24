@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: geo-probe
-description_zh: "GEO 可见性探针（两段式）：op=queries 从页面主题+品牌生成代表性提问；op=score 解析一组模型回答，统计品牌提及率、带来源引用率(SoV)与竞品份额，诚实区分参数记忆提及与来源引用；模型回答由 agent 用自己的模型/web_search 提供；适合\"测一下 AI 里能不能搜到这个品牌\"\"AI 引用份额\"；触发词：GEO 探针、AI 可见性、品牌提及、SoV、份额、AI 引用率"
-description_en: "GEO visibility probe (two ops): op=queries generates representative prompts from the page topic+brand; op=score parses a set of model answers into brand-mention rate, sourced-citation rate (SoV) and competitor share, honestly separating parametric mentions from sourced citations; the agent supplies the model answers (its own model / web_search); For: 'check if AI engines surface this brand', 'AI citation share'; Triggers: GEO probe, AI visibility, brand mention, SoV, share of voice"
-category: data
+description_zh: "生成品牌/主题的代表性提问，或分析模型回答中的品牌提及率、带来源引用率（SoV）和竞品份额；用于检查 AI 回答是否呈现或引用某品牌，并区分参数记忆提及与真实来源引用。"
+description_en: "Generate representative brand/topic questions or score supplied model answers for brand mentions, sourced-citation share (SoV), and competitor share. Use to test whether AI answers surface or cite a brand while distinguishing parametric mentions from sourced citations."
 ---
 
 # geo-probe
@@ -30,7 +29,23 @@ Measure whether AI answer engines surface a brand. Split because a skill can't r
 ```
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" geo-probe geo_probe -- --op queries --input <crawl.json> [--brand X] [--domain x.com] [--competitors "A,B"]
 ```
-→ `{ ok, data: { brand, domain, competitors, queries:[...] } }`
+→ `{ ok, data: { brand, domain, competitors, context_terms, queries:[{query, kind, intent}] } }`
+
+`kind` is `unbranded` (the measurement set) or `branded` (control). **A branded
+query cannot measure visibility** — asked "What is <brand>?" a model names the
+brand by construction, so counting those rows reports a share of voice the probe
+never tested. Branded rows are kept only to separate "nobody recommends us" from
+"the model does not know we exist"; keep their `kind` when you feed answers back.
+
+1b) Validate agent- or user-supplied candidates before probing with them:
+```
+echo '{"brand":"Orkas","domain":"orkas.ai","candidates":["best ai agent tools for teams","..."]}' | "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" geo-probe geo_probe -- --op filter
+```
+→ `{ ok, data: { kept:[...], rejected:[{query, reason}] } }`. Rejects a query that
+carries the brand or domain core, duplicates, is under 3 or over 12 words, uses a
+bare ambiguous acronym (`GEO`, `AEO`, `CRM`… without its expansion — an answer
+engine will answer for the wrong industry), or compares AI answer engines rather
+than vendors. Every drop names its reason; never discard one silently.
 
 2) The agent asks each query to one or more models / `web_search`, recording `{query, model, mode:"param"|"retrieval", text}` (mode = whether the model retrieved sources or answered from memory).
 
@@ -40,10 +55,17 @@ The `queries` op also returns `context_terms` (distinctive page-vocabulary words
 ```
 echo '{"brand":"Orkas","domain":"orkas.ai","competitors":["Cursor"],"context_terms":["ai","agent","desktop"],"answers":[{"query":"...","model":"...","mode":"retrieval","text":"..."}]}' | "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" geo-probe geo_probe -- --op score
 ```
-→ `{ ok, data: { share_of_voice, citation_rate, brand_mentions, domain_citations, ambiguous_mentions, competitor_share, context_terms, per_answer:[...], data_tier, note } }`
+→ `{ ok, data: { share_of_voice, share_of_voice_basis, unbranded, branded_control, share_of_voice_all_answers, citation_rate, brand_mentions, domain_citations, ambiguous_mentions, competitor_share, context_terms, per_answer:[...], data_tier, note } }`
 
 ## Honesty
 
+- **`share_of_voice` is measured over `unbranded` rows only.** Report it against
+  `branded_control`: unbranded 0 with control 1.0 means the brand is recognised
+  but never recommended; both near 0 means the answer engines do not know the
+  entity at all — a different problem with a different fix. `share_of_voice_all_answers`
+  is the un-split number, kept for comparison only; do not headline it. When a
+  probe set carried no unbranded row, `share_of_voice_basis` says so instead of
+  presenting the branded average as a clean score.
 - `share_of_voice` counts only **corroborated product mentions**: the answer cites the domain, OR the brand token appears together with a page-context term. A brand-token hit with no context term and no domain is **`ambiguous`** (likely a homonym, e.g. "Orkas" → orcas/whales) and is excluded from share_of_voice (surfaced as `ambiguous_mentions`). Without `context_terms`, it falls back to counting any brand-token hit.
 - `citation_rate` counts sourced domain citations and is the most reliable signal.
 - `data_tier` is `Measured` only when every answer came from a retrieval-capable model, otherwise `Estimated`. Always report which it is — never present a parametric-memory mention as a real citation.

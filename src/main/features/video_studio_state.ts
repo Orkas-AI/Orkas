@@ -1085,18 +1085,49 @@ export function summarizeVideoProductionState(
     // append-at-end, so the tail is the recent end; the full records stay on
     // disk and the counts below keep the "how many" fact.
     //
-    // The journal entries keep what a reader can act on. `operation_id` and
-    // `input_hash` were 1.4KB of every status call and neither is actionable
-    // from outside: the model cannot compute a hash, and the repeated-input
-    // question it would answer is decided host-side and returned as
-    // `same_input_attempts` by the operation that needs it.
-    operation_journal: (state.operation_journal || []).slice(-10).map((entry) => {
-      const { operation_id: _id, input_hash: _hash, ...actionable } = entry;
-      return actionable;
-    }),
+    // The journal entries keep what a reader can act on: which operation, how
+    // it ended. The first pass (2026-08-08) dropped `operation_id`/`input_hash`;
+    // re-measured on the 2026-08-23 drives, the surviving absolute
+    // findings/output paths and double timestamps were still 37% of every
+    // state echo with zero prompt/skill references — the most recent failure's
+    // findings_path already rides the result top level.
+    operation_journal: (state.operation_journal || []).slice(-10).map((entry) => ({
+      op: entry.op,
+      status: entry.status,
+      ...(entry.error_code ? { error_code: entry.error_code } : {}),
+      // Crash-recovery verdict: an interrupted attempt that must not burn a
+      // same-input retry says so here, and the model acts on it.
+      ...(entry.consumes_same_input_attempt !== undefined
+        ? { consumes_same_input_attempt: entry.consumes_same_input_attempt }
+        : {}),
+    })),
     operation_journal_count: state.operation_journal?.length || 0,
     ...(state.blocked_operation ? { blocked_operation: state.blocked_operation } : {}),
-    ...(state.visual_qa ? { visual_qa: state.visual_qa } : {}),
+    // Verdict facts only. The full cycle history — per-cycle 64-char signature
+    // arrays, timestamps, turn ids — was 28% of every state echo on the
+    // 2026-08-23 drives with zero prompt/skill references; the actionable
+    // repair view rides the result's own `visual_repair_cycle`, and the full
+    // ledger stays in the state file.
+    ...(state.visual_qa
+      ? {
+        visual_qa: {
+          ...(state.visual_qa.cycle
+            ? {
+              cycle: {
+                status: state.visual_qa.cycle.status,
+                visual_revision: state.visual_qa.cycle.visual_revision,
+                max_repair_passes: state.visual_qa.cycle.max_repair_passes,
+                failed_signature_count: state.visual_qa.cycle.failed_signatures?.length || 0,
+                ...(state.visual_qa.cycle.last_error_code
+                  ? { last_error_code: state.visual_qa.cycle.last_error_code }
+                  : {}),
+              },
+            }
+            : {}),
+          history_count: state.visual_qa.history?.length || 0,
+        },
+      }
+      : {}),
     ...(state.current_candidate
       ? { current_candidate: projectCandidateRevisionForModel(state.current_candidate) }
       : {}),

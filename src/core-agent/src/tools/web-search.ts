@@ -660,9 +660,7 @@ export const webSearchTool: AgentTool = defineTool({
   name: "web_search",
   executionMode: "parallel",
   description:
-    "Search the web for information. Returns a list of search results with titles, URLs, and snippets. " +
-    "Use this when you need to find current information, news, documentation, or any web content. " +
-    "After searching, use web_fetch to read the full content of relevant result URLs.",
+    "Search the web and return result titles, URLs, and snippets. Use web_fetch to retrieve full text from a selected URL.",
   inputSchema: {
     type: "object",
     properties: {

@@ -10,7 +10,7 @@ import type { AgentTool } from '#core-agent';
  * shared mutable state, no ordering dependence, no concurrency-unsafe resource.
  * For these read-tool factories that means side-effect-free reads.
  *
- * `kb_search` IS in the set: it embeds the query on the shared ONNX embedder
+ * `library` IS in the set: its search action embeds on the shared ONNX embedder
  * singleton, but concurrent calls are safe (verified by reading fastembed@2.1.0:
  * embed() keeps state local + already calls the tokenizer concurrently within a
  * batch; onnxruntime run() is concurrency-safe on a shared session). The
@@ -31,11 +31,11 @@ import type { AgentTool } from '#core-agent';
 const UID = '12345678';
 const CID = 'c0a1b2c3d4e5';
 
-// The reviewed set of read tools safe to run concurrently. kb_search is included
+// The reviewed set of read tools safe to run concurrently. library is included
 // (concurrent embed on the shared ONNX session is safe — see header).
 const PARALLEL_ALLOWLIST = [
-  'chat_read', 'chat_search',
-  'grep_files', 'kb_list', 'kb_read', 'kb_search', 'list_files', 'read_file', 'read_files', 'search_files',
+  'chat_history',
+  'grep_files', 'library', 'list_files', 'read_files', 'search_files',
 ].sort();
 
 let tmpDir: string;
@@ -57,12 +57,12 @@ afterEach(() => {
 describe('parallel-safety: executionMode:parallel ⊆ reviewed side-effect-free tools', () => {
   async function buildReadTools(): Promise<AgentTool[]> {
     const { createFileTools } = await import('../../../../src/main/model/core-agent/file-tools');
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
+    const { createLibraryTool } = await import('../../../../src/main/model/core-agent/kb-tools');
     return [
       ...createFileTools({ userId: UID, cid: CID }),
-      ...createChatHistoryTools({ userId: UID }),
-      ...createKbTools({ userId: UID }),
+      createChatHistoryTool({ userId: UID }),
+      createLibraryTool({ userId: UID }),
     ];
   }
 
@@ -73,15 +73,15 @@ describe('parallel-safety: executionMode:parallel ⊆ reviewed side-effect-free 
       .map((t) => t.name)
       .sort();
     // Exact match: a new parallel mark on a write/side-effectful tool, or
-    // re-marking kb_search, fails here and forces a safety review.
+    // re-marking library, fails here and forces a safety review.
     expect(parallel).toEqual(PARALLEL_ALLOWLIST);
   });
 
-  it('kb_search is parallel (concurrent embed on the shared ONNX session is safe)', async () => {
+  it('library is parallel (concurrent search embeds on the shared ONNX session are safe)', async () => {
     const tools = await buildReadTools();
-    const search = tools.find((t) => t.name === 'kb_search');
-    expect(search, 'kb_search should be registered').toBeTruthy();
-    expect(search!.executionMode).toBe('parallel');
+    const library = tools.find((t) => t.name === 'library');
+    expect(library, 'library should be registered').toBeTruthy();
+    expect(library!.executionMode).toBe('parallel');
   });
 
   it('every write / side-effectful read-factory tool is NOT parallel', async () => {

@@ -15,6 +15,7 @@
  */
 
 import type { AgentRunSteerInput, AgentTool, HistoryResource, Message } from '#core-agent';
+import type { SkillRuntimeBinding, SkillSelectionInput } from './core-agent/skill-registry';
 
 import {
   abortActiveSession as _abortActiveSession,
@@ -34,6 +35,8 @@ export interface StreamEvent {
   failureCode?: string;
   /** Runtime phase where the terminal failure occurred. */
   failurePhase?: 'preflight' | 'provider_wait' | 'model_text' | 'tool_input' | 'tool' | 'compaction';
+  /** Bounded provider code retained only for local failure classification. */
+  failureRawCode?: string;
   /** Only present on the main-chat `final` event when the assistant text
    * contained a fenced `agent-input-form` block. Carries the parsed form
    * payload + the msgIndex at which the assistant message will land, so
@@ -108,9 +111,7 @@ export interface ChatOptions {
    *  which legitimately run long multi-step builds (e.g. VideoStudio draft/render,
    *  DeepResearcher gathering); loop_detection still guards true runaway loops. */
   maxToolLoops?: number;
-  /** Optional elapsed tool-execution threshold for the runner's one-time soft
-   *  convergence reminder. It does not stop the turn or change maxToolLoops;
-   *  undefined preserves core-agent's default eight-minute threshold. */
+  /** Optional soft convergence threshold; the hard tool-loop limit is unchanged. */
   elapsedConvergenceMs?: number;
   abortSignal?: AbortSignal | null;
   /** Optional host-owned structural check for terminal text. Returning a
@@ -125,9 +126,25 @@ export interface ChatOptions {
    * `skill_list: []`. Sourced from the target agent's `skill_list` field
    * (see `features/agents.ts`). */
   skillList?: string[];
+  /** Host-owned subset of hidden System Skill protocols exposed to this
+   * session. Undefined preserves the full catalog for Commander; edit
+   * surfaces pass an explicit fixed list. This is independent of the
+   * Agent's user-facing `skillList`. */
+  systemSkillList?: readonly string[];
+  /** Fixed tool groups authored by the target Agent. Undefined selects the
+   * historical fixed compatibility surface; [] is host-only. */
+  toolList?: string[];
+  /** This call can author LLM-managed Agent tool dependencies. The runner
+   * exposes the shared group-id directory without expanding the editor. */
+  agentToolDependencyAuthoring?: boolean;
   /** User-explicit skill refs selected in the composer. Open/global skills
    *  named here may be rendered even when an agent skill allowlist is active. */
-  forceOpenSkillRefs?: readonly string[];
+  forceOpenSkillRefs?: readonly SkillSelectionInput[];
+  /** Shared host-owned bindings for Skills admitted later by rich steer. */
+  runtimeSkillBindings?: Map<string, SkillRuntimeBinding>;
+  /** Mutable current-turn Agent tool groups granted by explicit user
+   * selections. These activate before the Agent's lower-priority fallback. */
+  runtimeGrantedToolGroups?: string[];
   /** Project-scope skill allowlist applied ONLY to the System A render
    *  block (`getSystemPromptBlock`). Resolved from the conversation's
    *  project bindings at the top of `runTurn`. The runner intersects this
@@ -172,7 +189,7 @@ export interface ChatOptions {
   extraRoots?: readonly string[];
   /** Read-only extra roots: read tools (read_file / search_files /
    *  grep_files / stat_file) can see these, but write-side tools
-   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  (edit_file / write_file / bash / create_pdf /
    *  generate_image) cannot mutate paths inside. Used by group-chat
    *  commander to inspect agent / skill specs while the structured
    *  `<agent>` / `<skill>` containers remain the only sanctioned mutation
@@ -181,7 +198,7 @@ export interface ChatOptions {
   /** File-tool-only read roots. These are visible to `read_file` /
    *  `search_files` / `grep_files` / `stat_file`, but are intentionally not
    *  passed to local-exec tools such as `delete_file`, `bash`, `write_file`,
-   *  `markdown_to_pdf`, or `html_to_pdf`. Used for user-approved read-only
+   *  `create_pdf`. Used for user-approved read-only
    *  folder grants. */
   fileReadOnlyExtraRoots?: readonly string[];
   /** Mutable, run-scoped read-only roots admitted by rich interrupt-steer.
@@ -193,7 +210,7 @@ export interface ChatOptions {
    * executed). Group Chat sets this only for top-level CoreAgent turns. */
   richSteerEnabled?: boolean;
   /** Fired with the absolute path of every file produced by the local-exec
-   * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`, `bash`)
+   * tools (`write_file`, `create_pdf`, `bash`)
    * during this run.
    * `features/chats` uses this to attach a `produced[]` list to the
    * assistant message so the UI can offer a "reveal in Finder" chip. */
@@ -202,6 +219,9 @@ export interface ChatOptions {
    * turn and returns the subset accepted by the conversation owner. Paths
    * are absolute before this callback runs. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** Existing current-turn paths eligible for publication. Used only to give
+   * the model a bounded recovery after a rejected declaration. */
+  getPublishableOutputPaths?: () => string[];
   /** Predicate: true when the given absolute path was already written by
    * this caller's session (typically: a `Set` populated by `onFileWritten`
    * earlier in the same turn). Used by the write-style tools' uniquify
@@ -231,10 +251,10 @@ export interface ChatOptions {
    * a future settings-page toggle will flip it per-user. Providers without
    * prompt-cache support (e.g. Mistral) silently ignore it. */
   cacheRetention?: 'none' | 'short' | 'long';
-  /** Thinking/reasoning effort for reasoner models. Undefined omits an
-   *  explicit effort so the upstream applies its model default. Set `'off'`
-   *  to suppress a provider-configured default; set `'low'` / `'high'` to
-   *  override when the selected provider supports the field. */
+  /** Thinking/reasoning effort for reasoner models. Undefined lets the
+   *  provider apply its configured default, or omit an explicit effort when
+   *  it has none. Set `'off'` to suppress a provider-configured default; set
+   *  `'low'` / `'high'` to override when the selected provider supports it. */
   thinkingLevel?: 'off' | 'low' | 'high';
   /** G8d in-process nested sub-run (a dispatch tool running a worker/agent turn
    *  inside its caller's turn). When true, the run does NOT acquire a global

@@ -33,6 +33,7 @@ import {
 import {
   getSystemPromptBlock,
   getSystemSkillsPromptBlock,
+  type SkillSelectionInput,
   type SkillRuntimeBinding,
 } from './skill-registry';
 import { t } from '../../i18n';
@@ -43,6 +44,7 @@ import {
   getSession,
   getSessionForUser,
   memoryScopeForSession,
+  metacognitionAllowedForSession,
   sessionKindOf,
   toolResultsDirForSession,
 } from './session-store';
@@ -62,26 +64,32 @@ import {
 } from '../../features/projects';
 import * as projectTasks from '../../features/project_tasks';
 import * as metacognition from '../../features/metacognition';
-import { appendAgentSkill, listAgents } from '../../features/agents';
+import { appendAgentSkill, listAgentSummaries } from '../../features/agents';
 const log = createLogger('model/runner');
+const REFLECTION_TOOL_NAMES = new Set(['metacognition', 'skill_manage']);
 import { createLocalTools, createFileTools } from './local-tools';
 import { createOfficeTools } from './office-tools';
 import { createPdfTools } from './pdf-tools';
 import { officeCliAvailable } from '../../features/office/office_engine';
-import { createKbTools } from './kb-tools';
-import { createChatHistoryTools } from './chat-history-tools';
+import { createLibraryTool } from './kb-tools';
+import { createChatHistoryTool } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createGenerateSpeechTool } from './generate-speech-tool';
-import { createVideoStudioTool } from './video-studio-tool';
-import { createImageStudioTool } from './image-studio-tool';
-import { isToolVisibleToAgent } from './tool-catalog';
+import {
+  AGENT_DEPENDENCY_TOOL_GROUP_IDS,
+  getActiveToolGroupsTurnBlock,
+  getToolCatalogEntry,
+  getLoadableToolGroupsSystemPromptBlock,
+  isToolVisibleToAgent,
+  toolNamesForGroups,
+} from './tool-catalog';
+import { createToolLoadTool, createToolSurfaceController } from './tool-surface';
 import { shouldExposeOcrFileTool } from './ocr-tool-policy';
 import { createWebSearchOverrideTool } from './search-tools';
 import {
   agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
   userMarketplaceAgentSkillsDir,
-  userSystemSkillsDir,
 } from '../../paths';
 import { artifactDirForConversation, chatAttachmentDirForConversation } from '../../util/project-layout';
 import {
@@ -107,15 +115,31 @@ import {
   modelInputImageLimit,
 } from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
-import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-tools';
+import {
+  nativeSearchToolForApi,
+  nativeSearchToolName,
+  routeSearchPayloadTools,
+} from './native-search-tools';
 import { hasAnySearchProfile } from '../../features/search_auth';
-import { createConnectorMetaTools, getConnectorPromptBlock } from './connector-meta-tools';
+import { buildConnectorSurface } from './connector-meta-tools';
 import { createLogger } from '../../logger';
-import { createConversationHistorySummaryCache } from '../../features/group_chat/history-summary-cache';
 import { logErrorSummary, maskId } from '../../util/log-redact';
+import { repairOpenAIToolMessageOrder } from './openai-payload';
+import {
+  DEEP_RESEARCH_EVIDENCE_STATE_KEY,
+  DEEP_RESEARCH_SKILL_ID,
+  captureDeepResearchWebFetchEvidence,
+  deepResearchEvidenceFile,
+} from './deep-research-evidence';
 import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
-import { repairOpenAIToolMessageOrder } from './openai-payload';
+import {
+  splitCommanderAgentsBlock,
+  splitCommanderOrchestrationBlock,
+  splitLanguageDirectiveBlock,
+  splitRuntimeInjectionBlock,
+  splitVolatilePromptTail,
+} from '../../prompts/chat_prompt_composer';
 
 const runnerLog = createLogger('runner');
 const legacySkillEnabledRepairAttempted = new Set<string>();
@@ -249,16 +273,34 @@ export interface BuildRunnerParams {
   /** Optional subset of skill ids; undefined = full global listing. See
    * `skill-registry.getSystemPromptBlock` for the exact semantics. */
   skillList?: string[];
+  /** Host-owned System Skill allowlist. Undefined preserves Commander's full
+   * catalog; edit surfaces pass fixed protocol ids. */
+  systemSkillList?: readonly string[];
+  /** Agent-authored fixed tool groups. An explicit empty list requests only
+   * host-required tools; missing metadata gets a fixed compatibility surface. */
+  toolList?: string[];
+  /** Expose the shared dependency-group directory for Agent Creator. This does
+   * not expand the editor session's own fixed tool surface. */
+  agentToolDependencyAuthoring?: boolean;
   /** Project-scope skill allowlist applied ONLY to the System A render
    *  block (`getSystemPromptBlock`). When present, the rendered allowlist
    *  is `intersect(skillList, projectAllowedSkillIds)`; SkillStore (System
    *  B, agent self-evolved skills) stays gated by `skillList` alone so
    *  agents in projects retain access to their own evolved skills. See
-   *  CLAUDE.md §6 + `features/projects.ts::resolveProjectScope`. */
+   *  `docs/architecture/skill-engineering-contract.md` and
+   *  `features/projects.ts::resolveProjectScope`. */
   projectAllowedSkillIds?: readonly string[];
   /** User-explicit skill refs selected in the composer. These are rendered
    *  even when they live in open/global skill roots that are normally lazy. */
-  forceOpenSkillRefs?: readonly string[];
+  forceOpenSkillRefs?: readonly SkillSelectionInput[];
+  /** Shared host-owned map for Skills selected after runner construction.
+   * Rich steer mutates the same identity only after Session accepts the user
+   * message, so read_file can resolve the newly advertised @skill ref. */
+  runtimeSkillBindings?: Map<string, SkillRuntimeBinding>;
+  /** Mutable current-turn tool-group grants from explicit user selections.
+   * This host ingress activates obvious dependencies before the named Agent's
+   * lower-priority `tool_load` fallback is needed. */
+  runtimeGrantedToolGroups?: string[];
   /** Extra tools added to core-agent's builtins (e.g. group_chat commander
    * gets dispatch tools (`run_worker` / `dispatch_to`) plus marketplace /
    * skill-search / automation-listing tools). */
@@ -287,11 +329,14 @@ export interface BuildRunnerParams {
   /** Expose the stable tool superset needed by rich active-turn messages. */
   richSteerEnabled?: boolean;
   /** Fires with the absolute path after each successful `write_file` /
-   * `markdown_to_pdf` / `html_to_pdf` call or tracked bash output file. See `model/client.ts`
+   * `create_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
   onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Turn owner validation hook for the `publish_outputs` tool. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
+  /** Existing current-turn paths eligible for publication after a rejected
+   * declaration. */
+  getPublishableOutputPaths?: () => string[];
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -370,79 +415,18 @@ export interface ToolDefSnapshot {
   source: 'core-agent' | 'orkas' | 'extra';
 }
 
-function splitVolatilePromptTail(prompt: string | undefined): { stable: string; volatileTail: string } {
-  const raw = (prompt || '').trim();
-  if (!raw) return { stable: '', volatileTail: '' };
-  const marker = '\n\n---\n\n## Current date\n';
-  const idx = raw.lastIndexOf(marker);
-  if (idx < 0) return { stable: raw, volatileTail: '' };
-  const stable = raw.slice(0, idx).trim();
-  const volatileTail = raw.slice(idx + 2).trim();
-  return { stable, volatileTail };
-}
-
-function splitCommanderAgentsBlock(prompt: string): { stable: string; agentsBlock: string } {
-  const marker = '\n\n### Agents list\n\n';
-  const idx = prompt.indexOf(marker);
-  if (idx < 0) return { stable: prompt, agentsBlock: '' };
-  const blockStart = idx + 2;
-  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
-  const blockEnd = nextSection < 0
-    ? prompt.length
-    : blockStart + marker.trimStart().length + nextSection;
-  return {
-    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
-    agentsBlock: prompt.slice(blockStart, blockEnd).trim().replace(/^### Agents list/, '## Agents list'),
-  };
-}
-
-function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeInjectionBlock: string } {
-  const marker = '\n\n## Runtime injection';
-  const idx = prompt.indexOf(marker);
-  if (idx < 0) return { stable: prompt, runtimeInjectionBlock: '' };
-  const blockStart = idx + 2;
-  return {
-    stable: prompt.slice(0, idx).trim(),
-    runtimeInjectionBlock: prompt.slice(blockStart).trim(),
-  };
-}
-
-function splitLanguageDirectiveBlock(prompt: string): { stable: string; languageDirectiveBlock: string } {
-  const marker = '\n\n---\n\n## User language';
-  const idx = prompt.lastIndexOf(marker);
-  if (idx < 0) return { stable: prompt, languageDirectiveBlock: '' };
-  const blockStart = idx + '\n\n---\n\n'.length;
-  return {
-    stable: prompt.slice(0, idx).trim(),
-    languageDirectiveBlock: prompt.slice(blockStart).trim(),
-  };
-}
-
-/**
- * Peel the commander's `## Orchestration state` section out of the cached
- * prefix. Its body renders the per-turn `orchestration_ledger` JSON (status,
- * updated_at, interrupted_at, …), which changes every commander turn while an
- * agent handoff / form / dispatch pause is live. Left in place — it sits near
- * the TOP of chat_commander.md, far ahead of `## Runtime injection` — any
- * ledger change invalidates the whole Anthropic cache prefix after it (~7-9K
- * tokens re-billed at full input price per turn). Relocating the whole H2
- * section to the volatile region keeps the cached prefix stable and follows
- * CLAUDE.md's "runtime-volatile prompt fields go in one trailing section"
- * rule. The header is already H2 so no heading rewrite is needed.
- */
-function splitCommanderOrchestrationBlock(prompt: string): { stable: string; orchestrationBlock: string } {
-  const marker = '\n\n## Orchestration state';
-  const idx = prompt.indexOf(marker);
-  if (idx < 0) return { stable: prompt, orchestrationBlock: '' };
-  const blockStart = idx + 2;
-  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
-  const blockEnd = nextSection < 0
-    ? prompt.length
-    : blockStart + marker.trimStart().length + nextSection;
-  return {
-    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
-    orchestrationBlock: prompt.slice(blockStart, blockEnd).trim(),
-  };
+/** Run-local tool-surface counters. Raw group ids remain inside main and are
+ * reduced to bounded counts/buckets before analytics emission. */
+export interface ToolSurfaceTelemetrySnapshot {
+  mode: 'scoped' | 'legacy_all' | 'unknown';
+  peakToolCount: number;
+  loadCallCount: number;
+  loadedGroupCount: number;
+  /** Provider-definition characters added specifically by model tool_load
+   * calls. Host-granted runtime tools are excluded. */
+  loadedSchemaChars: number;
+  loadedUnusedGroupCount: number;
+  webToolUsed: boolean;
 }
 
 /** Exported for unit tests — see runner.test.ts. */
@@ -450,6 +434,10 @@ export const _splitCommanderOrchestrationBlock = splitCommanderOrchestrationBloc
 
 export async function buildRunner(params: BuildRunnerParams): Promise<{
   runner: AgentRunnerInstance;
+  /** Opaque identity shared by every turn of this persisted model session.
+   *  Consumers may use object identity for session-local transient state but
+   *  must not inspect or expose the underlying PersistentSession. */
+  failureTrackingScope: object;
   resolvedSystemPrompt: string;
   /** Per-turn volatile blocks (orchestration ledger / plan / datetime) peeled
    *  OUT of the system prompt to keep the cache prefix stable; the caller
@@ -460,6 +448,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   profileId?: string;
   providerId: string;
   modelId: string;
+  /** Actual activation mode after rollout, eligibility, and history-compat checks. */
+  toolSurfaceMode: 'scoped' | 'legacy_all';
+  /** Snapshot current run-local loading/usage counters at the terminal
+   * boundary. No tool/group names leave the main process. */
+  toolSurfaceTelemetry(usedToolNames?: readonly string[]): ToolSurfaceTelemetrySnapshot;
   /** Final tool set visible to the LLM (after last-write-wins merge of
    *  core-agent builtins + buildRunner-injected + caller-supplied extras).
    *  Used by the dev-only archiver. */
@@ -467,9 +460,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   /** UI-only skill display names collected while rendering the prompt block.
    *  Not injected into model context; reused for process-log labels. */
   skillDisplayNameById: Map<string, string>;
+  /** Run-scoped read-ref identities for process-log labels. Physical Skill
+   *  roots stay private to the runner and are not included in these values. */
+  skillMetadataByReadRef: Map<string, { id: string; name: string; source: string }>;
   /** UI-only agent display names collected once before the run.
    *  Not injected into model context; reused for process-log labels. */
   agentDisplayNameById: Map<string, string>;
+  /** UI-only Connector display names from the same visible snapshot and live
+   * checks used by this runner's connector tools. */
+  connectorDisplayNameById: Map<string, string>;
 }> {
   // Auth gate first — if no group has any usable candidate, fail before
   // loading core-agent / scanning skills / opening a session file. Gives
@@ -491,6 +490,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     throw new Error(t('errors.no_model_configured'));
   }
 
+  const sessionKind = sessionKindOf(params.sessionId);
+  const isReflectionSession = sessionKind === 'reflect';
+
   // Per-user disabled-skill set; passed into getSystemPromptBlock so the
   // rendered `## Available skills` block excludes user-disabled skills regardless
   // of agent-level allowlist. Resolved off the active uid; session_id no longer
@@ -499,7 +501,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // test paths that activate no user just see a null uid → empty disabled set.
   const earlyUid = params.userId || _safeActiveUserId();
   if (
-    earlyUid
+    !isReflectionSession
+    && earlyUid
     && earlyUid === _safeActiveUserId()
     && !legacySkillEnabledRepairAttempted.has(earlyUid)
   ) {
@@ -521,7 +524,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       });
     }
   }
-  const disabledSkillIds = earlyUid ? readDisabledSets(earlyUid).skills : new Set<string>();
+  const disabledSkillIds = earlyUid && !isReflectionSession
+    ? readDisabledSets(earlyUid).skills
+    : new Set<string>();
 
   // System A render allowlist = intersect(skillList, project bindings).
   //   - no project scope (`projectAllowedSkillIds` undefined) → legacy
@@ -536,39 +541,55 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // exact filtered prompt render; every provider/tool round then reuses the
   // same snapshot without rescanning Skill directories or persisting paths in
   // conversation history.
-  const skillRuntimeBindings = new Map<string, SkillRuntimeBinding>();
+  const skillRuntimeBindings = !isReflectionSession && params.runtimeSkillBindings
+    ? params.runtimeSkillBindings
+    : new Map<string, SkillRuntimeBinding>();
   const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
   const openSkillSourcesVisible = openSkillSourcesExposureFromSessionId(params.sessionId);
-  const skillBlocksPromise = (async (): Promise<[string, string]> => {
-    // Register system skills first so cross-tier same-name collisions resolve
-    // deterministically; the regular entry falls back to its id read ref.
-    const systemBlock = systemSkillsVisible
-      ? await getSystemSkillsPromptBlock(earlyUid || undefined, skillRuntimeBindings)
-      : '';
-    const regularBlock = await getSystemPromptBlock({
-      ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
-      disabledIds: disabledSkillIds,
-      // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's
-      // own internal skills render for it, but never for the commander or
-      // other agents. Empty for commander/non-agent sessions.
-      ...(params.agentId ? { agentId: params.agentId } : {}),
-      ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
-      displayNameById: skillDisplayNameById,
-      runtimeBindings: skillRuntimeBindings,
-      ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
-      ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
-    });
-    return [systemBlock, regularBlock];
-  })();
+  const skillBlocksPromise: Promise<[string, string]> = isReflectionSession
+    ? Promise.resolve(['', ''])
+    : (async (): Promise<[string, string]> => {
+      // Register system skills first so cross-tier same-name collisions resolve
+      // deterministically; the regular entry falls back to its id read ref.
+      const systemBlock = systemSkillsVisible
+        ? await getSystemSkillsPromptBlock(
+            earlyUid || undefined,
+            skillRuntimeBindings,
+            params.systemSkillList,
+            params.projectId ? undefined : ['project-tasks'],
+          )
+        : '';
+      const regularBlock = await getSystemPromptBlock({
+        ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
+        disabledIds: disabledSkillIds,
+        // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's
+        // own internal skills render for it, but never for the commander or
+        // other agents. Empty for commander/non-agent sessions.
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+        ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
+        displayNameById: skillDisplayNameById,
+        runtimeBindings: skillRuntimeBindings,
+        ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
+        ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
+      });
+      return [systemBlock, regularBlock];
+    })();
   const [mod, session, [systemSkillsBlock, skillsBlock]] = await Promise.all([
     ca(),
     earlyUid ? getSessionForUser(earlyUid, params.sessionId) : getSession(params.sessionId),
     skillBlocksPromise,
   ]);
+  const skillMetadataByReadRef = new Map(
+    Array.from(skillRuntimeBindings, ([ref, binding]) => [
+      ref,
+      { id: binding.id, name: binding.name, source: binding.source },
+    ]),
+  );
 
   const providerId = primary?.provider || 'anthropic';
   const modelId    = primary?.model    || 'claude-opus-4-8';
 
+  const sessionHadHistoryBeforeSync = session.length > 0;
   const preservingActiveTurn = !!params.resumeActiveTurn
     && !!session.getSerializedContextState()?.activeTurn;
   if (params.conversationHistory && !preservingActiveTurn) {
@@ -586,9 +607,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     );
   }
 
-  // Build tools array: memory tool + metacognition tool. Assembly stays
-  // above the system-prompt build because finalToolNames is still snapshotted
-  // for the dev archive after this section.
+  // Build tools array: memory tool + metacognition tool. AgentRunner owns the
+  // final provider-definition snapshot after every source is assembled.
   const uid = params.userId || _safeActiveUserId();
   const agentId = params.agentId || '';
   // Cross-session memory eligibility + per-agent scope (null = not eligible →
@@ -599,23 +619,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // the `project_instructions` tool) and project memory. Dispatched sub-agents
   // (gmember / gworker / cli) get read-only access to both. Derived from the
   // immutable session id, so it can't drift mid-session.
-  const sessionKind = sessionKindOf(params.sessionId);
   const isCommander = sessionKind === 'gconv';
   const isGroupAgent = sessionKind === 'gmember';
-  const sharedHistorySummaryCache = (
-    uid
-    && params.cid
-    && params.conversationHistory
-    && (isCommander || isGroupAgent)
-  ) ? createConversationHistorySummaryCache({
-      uid,
-      cid: params.cid,
-      source: params.conversationHistory.source,
-    }) : null;
   const agentDisplayNameById = new Map<string, string>();
   if (uid) {
     try {
-      for (const agent of await listAgents()) {
+      for (const agent of await listAgentSummaries()) {
         if (agent?.agent_id) agentDisplayNameById.set(agent.agent_id, agent.name || agent.agent_id);
       }
     } catch (err) {
@@ -758,7 +767,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Metacognition tool (per-agent/account, only if enabled for the turn's
   // owner). Never resolve this through the active-user singleton: a queued
   // turn or background reflection may overlap an account switch.
-  if (uid && metacognition.isFeatureEnabledForUser(uid)) {
+  if (
+    uid
+    && metacognitionAllowedForSession(params.sessionId, agentId)
+    && metacognition.isFeatureEnabledForUser(uid)
+  ) {
     const metaHandler: MetacognitionToolHandler = {
       read: (target) => metacognition.readContentForUser(uid, agentId, target),
       write: (target, content) => metacognition.writeContentForUser(uid, agentId, target, content),
@@ -771,10 +784,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   }
 
   // Local-machine tools: bash / write_file overrides (permission-gated) +
-  // markdown_to_pdf / html_to_pdf. These MUST come after core-agent's
+  // create_pdf. These MUST come after core-agent's
   // builtins in the list so `AgentRunner`'s last-write-wins tool map
   // overrides `bash` and `write_file` with the permission-gated versions.
-  const systemSkillReadRoots = uid ? [userSystemSkillsDir(uid)] : [];
   const runtimeSkillReadRoots = Array.from(new Set(
     Array.from(skillRuntimeBindings.values(), (binding) => path.resolve(binding.root)),
   ));
@@ -788,11 +800,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const fileReadOnlyExtraRoots = [
     ...(params.fileReadOnlyExtraRoots || []),
     ...(params.readOnlyExtraRoots || []),
-    ...systemSkillReadRoots,
     ...agentPrivateSkillReadRoots,
     ...runtimeSkillReadRoots,
   ];
   const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
+  const deepResearchSnapshotFile = toolResultsDir
+    ? deepResearchEvidenceFile(toolResultsDir)
+    : '';
+  const deepResearchIsAvailable = (): boolean => Array.from(
+    skillRuntimeBindings.values(),
+  ).some((binding) => binding.id === DEEP_RESEARCH_SKILL_ID);
   const visionFallbackAvailable = inputImageLimitForChoice(mod, primary) > 0;
   const includeOcrFile = !!uid && (
     params.richSteerEnabled === true
@@ -816,19 +833,21 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(agentName ? { agentName } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-    // Read-only roots intentionally stay out of localTools. `delete_file`,
-    // `write_file`, PDF tools, and bash-adjacent local execution only get the
-    // writable lane (`extraRoots`), while read-only roots are visible through
-    // fileTools below.
+    // Read-only roots stay out of the writable lane, but localTools still
+    // receive them as deny-only roots. This keeps all-files access modes from
+    // mutating platform/skill/agent specs that were exposed for inspection.
+    ...(localReadOnlyDenyRoots.length ? { readOnlyExtraRoots: localReadOnlyDenyRoots } : {}),
+    ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
+    skillRuntimeBindings,
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.onOutputsPublished ? { onOutputsPublished: params.onOutputsPublished } : {}),
+    ...(params.getPublishableOutputPaths ? { getPublishableOutputPaths: params.getPublishableOutputPaths } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
   });
 
-  // File-scoped tools (read_file override + search_files + grep_files).
-  // Same last-write-wins rule — placed after localTools so `read_file` wins
-  // over core-agent's builtin `read_file`. Skipped when uid is unknown
+  // File-scoped tools (read_files + search_files + grep_files). Skipped when
+  // uid is unknown
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
   // `readOnlyExtraRoots` is threaded here for the read scope (workspace +
   // attachment + extraRoots + readOnlyExtraRoots all visible). Local write
@@ -849,7 +868,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, ...(toolResultsDir ? [toolResultsDir] : [])] }
           : {}),
         ...(params.runtimeReadOnlyRoots ? { runtimeReadOnlyRoots: params.runtimeReadOnlyRoots } : {}),
-        ...(skillRuntimeBindings.size ? { skillRuntimeBindings } : {}),
+        // Keep the shared map identity even when it starts empty: trusted
+        // rich-steer selection may bind an additional Skill later this run.
+        skillRuntimeBindings,
         ...(toolResultsDir ? { toolResultsRoot: toolResultsDir } : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
@@ -860,22 +881,22 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // generic read_file is explicitly denied for this root below.
   const toolResultTools = toolResultsDir ? createToolResultTools({ toolResultsDir }) : [];
 
-  // Library tools (kb_list + kb_search + kb_read). Read-only, no localExec
+  // Library tool (list/search/read actions). Read-only, no localExec
   // required. Injected for every main conv + group_chat actor; agent-edit
   // / skill-edit sessions also get them (the LLM may want to preview KB
   // content when building workflows). Skipped when uid is unknown
   // (matches file-tools).
-  const kbTools = uid ? createKbTools({
+  const kbTools = uid ? [createLibraryTool({
     userId: uid,
     ...(params.projectId ? { projectId: params.projectId } : {}),
-  }) : [];
+  })] : [];
 
-  // Conversation-history tools (chat_search + chat_read). Group Agents get
+  // Conversation-history tool (search/read actions). Group Agents get
   // only a host-bound current-conversation scope; they never receive automatic
   // canonical-history replay and cannot browse sibling conversations.
   // Commander additionally retains all scope, plus project only when this
   // conversation is actually bound to a project.
-  const chatHistoryTools = uid && (isCommander || isGroupAgent) ? createChatHistoryTools({
+  const chatHistoryTools = uid && (isCommander || isGroupAgent) ? [createChatHistoryTool({
     userId: uid,
     ...(params.cid ? { currentCid: params.cid } : {}),
     ...(params.historyBoundaryMessageId
@@ -885,7 +906,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     allowedScopes: isCommander
       ? (params.projectId ? ['current', 'project', 'all'] : ['current', 'all'])
       : ['current'],
-  }) : [];
+  })] : [];
 
   // Media generation. Shares the localExec access mode with
   // local-tools (writing image bytes is the same blast radius as write_file).
@@ -919,8 +940,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
-  const videoStudioTools: AgentTool[] = uid
-    ? [createVideoStudioTool({
+
+  // Owner-only native Studio runtimes are large implementation modules. Do
+  // not import or construct them for Commander or unrelated Agents merely to
+  // discard them at the owner gate below.
+  const videoStudioTools: AgentTool[] = uid && isToolVisibleToAgent('video_studio', agentId)
+    ? [(await import('./video-studio-tool')).createVideoStudioTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.turnId ? { turnId: params.turnId } : {}),
@@ -935,8 +960,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       })]
     : [];
 
-  const imageStudioTools: AgentTool[] = uid
-    ? [createImageStudioTool({
+  const imageStudioTools: AgentTool[] = uid && isToolVisibleToAgent('image_studio', agentId)
+    ? [(await import('./image-studio-tool')).createImageStudioTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.turnId ? { turnId: params.turnId } : {}),
@@ -1015,28 +1040,42 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   //                                                         `call_connector_tool` is withheld
   //                                                         so an authoring session can never
   //                                                         produce external side effects.
-  //   - everything else (skill-edit / KB-image / CLI dispatch / reflect / memory-extract /
+  //   - everything else (skill-edit / KB-image / CLI dispatch / reflect /
   //     anon)                                            → none.
-  // Group-chat agents intentionally share the commander's connector visibility:
-  // do not pass agentId here. Agent-edit also bypasses `agent.enabled_connectors`
-  // so the editor LLM can inspect every installed connector while authoring.
+  // Connector visibility is user-scoped. Session kind controls whether an actor
+  // may discover or call the visible connectors.
   const exposure = uid ? connectorExposureFromSessionId(params.sessionId) : 'none';
-  const blockAgentId = undefined;
-  const connectorBlock = exposure !== 'none' && uid
-    ? await getConnectorPromptBlock(uid, blockAgentId)
-    : '';
-  const connectorMetaTools = uid && exposure !== 'none'
-    ? await createConnectorMetaTools(
+  const connectorSurface = uid && exposure !== 'none'
+    ? await buildConnectorSurface(
         {
           userId: uid,
           ...(params.cid ? { cid: params.cid } : {}),
           ...(params.richSteerEnabled ? { allowRuntimeRefresh: true } : {}),
+          ...(isCommander ? { allowCustomConnectorInstall: true } : {}),
         },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
-    : [];
+    : { promptBlock: '', tools: [], connectorDisplayNameById: new Map<string, string>() };
+  const connectorDisplayNameById = connectorSurface.connectorDisplayNameById;
+  const agentConnectorPromptEnabled = sessionKind !== 'gmember'
+    || params.toolList === undefined
+    || toolNamesForGroups([
+      ...params.toolList,
+      ...(params.runtimeGrantedToolGroups || []),
+    ]).includes('list_connector_tools');
+  // A fixed Agent sees the Connector catalog only when its authored
+  // dependency or a user-explicit current-turn selection activates that
+  // capability. Rich steer may grant it later; that selection carries its own
+  // host-authored Connector notice in the user message.
+  const connectorBlock = agentConnectorPromptEnabled
+    ? connectorSurface.promptBlock
+    : '';
+  const connectorMetaTools = connectorSurface.tools;
 
-  const builtinTools = mod.getBuiltinTools();
+  // Orkas consolidates the core package's single-file reader into the host
+  // read_files contract. Filtering here retires only the model-visible alias;
+  // the core package remains reusable by callers that still own read_file.
+  const builtinTools = mod.getBuiltinTools().filter((tool) => tool.name !== 'read_file');
 
   // Merge injected tools with extra tools from caller
   const allTools = [
@@ -1061,68 +1100,184 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // entry declares an `ownerAgent` other than this actor. Defense-in-depth
   // beyond the construction-time gate above — guarantees an owner-only tool can
   // never reach another actor's tools[] regardless of which injection path
-  // produced it. Caller-supplied extraTools / core-agent builtins aren't in the
-  // catalog, so `isToolVisibleToAgent` returns true for them (unaffected).
+  // produced it. Unknown caller tools remain visible in legacy mode; scoped
+  // mode rejects them below so a registration cannot silently become
+  // permanently inactive.
   const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
-  const visibleToolNameSet = new Set(visibleTools.map((tool) => tool.name));
+  const evolutionToolNames = agentId && earlyUid ? ['skill_manage'] : [];
+  const isAgentEditSession = sessionKind === 'agent';
+  const isAgentToolAuthoringSession = isAgentEditSession
+    && params.agentToolDependencyAuthoring === true;
+  const isNamedAgentRuntime = sessionKind === 'gmember';
+  const dynamicToolLoading = isCommander || isNamedAgentRuntime;
+  const dynamicLoadPolicy = isNamedAgentRuntime
+    ? 'agent-dependency' as const
+    : 'loadable' as const;
+  const availableToolNames = Array.from(new Set([
+    ...builtinTools.map((tool) => tool.name),
+    ...visibleTools.map((tool) => tool.name),
+    'manage_execution_plan',
+    ...evolutionToolNames,
+    ...(dynamicToolLoading ? ['tool_load'] : []),
+  ]));
+  // Reflection is a fixed utility surface. Its independent prompt never uses
+  // ordinary Host Skills or general task tools: named Agents may update their
+  // learned Skill store, while every reflection may update metacognition.
+  // Restrict the controller's available set itself so host-managed groups and
+  // the global legacy rollback cannot accidentally widen this actor.
+  const surfaceAvailableToolNames = isReflectionSession
+    ? availableToolNames.filter((name) => REFLECTION_TOOL_NAMES.has(name))
+    : availableToolNames;
+  // Rich steer may retain Connector list/call executors even when this run
+  // starts with no visible Connector. They are host-grantable after an
+  // explicit user selection, but must not make the model-facing fallback
+  // directory or tool_load enum claim that Connectors are currently usable.
+  const dynamicLoadableToolNames = connectorSurface.promptBlock
+    ? availableToolNames
+    : availableToolNames.filter((name) => (
+        name !== 'list_connector_tools' && name !== 'call_connector_tool'
+      ));
+  // Agent creation is an infrequent Commander route, so its exact
+  // group-to-tool directory belongs in the progressive-disclosure read rather
+  // than every Commander system prompt. The binding is run-scoped and the file
+  // tool renders this prelude only for the System Skill entry itself; SKILL.md
+  // bytes, hashes, ranges, and referenced files remain unchanged.
+  if (isCommander) {
+    const dependencyDirectory = getLoadableToolGroupsSystemPromptBlock({
+      availableToolNames,
+      purpose: 'agent-authoring',
+    });
+    for (const binding of new Set(skillRuntimeBindings.values())) {
+      if (binding.source === 'system' && binding.id === 'agent-creator') {
+        binding.entryReadPrelude = [binding.entryReadPrelude, dependencyDirectory]
+          .filter(Boolean)
+          .join('\n\n');
+      }
+    }
+  }
+  const scopedEligible = isReflectionSession
+    || isCommander
+    || sessionKind === 'gmember'
+    || sessionKind === 'gworker'
+    || isAgentEditSession
+    || params.toolList !== undefined;
+  const configuredGroups = params.toolList !== undefined
+    ? params.toolList
+    // Historical custom/marketplace Agents without dependency metadata keep a
+    // fixed compatibility surface. Unlike legacy_all, this cannot grow during
+    // the session and excludes host/runtime-only management groups.
+    : sessionKind === 'gmember'
+      ? AGENT_DEPENDENCY_TOOL_GROUP_IDS
+      : [];
+  const hostPreloadGroups = sessionKind === 'gworker'
+    ? ['workspace', 'web', 'library']
+    : isCommander
+      ? ['workspace.read', 'web']
+    : isAgentEditSession
+      // Agent editor may inspect installed Connector action schemas while
+      // authoring dependencies, but discover mode still withholds calls.
+      ? ['workspace.read', 'connectors']
+      : [];
+  const toolSurface = createToolSurfaceController({
+    availableToolNames: surfaceAvailableToolNames,
+    dynamicLoadableToolNames: isReflectionSession
+      ? surfaceAvailableToolNames
+      : dynamicLoadableToolNames,
+    configuredGroups,
+    hostPreloadGroups,
+    ...(params.runtimeGrantedToolGroups
+      ? { runtimeGrantedGroups: params.runtimeGrantedToolGroups }
+      : {}),
+    hostRequiredToolNames: isReflectionSession
+      ? surfaceAvailableToolNames
+      : [
+          'read_files',
+          'tool_result',
+          // Global Skills are deliberately absent from the initial file scope.
+          // Commander needs this small discovery gate active so a successful
+          // search can grant read access to only the returned Skill directories.
+          ...(isCommander && availableToolNames.includes('skill_search') ? ['skill_search'] : []),
+          ...(params.onOutputsPublished ? ['publish_outputs'] : []),
+        ],
+    restoredState: session.getToolSurfaceState(),
+    preserveLegacySession: dynamicToolLoading
+      && !session.getToolSurfaceState()
+      && sessionHadHistoryBeforeSync,
+    scopedEligible,
+    dynamicLoading: dynamicToolLoading,
+    dynamicLoadPolicy,
+    // The environment rollback exists for Commander incidents. It must not
+    // turn a named Agent's low-priority fallback into a legacy full surface.
+    allowLegacyAll: isCommander,
+    persist: (state) => session.setToolSurfaceState(state),
+  });
+  if (toolSurface.mode === 'scoped') {
+    const uncataloged = availableToolNames.filter((name) => !getToolCatalogEntry(name));
+    if (uncataloged.length) {
+      throw new Error(`Scoped tool surface contains uncataloged tools: ${uncataloged.join(', ')}`);
+    }
+  }
+  if (toolSurface.mode === 'scoped' && toolSurface.dynamicLoading) {
+    visibleTools.push(createToolLoadTool(toolSurface, {
+      ...(isNamedAgentRuntime && !connectorBlock && connectorSurface.promptBlock
+        ? { contextByGroup: { connectors: connectorSurface.promptBlock } }
+        : {}),
+    }));
+  }
+  const runtimeGrantableToolNames = new Set(
+    params.richSteerEnabled ? toolNamesForGroups(['connectors']) : [],
+  );
 
-  // Apply one simple 8K per-result policy at AgentRunner's FINAL result
-  // boundary. Keeping this as a result transformer (instead of pre-wrapping
-  // the current tool list) also covers core builtins and tools AgentRunner adds
-  // later, notably skill_manage. AgentRunner supplies a shared 16K-per-model-
-  // step ledger through ctx.state and shrinks it when context headroom is low.
-  // `uid` can be empty in ad-hoc tests; without a session Result Store we leave
-  // outputs untouched.
+  // Apply the inline-result policy at AgentRunner's FINAL result boundary.
+  // The per-result cap is budget-derived (the round ledger's perResultTokens,
+  // from the resolved model window); DEFAULT_INLINE_RESULT_TOKENS is only the
+  // fallback when no window resolves. Keeping this as a result transformer
+  // (instead of pre-wrapping the current tool list) also covers core builtins
+  // and tools AgentRunner adds later, notably skill_manage. AgentRunner
+  // supplies the shared per-model-step inline ledger through ctx.state and
+  // shrinks it when context headroom is low. `uid` can be empty in ad-hoc
+  // tests; without a session Result Store we leave outputs untouched.
   const transformToolResult = uid
-    ? (toolName: string, result: ToolResult, ctx: ToolContext): ToolResult =>
-        capToolResult(toolName, result, ctx, {
+    ? (toolName: string, result: ToolResult, ctx: ToolContext): ToolResult => {
+        if (
+          deepResearchSnapshotFile
+          && toolName === 'web_fetch'
+          && deepResearchIsAvailable()
+        ) {
+          const capture = captureDeepResearchWebFetchEvidence(
+            result,
+            deepResearchSnapshotFile,
+          );
+          if (capture.reason === 'io_error') {
+            runnerLog.warn('deep research evidence capture failed', {
+              error_type: capture.errorType || 'UnknownError',
+            });
+          }
+        }
+        return capToolResult(toolName, result, ctx, {
           maxInlineTokens: DEFAULT_INLINE_RESULT_TOKENS,
           toolResultsDir,
-        })
+        });
+      }
     : undefined;
 
-  // Final tool name set the AgentRunner will see — core-agent builtins
-  // (read_file/write_file/bash/list_files/web_search/web_fetch) merged with
-  // our visibleTools via last-write-wins. Used by the snapshot below and by
-  // the catalog-drift test (`tool-catalog.test.ts`); we no longer render a
-  // `## Available tools` block into the system prompt because the model
-  // already receives every tool's compact description + JSON schema via the
-  // SDK tool-use protocol — the prompt block was an information subset
-  // duplicating ~800 chars per call without giving the model anything new.
+  // Source attribution for the final AgentRunner-owned definition snapshot.
+  // Do not construct definitions here: AgentRunner still has to add late core
+  // tools (manage_execution_plan and, when evolution is enabled,
+  // skill_manage), and dormant schemas must stay unmaterialized.
   const extraToolNameSet = new Set((params.extraTools ?? []).map((t) => t.name));
-  const finalToolNames = Array.from(new Set([
-    ...builtinTools.map((t) => t.name),
-    ...visibleTools.map((t) => t.name),
-  ]));
-
-  // Snapshot the final tool definitions for the dev archive. Last-write-wins
-  // merge: builtins first, then visibleTools override by name. Source label
-  // tracks where each definition came from so the debug panel can call out
-  // injected vs. caller-supplied tools.
-  const toolDefMap = new Map<string, ToolDefSnapshot>();
-  const snapshotTool = (t: AgentTool, source: ToolDefSnapshot['source']): ToolDefSnapshot => {
-    const def = mod.toToolDefinition(t);
-    return {
-      name: def.name,
-      description: def.description,
-      inputSchema: def.inputSchema,
-      source,
-    };
-  };
+  const toolSourceByName = new Map<string, ToolDefSnapshot['source']>();
   for (const t of builtinTools) {
-    toolDefMap.set(t.name, snapshotTool(t, 'core-agent'));
+    toolSourceByName.set(t.name, 'core-agent');
   }
   for (const t of visibleTools) {
-    toolDefMap.set(
+    toolSourceByName.set(
       t.name,
-      snapshotTool(
-        t,
-        extraToolNameSet.has(t.name) ? 'extra' : visibleToolNameSet.has(t.name) ? 'orkas' : 'core-agent',
-      ),
+      extraToolNameSet.has(t.name)
+        ? 'extra'
+        : 'orkas',
     );
   }
-  const toolDefs: ToolDefSnapshot[] = Array.from(toolDefMap.values())
-    .sort((a, b) => a.name.localeCompare(b.name));
 
   // Finalize system prompt. Cache-friendly order:
   //   [base prompt] → [connectors] → [system skills] → [skills]
@@ -1144,6 +1299,28 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // volatile region below.
   const { stable: stableWithoutOrchestration, orchestrationBlock } = splitCommanderOrchestrationBlock(stableWithoutRuntime);
   if (stableWithoutOrchestration) parts.push(stableWithoutOrchestration);
+  // Commander and named Agents receive a compact runtime directory. Named
+  // Agents treat it as a lower-priority, current-turn fallback after their
+  // authored baseline. Commander gets its exact Agent dependency directory on
+  // demand with agent-creator. Dedicated Agent editors receive that authoring
+  // directory directly without expanding their own fixed tool surface.
+  const toolGroupsPurpose = isAgentToolAuthoringSession
+    ? 'agent-authoring'
+    : toolSurface.mode === 'scoped' && toolSurface.dynamicLoading
+      ? (isNamedAgentRuntime ? 'agent-runtime' : 'runtime')
+      : null;
+  const toolGroupsBlock = toolGroupsPurpose
+    ? getLoadableToolGroupsSystemPromptBlock({
+        availableToolNames: toolGroupsPurpose === 'agent-authoring'
+          ? availableToolNames
+          : dynamicLoadableToolNames,
+        purpose: toolGroupsPurpose,
+        ...(toolGroupsPurpose !== 'agent-authoring'
+          ? { allowedGroupIds: toolSurface.loadableGroups() }
+          : {}),
+      })
+    : '';
+  if (toolGroupsBlock) parts.push(toolGroupsBlock);
   if (connectorBlock) parts.push(connectorBlock.trim());
   if (systemSkillsBlock) parts.push(systemSkillsBlock.trim());
   if (skillsBlock) parts.push(skillsBlock.trim());
@@ -1181,7 +1358,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     && metacognition.isFeatureEnabledForUser(uid)
   ) ? metacognition.formatForSystemPromptForUser(uid, agentId) : '';
   if (metacognitionBlock) parts.push(metacognitionBlock);
-  // Keep the selected response language as the final system instruction.
+  // Keep the selected response language as the final instruction in the
+  // host-composed base prompt. Core-agent may append learned-Skill guidance
+  // and repository instructions after this boundary.
   // Agent workflows, skills, and memory may legitimately be authored in
   // English, but their source language must not become the reply language.
   if (languageDirectiveBlock) parts.push(languageDirectiveBlock);
@@ -1201,7 +1380,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const projectStatusBlock = (uid && memoryAgentScope && params.projectId)
     ? await projectTasks.formatProjectStatusForTurn(uid, params.projectId)
     : '';
-  const turnEphemeral = [orchestrationBlock, volatileTail, projectStatusBlock]
+  const activeToolGroupsBlock = toolSurface.mode === 'scoped' && toolSurface.dynamicLoading
+    ? getActiveToolGroupsTurnBlock(toolSurface.loadedGroups())
+    : '';
+  const turnEphemeral = [
+    orchestrationBlock,
+    volatileTail,
+    projectStatusBlock,
+    activeToolGroupsBlock,
+  ]
     .filter((b) => b && b.trim())
     .join('\n\n');
 
@@ -1320,30 +1507,106 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     config,
     providers,
     session,
-    ...(params.elapsedConvergenceMs != null
-      ? { elapsedConvergenceMs: params.elapsedConvergenceMs }
-      : {}),
-    ...(isCommander ? { requirePlanForRepeatedMutations: true } : {}),
     ...(visibleTools.length ? { tools: visibleTools } : {}),
+    ...(toolSurface.mode === 'scoped'
+      ? {
+          isToolActive: (name: string) => toolSurface.isActive(name),
+          ...(toolSurface.dynamicLoading
+            ? {
+                // Makes the E_TOOL_NOT_LOADED refusal name the exact group(s)
+                // Commander can load instead of making it guess.
+                toolLoadGroups: (name: string) => getToolCatalogEntry(name)?.loadGroups,
+              }
+            : {}),
+        }
+      : {}),
+    // The core package still ships read_file for standalone callers. Orkas
+    // owns a consolidated read_files contract, so retire the builtin executor
+    // in every surface mode (including reflection and legacy rollback). Fixed
+    // actors additionally drop dormant executors as before.
+    disabledToolNames: [
+      'read_file',
+      ...(toolSurface.mode === 'scoped' && !toolSurface.dynamicLoading
+        ? availableToolNames.filter((name) => (
+            !toolSurface.isActive(name) && !runtimeGrantableToolNames.has(name)
+          ))
+        : []),
+    ],
     ...(transformToolResult ? { transformToolResult } : {}),
-    ...(toolResultsDir ? { toolContextState: { toolResultSpoolDir: toolResultsDir } } : {}),
+    ...(toolResultsDir ? {
+      toolContextState: {
+        toolResultSpoolDir: toolResultsDir,
+        ...(deepResearchSnapshotFile ? {
+          [DEEP_RESEARCH_EVIDENCE_STATE_KEY]: deepResearchSnapshotFile,
+        } : {}),
+      },
+    } : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
     ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
-    ...(sharedHistorySummaryCache ? { sharedHistorySummaryCache } : {}),
   });
+
+  // This is the same active-definition path used by AgentRunner immediately
+  // before an ordinary provider request. Reading it after construction keeps
+  // diagnostics, the dev archive, tests, and telemetry aligned with late core
+  // tools without serializing dormant schemas.
+  const snapshotToolDefinition = (definition: {
+    name: string;
+    description: string;
+    inputSchema: Record<string, unknown>;
+  }): ToolDefSnapshot => ({
+    name: definition.name,
+    description: definition.description,
+    inputSchema: definition.inputSchema,
+    source: toolSourceByName.get(definition.name) ?? 'core-agent',
+  });
+  const toolDefs = runner.getActiveToolDefinitions()
+    .map(snapshotToolDefinition)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const toolSurfaceTelemetry = (
+    usedToolNames: readonly string[] = [],
+  ): ToolSurfaceTelemetrySnapshot => {
+    const used = new Set(usedToolNames);
+    const currentToolDefs = runner.getActiveToolDefinitions();
+    const stats = toolSurface.runtimeStats();
+    const toolLoadActivatedNames = new Set(stats.newlyActivatedToolNames);
+    const loadedToolDefs = currentToolDefs.filter((tool) => toolLoadActivatedNames.has(tool.name));
+    return {
+      mode: toolSurface.mode,
+      peakToolCount: currentToolDefs.length,
+      loadCallCount: stats.loadCalls,
+      loadedGroupCount: stats.newlyLoadedGroups.length,
+      loadedSchemaChars: loadedToolDefs.reduce(
+        (total, tool) => total + JSON.stringify({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        }).length,
+        0,
+      ),
+      loadedUnusedGroupCount: stats.newlyLoadedGroups.filter((group) => (
+        !toolNamesForGroups([group]).some((name) => used.has(name))
+      )).length,
+      webToolUsed: used.has('web_search') || used.has('web_fetch'),
+    };
+  };
 
   return {
     runner,
+    failureTrackingScope: session,
     resolvedSystemPrompt,
     turnEphemeral,
     entryId: primary?.entryId,
     profileId: primary?.profileId,
     providerId,
     modelId,
+    toolSurfaceMode: toolSurface.mode,
+    toolSurfaceTelemetry,
     toolDefs,
     skillDisplayNameById,
+    skillMetadataByReadRef,
     agentDisplayNameById,
+    connectorDisplayNameById,
   };
 }
 
@@ -1366,7 +1629,7 @@ function _safeActiveUserId(): string | null {
  *   - `discover+block`: agent-edit (`agent`) — block + `list_connector_tools` ONLY. Editor LLM
  *     can discover action names + JSON schemas to write specific workflow steps; cannot invoke
  *     (an authoring session must never produce external side effects).
- *   - `none`:           skill-edit, KB-image, CLI dispatch, reflect, memory-extract, anon, and
+ *   - `none`:           skill-edit, KB-image, CLI dispatch, reflect, anon, and
  *     any future kind — neither block nor tools.
  *   Add a new conversation kind that needs connectors? Extend this function explicitly + add
  *   an entry to CLAUDE.md §5's session-id table.
@@ -1378,7 +1641,7 @@ export function connectorExposureFromSessionId(sessionId: string): 'tools+block'
   // Agent-edit gets `list_connector_tools` (read-only, no side effects) so the editor LLM can
   // learn each connector's action names and write specific workflow steps — but NOT
   // `call_connector_tool`, since an authoring session must never produce external side
-  // effects. See `connector-meta-tools.ts::createConnectorMetaTools` mode handling.
+  // effects. See `connector-meta-tools.ts::buildConnectorSurface` mode handling.
   if (/^agent-/.test(sessionId)) return 'discover+block';
   return 'none';
 }
@@ -1390,11 +1653,14 @@ export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
   return /^gconv-/.test(sessionId) || /^agent-/.test(sessionId) || /^skill-/.test(sessionId);
 }
 
-/** OPEN-tier skills (external packages + global roots) render for group-chat
- *  task sessions and agent-edit authoring sessions. One-shots and background
- *  kinds never see them. */
+/** OPEN-tier skills (external packages + global roots) render only for
+ *  Commander task sessions. Agent editors author dependencies for runtime
+ *  Agents, whose contract is trusted/private Skills only, so showing OPEN
+ *  sources there would offer dependencies the finished Agent cannot load.
+ *  User-explicit picker selections remain handled separately through
+ *  `forceOpenSkillRefs`. */
 export function openSkillSourcesExposureFromSessionId(sessionId: string): boolean {
-  return /^(gconv|gmember|agent)-/.test(sessionId);
+  return /^gconv-/.test(sessionId);
 }
 
 /**
@@ -1500,6 +1766,18 @@ async function buildRotatingProvider(
   return createRotatingProvider({
     providerId,
     candidates,
+    ...(process.env.ORKAS_MODEL_EVAL_PINNED_ROUTE === '1'
+      && providerId === 'custom'
+      && candidates.length === 1
+      ? {
+          // The local managed-eval bridge already owns one bounded retry on
+          // the same concrete upstream. Do not multiply that provider call
+          // budget in the desktop rotation layer; the comparison coordinator
+          // owns the single whole-case recovery attempt.
+          networkRetryAttempts: 0,
+          normalEmptyRetryAttempts: 0,
+        }
+      : {}),
     onSuccess: (profileId, candidate) => {
       const winner = group.find((choice) => (
         choice.profileId === profileId
@@ -1530,9 +1808,10 @@ export function isMetacognitionEnabled(): boolean {
  * Builds a pi-ai `onPayload` callback: pi-ai invokes it after handing us
  * the result of `buildParams` and before sending the request. When both
  * "the debug toggle is on" and "model.api is in the supported list" hold,
- * we append the model's native web search tool schema to `params.tools`,
- * write an info log, and bubble the "injected" event up through the
- * caller-supplied callback to client.ts's archive recorder.
+ * we replace the function-style Orkas search schema with the model's native
+ * search schema, write an info log, and bubble the "injected" event up through
+ * the caller-supplied callback to client.ts's archive recorder. Paid search
+ * profiles and unsupported APIs retain the Orkas function instead.
  *
  * On a miss we return params unchanged (pi-ai treats an undefined return
  * as no-op, so a no-op return is also legal).
@@ -1544,36 +1823,37 @@ function buildNativeSearchOnPayload(
 ): (params: unknown, model: { api?: string }) => unknown {
   return (params, model) => {
     const repaired = repairOpenAIToolMessageOrder(params);
-    if (!isNativeSearchEnabled()) return repaired;
-    // Don't inject the model-side native search when the user has any paid
-    // search-tool API key configured — let the overriding `web_search` tool
-    // (search-tools.ts) be the single search surface, otherwise the LLM
-    // sees two competing tools and may bypass the paid one the user paid for.
-    if (hasAnySearchProfile()) return repaired;
+    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[] } & Record<string, unknown>;
     const api = model?.api;
-    if (!api) return repaired;
     const tool = nativeSearchToolForApi(api);
-    if (!tool) return repaired;
+    const route = routeSearchPayloadTools({
+      tools: cur.tools,
+      nativeEnabled: isNativeSearchEnabled(),
+      paidSearchConfigured: hasAnySearchProfile(),
+      nativeTool: tool,
+    });
+    if (route.route !== 'native' || !api || !tool) return repaired;
     const toolName = nativeSearchToolName(tool) || 'native_web_search';
     // Payload shape + size stamped into each injection so post-incident
     // grepping can correlate fetch failures to body size / turn length.
     // Cheap — one JSON.stringify of an already-serialisable object.
-    const cur = repaired as { tools?: unknown[]; messages?: unknown[]; input?: unknown[] } & Record<string, unknown>;
     let approxBodyBytes = -1;
     try { approxBodyBytes = JSON.stringify(repaired).length; } catch { /* circular — give up */ }
     const msgCount = Array.isArray(cur.messages)
       ? cur.messages.length
       : (Array.isArray(cur.input) ? cur.input.length : -1);
     const toolsBefore = Array.isArray(cur.tools) ? cur.tools.length : 0;
-    runnerLog.info('native web search injected', {
+    const toolsAfter = Array.isArray(route.tools) ? route.tools.length : 0;
+    runnerLog.info('native web search selected', {
       provider: providerId, model: modelId, api, tool: toolName,
-      msgCount, toolsBefore, approxBodyBytes,
+      msgCount, toolsBefore, toolsAfter, replacedOrkasSearch: route.replacedOrkasSearch,
+      approxBodyBytes,
     });
     try {
       onNativeSearchInjected?.({ provider: providerId, model: modelId, api, tool: toolName });
     } catch (err) {
       runnerLog.warn(`onNativeSearchInjected callback failed: ${(err as Error).message}`);
     }
-    return { ...cur, tools: [...(Array.isArray(cur.tools) ? cur.tools : []), tool] };
+    return { ...cur, tools: route.tools };
   };
 }

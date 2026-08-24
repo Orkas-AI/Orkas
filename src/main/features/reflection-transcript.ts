@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import { userSessionsDir, projectSessionsDir } from '../paths';
 import { cloudSessionFileFor, listProjectIds } from '../util/project-layout';
 import { createLogger } from '../logger';
+import { ACCURATE_CJK_WEIGHT, estimateTokensWithWeight } from '../util/token-estimate';
 import { listConversations, type Conversation } from './chats';
 import { buildGmemberSessionId } from './group_chat/state';
 import { querySignalsForUser, type Signal, type SignalType } from './expert_signals';
@@ -31,19 +32,21 @@ const log = createLogger('reflection-transcript');
 export const MAX_CONVS = 5;
 export const MAX_TOKENS = 16_000;
 export const MAX_AGENT_REPLY_CHARS = 800;
-const SYSTEM_EVENT_TYPES: SignalType[] = ['retry', 'skip', 'form_left_blank', 'silence'];
+const SYSTEM_EVENT_TYPES: SignalType[] = ['form_left_blank', 'silence'];
 
 // ── Token estimation (CJK-aware) ────────────────────────────────────────
 
-/** Estimate token count. CJK chars count as ~0.7 token each; other chars
- *  as ~0.25 token (≈4 chars/token English heuristic). Empirically within
- *  ~10% of model tokenizers for mixed Chinese / English text. */
+/** Estimate token count for the transcript caps.
+ *
+ *  Uses the accurate CJK weight, not the conservative one the context budget
+ *  uses: this bounds how much material a reflection prompt carries inside a
+ *  much larger window, so over-estimating silently halves the evidence for a
+ *  Chinese-heavy account while under-estimating only makes one section of a
+ *  roomy prompt slightly larger. Shares the classifier with the rest of main
+ *  — the previous local copy also missed CJK punctuation (、。「」), which
+ *  charged ordinary Chinese text at the Latin rate. */
 export function estimateTokens(text: string): number {
-  // CJK Unified Ideographs (U+4E00–U+9FFF) + Hiragana (U+3040–U+309F)
-  // + Katakana (U+30A0–U+30FF) + Hangul Syllables (U+AC00–U+D7AF).
-  const cjkChars = (text.match(/[一-鿿぀-ヿ가-힯]/g) || []).length;
-  const otherChars = text.length - cjkChars;
-  return Math.ceil(cjkChars * 0.7 + otherChars / 4);
+  return estimateTokensWithWeight(text, ACCURATE_CJK_WEIGHT);
 }
 
 // ── Filesystem-based agent participation discovery ──────────────────────
@@ -157,17 +160,13 @@ function extractAgentEntries(messages: any[]): TranscriptEntry[] {
 }
 
 /** Render one signal as a synthetic system-event transcript entry. Returns
- *  null when the signal type isn't one of the 4 inlined kinds (defensive —
+ *  null when the signal type isn't one of the inlined kinds (defensive —
  *  caller already filters by type). */
 function renderSignalEntry(sig: Signal): TranscriptEntry | null {
   const ts = Date.parse(sig.ts);
   if (Number.isNaN(ts)) return null;
   const meta = (sig.metadata || {}) as Record<string, unknown>;
   switch (sig.type) {
-    case 'retry':
-      return { ts, kind: 'system', text: `user clicked retry on step #${meta.step_index ?? '?'}` };
-    case 'skip':
-      return { ts, kind: 'system', text: `user clicked skip on step #${meta.step_index ?? '?'}` };
     case 'form_left_blank': {
       const reqLabel = meta.was_required ? 'required field' : 'field';
       return { ts, kind: 'system', text: `user left ${reqLabel} "${meta.input_id ?? '?'}" blank on form submit` };
@@ -227,6 +226,10 @@ function formatConvSection(section: ConvSection): string {
 export interface TranscriptResult {
   /** Markdown-ish transcript string. Empty when no activity matched. */
   text: string;
+  /** The sources could not be read, so an empty `text` means "unknown", not
+   *  "nothing happened". Callers must treat this as a transient failure worth
+   *  retrying rather than as an examined-and-empty window. */
+  unavailable?: boolean;
   /** Sanity-check counters for callers / observability. */
   stats: {
     convsConsidered: number;
@@ -255,7 +258,7 @@ export async function buildTranscript(
   try { convs = await listConversations(uid); }
   catch (err) {
     log.warn(`listConversations failed uid=${uid}: ${(err as Error).message}`);
-    return _empty();
+    return { ..._empty(), unavailable: true };
   }
 
   // Cid → conv metadata lookup for both branches.
@@ -285,9 +288,9 @@ export async function buildTranscript(
   if (!matched.length) return _empty();
 
   // Single signal query covers the whole window; we partition by cid below.
-  // For `_default` we pass `aid: null` (commander-scope signals like
-  // agent_dispatched are filtered out by the SYSTEM_EVENT_TYPES whitelist
-  // anyway, so a permissive aid filter for _default is fine).
+  // For `_default` we pass `aid: null` (any commander-scope signal outside
+  // the SYSTEM_EVENT_TYPES whitelist is filtered out anyway, so a
+  // permissive aid filter for _default is fine).
   let windowSignals: Signal[] = [];
   try {
     windowSignals = await querySignalsForUser(uid, {

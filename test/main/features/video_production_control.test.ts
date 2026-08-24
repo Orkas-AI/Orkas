@@ -17,7 +17,9 @@ import {
   readVideoProductionPlanIdentity,
   validateVideoProductionPlanApproval,
   videoProductionControlStatePath,
+  VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS,
 } from '../../../src/main/features/video_production_control';
+import { GENERATE_SPEC_ALLOWED_FIELDS } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edl';
 
 let root = '';
 let planPath = '';
@@ -75,6 +77,10 @@ afterEach(() => {
 });
 
 describe('VideoStudio project production control', () => {
+  it('keeps the script and native Gate B on the same generate-field contract', () => {
+    expect(VIDEO_PRODUCTION_GENERATE_SPEC_ALLOWED_FIELDS).toEqual(GENERATE_SPEC_ALLOWED_FIELDS);
+  });
+
   it('uses the plan artifact, not conversation/project routing metadata, as state identity', () => {
     expect(videoProductionControlStatePath({ userId: 'u', projectId: 'project-a', planPath }))
       .toBe(videoProductionControlStatePath({ userId: 'u', projectId: 'project-b', planPath }));
@@ -1162,6 +1168,39 @@ describe('VideoStudio project production control', () => {
     writePlan(invalidOperationPlan);
     await expect(approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' }))
       .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATE_SETTINGS_INVALID/);
+  });
+
+  it('rejects unknown generate fields at the native Gate B boundary without recording approval', async () => {
+    const unknownFieldPlan = plan();
+    const spec = (unknownFieldPlan.segments as Array<Record<string, any>>)[0].spec as Record<string, unknown>;
+    spec.settings = { resolution: '1080p' };
+    spec.provider_options = { audio: false };
+    writePlan(unknownFieldPlan);
+
+    await expect(approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' }))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATE_UNKNOWN_FIELD:.*segments\[0\]\.spec\.settings.*segments\[0\]\.spec\.provider_options.*write only video generation fields directly on spec.*generation_duration_sec.*generate_audio/);
+    expect((await readVideoProductionControlState(statePath, planPath)).plan_approval).toBeUndefined();
+  });
+
+  it('rechecks unknown generate fields immediately before paid provider dispatch', async () => {
+    await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
+    await approveVideoProductionGeneration({ statePath, planPath, turnId: 'turn-c' });
+    const changedPlan = plan();
+    ((changedPlan.segments as Array<Record<string, any>>)[0].spec as Record<string, unknown>).settings = {
+      resolution: '1080p',
+    };
+    writePlan(changedPlan);
+
+    await expect(beginVideoProductionGeneration({
+      statePath,
+      planPath,
+      segmentId: 'shot-1',
+      kind: 'video',
+      outputPath: path.join(root, 'must-not-exist.mp4'),
+      request: request(),
+    })).rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATE_UNKNOWN_FIELD:.*segments\[0\]\.spec\.settings/);
+    expect(Object.keys((await readVideoProductionControlState(statePath, planPath)).transactions)).toEqual([]);
+    expect(fs.existsSync(path.join(root, 'must-not-exist.mp4'))).toBe(false);
   });
 
   it('enforces the intelligent semantic-edit contract at the native Gate B boundary', async () => {

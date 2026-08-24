@@ -16,7 +16,7 @@ function _initSkillsStaticBindings() {
   });
   document.getElementById('skill-use-btn')?.addEventListener('click', () => {
     if (_selectedSkill && !_skillsCache?.some((s) => s.id === _selectedSkill.id && s.enabled === false)) {
-      useSkill(_selectedSkill.id, _selectedSkill.name);
+      useSkill(_selectedSkill.id, _selectedSkill.name, _selectedSkill.source);
     }
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);

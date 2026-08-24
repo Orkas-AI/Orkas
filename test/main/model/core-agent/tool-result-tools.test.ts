@@ -7,6 +7,7 @@ import {
   estimateToolResultTokens,
   persistToolResult,
   toolResultRefForPath,
+  wrapToolWithCap,
 } from '../../../../src/main/util/tool-result-cap';
 import {
   TOOL_RESULT_ROUND_MAX_TOKENS,
@@ -15,11 +16,18 @@ import {
   createToolResultTools,
   resolveToolResultRef,
 } from '../../../../src/main/model/core-agent/tool-result-tools';
+import { TOOL_RESULT_QUERY_MAX_INPUT_BYTES } from '../../../../src/main/util/tool-result-data';
 
 function getTool(tools: AgentTool[], name: string): AgentTool {
   const tool = tools.find((candidate) => candidate.name === name);
   if (!tool) throw new Error(`missing tool ${name}`);
   return tool;
+}
+
+function queryRows(content: string): Array<{ group?: Record<string, unknown>; value: number | null }> {
+  const match = /<tool-result-query\b[^>]*>\n([^\n]*)\n<\/tool-result-query>/.exec(content);
+  if (!match) throw new Error(`missing query payload: ${content}`);
+  return JSON.parse(match[1]);
 }
 
 describe('persisted tool-result retrieval', () => {
@@ -60,7 +68,112 @@ describe('persisted tool-result retrieval', () => {
       ok: false,
       code: 'E_RESULT_REF_NOT_PERSISTED',
     });
-    expect(resolveToolResultRef(dir, 'web_fetch.0000000000000000')).toMatchObject({ ok: false, code: 'E_RESULT_REF_MISSING' });
+    // The refusal carries the retention window and the remedy: a ref can
+    // vanish through the 30-day cloud expiry sweep, and the model must know
+    // to re-run the tool instead of retrying the ref.
+    expect(resolveToolResultRef(dir, 'web_fetch.0000000000000000')).toMatchObject({
+      ok: false,
+      code: 'E_RESULT_REF_MISSING',
+      message: expect.stringMatching(/retained up to 30 days[\s\S]*Re-run the original tool/),
+    });
+  });
+
+  it('retrieves persisted connector output whose tool name starts with call_', async () => {
+    const connectorContent = 'Figma frame title: Checkout\nReview status: needs spacing fix';
+    const connectorRef = toolResultRefForPath(
+      persistToolResult(dir, 'call_connector_tool', connectorContent),
+    );
+
+    expect(connectorRef).toMatch(/^call_connector_tool\.[a-f0-9]{64}$/);
+    expect(resolveToolResultRef(dir, connectorRef)).toMatchObject({ ok: true });
+
+    const search = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [{ ref: connectorRef, query: 'Checkout spacing' }],
+    }, ctx);
+    expect(search.isError).toBeFalsy();
+    expect(search.content).toContain('Checkout');
+
+    ctx.state.toolResultReadLedger = {
+      epoch: 1,
+      remainingTokens: TOOL_RESULT_ROUND_MAX_TOKENS,
+      readKeys: new Set<string>(),
+    };
+    const read = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [{ ref: connectorRef, cursor: 0, max_tokens: 256 }],
+    }, ctx);
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toContain('Review status: needs spacing fix');
+  });
+
+  it('round-trips an oversized structured connector result through persistence and exact query', async () => {
+    const campaigns = [
+      ...Array.from({ length: 120 }, (_, index) => ({
+        id: `invalid-ph-${index}`,
+        status: 'invalid',
+        region: 'PH',
+        spend: 10,
+        diagnostic: 'x'.repeat(160),
+      })),
+      ...Array.from({ length: 80 }, (_, index) => ({
+        id: `invalid-sg-${index}`,
+        status: 'invalid',
+        region: 'SG',
+        spend: 20,
+        diagnostic: 'y'.repeat(160),
+      })),
+      ...Array.from({ length: 40 }, (_, index) => ({
+        id: `active-ph-${index}`,
+        status: 'active',
+        region: 'PH',
+        spend: 999,
+        diagnostic: 'z'.repeat(160),
+      })),
+    ];
+    const connector = wrapToolWithCap({
+      name: 'call_connector_tool',
+      description: 'Return a structured connector report',
+      inputSchema: { type: 'object', properties: {} },
+      async execute() {
+        return { content: JSON.stringify({ campaigns }) };
+      },
+    }, {
+      maxInlineTokens: 100,
+      toolResultsDir: dir,
+    });
+
+    const capped = await connector.execute({}, ctx);
+    expect(capped.persistedOutput?.ref).toMatch(/^call_connector_tool\.[a-f0-9]{64}$/);
+    expect(capped.content).toContain('actions="query,search,read"');
+    expect(capped.content).not.toContain('invalid-ph-119');
+
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [
+        {
+          ref: capped.persistedOutput!.ref,
+          operation: 'count',
+          dataset: 'campaigns',
+          filters: [{ field: 'status', op: 'eq', value: 'invalid' }],
+        },
+        {
+          ref: capped.persistedOutput!.ref,
+          operation: 'sum',
+          dataset: 'campaigns',
+          field: 'spend',
+          filters: [{ field: 'status', op: 'eq', value: 'invalid' }],
+          group_by: ['region'],
+        },
+      ],
+    }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content.match(/<tool-result-query /g)).toHaveLength(2);
+    expect(result.content).toContain('[{"value":200}]');
+    expect(result.content).toContain('{"group":{"region":"SG"},"value":1600}');
+    expect(result.content).toContain('{"group":{"region":"PH"},"value":1200}');
+    expect(result.content).not.toContain('diagnostic');
   });
 
   it('grounds every model-facing ref field to persisted-output syntax after compaction', () => {
@@ -71,48 +184,75 @@ describe('persisted tool-result retrieval', () => {
       items?: Schema;
     };
     const definitions = tools.map(toToolDefinition);
-    const refs = definitions.flatMap((tool) => {
+    const refs = definitions.map((tool) => {
       const schema = tool.inputSchema as Schema;
-      const batchKey = tool.name === 'tool_result_search' ? 'queries' : 'chunks';
-      return [schema.properties?.[batchKey]?.items?.properties?.ref];
+      return schema.properties?.requests?.items?.properties?.ref;
     });
 
-    expect(refs).toHaveLength(2);
+    expect(refs).toHaveLength(1);
     for (const schema of refs) {
       expect(schema?.pattern).toBe(TOOL_RESULT_REF_SCHEMA_PATTERN);
       expect(schema?.description).toMatch(/persisted-output/i);
       expect(schema?.description).toMatch(/never use.*call_/i);
       expect(new RegExp(schema!.pattern!).test('call_246')).toBe(false);
       expect(new RegExp(schema!.pattern!).test('grep_files.0123456789abcdef')).toBe(true);
+      expect(new RegExp(schema!.pattern!).test('call_connector_tool.0123456789abcdef')).toBe(true);
     }
     for (const tool of definitions) {
       expect(tool.description).toMatch(/call_\.\.\..*never|never.*call_\.\.\./i);
     }
   });
 
-  it('advertises only the canonical batch request while retaining legacy execution compatibility', async () => {
-    const search = getTool(tools, 'tool_result_search');
-    const read = getTool(tools, 'tool_result_read_chunk');
-    const searchSchema = search.inputSchema as any;
-    const readSchema = read.inputSchema as any;
+  it('advertises one action-discriminated canonical batch request', async () => {
+    expect(tools.map((tool) => tool.name)).toEqual(['tool_result']);
+    const schema = getTool(tools, 'tool_result').inputSchema as any;
 
-    expect(searchSchema.required).toEqual(['queries']);
-    expect(searchSchema.properties).toEqual({ queries: expect.any(Object) });
-    expect(searchSchema.properties.queries.items.additionalProperties).toBe(false);
-    expect(readSchema.required).toEqual(['chunks']);
-    expect(readSchema.properties).toEqual({ chunks: expect.any(Object) });
-    expect(readSchema.properties.chunks.items.additionalProperties).toBe(false);
+    expect(schema.required).toEqual(['action', 'requests']);
+    expect(schema.properties.action.enum).toEqual(['search', 'query', 'read']);
+    expect(schema.properties.requests.items.additionalProperties).toBe(false);
 
-    const legacySearch = await search.execute({ ref, query: 'needle important' }, ctx);
-    expect(legacySearch.isError).toBeFalsy();
+    const invalid = await getTool(tools, 'tool_result').execute({
+      action: 'unknown',
+      requests: [{ ref }],
+    }, ctx);
+    expect(invalid.isError).toBe(true);
+    expect(invalid.content).toContain('E_BAD_INPUT');
+  });
 
-    ctx.state.toolResultReadLedger = {
-      epoch: 1,
-      remainingTokens: TOOL_RESULT_ROUND_MAX_TOKENS,
-      readKeys: new Set<string>(),
-    };
-    const legacyRead = await read.execute({ ref, cursor: 0, maxTokens: 300 }, ctx);
-    expect(legacyRead.isError).toBeFalsy();
+  it('rejects action-specific request shapes without consuming the retrieval ledger', async () => {
+    const tool = getTool(tools, 'tool_result');
+    const invalidSearch = await tool.execute({
+      action: 'search',
+      requests: [{ ref, cursor: 0 }],
+    }, ctx);
+    const invalidRead = await tool.execute({
+      action: 'read',
+      requests: [{ ref, query: 'needle important' }],
+    }, ctx);
+    const invalidQuery = await tool.execute({
+      action: 'query',
+      requests: [{ ref }],
+    }, ctx);
+
+    expect(invalidSearch).toMatchObject({ isError: true });
+    expect(invalidSearch.content).toContain('`ref` and `query` are required');
+    expect(invalidRead).toMatchObject({ isError: true });
+    expect(invalidRead.content).toContain('non-negative integer `cursor`');
+    expect(invalidQuery).toMatchObject({ isError: true });
+    expect(invalidQuery.content).toContain('`ref` and `operation` are required');
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+  });
+
+  it('rejects an oversized batch before reading or partially disclosing any result', async () => {
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: Array.from({ length: 9 }, (_, index) => ({ ref, query: `needle ${index}` })),
+    }, ctx);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('1-8 requests');
+    expect(result.content).not.toContain('important observation');
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
   });
 
   it('keeps legacy 16-hex refs readable while new writes use full SHA-256 refs', () => {
@@ -123,7 +263,10 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('searches for narrow excerpts without returning the whole result', async () => {
-    const result = await getTool(tools, 'tool_result_search').execute({ ref, query: 'needle important' }, ctx);
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [{ ref, query: 'needle important' }],
+    }, ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('<tool-result-search');
     expect(result.content).toContain('needle first important observation');
@@ -132,8 +275,9 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('searches multiple narrow queries in one tool round under the shared budget', async () => {
-    const result = await getTool(tools, 'tool_result_search').execute({
-      queries: [
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [
         { ref, query: 'alpha preface' },
         { ref, query: 'omega ending' },
       ],
@@ -148,8 +292,9 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('canonicalizes reordered search terms and reports a duplicate inside a batch', async () => {
-    const result = await getTool(tools, 'tool_result_search').execute({
-      queries: [
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [
         { ref, query: 'needle important' },
         { ref, query: ' IMPORTANT   needle ' },
       ],
@@ -161,8 +306,186 @@ describe('persisted tool-result retrieval', () => {
     expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(1);
   });
 
+  it('computes exact filtered and grouped aggregates without returning the source records', async () => {
+    const structured = JSON.stringify({
+      campaigns: [
+        { status: 'invalid', region: 'PH', spend: 10, metrics: { clicks: 2 } },
+        { status: 'active', region: 'PH', spend: 20, metrics: { clicks: 4 } },
+        { status: 'invalid', region: 'SG', spend: 5, metrics: { clicks: 1 } },
+        { status: 'invalid', region: 'PH', spend: 25, metrics: { clicks: 5 } },
+        { status: 'invalid', region: 'SG', spend: null, metrics: { clicks: 0 } },
+      ],
+      archived: [{ status: 'invalid', region: 'PH', spend: 999 }],
+      padding: 'private-source-padding-'.repeat(4_000),
+    });
+    const structuredRef = toolResultRefForPath(persistToolResult(dir, 'connector', structured));
+    const tool = getTool(tools, 'tool_result');
+
+    const missingDataset = await tool.execute({
+      action: 'query',
+      requests: [{ ref: structuredRef, operation: 'count' }],
+    }, ctx);
+    expect(missingDataset).toMatchObject({ isError: true });
+    expect(missingDataset.content).toContain('E_RESULT_QUERY_DATASET');
+    expect(missingDataset.content).toContain('campaigns');
+    expect(missingDataset.content).toContain('archived');
+
+    const count = await tool.execute({
+      action: 'query',
+      requests: [{
+        ref: structuredRef,
+        operation: 'count',
+        dataset: 'campaigns',
+        filters: [{ field: 'status', op: 'eq', value: 'invalid' }],
+      }],
+    }, ctx);
+    expect(count.isError).toBeFalsy();
+    expect(count.content).toContain('unit="records"');
+    expect(count.content).toContain('scanned="5"');
+    expect(count.content).toContain('matched="4"');
+    expect(queryRows(count.content)).toEqual([{ value: 4 }]);
+    expect(count.content).not.toContain('private-source-padding');
+
+    const grouped = await tool.execute({
+      action: 'query',
+      requests: [{
+        ref: structuredRef,
+        operation: 'sum',
+        dataset: 'campaigns',
+        field: 'spend',
+        filters: [{ field: 'status', op: 'eq', value: 'invalid' }],
+        group_by: ['region'],
+      }],
+    }, ctx);
+    expect(grouped.isError).toBeFalsy();
+    expect(queryRows(grouped.content)).toEqual([
+      { group: { region: 'PH' }, value: 35 },
+      { group: { region: 'SG' }, value: 5 },
+    ]);
+  });
+
+  it('returns exact, explicitly labelled text counts and refuses unsupported calculations', async () => {
+    const textRef = toolResultRefForPath(persistToolResult(
+      dir,
+      'bash',
+      'error on first line\nclean line\nERROR twice: error\n',
+    ));
+    const tool = getTool(tools, 'tool_result');
+    const matchingLines = await tool.execute({
+      action: 'query',
+      requests: [{
+        ref: textRef,
+        operation: 'count',
+        match: 'error',
+        count_unit: 'matching_lines',
+      }],
+    }, ctx);
+    expect(matchingLines.isError).toBeFalsy();
+    expect(matchingLines.content).toContain('unit="matching_lines"');
+    expect(queryRows(matchingLines.content)).toEqual([{ value: 2 }]);
+
+    const occurrences = await tool.execute({
+      action: 'query',
+      requests: [{
+        ref: textRef,
+        operation: 'count',
+        match: 'error',
+        count_unit: 'occurrences',
+      }],
+    }, ctx);
+    expect(occurrences.isError).toBeFalsy();
+    expect(occurrences.content).toContain('unit="occurrences"');
+    expect(queryRows(occurrences.content)).toEqual([{ value: 3 }]);
+
+    const ambiguousCount = await tool.execute({
+      action: 'query',
+      requests: [{ ref: textRef, operation: 'count' }],
+    }, ctx);
+    expect(ambiguousCount).toMatchObject({ isError: true });
+    expect(ambiguousCount.content).toContain('E_RESULT_COUNT_UNIT_REQUIRED');
+    expect(ambiguousCount.content).not.toContain('<tool-result-query');
+
+    const unsupported = await tool.execute({
+      action: 'query',
+      requests: [{ ref: textRef, operation: 'sum', field: 'amount' }],
+    }, ctx);
+    expect(unsupported).toMatchObject({ isError: true });
+    expect(unsupported.content).toContain('E_RESULT_NOT_QUERYABLE');
+    expect(unsupported.content).not.toContain('<tool-result-query');
+  });
+
+  it('batches independent deterministic queries in one tool round', async () => {
+    const batchRef = toolResultRefForPath(persistToolResult(
+      dir,
+      'connector',
+      JSON.stringify([
+        { state: 'active', amount: 4 },
+        { state: 'paused', amount: 9 },
+        { state: 'active', amount: 7 },
+      ]),
+    ));
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [
+        {
+          ref: batchRef,
+          operation: 'count',
+          filters: [{ field: 'state', op: 'eq', value: 'active' }],
+        },
+        { ref: batchRef, operation: 'sum', field: 'amount' },
+      ],
+    }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content.match(/<tool-result-query /g)).toHaveLength(2);
+    expect(result.content).toContain('[{"value":2}]');
+    expect(result.content).toContain('[{"value":20}]');
+    expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(TOOL_RESULT_ROUND_MAX_TOKENS);
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(2);
+  });
+
+  it('returns zero for an exact structured count with no matching records', async () => {
+    const emptyMatchRef = toolResultRefForPath(persistToolResult(
+      dir,
+      'connector',
+      JSON.stringify([{ status: 'active' }, { status: 'paused' }]),
+    ));
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [{
+        ref: emptyMatchRef,
+        operation: 'count',
+        filters: [{ field: 'status', op: 'eq', value: 'missing' }],
+      }],
+    }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('matched="0"');
+    expect(queryRows(result.content)).toEqual([{ value: 0 }]);
+  });
+
+  it('rejects deterministic aggregation above the input cap before parsing the file', async () => {
+    const oversizedRef = `bash.${'a'.repeat(64)}`;
+    const oversizedPath = path.join(dir, `${oversizedRef}.txt`);
+    fs.closeSync(fs.openSync(oversizedPath, 'w'));
+    fs.truncateSync(oversizedPath, TOOL_RESULT_QUERY_MAX_INPUT_BYTES + 1);
+
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'query',
+      requests: [{ ref: oversizedRef, operation: 'count', match: 'error', count_unit: 'occurrences' }],
+    }, ctx);
+
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content).toContain('E_RESULT_QUERY_TOO_LARGE');
+    expect(result.content).toMatch(/search or paged read/);
+    expect((ctx.state.toolResultReadLedger as { readKeys: Set<string> }).readKeys.size).toBe(0);
+  });
+
   it('reads an exact bounded chunk and returns a continuation cursor', async () => {
-    const result = await getTool(tools, 'tool_result_read_chunk').execute({ ref, cursor: 0, maxTokens: 9_000 }, ctx);
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [{ ref, cursor: 0, max_tokens: 9_000 }],
+    }, ctx);
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('covered="0-');
     expect(result.content).toMatch(/next_cursor="\d+"/);
@@ -171,10 +494,11 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('reads multiple exact chunks in one tool round under the shared budget', async () => {
-    const result = await getTool(tools, 'tool_result_read_chunk').execute({
-      chunks: [
-        { ref, cursor: 0, maxTokens: 2_000 },
-        { ref, cursor: 10_000, maxTokens: 2_000 },
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [
+        { ref, cursor: 0, max_tokens: 2_000 },
+        { ref, cursor: 10_000, max_tokens: 2_000 },
       ],
     }, ctx);
 
@@ -187,8 +511,9 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('shares the aggregate budget across every requested chunk instead of dropping the batch tail', async () => {
-    const result = await getTool(tools, 'tool_result_read_chunk').execute({
-      chunks: [0, 3_000, 6_000, 9_000].map((cursor) => ({ ref, cursor, maxTokens: 2_000 })),
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [0, 3_000, 6_000, 9_000].map((cursor) => ({ ref, cursor, max_tokens: 2_000 })),
     }, ctx);
 
     expect(result.isError).toBeFalsy();
@@ -198,8 +523,9 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('keeps successful batch items when another persisted-result request is invalid', async () => {
-    const result = await getTool(tools, 'tool_result_search').execute({
-      queries: [
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [
         { ref: '../invalid', query: 'needle' },
         { ref, query: 'omega ending' },
       ],
@@ -213,18 +539,17 @@ describe('persisted tool-result retrieval', () => {
   it('searches and reads correctly across a 64KB UTF-8 scan boundary', async () => {
     const content = `${'a'.repeat(65_535)}界needle-after-boundary\nomega`;
     const boundaryRef = toolResultRefForPath(persistToolResult(dir, 'bash', content));
-    const search = await getTool(tools, 'tool_result_search').execute({
-      ref: boundaryRef,
-      query: '界needle',
+    const search = await getTool(tools, 'tool_result').execute({
+      action: 'search',
+      requests: [{ ref: boundaryRef, query: '界needle' }],
     }, ctx);
     expect(search.isError).toBeFalsy();
     expect(search.content).toContain('界needle-after-boundary');
     expect(search.content).toContain(`total_chars="${content.length}"`);
 
-    const chunk = await getTool(tools, 'tool_result_read_chunk').execute({
-      ref: boundaryRef,
-      cursor: 65_534,
-      maxTokens: 256,
+    const chunk = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [{ ref: boundaryRef, cursor: 65_534, max_tokens: 256 }],
     }, ctx);
     expect(chunk.isError).toBeFalsy();
     expect(chunk.content).toContain('a界needle-after-boundary');
@@ -232,9 +557,9 @@ describe('persisted tool-result retrieval', () => {
   });
 
   it('suppresses duplicate reads in the same compaction epoch', async () => {
-    const tool = getTool(tools, 'tool_result_read_chunk');
-    await tool.execute({ ref, cursor: 0, maxTokens: 300 }, ctx);
-    const duplicate = await tool.execute({ ref, cursor: 0, maxTokens: 300 }, ctx);
+    const tool = getTool(tools, 'tool_result');
+    await tool.execute({ action: 'read', requests: [{ ref, cursor: 0, max_tokens: 300 }] }, ctx);
+    const duplicate = await tool.execute({ action: 'read', requests: [{ ref, cursor: 0, max_tokens: 300 }] }, ctx);
     expect(duplicate.isError).toBe(true);
     expect(duplicate.content).toContain('E_RESULT_CHUNK_ALREADY_READ');
   });
@@ -242,7 +567,10 @@ describe('persisted tool-result retrieval', () => {
   it('enforces the aggregate per-round read budget', async () => {
     const ledger = ctx.state.toolResultReadLedger as { remainingTokens: number };
     ledger.remainingTokens = 100;
-    const result = await getTool(tools, 'tool_result_read_chunk').execute({ ref, cursor: 0, maxTokens: 300 }, ctx);
+    const result = await getTool(tools, 'tool_result').execute({
+      action: 'read',
+      requests: [{ ref, cursor: 0, max_tokens: 300 }],
+    }, ctx);
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_RESULT_READ_BUDGET');
   });

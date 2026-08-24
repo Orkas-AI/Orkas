@@ -106,6 +106,7 @@ describe('packaged-entrypoint-gate', () => {
     );
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-entrypoint-gate.cjs');
     expect(gate.BUILD_ONLY_BIN_FILES).toContain('packaged-dependency-gate.cjs');
+    expect(gate.PACKAGED_BIN_HELPERS).toContain('bridge-skill-runner.cjs');
     expect(gate.PACKAGED_BIN_HELPERS).toContain('proxy-bootstrap.cjs');
   });
 

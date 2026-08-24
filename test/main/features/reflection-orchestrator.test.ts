@@ -18,12 +18,70 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.useRealTimers();
+  // `loadModuleWithAgents` installs a catalog stub; without this it survives
+  // into later tests and silently changes how many agents a cycle sees.
+  vi.doUnmock('../../../src/main/features/agents');
+  vi.doUnmock('../../../src/main/features/reflection-transcript');
+  vi.doUnmock('../../../src/main/model/core-agent/runner');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 async function loadModule() {
   return import('../../../src/main/features/reflection-orchestrator');
+}
+
+/**
+ * Load with the model and transcript stubbed so the *real* reflect path runs.
+ * Every other cycle test injects `reflect`, which leaves the write-count →
+ * outcome mapping — where the "any reply is a success" defect lived —
+ * uncovered.
+ */
+async function loadModuleWithRunner(opts: {
+  writes: number;
+  responseText?: string;
+  transcriptText?: string;
+}) {
+  vi.resetModules();
+  vi.doMock('../../../src/main/features/reflection-transcript', () => ({
+    buildTranscript: async () => ({
+      text: opts.transcriptText ?? 'user did something',
+      stats: { convsIncluded: 1, convsConsidered: 2, estimatedTokens: 42 },
+    }),
+    listAgentGmemberFiles: async () => [],
+  }));
+  vi.doMock('../../../src/main/model/core-agent/runner', () => ({
+    buildRunner: async () => ({
+      runner: {
+        runReflection: async (
+          _prompt: string,
+          _signal?: AbortSignal,
+          _sandboxEnv?: Record<string, string>,
+          _onModelCall?: unknown,
+          onDurableWrite?: () => void,
+        ) => {
+          for (let i = 0; i < opts.writes; i++) onDurableWrite?.();
+          return opts.responseText ?? 'nothing to save';
+        },
+      },
+    }),
+  }));
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(TEST_UID);
+  return import('../../../src/main/features/reflection-orchestrator');
+}
+
+/** Load with a stubbed agent catalog. The tmp workspace has no agents on
+ *  disk, so cycle-ordering behaviour needs more than the `_default` bucket. */
+async function loadModuleWithAgents(agentIds: string[]) {
+  vi.resetModules();
+  vi.doMock('../../../src/main/features/agents', () => ({
+    listAgents: async () => agentIds.map((id) => ({ agent_id: id, enabled: true })),
+  }));
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(TEST_UID);
+  const mod = await import('../../../src/main/features/reflection-orchestrator');
+  return mod;
 }
 
 function writeReflectionState(uid: string, lastReflectedAt: Record<string, string>): void {
@@ -52,13 +110,16 @@ describe('reflection-orchestrator › pickAgentsForCycle', () => {
     expect(picked[0].reason).toBe('dirty');
   });
 
-  it('forces reflection when past 7-day max gap regardless of dirty', async () => {
+  it('leaves a long-idle agent alone — activity is the only reason to reflect', async () => {
     const mod = await loadModule();
-    const stale = new Date(NOW - 10 * 24 * 3600 * 1000).toISOString();
+    // Formerly the 7-day max-gap fallback forced this agent in regardless of
+    // activity. Its transcript is empty by construction, so it failed every
+    // cycle and, because failures never advanced the timestamp, held a cap
+    // slot forever against agents that did have activity.
+    const stale = new Date(NOW - 30 * 24 * 3600 * 1000).toISOString();
     const state = { lastReflectedAt: { 'agent-x': stale } };
     const picked = await mod.pickAgentsForCycle(TEST_UID, ['agent-x'], state, NOW, async () => false);
-    expect(picked.length).toBe(1);
-    expect(picked[0].reason).toBe('max_gap');
+    expect(picked.length).toBe(0);
   });
 
   it('treats never-reflected agents as eligible when dirty (default lookback)', async () => {
@@ -92,20 +153,19 @@ describe('reflection-orchestrator › pickAgentsForCycle', () => {
     expect(picked[0].agentId).toBe('agent-0');
   });
 
-  it('processes a mix: cooldown / dirty / max_gap correctly', async () => {
+  it('processes a mix: only past-cooldown dirty agents are picked', async () => {
     const mod = await loadModule();
     const state = {
       lastReflectedAt: {
-        'cool':    new Date(NOW - 1 * 3600 * 1000).toISOString(),   // within cooldown
-        'dirty':   new Date(NOW - 6 * 3600 * 1000).toISOString(),   // past cooldown, dirty
-        'stale':   new Date(NOW - 10 * 24 * 3600 * 1000).toISOString(), // max_gap
-        'idle':    new Date(NOW - 6 * 3600 * 1000).toISOString(),   // past cooldown, not dirty
+        'cool':    new Date(NOW - 1 * 3600 * 1000).toISOString(),        // within cooldown
+        'dirty':   new Date(NOW - 6 * 3600 * 1000).toISOString(),        // past cooldown, dirty
+        'stale':   new Date(NOW - 30 * 24 * 3600 * 1000).toISOString(),  // very old, but idle
+        'idle':    new Date(NOW - 6 * 3600 * 1000).toISOString(),        // past cooldown, not dirty
       },
     };
     const isDirty = async (_u: string, id: string) => id === 'dirty';
     const picked = await mod.pickAgentsForCycle(TEST_UID, ['cool', 'dirty', 'stale', 'idle'], state, NOW, isDirty);
-    const ids = picked.map((p) => p.agentId).sort();
-    expect(ids).toEqual(['dirty', 'stale']);
+    expect(picked.map((p) => p.agentId)).toEqual(['dirty']);
   });
 
   it('stops catalog checks at a cooperative cancellation point', async () => {
@@ -137,7 +197,7 @@ describe('reflection-orchestrator › runOneCycle', () => {
 
   it('returns 0 when no agents are eligible', async () => {
     const mod = await loadModule();
-    const reflect = vi.fn(async () => { /* never called */ });
+    const reflect = vi.fn(async () => 'reflected' as const);
     const completed = await mod.runOneCycle(TEST_UID, {
       now: () => NOW,
       reflect,
@@ -163,7 +223,7 @@ describe('reflection-orchestrator › runOneCycle', () => {
 
   it('successful reflection stamps lastReflectedAt with `now`', async () => {
     const mod = await loadModule();
-    const reflect = vi.fn(async () => { /* succeed */ });
+    const reflect = vi.fn(async () => 'reflected' as const);
     const completed = await mod.runOneCycle(TEST_UID, {
       now: () => NOW,
       reflect,
@@ -174,17 +234,179 @@ describe('reflection-orchestrator › runOneCycle', () => {
     expect(state.lastReflectedAt[mod.DEFAULT_AGENT_ID]).toBe(new Date(NOW).toISOString());
   });
 
+  it('advances the baseline when the window held no reflectable activity', async () => {
+    const mod = await loadModule();
+    const reflect = vi.fn(async () => 'nothing_to_reflect' as const);
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+    });
+
+    // Not a reflection, so it is not counted as one …
+    expect(completed).toBe(0);
+    // … but the window was read and held nothing, so re-reading the same span
+    // can only fail the same way. Leaving the baseline was what let idle
+    // agents hold every cap slot for 21 consecutive cycles.
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID])
+      .toBe(new Date(NOW).toISOString());
+  });
+
+  it('an examined-empty agent stops crowding out agents with real activity', async () => {
+    const mod = await loadModule();
+    const seen: string[] = [];
+    const reflect = vi.fn(async (_uid: string, agentId: string) => {
+      seen.push(agentId);
+      return 'nothing_to_reflect' as const;
+    });
+    const first = await mod.runOneCycle(TEST_UID, { now: () => NOW, reflect, isDirty: async () => true });
+    expect(first).toBe(0);
+    expect(seen).toContain(mod.DEFAULT_AGENT_ID);
+
+    // Next cycle within the cooldown: the examined agent is no longer eligible,
+    // so its cap slot is free.
+    seen.length = 0;
+    await mod.runOneCycle(TEST_UID, {
+      now: () => NOW + 60_000,
+      reflect,
+      isDirty: async () => true,
+    });
+    expect(seen).not.toContain(mod.DEFAULT_AGENT_ID);
+  });
+
+  it('a deliberate "nothing to save" consumes the window without counting as a reflection', async () => {
+    const mod = await loadModule();
+    const reflect = vi.fn(async () => 'nothing_to_save' as const);
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+    });
+
+    // The review prompt asks for this reply when a window holds no new lesson,
+    // so it is a healthy outcome — but it wrote nothing, and counting it as a
+    // reflection is what made an idle loop look productive.
+    expect(completed).toBe(0);
+    // The window was read; re-reading it can only reach the same conclusion.
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID])
+      .toBe(new Date(NOW).toISOString());
+  });
+
+  it('a reply that wrote nothing is not counted as a reflection', async () => {
+    // The exact shape observed in production: one model turn, a 15-character
+    // "nothing to save", no tool call, meta files untouched — and the cycle
+    // reporting a successful reflection.
+    const mod = await loadModuleWithRunner({ writes: 0, responseText: 'nothing to save' });
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      isDirty: async () => true,
+    });
+    expect(completed).toBe(0);
+    // Still terminal: the window was read, so the baseline advances.
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt[mod.DEFAULT_AGENT_ID])
+      .toBe(new Date(NOW).toISOString());
+  });
+
+  it('counts a reflection once the model actually writes something', async () => {
+    const mod = await loadModuleWithRunner({ writes: 1, responseText: 'updated competence' });
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      isDirty: async () => true,
+    });
+    expect(completed).toBe(1);
+  });
+
+  it('treats an empty model response as retryable, not as a consumed window', async () => {
+    const mod = await loadModuleWithRunner({ writes: 0, responseText: '' });
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      isDirty: async () => true,
+    });
+    expect(completed).toBe(0);
+    // `runReflection` returns '' for provider errors and loop exhaustion, so
+    // unlike "nothing to save" this must not consume the window.
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
+  });
+
+  it('one agent exceeding its deadline does not take the rest of the cycle down', async () => {
+    const mod = await loadModuleWithAgents(['agent-b']);
+    const seen: string[] = [];
+    const reflect = vi.fn(async (
+      _uid: string,
+      agentId: string,
+      _sinceMs: number,
+      signal?: AbortSignal,
+    ) => {
+      seen.push(agentId);
+      if (agentId === mod.DEFAULT_AGENT_ID) {
+        // Hang until this agent's own deadline fires.
+        await new Promise<void>((resolve) => {
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        throw new Error('deadline');
+      }
+      return 'reflected' as const;
+    });
+
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+      perAgentTimeoutMs: 20,
+      isIdle: () => true,
+    });
+
+    // A single cycle-wide budget used to abort the slow agent *and* end the
+    // cycle, so the agents behind it were never attempted — and the slow ones
+    // are precisely those reading their files and writing an update.
+    expect(seen).toEqual([mod.DEFAULT_AGENT_ID, 'agent-b']);
+    expect(completed).toBe(1);
+    const stamped = mod.readReflectionState(TEST_UID).lastReflectedAt;
+    expect(stamped['agent-b']).toBe(new Date(NOW).toISOString());
+    expect(stamped[mod.DEFAULT_AGENT_ID]).toBeUndefined();  // failed → retry
+  });
+
+  it('defers the remaining agents when the user comes back, never cutting one off', async () => {
+    const mod = await loadModuleWithAgents(['agent-b', 'agent-c']);
+    const seen: string[] = [];
+    const reflect = vi.fn(async (_uid: string, agentId: string) => {
+      seen.push(agentId);
+      return 'reflected' as const;
+    });
+
+    const completed = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW,
+      reflect,
+      isDirty: async () => true,
+      // Idle for the admission-granted first agent, busy from then on.
+      isIdle: () => false,
+    });
+
+    expect(seen).toEqual([mod.DEFAULT_AGENT_ID]);
+    expect(completed).toBe(1);
+    // Deferred agents keep their old baseline, so they lead the next cycle.
+    const stamped = mod.readReflectionState(TEST_UID).lastReflectedAt;
+    expect(stamped['agent-b']).toBeUndefined();
+    expect(stamped['agent-c']).toBeUndefined();
+  });
+
   it('does not stamp stale work that resolves after account-switch cancellation', async () => {
     const mod = await loadModule();
     const controller = new AbortController();
+    let parentAbortReached = false;
     const reflect = vi.fn(async (
       _uid: string,
       _agentId: string,
       _sinceMs: number,
       signal?: AbortSignal,
     ) => {
-      expect(signal).toBe(controller.signal);
+      // The per-agent deadline hands down a derived controller, not the cycle
+      // signal itself; what has to hold is that cancelling the cycle still
+      // reaches the running reflection. Asserting object identity here would
+      // be swallowed by the cycle's catch and pass vacuously.
       controller.abort();
+      parentAbortReached = signal?.aborted === true;
+      return 'reflected' as const;
     });
 
     const completed = await mod.runOneCycle(TEST_UID, {
@@ -195,6 +417,7 @@ describe('reflection-orchestrator › runOneCycle', () => {
     });
 
     expect(reflect).toHaveBeenCalledOnce();
+    expect(parentAbortReached).toBe(true);
     expect(completed).toBe(0);
     expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
   });

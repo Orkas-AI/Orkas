@@ -116,10 +116,11 @@ describe('Agent and Skill quality regression runner', () => {
     expect(validateSkillDir.mock.calls.map(([directory, options]) => [
       path.basename(directory),
       options.enforceSkillRunner,
+      options.source,
     ])).toEqual([
-      ['b-medium', true],
-      ['z-throws', true],
-      ['m-clean', false],
+      ['b-medium', true, 'custom'],
+      ['z-throws', true, 'custom'],
+      ['m-clean', false, 'marketplace'],
     ]);
     expect(validateAgentDir.mock.calls.map(([directory, options]) => [
       path.basename(directory),

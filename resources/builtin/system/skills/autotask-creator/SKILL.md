@@ -1,7 +1,7 @@
 ---
 name: autotask-creator
-description_zh: "创建、修改、删除或启停自动化任务的系统协议；适合\"每天早上提醒我复盘\"\"把这个自动化改到周五\"\"删除那个自动化\"；触发词：自动化、自动任务、定时、提醒、周期、删除自动化、修改自动化"
-description_en: "System protocol for creating, updating, deleting, enabling, or disabling automation tasks; for 'remind me every morning', 'move this automation to Friday', 'delete that automation'; triggers: automation, auto task, schedule, reminder, recurring, delete automation, update automation."
+description_zh: "创建、修改、删除、启用或停用自动化任务；用于定时提醒、周期任务和已有自动化的调整，不用于普通一次性任务。"
+description_en: "Create, update, delete, enable, or disable automation tasks. Use for scheduled reminders, recurring work, and changes to existing automations; not for ordinary one-off tasks."
 category: "general"
 ---
 
@@ -9,9 +9,9 @@ category: "general"
 
 Rules for automation CRUD from the group-chat commander. The commander does not call mutation tools and does not edit `cloud/auto_tasks` files directly. It emits one or more top-level `<auto-task>...</auto-task>` containers in its final text; the bus parses and applies them after the turn.
 
-## When to consult this skill
+## When to use this skill
 
-`read_file <ROOT>/autotask-creator/SKILL.md` whenever the user asks to:
+Use this Skill when the user asks to:
 
 - Create an automation / auto task / scheduled reminder.
 - Update an existing automation's content, title, schedule, recipient, skill, connector, project scope, attachments, or enabled state.

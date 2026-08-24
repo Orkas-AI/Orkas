@@ -1,9 +1,8 @@
 ---
 ownerAgent: 814b61b027f0
 name: image-generate
-description_zh: 路线锁定为 GENERATE、语义 EDIT 或 HYBRID 的栅格生成阶段后，才负责编译提示词、控制调用预算并把生成结果送入统一视觉复核。
+description_zh: 路线锁定为 GENERATE、语义 EDIT 或 HYBRID 的栅格生成阶段后，才负责编译提示词、控制调用预算并对生成结果做确定性文件校验；生成栅格不进入 ImageStudio 视觉复核。
 description_en: After route lock, handles synthesized or reconstructed pixels for GENERATE, semantic EDIT, or the raster phase of HYBRID; skip COMPOSE and deterministic transforms.
-category: creation
 ---
 
 # Image Generate
@@ -14,12 +13,12 @@ This production skill is the earliest point at which a manifest for a direct `GE
 
 ## Generation rules
 
-- Respect `generation_budget.max_calls` within the current user turn. The host reapplies this limit independently for each new user turn while retaining older transactions only as audit history. `COMPOSE` has a budget of zero; `HYBRID` normally has one; `GENERATE` and `EDIT` normally allow one initial call and one evidence-based repair in that turn.
+- Respect `generation_budget.max_calls` within the current user turn. The host reapplies this limit independently for each new user turn while retaining older transactions only as audit history. `COMPOSE` has a budget of zero; `HYBRID`, `GENERATE`, and `EDIT` normally use one call. Set a two-call budget only when the user explicitly requests iterative refinement or authorizes another billable attempt. A review finding alone never authorizes that second call.
 - Generate at the final aspect ratio whenever the provider supports it. Do not rely on destructive cropping to fix a mismatched composition.
 - Use reference images only when they encode composition, identity, product fidelity, or edit continuity that the prompt cannot preserve reliably.
 - Mirror manifest references into `generate_image.reference_bindings` using the exact concatenated reference order. Include role, strength, preserve, may-change, and target region. Send `generation_contract.negative_prompt` separately.
 - Compile `reference_intent.mode` into the request: reproduction asks for the declared protected attributes to match; guide limits influence to declared roles; editing uses the required `edit_source` as the original. User-declared instructions and boundaries have priority over inferred defaults and provider convenience.
-- Treat every planned `output_path` as one stable artifact binding. Reuse that exact string byte-for-byte for the provider/workflow result, later `project.inspect`, review candidate, and export input; never retype, derive, or silently correct the path in a downstream handoff.
+- Treat every planned `output_path` as one stable artifact binding. Reuse that exact string byte-for-byte for the provider/workflow result, later `project.inspect`, optional review candidate, and export input; never retype, derive, or silently correct the path in a downstream handoff.
 - For edits, send the manifest instructions, protected regions, unchanged attributes, and allowed changes explicitly. Prefer a localized edit over regenerating the full scene, and never reinterpret an edit as a fresh variation.
 - For reproduction, do not silently change subject, crop, layout, identity, typography, palette, or other preserved axes merely because regeneration is easier. Choose the provider/control path that can honor the declared fidelity floor.
 - For hybrid work, generate only the difficult raster layer. Exclude final copy, logos, labels, diagrams, and UI text from the model request.
@@ -68,8 +67,8 @@ An execution handoff must retain concrete, executable fields: the exact
 `workflow.run` operation, engine, project-local `workflow_path`, stable
 `image_request_id`, output path, manifest `max_calls`, and output node/index
 when applicable. The next-evidence chain must name `project.inspect` and
-`project.submit_design_review` exactly; natural-language approximations are not
-an executable handoff.
+`project.export` exactly. Never add `project.submit_design_review` for the
+generated raster; natural-language approximations are not an executable handoff.
 
 For missing capabilities:
 
@@ -80,6 +79,6 @@ For missing capabilities:
 
 ## Review loop
 
-After either generation path, call `image_studio` with `project.inspect`, passing the raster path. Deterministic project/raster validation runs first; only a passing result attaches the full-color candidate followed by every declared reference in one ordered model batch. Inspect those attachments side-by-side for subject accuracy, changed-versus-protected regions, composition, anatomy, material behavior, text artifacts, continuity, and the manifest's must-avoid constraints. Do not reopen the same paths individually through generic `read_file`. A repair call must address concrete findings from the current evidence; never spend the second call on an ungrounded variation search.
+After either generation path, call `image_studio` with `project.inspect`, passing the raster path. Deterministic project/raster validation always runs and records signature-bound evidence. It verifies that the project-local output exists, decodes, and matches the current manifest/signature; it never attaches a GENERATE or EDIT raster to a visual adapter, never requests quality scores, and returns `project.export` as the next operation. This is also the rule for strict reproduction, semantic edits, explicit visual-QA wording, and multi-image consistency: encode those requirements in the provider request and reference bindings, then rely on the configured image service's result. Do not load `image-design-review` or submit a design review for the raster.
 
-Submit a signature-bound design review and export the exact approved raster through `image_studio`. A definite pre-dispatch failure is recorded but does not consume a generation call; a dispatched, terminal failure or `pending_uncertain` attempt still counts in the current turn. If the repair budget is exhausted in that turn, use `project.status.current_candidate` and `recovery_context`: keep the best reviewed image visible, apply any useful deterministic zero-call repair, report the remaining finding, and end the turn. Never raise manifest `max_calls` or request a quota-increase form to bypass the same-turn limit. A later direct user message starts a fresh turn-scoped allowance automatically; never carry earlier-turn exhaustion forward or request extra authorization solely because that earlier turn used its calls. Ask the user only for a material intent/quality/reference/delivery tradeoff, using normal chat rather than a recovery form.
+Export the exact validated raster through `image_studio`. Never start another provider call based on an ImageStudio post-generation judgment. Spend a second generation only after an explicit user request or approval, and make it address the user's requested change rather than an internal variation search. A definite pre-dispatch failure is recorded but does not consume a generation call; a dispatched, terminal failure or `pending_uncertain` attempt still counts in the current turn. If the authorized repair budget is exhausted in that turn, use `project.status.current_candidate` and `recovery_context`: keep the best image visible, apply any useful deterministic zero-call repair, report the remaining finding, and end the turn. Never raise manifest `max_calls` or request a quota-increase form to bypass the same-turn limit. A later direct user message starts a fresh turn-scoped allowance automatically; never carry earlier-turn exhaustion forward or request extra authorization solely because that earlier turn used its calls. Ask the user only for a material intent/quality/reference/delivery tradeoff, using normal chat rather than a recovery form.

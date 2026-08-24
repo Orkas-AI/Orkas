@@ -1,9 +1,7 @@
 ---
 name: office-excel
-description_zh: 使用内置 Office 工具创建、读取、编辑和检查 Excel / XLSX 工作簿，可靠处理公式、日期、数据类型、格式、验证规则、模板、图表和打印设置。适合“做一个 Excel 报表”“把 CSV 整理成带公式的 XLSX”“修改工作簿并保留格式”；触发词：Excel、XLSX、XLS、CSV、TSV、表格、工作簿、公式、数据验证、打印区域
-description_en: Use the built-in Office tools to create, read, edit, and check Excel/XLSX workbooks while protecting formulas, dates, data types, formatting, validations, templates, charts, and print settings. Use for spreadsheet deliverables, workbook cleanup, CSV-to-XLSX conversion, formula models, and Excel-compatible reporting.
-category: office
-min_app_version: 1.6.1
+description_zh: "创建、读取、编辑和检查 Excel/XLSX 工作簿，并保护公式、日期、数据类型、格式、验证规则、模板、图表和打印设置；用于报表制作、CSV 转 XLSX、公式模型、工作簿清理和保格式修改。"
+description_en: "Create, read, edit, and check Excel/XLSX workbooks while protecting formulas, dates, data types, formatting, validations, templates, charts, and print settings. Use for spreadsheet deliverables, workbook cleanup, CSV conversion, formula models, and Excel reporting."
 ---
 
 # Office Excel
@@ -12,17 +10,24 @@ min_app_version: 1.6.1
 
 Use the bundled Office tools as the default artifact path. Do not install OfficeCLI, pandas, or openpyxl when the built-in tools cover the task.
 
-- Use `stat_file` before `read_file` for a broad workbook read.
+- Use `read_files` with one `paths` item for a broad workbook read; use `metadata_only:true` when only prepared metadata is needed.
 - Use `create_xlsx` for a new `.xlsx`, including multiple sheets, live formulas, number formats, widths, common cell styling, and native editable charts in each sheet's `charts` array.
 - Calling `create_xlsx` is mandatory for a supported new workbook. Bash or local code may prepare input rows or perform calculations that the tool cannot express, but must not construct, rewrite, or patch the final `.xlsx` package.
 - Call `create_xlsx` exactly once for one requested workbook. Include the complete initial workbook and chart plan in that call. If QA finds a correction, use `office_read` and `edit_office` on the exact returned path; a file created in this conversation is refined in place. Do not restart with a second `create_xlsx`, create a “可编辑” duplicate, or publish an intermediate workbook.
 - Use `office_read` to inspect sheet/cell paths before editing an existing `.xlsx` workbook.
 - Use `edit_office` for `.xlsx`; it creates a separate working copy when the source was not already produced by this conversation.
-- Run `office_check` after every create or edit, then use `office_render` when visible layout matters. For XLSX, first use `office_read` with `mode:"outline"` to map worksheet names to workbook order, then pass the worksheet's one-based numeric position as `office_render.page`; never pass a worksheet name or cell range as `page`.
+- After every create or edit, use `office_review` with `action:"check_and_render"` when visible layout matters, or `action:"check"` for structural-only validation. For XLSX, first use `office_read` with `mode:"outline"` to map worksheet names to workbook order, then pass one-based worksheet positions in `office_review.pages`; never pass a worksheet name or cell range as a page.
 
-Use existing local compute only for transformations the Office tools do not express; do not add package dependencies during a workbook task. The built-in engine supports `.xlsx`, not legacy `.xls`, macro-enabled `.xlsm` editing, or macro execution. Require conversion for `.xls`. An `.xlsm` may be attached for broad read-only inspection through `stat_file`/`read_file` only, but do not pass it to `office_read`, `edit_office`, `office_check`, or `office_render`; preserve the source, never execute its macros, and require target-Excel editing/review with macros disabled when its VBA project, external links, or signature must remain intact.
+### Artifact identity and convergence
 
-For an attached `.xlsm` capability-boundary request, first call `stat_file` on the actual supplied workspace path. Then give the complete user-visible boundary result: name the untouched source, state explicitly that no VBA or macro was executed, and require target-Excel editing plus external-link and digital-signature review. End with the group protocol's required capability-boundary handback. Do not publish outputs, convert or copy the package, run shell/process tools, create an `.xlsx` substitute, or ask another actor to retry the unsupported edit.
+- Treat the `artifact_path` in the latest create/edit `<office-artifact>` receipt as the only current artifact identity. Pass that exact path verbatim to `office_read`, `office_review`, `edit_office`, and `publish_outputs`; do not reconstruct, shorten, or guess a path.
+- Batch all required worksheet pages into one review when possible. Do not repeat `office_review` for an unchanged `artifact_revision` and the same page set; a page that failed to render may be retried once by itself.
+- Continue editing only when the latest review identifies a concrete blocking defect and a targeted repair. Consolidate related repairs into one edit batch, then review the new revision. When structure is valid and only warnings or subjective polish remain, stop editing and publish.
+- If `publish_outputs` returns `E_OUTPUT_NOT_PRODUCED`, do not edit, review, or regenerate the workbook. Retry publication once with an exact `eligible_current_turn_paths` entry from the error. If no eligible path is returned or that retry fails, report the preserved artifact and the delivery blocker; never guess another path or claim publication succeeded.
+
+Use existing local compute only for transformations the Office tools do not express; do not add package dependencies during a workbook task. The built-in engine supports `.xlsx`, not legacy `.xls`, macro-enabled `.xlsm` editing, or macro execution. Require conversion for `.xls`. An `.xlsm` may be attached for broad read-only inspection through `read_files` only, but do not pass it to `office_read`, `edit_office`, or `office_review`; preserve the source, never execute its macros, and require target-Excel editing/review with macros disabled when its VBA project, external links, or signature must remain intact.
+
+For an attached `.xlsm` capability-boundary request, first call `read_files` with the actual supplied workspace path and `metadata_only:true`. Then give the complete user-visible boundary result: name the untouched source, state explicitly that no VBA or macro was executed, and require target-Excel editing plus external-link and digital-signature review. End with the group protocol's required capability-boundary handback. Do not publish outputs, convert or copy the package, run shell/process tools, create an `.xlsx` substitute, or ask another actor to retry the unsupported edit.
 
 ## Integrity Rules
 
@@ -47,6 +52,6 @@ For KPI reports, monthly reports, dashboards, or sample-driven workbooks:
 - Give every chart an explicit source table or named range, category field, value series, title, axis labels and units, intentional category order, and a truthful scale. Use native editable chart objects when `create_xlsx` supports them; a source table, text bar, screenshot, or “insert this chart later” instruction does not satisfy a chart request. In a tools-off specification, name these bindings before execution. Bar charts start at zero unless the exception is explained; avoid pie charts when exact comparison matters.
 - Never plot measures with different units or materially different scales on the same primary axis. Prefer separate charts; otherwise use a documented combo/secondary axis and label both axes. For the ecommerce monthly-report default, a single-series sales trend plus a separate channel-sales bar chart is clearer than putting sales and order count on one axis.
 - Bind time trends to a complete ordered period range and category comparisons to a clearly sorted range. After creation, use `office_read` to confirm chart nodes and source bindings, then render every chart-bearing worksheet by its one-based numeric page position.
-- Complete the artifact loop with `create_xlsx` or `edit_office`, `office_check`, representative `office_render`, and `publish_outputs`, including a single final workbook. If a tool is unavailable, name the missing check instead of implying it ran.
+- Complete the artifact loop with `create_xlsx` or `edit_office`, representative-page `office_review` using `action:"check_and_render"`, and `publish_outputs`, including a single final workbook. If a tool is unavailable, name the missing check instead of implying it ran.
 
 Return the final `.xlsx` path, the untouched source or backup path, sheet structure, formula/data checks, assumptions, and any Excel/WPS recalculation or visual review still required. For every requested chart, also report its native chart type, title, category/value source ranges, axis labels/units, and scale or secondary-axis choice so delivery quality is evidenced rather than merely claimed.

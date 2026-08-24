@@ -67,7 +67,7 @@ describe('generate_image tool in the open build', () => {
     expect(String(result.content)).toContain('test-provider/test-model');
   });
 
-  it('blocks provider dispatch when tool execution access is disabled', async () => {
+  it('does not apply the retired global execution gate inside provider dispatch', async () => {
     h.granted = false;
     const tool = createImageGenTool({ userId: 'user-a' });
     const result = await tool.execute(
@@ -75,9 +75,8 @@ describe('generate_image tool in the open build', () => {
       { workingDir: root } as any,
     );
 
-    expect(result.isError).toBe(true);
-    expect(String(result.content)).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
-    expect(h.generateImage).not.toHaveBeenCalled();
+    expect(result.isError).not.toBe(true);
+    expect(h.generateImage).toHaveBeenCalledTimes(1);
   });
 
   it('rejects outputs and references outside the workspace before dispatch', async () => {

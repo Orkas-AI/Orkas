@@ -174,6 +174,12 @@ function _convsByProject() {
 function renderProjectsSection() {
   const container = document.getElementById('projects-list');
   if (!container) return;
+  if (typeof _conversationInlineRenameBlocksRender === 'function'
+      && _conversationInlineRenameBlocksRender(container)) {
+    if (typeof _refreshAllConvBadges === 'function') _refreshAllConvBadges();
+    if (typeof _refreshUnreadTaskIndicators === 'function') _refreshUnreadTaskIndicators();
+    return;
+  }
   const currentCreateInput = _projectsInlineCreate
     ? document.getElementById('project-create-input')
     : null;

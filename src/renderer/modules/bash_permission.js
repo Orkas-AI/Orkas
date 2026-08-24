@@ -1,10 +1,9 @@
 // Sensitive-operation prompts — under approval access modes, when an
 // in-process agent wants to run a command or access a path the classifier
-// flagged as sensitive (network exfil / dangerous delete / privilege
-// escalation / sensitive path), main pushes `bash:permission` and this module shows the
-// allow-once / allow-for-this-run / deny choice, plus a compact selector for
-// the durable local-access permission level. Waiting for a human click is kept
-// alive on the main side with progress heartbeats.
+// flagged as sensitive, main pushes `bash:permission` and this module shows an
+// exact-command allow-once / deny choice. Waiting for a human click is kept
+// alive on the main side with progress heartbeats. Legacy task-level choices
+// are narrowed to one command here and again in main (defense in depth).
 //
 // Requests queue FIFO so concurrent workers can't stack overlapping dialogs.
 
@@ -17,7 +16,7 @@ const _bashPermDialogClosers = new Map();
 
 const _BASH_PERMISSION_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 const _BASH_PERMISSION_DEFAULT_MODE = 'all_files_approval';
-const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path'];
+const _BASH_PERMISSION_RISK_CATEGORIES = ['network_egress', 'destructive', 'priv_esc', 'sensitive_path', 'system_package_change', 'external_mutation'];
 
 function _bashPermissionVisibilityState() {
   try {
@@ -93,6 +92,25 @@ function _bashReasonText(reasons) {
   return labels.filter(Boolean).join(t('bash.permission.reason_sep'));
 }
 
+const _BASH_EXTERNAL_MUTATION_KINDS = [
+  'database_write', 'remote_command', 'remote_file_write', 'service_change',
+  'deployment_change', 'external_api_write', 'remote_publish', 'external_launch',
+];
+
+function _bashExternalMutationText(findings) {
+  if (!Array.isArray(findings)) return '';
+  const operations = [];
+  for (const raw of findings.slice(0, 8)) {
+    if (!raw || typeof raw !== 'object' || !_BASH_EXTERNAL_MUTATION_KINDS.includes(raw.kind)) continue;
+    const kind = _bashT(`bash.permission.external_kind.${raw.kind}`, raw.kind);
+    const action = String(raw.action || '').replace(/\s+/g, ' ').trim().slice(0, 48);
+    const target = String(raw.target || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    operations.push([kind, action, target].filter(Boolean).join(' · '));
+  }
+  if (!operations.length) return '';
+  return t('bash.permission.external_operations', { operations: operations.join('\n') });
+}
+
 function _bashPermissionModeOptions() {
   return _BASH_PERMISSION_MODES.map((mode) => ({
     mode,
@@ -133,7 +151,15 @@ async function _setBashPermissionMode(mode) {
   }
 }
 
-function _showBashPermissionModeDialog({ title, message, currentMode, requestId, onPresented }) {
+function _showBashPermissionModeDialog({
+  title,
+  message,
+  currentMode,
+  requestId,
+  onPresented,
+  allowRun = true,
+  showModeControl = true,
+}) {
   const modes = _bashPermissionModeOptions();
   const safeCurrentMode = _bashIsMode(currentMode) ? currentMode : _BASH_PERMISSION_DEFAULT_MODE;
   const modeTitle = _bashT('bash.permission.mode_title', 'Permission level');
@@ -170,6 +196,8 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId,
           modeTitle,
           modeHint,
           modes,
+          allowRun,
+          showModeControl,
         })).then(finish, () => finish({ choice: 'deny', mode: safeCurrentMode }));
       });
     }
@@ -195,6 +223,16 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId,
     const caretHtml = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
       ? window.uiIconHtml('chevron-down', 'bash-permission-mode-trigger-caret')
       : '<span class="bash-permission-mode-trigger-caret" aria-hidden="true">⌄</span>';
+    const modeControlHtml = showModeControl ? `
+            <div class="bash-permission-mode-control">
+              <button class="btn bash-permission-mode-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+                <span class="bash-permission-mode-trigger-label">${_bashEscapeHtml(initialItem ? initialItem.label : modeTitle)}</span>
+                ${caretHtml}
+              </button>
+            </div>` : '';
+    const allowRunHtml = allowRun
+      ? `<button class="btn" data-act="choice" data-id="allow_run">${_bashEscapeHtml(t('bash.permission.allow_run'))}</button>`
+      : '';
 
     overlay.innerHTML = `
       <div class="modal modal-standard ui-dialog bash-permission-dialog" role="dialog" aria-modal="true">
@@ -202,18 +240,13 @@ function _showBashPermissionModeDialog({ title, message, currentMode, requestId,
         <div class="modal-body ui-dialog-message bash-permission-message">${msgHtml}</div>
         <div class="bash-permission-footer">
           <div class="modal-actions bash-permission-actions">
-            <div class="bash-permission-mode-control">
-              <button class="btn bash-permission-mode-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
-                <span class="bash-permission-mode-trigger-label">${_bashEscapeHtml(initialItem ? initialItem.label : modeTitle)}</span>
-                ${caretHtml}
-              </button>
-            </div>
+            ${modeControlHtml}
             <span class="bash-permission-actions-spacer" aria-hidden="true"></span>
             <button class="btn" data-act="cancel">${_bashEscapeHtml(t('bash.permission.deny'))}</button>
             <button class="btn btn-primary" data-act="choice" data-id="allow_once">${_bashEscapeHtml(t('bash.permission.allow_once'))}</button>
-            <button class="btn" data-act="choice" data-id="allow_run">${_bashEscapeHtml(t('bash.permission.allow_run'))}</button>
+            ${allowRunHtml}
           </div>
-          <div class="bash-permission-mode-hint">${_bashEscapeHtml(modeHint)}</div>
+          ${showModeControl ? `<div class="bash-permission-mode-hint">${_bashEscapeHtml(modeHint)}</div>` : ''}
         </div>
       </div>
       <div class="bash-permission-mode-menu" role="listbox" hidden>
@@ -349,13 +382,15 @@ async function _showBashPermissionDialog(info) {
   const operation = String(info.operation || '').trim();
   const subject = String(info.subject || '').trim();
   const isAction = !!(operation || subject);
-  const message = isAction
+  const baseMessage = isAction
     ? t('bash.permission.action_message', {
       agent,
       operation: operation || t('bash.permission.action_fallback'),
       reasons: reasonsText,
     }) + (subject ? `\n\n${subject}` : '')
     : t('bash.permission.message', { agent, reasons: reasonsText }) + '\n\n' + command;
+  const externalMutationText = _bashExternalMutationText(info.external_mutations);
+  const message = baseMessage + (externalMutationText ? `\n\n${externalMutationText}` : '');
 
   const currentMode = await _getBashPermissionCurrentMode();
   if (_bashPermCancelled.delete(requestId)) {
@@ -363,11 +398,15 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   let presented = false;
+  const requiresPerCommandApproval = Array.isArray(info.reasons)
+    && info.reasons.some((reason) => _BASH_PERMISSION_RISK_CATEGORIES.includes(reason));
   const result = await _showBashPermissionModeDialog({
     title: t(isAction ? 'bash.permission.action_title' : 'bash.permission.title'),
     message,
     currentMode,
     requestId,
+    allowRun: !requiresPerCommandApproval,
+    showModeControl: !requiresPerCommandApproval,
     onPresented: () => {
       if (presented) return;
       presented = true;
@@ -385,13 +424,18 @@ async function _showBashPermissionDialog(info) {
     return;
   }
   const choice = result && typeof result === 'object' ? result.choice : result;
-  const selectedMode = _bashIsMode(result && result.mode) ? result.mode : currentMode;
+  const selectedMode = !requiresPerCommandApproval && _bashIsMode(result && result.mode)
+    ? result.mode
+    : currentMode;
   const requestedDecision = (choice === 'allow_once' || choice === 'allow_run' || choice === 'allow_always')
     ? choice
     : 'deny';
   let decision = (choice === 'allow_once' || choice === 'allow_run') ? choice : 'deny';
+  if (requiresPerCommandApproval && decision === 'allow_run') decision = 'allow_once';
   let effectiveMode = currentMode;
-  if (choice === 'allow_always') {
+  if (choice === 'allow_always' && requiresPerCommandApproval) {
+    decision = 'allow_once';
+  } else if (choice === 'allow_always') {
     const ok = currentMode === 'all_files_auto' || await _setBashPermissionMode('all_files_auto');
     if (ok) {
       decision = 'allow_once';

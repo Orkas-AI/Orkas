@@ -10,7 +10,6 @@ describe("CLI", () => {
     expect(names).toContain("run");
     expect(names).toContain("chat");
     expect(names).toContain("config");
-    expect(names).toContain("memory");
     expect(names).toContain("models");
     expect(names).toContain("help");
   });

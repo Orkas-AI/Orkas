@@ -17,8 +17,8 @@
  * call so the vector store reconciles with disk in the background.
  *
  * `_INDEX.md` is still written, but only at the root: it's a human-readable
- * overview for Finder browsing, not a model routing input (the model uses
- * `kb_search` / `kb_read` tools). Sub-directory index files are no longer
+ * overview for Finder browsing, not a model routing input (the model uses the
+ * `library` search/read actions). Sub-directory index files are no longer
  * generated.
  */
 
@@ -797,7 +797,7 @@ export function renameContextEntry(
 
 // ── Body helpers ────────────────────────────────────────────────────────
 // No frontmatter. Files are plain markdown/text; `_INDEX.md` + first heading
-// is enough for human browsing, `kb_search` covers model routing. Anything
+// is enough for human browsing, the `library` search action covers model routing. Anything
 // legacy organizer emitted as frontmatter is stripped on read.
 
 export function stripLegacyFrontmatter(text: string): string {

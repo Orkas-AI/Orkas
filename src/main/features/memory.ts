@@ -59,6 +59,20 @@ export interface MemoryOpResult {
   error?: string;
   entries: string[];
   usage: { current: number; limit: number; entries_current?: number; entries_limit?: number };
+  /** What the store had to discard to stay inside its caps during THIS write.
+   *  Present only when something was lost, so an ordinary write keeps its
+   *  exact historical shape. The host knows what it dropped; a caller that is
+   *  never told silently loses memory it believes it saved. Counts only —
+   *  entry text never enters a field that reaches logs or telemetry. */
+  evicted?: { dropped_entries?: number; truncated_entries?: number };
+}
+
+/** Per-write eviction report produced by `saveEntries`. */
+export interface MemorySaveReport {
+  /** Whole entries removed (oldest first) to satisfy the count/char caps. */
+  droppedEntries: number;
+  /** Entries whose text was cut to fit (only possible for a lone entry). */
+  truncatedEntries: number;
 }
 
 // ── Security: injection pattern scanning ─────────────────────────────────
@@ -150,7 +164,12 @@ export function loadEntries(filePath: string): MemoryEntry[] {
  * when a cap is exceeded we evict from the front and preserve the latest
  * memory. Duplicate text keeps the newest occurrence for the same reason.
  */
-export function saveEntries(filePath: string, entries: MemoryEntry[], charLimit: number, entryLimit = Number.POSITIVE_INFINITY): void {
+export function saveEntries(
+  filePath: string,
+  entries: MemoryEntry[],
+  charLimit: number,
+  entryLimit = Number.POSITIVE_INFINITY,
+): MemorySaveReport {
   // Deduplicate (keep newest occurrence) and normalize whitespace around items.
   const seen = new Set<string>();
   const deduped: MemoryEntry[] = [];
@@ -163,21 +182,55 @@ export function saveEntries(filePath: string, entries: MemoryEntry[], charLimit:
 
   const maxEntries = Number.isFinite(entryLimit) && entryLimit > 0 ? Math.floor(entryLimit) : deduped.length;
   let kept = deduped.slice(-maxEntries);
+  // Deduplication is normalization, not loss; only cap-driven eviction counts.
+  let droppedEntries = Math.max(0, deduped.length - kept.length);
+  let truncatedEntries = 0;
   let text = kept.map(e => e.text).join(ENTRY_SEPARATOR);
   while (text.length > charLimit && kept.length > 1) {
     kept.shift();
+    droppedEntries++;
     text = kept.map(e => e.text).join(ENTRY_SEPARATOR);
   }
   if (text.length > charLimit && kept.length === 1) {
     kept = [{ text: kept[0].text.slice(0, charLimit).trim() }];
+    truncatedEntries = 1;
     text = kept[0].text;
   }
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   writeTextAtomicSync(filePath, text);
+  if (droppedEntries || truncatedEntries) {
+    // Counts only: entry text is user-private and must not reach logs.
+    log.warn('memory entries evicted to fit store caps', {
+      store: storeLabelForPath(filePath),
+      dropped_entries: droppedEntries,
+      truncated_entries: truncatedEntries,
+      kept_entries: kept.length,
+      entry_limit: Number.isFinite(entryLimit) ? entryLimit : undefined,
+      char_limit: charLimit,
+    });
+  }
+  return { droppedEntries, truncatedEntries };
 }
 
-function buildResult(userId: string, target: MemoryScope, ok: boolean, error?: string): MemoryOpResult {
+/** Store label for logs: the sync-relative path shape with private ids
+ *  masked, never an absolute local path. */
+function storeLabelForPath(filePath: string): string {
+  const parts = filePath.split(path.sep);
+  const cloudIdx = parts.lastIndexOf('cloud');
+  if (cloudIdx < 0) return 'memory';
+  return parts.slice(cloudIdx).map((seg, i, all) => (
+    (all[i - 1] === 'projects' || all[i - 1] === 'agents') ? '<id>' : seg
+  )).join('/');
+}
+
+function buildResult(
+  userId: string,
+  target: MemoryScope,
+  ok: boolean,
+  error?: string,
+  report?: MemorySaveReport,
+): MemoryOpResult {
   const entries = loadEntries(fileForTarget(userId, target));
   const text = entries.map(e => e.text).join(ENTRY_SEPARATOR);
   return {
@@ -185,6 +238,19 @@ function buildResult(userId: string, target: MemoryScope, ok: boolean, error?: s
     ...(error ? { error } : {}),
     entries: entries.map(e => e.text),
     usage: { current: text.length, limit: limitForTarget(target), entries_current: entries.length, entries_limit: entryLimitForTarget(target) },
+    ...evictedField(report),
+  };
+}
+
+/** Attach the eviction report only when the write actually lost something,
+ *  so an ordinary result keeps its exact historical shape. */
+function evictedField(report?: MemorySaveReport): { evicted?: MemoryOpResult['evicted'] } {
+  if (!report || (!report.droppedEntries && !report.truncatedEntries)) return {};
+  return {
+    evicted: {
+      ...(report.droppedEntries ? { dropped_entries: report.droppedEntries } : {}),
+      ...(report.truncatedEntries ? { truncated_entries: report.truncatedEntries } : {}),
+    },
   };
 }
 
@@ -234,7 +300,13 @@ function loadAgentEntries(userId: string, agentId: string): MemoryEntry[] {
   return loadEntries(agentMemoryFile(userId, agentId));
 }
 
-function buildAgentResult(userId: string, agentId: string, ok: boolean, error?: string): MemoryOpResult {
+function buildAgentResult(
+  userId: string,
+  agentId: string,
+  ok: boolean,
+  error?: string,
+  report?: MemorySaveReport,
+): MemoryOpResult {
   const entries = loadAgentEntries(userId, agentId);
   const text = entries.map(e => e.text).join(ENTRY_SEPARATOR);
   return {
@@ -242,6 +314,7 @@ function buildAgentResult(userId: string, agentId: string, ok: boolean, error?: 
     ...(error ? { error } : {}),
     entries: entries.map(e => e.text),
     usage: { current: text.length, limit: AGENT_CHAR_LIMIT, entries_current: entries.length, entries_limit: AGENT_ENTRY_LIMIT },
+    ...evictedField(report),
   };
 }
 
@@ -292,14 +365,17 @@ export function addEntry(userId: string, target: MemoryScope, content: string): 
   const entryLimit = entryLimitForTarget(target);
   const entries = loadEntries(filePath);
   entries.push({ text: trimmed });
-  saveEntries(filePath, entries, limit, entryLimit);
+  const report = saveEntries(filePath, entries, limit, entryLimit);
   notifyMemoryDirty(target);
-  return buildResult(userId, target, true);
+  return buildResult(userId, target, true, undefined, report);
 }
 
 export function addAgentEntry(userId: string, agentId: string, content: string): MemoryOpResult {
   const res = addEntry(userId, { agent: agentId }, content);
-  return buildAgentResult(userId, agentId, res.ok, res.error);
+  const report: MemorySaveReport | undefined = res.evicted
+    ? { droppedEntries: res.evicted.dropped_entries || 0, truncatedEntries: res.evicted.truncated_entries || 0 }
+    : undefined;
+  return buildAgentResult(userId, agentId, res.ok, res.error, report);
 }
 
 export function replaceEntry(userId: string, target: MemoryScope, oldText: string, content: string): MemoryOpResult {
@@ -320,9 +396,9 @@ export function replaceEntry(userId: string, target: MemoryScope, oldText: strin
   if (match.ok === false) return buildResult(userId, target, false, match.error);
 
   entries[match.index] = { text: trimmed };
-  saveEntries(filePath, entries, limit, entryLimit);
+  const report = saveEntries(filePath, entries, limit, entryLimit);
   notifyMemoryDirty(target);
-  return buildResult(userId, target, true);
+  return buildResult(userId, target, true, undefined, report);
 }
 
 export function replaceAgentEntry(userId: string, agentId: string, oldText: string, content: string): MemoryOpResult {
@@ -341,9 +417,9 @@ export function replaceAgentEntry(userId: string, agentId: string, oldText: stri
   const match = resolveMemoryEntryMatch(canonicalEntries.map(e => e.text), oldText);
   if (match.ok === false) return buildAgentResult(userId, agentId, false, match.error);
   canonicalEntries[match.index] = { text: trimmed };
-  saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+  const report = saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
   notifyMemoryDirty({ agent: agentId });
-  return buildAgentResult(userId, agentId, true);
+  return buildAgentResult(userId, agentId, true, undefined, report);
 }
 
 export function removeEntry(userId: string, target: MemoryScope, oldText: string): MemoryOpResult {
@@ -354,9 +430,9 @@ export function removeEntry(userId: string, target: MemoryScope, oldText: string
   if (match.ok === false) return buildResult(userId, target, false, match.error);
 
   entries.splice(match.index, 1);
-  saveEntries(filePath, entries, limit, entryLimitForTarget(target));
+  const report = saveEntries(filePath, entries, limit, entryLimitForTarget(target));
   notifyMemoryDirty(target);
-  return buildResult(userId, target, true);
+  return buildResult(userId, target, true, undefined, report);
 }
 
 export function removeAgentEntry(userId: string, agentId: string, oldText: string): MemoryOpResult {
@@ -366,9 +442,9 @@ export function removeAgentEntry(userId: string, agentId: string, oldText: strin
   const match = resolveMemoryEntryMatch(canonicalEntries.map(e => e.text), oldText);
   if (match.ok === false) return buildAgentResult(userId, agentId, false, match.error);
   canonicalEntries.splice(match.index, 1);
-  saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+  const report = saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
   notifyMemoryDirty({ agent: agentId });
-  return buildAgentResult(userId, agentId, true);
+  return buildAgentResult(userId, agentId, true, undefined, report);
 }
 
 export function listEntries(userId: string, target: MemoryScope): MemoryOpResult {

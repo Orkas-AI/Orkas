@@ -3,12 +3,13 @@ ownerAgent: 814b61b027f0
 name: image-router
 description_zh: ImageStudio 每次任务首先且单独读取的路由技能；按用户意图、画面类型和成本选择 COMPOSE、HYBRID、GENERATE 或 EDIT，再决定后续需要读取的技能。
 description_en: The first and only ImageStudio skill to read before route lock; selects COMPOSE, HYBRID, GENERATE, or EDIT from intent, visual requirements, and cost, then identifies the next skill to load.
-category: creation
 ---
 
 # Image Router
 
 Read this skill first and alone for every image creation or revision request. Return a locked route before reading any other ImageStudio skill; do not batch this read with craft, canvas, production, or review skills.
+
+For a clear zero-input poster or social graphic, routine canvas and export choices are low-risk defaults: choose them without asking and state the chosen defaults in the delivery. Ask only when a missing choice changes subject, required copy, brand fidelity, reference intent, paid budget, or final format.
 
 Before routing any request with a supplied image, classify the user's relationship to that image. An explicit user requirement always wins. Only when the user did not specify the relationship may ImageStudio infer a default:
 
@@ -22,7 +23,7 @@ Record this as `reference_intent:{mode,basis:"user|inferred",instructions,minimu
 
 - Choose `COMPOSE` when typography, diagrams, charts, abstract geometry, cards, covers, posters, social graphics, simple illustrations, or brand layouts can be expressed faithfully with HTML/CSS/SVG. This route uses zero image-generation calls.
 - Choose `HYBRID` when one photographic, painterly, character, or textured raster asset is needed but exact copy, layout, logo placement, or labels should remain deterministic in HTML/SVG. The normal budget is one generated raster asset per user turn.
-- Choose `GENERATE` when the desired output is primarily photographic, cinematic, painterly, character-led, or otherwise depends on synthesized pixels. The normal budget per user turn is one initial call and at most one repair call after evidence-based review.
+- Choose `GENERATE` when the desired output is primarily photographic, cinematic, painterly, character-led, or otherwise depends on synthesized pixels. The normal budget per user turn is one call. Allow a second billable call only when the user explicitly requests iterative refinement or authorizes another attempt; a visual finding by itself is not authorization.
 - Choose `EDIT` when the user supplied a raster image and requested a semantic pixel change that HTML overlays cannot accomplish. The manifest must use `reference_intent.mode:"edit"`, name a required `edit_source`, list the exact instructions, and preserve every unaffected region.
 - Distinguish `HYBRID` from `EDIT` by the final artifact contract, not merely by the presence of a supplied photo. A poster or layout that keeps a supplied product/subject image as an immutable foreground layer, generates a separate background asset, and places exact copy/logo deterministically is `HYBRID`. Use `EDIT` only when the final raster remains the supplied source canvas and pixels inside that source must be semantically reconstructed, such as replacing a portrait background in place.
 - A `reproduce` request does not force `EDIT`: choose COMPOSE, HYBRID, or GENERATE according to the visual material required to reproduce the declared attributes.
@@ -96,8 +97,8 @@ Return `route`, `reason`, `generation_budget`, and a phased `next_skills` list:
 - Add `image-canvas` only for multiple meaningful regions, explicit reading order, exact layout constraints, or region-bound references.
 - Add `image-compose` for `COMPOSE`, or later in another route only for a deterministic overlay, layout, diagram, crop, mask, or composite.
 - Add `image-generate` for `GENERATE`, semantic `EDIT`, or the synthesized raster phase of `HYBRID`.
-- Never add `image-design-review` to startup. Load it only after current inspect or snapshot evidence exists.
+- Never add `image-design-review` to startup. Load it only after a current COMPOSE or HYBRID snapshot exists. GENERATE and EDIT never use ImageStudio visual review, including strict reproduction, semantic editing, and multi-image sets; the configured image service owns those guarantees.
 
 When more than one skill is required, `next_skills` expresses execution order, not a parallel preload request. Read each skill only when its phase begins.
 
-For `COMPOSE` and `HYBRID`, use private `image-compose` scripts for evolving authoring/asset capabilities and reserve native `image_studio` for inspect, capture, review, and export. For `GENERATE` and `EDIT`, use `generate_image` by default; choose a host-configured ComfyUI, InvokeAI, AUTOMATIC1111, or IOPaint workflow only after `workflow.capabilities` proves it executable and the project-local request provides a specific model/control advantage. Both paths use the same manifest budget, then converge on `image_studio` inspect, scored review, and export.
+For `COMPOSE` and `HYBRID`, use private `image-compose` scripts for evolving authoring/asset capabilities and reserve native `image_studio` for inspect, capture, review, and export. For `GENERATE` and `EDIT`, use `generate_image` by default; choose a host-configured ComfyUI, InvokeAI, AUTOMATIC1111, or IOPaint workflow only after `workflow.capabilities` proves it executable and the project-local request provides a specific model/control advantage. Both paths use the same manifest budget and converge on deterministic `image_studio` inspection and export. Scored review remains part of COMPOSE/HYBRID snapshot delivery and never runs on a GENERATE/EDIT raster.

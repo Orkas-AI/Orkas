@@ -173,8 +173,10 @@ try {
   });
   const editOffice = officeTools.find((tool) => tool.name === 'edit_office');
   const createXlsx = officeTools.find((tool) => tool.name === 'create_xlsx');
+  const officeRead = officeTools.find((tool) => tool.name === 'office_read');
   assert(editOffice, 'edit_office tool is missing');
   assert(createXlsx, 'create_xlsx tool is missing');
+  assert(officeRead, 'office_read tool is missing');
   const editResult = await editOffice.execute({
     path: sourceDocx,
     operations: [
@@ -249,6 +251,42 @@ try {
     'native workbook chart is missing the explicit zero value-axis minimum',
   );
 
+  const xlsxEditResult = await editOffice.execute({
+    path: workbook,
+    operations: [
+      {
+        action: 'set',
+        path: '/数据/A2',
+        props: { value: '00999', type: 'string', format: '@', bold: true },
+      },
+      {
+        action: 'set',
+        path: '/数据/B2',
+        props: { formula: '=SUM(40,2)', format: '0.00', fill: '#FFF2CC' },
+      },
+    ],
+    preview: false,
+  }, { workingDir: tempDir, state: {} });
+  assert(!xlsxEditResult.isError, `edit_office XLSX cell contract failed: ${xlsxEditResult.content}`);
+
+  const editedTextCell = await officeRead.execute({
+    path: workbook,
+    mode: 'get',
+    target: '/数据/A2',
+  }, { workingDir: tempDir, state: {} });
+  assert(!editedTextCell.isError, `office_read XLSX text cell failed: ${editedTextCell.content}`);
+  assertContains(editedTextCell.content, '00999', 'edited XLSX text value');
+  assertContains(editedTextCell.content, '"numberformat": "@"', 'edited XLSX text number format');
+
+  const editedFormulaCell = await officeRead.execute({
+    path: workbook,
+    mode: 'get',
+    target: '/数据/B2',
+  }, { workingDir: tempDir, state: {} });
+  assert(!editedFormulaCell.isError, `office_read XLSX formula cell failed: ${editedFormulaCell.content}`);
+  assertContains(editedFormulaCell.content, '"formula": "SUM(40,2)"', 'edited XLSX formula');
+  assertContains(editedFormulaCell.content, '"numberformat": "0.00"', 'edited XLSX formula number format');
+
   run(binary, ['create', deck, '--force', '--json']);
   await batch(binary, deck, [
     { command: 'add', parent: '/', type: 'slide', props: { title: '项目简报', text: '本季度进展正常' } },
@@ -266,7 +304,7 @@ try {
   validateAndInspect(
     binary,
     workbook,
-    '00123',
+    '00999',
     path.join(tempDir, 'workbook-sheet-1.html'),
   );
   validateAndInspect(
@@ -298,7 +336,7 @@ try {
     );
   }
 
-  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
+  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true xlsx-edit-readback=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
 } catch (error) {
   failed = true;
   console.error(`[office-artifact-smoke] FAIL: ${error instanceof Error ? error.message : String(error)}`);

@@ -1,17 +1,15 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: composition-design-review
-min_app_version: "1.6.5"
 description_zh: VideoStudio 的 COMPOSE 视觉自检清单 - 在展示 HTML 预览前，由作者自己完整检查首帧、每镜中点与收束帧，汇总一次可执行修复；不向宿主提交任何审查结果。
 description_en: Advisory visual checklist for VideoStudio COMPOSE. The author reviews the first frame, every scene midpoint, and the payoff frame before exposing the HTML preview, batching actionable fixes; nothing is submitted to the host.
-category: creation
 ---
 
 # composition-design-review
 
 Apply this checklist yourself after a successful `composition.snapshot`, before the preview is shown. It is advisory: nothing is submitted to the host, no operation records a verdict, and no gate waits on it — the host publishes the contact sheet with the passing snapshot. It is a design QA layer for your own authoring, not a renderer, line router, or generic video craft checklist.
 
-Do not open a new user Gate. Native preflight/inspect/sampled-frame QA runs before this pass; a passing snapshot attaches the full-color contact sheet directly as model-visible evidence. Review every frame in that attached complete index, without reopening the sheet through generic `read_file`, and open at full scale only the frame-0 cover, frames named by QA findings, and frames whose sheet cell shows risk (dense or doubtful text, suspected overlap or blankness). Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot; then re-check the complete new frame set.
+Do not open a new user Gate. Native preflight/inspect/sampled-frame QA runs before this pass; a passing snapshot attaches the full-color contact sheet directly as model-visible evidence. Review every frame in that attached complete index, without reopening the sheet through generic `read_files`, and open at full scale only the frame-0 cover, frames named by QA findings, and frames whose sheet cell shows risk (dense or doubtful text, suspected overlap or blankness). Do not stop after the first defect. Collect all concrete visible blockers across the full frame set, make one batched localized repair to `manifest.art_direction` or affected HTML, and re-run inspect + snapshot; then re-check the complete new frame set.
 
 ## Activation
 

@@ -35,6 +35,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.doUnmock('../../../../src/main/features/ocr_runtime');
+  vi.doUnmock('../../../../src/main/features/file_indexer');
   vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
@@ -91,8 +92,27 @@ async function buildProjectTools() {
 
 function getTool(tools: any[], name: string) {
   const t = tools.find((x) => x.name === name);
-  if (!t) throw new Error(`tool ${name} not found`);
-  return t;
+  if (t) return t;
+  // Keep the older behavior assertions below focused on the shared item
+  // executor while the explicit surface tests verify that these aliases are
+  // no longer registered for the model.
+  const readFiles = tools.find((x) => x.name === 'read_files');
+  if (name === 'read_file' && readFiles) {
+    return {
+      inputSchema: (readFiles.inputSchema as any).properties.paths.items,
+      execute: (input: Record<string, unknown>, ctx: unknown) => (
+        readFiles.execute({ paths: [input] }, ctx)
+      ),
+    };
+  }
+  if (name === 'stat_file' && readFiles) {
+    return {
+      execute: (input: Record<string, unknown>, ctx: unknown) => (
+        readFiles.execute({ paths: [input], metadata_only: true }, ctx)
+      ),
+    };
+  }
+  throw new Error(`tool ${name} not found`);
 }
 
 describe('file-tools › list_files', () => {
@@ -353,23 +373,24 @@ describe('file-tools › portable skill documents', () => {
   });
 });
 
-describe('file-tools › read_file (rich documents require stat_file first)', () => {
-  it('returns E_NEED_STAT when pdf has never been stated', async () => {
+describe('file-tools › read_files (rich documents prepare on first read)', () => {
+  it('extracts and reads a fresh pdf in one call', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'fresh.pdf');
     fs.writeFileSync(p, makeMinimalPdf(['Alpha', 'Bravo']));
     const r = await run(getTool(tools, 'read_file'), { path: p });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_NEED_STAT');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('Alpha');
+    expect(r.content).toContain('Bravo');
   });
 
-  it('returns E_NEED_STAT when xlsx has never been stated', async () => {
+  it('extracts and reads a fresh xlsx in one call', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'fresh.xlsx');
     fs.writeFileSync(p, makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
     const r = await run(getTool(tools, 'read_file'), { path: p });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_NEED_STAT');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('Row 2: Ada');
   });
 
   it('reads pdf after stat_file', async () => {
@@ -620,7 +641,7 @@ describe('file-tools › read_file scope guards', () => {
     const result = await run(getTool(tools, 'read_file'), { path: stored });
     expect(result.isError).toBe(true);
     expect(result.content).toContain('E_TOOL_RESULT_REF_REQUIRED');
-    expect(result.content).toContain('tool_result_read_chunk');
+    expect(result.content).toContain('tool_result');
   });
 
   it('rejects paths outside the scope with E_PATH_OUT_OF_SCOPE', async () => {
@@ -669,7 +690,7 @@ describe('file-tools › read_file scope guards', () => {
       expect(r.isError).toBe(true);
       expect(r.content).toContain('E_SENSITIVE_PATH_DENIED');
       expect(r.content).not.toContain('SECRET-FILE-TOOLS');
-      expect(payload.operation).toBe('read_file');
+      expect(payload.operation).toBe('read_files');
       expect(payload.reasons).toEqual(['sensitive_path']);
     } finally {
       bashPerms._setBroadcastForTest(null);
@@ -704,6 +725,9 @@ describe('file-tools › read_file scope guards', () => {
     const r = await run(getTool(tools, 'read_file'), { path: path.join(wsDir, 'ghost.md') });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_NOT_FOUND');
+    expect(r.content).toContain('<missing-file-recovery>');
+    expect(r.content).toContain('ask for the correct accessible path or an attachment');
+    expect(r.content).toContain('use search_files to locate the source');
   });
 
   it('allows project-scoped conversation attachments', async () => {
@@ -832,6 +856,8 @@ describe('file-tools › read_file scope guards', () => {
     });
 
     expect(entryResult.isError).toBeFalsy();
+    expect(entryResult.content).toContain('<skill-runtime execution_ref="deep-research">');
+    expect(entryResult.content).toContain('already bound it to this Skill');
     expect(entryResult.content).toContain('path="@skill/deep-research"');
     expect(entryResult.content).toContain('main workflow');
     expect(referenceResult.isError).toBeFalsy();
@@ -847,6 +873,9 @@ describe('file-tools › read_file scope guards', () => {
     expect(imageResult.images[0].mediaType).toBe('image/jpeg');
     expect(scriptResult.isError).toBeFalsy();
     expect(scriptResult.content).toContain('print("caps")');
+    for (const result of [referenceResult, templateResult, configResult, imageResult, scriptResult]) {
+      expect(result.content).not.toContain('<skill-runtime execution_ref=');
+    }
     for (const result of [entryResult, referenceResult, templateResult, configResult, imageResult, scriptResult]) {
       expect(result.content).not.toContain(skillRoot);
     }
@@ -867,10 +896,10 @@ describe('file-tools › read_file scope guards', () => {
       skillRuntimeBindings: new Map([['bundle', binding]]),
     });
     const readFilesSchema = getTool(tools, 'read_files').inputSchema as any;
-    expect(readFilesSchema.properties.files.items.properties.path.description).toContain('@skill/<read-ref>');
+    expect(readFilesSchema.properties.paths.items.properties.path.description).toContain('@skill/<read-ref>');
 
     const batch = await run(getTool(tools, 'read_files'), {
-      files: [
+      paths: [
         { path: '@skill/bundle' },
         { path: '@skill/bundle/references/facts.md' },
       ],
@@ -912,6 +941,51 @@ describe('file-tools › read_file scope guards', () => {
       expect(result.content).not.toContain(skillRoot);
     }
     expect(grep.content).toContain('needle fact');
+  });
+
+  it('prepends run-scoped entry context without changing other Skill reads', async () => {
+    const skillRoot = path.join(tmpDir, 'bound-skills', 'contextual-skill');
+    const skillEntry = path.join(skillRoot, 'SKILL.md');
+    const reference = path.join(skillRoot, 'references', 'details.md');
+    fs.mkdirSync(path.dirname(reference), { recursive: true });
+    fs.writeFileSync(skillEntry, '---\nname: contextual-skill\n---\nentry instructions');
+    fs.writeFileSync(reference, 'reference details');
+    const binding = {
+      id: 'contextual-skill',
+      name: 'contextual-skill',
+      root: skillRoot,
+      entry: skillEntry,
+      source: 'system',
+      entryReadPrelude: '## Host-generated context\n\n- exact runtime fact',
+    };
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({
+      userId: UID,
+      skillRuntimeBindings: new Map([['contextual-skill', binding]]),
+    });
+    const readFile = getTool(tools, 'read_file');
+
+    const entry = await run(readFile, { path: '@skill/contextual-skill' });
+    const explicitEntry = await run(readFile, { path: '@skill/contextual-skill/SKILL.md' });
+    const referenceResult = await run(readFile, { path: '@skill/contextual-skill/references/details.md' });
+    const batch = await run(getTool(tools, 'read_files'), {
+      paths: [
+        { path: '@skill/contextual-skill' },
+        { path: '@skill/contextual-skill/references/details.md' },
+      ],
+    });
+
+    for (const result of [entry, explicitEntry]) {
+      expect(result.isError).toBeFalsy();
+      expect(result.content.indexOf('## Host-generated context')).toBeGreaterThanOrEqual(0);
+      expect(result.content.indexOf('## Host-generated context'))
+        .toBeLessThan(result.content.indexOf('<file '));
+      expect(result.content).toContain('entry instructions');
+    }
+    expect(referenceResult.content).toContain('reference details');
+    expect(referenceResult.content).not.toContain('## Host-generated context');
+    expect(batch.content.match(/## Host-generated context/g)).toHaveLength(1);
+    expect(fs.readFileSync(skillEntry, 'utf8')).not.toContain('Host-generated context');
   });
 
   it('keeps logical Skill refs in missing-path and OCR results without leaking installation roots', async () => {
@@ -1059,6 +1133,40 @@ describe('file-tools › read_file scope guards', () => {
     expect(r.content).not.toContain('secret workflow');
   });
 
+  it('blocks read_file from loading a disabled external-package Skill', async () => {
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const paths = await import('../../../../src/main/paths');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const r0 = ws.setWorkspacePath(UID, wsDir);
+    if (!r0.ok) throw new Error(`setWorkspacePath failed: ${r0.error}`);
+
+    const packagesRoot = paths.userPackagesDir(UID);
+    const skillRoot = path.join(packagesRoot, 'pkg-tools', 'skills');
+    const skillPath = path.join(skillRoot, 'external-disabled', 'SKILL.md');
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, '---\nname: External disabled\n---\nsecret external workflow');
+    fs.writeFileSync(paths.userPackagesRegistryFile(UID), JSON.stringify({
+      version: 1,
+      packages: [{
+        name: 'pkg-tools',
+        kind: 'skill',
+        skill_roots: ['skills'],
+        bin_entries: [],
+        enabled: true,
+      }],
+    }));
+    enabled.setSkillEnabled(UID, 'external-disabled', false);
+
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, readOnlyExtraRoots: [skillRoot] });
+    const r = await run(getTool(tools, 'read_file'), { path: skillPath });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).not.toContain('secret external workflow');
+  });
+
   it('blocks stat_file from touching files inside a disabled skill', async () => {
     const ws = await import('../../../../src/main/features/user_workspace');
     const paths = await import('../../../../src/main/paths');
@@ -1083,10 +1191,21 @@ describe('file-tools › read_file scope guards', () => {
 });
 
 describe('file-tools › read_files', () => {
+  it('is the only model-visible file content/metadata reader', async () => {
+    const { tools } = await buildTools();
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain('read_files');
+    expect(names).not.toContain('read_file');
+    expect(names).not.toContain('stat_file');
+  });
+
   it('advertises and executes the same tagged range contract for every batch item', async () => {
     const { tools, wsDir } = await buildTools();
     const readFiles = getTool(tools, 'read_files');
-    const itemSchema = (readFiles.inputSchema as any).properties.files.items;
+    const schema = readFiles.inputSchema as any;
+    const itemSchema = schema.properties.paths.items;
+    expect(schema.required).toEqual(['paths']);
+    expect(schema.properties.metadata_only.type).toBe('boolean');
     expect(itemSchema.properties).not.toHaveProperty('charStart');
     expect(itemSchema.properties).not.toHaveProperty('lineStart');
     expect(itemSchema.properties.range).toMatchObject({
@@ -1098,7 +1217,7 @@ describe('file-tools › read_files', () => {
     const p = path.join(wsDir, 'batch-range.txt');
     fs.writeFileSync(p, 'one\ntwo\nthree\n');
     const result = await run(readFiles, {
-      files: [{ path: p, range: { unit: 'line', start: 2, end: 2 } }],
+      paths: [{ path: p, range: { unit: 'line', start: 2, end: 2 } }],
     });
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain('2\ttwo');
@@ -1114,9 +1233,9 @@ describe('file-tools › read_files', () => {
     fs.writeFileSync(second, 'export const second = 2;\n');
 
     const r = await run(getTool(tools, 'read_files'), {
-      files: [
+      paths: [
         { path: first },
-        { path: second, charStart: 7, charEnd: 19 },
+        { path: second, range: { unit: 'char', start: 7, end: 19 } },
         { path: missing },
       ],
     });
@@ -1132,10 +1251,101 @@ describe('file-tools › read_files', () => {
     const { tools, wsDir } = await buildTools();
     const large = path.join(wsDir, 'large.txt');
     fs.writeFileSync(large, 'x'.repeat(30_000));
-    const r = await run(getTool(tools, 'read_files'), { files: [{ path: large }] });
+    const r = await run(getTool(tools, 'read_files'), { paths: [{ path: large }] });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-24000"');
     expect(r.content.length).toBeLessThan(30_000);
+  });
+
+  it('pages and resumes a real >4 MiB UTF-8 file through the model-visible contract', async () => {
+    const { tools, wsDir } = await buildTools();
+    const readFiles = getTool(tools, 'read_files');
+    const large = path.join(wsDir, 'large-streamed.log');
+    const firstPage = `${'a'.repeat(23_990)}0123456789`;
+    const secondPageMarker = '第二页开始🙂';
+    const targetLine = '需要按行读取的目标';
+    const body = `${firstPage}${secondPageMarker}\n${targetLine}\n${'z'.repeat(4_500_000)}`;
+    fs.writeFileSync(large, body, 'utf8');
+    expect(fs.statSync(large).size).toBeGreaterThan(4 * 1024 * 1024);
+
+    const first = await run(readFiles, { paths: [{ path: large }] });
+    expect(first.isError).toBeFalsy();
+    expect(first.content).toContain('covered="0-24000"');
+    expect(first.content).toContain('has_more="true"');
+    expect(first.content).toContain('next_range="char:24000-48000"');
+    expect(first.content).not.toContain(secondPageMarker);
+    expect(first.content.length).toBeLessThan(30_000);
+
+    const firstHash = /file_hash="([^"]+)"/.exec(first.content)?.[1];
+    expect(firstHash).toMatch(/^sha256:[a-f0-9]{64}$/);
+    const second = await run(readFiles, {
+      paths: [{ path: large, range: { unit: 'char', start: 24_000, end: 48_000 } }],
+    });
+    expect(second.isError).toBeFalsy();
+    expect(second.content).toContain('covered="24000-48000"');
+    expect(second.content).toContain(secondPageMarker);
+    expect(second.content).toContain(`file_hash="${firstHash}"`);
+    expect(second.content.length).toBeLessThan(30_000);
+
+    const line = await run(readFiles, {
+      paths: [{ path: large, range: { unit: 'line', start: 2, end: 2 } }],
+    });
+    expect(line.isError).toBeFalsy();
+    expect(line.content).toContain(`2\t${targetLine}`);
+    expect(line.content).not.toContain('zzzzz');
+    expect(line.content.length).toBeLessThan(2_000);
+  });
+
+  it('uses the current round token budget and returns a resumable prefix without Result Store spill', async () => {
+    const { tools, wsDir } = await buildTools();
+    const large = path.join(wsDir, 'large-cjk.txt');
+    fs.writeFileSync(large, '需要继续读取的大文件内容。'.repeat(4_000));
+    const cap = await import('../../../../src/main/util/tool-result-cap');
+    const ledger = {
+      initialTokens: 900,
+      remainingTokens: 900,
+      perResultTokens: 900,
+      verbatimDocumentTokens: 900,
+    };
+    const ctx = {
+      workingDir: wsDir,
+      signal: undefined,
+      state: { [cap.TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: ledger },
+    } as any;
+
+    const raw = await getTool(tools, 'read_files').execute({ paths: [{ path: large }] }, ctx);
+    expect(raw.content).toContain('has_more="true"');
+    expect(raw.content).toMatch(/next_range="char:\d+-\d+"/);
+    const final = cap.capToolResult('read_files', raw, ctx, {
+      maxInlineTokens: cap.DEFAULT_INLINE_RESULT_TOKENS,
+      toolResultsDir: path.join(tmpDir, 'tool-results'),
+    });
+    expect(final.persistedOutput).toBeUndefined();
+    expect(final.content).toBe(raw.content);
+
+    const continuation = /next_range="char:(\d+)-(\d+)"/.exec(raw.content);
+    expect(continuation).toBeTruthy();
+    const continuationStart = Number(continuation![1]);
+    const continuationEnd = Number(continuation![2]);
+    const nextCtx = {
+      ...ctx,
+      state: {
+        [cap.TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: {
+          initialTokens: 900,
+          remainingTokens: 900,
+          perResultTokens: 900,
+          verbatimDocumentTokens: 900,
+        },
+      },
+    } as any;
+    const next = await getTool(tools, 'read_files').execute({
+      paths: [{
+        path: large,
+        range: { unit: 'char', start: continuationStart, end: continuationEnd },
+      }],
+    }, nextCtx);
+    expect(next.isError).toBeFalsy();
+    expect(next.content).toContain(`covered="${continuationStart}-`);
   });
 
   it('reads skill documents whole and preserves their semantics across batch aggregation', async () => {
@@ -1155,20 +1365,19 @@ describe('file-tools › read_files', () => {
     fs.writeFileSync(referenceFile, `${'r'.repeat(30_000)}\nEND-NESTED-REFERENCE\n`);
 
     const withSkill = await run(readFiles, {
-      files: [...skillFiles.map((path) => ({ path })), { path: referenceFile }],
+      paths: [...skillFiles.map((path) => ({ path })), { path: referenceFile }],
     });
     expect(withSkill.verbatimDocument).toBe(true);
-    expect(withSkill.content).toContain('truncated="false"');
     expect(withSkill.content.length).toBeGreaterThan(160_000);
     expect(withSkill.content).toContain('END-SKILL-4');
     expect(withSkill.content).toContain('END-NESTED-REFERENCE');
 
-    const ordinaryOnly = await run(readFiles, { files: [{ path: ordinaryFile }] });
+    const ordinaryOnly = await run(readFiles, { paths: [{ path: ordinaryFile }] });
     expect(ordinaryOnly.verbatimDocument).toBeUndefined();
   });
 });
 
-describe('file-tools › stat_file', () => {
+describe('file-tools › read_files metadata_only', () => {
   it('returns total_chars for text without extra extraction work', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'hello.txt');
@@ -1207,15 +1416,85 @@ describe('file-tools › stat_file', () => {
     expect(s2.content).toMatch(/total_chars="\d+"/);
   });
 
-  it('returns E_NO_TEXT for image kind', async () => {
+  it('returns image metadata without loading an image body', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'chart.png');
     const { Jimp } = await import('jimp' as any);
     const img: any = new Jimp({ width: 30, height: 30, color: 0xFF00FFFF });
     fs.writeFileSync(p, await img.getBuffer('image/png'));
     const r = await run(getTool(tools, 'stat_file'), { path: p });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_NO_TEXT');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('kind="image"');
+    expect(r.content).toMatch(/bytes="\d+"/);
+    expect(r.images).toBeUndefined();
+  });
+
+  it('prepares and reports metadata for several rich documents in one call', async () => {
+    const { tools, wsDir } = await buildTools();
+    const pdf = path.join(wsDir, 'metadata.pdf');
+    const sheet = path.join(wsDir, 'metadata.xlsx');
+    fs.writeFileSync(pdf, makeMinimalPdf(['Prepared PDF']));
+    fs.writeFileSync(sheet, makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+
+    const result = await run(getTool(tools, 'read_files'), {
+      paths: [{ path: pdf }, { path: sheet }],
+      metadata_only: true,
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain('metadata_only="true"');
+    expect(result.content).toContain('kind="pdf"');
+    expect(result.content).toContain('kind="spreadsheet"');
+    expect(result.content.match(/total_chars="\d+"/g)).toHaveLength(2);
+    expect(result.content).not.toContain('Prepared PDF');
+    expect(result.content).not.toContain('Row 2: Ada');
+  });
+
+  it('limits rich-document extraction to two concurrent jobs across one batch', async () => {
+    let active = 0;
+    let peak = 0;
+    vi.doMock('../../../../src/main/features/file_indexer', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../../../src/main/features/file_indexer')>();
+      return {
+        ...actual,
+        statFile: async (_userId: string, absPath: string) => {
+          active++;
+          peak = Math.max(peak, active);
+          await new Promise<void>((resolve) => setTimeout(resolve, 8));
+          active--;
+          const source = fs.statSync(absPath);
+          return {
+            kind: actual.kindOf(absPath),
+            absPath,
+            bytes: source.size,
+            mtime: source.mtimeMs,
+            source: 'workspace',
+            totalChars: 42,
+          };
+        },
+      };
+    });
+
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'concurrency-ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const selected = ws.setWorkspacePath(UID, wsDir);
+    if (!selected.ok) throw new Error(`setWorkspacePath failed: ${selected.error}`);
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const readFiles = getTool(mod.createFileTools({ userId: UID }), 'read_files');
+    const files = Array.from({ length: 6 }, (_, index) => {
+      const file = path.join(wsDir, `rich-${index}.pdf`);
+      fs.writeFileSync(file, `%PDF-${index}`);
+      return file;
+    });
+
+    const result = await run(readFiles, {
+      paths: files.map((path) => ({ path })),
+      metadata_only: true,
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.content.match(/total_chars="42"/g)).toHaveLength(files.length);
+    expect(peak).toBe(2);
   });
 
   it('rejects paths outside scope', async () => {

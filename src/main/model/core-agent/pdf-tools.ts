@@ -10,19 +10,9 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import {
-  PDFCheckBox,
-  PDFDocument,
-  PDFDropdown,
-  PDFOptionList,
-  PDFRadioGroup,
-  PDFTextField,
-  degrees as pdfDegrees,
-} from 'pdf-lib';
-import { createCanvas } from '@napi-rs/canvas';
+import type { PDFDocument as PdfDocument } from 'pdf-lib';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
-import { getLocalExecGranted } from '../../features/permissions';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { isPathAllowed } from '../../util/path-sandbox';
@@ -30,13 +20,24 @@ import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { fileEditLock } from '../../util/locks';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
-import { DENY_MESSAGE } from './local-tools';
 
 const log = createLogger('pdf-tools');
 const MAX_INPUT_BYTES = 128 * 1024 * 1024;
 const MAX_PAGE_COUNT = 2_000;
 const MAX_RENDER_PIXELS = 8 * 1024 * 1024;
 const MAX_TEXT_CHARS = 2_000;
+
+let pdfLibPromise: Promise<typeof import('pdf-lib')> | null = null;
+function loadPdfLib(): Promise<typeof import('pdf-lib')> {
+  if (!pdfLibPromise) pdfLibPromise = import('pdf-lib');
+  return pdfLibPromise;
+}
+
+let canvasPromise: Promise<typeof import('@napi-rs/canvas')> | null = null;
+function loadCanvas(): Promise<typeof import('@napi-rs/canvas')> {
+  if (!canvasPromise) canvasPromise = import('@napi-rs/canvas');
+  return canvasPromise;
+}
 
 type PdfAction =
   | 'merge'
@@ -56,10 +57,6 @@ export interface PdfToolsOpts {
   extraRoots?: readonly string[];
   onFileWritten?: (absPath: string) => void | Promise<void>;
   hasProducedPath?: (absPath: string) => boolean;
-}
-
-function deniedResult(): ToolResult {
-  return { content: DENY_MESSAGE, isError: true };
 }
 
 function errResult(code: string, message: string): ToolResult {
@@ -172,12 +169,13 @@ function canvasFontFamily(): string {
   return '"Noto Sans CJK SC", "Noto Sans SC", "DejaVu Sans", Arial, sans-serif';
 }
 
-function renderTextPng(input: {
+async function renderTextPng(input: {
   text: string;
   fontSize: number;
   color: string;
   backgroundColor?: string;
-}): Buffer {
+}): Promise<Buffer> {
+  const { createCanvas } = await loadCanvas();
   const lines = input.text.split(/\r?\n/).slice(0, 40);
   const padding = Math.max(4, Math.round(input.fontSize * 0.25));
   const lineHeight = Math.ceil(input.fontSize * 1.3);
@@ -204,7 +202,8 @@ function renderTextPng(input: {
   return canvas.toBuffer('image/png');
 }
 
-async function loadPdf(abs: string): Promise<PDFDocument> {
+async function loadPdf(abs: string): Promise<PdfDocument> {
+  const { PDFDocument } = await loadPdfLib();
   const document = await PDFDocument.load(fs.readFileSync(abs), { updateMetadata: false });
   if (document.getPageCount() > MAX_PAGE_COUNT) {
     throw new Error(`PDF exceeds the ${MAX_PAGE_COUNT}-page processing limit`);
@@ -212,7 +211,7 @@ async function loadPdf(abs: string): Promise<PDFDocument> {
   return document;
 }
 
-async function writePdf(abs: string, document: PDFDocument): Promise<void> {
+async function writePdf(abs: string, document: PdfDocument): Promise<void> {
   const tmp = path.join(
     path.dirname(abs),
     `.${path.basename(abs)}.orkas-pdf-${process.pid}-${Date.now()}.tmp`,
@@ -225,7 +224,8 @@ async function writePdf(abs: string, document: PDFDocument): Promise<void> {
   }
 }
 
-async function documentForMerge(inputPaths: string[]): Promise<PDFDocument> {
+async function documentForMerge(inputPaths: string[]): Promise<PdfDocument> {
+  const { PDFDocument } = await loadPdfLib();
   const output = await PDFDocument.create();
   for (const inputPath of inputPaths) {
     const source = await loadPdf(inputPath);
@@ -235,7 +235,8 @@ async function documentForMerge(inputPaths: string[]): Promise<PDFDocument> {
   return output;
 }
 
-async function documentForExtract(inputPath: string, pages: number[]): Promise<PDFDocument> {
+async function documentForExtract(inputPath: string, pages: number[]): Promise<PdfDocument> {
+  const { PDFDocument } = await loadPdfLib();
   const source = await loadPdf(inputPath);
   const output = await PDFDocument.create();
   const copied = await output.copyPages(source, pages.map((page) => page - 1));
@@ -249,7 +250,8 @@ async function applyPdfAction(
   inputPaths: string[],
   opts: PdfToolsOpts,
   ctx: ToolContext,
-): Promise<{ document: PDFDocument; changedPages: number[]; notes?: string[] }> {
+): Promise<{ document: PdfDocument; changedPages: number[]; notes?: string[] }> {
+  const pdfLib = await loadPdfLib();
   if (action === 'merge') {
     if (inputPaths.length < 2) throw new Error('merge requires at least two input_paths');
     const document = await documentForMerge(inputPaths);
@@ -293,7 +295,7 @@ async function applyPdfAction(
     pages.forEach((pageNumber) => {
       const page = document.getPage(pageNumber - 1);
       const current = page.getRotation().angle || 0;
-      page.setRotation(pdfDegrees(((current + amount) % 360 + 360) % 360));
+      page.setRotation(pdfLib.degrees(((current + amount) % 360 + 360) % 360));
     });
     return { document, changedPages: pages };
   }
@@ -303,7 +305,7 @@ async function applyPdfAction(
     const fontSize = finiteNumber(input.font_size, action === 'watermark' ? 42 : 18, 6, 240, 'font_size');
     const opacity = finiteNumber(input.opacity, action === 'watermark' ? 0.18 : 1, 0.01, 1, 'opacity');
     const rotation = finiteNumber(input.rotation, action === 'watermark' ? 35 : 0, -360, 360, 'rotation');
-    const png = await document.embedPng(renderTextPng({
+    const png = await document.embedPng(await renderTextPng({
       text,
       fontSize,
       color: String(input.color || (action === 'watermark' ? '#666666' : '#000000')),
@@ -319,7 +321,7 @@ async function applyPdfAction(
       const height = finiteNumber(input.height, natural.height * scale, 1, size.height * 4, 'height');
       const x = finiteNumber(input.x, action === 'watermark' ? (size.width - width) / 2 : 36, -size.width * 2, size.width * 3, 'x');
       const y = finiteNumber(input.y, action === 'watermark' ? (size.height - height) / 2 : 36, -size.height * 2, size.height * 3, 'y');
-      page.drawImage(png, { x, y, width, height, opacity, rotate: pdfDegrees(rotation) });
+      page.drawImage(png, { x, y, width, height, opacity, rotate: pdfLib.degrees(rotation) });
     });
     return {
       document,
@@ -354,7 +356,7 @@ async function applyPdfAction(
       const height = finiteNumber(input.height, natural.height * scale, 1, size.height * 4, 'height');
       const x = finiteNumber(input.x, 36, -size.width * 2, size.width * 3, 'x');
       const y = finiteNumber(input.y, 36, -size.height * 2, size.height * 3, 'y');
-      page.drawImage(image, { x, y, width, height, opacity, rotate: pdfDegrees(rotation) });
+      page.drawImage(image, { x, y, width, height, opacity, rotate: pdfLib.degrees(rotation) });
     });
     return { document, changedPages: pages };
   }
@@ -369,11 +371,11 @@ async function applyPdfAction(
     for (const [name, value] of Object.entries(fields as Record<string, unknown>)) {
       const field = available.get(name);
       if (!field) throw new Error(`unknown PDF form field: ${name}`);
-      if (field instanceof PDFTextField) field.setText(String(value ?? ''));
-      else if (field instanceof PDFCheckBox) value ? field.check() : field.uncheck();
-      else if (field instanceof PDFDropdown) field.select(String(value ?? ''));
-      else if (field instanceof PDFRadioGroup) field.select(String(value ?? ''));
-      else if (field instanceof PDFOptionList) {
+      if (field instanceof pdfLib.PDFTextField) field.setText(String(value ?? ''));
+      else if (field instanceof pdfLib.PDFCheckBox) value ? field.check() : field.uncheck();
+      else if (field instanceof pdfLib.PDFDropdown) field.select(String(value ?? ''));
+      else if (field instanceof pdfLib.PDFRadioGroup) field.select(String(value ?? ''));
+      else if (field instanceof pdfLib.PDFOptionList) {
         field.select(Array.isArray(value) ? value.map(String) : String(value ?? ''));
       } else {
         throw new Error(`unsupported PDF form field type for ${name}`);
@@ -390,26 +392,25 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
   return {
     name: 'edit_pdf',
     description:
-      'Edit an existing PDF with deterministic built-in operations: merge files; extract, delete, reorder, or rotate pages; ' +
-      'add CJK-capable visible text/watermarks or PNG/JPEG overlays; and fill form fields. Always writes a separate PDF. ' +
-      'Page numbers are 1-based. overlay_text is not secure redaction and arbitrary replacement of existing PDF text is unsupported.',
+      'Edit PDF pages, overlays, watermarks, or forms with built-in deterministic operations and write a separate PDF. overlay_text is not secure redaction, and existing text cannot be replaced arbitrarily.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         action: {
           type: 'string',
           enum: ['merge', 'extract_pages', 'delete_pages', 'reorder_pages', 'rotate_pages', 'watermark', 'overlay_text', 'overlay_image', 'fill_form'],
         },
-        input_path: { type: 'string', description: 'Source PDF for every action except merge.' },
-        input_paths: { type: 'array', items: { type: 'string' }, description: 'Source PDFs in order for merge.' },
-        output_path: { type: 'string', description: 'Separate output .pdf path; must differ from every input path.' },
-        pages: { type: 'array', items: { type: 'number' }, description: 'Optional 1-based target pages; omit for all pages where allowed.' },
-        page_order: { type: 'array', items: { type: 'number' }, description: 'Full 1-based permutation for reorder_pages.' },
+        input_path: { type: 'string', description: 'Source PDF except for merge.' },
+        input_paths: { type: 'array', items: { type: 'string' }, description: 'Ordered source PDFs for merge.' },
+        output_path: { type: 'string', description: 'Output .pdf; must differ from every input.' },
+        pages: { type: 'array', items: { type: 'number' }, description: 'Optional 1-based pages; omit for all where allowed.' },
+        page_order: { type: 'array', items: { type: 'number' }, description: 'Full 1-based order for reorder_pages.' },
         degrees: { type: 'number', description: 'Rotation amount; multiple of 90.' },
         text: { type: 'string', description: 'Text for watermark or overlay_text.' },
         image_path: { type: 'string', description: 'PNG/JPEG path for overlay_image.' },
-        x: { type: 'number', description: 'Overlay x in PDF points from the bottom-left.' },
-        y: { type: 'number', description: 'Overlay y in PDF points from the bottom-left.' },
+        x: { type: 'number', description: 'Overlay x in points from bottom-left.' },
+        y: { type: 'number', description: 'Overlay y in points from bottom-left.' },
         width: { type: 'number' },
         height: { type: 'number' },
         font_size: { type: 'number' },
@@ -423,7 +424,6 @@ function createEditPdfTool(opts: PdfToolsOpts): AgentTool {
       required: ['action', 'output_path'],
     },
     async execute(rawInput, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const input = rawInput as Record<string, unknown>;
       const action = String(input.action || '') as PdfAction;
       const validActions = new Set<PdfAction>([
@@ -507,10 +507,10 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
     name: 'pdf_render',
     executionMode: 'parallel',
     description:
-      'Render one page of a PDF to an inline PNG for visual QA after edit_pdf. Page numbers are 1-based. ' +
-      'Use read_file for text and ocr_file for scanned text; use this tool to inspect layout, overlays, clipping, and page selection.',
+      'Render one PDF page to a PNG for visual QA of layout, overlays, clipping, or page selection. Use read_files or ocr_file for text extraction.',
     inputSchema: {
       type: 'object',
+      additionalProperties: false,
       properties: {
         path: { type: 'string' },
         page: { type: 'number', description: '1-based page number. Default 1.' },
@@ -519,7 +519,6 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
       required: ['path'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
       const abs = resolvePath(ctx, input.path);
       const inputErr = ensurePdfInput(opts, abs);
       if (inputErr) return errResult(inputErr.startsWith('E_') ? inputErr.split(':')[0] : 'E_BAD_INPUT', inputErr.replace(/^E_[A-Z_]+:\s*/, ''));
@@ -529,7 +528,7 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
       let loadingTask: any;
       let document: any;
       try {
-        const pdfjs = await loadPdfJs();
+        const [pdfjs, { createCanvas }] = await Promise.all([loadPdfJs(), loadCanvas()]);
         const bytes = fs.readFileSync(abs);
         loadingTask = pdfjs.getDocument({
           data: new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength),

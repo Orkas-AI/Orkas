@@ -17,11 +17,17 @@ let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
+function builtinDirFor(uid: string): string {
+  return path.join(tmpDir, uid, 'local', 'marketplace', 'skills');
+}
 function builtinDir(): string {
-  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'skills');
+  return builtinDirFor(TEST_UID);
+}
+function customDirFor(uid: string): string {
+  return path.join(tmpDir, uid, 'cloud', 'skills');
 }
 function customDir(): string {
-  return path.join(tmpDir, TEST_UID, 'cloud', 'skills');
+  return customDirFor(TEST_UID);
 }
 function systemDir(): string {
   return path.join(tmpDir, TEST_UID, 'local', 'system', 'skills');
@@ -44,6 +50,28 @@ function writeSkill(root: string, id: string, name: string, description: string,
   if (installMeta) {
     fs.writeFileSync(path.join(skillDir, '_install.json'), JSON.stringify(installMeta));
   }
+}
+
+function writeLocalizedSkill(
+  root: string,
+  id: string,
+  name: string,
+  descriptionZh: string,
+  descriptionEn: string,
+) {
+  const skillDir = path.join(root, id);
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    [
+      '---',
+      `name: ${name}`,
+      `description_zh: ${JSON.stringify(descriptionZh)}`,
+      `description_en: ${JSON.stringify(descriptionEn)}`,
+      '---',
+      'body',
+    ].join('\n'),
+  );
 }
 
 beforeEach(async () => {
@@ -73,6 +101,50 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const text = await getSystemPromptBlock();
     expect(text).toContain('translate');
     expect(text).toContain('summarize');
+  });
+
+  it('rebuilds the trusted Skill roster and logical bindings when the active account changes', async () => {
+    writeSkill(customDirFor('u1'), 'account-a-only', 'Account A Only', 'visible only to account A');
+    writeSkill(customDirFor('u2'), 'account-b-only', 'Account B Only', 'visible only to account B');
+    const registry = await loadRegistry();
+
+    const accountABindings = new Map();
+    const accountAText = await registry.getSystemPromptBlock({ runtimeBindings: accountABindings });
+    expect(accountAText).toContain('Account A Only');
+    expect(accountAText).not.toContain('Account B Only');
+
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('u2');
+    const accountBBindings = new Map();
+    const accountBText = await registry.getSystemPromptBlock({ runtimeBindings: accountBBindings });
+    expect(accountBText).toContain('Account B Only');
+    expect(accountBText).not.toContain('Account A Only');
+    expect(accountBBindings.get('account-b-only')).toMatchObject({
+      root: path.join(path.resolve(customDirFor('u2')), 'account-b-only'),
+    });
+    expect(accountBBindings.has('account-a-only')).toBe(false);
+
+    const explicitAccountASpecs = await registry.listSkillSpecsForAgentMetadata('u1');
+    expect(explicitAccountASpecs.map((spec) => spec.id)).toContain('account-a-only');
+    expect(explicitAccountASpecs.map((spec) => spec.id)).not.toContain('account-b-only');
+  });
+
+  it('renders the platform Skill when trusted roots contain the same id', async () => {
+    writeSkill(builtinDir(), 'shared-skill', 'Platform Shared', 'platform body marker');
+    writeSkill(customDir(), 'shared-skill', 'Custom Shared', 'custom body marker');
+    const runtimeBindings = new Map();
+    const { getSystemPromptBlock } = await loadRegistry();
+
+    const text = await getSystemPromptBlock({ runtimeBindings });
+
+    expect(text).toContain('**Platform Shared**');
+    expect(text).toContain('platform body marker');
+    expect(text).not.toContain('Custom Shared');
+    expect(text).not.toContain('custom body marker');
+    expect(runtimeBindings.get('shared-skill')).toMatchObject({
+      source: 'platform',
+      root: path.join(path.resolve(builtinDir()), 'shared-skill'),
+    });
   });
 
   it('renders only allowlisted skills when allowlist is provided', async () => {
@@ -107,7 +179,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
       runtimeBindings,
     });
 
-    expect(text).toContain('read_file("@skill/<read-ref>")');
+    expect(text).toContain('read_files({"paths":[{"path":"@skill/<read-ref>"}]})');
     expect(text).toContain('read ref: @skill/github');
     expect(text).toContain('read ref: @skill/find-skill');
     expect(text).not.toContain(path.resolve(builtinDir()));
@@ -224,7 +296,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     writeSkill(customDir(), 'mine', 'Mine', 'desc-c');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
-    expect(text).toContain('`read_file(<ROOT>/<id>/SKILL.md)`');
+    expect(text).toContain('`read_files({"paths":[{"path":"<ROOT>/<id>/SKILL.md"}]})`');
     expect(text).toContain(`- custom:  ${path.resolve(customDir())}`);
     expect(text).toContain(`- platform: ${path.resolve(builtinDir())}`);
     expect(text).toContain(`- builtin: ${path.resolve(builtinDir())}`);
@@ -240,18 +312,30 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toBe('');
   });
 
-  it('renders compact skill descriptions in the prompt across zh/en descriptions', async () => {
+  it('preserves routing intent and boundaries in prompt descriptions', async () => {
     writeSkill(customDir(), 'zh-long', 'ZhLong', '抓取网页并提取结构化信息；适合网页调研和数据整理；触发词：抓取、网页');
     writeSkill(customDir(), 'zh-sentence', 'ZhSentence', '分析资料并输出结论。适合深度研究。');
     writeSkill(customDir(), 'en-long', 'EnLong', 'Analyze API logs. Suitable for debugging production incidents. Triggers: logs, traces.');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
-    expect(text).toContain('**ZhLong** (Source: custom; internal read id: zh-long) — 抓取网页并提取结构化信息');
-    expect(text).toContain('**ZhSentence** (Source: custom; internal read id: zh-sentence) — 分析资料并输出结论。');
-    expect(text).toContain('**EnLong** (Source: custom; internal read id: en-long) — Analyze API logs.');
-    expect(text).not.toContain('触发词');
-    expect(text).not.toContain('Suitable for debugging');
-    expect(text).not.toContain('Triggers: logs');
+    expect(text).toContain('**ZhLong** (Source: custom; internal read id: zh-long) — 抓取网页并提取结构化信息；适合网页调研和数据整理；触发词：抓取、网页');
+    expect(text).toContain('**ZhSentence** (Source: custom; internal read id: zh-sentence) — 分析资料并输出结论。适合深度研究。');
+    expect(text).toContain('**EnLong** (Source: custom; internal read id: en-long) — Analyze API logs. Suitable for debugging production incidents. Triggers: logs, traces.');
+  });
+
+  it('renders bilingual regular Skill routing descriptions in English', async () => {
+    writeLocalizedSkill(
+      customDir(),
+      'bilingual-route',
+      'BilingualRoute',
+      '中文内部路由说明',
+      'English internal routing description',
+    );
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+
+    expect(text).toContain('**BilingualRoute** (Source: custom; internal read id: bilingual-route) — English internal routing description');
+    expect(text).not.toContain('中文内部路由说明');
   });
 
   it('dedupes same display-name skills with platform shadowing custom', async () => {
@@ -352,6 +436,21 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
 });
 
 describe('skill-registry › getSystemSkillsPromptBlock', () => {
+  it('renders bilingual System Skill routing descriptions in English', async () => {
+    writeLocalizedSkill(
+      systemDir(),
+      'bilingual-system-route',
+      'bilingual-system-route',
+      '中文系统协议说明',
+      'English system protocol description',
+    );
+    const { getSystemSkillsPromptBlock } = await loadRegistry();
+    const text = await getSystemSkillsPromptBlock();
+
+    expect(text).toContain('**bilingual-system-route** — English system protocol description');
+    expect(text).not.toContain('中文系统协议说明');
+  });
+
   it('renders system skills in a separate block with SYSTEM_SKILLS_ROOT', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
     writeSkill(systemDir(), 'autotask-creator', 'autotask-creator', 'Create automations');
@@ -359,9 +458,15 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
       systemDir(),
       'orkas-guide',
       'orkas-guide',
-      "Provide user-facing guidance about Orkas application features and usage problems, not about Commander's own capabilities or requests for Commander to perform work. Explain what Orkas features are available, where to find them, how to use common workflows, and how to recover from normal in-app problems. Use only for questions about Orkas features, navigation, settings, concepts, availability, or troubleshooting; requests to create a deliverable or use tools belong to the appropriate Agent or Skill.",
+      "Answer user questions about how to use current Orkas application features, navigation, settings, availability, and recovery, including a distinct product-usage question within a mixed request. Supply user-facing product facts only. Do not guide Commander execution, own creation or other work requests, or load merely because work happens inside Orkas.",
     );
     writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
+    writeSkill(
+      systemDir(),
+      'project-tasks',
+      'project-tasks',
+      'Manage or execute the structured project backlog',
+    );
     writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
     const { getSystemSkillsPromptBlock, getSystemPromptBlock } = await loadRegistry();
 
@@ -369,15 +474,22 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(systemText).toContain('## System skills');
     expect(systemText).toContain('SYSTEM_SKILLS_ROOT');
     expect(systemText).toContain(path.resolve(systemDir()));
-    expect(systemText).toContain('When the task or the work you decide to perform clearly matches a description below');
-    expect(systemText).toContain('Do not load system skills that do not match.');
+    expect(systemText).toContain('Match the whole request against every description.');
+    expect(systemText).toContain('Before other work, read the smallest complete set of matching SKILL.md files');
+    expect(systemText).toContain('never load nonmatches.');
+    expect(systemText).toContain('Read 2+ matches together first:');
+    expect(systemText).toContain('read_files({"paths"');
+    expect(systemText).toContain('Load only system SKILL.md files in that call');
+    expect(systemText).toContain('read attachments and other task sources afterward.');
     expect(systemText).toContain('**agent-creator**');
     expect(systemText).toContain('**autotask-creator**');
     expect(systemText).toContain('**orkas-guide**');
-    expect(systemText).toContain('guidance about Orkas application features and usage problems');
-    expect(systemText).toContain("not about Commander's own capabilities");
-    expect(systemText).toContain('requests for Commander to perform work');
+    expect(systemText).toContain('questions about how to use current Orkas application features');
+    expect(systemText).toContain('distinct product-usage question within a mixed request');
+    expect(systemText).toContain('Do not guide Commander execution');
     expect(systemText).toContain('**package-installer**');
+    expect(systemText).toContain('**project-tasks**');
+    expect(systemText).toContain('structured project backlog');
     expect(systemText).toContain('**skill-creator**');
 
     const regularText = await getSystemPromptBlock();
@@ -385,6 +497,7 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(regularText).not.toContain('autotask-creator');
     expect(regularText).not.toContain('orkas-guide');
     expect(regularText).not.toContain('package-installer');
+    expect(regularText).not.toContain('project-tasks');
     expect(regularText).not.toContain('skill-creator');
   });
 
@@ -400,13 +513,32 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
     expect(fs.existsSync(path.join(systemDirFor(otherUid), 'agent-creator', 'SKILL.md'))).toBe(true);
   });
 
+  it('can exclude a context-specific system skill without changing the catalog', async () => {
+    writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
+    writeSkill(systemDir(), 'project-tasks', 'project-tasks', 'Manage the project backlog');
+    const { getSystemSkillsPromptBlock } = await loadRegistry();
+
+    const nonProjectText = await getSystemSkillsPromptBlock(
+      TEST_UID,
+      undefined,
+      undefined,
+      ['project-tasks'],
+    );
+    const projectText = await getSystemSkillsPromptBlock(TEST_UID);
+
+    expect(nonProjectText).toContain('**agent-creator**');
+    expect(nonProjectText).not.toContain('**project-tasks**');
+    expect(projectText).toContain('**project-tasks**');
+  });
+
   it('registers system skills in the same run-scoped logical namespace', async () => {
     writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
     const runtimeBindings = new Map();
     const { getSystemSkillsPromptBlock } = await loadRegistry();
     const text = await getSystemSkillsPromptBlock(undefined, runtimeBindings);
 
-    expect(text).toContain('read_file("@skill/<read-ref>")');
+    expect(text).toContain('read_files({"paths":[{"path":"@skill/<read-ref>"}]})');
+    expect(text).toContain('read_files({"paths":[{"path":"@skill/<read-ref-1>"}');
     expect(text).toContain('read ref: @skill/agent-creator');
     expect(text).not.toContain('SYSTEM_SKILLS_ROOT');
     expect(runtimeBindings.get('agent-creator')).toMatchObject({
@@ -414,6 +546,32 @@ describe('skill-registry › getSystemSkillsPromptBlock', () => {
       source: 'system',
       root: path.join(path.resolve(systemDir()), 'agent-creator'),
     });
+  });
+
+  it('renders and binds only the host-allowlisted system skills', async () => {
+    writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
+    writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
+    writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
+    const runtimeBindings = new Map();
+    const { getSystemSkillsPromptBlock } = await loadRegistry();
+
+    const text = await getSystemSkillsPromptBlock(
+      undefined,
+      runtimeBindings,
+      ['skill-creator', 'package-installer'],
+    );
+
+    expect(text).toContain('**skill-creator**');
+    expect(text).toContain('**package-installer**');
+    expect(text).not.toContain('**agent-creator**');
+    expect(runtimeBindings.has('skill-creator')).toBe(true);
+    expect(runtimeBindings.has('package-installer')).toBe(true);
+    expect(runtimeBindings.has('agent-creator')).toBe(false);
+
+    const emptyBindings = new Map();
+    const emptyText = await getSystemSkillsPromptBlock(undefined, emptyBindings, []);
+    expect(emptyText).toBe('');
+    expect(emptyBindings.size).toBe(0);
   });
 });
 
@@ -438,71 +596,60 @@ describe('skill-registry › replaceKnownSkillIdsForDisplay', () => {
 });
 
 describe('skill-registry › compactPromptDescription', () => {
-  // The commander's "Agents list" and skill list inject this compacted entry.
-  // The bug it guards: an agent/skill whose FIRST sentence is a throwaway
-  // tagline (ends with 。 before the real capability + routing guidance) used to
-  // collapse to that 9-char tagline, so the commander never saw the routing
-  // instruction and self-served the task instead of dispatching.
-
-  it('keeps a substantive first sentence as-is (the common, adequate case)', async () => {
+  it('keeps the complete authored routing index below the safety boundary', async () => {
     const { compactPromptDescription } = await loadRegistry();
     const desc =
       '办公写作与交付入口：把用户想做、想改、想整理的办公材料落成可交付文档、表格、演示或 PDF；适合写报告。触发词：写文档';
-    // `；适合` marker fires → cut before the 适合 tail; unchanged by the floor.
-    expect(compactPromptDescription(desc)).toBe(
-      '办公写作与交付入口：把用户想做、想改、想整理的办公材料落成可交付文档、表格、演示或 PDF',
-    );
+    expect(compactPromptDescription(desc)).toBe(desc);
   });
 
-  it('extends a too-short tagline-first description past the tagline (the floor)', async () => {
+  it('does not discard later routing clauses based on sentence shape or labels', async () => {
     const { compactPromptDescription } = await loadRegistry();
     const desc =
       '做视频，也剪视频。三条产线：①解说②AI 生成③剪辑你上传的真实视频。' +
       '凡是“对一段已有视频做处理”的都路由到它，而不是 commander 自己拿命令行拼。' +
       '适合“做个动画”。触发词：做视频、加字幕、剪辑';
-    const out = compactPromptDescription(desc);
-    // Must not collapse to the 9-char "做视频，也剪视频。" tagline …
-    expect(out.length).toBeGreaterThan('做视频，也剪视频。'.length);
-    // … must carry the routing instruction the commander needs …
-    expect(out).toContain('路由到它');
-    // … and must stop before the 适合/触发词 enumeration (recognising the 。
-    // delimiter the ；-only markers miss), not bleed the whole description in.
-    expect(out).not.toContain('适合');
-    expect(out).not.toContain('触发');
+    expect(compactPromptDescription(desc)).toBe(desc);
   });
 
-  it('does not over-extend a short BUT complete description (no tail to add)', async () => {
+  it('applies the shared visible cap without semantic rewriting', async () => {
     const { compactPromptDescription } = await loadRegistry();
-    // Below the floor length, but there is nothing after it — return as-is,
-    // never pad from absent content.
-    expect(compactPromptDescription('查天气。')).toBe('查天气。');
-  });
-
-  it('preserves the existing English ". Triggers"/"。触发词" marker cut', async () => {
-    const { compactPromptDescription } = await loadRegistry();
-    const en =
-      'Makes and edits videos for you across explainer, generated footage, and real-clip editing. Triggers: make a video, add captions, edit video';
-    // Long-enough lead → floor never fires; period-keyword marker still trims
-    // the Triggers tail (regression guard on the original behavior).
-    expect(compactPromptDescription(en)).toBe(
-      'Makes and edits videos for you across explainer, generated footage, and real-clip editing.',
-    );
-  });
-
-  it('caps a runaway extension at a sentence boundary', async () => {
-    const { compactPromptDescription } = await loadRegistry();
-    // Tagline first, then many sentences and NO 适合/触发 section → the floor
-    // extends but must clip at a 。 under the hard cap, not return 1000 chars.
     const long = '短。' + '这是一段没有触发段的很长描述内容用来测试上限。'.repeat(40);
     const out = compactPromptDescription(long);
-    expect(out.length).toBeGreaterThan('短。'.length);
-    expect(out.length).toBeLessThanOrEqual(240);
-    expect(out.endsWith('。')).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(512);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  it('caps a long substantive summary instead of bypassing the ceiling', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    const exact = 'x'.repeat(512);
+    const over = 'x'.repeat(513);
+
+    expect(compactPromptDescription(exact)).toBe(exact);
+    expect(compactPromptDescription(over)).toHaveLength(512);
+    expect(compactPromptDescription(over).endsWith('…')).toBe(true);
+
+    const emojiAtBoundary = `${'x'.repeat(510)}🙂tail`;
+    expect(compactPromptDescription(emojiAtBoundary)).toBe(`${'x'.repeat(510)}…`);
   });
 
   it('returns empty string for empty/whitespace input', async () => {
     const { compactPromptDescription } = await loadRegistry();
     expect(compactPromptDescription('   ')).toBe('');
     expect(compactPromptDescription('')).toBe('');
+  });
+});
+
+describe('skill-registry › prompt-internal description language', () => {
+  it('chooses English without rewriting content and falls back to Chinese', async () => {
+    const { pickPromptDescription } = await loadRegistry();
+    expect(pickPromptDescription({
+      description_zh: '中文说明',
+      description_en: 'English description',
+    })).toBe('English description');
+    expect(pickPromptDescription({
+      description_zh: '仅中文说明',
+      description_en: '',
+    })).toBe('仅中文说明');
   });
 });

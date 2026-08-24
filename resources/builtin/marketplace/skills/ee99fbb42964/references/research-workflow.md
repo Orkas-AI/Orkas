@@ -1,6 +1,9 @@
 # Research Workflow
 
-Use this workflow for every deep-research request unless the user explicitly asks for a lighter pass.
+Use this workflow when a request benefits from explicit question framing,
+planning, and cross-theme synthesis. It does not replace the path selected in
+the root Skill. Treat `caps` as ceilings, stop when evidence is sufficient, and
+keep the user's requested depth and deliverable authoritative.
 
 ## Phase 1: Clarify
 
@@ -36,7 +39,9 @@ The plan can use a table if that makes approval easier.
 
 ## Phase 3: Research cycles
 
-Complete at least two cycles per theme.
+Use only the collection cycles needed to resolve material questions within the
+selected path and its remaining budget. A cycle is evidence work, not a target
+count.
 
 Cycle 1:
 
@@ -45,7 +50,7 @@ Cycle 1:
 - Capture early evidence and initial contradictions.
 - Note gaps that require targeted follow-up.
 
-Cycle 2:
+Targeted follow-up, only when material gaps or contradictions remain:
 
 - Target the gaps found in Cycle 1.
 - Prefer primary sources or higher-quality sources where available.
@@ -53,7 +58,10 @@ Cycle 2:
 - Compare new evidence against the first cycle.
 - Update confidence and document unresolved uncertainty.
 
-If evidence remains thin after two cycles, do not pretend the conclusion is strong. State the gap and lower confidence.
+Stop without another cycle when the available evidence already supports the
+requested conclusion at the appropriate risk level. When evidence remains thin
+at the path ceiling, do not pretend the conclusion is strong: state the gap,
+lower confidence, or abstain.
 
 ## Phase 4: Cross-theme synthesis
 
@@ -65,9 +73,11 @@ After all themes are researched:
 - Explain contradictions and whether they can be resolved.
 - Map practical implications and risks.
 
-## Phase 5: Final report
+## Phase 5: Requested deliverable
 
-The final report must include:
+Use the format and depth the user requested. For a conventional long-form
+research report, include the applicable items below; compact landscapes,
+resume/recovery work, and other root paths keep their own delivery contract:
 
 - Research date or date range.
 - Methodology and source-selection notes.
@@ -76,7 +86,8 @@ The final report must include:
 - Contradictions and competing interpretations.
 - Limitations and gaps.
 - Practical implications.
-- APA 7 references.
+- References in the requested citation style. Do not impose APA unless the user
+  or selected deliverable requires it.
 
 ## Stop points
 

@@ -1,10 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-assemble
-min_app_version: "1.5.1"
-description_zh: 把已审批的跨模态 EDL（plan.json）确定性地装配成成片的知识——按序产出每个片段（剪辑/合成/生成/已提供，分别委派给对应产线），再按 ffmpeg 层级装配：主轨拼接→合成叠层→混旁白(覆盖校验)→烧字幕→响度核对；带断点续跑，交 D 门前做 QA。AUTO 端到端产线的装配核心。
-description_en: Knowledge for deterministically assembling an approved cross-modal EDL (plan.json) into a finished video — produce each segment (edit / compose / generate / provided, each delegated to its line), then assemble in ffmpeg tiers: concat the primary track → overlay composed layers → mix narration (with a coverage check) → burn captions → verify loudness; idempotent-resumable, with QA before gate D. The assembly core of the AUTO end-to-end line.
-category: creation
+description_zh: "把已审批的跨模态 EDL 确定性装配成成片，生产剪辑、合成、生成或已提供片段，并完成主轨、叠层、旁白、字幕、响度和 QA；用于 AUTO 计划获批后的成片执行，不用于前期规划或原始素材取舍。"
+description_en: "Assemble an approved cross-modal EDL into a finished video by producing edit, compose, generate, or provided segments and completing picture, overlays, narration, captions, loudness checks, and QA. Use for AUTO execution after plan approval, not planning or raw-footage selection."
 ---
 
 # stage-assemble
@@ -30,7 +28,7 @@ Iterate segments in `order`. For each, produce its `produced_path` according to 
 - **generate** → `stage-generate` (+ `stage-consistency` for recurring characters): proceed only while `production.status` reports the current paid-generation signature. Call `generate_video` or `generate_image` with `production_plan_path:"project/plan.json"` and `production_segment_id:<id>` → `project/assets/<id>.<ext>`. When the segment has `operation:"edit"`, treat it as the bounded semantic-edit executor for the EDIT/AUTO workflow: pass the exact original reference video and obey top-level `references` + `edit_strategy`; never widen it into regeneration. Every auxiliary portrait/keyframe is already its own signed generate segment; do not create unplanned billable calls. The host transaction reuses a completed artifact and blocks an interrupted/failed duplicate. Pass pending/failed state to `gate-control`; never automatically retry or invent a recovery API, and use a new output path for any later authorized retry.
 - **provided** → use `spec.asset_id` as-is (probe it first; conform aspect/fps if needed).
 
-Billable `generate` segments must not run before Gate C has confirmed the exact count from `cost_estimate`, disclosed that the external provider's billing and balance cannot be verified locally, and `production.approve_generation` has persisted that approval. Produce cheap/free segments first, then show one combined `gate_c_decision` form; never interleave per-shot confirmations.
+Billable `generate` segments must not run until `gate-control` accepts the current signed plan, exact count, configured external provider, external-billing disclosure, and fresh `production.status` transaction evidence, then returns the provider-call transition. The open build cannot verify the provider's billing or balance locally. Produce cheap/free segments first; never interleave per-shot confirmations.
 
 ## Step 2 — Assemble in ffmpeg tiers (the default path)
 

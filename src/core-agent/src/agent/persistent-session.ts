@@ -17,8 +17,10 @@ import {
   type ExecutionPlanUpdate,
   type HistoryResource,
   type SerializedSessionContextState,
+  type ToolSurfaceState,
 } from "./session.js";
 import type { WorkspaceObservationEntry } from "./workspace-state.js";
+import { errorCodeForLog } from "../shared/errors.js";
 
 const log = createLogger("persistent-session");
 
@@ -111,14 +113,21 @@ export class PersistentSession extends Session {
     super.clear();
     this.messageStartOffsets = [];
     this.sessionFileSize = 0;
-    if (!fs.existsSync(this.sessionFile)) return;
+    if (!fs.existsSync(this.sessionFile)) {
+      // Context can legitimately exist before the first transcript row (for
+      // example, a scoped tool surface is established while building the
+      // runner). Restore that sidecar independently of JSONL existence.
+      this.loadContextFromDisk();
+      return;
+    }
 
     let raw: Buffer;
     try {
       raw = fs.readFileSync(this.sessionFile);
       this.sessionFileSize = raw.length;
     } catch (err) {
-      console.warn(`[persistent-session] failed to read ${this.sessionFile}: ${(err as Error).message}`);
+      log.warn("session read failed", { code: errorCodeForLog(err) });
+      this.loadContextFromDisk();
       return;
     }
 
@@ -160,11 +169,10 @@ export class PersistentSession extends Session {
     if (this.healOrphanToolUses()) {
       this.flushToDisk();
       const report = this.lastToolProtocolRepairReport;
-      const detail = { sessionId: this.getSessionId(), ...report };
       if (report.synthesizedOrphanResults || report.droppedUnmatchedResults) {
-        log.warn("repaired invalid tool protocol", detail);
+        log.warn("repaired invalid tool protocol", report);
       } else {
-        log.info("normalized parallel tool results", detail);
+        log.info("normalized parallel tool results", report);
       }
     }
     this.loadContextFromDisk();
@@ -500,12 +508,16 @@ export class PersistentSession extends Session {
     this.requestContextWrite();
   }
 
+  override setToolSurfaceState(state: ToolSurfaceState | undefined): void {
+    super.setToolSurfaceState(state);
+    this.requestContextWrite();
+  }
+
   override applyHistorySummary(
     summary: string,
     turnIds: readonly number[],
-    throughMessageId?: string,
   ): void {
-    super.applyHistorySummary(summary, turnIds, throughMessageId);
+    super.applyHistorySummary(summary, turnIds);
     this.requestContextWrite();
   }
 
@@ -515,13 +527,8 @@ export class PersistentSession extends Session {
     return appliedSummary;
   }
 
-  /**
-   * Overwrite the backing file with the current in-memory state.
-   * Called after `compact()` so the on-disk jsonl matches the compacted view.
-   */
-  override compact(summary: string): void {
-    super.compact(summary);
-    this.flushToDisk();
+  override applyPersistentBlockShrink(newSummaryText: string): void {
+    super.applyPersistentBlockShrink(newSummaryText);
     this.requestContextWrite();
   }
 
@@ -548,7 +555,7 @@ export class PersistentSession extends Session {
       if (fs.existsSync(this.sessionFile)) fs.truncateSync(this.sessionFile, 0);
       if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
     } catch (err) {
-      console.warn(`[persistent-session] truncate failed ${this.sessionFile}: ${(err as Error).message}`);
+      log.warn("session truncate failed", { code: errorCodeForLog(err) });
     }
   }
 
@@ -577,7 +584,7 @@ export class PersistentSession extends Session {
       this.messageStartOffsets.push(start);
       this.sessionFileSize += Buffer.byteLength(line, "utf-8");
     } catch (err) {
-      console.warn(`[persistent-session] append failed ${this.sessionFile}: ${(err as Error).message}`);
+      log.warn("session append failed", { code: errorCodeForLog(err) });
     }
   }
 
@@ -639,7 +646,7 @@ export class PersistentSession extends Session {
       this.messageStartOffsets = nextOffsets;
       this.sessionFileSize = position;
     } catch (err) {
-      console.warn(`[persistent-session] tail rewrite failed ${this.sessionFile}: ${(err as Error).message}`);
+      log.warn("session tail rewrite failed", { code: errorCodeForLog(err) });
       if (fd !== undefined) {
         try { fs.closeSync(fd); } catch { /* ignore */ }
         fd = undefined;
@@ -678,7 +685,7 @@ export class PersistentSession extends Session {
       }
       this.sessionFileSize = position;
     } catch (err) {
-      console.warn(`[persistent-session] flush failed ${this.sessionFile}: ${(err as Error).message}`);
+      log.warn("session flush failed", { code: errorCodeForLog(err) });
       try { fs.unlinkSync(tmp); } catch { /* ignore */ }
     }
   }
@@ -697,16 +704,15 @@ export class PersistentSession extends Session {
           && report.synthesizedOrphanResults === 0
           && report.droppedUnmatchedResults === 0
           && report.mergedParallelResultMessages > 0;
-        const detail = { sessionId: this.getSessionId() };
         if (benignParallelNormalization) {
-          log.info("context sidecar normalized after parallel result merge", detail);
+          log.info("context sidecar normalized after parallel result merge");
         } else {
-          log.warn("context sidecar repaired", detail);
+          log.warn("context sidecar repaired");
         }
         this.writeContextToDisk();
       }
     } catch (err) {
-      console.warn(`[persistent-session] failed to read context ${this.contextFile}: ${(err as Error).message}`);
+      log.warn("session context read failed", { code: errorCodeForLog(err) });
       this.restoreContextState(null);
     }
   }
@@ -723,7 +729,7 @@ export class PersistentSession extends Session {
       fs.writeFileSync(tmp, JSON.stringify(state) + "\n", "utf-8");
       fs.renameSync(tmp, this.contextFile);
     } catch (err) {
-      console.warn(`[persistent-session] context write failed ${this.contextFile}: ${(err as Error).message}`);
+      log.warn("session context write failed", { code: errorCodeForLog(err) });
     }
   }
 

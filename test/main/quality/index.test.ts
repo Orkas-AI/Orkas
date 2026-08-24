@@ -204,7 +204,34 @@ describe('quality › validateSkillDir', () => {
     const r = validateSkillDir(dir);
     expect(r.ok).toBe(true);
     expect(r.violations.map((v) => v.rule)).not.toContain('skill_meta_category_missing');
+    expect(r.violations.map((v) => v.rule)).not.toContain('skill_meta_routing_incomplete');
+  });
+
+  it('validates a supplied routing object as one complete contract', () => {
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: x\ndescription: x\n---\n');
+    fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({
+      category: 'data',
+      routing: { applicable_domain: 'reports' },
+    }));
+    const r = validateSkillDir(dir);
     expect(r.violations.map((v) => v.rule)).toContain('skill_meta_routing_incomplete');
+  });
+
+  it('inherits metadata for system and Agent-private Skills', () => {
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), [
+      '---',
+      'name: inherited-skill',
+      'description_zh: 中文',
+      'description_en: English',
+      '---',
+    ].join('\n'));
+
+    for (const source of ['system', 'agent-private'] as const) {
+      const report = validateSkillDir(dir, { source });
+      expect(report.violations.map((violation) => violation.rule))
+        .not.toContain('skill_meta_category_missing');
+    }
   });
 
   it('enforces the runner contract for authoring but can omit it for verbatim installs', () => {
@@ -282,6 +309,61 @@ describe('quality › validateAgentSpec', () => {
     });
     expect(r.ok).toBe(true);
     expect(r.violations.map((v) => v.rule)).not.toContain('skill_script_requires_runner');
+  });
+
+  it('accepts bounded display know-how and observable delivery standards', () => {
+    const r = validateAgentSpec({
+      agentJson: {
+        agent_id: 'a', name: 'BoundedAgent',
+        description_en: 'en', description_zh: 'zh',
+        category: 'general',
+        workflow: '### 1. Work\n- Use `known-skill`.\n\n### 2. Deliver\n- Return the checked result.',
+        knowhow: ['Organizes supplied evidence into traceable findings'],
+        standards: ['The handoff names the artifact, checks performed, limitations, and next action.'],
+      },
+    });
+    expect(r.ok).toBe(true);
+    expect(r.violations.map((v) => v.rule)).not.toContain('agent_knowhow_missing');
+    expect(r.violations.map((v) => v.rule)).not.toContain('agent_standards_missing');
+  });
+
+  it('requires delivery standards but keeps display-only know-how optional', () => {
+    const managed = validateAgentSpec({
+      agentJson: {
+        agent_id: 'a', name: 'ManagedAgent',
+        description_en: 'en', description_zh: 'zh', category: 'general',
+        workflow: '### 1. Work\n- Produce the requested artifact.',
+      },
+    });
+    expect(managed.violations.map((v) => v.rule)).not.toContain('agent_knowhow_missing');
+    expect(managed.violations.map((v) => v.rule)).toContain('agent_standards_missing');
+
+    const stub = validateAgentSpec({
+      agentJson: {
+        agent_id: 'b', name: 'StubAgent',
+        description_en: 'en', description_zh: 'zh', category: 'general',
+      },
+    });
+    expect(stub.violations.map((v) => v.rule)).not.toContain('agent_knowhow_missing');
+    expect(stub.violations.map((v) => v.rule)).not.toContain('agent_standards_missing');
+  });
+
+  it('flags unbounded workflow and malformed or oversized guidance lists', () => {
+    const r = validateAgentSpec({
+      agentJson: {
+        agent_id: 'a', name: 'UnboundedAgent',
+        description_en: 'en', description_zh: 'zh', category: 'general',
+        workflow: 'x'.repeat(3_001),
+        knowhow: ['a', 'b', 'c', 'd', 'e', 'f'],
+        standards: ['', 'x'.repeat(221)],
+      },
+    });
+    expect(r.violations.map((v) => v.rule)).toEqual(expect.arrayContaining([
+      'agent_workflow_too_long',
+      'agent_knowhow_too_many',
+      'agent_standards_item_invalid',
+      'agent_standards_item_too_long',
+    ]));
   });
 });
 

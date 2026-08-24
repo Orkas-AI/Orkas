@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   assertImageQualityVerdict,
   compileImageQualityScorecard,
+  imageStudioEvidenceReviewRequired,
   inspectImageStudioProject,
   requiredCopyLayoutIssues,
   validateImageStudioManifest,
@@ -49,6 +50,14 @@ afterEach(() => {
 });
 
 describe('ImageStudio project contract', () => {
+  it('never review-gates generated or edited raster evidence, including legacy state', () => {
+    expect(imageStudioEvidenceReviewRequired(null)).toBe(false);
+    expect(imageStudioEvidenceReviewRequired({ route: 'generate' } as any)).toBe(false);
+    expect(imageStudioEvidenceReviewRequired({ route: 'edit', review_required: true } as any)).toBe(false);
+    expect(imageStudioEvidenceReviewRequired({ route: 'compose' } as any)).toBe(true);
+    expect(imageStudioEvidenceReviewRequired({ route: 'hybrid', review_required: true } as any)).toBe(true);
+  });
+
   it('compiles an evidence scorecard and enforces reference-specific scoring', () => {
     const scorecard = compileImageQualityScorecard({
       intent_alignment: 92,

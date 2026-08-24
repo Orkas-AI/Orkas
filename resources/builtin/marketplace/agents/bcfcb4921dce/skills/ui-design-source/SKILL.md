@@ -1,9 +1,8 @@
 ---
 ownerAgent: bcfcb4921dce
 name: ui-design-source
-description_zh: "处理 Figma 链接/导出、设计稿截图、PDF、JSON、现有 HTML 或设计说明，把来源抽取成 frame map、源图到 HTML 检查点、组件/变量/资产/交互清单、保真边界和 UIDesigner 实现交接；没有真实访问能力时不假装已导入。"
-description_en: "Handle Figma links/exports, design screenshots, PDFs, JSON, existing HTML, or design notes by extracting a frame map, source-to-HTML checkpoints, components/variables/assets/interactions, fidelity boundaries, and UIDesigner implementation handoff; never pretend a design source was imported when access is unavailable."
-category: rnd
+description_zh: "把 Figma 链接或导出、设计稿截图、PDF、JSON、现有 HTML 和设计说明提炼成 frame map、组件/变量/资产/交互清单、保真边界和 UIDesigner 实现交接；用于依据设计来源重建设计，没有真实访问能力时不声称已导入。"
+description_en: "Extract Figma links or exports, screenshots, PDFs, JSON, HTML, and design notes into a frame map, components, variables, assets, interactions, fidelity limits, and a UIDesigner handoff. Use when a design source must guide UI reconstruction; never claim unavailable sources were imported."
 ---
 
 # ui-design-source
@@ -67,6 +66,22 @@ For Figma-like sources, look specifically for:
 - Text styles and localization risks.
 - Exportable assets and which assets must be replaced or recreated.
 - Prototype links, overlays, interactions, transitions, and disabled/error states.
+
+## Multi-Source Coverage Ledger
+
+When the request covers a directory, batch, flow, or other set of multiple inspectable screens, inventory the complete authoritative source set before implementation. Do not treat a representative sample, shared tokens, or the first few screens as proof that the remaining sources were inspected.
+
+Keep one row per promised source screen with:
+
+- Source identity/path and target route/component.
+- Must-preserve visible anchors: page type, primary heading/copy, major regions, density, and primary action.
+- Fidelity mode and intentional changes.
+- Independent status for `inspected`, `implemented`, and post-implementation `compared`.
+- Remaining drift or blocker.
+
+Batch source reads and comparisons when useful, but do not claim complete coverage until every promised row has a fresh rendered/source comparison. Build success, valid routes or links, shared tokens, no-overflow checks, and spot checks prove different properties; they do not prove visual fidelity for unreviewed screens. If the turn stops early, report the exact remaining source rows instead of saying the whole set is complete.
+
+If the user says the mocks or screens do not match, reopen the full coverage ledger and compare the inspectable source set again. Do not ask them to supply one example as a substitute for auditing sources already available to the Agent.
 
 ## Source-To-HTML Checkpoints
 

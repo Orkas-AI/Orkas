@@ -3,13 +3,9 @@ Refine one **CLI-backed agent** with the user: `name`, bilingual `description`, 
 
 It spawns a local coding CLI to execute end-to-end; no workflow / skills / tools are authored here.
 
-Full authoring rules live in system skill `agent-creator`. **Read it first**:
-
-```
-read_file "@skill/agent-creator"
-```
-
-Use the exact read ref shown in the `## System skills` block; its CLI-backed section is canonical.
+Full authoring rules live in system skill `agent-creator`. **Read it first**
+using the exact read ref shown in the generated `## System skills` block; its
+CLI-backed section is canonical.
 
 ---
 
@@ -18,7 +14,7 @@ Use the exact read ref shown in the `## System skills` block; its CLI-backed sec
 - **Editable here**: `name` / `description_zh` / `description_en` / `inputs` / `interactive`.
 - **Not editable**: `workflow` / `knowhow` / `standards` / `skills` / `runtime` / `system` / `persona`; do not emit those sub-tags.
 - Runtime CLI is interchangeable, so authored text must describe the role, not a specific CLI/brand/model. Never name CLI/runtime/vendor/model terms listed in `agent-creator`.
-- Bound to one agent: emit at most one `<agent>` container, no `<agent_id>`.
+- Bound to one agent: emit at most one `<agent>` container, with neither `<operation>` nor `<agent_id>`.
 - Emit `<name>` / `<description_zh>` / `<description_en>` only when changed; judge zh/en independently.
 - Emit `<inputs>` / `<interactive>` only when that field changed. If changing `<inputs>`, emit the complete intended input list for that one field.
 - Emit no container for pure discussion or unrelated questions.

@@ -7,12 +7,10 @@
  * differences:
  *
  *   1. THREE outcomes — `allow_once`, `allow_run`, `deny` — not a boolean.
- *   2. NO persistent store. "Allow for this run" is an IN-MEMORY grant keyed
- *      by (uid, cid, agentId) → set of risk categories, cleared when the run ends
- *      (`cancelForCid`). It deliberately does NOT survive a restart or apply
- *      to another conversation: a one-time "stop asking me for the rest of
- *      this task" convenience, not a durable policy. (Durable per-pattern
- *      allow is plan option A, intentionally out of scope here.)
+ *   2. NO persistent store. Every classified sensitive operation requires an
+ *      exact-command decision. A stale renderer may still send `allow_run`,
+ *      but main always narrows it to `allow_once`; broad run-scoped approval
+ *      is not a safe substitute for reviewing the concrete command.
  *
  * Never throws: a broken push channel degrades to deny, so a risky command can
  * never silently run because the dialog failed to show. Once the prompt is
@@ -27,6 +25,7 @@ import { createLogger } from '../../logger';
 import { maskId } from '../../util/log-redact';
 import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 import type { RiskCategory } from './bash-risk';
+import type { ExternalMutationFinding } from './external-mutation-risk';
 
 const log = createLogger('bash-permissions');
 
@@ -39,40 +38,6 @@ const WAITING_HEARTBEAT_MS = 25_000;
 /** Renderer dialog command preview cap — the user must see what will run, but
  *  an unbounded command would bloat the push payload. */
 const COMMAND_PREVIEW_MAX = 800;
-
-// ── Run-scoped "allow for this run" grants (in-memory only) ──────────────────
-
-function runKey(uid: string, cid: string, agentId: string): string {
-  return `${uid}\0${cid}\0${agentId}`;
-}
-
-interface RunGrant {
-  uid: string;
-  cid: string;
-  agentId: string;
-  reasons: Set<RiskCategory>;
-}
-
-const _runAllow = new Map<string, RunGrant>();
-
-function isCoveredByRun(uid: string, cid: string, agentId: string, reasons: RiskCategory[]): boolean {
-  const grant = _runAllow.get(runKey(uid, cid, agentId));
-  if (!grant || !grant.reasons.size) return false;
-  return reasons.every((r) => grant.reasons.has(r));
-}
-
-function recordRunAllow(uid: string, cid: string, agentId: string, reasons: RiskCategory[]): void {
-  const key = runKey(uid, cid, agentId);
-  const grant = _runAllow.get(key) || {
-    uid,
-    cid,
-    agentId,
-    reasons: new Set<RiskCategory>(),
-  };
-  for (const r of reasons) grant.reasons.add(r);
-  _runAllow.set(key, grant);
-}
-
 // ── Pending requests ─────────────────────────────────────────────────────────
 
 export interface BashPermissionInfo {
@@ -86,14 +51,14 @@ export interface BashPermissionInfo {
   /** Optional subject for non-shell operations, typically a path. */
   subject?: string;
   reasons: RiskCategory[];
+  /** Structured, bounded external actions detected inside the command/script. */
+  external_mutations?: ExternalMutationFinding[];
   cid: string;
 }
 
 interface Pending {
   uid: string;
   cid: string;
-  agentId: string;
-  reasons: RiskCategory[];
   resolve: (d: BashDecision) => void;
   heartbeat?: NodeJS.Timeout;
 }
@@ -112,7 +77,6 @@ export function _resetForTest(): void {
     if (p.heartbeat) clearInterval(p.heartbeat);
   }
   _pending.clear();
-  _runAllow.clear();
 }
 
 function _broadcast(channel: string, payload: unknown): boolean {
@@ -129,9 +93,9 @@ function _broadcast(channel: string, payload: unknown): boolean {
 }
 
 /**
- * Gate one risky bash command. Resolves to the user's decision. Silent
- * `allow_run` when this run already granted every category. Deny on a broken
- * push channel; otherwise wait for the explicit renderer response.
+ * Gate one risky bash command. Resolves to the user's exact-command decision.
+ * Deny on a broken push channel; otherwise wait for the explicit renderer
+ * response.
  */
 export async function requestBashDecision(opts: {
   uid: string;
@@ -142,11 +106,10 @@ export async function requestBashDecision(opts: {
   operation?: string;
   subject?: string;
   reasons: RiskCategory[];
+  externalMutations?: ExternalMutationFinding[];
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
   const reasons = opts.reasons.slice();
-  if (isCoveredByRun(opts.uid, opts.cid, opts.agentId, reasons)) return 'allow_run';
-
   const requestId = crypto.randomBytes(8).toString('hex');
   const command = opts.command.length > COMMAND_PREVIEW_MAX
     ? `${opts.command.slice(0, COMMAND_PREVIEW_MAX)}…`
@@ -159,6 +122,7 @@ export async function requestBashDecision(opts: {
     ...(opts.operation ? { operation: opts.operation } : {}),
     ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
+    ...(opts.externalMutations?.length ? { external_mutations: opts.externalMutations.slice(0, 8) } : {}),
     cid: opts.cid,
   };
 
@@ -181,8 +145,6 @@ export async function requestBashDecision(opts: {
     const pending: Pending = {
       uid: opts.uid,
       cid: opts.cid,
-      agentId: opts.agentId,
-      reasons,
       resolve,
     };
     _pending.set(requestId, pending);
@@ -209,42 +171,13 @@ export function respond(requestId: string, decision: BashDecision): boolean {
   if (!pending) return false;
   _pending.delete(requestId);
   if (pending.heartbeat) clearInterval(pending.heartbeat);
-  if (decision === 'allow_run') {
-    recordRunAllow(pending.uid, pending.cid, pending.agentId, pending.reasons);
-
-    // More than one risky operation can reach the gate before the renderer
-    // answers the first prompt. Apply the new run grant to those already
-    // queued requests too, otherwise the user is asked again for a category
-    // they just allowed for this task. Keep unrelated scopes/categories
-    // pending so a broad approval cannot leak across their safety boundary.
-    const coveredIds: string[] = [];
-    const coveredPending: Pending[] = [];
-    for (const [id, queued] of _pending) {
-      if (
-        queued.uid !== pending.uid
-        || queued.cid !== pending.cid
-        || queued.agentId !== pending.agentId
-        || !isCoveredByRun(queued.uid, queued.cid, queued.agentId, queued.reasons)
-      ) continue;
-      _pending.delete(id);
-      if (queued.heartbeat) clearInterval(queued.heartbeat);
-      coveredIds.push(id);
-      coveredPending.push(queued);
-    }
-    if (coveredIds.length) {
-      _broadcast('bash:permission_cancelled', {
-        request_ids: coveredIds,
-        cid: pending.cid,
-      });
-      for (const queued of coveredPending) queued.resolve('allow_run');
-    }
-  }
-  pending.resolve(decision);
+  const effectiveDecision = decision === 'allow_run' ? 'allow_once' : decision;
+  pending.resolve(effectiveDecision);
   return true;
 }
 
-/** Abandon every pending request for a conversation AND drop its run-scoped
- *  grants (run ended / aborted). Pending requests resolve to `deny`. */
+/** Abandon every pending request for a conversation. Pending requests resolve
+ *  to `deny`. */
 export function cancelForCid(cid: string): void {
   const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
@@ -254,17 +187,13 @@ export function cancelForCid(cid: string): void {
     requestIds.push(id);
     pending.resolve('deny');
   }
-  for (const [key, grant] of _runAllow) {
-    if (grant.cid === cid) _runAllow.delete(key);
-  }
   if (requestIds.length) {
     _broadcast('bash:permission_cancelled', { request_ids: requestIds, cid });
   }
 }
 
-/** Account-switch boundary: pending dialogs and grants owned by the previous
- * user must not survive into the next active account, even if conversation
- * ids happen to collide. */
+/** Account-switch boundary: pending dialogs owned by the previous user must
+ * not survive into the next active account, even if ids happen to collide. */
 export function cancelForUid(uid: string): void {
   const requestIds: string[] = [];
   for (const [id, pending] of _pending) {
@@ -273,9 +202,6 @@ export function cancelForUid(uid: string): void {
     if (pending.heartbeat) clearInterval(pending.heartbeat);
     requestIds.push(id);
     pending.resolve('deny');
-  }
-  for (const [key, grant] of _runAllow) {
-    if (grant.uid === uid) _runAllow.delete(key);
   }
   if (requestIds.length) {
     _broadcast('bash:permission_cancelled', { request_ids: requestIds, uid });

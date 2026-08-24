@@ -5,7 +5,6 @@
  *   run     — one-shot agent execution
  *   chat    — interactive chat loop
  *   config  — show/validate configuration
- *   memory  — memory status and search
  *   models  — list available providers and models
  */
 import { createInterface } from "node:readline";
@@ -14,8 +13,6 @@ import type { CoreAgentConfig } from "../config/index.js";
 import { AgentRunner } from "../agent/index.js";
 import { ProviderRegistry } from "../providers/registry.js";
 import { listPiProviders, listPiModels } from "../providers/pi-provider.js";
-import { MemoryIndexManager } from "../memory/manager.js";
-import { SqliteMemoryManager } from "../memory/sqlite-manager.js";
 import { createLogger } from "../shared/logger.js";
 import { listCredentials, removeCredential, writeApiKeyCredential } from "../auth/store.js";
 import { loginOAuthProvider } from "../auth/oauth-flow.js";
@@ -76,7 +73,6 @@ export class CLI {
     this.register(runCommand);
     this.register(chatCommand);
     this.register(configCommand);
-    this.register(memoryCommand);
     this.register(modelsCommand);
     this.register(loginCommand);
     this.register(authCommand);
@@ -249,71 +245,6 @@ const configCommand: CLICommand = {
     } catch (err) {
       console.error(`Configuration error: ${(err as Error).message}`);
       process.exitCode = 1;
-    }
-  },
-};
-
-/** `memory` — memory status and search. */
-const memoryCommand: CLICommand = {
-  name: "memory",
-  description: "Memory status, search, or sync",
-  usage: "memory [status|search|sync] [--dir <path>] [--query <text>] [--sqlite]",
-  async execute(_args, opts) {
-    const subcommand = opts.positional[0] ?? "status";
-    const memoryDir = (opts.flags.dir as string) ?? "./memory";
-    const useSqlite = Boolean(opts.flags.sqlite);
-    const config = createConfig();
-
-    const manager = useSqlite
-      ? new SqliteMemoryManager({ memoryDir, config: config.memory })
-      : new MemoryIndexManager({ memoryDir, config: config.memory });
-
-    try {
-      switch (subcommand) {
-        case "status": {
-          await manager.sync();
-          const status = manager.status();
-          console.log("Memory Status:");
-          console.log(`  Provider: ${status.provider}`);
-          console.log(`  Files: ${status.files}`);
-          console.log(`  Chunks: ${status.chunks}`);
-          console.log(`  FTS: ${status.fts.enabled ? "enabled" : "disabled"}`);
-          console.log(`  Vector: ${status.vector.enabled ? "enabled" : "disabled"}${status.vector.dims ? ` (${status.vector.dims}d)` : ""}`);
-          if (useSqlite) console.log(`  Backend: SQLite`);
-          break;
-        }
-        case "search": {
-          const query = (opts.flags.query as string) ?? opts.positional.slice(1).join(" ");
-          if (!query) {
-            console.error("Error: No search query provided.");
-            console.error("Usage: memory search --query <text>");
-            process.exitCode = 1;
-            return;
-          }
-          await manager.sync();
-          const results = await manager.search(query);
-          if (results.length === 0) {
-            console.log("No results found.");
-          } else {
-            for (const r of results) {
-              console.log(`[${r.score.toFixed(2)}] ${r.path} (lines ${r.startLine}-${r.endLine})`);
-              console.log(`  ${r.snippet.slice(0, 120)}...\n`);
-            }
-          }
-          break;
-        }
-        case "sync": {
-          await manager.sync({ force: true });
-          const status = manager.status();
-          console.log(`Synced: ${status.files} files, ${status.chunks} chunks`);
-          break;
-        }
-        default:
-          console.error(`Unknown memory subcommand: ${subcommand}`);
-          process.exitCode = 1;
-      }
-    } finally {
-      await manager.close?.();
     }
   },
 };

@@ -23,6 +23,7 @@ import * as path from 'node:path';
 
 import { createLogger } from '../logger';
 import { bundledFfmpegPaths } from '../util/bundled-runtime';
+import { isPathAllowed } from '../util/path-sandbox';
 
 const log = createLogger('video-studio-delivery');
 
@@ -329,6 +330,7 @@ export async function verifyProductionDelivery(input: {
   planAbsPath: string;
   plan: Record<string, unknown>;
   videoAbsPath: string;
+  allowedRoots: readonly string[];
   signal?: AbortSignal;
 }): Promise<DeliveryVerdict> {
   // The plan lives at `<video>/project/plan.json` and its own paths read
@@ -363,16 +365,24 @@ export async function verifyProductionDelivery(input: {
   for (let index = 0; index < narrationSegments.length; index += 1) {
     const line = narrationSegments[index];
     const produced = typeof line.produced_path === 'string' ? line.produced_path.trim() : '';
-    const startSec = Number(line.start_sec);
+    const startSec = typeof line.start_sec === 'number'
+      && Number.isFinite(line.start_sec)
+      && line.start_sec >= 0
+      ? line.start_sec
+      : null;
     if (!produced) {
       unjudged.push({ index, reason: 'no produced_path' });
       continue;
     }
-    if (!Number.isFinite(startSec)) {
+    if (startSec === null) {
       unjudged.push({ index, reason: 'no start_sec (its position on the timeline)' });
       continue;
     }
     const audioAbs = path.isAbsolute(produced) ? produced : path.resolve(videoDir, produced);
+    if (!isPathAllowed(audioAbs, input.allowedRoots)) {
+      unjudged.push({ index, reason: `audio at ${produced} is outside allowed scope` });
+      continue;
+    }
     const span = await measureVoicedSpan(audioAbs, input.signal);
     if (!span) {
       unjudged.push({ index, reason: `audio at ${produced} could not be read` });
@@ -381,7 +391,11 @@ export async function verifyProductionDelivery(input: {
     measured.push({
       index,
       startSec,
-      targetSec: Number.isFinite(Number(line.target_sec)) ? Number(line.target_sec) : null,
+      targetSec: typeof line.target_sec === 'number'
+        && Number.isFinite(line.target_sec)
+        && line.target_sec > 0
+        ? line.target_sec
+        : null,
       voicedStartSec: startSec + span.startSec,
       voicedEndSec: startSec + span.endSec,
       textHead: String(line.text ?? '').slice(0, 20),

@@ -327,6 +327,8 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
       apiKey: 'sk-custom-runtime-xxxxxxxx',
       contextWindow: 262_144,
       maxTokens: 16_384,
+      supportsReasoning: true,
+      supportsVision: true,
       reasoningEffort: 'medium',
     });
 
@@ -351,6 +353,8 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
           baseUrl: 'https://gateway.example.test/v1',
           contextWindow: 262_144,
           maxTokens: 16_384,
+          supportsReasoning: true,
+          supportsVision: true,
           reasoningEffort: 'medium',
         },
       }),
@@ -367,6 +371,8 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
     ));
     expect(persisted.profiles['custom:公司网关']).toMatchObject({
       maxTokens: 16_384,
+      supportsReasoning: true,
+      supportsVision: true,
       reasoningEffort: 'medium',
     });
     expect(persisted.profiles['custom:公司网关']).not.toHaveProperty('maxTokensSource');
@@ -438,6 +444,22 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
     ).toEqual([
       expect.objectContaining({ profileId: 'custom:full-endpoint' }),
     ]);
+  });
+
+  it('rejects API keys that cannot be sent in an Authorization header without a partial credential', async () => {
+    const a = await import('../../../src/main/features/auth');
+
+    await expect(a.addCustomModelEntry({
+      label: 'invalid-header',
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'acme/reasoner-v2',
+      apiKey: 'щ-custom-key',
+    })).rejects.toMatchObject({ code: 'CUSTOM_API_KEY_INVALID' });
+
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect(
+      (await a.listProviders()).providers.find((provider) => provider.id === 'custom')?.profiles,
+    ).toEqual([]);
   });
 
   it('uses the 32K runtime default without persisting an omitted maxTokens field', async () => {

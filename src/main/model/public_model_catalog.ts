@@ -55,8 +55,8 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'gemini-3.5-flash-lite', name: 'Gemini 3.5 Flash Lite', maxInputImages: 20 },
   ],
   zai: [
+    { id: 'glm-5.3', name: 'GLM-5.3' },
     { id: 'glm-5.2', name: 'GLM-5.2' },
-    { id: 'glm-5.1', name: 'GLM-5.1' },
   ],
   moonshot: [
     { id: 'kimi-k3', name: 'Kimi K3', contextWindow: 1048576, maxTokens: 131072 },
@@ -79,8 +79,8 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
   ],
   deepseek: [
-    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576, maxTokens: 384_000 },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576, maxTokens: 384_000 },
   ],
   doubao: [
     { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },

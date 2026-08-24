@@ -48,7 +48,8 @@ async function waitForProcessRead(
   const deadline = performance.now() + timeoutMs;
   let lastPayload: Record<string, any> | null = null;
   while (performance.now() < deadline) {
-    const result = await tool("process_read").execute({
+    const result = await tool("process_session").execute({
+      action: "read",
       session_id: sessionId,
       cursor,
     }, context(owner));
@@ -75,12 +76,27 @@ afterEach(async () => {
 });
 
 describe("persistent process sessions", () => {
+  it("exposes one lifecycle tool and rejects an unknown action", async () => {
+    expect(getProcessSessionTools().map((candidate) => candidate.name)).toEqual(["process_session"]);
+    expect(getProcessSessionTools()[0].inputSchema.required).toContain("action");
+    const marker = path.join(workingDir, "must-not-run.txt");
+    const command = shellInvoke(TEST_NODE, [
+      "-e",
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`,
+    ]);
+    const result = await tool("process_session").execute({ action: "unknown", command }, context("owner-a"));
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("E_BAD_INPUT");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("streams cursor-based output across separate Agent tool contexts", async () => {
     const command = shellInvoke(TEST_NODE, [
       "-e",
       "process.stdout.write('first\\n');process.stdin.once('data',()=>{process.stdout.write('second\\n');process.exit(0)})",
     ]);
-    const started = await tool("process_start").execute({ command }, context("conversation-a"));
+    const started = await tool("process_session").execute({ action: "start", command }, context("conversation-a"));
     expect(started.isError).toBeUndefined();
     let firstResult = { result: started, payload: json(started.content) };
     if (!String(firstResult.payload.output).includes("first")) {
@@ -94,7 +110,8 @@ describe("persistent process sessions", () => {
     const first = firstResult.payload;
     expect(first.output).toContain("first");
 
-    const written = await tool("process_write").execute({
+    const written = await tool("process_session").execute({
+      action: "write",
       session_id: first.session_id,
       chars: "continue",
       add_newline: true,
@@ -119,7 +136,8 @@ describe("persistent process sessions", () => {
     });
     expect(later.result.observations?.execution?.stdout.bytes).toBeGreaterThan(0);
 
-    const emptyResult = await tool("process_read").execute({
+    const emptyResult = await tool("process_session").execute({
+      action: "read",
       session_id: first.session_id,
       cursor: second.next_cursor,
     }, context("conversation-a"));
@@ -130,13 +148,31 @@ describe("persistent process sessions", () => {
   });
 
   it("isolates session ids by host owner", async () => {
-    const command = shellInvoke(TEST_NODE, ["-e", "setTimeout(()=>process.exit(0),500)"]);
-    const started = json((await tool("process_start").execute({ command }, context("owner-a"))).content);
-    const denied = await tool("process_read").execute({
+    const command = shellInvoke(TEST_NODE, ["-e", "setTimeout(()=>process.exit(0),5000)"]);
+    const started = json((await tool("process_session").execute({ action: "start", command }, context("owner-a"))).content);
+    const denied = await tool("process_session").execute({
+      action: "read",
       session_id: started.session_id,
     }, context("owner-b"));
     expect(denied.isError).toBe(true);
     expect(denied.content).toContain("E_PROCESS_SESSION_NOT_FOUND");
+
+    const deniedStop = await tool("process_session").execute({
+      action: "stop",
+      session_id: started.session_id,
+    }, context("owner-b"));
+    expect(deniedStop.isError).toBe(true);
+    expect(deniedStop.content).toContain("E_PROCESS_SESSION_NOT_FOUND");
+
+    const ownerView = json((await tool("process_session").execute({
+      action: "read",
+      session_id: started.session_id,
+    }, context("owner-a"))).content);
+    expect(ownerView.status).toBe("running");
+    await tool("process_session").execute({
+      action: "stop",
+      session_id: started.session_id,
+    }, context("owner-a"));
   });
 
   it("writes stdin and can stop a running process tree", async () => {
@@ -144,15 +180,17 @@ describe("persistent process sessions", () => {
       "-e",
       "process.stdin.once('data',d=>process.stdout.write('echo:'+d.toString()));setInterval(()=>{},1000)",
     ]);
-    const started = json((await tool("process_start").execute({ command }, context("owner-a"))).content);
-    const written = await tool("process_write").execute({
+    const started = json((await tool("process_session").execute({ action: "start", command }, context("owner-a"))).content);
+    const written = await tool("process_session").execute({
+      action: "write",
       session_id: started.session_id,
       chars: "hello",
       add_newline: true,
     }, context("owner-a"));
     expect(written.isError).toBeUndefined();
     await expect.poll(async () => {
-      const output = json((await tool("process_read").execute({
+      const output = json((await tool("process_session").execute({
+        action: "read",
         session_id: started.session_id,
         cursor: 0,
       }, context("owner-a"))).content);
@@ -162,7 +200,8 @@ describe("persistent process sessions", () => {
       interval: 25,
     }).toContain("echo:hello");
 
-    const stoppedResult = await tool("process_stop").execute({
+    const stoppedResult = await tool("process_session").execute({
+      action: "stop",
       session_id: started.session_id,
     }, context("owner-a"));
     const stopped = json(stoppedResult.content);
@@ -172,6 +211,12 @@ describe("persistent process sessions", () => {
       exitCode: null,
       timedOut: false,
     });
+
+    const repeatedStop = json((await tool("process_session").execute({
+      action: "stop",
+      session_id: started.session_id,
+    }, context("owner-a"))).content);
+    expect(repeatedStop.status).toBe("stopped");
   });
 
   it("reports a non-zero terminal command as failed structured execution", async () => {
@@ -179,8 +224,8 @@ describe("persistent process sessions", () => {
       "-e",
       "process.stderr.write('failed\\n');process.exit(7)",
     ]);
-    const result = await tool("process_start").execute(
-      { command },
+    const result = await tool("process_session").execute(
+      { action: "start", command },
       context("owner-a"),
     );
     let terminal = { result, payload: json(result.content) };

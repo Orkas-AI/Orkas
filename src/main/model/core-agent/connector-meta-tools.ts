@@ -9,23 +9,23 @@
  *
  * Architecture:
  *   1. The list of connected (and visible) connectors is rendered as a `## Connectors` markdown
- *      block injected into the system prompt — `getConnectorPromptBlock`. The block is stable
- *      per session and lives in the cached prefix; the model sees the names + descriptions
- *      without a discovery round-trip.
+ *      block injected into the system prompt — `getConnectorPromptBlock`. Runner construction
+ *      uses `buildConnectorSurface` so this block and the meta-tools share one visibility
+ *      snapshot. The block is stable per session and lives in the cached prefix; the model sees
+ *      the names + descriptions without a discovery round-trip.
  *   2. Two meta-tools enable lazy disclosure of each connector's per-action schema:
  *        list_connector_tools(connector_id)        → MCP tool schemas for one connector
  *        call_connector_tool(connector_id, …)      → route to manager.callTool
  *   3. When NO connector is visible to this actor, both the prompt block and the meta-tools are
  *      omitted entirely — `tools[]` shrinks by two slots and the system prompt stays smaller.
  *
- * Visibility: group-chat commander and agent workers see every connected instance. The
- * `enabled_subtools` instance-level whitelist further filters which actions each connector
- * advertises. The resolver still accepts an optional actor filter for tests / future gates,
- * but runner.ts intentionally does not pass one for group-chat actors.
+ * Visibility: group-chat commander and agent workers see every user-enabled connected instance.
+ * The `enabled_subtools` instance-level whitelist further filters which actions each connector
+ * advertises.
  *
  * Session-kind gate: callers (runner.ts) invoke this module for `gconv` full access and
  * `gmember` full access, plus `agent` edit-session discovery. Skill edit chats / KB-image
- * extraction / CLI dispatch / reflect / memory-extract / anon stay free of connector exposure.
+ * extraction / CLI dispatch / reflect / anon stay free of connector exposure.
  */
 import type { AgentTool, ToolResult } from '#core-agent';
 
@@ -47,7 +47,7 @@ const log = createLogger('connector-meta-tools');
 export interface ConnectorMetaToolsOpts {
   /** Active uid. Required — without it the meta-tools have no scope. */
   userId: string;
-  /** Optional actor filter. Empty / undefined = full task-session scope. */
+  /** Optional actor id for redacted failure diagnostics; it never filters visibility. */
   agentId?: string;
   /** Conversation id — required for the task-session `add_custom_connector`
    *  tool so its confirmation dialog routes to the right conversation.
@@ -56,6 +56,24 @@ export interface ConnectorMetaToolsOpts {
   /** Keep list/call schemas available for a live run that may gain a
    * connector after construction. */
   allowRuntimeRefresh?: boolean;
+  /** Only the commander may offer installation of a custom MCP server. */
+  allowCustomConnectorInstall?: boolean;
+  /** UI-only display metadata refreshed by the same visibility checks. */
+  connectorDisplayNameById?: Map<string, string>;
+}
+
+type VisibleConnectors = Awaited<ReturnType<typeof resolveVisibleConnectors>>;
+
+function _recordVisibleConnectorDisplayNames(
+  opts: ConnectorMetaToolsOpts,
+  visible: VisibleConnectors,
+): void {
+  if (!opts.connectorDisplayNameById) return;
+  for (const { instance } of visible) {
+    const id = String(instance.id || '').trim();
+    const name = String(instance.display_name || '').trim();
+    if (id && name) opts.connectorDisplayNameById.set(id, name);
+  }
 }
 
 function errResult(code: string, msg: string): ToolResult {
@@ -94,21 +112,52 @@ function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): s
     : `- **${instance.id}** — ${instance.display_name}${acct}${warn}`;
 }
 
+const MAX_RECOVERY_ACTIONS = 24;
+const MAX_RECOVERY_ACTION_LIST_CHARS = 3_000;
+
+function _unavailableActionMessage(cid: string, requestedTool: string, tools: ToolSchema[]): string {
+  const boundedRequestedTool = String(requestedTool || '').slice(0, 160);
+  const names: string[] = [];
+  let renderedChars = 0;
+  for (const tool of tools) {
+    if (names.length >= MAX_RECOVERY_ACTIONS) break;
+    const name = String(tool.name || '').trim().slice(0, 160);
+    if (!name) continue;
+    const nextChars = renderedChars + name.length + 3;
+    if (nextChars > MAX_RECOVERY_ACTION_LIST_CHARS) break;
+    names.push(name);
+    renderedChars = nextChars;
+  }
+  const omitted = Math.max(0, tools.length - names.length);
+  const lines = [
+    `action "${boundedRequestedTool}" is not available on connector "${cid}".`,
+    'Available actions:',
+    ...names.map((name) => `- ${name}`),
+  ];
+  if (omitted) lines.push(`- ... ${omitted} more actions omitted`);
+  lines.push('Choose an exact action name, then inspect its input schema before invoking it.');
+  return lines.join('\n');
+}
+
 /** Render the `## Connectors` system-prompt block — pure enumeration (one line per connector).
  *  Returns `''` when nothing is visible; the caller skips concatenation in that case. The block
  *  is stable per session (only changes on connect / disconnect events) so it sits in the cached
  *  prompt prefix. The protocol for invoking connectors via the meta-tools is taught in the
  *  per-role chat prompts (`chat_commander.md` / `chat_agent_in_group.md`); the agent-edit
- *  prompt teaches the "reference connectors by id in the workflow" usage. Keeping the
- *  protocol out of the block lets each role frame its own use without duplication. */
-export async function getConnectorPromptBlock(uid: string, agentId: string | undefined): Promise<string> {
-  if (!uid) return '';
-  const visible = await resolveVisibleConnectors(uid, agentId);
+ *  prompt teaches the "reference connectors by id in the workflow" usage. The role
+ *  prompts retain only the routing boundary; these meta-tool schemas own the detailed
+ *  discovery, invocation, and success-evidence contract. */
+function renderConnectorPromptBlock(uid: string, visible: VisibleConnectors): string {
   if (!visible.length) return '';
   const lang = _descriptionLangForUser(uid);
   const lines: string[] = ['## Connectors', ''];
   for (const { instance } of visible) lines.push(_renderConnectorLine(instance, lang));
   return lines.join('\n');
+}
+
+export async function getConnectorPromptBlock(uid: string): Promise<string> {
+  if (!uid) return '';
+  return renderConnectorPromptBlock(uid, await resolveVisibleConnectors(uid));
 }
 
 function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
@@ -129,10 +178,10 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
       properties: {
         connector_id: {
           type: 'string',
-          description: 'The connector id from the `## Connectors` system-prompt block.',
+          description: 'Optional visible connector id. Omit to discover valid ids.',
         },
       },
-      required: ['connector_id'],
+      additionalProperties: false,
     },
     async execute(input) {
       const cid = typeof (input as { connector_id?: unknown }).connector_id === 'string'
@@ -140,7 +189,7 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
         : '';
       if (!cid) return errResult('E_BAD_INPUT', '`connector_id` is required (a non-empty string)');
 
-      const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
+      const visible = await resolveVisibleConnectors(opts.userId);
       const match = visible.find((v) => v.instance.id === cid);
       if (!match) {
         // resolveVisibleConnectors already filters to `status.kind === 'connected'`, so a miss
@@ -149,7 +198,7 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
         // `## Connectors` block, or ask the user to refresh) — one error code keeps it simple.
         return errResult(
           'E_CONNECTOR_NOT_VISIBLE',
-          `connector "${cid}" is not currently available. See the \`## Connectors\` system-prompt block for valid ids; if it was there a moment ago, ask the user to refresh it in the Connectors panel.`,
+          `connector "${cid}" is not currently available. Call \`list_connector_tools\` without connector_id to refresh valid ids; if it was available a moment ago, ask the user to refresh it in the Connectors panel.`,
         );
       }
       if (!match.tools.length) {
@@ -187,16 +236,13 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   return {
     name: 'call_connector_tool',
     description:
-      'Invoke a specific action on a connected third-party service. Always call ' +
-      '`list_connector_tools(connector_id)` first (in this conversation) to learn the action ' +
-      'name and its input schema; then construct `args` to match that schema. The result is ' +
-      'the connector\'s response (text / JSON), exactly as the underlying service returned it.',
+      'Invoke a connector action using the schema returned by list_connector_tools. A successful tool call confirms transport only; claim an external side effect completed only when the returned response explicitly confirms it.',
     inputSchema: {
       type: 'object',
       properties: {
         connector_id: {
           type: 'string',
-          description: 'The connector id from the `## Connectors` system-prompt block.',
+          description: 'An exact visible id returned by `list_connector_tools` or the `## Connectors` block.',
         },
         tool_name: {
           type: 'string',
@@ -241,20 +287,20 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
         return errResult('E_BAD_INPUT', '`args` is required and must be a JSON object (use {} for no-arg actions)');
       }
 
-      const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
+      const visible = await resolveVisibleConnectors(opts.userId);
+      _recordVisibleConnectorDisplayNames(opts, visible);
       const match = visible.find((v) => v.instance.id === cid);
       if (!match) {
         return errResult(
           'E_CONNECTOR_NOT_VISIBLE',
-          `connector "${cid}" is not enabled for this conversation. See the \`## Connectors\` system-prompt block for valid ids.`,
+          `connector "${cid}" is not enabled for this conversation. Call \`list_connector_tools\` without connector_id to refresh valid ids.`,
         );
       }
       const toolMatch = match.tools.find((t) => t.name === toolName);
       if (!toolMatch) {
         return errResult(
           'E_TOOL_NOT_AVAILABLE',
-          `action "${toolName}" is not available on connector "${cid}". ` +
-          `Call list_connector_tools({connector_id: "${cid}"}) to see the actual action names.`,
+          _unavailableActionMessage(cid, toolName, match.tools),
         );
       }
 
@@ -283,13 +329,7 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
   return {
     name: 'add_custom_connector',
     description:
-      'Add a custom MCP server the user described (e.g. pasted from an mcp.json or docs). '
-      + 'Use ONLY when the user explicitly wants to connect a specific MCP server that is not in '
-      + 'the built-in Connectors list. The user must approve a confirmation dialog before it is '
-      + 'installed — for a local command, that dialog shows the exact command that will run, so '
-      + 'present what you are about to add in plain terms first. On approval the server is '
-      + 'connected and its tools become available via `list_connector_tools` / '
-      + '`call_connector_tool` like any other connector.',
+      'Add a specific custom MCP server only when explicitly requested by the user. Installation requires user confirmation; approved servers are then used through list_connector_tools and call_connector_tool.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -347,24 +387,23 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
  *                     "gmail's email-sending feature". `call_connector_tool` is withheld so an
  *                     authoring session can never produce external side effects.).
  *
- *  Returns `[]` when uid is empty. Normally an actor with no visible
- *  connectors receives only the optional add tool; rich active-turn sessions
- *  may opt into a stable list/call schema whose execution resolves live state. */
-export async function createConnectorMetaTools(
+ *  Returns `[]` when uid is empty. The add tool is a separate commander-only
+ *  capability selected by `allowCustomConnectorInstall`; rich active-turn
+ *  sessions may opt into a stable list/call schema whose execution resolves
+ *  live state. */
+function createConnectorMetaToolsFromVisible(
   opts: ConnectorMetaToolsOpts,
-  mode: 'full' | 'discover' = 'full',
-): Promise<AgentTool[]> {
+  mode: 'full' | 'discover',
+  visible: VisibleConnectors,
+): AgentTool[] {
   if (!opts.userId) return [];
-  // Full task sessions (commander and group-chat agent workers) always get
-  // `add_custom_connector`, even with zero connectors installed — that's the
-  // path to the FIRST one. The discover-mode add tool is intentionally absent
-  // (agent-edit must not produce side effects). The add tool needs a cid to
-  // route its confirm dialog; without one we cannot safely expose it.
-  const addTool = mode === 'full' && opts.cid
+  // Only a host-authorized commander gets `add_custom_connector`, even when
+  // zero connectors are installed — that's the path to the first one. The add
+  // tool needs a cid to route its confirm dialog; without one it is withheld.
+  const addTool = mode === 'full' && opts.cid && opts.allowCustomConnectorInstall === true
     ? [createAddCustomConnectorTool({ ...opts, cid: opts.cid })]
     : [];
 
-  const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
   if (!visible.length && !opts.allowRuntimeRefresh) return addTool;
   if (mode === 'discover') return [createListConnectorToolsTool(opts)];
   return [
@@ -372,4 +411,38 @@ export async function createConnectorMetaTools(
     createCallConnectorToolTool(opts),
     ...addTool,
   ];
+}
+
+/** Build both runner-facing Connector surfaces from one visibility snapshot.
+ *  Besides avoiding a duplicate local catalog scan, this keeps the prompt
+ *  catalog and the available meta-tools coherent if connector state changes
+ *  while a runner is being assembled. Tool execution still resolves live
+ *  visibility on every call. */
+export async function buildConnectorSurface(
+  opts: ConnectorMetaToolsOpts,
+  mode: 'full' | 'discover' = 'full',
+): Promise<{
+  promptBlock: string;
+  tools: AgentTool[];
+  connectorDisplayNameById: Map<string, string>;
+}> {
+  const connectorDisplayNameById = new Map<string, string>();
+  if (!opts.userId) return { promptBlock: '', tools: [], connectorDisplayNameById };
+  const visible = await resolveVisibleConnectors(opts.userId);
+  const scopedOpts = { ...opts, connectorDisplayNameById };
+  _recordVisibleConnectorDisplayNames(scopedOpts, visible);
+  return {
+    promptBlock: renderConnectorPromptBlock(opts.userId, visible),
+    tools: createConnectorMetaToolsFromVisible(scopedOpts, mode, visible),
+    connectorDisplayNameById,
+  };
+}
+
+export async function createConnectorMetaTools(
+  opts: ConnectorMetaToolsOpts,
+  mode: 'full' | 'discover' = 'full',
+): Promise<AgentTool[]> {
+  if (!opts.userId) return [];
+  const visible = await resolveVisibleConnectors(opts.userId);
+  return createConnectorMetaToolsFromVisible(opts, mode, visible);
 }

@@ -90,6 +90,32 @@ describe('core-agent client skill sandbox env', () => {
     await expect(pending).resolves.toEqual({ value: undefined, done: true });
   });
 
+  it('flushes pending mapped state before stopping an aborted stream', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const controller = new AbortController();
+
+    async function* stuckStream() {
+      yield { type: 'event', event: { stream: 'reasoning', data: { phase: 'start' } } };
+      await new Promise(() => { /* never resolves */ });
+    }
+
+    const flushed = {
+      type: 'event',
+      event: { stream: 'reasoning', data: { phase: 'end', summary: 'complete' } },
+    };
+    const iterator = client.stopStreamOnAbort(
+      stuckStream(),
+      controller.signal,
+      'reasoning-test',
+      () => flushed,
+    )[Symbol.asyncIterator]();
+    expect((await iterator.next()).value.event.data.phase).toBe('start');
+    const pending = iterator.next();
+    controller.abort();
+    await expect(pending).resolves.toEqual({ value: flushed, done: false });
+    await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
+  });
+
   it('keeps a non-overlapping live timing snapshot when a run aborts before done metadata', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const timings = client.createLiveRunTimings(1_000);
@@ -125,6 +151,8 @@ describe('core-agent client skill sandbox env', () => {
       workingDir: '/Users/test/Secret Project',
       extraRoots: ['/Users/test/Extra Private Root'],
       readOnlyExtraRoots: ['/Users/test/Readonly Private Root'],
+      toolList: ['workspace.read', 'web'],
+      toolSurfaceMode: 'scoped',
       toolDefs: [
         { name: 'read_file', description: 'reads files', inputSchema: {}, source: 'core-agent' },
         { name: 'dispatch_to', description: 'dispatches', inputSchema: {}, source: 'extra' },
@@ -133,7 +161,6 @@ describe('core-agent client skill sandbox env', () => {
       modelId: 'gpt-test',
       profileId: 'profile-secret-123456',
       entryId: 'entry-secret-123456',
-      elapsedConvergenceMs: 3 * 60 * 1000,
       buildDurationMs: 42,
     });
 
@@ -141,9 +168,11 @@ describe('core-agent client skill sandbox env', () => {
     expect(ctx.system_prompt_chars).toBe('private system rules'.length);
     expect(ctx.extra_root_count).toBe(1);
     expect(ctx.read_only_extra_root_count).toBe(1);
-    expect(ctx.elapsed_convergence_ms).toBe(3 * 60 * 1000);
     expect(ctx.tool_count).toBe(2);
     expect(ctx.tool_names).toEqual(['dispatch_to', 'read_file']);
+    expect(ctx.tool_list_mode).toBe('scoped');
+    expect(ctx.tool_list_count).toBe(2);
+    expect(ctx.tool_surface_mode).toBe('scoped');
     const serialized = JSON.stringify(ctx);
     expect(serialized).not.toContain('private launch plan');
     expect(serialized).not.toContain('private system rules');
@@ -155,13 +184,24 @@ describe('core-agent client skill sandbox env', () => {
     expect(serialized).not.toContain('profile-secret');
   });
 
+  it('logs the actual scoped surface even when Commander has no Agent tool_list', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const ctx = client.modelTurnContextForLog({
+      sessionId: 'gconv-new-scoped-session',
+      toolSurfaceMode: 'scoped',
+    });
+
+    expect(ctx.tool_list_mode).toBe('legacy');
+    expect(ctx.tool_surface_mode).toBe('scoped');
+  });
+
   it('preserves compound session kinds instead of truncating them at the first dash', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
 
     expect(client.modelTurnContextForLog({ sessionId: 'extract-img-private-tail' }).session_kind)
       .toBe('extract-img');
     expect(client.modelTurnContextForLog({ sessionId: 'memory-extract-private-tail' }).session_kind)
-      .toBe('memory-extract');
+      .toBe('unknown');
     expect(client.modelTurnContextForLog({ sessionId: 'private-prefix-tail' }).session_kind)
       .toBe('unknown');
   });
@@ -330,6 +370,52 @@ describe('core-agent client skill sandbox env', () => {
     expect(JSON.stringify(summary)).not.toContain('private provider body');
   });
 
+  it('counts context-gate interventions and compaction-span re-reads for run telemetry', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const stats = client.createModelRunLogDiagnostics(1000);
+
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'overflow_recovery',
+      data: { result: 'retried', foldedGroups: 2 },
+    }, 1010);
+    // A recovery that found nothing terminates the run with a context_overflow
+    // error code; counting it here would double-report the same failure.
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'overflow_recovery',
+      data: { result: 'nothing_to_recover' },
+    }, 1015);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'emergency_reduction',
+      data: { result: 'applied', foldedGroups: 1 },
+    }, 1020);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'emergency_reduction',
+      data: { result: 'nothing_to_drop' },
+    }, 1025);
+    // A run's first compaction has no measured span yet: no re-read fields.
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'active_process_compaction_start',
+      data: { groups: 2 },
+    }, 1030);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'active_process_compaction_start',
+      data: { groups: 1, readsSinceLastCompaction: 5, rereadPaths: 3, rereadIdenticalContent: 2 },
+    }, 1040);
+    client.recordModelRawEventForLog(stats, {
+      type: 'context_status', phase: 'history_summary_start',
+      data: { turns: 4, readsSinceLastCompaction: 4, rereadPaths: 1, rereadIdenticalContent: 0 },
+    }, 1050);
+
+    expect(client.summarizeModelRunForLog(stats, 1060)).toMatchObject({
+      overflowRecoveryCount: 1,
+      emergencyFoldCount: 1,
+      emergencyNoDropCount: 1,
+      rereadReads: 9,
+      rereadPaths: 4,
+      rereadIdentical: 2,
+    });
+  });
+
   it('separates host fallback activity from first model event and first usable content', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const stats = client.createModelRunLogDiagnostics(1_000);
@@ -362,13 +448,35 @@ describe('core-agent client skill sandbox env', () => {
       outcome: 'completed',
       model: 'private-model-id',
       durationMs: 70_000,
+      usage: {
+        inputTokens: 100,
+        outputTokens: 4,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 5,
+        totalTokens: 1_109,
+      },
     }, 1_240);
     client.recordModelRawEventForLog(stats, {
       type: 'provider_call',
       outcome: 'completed',
       model: 'private-model-id',
       durationMs: 500,
+      stopReason: 'tool_use',
+      textChars: 37,
+      usage: {
+        inputTokens: 120,
+        outputTokens: 5,
+        cacheReadTokens: 1_000,
+        cacheWriteTokens: 6,
+        totalTokens: 1_131,
+      },
     }, 1_250);
+    client.recordModelRawEventForLog(stats, {
+      type: 'tool_start',
+      id: 'private-call-id',
+      name: 'read_file',
+      input: { path: '/private/workspace/.agents/skills/research/SKILL.md' },
+    }, 1_300);
     client.recordModelRawEventForLog(stats, {
       type: 'tool_delta',
       id: 'private-call-id',
@@ -379,8 +487,8 @@ describe('core-agent client skill sandbox env', () => {
     const summary = client.summarizeModelRunForLog(stats, 1_500);
     expect(summary).toMatchObject({
       firstRawEventMs: 180,
-      firstModelEventMs: 400,
-      firstContentMs: 400,
+      firstModelEventMs: 300,
+      firstContentMs: 300,
       providerFallbackCount: 2,
       providerFallbackAuthCount: 1,
       providerFallbackTimeoutCount: 1,

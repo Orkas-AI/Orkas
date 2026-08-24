@@ -23,6 +23,7 @@
   --warn-text: #b45309;
   --danger: #dc2626;
   --danger-hover: #b91c1c;
+  --attention-dot-size: 4px;
   --radius-lg: 20px;
   --radius-md: 14px;
   --radius-sm: 10px;
@@ -662,13 +663,13 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   white-space: nowrap;
 }
 
-/* Unread task reply. Sidebar-only, and intentionally identical to the red
-   Settings label dot: 4px, danger red, no halo. */
+/* Unread task reply. Sidebar-only, and intentionally identical to every
+   renderer attention dot: shared size, semantic danger red, no halo. */
 .task-unread-dot {
   display: inline-block;
-  width: 4px;
-  height: 4px;
-  flex: 0 0 4px;
+  width: var(--attention-dot-size);
+  height: var(--attention-dot-size);
+  flex: 0 0 var(--attention-dot-size);
   border-radius: 999px;
   background: var(--danger);
   vertical-align: middle;
@@ -765,8 +766,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 #settings-btn.has-dot .sidebar-footer-label::after {
   content: '';
   display: inline-block;
-  width: 4px;
-  height: 4px;
+  width: var(--attention-dot-size);
+  height: var(--attention-dot-size);
   border-radius: 50%;
   background: var(--warn);
   margin-left: 6px;
@@ -3597,6 +3598,172 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: none;
 }
 
+/* AI-team grid only: a screen of filled primary "use" blocks reads as noise,
+   so inside `.agent-card` the button rests as a ghost and fills only while
+   its own card is hovered (or the button is keyboard-focused). Other reuses
+   of `.agent-card-use` (detail dialog, connector cards, project rows) render
+   a single button and keep the filled default. Rules sit after the shared
+   family so the equal-specificity disabled override below wins by order. */
+.agent-card .agent-card-use {
+  background: transparent;
+  color: var(--primary);
+  /* Resting border stays faint (matches the 0.28 translucent-primary
+     convention used elsewhere); fills below restore the solid border. */
+  border-color: rgba(91, 87, 214, 0.28);
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.agent-card:hover .agent-card-use:not(:disabled),
+.agent-card .agent-card-use:not(:disabled):focus-visible {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.agent-card .agent-card-use:not(:disabled):hover {
+  background: var(--primary-hover, #4f46e5);
+  border-color: var(--primary-hover, #4f46e5);
+  color: #fff;
+}
+.agent-card .agent-card-use:disabled,
+.agent-card .agent-card-use:disabled:hover {
+  background: transparent;
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.55);
+}
+
+/* Same ghost-until-card-hover pattern for the other card grids: skill
+   library use, connector connect/retry/use, marketplace install/update.
+   Deliberate exclusions: `.btn-danger` (disconnect) is already a quiet
+   outline button; a connector's `is-loading` connect stays filled because
+   in-progress feedback must not fade out; marketplace installed/installing
+   render as plain `.btn is-disabled`, not `.btn-primary`. Dialog buttons
+   (`.agent-dialog-btn`, `.skill-dialog-btn`, marketplace detail) sit outside
+   these card containers and keep the filled default. */
+.skill-card .skill-card-use,
+.connector-card .agent-card-use,
+.connector-card .btn-primary:not(.is-loading),
+.marketplace-card .btn-primary,
+.mp-oss-card .btn-primary {
+  background: transparent;
+  color: var(--primary);
+  border-color: rgba(91, 87, 214, 0.28);
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.skill-card:hover .skill-card-use:not(:disabled),
+.skill-card .skill-card-use:not(:disabled):focus-visible,
+.connector-card:hover .agent-card-use:not(:disabled),
+.connector-card .agent-card-use:not(:disabled):focus-visible,
+.connector-card:hover .btn-primary:not(.is-loading):not(:disabled),
+.connector-card .btn-primary:not(.is-loading):not(:disabled):focus-visible,
+.marketplace-card:hover .btn-primary:not(:disabled),
+.marketplace-card .btn-primary:not(:disabled):focus-visible,
+.mp-oss-card:hover .btn-primary:not(:disabled),
+.mp-oss-card .btn-primary:not(:disabled):focus-visible {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.skill-card .skill-card-use:not(:disabled):hover,
+.connector-card .agent-card-use:not(:disabled):hover,
+.connector-card .btn-primary:not(.is-loading):not(:disabled):hover,
+.marketplace-card .btn-primary:not(:disabled):hover,
+.mp-oss-card .btn-primary:not(:disabled):hover {
+  background: var(--primary-hover, #4f46e5);
+  border-color: var(--primary-hover, #4f46e5);
+  color: #fff;
+}
+.skill-card .skill-card-use:disabled,
+.skill-card .skill-card-use:disabled:hover,
+.connector-card .agent-card-use:disabled,
+.connector-card .agent-card-use:disabled:hover {
+  background: transparent;
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.55);
+  box-shadow: none;
+}
+
+/* AI-team grid only: a screen of filled primary "use" blocks reads as noise,
+   so inside `.agent-card` the button rests as a ghost and fills only while
+   its own card is hovered (or the button is keyboard-focused). Other reuses
+   of `.agent-card-use` (detail dialog, connector cards, project rows) render
+   a single button and keep the filled default. Rules sit after the shared
+   family so the equal-specificity disabled override below wins by order. */
+.agent-card .agent-card-use {
+  background: transparent;
+  color: var(--primary);
+  /* Resting border stays faint (matches the 0.28 translucent-primary
+     convention used elsewhere); fills below restore the solid border. */
+  border-color: rgba(91, 87, 214, 0.28);
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.agent-card:hover .agent-card-use:not(:disabled),
+.agent-card .agent-card-use:not(:disabled):focus-visible {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.agent-card .agent-card-use:not(:disabled):hover {
+  background: var(--primary-hover, #4f46e5);
+  border-color: var(--primary-hover, #4f46e5);
+  color: #fff;
+}
+.agent-card .agent-card-use:disabled,
+.agent-card .agent-card-use:disabled:hover {
+  background: transparent;
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.55);
+}
+
+/* Same ghost-until-card-hover pattern for the other card grids: skill
+   library use, connector connect/retry/use, marketplace install/update.
+   Deliberate exclusions: `.btn-danger` (disconnect) is already a quiet
+   outline button; a connector's `is-loading` connect stays filled because
+   in-progress feedback must not fade out; marketplace installed/installing
+   render as plain `.btn is-disabled`, not `.btn-primary`. Dialog buttons
+   (`.agent-dialog-btn`, `.skill-dialog-btn`, marketplace detail) sit outside
+   these card containers and keep the filled default. */
+.skill-card .skill-card-use,
+.connector-card .agent-card-use,
+.connector-card .btn-primary:not(.is-loading),
+.marketplace-card .btn-primary,
+.mp-oss-card .btn-primary {
+  background: transparent;
+  color: var(--primary);
+  border-color: rgba(91, 87, 214, 0.28);
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.skill-card:hover .skill-card-use:not(:disabled),
+.skill-card .skill-card-use:not(:disabled):focus-visible,
+.connector-card:hover .agent-card-use:not(:disabled),
+.connector-card .agent-card-use:not(:disabled):focus-visible,
+.connector-card:hover .btn-primary:not(.is-loading):not(:disabled),
+.connector-card .btn-primary:not(.is-loading):not(:disabled):focus-visible,
+.marketplace-card:hover .btn-primary:not(:disabled),
+.marketplace-card .btn-primary:not(:disabled):focus-visible,
+.mp-oss-card:hover .btn-primary:not(:disabled),
+.mp-oss-card .btn-primary:not(:disabled):focus-visible {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.skill-card .skill-card-use:not(:disabled):hover,
+.connector-card .agent-card-use:not(:disabled):hover,
+.connector-card .btn-primary:not(.is-loading):not(:disabled):hover,
+.marketplace-card .btn-primary:not(:disabled):hover,
+.mp-oss-card .btn-primary:not(:disabled):hover {
+  background: var(--primary-hover, #4f46e5);
+  border-color: var(--primary-hover, #4f46e5);
+  color: #fff;
+}
+.skill-card .skill-card-use:disabled,
+.skill-card .skill-card-use:disabled:hover,
+.connector-card .agent-card-use:disabled,
+.connector-card .agent-card-use:disabled:hover {
+  background: transparent;
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.55);
+  box-shadow: none;
+}
+
 .btn-icon-use {
   flex-shrink: 0;
   width: 26px;
@@ -4317,15 +4484,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 4px 0 0;
 }
 .quick-panel-head {
-  min-height: 26px;
+  min-height: 28px;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
 }
 .quick-panel-title {
   color: var(--text-2);
   font-size: 13px;
-  font-weight: 400;
+  font-weight: 600;
   line-height: 1.4;
   letter-spacing: 0;
   white-space: nowrap;
@@ -4360,21 +4527,21 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   grid-auto-rows: 1fr;
-  gap: 12px;
-  margin-top: 12px;
+  gap: 10px;
+  margin-top: 10px;
 }
 .new-chat-scenario-chip {
-  --card-accent: #5b57d6;
-  --card-tint: #efeeff;
   position: relative;
   min-width: 0;
-  min-height: 114px;
-  display: flex;
+  min-height: 88px;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
   align-items: center;
-  gap: 11px;
-  padding: 12px;
+  gap: 12px;
+  padding: 10px 12px;
+  overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: 10px;
   background: var(--surface);
   color: var(--text);
   text-align: left;
@@ -4384,778 +4551,32 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .new-chat-scenario-chip:hover {
   transform: translateY(-1px);
-  border-color: var(--primary);
+  border-color: rgba(91, 87, 214, 0.45);
   box-shadow: 0 10px 26px -18px rgba(91, 87, 214, .5);
 }
-.new-chat-scenario-chip[data-tone="video"] { --card-accent: #7356df; --card-tint: #f0ebff; }
-.new-chat-scenario-chip[data-tone="image"] { --card-accent: #d54883; --card-tint: #fff0f6; }
-.new-chat-scenario-chip[data-tone="ui"] { --card-accent: #7a58c8; --card-tint: #f2edff; }
-.new-chat-scenario-chip[data-tone="search"] { --card-accent: #278ac0; --card-tint: #e9f7ff; }
-.new-chat-scenario-chip[data-tone="doc"] { --card-accent: #3772d7; --card-tint: #edf3ff; }
-.new-chat-scenario-chip[data-tone="presentation"] { --card-accent: #7656d9; --card-tint: #f1edff; }
-.new-chat-scenario-chip[data-tone="code"] { --card-accent: #17846f; --card-tint: #e8f8f4; }
-.new-chat-scenario-chip[data-tone="writing"] { --card-accent: #b8731e; --card-tint: #fff1dc; }
-.quick-thumb {
-  width: 86px;
-  height: 74px;
+
+/* Keep the established neutral icon treatment at rest. Hover turns the tile
+   and card toward primary together while the dimensions stay fixed. */
+.quick-tile {
+  width: 40px;
+  height: 40px;
   flex: 0 0 auto;
-  align-self: center;
-  overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--card-accent) 14%, var(--border));
-  border-radius: 11px;
-  background: var(--surface-2);
-  box-shadow: 0 5px 14px -12px color-mix(in srgb, var(--card-accent) 55%, transparent);
-}
-.quick-thumb-art {
-  position: relative;
-  width: 100%;
-  height: 100%;
-  display: block;
-}
-
-/* Development — a compact product site rather than a generic wireframe. */
-.quick-thumb-web {
-  padding: 12px 7px 6px;
-  background: #fffdf8;
-}
-.quick-thumb-browser-bar,
-.quick-thumb-window-bar {
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 10px;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding-left: 5px;
-  background: color-mix(in srgb, var(--surface-3) 70%, white);
-}
-.quick-thumb-browser-bar i,
-.quick-thumb-window-bar i {
-  width: 2.5px;
-  height: 2.5px;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--card-accent) 45%, var(--surface-3));
-}
-.quick-thumb-web-hero {
-  position: relative;
-  height: 34px;
-  display: block;
-  padding: 7px 6px;
-  border-radius: 4px;
-  background:
-    radial-gradient(circle at 84% 32%, rgba(255,255,255,.72) 0 6px, transparent 7px),
-    linear-gradient(135deg, #d8f2df, #f5e6b9);
-}
-.quick-thumb-web-title,
-.quick-thumb-web-copy,
-.quick-thumb-web-button {
-  display: block;
-  border-radius: 99px;
-}
-.quick-thumb-web-title {
-  width: 39px;
-  height: 4px;
-  background: #315740;
-}
-.quick-thumb-web-copy {
-  width: 28px;
-  height: 2px;
-  margin-top: 4px;
-  background: rgba(49,87,64,.34);
-}
-.quick-thumb-web-button {
-  width: 18px;
-  height: 5px;
-  margin-top: 5px;
-  background: #315740;
-}
-.quick-thumb-web-menu {
-  height: 15px;
-  display: flex;
-  gap: 3px;
-  margin-top: 3px;
-}
-.quick-thumb-web-menu i {
-  flex: 1;
-  border: 1px solid #e5ddc8;
-  border-radius: 3px;
-  background: #fff;
-}
-
-/* Research — a source document under active inspection. */
-.quick-thumb-research {
-  overflow: hidden;
-  background: linear-gradient(145deg, #eef4ff, #f9fbff 68%);
-}
-.quick-thumb-paper {
-  position: absolute;
-  width: 56px;
-  height: 58px;
-  left: 8px;
-  top: 7px;
-  padding: 10px 8px;
-  border-radius: 5px;
-  background: #fff;
-  box-shadow: 0 5px 14px rgba(35,72,130,.12);
-  transform: rotate(-3deg);
-}
-.quick-thumb-paper-title,
-.quick-thumb-paper-line {
-  display: block;
-  height: 3px;
-  margin-top: 5px;
-  border-radius: 99px;
-  background: #cbd7ea;
-}
-.quick-thumb-paper-title {
-  width: 30px;
-  height: 5px;
-  margin: 0 0 8px;
-  background: #6e8fc4;
-}
-.quick-thumb-paper-line.is-wide { width: 39px; }
-.quick-thumb-paper-line.is-medium { width: 31px; }
-.quick-thumb-paper-line.is-short { width: 22px; }
-.quick-thumb-research-lens {
-  position: absolute;
-  width: 25px;
-  height: 25px;
-  right: 7px;
-  bottom: 8px;
-  border: 4px solid #567fc2;
-  border-radius: 50%;
-  background: rgba(255,255,255,.48);
-  box-shadow: 0 3px 8px rgba(53,86,137,.18);
-}
-.quick-thumb-research-lens::after {
-  content: "";
-  position: absolute;
-  width: 13px;
-  height: 4px;
-  right: -10px;
-  bottom: -5px;
-  border-radius: 99px;
-  background: #567fc2;
-  transform: rotate(46deg);
-  transform-origin: left center;
-}
-
-/* UI design — a two-panel login screen with visible component hierarchy. */
-.quick-thumb-login {
-  padding: 14px 6px 6px;
-  display: grid;
-  grid-template-columns: 42% 1fr;
-  gap: 5px;
-  background: #fbfaff;
-}
-.quick-thumb-login-visual {
-  border-radius: 5px;
-  background:
-    radial-gradient(circle at 58% 33%, rgba(255,255,255,.8) 0 7px, transparent 8px),
-    linear-gradient(145deg, #b9a4f4, #7c5bd7);
-}
-.quick-thumb-login-form {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-  padding: 2px;
-}
-.quick-thumb-login-form i {
-  display: block;
-  border-radius: 99px;
-}
-.quick-thumb-login-title {
-  width: 23px;
-  height: 5px;
-  margin-bottom: 2px;
-  background: #6d5aaa;
-}
-.quick-thumb-login-field {
-  width: 100%;
-  height: 7px;
-  border: 1px solid #ddd6f0;
-  background: #fff;
-}
-.quick-thumb-login-button {
-  width: 100%;
-  height: 7px;
-  background: #7a5bc7;
-}
-
-/* Video — a bright vertical-video frame with a real subject and timeline. */
-.quick-thumb-video {
-  overflow: hidden;
-  background: linear-gradient(145deg, #332565 0%, #754bc7 56%, #f2949f 100%);
-}
-.quick-thumb-video-glow {
-  position: absolute;
-  width: 58px;
-  height: 58px;
-  right: -14px;
-  top: -16px;
-  border-radius: 50%;
-  background: rgba(255,220,171,.35);
-  filter: blur(1px);
-}
-.quick-thumb-video-subject {
-  position: absolute;
-  width: 29px;
-  height: 41px;
-  right: 9px;
-  bottom: 8px;
-  border-radius: 14px 14px 7px 7px;
-  background: linear-gradient(180deg, #ffe0c7 0 30%, #f7f0ff 31% 100%);
-  box-shadow: 0 5px 14px rgba(29,17,63,.2);
-}
-.quick-thumb-video-subject::before {
-  content: "";
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  left: 7px;
-  top: -7px;
-  border-radius: 50%;
-  background: #ffd4b7;
-}
-.quick-thumb-play {
-  position: absolute;
-  left: 10px;
-  top: 18px;
-  width: 28px;
-  height: 28px;
   display: grid;
   place-items: center;
-  border-radius: 99px;
-  color: #563b9e;
-  background: rgba(255,255,255,.94);
-  box-shadow: 0 4px 12px rgba(25,14,63,.26);
-}
-.quick-thumb-play-icon {
-  width: 12px;
-  height: 12px;
-  margin-left: 2px;
-}
-.quick-thumb-video-caption {
-  position: absolute;
-  width: 34px;
-  height: 5px;
-  left: 8px;
-  bottom: 13px;
-  border-radius: 99px;
-  background: rgba(255,255,255,.88);
-}
-.quick-thumb-video-progress {
-  position: absolute;
-  height: 2px;
-  inset: auto 8px 6px;
-  border-radius: 99px;
-  background: rgba(255,255,255,.34);
-}
-.quick-thumb-video-progress i {
-  display: block;
-  width: 56%;
-  height: 100%;
-  border-radius: inherit;
-  background: #fff;
-}
-
-/* Office — a report card with a header, bars, and trend line. */
-.quick-thumb-chart {
-  padding: 9px 8px 7px;
-  background: linear-gradient(145deg, #f4f8ff, #fff);
-}
-.quick-thumb-chart-head {
-  height: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.quick-thumb-chart-head i,
-.quick-thumb-chart-head b {
-  display: block;
-  border-radius: 99px;
-}
-.quick-thumb-chart-head i {
-  width: 28px;
-  height: 4px;
-  background: #7e98c3;
-}
-.quick-thumb-chart-head b {
-  width: 13px;
-  height: 6px;
-  background: #dce7f8;
-}
-.quick-thumb-chart-bars {
-  position: absolute;
-  left: 9px;
-  right: 9px;
-  bottom: 8px;
-  height: 44px;
-  display: flex;
-  align-items: flex-end;
-  gap: 4px;
-}
-.quick-thumb-chart-bars i {
-  min-width: 0;
-  flex: 1;
-  border-radius: 2px 2px 0 0;
-  background: linear-gradient(180deg, #6e98da, #bcd1f1);
-}
-.quick-thumb-chart-bars i:nth-child(1) { height: 42%; }
-.quick-thumb-chart-bars i:nth-child(2) { height: 68%; }
-.quick-thumb-chart-bars i:nth-child(3) { height: 54%; }
-.quick-thumb-chart-bars i:nth-child(4) { height: 88%; }
-.quick-thumb-chart-bars i:nth-child(5) { height: 72%; }
-.quick-thumb-chart-trend {
-  position: absolute;
-  width: 48px;
-  height: 22px;
-  left: 19px;
-  bottom: 22px;
-  border-top: 2px solid #385f9c;
-  transform: rotate(-13deg);
-  opacity: .75;
-}
-
-/* Presentation — an editable deck canvas with a slide rail and data story. */
-.quick-thumb-presentation {
-  display: grid;
-  grid-template-columns: 17px 1fr;
-  gap: 5px;
-  padding: 7px;
-  background: linear-gradient(145deg, #eee9ff, #fbfaff);
-}
-.quick-thumb-presentation-rail {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.quick-thumb-presentation-rail i {
-  display: block;
-  height: 14px;
-  border: 1px solid #d6ccf5;
-  border-radius: 2px;
-  background: #fff;
-}
-.quick-thumb-presentation-rail i:first-child {
-  border-color: #7656d9;
-  box-shadow: 0 0 0 1px rgba(118, 86, 217, .12);
-}
-.quick-thumb-presentation-slide {
-  position: relative;
-  min-width: 0;
-  overflow: hidden;
-  border-radius: 4px;
-  background: #fff;
-  box-shadow: 0 4px 12px rgba(72, 49, 142, .12);
-}
-.quick-thumb-presentation-title,
-.quick-thumb-presentation-copy {
-  position: absolute;
-  left: 7px;
-  display: block;
-  border-radius: 99px;
-}
-.quick-thumb-presentation-title {
-  top: 8px;
-  width: 32px;
-  height: 5px;
-  background: #6146b7;
-}
-.quick-thumb-presentation-copy {
-  top: 17px;
-  width: 23px;
-  height: 3px;
-  background: #c7bce9;
-}
-.quick-thumb-presentation-chart {
-  position: absolute;
-  left: 7px;
-  right: 7px;
-  bottom: 7px;
-  height: 29px;
-  display: flex;
-  align-items: flex-end;
-  gap: 4px;
-  padding: 4px 5px;
-  border-radius: 3px;
-  background: #f2effb;
-}
-.quick-thumb-presentation-chart i {
-  flex: 1;
-  min-width: 0;
-  border-radius: 2px 2px 0 0;
-  background: linear-gradient(180deg, #8064db, #baa9ef);
-}
-.quick-thumb-presentation-chart i:nth-child(1) { height: 45%; }
-.quick-thumb-presentation-chart i:nth-child(2) { height: 78%; }
-.quick-thumb-presentation-chart i:nth-child(3) { height: 60%; }
-
-/* Image — a polished campaign poster with product silhouette and copy. */
-.quick-thumb-poster {
-  overflow: hidden;
-  background: linear-gradient(150deg, #ffe8f0, #f8d6df 50%, #e5d7fa);
-}
-.quick-thumb-poster-orb {
-  position: absolute;
-  width: 54px;
-  height: 54px;
-  right: -12px;
-  top: -10px;
-  border-radius: 50%;
-  background: rgba(255,255,255,.52);
-}
-.quick-thumb-poster-product {
-  position: absolute;
-  width: 24px;
-  height: 43px;
-  right: 13px;
-  bottom: 7px;
-  border-radius: 10px 10px 6px 6px;
-  background: linear-gradient(180deg, #fff 0 22%, #d95184 23% 100%);
-  box-shadow: 0 7px 13px rgba(130,43,79,.2);
-  transform: rotate(5deg);
-}
-.quick-thumb-poster-copy {
-  position: absolute;
-  left: 9px;
-  top: 15px;
-}
-.quick-thumb-poster-copy i {
-  display: block;
-  width: 34px;
-  height: 5px;
-  margin-bottom: 5px;
-  border-radius: 99px;
-  background: #843459;
-}
-.quick-thumb-poster-copy i:last-child {
-  width: 25px;
-  height: 3px;
-  background: rgba(132,52,89,.48);
-}
-.quick-thumb-poster-tag {
-  position: absolute;
-  width: 22px;
-  height: 8px;
-  left: 9px;
-  bottom: 11px;
-  border-radius: 99px;
-  background: #d54883;
-}
-
-/* Writing — an editorial social post preview. */
-.quick-thumb-article {
-  display: grid;
-  grid-template-columns: 34px 1fr;
-  gap: 6px;
-  padding: 7px;
-  background: #fffaf1;
-}
-.quick-thumb-article-cover {
-  border-radius: 5px;
-  background:
-    radial-gradient(circle at 66% 29%, rgba(255,255,255,.62) 0 7px, transparent 8px),
-    linear-gradient(150deg, #edb95d, #c87535);
-}
-.quick-thumb-article-body {
-  padding-top: 4px;
-}
-.quick-thumb-article-body i {
-  display: block;
-  border-radius: 99px;
-}
-.quick-thumb-article-kicker {
-  width: 19px;
-  height: 3px;
-  margin-bottom: 6px;
-  background: #dc9a3b;
-}
-.quick-thumb-article-title {
-  width: 35px;
-  height: 6px;
-  margin-bottom: 8px;
-  background: #80582f;
-}
-.quick-thumb-article-line {
-  width: 35px;
-  height: 3px;
-  margin-top: 5px;
-  background: #ddcbb4;
-}
-.quick-thumb-article-line.is-short { width: 25px; }
-
-/* Growth — a search result page with a visible ranking improvement. */
-.quick-thumb-seo {
-  padding: 8px;
-  background: linear-gradient(145deg, #eefaff, #fff);
-}
-.quick-thumb-search-bar {
-  height: 10px;
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0 5px;
-  border: 1px solid #cce7f3;
-  border-radius: 99px;
-  background: #fff;
-}
-.quick-thumb-search-bar i {
-  width: 4px;
-  height: 4px;
-  border: 1px solid #3992ba;
-  border-radius: 50%;
-}
-.quick-thumb-search-bar b {
-  width: 26px;
-  height: 2px;
-  border-radius: 99px;
-  background: #b9dce9;
-}
-.quick-thumb-search-result {
-  display: block;
-  width: 45px;
-  margin-top: 8px;
-}
-.quick-thumb-search-result i {
-  display: block;
-  width: 100%;
-  height: 3px;
-  margin-top: 3px;
-  border-radius: 99px;
-  background: #add5e4;
-}
-.quick-thumb-search-result i:first-child {
-  width: 30px;
-  height: 4px;
-  background: #3b8fb5;
-}
-.quick-thumb-search-result.is-second {
-  margin-top: 5px;
-  opacity: .58;
-}
-.quick-thumb-rank {
-  position: absolute;
-  right: 7px;
-  bottom: 8px;
-  width: 22px;
-  height: 31px;
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  padding: 4px;
-  border-radius: 5px;
-  background: #e1f4fa;
-}
-.quick-thumb-rank i,
-.quick-thumb-rank b,
-.quick-thumb-rank em {
-  flex: 1;
-  display: block;
-  border-radius: 1px 1px 0 0;
-  background: #42a5c7;
-}
-.quick-thumb-rank i { height: 35%; }
-.quick-thumb-rank b { height: 62%; }
-.quick-thumb-rank em { height: 92%; }
-
-/* Quick-start preview v2 — restrained document/UI thumbnails following the
-   handoff reference: white canvas, gray structure, one soft accent. */
-.quick-thumb {
-  height: 72px;
-  border-color: var(--border);
-  border-radius: 9px;
-  background: var(--surface);
-  box-shadow: none;
-}
-.quick-thumb-art { background: var(--surface); }
-.new-chat-scenario-chip[data-tone="video"] { --card-accent: #7770b6; --card-tint: #f2f1fa; }
-.new-chat-scenario-chip[data-tone="image"] { --card-accent: #b96c89; --card-tint: #fbf1f5; }
-.new-chat-scenario-chip[data-tone="ui"] { --card-accent: #756eae; --card-tint: #f2f1fa; }
-.new-chat-scenario-chip[data-tone="search"] { --card-accent: #4b879e; --card-tint: #eef7fa; }
-.new-chat-scenario-chip[data-tone="doc"] { --card-accent: #6681aa; --card-tint: #f0f4f9; }
-.new-chat-scenario-chip[data-tone="code"] { --card-accent: #527d72; --card-tint: #eef5f3; }
-.new-chat-scenario-chip[data-tone="writing"] { --card-accent: #9a7955; --card-tint: #f8f3ed; }
-.new-chat-scenario-chip:hover {
-  border-color: var(--border-strong);
-  box-shadow: 0 8px 22px -18px rgba(31, 43, 68, .28);
-}
-
-.quick-thumb-web {
-  padding: 13px 7px 6px;
-  background: #fff;
-}
-.quick-thumb-browser-bar,
-.quick-thumb-window-bar {
-  background: #f4f5f8;
-}
-.quick-thumb-browser-bar i,
-.quick-thumb-window-bar i {
-  background: #c5cad3;
-}
-.quick-thumb-web-hero {
-  height: 31px;
-  padding: 7px;
-  background: #eef0f8;
-}
-.quick-thumb-web-title { width: 36px; background: #a5adc0; }
-.quick-thumb-web-copy { width: 28px; background: #d4d9e4; }
-.quick-thumb-web-button { width: 18px; background: #c6cbea; }
-.quick-thumb-web-menu { height: 13px; }
-.quick-thumb-web-menu i { border-color: #e1e4ea; }
-
-.quick-thumb-research {
-  background: #fff;
-}
-.quick-thumb-paper {
-  width: 60px;
-  height: 54px;
-  left: 10px;
-  top: 8px;
-  padding: 9px;
-  border: 0;
-  background: #fbfcfe;
-  box-shadow: none;
-  transform: none;
-}
-.quick-thumb-paper-title { width: 28px; height: 4px; background: #aeb5c0; }
-.quick-thumb-paper-line { height: 3px; background: #dce2eb; }
-.quick-thumb-research-lens { display: none; }
-
-.quick-thumb-login {
-  padding: 14px 7px 7px;
-  grid-template-columns: 42% 1fr;
-  background: #fff;
-}
-.quick-thumb-login-visual {
-  background: #efedf9;
-}
-.quick-thumb-login-title { background: #aaa5ce; }
-.quick-thumb-login-field {
-  border-color: #e4e3eb;
-  background: #fafafd;
-}
-.quick-thumb-login-button { background: #8d87cb; }
-
-.quick-thumb-video {
-  background: #fff;
-}
-.quick-thumb-video::before {
-  content: "";
-  position: absolute;
-  inset: 8px 9px 24px;
-  border-radius: 6px;
-  background: #efedf8;
-}
-.quick-thumb-video-glow,
-.quick-thumb-video-subject { display: none; }
-.quick-thumb-play {
-  width: 24px;
-  height: 24px;
-  left: 31px;
-  top: 15px;
-  color: #7169ad;
-  background: rgba(255,255,255,.92);
-  box-shadow: none;
-}
-.quick-thumb-play-icon { width: 10px; height: 10px; }
-.quick-thumb-video-caption {
-  width: 32px;
-  height: 3px;
-  left: 9px;
-  bottom: 14px;
-  background: #d8dce6;
-}
-.quick-thumb-video-progress {
-  inset: auto 9px 7px;
-  background: #eceef3;
-}
-.quick-thumb-video-progress i { background: #918aca; }
-
-.quick-thumb-chart {
-  padding: 9px 8px 7px;
-  background: #fff;
-}
-.quick-thumb-chart-head i { background: #adb4c0; }
-.quick-thumb-chart-head b { background: #e5e9ef; }
-.quick-thumb-chart-bars i {
-  background: #bdcce5;
-}
-.quick-thumb-chart-bars i:nth-child(4) { background: #7f91d1; }
-.quick-thumb-chart-trend { display: none; }
-
-.quick-thumb-poster {
-  background: #fff;
-}
-.quick-thumb-poster-orb { display: none; }
-.quick-thumb-poster-product {
-  width: 26px;
-  height: 42px;
-  right: 10px;
-  bottom: 8px;
-  border-radius: 7px;
-  background: #f0dce5;
-  box-shadow: none;
-  transform: none;
-}
-.quick-thumb-poster-product::after {
-  content: "";
-  position: absolute;
-  inset: 13px 0 auto;
-  height: 20px;
-  border-radius: 4px;
-  background: #cb7d9a;
-}
-.quick-thumb-poster-copy { left: 9px; top: 15px; }
-.quick-thumb-poster-copy i { width: 32px; height: 4px; background: #aeb4bf; }
-.quick-thumb-poster-copy i:last-child { background: #dce1e8; }
-.quick-thumb-poster-tag {
-  width: 20px;
-  height: 6px;
-  background: #d38aa5;
-}
-
-.quick-thumb-article {
-  grid-template-columns: 26px 1fr;
-  background: #fff;
-}
-.quick-thumb-article-cover {
-  background: #f3eee7;
-}
-.quick-thumb-article-kicker { background: #b9a58c; }
-.quick-thumb-article-title { background: #aab0ba; }
-.quick-thumb-article-line { background: #dfe3e9; }
-
-.quick-thumb-seo {
-  background: #fff;
-}
-.quick-thumb-search-bar {
-  border-color: #dde6ea;
-  background: #fafcfd;
-}
-.quick-thumb-search-bar i { border-color: #7aa1b1; }
-.quick-thumb-search-bar b { background: #d7e2e7; }
-.quick-thumb-search-result i { background: #dce5e9; }
-.quick-thumb-search-result i:first-child { background: #95aeb9; }
-.quick-thumb-rank { background: #edf5f7; }
-.quick-thumb-rank i,
-.quick-thumb-rank b,
-.quick-thumb-rank em { background: #7da9ba; }
-
-.quick-icon {
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  flex: 0 0 auto;
-  border-radius: 7px;
-  color: var(--card-accent);
-  background: color-mix(in srgb, var(--card-accent) 9%, var(--surface));
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: linear-gradient(180deg, var(--surface), var(--surface-2));
+  color: var(--text-2);
+  transition: border-color .16s, background .16s, color .16s;
+}
+.new-chat-scenario-chip:hover .quick-tile {
+  border-color: rgba(91, 87, 214, 0.45);
+  background: linear-gradient(180deg, rgba(91, 87, 214, 0.03), rgba(91, 87, 214, 0.12));
+  color: var(--primary);
 }
 .new-chat-scenario-icon {
-  width: 14px;
-  height: 14px;
+  width: 20px;
+  height: 20px;
   color: currentColor;
 }
 .quick-copy {
@@ -5164,38 +4585,38 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: 1px 0;
-}
-.quick-cat {
-  min-height: 24px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  align-items: flex-start;
 }
 .quick-cat-name {
   min-width: 0;
-  font-size: 12px;
-  line-height: 1.25;
-  font-weight: 700;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.3;
+  font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .quick-task {
   display: block;
-  margin-top: 4px;
+  margin-top: 2px;
   color: var(--text);
-  font-size: 12px;
+  font-size: 13.5px;
+  font-weight: 600;
   line-height: 1.35;
+  letter-spacing: -0.005em;
   text-wrap: pretty;
 }
 .quick-deliver {
   display: block;
-  margin-top: 5px;
-  padding-top: 0;
+  max-width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
   color: var(--muted);
   font-size: 10.5px;
-  line-height: 1.25;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .quick-deliver b {
   color: var(--text-2);
@@ -6940,24 +6361,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   gap: 6px;
   margin-top: 8px;
 }
-.chat-msg-attach {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  background: rgba(255, 255, 255, 0.7);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 12px;
-  color: #475569;
-  max-width: 240px;
-}
-.chat-message.user .chat-msg-attach {
-  background: #fff;
-  border-color: rgba(37, 99, 235, 0.2);
-  color: #1e293b;
-}
-.chat-msg-attach-icon,
 .chat-msg-produced-icon {
   display: inline-flex;
   align-items: center;
@@ -6997,41 +6400,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 2px 4px;
 }
 .chat-msg-attach.is-image .chat-msg-attach-thumb { cursor: zoom-in; }
-
-/* Video attachment — inline playable. Wider than images so controls fit;
-   max-height keeps it from dominating a long bubble. */
-.chat-msg-attach.is-video {
-  box-sizing: border-box;
-  padding: 4px;
-  flex-direction: column;
-  align-items: stretch;
-  width: min(320px, 100%);
-  max-width: 100%;
-}
-.chat-msg-attach-video-shell {
-  position: relative;
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  overflow: hidden;
-  border-radius: 4px;
-  background: #000;
-  cursor: pointer;
-}
-.chat-msg-attach-video {
-  display: block;
-  width: 100%;
-  height: 100%;
-  border-radius: 0;
-  object-fit: contain;
-  background: #000;
-  cursor: pointer;
-}
-.chat-msg-attach.is-video .chat-msg-attach-label {
-  text-align: center;
-  font-size: 11px;
-  padding: 2px 4px;
-}
 
 /* Markdown-embedded media in chat bubbles — generated by utils.js
    inlineFormat from `![alt](src)`. Applies to any src (http, chat-media://,
@@ -7145,8 +6513,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .chat-md-video::-webkit-media-controls-fullscreen-button,
 .chat-md-video::-webkit-media-controls-overflow-button,
-.chat-msg-attach-video::-webkit-media-controls-fullscreen-button,
-.chat-msg-attach-video::-webkit-media-controls-overflow-button,
 .chat-file-viewer-video::-webkit-media-controls-fullscreen-button,
 .chat-file-viewer-video::-webkit-media-controls-overflow-button {
   display: none !important;
@@ -7177,6 +6543,31 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: center;
+}
+.chat-lightbox.is-loading .chat-lightbox-stage {
+  width: min(420px, 92vw);
+  height: min(280px, 92vh);
+}
+.chat-lightbox-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #e2e8f0;
+  font-size: 13px;
+  pointer-events: none;
+}
+.chat-lightbox-loading[hidden] { display: none; }
+.chat-lightbox.is-loading .chat-lightbox-img {
+  visibility: hidden;
+}
+.chat-lightbox-loading .chat-file-viewer-loading-spinner {
+  border-color: #64748b;
+  border-top-color: #60a5fa;
 }
 .chat-lightbox-img {
   display: block;
@@ -7419,6 +6810,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   transform: translateY(0);
 }
 .chat-file-viewer-body {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: auto;
@@ -7441,6 +6833,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 100%;
   border: none;
   display: block;
+}
+.chat-file-viewer-html-host {
+  width: 100%;
+  height: 100%;
 }
 .chat-file-viewer.is-html-canvas .chat-file-viewer-body {
   overflow-x: hidden;
@@ -7584,6 +6980,24 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: #64748b;
   font-size: 13px;
 }
+.chat-file-viewer-loading.is-preview-loading {
+  box-sizing: border-box;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  min-height: 240px;
+  flex-direction: column;
+  gap: 12px;
+  background: #f8fafc;
+}
+.chat-file-viewer.is-office .chat-file-viewer-loading.is-preview-loading {
+  background: #eef2f7;
+}
+.chat-file-viewer-loading-resource {
+  visibility: hidden;
+}
 
 /* Office layout generation can take a few seconds for image-heavy documents.
    Keep every preview surface visibly occupied instead of showing a blank body. */
@@ -7606,7 +7020,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-file-viewer.is-office .office-preview-loading {
   background: #eef2f7;
 }
-.office-preview-loading-spinner {
+.office-preview-loading-spinner,
+.chat-file-viewer-loading-spinner {
   width: 30px;
   height: 30px;
   border: 3px solid #cbd5e1;
@@ -7614,14 +7029,16 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 50%;
   animation: office-preview-loading-spin 0.8s linear infinite;
 }
-.office-preview-loading-label {
+.office-preview-loading-label,
+.chat-file-viewer-loading-label {
   line-height: 1.4;
 }
 @keyframes office-preview-loading-spin {
   to { transform: rotate(360deg); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .office-preview-loading-spinner { animation: none; }
+  .office-preview-loading-spinner,
+  .chat-file-viewer-loading-spinner { animation: none; }
 }
 
 /* In-app "My Apps" viewer. Uses chat-app://saved/... so multi-file app
@@ -7677,17 +7094,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   width: 100%;
   border: 0;
   background: #fff;
-}
-
-/* Attachment chips that aren't images / videos are clickable too
-   (chat-file-viewer); surface the affordance with the same hover treatment
-   as image chips. */
-.chat-msg-attach.is-clickable {
-  cursor: pointer;
-  transition: background 120ms ease;
-}
-.chat-msg-attach.is-clickable:hover {
-  background: rgba(59, 130, 246, 0.08);
 }
 
 /* User-facing deliverables live at the bottom of the assistant bubble. Each
@@ -8915,6 +8321,29 @@ body.model-not-configured .main-content { flex-direction: column; }
   .chat-share-link-row { grid-template-columns: 1fr; }
   .chat-share-link-row .btn { justify-self: end; }
 }
+
+/* Keep the shared quick-start landing usable as the application narrows. */
+@media (max-width: 1120px) {
+  .new-chat-center { padding-left: 24px; padding-right: 24px; }
+  .quick-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 620px) {
+  .new-chat-center { padding: 24px 16px 28px; }
+  .new-chat-header { padding-top: 32px; }
+  .new-chat-greeting { font-size: 30px; }
+  .new-chat-subtitle { margin-top: 6px; font-size: 15px; }
+  .new-chat-input-area { padding: 7px 14px; border-radius: 14px; }
+  .chat-bottom-bar .composer-model-chip:not(.is-compact) { max-width: 150px; }
+  .new-chat-input-area textarea,
+  .new-chat-input-area .chat-rich-editor { min-height: 80px; font-size: 16px; }
+  .new-chat-input-area .chat-input-mirror { font-size: 16px; }
+  .quick-grid { grid-template-columns: 1fr; }
+  .quick-panel-head { flex-wrap: wrap; row-gap: 4px; }
+  .quick-panel-title { min-width: 0; flex: 1 1 100%; white-space: normal; }
+  .quick-panel-more { margin-left: auto; }
+  .new-chat-scenario-chip { min-height: 88px; }
+}
 .chat-bubble-actions {
   position: relative;
   display: inline-flex;
@@ -9554,7 +8983,8 @@ body.model-not-configured .main-content { flex-direction: column; }
      1. Core    — milestones / tool calls / plans / file edits;
                   slate-500 + 500 weight. Distinguishable at a glance
                   but still a notch below the header.
-     2. Normal  — reasoning, live preview, stdout, context, meta;
+     2. Normal  — reasoning, live preview, stdout, context, meta, ordinary
+                  agent-response waiting;
                   slate-400.
                   Same as the body baseline so unrecognized lines
                   read as plain text, not "missing styling".
@@ -9575,6 +9005,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 .stream-process-line.kind-out   { color: #94a3b8; }
 .stream-process-line.kind-context { color: #94a3b8; }
 .stream-process-line.kind-meta  { color: #94a3b8; }
+.stream-process-line.kind-wait  { color: #94a3b8; }
 .stream-process-line.kind-warn  { color: #d97706; }
 .stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }
 .stream-process-line.kind-info  { color: #6366f1; }
@@ -9596,11 +9027,33 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .stream-process-line.is-continuation { padding-left: 19px; }
 
-/* Expandable tool-result row: cursor hint + subtle underline on hover.
+/* Expandable tool-result row: pointer/keyboard hint + subtle activation state.
    Used for CLI tool-event(result) rows whose full output spilled to
-   disk; click reveals a `.stream-process-line-full` <pre> sibling. */
+   disk; activation reveals a `.stream-process-line-full` <pre> sibling. */
 .stream-process-line.is-expandable { cursor: pointer; }
 .stream-process-line.is-expandable:hover { text-decoration: underline; text-decoration-color: rgba(0,0,0,0.25); }
+.stream-process-line.is-expandable:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 48%, transparent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.stream-process-expand-hint {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-top: 2px;
+  color: currentColor;
+  opacity: 0.48;
+}
+.stream-process-expand-icon {
+  width: 11px;
+  height: 11px;
+  transition: transform 120ms ease;
+}
+.stream-process-line.is-expandable:hover .stream-process-expand-hint { opacity: 0.78; }
+.stream-process-line.is-expandable[aria-expanded="true"] .stream-process-expand-icon {
+  transform: rotate(90deg);
+}
 .stream-process-line-full {
   margin: 4px 0 8px 16px;
   padding: 8px 12px;
@@ -13233,8 +12686,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 .has-dot:not(.sidebar-footer-btn)::after {
   content: '';
   display: inline-block;
-  width: 4px;
-  height: 4px;
+  width: var(--attention-dot-size);
+  height: var(--attention-dot-size);
   border-radius: 50%;
   background: var(--warn);
   margin-left: 6px;
@@ -13587,8 +13040,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .settings-lang-opt input[type="radio"] { margin: 0; }
 
-/* Mode selector — stacked radio options each with a label + description
- * (Tool Execution Access). Reuses the settings-row container; the list grows
+/* Local-operation mode selector — stacked radio options each with a label +
+ * description. Reuses the settings-row container; the list grows
  * full-width with the radios left-aligned to their text. */
 .settings-row.settings-mode-list {
   flex-direction: column;
@@ -16568,46 +16021,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .driver-badge--cli { color: #8b5cf6; background: color-mix(in srgb, #8b5cf6 12%, transparent); }
 .driver-badge--mcp { color: #10b981; background: color-mix(in srgb, #10b981 12%, transparent); }
 
-/* Public runtime styles synced from the desktop distribution. */
-.chat-msg-attach-video-float {
-  position: absolute;
-  top: 7px;
-  right: 7px;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 6px;
-  background: rgba(15, 23, 42, 0.72);
-  color: #fff;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 120ms ease, background 120ms ease, border-color 120ms ease;
-}
-.chat-msg-attach-video-shell:hover .chat-msg-attach-video-float,
-.chat-msg-attach-video-float:focus-visible {
-  opacity: 1;
-  pointer-events: auto;
-}
-.chat-msg-attach-video-float:hover,
-.chat-msg-attach-video-float:focus-visible {
-  background: rgba(15, 23, 42, 0.92);
-  border-color: rgba(255, 255, 255, 0.52);
-}
-.chat-msg-attach-video-float-svg {
-  width: 15px;
-  height: 15px;
-}
-.chat-msg-attach.is-video .chat-msg-attach-label {
-  text-align: center;
-  font-size: 11px;
-  padding: 2px 4px;
-}
-
 /* Audio attachment — inline playable, compact enough to sit inside a bubble
    without reading as a generic file chip. */
 .chat-msg-attach.is-audio {
@@ -16664,7 +16077,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 16px;
 }
 @media (hover: none) {
-  .chat-msg-attach-video-float,
   .chat-md-video-float {
     opacity: 1;
     pointer-events: auto;

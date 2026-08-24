@@ -12,6 +12,71 @@ const PNG_1X1 = Buffer.from(
 );
 
 test.describe('local HTML offline preview', () => {
+  test('keeps layout inference responsive for long HTML with blocking resource tags', async ({
+    appPage,
+    orkas,
+  }) => {
+    const blockers = Array.from({ length: 16 }, (_, index) => (
+      `<script src="./blocked-${index}.js"></script><link rel="stylesheet" href="./blocked-${index}.css">`
+    )).join('');
+    const htmlPath = orkas.createWorkspaceFile('blocking-resource-preview.html', `<!doctype html>
+<html><head>${blockers}<style>main { color: rgb(12, 34, 56); }</style></head>
+<body><main id="ready">${'preview-ready '.repeat(8_000)}</main></body></html>`);
+
+    const startedAt = Date.now();
+    await appPage.evaluate((pathValue) => {
+      void (window as any).openChatFileViewer(pathValue, 'blocking-resource-preview.html');
+    }, htmlPath);
+
+    const body = appPage.locator('.chat-file-viewer-body');
+    await expect(body).not.toHaveAttribute('aria-busy', 'true', { timeout: 5_000 });
+    const elapsedMs = Date.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(5_000);
+    const frame = appPage.locator('.chat-file-viewer-html');
+    expect(await frame.getAttribute('src')).toMatch(/^chat-media:\/\/local\//);
+    await expect(frame.contentFrame().locator('#ready')).toContainText('preview-ready');
+  });
+
+  test('keeps the file-viewer loading state visible until layout and iframe are both ready', async ({
+    appPage,
+    orkas,
+  }) => {
+    const htmlPath = orkas.createWorkspaceFile('loading-preview.html', `<!doctype html>
+<html><body><main id="ready">preview-ready</main></body></html>`);
+
+    await appPage.evaluate((pathValue) => {
+      const globals = window as any;
+      const originalLoaded = globals._viewerHtmlIframeLoaded;
+      const originalReveal = globals._viewerMaybeRevealHtml;
+      let pendingState: unknown = null;
+      let revealArgs: unknown[] | null = null;
+      globals._viewerHtmlIframeLoaded = (state: unknown) => { pendingState = state; };
+      globals._viewerMaybeRevealHtml = (...args: unknown[]) => {
+        revealArgs = args;
+        return originalReveal(...args);
+      };
+      globals.__releaseHtmlPreviewIframe = () => {
+        globals._viewerHtmlIframeLoaded = originalLoaded;
+        globals._viewerMaybeRevealHtml = originalReveal;
+        if (pendingState) originalLoaded(pendingState);
+        if (revealArgs) originalReveal(...revealArgs);
+      };
+      void (window as any).openChatFileViewer(pathValue, 'loading-preview.html');
+    }, htmlPath);
+
+    const viewer = appPage.locator('.chat-file-viewer');
+    const body = viewer.locator('.chat-file-viewer-body');
+    await expect(viewer).toHaveClass(/is-open/);
+    await expect(body).toHaveAttribute('aria-busy', 'true');
+    await expect(body.locator('.chat-file-viewer-loading')).toBeVisible();
+    await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'hidden');
+
+    await appPage.evaluate(() => (window as any).__releaseHtmlPreviewIframe());
+    await expect(body).not.toHaveAttribute('aria-busy', 'true');
+    await expect(body.locator('.chat-file-viewer-loading')).toHaveCount(0);
+    await expect(body.locator('.chat-file-viewer-html')).toHaveCSS('visibility', 'visible');
+  });
+
   test('runs self-contained code while blocking remote code, assets, connections, and navigation', async ({
     appPage,
     orkas,
@@ -49,7 +114,6 @@ test.describe('local HTML offline preview', () => {
       const localImagePath = path.join(orkas.userWorkspaceRoot, 'offline-preview-local.png');
       const htmlPath = path.join(orkas.userWorkspaceRoot, 'offline-preview.html');
       const localImageUrl = chatMediaLocalUrl(localImagePath);
-      const previewUrl = chatMediaLocalUrl(htmlPath);
 
       writeFileSync(localImagePath, PNG_1X1);
       writeFileSync(htmlPath, `<!doctype html>
@@ -103,18 +167,15 @@ test.describe('local HTML offline preview', () => {
 </body>
 </html>`);
 
-      await appPage.evaluate((url) => {
-        const frame = document.createElement('iframe');
-        frame.id = 'offline-preview-policy-test';
-        frame.setAttribute('sandbox', 'allow-scripts');
-        frame.src = url;
-        document.body.appendChild(frame);
-      }, previewUrl);
+      await appPage.evaluate((pathValue) => {
+        void (window as any).openChatFileViewer(pathValue, 'offline-preview.html');
+      }, htmlPath);
 
-      await expect.poll(() => (
-        appPage.frames().some((frame) => frame.url() === previewUrl)
-      )).toBe(true);
-      const previewFrame = appPage.frames().find((frame) => frame.url() === previewUrl);
+      const previewElement = appPage.locator('.chat-file-viewer-html');
+      await expect(previewElement).toBeVisible();
+      const previewSrc = await previewElement.getAttribute('src');
+      await expect.poll(() => appPage.frames().some((frame) => frame.url() === previewSrc)).toBe(true);
+      const previewFrame = appPage.frames().find((frame) => frame.url() === previewSrc);
       if (!previewFrame) throw new Error('Local HTML preview frame did not load');
 
       await expect.poll(async () => previewFrame.evaluate(() => {
@@ -149,7 +210,7 @@ test.describe('local HTML offline preview', () => {
         'script-src-elem',
         'style-src-elem',
       ]));
-      expect(previewFrame.url()).toBe(previewUrl);
+      expect(previewFrame.url()).toMatch(/^chat-media:\/\/local\//);
       expect(requests).toEqual([]);
     } finally {
       if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {

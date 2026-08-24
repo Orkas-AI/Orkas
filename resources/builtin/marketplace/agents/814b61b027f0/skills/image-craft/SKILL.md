@@ -3,7 +3,6 @@ ownerAgent: 814b61b027f0
 name: image-craft
 description_zh: 路线锁定后，仅为原创、改风格或视觉方向不明确的图片需求补充具体且反模板化的艺术指导；精确机械编辑或视觉体系已明确时跳过。
 description_en: After route lock, turns original, restyled, or underspecified image requests into specific anti-template art direction; skip for precise mechanical edits or already-defined visual systems.
-category: creation
 ---
 
 # Image Craft
@@ -25,7 +24,7 @@ Populate all of the following inside the canonical `image-manifest.json` templat
 
 Reject vague defaults such as “modern, premium, cinematic” unless each word is translated into visible choices. Prefer one strong thesis over a collage of styles.
 
-For a multi-image set, define this art direction once for the set instead of independently re-expanding the style for every member. Treat the first image that passes design review as the style anchor. Later images may change their subject-specific content and local composition, but must carry forward the anchor's palette roles, typography roles, spacing/grid rhythm, shape and icon language, material treatment, and signature device unless the user explicitly requests a variation.
+For a multi-image set, define this art direction once for the set instead of independently re-expanding the style for every member. Treat the first produced image as the style anchor; GENERATE and EDIT rely on the image service rather than ImageStudio post-generation review. Later images may change their subject-specific content and local composition, but must carry forward the anchor's palette roles, typography roles, spacing/grid rhythm, shape and icon language, material treatment, and signature device unless the user explicitly requests a variation.
 
 ## Prompt compiler
 

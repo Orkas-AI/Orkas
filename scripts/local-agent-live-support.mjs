@@ -270,7 +270,7 @@ function check(name, pass, detail) {
 }
 
 export function classifyCurrentHistoryReadMode(toolName, input) {
-  if (!/chat_read$/i.test(String(toolName || ''))) return null;
+  if (!/(?:chat_history|chat_read)$/i.test(String(toolName || ''))) return null;
   let args = input;
   if (typeof args === 'string') {
     try { args = JSON.parse(args); } catch { return null; }
@@ -279,10 +279,14 @@ export function classifyCurrentHistoryReadMode(toolName, input) {
   if (args.arguments && typeof args.arguments === 'object' && !Array.isArray(args.arguments)) {
     args = args.arguments;
   }
+  if (/chat_history$/i.test(String(toolName || '')) && args.action !== 'read') return null;
   if (args.scope !== undefined && args.scope !== 'current') return null;
-  if (Number(args.limit) > 10) return 'wide';
-  if (args.before_msg_index !== undefined && args.before_msg_index !== null) return 'backward';
-  if (args.msg_index !== undefined && args.msg_index !== null) return 'hit-window';
+  const page = args.page && typeof args.page === 'object' && !Array.isArray(args.page)
+    ? args.page
+    : null;
+  if (Number(page?.count ?? args.limit) > 10) return 'wide';
+  if (page?.mode === 'before' || (args.before_msg_index !== undefined && args.before_msg_index !== null)) return 'backward';
+  if (page?.mode === 'around' || (args.msg_index !== undefined && args.msg_index !== null)) return 'hit-window';
   return 'latest';
 }
 
@@ -325,14 +329,13 @@ export function scoreLocalAgentBenchmarkScenario(scenario, observation) {
     );
   } else if (scenario?.id === 'local-agent-current-history-reference') {
     const historyToolNames = (observation?.toolNames || []).map(name => String(name || ''));
-    const historyReadCount = historyToolNames.filter(
-      name => /chat_read$/i.test(name),
-    ).length;
-    const historySearchCount = historyToolNames.filter(
-      name => /chat_search$/i.test(name),
-    ).length;
     const historyReadModes = (observation?.historyReadModes || [])
       .map(mode => String(mode || ''));
+    const historyReadCount = historyReadModes.length;
+    const historyCallCount = historyToolNames.filter(
+      name => /(?:chat_history|chat_read|chat_search)$/i.test(name),
+    ).length;
+    const historySearchCount = historyCallCount - historyReadCount;
     const latestPosition = historyReadModes.indexOf('latest');
     const backwardPosition = historyReadModes.indexOf('backward');
     checks.push(

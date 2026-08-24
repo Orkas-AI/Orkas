@@ -466,8 +466,10 @@ describe('locale resource contract', () => {
         .not.toContain('read_file');
       expect(tables[lang]['chat.archive_btn'], `${lang}: Library action`)
         .toBe(tables[lang]['chat.archive_btn_title']);
-      expect(tables[lang]['chat.archive_picker_title'], `${lang}: Library picker`)
-        .toBe(tables[lang]['chat.archive_btn_title']);
+      expect(tables[lang]['kb_picker.title_global'].toLocaleLowerCase(), `${lang}: Global Library picker`)
+        .toContain(tables[lang]['contexts.transfer.global_library'].toLocaleLowerCase());
+      expect(tables[lang]['kb_picker.title_project'].toLocaleLowerCase(), `${lang}: Project Library picker`)
+        .toContain(tables[lang]['contexts.transfer.project_library'].toLocaleLowerCase());
     }
   });
 

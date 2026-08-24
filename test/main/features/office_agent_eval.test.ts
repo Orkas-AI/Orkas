@@ -18,27 +18,33 @@ const excelSkillPath = path.join(
 describe('OfficeWorker built-in agent evaluation', () => {
   it('requires one built-in creation route with native charts for a new workbook', () => {
     const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')) as {
+      description_zh: string;
+      description_en: string;
       workflow: string;
       standards: string[];
       skill_list: string[];
     };
     const excelSkill = fs.readFileSync(excelSkillPath, 'utf8');
     const standards = agent.standards.join('\n');
+    const surface = [agent.workflow, standards, excelSkill].join('\n');
 
     expect(agent.skill_list).toContain('081c15ffbab4');
-    expect(agent.workflow).toContain('Resolve existing inputs before asking for files');
-    expect(agent.workflow).toContain('call `search_files` once with a narrow extension/name query');
-    expect(agent.workflow).toContain('Never show a file-upload form or claim the source is missing before this lookup');
-    expect(agent.workflow).toContain('do not call `publish_outputs`, including with an empty `paths` list');
-    expect(standards).toContain('one literal extension-glob search');
-    expect(standards).toContain('not semantic topic words such as contract or business data');
-    expect(standards).toContain('`query: "*"` plus `include_glob`');
-    expect(standards).toContain('calling the matching built-in create tool is mandatory');
-    expect(standards).toContain('must not construct, rewrite, or patch the final Office package');
-    expect(standards).toContain('Create one file per requested artifact');
-    expect(standards).toContain('visible editable assumptions/parameters block');
-    expect(standards).toContain('native editable chart objects');
-    expect(standards).toContain('a source table or insertion instruction alone is not a chart');
+    expect(agent.workflow).toContain('Resolve attachments before asking for files');
+    expect(agent.workflow).toContain('call `search_files` once');
+    expect(agent.workflow).toContain('narrow literal extension `include_glob`');
+    expect(agent.workflow).toContain('never search by semantic topic');
+    expect(agent.workflow).toContain('publish an empty output set');
+    expect(surface).toContain('literal extension');
+    // a9ab42a49 dropped the examples and kept the prohibition, so bind the rule:
+    // an unknown source is found by extension, never by what it is about.
+    expect(surface).toMatch(/never search by semantic topic/i);
+    expect(surface).toContain('`query:*` and a narrow literal extension `include_glob`');
+    expect(surface).toContain('Calling `create_xlsx` is mandatory');
+    expect(surface).toContain('must not construct, rewrite, or patch the final `.xlsx` package');
+    expect(standards).toContain('one current final file per requested artifact');
+    expect(surface).toContain('visible editable `假设与参数` block');
+    expect(surface).toContain('native editable chart objects');
+    expect(surface).toContain('does not satisfy a chart request');
     expect(excelSkill).toContain('Calling `create_xlsx` is mandatory');
     expect(excelSkill).toContain('must not construct, rewrite, or patch the final `.xlsx` package');
     expect(excelSkill).toContain('Call `create_xlsx` exactly once');
@@ -49,5 +55,28 @@ describe('OfficeWorker built-in agent evaluation', () => {
     expect(excelSkill).toContain('does not satisfy a chart request');
     expect(excelSkill).toContain('Never plot measures with different units');
     expect(excelSkill).toContain('category/value source ranges');
+    expect(excelSkill).toContain('`artifact_path` in the latest create/edit `<office-artifact>` receipt');
+    expect(excelSkill).toContain('Do not repeat `office_review` for an unchanged `artifact_revision`');
+    expect(excelSkill).toContain('concrete blocking defect and a targeted repair');
+    expect(excelSkill).toContain('Retry publication once with an exact `eligible_current_turn_paths` entry');
+    expect(excelSkill).toContain('do not edit, review, or regenerate the workbook');
+  });
+
+  it('owns both single Word and single Excel deliverables after specialist retirement', () => {
+    const agent = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8')) as {
+      description_zh: string;
+      description_en: string;
+      workflow: string;
+      skill_list: string[];
+    };
+
+    expect(agent.description_zh).toContain('单个或多个');
+    expect(agent.description_en).toContain('one or more');
+    expect(agent.description_en).not.toContain('specialist agent for a single Word, Excel');
+    expect(agent.workflow).toContain('Single or multiple supported Office files stay here');
+    expect(agent.workflow).toContain('`office-word`');
+    expect(agent.workflow).toContain('`office-excel`');
+    expect(agent.workflow).not.toContain('`office-formatting`');
+    expect(agent.skill_list).toEqual(expect.arrayContaining(['c72c656eca12', '081c15ffbab4']));
   });
 });

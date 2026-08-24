@@ -72,8 +72,9 @@ test.describe('TTS generation lifecycle', () => {
         '#chat-history .chat-message.assistant [data-role="final"]',
         { hasText: 'E2E speech generation completed once.' },
       )).toBeVisible({ timeout: 20_000 });
-      await expect.poll(() => app.modelRequests.length).toBe(2);
-      expect(JSON.stringify(app.modelRequests[1])).toContain('Speech written to');
+      // The open build discovers generate_speech lazily through tool_load.
+      await expect.poll(() => app.modelRequests.length).toBe(3);
+      expect(JSON.stringify(app.modelRequests[2])).toContain('Speech written to');
       await expect.poll(() => existsSync(outputPath)).toBe(true);
       expect(readFileSync(outputPath)).toEqual(audio);
       expect(requests).toEqual([{
@@ -85,8 +86,8 @@ test.describe('TTS generation lifecycle', () => {
           response_format: 'mp3',
         },
       }]);
-      expect(app.modelRequests).toHaveLength(2);
-      const postToolMessages = app.modelRequests[1].messages as Array<{
+      expect(app.modelRequests).toHaveLength(3);
+      const postToolMessages = app.modelRequests[2].messages as Array<{
         role?: unknown;
         content?: unknown;
       }>;

@@ -28,6 +28,10 @@ const PER_FILE_TOKEN_TARGET = Math.floor(PER_RESULT_INLINE_TOKENS * 0.9);
 /** Exceed the trigger by enough that a small threshold change does not silently
  *  drop the run below it. */
 const AGGREGATE_PRESSURE_RATIO = 1.12;
+/** The deterministic provider reports deliberately tiny usage numbers, so the
+ *  session's estimator calibration settles at the production floor. Size the
+ *  fixture against the same calibrated trigger comparison. */
+const E2E_ESTIMATOR_CALIBRATION_FLOOR = 0.5;
 
 /** The E2E model is Orkas LLM: a 1M window, and a fixed overhead large enough
  *  to be realistic without needing the real prompt here. */
@@ -39,7 +43,10 @@ const E2E_ACTIVE_TRIGGER = contextBudget({
 const CONTEXT_PRESSURE_ROWS = pressureRowsFor(PER_FILE_TOKEN_TARGET);
 const SOURCE_COUNT = Math.max(
   3,
-  Math.ceil((E2E_ACTIVE_TRIGGER * AGGREGATE_PRESSURE_RATIO) / PER_FILE_TOKEN_TARGET),
+  Math.ceil(
+    (E2E_ACTIVE_TRIGGER * AGGREGATE_PRESSURE_RATIO)
+      / (PER_FILE_TOKEN_TARGET * E2E_ESTIMATOR_CALIBRATION_FLOOR),
+  ),
 );
 
 /** Rows needed for one fixture to reach the per-file token target, measured
@@ -65,14 +72,16 @@ function pressureRow(label: string, index: number): string {
 function assertFixturePressure(compactionCount: number): void {
   const perFile = estimateTextTokens(contextPressureFixture('KEEP01', 'E2E_CTX_KEEP01=ALPHA-1'));
   const aggregate = perFile * SOURCE_COUNT;
+  const calibratedAggregate = aggregate * E2E_ESTIMATOR_CALIBRATION_FLOOR;
   const sizing = `per-file ~${perFile} tokens x ${SOURCE_COUNT} files = ~${aggregate}; `
-    + `derived active trigger ${E2E_ACTIVE_TRIGGER}; per-result spill line ${PER_RESULT_INLINE_TOKENS}`;
+    + `calibrated aggregate ~${calibratedAggregate}; derived active trigger ${E2E_ACTIVE_TRIGGER}; `
+    + `per-result spill line ${PER_RESULT_INLINE_TOKENS}`;
   expect(
     perFile,
     `Fixture exceeds the per-result inline budget, so each read spills to disk and builds no context pressure (${sizing})`,
   ).toBeLessThan(PER_RESULT_INLINE_TOKENS);
   expect(
-    aggregate,
+    calibratedAggregate,
     `Fixture no longer exceeds the derived active trigger, so compaction cannot fire (${sizing})`,
   ).toBeGreaterThan(E2E_ACTIVE_TRIGGER);
   expect(

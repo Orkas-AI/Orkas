@@ -11,6 +11,7 @@
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 import {
   conversationLayout,
@@ -20,7 +21,8 @@ import {
 import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
-import { logErrorRef } from '../../util/log-redact';
+import { logErrorRef, logErrorSummary, maskId } from '../../util/log-redact';
+import { fileEditLock } from '../../util/locks';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
@@ -88,7 +90,6 @@ import {
 } from './router';
 import type { MarketplaceInstallRequest } from './visibility';
 import * as marketplace from '../marketplace';
-import { clearConversationHistorySummary } from './history-summary-cache';
 
 const log = createLogger('group_chat.facade');
 
@@ -114,6 +115,8 @@ export interface SendInput {
   attachments?: string[];
   use_selections?: ChatUseSelection[];
   references?: Array<{ source_cid: string; source_msg_id: string }>;
+  /** Host-owned delivery decision for the explicit queue “Send now” action. */
+  steerActiveTurn?: boolean;
 }
 
 async function _resolveMessageReferences(
@@ -242,6 +245,7 @@ export async function send(
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
   const {
     userId, cid, text, title_text, model_text, attachments, use_selections, references,
+    steerActiveTurn,
     client_msg_id,
   } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
@@ -280,6 +284,7 @@ export async function send(
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
       ...(use_selections && use_selections.length ? { use_selections } : {}),
       ...(resolvedReferences.length ? { references: resolvedReferences } : {}),
+      ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
     });
     return { ok: true, msg };
   } catch (err) {
@@ -573,6 +578,23 @@ export async function resolveFailedTurnRetry(
     interrupted,
   });
   const originalModelText = String(source.model_text || source.text || '');
+  const commanderRetry = source.commander_retry?.source_tool === 'dispatch_to'
+    ? source.commander_retry
+    : null;
+  const commanderGoal = commanderRetry && source.source_message_id
+    ? rows.find((row) => (
+        row.id === source.source_message_id
+        && !row.deleted_at
+        && !!String(row.model_text || row.text || '').trim()
+      ))
+    : undefined;
+  const commanderRetryContinuation = commanderRetry && commanderGoal
+    ? {
+        userGoal: String(commanderGoal.model_text || commanderGoal.text || '').slice(0, 6000),
+        agentTask: originalModelText.slice(0, 6000),
+        resumeInstruction: String(commanderRetry.resume_instruction || '').slice(0, 6000),
+      }
+    : undefined;
 
   return {
     ok: true,
@@ -599,6 +621,10 @@ export async function resolveFailedTurnRetry(
         failedTurnRetryMode: mode,
         retrySourceMessageId: source.id,
         retryUncertainOperationCount: recovery.uncertain_operation_count,
+        ...(commanderRetryContinuation ? {
+          source_message_id: commanderGoal!.id,
+          commanderRetryContinuation,
+        } : {}),
         ...(mode === 'resume' ? { resumeActiveTurn: true } : {}),
         ...(source.use_selections?.length ? { use_selections: source.use_selections.slice() } : {}),
         ...(mode === 'restart' && source.attachments?.length ? { attachments: source.attachments.slice() } : {}),
@@ -723,6 +749,70 @@ export interface MarkFormSubmittedInput {
   values: Record<string, unknown>;
 }
 
+type CodingProjectDirFormUpdate = {
+  projectDir: string;
+  oldDir: string;
+  oldExplicit: boolean;
+};
+
+async function _prepareCodingProjectDirFormUpdate(
+  userId: string,
+  cid: string,
+  target: GroupMessage,
+  values: Record<string, unknown>,
+): Promise<
+  { ok: true; update: CodingProjectDirFormUpdate | null }
+  | { ok: false; error: string }
+> {
+  const projectDirField = target.form?.fields.find((field) => field.id === 'project_dir');
+  if (!projectDirField || !target.form) return { ok: true, update: null };
+
+  let agentsFeat: typeof import('../agents');
+  let agent: Awaited<ReturnType<typeof import('../agents')['getAgent']>>;
+  try {
+    agentsFeat = await import('../agents');
+    agent = await agentsFeat.getAgent(target.form.agent_id);
+  } catch (err) {
+    log.warn('form-submit project directory agent lookup failed', { error: logErrorSummary(err) });
+    return { ok: false, error: t('errors.dir_not_exists') };
+  }
+  const cli = agent?.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  if (!agentsFeat.cliIsCodingAgent(cli)) return { ok: true, update: null };
+
+  // Unchanged controls may be omitted from submitted values, so resolve the
+  // effective value the same way encodeSubmission does: explicit value first,
+  // then the field default. A coding cwd is host state, not model prose; only
+  // an absolute path to an existing directory is allowed across this boundary.
+  const raw = Object.prototype.hasOwnProperty.call(values || {}, 'project_dir')
+    ? values.project_dir
+    : projectDirField.default;
+  if (typeof raw !== 'string' || !raw.trim() || !path.isAbsolute(raw.trim())) {
+    return { ok: false, error: t('errors.dir_not_exists') };
+  }
+  const projectDir = path.resolve(raw.trim());
+  try {
+    const stat = await fsp.stat(projectDir);
+    if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
+  } catch {
+    return { ok: false, error: t('errors.dir_not_exists') };
+  }
+
+  try {
+    const previous = await readState(userId, cid);
+    return {
+      ok: true,
+      update: {
+        projectDir,
+        oldDir: previous.coding_project_dir || '',
+        oldExplicit: previous.coding_project_dir_explicit === true,
+      },
+    };
+  } catch (err) {
+    log.warn('form-submit project directory state lookup failed', { error: logErrorSummary(err) });
+    return { ok: false, error: t('errors.dir_not_exists') };
+  }
+}
+
 /**
  * Mutate the message that owns this form (main jsonl + the agent's
  * visibility slice) to mark it submitted. Does **not** enqueue a follow-up
@@ -737,104 +827,20 @@ export interface MarkFormSubmittedInput {
  * forms route back to that agent; user-owned plan forms route to `@user`
  * so the executor can close the user step without waking commander.
  */
-export async function markFormSubmittedAndDispatch(
-  input: MarkFormSubmittedInput,
-): Promise<{ ok: boolean; error?: string; submission?: { text: string; agent_id: string } }> {
-  const { userId, cid, msgId, formId, values } = input;
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+type FormSubmissionResult = {
+  ok: boolean;
+  error?: string;
+  submission?: { text: string; agent_id: string };
+};
 
-  const file = mainJsonlFile(userId, cid);
-  const all = await readJsonl<GroupMessage>(file, 100_000);
-  const idx = all.findIndex((m) => m.id === msgId);
-  if (idx < 0) return { ok: false, error: 'message not found' };
-  const target = all[idx];
-  if (!target.form || target.form.form_id !== formId) return { ok: false, error: 'form id mismatch' };
-
+async function _buildFormSubmissionResult(
+  target: GroupMessage,
+  values: Record<string, unknown>,
+): Promise<FormSubmissionResult> {
+  if (!target.form) return { ok: false, error: 'form not found' };
   const agentId = target.form.agent_id;
-  const updated: ChatFormPayload = {
-    ...target.form,
-    submitted: true,
-    values,
-    submitted_at: nowIso(),
-  };
-
-  const r = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
-    if (!rec || rec.id !== msgId) return null;
-    return { ...rec, form: updated };
-  });
-  if (r.ok === false) {
-    log.warn(`form mark failed user=${userId} cid=${cid} msgId=${msgId}: ${r.error}`);
-    return { ok: false, error: r.error };
-  }
-  log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
-
-  // Expert-signals hook (plan §5 mount #4): one form_left_blank signal per
-  // field the user didn't touch (kept blank OR kept default). Fire-and-
-  // forget; failures never block the form submission.
-  (async () => {
-    try {
-      const { emitSignal } = await import('../expert_signals');
-      const { buildFormLeftBlankSignals } = await import('../expert_signals/extractors/event');
-      const signals = buildFormLeftBlankSignals({
-        cid, aid: agentId, turn_id: msgId, msg_id: msgId,
-        fields: target.form.fields as any,
-        values: (values || {}) as Record<string, unknown>,
-      });
-      for (const sig of signals) emitSignal(userId, sig);
-    } catch (err) {
-      log.warn(`expert-signals form_left_blank emit failed cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
-    }
-  })();
-
-  // Coding-agent contract: when a `project_dir` field is present in the
-  // submitted form for an external claude / codex agent, persist it to
-  // conv state so `_runCliAgentTurn` can spawn the CLI inside that
-  // directory. Other form values stay only in the message log — the
-  // agent extracts them from the encoded submission text.
-  try {
-    const projDir = values && typeof (values as any).project_dir === 'string'
-      ? String((values as any).project_dir).trim()
-      : '';
-    if (projDir) {
-      const agentsFeat = await import('../agents');
-      const ag = await agentsFeat.getAgent(agentId);
-      const cli = ag?.runtime?.kind === 'cli' ? ag.runtime.cli : '';
-      if (agentsFeat.cliIsCodingAgent(cli)) {
-        const prev = await readState(userId, cid);
-        const oldDir = prev.coding_project_dir || '';
-        await setCodingProjectDir(userId, cid, projDir, { explicit: true });
-        if (oldDir && oldDir !== projDir) {
-          // cwd is about to change — claude code's sessions are cwd-keyed,
-          // so the existing binding would fail with "No conversation
-          // found" on resume. Drop it; next dispatch starts a fresh CLI
-          // session and bridges the prior visible transcript once so the
-          // user-visible conversation continues seamlessly.
-          const cliSessions = await import('../local_agents/sessions');
-          await cliSessions.clearForConversation(userId, cid);
-          log.info(`coding cwd changed (form) user=${userId} cid=${cid} ${oldDir} → ${projDir} — cleared cli sessions`);
-        } else {
-          log.info(`coding project_dir set (explicit) user=${userId} cid=${cid} agent=${agentId} dir=${projDir}`);
-        }
-      }
-    }
-  } catch (err) {
-    log.warn(`form-submit project_dir hook failed: ${(err as Error).message}`);
-  }
-
-  const sliceFile = conversationLayout(userId, cid).visibilityFile(agentId);
-  if (fs.existsSync(sliceFile)) {
-    const slice = await readJsonl<GroupMessage>(sliceFile, 100_000);
-    const sIdx = slice.findIndex((m) => m.id === msgId);
-    if (sIdx >= 0) {
-      await rewriteJsonlLine<GroupMessage>(sliceFile, sIdx, (rec) => {
-        if (!rec || rec.id !== msgId) return null;
-        return { ...rec, form: updated };
-      });
-    }
-  }
-
   const encoded = encodeSubmission(
-    { form_id: formId, agent_id: agentId, fields: target.form.fields },
+    { form_id: target.form.form_id, agent_id: agentId, fields: target.form.fields },
     values,
   );
   // `buildMention` keeps the display name verbatim (whitespace included);
@@ -850,7 +856,10 @@ export async function markFormSubmittedAndDispatch(
       const ag = await agentsFeat.getAgent(agentId);
       if (ag && ag.name) mention = buildMention(ag.name);
     } catch (err) {
-      log.warn(`form-submit name lookup failed agent=${agentId}: ${(err as Error).message}`);
+      log.warn('form-submit name lookup failed', {
+        agent_id: maskId(agentId),
+        error: logErrorSummary(err),
+      });
     }
   }
   // Newline (not space) between the @-mention and the bullet list so the
@@ -859,6 +868,199 @@ export async function markFormSubmittedAndDispatch(
   // and gets parsed as a hyphen in prose, dropping the first field out of
   // the list and leaving subsequent bullets visually orphaned.
   return { ok: true, submission: { text: `${mention}\n${encoded}`, agent_id: agentId } };
+}
+
+async function _restoreProjectDirAfterFailedFormCommit(
+  userId: string,
+  cid: string,
+  update: CodingProjectDirFormUpdate | null,
+): Promise<void> {
+  if (!update) return;
+  try {
+    await setCodingProjectDir(userId, cid, update.oldDir, { explicit: update.oldExplicit });
+  } catch (err) {
+    log.error('form-submit project directory rollback failed', { error: logErrorSummary(err) });
+  }
+}
+
+export async function markFormSubmittedAndDispatch(
+  input: MarkFormSubmittedInput,
+): Promise<FormSubmissionResult> {
+  const { userId, cid, msgId, formId } = input;
+  const values = input.values || {};
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+
+  const file = mainJsonlFile(userId, cid);
+  // A lost HTTP response or a double click may retry the same form. Serialize
+  // the complete host-side commit so exactly one caller mutates state/session
+  // and later identical callers receive the same replay payload idempotently.
+  return fileEditLock(`${file}.form-submit`).runExclusive(async () => {
+    const all = await readJsonl<GroupMessage>(file, 100_000);
+    const idx = all.findIndex((m) => m.id === msgId);
+    if (idx < 0) return { ok: false, error: 'message not found' };
+    const target = all[idx];
+    if (!target.form || target.form.form_id !== formId) {
+      return { ok: false, error: 'form id mismatch' };
+    }
+
+    if (target.form.submitted) {
+      const storedValues = target.form.values && typeof target.form.values === 'object'
+        ? target.form.values
+        : {};
+      if (!isDeepStrictEqual(storedValues, values)) {
+        return { ok: false, error: 'form already submitted with different values' };
+      }
+      return _buildFormSubmissionResult(target, storedValues);
+    }
+
+    // Validate host-affecting form values and prepare the compatibility slice
+    // before touching state or either transcript. Invalid/stale paths and read
+    // failures therefore leave the whole operation retryable.
+    const projectDirPreparation = await _prepareCodingProjectDirFormUpdate(
+      userId,
+      cid,
+      target,
+      values,
+    );
+    if (!projectDirPreparation.ok) return projectDirPreparation;
+
+    const agentId = target.form.agent_id;
+    const sliceFile = conversationLayout(userId, cid).visibilityFile(agentId);
+    let sliceIndex = -1;
+    if (fs.existsSync(sliceFile)) {
+      try {
+        const slice = await readJsonl<GroupMessage>(sliceFile, 100_000);
+        sliceIndex = slice.findIndex((message) => message.id === msgId);
+      } catch (err) {
+        log.warn('form-submit visibility slice read failed', { error: logErrorSummary(err) });
+        return { ok: false, error: 'form submit failed' };
+      }
+    }
+
+    // Coding-agent contract: commit the validated cwd before consuming the
+    // form. A state write failure therefore has zero transcript/session side
+    // effects. If a later transcript rewrite fails, restore the prior cwd and
+    // original main record so the same form remains retryable.
+    const projectDirUpdate = projectDirPreparation.update;
+    if (projectDirUpdate) {
+      try {
+        await setCodingProjectDir(userId, cid, projectDirUpdate.projectDir, { explicit: true });
+      } catch (err) {
+        log.warn('form-submit project directory update failed', { error: logErrorSummary(err) });
+        return { ok: false, error: t('errors.dir_not_exists') };
+      }
+    }
+
+    const updated: ChatFormPayload = {
+      ...target.form,
+      submitted: true,
+      values,
+      submitted_at: nowIso(),
+    };
+    let mainUpdated = false;
+    try {
+      const mainResult = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
+        if (!rec || rec.id !== msgId || rec.form?.submitted) return null;
+        return { ...rec, form: updated };
+      });
+      if (mainResult.ok === false) throw new Error(mainResult.error);
+      mainUpdated = true;
+
+      if (sliceIndex >= 0) {
+        const sliceResult = await rewriteJsonlLine<GroupMessage>(sliceFile, sliceIndex, (rec) => {
+          if (!rec || rec.id !== msgId) return null;
+          return { ...rec, form: updated };
+        });
+        if (sliceResult.ok === false) throw new Error(sliceResult.error);
+      }
+    } catch (err) {
+      let mainRollbackFailed = false;
+      if (mainUpdated) {
+        try {
+          const rollbackResult = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => (
+            rec && rec.id === msgId ? target : null
+          ));
+          if (rollbackResult.ok === false) throw new Error(rollbackResult.error);
+        } catch (rollbackError) {
+          mainRollbackFailed = true;
+          log.error('form-submit transcript rollback failed; keeping authoritative commit', {
+            error: logErrorSummary(rollbackError),
+          });
+        }
+      }
+      if (!mainRollbackFailed) {
+        await _restoreProjectDirAfterFailedFormCommit(userId, cid, projectDirUpdate);
+        log.warn('form mark failed', { error: logErrorSummary(err) });
+        return { ok: false, error: 'form submit failed' };
+      }
+      // The main transcript is authoritative. If its rollback itself failed,
+      // report a committed submission instead of returning a false retryable
+      // error that would execute the same form twice. Repair the compatibility
+      // slice best-effort, then continue through ordinary post-commit hooks.
+      if (sliceIndex >= 0) {
+        try {
+          const sliceRepair = await rewriteJsonlLine<GroupMessage>(sliceFile, sliceIndex, (rec) => (
+            rec && rec.id === msgId ? { ...rec, form: updated } : null
+          ));
+          if (sliceRepair.ok === false) throw new Error(sliceRepair.error);
+        } catch (repairError) {
+          log.error('form-submit visibility slice repair failed', {
+            error: logErrorSummary(repairError),
+          });
+        }
+      }
+    }
+
+    if (projectDirUpdate) {
+      if (projectDirUpdate.oldDir
+          && path.resolve(projectDirUpdate.oldDir) !== projectDirUpdate.projectDir) {
+        // Session cleanup is best-effort: cwdFingerprint still guarantees the
+        // next dispatch cannot resume a binding from the old directory.
+        try {
+          const cliSessions = await import('../local_agents/sessions');
+          await cliSessions.clearForConversation(userId, cid);
+          log.info('coding project directory changed from form; cleared CLI sessions');
+        } catch (err) {
+          log.warn('coding project directory changed but session cleanup failed', {
+            error: logErrorSummary(err),
+          });
+        }
+      } else {
+        log.info('coding project directory set explicitly from form');
+      }
+    }
+
+    log.info('form submitted', {
+      user_id: maskId(userId),
+      cid: maskId(cid),
+      message_id: maskId(msgId),
+      agent_id: maskId(agentId),
+      field_count: target.form.fields.length,
+    });
+    // Expert-signals hook (plan §5 mount #4): one form_left_blank signal per
+    // field the user didn't touch. Run only after the complete commit, and
+    // never again for an idempotent response retry.
+    (async () => {
+      try {
+        const { emitSignal } = await import('../expert_signals');
+        const { buildFormLeftBlankSignals } = await import('../expert_signals/extractors/event');
+        const signals = buildFormLeftBlankSignals({
+          cid, aid: agentId, turn_id: msgId, msg_id: msgId,
+          fields: target.form!.fields as any,
+          values,
+        });
+        for (const sig of signals) emitSignal(userId, sig);
+      } catch (err) {
+        log.warn('expert-signals form_left_blank emit failed', {
+          cid: maskId(cid),
+          message_id: maskId(msgId),
+          error: logErrorSummary(err),
+        });
+      }
+    })();
+
+    return _buildFormSubmissionResult({ ...target, form: updated }, values);
+  });
 }
 
 // ── Marketplace install confirmation ────────────────────────────────────
@@ -1144,7 +1346,6 @@ export async function deleteMessages(
 
   const deletedAt = nowIso();
   await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
-  await clearConversationHistorySummary(userId, cid);
   const layout = conversationLayout(userId, cid);
   try {
     const entries = await fsp.readdir(layout.visibilityDir, { withFileTypes: true });

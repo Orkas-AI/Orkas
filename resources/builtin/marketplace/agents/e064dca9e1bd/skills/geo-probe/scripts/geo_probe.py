@@ -95,26 +95,183 @@ def context_terms(crawl_obj: dict, brand: str, domain: str, limit: int = 10) -> 
     return out
 
 
-def gen_queries(crawl_obj: dict, brand: str, competitors: list[str]) -> list[str]:
-    page, _ = _data_page(crawl_obj)
-    terms = _topic_terms(page)
-    topic = " ".join(terms[:2]) if terms else "this category"
-    qs = [
-        "What is {}?".format(brand),
-        "{} review — is it any good?".format(brand),
-        "Best {} tools".format(topic),
-        "How does {} work?".format(brand),
-    ]
-    if competitors:
-        qs.append("{} vs {}".format(brand, competitors[0]))
-    else:
-        qs.append("{} alternatives".format(brand))
-    # de-dup, keep order
+# Acronyms whose bare form means different things in different industries, so an
+# answer engine may answer for the wrong one. Only these get expanded; spelling
+# out a universally-read acronym ("Artificial Intelligence voice tools") is a
+# phrasing no real user searches.
+AMBIGUOUS_ACRONYMS = (
+    ("AEO", "Answer Engine Optimization"),
+    ("GEO", "Generative Engine Optimization"),
+    ("CRO", "Conversion Rate Optimization"),
+    ("CDP", "Customer Data Platform"),
+    ("CRM", "Customer Relationship Management"),
+    ("ERP", "Enterprise Resource Planning"),
+)
+
+_COMPARISON_RE = re.compile(r"\b(vs\.?|versus|alternatives?|compared to|better than|instead of)\b", re.I)
+_AI_CHANNEL_RE = re.compile(
+    r"\b(chatgpt|gemini|claude|perplexity|copilot|llama|grok|mistral|bard|openai|gpt-?[34-9])\b", re.I)
+# Segment words that make a vendor-listing query specific enough to track. Read
+# from the page so we never invent an industry the site has no product for.
+_SEGMENT_RE = re.compile(
+    r"\b(teams?|developers?|designers?|startups?|agencies|enterprises?|marketers?|"
+    r"founders?|students?|researchers?|writers?|creators?|analysts?|small business(?:es)?)\b", re.I)
+
+QUERY_KINDS = ("unbranded", "branded")
+
+
+def _segment_terms(page: dict, limit: int = 2) -> list[str]:
+    text = " ".join([page.get("title") or ""] + (page.get("h1s") or [])
+                    + (page.get("h2s") or []) + [page.get("first_paragraph") or ""])
     out, seen = [], set()
-    for q in qs:
-        if q not in seen:
-            seen.add(q); out.append(q)
+    for m in _SEGMENT_RE.finditer(text):
+        w = m.group(0).lower()
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+        if len(out) >= limit:
+            break
     return out
+
+
+def _topic_terms_excluding_brand(page: dict, brand: str, domain: str, limit: int = 3) -> list[str]:
+    """Topic words with the brand and domain core removed.
+
+    `_topic_terms` reads the title and H1, which is exactly where a brand name
+    lives — so the naive topic for "Orkas — multi-agent desktop app" is
+    "orkas multi-agent", and every "unbranded" query built from it silently
+    carries the brand. Caught by smoke-testing the generator before its tests.
+    """
+    drop = set(_WORD_RE.findall((brand or "").lower()))
+    core = re.sub(r"\.[a-z]{2,}$", "", (domain or "").lower())
+    drop |= set(_WORD_RE.findall(core))
+    text = " ".join([page.get("title") or ""] + (page.get("h1s") or []))
+    seen, terms = set(), []
+    for w in _WORD_RE.findall(text.lower()):
+        if len(w) > 3 and w not in _STOP and w not in drop and w not in seen:
+            seen.add(w)
+            terms.append(w)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _current_year_hint() -> str:
+    """Recency marker, as a literal year string. Probe queries are a snapshot and
+    carry no other time state."""
+    import datetime
+    return str(datetime.date.today().year)
+
+
+def filter_candidates(candidates, brand: str, domain: str) -> dict:
+    """Validate probe queries, naming a reason for every drop.
+
+    The generator below is deterministic and narrow on purpose. When the agent
+    produces richer candidates from a model, they clear the same bar — and a
+    silently dropped candidate is how a probe set quietly becomes branded again.
+    """
+    kept, rejected, seen = [], [], set()
+    brand_l = (brand or "").lower().strip()
+    core = re.sub(r"\.[a-z]{2,}$", "", (domain or "").lower().strip())
+
+    for cand in candidates or []:
+        text = (cand.get("query") if isinstance(cand, dict) else cand) or ""
+        text = str(text).strip()
+        if not text:
+            rejected.append({"query": text, "reason": "empty"})
+            continue
+        low = text.lower()
+
+        if brand_l and brand_l in low:
+            rejected.append({"query": text, "reason": 'contains brand "{}"'.format(brand)})
+            continue
+        if core and len(core) >= 4 and core in low:
+            rejected.append({"query": text, "reason": 'contains domain core "{}"'.format(core)})
+            continue
+        if low in seen:
+            rejected.append({"query": text, "reason": "duplicate"})
+            continue
+        seen.add(low)
+
+        wc = len(text.split())
+        if wc < 3:
+            rejected.append({"query": text, "reason": "too short ({} words)".format(wc)})
+            continue
+        if wc > 12:
+            rejected.append({"query": text, "reason": "too long ({} words)".format(wc)})
+            continue
+
+        bare = None
+        for abbr, expansion in AMBIGUOUS_ACRONYMS:
+            if re.search(r"\b{}\b".format(abbr), text, re.I) and expansion.lower() not in low:
+                bare = (abbr, expansion)
+                break
+        if bare:
+            rejected.append({"query": text, "reason": 'bare "{}" without "{}"'.format(*bare)})
+            continue
+
+        if _COMPARISON_RE.search(text) and _AI_CHANNEL_RE.search(text):
+            rejected.append({"query": text, "reason": "compares AI answer engines, not vendors"})
+            continue
+
+        kept.append({"query": text, "kind": "unbranded", "intent": "commercial"})
+
+    return {"kept": kept, "rejected": rejected}
+
+
+def gen_queries(crawl_obj: dict, brand: str, competitors: list[str], domain: str = "") -> list[dict]:
+    """Build the probe set, unbranded first.
+
+    A branded query cannot measure GEO visibility: asked "What is <brand>?", a
+    model names the brand by construction, so every such row scores a hit and
+    inflates share of voice. The question worth answering is whether the brand
+    is named at all in the unbranded vendor-listing queries a buyer types.
+    Branded rows stay as a labelled CONTROL — if they miss too, the problem is
+    entity recognition, not competitive position.
+
+    Returns `{query, kind, intent}` rows; `kind` drives the split in
+    `score_answers`.
+    """
+    page, _ = _data_page(crawl_obj)
+    domain = domain or (urlsplit(page.get("url") or "").hostname or "")
+    terms = _topic_terms_excluding_brand(page, brand, domain)
+    topic = " ".join(terms[:2]) if terms else "this category"
+    segments = _segment_terms(page)
+
+    unbranded = [
+        "best {} tools".format(topic),
+        "top {} software {}".format(topic, _current_year_hint()),
+    ]
+    for seg in segments:
+        unbranded.append("best {} tools for {}".format(topic, seg))
+    if competitors:
+        # Vendor-vs-vendor, not brand-vs-vendor: a query a buyer runs before
+        # they know our brand exists. "best" prefix clears the 3-word floor —
+        # bare "<competitor> alternatives" is a real query but the filter reads
+        # two words as an under-specified head term.
+        unbranded.append("best {} alternatives".format(competitors[0]))
+
+    # Generated rows clear the same bar as agent-supplied ones. Labelling a row
+    # `unbranded` is not the same as it being unbranded, and that difference is
+    # exactly the bias this change removes.
+    kept = filter_candidates(unbranded, brand, domain)["kept"]
+
+    branded = ["What is {}?".format(brand), "{} review — is it any good?".format(brand)]
+    if competitors:
+        branded.append("{} vs {}".format(brand, competitors[0]))
+
+    rows, seen = [], set()
+    for row in kept:
+        k = row["query"].lower()
+        if k not in seen:
+            seen.add(k)
+            rows.append(row)
+    for q in branded:
+        k = q.lower()
+        if k not in seen:
+            seen.add(k)
+            rows.append({"query": q, "kind": "branded", "intent": "control"})
+    return rows
 
 
 def _mentions(text: str, needle: str) -> bool:
@@ -168,6 +325,7 @@ def score_answers(payload: dict) -> dict:
             if _mentions(text, c):
                 comp_hits[c] += 1
         rows.append({"query": a.get("query"), "model": a.get("model"), "mode": mode,
+                     "kind": _answer_kind(a, brand),
                      "brand_token_present": bool(m_brand), "domain_cited": bool(m_dom),
                      "context_corroborated": (bool(corroborated) if context else None),
                      "result": kind})
@@ -175,10 +333,22 @@ def score_answers(payload: dict) -> dict:
     n = len(answers)
     brand_hits = cited_n + mentioned_n  # corroborated product mentions only
     tier = "Measured" if retrieval_n == n and n else "Estimated"
+    unbranded = _subset_metrics(rows, "unbranded")
+    branded = _subset_metrics(rows, "branded")
     return {
         "brand": brand, "domain": domain,
         "answers_scored": n, "retrieval_answers": retrieval_n,
-        "share_of_voice": round(brand_hits / n, 3),
+        # Headline metric: unbranded only. A branded query names the brand by
+        # construction, so averaging it in reports competitive position the probe
+        # never tested. Falls back to the whole set only when the probe carried no
+        # unbranded row at all, and says so in `share_of_voice_basis`.
+        "share_of_voice": (unbranded["share_of_voice"] if unbranded["answers"]
+                           else round(brand_hits / n, 3)),
+        "share_of_voice_basis": ("unbranded" if unbranded["answers"]
+                                 else "all_answers_no_unbranded_probe"),
+        "unbranded": unbranded,
+        "branded_control": branded,
+        "share_of_voice_all_answers": round(brand_hits / n, 3),
         "citation_rate": round(cited_n / n, 3),
         "brand_mentions": brand_hits, "domain_citations": cited_n,
         "ambiguous_mentions": ambiguous_n,
@@ -186,12 +356,37 @@ def score_answers(payload: dict) -> dict:
         "context_terms": context,
         "per_answer": rows,
         "data_tier": tier,
-        "note": ("share_of_voice counts only corroborated product mentions (domain cited, OR "
-                 "brand token + a page-context term); brand-token hits with no context are "
-                 "'ambiguous' (likely a homonym) and excluded. citation_rate counts sourced "
-                 "domain citations. Tier is Measured only when every answer came from a "
-                 "retrieval-capable model."),
+        "note": ("share_of_voice is measured over UNBRANDED probe rows only — a branded query "
+                 "names the brand by construction and cannot show competitive position; branded "
+                 "rows are reported separately as a control (if they miss too, the gap is entity "
+                 "recognition, not competition). A hit counts only as a corroborated product "
+                 "mention (domain cited, OR brand token + a page-context term); brand-token hits "
+                 "with no context are 'ambiguous' (likely a homonym) and excluded. citation_rate "
+                 "counts sourced domain citations. Tier is Measured only when every answer came "
+                 "from a retrieval-capable model."),
     }
+
+
+def _answer_kind(answer: dict, brand: str) -> str:
+    """Classify a scored answer's query. `kind` from the probe set wins; a payload
+    predating it (or hand-assembled) is classified by whether the query names the
+    brand, so an old answers file still gets an honest split."""
+    kind = str(answer.get("kind") or "").lower()
+    if kind in QUERY_KINDS:
+        return kind
+    q = str(answer.get("query") or "")
+    return "branded" if (brand and _mentions(q, brand)) else "unbranded"
+
+
+def _subset_metrics(rows: list[dict], kind: str) -> dict:
+    subset = [r for r in rows if r.get("kind") == kind]
+    n = len(subset)
+    if not n:
+        return {"answers": 0, "share_of_voice": 0.0, "citation_rate": 0.0}
+    hits = sum(1 for r in subset if r["result"] in ("cited", "mentioned"))
+    cited = sum(1 for r in subset if r["result"] == "cited")
+    return {"answers": n, "share_of_voice": round(hits / n, 3),
+            "citation_rate": round(cited / n, 3)}
 
 
 def _load(path):
@@ -201,8 +396,10 @@ def _load(path):
 
 def main(argv):
     ap = argparse.ArgumentParser(prog="geo-probe")
-    ap.add_argument("--op", choices=["queries", "score"], required=True)
-    ap.add_argument("--input", default=None, help="queries: seo-crawl JSON; score: answers payload (default stdin)")
+    ap.add_argument("--op", choices=["queries", "filter", "score"], required=True)
+    ap.add_argument("--input", default=None,
+                    help="queries: seo-crawl JSON; filter: {brand,domain,candidates[]}; "
+                         "score: answers payload (default stdin)")
     ap.add_argument("--brand", default=None)
     ap.add_argument("--domain", default=None)
     ap.add_argument("--competitors", default=None, help="comma-separated")
@@ -215,7 +412,15 @@ def main(argv):
         brand, domain = derive_brand_domain(crawl_obj, args.brand, args.domain)
         data = {"brand": brand, "domain": domain, "competitors": competitors,
                 "context_terms": context_terms(crawl_obj, brand, domain),
-                "queries": gen_queries(crawl_obj, brand, competitors)}
+                "queries": gen_queries(crawl_obj, brand, competitors, domain)}
+    elif args.op == "filter":
+        payload = _load(args.input)
+        brand = args.brand or payload.get("brand") or ""
+        domain = args.domain or payload.get("domain") or ""
+        res = filter_candidates(payload.get("candidates") or payload.get("queries"), brand, domain)
+        data = {"brand": brand, "domain": domain, **res,
+                "note": ("Every drop names its reason. A candidate set that silently loses its "
+                         "unbranded rows is how a probe set becomes branded again.")}
     else:
         payload = _load(args.input)
         if args.brand:

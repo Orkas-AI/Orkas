@@ -17,6 +17,28 @@ const OUTPUT_CAP_BYTES = 1024 * 1024;
 const CACHE_TTL_MS = 30_000;
 const MAX_MODELS = 200;
 const MAX_THINKING_LEVELS = 32;
+const CLAUDE_MODEL_LIST_REQUEST_ID = 'orkas-list-models';
+/** A build that answers this control request replies in well under a second;
+ * one that ignores it holds the pipe open until it is killed, so this probe
+ * gives up early instead of stalling the settings panel behind it. */
+const CLAUDE_MODEL_LIST_TIMEOUT_MS = 8_000;
+/** `--bare` keeps this capability probe from running the user's hooks, plugin
+ * sync, keychain reads and CLAUDE.md discovery, and answers in ~0.25s instead
+ * of ~1.5s. The probe never sends a user message, so no model call is billed. */
+const CLAUDE_MODEL_LIST_ARGS = [
+  '--print',
+  '--input-format', 'stream-json',
+  '--output-format', 'stream-json',
+  '--verbose',
+  '--bare',
+];
+/** Builds that answer no model list still document these `--model` aliases. */
+const CLAUDE_FALLBACK_MODELS: LocalCliModelOption[] = [
+  { id: 'sonnet', label: 'Sonnet', is_alias: true },
+  { id: 'opus', label: 'Opus', is_alias: true },
+  { id: 'haiku', label: 'Haiku', is_alias: true },
+];
+const CLAUDE_FALLBACK_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 export type LocalCliThinkingKind = 'effort' | 'thinking' | 'variant' | 'none';
 
@@ -31,6 +53,8 @@ export interface LocalCliModelOption {
   /** Stable CLI alias whose concrete provider model can change over time. */
   is_alias?: boolean;
   is_default?: boolean;
+  /** Present only when the CLI states the model takes no thinking level. */
+  supports_thinking?: boolean;
   default_thinking_level?: string;
   thinking_levels?: LocalCliThinkingOption[];
 }
@@ -39,6 +63,9 @@ export interface LocalCliRuntimeOptions {
   cli: LocalCliType;
   status: 'ready' | 'partial' | 'unavailable';
   default_model: string | null;
+  /** Concrete model the CLI's own default resolves to right now, when the CLI
+   * reports it. Selecting the default still sends no model flag. */
+  default_model_resolved: string | null;
   default_thinking_level: string | null;
   models: LocalCliModelOption[];
   thinking_kind: LocalCliThinkingKind;
@@ -96,6 +123,7 @@ function uniqueModels(values: LocalCliModelOption[]): LocalCliModelOption[] {
       label: safeLabel(value.label, id),
       ...(value.is_alias ? { is_alias: true } : {}),
       ...(value.is_default ? { is_default: true } : {}),
+      ...(value.supports_thinking === false ? { supports_thinking: false } : {}),
       ...(safeToken(value.default_thinking_level) ? {
         default_thinking_level: safeToken(value.default_thinking_level),
       } : {}),
@@ -250,6 +278,51 @@ export function mapCodexModelList(result: unknown): Pick<LocalCliRuntimeOptions,
   };
 }
 
+/** Strip the context-window variant suffix (`opus[1m]`) before comparing a
+ * selectable value with the model it currently resolves to. */
+function claudeModelBase(value: string): string {
+  return value.replace(/\[[^\]]*\]$/, '').toLocaleLowerCase('en-US');
+}
+
+export function mapClaudeModelList(result: unknown): Pick<LocalCliRuntimeOptions,
+  'models' | 'thinking_levels' | 'default_model_resolved'
+> {
+  const root = result && typeof result === 'object' ? result as any : {};
+  const rows: any[] = Array.isArray(root.models) ? root.models : [];
+  // `default` is whatever the CLI would pick on its own, which the empty
+  // override already means. Keeping the row would offer the same choice twice,
+  // so only the model it resolves to survives, as a label for that choice.
+  const defaultRow = rows.find((row: any) => safeToken(row?.value) === 'default');
+  // Only a build that advertises effort somewhere can be read as denying it on
+  // one model; a build that reports nothing leaves every model unmarked.
+  const reportsEffort = rows.some((row: any) => row?.supportsEffort === true
+    || (Array.isArray(row?.supportedEffortLevels) && row.supportedEffortLevels.length > 0));
+  const models = uniqueModels(rows
+    .filter((row: any) => safeToken(row?.value) !== 'default')
+    .map((row: any) => {
+      const id = safeToken(row?.value);
+      const resolved = safeToken(row?.resolvedModel);
+      const levels = uniqueThinking(Array.isArray(row?.supportedEffortLevels)
+        ? row.supportedEffortLevels : []);
+      return {
+        id,
+        label: safeLabel(row?.displayName, id),
+        // A value that resolves to a different model follows whatever that
+        // family points at today; a pinned model id stays on one version.
+        is_alias: !!id && !!resolved && claudeModelBase(id) !== claudeModelBase(resolved),
+        // The CLI states effort support per model, so a model that takes none
+        // must not inherit the levels its siblings advertise.
+        supports_thinking: !reportsEffort || row?.supportsEffort === true || levels.length > 0,
+        thinking_levels: levels,
+      };
+    }));
+  return {
+    models,
+    default_model_resolved: safeToken(defaultRow?.resolvedModel) || null,
+    thinking_levels: uniqueThinking(models.flatMap(model => model.thinking_levels || [])),
+  };
+}
+
 export function mapOpenclawModels(statusRaw: string, listRaw: string): {
   models: LocalCliModelOption[];
   default_model: string | null;
@@ -289,6 +362,55 @@ export function parseHermesDefaultModel(raw: string): string | null {
     if (id) return id;
   }
   return null;
+}
+
+/** Ask Claude Code for the models it can run, over the stream-json control
+ * protocol. Builds without that control request exit or stay silent, which the
+ * caller reads as "keep the documented aliases". */
+async function claudeModelList(entry: LocalCliEntry, cwd: string): Promise<unknown> {
+  if (!entry.path) return null;
+  return new Promise<unknown>((resolve) => {
+    const child = spawnCli(entry.path!, CLAUDE_MODEL_LIST_ARGS, cwd);
+    const splitter = new LineSplitter();
+    let settled = false;
+    let stdoutBytes = 0;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (value: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      killProcessTree(child, 'SIGTERM');
+      resolve(value);
+    };
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      stdoutBytes += Buffer.byteLength(String(chunk));
+      if (stdoutBytes > OUTPUT_CAP_BYTES) return finish(null);
+      splitter.push(String(chunk), line => {
+        let message: any;
+        try { message = JSON.parse(line); } catch { return; }
+        if (message?.type !== 'control_response') return;
+        const response = message.response;
+        if (response?.request_id !== CLAUDE_MODEL_LIST_REQUEST_ID) return;
+        finish(response?.subtype === 'success' ? response.response : null);
+      });
+    });
+    child.on('error', () => finish(null));
+    child.on('close', () => finish(null));
+    try {
+      child.stdin.write(`${JSON.stringify({
+        type: 'control_request',
+        request_id: CLAUDE_MODEL_LIST_REQUEST_ID,
+        request: { subtype: 'list_models' },
+      })}\n`);
+    } catch (_) {
+      finish(null);
+    }
+    if (!settled) {
+      timer = setTimeout(() => finish(null), CLAUDE_MODEL_LIST_TIMEOUT_MS);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
+  });
 }
 
 async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknown> {
@@ -345,6 +467,7 @@ function baseOptions(cli: LocalCliType): LocalCliRuntimeOptions {
     cli,
     status: 'unavailable',
     default_model: null,
+    default_model_resolved: null,
     default_thinking_level: null,
     models: [],
     thinking_kind: 'none',
@@ -360,15 +483,19 @@ async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRunt
   const out = baseOptions(entry.type);
   if (!entry.available || !entry.path) return out;
   if (entry.type === 'claude') {
-    const help = await captureCli(entry, ['--help'], cwd);
+    const [help, advertised] = await Promise.all([
+      captureCli(entry, ['--help'], cwd),
+      claudeModelList(entry, cwd).then(mapClaudeModelList),
+    ]);
     out.status = help.ok ? 'ready' : 'partial';
-    out.models = [
-      { id: 'sonnet', label: 'Sonnet', is_alias: true },
-      { id: 'opus', label: 'Opus', is_alias: true },
-      { id: 'haiku', label: 'Haiku', is_alias: true },
-    ];
+    out.models = advertised.models.length
+      ? advertised.models
+      : uniqueModels(CLAUDE_FALLBACK_MODELS);
+    out.default_model_resolved = advertised.default_model_resolved;
     out.thinking_kind = 'effort';
-    out.thinking_levels = uniqueThinking(['low', 'medium', 'high', 'xhigh', 'max']);
+    out.thinking_levels = advertised.thinking_levels.length
+      ? advertised.thinking_levels
+      : uniqueThinking(CLAUDE_FALLBACK_EFFORTS);
     out.can_select_model = help.ok && /--model\b/.test(help.stdout + help.stderr);
     out.can_select_thinking = help.ok && /--effort\b/.test(help.stdout + help.stderr);
     out.allow_custom_model = out.can_select_model;

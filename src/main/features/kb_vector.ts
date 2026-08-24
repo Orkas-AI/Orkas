@@ -38,18 +38,27 @@ function storeForUid(uid: string): vs.VecStore {
   return vs.openVecStore(kbDbDir(uid));
 }
 
+/** True when this user already has an index on disk. Reads consult it first:
+ *  `openVecStore` creates `vector.db`, so an unguarded read materialises a
+ *  Library for someone who never made one — a model `library(search)` against
+ *  an empty account did exactly that. Writes stay unguarded; creating the
+ *  store is what they are for. */
+function hasStore(uid: string): boolean {
+  return fs.existsSync(userKbVectorDbPath(uid));
+}
+
 // ── File-level CRUD ─────────────────────────────────────────────────────
 
 export function getFileByPath(uid: string, relPath: string): KbFileRow | null {
-  return storeForUid(uid).getFile(relPath);
+  return hasStore(uid) ? storeForUid(uid).getFile(relPath) : null;
 }
 
 export function findBySha1(uid: string, sha1: string): KbFileRow | null {
-  return storeForUid(uid).findBySha1(sha1);
+  return hasStore(uid) ? storeForUid(uid).findBySha1(sha1) : null;
 }
 
 export function listFiles(uid: string): KbFileRow[] {
-  return storeForUid(uid).listFiles();
+  return hasStore(uid) ? storeForUid(uid).listFiles() : [];
 }
 
 export function upsertFile(
@@ -89,7 +98,7 @@ export function deleteFile(uid: string, relPath: string): Promise<boolean> {
 // ── Search / read ──────────────────────────────────────────────────────
 
 export function search(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
-  return storeForUid(uid).search(queryVec, opts);
+  return hasStore(uid) ? storeForUid(uid).search(queryVec, opts) : [];
 }
 
 /** Query an already-built Library index without creating an empty vector
@@ -97,16 +106,17 @@ export function search(uid: string, queryVec: number[] | Float32Array, opts: KbS
  * user with no Library must stay a read-only no-op. Index creation and source
  * reconciliation remain owned by the Library indexing lifecycle. */
 export function searchExisting(uid: string, queryVec: number[] | Float32Array, opts: KbSearchOpts = {}): KbSearchHit[] {
-  if (!fs.existsSync(userKbVectorDbPath(uid))) return [];
-  return storeForUid(uid).search(queryVec, opts);
+  return search(uid, queryVec, opts);
 }
 
 export function readFileChunks(uid: string, relPath: string): Array<{ chunk_idx: number; title: string | null; content: string }> {
-  return storeForUid(uid).readFileChunks(relPath);
+  return hasStore(uid) ? storeForUid(uid).readFileChunks(relPath) : [];
 }
 
 export function statusSummary(uid: string): { total: number; ready: number; processing: number; pending: number; failed: number } {
-  return storeForUid(uid).statusSummary();
+  return hasStore(uid)
+    ? storeForUid(uid).statusSummary()
+    : { total: 0, ready: 0, processing: 0, pending: 0, failed: 0 };
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────

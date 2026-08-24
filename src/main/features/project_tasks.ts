@@ -88,7 +88,17 @@ function clampStr(v: unknown, max: number): string | undefined {
 }
 
 function canonicalOpenTaskTitle(title: string): string {
-  return title.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
+  let normalized = title.normalize('NFKC').trim();
+  const wrappingQuotes: ReadonlyArray<readonly [string, string]> = [
+    ['"', '"'], ["'", "'"], ['`', '`'], ['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'],
+  ];
+  for (const [open, close] of wrappingQuotes) {
+    if (normalized.startsWith(open) && normalized.endsWith(close)) {
+      normalized = normalized.slice(open.length, -close.length).trim();
+      break;
+    }
+  }
+  return normalized.replace(/\s+/g, ' ').toLowerCase();
 }
 
 async function withCreateLock<T>(uid: string, pid: string, fn: () => Promise<T>): Promise<T> {

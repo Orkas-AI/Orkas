@@ -8,6 +8,7 @@ import {
   buildCliSpawnEnv,
   resolveCliCommand,
 } from '../../../../src/main/features/local_agents/spawn-command';
+import { spawnCli } from '../../../../src/main/features/local_agents/backends/base';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 

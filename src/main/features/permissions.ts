@@ -25,7 +25,6 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { userLocalConfigDir, userPermissionsFile } from '../paths';
-import { nowIso } from '../storage';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 
@@ -42,17 +41,10 @@ const DEFAULT_MODE: LocalExecMode = 'all_files_approval';
 
 export interface LocalExecState {
   mode: LocalExecMode;
-  /** Kept for legacy callers. New modes all allow local execution; the mode
-   * decides filesystem breadth and approval behavior. */
-  granted: boolean;
-  grantedAt?: string;
-  revokedAt?: string;
 }
 
 interface StoredState {
   mode: LocalExecMode;
-  grantedAt?: string;
-  revokedAt?: string;
 }
 
 interface StoredFile {
@@ -99,21 +91,14 @@ function parseStoredFile(raw: string): StoredState | null {
   if (!le || typeof le !== 'object') return null;
 
   const rec = le as Record<string, unknown>;
-  const grantedAt = typeof rec.grantedAt === 'string' ? rec.grantedAt : undefined;
-  const revokedAt = typeof rec.revokedAt === 'string' ? rec.revokedAt : undefined;
-
   if (isMode(rec.mode)) {
-    return { mode: rec.mode, ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
+    return { mode: rec.mode };
   }
   if (isLegacyMode(rec.mode)) {
-    return { mode: migrateLegacyMode(rec.mode), ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
+    return { mode: migrateLegacyMode(rec.mode) };
   }
   if (typeof rec.granted === 'boolean') {
-    return {
-      mode: rec.granted ? 'all_files_approval' : 'workspace_approval',
-      ...(grantedAt ? { grantedAt } : {}),
-      ...(revokedAt ? { revokedAt } : {}),
-    };
+    return { mode: rec.granted ? 'all_files_approval' : 'workspace_approval' };
   }
   return null;
 }
@@ -182,12 +167,7 @@ function writeStored(state: StoredState): void {
 }
 
 function toPublic(state: StoredState): LocalExecState {
-  return {
-    mode: state.mode,
-    granted: true,
-    ...(state.grantedAt ? { grantedAt: state.grantedAt } : {}),
-    ...(state.revokedAt ? { revokedAt: state.revokedAt } : {}),
-  };
+  return { mode: state.mode };
 }
 
 export function getLocalExecState(): LocalExecState {
@@ -196,12 +176,6 @@ export function getLocalExecState(): LocalExecState {
 
 export function getLocalExecMode(): LocalExecMode {
   return readStored().mode;
-}
-
-/** Legacy boolean check retained for existing tool wrappers. New modes all
- * allow local execution; scope/approval is enforced separately. */
-export function getLocalExecGranted(): boolean {
-  return true;
 }
 
 export function localAccessAllowsOutsideWorkspace(mode: LocalExecMode = getLocalExecMode()): boolean {
@@ -214,25 +188,8 @@ export function localAccessRequiresSensitiveApproval(mode: LocalExecMode = getLo
 
 export function setLocalExecMode(mode: LocalExecMode): LocalExecState {
   if (!isMode(mode)) throw new Error(`invalid local-access mode: ${String(mode)}`);
-  const next: StoredState = { mode, grantedAt: nowIso() };
+  const next: StoredState = { mode };
   writeStored(next);
   log.info(`local access mode set: ${mode}`);
-  return toPublic(next);
-}
-
-// ── Back-compat helpers (legacy IPC / tests) ─────────────────────────────
-
-/** Legacy "enable" maps to the most permissive new mode, matching the old
- * explicit grant behavior of "run without asking". */
-export function grantLocalExec(): LocalExecState {
-  return setLocalExecMode('all_files_auto');
-}
-
-/** Legacy "disable" no longer exists in the product. Map it to the safest
- * available new mode. */
-export function revokeLocalExec(): LocalExecState {
-  const next: StoredState = { mode: 'workspace_approval', revokedAt: nowIso() };
-  writeStored(next);
-  log.info('legacy local execution revoke mapped to workspace_approval');
   return toPublic(next);
 }

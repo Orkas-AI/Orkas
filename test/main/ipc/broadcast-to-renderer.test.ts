@@ -6,6 +6,11 @@ const electronMocks = vi.hoisted(() => ({
     webContents: { send: ReturnType<typeof vi.fn> };
   }>,
 }));
+const captureDeliveredTaskIntervention = vi.hoisted(() => vi.fn());
+
+vi.mock('../../../src/main/util/task-intervention-events', () => ({
+  captureDeliveredTaskIntervention,
+}));
 
 vi.mock('electron', () => ({
   app: {
@@ -30,11 +35,13 @@ import { broadcastToRenderer } from '../../../src/main/ipc';
 
 beforeEach(() => {
   electronMocks.windows.length = 0;
+  captureDeliveredTaskIntervention.mockClear();
 });
 
 describe('ipc broadcastToRenderer delivery contract', () => {
   it('reports undelivered when no live renderer can show a permission prompt', () => {
-    expect(broadcastToRenderer('bash:permission', { request_id: 'req-1' })).toBe(false);
+    expect(broadcastToRenderer('bash:permission', { request_id: 'req-1', cid: 'c1' })).toBe(false);
+    expect(captureDeliveredTaskIntervention).not.toHaveBeenCalled();
   });
 
   it('skips destroyed windows and reports success after delivering to a live renderer', () => {
@@ -48,6 +55,7 @@ describe('ipc broadcastToRenderer delivery contract', () => {
     expect(broadcastToRenderer('bash:permission', { request_id: 'req-2' })).toBe(true);
     expect(destroyedSend).not.toHaveBeenCalled();
     expect(liveSend).toHaveBeenCalledWith('bash:permission', { request_id: 'req-2' });
+    expect(captureDeliveredTaskIntervention).toHaveBeenCalledOnce();
   });
 
   it('continues past a broken window and only reports success when another renderer receives it', () => {

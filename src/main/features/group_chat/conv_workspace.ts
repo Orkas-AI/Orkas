@@ -133,7 +133,7 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
  *   `state.json::workspace_dir`, return the absolute path
  *
  * **Does NOT mkdir** — the directory is materialised lazily by the producing
- * tool (write_file mkdirs parent before write; markdown_to_pdf / image gen
+ * tool (write_file mkdirs parent before write; create_pdf / image gen
  * follow the same pattern). For tools that need cwd-as-existing-directory
  * (bash via child_process.spawn), the wrapped `bash` tool mkdirs `cwd`
  * defensively before delegating. Skipping the eager mkdir here means a
