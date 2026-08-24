@@ -1897,8 +1897,6 @@
   "search.no_results": "「{query}」の結果はありません",
   "search.role.user": "自分",
   "search.role.ai": "AI",
-  "model_guard.banner": "モデルが追加されていないため、AI 機能は現在利用できません。設定でモデルアカウントを追加してください。",
-  "model_guard.cta": "設定を開く",
   "model_guard.modal": "モデルが追加されていないため、この機能は現在利用できません。\n\n設定でモデルアカウントを追加してください。",
   "marketplace.title": "マーケットプレイス",
   "marketplace.tab_agent": "エージェント",

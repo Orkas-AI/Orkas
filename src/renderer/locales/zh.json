@@ -1897,8 +1897,6 @@
   "search.no_results": "未找到「{query}」相关内容",
   "search.role.user": "我",
   "search.role.ai": "AI",
-  "model_guard.banner": "尚未添加模型，AI 功能暂不可用。请先在设置中添加模型账号。",
-  "model_guard.cta": "前往设置",
   "model_guard.modal": "尚未添加模型，暂时无法使用此功能。\n\n请先在设置中添加模型账号。",
   "marketplace.title": "官方平台",
   "marketplace.tab_agent": "智能体",

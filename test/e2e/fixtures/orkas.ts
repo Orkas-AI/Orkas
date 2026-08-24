@@ -1054,7 +1054,7 @@ export class OrkasTestApp {
             await (window as any).refreshModelGuard();
           }
         });
-        await expect(page.locator('#model-guard-banner')).toBeHidden();
+        await expect(page.locator('#model-guard-banner')).toHaveCount(0);
       }
       // Builtin Marketplace installation is intentionally deferred from the
       // renderer-ready signal. Open-build E2E cases exercise shipped agents

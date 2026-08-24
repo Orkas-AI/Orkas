@@ -147,4 +147,32 @@ test.describe('settings modules and model guard', () => {
     await expect(row).toHaveCount(0);
   });
 
+  test('keeps an empty model state quiet until an LLM action needs configuration', async ({ appPage, orkas }) => {
+    const listed = await orkas.invoke<{
+      entries: Array<{ entryId: string }>;
+    }>('auth.listEntries');
+    for (const entry of listed.entries) {
+      const removed = await orkas.invoke<{ ok: boolean; removed: boolean }>('auth.removeEntry', {
+        entryId: entry.entryId,
+      });
+      expect(removed).toMatchObject({ ok: true, removed: true });
+    }
+
+    const silentResult = await appPage.evaluate(async () => {
+      await (window as any).refreshModelGuard();
+      return (window as any).ensureModelConfigured({ silent: true });
+    });
+    expect(silentResult).toBe(false);
+    await expect(appPage.locator('#model-guard-banner')).toHaveCount(0);
+    await expect(appPage.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+
+    await appPage.locator('#new-chat-input').fill('This request needs a configured model.');
+    await appPage.locator('#new-chat-send-btn').click();
+
+    await expect(appPage.locator('#panel-settings')).toHaveClass(/\bactive\b/);
+    await expect(appPage.locator('.settings-tab[data-settings-tab="credentials"]')).toHaveClass(/\bis-active\b/);
+    await expect(appPage.locator('.ui-dialog-overlay:visible .ui-dialog')).toBeVisible();
+    await expect(appPage.locator('#conversation-list .conv-item')).toHaveCount(0);
+  });
+
 });

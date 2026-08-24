@@ -1897,8 +1897,6 @@
   "search.no_results": "No results for \"{query}\"",
   "search.role.user": "Me",
   "search.role.ai": "AI",
-  "model_guard.banner": "No model has been added. AI features are currently unavailable. Add a model account in Settings.",
-  "model_guard.cta": "Open Settings",
   "model_guard.modal": "No model has been added, so this feature is currently unavailable.\n\nAdd a model account in Settings.",
   "marketplace.title": "Marketplace",
   "marketplace.tab_agent": "Agents",

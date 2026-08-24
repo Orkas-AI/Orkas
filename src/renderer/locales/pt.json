@@ -1886,8 +1886,6 @@
   "search.no_results": "Nenhum resultado para \"{query}\"",
   "search.role.user": "Eu",
   "search.role.ai": "IA",
-  "model_guard.banner": "Nenhum modelo foi adicionado. Os recursos de IA estão indisponíveis no momento. Adicione uma conta de modelo nas Configurações.",
-  "model_guard.cta": "Abra Configurações",
   "model_guard.modal": "Nenhum modelo foi adicionado, portanto este recurso está indisponível no momento.\n\nAdicione uma conta de modelo nas Configurações.",
   "marketplace.title": "Marketplace",
   "marketplace.tab_agent": "Agentes",

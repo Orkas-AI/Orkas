@@ -2670,38 +2670,6 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   overflow: hidden;
 }
 
-/* When the model-guard banner is visible we switch main-content to a
-   vertical stack so the banner sits above the active panel instead of
-   fighting it for horizontal space. */
-body.model-not-configured .main-content { flex-direction: column; }
-
-/* Top-of-main warning banner: shown on every view except settings when
-   no (provider, model, credential) entry has been configured. CTA jumps
-   the user straight into the settings page. */
-.model-guard-banner {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 20px;
-  background: #fff7e6;
-  border-bottom: 1px solid #f0c66b;
-  color: #7a4d00;
-  font-size: 13px;
-  line-height: 1.5;
-  flex: 0 0 auto;
-}
-.model-guard-banner .model-guard-icon {
-  color: #d97706;
-  font-size: 14px;
-  line-height: 1;
-}
-.model-guard-banner .model-guard-text { flex: 1; }
-.model-guard-banner .model-guard-cta { flex: 0 0 auto; }
-
-/* Hide the banner when the user is already on the settings page (they're
-   at the fix spot anyway). Uses :has() — Electron's Chromium supports it. */
-.main-content:has(#panel-settings.active) .model-guard-banner { display: none !important; }
-
 .panel {
   display: none;
   flex: 1;

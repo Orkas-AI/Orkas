@@ -84,7 +84,7 @@ test.describe('desktop shell', () => {
     ))).toBe(true);
     const model = await orkas.invoke<{ configured: boolean }>('auth.hasConfiguredModel');
     expect(model.configured).toBe(true);
-    await expect(appPage.locator('#model-guard-banner')).toBeHidden();
+    await expect(appPage.locator('#model-guard-banner')).toHaveCount(0);
 
     const openBuildEnvironment = await appPage.evaluate(async () => {
       const env = await (window as any).orkas.env();
