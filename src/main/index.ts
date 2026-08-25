@@ -194,7 +194,10 @@ import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as taskNotifications from './features/task_notifications';
 import * as notificationPermissions from './features/notification_permissions';
-import { startOpenLifecycleTracking } from './features/open_lifecycle';
+import {
+  startOpenLifecycleTracking,
+  type OpenLifecycleTracking,
+} from './features/open_lifecycle';
 import {
   consumeColdLaunchConnectorCallback,
   registerConnectorProtocol,
@@ -205,6 +208,7 @@ import * as windowState from './features/window_state';
 // through the open server bridge.
 
 let windowsTaskBadgeIcon: ReturnType<typeof nativeImage.createFromDataURL> | null = null;
+let openLifecycleTracking: OpenLifecycleTracking | null = null;
 
 function setTaskNotificationBadgeCount(count: number): void {
   const normalized = Math.max(0, Math.trunc(count));
@@ -421,7 +425,7 @@ function registerIpc(): void {
     // crashes immediately due to missing packages. The shell script receives
     // this process as its explicit owner, waits for it to exit, then starts the
     // replacement without touching any other Electron process.
-    ipcMain.handle('orkas.relaunch', () => {
+    ipcMain.handle('orkas.relaunch', async () => {
       const isWindows = process.platform === 'win32';
       const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
       const resolved = isWindows
@@ -444,6 +448,7 @@ function registerIpc(): void {
       });
       child.unref();
       log.info('relaunch via shell script');
+      await openLifecycleTracking?.flushQuit();
       app.exit(0);
       return { ok: true };
     });
@@ -1338,7 +1343,7 @@ if (!gotLock) {
     }, CONNECTORS_BOOTSTRAP_DELAY_MS);
     connectorsTimer.unref?.();
     createWindow();
-    const stopOpenLifecycleTracking = startOpenLifecycleTracking({
+    openLifecycleTracking = startOpenLifecycleTracking({
       app,
       getActiveUserId: () => users.getActiveUserId(),
       hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
@@ -1348,7 +1353,10 @@ if (!gotLock) {
       // write production analytics. Normal source and packaged runs behave alike.
       enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
     });
-    app.once('will-quit', stopOpenLifecycleTracking);
+    app.once('will-quit', () => {
+      openLifecycleTracking?.stop();
+      openLifecycleTracking = null;
+    });
     await consumeColdLaunchConnectorCallback();
 
     // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
@@ -1433,12 +1441,16 @@ if (!gotLock) {
   app.on('before-quit', async (e) => {
     if (shutdownFlushed) return;
     e.preventDefault();
+    // Begin the network request before slower disk cleanup and do not release
+    // the Electron process until Server has acknowledged the lifecycle request.
+    const lifecycleFlush = openLifecycleTracking?.flushQuit();
     try { await searchFeature.flushAll(); }
     catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
     try {
       const kb = await import('./features/kb_vector');
       kb.closeAllKb();
     } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
+    await lifecycleFlush;
     shutdownFlushed = true;
     app.quit();
   });

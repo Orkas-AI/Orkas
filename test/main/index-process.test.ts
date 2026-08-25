@@ -40,6 +40,7 @@ describe('main process child-process ownership', () => {
     expect(relaunchBlock).toContain('windowsVerbatimArguments: resolved.windowsVerbatimArguments');
     expect(relaunchBlock).toContain('env: childEnv');
     expect(relaunchBlock).toContain('child.unref()');
+    expect(relaunchBlock).toContain('await openLifecycleTracking?.flushQuit()');
 
     const shellLauncher = fs.readFileSync(
       path.resolve(process.cwd(), 'run.sh'),

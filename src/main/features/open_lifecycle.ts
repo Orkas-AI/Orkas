@@ -26,10 +26,15 @@ interface StartOptions {
   getActiveUserId: () => string;
   hasFocusedWindow: () => boolean;
   enabled?: boolean;
-  emit?: (record: OpenLifecycleRecord) => void;
+  emit?: (record: OpenLifecycleRecord) => void | Promise<void>;
   setTimer?: typeof setTimeout;
   clearTimer?: typeof clearTimeout;
   blurSettleMs?: number;
+}
+
+export interface OpenLifecycleTracking {
+  stop: () => void;
+  flushQuit: () => Promise<void>;
 }
 
 const log = createLogger('open-lifecycle');
@@ -52,12 +57,12 @@ export function openLifecycleRequestBody(
   return { uid, event: record.event, trigger: record.trigger };
 }
 
-export function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): void {
+export async function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): Promise<void> {
   if (!safeId(uid) || uid.length > 50) {
     warnTransport('lifecycle event skipped because the active uid is invalid', { reason: 'invalid_uid' });
     return;
   }
-  void (async () => {
+  try {
     const response = await fetchWithRetry(
       'open-lifecycle',
       `${apiBase()}/analytics/open-app-lifecycle`,
@@ -81,49 +86,75 @@ export function reportOpenLifecycle(uid: string, record: OpenLifecycleRecord): v
       return;
     }
     await response.body?.cancel().catch(() => {});
-  })().catch((error) => {
+  } catch (error) {
     warnTransport('lifecycle event delivery failed', { error: logErrorRef(error) });
-  });
+  }
 }
 
 export class OpenLifecycleState {
   private started = false;
   private foreground = false;
+  private quitReported = false;
 
-  constructor(private readonly emit: (record: OpenLifecycleRecord) => void) {}
+  constructor(private readonly emit: (
+    record: OpenLifecycleRecord,
+  ) => void | Promise<void>) {}
 
-  start(): void {
+  start(): void | Promise<void> {
     if (this.started) return;
     this.started = true;
     this.foreground = true;
-    this.emit({ event: 'enter', trigger: 'cold_start' });
+    return this.emit({ event: 'enter', trigger: 'cold_start' });
   }
 
-  enterForeground(): void {
-    if (!this.started || this.foreground) return;
+  enterForeground(): void | Promise<void> {
+    if (!this.started || this.foreground || this.quitReported) return;
     this.foreground = true;
-    this.emit({ event: 'enter', trigger: 'foreground' });
+    return this.emit({ event: 'enter', trigger: 'foreground' });
   }
 
-  leaveForeground(trigger: 'background' | 'quit'): void {
-    if (!this.started || !this.foreground) return;
+  leaveForeground(trigger: 'background' | 'quit'): void | Promise<void> {
+    if (!this.started || this.quitReported) return;
+    if (trigger === 'quit') {
+      // A process exit is a terminal application event, not another focus
+      // transition. macOS commonly blurs the last window before before-quit;
+      // suppressing quit in that state made real exits disappear entirely.
+      this.quitReported = true;
+      this.foreground = false;
+      return this.emit({ event: 'leave', trigger });
+    }
+    if (!this.foreground) return;
     this.foreground = false;
-    this.emit({ event: 'leave', trigger });
+    return this.emit({ event: 'leave', trigger });
   }
 }
 
-export function startOpenLifecycleTracking(options: StartOptions): () => void {
-  if (options.enabled === false) return () => {};
+export function startOpenLifecycleTracking(options: StartOptions): OpenLifecycleTracking {
+  if (options.enabled === false) {
+    return {
+      stop: () => {},
+      flushQuit: async () => {},
+    };
+  }
   const setTimer = options.setTimer || setTimeout;
   const clearTimer = options.clearTimer || clearTimeout;
-  const state = new OpenLifecycleState(options.emit || ((record) => {
+  const deliver = (record: OpenLifecycleRecord): Promise<void> => {
     try {
-      reportOpenLifecycle(options.getActiveUserId(), record);
+      return Promise.resolve(
+        options.emit
+          ? options.emit(record)
+          : reportOpenLifecycle(options.getActiveUserId(), record),
+      ).catch((error) => {
+        warnTransport('lifecycle event delivery failed', { error: logErrorRef(error) });
+      });
     } catch (error) {
       warnTransport('lifecycle event preparation failed', { error: logErrorRef(error) });
+      return Promise.resolve();
     }
-  }));
+  };
+  const state = new OpenLifecycleState(deliver);
   let blurTimer: ReturnType<typeof setTimeout> | null = null;
+  let quitDelivery: Promise<void> | null = null;
 
   const cancelBlurTimer = () => {
     if (blurTimer === null) return;
@@ -141,20 +172,30 @@ export function startOpenLifecycleTracking(options: StartOptions): () => void {
       if (!options.hasFocusedWindow()) state.leaveForeground('background');
     }, options.blurSettleMs ?? BLUR_SETTLE_MS);
   };
-  const onBeforeQuit = () => {
+  const flushQuit = (): Promise<void> => {
     cancelBlurTimer();
-    state.leaveForeground('quit');
+    if (!quitDelivery) {
+      quitDelivery = Promise.resolve(state.leaveForeground('quit'));
+    }
+    return quitDelivery;
+  };
+  const onBeforeQuit = () => {
+    // The main shutdown barrier awaits the same promise. Starting it here
+    // keeps this module correct for callers with their own quit sequence too.
+    void flushQuit();
   };
 
   options.app.on('browser-window-focus', onFocus);
   options.app.on('browser-window-blur', onBlur);
   options.app.on('before-quit', onBeforeQuit);
-  state.start();
+  void state.start();
 
-  return () => {
+  const stop = () => {
     cancelBlurTimer();
     options.app.off('browser-window-focus', onFocus);
     options.app.off('browser-window-blur', onBlur);
     options.app.off('before-quit', onBeforeQuit);
   };
+
+  return { stop, flushQuit };
 }
