@@ -1,6 +1,8 @@
 import * as crypto from 'crypto';
 import * as path from 'path';
 
+import { sanitizeLogTextForUpload } from './log-sanitize';
+
 const MAX_LOG_MESSAGE_LEN = 240;
 
 export function maskId(value: unknown): string {
@@ -59,7 +61,9 @@ export function logRenameRef(from: unknown, to: unknown): Record<string, unknown
 }
 
 export function sanitizeLogText(value: unknown): string {
-  let text = String(value ?? '');
+  // Keep this helper safe when it is used before the central logger hook is
+  // initialized (for example in focused tests and startup error paths).
+  let text = sanitizeLogTextForUpload(String(value ?? ''));
   text = text.replace(/cloud\/[^\s'",)]+/g, (m) => `<cloud-path:${hashForLog(m)}>`);
   text = text.replace(/\/sync\/[A-Za-z0-9_/-]+/g, (m) => m.split('?')[0]);
   text = text.replace(/https?:\/\/[^\s'",)]+/g, (m) => safeUrlAction(m));
