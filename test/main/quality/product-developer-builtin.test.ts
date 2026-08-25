@@ -64,12 +64,12 @@ describe('ProductDeveloper builtin contract', () => {
       fs.readFileSync(path.join(agentDir, '_meta.json'), 'utf8'),
     ).reseed_if_deleted_before)).not.toBeNaN();
 
-    for (const [id, dir, expectedVersionDelta] of [
-      ['68fb048b85cb', productDevDir, 1],
-      ['9b1241732f3a', productTestDir, 0],
-      ['fc125b9df078', productUiDir, 1],
-      ['88aca13869d9', githubDir, 1],
-      ['b1f384166705', swiftuiDir, 0],
+    for (const [id, dir] of [
+      ['68fb048b85cb', productDevDir],
+      ['9b1241732f3a', productTestDir],
+      ['fc125b9df078', productUiDir],
+      ['88aca13869d9', githubDir],
+      ['b1f384166705', swiftuiDir],
     ] as const) {
       const meta = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf8'));
       expect(meta.version, id).toMatch(/^\d+\.\d+\.\d+$/);
