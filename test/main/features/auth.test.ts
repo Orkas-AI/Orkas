@@ -950,6 +950,50 @@ describe('auth › listModels', () => {
       'gpt-5.4',
     ]);
   });
+
+  it('exposes and saves only configured models resolvable by this runtime', async () => {
+    const { clientConfig } = await import('../../../src/main/features/client_config');
+    const a = await import('../../../src/main/features/auth');
+    const exact = { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' };
+    const templated = {
+      id: 'claude-open-future-999',
+      name: 'Claude Future',
+      template: 'claude-opus-4-8',
+      supportsVision: true,
+    };
+    const unresolved = { id: 'brand-new-open-999', name: 'Brand New' };
+    clientConfig.applyServerPayload({
+      immediate: {
+        model_catalog: {
+          providers: { anthropic: [exact, templated, unresolved] },
+        },
+      },
+      restart: {},
+      config_hash: 'sha256:runtime-model-resolution',
+    }, '"runtime-model-resolution"');
+
+    expect((await a.listModels('anthropic')).models.map((model) => model.id)).toEqual([
+      exact.id,
+      templated.id,
+    ]);
+    await expect(a.addApiKeyEntry(
+      'anthropic',
+      unresolved.id,
+      'sk-unresolved-must-not-save-xxxxxxxx',
+    )).rejects.toMatchObject({ code: 'MODEL_NOT_AVAILABLE' });
+    expect((await a.listProviders()).providers
+      .find((provider) => provider.id === 'anthropic')?.profiles).toEqual([]);
+
+    const added = await a.addApiKeyEntry(
+      'anthropic',
+      templated.id,
+      'sk-templated-model-xxxxxxxx',
+    );
+    expect((await a.pickChatEntryGroup())[0]).toMatchObject({
+      entryId: added.entryId,
+      model: templated.id,
+    });
+  });
 });
 
 describe('auth › DeepSeek policy gate', () => {

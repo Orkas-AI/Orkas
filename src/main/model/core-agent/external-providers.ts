@@ -41,6 +41,7 @@ import type { Model } from '@earendil-works/pi-ai';
 import { isBearerTokenHeaderSafe } from '../../util/http-authorization';
 import {
   curatedModelsFor,
+  modelInputFromConfiguredCapabilities,
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../provider_catalog';
 import { repairOpenAIToolMessageOrder } from './openai-payload';
@@ -84,6 +85,15 @@ function openAICompatibleModelSupportsImages(
     return false;
   }
   return declared ?? unknownDefault;
+}
+
+function configuredModelVisionDeclaration(model: {
+  supportsVision?: boolean;
+  maxInputImages?: number;
+} | undefined): boolean | undefined {
+  if (typeof model?.supportsVision === 'boolean') return model.supportsVision;
+  if (typeof model?.maxInputImages === 'number') return model.maxInputImages > 0;
+  return undefined;
 }
 
 export function repairOpenAICompatiblePayload(params: unknown): unknown {
@@ -174,7 +184,10 @@ export function buildMoonshotModel(modelId: string): Model<'openai-completions'>
     baseUrl: MOONSHOT_BASE_URL,
     reasoning: protocol?.reasoning ?? false,
     ...(protocol?.thinkingLevelMap ? { thinkingLevelMap: { ...protocol.thinkingLevelMap } } : {}),
-    input: protocol ? [...protocol.input] : ['text', 'image'],
+    input: modelInputFromConfiguredCapabilities(
+      protocol ? [...protocol.input] : ['text', 'image'],
+      curated,
+    ),
     // The Moonshot open platform bills per token, but pi-ai's `cost`
     // field is only used for local cost-statistics display and does not
     // affect the actual request. Filling 0 means "not accounted for here";
@@ -246,9 +259,7 @@ function deepseekMaxOutputTokens(modelId: string): number {
 
 export function buildDeepSeekModel(modelId: string): Model<'openai-completions'> {
   const curated = curatedModelsFor('deepseek').find((m) => m.id === modelId);
-  const configuredVision = typeof curated?.maxInputImages === 'number'
-    ? curated.maxInputImages > 0
-    : undefined;
+  const configuredVision = configuredModelVisionDeclaration(curated);
   return {
     id: modelId,
     name: curated?.name || modelId,
@@ -266,9 +277,10 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     // true, paired with `defaultReasoning: 'low'` below so the request
     // always carries the effort field.
     reasoning: /^deepseek-v4-/.test(modelId),
-    // Official Pro/Flash aliases remain text-only. Flash Vision Exp opts into
-    // image input through its public catalog capability metadata.
-    input: openAICompatibleModelSupportsImages(modelId, configuredVision, false)
+    // Official Pro/Flash aliases remain text-only. Flash Vision and remotely
+    // configured models can declare supportsVision explicitly; an omitted
+    // declaration defaults to visual for parity with user-defined endpoints.
+    input: openAICompatibleModelSupportsImages(modelId, configuredVision, true)
       ? ['text', 'image']
       : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -387,7 +399,7 @@ export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
     // developer role for unknown providers, which Ark rejects with a
     // 400. Disable it explicitly.
     compat: { supportsDeveloperRole: false },
-    input: ['text', 'image'],
+    input: modelInputFromConfiguredCapabilities(['text', 'image'], curated),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: configuredPositiveInteger(curated?.contextWindow, doubaoContextWindow(modelId)),
     maxTokens: configuredPositiveInteger(curated?.maxTokens, doubaoMaxOutputTokens(modelId)),

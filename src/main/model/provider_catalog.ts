@@ -142,15 +142,15 @@ export function curatedModelsFor(providerId: string): ProviderModelEntry[] {
  * storage may keep more files over the life of a conversation, but a single
  * composer turn currently accepts at most 20 attachments. */
 export const MAX_MODEL_INPUT_IMAGES = 20;
-export const DEFAULT_MODEL_INPUT_IMAGE_LIMIT = 5;
+export const DEFAULT_MODEL_INPUT_IMAGE_LIMIT = MAX_MODEL_INPUT_IMAGES;
 
 /**
  * Resolve the image count for one concrete provider/model candidate.
  *
  * Model protocol metadata is authoritative for whether images are supported
  * at all. The remotely configurable catalog may then declare the provider's
- * exact per-request count. Unknown multimodal models retain the old,
- * conservative five-image behavior instead of risking an upstream 400.
+ * exact per-request count. Multimodal models without a declared provider
+ * limit use the Orkas product boundary of 20 images per request.
  */
 export function modelInputImageLimit(
   providerId: string,
@@ -348,7 +348,10 @@ function cloneModelWithId(
   template: Model<Api>,
   id: string,
   name: string,
-  overrides?: Pick<ProviderModelEntry, 'contextWindow' | 'maxTokens'>,
+  overrides?: Pick<
+    ProviderModelEntry,
+    'contextWindow' | 'maxTokens' | 'supportsVision' | 'maxInputImages'
+  >,
 ): Model<Api> {
   const cloned = {
     ...template,
@@ -364,16 +367,48 @@ function cloneModelWithId(
 
 function hasConfiguredModelOverrides(configured: ProviderModelEntry | undefined): boolean {
   return !!configured
-    && (typeof configured.contextWindow === 'number' || typeof configured.maxTokens === 'number');
+    && (
+      typeof configured.contextWindow === 'number'
+      || typeof configured.maxTokens === 'number'
+      || typeof configured.supportsVision === 'boolean'
+      || typeof configured.maxInputImages === 'number'
+    );
+}
+
+/**
+ * Apply only an explicitly configured image capability. An omitted declaration
+ * preserves pi-ai/provider protocol metadata byte-for-byte, which keeps older
+ * Server catalogs backward compatible. `maxInputImages` remains a legacy
+ * capability declaration: zero means text-only, any positive value means the
+ * model accepts images (the actual product limit is resolved separately).
+ */
+export function modelInputFromConfiguredCapabilities(
+  input: Model<Api>['input'],
+  overrides?: Pick<ProviderModelEntry, 'supportsVision' | 'maxInputImages'>,
+): Model<Api>['input'] {
+  const declared = typeof overrides?.supportsVision === 'boolean'
+    ? overrides.supportsVision
+    : typeof overrides?.maxInputImages === 'number'
+      ? overrides.maxInputImages > 0
+      : undefined;
+  if (declared === undefined) return input;
+  if (!declared) return ['text'];
+  const withText: Model<Api>['input'] = input.includes('text') ? input : ['text', ...input];
+  return withText.includes('image') ? withText : [...withText, 'image'];
 }
 
 function applyConfiguredModelOverrides(
   model: Model<Api>,
-  overrides?: Pick<ProviderModelEntry, 'contextWindow' | 'maxTokens'>,
+  overrides?: Pick<
+    ProviderModelEntry,
+    'contextWindow' | 'maxTokens' | 'supportsVision' | 'maxInputImages'
+  >,
 ): Model<Api> {
   if (!overrides) return model;
+  const input = modelInputFromConfiguredCapabilities(model.input, overrides);
   return {
     ...model,
+    ...(input !== model.input ? { input } : {}),
     ...(typeof overrides.contextWindow === 'number' && overrides.contextWindow > 0
       ? { contextWindow: overrides.contextWindow }
       : {}),

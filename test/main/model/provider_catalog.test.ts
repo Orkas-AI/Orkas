@@ -16,6 +16,8 @@ import {
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
+  modelInputFromConfiguredCapabilities,
+  modelInputImageLimit,
   resolveConfiguredPiModel,
   pickLatestGenerations,
 } from '../../../src/main/model/provider_catalog';
@@ -188,6 +190,23 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
   it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {
     expect(curatedModelsFor('no-such-provider-id')).toEqual([]);
+  });
+
+  it('applies explicit vision declarations and uses the product image limit by default', () => {
+    expect(modelInputFromConfiguredCapabilities(['text', 'image'], {})).toEqual(['text', 'image']);
+    expect(modelInputFromConfiguredCapabilities(['text', 'image'], {
+      supportsVision: false,
+    })).toEqual(['text']);
+    expect(modelInputFromConfiguredCapabilities(['text'], {
+      supportsVision: true,
+    })).toEqual(['text', 'image']);
+    expect(modelInputFromConfiguredCapabilities(['text', 'image'], {
+      maxInputImages: 0,
+    })).toEqual(['text']);
+    expect(modelInputImageLimit('unknown-provider', 'vision-next', {
+      id: 'vision-next',
+      input: ['text', 'image'],
+    } as any)).toBe(20);
   });
 
   it('curatedModelsFor can be overridden by Server remote-config cache', async () => {

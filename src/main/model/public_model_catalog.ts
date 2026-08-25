@@ -22,9 +22,14 @@ export interface ProviderModelEntry {
   template?: string;
   contextWindow?: number;
   maxTokens?: number;
-  /** Maximum image inputs Orkas may send in one model request. Zero disables
-   * visual input. Omit when the provider/model limit is unknown; the runtime
-   * then uses a conservative fallback. Text-only capability always wins. */
+  /** Explicit visual capability for any Server-configured model. Omit to
+   * preserve a built-in/template model's protocol metadata; declarative
+   * OpenAI-compatible models default unknown ids to visual input. */
+  supportsVision?: boolean;
+  /** Maximum image inputs Orkas may send in one model request. This is a
+   * quantity limit, not the primary capability flag. Zero remains a legacy
+   * text-only declaration. Omit when the provider/model limit is unknown; the
+   * runtime then uses the Orkas product limit. */
   maxInputImages?: number;
 }
 
@@ -79,9 +84,9 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'MiniMax-M2.7', name: 'MiniMax 2.7' },
   ],
   deepseek: [
-    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576, maxTokens: 384_000 },
-    { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision', contextWindow: 1_048_576, maxTokens: 384_000, maxInputImages: 600 },
-    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576, maxTokens: 384_000 },
+    { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
+    { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: true, maxInputImages: 600 },
+    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', contextWindow: 1_048_576, maxTokens: 384_000, supportsVision: false },
   ],
   doubao: [
     { id: 'doubao-seed-2-0-pro-260215', name: 'Doubao Seed 2.0 Pro' },

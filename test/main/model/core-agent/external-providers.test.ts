@@ -81,6 +81,11 @@ describe('external-providers › DeepSeek model capabilities', () => {
     });
     expect(modelInputImageLimit('deepseek', 'deepseek-v4-flash-vision-exp', model)).toBe(20);
   });
+
+  it('defaults unknown direct DeepSeek models to vision while known aliases remain text-only', () => {
+    expect(buildDeepSeekModel('deepseek-next').input).toEqual(['text', 'image']);
+    expect(buildDeepSeekModel('deepseek-v4-flash').input).toEqual(['text']);
+  });
 });
 
 describe('external-providers › buildMoonshotModel', () => {

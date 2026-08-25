@@ -651,6 +651,12 @@ function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
     const contextWindow = normalizePositiveInteger(r.contextWindow);
     const maxTokens = normalizePositiveInteger(r.maxTokens);
     const maxInputImages = normalizeNonNegativeInteger(r.maxInputImages);
+    const supportsVision = typeof r.supportsVision === 'boolean' ? r.supportsVision : undefined;
+    if (r.supportsVision !== undefined && supportsVision === undefined) return null;
+    if (
+      (supportsVision === false && typeof maxInputImages === 'number' && maxInputImages > 0)
+      || (supportsVision === true && maxInputImages === 0)
+    ) return null;
     const includedModels = normalizeIncludedModels(r.includedModels);
     if (r.includedModels !== undefined && includedModels === null) return null;
     out.push({
@@ -662,6 +668,7 @@ function normalizeProviderModels(value: unknown): ProviderModelEntry[] | null {
       ...(template ? { template } : {}),
       ...(contextWindow ? { contextWindow } : {}),
       ...(maxTokens ? { maxTokens } : {}),
+      ...(supportsVision !== undefined ? { supportsVision } : {}),
       ...(maxInputImages !== undefined ? { maxInputImages } : {}),
     });
   }
