@@ -2661,9 +2661,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.addApiKeyEntry': async ({ provider, model, apiKey, label }) => (
     auth.addApiKeyEntry(provider, model, apiKey, label)
   ),
-  'auth.addCustomModelEntry': async ({ label, baseUrl, model, apiKey, contextWindow, maxTokens }) => (
-    auth.addCustomModelEntry({ label, baseUrl, model, apiKey, contextWindow, maxTokens })
-  ),
+  'auth.addCustomModelEntry': async (
+    { label, baseUrl, model, apiKey, contextWindow, maxTokens, supportsVision },
+  ) => auth.addCustomModelEntry({
+    label,
+    baseUrl,
+    model,
+    apiKey,
+    contextWindow,
+    maxTokens,
+    supportsVision,
+  }),
   // Legacy alias; renderer migrated to auth.addApiKey.
   'auth.saveApiKey': async ({ provider, apiKey, label }) => auth.saveApiKey(provider, apiKey, label),
   'auth.renameProfile': async ({ profileId, label }) => auth.renameProfile(profileId, label),

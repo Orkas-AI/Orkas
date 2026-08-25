@@ -38,10 +38,12 @@
 
 import type { LLMProvider } from '#core-agent';
 import type { Model } from '@earendil-works/pi-ai';
+import { isBearerTokenHeaderSafe } from '../../util/http-authorization';
 import {
   curatedModelsFor,
   type CustomOpenAICompatibleRuntimeConfig,
 } from '../provider_catalog';
+import { repairOpenAIToolMessageOrder } from './openai-payload';
 
 // core-agent is an ESM package and the Orkas main process is CJS, so
 // **static import is not allowed**. Reuse the dynamic-import + lazy cache
@@ -57,6 +59,35 @@ function configuredPositiveInteger(value: number | undefined, fallback: number):
   return typeof value === 'number' && Number.isInteger(value) && value > 0
     ? value
     : fallback;
+}
+
+/**
+ * OpenAI-compatible endpoints do not expose a portable capability-discovery
+ * API. Treat unknown custom models as multimodal so attached images reach new
+ * models without a client release, while retaining a narrow list of official
+ * DeepSeek aliases that are documented as text-only. Dated snapshots and the
+ * official `[1m]` alias share the same capability; names containing an
+ * explicit vision variant intentionally do not match.
+ */
+const KNOWN_TEXT_ONLY_OPENAI_COMPATIBLE_MODELS = [
+  /^deepseek-(?:chat|reasoner)$/i,
+  /^deepseek-v4-(?:pro|flash)(?:-\d{4,8})?(?:\[[^\]]+\])?$/i,
+];
+
+function openAICompatibleModelSupportsImages(
+  modelId: string,
+  declared: boolean | undefined,
+  unknownDefault: boolean,
+): boolean {
+  const leafId = String(modelId || '').trim().split('/').pop()?.split(':', 1)[0] || '';
+  if (KNOWN_TEXT_ONLY_OPENAI_COMPATIBLE_MODELS.some((pattern) => pattern.test(leafId))) {
+    return false;
+  }
+  return declared ?? unknownDefault;
+}
+
+export function repairOpenAICompatiblePayload(params: unknown): unknown {
+  return repairOpenAIToolMessageOrder(params);
 }
 
 // ── Moonshot open-platform (https://api.moonshot.cn/v1) ─────────────────
@@ -186,24 +217,27 @@ export async function createMoonshotProvider(config: CreateMoonshotProviderConfi
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
 
 // Context windows from https://api-docs.deepseek.com/quick_start/pricing
-// (checked 2026-04). DeepSeek V4 series introduced 1M-token context via
+// (checked 2026-08). DeepSeek V4 series introduced 1M-token context via
 // Compressed Sparse Attention. Fallback 131072 for unknown ids (safe lower
 // bound; older deprecated v3 snapshots top out there).
 const DEEPSEEK_CONTEXT_WINDOW: Record<string, number> = {
-  'deepseek-v4-pro':   1_048_576,
-  'deepseek-v4-flash': 1_048_576,
+  'deepseek-v4-pro':              1_048_576,
+  'deepseek-v4-flash-vision-exp': 1_048_576,
+  'deepseek-v4-flash':            1_048_576,
 };
 
 function deepseekContextWindow(modelId: string): number {
   return DEEPSEEK_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
-// V4 reasoner series streams long reasoning + final answer; 32K matches
-// pi-ai's clamp ceiling in simple-options. Older `deepseek-chat` /
-// `deepseek-reasoner` and unknown ids fall back to the conservative 8192.
+// The official V4 pricing/spec table lists a 384K maximum output for Pro,
+// Flash, and Flash Vision Exp. pi-ai clamps only against remaining context,
+// so preserving the provider's real cap avoids silently truncating long
+// reasoning + answers. Unknown/legacy ids retain a conservative 8192 fallback.
 const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
-  'deepseek-v4-pro':   32768,
-  'deepseek-v4-flash': 16384,
+  'deepseek-v4-pro':              384_000,
+  'deepseek-v4-flash-vision-exp': 384_000,
+  'deepseek-v4-flash':            384_000,
 };
 
 function deepseekMaxOutputTokens(modelId: string): number {
@@ -212,6 +246,9 @@ function deepseekMaxOutputTokens(modelId: string): number {
 
 export function buildDeepSeekModel(modelId: string): Model<'openai-completions'> {
   const curated = curatedModelsFor('deepseek').find((m) => m.id === modelId);
+  const configuredVision = typeof curated?.maxInputImages === 'number'
+    ? curated.maxInputImages > 0
+    : undefined;
   return {
     id: modelId,
     name: curated?.name || modelId,
@@ -229,10 +266,14 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     // true, paired with `defaultReasoning: 'low'` below so the request
     // always carries the effort field.
     reasoning: /^deepseek-v4-/.test(modelId),
-    input: ['text'],
+    // Official Pro/Flash aliases remain text-only. Flash Vision Exp opts into
+    // image input through its public catalog capability metadata.
+    input: openAICompatibleModelSupportsImages(modelId, configuredVision, false)
+      ? ['text', 'image']
+      : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: deepseekContextWindow(modelId),
-    maxTokens: deepseekMaxOutputTokens(modelId),
+    contextWindow: configuredPositiveInteger(curated?.contextWindow, deepseekContextWindow(modelId)),
+    maxTokens: configuredPositiveInteger(curated?.maxTokens, deepseekMaxOutputTokens(modelId)),
   };
 }
 
@@ -388,15 +429,17 @@ export function buildCustomOpenAICompatibleModel(
     api: 'openai-completions',
     provider: 'custom' as any,
     baseUrl: config.baseUrl,
-    reasoning: false,
-    input: ['text'],
+    reasoning: config.supportsReasoning ?? !!config.reasoningEffort,
+    input: openAICompatibleModelSupportsImages(modelId, config.supportsVision, true)
+      ? ['text', 'image']
+      : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: config.contextWindow,
     maxTokens: config.maxTokens,
     compat: {
       supportsDeveloperRole: false,
       supportsStore: false,
-      supportsReasoningEffort: false,
+      supportsReasoningEffort: !!config.reasoningEffort,
       supportsStrictMode: false,
       maxTokensField: 'max_tokens',
     },
@@ -407,6 +450,14 @@ export async function createCustomOpenAICompatibleProvider(
   config: CreateCustomOpenAICompatibleProviderConfig,
 ): Promise<LLMProvider> {
   if (!config.apiKey) throw new Error('custom: apiKey required');
+  if (!isBearerTokenHeaderSafe(config.apiKey)) {
+    throw Object.assign(
+      new Error(
+        'Custom model has an invalid API key for HTTP Authorization headers. Re-enter it in Settings.',
+      ),
+      { code: 'CUSTOM_API_KEY_INVALID' },
+    );
+  }
   if (!config.modelId) throw new Error('custom: modelId required');
   if (!config.baseUrl) throw new Error('custom: baseUrl required');
   const mod = await ca();
@@ -414,5 +465,7 @@ export async function createCustomOpenAICompatibleProvider(
     provider: 'custom',
     apiKey: config.apiKey,
     customModel: buildCustomOpenAICompatibleModel(config.modelId, config),
+    onPayload: repairOpenAICompatiblePayload,
+    ...(config.reasoningEffort ? { defaultReasoning: config.reasoningEffort } : {}),
   });
 }

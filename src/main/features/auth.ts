@@ -666,7 +666,9 @@ function customRuntimeConfigFromProfile(
       contextWindow,
       maxTokens,
       ...(profile.supportsReasoning === true ? { supportsReasoning: true } : {}),
-      ...(profile.supportsVision === true ? { supportsVision: true } : {}),
+      ...(typeof profile.supportsVision === 'boolean'
+        ? { supportsVision: profile.supportsVision }
+        : {}),
       ...(reasoningEffort ? { reasoningEffort } : {}),
     };
   } catch {
@@ -1093,7 +1095,9 @@ export async function addCustomModelEntry(
     contextWindow,
     ...(maxTokens !== undefined ? { maxTokens } : {}),
     ...(input.supportsReasoning === true ? { supportsReasoning: true } : {}),
-    ...(input.supportsVision === true ? { supportsVision: true } : {}),
+    ...(typeof input.supportsVision === 'boolean'
+      ? { supportsVision: input.supportsVision }
+      : {}),
     ...(reasoningEffort
       ? { reasoningEffort: reasoningEffort as 'low' | 'medium' | 'high' }
       : {}),

@@ -47,6 +47,19 @@ describe('public model catalog', () => {
     ]);
   });
 
+  it('publishes the DeepSeek V4 vision model with its official limits', () => {
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.map((model) => model.id)).toEqual([
+      'deepseek-v4-pro',
+      'deepseek-v4-flash-vision-exp',
+      'deepseek-v4-flash',
+    ]);
+    expect(PUBLIC_PROVIDER_MODELS.deepseek?.[1]).toMatchObject({
+      contextWindow: 1_048_576,
+      maxTokens: 384_000,
+      maxInputImages: 600,
+    });
+  });
+
   it('keeps the explicitly curated OpenRouter shortcut set', () => {
     expect(PUBLIC_PROVIDER_MODELS.openrouter?.map((model) => model.id)).toEqual([
       'anthropic/claude-opus-5',

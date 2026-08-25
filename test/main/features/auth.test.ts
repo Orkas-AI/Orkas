@@ -386,6 +386,23 @@ describe('auth › custom OpenAI-compatible model configuration', () => {
     });
   });
 
+  it('preserves an explicit text-only override for a custom model', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const added = await a.addCustomModelEntry({
+      baseUrl: 'https://gateway.example.test/v1',
+      model: 'acme/text-only',
+      apiKey: 'sk-custom-text-only-xxxxxxxx',
+      supportsVision: false,
+    });
+
+    expect(await a.pickChatEntryGroup()).toEqual([
+      expect.objectContaining({
+        entryId: added.entryId,
+        customConfig: expect.objectContaining({ supportsVision: false }),
+      }),
+    ]);
+  });
+
   it('assigns provider-local labels when the optional label is blank', async () => {
     const a = await import('../../../src/main/features/auth');
     const first = await a.addCustomModelEntry({

@@ -657,7 +657,8 @@ export interface CustomOpenAICompatibleRuntimeConfig {
   baseUrl: string;
   contextWindow: number;
   maxTokens: number;
-  /** Curated capability metadata; omitted custom profiles stay conservative. */
+  /** Curated capability metadata. Vision defaults on for unknown custom
+   * models; false explicitly disables image blocks. */
   supportsReasoning?: boolean;
   supportsVision?: boolean;
   /** Optional OpenAI-compatible reasoning effort for curated relay profiles. */

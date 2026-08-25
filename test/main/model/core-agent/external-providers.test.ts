@@ -1,9 +1,87 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildCustomOpenAICompatibleModel,
+  buildDeepSeekModel,
   buildDoubaoModel,
   buildMoonshotModel,
   createMoonshotProvider,
 } from '../../../../src/main/model/core-agent/external-providers';
+import { modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
+
+describe('external-providers › custom OpenAI-compatible model', () => {
+  const runtimeConfig = {
+    baseUrl: 'https://gateway.example.test/v1',
+    contextWindow: 262_144,
+    maxTokens: 16_384,
+  };
+
+  it('defaults unknown models to image input and preserves explicit text-only overrides', () => {
+    expect(buildCustomOpenAICompatibleModel('acme/reasoner-v2', runtimeConfig)).toMatchObject({
+      reasoning: false,
+      input: ['text', 'image'],
+      contextWindow: 262_144,
+      maxTokens: 16_384,
+    });
+    expect(buildCustomOpenAICompatibleModel('acme/text-only', {
+      ...runtimeConfig,
+      supportsVision: false,
+    }).input).toEqual(['text']);
+  });
+
+  it('keeps documented DeepSeek text aliases text-only without hiding vision variants', () => {
+    for (const modelId of [
+      'deepseek-chat',
+      'deepseek-reasoner',
+      'deepseek-v4-flash',
+      'deepseek-v4-pro[1m]',
+      'deepseek/deepseek-v4-flash-0731',
+    ]) {
+      expect(buildCustomOpenAICompatibleModel(modelId, {
+        ...runtimeConfig,
+        supportsVision: true,
+      }).input).toEqual(['text']);
+    }
+    expect(buildCustomOpenAICompatibleModel(
+      'deepseek-v4-flash-vision-exp',
+      runtimeConfig,
+    ).input).toEqual(['text', 'image']);
+  });
+
+  it('carries explicit reasoning controls into the custom adapter contract', () => {
+    expect(buildCustomOpenAICompatibleModel('acme/reasoner-v2', {
+      ...runtimeConfig,
+      supportsReasoning: true,
+      reasoningEffort: 'medium',
+    })).toMatchObject({
+      reasoning: true,
+      compat: { supportsReasoningEffort: true },
+    });
+  });
+});
+
+describe('external-providers › DeepSeek model capabilities', () => {
+  it('uses official V4 limits and keeps the text aliases text-only', () => {
+    for (const modelId of ['deepseek-v4-pro', 'deepseek-v4-flash']) {
+      expect(buildDeepSeekModel(modelId)).toMatchObject({
+        id: modelId,
+        input: ['text'],
+        contextWindow: 1_048_576,
+        maxTokens: 384_000,
+      });
+    }
+  });
+
+  it('enables image input for DeepSeek V4 Flash Vision', () => {
+    const model = buildDeepSeekModel('deepseek-v4-flash-vision-exp');
+    expect(model).toMatchObject({
+      name: 'DeepSeek V4 Flash Vision',
+      input: ['text', 'image'],
+      contextWindow: 1_048_576,
+      maxTokens: 384_000,
+    });
+    expect(modelInputImageLimit('deepseek', 'deepseek-v4-flash-vision-exp', model)).toBe(20);
+  });
+});
 
 describe('external-providers › buildMoonshotModel', () => {
   it('builds a Model for https://api.moonshot.cn/v1 using openai-completions', () => {
