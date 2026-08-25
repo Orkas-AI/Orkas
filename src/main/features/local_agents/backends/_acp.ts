@@ -16,7 +16,6 @@
 
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
-import { isHermesApiRetryFailureText } from '../errors.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -266,18 +265,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
           if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
           if (code === 0 && resultStatus === 'completed') {
-            // Hermes can exhaust its upstream API retries, stream the failure
-            // sentence as an agent_message_chunk, then still close with
-            // stopReason=end_turn and exit 0. The prefix is runtime-authored,
-            // not model prose. Treat that exact one-line terminal shape as a
-            // failed run and keep the provider detail out of public output.
-            if (isHermesApiRetryFailureText(resultText)) {
-              return finish('failed', {
-                error: 'upstream provider request failed after retries',
-                output: '',
-                stderrTail: tail.toString(),
-              });
-            }
             // Demote silent failure: server claimed success via
             // stopReason=end_turn but never streamed any text AND
             // stderr contained an upstream-provider error. Hermes

@@ -206,7 +206,7 @@ describe('local_agents/backends/_acp process lifecycle', () => {
     });
   });
 
-  it('fails a terminal Hermes API retry message instead of publishing it as a successful answer', async () => {
+  it('does not infer a transport failure from successful ACP response text', async () => {
     const fakeAcpServer = String.raw`
       let buffer = '';
       const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
@@ -260,9 +260,8 @@ describe('local_agents/backends/_acp process lifecycle', () => {
     }));
     expect(events.at(-1)).toMatchObject({
       type: 'done',
-      status: 'failed',
-      error: 'upstream provider request failed after retries',
-      output: '',
+      status: 'completed',
+      output: 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.',
     });
   });
 });

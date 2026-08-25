@@ -208,14 +208,14 @@ describe('local_agents/public-output', () => {
     })).toBe(raw);
   });
 
-  it('does not publish a Hermes terminal API retry failure as agent prose', () => {
+  it('does not infer a Hermes runtime failure from successful response text', () => {
     const raw = 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.';
 
     expect(sanitizeLocalAgentPublicOutput({
       cli: 'hermes',
       text: raw,
-      userTask: 'Explain why the local conversation did not continue.',
-    })).toBe('');
+      userTask: 'Reply with this diagnostic verbatim.',
+    })).toBe(raw);
     expect(sanitizeLocalAgentPublicOutput({
       cli: 'codex',
       text: raw,

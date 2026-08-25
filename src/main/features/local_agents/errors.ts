@@ -9,17 +9,6 @@ const UPGRADE_REQUIRED_PATTERNS = [
   /Codex version is (?:too old|unsupported)/i,
 ];
 
-/** Hermes 0.9 can stream this runtime-authored sentence as its only agent
- * message before returning a successful ACP end_turn. It is an upstream
- * request failure, not a model answer. Keep the match deliberately narrow so
- * ordinary explanations that merely discuss API errors remain untouched. */
-export function isHermesApiRetryFailureText(text: unknown): boolean {
-  const value = typeof text === 'string' ? text.trim() : '';
-  return value.length > 0
-    && value.length <= 1_000
-    && /^API call failed after \d+ retries?:\s*[^\r\n]+$/iu.test(value);
-}
-
 export function classifyCliRuntimeFailure(error: unknown): CliRuntimeFailure {
   const text = typeof error === 'string'
     ? error

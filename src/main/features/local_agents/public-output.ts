@@ -8,7 +8,6 @@
  */
 
 import type { LocalCliType } from './registry.js';
-import { isHermesApiRetryFailureText } from './errors.js';
 
 type KstarSectionId = 'K' | 'S' | 'T' | 'A' | 'EXPECTED' | 'R' | 'DELTA' | 'AAR';
 
@@ -122,7 +121,6 @@ export function sanitizeLocalAgentPublicOutput(args: {
 }): string {
   const text = String(args.text || '');
   if (args.cli !== 'hermes' || !text.trim()) return text;
-  if (isHermesApiRetryFailureText(text)) return '';
   if (hasExplicitKstarRequest(String(args.userTask || ''))) return text;
   const extracted = extractHermesKstarResult(text);
   return extracted.matched ? extracted.result : text;
