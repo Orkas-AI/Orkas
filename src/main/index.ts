@@ -38,6 +38,7 @@ import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, prot
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
+import { resolveCliCommand } from './features/local_agents/spawn-command';
 import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
 import {
   hardenedWebPreferences,
@@ -417,23 +418,32 @@ function registerIpc(): void {
     // The relaunch button shells out to run.sh / run.cmd instead of using
     // `app.relaunch()` so we can reuse `scripts/ensure-deps.cjs` for
     // dependency self-healing — otherwise pulling new code + relaunching
-    // crashes immediately due to missing packages. The shell script handles
-    // ensure-deps + killing the old electron + npm start; here we just
-    // detach-spawn it and call `app.exit(0)`.
+    // crashes immediately due to missing packages. The shell script receives
+    // this process as its explicit owner, waits for it to exit, then starts the
+    // replacement without touching any other Electron process.
     ipcMain.handle('orkas.relaunch', () => {
-      const isWin = process.platform === 'win32';
-      const script = path.join(paths.PC_ROOT, isWin ? 'run.cmd' : 'run.sh');
-      const [cmd, args] = isWin
-        ? ['cmd.exe', ['/c', script]] as const
-        : ['bash',    [script]]       as const;
-      const child = spawn(cmd, args, {
+      const isWindows = process.platform === 'win32';
+      const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
+      const resolved = isWindows
+        ? resolveCliCommand(script, [], process.platform, process.env)
+        : { command: 'bash', args: [script], windowsVerbatimArguments: undefined };
+      // install-data-root.cjs must resolve the workspace again in the
+      // replacement process. Inheriting the current resolved roots would
+      // short-circuit that boot decision.
+      const childEnv = { ...process.env };
+      delete childEnv.ORKAS_WORKSPACE_ROOT;
+      delete childEnv.CORE_AGENT_AUTH_DIR;
+      childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid);
+      const child = spawn(resolved.command, resolved.args, {
         cwd: paths.PC_ROOT,
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
+        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+        env: childEnv,
       });
       child.unref();
-      log.info('relaunch via shell script', { script });
+      log.info('relaunch via shell script');
       app.exit(0);
       return { ok: true };
     });
