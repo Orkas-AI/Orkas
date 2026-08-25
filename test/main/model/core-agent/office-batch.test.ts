@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 
 import {
-  buildDocxBatch, buildXlsxBatch, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, columnLetter,
+  buildDocxBatch, buildXlsxBatch, buildXlsxCellProps, buildXlsxWorkbookBatch, buildPptxBatch, buildEditBatch, columnLetter,
   serializeOfficeBatch, OfficeEditInputError,
   type DocxParagraphSpec, type XlsxCell, type EditOp,
 } from '../../../../src/main/model/core-agent/office-batch';
@@ -217,6 +217,25 @@ describe('buildXlsxBatch', () => {
         props: { value: '标题', bold: 'true', fill: '#1F4E79', 'font.color': '#FFFFFF', halign: 'center', merge: 'A1:C1' },
       },
     ]);
+  });
+
+  it('uses one XLSX cell-property normalizer for create and edit callers', () => {
+    expect(buildXlsxCellProps({
+      value: 7,
+      formula: '=SUM(A1:A2)',
+      format: '#,##0.00',
+      bold: false,
+      fill: '#FFF2CC',
+    }, { allowEmptyValue: true })).toEqual({
+      formula: 'SUM(A1:A2)',
+      numberformat: '#,##0.00',
+      bold: 'false',
+      fill: '#FFF2CC',
+    });
+    expect(buildXlsxCellProps({ value: '', format: '@' }, { allowEmptyValue: true })).toEqual({
+      value: '',
+      numberformat: '@',
+    });
   });
 });
 

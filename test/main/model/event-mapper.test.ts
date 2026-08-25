@@ -5,6 +5,7 @@ import {
   extractPersistedOutputPath,
   skillReadMetadataForToolStart,
   agentReadMetadataForToolStart,
+  sanitizePublicReasoningSummary,
 } from '../../../src/main/model/core-agent/event-mapper';
 import {
   userMarketplaceAgentSkillsDir,
@@ -16,6 +17,7 @@ import { setCurrentLang } from '../../../src/main/i18n';
 
 type AgentRunEvent =
   | { type: 'text_delta'; text: string }
+  | { type: 'thinking'; phase: 'start' | 'progress' | 'end'; chars: number; text?: string }
   | { type: 'tool_delta'; name?: string; id: string; inputDelta: string; inputBytes?: number }
   | { type: 'tool_start'; name: string; id: string; input: unknown }
   | { type: 'tool_progress'; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
@@ -77,10 +79,12 @@ type AgentRunEvent =
       result: {
         text: string;
         meta: {
+          provider?: string;
           error: null | {
             kind?: 'auth' | 'rate_limit' | 'context_overflow' | 'timeout' | 'provider_error';
             message: string;
             code?: string;
+            statusCode?: number;
           };
           convergenceSignals?: string[];
         };
@@ -91,12 +95,36 @@ async function* toAsync<T>(items: T[]): AsyncIterable<T> {
   for (const it of items) yield it;
 }
 
-async function collect(events: AgentRunEvent[], opts?: Parameters<typeof mapCoreAgentEvents>[1]) {
+async function collect(
+  events: AgentRunEvent[],
+  opts: Partial<Parameters<typeof mapCoreAgentEvents>[1]> = {},
+) {
   const out: any[] = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gen = mapCoreAgentEvents(toAsync(events) as any, opts);
+  const gen = mapCoreAgentEvents(toAsync(events) as any, {
+    failureTrackingScope: opts.failureTrackingScope ?? {},
+    ...opts,
+  });
   for await (const ev of gen) out.push(ev);
   return out;
+}
+
+function reconstructReasoningSummaries(events: any[]): string[] {
+  let summary = '';
+  const snapshots: string[] = [];
+  for (const event of events) {
+    const data = event?.event?.data;
+    if (event?.type !== 'event' || event?.event?.stream !== 'reasoning' || !data) continue;
+    if (typeof data.summary === 'string') {
+      summary = data.summary;
+    } else if (Number.isInteger(data.summary_from) && typeof data.summary_delta === 'string') {
+      summary = summary.slice(0, data.summary_from) + data.summary_delta;
+    } else {
+      continue;
+    }
+    snapshots.push(summary);
+  }
+  return snapshots;
 }
 
 it('keeps provider-call diagnostics internal', async () => {
@@ -371,25 +399,26 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(executionUpdate?.event.data.arguments).toEqual({ path: 'snake-game.html', content });
   });
 
-  it('read_file of marketplace SKILL.md carries the display name without another skill scan', async () => {
+  it('read_files with one paths item carries the Skill display name without another scan', async () => {
     const uid = 'u-skill-event';
     const skillId = '16e1bfcb3426';
     const skillPath = `${userMarketplaceSkillsDir(uid)}/${skillId}/SKILL.md`;
     const skillDisplayNameById = new Map([[skillId, 'agent-creator']]);
     const meta = skillReadMetadataForToolStart(
-      'read_file',
-      { path: skillPath },
+      'read_files',
+      { paths: [{ path: skillPath }] },
       { userId: uid, skillDisplayNameById },
     );
     expect(meta).toEqual({
       skill_id: skillId,
       skill_name: 'agent-creator',
       skill_system: 'A.platform',
+      skill_file: 'SKILL.md',
     });
 
     const out = await collect([
-      { type: 'tool_start', name: 'read_file', id: 'c-skill', input: { path: skillPath } },
-      { type: 'tool_end', name: 'read_file', id: 'c-skill', result: '<file>body</file>' },
+      { type: 'tool_start', name: 'read_files', id: 'c-skill', input: { paths: [{ path: skillPath }] } },
+      { type: 'tool_end', name: 'read_files', id: 'c-skill', result: '<file>body</file>' },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ], { userId: uid, skillDisplayNameById });
     const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
@@ -412,6 +441,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       skill_id: 'agent-creator',
       skill_name: 'agent-creator',
       skill_system: 'system',
+      skill_file: 'SKILL.md',
     });
 
     const out = await collect([
@@ -441,7 +471,102 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       skill_id: 'stage-plan',
       skill_name: 'stage-plan',
       skill_system: 'B',
+      skill_file: 'SKILL.md',
     });
+  });
+
+  it('labels run-scoped Skill entry and reference reads without exposing the read ref', async () => {
+    const skillMetadataByReadRef = new Map([
+      ['5aa5286f3aee', {
+        id: 'release-decision',
+        name: 'Release Decision',
+        source: 'custom',
+      }],
+    ]);
+
+    expect(skillReadMetadataForToolStart(
+      'read_file',
+      { path: '@skill/5aa5286f3aee' },
+      { userId: 'u-runtime-skill', skillMetadataByReadRef },
+    )).toEqual({
+      skill_id: 'release-decision',
+      skill_name: 'Release Decision',
+      skill_system: 'A.custom',
+      skill_file: 'SKILL.md',
+    });
+
+    const out = await collect([
+      {
+        type: 'tool_start',
+        name: 'read_file',
+        id: 'c-skill-reference',
+        input: { path: '@skill/5aa5286f3aee/references/release-decision.md' },
+      },
+      {
+        type: 'tool_end',
+        name: 'read_file',
+        id: 'c-skill-reference',
+        result: '<file>reference body</file>',
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { userId: 'u-runtime-skill', skillMetadataByReadRef });
+    const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+
+    expect(startEvent.event.data).toMatchObject({
+      skill_id: 'release-decision',
+      skill_name: 'Release Decision',
+      skill_file: 'references/release-decision.md',
+    });
+    expect(endEvent.event.data).toMatchObject({
+      skill_id: 'release-decision',
+      skill_name: 'Release Decision',
+      skill_file: 'references/release-decision.md',
+    });
+    expect(JSON.stringify([startEvent, endEvent])).not.toContain('skill_name":"5aa5286f3aee');
+  });
+
+  it.each([
+    ['system', 'system'],
+    ['builtin', 'A.platform'],
+    ['platform', 'A.platform'],
+    ['external', 'B'],
+    ['global', 'B'],
+    ['unknown', 'B'],
+  ] as const)('maps run-scoped %s Skill reads to the %s event system', (source, skillSystem) => {
+    const skillMetadataByReadRef = new Map([
+      ['runtime-ref', { id: `${source}-skill`, name: `${source} Skill`, source }],
+    ]);
+
+    expect(skillReadMetadataForToolStart(
+      'read_file',
+      { path: '@skill/runtime-ref/references/guide.md' },
+      { skillMetadataByReadRef },
+    )).toEqual({
+      skill_id: `${source}-skill`,
+      skill_name: `${source} Skill`,
+      skill_system: skillSystem,
+      skill_file: 'references/guide.md',
+    });
+  });
+
+  it.each([
+    ['unknown ref', '@skill/not-listed/references/guide.md'],
+    ['parent traversal', '@skill/runtime-ref/../secret.md'],
+    ['dot segment', '@skill/runtime-ref/./guide.md'],
+    ['empty segment', '@skill/runtime-ref/references//guide.md'],
+    ['backslash separator', '@skill/runtime-ref\\references\\guide.md'],
+    ['lookalike prefix', 'notes/@skill/runtime-ref'],
+  ])('does not attribute a %s as a trusted run-scoped Skill read', (_scenario, requestedPath) => {
+    const skillMetadataByReadRef = new Map([
+      ['runtime-ref', { id: 'trusted-skill', name: 'Trusted Skill', source: 'custom' }],
+    ]);
+
+    expect(skillReadMetadataForToolStart(
+      'read_file',
+      { path: requestedPath },
+      { skillMetadataByReadRef },
+    )).toBeNull();
   });
 
   it('read_file of marketplace agent.json carries the agent display name', async () => {
@@ -471,6 +596,51 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(startEvent.event.data.agent_id).toBe(agentId);
     expect(endEvent.event.data.agent_name).toBe('学习路径设计师');
     expect(endEvent.event.data.agent_file).toBe('agent.json');
+  });
+
+  it.each([
+    ['list_connector_tools', { connector_id: 'connector-instance-91f0' }],
+    ['call_connector_tool', {
+      connector_id: 'connector-instance-91f0',
+      tool_name: 'search',
+      args: { query: 'release plan' },
+    }],
+  ])('%s carries the visible Connector name through tool_end', async (name, input) => {
+    const connectorDisplayNameById = new Map([
+      ['connector-instance-91f0', 'Notion Workspace'],
+    ]);
+    const out = await collect([
+      { type: 'tool_start', name, id: 'c-connector', input },
+      { type: 'tool_end', name, id: 'c-connector', result: 'ok' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { connectorDisplayNameById });
+    const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+
+    expect(startEvent.event.data).toMatchObject({
+      connector_id: 'connector-instance-91f0',
+      connector_name: 'Notion Workspace',
+    });
+    expect(endEvent.event.data).toMatchObject({
+      connector_id: 'connector-instance-91f0',
+      connector_name: 'Notion Workspace',
+    });
+  });
+
+  it('does not invent Connector metadata outside the visible snapshot', async () => {
+    const out = await collect([
+      {
+        type: 'tool_start',
+        name: 'call_connector_tool',
+        id: 'c-hidden-connector',
+        input: { connector_id: 'hidden-instance', tool_name: 'search', args: {} },
+      },
+      { type: 'tool_end', name: 'call_connector_tool', id: 'c-hidden-connector', result: 'denied' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { connectorDisplayNameById: new Map() });
+    const toolEvents = out.filter((e) => e.type === 'event' && e.event?.stream === 'tool');
+
+    expect(toolEvents.every((e) => e.event.data.connector_name === undefined)).toBe(true);
   });
 
   it('retry event → friendly Chinese progress, raw reason not leaked', async () => {
@@ -700,6 +870,72 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     }
   });
 
+  it('treats an Orkas-looking quota code from a BYO provider as provider balance', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              provider: 'deepseek',
+              error: {
+                kind: 'provider_error',
+                message: 'payment required',
+                code: 'orkas_llm_quota_exceeded',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatchObject({
+        type: 'error',
+        failureCode: 'provider_balance',
+        failurePhase: 'provider_wait',
+      });
+      expect(String(out[0].text || '')).toContain('DeepSeek');
+      expect(String(out[0].text || '')).toContain('余额不足');
+      expect(String(out[0].text || '')).not.toContain('积分不足');
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('treats an Orkas-looking quota code from a BYO provider as provider balance', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              provider: 'deepseek',
+              error: {
+                kind: 'provider_error',
+                message: 'payment required',
+                code: 'orkas_llm_quota_exceeded',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toHaveLength(1);
+      expect(out[0]).toMatchObject({
+        type: 'error',
+        failureCode: 'provider_balance',
+        failurePhase: 'provider_wait',
+      });
+      expect(String(out[0].text || '')).toContain('DeepSeek');
+      expect(String(out[0].text || '')).toContain('余额不足');
+      expect(String(out[0].text || '')).not.toContain('积分不足');
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
   it.each([
     ['PROVIDER_EMPTY_NORMAL', 'empty_response_normal'],
     ['PROVIDER_EMPTY_SAFETY', 'empty_response_safety'],
@@ -731,6 +967,74 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
         failureCode,
         failurePhase: 'provider_wait',
       }]);
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('names the user-configured provider on a third-party balance failure, never Orkas credits', async () => {
+    // W4-3: BYOK balance exhaustion used the same "credits" wording as Orkas
+    // billing, sending users to the wrong top-up page. The two must stay
+    // visually distinct: third-party balance names the provider account,
+    // Orkas billing keeps the credits wording (previous case).
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              provider: 'deepseek',
+              error: {
+                kind: 'provider_error',
+                message: 'insufficient_balance: your account balance is not enough',
+                code: 'INSUFFICIENT_BALANCE',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toHaveLength(1);
+      const text = String(out[0].text || '');
+      expect(text).toContain('DeepSeek');
+      expect(text).toContain('余额不足');
+      expect(text).not.toContain('积分不足');
+      expect(out[0]).toMatchObject({ type: 'error', failureCode: 'provider_balance' });
+    } finally {
+      setCurrentLang('en');
+    }
+  });
+
+  it('names the user-configured provider on a third-party balance failure, never Orkas credits', async () => {
+    // W4-3: BYOK balance exhaustion used the same "credits" wording as Orkas
+    // billing, sending users to the wrong top-up page. The two must stay
+    // visually distinct: third-party balance names the provider account,
+    // Orkas billing keeps the credits wording (previous case).
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        {
+          type: 'done',
+          result: {
+            text: '',
+            meta: {
+              provider: 'deepseek',
+              error: {
+                kind: 'provider_error',
+                message: 'insufficient_balance: your account balance is not enough',
+                code: 'INSUFFICIENT_BALANCE',
+              },
+            },
+          },
+        },
+      ]);
+      expect(out).toHaveLength(1);
+      const text = String(out[0].text || '');
+      expect(text).toContain('DeepSeek');
+      expect(text).toContain('余额不足');
+      expect(text).not.toContain('积分不足');
+      expect(out[0]).toMatchObject({ type: 'error', failureCode: 'provider_balance' });
     } finally {
       setCurrentLang('en');
     }
@@ -802,6 +1106,339 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
         failurePhase: 'provider_wait',
       }]);
     }
+  });
+
+  // W0 remediation: the provider_error fallback once absorbed max_tokens
+  // truncation, endpoint-level HTTP rejections, and exhausted retries — a
+  // third of hard failures were unclassifiable in weekly conversation
+  // sampling. Each named class must map to its own stable code.
+  it('classifies a max_tokens truncation as provider_max_tokens', async () => {
+    const out = await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error',
+              message: 'Model output reached max_tokens (16384) before completing the turn; the partial response was discarded because it contained non-recoverable content and could include an incomplete tool call.',
+              code: 'OUTPUT_LIMIT',
+            },
+          },
+        },
+      },
+    ]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error',
+      failureKind: 'model',
+      failureCode: 'provider_max_tokens',
+      failurePhase: 'provider_wait',
+    })]);
+  });
+
+  it('classifies exhausted runner retries as provider_retries_exhausted', async () => {
+    const out = await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error',
+              message: 'Max retries exceeded',
+              code: 'PROVIDER_RETRIES_EXHAUSTED',
+            },
+          },
+        },
+      },
+    ]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error',
+      failureKind: 'model',
+      failureCode: 'provider_retries_exhausted',
+      failurePhase: 'provider_wait',
+    })]);
+  });
+
+  it('classifies an endpoint-level HTTP 4xx by status without leaking a raw code', async () => {
+    const out = await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error',
+              message: '410 status code (no body)',
+              code: 'PROVIDER_ERROR',
+              statusCode: 410,
+            },
+          },
+        },
+      },
+    ]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error',
+      failureKind: 'model',
+      failureCode: 'provider_http_410',
+    })]);
+    expect(out[0].failureRawCode).toBeUndefined();
+  });
+
+  it('diagnoses a repeatedly failing custom endpoint on the second consecutive 4xx', async () => {
+    // W4-1 replay: a custom provider answered `410 (no body)` three runs in a
+    // row; the user only ever saw "模型调用失败：410" and left with nothing.
+    // From the second consecutive endpoint-level failure the visible error
+    // must say the endpoint itself is suspect and point at Settings; a
+    // successful run clears the suspicion again.
+    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    mapper.resetCustomEndpointFailureTracking();
+    const failureTrackingScope = {};
+    const failedRun = () => collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            provider: 'custom',
+            error: {
+              kind: 'provider_error' as const,
+              message: '410 status code (no body)',
+              code: 'PROVIDER_ERROR',
+              statusCode: 410,
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+
+    const first = await failedRun();
+    expect(String(first[0].text || '')).not.toContain('endpoint');
+
+    const second = await failedRun();
+    expect(String(second[0].text || '')).toContain('endpoint');
+    expect(String(second[0].text || '')).toContain('410');
+    expect(second[0]).toMatchObject({ type: 'error', failureCode: 'provider_http_410' });
+
+    // A successful run resets the streak: the next single failure is quiet.
+    await collect([
+      { type: 'text_delta', text: 'recovered output' },
+      {
+        type: 'done',
+        result: { text: 'recovered output', meta: { provider: 'custom', error: null } },
+      },
+    ], { failureTrackingScope });
+    const afterRecovery = await failedRun();
+    expect(String(afterRecovery[0].text || '')).not.toContain('endpoint');
+
+    // An unrelated terminal failure also breaks the endpoint-specific streak.
+    await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            provider: 'custom',
+            error: {
+              kind: 'rate_limit' as const,
+              message: 'Too many requests',
+              code: 'RATE_LIMIT',
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+    const afterUnrelatedFailure = await failedRun();
+    expect(String(afterUnrelatedFailure[0].text || '')).not.toContain('endpoint');
+    mapper.resetCustomEndpointFailureTracking();
+  });
+
+  it('keeps repeated custom-endpoint guidance isolated between model sessions', async () => {
+    // A user opening another conversation must not inherit endpoint suspicion
+    // from the first one, and recovery elsewhere must not erase the first
+    // conversation's own streak. The visible guidance is the independent
+    // oracle: each session must reach the threshold using only its own runs.
+    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    mapper.resetCustomEndpointFailureTracking();
+    const sessionA = {};
+    const sessionB = {};
+    const freshSession = {};
+    const failedRun = (failureTrackingScope: object) => collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            provider: 'custom',
+            error: {
+              kind: 'provider_error' as const,
+              message: '410 status code (no body)',
+              code: 'PROVIDER_ERROR',
+              statusCode: 410,
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+    const successfulRun = (failureTrackingScope: object) => collect([
+      { type: 'text_delta', text: 'recovered output' },
+      {
+        type: 'done',
+        result: { text: 'recovered output', meta: { provider: 'custom', error: null } },
+      },
+    ], { failureTrackingScope });
+
+    const firstA = await failedRun(sessionA);
+    const firstB = await failedRun(sessionB);
+    expect(String(firstA[0].text || '')).not.toContain('endpoint');
+    expect(String(firstB[0].text || '')).not.toContain('endpoint');
+
+    await successfulRun(sessionB);
+    const secondA = await failedRun(sessionA);
+    expect(String(secondA[0].text || '')).toContain('endpoint');
+
+    const firstFresh = await failedRun(freshSession);
+    expect(String(firstFresh[0].text || '')).not.toContain('endpoint');
+
+    const afterRecoveryB = await failedRun(sessionB);
+    expect(String(afterRecoveryB[0].text || '')).not.toContain('endpoint');
+    mapper.resetCustomEndpointFailureTracking();
+  });
+
+  it('tells the user when a text-only model dropped their image attachments', async () => {
+    // W4-2: without this row the only symptom is the model itself claiming
+    // it cannot see the attachment, which sampled users debugged as their
+    // own mistake for whole conversations.
+    const out = await collect([
+      { type: 'images_omitted', count: 2, providerId: 'custom' },
+      { type: 'text_delta', text: 'answering without the screenshots' },
+      { type: 'done', result: { text: 'answering without the screenshots', meta: { error: null } } },
+    ] as never);
+    expect(out[0]).toMatchObject({
+      type: 'progress',
+      event: { stream: 'provider', data: { phase: 'images_omitted', count: 2 } },
+    });
+    expect(String(out[0].text || '')).toContain('2');
+    expect(String(out[0].text || '')).toContain('vision-capable');
+  });
+
+  it('advises switching models after the second consecutive output-cap overrun', async () => {
+    // W4-2: an 8B model with an 8192 cap truncated six replies in a row and
+    // nothing ever said the model was the problem. One overrun stays quiet
+    // (long answers legitimately overrun once); the second names the cap.
+    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    mapper.resetCustomEndpointFailureTracking();
+    const failureTrackingScope = {};
+    const overrun = () => collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error' as const,
+              message: 'Model output reached max_tokens (8192) before completing the turn; the partial response was discarded because it contained non-recoverable content and could include an incomplete tool call.',
+              code: 'OUTPUT_LIMIT',
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+    const first = await overrun();
+    expect(String(first[0].text || '')).not.toContain('output limit');
+    const second = await overrun();
+    expect(String(second[0].text || '')).toContain('larger output limit');
+    expect(second[0]).toMatchObject({ type: 'error', failureCode: 'provider_max_tokens' });
+
+    // A different terminal error interrupts the output-cap streak.
+    await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'timeout' as const,
+              message: 'Request timed out',
+              code: 'ETIMEDOUT',
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+    const afterUnrelatedFailure = await overrun();
+    expect(String(afterUnrelatedFailure[0].text || '')).not.toContain('larger output limit');
+    mapper.resetCustomEndpointFailureTracking();
+  });
+
+  it('keeps repeated output-cap guidance isolated between model sessions', async () => {
+    // Two conversations can hit the same small-model limit concurrently.
+    // Neither user's first failure should be mislabeled as a repeated failure
+    // because the other conversation failed or recovered.
+    const mapper = await import('../../../../src/main/model/core-agent/event-mapper');
+    mapper.resetCustomEndpointFailureTracking();
+    const sessionA = {};
+    const sessionB = {};
+    const freshSession = {};
+    const overrun = (failureTrackingScope: object) => collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error' as const,
+              message: 'Model output reached max_tokens before completing the turn.',
+              code: 'OUTPUT_LIMIT',
+            },
+          },
+        },
+      },
+    ], { failureTrackingScope });
+    const successfulRun = (failureTrackingScope: object) => collect([
+      { type: 'text_delta', text: 'completed' },
+      { type: 'done', result: { text: 'completed', meta: { error: null } } },
+    ], { failureTrackingScope });
+
+    const firstA = await overrun(sessionA);
+    const firstB = await overrun(sessionB);
+    expect(String(firstA[0].text || '')).not.toContain('larger output limit');
+    expect(String(firstB[0].text || '')).not.toContain('larger output limit');
+
+    await successfulRun(sessionB);
+    const secondA = await overrun(sessionA);
+    expect(String(secondA[0].text || '')).toContain('larger output limit');
+
+    const firstFresh = await overrun(freshSession);
+    expect(String(firstFresh[0].text || '')).not.toContain('larger output limit');
+
+    const afterRecoveryB = await overrun(sessionB);
+    expect(String(afterRecoveryB[0].text || '')).not.toContain('larger output limit');
+    mapper.resetCustomEndpointFailureTracking();
+  });
+
+  it('keeps the residual provider_error fallback but carries the original code', async () => {
+    const out = await collect([
+      {
+        type: 'done',
+        result: {
+          text: '',
+          meta: {
+            error: {
+              kind: 'provider_error',
+              message: 'upstream rejected the request',
+              code: 'SOME_VENDOR_SPECIFIC_CODE',
+            },
+          },
+        },
+      },
+    ]);
+    expect(out).toEqual([expect.objectContaining({
+      type: 'error',
+      failureKind: 'model',
+      failureCode: 'provider_error',
+      failureRawCode: 'SOME_VENDOR_SPECIFIC_CODE',
+    })]);
   });
 });
 

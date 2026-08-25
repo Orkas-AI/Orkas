@@ -61,6 +61,37 @@ describe("PersistentSession", () => {
     expect(msgs[1].role).toBe("assistant");
   });
 
+  it("persists the v3 tool-surface marker without dynamic groups", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.setToolSurfaceState({
+      version: 3,
+      mode: "scoped",
+      loadedGroups: [],
+      catalogRevision: "6",
+    });
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.getToolSurfaceState()).toEqual({
+      version: 3,
+      mode: "scoped",
+      loadedGroups: [],
+      catalogRevision: "6",
+    });
+
+    // A full history rewrite must not disturb the tool-surface sidecar.
+    // (This step used the legacy whole-session compact() before its removal;
+    // canonical history replacement is the surviving rewrite operation.)
+    s2.replaceConversationHistory([
+      { role: "user", turnId: 1, content: [{ type: "text", text: "old turn" }] },
+      { role: "assistant", turnId: 1, content: [{ type: "text", text: "old reply" }] },
+    ], "group-main-v1:tool-surface-test");
+    const s3 = new PersistentSession({ sessionFile: file });
+    expect(s3.getToolSurfaceState()?.loadedGroups).toEqual([]);
+
+    s3.clear();
+    expect(s3.getToolSurfaceState()).toBeUndefined();
+  });
+
   it("persists one rich steer durability batch with its resource sidecar", () => {
     const s1 = new PersistentSession({ sessionFile: file });
     s1.withContextMutationBatch(() => {
@@ -129,7 +160,6 @@ describe("PersistentSession", () => {
     session.applyHistorySummary(
       "Summary of the first canonical turn",
       [1],
-      "canonical-message-1",
     );
     session.replaceConversationHistory([
       ...canonical,
@@ -148,13 +178,10 @@ describe("PersistentSession", () => {
     const restored = new PersistentSession({ sessionFile: file });
     expect(restored.getSerializedContextState()?.conversationHistorySource)
       .toBe("group-main-v1:cid-1");
-    expect(restored.getSerializedContextState()?.summaryThroughMessageId)
-      .toBe("canonical-message-1");
     expect(JSON.stringify(restored.getMessages())).toContain("Third exact response");
 
     restored.replaceConversationHistory(canonical, "group-main-v2:cid-1");
     expect(restored.getSerializedContextState()?.historySummary).toBeUndefined();
-    expect(restored.getSerializedContextState()?.summaryThroughMessageId).toBeUndefined();
     expect(JSON.stringify(restored.getMessagesForModel())).toContain("Make the video");
   });
 
@@ -285,6 +312,57 @@ describe("PersistentSession", () => {
 
     const restored = new PersistentSession({ sessionFile: file });
     expect(restored.getWorkspaceObservations().entries).toHaveLength(1);
+  });
+
+  it("restores the workspace cache anchor from persisted tool-call identity", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Update the persistent file and inspect it" }]);
+    s1.addAssistantMessage([{
+      type: "tool_use",
+      id: "persistent-change",
+      name: "edit_file",
+      input: { path: "/workspace/persistent.ts" },
+    }]);
+    s1.recordToolObservations({
+      toolCallId: "persistent-change",
+      tool: "edit_file",
+      observations: {
+        fileChanges: [{
+          operation: "update",
+          sourcePath: "/workspace/persistent.ts",
+          beforeExists: true,
+          afterExists: true,
+          beforeHash: "sha256:persistent-before",
+          afterHash: "sha256:persistent-after",
+          coverage: "exact",
+        }],
+      },
+    });
+    s1.addToolResult("persistent-change", "PERSISTENT_CHANGE_RESULT", undefined, false);
+    s1.addAssistantMessage([{
+      type: "tool_use",
+      id: "persistent-read",
+      name: "read_file",
+      input: { path: "/workspace/persistent.ts" },
+    }]);
+    s1.addToolResult("persistent-read", "PERSISTENT_READ_RESULT", undefined, false);
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    const modelView = s2.getMessagesForModel();
+    const changeResultIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_result" && content.toolUseId === "persistent-change"
+    )));
+    const workspaceIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "text" && content.text.startsWith("[Workspace changes")
+    )));
+    const readUseIndex = modelView.findIndex((message) => message.content.some((content) => (
+      content.type === "tool_use" && content.id === "persistent-read"
+    )));
+
+    expect(workspaceIndex).toBe(changeResultIndex + 1);
+    expect(workspaceIndex).toBeLessThan(readUseIndex);
+    expect(JSON.stringify(modelView)).toContain("PERSISTENT_READ_RESULT");
+    expect(s2.getWorkspaceObservations().entries).toHaveLength(1);
   });
 
   it("coalesces one logical tool completion into one context sidecar rewrite", () => {
@@ -528,6 +606,39 @@ describe("PersistentSession", () => {
     expect(s3.getCompletedWorkLedger()).toHaveLength(1);
   });
 
+  it("recomputes completed-work visibility after restart and checkpoint recovery", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "Continue from the durable tool result" }]);
+    s1.addAssistantMessage([{
+      type: "tool_use",
+      id: "call-durable",
+      name: "bash",
+      input: { command: "npm test" },
+    }]);
+    s1.addToolResult("call-durable", "DURABLE_RAW_RESULT", undefined, false);
+    s1.recordCompletedWork({
+      toolCallId: "call-durable",
+      tool: "bash",
+      inputDigest: "durable:1",
+      inputSummary: "run npm test",
+      status: "succeeded",
+      resultSummary: "DURABLE_LEDGER_RESULT",
+    });
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    let modelView = JSON.stringify(s2.getMessagesForModel());
+    expect(modelView).toContain("DURABLE_RAW_RESULT");
+    expect(modelView).not.toContain("DURABLE_LEDGER_RESULT");
+    expect(s2.getCompletedWorkLedger()).toHaveLength(1);
+
+    s2.applyActiveCheckpointSummary("The durable command completed successfully.", 2);
+    const s3 = new PersistentSession({ sessionFile: file });
+    modelView = JSON.stringify(s3.getMessagesForModel());
+    expect(modelView).not.toContain("DURABLE_RAW_RESULT");
+    expect(modelView).toContain("DURABLE_LEDGER_RESULT");
+    expect(s3.getCompletedWorkLedger()).toHaveLength(1);
+  });
+
   it("repairs restored turn context when indexes point at tool process rows", () => {
     fs.writeFileSync(
       file,
@@ -609,20 +720,19 @@ describe("PersistentSession", () => {
     expect(s.getMessages()[1].role).toBe("assistant");
   });
 
-  it("compact rewrites the file to match in-memory state", () => {
+  it("persistent-block shrink survives a restart via the sidecar", () => {
     const s = new PersistentSession({ sessionFile: file });
-    for (let i = 0; i < 6; i++) {
-      s.addUserMessage(`msg ${i}`);
-      s.addAssistantMessage([{ type: "text", text: `reply ${i}` }]);
-    }
-    const before = fs.readFileSync(file, "utf-8").trim().split("\n").length;
+    s.beginUserTurn([{ type: "text", text: "long project" }]);
+    s.addAssistantMessage([{ type: "text", text: "ack" }]);
+    s.completeActiveTurn();
+    s.applyHistorySummary("Original prose before the shrink.", [1]);
 
-    s.compact("summary text");
+    s.applyPersistentBlockShrink("Shrunk prose after overflow recovery.");
 
-    const after = fs.readFileSync(file, "utf-8").trim().split("\n").length;
-    expect(after).toBeLessThan(before);
-    // file should match the in-memory state line-for-line
-    expect(after).toBe(s.length);
+    const reloaded = new PersistentSession({ sessionFile: file });
+    const restored = reloaded.getSerializedContextState();
+    expect(restored?.historySummary).toContain("Shrunk prose");
+    expect(restored?.historySummary).not.toContain("Original prose");
   });
 
   it("clear truncates backing file", () => {

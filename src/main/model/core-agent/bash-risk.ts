@@ -5,18 +5,23 @@
  *
  * Design principle — match command structure, not broad keywords. This runs on
  * a default-on surface, so we avoid text-only matches that would flag routine
- * commands like `npm rm`; however, actual shell delete commands are sensitive
- * because they mutate disk state directly.
+ * commands like `npm ls`; however, host/global package changes and actual
+ * shell delete commands are sensitive because they mutate durable state
+ * outside the active workspace.
  *
- * Four categories (see Common/docs/plans/agent-bash-risk-prompt.md §1):
- *   - network_egress  — UPLOAD / exfil shapes only; plain downloads pass.
- *   - destructive     — shell delete commands (`rm`, `Remove-Item`, `del`),
+ * Six categories:
+ *   - network_egress  — explicit shell network access, including downloads.
+ *   - destructive     — shell/Git deletion and rollback, process termination,
  *                       plus dd / mkfs / disk tools / fork bombs.
- *   - priv_esc        — sudo / su / doas / pkexec / Windows elevation.
+ *   - priv_esc        — elevation or a persistent security-boundary weakening.
  *   - sensitive_path  — credential & key files (any access), persistence /
  *                       autostart locations (writes), /etc writes. Excludes
  *                       `.env`, broad `~/.config`, /etc reads, and the macOS
  *                       user dirs (Documents/Desktop/Downloads).
+ *   - system_package_change — native system packages and explicit user/global
+ *                       toolchain changes. Project-local dependencies pass.
+ *   - external_mutation — writes to databases, remote hosts/files, deployed
+ *                       services, external APIs, registries, or control planes.
  *
  * Known gap (accepted for v1): a command name fully hidden behind command
  * substitution (`$(echo cu)rl ...`) is not decomposed. The common exfil
@@ -27,11 +32,24 @@
  * it stays unit-testable without Electron and cheap to call per command.
  */
 
-export type RiskCategory = 'network_egress' | 'destructive' | 'priv_esc' | 'sensitive_path';
+import {
+  classifyExternalMutationCommand,
+  classifyExternalMutationScript,
+  type ExternalMutationFinding,
+} from './external-mutation-risk';
+
+export type RiskCategory =
+  | 'network_egress'
+  | 'destructive'
+  | 'priv_esc'
+  | 'sensitive_path'
+  | 'system_package_change'
+  | 'external_mutation';
 
 export interface RiskResult {
   risky: boolean;
   reasons: RiskCategory[];
+  externalMutations: ExternalMutationFinding[];
 }
 
 // ── Tokenizer ──────────────────────────────────────────────────────────────
@@ -223,12 +241,20 @@ function effectiveCommand(words: string[]): { cmd: string; args: string[] } | nu
 
 const POWERSHELL_CMDS = new Set(['powershell', 'powershell.exe', 'pwsh', 'pwsh.exe']);
 const CMD_SHELL_CMDS = new Set(['cmd', 'cmd.exe']);
+const POSIX_SHELL_CMDS = new Set(['bash', 'bash.exe', 'dash', 'dash.exe', 'ksh', 'ksh.exe', 'sh', 'sh.exe', 'zsh', 'zsh.exe']);
 
-function unwrapWindowsShell(
+function unwrapCommandShell(
   cmd: string,
   args: string[],
 ): { command: string; opaque: boolean } | null {
   const lower = args.map((arg) => arg.toLowerCase());
+  if (POSIX_SHELL_CMDS.has(cmd)) {
+    const marker = lower.findIndex((arg) => /^-[a-z]*c[a-z]*$/i.test(arg));
+    if (marker >= 0 && marker + 1 < args.length) {
+      return { command: args[marker + 1], opaque: false };
+    }
+    return null;
+  }
   if (POWERSHELL_CMDS.has(cmd)) {
     if (lower.some((arg) => arg === '-encodedcommand' || arg === '-enc' || arg === '-e')) {
       return { command: '', opaque: true };
@@ -246,6 +272,44 @@ function unwrapWindowsShell(
     }
   }
   return null;
+}
+
+function inlineProgramSource(cmd: string, args: string[]): string | undefined {
+  const flags = cmd === 'node' || cmd === 'node.exe'
+    ? new Set(['-e', '--eval'])
+    : cmd === 'php' || cmd === 'php.exe'
+      ? new Set(['-r'])
+      : /^(?:python(?:3(?:\.\d+)?)?|py)(?:\.exe)?$/i.test(cmd)
+        ? new Set(['-c'])
+        : /^(?:ruby|perl)(?:\.exe)?$/i.test(cmd)
+          ? new Set(['-e'])
+          : null;
+  if (!flags) return undefined;
+  const index = args.findIndex((arg) => flags.has(arg.toLowerCase()));
+  if (index >= 0) return args[index + 1];
+  for (const arg of args) {
+    const lower = arg.toLowerCase();
+    if ((cmd === 'node' || cmd === 'node.exe') && lower.startsWith('--eval=')) return arg.slice('--eval='.length);
+    if (flags.has('-e') && /^-e[^-]/i.test(arg)) return arg.slice(2);
+    if (flags.has('-c') && /^-c[^-]/i.test(arg)) return arg.slice(2);
+    if (flags.has('-r') && /^-r[^-]/i.test(arg)) return arg.slice(2);
+  }
+  return undefined;
+}
+
+function effectivePrivilegeCommand(args: string[]): { cmd: string; args: string[] } | null {
+  const optionsWithValues = new Set([
+    '-C', '-D', '-g', '-h', '-p', '-R', '-T', '-u', '--chdir', '--close-from',
+    '--group', '--host', '--prompt', '--role', '--type', '--user',
+  ]);
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === '--') { index++; break; }
+    if (!arg.startsWith('-')) break;
+    index += optionsWithValues.has(arg) ? 2 : 1;
+  }
+  return effectiveCommand(args.slice(index));
 }
 
 function isFlag(w: string): boolean { return w.startsWith('-'); }
@@ -266,7 +330,7 @@ function commandOperands(args: string[]): string[] {
 const PRIV_ESC_CMDS = new Set(['sudo', 'su', 'doas', 'pkexec']);
 const WINDOWS_PRIV_ESC_CMDS = new Set(['runas', 'runas.exe', 'gsudo', 'gsudo.exe']);
 
-const NET_DOWNLOADERS = new Set(['curl', 'wget']);
+const NET_DOWNLOADERS = new Set(['curl', 'wget', 'fetch']);
 const RAW_SOCKET_CMDS = new Set(['nc', 'ncat', 'netcat', 'telnet', 'socat']);
 const REMOTE_COPY_CMDS = new Set(['scp', 'sftp', 'rsync']);
 const SHELL_INTERPRETERS = new Set([
@@ -288,11 +352,66 @@ function looksRemote(arg: string): boolean {
   return /^[^/\s:]+@[^/\s:]+:|^[A-Za-z0-9_.-]+:[^\\]/.test(arg) && arg.includes(':');
 }
 
+function hasHelpOrVersion(args: readonly string[]): boolean {
+  return args.some((arg) => new Set(['--help', '-h', '-?', '/?', '--version']).has(arg.toLowerCase()));
+}
+
+function gitAction(args: readonly string[]): { action?: string; index: number } {
+  const optionsWithValues = new Set(['-c', '-C', '--config-env', '--exec-path', '--git-dir', '--namespace', '--super-prefix', '--work-tree']);
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index];
+    if (arg === '--') { index++; break; }
+    if (!arg.startsWith('-')) break;
+    if (optionsWithValues.has(arg)) { index += 2; continue; }
+    if (/^--(?:config-env|exec-path|git-dir|namespace|super-prefix|work-tree)=/.test(arg)) { index++; continue; }
+    index++;
+  }
+  return { action: args[index]?.toLowerCase(), index };
+}
+
+function matchGitNetwork(args: readonly string[]): boolean {
+  const { action, index } = gitAction(args);
+  if (action === 'clone') {
+    const optionsWithValues = new Set(['-b', '--branch', '--depth', '--filter', '-j', '--jobs', '-o', '--origin', '--reference', '--reference-if-able', '--separate-git-dir', '--server-option', '-u', '--upload-pack']);
+    let source: string | undefined;
+    const rest = args.slice(index + 1);
+    for (let offset = 0; offset < rest.length; offset++) {
+      const arg = rest[offset];
+      if (optionsWithValues.has(arg)) { offset++; continue; }
+      if (arg.startsWith('-')) continue;
+      source = arg;
+      break;
+    }
+    return Boolean(source && (/^[a-z][a-z0-9+.-]*:\/\//i.test(source) || looksRemote(source)));
+  }
+  if (action === 'archive') return args.slice(index + 1).some((arg) => arg === '--remote' || arg.startsWith('--remote='));
+  return Boolean(action && new Set(['fetch', 'pull', 'push', 'ls-remote', 'send-email']).has(action));
+}
+
+function matchToolNetwork(cmd: string, args: readonly string[]): boolean {
+  if (hasHelpOrVersion(args)) return false;
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (cmd === 'git') return matchGitNetwork(args);
+  if (cmd === 'gh' || cmd === 'glab') return lower.some((arg) => !arg.startsWith('-'));
+  if (cmd === 'docker' || cmd === 'podman') {
+    return ['pull', 'login', 'search'].includes(lower[0] || '');
+  }
+  if (cmd === 'npm' || cmd === 'pnpm') {
+    return new Set(['view', 'info', 'show', 'search', 'audit', 'outdated', 'ping']).has(lower[0] || '');
+  }
+  if (cmd === 'pip' || cmd === 'pip3') return new Set(['download', 'index']).has(lower[0] || '');
+  return false;
+}
+
 function matchNetwork(cmd: string, args: string[], seg: Segment): boolean {
   if (RAW_SOCKET_CMDS.has(cmd)) return true;
   if (cmd === 'ssh') return args.length > 0; // ssh host [cmd] — remote exec
   if (REMOTE_COPY_CMDS.has(cmd)) return args.some(looksRemote);
+  if (matchToolNetwork(cmd, args)) return true;
   if (NET_DOWNLOADERS.has(cmd)) {
+    if (hasHelpOrVersion(args)) return false;
+    if (args.some((arg) => !arg.startsWith('-'))) return true;
     for (let i = 0; i < args.length; i++) {
       const a = args[i];
       if (CURL_UPLOAD_FLAGS.has(a)) return true;
@@ -305,6 +424,7 @@ function matchNetwork(cmd: string, args: string[], seg: Segment): boolean {
     if (seg.hasSubstitution) return true;
   }
   if (POWERSHELL_WEB_CMDS.has(cmd)) {
+    if (hasHelpOrVersion(args)) return false;
     const lower = args.map((arg) => arg.toLowerCase());
     for (let i = 0; i < lower.length; i++) {
       const arg = lower[i];
@@ -312,6 +432,11 @@ function matchNetwork(cmd: string, args: string[], seg: Segment): boolean {
       if (arg === '-method' && /^(post|put|patch|delete)$/.test(lower[i + 1] || '')) return true;
       if (/^-method:(post|put|patch|delete)$/.test(arg)) return true;
     }
+    return args.some((arg, index) => (
+      (!arg.startsWith('-') && lower[index - 1] !== '-outfile')
+      || /^(?:-uri|-url):/i.test(arg)
+      || ((lower[index - 1] === '-uri' || lower[index - 1] === '-url') && Boolean(arg))
+    ));
   }
   return false;
 }
@@ -331,12 +456,109 @@ function matchPipeToShell(seg: Segment): boolean {
 }
 
 const RAW_DEVICE_RE = /^\/dev\/(sd|hd|nvme|disk|rdisk|mapper)/i;
+const POSIX_PROCESS_TERMINATORS = new Set(['kill', 'pkill', 'killall']);
+const SIGNAL_NAME_RE = /^-(?:sig)?(?:abrt|alrm|bus|chld|cld|cont|emt|fpe|hup|ill|info|int|io|iot|kill|lost|pipe|poll|prof|pwr|quit|segv|stkflt|stop|sys|term|trap|tstp|ttin|ttou|urg|usr1|usr2|vtalrm|winch|xcpu|xfsz)$/i;
 
 function hasRecursiveFlag(args: string[]): boolean {
   return args.some((a) => a === '--recursive' || (/^-[A-Za-z]+$/.test(a) && /[rR]/.test(a)));
 }
 
+/** Return the last explicit POSIX signal selector, if any. Later selectors
+ *  win in the common implementations, so `kill -0 -TERM 1234` must not be
+ *  mistaken for a read-only signal-zero probe. */
+function explicitProcessSignal(args: string[]): string | null {
+  let signal: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const lower = arg.toLowerCase();
+    if (lower === '-s' || lower === '--signal') {
+      if (i + 1 < args.length) signal = args[++i].toLowerCase().replace(/^sig/, '');
+      continue;
+    }
+    if (lower.startsWith('--signal=')) {
+      signal = lower.slice('--signal='.length).replace(/^sig/, '');
+      continue;
+    }
+    if (/^-\d+$/.test(lower) || SIGNAL_NAME_RE.test(lower)) {
+      signal = lower.slice(1).replace(/^sig/, '');
+    }
+  }
+  return signal;
+}
+
+/** Find actual POSIX process selectors while excluding signal syntax. Other
+ *  option values deliberately count: e.g. `pkill -u alice` really does select
+ *  and terminate processes even without a trailing pattern. */
+function processTerminationTargets(args: string[]): string[] {
+  const targets: string[] = [];
+  let endOfFlags = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const lower = arg.toLowerCase();
+    if (!endOfFlags && arg === '--') { endOfFlags = true; continue; }
+    if (!endOfFlags && (lower === '-s' || lower === '--signal')) { i++; continue; }
+    if (!endOfFlags && (lower.startsWith('--signal=') || /^-\d+$/.test(lower) || SIGNAL_NAME_RE.test(lower))) {
+      continue;
+    }
+    if (!endOfFlags && isFlag(arg)) continue;
+    targets.push(arg);
+  }
+  return targets;
+}
+
+function matchProcessTermination(cmd: string, args: string[]): boolean {
+  const lower = args.map((arg) => arg.toLowerCase());
+  const hasHelp = lower.some((arg) => arg === '--help' || arg === '--version' || arg === '-?' || arg === '/?');
+  if (hasHelp) return false;
+
+  if (cmd === 'taskkill' || cmd === 'taskkill.exe') {
+    return lower.some((arg, index) => (
+      ((arg === '/pid' || arg === '/im') && Boolean(args[index + 1]) && !args[index + 1].startsWith('/'))
+      || /^\/(?:pid|im):.+/i.test(arg)
+    ));
+  }
+
+  if (cmd === 'stop-process') {
+    if (lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true')) return false;
+    // Like Remove-Item, Stop-Process accepts pipeline input and may therefore
+    // terminate a process even without an explicit operand in this stage.
+    return true;
+  }
+
+  if (!POSIX_PROCESS_TERMINATORS.has(cmd)) return false;
+  if (lower.some((arg) => arg === '-l' || arg === '--list')) return false;
+  const targets = processTerminationTargets(args);
+  if (!targets.length) return false;
+  const signal = explicitProcessSignal(args);
+  return signal === null || !/^0+$/.test(signal);
+}
+
+function matchDestructiveGit(args: readonly string[]): boolean {
+  if (hasHelpOrVersion(args)) return false;
+  const { action, index } = gitAction(args);
+  if (!action) return false;
+  const rest = args.slice(index + 1).map((arg) => arg.toLowerCase());
+  if (action === 'reset') return rest.some((arg) => arg === '--hard' || arg === '--merge' || arg === '--keep');
+  if (action === 'clean') return !rest.some((arg) => arg === '-n' || arg === '--dry-run' || /^-[^-]*n/.test(arg));
+  if (action === 'checkout') return rest.includes('--') || rest.some((arg) => arg === '-f' || arg === '--force');
+  if (action === 'switch') return rest.some((arg) => arg === '-f' || arg === '--force' || arg === '--discard-changes');
+  if (action === 'restore') {
+    if (rest.some((arg) => arg === '--worktree')) return true;
+    return !rest.some((arg) => arg === '--staged');
+  }
+  if (action === 'branch' || action === 'tag') {
+    return rest.some((arg) => arg === '-d' || arg === '--delete' || /^-[^-]*d/.test(arg));
+  }
+  if (action === 'stash') return rest.some((arg) => arg === 'drop' || arg === 'clear');
+  if (action === 'reflog') return rest.some((arg) => arg === 'expire' || arg === 'delete');
+  if (action === 'prune') return true;
+  if (action === 'gc') return rest.some((arg) => arg === '--aggressive' || /^--prune(?:=now)?$/.test(arg));
+  return false;
+}
+
 function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
+  if (matchProcessTermination(cmd, args)) return true;
+  if (cmd === 'git' && matchDestructiveGit(args)) return true;
   if (cmd === 'rm') {
     if (args.some((a) => a === '--help' || a === '--version')) return false;
     const targets = commandOperands(args);
@@ -439,7 +661,78 @@ function matchSensitive(cmd: string, args: string[], seg: Segment, allWords: str
   return false;
 }
 
-function matchPrivilegeEscalation(cmd: string, args: string[]): boolean {
+function chmodWidensAccess(args: readonly string[]): boolean {
+  if (hasHelpOrVersion(args)) return false;
+  const mode = args.find((arg) => !arg.startsWith('-'));
+  if (!mode) return false;
+  if (/^[0-7]{3,4}$/.test(mode)) {
+    const digits = mode.slice(-3).split('').map(Number);
+    const special = mode.length === 4 && mode[0] !== '0';
+    return special || (digits[1] & 2) !== 0 || (digits[2] & 2) !== 0;
+  }
+  return /(?:^|,)[augo]*\+[^,]*w/i.test(mode)
+    || /(?:^|,)[ago]*=[^,]*w/i.test(mode)
+    || /(?:^|,)[augo]*\+[^,]*[st]/i.test(mode);
+}
+
+function hasSecurityWeakeningAssignment(words: readonly string[]): boolean {
+  return words.some((word) => (
+    /^NODE_TLS_REJECT_UNAUTHORIZED=0$/i.test(word)
+    || /^GIT_SSL_NO_VERIFY=(?:1|true|yes)$/i.test(word)
+    || /^PYTHONHTTPSVERIFY=0$/i.test(word)
+  ));
+}
+
+function matchSecurityWeakening(cmd: string, args: string[], originalWords: readonly string[]): boolean {
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (hasSecurityWeakeningAssignment(originalWords)) return true;
+  if (cmd === 'chmod' && lower.some((arg) => arg === '--reference' || arg.startsWith('--reference='))) return true;
+  if (cmd === 'chmod') return chmodWidensAccess(args);
+  if (cmd === 'chown' || cmd === 'chgrp' || cmd === 'setfacl') return !hasHelpOrVersion(args);
+  if ((cmd === 'curl' || cmd === 'curl.exe') && lower.some((arg) => arg === '-k' || arg === '--insecure')) return true;
+  if (cmd === 'wget' && lower.includes('--no-check-certificate')) return true;
+  if ((cmd === 'ssh' || cmd === 'scp' || cmd === 'sftp') && lower.some((arg, index) => (
+    /^stricthostkeychecking=(?:no|off)$/i.test(arg)
+    || /^userknownhostsfile=(?:\/dev\/null|nul)$/i.test(arg)
+    || (arg === '-o' && /^(?:stricthostkeychecking=(?:no|off)|userknownhostsfile=(?:\/dev\/null|nul))$/i.test(lower[index + 1] || ''))
+  ))) return true;
+  if (cmd === 'git') {
+    const joined = lower.join(' ');
+    if (/https?\.sslverify(?:=|\s+)false\b/.test(joined)) return true;
+    const { action, index } = gitAction(args);
+    if (action === 'config') {
+      const rest = lower.slice(index + 1).filter((arg) => !arg.startsWith('-'));
+      if (rest.some((arg, i) => /^https?\.sslverify$/.test(arg) && rest[i + 1] === 'false')) return true;
+    }
+  }
+  if ((cmd === 'npm' || cmd === 'pnpm' || cmd === 'yarn')
+    && lower.includes('config') && lower.includes('strict-ssl') && lower.includes('false')) return true;
+  if (cmd === 'spctl') return lower.some((arg) => arg === '--master-disable' || arg === '--global-disable');
+  if (cmd === 'csrutil') return lower[0] === 'disable';
+  if (cmd === 'pfctl') return lower.includes('-d');
+  if (cmd === 'ufw') {
+    return Boolean(lower[0] && !new Set(['status', 'show', 'version', 'help', '--help']).has(lower[0]));
+  }
+  if (cmd === 'iptables' || cmd === 'ip6tables') {
+    const mutating = new Set([
+      '-A', '--append', '-D', '--delete', '-I', '--insert', '-R', '--replace',
+      '-F', '--flush', '-X', '--delete-chain', '-N', '--new-chain', '-P', '--policy',
+      '-E', '--rename-chain', '-Z', '--zero',
+    ]);
+    return args.some((arg) => mutating.has(arg) || /^-[^-]*[ADIRFXNPEZ]/.test(arg));
+  }
+  if (cmd === 'netsh' || cmd === 'netsh.exe') {
+    return lower.includes('advfirewall') && lower.some((arg) => new Set(['set', 'add', 'delete', 'reset', 'import']).has(arg));
+  }
+  if (new Set(['new-netfirewallrule', 'remove-netfirewallrule', 'set-netfirewallrule', 'set-netfirewallprofile']).has(cmd)) {
+    return !lower.some((arg) => arg === '-whatif' || arg === '-whatif:$true');
+  }
+  if ((cmd === 'xattr' || cmd === 'xattr.exe') && lower.includes('-d') && lower.includes('com.apple.quarantine')) return true;
+  return false;
+}
+
+function matchPrivilegeEscalation(cmd: string, args: string[], originalWords: readonly string[]): boolean {
+  if (matchSecurityWeakening(cmd, args, originalWords)) return true;
   if (PRIV_ESC_CMDS.has(cmd) || WINDOWS_PRIV_ESC_CMDS.has(cmd)) return true;
   const lower = args.map((arg) => arg.toLowerCase());
   if (cmd === 'start-process') {
@@ -453,6 +746,12 @@ function matchPrivilegeEscalation(cmd: string, args: string[]): boolean {
   if (cmd === 'add-mppreference') {
     return lower.some((arg) => arg.startsWith('-exclusion'));
   }
+  if (cmd === 'set-mppreference') {
+    return lower.some((arg, index) => (
+      arg.startsWith('-exclusion')
+      || (arg.startsWith('-disable') && /^(?:true|\$true|1)$/.test(lower[index + 1] || ''))
+    ));
+  }
   if (cmd === 'net' || cmd === 'net.exe') {
     if (lower[0] === 'user') return lower.some((arg) => arg === '/add' || arg === '/delete' || arg.startsWith('/active:'));
     if (lower[0] === 'localgroup' && lower[1] === 'administrators') {
@@ -462,14 +761,212 @@ function matchPrivilegeEscalation(cmd: string, args: string[]): boolean {
   return false;
 }
 
+const SYSTEM_PACKAGE_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  winget: new Set(['install', 'upgrade', 'uninstall', 'remove', 'import', 'configure']),
+  choco: new Set(['install', 'upgrade', 'uninstall']),
+  chocolatey: new Set(['install', 'upgrade', 'uninstall']),
+  scoop: new Set(['install', 'uninstall', 'update', 'reset', 'hold', 'unhold']),
+  brew: new Set(['install', 'uninstall', 'remove', 'reinstall', 'upgrade', 'tap', 'untap', 'pin', 'unpin', 'bundle']),
+  apt: new Set(['install', 'remove', 'purge', 'upgrade', 'full-upgrade', 'dist-upgrade', 'autoremove']),
+  'apt-get': new Set(['install', 'remove', 'purge', 'upgrade', 'full-upgrade', 'dist-upgrade', 'autoremove']),
+  dnf: new Set(['install', 'remove', 'erase', 'upgrade', 'update', 'downgrade', 'reinstall', 'distro-sync', 'autoremove']),
+  yum: new Set(['install', 'remove', 'erase', 'upgrade', 'update', 'downgrade', 'reinstall', 'distro-sync', 'autoremove']),
+  apk: new Set(['add', 'del', 'upgrade', 'fix']),
+  zypper: new Set(['install', 'in', 'remove', 'rm', 'update', 'up', 'patch', 'dist-upgrade', 'dup', 'addrepo', 'ar', 'removerepo', 'rr', 'modifyrepo', 'mr']),
+  pkg: new Set(['install', 'delete', 'remove', 'upgrade', 'autoremove', 'lock', 'unlock']),
+  snap: new Set(['install', 'remove', 'refresh', 'revert', 'enable', 'disable']),
+  flatpak: new Set(['install', 'uninstall', 'update', 'remote-add', 'remote-delete', 'remote-modify']),
+  pipx: new Set(['install', 'uninstall', 'upgrade', 'upgrade-all', 'inject', 'uninject', 'reinstall', 'reinstall-all']),
+  cargo: new Set(['install', 'uninstall']),
+};
+
+const SYSTEM_PACKAGE_READ_ACTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  winget: new Set(['search', 'show', 'list', 'export', 'validate', 'hash', 'help']),
+  choco: new Set(['search', 'find', 'list', 'info', 'help']),
+  chocolatey: new Set(['search', 'find', 'list', 'info', 'help']),
+  scoop: new Set(['search', 'list', 'info', 'status', 'which', 'help']),
+  brew: new Set(['search', 'info', 'list', 'leaves', 'outdated', 'doctor', 'config', 'help']),
+  apt: new Set(['list', 'search', 'show', 'satisfy', 'help']),
+  'apt-get': new Set(['update', 'download', 'source', 'changelog', 'check', 'help']),
+  dnf: new Set(['search', 'info', 'list', 'repoquery', 'check-update', 'history', 'help']),
+  yum: new Set(['search', 'info', 'list', 'provides', 'check-update', 'history', 'help']),
+  apk: new Set(['search', 'info', 'list', 'policy', 'stats', 'version', 'update', 'help']),
+  zypper: new Set(['search', 'se', 'info', 'if', 'list-updates', 'lu', 'repos', 'lr', 'refresh', 'ref', 'help']),
+  pkg: new Set(['search', 'info', 'which', 'version', 'audit', 'help']),
+  snap: new Set(['find', 'info', 'list', 'changes', 'tasks', 'help']),
+  flatpak: new Set(['search', 'list', 'info', 'remotes', 'history', 'help']),
+  pipx: new Set(['list', 'environment', 'ensurepath', 'completions', 'help']),
+  cargo: new Set(['search', 'info', 'help']),
+};
+
+function packageCommandName(cmd: string): string {
+  return cmd.replace(/\.(?:exe|cmd|bat|ps1)$/i, '');
+}
+
+function firstRecognizedAction(
+  args: string[],
+  mutating: ReadonlySet<string>,
+  readonly: ReadonlySet<string> = new Set<string>(),
+): string | null {
+  for (const raw of args) {
+    const arg = raw.toLowerCase();
+    if (mutating.has(arg) || readonly.has(arg)) return arg;
+  }
+  return null;
+}
+
+function matchPacmanPackageChange(args: string[]): boolean {
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (lower.some((arg) => arg === '--remove' || arg === '--upgrade' || arg === '--sysupgrade')) return true;
+  const syncQuery = lower.some((arg) => (
+    arg === '--search' || arg === '--info' || arg === '--list' || arg === '--groups'
+    || arg === '--print' || arg === '--downloadonly'
+  ));
+  if (lower.includes('--sync')) {
+    return !syncQuery && lower.some((arg) => !arg.startsWith('-') && arg !== '--');
+  }
+  for (const arg of args) {
+    if (!/^-[^-]/.test(arg)) continue;
+    const flags = arg.slice(1);
+    if (flags.includes('R') || flags.includes('U')) return true;
+    if (!flags.includes('S')) continue;
+    if (flags.includes('u')) return true;
+    const queryOnly = /[silgpw]/.test(flags);
+    if (!queryOnly && lower.some((item) => !item.startsWith('-'))) return true;
+  }
+  return false;
+}
+
+function matchSystemPackageChange(cmd: string, args: string[]): boolean {
+  const command = packageCommandName(cmd);
+  const lower = args.map((arg) => arg.toLowerCase());
+  if (hasHelpOrVersion(args) || lower[0] === 'help') return false;
+
+  // This category protects durable host/user toolchain state, not ordinary
+  // workspace dependency work. Install hooks can execute code, but so can any
+  // project command; treating every local install/runner as a system change
+  // made the approval surface much broader than the category name promised.
+  // `python -m pip` is the common cross-platform spelling for pip.
+  if (/^(?:python(?:3(?:\.\d+)?)?|py)$/.test(command)
+    && lower[0] === '-m' && (lower[1] === 'pip' || lower[1] === 'pip3')) {
+    return matchSystemPackageChange(lower[1], args.slice(2));
+  }
+  if (command === 'pip' || command === 'pip3') {
+    const actions = new Set(['install', 'uninstall']);
+    const action = firstRecognizedAction(
+      args,
+      actions,
+      new Set(['list', 'show', 'check', 'freeze', 'download', 'index', 'inspect', 'help']),
+    );
+    return action !== null && actions.has(action) && lower.some((arg) => (
+      arg === '--user'
+      || arg === '--break-system-packages'
+      || arg.startsWith('--user=')
+      || arg.startsWith('--break-system-packages=')
+    ));
+  }
+
+  if (command === 'npm' || command === 'pnpm') {
+    const actions = command === 'npm'
+      ? new Set(['install', 'i', 'add', 'ci', 'update', 'upgrade', 'uninstall', 'remove', 'rm', 'prune', 'dedupe', 'link'])
+      : new Set(['install', 'i', 'add', 'update', 'up', 'uninstall', 'remove', 'rm', 'prune', 'dedupe', 'link', 'import', 'deploy']);
+    const readonly = new Set(['list', 'ls', 'why', 'view', 'info', 'show', 'search', 'audit', 'outdated', 'ping', 'config', 'help', 'run']);
+    const action = firstRecognizedAction(args, actions, readonly);
+    if (command === 'pnpm' && lower[0] === 'self-update') return true;
+    if (command === 'npm' && action === 'link') return true;
+    const global = lower.some((arg, index) => (
+      arg === '-g'
+      || arg === '--global'
+      || arg.startsWith('--global=')
+      || arg === '--location=global'
+      || (arg === '--location' && lower[index + 1] === 'global')
+    ));
+    return global && action !== null && actions.has(action);
+  }
+  if (command === 'yarn') {
+    return lower[0] === 'global' && ['add', 'remove', 'upgrade'].includes(lower[1] || '');
+  }
+  if (command === 'bun') {
+    if (lower[0] === 'upgrade') return true;
+    const global = lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+    return global && new Set(['install', 'i', 'add', 'remove', 'rm', 'update', 'link']).has(lower[0] || '');
+  }
+  if (command === 'uv') {
+    const toolIndex = lower.indexOf('tool');
+    const pythonIndex = lower.indexOf('python');
+    const selfIndex = lower.indexOf('self');
+    const actions = new Set(['install', 'uninstall', 'upgrade']);
+    if (toolIndex >= 0) return actions.has(lower[toolIndex + 1] || '');
+    if (pythonIndex >= 0) return actions.has(lower[pythonIndex + 1] || '');
+    if (selfIndex >= 0) return lower[selfIndex + 1] === 'update';
+    return false;
+  }
+  if (command === 'poetry') {
+    return lower[0] === 'self' && new Set(['add', 'remove', 'update']).has(lower[1] || '');
+  }
+  if (command === 'conda' || command === 'mamba' || command === 'micromamba') {
+    return new Set(['create', 'install', 'remove', 'uninstall', 'update', 'upgrade']).has(lower[0] || '');
+  }
+  if (command === 'cargo') {
+    if (lower[0] === 'install' && lower.includes('--list')) return false;
+    return new Set(['install', 'uninstall']).has(lower[0] || '');
+  }
+  if (command === 'go') {
+    return lower[0] === 'install'
+      || (lower[0] === 'env' && lower.some((arg) => arg === '-w' || arg === '-u'));
+  }
+  if (command === 'gem') return new Set(['install', 'uninstall', 'update', 'cleanup']).has(lower[0] || '');
+  if (command === 'composer') {
+    return lower[0] === 'global' && new Set(['install', 'update', 'require', 'remove']).has(lower[1] || '');
+  }
+  if (command === 'dotnet') {
+    return lower[0] === 'tool'
+      && new Set(['install', 'update', 'uninstall']).has(lower[1] || '')
+      && lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+  }
+  if (command === 'corepack') {
+    if (lower[0] === 'enable' || lower[0] === 'disable' || lower[0] === 'prepare') return true;
+    return lower[0] === 'install'
+      && lower.some((arg) => arg === '-g' || arg === '--global' || arg.startsWith('--global='));
+  }
+  if (command === 'pacman') return matchPacmanPackageChange(args);
+  if (command === 'winget' || command === 'choco' || command === 'chocolatey') {
+    const upgradeIndex = lower.indexOf('upgrade');
+    const primaryAction = command === 'winget'
+      ? firstRecognizedAction(args, SYSTEM_PACKAGE_ACTIONS.winget, SYSTEM_PACKAGE_READ_ACTIONS.winget)
+      : null;
+    // Bare `winget upgrade` only lists available upgrades. A target or option
+    // after the verb selects an actual upgrade operation.
+    if (primaryAction === 'upgrade' && upgradeIndex >= 0) return lower.length > upgradeIndex + 1;
+    const sourceIndex = lower.indexOf('source');
+    if (sourceIndex >= 0) {
+      return ['add', 'remove', 'update', 'reset', 'enable', 'disable'].includes(lower[sourceIndex + 1] || '');
+    }
+    const pinIndex = lower.indexOf('pin');
+    if (pinIndex >= 0) return ['add', 'remove'].includes(lower[pinIndex + 1] || '');
+  }
+  if (command === 'scoop') {
+    const bucketIndex = lower.indexOf('bucket');
+    if (bucketIndex >= 0) return ['add', 'rm', 'remove'].includes(lower[bucketIndex + 1] || '');
+  }
+  if (command === 'add-apt-repository') {
+    return !lower.some((arg) => arg === '--help' || arg === '-h' || arg === '--list');
+  }
+  const mutating = SYSTEM_PACKAGE_ACTIONS[command];
+  if (!mutating) return false;
+  const action = firstRecognizedAction(args, mutating, SYSTEM_PACKAGE_READ_ACTIONS[command]);
+  return action !== null && mutating.has(action);
+}
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /** Classify a bash command. Returns the set of risk categories it trips
  *  (deduped); `risky` is true when any category fires. */
 function classifyBashCommandInternal(command: string, depth: number): RiskResult {
   const reasons = new Set<RiskCategory>();
+  const externalMutations: ExternalMutationFinding[] = [];
   const cmd = String(command ?? '');
-  if (!cmd.trim()) return { risky: false, reasons: [] };
+  if (!cmd.trim()) return { risky: false, reasons: [], externalMutations: [] };
 
   // Fork bomb — operator soup the tokenizer can't meaningfully decompose;
   // matched on the raw despaced string.
@@ -487,29 +984,46 @@ function classifyBashCommandInternal(command: string, depth: number): RiskResult
       if (!eff) continue;
       let { cmd: c, args } = eff;
 
-      if (matchPrivilegeEscalation(c, args)) {
+      if (matchPrivilegeEscalation(c, args, stage.words)) {
         reasons.add('priv_esc');
         // inspect the inner command too: `sudo rm -rf /`
         if (PRIV_ESC_CMDS.has(c)) {
-          const inner = effectiveCommand(args);
+          const inner = effectivePrivilegeCommand(args);
           if (inner) { c = inner.cmd; args = inner.args; }
         }
       }
 
+      // Privilege wrappers are peeled above so the inner operation can add
+      // its own security-boundary reason as well (for example `sudo chmod`).
+      if (matchSecurityWeakening(c, args, stage.words)) reasons.add('priv_esc');
+
       if (matchNetwork(c, args, seg)) reasons.add('network_egress');
       if (matchDestructive(c, args, seg)) reasons.add('destructive');
       if (matchSensitive(c, args, seg, allWords)) reasons.add('sensitive_path');
+      if (matchSystemPackageChange(c, args)) reasons.add('system_package_change');
+      const externalMutation = classifyExternalMutationCommand(c, args);
+      if (externalMutation) {
+        reasons.add('external_mutation');
+        externalMutations.push(externalMutation);
+      }
+      const inlineSource = inlineProgramSource(c, args);
+      if (inlineSource) {
+        const inlineMutations = classifyExternalMutationScript(inlineSource);
+        if (inlineMutations.length) reasons.add('external_mutation');
+        externalMutations.push(...inlineMutations);
+      }
 
-      const wrapped = unwrapWindowsShell(c, args);
+      const wrapped = unwrapCommandShell(c, args);
       if (wrapped?.opaque) reasons.add('destructive');
       if (wrapped?.command && depth < 4) {
         const nested = classifyBashCommandInternal(wrapped.command, depth + 1);
         for (const reason of nested.reasons) reasons.add(reason);
+        externalMutations.push(...nested.externalMutations);
       }
     }
   }
 
-  return { risky: reasons.size > 0, reasons: [...reasons] };
+  return { risky: reasons.size > 0, reasons: [...reasons], externalMutations };
 }
 
 export function classifyBashCommand(command: string): RiskResult {

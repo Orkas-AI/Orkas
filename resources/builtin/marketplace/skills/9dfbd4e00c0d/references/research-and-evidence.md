@@ -51,34 +51,42 @@ Search in layers:
 3. Challenge the emerging thesis with counterevidence and boundary cases.
 4. Close only the gaps that affect the reader promise or publication decision.
 
-For ordinary current-research work, make one discovery batch of at most 3 family-specific `web_search` calls and request at most 5 results per call. It is the first and only batch. In each query, ask for the requested period plus the latest prior-period authoritative baseline. Append negative source filters: Chinese queries include `-百科 -baike -wikipedia`; other queries include `-wikipedia -encyclopedia`. Once the batch returns, search is permanently closed even when results are weak or empty and after an error, gate, retry, recovery, or compaction. Never repeat the batch after a provider/model retry. Immediately persist `search_batch_complete: true`, the actual `search_attempts`, zero `fetch_attempts`, and empty `sources` in `RESEARCH_LEDGER.json`; after compaction, read it before any network or plan tool. A successful same-turn write already confirms the ledger: do not call `read_file` just to inspect it. Preserve unused authoritative result URLs as alternates. Reject encyclopedia, homepage, category, tag, search, and generic research-hub URLs; prefer a dated title-matched report/article or the exact official document. Every fetched URL must be copied verbatim from a successful search result; never guess, synthesize, shorten, or extrapolate a URL path. If an inaccessible commercial first-party report blocks a family, use an exact search-returned, dated reputable article that names the report and label the evidence secondary. A prior-period source covers a family only as an explicitly dated latest baseline, never as current-period measurement. After discovery, emit at most 2 `web_fetch` calls per model tool-use response, each for a different uncovered evidence family, with `maxChars: 2500`. Wait for and classify the whole batch before continuing; never emit 3 or more sibling `web_fetch` calls. Count a source as successful only when it returns usable body text for its required family. Stop only when both conditions hold: at least 3 independent sources succeeded, and every named evidence family has usable support. Neither raw source count nor family coverage alone is sufficient, and no fetch is allowed after both conditions are met. Use no more than 6 fetch attempts and 9 combined search/fetch attempts. After recovery, resume from the source and claim ledgers without another search batch. Exceed the budget only when the user explicitly approves extended research; otherwise mark unsupported families as gaps and deliver.
+For current research, derive evidence families from the material claims and
+decisions in scope. Use the fewest targeted searches that can locate suitable
+sources, and change a query only when it addresses a different unresolved gap.
+Prefer exact primary or official pages for facts they own, then add independent
+context or corroboration when the claim risk requires it. A source target comes
+from a successful search result or the user's supplied material; never guess,
+synthesize, shorten, or extrapolate a URL.
 
-Keep this bounded path in the source and claim ledgers. Do not call a plan-management tool. For an ordinary analytical article, use the scoped research shape without loading this format reference.
+Fetch enough specific pages to support the material claims, not a predetermined
+number. Reject encyclopedias, homepages, search/category/tag pages, generic
+hubs, and pages whose body does not support the assigned family. A prior-period
+source is a dated baseline, not a current-period measurement. If a commercial
+primary source is inaccessible, a reputable dated report that clearly
+attributes it may be secondary evidence when that limitation is disclosed.
 
-Synthesize each bounded `web_fetch` result directly into the ledgers. Do not use `tool_result_search` for a fetch made with `maxChars: 2500`.
+Update the source and claim ledgers as usable material arrives. A native search
+result with readable source content and an exact citation can supply evidence;
+a title or snippet cannot. When separate retrieval is needed, read the specific
+page through the web tools rather than an ad-hoc shell HTTP command. Add
+`status: "usable"` only after reading content that supports the assigned claim.
+One source may cover multiple evidence families only when it directly supports
+each. Stop when critical claims are supported, narrowed, removed, or explicitly
+held; do not continue merely to reach a source count. Resume from the ledgers
+after retry or compaction instead of repeating completed discovery.
 
-Before drafting, write the literal `RESEARCH_LEDGER.json` file and apply the
-canonical `content-writer research_gate` procedure documented in SKILL.md.
-Never run the first gate until `fetch_attempts >= 3`. Draft a completed-research artifact only on `READY_TO_DRAFT`. On
-`CONTINUE_RESEARCH`, obey `remaining_fetch_attempts`: fetch a saved exact
-alternate only when its title, snippet, and publisher cover every reported
-`missing_family` and its one new independent URL satisfies the remaining
-`source_deficit`, making `READY_TO_DRAFT` plausible on the next gate. If no such
-candidate exists, skip the fetch, ledger rewrite, and second gate and deliver
-an explicit `HOLD`.
-A second gate is valid only after `fetch_attempts` increased. Never run the gate more than
-twice. The second gate is final; never fetch after it. Treat
-`READY_TO_DRAFT` as collection completeness only;
-source quality, factual support, freshness, and claim entailment still require
-the checks below.
-Production regression binds each fetch to a specific URL observed in successful
-search output without persisting the URL; guessed or disallowed URLs fail the
-source-binding check.
-Record all successful and failed reads in `fetch_attempts`. After a first
-gate made only once `fetch_attempts >= 3`, a `CONTINUE_RESEARCH` requires at
-least one new exact-result fetch before a second gate. If no alternate exists,
-skip that second gate and deliver gaps. Otherwise rerun immediately and never
-fetch after the second gate.
+Before drafting completed research, write `RESEARCH_LEDGER.json` and apply the
+`content-writer research_gate` coverage check documented in SKILL.md when its
+runner is available. `READY_TO_DRAFT` proves only that every required evidence
+family has usable collection coverage. An undated family is advisory: decide
+whether it can support the claim's freshness requirement rather than forcing a
+generic search for a date. The gate does not prove source quality, factual
+accuracy, freshness, independence, or claim entailment; apply the checks below.
+On `CONTINUE_RESEARCH`, continue only when a specific missing family has a
+promising source or meaningfully different query. If the latest attempt adds no
+usable support, narrow or remove the claim, or deliver confirmed findings and
+an explicit `HOLD` with the evidence needed to close the gap.
 
 ## Select sources by role
 
@@ -187,6 +195,11 @@ Stop when all are true:
 - recent searches mostly repeat known evidence or lead to the same evidence families.
 - remaining gaps are nonmaterial or require user/private access.
 
-Before another fetch, check the ledger for the same URL and evidence family. Do not retry the same failed route, reread an accepted source, or reopen a closed gap after context compaction. Resume from the ledger and use one alternate source within the remaining budget when access fails.
+Also stop work on one gap when a meaningfully different retrieval attempt adds
+no usable support for it. Do not reopen that gap through equivalent searches;
+narrow or remove the dependent claim, or hold the artifact if it is essential
+to the reader promise.
+
+Before another retrieval, check the ledger for the same URL and evidence family. Do not retry the same failed route, reread an accepted source, or reopen a closed gap after context compaction. Resume from the ledger and use one alternate source within the remaining budget when access fails.
 
 Do not stop merely because a target number of links was reached. Do not continue merely to make the bibliography look large.

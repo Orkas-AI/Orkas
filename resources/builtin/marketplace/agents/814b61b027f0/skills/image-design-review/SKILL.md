@@ -3,12 +3,11 @@ ownerAgent: 814b61b027f0
 name: image-design-review
 description_zh: 仅在 ImageStudio 已取得当前 inspect 或 snapshot 视觉证据后读取，用于多模态审美复核并绑定精确证据签名；任务启动和路由阶段不要读取。
 description_en: Read only after current ImageStudio inspect or snapshot evidence exists; performs signature-bound multimodal review and must not be loaded at task start or during routing.
-category: creation
 ---
 
 # Image Design Review
 
-Read this skill only after a passing `image_studio project.inspect` or `project.snapshot` returns `visual_evidence.attached:true`. Never load it at task start, during routing, or in the same parallel batch as `image-router`. Inspect the attached complete full-color image, not a textual description of it, a media URL, or the generic `read_file` grayscale preview of the same path. Failed deterministic inspection intentionally returns no visual attachment and must be repaired before this review begins.
+Read this skill only after a passing COMPOSE or HYBRID `image_studio project.snapshot` returns `visual_evidence.attached:true`. Never load it at task start, during routing, or in the same parallel batch as `image-router`. Never use it for a GENERATE or EDIT raster, including strict reproduction, semantic editing, explicit visual-QA wording, or multi-image consistency; the configured image service owns those guarantees. Inspect the attached complete full-color composition, not a textual description of it, a media URL, or the generic `read_files` grayscale preview of the same path. Failed deterministic inspection intentionally returns no visual attachment and must be repaired before this review begins.
 
 ## Review rubric
 
@@ -24,9 +23,11 @@ Check, in order:
 
 ## Multi-image style consistency
 
-When the user requests multiple images as one set, use the first image that passes design review as the style anchor. For every later image, place a project-local copy of that anchor in `references` as a required reference with `role:"style"`; use `reference_intent.mode:"guide"`, recording `basis:"user"` only when the user explicitly requested the shared style and `basis:"inferred"` otherwise; preserve palette roles, typography roles, spacing/grid rhythm, shape/icon/stroke language, material or lighting treatment, and the signature device; allow only the content and local composition changes needed by that member; and set `reference_intent.minimum_score` to at least 85.
+When the user requests multiple COMPOSE or HYBRID images as one set, use the first image that passes design review as the style anchor. For every later image, place a project-local copy of that anchor in `references` as a required reference with `role:"style"`; use `reference_intent.mode:"guide"`, recording `basis:"user"` only when the user explicitly requested the shared style and `basis:"inferred"` otherwise; preserve palette roles, typography roles, spacing/grid rhythm, shape/icon/stroke language, material or lighting treatment, and the signature device; allow only the content and local composition changes needed by that member; and set `reference_intent.minimum_score` to at least 85.
 
 Inspect each later candidate and the style anchor side by side. Use the existing `reference_fidelity` score as the style-consistency score for that comparison. Treat an undeclared change in the preserved style axes as a `fix`, while normal content differences are not drift. Before delivery, inspect all final images side by side once, repair and re-review any visual outlier, and only then report that the set is style-consistent. Separate high individual scores are not evidence of set-level consistency.
+
+Then decide what the user sees. Preview every exported image in its intended order so the set reads as a set; a representative image or a contact sheet is enough when the user asked for a summary or showing everything inline would be less useful. This shapes the reply, not the export: never withhold or delay a passing export because of how many images the message shows.
 
 Classify findings as:
 

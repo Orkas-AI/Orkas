@@ -137,6 +137,11 @@ export type ToolResult = {
    *  deliberate last act of a turn — e.g. handing the conversation off to
    *  another agent, where a commander "synthesis" turn would be wasted. */
   endTurn?: boolean;
+  /** Used with `endTurn` when a terminal bookkeeping tool expects the model to
+   * write the user-facing reply in the same response. If that response has no
+   * text, the runner permits exactly one tool-free synthesis instead of
+   * completing the turn with an empty reply. */
+  synthesizeIfNoText?: boolean;
   /** User-boundary tool: commit this result, withhold every tool for exactly
    * one follow-up inference, then end the run with that model-authored reply.
    *
@@ -160,10 +165,16 @@ export interface AgentTool {
   /** Whether this tool may run concurrently with ADJACENT same-mode tool
    *  calls in one tool-use batch. Defaults to "sequential". Only
    *  side-effect-free, `ctx.state`-non-mutating tools (read / list / grep /
-   *  search / web / kb_read …) should opt into "parallel"; write / edit /
+   *  search / web / library reads …) should opt into "parallel"; write / edit /
    *  delete / bash / pdf / generate / connector-call / skill tools stay
    *  sequential. Engine-internal — never sent to the model. */
   readonly executionMode?: "sequential" | "parallel";
+
+  /** Selects who owns the execution deadline. The default is the core-agent
+   * runner. Set to "executor" only for delegation tools whose child runtime
+   * has its own bounded timeout/cancellation contract. Engine-internal —
+   * never sent to the model. */
+  readonly executionTimeoutOwner?: "executor";
 
   /** Execute the tool with the given input. */
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
@@ -172,8 +183,12 @@ export interface AgentTool {
 export const TOOL_DESCRIPTION_SOFT_BUDGET_CHARS = 480;
 export const SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS = 220;
 
+const toolDefinitionCache = new WeakMap<AgentTool, ToolDefinition>();
+
 /** Convert an AgentTool to the provider ToolDefinition format. */
 export function toToolDefinition(tool: AgentTool): ToolDefinition {
+  const cached = toolDefinitionCache.get(tool);
+  if (cached) return cached;
   const description = normalizeDescription(tool.description);
   warnLongDescriptionOnce(
     `tool:${tool.name}:description`,
@@ -182,11 +197,13 @@ export function toToolDefinition(tool: AgentTool): ToolDefinition {
     description.length,
     TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
   );
-  return {
+  const definition = {
     name: tool.name,
     description,
     inputSchema: compactSchema(tool.inputSchema, tool.name),
   };
+  toolDefinitionCache.set(tool, definition);
+  return definition;
 }
 
 const DROPPED_SCHEMA_KEYS = new Set([
@@ -265,6 +282,7 @@ export function defineTool(opts: {
   description: string;
   inputSchema: Record<string, unknown>;
   executionMode?: "sequential" | "parallel";
+  executionTimeoutOwner?: "executor";
   execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }): AgentTool {
   return {
@@ -272,6 +290,7 @@ export function defineTool(opts: {
     description: opts.description,
     inputSchema: opts.inputSchema,
     ...(opts.executionMode ? { executionMode: opts.executionMode } : {}),
+    ...(opts.executionTimeoutOwner ? { executionTimeoutOwner: opts.executionTimeoutOwner } : {}),
     execute: opts.execute,
   };
 }

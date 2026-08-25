@@ -275,19 +275,15 @@ function renderMarkdownFull(md) {
   // ── Phase 2: line-by-line parsing ──
   const lines = md.split('\n');
   const out = [];
-  // Stack of open lists: { type:'ul'|'ol', indent:number, count:number,
+  // Stack of open lists: { type:'ul'|'ol', indent:number,
   //   siblingOpen:boolean }. Indent is measured in spaces (tabs → 2 spaces).
   const listStack = [];
-  // Remember the last count seen at a given indent so that `<ol>` numbering
-  // resumes if broken by a paragraph / hr / heading.
-  const olCounts = {};
   let inBlockquote = false;
   let tableRows = [];
 
   const closeList = (top) => {
     if (top.siblingOpen) out.push('</li>');
     out.push(`</${top.type}>`);
-    if (top.type === 'ol') olCounts[top.indent] = top.count;
   };
   const flushList = () => {
     while (listStack.length) {
@@ -305,12 +301,11 @@ function renderMarkdownFull(md) {
     out.push(buildTable(tableRows));
     tableRows = [];
   };
-  const resetOl = () => { for (const k of Object.keys(olCounts)) delete olCounts[k]; };
-
-  const openList = (type, indent) => {
-    const resume = type === 'ol' ? (olCounts[indent] || 0) : 0;
-    out.push(resume > 0 ? `<ol start="${resume + 1}">` : `<${type}>`);
-    listStack.push({ type, indent, count: resume, siblingOpen: false });
+  const openList = (type, indent, orderedStart) => {
+    const start = type === 'ol' ? Number.parseInt(orderedStart || '1', 10) : 1;
+    const startAttr = Number.isSafeInteger(start) && start !== 1 ? ` start="${start}"` : '';
+    out.push(`<${type}${startAttr}>`);
+    listStack.push({ type, indent, siblingOpen: false });
   };
 
   for (let i = 0; i < lines.length; i++) {
@@ -329,14 +324,12 @@ function renderMarkdownFull(md) {
     const hm = line.match(/^(#{1,6})\s+(.*)/);
     if (hm) {
       flushList(); flushBQ();
-      resetOl();
       out.push(`<h${hm[1].length}>${inlineFormat(hm[2])}</h${hm[1].length}>`);
       continue;
     }
     // Horizontal rule
     if (/^[-*_]{3,}\s*$/.test(line)) {
       flushList(); flushBQ();
-      resetOl();
       out.push('<hr>');
       continue;
     }
@@ -356,6 +349,7 @@ function renderMarkdownFull(md) {
       const raw = ulm || olm;
       const indent = raw[1].replace(/\t/g, '  ').length;
       const type = ulm ? 'ul' : 'ol';
+      const orderedStart = olm ? olm[2] : null;
       let content = ulm ? ulm[2] : olm[3];
 
       // Task list checkbox prefix
@@ -387,13 +381,12 @@ function renderMarkdownFull(md) {
       }
       // Open a new list if none at this indent
       if (!listStack.length || listStack[listStack.length - 1].indent < indent) {
-        openList(type, indent);
+        openList(type, indent, orderedStart);
       }
 
       // Close previous sibling <li> at this level before starting new one
       const top = listStack[listStack.length - 1];
       if (top.siblingOpen) out.push('</li>');
-      if (type === 'ol') top.count++;
 
       out.push(`<li${liClass}>${taskHtml}${inlineFormat(content)}`);
       top.siblingOpen = true;
@@ -1240,14 +1233,30 @@ function _markdownVideoOpenIconHtml() {
   return '';
 }
 
+function _parseOrkasMediaTitle(title) {
+  const match = /^orkas-media-v1:(image|video):(.+)$/.exec(String(title || ''));
+  if (!match) return null;
+  let remoteSrc = '';
+  try { remoteSrc = decodeURIComponent(match[2]); }
+  catch (_) { return null; }
+  if (!/^https?:\/\//i.test(remoteSrc) || /[\u0000-\u001f\u007f]/.test(remoteSrc)) return null;
+  return { kind: match[1], remoteSrc };
+}
+
 function _markdownVideoHtml(src, label, title) {
-  const t = title ? ` title="${escapeHtml(title)}"` : '';
+  const mediaMeta = _parseOrkasMediaTitle(title);
+  const visibleTitle = mediaMeta ? '' : title;
+  const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
   const localPath = _chatMediaLocalPathFromUrl(src);
+  const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
+  const fallbackAttrs = mediaMeta
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}"${managedLocalSrc ? ` data-orkas-local-src="${escapeHtml(managedLocalSrc)}"` : ''}`
+    : '';
   const openLabel = _markdownVideoOpenFloatingLabel();
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell" data-chat-video-playback-surface="markdown_bubble"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t}${fallbackAttrs} aria-label="${escapeHtml(label || 'video')}" data-monitor-resource="chat-markdown-video"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1409,8 +1418,15 @@ function _hydrateMarkdownHtmlEmbeds(root) {
 }
 
 function _markdownImageHtml(src, alt, title) {
-  const t = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t} data-monitor-resource="chat-markdown-image"></span>`;
+  const mediaMeta = _parseOrkasMediaTitle(title);
+  const visibleTitle = mediaMeta ? '' : title;
+  const t = visibleTitle ? ` title="${escapeHtml(visibleTitle)}"` : '';
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  const managedLocalSrc = localPath || /^chat-media:\/\/cid\//i.test(src) ? src : '';
+  const fallbackAttrs = mediaMeta
+    ? ` data-orkas-remote-src="${escapeHtml(mediaMeta.remoteSrc)}"${managedLocalSrc ? ` data-orkas-local-src="${escapeHtml(managedLocalSrc)}"` : ''}`
+    : '';
+  return `<span class="chat-image-shell chat-md-img-shell is-loading"><img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}${fallbackAttrs} data-monitor-resource="chat-markdown-image"></span>`;
 }
 
 function _notifyChatImageSettled(node) {
@@ -1471,6 +1487,28 @@ function _missingMarkdownVideoLabel() {
   return 'Video missing';
 }
 
+function _markdownVideoLoadFailedLabel() {
+  const key = 'chat.video_load_failed';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Video could not be loaded';
+}
+
+function _retryLabel() {
+  const key = 'chat.retry_btn';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Retry';
+}
+
 function _replaceMissingMarkdownImage(img) {
   if (!img || !img.parentNode || img.dataset?.missingImageHandled === '1') return;
   if (img.dataset) img.dataset.missingImageHandled = '1';
@@ -1497,12 +1535,23 @@ function _replaceMissingMarkdownImage(img) {
   chip.appendChild(icon);
   chip.appendChild(text);
   const shell = img.closest?.('.chat-md-img-shell');
-  (shell || img).replaceWith(chip);
+  if (shell && img.getAttribute?.('data-orkas-local-src')) {
+    img.hidden = true;
+    shell.classList?.remove('is-loading', 'is-loaded');
+    shell.classList?.add('is-error');
+    shell.appendChild(chip);
+  } else {
+    (shell || img).replaceWith(chip);
+  }
   _notifyChatImageSettled(chip);
 }
 
 function _replaceMissingMarkdownVideo(video) {
   if (!video || !video.parentNode || video.dataset?.missingVideoHandled === '1') return;
+  if (video.getAttribute?.('data-orkas-local-src')) {
+    _showMarkdownVideoLoadFailure(video);
+    return;
+  }
   if (video.dataset) video.dataset.missingVideoHandled = '1';
   const label = _missingMarkdownVideoLabel();
   const alt = String(video.getAttribute('aria-label') || '').trim();
@@ -1531,11 +1580,141 @@ function _replaceMissingMarkdownVideo(video) {
   video.replaceWith(chip);
 }
 
+function _clearMarkdownVideoLoadFailure(video) {
+  if (!video) return;
+  const shell = video.closest?.('.chat-md-video-shell');
+  shell?.classList?.remove('is-load-failed');
+  const failure = shell?.querySelector?.('[data-chat-md-video-load-failure="1"]');
+  failure?.remove?.();
+  if (video.dataset) {
+    delete video.dataset.videoErrorHandled;
+    delete video.dataset.videoErrorDiagnosis;
+  }
+}
+
+function _tryMarkdownRemoteFallback(media) {
+  if (!media || media.dataset?.orkasRemoteFallbackAttempted === '1') return false;
+  const remoteSrc = String(media.getAttribute?.('data-orkas-remote-src') || '');
+  const currentSrc = String(media.getAttribute?.('src') || '');
+  if (!remoteSrc || remoteSrc === currentSrc) return false;
+  if (media.dataset) media.dataset.orkasRemoteFallbackAttempted = '1';
+  media.setAttribute('src', remoteSrc);
+  if (media.tagName === 'VIDEO') {
+    const button = media.closest?.('.chat-md-video-shell')?.querySelector?.('[data-chat-md-video-open="1"]');
+    if (button) button.hidden = true;
+    try { media.load(); } catch (_) { /* the normal error path remains available */ }
+  }
+  return true;
+}
+
+function _applyMaterializedMarkdownMedia(payload, root) {
+  const remoteSrc = String(payload?.remote_url || '');
+  const localSrc = String(payload?.local_url || '');
+  const kind = String(payload?.media_kind || '');
+  const scope = root || (typeof document !== 'undefined' ? document : null);
+  if (!scope || !remoteSrc || !/^chat-media:\/\/cid\//i.test(localSrc)) return 0;
+  if (kind !== 'image' && kind !== 'video') return 0;
+  const nodes = scope.querySelectorAll?.('[data-orkas-remote-src]') || [];
+  let updated = 0;
+  for (const media of nodes) {
+    if (media.getAttribute?.('data-orkas-remote-src') !== remoteSrc) continue;
+    if ((kind === 'video') !== (media.tagName === 'VIDEO')) continue;
+    if ((kind === 'image') !== (media.tagName === 'IMG')) continue;
+    media.setAttribute('data-orkas-local-src', localSrc);
+    media.setAttribute('src', localSrc);
+    if (media.dataset) {
+      delete media.dataset.orkasRemoteFallbackAttempted;
+      delete media.dataset.missingImageHandled;
+      delete media.dataset.missingVideoHandled;
+    }
+    if (kind === 'image') {
+      media.hidden = false;
+      const shell = media.closest?.('.chat-md-img-shell');
+      shell?.querySelector?.('.chat-md-img-missing')?.remove?.();
+      shell?.classList?.remove('is-error', 'is-loaded');
+      shell?.classList?.add('is-loading');
+    } else {
+      _clearMarkdownVideoLoadFailure(media);
+      const button = media.closest?.('.chat-md-video-shell')?.querySelector?.('[data-chat-md-video-open="1"]');
+      if (button) {
+        button.hidden = false;
+        button.setAttribute('data-video-src', localSrc);
+      }
+      try { media.load(); } catch (_) { /* the normal error path remains available */ }
+    }
+    updated += 1;
+  }
+  return updated;
+}
+
+function _showMarkdownVideoLoadFailure(video) {
+  if (!video || !video.parentNode) return;
+  const shell = video.closest?.('.chat-md-video-shell');
+  if (!shell || shell.querySelector?.('[data-chat-md-video-load-failure="1"]')) return;
+  const label = _markdownVideoLoadFailedLabel();
+  const retryLabel = _retryLabel();
+  shell.classList?.add('is-load-failed');
+  if (video.dataset) video.dataset.videoErrorDiagnosis = 'load_failed';
+
+  const failure = document.createElement('span');
+  failure.className = 'chat-md-video-load-failure';
+  failure.setAttribute('data-chat-md-video-load-failure', '1');
+  failure.setAttribute('role', 'status');
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-video-load-failure-text';
+  text.textContent = label;
+
+  const retry = document.createElement('button');
+  retry.className = 'chat-md-video-retry';
+  retry.setAttribute('type', 'button');
+  retry.setAttribute('data-chat-md-video-retry', '1');
+  retry.setAttribute('aria-label', retryLabel);
+  retry.textContent = retryLabel;
+
+  failure.appendChild(text);
+  failure.appendChild(retry);
+  shell.appendChild(failure);
+}
+
+function _diagnoseMarkdownVideoError(video) {
+  if (!video || !video.parentNode || video.dataset?.videoErrorHandled === '1') return;
+  if (video.dataset) video.dataset.videoErrorHandled = '1';
+  const rawUrl = String(video.currentSrc || video.getAttribute?.('src') || '');
+  const invoke = typeof window !== 'undefined' && window.orkas && typeof window.orkas.invoke === 'function'
+    ? window.orkas.invoke.bind(window.orkas)
+    : null;
+  if (!invoke) {
+    _showMarkdownVideoLoadFailure(video);
+    return;
+  }
+  Promise.resolve(invoke('media.diagnose', { url: rawUrl }))
+    .then((result) => {
+      if (!video.parentNode) return;
+      const diagnosis = String(result?.diagnosis || '').toLowerCase();
+      if (diagnosis === 'not_found' || diagnosis === 'source_not_found') {
+        _replaceMissingMarkdownVideo(video);
+        return;
+      }
+      _showMarkdownVideoLoadFailure(video);
+    })
+    .catch(() => {
+      if (video.parentNode) _showMarkdownVideoLoadFailure(video);
+    });
+}
+
 if (typeof document !== 'undefined') document.addEventListener('load', (e) => {
   const target = e.target;
   if (!target || target.nodeType !== 1 || target.tagName !== 'IMG') return;
-  if (target.classList?.contains('chat-md-img') || target.classList?.contains('chat-msg-attach-thumb')) {
+  if (target.classList?.contains('chat-md-img')) {
     _settleChatImageLayout(target);
+  }
+}, true);
+
+if (typeof document !== 'undefined') document.addEventListener('loadedmetadata', (e) => {
+  const target = e.target;
+  if (target?.nodeType === 1 && target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
+    _clearMarkdownVideoLoadFailure(target);
   }
 }, true);
 
@@ -1543,15 +1722,13 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
   const target = e.target;
   if (!target || target.nodeType !== 1) return;
   if (target.tagName === 'IMG' && target.classList?.contains('chat-md-img')) {
+    if (_tryMarkdownRemoteFallback(target)) return;
     _replaceMissingMarkdownImage(target);
     return;
   }
-  if (target.tagName === 'IMG' && target.classList?.contains('chat-msg-attach-thumb')) {
-    _settleChatImageLayout(target, 'error');
-    return;
-  }
   if (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
-    _replaceMissingMarkdownVideo(target);
+    if (_tryMarkdownRemoteFallback(target)) return;
+    _diagnoseMarkdownVideoError(target);
   }
 }, true);
 
@@ -1605,6 +1782,17 @@ function _toggleChatVideoFromSurface(e, surface) {
 
 if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const target = e.target;
+  const retry = target && target.closest ? target.closest('[data-chat-md-video-retry="1"]') : null;
+  if (retry) {
+    e.preventDefault();
+    e.stopPropagation();
+    const shell = retry.closest('.chat-md-video-shell');
+    const video = shell?.querySelector?.('video.chat-md-video');
+    if (!video) return;
+    _clearMarkdownVideoLoadFailure(video);
+    try { video.load(); } catch (_) { /* a later error restores the retry state */ }
+    return;
+  }
   const btn = target && target.closest ? target.closest('[data-chat-md-video-open="1"]') : null;
   if (btn) {
     e.preventDefault();
@@ -1690,8 +1878,9 @@ function inlineFormat(text) {
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, alt, rawSrc, title) => {
         const src = _normalizeLocalMediaSrc(rawSrc);
+        const mediaMeta = _parseOrkasMediaTitle(title);
         if (_isHtmlSrc(src)) return _markdownHtmlEmbedHtml(src, alt, title);
-        if (_isVideoSrc(src)) {
+        if (mediaMeta ? mediaMeta.kind === 'video' : _isVideoSrc(src)) {
           // `preload=metadata` so listings don't auto-fetch the whole file;
           // controls visible so user can play/seek.
           return _markdownVideoHtml(src, alt, title);
@@ -2211,6 +2400,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _chatImageIntrinsicStyle,
     _chatMediaLocalPathFromUrl,
     _normalizeLocalMediaSrc,
+    _parseOrkasMediaTitle,
     _chatVideoNativeControlsHit,
     escapeHtml,
     sanitizeHtml,

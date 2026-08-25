@@ -1,20 +1,19 @@
 ---
 ownerAgent: 7e91cb9ec9e9
 name: ppt-review
-description_zh: 在已有 office_check 和逐页 office_render 证据后，诊断单页审美、参考一致性与整套叙事节奏，以具体缺陷而非固定审美分数驱动定向修复和复验。
+description_zh: 在已有 office_review 结构检查和逐页渲染证据后，诊断单页审美、参考一致性与整套叙事节奏，以具体缺陷而非固定审美分数驱动定向修复和复验。
 description_en: After structural validation and per-slide renders exist, diagnose slide aesthetics, reference fit, and whole-deck narrative rhythm, then repair concrete evidence-based defects from current evidence.
-category: office
 ---
 
 # PPT Review
 
-Read this skill only after current `office_check` output and relevant `office_render` images exist. Do not use source code, a tool success flag, or the first-slide preview as a substitute for deck evidence.
+Read this skill only after current `office_review` structural output and relevant rendered images exist. Do not use source code, a tool success flag, or the first-slide preview as a substitute for deck evidence.
 
 ## Evidence set
 
-- Run `office_check` after every create or edit. Invalid OpenXML is a blocker, not a warning.
+- Run `office_review` with `action:"check_and_render"` after every create or edit. Invalid OpenXML is a blocker, not a warning.
 - For a new deck, render every slide. For an existing deck, render every changed slide plus the cover, a representative unchanged content slide, and any slide whose theme, master, or shared element could be affected. Every render intended as current visual-defect evidence must set `analysis_mode:"quality_review"`; ordinary source understanding keeps the default `understand` mode.
-- After a repair affects multiple pages, request their independent `office_render` calls together in one assistant tool-call batch, each with `analysis_mode:"quality_review"`. Do not insert a model round between page renders; one collected image set lets managed visual preprocessing analyze the affected pages as a batch. If one render fails, retry only that page rather than rerendering the successful set.
+- After a repair affects multiple pages, request them together in one `office_review` call with `action:"check_and_render"`, a `pages` array, and `analysis_mode:"quality_review"`. One collected image set lets managed visual preprocessing analyze the affected pages as a batch. If one render fails after a valid check, retry only that page with `action:"render"` rather than rerendering the successful set.
 - Rendered image blocks are transient after the next assistant response. In the first response that sees each collected `quality_review` image set, write one concise plain-language evidence sentence before any follow-up tool calls: name the reviewed pages, concrete pass/defect observations, and the next action. This sentence is the durable visual-review state for later tool rounds and compaction. When exact edit paths are needed, request the targeted `office_read` calls together in that same response; do not rerender an unchanged `artifact_revision` merely to recover forgotten pixels.
 - Use the returned `artifact_revision` to distinguish current from stale check/render evidence and `image_revision` to compare rerenders. If an edit claimed to repair a visible defect but the affected page keeps the same `image_revision`, do not claim a visual repair: verify that the edited artifact revision was rendered, then make a supported layout/content change or retain the finding as unresolved.
 - If rendering is unavailable, mark visual checks `not_run`; do not infer a pass from structural validity.
@@ -108,7 +107,7 @@ Classify each finding:
 - `WARNING`: visible but non-blocking density, hierarchy, consistency, image-quality, source-placement, or target-viewer risk.
 - `PASS`: supported by named structural or render evidence.
 
-Repair blockers and straightforward warnings with the smallest edit. Before `edit_office`, use `office_read` to get the exact target path, then call `edit_office` with `preview:false`. Its automatic first-page preview must not run ahead of structural validation or substitute for current review evidence. Consolidate all known defects into one edit batch where possible before requesting new render evidence. After each repair batch, rerun `office_check`, then rerender only affected slides at a new `artifact_revision`; never rerender an unchanged page/revision. Continue only while current evidence identifies a concrete blocker or a proportionate repair. Stop when only non-blocking warnings remain or another pass would not materially improve the user-facing deck, and disclose those warnings. If a blocker remains unresolved, do not publish the deck as complete; preserve and report the last structurally valid artifact when useful and label the remaining boundary. Existing-deck edit work may continue with another safe, evidence-based pass when it can resolve a remaining blocker without changing the authorized scope.
+Repair blockers and straightforward warnings with the smallest edit. Before `edit_office`, use `office_read` to get the exact target path, then call `edit_office` with `preview:false`. Its automatic first-page preview must not run ahead of structural validation or substitute for current review evidence. Consolidate all known defects into one edit batch where possible before requesting new render evidence. After each repair batch, call `office_review` with `action:"check_and_render"`, rerendering only affected slides at a new `artifact_revision`; never rerender an unchanged page/revision. Continue only while current evidence identifies a concrete blocker or a proportionate repair. Stop when only non-blocking warnings remain or another pass would not materially improve the user-facing deck, and disclose those warnings. If a blocker remains unresolved, do not publish the deck as complete; preserve and report the last structurally valid artifact when useful and label the remaining boundary. Existing-deck edit work may continue with another safe, evidence-based pass when it can resolve a remaining blocker without changing the authorized scope.
 
 Do not repair by hiding content, shrinking all text globally, flattening the page, removing source labels, or changing the locked narrative without evidence that the plan itself was wrong.
 

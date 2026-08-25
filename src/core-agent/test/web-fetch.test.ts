@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { resolveCharset, decodeBytes, classifyFetchContent } from "../src/tools/web-fetch.js";
+import {
+  resolveCharset,
+  decodeBytes,
+  classifyFetchContent,
+  formatWebFetchNetworkFailure,
+  webFetchTool,
+} from "../src/tools/web-fetch.js";
 
 describe("web-fetch › resolveCharset", () => {
   it("picks charset from Content-Type header when present", () => {
@@ -163,5 +169,88 @@ describe("web-fetch › classifyFetchContent", () => {
     );
 
     expect(issue).toBeNull();
+  });
+});
+
+describe("web-fetch › safe network diagnostics", () => {
+  it("surfaces a nested undici timeout code without returning arbitrary cause text", () => {
+    const cause = Object.assign(new Error("connect timed out at 192.0.2.10:443"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+    });
+    const error = new TypeError("fetch failed", { cause });
+
+    const result = formatWebFetchNetworkFailure(error);
+
+    expect(result).toBe(
+      "fetch failed [network_diagnostic category=timeout; codes=UND_ERR_CONNECT_TIMEOUT]",
+    );
+    expect(result).not.toContain("192.0.2.10");
+  });
+
+  it("inspects bounded AggregateError children and keeps only stable network codes", () => {
+    const error = new TypeError("fetch failed", {
+      cause: new AggregateError([
+        Object.assign(new Error("IPv6 route includes a private address"), { code: "ENETUNREACH" }),
+        Object.assign(new Error("IPv4 endpoint timed out"), { code: "ETIMEDOUT" }),
+      ], "secret proxy details"),
+    });
+
+    const result = formatWebFetchNetworkFailure(error);
+
+    expect(result).toBe(
+      "fetch failed [network_diagnostic category=timeout; codes=ENETUNREACH,ETIMEDOUT]",
+    );
+    expect(result).not.toContain("private address");
+    expect(result).not.toContain("secret proxy details");
+  });
+
+  it("classifies TLS failures while suppressing certificate and path details", () => {
+    const error = Object.assign(
+      new Error("certificate for internal.example from /Users/test/corp.pem was rejected"),
+      { code: "UNABLE_TO_VERIFY_LEAF_SIGNATURE" },
+    );
+
+    const result = formatWebFetchNetworkFailure(error);
+
+    expect(result).toBe(
+      "request failed [network_diagnostic category=tls; codes=UNABLE_TO_VERIFY_LEAF_SIGNATURE]",
+    );
+    expect(result).not.toContain("internal.example");
+    expect(result).not.toContain("/Users/test");
+  });
+
+  it("uses a generic network category when the cause has no approved code", () => {
+    const error = Object.assign(new Error("failed near /private/project/token.txt"), {
+      code: "E_PRIVATE_SECRET",
+    });
+
+    expect(formatWebFetchNetworkFailure(error)).toBe(
+      "request failed [network_diagnostic category=network; codes=unavailable]",
+    );
+  });
+
+  it("returns the safe diagnostic through the web_fetch tool error result", async () => {
+    const originalFetch = globalThis.fetch;
+    const cause = Object.assign(new Error("lookup secret.proxy.local failed"), {
+      code: "ENOTFOUND",
+    });
+    globalThis.fetch = async () => {
+      throw new TypeError("fetch failed", { cause });
+    };
+    try {
+      const result = await webFetchTool.execute(
+        { url: "https://example.com/research" },
+        { state: {} } as any,
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.content).toBe(
+        "Error fetching https://example.com/research: "
+        + "fetch failed [network_diagnostic category=dns; codes=ENOTFOUND]",
+      );
+      expect(result.content).not.toContain("secret.proxy.local");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

@@ -3,7 +3,6 @@ ownerAgent: 79df9cc89f5f
 name: video-router
 description_zh: 视频制作的产线路由与运行时锁定知识——按创意简报选「生成/合成/剪辑」能力轴并锁定主路径，开工前定调，避免中途无声切换。
 description_en: Routing + runtime-lock knowledge for video production — pick the generate/compose/edit capability axis from the brief and lock the main path before work starts.
-category: creation
 ---
 
 # video-router
@@ -46,19 +45,23 @@ A finished video is built from one or more of three orthogonal axes. Decide whic
 
 ## Decision rules
 
-1. Read the brief (topic, aspect ratio, language, duration) and classify the **dominant work object**:
+1. Decide whether supplied video is the **edit target** or only a **production input** before choosing a line:
+   - When the user asks to change supplied video and the output keeps that footage or timeline as its spine, choose **Edit (C)**. Cuts, joins, reframing, captions, localization, deterministic overlays, and replacing or mixing audio—including supplied narration—remain edits of that video.
+   - A video used only as a reference, motion/timing guide, or one input in a newly authored timeline does not select EDIT. Neither do supplied images, narration audio, music, or scripts. Route the new deliverable by the production work it needs.
+   - Attachment type alone never decides the line. Ask whether to modify the existing video or make a new video from/reference it only when the requested output is genuinely ambiguous.
+2. Read the brief (topic, aspect ratio, language, duration) and classify the **dominant work object**:
    - "explain / teach / animate / motion-graphics / kinetic text" → **Compose (B)** primary, optionally Generate (A) for b-roll.
    - "make footage of / cinematic / a scene of / a character doing" → **Generate (A)** primary, Compose (B) to overlay captions.
    - "cut / clip / trim / repurpose / make highlights / remove or change something in my video" → **Edit (C)** primary. Keep EDIT as the route even when one billable `operation:"edit"` video-model segment is required.
-2. Most explainer/animation requests are **Compose-primary**: typographic and motion-graphic scenes assembled as an HTML composition, with AI imagery only where a shot genuinely needs it.
-3. For supplied reference media, classify the requested relationship before choosing execution: `reproduce`, `edit`, or `guide`. Apply the same classification to images and videos regardless of which app, model, camera, or authoring format produced them. Images can control content/identity/composition/structure/style; videos can additionally control motion/timing/audio through temporal anchors.
-4. Aspect ratio drives the canvas: 16:9 → 1920×1080, 9:16 → 1080×1920, 1:1 → 1080×1080.
+3. Most explainer/animation requests are **Compose-primary**: typographic and motion-graphic scenes assembled as an HTML composition, with AI imagery only where a shot genuinely needs it.
+4. For supplied reference media, classify the requested relationship before choosing execution: `reproduce`, `edit`, or `guide`. Apply the same classification to images and videos regardless of which app, model, camera, or authoring format produced them. Images can control content/identity/composition/structure/style; videos can additionally control motion/timing/audio through temporal anchors.
+5. Aspect ratio drives the canvas: 16:9 → 1920×1080, 9:16 → 1080×1920, 1:1 → 1080×1080.
 
 ## End-to-end (AUTO) — when the job spans lines
 
-Pick a **single line** when one axis cleanly dominates (just trim a clip; just an explainer; just generate a scene). Route to **AUTO end-to-end** when the deliverable genuinely needs MORE THAN ONE axis woven together — most often the user supplies their own material AND wants finished framing/voice/motion around it:
+Pick a **single line** when one axis cleanly dominates (just trim a clip; just an explainer; just generate a scene). Adding captions, supplied narration, localization, reframing, or a deterministic overlay while keeping the supplied video's timeline as the spine remains EDIT. Route to **AUTO end-to-end** only when the primary timeline genuinely weaves MORE THAN ONE axis:
 
-- "trim my clip, add a title card + captions, and a voiceover" (edit + compose + narration)
+- "use my clip in the middle, author a full-frame motion-graphics opener, and add generated b-roll" (edit + compose + generate)
 - "my footage in the middle, generate an opener, compose the stats" (edit + generate + compose)
 - "make a finished video from these assets" where the assets alone are not the deliverable.
 
@@ -72,12 +75,24 @@ AUTO does not abandon the axes — it sequences them through one cross-modal pla
 
 ## Runtime handoff
 
-When the production runtime is available, routing ends at the direction
-boundary, not at a production plan. For a Chinese UI, use the exact gate-control
-title `制作方向确认` (never `创意方向确认`) and show only two or three direction
-concepts plus the facts already locked by the brief. Do not write a manifest,
-script, narration copy, or art direction before that choice.
+For a fully specified one-shot deterministic EDIT, hand off directly to
+`stage-edit`: state the locked EDIT line, skip the direction artifact and plan,
+probe the source, and execute the requested operation. Load `stage-decide` first
+only when content or timing must be located from evidence.
+
+For every other job with the production runtime available, routing ends at the
+direction boundary, not at a production plan. For a Chinese UI, use the exact
+gate-control title `制作方向确认` (never `创意方向确认`) and show only two or three
+direction concepts plus the facts already locked by the brief. Do not write a
+manifest, script, narration copy, or art direction before that choice. End the
+direction question with `<plan-interaction status="open" />` — without it the
+runtime reads the stop as an unfinished turn and bounces the reply.
 
 ## Boundary / non-goals
 
 This skill only routes and locks. It does not author compositions or execute edits. Semantic editing is not a silent switch to GENERATE: it remains an EDIT/AUTO job whose EDL contains a signed, billable video `operation:"edit"` segment with the original reference video and preservation boundary.
+
+The native VideoStudio lines are the only production path. Never substitute an
+outside video framework for a missing native component. If a required component
+is unavailable, say plainly which component is missing and stop rather than
+inventing a replacement pipeline.

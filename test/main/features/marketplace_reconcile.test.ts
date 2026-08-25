@@ -1303,6 +1303,9 @@ describe('marketplace reconcile', () => {
       }],
       skills: [],
     });
+    const customSameId = path.join(tmpDir, 'u1', 'cloud', 'skills', 'dep-skill', 'SKILL.md');
+    fs.mkdirSync(path.dirname(customSameId), { recursive: true });
+    fs.writeFileSync(customSameId, '---\nname: dep-skill\n---\ncustom marker\n');
 
     const reconcile = await import('../../../src/main/features/marketplace_reconcile');
     const installs = await import('../../../src/main/features/marketplace_installs');
@@ -1318,6 +1321,7 @@ describe('marketplace reconcile', () => {
       }),
     ]);
     expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'dep-skill', 'SKILL.md'))).toBe(true);
+    expect(fs.readFileSync(customSameId, 'utf8')).toContain('custom marker');
     const agentJson = JSON.parse(fs.readFileSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', 'agent-updated', 'agent.json'), 'utf8'));
     expect(agentJson.skill_list).toEqual(['dep-skill']);
   });

@@ -60,6 +60,31 @@ function _memTrackError(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
+function _memTrackReadResult(action, startedAt, results) {
+  const rows = Array.isArray(results) ? results : [];
+  const failures = rows.filter((row) => !row || row.ok !== true);
+  const successCount = rows.length - failures.length;
+  const payload = {
+    result: failures.length === 0
+      ? 'success'
+      : (successCount > 0 ? 'partial_failure' : 'failure'),
+    action: action === 'reveal' ? 'reveal' : 'list',
+    duration_ms: _memDuration(startedAt),
+    entry_count: rows.reduce((total, row) => (
+      total + (row && row.ok && Array.isArray(row.entries) ? row.entries.length : 0)
+    ), 0),
+    failed_count: failures.length,
+  };
+  if (failures.length > 0) {
+    const details = failures.map(_memFailureDetails);
+    const errorCodes = [...new Set(details.map((item) => item.error_code))];
+    const errorTypes = [...new Set(details.map((item) => item.error_type))];
+    payload.error_code = errorCodes.length === 1 ? errorCodes[0] : 'multiple';
+    payload.error_type = errorTypes.length === 1 ? errorTypes[0] : 'runtime';
+  }
+  _memTrackEvent('memory_read_result', payload);
+}
+
 function _memDuration(startedAt) {
   return Math.max(0, Date.now() - startedAt);
 }
@@ -190,17 +215,34 @@ function _memScopePayload(key, extra) {
 // ── Data load ──────────────────────────────────────────────────────────────
 
 async function _memLoad() {
+  const startedAt = Date.now();
   _memScopes = [
     { key: 'user', kind: 'user', title: t('memory.section_user'), sub: t('memory.section_user_sub'), icon: 'users' },
     { key: 'shared', kind: 'shared', title: t('memory.section_shared'), sub: t('memory.section_shared_sub'), icon: 'sparkles' },
   ];
 
-  const results = await Promise.all(_memScopes.map((s) => _memInvoke('memory.list', _memParseScope(s.key))));
+  const results = await Promise.all(_memScopes.map((s) => _memInvoke(
+    'memory.list',
+    _memParseScope(s.key),
+    { resultOwned: true },
+  )));
+  _memTrackReadResult('list', startedAt, results);
   _memData = {};
   _memScopes.forEach((s, i) => {
     const r = results[i];
     _memData[s.key] = (r && r.ok) ? r : { entries: [], usage: { current: 0, limit: 0 }, path: '' };
   });
+}
+
+async function _memReveal(target) {
+  const startedAt = Date.now();
+  const result = await _memInvoke(
+    'memory.reveal',
+    _memParseScope(target),
+    { resultOwned: true },
+  );
+  _memTrackReadResult('reveal', startedAt, [result]);
+  return result;
 }
 
 // ── Page render ──────────────────────────────────────────────────────────────
@@ -821,7 +863,9 @@ async function _memOpenExport() {
     });
   });
   host.querySelectorAll('[data-mem-action="reveal"]').forEach((b) => {
-    b.addEventListener('click', () => _memInvoke('memory.reveal', _memParseScope(b.getAttribute('data-mem-target'))));
+    b.addEventListener('click', () => {
+      void _memReveal(b.getAttribute('data-mem-target'));
+    });
   });
 }
 

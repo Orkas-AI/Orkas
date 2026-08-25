@@ -26,6 +26,8 @@ let _lightboxAddLibraryBtn = null;
 let _lightboxRevealBtn = null;
 let _lightboxKeyHandler = null;
 let _lightboxCurrentFile = null;
+let _lightboxLoadSeq = 0;
+let _lightboxLoadCleanup = null;
 
 // Zoom / pan state. Reset on every close so the next open starts at 1×.
 let _scale = 1;
@@ -79,6 +81,42 @@ function _resetZoom() {
   _tx = 0;
   _ty = 0;
   _applyTransform();
+}
+
+function _lightboxLoadingLabel() {
+  try {
+    const label = t('common.loading');
+    return label && label !== 'common.loading' ? label : 'Loading…';
+  } catch (_) {
+    return 'Loading…';
+  }
+}
+
+function _lightboxEscapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function _setLightboxLoading(loading) {
+  if (!_lightboxEl) return;
+  _lightboxEl.classList.toggle('is-loading', !!loading);
+  const stage = _lightboxEl.querySelector('.chat-lightbox-stage');
+  const status = _lightboxEl.querySelector('.chat-lightbox-loading');
+  if (stage) {
+    if (loading) stage.setAttribute('aria-busy', 'true');
+    else stage.removeAttribute('aria-busy');
+  }
+  if (status) status.hidden = !loading;
+}
+
+function _clearLightboxLoadListeners() {
+  if (!_lightboxLoadCleanup) return;
+  _lightboxLoadCleanup();
+  _lightboxLoadCleanup = null;
 }
 
 // Cursor-anchored zoom: keep the image-pixel currently under (fx, fy)
@@ -182,6 +220,10 @@ function _ensureLightbox() {
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
+      <div class="chat-lightbox-loading" role="status" aria-live="polite" hidden>
+        <span class="chat-file-viewer-loading-spinner" aria-hidden="true"></span>
+        <span class="chat-lightbox-loading-label">${_lightboxEscapeHtml(_lightboxLoadingLabel())}</span>
+      </div>
       <img class="chat-lightbox-img" alt="" draggable="false" data-monitor-resource="chat-image-lightbox" />
       <div class="chat-lightbox-actions">
         <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
@@ -219,6 +261,8 @@ function _ensureLightbox() {
       reveal.setAttribute('aria-label', label);
       reveal.setAttribute('title', label);
     }
+    const loading = _lightboxEl.querySelector('.chat-lightbox-loading-label');
+    if (loading) loading.textContent = _lightboxLoadingLabel();
   });
   _lightboxEl = root;
   _lightboxImg = root.querySelector('.chat-lightbox-img');
@@ -305,9 +349,24 @@ async function _onLightboxAddLibrary(e) {
 function openChatImageLightbox(src, alt, opts) {
   if (!src) return;
   const el = _ensureLightbox();
+  _lightboxLoadSeq += 1;
+  const loadSeq = _lightboxLoadSeq;
+  _clearLightboxLoadListeners();
   _resetZoom();
-  _lightboxImg.src = src;
   _lightboxImg.alt = alt || '';
+  _setLightboxLoading(true);
+  const settle = () => {
+    if (loadSeq !== _lightboxLoadSeq) return;
+    _clearLightboxLoadListeners();
+    _setLightboxLoading(false);
+  };
+  _lightboxImg.addEventListener('load', settle, { once: true });
+  _lightboxImg.addEventListener('error', settle, { once: true });
+  _lightboxLoadCleanup = () => {
+    _lightboxImg.removeEventListener('load', settle);
+    _lightboxImg.removeEventListener('error', settle);
+  };
+  _lightboxImg.src = src;
   const inferredAbsPath = (!opts || !opts.absPath) ? _absPathFromChatMediaLocalUrl(src) : '';
   const fallbackCid = (typeof currentCid !== 'undefined' && currentCid) ? currentCid : null;
   const fileOpts = (opts && opts.absPath)
@@ -352,6 +411,9 @@ function _releaseLightboxImage(image) {
 
 function closeChatImageLightbox() {
   if (!_lightboxEl) return;
+  _lightboxLoadSeq += 1;
+  _clearLightboxLoadListeners();
+  _setLightboxLoading(false);
   _lightboxEl.classList.remove('is-open');
   _lightboxEl.setAttribute('aria-hidden', 'true');
   // Drop the <img> src so the browser can release the blob / protocol

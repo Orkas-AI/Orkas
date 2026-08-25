@@ -233,6 +233,7 @@ describe('local_agents/bridge › auth + skills', () => {
       });
 
       expect((list.reply as any).result.skills.map((skill: any) => skill.id)).not.toContain('74e05fe08cc5');
+      expect(bridge.getSkillDisplayName('74e05fe08cc5')).toBeNull();
       expect(enabled.readEnabledMap(TEST_UID).skills).toEqual({ '74e05fe08cc5': false });
     } finally {
       await bridge.close();
@@ -330,7 +331,7 @@ describe('local_agents/bridge › auth + skills', () => {
       });
       expect((denied.reply as any).ok).toBe(false);
       expect((denied.reply as any).error).toContain('unknown method');
-      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID, undefined);
+      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID);
     } finally {
       await bridge.close();
     }
@@ -349,7 +350,9 @@ describe('local_agents/bridge › auth + skills', () => {
       });
       expect((listed.reply as any).ok).toBe(true);
       expect((listed.reply as any).result.connectors[0].id).toBe('slack');
-      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID, undefined);
+      expect(bridge.getConnectorDisplayName('slack')).toBe('Slack');
+      expect(bridge.getConnectorDisplayName('unknown-connector')).toBeNull();
+      expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID);
     } finally {
       await bridge.close();
     }
@@ -393,8 +396,8 @@ describe('local_agents/bridge › auth + skills', () => {
   });
 });
 
-describe('local_agents/bridge › KB project scope', () => {
-  it('serves kb.list across global and current project libraries when projectId is supplied', async () => {
+describe('local_agents/bridge › Library project scope', () => {
+  it('serves library list/search actions across global and current project scopes', async () => {
     await seedGlobalKbFile('global-note.md', 'global bridge alpha');
     const projects = await import('../../../../src/main/features/projects');
     const projectFiles = await import('../../../../src/main/features/project_files');
@@ -409,7 +412,7 @@ describe('local_agents/bridge › KB project scope', () => {
     const bridge = await startTestBridge({ projectId });
     try {
       const r = await rpcOnce(bridge.socketPath, {
-        id: 5, token: bridge.token, method: 'kb.list', params: {},
+        id: 5, token: bridge.token, method: 'library', params: { action: 'list' },
       });
       expect((r.reply as any).ok).toBe(true);
       const text = (r.reply as any).result.text;
@@ -419,7 +422,7 @@ describe('local_agents/bridge › KB project scope', () => {
       expect(text).toContain('scope=project path="project-note.md"');
 
       const search = await rpcOnce(bridge.socketPath, {
-        id: 6, token: bridge.token, method: 'kb.search', params: { query: 'bridge alpha', k: 10 },
+        id: 6, token: bridge.token, method: 'library', params: { action: 'search', query: 'bridge alpha', k: 10 },
       });
       expect((search.reply as any).ok).toBe(true);
       const searchText = (search.reply as any).result.text;
@@ -430,7 +433,7 @@ describe('local_agents/bridge › KB project scope', () => {
     }
   });
 
-  it('serves only global kb.list when no projectId is supplied', async () => {
+  it('serves only global Library actions when no projectId is supplied', async () => {
     await seedGlobalKbFile('global-only.md', 'global only bridge alpha');
     const projects = await import('../../../../src/main/features/projects');
     const projectFiles = await import('../../../../src/main/features/project_files');
@@ -445,7 +448,7 @@ describe('local_agents/bridge › KB project scope', () => {
     const bridge = await startTestBridge();
     try {
       const r = await rpcOnce(bridge.socketPath, {
-        id: 7, token: bridge.token, method: 'kb.list', params: {},
+        id: 7, token: bridge.token, method: 'library', params: { action: 'list' },
       });
       expect((r.reply as any).ok).toBe(true);
       const text = (r.reply as any).result.text;
@@ -455,7 +458,7 @@ describe('local_agents/bridge › KB project scope', () => {
       expect(text).not.toMatch(/project-hidden\.md/);
 
       const search = await rpcOnce(bridge.socketPath, {
-        id: 8, token: bridge.token, method: 'kb.search', params: { query: 'bridge alpha', k: 10 },
+        id: 8, token: bridge.token, method: 'library', params: { action: 'search', query: 'bridge alpha', k: 10 },
       });
       expect((search.reply as any).ok).toBe(true);
       const searchText = (search.reply as any).result.text;
@@ -476,8 +479,8 @@ describe('local_agents/bridge › current conversation history', () => {
       const read = await rpcOnce(bridge.socketPath, {
         id: 40,
         token: bridge.token,
-        method: 'chat.read',
-        params: { scope: 'current', limit: 20 },
+        method: 'chat_history',
+        params: { action: 'read', scope: 'current', page: { mode: 'latest', count: 20 } },
       });
       expect((read.reply as any).ok).toBe(true);
       const text = (read.reply as any).result.text;
@@ -491,8 +494,8 @@ describe('local_agents/bridge › current conversation history', () => {
       const paged = await rpcOnce(bridge.socketPath, {
         id: 41,
         token: bridge.token,
-        method: 'chat.read',
-        params: { scope: 'current', before_msg_index: 1, limit: 20 },
+        method: 'chat_history',
+        params: { action: 'read', scope: 'current', page: { mode: 'before', index: 1, count: 20 } },
       });
       expect((paged.reply as any).ok).toBe(true);
       expect((paged.reply as any).result.text).toContain('PUBLIC_PRIOR_CONTEXT');
@@ -500,8 +503,8 @@ describe('local_agents/bridge › current conversation history', () => {
       const denied = await rpcOnce(bridge.socketPath, {
         id: 42,
         token: bridge.token,
-        method: 'chat.read',
-        params: { scope: 'all', cid: 'c1' },
+        method: 'chat_history',
+        params: { action: 'read', scope: 'all', cid: 'c1' },
       });
       expect((denied.reply as any).ok).toBe(false);
       expect((denied.reply as any).error).toContain('not allowed for this agent');

@@ -53,6 +53,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let resultText = '';
       let resultStatus: 'completed' | 'failed' | undefined;
       let resultError: string | undefined;
+      const toolNames = new Map<string, string>();
       // Captured upstream-provider error text from stderr. ACP servers
       // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
       // "non-retryable" and still return `stopReason: end_turn` with
@@ -167,8 +168,23 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
               opts.onEvent({ type: 'text-delta', text });
             },
             onThinking: text => opts.onEvent({ type: 'thinking', text }),
-            onToolUse: tool => opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input }),
-            onToolResult: tool => opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'result', output: tool.output }),
+            onToolUse: tool => {
+              if (tool.callId) toolNames.set(tool.callId, tool.name);
+              opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input });
+            },
+            onToolResult: tool => {
+              const name = tool.name === 'tool' && tool.callId
+                ? toolNames.get(tool.callId) || tool.name
+                : tool.name;
+              opts.onEvent({ type: 'tool-event', tool: name, callId: tool.callId, phase: 'result', output: tool.output });
+              if (tool.callId) toolNames.delete(tool.callId);
+            },
+            onMediaOutput: media => opts.onEvent({
+              type: 'media-output',
+              source: 'acp',
+              callId: media.callId,
+              items: media.items,
+            }),
             onPromptResult: r => {
               resultStatus = r.ok ? 'completed' : 'failed';
               if (r.ok && r.text) resultText = r.text;
@@ -278,6 +294,7 @@ interface AcpHandlers {
   onThinking(text: string): void;
   onToolUse(tool: { name: string; callId: string; input: unknown }): void;
   onToolResult(tool: { name: string; callId: string; output: string }): void;
+  onMediaOutput(media: { callId: string; items: Array<Record<string, string>> }): void;
   onPromptResult(r: { ok: boolean; text?: string; error?: string }): void;
   onUnknown(raw: any): void;
 }
@@ -317,20 +334,27 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
       if (typeof text === 'string' && text.length) h.onThinking(text);
       return;
     }
-    if (kind === 'tool_call' && upd.tool) {
+    if (kind === 'tool_call') {
+      const tool = upd.tool && typeof upd.tool === 'object' ? upd.tool : {};
+      const callId = String(upd.toolCallId || tool.id || tool.callId || '');
+      const name = String(upd.title || tool.name || upd.kind || 'tool');
       h.onToolUse({
-        name: String(upd.tool.name || 'tool'),
-        callId: String(upd.tool.id || upd.tool.callId || ''),
-        input: upd.tool.input ?? {},
+        name,
+        callId,
+        input: upd.rawInput ?? tool.input ?? {},
       });
+      emitAcpMedia(upd, callId, h);
       return;
     }
-    if (kind === 'tool_call_update' && upd.tool) {
+    if (kind === 'tool_call_update') {
+      const tool = upd.tool && typeof upd.tool === 'object' ? upd.tool : {};
+      const callId = String(upd.toolCallId || tool.id || tool.callId || '');
       h.onToolResult({
-        name: String(upd.tool.name || 'tool'),
-        callId: String(upd.tool.id || upd.tool.callId || ''),
-        output: typeof upd.tool.output === 'string' ? upd.tool.output : JSON.stringify(upd.tool.output ?? ''),
+        name: String(upd.title || tool.name || 'tool'),
+        callId,
+        output: acpToolOutput(upd, tool),
       });
+      emitAcpMedia(upd, callId, h);
       return;
     }
     if (kind === 'available_commands_update') {
@@ -365,4 +389,42 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
       return;
     }
   }
+}
+
+function acpToolOutput(upd: any, tool: any): string {
+  const raw = upd.rawOutput ?? tool.output;
+  if (typeof raw === 'string') return raw;
+  if (raw !== undefined) return JSON.stringify(raw);
+  if (!Array.isArray(upd.content)) return '';
+  return upd.content.flatMap((item: any): string[] => {
+    const content = item?.type === 'content' ? item.content : item;
+    return content?.type === 'text' && typeof content.text === 'string' ? [content.text] : [];
+  }).join('\n');
+}
+
+function emitAcpMedia(upd: any, callId: string, h: AcpHandlers): void {
+  const items: Array<Record<string, string>> = [];
+  if (Array.isArray(upd.content)) {
+    for (const entry of upd.content) {
+      const content = entry?.type === 'content' ? entry.content : entry;
+      if (content?.type !== 'image') continue;
+      const data = typeof content.data === 'string' ? content.data.trim() : '';
+      const uri = typeof content.uri === 'string' ? content.uri.trim() : '';
+      const mediaType = typeof content.mimeType === 'string' ? content.mimeType.trim() : '';
+      if (data || uri) items.push({
+        ...(data ? { data } : {}),
+        ...(uri ? { uri } : {}),
+        ...(mediaType ? { mediaType } : {}),
+      });
+    }
+  }
+  const raw = upd.rawOutput ?? upd.tool?.output;
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+  }
+  if (parsed && typeof parsed === 'object' && typeof parsed.image === 'string' && parsed.image.trim()) {
+    items.push({ uri: parsed.image.trim() });
+  }
+  if (items.length) h.onMediaOutput({ callId, items });
 }

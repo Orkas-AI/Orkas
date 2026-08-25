@@ -31,6 +31,22 @@ function ctxFor(state: Record<string, unknown> = {}) {
   return { state } as unknown as { state: Record<string, unknown> };
 }
 
+async function createChatHistoryActions(opts: {
+  userId: string;
+  currentCid?: string;
+  currentMessageId?: string;
+  projectId?: string;
+  allowedScopes?: readonly ('current' | 'project' | 'all')[];
+}) {
+  const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
+  const tool = createChatHistoryTool(opts);
+  const forAction = (action: 'search' | 'read') => ({
+    ...tool,
+    execute: (input: Record<string, unknown>, ctx: any) => tool.execute({ ...input, action }, ctx),
+  });
+  return [forAction('search'), forAction('read'), tool] as const;
+}
+
 function writeConversation(cid: string, title: string, messages: unknown[], projectId = ''): void {
   if (projectId) {
     const projectDir = path.join(tmpDir, TEST_UID, 'cloud', 'projects', projectId);
@@ -77,13 +93,12 @@ function firstHitCid(content: string): string {
   return match ? match[1] : '';
 }
 
-describe('chat-history-tools › chat_search', () => {
+describe('chat-history-tools › chat_history(search)', () => {
   it('finds current group-chat message text and returns cid/msg metadata', async () => {
     writeConversation('cgroup', 'Planning chat', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'remember the nebula migration decision' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatSearch.execute({ query: 'nebula', k: 3 }, ctxFor());
     expect(result.isError).toBeFalsy();
     expect(result.content).toMatch(/cid=cgroup/);
@@ -93,8 +108,7 @@ describe('chat-history-tools › chat_search', () => {
   });
 
   it('rejects empty query', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatSearch.execute({ query: '   ' }, ctxFor());
     expect(result.isError).toBe(true);
     expect(result.content).toMatch(/required/);
@@ -107,8 +121,7 @@ describe('chat-history-tools › chat_search', () => {
     writeConversation('hot', 'Newer other chat', [
       { id: 'm0', ts: '2026-02-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'priorityword same body' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID, currentCid: 'cold' });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'cold' });
     const result = await chatSearch.execute({ query: 'priorityword', k: 2 }, ctxFor());
     expect(result.isError).toBeFalsy();
     expect(firstHitCid(result.content)).toBe('cold');
@@ -131,8 +144,7 @@ describe('chat-history-tools › chat_search', () => {
     writeConversation('new', 'New chat', [
       { id: 'm0', ts: '2026-02-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'recencyword same body' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatSearch.execute({ query: 'recencyword', k: 2 }, ctxFor());
     expect(result.isError).toBeFalsy();
     expect(firstHitCid(result.content)).toBe('new');
@@ -151,9 +163,7 @@ describe('chat-history-tools › chat_search', () => {
     writeConversation('unprojected', 'Non-project task', [
       { id: 'm0', ts: '2026-05-01T00:00:00Z', from: 'commander', text: 'projectcontinuity same body' },
     ]);
-
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({
+    const [chatSearch] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current',
       projectId: 'project-a',
@@ -180,9 +190,7 @@ describe('chat-history-tools › chat_search', () => {
     writeConversation('unprojected', 'Non-project task', [
       { id: 'm0', ts: '2026-03-01T00:00:00Z', from: 'commander', text: 'crossprojectword same body' },
     ]);
-
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID, projectId: 'project-a' });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
     const result = await chatSearch.execute({ query: 'crossprojectword', scope: 'all', k: 3 }, ctxFor());
 
     expect(result.isError).toBeFalsy();
@@ -204,8 +212,7 @@ describe('chat-history-tools › chat_search', () => {
   });
 
   it('rejects unadvertised project scope when the current conversation is not in a project', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({ userId: TEST_UID });
+    const [chatSearch] = await createChatHistoryActions({ userId: TEST_UID });
     expect((chatSearch.inputSchema.properties as any).scope.enum).toEqual(['current', 'all']);
     const result = await chatSearch.execute({ query: 'anything', scope: 'project' }, ctxFor());
     expect(result.isError).toBe(true);
@@ -222,8 +229,7 @@ describe('chat-history-tools › chat_search', () => {
     writeConversation('other-chat', 'Other task', [
       { id: 'other', ts: '2026-07-30T00:00:00Z', from: 'user', text: 'BOUNDARYWORD other conversation' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({
+    const [chatSearch] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current-bound',
       currentMessageId: 'trigger',
@@ -246,8 +252,7 @@ describe('chat-history-tools › chat_search', () => {
   });
 
   it('denies project and all scopes to a current-only Agent', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch] = createChatHistoryTools({
+    const [chatSearch] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current',
       allowedScopes: ['current'],
@@ -261,10 +266,9 @@ describe('chat-history-tools › chat_search', () => {
   });
 });
 
-describe('chat-history-tools › chat_read', () => {
+describe('chat-history-tools › chat_history(read)', () => {
   it('advertises one tagged page object instead of conflicting flat paging fields', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID, projectId: 'project-a' });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
     const schema = chatRead.inputSchema as any;
 
     expect(schema.properties).not.toHaveProperty('msg_index');
@@ -289,8 +293,7 @@ describe('chat-history-tools › chat_read', () => {
       { id: 'm1', ts: '2026-01-01T00:01:00Z', from: 'commander', text: 'middle tagged answer' },
       { id: 'm2', ts: '2026-01-01T00:02:00Z', from: 'user', text: 'last tagged followup' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
 
     const latest = await chatRead.execute({
       cid: 'ctagged',
@@ -316,8 +319,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('cmixed', 'Mixed chat', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'mixed note' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
 
     const mixed = await chatRead.execute({
       cid: 'cmixed',
@@ -338,8 +340,7 @@ describe('chat-history-tools › chat_read', () => {
       { id: 'm1', ts: '2026-01-01T00:01:00Z', from: 'commander', to: ['user'], mentions: [], text: 'middle answer' },
       { id: 'm2', ts: '2026-01-01T00:02:00Z', from: 'user', to: ['commander'], mentions: [], text: 'last followup' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatRead.execute({ cid: 'cread', msg_index: 1, window: 1 }, ctxFor());
     expect(result.isError).toBeFalsy();
     expect(result.content).toMatch(/<chat-history cid="cread"/);
@@ -354,8 +355,7 @@ describe('chat-history-tools › chat_read', () => {
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'old' },
       { id: 'm1', ts: '2026-01-01T00:01:00Z', from: 'commander', to: ['user'], mentions: [], text: 'newer' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatRead.execute({ cid: 'clatest', limit: 1 }, ctxFor());
     expect(result.isError).toBeFalsy();
     expect(result.content).not.toMatch(/old/);
@@ -369,8 +369,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('unprojected', 'Non-project', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'non-project context' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID, projectId: 'project-a' });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
 
     const sameProject = await chatRead.execute({ cid: 'sameproject' }, ctxFor());
     const unprojected = await chatRead.execute({ cid: 'unprojected' }, ctxFor());
@@ -388,8 +387,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('foreign', 'Foreign project', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'foreign project context' },
     ], 'project-b');
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID, projectId: 'project-a' });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
 
     const defaultRead = await chatRead.execute({ cid: 'foreign' }, ctxFor());
     const allScopeRead = await chatRead.execute({ cid: 'foreign', scope: 'all' }, ctxFor());
@@ -404,8 +402,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('outside', 'Outside project', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', text: 'outside context' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
     expect((chatRead.inputSchema.properties as any).scope.enum).toEqual(['current', 'all']);
     const result = await chatRead.execute({ cid: 'outside', scope: 'project' }, ctxFor());
 
@@ -414,8 +411,7 @@ describe('chat-history-tools › chat_read', () => {
   });
 
   it('rejects unsafe conversation ids', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatRead.execute({ cid: '../nope' }, ctxFor());
     expect(result.isError).toBe(true);
     expect(result.content).toMatch(/valid `cid`/);
@@ -425,8 +421,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('crange', 'Range chat', [
       { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'only message' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({ userId: TEST_UID });
+    const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID });
     const result = await chatRead.execute({ cid: 'crange', msg_index: 4 }, ctxFor());
     expect(result.isError).toBe(true);
     expect(result.content).toMatch(/out of range/);
@@ -451,8 +446,7 @@ describe('chat-history-tools › chat_read', () => {
     writeConversation('other-read', 'Other read task', [
       { id: 'other', ts: '2026-07-30T00:00:00Z', from: 'user', text: 'OTHER_CONVERSATION_TEXT' },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({
+    const [, chatRead] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current-read',
       currentMessageId: 'trigger',
@@ -499,8 +493,7 @@ describe('chat-history-tools › chat_read', () => {
         text: 'continue that',
       },
     ]);
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [, chatRead] = createChatHistoryTools({
+    const [, chatRead] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current-pages',
       currentMessageId: 'trigger',
@@ -551,56 +544,62 @@ describe('chat-history-tools › chat_read', () => {
 });
 
 describe('chat-history-tools › shape', () => {
-  it('createChatHistoryTools returns search + read tools', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const tools = createChatHistoryTools({ userId: TEST_UID });
-    expect(tools.map((t) => t.name)).toEqual(['chat_search', 'chat_read']);
-    for (const tool of tools) {
-      expect((tool.inputSchema.properties as any).scope.enum).toEqual(['current', 'all']);
-      expect(tool.description.replace(/\s+/g, ' ')).not.toContain('Project scope');
-      expect(JSON.stringify(tool.inputSchema)).not.toMatch(/project/i);
-    }
+  it('exposes one chat_history tool with search and read actions', async () => {
+    const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+    expect(chatHistory.name).toBe('chat_history');
+    expect((chatHistory.inputSchema.properties as any).action.enum).toEqual(['search', 'read']);
+    expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current', 'all']);
+    expect(chatHistory.inputSchema.required).toEqual(['action']);
+    expect(chatHistory.inputSchema.additionalProperties).toBe(false);
+    expect(JSON.stringify(chatHistory.inputSchema)).not.toMatch(/project/i);
   });
 
-  it('advertises conditional project continuity search rather than every-turn retrieval', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch, chatRead] = createChatHistoryTools({ userId: TEST_UID, projectId: 'project-a' });
-    const searchDescription = chatSearch.description.replace(/\s+/g, ' ');
-    expect(searchDescription).toContain('Skip self-contained');
-    expect(searchDescription).toContain('discriminative name, phrase, id, or fact');
-    expect(searchDescription).toContain('page current history with chat_read');
-    expect(searchDescription).toContain('Project scope is limited to this project');
-    expect((chatSearch.inputSchema.properties as any).scope.enum).toEqual(['current', 'project', 'all']);
-    expect((chatSearch.inputSchema.properties as any).include_current.type).toBe('boolean');
-    expect(chatRead.description.replace(/\s+/g, ' ')).toContain('quoted stale data');
-    expect(chatRead.description.replace(/\s+/g, ' ')).toContain('mode latest');
-    expect((chatRead.inputSchema.properties as any).page.properties.count.description).toContain('Defaults to 3 or 10');
-    expect((chatRead.inputSchema.properties as any).scope.enum).toEqual(['current', 'project', 'all']);
+  it('keeps conditional selection at tool level and paging semantics on their fields', async () => {
+    const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
+    const description = chatHistory.description.replace(/\s+/g, ' ');
+    const properties = chatHistory.inputSchema.properties as any;
+    expect(description).toContain('when the request depends on earlier work');
+    expect(description).toContain('quoted, potentially stale data');
+    expect(properties.query.description).toContain('Natural language or keywords');
+    expect(properties.action.description).toContain('search requires query');
+    expect(properties.page.properties.mode.description).toContain('latest reads the tail');
+    expect(properties.page.properties.mode.description).toContain('around centers on index');
+    expect(properties.page.properties.mode.description).toContain('before pages backward');
+    expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current', 'project', 'all']);
+    expect((chatHistory.inputSchema.properties as any).scope.description).toContain('project stays in this project');
+    expect((chatHistory.inputSchema.properties as any).include_current.type).toBe('boolean');
+    expect((chatHistory.inputSchema.properties as any).page.properties.count.description).toContain('Defaults to 3 or 10');
   });
 
   it('advertises only current scope to ordinary Agents', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch, chatRead] = createChatHistoryTools({
+    const [, , chatHistory] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current',
       allowedScopes: ['current'],
     });
-    expect((chatSearch.inputSchema.properties as any).scope.enum).toEqual(['current']);
-    expect((chatRead.inputSchema.properties as any).scope.enum).toEqual(['current']);
-    expect((chatRead.inputSchema.properties as any).page.properties.mode.enum)
+    expect((chatHistory.inputSchema.properties as any).scope.enum).toEqual(['current']);
+    expect((chatHistory.inputSchema.properties as any).page.properties.mode.enum)
       .toEqual(['latest', 'around', 'before']);
-    expect((chatSearch.inputSchema.properties as any).scope.description)
-      .toBe('Search scope. current is host-bound to this conversation.');
-    expect((chatRead.inputSchema.properties as any).scope.description)
-      .toBe('Read scope. current is host-bound to this conversation.');
-    expect((chatRead.inputSchema.properties as any)).not.toHaveProperty('cid');
-    expect((chatSearch.inputSchema as any).required).toEqual(['query', 'scope']);
-    expect((chatRead.inputSchema as any).required).toEqual(['scope']);
+    expect((chatHistory.inputSchema.properties as any).scope.description)
+      .toBe('History scope. current is host-bound to this conversation.');
+    expect((chatHistory.inputSchema.properties as any)).not.toHaveProperty('cid');
+    expect((chatHistory.inputSchema as any).required).toEqual(['action', 'scope']);
+  });
+
+  it('rejects a missing action and fields that belong to the other action', async () => {
+    const [, , chatHistory] = await createChatHistoryActions({ userId: TEST_UID });
+    const missingAction = await chatHistory.execute({ query: 'x' }, ctxFor());
+    const crossActionField = await chatHistory.execute({
+      action: 'read', cid: 'c1', query: 'x',
+    }, ctxFor());
+    expect(missingAction.isError).toBe(true);
+    expect(missingAction.content).toContain('`action`');
+    expect(crossActionField.isError).toBe(true);
+    expect(crossActionField.content).toContain('unsupported field(s): query');
   });
 
   it('fails current scope closed when the host omitted the turn boundary', async () => {
-    const { createChatHistoryTools } = await import('../../../../src/main/model/core-agent/chat-history-tools');
-    const [chatSearch, chatRead] = createChatHistoryTools({
+    const [chatSearch, chatRead] = await createChatHistoryActions({
       userId: TEST_UID,
       currentCid: 'current',
       allowedScopes: ['current'],

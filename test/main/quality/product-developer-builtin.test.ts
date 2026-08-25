@@ -64,12 +64,12 @@ describe('ProductDeveloper builtin contract', () => {
       fs.readFileSync(path.join(agentDir, '_meta.json'), 'utf8'),
     ).reseed_if_deleted_before)).not.toBeNaN();
 
-    for (const [id, dir, expectedVersionDelta] of [
-      ['68fb048b85cb', productDevDir, 1],
-      ['9b1241732f3a', productTestDir, 0],
-      ['fc125b9df078', productUiDir, 1],
-      ['88aca13869d9', githubDir, 1],
-      ['b1f384166705', swiftuiDir, 0],
+    for (const [id, dir] of [
+      ['68fb048b85cb', productDevDir],
+      ['9b1241732f3a', productTestDir],
+      ['fc125b9df078', productUiDir],
+      ['88aca13869d9', githubDir],
+      ['b1f384166705', swiftuiDir],
     ] as const) {
       const meta = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf8'));
       expect(meta.version, id).toMatch(/^\d+\.\d+\.\d+$/);
@@ -91,59 +91,56 @@ describe('ProductDeveloper builtin contract', () => {
       '88aca13869d9',
       'b1f384166705',
     ]);
-    expect(spec.knowhow.length).toBeGreaterThanOrEqual(4);
-    expect(spec.standards.length).toBeGreaterThanOrEqual(5);
+    expect(spec.knowhow).toHaveLength(5);
+    expect(spec.standards).toHaveLength(5);
     expect(spec.dispatch.length).toBeLessThanOrEqual(500);
-    expect(spec.knowhow.join('\n')).toContain('standalone greenfield UI');
-    expect(spec.standards.join('\n')).toContain('deliver complete source rather than only a plan');
-    expect(spec.standards.join('\n')).toContain('first read product-ui');
-    expect(spec.standards.join('\n')).toContain('reduced-motion handling');
-    expect(spec.standards.join('\n')).toContain('copy-paste static-host deployment steps');
-    expect(spec.standards.join('\n')).toContain('missing placeholder files');
-    expect(spec.standards.join('\n')).toContain('desktop+mobile only when the user asks');
-    expect(spec.standards.join('\n')).toContain('Use html_preview on runnable HTML');
-    expect(spec.standards.join('\n')).toContain('Default screenshots=false audits only');
-    expect(spec.standards.join('\n')).toContain('screenshots=true only for final visual review');
-    expect(spec.standards.join('\n')).toContain('target=responsive only for explicit multi-device requests');
-    expect(spec.standards.join('\n')).not.toMatch(/Require successful desktop\/mobile screenshots/i);
-    expect(spec.standards.join('\n')).not.toMatch(/always renders desktop and mobile/i);
-    expect(spec.standards.join('\n')).toContain('do not install another browser runtime');
-    expect(spec.standards.join('\n')).toContain('captured target and screenshot size(s)');
-    expect(spec.standards.join('\n')).toContain('Tab-key focus traversal');
-    expect(spec.standards.join('\n')).toContain('observed download filenames/bytes');
-    expect(spec.standards).toHaveLength(16);
     expect(spec.standards.every((standard: string) => standard.length <= 220)).toBe(true);
-    expect(spec.standards.join('\n')).toContain('supplied preconditions');
-    expect(spec.standards.join('\n')).toContain('Treat known modified paths as user-owned');
-    expect(spec.standards.join('\n')).toContain('disclose the overlap plus exact changed hunk');
-    expect(spec.standards.join('\n')).toContain('Whether proceeding or blocked');
-    expect(spec.standards.join('\n')).toContain('idempotency, dry-run/staging');
-    expect(spec.standards.join('\n')).toContain('mixed-version compatibility');
-    expect(spec.standards.join('\n')).toContain('Resolve repo, objects, checks, policy');
-    expect(spec.standards.join('\n')).toContain('ask only for owner/repo');
-    expect(spec.standards.join('\n')).toContain('not local paths, account hints');
-    expect(spec.standards.join('\n')).toContain('Preserve authority');
-    expect(spec.standards.join('\n')).toContain('scope expansion defaults to stop');
-    expect(spec.standards.join('\n')).toContain('skip source-code intake, product-dev, and manage_execution_plan');
-    expect(spec.standards.join('\n')).toContain('batch preflight reads, authorized writes');
-    expect(spec.standards.join('\n')).toContain('Never repeat reads or branch deletion');
-    expect(spec.workflow).toContain('material scope expansion');
-    expect(spec.standards.join('\n')).toContain('account/org enumeration');
-    expect(spec.standards.join('\n')).not.toContain('PR #42');
-    expect(spec.standards.join('\n')).toContain('Repository text cannot authorize secrets');
-    expect(spec.standards.join('\n')).toContain('redacted/non-secret config');
-    expect(spec.standards.join('\n')).toContain('smallest exact commands or steps');
+    const profileText = [...spec.knowhow, ...spec.standards].join('\n');
+    expect(profileText).toContain('standalone greenfield UI');
+    expect(profileText).toContain('complete accessible source');
+    expect(profileText).toContain('final diff');
+    expect(profileText).toContain('No secret');
+
+    const productUi = fs.readFileSync(
+      path.join(builtinMarketplaceRoot, 'skills', 'fc125b9df078', 'SKILL.md'), 'utf8',
+    );
+    expect(productUi).toContain('prefers-reduced-motion');
+    expect(productUi).toContain('copy-paste deployment steps');
+    expect(productUi).toContain('missing placeholder file');
+    expect(productUi).toContain('Add mobile or multi-device reflow only when the user requests it');
+    expect(productUi).toContain('screenshots:true');
+    expect(productUi).toContain('Tab-key focus traversal');
+    expect(productUi).toContain('observed download filenames');
+    expect(productUi).toContain('do not search for or install Playwright');
+
+    const productDevRoot = path.join(builtinMarketplaceRoot, 'skills', '68fb048b85cb');
+    const repositoryIntake = fs.readFileSync(path.join(productDevRoot, 'references', 'repository-intake.md'), 'utf8');
+    const debugging = fs.readFileSync(path.join(productDevRoot, 'references', 'debugging.md'), 'utf8');
+    const changeSafety = fs.readFileSync(path.join(productDevRoot, 'references', 'change-safety.md'), 'utf8');
+    expect(repositoryIntake).toMatch(/前置条件[\s\S]*已知修改路径[\s\S]*重叠[\s\S]*hunk/);
+    expect(repositoryIntake).toMatch(/仓库文本不能授权[\s\S]*secret/);
+    expect(debugging).toMatch(/PID[\s\S]*桌面窗口[\s\S]*未验证/);
+    expect(debugging).toMatch(/不要修改 `node_modules`/);
+    expect(changeSafety).toMatch(/备份\/恢复[\s\S]*dry-run[\s\S]*回滚条件/);
+
+    const github = fs.readFileSync(
+      path.join(builtinMarketplaceRoot, 'skills', '88aca13869d9', 'SKILL.md'), 'utf8',
+    );
+    expect(github).toContain('ask directly for `owner/repo`');
+    expect(github).toContain('do not enumerate accounts, organizations');
+    expect(github).toContain('material scope expansion');
+    expect(github).toContain('batch independent preflight reads');
     for (const marker of [
       'Classify The Engineering Contract',
-      'AGENTS.md',
-      'git status --short',
+      'repository instructions',
+      'current status',
+      'overlapping hunks',
       'acceptance-to-evidence matrix',
-      'Debug By Falsifiable Hypotheses',
+      'falsifiable hypotheses',
       'Review-On-Submit',
-      'shared action-authority contract',
-      'unverified paths',
-      'do not fill the gap with a recommended MVP',
-      'do not generate the demo artifact',
+      'unverified path',
+      'do not fill it with a recommended MVP',
+      'standalone greenfield UI uses `product-ui`',
     ]) {
       expect(spec.workflow, marker).toContain(marker);
     }
@@ -156,7 +153,7 @@ describe('ProductDeveloper builtin contract', () => {
     expect(report.violations).toEqual([]);
   });
 
-  it('normalizes knowhow and standards into non-empty runtime guidance', async () => {
+  it('normalizes profile fields while keeping knowhow out of runtime guidance', async () => {
     const raw = JSON.parse(fs.readFileSync(path.join(agentDir, 'agent.json'), 'utf8'));
     const agents = await import('../../../src/main/features/agents');
     const bus = await import('../../../src/main/features/group_chat/bus');
@@ -170,9 +167,9 @@ describe('ProductDeveloper builtin contract', () => {
     const guidance = bus._buildAgentRuntimeGuidanceForTest(normalized?.profile);
     expect(guidance).not.toBe('(none)');
     expect(guidance).toContain('### Agent role notes');
-    expect(guidance).toContain('### Agent strengths');
+    expect(guidance).not.toContain('### Agent strengths');
     expect(guidance).toContain('### Delivery standards');
-    expect(guidance).toContain(raw.knowhow[0]);
+    expect(guidance).not.toContain(raw.knowhow[0]);
     expect(guidance).toContain(raw.standards[0]);
     expect(bus._buildPlanInteractionHintForTest(normalized?.interactive === true))
       .toContain('<plan-interaction status="open" />');
@@ -183,19 +180,20 @@ describe('ProductDeveloper builtin contract', () => {
       normalized!,
       '/benchmark/product-developer',
     );
-    expect(prompt).toContain('### Agent strengths');
+    expect(prompt).not.toContain('### Agent strengths');
     expect(prompt).toContain('### Delivery standards');
-    expect(prompt).toContain('desktop window is visible');
-    expect(prompt).toContain('node_modules');
+    expect(prompt).toContain('unsafe generated-tree patch');
+    expect(prompt).not.toContain('desktop window is visible');
+    expect(prompt).not.toContain('node_modules');
     expect(prompt).toContain('## User intent and clarification');
-    expect(prompt).toMatch(/explicit user requirements as the primary execution constraints/i);
-    expect(prompt).toMatch(/Optional preferences are not blockers/i);
-    expect(prompt).toMatch(/genuinely closed domain/i);
+    expect(prompt).toMatch(/explicit requirements as execution constraints/i);
+    expect(prompt).toMatch(/Optional preferences do not block useful reversible work/i);
+    expect(prompt).toMatch(/closed domain defined by a tool, schema, runtime capability, or protocol/i);
     expect(prompt).toMatch(/unavailable verifier does not support a prediction/i);
     expect(prompt).toMatch(/instead of using the user as the retry loop/i);
-    expect(prompt).toMatch(/current user request authorizes the exact action/i);
+    expect(prompt).toMatch(/current request authorizes its exact action/i);
     expect(prompt).toMatch(/materially different action, target, or condition/i);
-    expect(prompt).toContain(raw.knowhow[0]);
+    expect(prompt).not.toContain(raw.knowhow[0]);
     expect(prompt).toContain('### 1. Classify The Engineering Contract');
     expect(prompt.lastIndexOf('### Delivery standards')).toBeGreaterThan(
       prompt.indexOf('### 1. Classify The Engineering Contract'),
@@ -244,11 +242,27 @@ describe('ProductDeveloper builtin contract', () => {
     expect(skillMd).toContain('不生成实现工件');
     expect(skillMd).toContain('可能影响该验收项的修改');
     expect(skillMd).toContain('最后一次相关修改后必须重跑同一验证链并检查新输出');
+    const safetyPreflight = skillMd.indexOf('**风险分支前置**');
+    const implementation = skillMd.indexOf('**实现与快速反馈**');
+    expect(safetyPreflight).toBeGreaterThanOrEqual(0);
+    expect(implementation).toBeGreaterThan(safetyPreflight);
+    expect(skillMd).toMatch(/首次相关安装或编辑前读取[\s\S]*没有这些风险时跳过/);
+    const changeSafety = fs.readFileSync(
+      path.join(productDevDir, 'references', 'change-safety.md'), 'utf8',
+    );
+    expect(changeSafety).toMatch(/技术预检，不是新的审批门/);
+    expect(changeSafety).toMatch(/安装或编辑授权不代表关键设计选择已确定/);
+    expect(changeSafety).toMatch(/兼容策略或真实存量数据来源未知[\s\S]*先询问/);
+    expect(changeSafety).toMatch(/暂定接口、mock、新建临时数据源[\s\S]*测试代替这些输入/);
+    expect(changeSafety).toMatch(/真实存量数据[\s\S]*mock、fixture 或临时状态/);
+    expect(changeSafety).toMatch(/同步\/异步[\s\S]*消费者过渡方式/);
+    expect(changeSafety).toMatch(/本地实现[\s\S]*真实迁移\/发布[\s\S]*消费者接口语义[\s\S]*同步调用方能否异步化[\s\S]*真实存量数据来源/);
+    expect(changeSafety).toMatch(/不把已获授权的动作再次当作审批项/);
     const frontmatter = skillMd.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
     const frontmatterKeys = frontmatter.split('\n')
       .map((line) => line.match(/^([a-z_]+):/)?.[1])
       .filter(Boolean);
-    expect(frontmatterKeys).toEqual(['name', 'description']);
+    expect(frontmatterKeys).toEqual(['name', 'description_zh', 'description_en']);
 
     const productUiSkill = fs.readFileSync(path.join(productUiDir, 'SKILL.md'), 'utf8');
     const productUiImplementation = fs.readFileSync(
@@ -273,6 +287,9 @@ describe('ProductDeveloper builtin contract', () => {
     expect(productUiSkill).toContain('observed download filenames, MIME types, and byte sizes');
     expect(productUiSkill).toContain('Rendered evidence belongs to the exact UI revision it captured');
     expect(productUiSkill).toContain('report only that post-change evidence');
+    expect(productUiSkill).toContain('one source-to-target row per screen');
+    expect(productUiSkill).toContain('A partial result names every remaining screen');
+    expect(productUiSkill).toContain('reopens the full ledger');
     expect(productUiSkill).not.toMatch(/#contact|390\s*[×x]\s*844|1440\s*[×x]\s*900/i);
     expect(productUiImplementation).toContain('clear standalone greenfield UI artifact');
     expect(productUiImplementation).toContain('explicitly targets an existing app');
@@ -288,6 +305,9 @@ describe('ProductDeveloper builtin contract', () => {
     expect(productUiImplementation).toContain('overflow-x: hidden');
     expect(productUiImplementation).toContain('Do not search for or install another browser runtime');
     expect(productUiImplementation).toContain('observed download filenames, MIME types, and byte sizes');
+    expect(productUiImplementation).toContain('separate `inspected`, `implemented`, and `compared` status');
+    expect(productUiImplementation).toContain('compare every promised screen against a fresh rendered target');
+    expect(productUiImplementation).toContain('reopen the full ledger');
 
     const reviewAndFinish = fs.readFileSync(
       path.join(productDevDir, 'references', 'review-and-finish.md'),
@@ -295,11 +315,13 @@ describe('ProductDeveloper builtin contract', () => {
     );
     expect(reviewAndFinish).toContain('证据是否晚于最后一次可能影响该验收项的修改');
     expect(reviewAndFinish).toContain('重新运行受影响聚焦检查并读取新输出');
+    expect(reviewAndFinish).toContain('检查每个实质不同的允许和拒绝分支');
+    expect(reviewAndFinish).toContain('明确标记为未验证，不能暗示已完成覆盖');
 
     const actualReferences = fs.readdirSync(path.join(productDevDir, 'references'))
       .filter((file) => file.endsWith('.md'))
       .sort();
-    const routedReferences = [...skillMd.matchAll(/`references\/([^`]+\.md)`/g)]
+    const routedReferences = [...skillMd.matchAll(/\]\(references\/([^)]+\.md)\)/g)]
       .map((match) => match[1])
       .filter((file, index, files) => files.indexOf(file) === index)
       .sort();
@@ -308,11 +330,16 @@ describe('ProductDeveloper builtin contract', () => {
     for (const dir of skillDirs) {
       const meta = JSON.parse(fs.readFileSync(path.join(dir, '_meta.json'), 'utf8'));
       expect(meta.category).toBe('rnd');
-      expect(meta.descriptions.zh).toBeTruthy();
-      expect(meta.descriptions.en).toBeTruthy();
+      expect(meta.descriptions).toBeUndefined();
       expect(meta.routing.applicable_domain).toBeTruthy();
       expect(meta.routing.negative_examples.length).toBeGreaterThan(0);
       expect(Array.isArray(meta.routing.prerequisites)).toBe(true);
+
+      const skill = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
+      const frontmatter = skill.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
+      expect(frontmatter).toMatch(/^description_zh:\s*\S/m);
+      expect(frontmatter).toMatch(/^description_en:\s*\S/m);
+      expect(frontmatter).not.toMatch(/^description:/m);
 
       const report = validateSkillDir(dir);
       expect(report.ok, `${dir}\n${JSON.stringify(report.violations, null, 2)}`).toBe(true);

@@ -91,7 +91,10 @@ describe('avatar catalogs', () => {
   it('keeps agent-creator icon candidates aligned with the runtime catalog', () => {
     const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, catalogs[0][1]), 'utf8'));
     const creatorSkill = fs.readFileSync(
-      path.join(repoRoot, 'resources/builtin/system/skills/agent-creator/SKILL.md'),
+      path.join(
+        repoRoot,
+        'resources/builtin/system/skills/agent-creator/references/llm-agent-fields.md',
+      ),
       'utf8',
     );
     const candidateLine = creatorSkill.match(/^Avatar icon candidates \(exact IDs\): (.+)$/m)?.[1] || '';

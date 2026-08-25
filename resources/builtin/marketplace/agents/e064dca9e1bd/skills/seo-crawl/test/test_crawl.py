@@ -479,5 +479,54 @@ class ParseEdgeCaseTest(unittest.TestCase):
         self.assertEqual(f["word_count"], 1)
 
 
+class LocalFileEvidenceTest(unittest.TestCase):
+    """A file crawl makes no request, so it must describe no response.
+
+    On 2026-08-09 crawl_file passed status=200 into extract_fields. That 200 and
+    an https derived from the base URL's scheme travelled into the audit, which
+    scored security and indexability 100 and labelled the findings Measured for
+    a page that had never been contacted.
+    """
+
+    HTML = ('<html lang="en"><head><title>Orkas</title>'
+            '<link rel="canonical" href="https://orkas.ai/"></head>'
+            '<body><h1>Orkas</h1><p>Hello.</p></body></html>')
+
+    def _page(self):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8")
+        fh.write(self.HTML)
+        fh.close()
+        try:
+            return crawl_file(fh.name, "https://orkas.ai/")
+        finally:
+            os.unlink(fh.name)
+
+    def test_response_fields_are_absent_not_defaulted(self):
+        page = self._page()["pages"][0]
+        for field in ("status_code", "https", "is_indexable",
+                      "redirect_chain", "response_time_ms"):
+            self.assertIsNone(page[field], field)
+        self.assertEqual(page["source"], "file")
+
+    def test_html_derived_fields_still_carry(self):
+        # The negative control: refusing to describe the response must not throw
+        # away what the file really does say.
+        page = self._page()["pages"][0]
+        self.assertEqual(page["title"], "Orkas")
+        self.assertEqual(page["canonical"], "https://orkas.ai/")
+        self.assertEqual(page["h1_count"], 1)
+        self.assertEqual(page["lang"], "en")
+        self.assertFalse(page["noindex"])
+
+    def test_a_real_fetch_still_describes_its_response(self):
+        page = extract_fields(self.HTML, "https://orkas.ai/", status=200,
+                              response_time_ms=42, fetched_at="2026-08-09T00:00:00Z")
+        self.assertEqual(page["status_code"], 200)
+        self.assertIs(page["https"], True)
+        self.assertIs(page["is_indexable"], True)
+        self.assertEqual(page["redirect_chain"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

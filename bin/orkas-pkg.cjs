@@ -28,14 +28,8 @@
  * (`features/packages.ts`, `features/package_skills.ts`) — keep the registry
  * schema in sync with that module's doc block.
  *
- * Design constraints (docs/plans/open-ecosystem-architecture.md §A):
- *   - The package tree is hosted VERBATIM. Never rewrite SKILL.md, never
- *     normalize frontmatter, never write Orkas metadata inside the package.
- *   - Dependency install (npm/pip) only runs with explicit consent: the
- *     `--consent-deps` flag on install, or the recorded `deps_consent`
- *     flag on update (D3: ask once per package, remember).
- *   - Projects with neither a SKILL.md shape nor CLI entry points are
- *     rejected — agent-driven-only projects are out of scope.
+ * Runtime and lifecycle constraints are defined in
+ * docs/architecture/skill-engineering-contract.md; do not duplicate them here.
  *
  * Standalone CommonJS like run-skill.cjs: no imports from src/main (this
  * runs out-of-process under Electron-as-Node or stock node).
@@ -156,40 +150,94 @@ function writeRegistry(uid, registry) {
   fs.renameSync(tmp, p);
 }
 
+function registryLockOwner(lockPath) {
+  let raw;
+  try { raw = fs.readFileSync(lockPath, 'utf8').trim(); } catch { return { state: 'unknown', pid: null }; }
+  if (!/^[1-9]\d*$/.test(raw)) return { state: 'unknown', pid: null };
+  const pid = Number(raw);
+  if (!Number.isSafeInteger(pid)) return { state: 'unknown', pid: null };
+  try {
+    process.kill(pid, 0);
+    return { state: 'alive', pid };
+  } catch (e) {
+    // EPERM means the process exists but this user cannot signal it. Reclaim
+    // only on ESRCH so an unexpected platform error stays conservative.
+    return { state: e && e.code === 'ESRCH' ? 'dead' : 'alive', pid };
+  }
+}
+
+function cleanupAbandonedStaging(uid, deadPid) {
+  const dir = packagesDir(uid);
+  const suffix = `-${deadPid}`;
+  let entries = [];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    // Install/update staging, tarball, and extraction paths all start with
+    // `.staging-` and end in the owning PID. Do not touch final packages,
+    // atomic-update backups, or another process's staging artifacts.
+    if (!entry.name.startsWith('.staging-') || !entry.name.endsWith(suffix)) continue;
+    try {
+      fs.rmSync(path.join(dir, entry.name), {
+        recursive: true, force: true, maxRetries: 3, retryDelay: 100,
+      });
+    } catch { /* recovery is best-effort; the new operation can still proceed */ }
+  }
+}
+
 async function withRegistryLock(uid, fn) {
   fs.mkdirSync(packagesDir(uid), { recursive: true });
   const lockPath = path.join(packagesDir(uid), '_registry.lock');
   let fd = null;
-  // `die()` calls process.exit, which skips `finally` — the exit hook is the
-  // path that guarantees the lock never outlives the process (a leftover
-  // lock would block every orkas-pkg call for LOCK_STALE_MS).
+  let ownsLock = false;
+  let abandonedOwnerPid = null;
+  // `die()` calls process.exit, which skips `finally`, so normal CLI exits use
+  // this hook. A host timeout can terminate the process without running either
+  // cleanup path; the next operation recovers that abandoned PID lock below.
   const releaseLock = () => {
+    if (!ownsLock) return;
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* already closed */ } fd = null; }
+    ownsLock = false;
     try { fs.unlinkSync(lockPath); } catch { /* already gone */ }
   };
   process.on('exit', releaseLock);
   try {
     try {
       fd = fs.openSync(lockPath, 'wx');
+      ownsLock = true;
     } catch (e) {
       if (e && e.code === 'EEXIST') {
-        let stale = false;
-        try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { stale = true; }
+        const owner = registryLockOwner(lockPath);
+        let stale = owner.state === 'dead';
+        if (owner.state === 'dead') abandonedOwnerPid = owner.pid;
+        if (owner.state === 'unknown') {
+          try { stale = Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS; } catch { stale = true; }
+        }
         if (!stale) {
           process.removeListener('exit', releaseLock); // not our lock — leave it
           die(75, 'another orkas-pkg operation is in progress; retry shortly', { lock: lockPath });
         }
         try { fs.unlinkSync(lockPath); } catch { /* raced */ }
-        fd = fs.openSync(lockPath, 'wx');
+        try {
+          fd = fs.openSync(lockPath, 'wx');
+          ownsLock = true;
+        } catch (retryError) {
+          if (retryError && retryError.code === 'EEXIST') {
+            process.removeListener('exit', releaseLock);
+            die(75, 'another orkas-pkg operation is in progress; retry shortly', { lock: lockPath });
+          }
+          throw retryError;
+        }
       } else {
         throw e;
       }
     }
     fs.writeSync(fd, String(process.pid));
+    if (abandonedOwnerPid !== null) cleanupAbandonedStaging(uid, abandonedOwnerPid);
     // `await` so an async fn (e.g. a GitHub tarball download) completes BEFORE
     // the lock is released in `finally`; a bare `return fn()` would release the
     // lock the instant fn returned its promise, while network I/O was still in
-    // flight. The exit hook still guards against the lock outliving the process.
+    // flight. The exit hook covers normal process.exit paths; a later caller
+    // recovers the PID lock if the host force-terminates this process instead.
     return await fn();
   } finally {
     releaseLock();

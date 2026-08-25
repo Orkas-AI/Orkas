@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-report
-description_zh: "把 seo-tech-audit、关键词机会池和 GEO 探针结果汇总成可内联渲染的 :::dashboard JSON（健康分、维度评分、问题清单、机会池、GEO SoV 快照）并生成 ACTION-PLAN.md 行动计划；适合\"出诊断报告\"\"给我一个 SEO 看板和行动清单\"；触发词：报告、看板、dashboard、行动计划、汇总"
-description_en: "Aggregate seo-tech-audit, keyword opportunities and GEO probe results into an inline-renderable :::dashboard JSON (health score, dimension charts, issue table, opportunity pool, GEO SoV snapshot) plus an ACTION-PLAN.md; For: 'produce the diagnosis report', 'give me a SEO dashboard and action list'; Triggers: report, dashboard, action plan, summary"
-category: data
+description_zh: "把技术审计、关键词机会和 GEO 探针结果汇总成可内联渲染的 SEO/GEO 看板及 ACTION-PLAN.md；用于完整诊断交付，包含健康分、维度图、问题清单、机会池、GEO SoV 快照和优先行动。"
+description_en: "Combine technical audit, keyword opportunities, and GEO probe results into an inline SEO/GEO dashboard plus ACTION-PLAN.md. Use for complete diagnosis delivery with health and dimension charts, an issue table, opportunity pool, GEO SoV snapshot, and prioritized actions."
 ---
 
 # seo-report
@@ -22,6 +21,10 @@ Render an audit into the deliverable: a dashboard spec the chat can show inline,
 - Acquiring page data — that is `seo-crawl`.
 
 ## Preconditions
+
+On a continuation, supplied current-run evidence remains usable context. Finish
+the pending artifact from it, keeping unsupported findings Estimated, instead
+of restarting collection merely because the work spans turns.
 
 - A `seo-tech-audit` JSON object. Optionally the originating `seo-crawl` JSON, `seo-opportunity` JSON, and `geo-probe --op score` JSON for extra context.
 - Python 3.9+ (stdlib only).
@@ -91,4 +94,16 @@ dashboard, inline:
      criterion.
 Do not replace these details with only an `ACTION-PLAN.md` link.
 
+Before strategy cards, print `### Execution sequence` with steps numbered
+1..N; each step names its owner role, effort band, and validation window. P0
+means dependency order, not technical severity. When no Critical/High technical
+finding exists, lead with intent ownership and first-party proof, and keep
+polish in P2 and last.
+
 Do not hand-edit the JSON — regenerate via this skill if the audit changes.
+
+For a strategy request, a safety-blocked crawl is an evidence limitation rather
+than a reason to stop. Do not retry, search, or open an execution plan. Write
+the evidence-honest Estimated plan to `ACTION-PLAN.md`, persist the bounded
+`strategy-baseline.json`, and deliver the provisional strategy with the missing
+verification named.

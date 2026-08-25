@@ -124,9 +124,12 @@ describe('chats › message history tombstones', () => {
     fs.mkdirSync(path.dirname(imagePath), { recursive: true });
     fs.writeFileSync(imagePath, 'current-poster');
     const unversioned = mediaUrls.chatMediaLocalUrl(imagePath);
+    const sandboxUrl = `sandbox:${imagePath}`;
     const rows = [
       { id: 'm1', ts: '2026-07-10T10:00:00Z', from: 'commander', to: ['user'], text: `![poster](${unversioned})` },
       { id: 'm2', ts: '2026-07-10T10:01:00Z', from: 'user', to: ['commander'], text: `keep ${unversioned}` },
+      { id: 'm3', ts: '2026-07-10T10:02:00Z', from: 'agent-1', to: ['user'], text: `[poster](${sandboxUrl})` },
+      { id: 'm4', ts: '2026-07-10T10:03:00Z', from: 'user', to: ['commander'], text: `keep [poster](${sandboxUrl})` },
     ];
     fs.writeFileSync(historyFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
 
@@ -134,7 +137,10 @@ describe('chats › message history tombstones', () => {
 
     expect(page.history[0].text).toMatch(/\?v=\d+-\d+-14/);
     expect(page.history[1].text).toBe(`keep ${unversioned}`);
+    expect(page.history[2].text).toMatch(/^\[poster\]\(chat-media:\/\/local\/.+\?v=\d+-\d+-14\)$/);
+    expect(page.history[3].text).toBe(`keep [poster](${sandboxUrl})`);
     expect(fs.readFileSync(historyFile, 'utf8')).toContain(`![poster](${unversioned})`);
+    expect(fs.readFileSync(historyFile, 'utf8')).toContain(`[poster](${sandboxUrl})`);
   });
 
   it('fills each page with visible messages while skipping deleted rows', async () => {

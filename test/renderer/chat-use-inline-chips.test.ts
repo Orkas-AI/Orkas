@@ -39,6 +39,7 @@ function loadChatUseHelpers() {
     ${block}
     ({
       normalize: _normalizeChatUseSelection,
+      normalizeMany: _normalizeChatUseSelections,
       tokenFor: _chatUseTokenFor,
       tokens: _findChatUseTokens,
       partsFromText: chatUseMessagePartsFromText,
@@ -102,6 +103,23 @@ describe('chat use inline chips', () => {
       { type: 'use', kind: 'connector', id: 'github', name: 'GitHub' },
     ]);
     expect(h.textFromParts(parts)).toBe(text);
+  });
+
+  it('preserves Skill source through token and message-part round trips', () => {
+    const h = loadChatUseHelpers();
+    const external = { kind: 'skill', id: 'same-id', name: 'Shared Skill', source: 'external' };
+    const global = { kind: 'skill', id: 'same-id', name: 'Shared Skill', source: 'global' };
+    const text = `${h.tokenFor(external)} + ${h.tokenFor(global)}`;
+
+    expect(h.normalizeMany([external, global, { ...global }])).toEqual([external, global]);
+    expect(h.partsFromText(text)).toEqual([
+      { type: 'use', ...external },
+      { type: 'text', text: ' + ' },
+      { type: 'use', ...global },
+    ]);
+    expect(h.textFromParts(h.partsFromText(text))).toBe(text);
+    expect(h.normalize({ kind: 'connector', id: 'drive', source: 'global' }))
+      .toEqual({ kind: 'connector', id: 'drive', name: 'drive' });
   });
 
   it('rejects malformed persisted message parts', () => {

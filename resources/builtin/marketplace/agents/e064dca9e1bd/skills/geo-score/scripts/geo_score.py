@@ -153,11 +153,20 @@ def score_geo(crawl_obj: dict) -> dict:
     entity_status = "recognized" if (has_org and has_sameas) else "partial" if has_org else "unrecognized"
 
     # ── Technical access ──
-    if not page.get("is_indexable", True):
+    # None means no request was made, so neither fact is known. Deducting would
+    # invent a defect and skipping silently would score the dimension as clean,
+    # so the unknown is recorded and the dimension goes unscored below.
+    not_assessed: list[dict] = []
+    local_only = "no request was made (local file crawl)"
+    if page.get("is_indexable") is None:
+        not_assessed.append({"dimension": "technical", "check": "is_indexable", "reason": local_only})
+    elif not page.get("is_indexable"):
         deduct("technical", 50, "Page not indexable",
                "is_indexable=false", "Make the page indexable (200 + no noindex); unindexable pages aren't cited.",
                "page indexable on recrawl", "still blocked")
-    if not page.get("https"):
+    if page.get("https") is None:
+        not_assessed.append({"dimension": "technical", "check": "https", "reason": local_only})
+    elif not page.get("https"):
         deduct("technical", 20, "Not HTTPS", "scheme http", "Serve over HTTPS.",
                "https on recrawl", "still http")
     if wc == 0:
@@ -173,12 +182,18 @@ def score_geo(crawl_obj: dict) -> dict:
                "AI bots allowed on recrawl", "still disallowed")
 
     geo_score = round(sum(dims[k] * w for k, w in _WEIGHTS.items()))
+    blind = {entry["dimension"] for entry in not_assessed}
     return {
         "geo_score": geo_score,
-        "geo_dimensions": dims,
+        "geo_dimensions": {k: (None if k in blind else v) for k, v in dims.items()},
+        "not_assessed": not_assessed,
         "entity_status": entity_status,
         "geo_recommendations": recs,
-        "meta": {"url": page.get("url"), "entity_status": entity_status},
+        "meta": {
+            "url": page.get("url"),
+            "entity_status": entity_status,
+            "source": page.get("source") or site.get("source") or "fetch",
+        },
     }
 
 

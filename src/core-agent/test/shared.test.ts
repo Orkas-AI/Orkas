@@ -15,7 +15,9 @@ import {
   isRetryableError,
   isStorageFullError,
   isTransientNetworkError,
+  errorCodeForLog,
   formatError,
+  providerHttpStatusOf,
 } from "../src/shared/errors.js";
 import { createLogger } from "../src/shared/logger.js";
 
@@ -387,6 +389,37 @@ describe("Errors", () => {
     it("formats non-Error values", () => {
       expect(formatError("string error")).toBe("string error");
       expect(formatError(42)).toBe("42");
+    });
+  });
+
+  describe("errorCodeForLog", () => {
+    it("retains a bounded machine code without exposing the message", () => {
+      const err = Object.assign(new Error("failed at /private/user/session.jsonl"), {
+        code: "EACCES",
+      });
+      expect(errorCodeForLog(err)).toBe("EACCES");
+    });
+
+    it("rejects untrusted or missing codes", () => {
+      expect(errorCodeForLog(new Error("/private/user/session.jsonl"))).toBe("UNKNOWN");
+      expect(errorCodeForLog({ code: "../../private/path" })).toBe("UNKNOWN");
+    });
+  });
+
+  describe("providerHttpStatusOf", () => {
+    it("reads the status from a ProviderError", () => {
+      expect(providerHttpStatusOf(new ProviderError("gone", "custom", 410))).toBe(410);
+    });
+
+    it("finds a wrapped status through the cause chain", () => {
+      const cause = Object.assign(new Error("bad request"), { status: 400 });
+      expect(providerHttpStatusOf(new ProviderError("wrapped", "custom", undefined, cause))).toBe(400);
+    });
+
+    it("ignores errors without a plausible HTTP status", () => {
+      expect(providerHttpStatusOf(new Error("terminated"))).toBeUndefined();
+      expect(providerHttpStatusOf(Object.assign(new Error("x"), { status: 9000 }))).toBeUndefined();
+      expect(providerHttpStatusOf(undefined)).toBeUndefined();
     });
   });
 });

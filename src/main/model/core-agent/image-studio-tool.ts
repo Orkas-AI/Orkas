@@ -3,7 +3,6 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
-import { getLocalExecGranted } from '../../features/permissions';
 import {
   assertImageGenerationRequestId,
   beginImageStudioGeneration,
@@ -27,6 +26,7 @@ import {
 } from '../../features/image_assets';
 import {
   exportImageStudioProject,
+  imageStudioEvidenceReviewRequired,
   inspectImageStudioProject,
   readImageStudioEvidenceState,
   recordRasterEvidence,
@@ -63,8 +63,6 @@ const OPS = new Set<ImageStudioOp>([
   'workflow.capabilities',
   'workflow.run',
 ]);
-
-const DENY_MESSAGE = 'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so ImageStudio rendering and export were not run.';
 
 export interface ImageStudioToolOpts {
   userId: string;
@@ -229,6 +227,7 @@ function nextImageStudioRecoveryOperation(input: {
   inspection: Awaited<ReturnType<typeof inspectImageStudioProject>>;
   evidenceCurrent: boolean;
   evidenceAvailable: boolean;
+  reviewRequired: boolean;
   reviewVerdict: ImageStudioReviewVerdict | null;
 }): string {
   if (!input.inspection.ok) return 'repair_project_then_project.inspect';
@@ -241,6 +240,7 @@ function nextImageStudioRecoveryOperation(input: {
   if (input.reviewVerdict === 'repair' || input.reviewVerdict === 'blocked') {
     return 'repair_candidate_then_reinspect';
   }
+  if (!input.reviewRequired) return 'project.export';
   return 'project.submit_design_review';
 }
 
@@ -265,7 +265,9 @@ async function buildImageStudioRecoveryHandoff(input: {
     && !!state
     && !!inspection.signature
     && state.signature === inspection.signature;
-  const reviewCurrent = evidenceCurrent
+  const reviewRequired = imageStudioEvidenceReviewRequired(state);
+  const reviewCurrent = reviewRequired
+    && evidenceCurrent
     && !!state?.review
     && state.review.signature === state.signature
     && path.resolve(state.review.evidence_path) === path.resolve(state.evidence_path);
@@ -273,7 +275,9 @@ async function buildImageStudioRecoveryHandoff(input: {
   const currentCandidate = state && evidenceAvailable ? {
     status: reviewVerdict === 'passed'
       ? 'approved'
-      : evidenceCurrent ? 'current_unapproved' : 'stale_unapproved',
+      : evidenceCurrent
+        ? reviewRequired ? 'current_unapproved' : 'validated'
+        : 'stale_unapproved',
     path: state.evidence_path,
     media: versionedChatMediaLocalUrl(state.evidence_path),
     content_hash: state.image_hash,
@@ -281,9 +285,10 @@ async function buildImageStudioRecoveryHandoff(input: {
     current_signature: inspection.signature || null,
     evidence_current: evidenceCurrent,
     review_current: reviewCurrent,
-    review_verdict: state.review?.verdict || null,
-    review_scores: state.review?.quality_scorecard || null,
-    review_findings: state.review?.findings || [],
+    review_required: reviewRequired,
+    review_verdict: reviewRequired ? state.review?.verdict || null : null,
+    review_scores: reviewRequired ? state.review?.quality_scorecard || null : null,
+    review_findings: reviewRequired ? state.review?.findings || [] : [],
   } : null;
   return {
     current_candidate: currentCandidate,
@@ -294,6 +299,7 @@ async function buildImageStudioRecoveryHandoff(input: {
       evidence_available: evidenceAvailable,
       evidence_current: evidenceCurrent,
       review_current: reviewCurrent,
+      review_required: reviewRequired,
       review_verdict: reviewVerdict,
       generation: {
         ...usage,
@@ -305,6 +311,7 @@ async function buildImageStudioRecoveryHandoff(input: {
         inspection,
         evidenceCurrent,
         evidenceAvailable,
+        reviewRequired,
         reviewVerdict,
       }),
     },
@@ -347,7 +354,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         output_path: { type: 'string', description: 'Snapshot, external workflow, or final export path.' },
         format: { type: 'string', enum: ['png', 'jpeg'], description: 'Final project.export format. Defaults from output_path, otherwise PNG.' },
         evidence_path: { type: 'string', description: 'Required for project.submit_design_review: exact current evidence path returned by project.inspect or project.snapshot.' },
-        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'Required for project.submit_design_review and must be sent in the same call as review_scope, review_findings, and the complete quality_scores object. One submission is allowed per exact evidence; after repair, both the source signature and rendered pixels must change before another review.' },
+        review_verdict: { type: 'string', enum: ['passed', 'repair', 'blocked'], description: 'For project.submit_design_review; send in the same call as review_scope, review_findings, and complete quality_scores. One submission per exact evidence; retry requires changed source signature and rendered pixels.' },
         review_scope: { type: 'string', description: 'Required for project.submit_design_review: concise statement of what was visually inspected.' },
         review_findings: { type: 'array', items: { type: 'string' }, description: 'Required for every project.submit_design_review call. Send [] for passed; send concrete non-empty findings for repair or blocked.' },
         quality_scores: {
@@ -367,7 +374,7 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
         additional_dimensions: {
           type: 'array',
           maxItems: 8,
-          description: 'Optional open-ended task-specific review dimensions not already covered by the mandatory scores. Add every materially applicable dimension with a stable id, user-facing label, why it applies, concrete visual evidence, and a 0-100 score. High extra scores never raise the mandatory overall; every extra score must still meet the native dimension floor for passed.',
+          description: 'Optional open-ended task-specific review dimensions beyond mandatory scores. Each needs id, label, reason, visual evidence, and a 0-100 score; all must meet the native pass floor and cannot raise mandatory overall.',
           items: {
             type: 'object',
             properties: {
@@ -393,7 +400,6 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
       required: ['op', 'project_dir'],
     },
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return { content: DENY_MESSAGE, isError: true } as ToolResult;
       if (opts.agentId !== IMAGE_STUDIO_AGENT_ID) {
         return { content: 'E_IMAGE_STUDIO_OWNER_REQUIRED: image_studio is private to ImageStudio.', isError: true } as ToolResult;
       }
@@ -674,14 +680,6 @@ export function createImageStudioTool(opts: ImageStudioToolOpts): AgentTool {
             inspection,
           });
           const result = { ok: inspection.ok, op, inspection, ...handoff };
-          if (inspection.ok
-            && (inspection.route === 'generate' || inspection.route === 'edit')
-            && inspection.evidence_path) {
-            return jsonResultWithVisualEvidence(
-              result,
-              imageStudioVisualEvidence(projectDirAbs, inspection),
-            );
-          }
           return jsonResult(result);
         }
 

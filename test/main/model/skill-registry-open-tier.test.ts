@@ -9,7 +9,7 @@ vi.mock('../../../src/main/logger', () => ({
 
 // OPEN-tier rendering (external packages + global roots) in
 // `getSystemPromptBlock`. Companion to skill-registry.test.ts (trusted
-// tier). Plan: docs/plans/open-ecosystem-architecture.md §A3/§B1; callers
+// tier). Contract: docs/architecture/skill-engineering-contract.md; callers
 // gate exposure via `includeOpenSources`.
 
 let tmpDir: string;
@@ -128,6 +128,120 @@ describe('skill-registry › open tier (includeOpenSources)', () => {
     expect(text).not.toContain('skill_search');
   });
 
+  it('honors the selected source when external and global tiers share one id', async () => {
+    writePackage('same-id-package', ['skills']);
+    writeSkill(
+      path.join(pkgsDir(), 'same-id-package', 'skills'),
+      'same-id-skill',
+      'External Same Id',
+      'external same-id contract',
+    );
+    writeSkill(
+      path.join(homeDir(), '.claude', 'skills'),
+      'same-id-skill',
+      'Global Same Id',
+      'global same-id contract',
+    );
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const runtimeBindings = new Map();
+    const globalText = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: [{ id: 'same-id-skill', source: 'global' }],
+      runtimeBindings,
+    });
+
+    expect(globalText).toContain('**Global Same Id** (Source: global');
+    expect(globalText).toContain('global same-id contract');
+    expect(globalText).not.toContain('External Same Id');
+    expect([...runtimeBindings.values()]).toContainEqual(expect.objectContaining({
+      id: 'same-id-skill',
+      name: 'Global Same Id',
+      source: 'global',
+    }));
+
+    const externalText = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: [{ id: 'same-id-skill', source: 'external' }],
+    });
+    expect(externalText).toContain('**External Same Id** (Source: external');
+    expect(externalText).not.toContain('Global Same Id');
+  });
+
+  it('retains two explicitly selected tiers that share one id', async () => {
+    writePackage('same-id-package', ['skills']);
+    writeSkill(
+      path.join(pkgsDir(), 'same-id-package', 'skills'),
+      'same-id-skill',
+      'External Same Id',
+      'external selected contract',
+    );
+    writeSkill(
+      path.join(homeDir(), '.claude', 'skills'),
+      'same-id-skill',
+      'Global Same Id',
+      'global selected contract',
+    );
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const runtimeBindings = new Map();
+    const text = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: [
+        { id: 'same-id-skill', source: 'external' },
+        { id: 'same-id-skill', source: 'global' },
+      ],
+      runtimeBindings,
+    });
+
+    expect(text).toContain('**External Same Id** (Source: external');
+    expect(text).toContain('**Global Same Id** (Source: global');
+    expect([...runtimeBindings.values()]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'same-id-skill', source: 'external' }),
+      expect.objectContaining({ id: 'same-id-skill', source: 'global' }),
+    ]));
+    expect(new Set(runtimeBindings.keys()).size).toBe(2);
+  });
+
+  it('does not substitute another tier when an exact selected source disappeared', async () => {
+    writePackage('external-only-package', ['skills']);
+    writeSkill(
+      path.join(pkgsDir(), 'external-only-package', 'skills'),
+      'external-only',
+      'External Only',
+      'must not substitute',
+    );
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const exactMissing = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: [{ id: 'external-only', source: 'global' }],
+    });
+    expect(exactMissing).toBe('');
+
+    const legacy = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: ['external-only'],
+    });
+    expect(legacy).toContain('**External Only** (Source: external');
+  });
+
+  it('does not use a same-source display-name match for a stale source-aware id', async () => {
+    writeSkill(
+      path.join(homeDir(), '.claude', 'skills'),
+      'replacement-id',
+      'Old Display Name',
+      'replacement must remain unselected',
+    );
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      allowlist: [],
+      forceOpenSkillRefs: [{ id: 'removed-id', name: 'Old Display Name', source: 'global' }],
+    });
+    expect(text).toBe('');
+  });
+
   it('omits the skill_search hint when open sources are not requested', async () => {
     writeSkill(customDir(), 'mine', 'mine', 'custom skill');
     const { getSystemPromptBlock } = await loadRegistry();
@@ -224,7 +338,7 @@ describe('skill-registry › open tier (includeOpenSources)', () => {
     expect(roots).not.toContain(path.join(homeDir(), '.codex', 'skills'));
   });
 
-  it('listSkillSpecsForAgentMetadata includes trusted + enabled external, but not global', async () => {
+  it('listSkillSpecsForAgentMetadata keeps Agent metadata trusted/private only', async () => {
     writeSkill(customDir(), 'mine', 'mine', 'trusted custom');
     writePackage('mypack', ['skills']);
     writeSkill(path.join(pkgsDir(), 'mypack', 'skills'), 'pkg-skill', 'pkg-skill', 'from package');
@@ -234,7 +348,7 @@ describe('skill-registry › open tier (includeOpenSources)', () => {
     const ids = (await listSkillSpecsForAgentMetadata(TEST_UID)).map((s) => s.id);
 
     expect(ids).toContain('mine');
-    expect(ids).toContain('pkg-skill');
+    expect(ids).not.toContain('pkg-skill');
     expect(ids).not.toContain('global-skill');
   });
 });
@@ -292,6 +406,30 @@ describe('skill-registry › searchOpenTierSkills (global tier only)', () => {
     expect(res.total_matched).toBe(5);
   });
 
+  it('pages the stable ranking by offset without duplicates or omissions', async () => {
+    for (const id of ['page-a', 'page-b', 'page-c', 'page-d', 'page-e']) {
+      writeSkill(G(), id, id, 'shared paged capability');
+    }
+    const { searchOpenTierSkills } = await loadRegistry();
+
+    const first = await searchOpenTierSkills(TEST_UID, 'paged', 2, undefined, 0);
+    const second = await searchOpenTierSkills(TEST_UID, 'paged', 2, undefined, 2);
+    const last = await searchOpenTierSkills(TEST_UID, 'paged', 2, undefined, 4);
+    const beyond = await searchOpenTierSkills(TEST_UID, 'paged', 2, undefined, 5);
+
+    expect(first.rows.map((row) => row.id)).toEqual(['page-a', 'page-b']);
+    expect(second.rows.map((row) => row.id)).toEqual(['page-c', 'page-d']);
+    expect(last.rows.map((row) => row.id)).toEqual(['page-e']);
+    expect(beyond.rows).toEqual([]);
+    expect([first, second, last, beyond].map((page) => page.total_matched)).toEqual([5, 5, 5, 5]);
+  });
+
+  it('rejects an invalid offset instead of silently changing the requested page', async () => {
+    const { searchOpenTierSkills } = await loadRegistry();
+    await expect(searchOpenTierSkills(TEST_UID, '', 2, undefined, -1))
+      .rejects.toThrow('offset must be a non-negative safe integer');
+  });
+
   it('empty query returns a bounded list (all matches, name-ordered)', async () => {
     writeSkill(G(), 'zeta', 'zeta', 'one');
     writeSkill(G(), 'alpha', 'alpha', 'two');
@@ -320,14 +458,22 @@ describe('skill-registry › searchOpenTierSkills (global tier only)', () => {
     expect(res.rows.map((r) => r.id)).toEqual(['report-builder', 'misc-tool']);
   });
 
-  it('clamps limit to the 1..20 range', async () => {
+  it('clamps limit to the compact 1..10 range', async () => {
     for (let i = 0; i < 22; i += 1) writeSkill(G(), `cap${i}`, `cap${i}`, 'shared cap tool');
     const { searchOpenTierSkills } = await loadRegistry();
     const high = await searchOpenTierSkills(TEST_UID, 'shared', 999);
-    expect(high.returned).toBe(20); // capped at max
+    expect(high.returned).toBe(10); // capped at max
     expect(high.total_matched).toBe(22);
     const low = await searchOpenTierSkills(TEST_UID, 'shared', 1);
     expect(low.returned).toBe(1);
+  });
+
+  it('returns at most five rows by default while preserving host-side match counts', async () => {
+    for (let i = 0; i < 7; i += 1) writeSkill(G(), `default${i}`, `default${i}`, 'default limit tool');
+    const { searchOpenTierSkills } = await loadRegistry();
+    const res = await searchOpenTierSkills(TEST_UID, 'default');
+    expect(res.returned).toBe(5);
+    expect(res.total_matched).toBe(7);
   });
 
   it('labels source=global and points read_path at the SKILL.md', async () => {

@@ -1,9 +1,8 @@
 ---
 ownerAgent: e064dca9e1bd
 name: seo-monitor
-description_zh: "SEO/GEO 漂移监控：op=snapshot 把一次抓取（含健康分/GEO 分）固化成可比对的基线快照（含内容哈希）；op=compare 把当前快照与基线对比，按规则引擎产出漂移项（schema 被删、加 noindex、canonical 改动、标题/H1 变化、健康分/GEO 回退、内容大幅缩水等），分级输出；适合\"监控这页有没有退步\"\"和上次比有什么变化\"；触发词：监控、漂移、回退、基线、对比、drift"
-description_en: "SEO/GEO drift monitoring: op=snapshot distills a crawl (+ health/GEO scores) into a comparable baseline (with content hash); op=compare diffs the current snapshot against the baseline via a rule engine and emits ranked drift findings (schema removed, noindex added, canonical changed, title/H1 changes, health/GEO regression, large content loss); For: 'monitor this page for regressions', 'what changed since last time'; Triggers: monitor, drift, regression, baseline, compare"
-category: data
+description_zh: "从抓取和评分数据建立可比较的 SEO/GEO 基线，或将新快照与基线比较并分级报告 schema、noindex、canonical、标题/H1、健康分、GEO 分和内容损失等漂移；用于页面退步监控和变化解释。"
+description_en: "Create a comparable SEO/GEO baseline from crawl and score data, or compare a later snapshot to rank drift such as schema, noindex, canonical, title/H1 changes, score regression, or content loss. Use for monitoring page regressions and explaining what changed."
 ---
 
 # seo-monitor

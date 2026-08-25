@@ -150,6 +150,8 @@ function loadConversationRenderer() {
       'chat.process.agent_ready': 'Agent connected',
       'chat.process.task_running': 'Handle task',
       'chat.process.task_done': 'Task complete',
+      'chat.tool_result_expand_hint': 'Click to view full output',
+      'chat.form.submit_failed': 'Submit failed',
       'chat.process.response_timeout': 'Response timed out',
       'chat.process.wait_agent_response': `Wait for agent response · ${params?.duration}`,
       'chat.process.cli_login_required': 'External agent sign-in required',
@@ -164,10 +166,19 @@ function loadConversationRenderer() {
       'chat.stream.background_stopped': `Background task stopped${params?.detail || ''}`,
       'chat.stream.tool_progress': `Tool running${params?.detail || ''}`,
       'chat.stream.thinking': 'Thinking',
+      'chat.stream.reasoning_done': 'Thinking complete',
       'chat.activity_working': 'Working',
       'chat.stream.model_rerouted': `Switch model${params?.detail || ''}`,
       'chat.stream.authenticating': 'Verify identity',
-      'chat.stream.rate_limit': 'Wait for service',
+      'chat.stream.rate_limit': 'Current usage limit reached',
+      'chat.stream.request_limited': 'Request rate limited',
+      'chat.stream.service_busy': 'Model service is busy',
+      'chat.stream.service_unavailable': 'Model service is temporarily unavailable',
+      'chat.stream.network_unavailable': 'Network connection unavailable',
+      'chat.stream.service_error': 'Temporary model service error',
+      'chat.stream.retry_attempt': `Retry ${params?.attempt}`,
+      'chat.stream.retry_attempt_total': `Retry ${params?.attempt}/${params?.total}`,
+      'chat.stream.retry_continue': `Continue in ${params?.duration}`,
       'model.retrying': 'Retrying',
       'model.retrying_n': `Retrying (attempt ${params?.attempt})`,
       'chat.stream.context_history_start': 'Organize conversation history',
@@ -216,6 +227,123 @@ function loadConversationRenderer() {
   vm.runInContext(source, context);
   return context;
 }
+
+describe('conversation form submission boundary', () => {
+  it('rejects a failed form mark with the backend error so the widget can retry', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({ ok: false, error: 'Directory does not exist' }),
+    });
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: () => null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'form-1',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: 'relative/path' }, []))
+      .rejects.toThrow('Directory does not exist');
+  });
+
+  it('undoes the optimistic submitted state and rejects when replay send fails', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        submission: { text: '@OpenCode\nselected /tmp/project', agent_id: 'agent-1' },
+      }),
+    });
+    context.sendInConversation = async () => {
+      throw new Error('Could not start task');
+    };
+    const classes = new Set<string>();
+    const formHost = {
+      classList: {
+        add: (name: string) => classes.add(name),
+        remove: (name: string) => classes.delete(name),
+      },
+    };
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: (selector: string) => selector === '.chat-input-form' ? formHost : null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'abcdef12',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: '/tmp/project' }, []))
+      .rejects.toThrow('Could not start task');
+    expect(classes.has('is-submitted')).toBe(false);
+  });
+
+  it('undoes the optimistic state when replay resolves without starting', async () => {
+    const context = loadConversationRenderer();
+    let submitOptions: any = null;
+    context.window.renderChatInputForm = (_host: any, _message: any, opts: any) => {
+      submitOptions = opts;
+    };
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        submission: { text: '@OpenCode\nselected /tmp/project', agent_id: 'agent-1' },
+      }),
+    });
+    context.sendInConversation = async () => ({
+      started: false,
+      queued: false,
+      result: 'failure',
+      reason: 'model_not_configured',
+    });
+    const classes = new Set<string>();
+    const formHost = {
+      classList: {
+        add: (name: string) => classes.add(name),
+        remove: (name: string) => classes.delete(name),
+      },
+    };
+    const msgDiv: any = {
+      dataset: { msgId: 'message-1' },
+      querySelector: (selector: string) => selector === '.chat-input-form' ? formHost : null,
+    };
+    const message = {
+      ts: '2026-08-14T00:00:00.000Z',
+      form: {
+        form_id: 'abcdef12',
+        agent_id: 'agent-1',
+        fields: [{ id: 'project_dir', type: 'directory', label: 'Project directory' }],
+      },
+    };
+
+    context._mountChatInputForm({}, msgDiv, message, { cid: 'c1' });
+
+    await expect(submitOptions.onSubmit('', { project_dir: '/tmp/project' }, []))
+      .rejects.toThrow('Submit failed');
+    expect(classes.has('is-submitted')).toBe(false);
+  });
+});
 
 describe('conversation create-agent inline gate', () => {
   it('hides while the current task is pending even without a scroll spacer', () => {
@@ -371,6 +499,79 @@ describe('conversation history initial window', () => {
     expect(appended).toHaveLength(0);
   });
 
+  it('replays retained milestones after history reattaches a pending task row', async () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const msg = { isConnected: false } as any;
+    const history = {
+      isConnected: true,
+      classList: { remove() {} },
+      innerHTML: '',
+      scrollHeight: 100,
+      scrollTop: 0,
+      style: {
+        scrollBehavior: '',
+        removeProperty() {},
+      },
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild(node: any) { node.isConnected = true; },
+      insertBefore(node: any) { node.isConnected = true; },
+    } as any;
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'cli', data: { type: 'log', message: 'still working' } },
+          },
+        },
+      },
+    };
+    context.currentCid = 'c1';
+    context.performance = performance;
+    context.convAgentEnabledByCid = new Map();
+    context.pollMsgCounts = new Map();
+    context.messageQueues = new Map();
+    context.pendingConvs.set('c1', {
+      loadingEl: msg,
+      needsIndicator: true,
+      controller: { abort() {} },
+      aborted: false,
+    });
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? history : null);
+    context._ensureCreateAgentInlineObserver = () => {};
+    context._ensureConvCreateAgentInline = () => {};
+    context._refreshGroupMembers = async () => [];
+    context._evaluateAutoRecipient = async () => {};
+    context._renderConvDisabledBanner = () => {};
+    context._updateConvSendUI = () => {};
+    context.startPolling = () => {};
+    context._appendBeforeSpacer = (_container: any, node: any) => { node.isConnected = true; };
+    context._handleStreamEvent = (...args: any[]) => rendered.push(args);
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        history: [],
+        conversation: { agent_enabled: true, processing: false },
+        next_cursor: null,
+      }),
+    });
+    context._bufferOffViewGroupProcessEvent('c1', processEvent);
+
+    await context.loadConversationHistory('c1');
+
+    expect(msg.isConnected).toBe(true);
+    expect(rendered).toEqual([['c1', msg, processEvent, { archive: true }]]);
+    expect(context._takeOffViewGroupProcessEvents('c1')).toEqual([]);
+  });
+
   it('recognizes a stale deleted-conversation result as recoverable', () => {
     const context = loadConversationRenderer();
 
@@ -412,6 +613,44 @@ describe('conversation run observer cleanup', () => {
 });
 
 describe('conversation sidebar task row actions', () => {
+  it('keeps the selected task mounted while other task rows still navigate', () => {
+    const context = loadConversationRenderer();
+    const navigations: Array<[string, string]> = [];
+    const trackedClicks: Array<[string, Record<string, unknown>]> = [];
+    let rowClick: ((event: any) => void) | null = null;
+    const row: any = {
+      dataset: { cid: 'c1' },
+      addEventListener(type: string, listener: (event: any) => void) {
+        if (type === 'click') rowClick = listener;
+      },
+    };
+    const container: any = {
+      querySelectorAll(selector: string) {
+        return selector === '.conv-item' ? [row] : [];
+      },
+    };
+    const event = { target: { closest: () => null } };
+    context.currentView = 'conversation';
+    context.currentCid = 'c1';
+    context.setView = (view: string, cid: string) => { navigations.push([view, cid]); };
+    context.window.Monitor = true;
+    context.Monitor = {
+      click: (action: string, data: Record<string, unknown>) => trackedClicks.push([action, data]),
+    };
+
+    context._bindConversationSidebarItems(container);
+    expect(rowClick).not.toBeNull();
+
+    rowClick!(event);
+    expect(navigations).toEqual([]);
+    expect(trackedClicks).toEqual([]);
+
+    row.dataset.cid = 'c2';
+    rowClick!(event);
+    expect(navigations).toEqual([['conversation', 'c2']]);
+    expect(trackedClicks).toEqual([]);
+  });
+
   it('renders a single menu button after the title', () => {
     const context = loadConversationRenderer();
     const html = context._renderConversationSidebarItem({
@@ -445,7 +684,11 @@ describe('conversation sidebar task row actions', () => {
 
   it('renders an inline title input while renaming a row', () => {
     const context = loadConversationRenderer();
-    vm.runInContext('_conversationInlineRenameCid = "c1"', context);
+    vm.runInContext(`
+      _conversationInlineRenameCid = "c1";
+      _conversationInlineRenameOriginal = "Editable task";
+      _conversationInlineRenameDraft = "Unsaved draft";
+    `, context);
 
     const html = context._renderConversationSidebarItem({
       conversation_id: 'c1',
@@ -454,6 +697,7 @@ describe('conversation sidebar task row actions', () => {
 
     expect(html).toContain('class="conv-item-title-input"');
     expect(html).toContain('data-conv-rename-cid="c1"');
+    expect(html).toContain('value="Unsaved draft"');
     expect(html).not.toContain('class="conv-item-title" title="Editable task"');
   });
 
@@ -639,11 +883,13 @@ describe('conversation sidebar task row actions', () => {
     expect(context._convRowStatus({ conversation_id: 'c1' })).toBe('idle');
   });
 
-  it('_isStructuredFailure keys off failure_kind/failed/error only — never text content', () => {
+  it('_isStructuredFailure ignores retired semantic failure codes and never sniffs text', () => {
     const context = loadConversationRenderer();
     expect(context._isStructuredFailure({ failure_kind: 'model' })).toBe(true);
     expect(context._isStructuredFailure({ failed: true })).toBe(true);
     expect(context._isStructuredFailure({ error: true })).toBe(true);
+    expect(context._isStructuredFailure({ failure_kind: 'operation', failure_code: 'claimed_media_missing' })).toBe(false);
+    expect(context._isStructuredFailure({ failure_kind: 'operation', failure_code: 'agent_reported_failure' })).toBe(false);
     // Danger-styled / error-mentioning TEXT with no structured flag → not failed.
     expect(context._isStructuredFailure({ text: '<span style="color:var(--danger)">模型调用失败</span>' })).toBe(false);
     expect(context._isStructuredFailure({})).toBe(false);
@@ -1416,6 +1662,33 @@ describe('conversation sticky scroll', () => {
     expect(parent.scrollTop).toBe(500);
     expect(finalEl.style.display).toBe('');
     expect(msg.dataset.finalText).toBe('done');
+  });
+
+  it('preserves Commander reply text verbatim at the streaming display boundary', () => {
+    const context = loadConversationRenderer();
+    context._attachAssistantActions = () => {};
+    context.renderMarkdownFull = (text: string) => escapeHtml(text);
+    context._stripSurvivingStructuralBlocks = (text: string) => text;
+    const finalEl = {
+      style: { display: 'none' },
+      innerHTML: '',
+      querySelector: () => null,
+    } as any;
+    const msg = {
+      dataset: { fromActor: 'commander', streamBuf: 'partial' },
+      parentElement: fakeScrollEl(),
+      querySelector(selector: string) {
+        if (selector === '[data-role="final"]') return finalEl;
+        return null;
+      },
+    } as any;
+    const reply = '[Commander -> User]\n\nThis literal example is part of the answer.';
+
+    context._streamingSetFinal(msg, reply, { archive: false });
+
+    expect(msg.dataset.finalText).toBe(reply);
+    expect(finalEl.innerHTML).toContain('Commander -&gt; User');
+    expect(finalEl.innerHTML).toContain('This literal example is part of the answer.');
   });
 
   it('waits for offscreen math before painting a finalized streaming reply', async () => {
@@ -2667,11 +2940,11 @@ describe('conversation process metadata formatting', () => {
       { connector_id: 'Notion', tool_name: 'search', args: { query: 'launch plan' } },
       'Use connector · Notion · search · launch plan',
     ],
-    ['orkas_kb_list', {}, 'View reference'],
-    ['orkas_kb_search', { query: 'launch plan' }, 'Search references · launch plan'],
-    ['orkas_kb_read', { path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
-    ['chat_search', { query: 'release checklist', scope: 'current' }, 'Search conversation · release checklist'],
-    ['chat_read', { scope: 'current', limit: 10 }, 'View conversation'],
+    ['library', { action: 'list' }, 'View reference'],
+    ['library', { action: 'search', query: 'launch plan' }, 'Search references · launch plan'],
+    ['library', { action: 'read', path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
+    ['chat_history', { action: 'search', query: 'release checklist', scope: 'current' }, 'Search conversation · release checklist'],
+    ['chat_history', { action: 'read', scope: 'current', page: { mode: 'latest', count: 10 } }, 'View conversation'],
     ['orkas_handoff_to_commander', { reason: 'needs orchestration' }, 'Hand off to Commander'],
   ];
   const orkasBridgeAliasCases = orkasBridgeCases.flatMap(([tool, input, expected]) => [
@@ -2679,6 +2952,23 @@ describe('conversation process metadata formatting', () => {
     [`orkas.${tool}`, input, expected],
     [`mcp__orkas__${tool}`, input, expected],
   ] as Array<[string, Record<string, unknown>, string]>);
+
+  it('keeps historical split-tool events readable without registering those tools', () => {
+    const context = loadConversationRenderer();
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ['orkas_kb_list', {}, 'View reference'],
+      ['orkas_kb_search', { query: 'launch plan' }, 'Search references · launch plan'],
+      ['orkas_kb_read', { path: 'plans/launch.md' }, 'View reference · plans/launch.md'],
+      ['chat_search', { query: 'release checklist' }, 'Search conversation · release checklist'],
+      ['chat_read', { scope: 'current' }, 'View conversation'],
+    ];
+    for (const [tool, input, expected] of cases) {
+      expect(context._formatEventLine({
+        stream: 'cli',
+        data: { type: 'tool-event', phase: 'use', tool, input },
+      })).toBe(expected);
+    }
+  });
 
   it('keeps the process-presentation matrix aligned with every registered Orkas bridge tool', () => {
     const bridgeSource = fs.readFileSync(
@@ -2688,9 +2978,234 @@ describe('conversation process metadata formatting', () => {
     const registeredTools = [...bridgeSource.matchAll(/server\.tool\(\s*'([^']+)'/g)]
       .map((match) => match[1])
       .sort();
-    const presentedTools = orkasBridgeCases.map(([tool]) => tool).sort();
+    const presentedTools = [...new Set(orkasBridgeCases.map(([tool]) => tool))].sort();
 
     expect(registeredTools).toEqual(presentedTools);
+  });
+
+  it('resolves known Bridge Skill ids and keeps unknown ids readable', () => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'mcp__orkas__orkas_read_skill',
+        callId: 'bridge-skill-read',
+        input: { id: '5aa5286f3aee' },
+      },
+    }, context._createProcessDisplayContext())).toBe('View skill · Release Decision');
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'mcp__orkas__orkas_run_skill',
+        callId: 'bridge-skill-run',
+        input: { skill: '5aa5286f3aee', script: 'scripts/check-release.js' },
+      },
+    }, context._createProcessDisplayContext())).toBe(
+      'Use skill · Release Decision · scripts/check-release.js',
+    );
+
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool: 'orkas_read_skill',
+        callId: 'bridge-unknown-skill-read',
+        input: { id: 'unknown-skill-id' },
+      },
+    }, context._createProcessDisplayContext())).toBe('View skill · unknown-skill-id');
+  });
+
+  it.each([
+    {
+      label: 'reading a Skill',
+      tool: 'mcp__orkas__orkas_read_skill',
+      input: { id: 'efb0fe5d9664' },
+      metadata: { skill_name: 'Release Decision' },
+      expected: 'View skill · Release Decision',
+      hiddenId: 'efb0fe5d9664',
+    },
+    {
+      label: 'running a Skill script',
+      tool: 'orkas.orkas_run_skill',
+      input: { skill: 'efb0fe5d9664', script: 'scripts/check-release.js' },
+      metadata: { skill_name: 'Release Decision' },
+      expected: 'Use skill · Release Decision · scripts/check-release.js',
+      hiddenId: 'efb0fe5d9664',
+    },
+    {
+      label: 'calling a Connector',
+      tool: 'mcp__orkas__orkas_call_connector_tool',
+      input: {
+        connector_id: 'connector-instance-91f0',
+        tool_name: 'search',
+        args: { query: 'release plan' },
+      },
+      metadata: { connector_name: 'Notion Workspace' },
+      expected: 'Use connector · Notion Workspace · search · release plan',
+      hiddenId: 'connector-instance-91f0',
+    },
+  ])('uses CLI event metadata when $label', ({ tool, input, metadata, expected, hiddenId }) => {
+    const context = loadConversationRenderer();
+    context._skillsCache = null;
+
+    const line = context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'use',
+        tool,
+        callId: 'bridge-display-metadata-call',
+        input,
+        ...metadata,
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).toBe(expected);
+    expect(line).not.toContain(hiddenId);
+  });
+
+  it.each([
+    {
+      label: 'viewing an in-process Connector',
+      tool: 'list_connector_tools',
+      input: { connector_id: 'connector-instance-91f0' },
+      expected: 'Started · View connector · Notion Workspace',
+    },
+    {
+      label: 'calling an in-process Connector',
+      tool: 'call_connector_tool',
+      input: {
+        connector_id: 'connector-instance-91f0',
+        tool_name: 'search',
+        args: { query: 'release plan' },
+      },
+      expected: 'Started · Use connector · Notion Workspace · search · release plan',
+    },
+  ])('uses event metadata when $label', ({ tool, input, expected }) => {
+    const context = loadConversationRenderer();
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'in-process-connector-call',
+        name: tool,
+        arguments: input,
+        connector_name: 'Notion Workspace',
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).toBe(expected);
+    expect(line).not.toContain('connector-instance-91f0');
+  });
+
+  it('restores Skill display names for historical virtual reference reads', () => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+    const displayContext = context._createProcessDisplayContext();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'legacy-skill-reference-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee/references/release-decision.md' },
+      },
+    }, displayContext)).toBe(
+      'Started · View skill · Release Decision / references/release-decision.md',
+    );
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'legacy-skill-reference-read',
+        name: 'read_file',
+      },
+    }, displayContext)).toBe(
+      'View skill · Release Decision / references/release-decision.md · Done',
+    );
+  });
+
+  it('uses event metadata for current Skill entry and reference reads', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'skill-entry-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee' },
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'SKILL.md',
+      },
+    }, context._createProcessDisplayContext())).toBe(
+      'Started · View skill · Release Decision',
+    );
+
+    const displayContext = context._createProcessDisplayContext();
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'skill-reference-read',
+        name: 'read_file',
+        arguments: { path: '@skill/5aa5286f3aee/references/release-decision.md' },
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'references/release-decision.md',
+      },
+    }, displayContext)).toBe(
+      'Started · View skill · Release Decision / references/release-decision.md',
+    );
+    expect(context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'end',
+        id: 'skill-reference-read',
+        name: 'read_file',
+        skill_id: 'release-decision',
+        skill_name: 'Release Decision',
+        skill_system: 'A.custom',
+        skill_file: 'references/release-decision.md',
+      },
+    }, displayContext)).toBe(
+      'View skill · Release Decision / references/release-decision.md · Done',
+    );
+  });
+
+  it.each([
+    '@skill/5aa5286f3aee/../secret.md',
+    '@skill/5aa5286f3aee/references//secret.md',
+    '@skill/5aa5286f3aee\\references\\secret.md',
+    '@skill/5aa5286f3aee\\SKILL.md',
+  ])('does not borrow a Skill display name for malformed virtual path %s', (requestedPath) => {
+    const context = loadConversationRenderer();
+    context._skillsCache = [{ id: '5aa5286f3aee', name: 'Release Decision' }];
+
+    const line = context._formatEventLine({
+      stream: 'tool',
+      data: {
+        phase: 'start',
+        id: 'malformed-skill-reference-read',
+        name: 'read_file',
+        arguments: { path: requestedPath },
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(line).not.toContain('Release Decision');
+    expect(line).toContain('Read file');
   });
 
   it('keeps the file target across core start, progress, and failed result events', () => {
@@ -2912,8 +3427,8 @@ describe('conversation process metadata formatting', () => {
         'Use skill · pdf · scripts/render_pdf.py',
       ],
       [
-        'orkas_kb_list',
-        { dir: 'launch/2026' },
+        'library',
+        { action: 'list', dir: 'launch/2026' },
         'View reference · launch/2026',
       ],
       [
@@ -3383,6 +3898,30 @@ describe('conversation process metadata formatting', () => {
     );
   });
 
+  it.each([
+    ['isError', { isError: true }],
+    ['error detail', { error: 'command exited with code 1' }],
+  ])('projects a CLI result carrying %s with error semantics', (_label, failure) => {
+    const context = loadConversationRenderer();
+    const projection = context._projectProcessRow({
+      stream: 'cli',
+      data: {
+        type: 'tool-event',
+        phase: 'result',
+        tool: 'exec_command',
+        input: { command: 'npm run verify' },
+        output: 'verification failed',
+        ...failure,
+      },
+    }, context._createProcessDisplayContext());
+
+    expect(projection).toMatchObject({
+      kind: 'err',
+      expandable: true,
+    });
+    expect(projection.text).toContain('Failed');
+  });
+
   it('prefers an exact result duration over the last progress estimate', () => {
     const context = loadConversationRenderer();
     const displayContext = context._createProcessDisplayContext();
@@ -3579,7 +4118,7 @@ describe('conversation process metadata formatting', () => {
     });
 
     expect(captured?.[1]).toBe('Run command · Done');
-    expect(captured?.[3]).toBe('ok');
+    expect(captured?.[4]).toBe('ok');
   });
 
   it('renders multiline process output as distinct DOM rows with aligned continuations', () => {
@@ -3708,6 +4247,29 @@ describe('conversation process metadata formatting', () => {
     expect(fullOutput).not.toHaveProperty('overflow');
   });
 
+  it('shows a restrained fixed-width affordance on expandable process rows', () => {
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const hint = onlyCssDeclarations(style, '.stream-process-expand-hint');
+    const icon = onlyCssDeclarations(style, '.stream-process-expand-icon');
+    const focus = onlyCssDeclarations(style, '.stream-process-line.is-expandable:focus-visible');
+    const expandedIcon = onlyCssDeclarations(
+      style,
+      '.stream-process-line.is-expandable[aria-expanded="true"] .stream-process-expand-icon',
+    );
+
+    expect(hint).toMatchObject({
+      display: 'inline-flex',
+      flex: '0 0 auto',
+      opacity: '0.48',
+    });
+    expect(icon).toMatchObject({ width: '11px', height: '11px' });
+    expect(focus).toMatchObject({
+      outline: '2px solid color-mix(in srgb, var(--primary) 48%, transparent)',
+      'outline-offset': '2px',
+    });
+    expect(expandedIcon).toMatchObject({ transform: 'rotate(90deg)' });
+  });
+
   it('keeps the process caret visible and fixed-width for runtime-only summaries', () => {
     const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
 
@@ -3730,7 +4292,7 @@ describe('conversation process metadata formatting', () => {
         retryDelayMs: 2_000,
         error: 'network unavailable',
       },
-    })).toBe('Retrying (attempt 2)/4 · retrying in 2s · network unavailable');
+    })).toBe('Network connection unavailable · Retry 2/4 · Continue in 2s');
     expect(context._formatEventLine({
       stream: 'cli',
       data: {
@@ -3738,7 +4300,7 @@ describe('conversation process metadata formatting', () => {
         status: 'background-running',
         message: 'indexing files',
       },
-    })).toBe('Background task · indexing files');
+    })).toBe('Background task running · indexing files');
     expect(context._formatEventLine({
       stream: 'cli',
       data: {
@@ -3776,6 +4338,139 @@ describe('conversation process metadata formatting', () => {
       stream: 'cli',
       data: { type: 'thinking', chars: 0 },
     }, '')).toBe('think');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'start', id: 'reasoning-1', chars: 0 },
+    })).toBe('Thinking');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'end', id: 'reasoning-1', chars: 0 },
+    })).toBe('Thinking complete');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: {
+        phase: 'progress', id: 'reasoning-1', chars: 16, summary: 'Reviewing the event parser',
+      },
+    })).toBe('Thinking · Reviewing the event parser');
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: {
+        phase: 'end', id: 'reasoning-1', chars: 32, summary: 'Reviewing the event parser',
+      },
+    })).toBe('Thinking complete · Reviewing the event parser');
+    const longReasoning = `BEGIN_${'x'.repeat(3_000)}_END`;
+    expect(context._formatEventLine({
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-long', summary: longReasoning },
+    })).toBe(`Thinking · ${longReasoning}`);
+    expect(context._eventProcessKind({
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-1', chars: 16, heartbeat: true },
+    }, '')).toBe('think');
+    expect([
+      { phase: 'start' },
+      { phase: 'progress' },
+      { phase: 'end' },
+    ].map(({ phase }) => context._processToolLifecycle({
+      stream: 'reasoning',
+      data: { phase, id: 'reasoning-1' },
+    }))).toEqual([
+      { key: 'reasoning:reasoning-1', terminal: false },
+      { key: 'reasoning:reasoning-1', terminal: false },
+      { key: 'reasoning:reasoning-1', terminal: true },
+    ]);
+  });
+
+  it('classifies stable retry reasons and uses a safe fallback for unknown provider errors', () => {
+    const context = loadConversationRenderer();
+    const retry = (data: Record<string, unknown>) => context._formatEventLine({
+      stream: 'cli',
+      data: {
+        type: 'status', status: 'retrying', attempt: 1, maxRetries: 10,
+        retryDelayMs: 1_000,
+        ...data,
+      },
+    });
+
+    expect(retry({ errorStatus: 429, error: 'provider wording may change' }))
+      .toBe('Request rate limited · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 529, error: 'overloaded' }))
+      .toBe('Model service is busy · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 503, error: 'service unavailable' }))
+      .toBe('Model service is temporarily unavailable · Retry 1/10 · Continue in 1s');
+    expect(retry({ error: 'ECONNRESET while connecting' }))
+      .toBe('Network connection unavailable · Retry 1/10 · Continue in 1s');
+    expect(retry({ errorStatus: 418, error: 'new-provider-error private detail' }))
+      .toBe('Temporary model service error · Retry 1/10 · Continue in 1s');
+    expect(context._formatKnownCliDiagnostic('HTTP 529 overloaded_error'))
+      .toBe('Model service is busy');
+    expect(context._formatKnownCliDiagnostic('HTTP 503 service unavailable'))
+      .toBe('Model service is temporarily unavailable');
+  });
+
+  it('merges one retry series into one row and closes it with the terminal outcome', () => {
+    const context = loadConversationRenderer();
+    const displayContext = context._createProcessDisplayContext();
+    const body: any = {
+      children: [],
+      appendChild(node: any) { this.children.push(node); },
+    };
+    context.document.createElement = () => ({ dataset: {}, className: '', innerHTML: '' });
+    const append = (data: Record<string, unknown>) => {
+      const projection = context._projectProcessRow({ stream: 'cli', data }, displayContext);
+      context._appendProjectedProcessRowToBody(body, projection);
+      return projection;
+    };
+
+    append({
+      type: 'status', status: 'retrying', attempt: 1, maxRetries: 10,
+      retryDelayMs: 1_000, errorStatus: 529, error: 'overloaded',
+    });
+    const latestRetry = append({
+      type: 'status', status: 'retrying', attempt: 7, maxRetries: 10,
+      retryDelayMs: 38_000, errorStatus: 529, error: 'overloaded',
+    });
+
+    expect(body.children).toHaveLength(1);
+    expect(latestRetry).toMatchObject({
+      lifecycleKey: 'cli-retry:1',
+      lifecycleTerminal: false,
+    });
+    expect(body.children[0].dataset.processText)
+      .toBe('Model service is busy · Retry 7/10 · Continue in 38s');
+
+    const completed = append({ type: 'status', status: 'result' });
+    expect(body.children).toHaveLength(1);
+    expect(completed).toMatchObject({
+      lifecycleKey: 'cli-retry:1',
+      lifecycleTerminal: true,
+      text: 'Task complete',
+    });
+    expect(body.children[0].dataset).toMatchObject({
+      processCallId: 'cli-retry:1',
+      processTerminal: '1',
+      processText: 'Task complete',
+    });
+
+    const nextSeries = append({
+      type: 'status', status: 'retrying', attempt: 1, error: 'unknown',
+    });
+    expect(body.children).toHaveLength(2);
+    expect(nextSeries.lifecycleKey).toBe('cli-retry:2');
+
+    const failed = append({ type: 'status', status: 'failed', error: 'overloaded' });
+    expect(body.children).toHaveLength(2);
+    expect(failed).toMatchObject({
+      lifecycleKey: 'cli-retry:2',
+      lifecycleTerminal: true,
+      kind: 'err',
+      text: 'Failed · Model service is busy',
+    });
+    expect(body.children[1].dataset).toMatchObject({
+      processCallId: 'cli-retry:2',
+      processTerminal: '1',
+      processText: 'Failed · Model service is busy',
+    });
   });
 
   it('keeps safe duration and error details without exposing credentials or absolute paths', () => {
@@ -3827,7 +4522,7 @@ describe('conversation process metadata formatting', () => {
     expect(context._formatEventLine({
       stream: 'cli',
       data: { type: 'status', status: 'rate-limit', retryAfterMs: 12_000 },
-    })).toBe('Wait for service · retrying in 12s');
+    })).toBe('Current usage limit reached · retrying in 12s');
     expect(context._formatEventLine({
       stream: 'cli',
       data: { type: 'status', status: 'timeout', timeoutMs: 30_000 },
@@ -3839,6 +4534,22 @@ describe('conversation process metadata formatting', () => {
         tokens_before: 12_000, tokens_after: 2_500,
       },
     })).toBe('Conversation organized · 12000 → 2500 tokens');
+  });
+
+  it.each([
+    ['rejected', 'Current usage limit reached'],
+    ['allowed', null],
+    ['allowed_warning', null],
+    ['unexpected', null],
+  ])('renders persisted provider rate-limit status %s only when it blocks use', (
+    rateLimitStatus,
+    expected,
+  ) => {
+    const context = loadConversationRenderer();
+    expect(context._formatEventLine({
+      stream: 'cli',
+      data: { type: 'status', status: 'rate-limit', rateLimitStatus },
+    })).toBe(expected);
   });
 
   it.each([
@@ -3913,9 +4624,9 @@ describe('conversation process metadata formatting', () => {
       'info',
     ],
     [
-      'CLI idle warning',
+      'CLI response wait',
       { stream: 'cli', data: { type: 'idle', stalledMs: 30_000 } },
-      'warn',
+      'wait',
     ],
     [
       'provider fallback',
@@ -3943,6 +4654,26 @@ describe('conversation process metadata formatting', () => {
     expect(context._eventProcessKind(event, 'localized process text')).toBe(expectedKind);
   });
 
+  it('renders ordinary CLI response waiting as a restrained neutral status', () => {
+    const context = loadConversationRenderer();
+    const event = { stream: 'cli', data: { type: 'idle', stalledMs: 95_000 } };
+    const text = context._formatEventLine(event);
+    const kind = context._eventProcessKind(event, text);
+    const line: any = { dataset: {}, innerHTML: '' };
+
+    context._setProcessLineContent(line, text, kind);
+
+    expect(text).toBe('Wait for agent response · 1m 35s');
+    expect(kind).toBe('wait');
+    expect(line.innerHTML).toContain('data-icon="clock"');
+    expect(line.innerHTML).not.toContain('data-icon="warning"');
+
+    const style = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
+    const wait = onlyCssDeclarations(style, '.stream-process-line.kind-wait');
+    expect(wait.color).toBe('#94a3b8');
+    expect(wait).not.toHaveProperty('font-weight');
+  });
+
   it.each([
     [
       { status: 'plan-updated', steps: [{ step: 'inspect' }, { step: 'test' }] },
@@ -3957,10 +4688,10 @@ describe('conversation process metadata formatting', () => {
       'Switch model · gpt-old → gpt-new',
     ],
     [{ status: 'authenticating' }, 'Verify identity'],
-    [{ status: 'rate-limit' }, 'Wait for service'],
+    [{ status: 'rate-limit' }, 'Current usage limit reached'],
     [{ status: 'background-completed', message: 'index ready' }, 'Background task · index ready · Done'],
     [{ status: 'background-failed', message: '/tmp/index failed: EIO' }, 'Background task · Failed · index failed: EIO'],
-    [{ status: 'background-running', taskType: 'Explore', message: '/tmp/private' }, 'Background task · Explore'],
+    [{ status: 'background-running', taskType: 'Explore', message: '/tmp/private' }, 'Background task running · Explore'],
     [{ status: 'background-stopped' }, 'Background task · Stopped'],
   ])('formats CLI status payload %j', (data, expected) => {
     const context = loadConversationRenderer();
@@ -4002,15 +4733,19 @@ describe('conversation process metadata formatting', () => {
 
     context._streamingUpdateActivityFromEvent(msg, {
       stream: 'cli',
-      data: { type: 'status', status: 'retrying', attempt: 3 },
+      data: {
+        type: 'status', status: 'retrying', attempt: 7, maxRetries: 10,
+        retryDelayMs: 38_000, errorStatus: 529, error: 'overloaded',
+      },
     });
-    expect(activityText.textContent).toBe('Retrying (attempt 3)');
+    expect(activityText.textContent)
+      .toBe('Model service is busy · Retry 7/10 · Continue in 38s');
 
     context._streamingUpdateActivityFromEvent(msg, {
       stream: 'cli',
       data: { type: 'status', status: 'background-running', message: 'indexing files' },
     });
-    expect(activityText.textContent).toBe('Background task · indexing files');
+    expect(activityText.textContent).toBe('Background task running · indexing files');
 
     context._streamingUpdateActivityFromEvent(msg, {
       stream: 'cli',
@@ -4025,7 +4760,23 @@ describe('conversation process metadata formatting', () => {
     context._streamingStopActivity(msg);
   });
 
-  it('uses Codex heartbeats for activity without appending duplicate process rows', () => {
+  it('ships the active background state in every renderer locale', () => {
+    const expected = {
+      en: 'Background task running{detail}',
+      zh: '后台任务执行中{detail}',
+      ja: 'バックグラウンドタスクを実行中{detail}',
+      pt: 'Tarefa em segundo plano em execução{detail}',
+    };
+    for (const [locale, copy] of Object.entries(expected)) {
+      const table = JSON.parse(fs.readFileSync(
+        path.join(__dirname, `../../src/renderer/locales/${locale}.json`),
+        'utf8',
+      ));
+      expect(table['chat.stream.background_running']).toBe(copy);
+    }
+  });
+
+  it('uses CLI and model-reasoning heartbeats without appending duplicate process rows', () => {
     const context = loadConversationRenderer();
     const msg = {
       querySelector() {
@@ -4041,6 +4792,94 @@ describe('conversation process metadata formatting', () => {
       stream: 'cli',
       data: { type: 'status', status: 'tool-progress', heartbeat: true },
     })).not.toThrow();
+    expect(() => context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+    })).not.toThrow();
+  });
+
+  it('projects every detail heartbeat and completion onto one reasoning lifecycle identity', () => {
+    const context = loadConversationRenderer();
+    const msg = {};
+    const firstSummary = 'Inspecting the selected files';
+    const completeSummary = 'Inspecting the relevant files and constraints';
+    const rows: Array<{
+      line: string;
+      kind: string;
+      lifecycleKey: string;
+      lifecycleTerminal: boolean;
+    }> = [];
+    context._streamingAppendProgress = (
+      _msg: unknown,
+      line: string,
+      kind: string,
+      _eventName: string,
+      lifecycleKey: string,
+      lifecycleTerminal: boolean,
+    ) => rows.push({ line, kind, lifecycleKey, lifecycleTerminal });
+
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: { phase: 'start', id: 'reasoning-1', chars: 0 },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'progress',
+        id: 'reasoning-1',
+        chars: 128,
+        summary_from: 0,
+        summary_delta: firstSummary,
+        heartbeat: true,
+      },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'progress',
+        id: 'reasoning-1',
+        chars: 192,
+        summary_from: 'Inspecting the '.length,
+        summary_delta: 'relevant files and constraints',
+        heartbeat: true,
+      },
+    });
+    context._renderAgentEvent(msg, {
+      stream: 'reasoning',
+      data: {
+        phase: 'end',
+        id: 'reasoning-1',
+        chars: 192,
+        summary: completeSummary,
+      },
+    });
+
+    expect(rows).toEqual([
+      {
+        line: 'Thinking',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: false,
+      },
+      {
+        line: 'Thinking · Inspecting the selected files',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: false,
+      },
+      {
+        line: 'Thinking · Inspecting the relevant files and constraints',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: false,
+      },
+      {
+        line: 'Thinking complete · Inspecting the relevant files and constraints',
+        kind: 'think',
+        lifecycleKey: 'reasoning:reasoning-1',
+        lifecycleTerminal: true,
+      },
+    ]);
   });
 
   it('buffers bounded process milestones while a conversation is off-view', () => {
@@ -4068,6 +4907,38 @@ describe('conversation process metadata formatting', () => {
 
     expect(context._bufferOffViewGroupProcessEvent('cid-off-view', processEvent)).toBe(true);
     expect(context._bufferOffViewGroupProcessEvent('cid-off-view', deltaEvent)).toBe(false);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'reasoning',
+              data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+            },
+          },
+        },
+      },
+    })).toBe(false);
+    expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          data: {
+            type: 'event',
+            event: {
+              stream: 'reasoning',
+              data: { phase: 'progress', id: 'reasoning-1', chars: 128, heartbeat: true },
+            },
+          },
+        },
+      },
+    })).toBe(false);
     expect(context._bufferOffViewGroupProcessEvent('cid-off-view', {
       type: 'event',
       event: {
@@ -4118,6 +4989,38 @@ describe('conversation process metadata formatting', () => {
     context._bufferOffViewGroupProcessEvent('cid-terminal', processEvent(999));
     context._clearOffViewGroupProcessEvents('cid-terminal');
     expect(context._takeOffViewGroupProcessEvents('cid-terminal')).toEqual([]);
+  });
+
+  it('replays off-view milestones only after the pending bubble is reattached', () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'cli', data: { type: 'log', message: 'running tests' } },
+          },
+        },
+      },
+    };
+    const msg = { isConnected: false };
+    context.currentCid = 'c1';
+    context._handleStreamEvent = (...args: any[]) => rendered.push(args);
+    context._bufferOffViewGroupProcessEvent('c1', processEvent);
+
+    expect(context._replayOffViewGroupProcessEvents('c1', msg, { archive: true })).toBe(0);
+    expect(rendered).toHaveLength(0);
+
+    msg.isConnected = true;
+    expect(context._replayOffViewGroupProcessEvents('c1', msg, { archive: true })).toBe(1);
+    expect(rendered).toEqual([['c1', msg, processEvent, { archive: true }]]);
+    expect(context._takeOffViewGroupProcessEvents('c1')).toEqual([]);
   });
 
   it('clears the conversation busy state from a terminal state snapshot', () => {
@@ -4770,6 +5673,98 @@ describe('conversation controller settlement', () => {
       inputEl: 'chat-input',
       sendBtnEl: 'chat-send-btn',
     });
+  });
+
+  it('binds a conversation controller render target to the mounted task, not its fixed request id', () => {
+    const context = loadConversationRenderer();
+    let config: any = null;
+    context.createChatController = (nextConfig: any) => {
+      config = nextConfig;
+      return { abort() {} };
+    };
+    context.currentView = 'conversation';
+    context.currentCid = 'c1';
+
+    context._makeConvChatController('c1');
+
+    expect(config.isRenderTargetActive('c1')).toBe(true);
+    context.currentCid = 'c2';
+    expect(config.isRenderTargetActive('c1')).toBe(false);
+    context.currentCid = 'c1';
+    context.currentView = 'project';
+    expect(config.isRenderTargetActive('c1')).toBe(false);
+  });
+
+  it('buffers live milestones when a fixed-id controller is no longer the mounted task', async () => {
+    const context = loadConversationRenderer();
+    const rendered: any[] = [];
+    const buffered: any[] = [];
+    context.TextDecoder = TextDecoder;
+    context.AbortController = AbortController;
+    context.performance = performance;
+    context.ensureModelConfigured = () => true;
+    context.nowIsoLocal = () => '2026-08-24T15:59:31';
+    context._createStreamingAssistantMessage = () => ({ dataset: {}, querySelector: () => null });
+    context._handleStreamEvent = (_cid: string, _msg: any, event: any) => rendered.push(event);
+    context._bufferOffViewGroupProcessEvent = (_cid: string, event: any) => {
+      buffered.push(event);
+      return true;
+    };
+    context._clearOffViewGroupProcessEvents = () => {};
+    context._makeStreamPaintYield = () => () => null;
+    context._streamingMarkAborted = () => {};
+    const processEvent = {
+      type: 'event',
+      event: {
+        stream: 'group',
+        data: {
+          type: 'process',
+          actor: 'codex',
+          turn_id: 'turn-1',
+          data: {
+            type: 'event',
+            event: { stream: 'tool', data: { phase: 'start', name: 'exec_command' } },
+          },
+        },
+      },
+    };
+    const chunk = new TextEncoder().encode(`data: ${JSON.stringify(processEvent)}\n\n`);
+    let reads = 0;
+    context.apiFetch = async (_url: string, options: any) => ({
+      ok: true,
+      body: {
+        getReader: () => ({
+          read: () => {
+            if (reads++ === 0) return Promise.resolve({ done: false, value: chunk });
+            return new Promise((_resolve, reject) => {
+              options.signal.addEventListener(
+                'abort',
+                () => reject(new DOMException('aborted', 'AbortError')),
+                { once: true },
+              );
+            });
+          },
+        }),
+      },
+    });
+
+    const controller = context.createChatController({
+      historyEl: { dataset: {} },
+      getCurrentId: () => 'c1',
+      isRenderTargetActive: () => false,
+      streamEndpoint: () => '/stream',
+      features: { bindInput: false, scrollPin: false, actorIdentity: true },
+      hooks: { appendHistoryMessage: () => ({ dataset: {} }) },
+    });
+
+    const send = controller.send('run the tests');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(rendered).toHaveLength(0);
+    expect(buffered).toEqual([processEvent]);
+
+    controller.abort();
+    await send;
   });
 
   it('restores and commits an edit-chat queue item through its composer', () => {

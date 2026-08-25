@@ -2,7 +2,7 @@
  * Tests for the `localAgents.readToolResult` IPC handler.
  *
  * Security invariants the handler MUST hold (CLAUDE.md §5 boundary):
- *   - active uid only, path must resolve under <uid>/local/tool-results/
+ *   - active uid only, opaque refs resolve under <uid>/local/tool-results/
  *   - reject ENOENT, symlink-escape, traversal (`../`), non-file targets
  *   - byte-cap reads at 256 KB; signal truncation via `{truncated:true}`
  *
@@ -52,10 +52,28 @@ function sessionDir(): string {
 }
 
 describe('ipc/local_agents.readToolResult', () => {
-  it('rejects when path is missing / not a string', async () => {
+  it('rejects when neither an opaque ref nor a legacy path is valid', async () => {
     expect(await callHandler({})).toMatchObject({ ok: false });
     expect(await callHandler({ path: 42 })).toMatchObject({ ok: false });
     expect(await callHandler({ path: '' })).toMatchObject({ ok: false });
+  });
+
+  it('resolves an opaque content ref without receiving a machine path', async () => {
+    const dir = sessionDir();
+    const ref = 'bash.0123456789abcdef';
+    fs.writeFileSync(path.join(dir, `${ref}.txt`), 'opaque ref content');
+
+    const r = await callHandler({ ref });
+
+    expect(r).toMatchObject({ ok: true, content: 'opaque ref content', truncated: false });
+  });
+
+  it('rejects malformed opaque refs before searching the local result store', async () => {
+    sessionDir();
+    expect(await callHandler({ ref: '../private/result' })).toMatchObject({
+      ok: false,
+      error: 'invalid result ref',
+    });
   });
 
   it('reads a small spill file when path is inside tool-results/', async () => {

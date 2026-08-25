@@ -31,6 +31,7 @@ const {
   _isHtmlSrc,
   _chatMediaLocalPathFromUrl,
   _normalizeLocalMediaSrc,
+  _parseOrkasMediaTitle,
   _chatVideoNativeControlsHit,
 } = utils as {
   _BARE_URL_RE: RegExp;
@@ -44,6 +45,7 @@ const {
   _isHtmlSrc: (src: string) => boolean;
   _chatMediaLocalPathFromUrl: (src: string) => string;
   _normalizeLocalMediaSrc: (src: string) => string;
+  _parseOrkasMediaTitle: (title: string) => { kind: 'image' | 'video'; remoteSrc: string } | null;
   _chatVideoNativeControlsHit: (clientY: number, rectTop: number, rectBottom: number) => boolean;
 };
 
@@ -168,6 +170,37 @@ describe('markdown media links', () => {
     expect(out).toContain('src="chat-media://local/Users/test/car.png"');
     expect(out).toContain('alt="car"');
     expect(out).toContain('title="preview"');
+  });
+
+  it('renders scheduled remote media from its stable local URL without exposing the fallback marker', () => {
+    const remote = 'https://cdn.example/render/result.png?token=signed';
+    const local = 'chat-media://cid/conversation-1/cli-remote-aabbccddeeff001122334455.png';
+    const marker = `orkas-media-v1:image:${encodeURIComponent(remote)}`;
+    const out = inlineFormat(`![generated image](${local} "${marker}")`);
+
+    expect(out).toContain(`<img class="chat-md-img" src="${local}"`);
+    expect(out).toContain(`data-orkas-local-src="${local}"`);
+    expect(out).toContain(`data-orkas-remote-src="${remote}"`);
+    expect(out).not.toContain('title="orkas-media-v1:');
+    expect(_parseOrkasMediaTitle(marker)).toEqual({ kind: 'image', remoteSrc: remote });
+  });
+
+  it('uses the persisted media kind to preview extensionless remote videos', () => {
+    const remote = 'https://cdn.example/render?id=clip-1';
+    const marker = `orkas-media-v1:video:${encodeURIComponent(remote)}`;
+    const out = inlineFormat(`![generated video](${remote} "${marker}")`);
+
+    expect(out).toContain('<video class="chat-md-video"');
+    expect(out).toContain(`src="${remote}"`);
+    expect(out).toContain(`data-orkas-remote-src="${remote}"`);
+    expect(out).not.toContain('<img class="chat-md-img"');
+  });
+
+  it('treats malformed internal media markers as ordinary visible titles', () => {
+    expect(_parseOrkasMediaTitle('orkas-media-v1:video:%E0%A4%A')).toBeNull();
+    const out = _markdownImageHtml('https://cdn.example/result.png', 'result', 'orkas-media-v1:video:%E0%A4%A');
+    expect(out).toContain('title="orkas-media-v1:video:%E0%A4%A"');
+    expect(out).not.toContain('data-orkas-remote-src');
   });
 
   it('escapes markdown image attributes', () => {

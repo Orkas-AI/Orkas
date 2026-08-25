@@ -5,13 +5,17 @@
  *
  * EXTREME = spec is unusable; MEDIUM = spec works but should be cleaned up.
  *
- * Portable SKILL.md frontmatter stays host-generic: `name / description`.
- * Orkas extensions such as category, localized descriptions, and routing
- * hints live in `_meta.json`. Legacy frontmatter extension fields are
- * tolerated as advisory findings so existing skills remain importable.
+ * User-authored and external portable SKILL.md frontmatter uses
+ * `name / description`. Repository-managed System, Marketplace, and official
+ * Agent-private Skills use `name / description_zh / description_en` so both
+ * routing locales are explicit. The two description shapes are alternatives,
+ * never three simultaneous fields. Other Orkas extensions such as category
+ * and routing hints live in `_meta.json`; legacy extension fields remain
+ * advisory so existing skills stay importable.
  */
 
 import { Violation } from '../types';
+import { SKILL_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
 
 // Skill name pattern: starts with a letter, then word chars / dashes.
 // Spaces are not allowed. Mirrors `skills.ts::SKILL_NAME_RE`.
@@ -19,16 +23,16 @@ const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 // Agent names mirror `agents.ts::NAME_TOKEN_RE`.
 const AGENT_NAME_RE = /^[A-Za-z0-9_一-鿿-]+$/;
 
-// Description length budget: signal for "selection prompt readability" rather
-// than a hard cap. Empirically established by scanning current marketplace
-// content — the long tail sits in the 500-700 range with a real ceiling
-// around 800.
-const MAX_DESC_LEN = 800;
+// Agent descriptions retain their existing authoring advisory. Skill
+// descriptions align with the runtime roster ceiling below so the author sees
+// a quality finding before routing-critical text is visibly shortened.
+const MAX_AGENT_DESC_LEN = 800;
+const MAX_AGENT_WORKFLOW_LEN = 3_000;
+const MAX_AGENT_GUIDANCE_ITEMS = 5;
+const MAX_AGENT_GUIDANCE_ITEM_LEN = 220;
 
 const CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
 const SKILL_FRONTMATTER_EXTENSION_KEYS = new Set([
-  'description_zh',
-  'description_en',
   'category',
   'status',
   'state',
@@ -49,6 +53,78 @@ function _skillMetaDescriptions(meta: Record<string, unknown> | undefined): { zh
   };
 }
 
+function _validateAgentGuidanceList(
+  agentJson: Record<string, unknown>,
+  field: 'knowhow' | 'standards',
+  required: boolean,
+): Violation[] {
+  const value = agentJson[field];
+  if (value === undefined) {
+    return required ? [{
+      level: 'MEDIUM',
+      rule: `agent_${field}_missing`,
+      field: `agent.json:${field}`,
+      snippet: '',
+      suggested_fix: field === 'knowhow'
+        ? 'Add 1–5 concise display-only capability summaries for this LLM-managed Agent.'
+        : 'Add 1–5 observable final handoff or valid-stop conditions for this LLM-managed Agent.',
+    }] : [];
+  }
+  if (!Array.isArray(value)) {
+    return [{
+      level: 'MEDIUM',
+      rule: `agent_${field}_invalid`,
+      field: `agent.json:${field}`,
+      snippet: String(value).slice(0, 120),
+      suggested_fix: field === 'knowhow'
+        ? `Store ${field} as an optional array of 0–${MAX_AGENT_GUIDANCE_ITEMS} concise strings.`
+        : `Store ${field} as an array of 1–${MAX_AGENT_GUIDANCE_ITEMS} concise strings.`,
+    }];
+  }
+
+  const out: Violation[] = [];
+  if (required && value.length === 0) {
+    out.push({
+      level: 'MEDIUM',
+      rule: `agent_${field}_missing`,
+      field: `agent.json:${field}`,
+      snippet: '[]',
+      suggested_fix: field === 'knowhow'
+        ? 'Add at least one concrete display-only capability summary.'
+        : 'Add at least one observable final handoff or valid-stop condition.',
+    });
+  }
+  if (value.length > MAX_AGENT_GUIDANCE_ITEMS) {
+    out.push({
+      level: 'MEDIUM',
+      rule: `agent_${field}_too_many`,
+      field: `agent.json:${field}`,
+      snippet: `${value.length} items`,
+      suggested_fix: `Merge overlaps or move route-specific detail into Skills; keep at most ${MAX_AGENT_GUIDANCE_ITEMS} items.`,
+    });
+  }
+  value.forEach((item, index) => {
+    if (typeof item !== 'string' || !item.trim()) {
+      out.push({
+        level: 'MEDIUM',
+        rule: `agent_${field}_item_invalid`,
+        field: `agent.json:${field}[${index}]`,
+        snippet: String(item).slice(0, 120),
+        suggested_fix: `Use a non-empty string for every ${field} item.`,
+      });
+    } else if (item.length > MAX_AGENT_GUIDANCE_ITEM_LEN) {
+      out.push({
+        level: 'MEDIUM',
+        rule: `agent_${field}_item_too_long`,
+        field: `agent.json:${field}[${index}]`,
+        snippet: `${item.slice(0, 80)}…`,
+        suggested_fix: `Keep each ${field} item at or below ${MAX_AGENT_GUIDANCE_ITEM_LEN} characters.`,
+      });
+    }
+  });
+  return out;
+}
+
 /**
  * Validate SKILL.md frontmatter. Body content is scanned separately by
  * red-flags + extractExecutableBlocks.
@@ -56,6 +132,7 @@ function _skillMetaDescriptions(meta: Record<string, unknown> | undefined): { zh
 export function validateSkillFrontmatter(
   frontmatter: Record<string, unknown>,
   skillMeta: Record<string, unknown> = {},
+  options: { allowExtensionFields?: boolean } = {},
 ): Violation[] {
   const out: Violation[] = [];
 
@@ -83,6 +160,7 @@ export function validateSkillFrontmatter(
 
   for (const key of Object.keys(frontmatter)) {
     if (!SKILL_FRONTMATTER_EXTENSION_KEYS.has(key)) continue;
+    if (options.allowExtensionFields === true) continue;
     out.push({
       level: 'LOW',
       rule: 'frontmatter_extension_field',
@@ -95,27 +173,45 @@ export function validateSkillFrontmatter(
   const metaDescriptions = _skillMetaDescriptions(skillMeta);
   const zh = _stringField(frontmatter, 'description_zh');
   const en = _stringField(frontmatter, 'description_en');
-  const legacy = _stringField(frontmatter, 'description');
-  if (!zh && !en && !legacy && !metaDescriptions.zh && !metaDescriptions.en) {
+  const generic = _stringField(frontmatter, 'description');
+  if (generic && (zh || en)) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'frontmatter_description_shapes_mixed',
+      field: 'frontmatter:description',
+      snippet: generic.slice(0, 120),
+      suggested_fix: 'Use exactly one description shape: `description` for a user/custom portable Skill, or both `description_zh` and `description_en` for a platform-managed Skill.',
+    });
+  }
+  if (!generic && (zh || en) && (!zh || !en)) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'frontmatter_localized_description_incomplete',
+      field: `frontmatter:${zh ? 'description_en' : 'description_zh'}`,
+      snippet: '',
+      suggested_fix: 'Platform-managed localized descriptions are a pair; add the missing `description_zh` or `description_en`, or use one portable `description` for a user/custom Skill.',
+    });
+  }
+  if (!zh && !en && !generic && !metaDescriptions.zh && !metaDescriptions.en) {
     out.push({
       level: 'MEDIUM',
       rule: 'frontmatter_description_missing',
       field: 'frontmatter:description',
       snippet: '',
-      suggested_fix: 'Add a concise `description:` in SKILL.md, or localized descriptions under `_meta.json.descriptions`.',
+      suggested_fix: 'Add one concise `description` for a user/custom Skill, or both `description_zh` and `description_en` for a platform-managed Skill.',
     });
   } else {
     for (const [field, value] of [
-      ['description_zh', zh], ['description_en', en], ['description', legacy],
+      ['description_zh', zh], ['description_en', en], ['description', generic],
       ['_meta.descriptions.zh', metaDescriptions.zh], ['_meta.descriptions.en', metaDescriptions.en],
     ] as const) {
-      if (value.length > MAX_DESC_LEN) {
+      if (value.length > SKILL_DESCRIPTION_ROSTER_MAX_CHARS) {
         out.push({
           level: 'MEDIUM',
           rule: 'frontmatter_description_too_long',
           field: `frontmatter:${field}`,
           snippet: `${value.slice(0, 80)}…`,
-          suggested_fix: `Trim ${field} to under ${MAX_DESC_LEN} characters — the commander selection prompt truncates long descriptions and loses signal.`,
+          suggested_fix: `Keep ${field} at or below ${SKILL_DESCRIPTION_ROSTER_MAX_CHARS} characters — longer runtime roster text is shortened with an ellipsis, so put routing-critical signal first.`,
         });
       }
     }
@@ -147,6 +243,10 @@ export function validateSkillMeta(
     });
   }
 
+  // Routing metadata is optional because the authored description is the
+  // runtime selection index. Validate a supplied routing object, but do not
+  // make every simple Skill carry a second copy of the same boundary text.
+  if (!Object.prototype.hasOwnProperty.call(skillMeta, 'routing')) return out;
   const routing = skillMeta.routing && typeof skillMeta.routing === 'object' && !Array.isArray(skillMeta.routing)
     ? skillMeta.routing as Record<string, unknown>
     : {};
@@ -163,7 +263,7 @@ export function validateSkillMeta(
       rule: 'skill_meta_routing_incomplete',
       field: '_meta.json:routing',
       snippet: '',
-      suggested_fix: 'Add routing.applicable_domain, routing.negative_examples, and routing.prerequisites when they help distinguish this skill.',
+      suggested_fix: 'Complete routing.applicable_domain, routing.negative_examples, and routing.prerequisites, or omit routing when the authored description already distinguishes this skill.',
     });
   }
 
@@ -241,13 +341,13 @@ export function validateAgentJsonShape(
     for (const [field, value] of [
       ['description_zh', zh], ['description_en', en], ['description', legacy],
     ] as const) {
-      if (value.length > MAX_DESC_LEN) {
+      if (value.length > MAX_AGENT_DESC_LEN) {
         out.push({
           level: 'MEDIUM',
           rule: 'agent_description_too_long',
           field: `agent.json:${field}`,
           snippet: `${value.slice(0, 80)}…`,
-          suggested_fix: `Trim ${field} to under ${MAX_DESC_LEN} characters.`,
+          suggested_fix: `Trim ${field} to under ${MAX_AGENT_DESC_LEN} characters.`,
         });
       }
     }
@@ -271,6 +371,29 @@ export function validateAgentJsonShape(
       suggested_fix: 'Use a safe marketplace category code from agent-creator.',
     });
   }
+
+  const workflowValue = agentJson.workflow;
+  const hasWorkflow = typeof workflowValue === 'string' && workflowValue.trim().length > 0;
+  if (workflowValue !== undefined && typeof workflowValue !== 'string') {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'agent_workflow_invalid',
+      field: 'agent.json:workflow',
+      snippet: String(workflowValue).slice(0, 120),
+      suggested_fix: 'Store workflow as a Markdown string for an LLM-managed Agent, or omit it for a CLI-backed Agent.',
+    });
+  } else if (typeof workflowValue === 'string' && workflowValue.length > MAX_AGENT_WORKFLOW_LEN) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'agent_workflow_too_long',
+      field: 'agent.json:workflow',
+      snippet: `${workflowValue.slice(0, 80)}…`,
+      suggested_fix: `Keep resident orchestration at or below ${MAX_AGENT_WORKFLOW_LEN} characters; move conditional procedure, commands, schemas, retries, and examples into the owning Skill.`,
+    });
+  }
+
+  out.push(..._validateAgentGuidanceList(agentJson, 'knowhow', false));
+  out.push(..._validateAgentGuidanceList(agentJson, 'standards', hasWorkflow));
 
   return out;
 }

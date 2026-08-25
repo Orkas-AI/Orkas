@@ -179,6 +179,10 @@ export type AgentRunMeta = {
     /** Machine-readable provider/runtime code. Host adapters must map this to
      * a bounded telemetry taxonomy before reporting it externally. */
     code?: string;
+    /** HTTP status of the provider response that terminated the run, when the
+     * failure was an HTTP-level rejection. Lets hosts separate endpoint-level
+     * 4xx failures from the generic provider_error bucket. */
+    statusCode?: number;
   };
   /** Names of tools actually called during this run. */
   toolNames?: string[];
@@ -193,8 +197,19 @@ export type AgentRunMeta = {
 /** Events emitted during an agent run for streaming. */
 export type AgentRunEvent =
   | { type: "text_delta"; text: string }
+  /** Reasoning-process signal. Progress `text` remains internal until the
+   * main-process mapper sanitizes and bounds it for UI/persistence. */
+  | { type: "thinking"; phase: "start" | "progress" | "end"; chars: number; text?: string }
   | { type: "tool_delta"; name?: string; id: string; inputDelta: string; inputBytes?: number }
-  | { type: "tool_start"; name: string; id: string; input: unknown }
+  | {
+      type: "tool_start";
+      name: string;
+      id: string;
+      input: unknown;
+      /** Internal watchdog routing. Omitted means the core-agent runner owns
+       * the deadline; "executor" means the tool's bounded child runtime does. */
+      executionTimeoutOwner?: "executor";
+    }
   | { type: "tool_progress"; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
   | {
       type: "tool_end";
@@ -218,6 +233,13 @@ export type AgentRunEvent =
       outcome: "completed" | "failed";
       model: string;
       stopReason?: StopReason;
+      /** Privacy-safe count of user-facing text characters in this response.
+       * Lets local eval distinguish a plan-only round from a final reply that
+       * atomically closes the plan. */
+      textChars?: number;
+      /** Request-local provider usage. The host may retain bounded per-round
+       * evidence for Model Eval, but production telemetry remains aggregated. */
+      usage?: Usage;
     }
   | {
       type: "context_status";
@@ -231,10 +253,16 @@ export type AgentRunEvent =
         /** Layered compaction could not hold the request under the ceiling, so
          *  raw tool output was dropped without a summary. Distinct from the
          *  phases above because information was lost, not condensed. */
-        | "emergency_reduction";
+        | "emergency_reduction"
+        /** The provider refused the request as too large and a one-shot
+         *  reactive recovery ran: emergency folds plus, when the persistent
+         *  summary/facts blocks are what remains, a bounded shrink rewrite.
+         *  `data.result` is `retried` or `nothing_to_recover`. */
+        | "overflow_recovery";
       data?: Record<string, unknown>;
     }
   | { type: "retry"; attempt: number; reason: string; waitMs?: number }
+  | { type: "images_omitted"; count: number; providerId: string }
   | {
       type: "provider_fallback";
       reason: "auth" | "no_first_event_timeout" | "server_model_fallback";

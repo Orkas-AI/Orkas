@@ -1,12 +1,10 @@
 // ─── Model config guard ──────────────────────────────────────────────────
-// Central gate that keeps LLM-dependent features disabled until the user
-// has at least one (provider, model, credential) entry. Two surfaces:
-//   1) a persistent banner pinned above the main content area that links
-//      to the settings page (hidden on settings itself);
-//   2) `ensureModelConfigured()`, a synchronous check that action handlers
-//      call before firing an LLM-backed request — it short-circuits with
-//      an alert + settings redirect when the user hasn't configured a
-//      model yet, so every action path fails the same way.
+// Central gate that keeps LLM-dependent actions disabled until the user has
+// at least one (provider, model, credential) entry. `ensureModelConfigured()`
+// is the synchronous action boundary: it short-circuits with an alert and a
+// Settings redirect when no model is available. There is intentionally no
+// persistent page-level warning; the user only needs guidance when starting
+// an action that requires a model.
 // Refreshed at boot and after Settings reloads following a successful
 // credential/entry transaction, OAuth entry creation, repair, or deletion.
 
@@ -17,70 +15,8 @@ function _modelGuardErrorType(error) {
 }
 
 let _hasConfiguredModel = true;   // optimistic — flipped to false after refresh if empty
-let _guardBannerEl = null;
-let _guardChecked = false;
 let _modelGuardRefreshSequence = 0;
 let _modelConfigSnapshotSignature = '';
-
-function _ensureGuardBanner() {
-  if (_guardBannerEl) return _guardBannerEl;
-  const main = document.querySelector('.main-content');
-  if (!main) return null;
-  const el = document.createElement('div');
-  el.className = 'model-guard-banner';
-  el.id = 'model-guard-banner';
-  el.style.display = 'none';
-  const dotIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
-    ? window.uiIconHtml('dot', 'ui-icon')
-    : '';
-  el.innerHTML = `
-    <span class="model-guard-icon" aria-hidden="true">${dotIcon}</span>
-    <span class="model-guard-text">${escapeHtml(t('model_guard.banner'))}</span>
-    <button type="button" class="btn btn-sm btn-primary model-guard-cta">${escapeHtml(t('model_guard.cta'))}</button>
-  `;
-  el.querySelector('.model-guard-cta').addEventListener('click', () => {
-    if (typeof setView === 'function') {
-      setView('settings', null, { entryPoint: 'model_guard_banner' });
-    }
-    // Drop the user straight on the 配置 (Credentials) tab — that's where
-    // the model-auth UI lives now (Phase 4 4-tab restructure).
-    _activateModelCredentialsTab();
-  });
-  // Keep this one in sync when user toggles language.
-  window.addEventListener('i18n-change', () => {
-    if (!_guardBannerEl) return;
-    const txt = _guardBannerEl.querySelector('.model-guard-text');
-    const cta = _guardBannerEl.querySelector('.model-guard-cta');
-    if (txt) txt.textContent = t('model_guard.banner');
-    if (cta) cta.textContent = t('model_guard.cta');
-  });
-  // Pin to the top of the main content area so it's visible on every view
-  // except settings (see CSS: `.panel-settings-active .model-guard-banner`).
-  main.insertBefore(el, main.firstChild);
-  _guardBannerEl = el;
-  return el;
-}
-
-function _applyGuardVisuals() {
-  const banner = _ensureGuardBanner();
-  if (banner) banner.style.display = _hasConfiguredModel ? 'none' : '';
-  document.body.classList.toggle('model-not-configured', !_hasConfiguredModel);
-  syncModelGuardBannerTelemetry();
-}
-
-/** Called after both model-state refreshes and logical view changes. The CSS
- * hides this banner on Settings, so only count an impression on a view where
- * the user can actually see it. */
-function syncModelGuardBannerTelemetry() {
-  const visible = !_hasConfiguredModel
-    && _modelGuardSourceView() !== 'settings'
-    && !!_guardBannerEl
-    && _guardBannerEl.style.display !== 'none';
-  if (visible && !_guardBannerTelemetryVisible && window.Monitor) {
-    Monitor.event('model_guard_banner_impression', _modelGuardTelemetryPayload());
-  }
-  _guardBannerTelemetryVisible = visible;
-}
 
 async function refreshModelGuard() {
   const refreshSequence = ++_modelGuardRefreshSequence;
@@ -93,14 +29,9 @@ async function refreshModelGuard() {
     // actual sends if no entry exists, so we don't lose correctness.
     if (res && res.ok) {
       const configured = !!res.configured;
-      const telemetryContext = configured
-        ? null
-        : await _refreshModelGuardTelemetryContext();
       await refreshModelConfigSnapshot();
       if (refreshSequence !== _modelGuardRefreshSequence) return _hasConfiguredModel;
       _hasConfiguredModel = configured;
-      _guardChecked = true;
-      if (telemetryContext) _guardTelemetryContext = telemetryContext;
     } else {
       _guardLog.warn('refresh ipc not-ok', { error: res && res.error });
     }
@@ -108,7 +39,6 @@ async function refreshModelGuard() {
       _guardLog.warn('refresh failed', { error: (e && e.message) || String(e) });
   }
   if (refreshSequence !== _modelGuardRefreshSequence) return _hasConfiguredModel;
-  _applyGuardVisuals();
   return _hasConfiguredModel;
 }
 

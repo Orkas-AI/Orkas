@@ -18,19 +18,30 @@ import type { AgentTool, ToolContext, ToolResult } from "./base.js";
  *  `shared`/`user` are global. */
 export type MemoryTier = 'agent' | 'project' | 'shared' | 'user';
 
+/** What a write had to discard to stay inside the store's caps. Present only
+ *  when the write actually lost something; the host reports it because a
+ *  caller that is never told silently loses memory it believes it saved. */
+export interface MemoryEvictionReport {
+  dropped_entries?: number;
+  truncated_entries?: number;
+}
+
 /** Handler interface implemented by the features layer. */
 export interface MemoryToolHandler {
   add(tier: MemoryTier, content: string): {
     ok: boolean; error?: string; entries: string[];
     usage: { current: number; limit: number };
+    evicted?: MemoryEvictionReport;
   };
   replace(tier: MemoryTier, oldText: string, content: string): {
     ok: boolean; error?: string; entries: string[];
     usage: { current: number; limit: number };
+    evicted?: MemoryEvictionReport;
   };
   remove(tier: MemoryTier, oldText: string): {
     ok: boolean; error?: string; entries: string[];
     usage: { current: number; limit: number };
+    evicted?: MemoryEvictionReport;
   };
   list(tier: MemoryTier): {
     ok: boolean; entries: string[];
@@ -38,55 +49,15 @@ export interface MemoryToolHandler {
   };
 }
 
-/** Base description (non-project sessions): three memory scopes. */
-const TOOL_DESCRIPTION = `Remember and manage durable cross-session memory.
+const TOOL_DESCRIPTION =
+  'Read or update durable cross-session memory.';
 
-Three scopes (default "agent"):
-- "agent" (DEFAULT): YOUR OWN durable agent memory: lessons, preferences, recurring task conventions, corrections.
-- "shared": durable facts that EVERY agent should know. Use sparingly.
-- "user": the user's global profile/preferences.
-
-Use when the user asks to remember something, gives a durable correction/preference, or states a future-relevant fact, decision, outcome, milestone, or convention. Do not save trivia, dumps/logs, rediscoverable facts, the current task's working decisions, one-off state, plans, progress, or temporary debug notes.
-
-Current non-empty memory entries are already present in your system context. Do not call list merely to load or refresh context. Use list only when the user explicitly asks to inspect stored memory or when an exact current entry is needed for replace/remove.
-
-Routing: agent-specific lessons -> agent; user identity/style/preferences -> user; repo/project conventions -> shared.
-
-LANGUAGE: Write in the current UI/response language. Preserve proper nouns, commands, file paths, URLs, and exact quoted wording.
-
-Actions: add, replace, remove, list. For replace/remove, a complete old_text entry is preferred;
-substring shorthand is accepted only when it matches exactly one entry. Ambiguous matches are
-rejected without changing memory, so list or ask the user for the exact entry instead of guessing.`;
-
-/** Project-session description: four tiers, routed by where a fact belongs
- *  ("would it still hold in another project?") rather than where it was said. */
-const TOOL_DESCRIPTION_WITH_PROJECT = `Manage durable cross-session memory.
-
-Targets:
-- agent (default): this agent's private lessons, workflow preferences, recurring task conventions, and corrections.
-- project: durable facts, decisions, outcomes, milestones, and conventions that belong to THIS project only.
-- shared: stable facts that hold across projects and matter to every agent. Use sparingly.
-- user: stable user-wide profile/preferences every agent should know.
-
-Use when the user asks to remember something, gives a durable correction/preference, or states a future-relevant fact. Do not save trivia, raw dumps/logs, rediscoverable facts, the current task's working decisions, one-off task state, plans, progress, or temporary debug notes. Live progress and todo status belong in project_tasks.
-
-Current non-empty entries for these targets are already present in your system context. Do not call list merely to load or refresh context. Use list only when the user explicitly asks to inspect stored memory or when an exact current entry is needed for replace/remove.
-
-Routing — ask "would this still hold in another project?":
-- No / project-specific -> project.
-- Yes, an objective fact any agent may need -> shared.
-- Yes, the user's own identity/style/preferences -> user.
-- Yes, but only this agent benefits (its own working lessons) -> agent.
-Write in the user's current language while preserving code, paths, commands, URLs, and exact quoted wording when needed.
-
-Actions: add, replace, remove, list. For replace/remove, a complete old_text entry is preferred;
-substring shorthand is accepted only when it matches exactly one entry. Ambiguous matches are
-rejected without changing memory, so list or ask the user for the exact entry instead of guessing.`;
+const TOOL_DESCRIPTION_WITH_PROJECT =
+  'Read or update durable agent, project, shared, or user memory; use project_tasks for task progress.';
 
 /** Appended for sub-agents: they may read project memory but not write it. */
-const PROJECT_READONLY_NOTE = `
-
-NOTE — project memory is READ-ONLY for you: it is already present in your system context when non-empty. Do not list it merely to reload context. You may use "list" when an exact current entry is required, but only the commander (the project's main conversation) can add/replace/remove project entries. When you learn a project-specific fact or decision worth keeping, surface it in your result so the commander can record it — do not try to write the "project" target yourself.`;
+const PROJECT_READONLY_NOTE =
+  ' Project memory is read-only for this actor; only Commander may add, replace, or remove it.';
 
 export interface CrossSessionMemoryToolOptions {
   /** Offer the `project` tier (project sessions only). The host binds it to
@@ -107,6 +78,10 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
   const description = opts.includeProjectTier
     ? TOOL_DESCRIPTION_WITH_PROJECT + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
     : TOOL_DESCRIPTION;
+  const targetDescription = opts.includeProjectTier
+    ? 'Defaults to agent: this agent\'s reusable lessons; project: project-specific facts and decisions; user: stable user-wide profile/preferences; shared: rare cross-project facts for every agent.'
+      + (projectReadOnly ? ' Project is read-only.' : '')
+    : 'Memory store. Defaults to agent: this agent\'s reusable lessons; user: stable user-wide profile/preferences; shared: rare cross-project facts for every agent.';
   return {
     name: 'cross_session_memory',
     description,
@@ -116,20 +91,20 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         action: {
           type: 'string',
           enum: ['add', 'replace', 'remove', 'list'],
-          description: 'The action to perform.',
+          description: 'Memory operation. Non-empty entries are already injected; use list only to inspect them or obtain exact text for replace/remove.',
         },
         target: {
           type: 'string',
           enum: tiers,
-          description: 'Which memory store to operate on. Defaults to "agent" (your own notes).',
+          description: targetDescription,
         },
         content: {
           type: 'string',
-          description: 'The entry content (required for "add" and "replace").',
+          description: 'Entry text; required for add and replace.',
         },
         old_text: {
           type: 'string',
-          description: 'Existing entry text for "replace" and "remove". An exact entry is preferred; a substring must match exactly one entry.',
+          description: 'Existing entry for replace/remove. Prefer the complete text; a substring must match exactly one entry.',
         },
       },
       required: ['action'],

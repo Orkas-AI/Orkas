@@ -224,9 +224,15 @@ describe('builtin marketplace startup seed', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
+    // A startup/account observer can join a refresh that was started through
+    // the lower-level API. The owner still sees the rejection and may retry;
+    // the active-user startup boundary must keep its non-throwing contract.
+    const activeRefresh = startup.seedBuiltinMarketplaceForActiveUser({ reason: 'concurrent-startup' });
+
     currentContext = false;
     releaseTurn();
     await expect(refresh).rejects.toThrow(/publish context changed/);
+    await expect(activeRefresh).resolves.toBeNull();
     const installed = JSON.parse(fs.readFileSync(
       path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'),
       'utf8',

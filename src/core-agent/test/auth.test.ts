@@ -76,7 +76,7 @@ describe("Auth Store", () => {
     expect(warn).toHaveBeenCalledWith(
       "[auth-store]",
       "failed to load auth store",
-      expect.objectContaining({ error: expect.any(String) }),
+      { code: "UNKNOWN" },
     );
   });
 

@@ -9,6 +9,11 @@ import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-of
 
 const UID = 'u-attach-001';
 const CID = 'conv-123';
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=',
+  'base64',
+);
+const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -485,6 +490,75 @@ describe('chat_attachments › listPendingAttachments', () => {
 
     const items = m.listPendingAttachments(UID, CID);
     expect(items.map((i) => i.name)).toEqual(['b.txt']);
+  });
+
+  it('keeps generated assistant images committed across filename collisions and device-local path changes', async () => {
+    const m = await loadMod();
+    const first = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1);
+    const second = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!(first.ok && second.ok)) return;
+    expect(second.info.name).not.toBe(first.info.name);
+    expect(fs.readFileSync(first.absPath)).toEqual(PNG_1X1);
+    expect(fs.readFileSync(second.absPath)).toEqual(PNG_1X1);
+
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const rows = [first.info.name, second.info.name].map((name) => ({
+      role: 'assistant',
+      produced: [`/old-device/cloud/chat_attachments/${CID}/${name}`],
+      text: `![generated image](chat-media://cid/${CID}/${encodeURIComponent(name)})`,
+    }));
+    fs.writeFileSync(
+      path.join(chatsDir, `${CID}.jsonl`),
+      `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`,
+    );
+
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+  });
+
+  it('stores validated generated video bytes with the normal attachment size and sync boundary', async () => {
+    const m = await loadMod();
+    const saved = m.saveGeneratedMediaAttachment(UID, CID, MP4_FTYP, 'generated-clip.mp4', 'video');
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    expect(saved.info).toMatchObject({ name: 'generated-clip.mp4', kind: 'video', bytes: MP4_FTYP.length });
+    expect(fs.readFileSync(saved.absPath)).toEqual(MP4_FTYP);
+    expect(m.saveGeneratedMediaAttachment(UID, CID, MP4_FTYP, 'generated-clip.txt', 'video')).toMatchObject({
+      ok: false,
+      error: 'generated output must use a supported video extension',
+    });
+  });
+
+  it('keeps a background media cache name stable and refuses to recreate a deleted conversation pool', async () => {
+    const m = await loadMod();
+    const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+    const messageFile = path.join(chatsDir, `${CID}.jsonl`);
+    fs.mkdirSync(chatsDir, { recursive: true });
+    fs.writeFileSync(messageFile, '{}\n');
+
+    const stableName = 'cli-remote-aabbccddeeff001122334455.png';
+    const first = await m.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, stableName, 'image');
+    const second = await m.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, stableName, 'image');
+
+    expect(first).toMatchObject({ ok: true, info: { name: stableName } });
+    if (first.ok) expect(first.reused).toBeUndefined();
+    expect(second).toMatchObject({ ok: true, info: { name: stableName }, reused: true });
+    expect(fs.readFileSync(path.join(attDir(), stableName))).toEqual(PNG_1X1);
+    expect(fs.readdirSync(attDir()).filter(name => name.startsWith('.'))).toEqual([]);
+
+    fs.unlinkSync(messageFile);
+    await m.purgeByCid(UID, CID);
+    const late = await m.saveGeneratedMediaCacheAttachment(
+      UID,
+      CID,
+      PNG_1X1,
+      'cli-remote-ffeeddccbbaa009988776655.png',
+      'image',
+    );
+    expect(late).toMatchObject({ ok: false, error: 'conversation no longer exists' });
+    expect(fs.existsSync(attDir())).toBe(false);
   });
 });
 
@@ -1144,6 +1218,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toMatch(/attached="model-bounded"/);
     expect(r.manifest).toMatch(/image_order="1"/);
     expect(r.manifest).toContain('image delivery is bounded by the active model');
+    expect(r.manifest).toContain('call read_files({"paths":[{"path":"<exact-path>"}]}) for that image, one at a time');
     // Look-alike negative: an image is candidate vision input and must NOT be
     // marked model_readable="false" like a video/audio file.
     expect(r.manifest).not.toContain('model_readable');

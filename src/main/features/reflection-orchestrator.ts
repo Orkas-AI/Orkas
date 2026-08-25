@@ -7,12 +7,23 @@
  *   - One scheduler: fire after the measured startup window (offset via
  *     util/boot_init.ts) and every `CYCLE_INTERVAL_MS` thereafter via a
  *     setTimeout chain.
- *   - Per-agent gating: 4h min cooldown, dirty gate (signals.jsonl or
- *     session jsonl newer than lastReflectedAt), 7-day max-gap fallback.
+ *   - Per-agent gating: 4h min cooldown plus the dirty gate (signals.jsonl or
+ *     session jsonl newer than the last examination). Activity is the only
+ *     reason to reflect: the former 7-day max-gap fallback forced a cycle for
+ *     idle agents whose transcript is empty by construction, and because a
+ *     failure never advanced the timestamp those agents re-occupied the cap
+ *     every cycle forever — 21 consecutive cycles produced 0 reflections on
+ *     the machine this was diagnosed on, all five slots held by the same
+ *     idle agents.
  *   - Per-cycle cap: at most `MAX_AGENTS_PER_CYCLE`; eligible-but-deferred
  *     agents wait for the next cycle (no agents lost).
- *   - Sequential execution; failures isolate per-agent and don't advance
- *     `lastReflectedAt`, so the next cycle retries.
+ *   - Sequential execution, bounded per agent (`PER_AGENT_TIMEOUT_MS`) and
+ *     yielding between agents when the user returns. A transient failure
+ *     (provider, cancellation, unreadable sources) does not advance the
+ *     timestamp, so the next cycle retries. An examined window does advance
+ *     it — whether it produced an update, nothing worth saving, or held no
+ *     activity — because re-reading the same span can only reach the same
+ *     conclusion while starving agents that do have new activity.
  *
  * Background work; every cycle enters through the shared boot/background
  * admission queue. Tests inject `reflect`, `now`, and timing knobs via
@@ -33,9 +44,15 @@ import { buildRunner } from '../model/core-agent/runner';
 import { cloudSessionFileFor } from '../util/project-layout';
 import { resolveLanguageForUser } from './config';
 import { getLocaleMeta } from '../i18n';
-import { scheduleBootBackground, type ScheduledBootBackgroundTask } from '../util/boot_init';
+import { scheduleBootBackground, isBootAdmissionIdle, type ScheduledBootBackgroundTask } from '../util/boot_init';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { getActiveUserId } from './users';
+type ReflectionErrorCode =
+  | 'transcript_unavailable'
+  | 'empty_response'
+  | 'cancelled'
+  | 'runner_unavailable'
+  | 'unknown';
 
 const log = createLogger('reflection-orchestrator');
 
@@ -45,19 +62,25 @@ const log = createLogger('reflection-orchestrator');
 export const CYCLE_INTERVAL_MS = 12 * 3600 * 1000;
 /** Minimum gap between reflections for the same agent (anti-thrash). */
 export const MIN_COOLDOWN_MS = 4 * 3600 * 1000;
-/** Maximum gap — force a sanity reflection even when no signals/activity. */
-export const MAX_GAP_MS = 7 * 24 * 3600 * 1000;
 /** Default initial lookback window for never-reflected agents. */
 export const DEFAULT_LOOKBACK_MS = 48 * 3600 * 1000;
 /** Per-cycle agent cap — defer overflow to next cycle. */
 export const MAX_AGENTS_PER_CYCLE = 5;
+/** Ceiling for one agent's reflection. A real one (read both meta files,
+ *  write an update) measured ~25s; the pathological bound is five model
+ *  calls. Exceeding it fails that agent alone — the cycle continues. */
+export const PER_AGENT_TIMEOUT_MS = 120 * 1000;
 /** Sentinel agent id covering all `normal` (no-agent-bound) conversations. */
 export const DEFAULT_AGENT_ID = '_default';
 
 // ── State IO (kept compatible with old reflection-state.json) ────────────
 
 export interface ReflectionState {
-  /** ISO timestamp per agent id (or `_default`). */
+  /** ISO timestamp per agent id (or `_default`): when this agent's activity
+   *  window was last examined. It is the baseline for the next transcript and
+   *  for the cooldown, so it also advances when the examination found nothing
+   *  to reflect on. The field name is kept for on-disk compatibility with
+   *  existing `reflection-state.json` files. */
   lastReflectedAt: Record<string, string>;
 }
 
@@ -93,7 +116,7 @@ interface AgentDecision {
   /** Lower bound for activity to include in the next reflection's transcript. */
   sinceMs: number;
   /** Why we picked this agent (logged when we actually run). */
-  reason: 'dirty' | 'max_gap' | 'never_reflected';
+  reason: 'dirty' | 'never_reflected';
 }
 
 /** Decide which agents are due for reflection in this cycle.
@@ -115,11 +138,6 @@ export async function pickAgentsForCycle(
     const hasLast = !Number.isNaN(lastMs);
 
     if (hasLast && now - lastMs < MIN_COOLDOWN_MS) continue;        // cooldown
-
-    if (hasLast && now - lastMs >= MAX_GAP_MS) {
-      out.push({ agentId: id, sinceMs: lastMs, reason: 'max_gap' });
-      continue;
-    }
 
     const sinceMs = hasLast ? lastMs : now - DEFAULT_LOOKBACK_MS;
     if (await isDirty(uid, id, sinceMs)) {
@@ -200,22 +218,49 @@ function _sessionNewerThan(uid: string, sessionId: string, sinceMs: number): boo
 
 // ── Reflection invocation ────────────────────────────────────────────────
 
+/**
+ * How a reflection ended. All three are terminal for this cycle and advance
+ * the baseline; only a thrown error means "retry next cycle".
+ *
+ *   - `reflected`          wrote something durable (metacognition or a skill)
+ *   - `nothing_to_save`    read the window, deliberately wrote nothing
+ *   - `nothing_to_reflect` the window itself held no activity
+ *
+ * `nothing_to_save` is a success, not a degraded one: the review prompt tells
+ * the model to answer "nothing to save" rather than reflect for its own sake.
+ * It is separate from `reflected` because otherwise the cycle aggregate
+ * reports "the LLM replied" while claiming to report "the loop produced
+ * something" — which is exactly how this feature ran for weeks unnoticed.
+ */
+export type ReflectOutcome = 'reflected' | 'nothing_to_save' | 'nothing_to_reflect';
+
 export type ReflectFn = (
   uid: string,
   agentId: string,
   sinceMs: number,
   signal?: AbortSignal,
-) => Promise<void>;
+) => Promise<ReflectOutcome>;
 
-/** Build the reflection prompt for one agent and run it. Throws on failure
- *  so the caller can decide whether to stamp `lastReflectedAt` (success)
- *  or leave it (retry next cycle). */
+/** Tag a failure with a bounded analytics code so the cycle aggregate can
+ *  report why without widening the dimension or leaking a raw message. */
+function reflectionError(code: ReflectionErrorCode, message: string): Error {
+  return Object.assign(new Error(message), { reflectionCode: code });
+}
+
+function reflectionErrorCode(err: unknown): ReflectionErrorCode {
+  const code = (err as { reflectionCode?: unknown } | null)?.reflectionCode;
+  return typeof code === 'string' ? code as ReflectionErrorCode : 'unknown';
+}
+
+/** Build the reflection prompt for one agent and run it. Throws only for
+ *  failures worth retrying; an examined-but-empty window returns
+ *  `nothing_to_reflect` so the caller advances the baseline. */
 async function realReflectForAgent(
   uid: string,
   agentId: string,
   sinceMs: number,
   signal?: AbortSignal,
-): Promise<void> {
+): Promise<ReflectOutcome> {
   const runnerAgentId = agentId === DEFAULT_AGENT_ID ? '' : agentId;
 
   // Ephemeral session — runReflection uses an in-memory session (not the
@@ -224,15 +269,22 @@ async function realReflectForAgent(
   const sessionId = `reflect-${tail}`;
 
   const { runner } = await buildRunner({ sessionId, userId: uid, agentId: runnerAgentId });
-  if (signal?.aborted) throw new Error('reflection cancelled');
+  if (signal?.aborted) throw reflectionError('cancelled', 'reflection cancelled');
 
   const transcriptResult = await buildTranscript(uid, agentId, sinceMs);
-  if (signal?.aborted) throw new Error('reflection cancelled');
+  if (signal?.aborted) throw reflectionError('cancelled', 'reflection cancelled');
+  if (transcriptResult.unavailable) {
+    // Sources could not be read: an empty transcript here means "unknown",
+    // so retry rather than consuming the window.
+    throw reflectionError('transcript_unavailable', 'transcript sources unavailable');
+  }
   if (!transcriptResult.text) {
-    // Dirty gate said yes but transcript came back empty (race / sweep / etc.).
-    // Skip without stamping — next cycle's dirty check decides again.
-    log.info(`reflect ${agentId}: transcript empty (considered=${transcriptResult.stats.convsConsidered}), skipping`);
-    throw new Error('transcript empty after dirty gate');
+    // The window was examined and held nothing a reflection could use — a
+    // dirty session file whose in-window content is tool-only, a swept conv,
+    // a race. Terminal for this window: the caller advances the baseline so
+    // the next cycle looks at new activity instead of re-reading this span.
+    log.info(`reflect ${agentId}: no reflectable activity in window (considered=${transcriptResult.stats.convsConsidered})`);
+    return 'nothing_to_reflect';
   }
 
   const ca = await import('#core-agent');
@@ -243,12 +295,25 @@ async function realReflectForAgent(
 
   // `runReflection` swallows provider/LLM/loop errors and returns ''; an
   // empty response is treated as a failed reflection (cooldown not stamped).
-  const responseText = await runner.runReflection(prompt, signal);
+  let writes = 0;
+  const responseText = await runner.runReflection(
+    prompt, signal, undefined, undefined, () => { writes += 1; },
+  );
   if (!responseText || !responseText.trim()) {
-    throw new Error('reflection returned empty (provider/LLM error or max loops; see core-agent log)');
+    // Every failure inside `runReflection` collapses to '', including our own
+    // deadline, so ask the signal before blaming the provider.
+    if (signal?.aborted) throw reflectionError('cancelled', 'reflection cancelled');
+    throw reflectionError('empty_response', 'reflection returned empty (provider/LLM error or max loops; see core-agent log)');
   }
 
-  log.info(`reflect ${agentId}: ok (transcript ${transcriptResult.stats.convsIncluded}/${transcriptResult.stats.convsConsidered} convs, ~${transcriptResult.stats.estimatedTokens} tokens)`);
+  const transcriptStats = `transcript ${transcriptResult.stats.convsIncluded}/${transcriptResult.stats.convsConsidered} convs, ~${transcriptResult.stats.estimatedTokens} tokens`;
+  if (writes === 0) {
+    // The prompt's own instruction when a window holds no new lesson.
+    log.info(`reflect ${agentId}: nothing to save (${transcriptStats})`);
+    return 'nothing_to_save';
+  }
+  log.info(`reflect ${agentId}: ok (wrote ${writes}, ${transcriptStats})`);
+  return 'reflected';
 }
 
 // ── Cycle ───────────────────────────────────────────────────────────────
@@ -262,6 +327,41 @@ export interface RunCycleOpts {
   isDirty?: (uid: string, agentId: string, sinceMs: number) => Promise<boolean>;
   /** Cooperative cancellation between catalog checks and agent reflections. */
   signal?: AbortSignal;
+  /** Override the between-agents idle check (test seam). */
+  isIdle?: () => boolean;
+  /** Override the per-agent deadline (test seam). */
+  perAgentTimeoutMs?: number;
+}
+
+/**
+ * Bound one agent's reflection without touching its neighbours.
+ *
+ * The cycle used to run under a single 30s `maxSliceMs`, so one slow agent
+ * aborted itself *and* ended the cycle — and the slow agents are precisely
+ * the ones reading their files and writing an update, while a "nothing to
+ * save" reply finishes in five seconds. Budgeting per agent removes that
+ * selection pressure.
+ */
+async function withDeadline<T>(
+  parent: AbortSignal | undefined,
+  timeoutMs: number,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const onParentAbort = (): void => controller.abort(parent?.reason);
+  parent?.addEventListener('abort', onParentAbort, { once: true });
+  if (parent?.aborted) onParentAbort();
+  const timer = setTimeout(
+    () => controller.abort(new Error('reflection deadline exceeded')),
+    Math.max(1, timeoutMs),
+  );
+  timer.unref?.();
+  try {
+    return await fn(controller.signal);
+  } finally {
+    clearTimeout(timer);
+    parent?.removeEventListener('abort', onParentAbort);
+  }
 }
 
 /** Run one reflection cycle: enumerate agents, pick eligible (capped),
@@ -279,6 +379,7 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   }
   fs.mkdirSync(userLocalConfigDir(uid), { recursive: true });
 
+  const startedAt = Date.now();
   const now = (opts.now ?? Date.now)();
   const reflect = opts.reflect ?? realReflectForAgent;
   const dirtyFn = opts.isDirty ?? isAgentDirty;
@@ -301,25 +402,66 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   log.info(`cycle start: ${eligible.length}/${agentIds.length} agent(s) eligible`);
 
   let completed = 0;
+  let noChange = 0;
+  let empty = 0;
+  let failed = 0;
+  let dominantError: ReflectionErrorCode | undefined;
+  const isIdle = opts.isIdle ?? isBootAdmissionIdle;
+  const perAgentTimeoutMs = opts.perAgentTimeoutMs ?? PER_AGENT_TIMEOUT_MS;
+  let attempted = 0;
   for (const { agentId, sinceMs, reason } of eligible) {
     if (opts.signal?.aborted) break;
+    // Yield between agents, never inside one. Cutting a reflection off throws
+    // away the tokens it already spent and leaves it to retry from scratch;
+    // deferring it here costs nothing, because a deferred agent keeps its old
+    // baseline and therefore leads the next cycle.
+    //
+    // Never before the first: admission already decided this cycle may run,
+    // and it admits a waiting cycle after `maxUserDeferralMs` even while the
+    // user is active. Re-asking here would overturn that and let a busy
+    // account defer every agent of every cycle indefinitely.
+    if (attempted > 0 && !isIdle()) {
+      const remaining = eligible.length - attempted;
+      log.info(`cycle: user active, deferring ${remaining} remaining agent(s) to next cycle`);
+      break;
+    }
+    attempted += 1;
     try {
-      await reflect(uid, agentId, sinceMs, opts.signal);
+      const outcome = await withDeadline(
+        opts.signal, perAgentTimeoutMs, (signal) => reflect(uid, agentId, sinceMs, signal),
+      );
       // Account switching cancels the old cycle. A provider/tool may resolve
       // after observing cancellation, but that stale work must never earn a
       // cooldown stamp or suppress the new account's next reflection.
       if (opts.signal?.aborted) break;
-      // Stamp success — read fresh state in case another writer touched it.
+      // Advance the baseline — read fresh state in case another writer touched
+      // it. An empty window advances too: re-reading a span already known to
+      // hold nothing cannot succeed, and leaving it would let that agent hold
+      // a cap slot against agents that do have activity.
       const next = readReflectionState(uid);
       next.lastReflectedAt[agentId] = new Date(now).toISOString();
       writeReflectionState(uid, next);
-      completed += 1;
-      log.info(`reflect ${agentId}: completed (${reason})`);
+      if (outcome === 'reflected') {
+        completed += 1;
+        log.info(`reflect ${agentId}: completed (${reason})`);
+      } else if (outcome === 'nothing_to_save') {
+        noChange += 1;
+      } else {
+        empty += 1;
+      }
     } catch (err) {
+      failed += 1;
+      // First failure wins: cycles are small and sequential, so the earliest
+      // code is the most useful single value for a bounded dimension.
+      if (!dominantError) dominantError = reflectionErrorCode(err);
       log.warn(`reflect ${agentId}: failed (${reason}): ${(err as Error).message}`);
     }
   }
-  log.info(`cycle end: ${completed}/${eligible.length} agent(s) completed`);
+  const endDetail = [
+    noChange ? `${noChange} with nothing to save` : '',
+    empty ? `${empty} with no reflectable activity` : '',
+  ].filter(Boolean).join(', ');
+  log.info(`cycle end: ${completed}/${eligible.length} agent(s) wrote an update${endDetail ? `, ${endDetail}` : ''}`);
   return completed;
 }
 
@@ -344,7 +486,11 @@ function createReflectionLoop(uid: string, opts: RunCycleOpts): LoopHandle {
     }, delayMs, {
       resourceClass: 'model',
       preferIdle: true,
-      maxSliceMs: 30_000,
+      // Hang net only. Throttling is `PER_AGENT_TIMEOUT_MS` plus the
+      // between-agents idle check: a cycle-wide slice aborts mid-write, and
+      // at 30s it could not even seat one real reflection, so it ended cycles
+      // after a single agent while reporting the rest as untouched.
+      maxSliceMs: 8 * 60 * 1000,
     });
     void scheduled.promise.finally(() => {
       scheduled = null;

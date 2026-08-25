@@ -1,9 +1,7 @@
 ---
 name: social-data
-description_zh: "采集和分析社媒数据：抓取小红书、X/Twitter、Reddit、YouTube、Bilibili 的公开帖子，或分析用户提供的社媒/活动数据，计算参与率、CTR、ROI、成本指标、Top/Bottom 内容和下一轮实验建议；适合\"抓一下 Reddit 上的口碑\"\"分析这批小红书讨论\"\"算一下这次活动 ROI\"；触发词：社媒数据、舆情、口碑、热度、公开帖子、社媒分析、参与率、CTR、ROI、campaign performance"
-description_en: "Fetch and analyze social media data: collect public posts from Xiaohongshu, X/Twitter, Reddit, YouTube, and Bilibili, or analyze user-provided social/campaign data to calculate engagement rate, CTR, ROI, cost metrics, top/bottom content, and next experiment recommendations; For: \"fetch Reddit reputation\", \"analyze these Xiaohongshu discussions\", \"calculate campaign ROI\"; Triggers: social data, sentiment, reputation, buzz, public posts, social analytics, engagement rate, CTR, ROI, campaign performance"
-description: "Fetch public social posts and analyze social/campaign metrics. Use this skill whenever the user asks to collect public social discussion, analyze social sentiment inputs, calculate engagement/CTR/ROI, compare platforms/content, or turn social samples into traceable findings."
-category: "data"
+description_zh: "抓取小红书、X/Twitter、Reddit、YouTube 和 Bilibili 的公开帖子，或分析用户提供的社媒/活动数据并交付舆情趋势、参与率、CTR、ROI、内容对比和实验建议；用于社媒聆听、品牌口碑和活动效果分析，不负责账号发布。"
+description_en: "Fetch public posts from Xiaohongshu, X/Twitter, Reddit, YouTube, and Bilibili, or analyze supplied social/campaign data for sentiment, engagement, CTR, ROI, content comparisons, and experiments. Use for social listening, brand reputation, and campaign performance, not account publishing."
 ---
 
 # Social Data
@@ -36,7 +34,7 @@ Do not use for:
    - `fetch_then_analyze`: user asks for a topic analysis and no data is provided.
 
 2. For fetch mode:
-   - Follow `references/fetching.md`.
+   - Follow the [fetching guide](references/fetching.md).
    - One platform per script call: `xhs`, `twitter`, `reddit`, `youtube`, or `bilibili`.
    - Expand the user's topic into 3-8 short divergent keyword groups unless the user explicitly restricts keywords.
    - Run the normal `run-skill.cjs` command directly. On the first fetch it automatically installs the pinned Python packages from `requirements.fetch.txt` into a workspace-local isolated environment, then continues the same request. Do not preflight with ad-hoc imports or ask the user to repair missing Python packages.
@@ -46,7 +44,7 @@ Do not use for:
    - Browser cookies are off by default. Before adding `--use-browser-cookies` for Reddit or Bilibili, explicitly ask the user for permission and disclose that the script will inspect installed browser cookie stores for that platform domain. Continue anonymously when permission is absent or declined.
 
 3. For analysis mode:
-   - Follow `references/metrics.md`.
+   - Follow the [metrics guide](references/metrics.md).
    - Validate fields before calculating.
    - Label evidence as direct calculation, limited inference, or assumption.
    - Separate organic and paid performance when possible.
@@ -54,6 +52,10 @@ Do not use for:
 4. Use scripts only when useful:
    - Fetch public samples (anonymous by default):
      `$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs social-data fetch -- <platform> <keywords> [options]`
+     Run or quote it as one contiguous command; do not split the runner, skill,
+     and operation across prose. In PowerShell use the call operator so the
+     example stays directly runnable:
+     `& $env:ORKAS_NODE "$env:ORKAS_PC_DIR/bin/run-skill.cjs" social-data fetch -- <platform> <keywords>`
    - Calculate metrics from JSON:
      `$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs social-data calculate_metrics -- data.json`
    - Analyze performance from JSON:

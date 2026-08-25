@@ -28,29 +28,28 @@ describe('createMetacognitionTool', () => {
 
   it('omits the limit block when no limits are supplied', () => {
     const tool = createMetacognitionTool(mockHandler());
-    expect(tool.description).not.toMatch(/Limits \(oversize writes are rejected\)/);
+    expect((tool.inputSchema as any).properties.content.description).not.toContain('Maximum');
   });
 
-  it('embeds char limits in description when supplied', () => {
+  it('places target-dependent character limits on the content parameter', () => {
     const tool = createMetacognitionTool(mockHandler(), { competence: 3000, strategies: 2500 });
-    expect(tool.description).toMatch(/CONTENT LIMITS \(oversize writes are rejected\)/);
-    expect(tool.description).toMatch(/competence: 3000 characters/);
-    expect(tool.description).toMatch(/strategies: 2500 characters/);
-    expect(tool.description).toMatch(/CONDENSE these files into living summaries/);
+    const contentDescription = (tool.inputSchema as any).properties.content.description;
+    expect(contentDescription).toContain('complete replacement');
+    expect(contentDescription).toContain('living summary');
+    expect(contentDescription).toContain('Maximum 3000 characters for competence');
+    expect(contentDescription).toContain('2500 for strategies');
   });
 
-  it('keeps language and content-limit guardrails visible in the provider definition', () => {
+  it('keeps selection and content constraints visible in the provider definition', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
     try {
       const tool = createMetacognitionTool(mockHandler(), { competence: 3000, strategies: 2500 });
       const def = toToolDefinition(tool);
-      expect(def.description).toContain('Use the user\'s current language');
-      expect(def.description).toContain('preserve code, paths, commands, and quoted wording');
-      expect(def.description).toContain('CONTENT LIMITS');
-      expect(def.description).toContain('competence: 3000 characters');
-      expect(def.description).toContain('strategies: 2500 characters');
-      expect(def.description).toContain('REJECTED');
-      expect(def.description).toContain('CONDENSE');
+      const properties = def.inputSchema.properties as Record<string, Record<string, unknown>>;
+      expect(def.description).toContain('persistent competence or strategy notes');
+      expect(def.description).toContain('rather than current task progress');
+      expect(properties.content.description).toContain('Maximum 3000 characters for competence');
+      expect(properties.content.description).toContain('2500 for strategies');
     } finally {
       warn.mockRestore();
     }

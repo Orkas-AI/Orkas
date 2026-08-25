@@ -474,6 +474,7 @@ async function _sendQueuedMessageIntoActiveRun(cid, next) {
       body: JSON.stringify({
         content,
         ...(extra || {}),
+        steer_active_turn: true,
       }),
     });
     const data = await res.json();

@@ -23,27 +23,9 @@ export interface MetacognitionToolHandler {
   };
 }
 
-function buildDescription(limits?: { competence?: number; strategies?: number }): string {
-  const compLimit = limits?.competence;
-  const stratLimit = limits?.strategies;
-  const limitBlock =
-    compLimit && stratLimit
-      ? [
-          '',
-          `CONTENT LIMITS (oversize writes are rejected):`,
-          `- competence: ${compLimit} characters`,
-          `- strategies: ${stratLimit} characters`,
-          `REJECTED writes must be shortened; CONDENSE these files into living summaries, not logs.`,
-        ].join('\n')
-      : '';
-
-  return `Read or replace this agent's persistent metacognition notes.
-
-Targets:
-- competence: strengths, weaknesses, limits, and learning priorities.
-- strategies: which learning/work approaches help for which task types.
-
-Update after meaningful user corrections, newly discovered capabilities/limits, or useful strategy lessons. Skip routine task progress. Action "write" replaces the whole markdown file; read first if you need current content/usage. Use the user's current language for prose and preserve code, paths, commands, and quoted wording.${limitBlock}`;
+function buildDescription(): string {
+  return 'Read or replace this agent\'s persistent competence or strategy notes. '
+    + 'Use them for durable corrections, capabilities, limits, or reusable approaches rather than current task progress.';
 }
 
 export function createMetacognitionTool(
@@ -52,23 +34,26 @@ export function createMetacognitionTool(
 ): AgentTool {
   return {
     name: 'metacognition',
-    description: buildDescription(limits),
+    description: buildDescription(),
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: ['read', 'write'],
-          description: 'The action to perform.',
+          description: 'Read the target or replace it completely.',
         },
         target: {
           type: 'string',
           enum: ['competence', 'strategies'],
-          description: 'Which metacognition store to operate on.',
+          description: 'competence stores strengths/limits; strategies stores reusable approaches by task type.',
         },
         content: {
           type: 'string',
-          description: 'The new content (required for "write"). Replaces entire file.',
+          description: 'Required for write; complete replacement condensed as a living summary rather than a log.'
+            + (limits?.competence && limits?.strategies
+              ? ` Maximum ${limits.competence} characters for competence or ${limits.strategies} for strategies.`
+              : ''),
         },
       },
       required: ['action', 'target'],

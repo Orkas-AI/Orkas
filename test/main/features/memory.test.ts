@@ -107,6 +107,77 @@ describe('memory › saveEntries', () => {
     mem.saveEntries(f, [{ text: 'ok' }], 1000);
     expect(fs.existsSync(f)).toBe(true);
   });
+
+  // A write that silently discards what the caller believes it saved is the
+  // defect these cases pin: the host knows exactly what it dropped, so the
+  // count must reach the caller (and the log) while entry text never does.
+  it('reports entries dropped for the char cap, and nothing when nothing is lost', async () => {
+    const mem = await loadMemory();
+    const f = path.join(tmpDir, 'evict-chars.md');
+    const report = mem.saveEntries(f, [
+      { text: 'aaaaa' },
+      { text: 'bbbbb' },
+      { text: 'ccccc' },
+    ], 14);
+    expect(report).toEqual({ droppedEntries: 1, truncatedEntries: 0 });
+
+    const clean = mem.saveEntries(path.join(tmpDir, 'evict-none.md'), [{ text: 'a' }, { text: 'b' }], 10000);
+    expect(clean).toEqual({ droppedEntries: 0, truncatedEntries: 0 });
+  });
+
+  it('reports entries dropped for the count cap without counting deduplication', async () => {
+    const mem = await loadMemory();
+    const f = path.join(tmpDir, 'evict-count.md');
+    // 4 distinct entries, cap 2 → 2 dropped. A duplicate is normalization,
+    // not loss, so it must not inflate the count.
+    const report = mem.saveEntries(f, [
+      { text: 'e1' }, { text: 'e2' }, { text: 'e3' }, { text: 'e3' }, { text: 'e4' },
+    ], 10000, 2);
+    expect(report).toEqual({ droppedEntries: 2, truncatedEntries: 0 });
+    expect(mem.loadEntries(f).map(e => e.text)).toEqual(['e3', 'e4']);
+  });
+
+  it('reports a lone oversized entry as truncated rather than dropped', async () => {
+    const mem = await loadMemory();
+    const f = path.join(tmpDir, 'evict-truncate.md');
+    const report = mem.saveEntries(f, [{ text: 'x'.repeat(50) }], 10);
+    expect(report).toEqual({ droppedEntries: 0, truncatedEntries: 1 });
+    expect(mem.loadEntries(f)[0].text).toBe('x'.repeat(10));
+  });
+});
+
+// ── eviction reporting through the op result ───────────────────────
+
+describe('memory › eviction reporting', () => {
+  it('tells the caller what an add discarded, and stays absent on a clean add', async () => {
+    const mem = await loadMemory();
+    const uid = 'u-evict';
+
+    for (let i = 0; i < mem.MEMORY_ENTRY_LIMIT; i++) {
+      const res = mem.addEntry(uid, 'memory', `entry ${i}`);
+      expect(res.ok).toBe(true);
+      expect(res.evicted).toBeUndefined();   // still inside both caps
+    }
+
+    // The next add is over the count cap: the oldest entry is evicted and the
+    // caller must be able to see that, not just infer it from entries.length.
+    const over = mem.addEntry(uid, 'memory', 'one too many');
+    expect(over.ok).toBe(true);
+    expect(over.evicted).toEqual({ dropped_entries: 1 });
+    expect(over.entries).toHaveLength(mem.MEMORY_ENTRY_LIMIT);
+    expect(over.entries).toContain('one too many');
+    expect(over.entries).not.toContain('entry 0');
+  });
+
+  it('keeps eviction counts free of entry text', async () => {
+    const mem = await loadMemory();
+    const uid = 'u-evict-privacy';
+    const secret = 'SECRET-MEMORY-CONTENT';
+    mem.addEntry(uid, 'user', secret);
+    let res = mem.addEntry(uid, 'user', 'x'.repeat(mem.USER_CHAR_LIMIT));
+    expect(res.evicted?.dropped_entries).toBe(1);
+    expect(JSON.stringify(res.evicted)).not.toContain(secret);
+  });
 });
 
 // ── addEntry ────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 ---
 name: product-test
-description: Use to turn a PRD section, user story, feature slice, or behavior description into product test scenarios and pass/fail conditions. Use when the user asks for product testing, acceptance criteria, Given/When/Then scenarios, QA-ready scenarios, pass/fail checks, edge cases, error states, non-functional acceptance checks, or story-level verification.
+description_zh: "把 PRD、用户故事或功能切片转成带稳定编号的 Given/When/Then 产品验收场景、边界、错误恢复和非功能通过条件；用于产品级验收设计，不用于实现或测试自动化。"
+description_en: "Turn a PRD section, user story, feature slice, or behavior description into stable-ID Given/When/Then acceptance scenarios, edge cases, recovery behavior, and non-functional pass/fail conditions. Use for product-level QA and acceptance design, not implementation or test automation."
 ---
 
 # Product Test
@@ -31,7 +32,7 @@ If the feature scope is unclear, ask for the smallest missing context before dra
 
 ## Output Format
 
-Use `references/product-test-template.md` as the default structure. Keep scenarios concise and avoid duplicate coverage.
+Use the [product test template](references/product-test-template.md) as the default structure. Keep scenarios concise and avoid duplicate coverage.
 
 ## Required Boundaries
 

@@ -92,6 +92,7 @@ describe('interactive CLI session privacy boundary', () => {
     ].join('');
     const started = startInteractiveCliSession({
       uid: 'account-a',
+      cid: 'conversation-a',
       command: commandFor(script),
       cwd,
       maxLifetimeMs: 30_000,
@@ -112,6 +113,7 @@ describe('interactive CLI session privacy boundary', () => {
     expect(events.length).toBeGreaterThanOrEqual(4);
     expect(events.every(({ channel }) => channel === 'interactive-cli:event')).toBe(true);
     expect(events.every(({ payload }) => payload.user_id === 'account-a')).toBe(true);
+    expect(events.every(({ payload }) => payload.conversation_id === 'conversation-a')).toBe(true);
     expect(JSON.stringify(events)).not.toContain('secret-code-42');
     expect(terminal.output).toContain('[redacted]');
     expect(terminal.output).not.toContain('secret-code-42');

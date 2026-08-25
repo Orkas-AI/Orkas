@@ -2,7 +2,11 @@ export interface AgentRuntimeStatsBucket {
   attempts: number;
   successes: number;
   deliveries: number;
+  /** Host-observed execution errors used by the current success-rate metric. */
+  execution_failures: number;
+  /** Legacy model-authored semantic failures. Preserved for file compatibility. */
   failures: number;
+  /** Diagnostic runtime errors; historical values may include cancellations. */
   errors: number;
   total_duration_ms: number;
   successful_duration_ms: number;
@@ -24,13 +28,14 @@ const COUNTER_KEYS = [
   'attempts',
   'successes',
   'deliveries',
+  'execution_failures',
   'failures',
   'errors',
   'total_duration_ms',
   'successful_duration_ms',
 ] as const;
 
-export type AgentRunStatus = 'success' | 'failure' | 'error';
+export type AgentRunStatus = 'success' | 'error' | 'cancelled' | 'waiting_input';
 
 function coerceCounter(raw: unknown): number {
   const n = Number(raw);
@@ -46,6 +51,7 @@ export function emptyAgentRuntimeStatsBucket(): AgentRuntimeStatsBucket {
     attempts: 0,
     successes: 0,
     deliveries: 0,
+    execution_failures: 0,
     failures: 0,
     errors: 0,
     total_duration_ms: 0,
@@ -89,6 +95,7 @@ function bucketScore(bucket: AgentRuntimeStatsBucket): number {
   return bucket.attempts
     + bucket.successes
     + bucket.deliveries
+    + bucket.execution_failures
     + bucket.failures
     + bucket.errors
     + bucket.total_duration_ms
@@ -99,9 +106,14 @@ function normalizeRunStatus(
   result: { status?: unknown; success?: unknown; aborted?: unknown; errored?: unknown } = {},
 ): AgentRunStatus {
   const rawStatus = typeof result.status === 'string' ? result.status.trim().toLowerCase() : '';
-  if (rawStatus === 'success' || rawStatus === 'failure' || rawStatus === 'error') return rawStatus;
-  if (result.aborted || result.errored) return 'error';
-  if (result.success === false) return 'failure';
+  if (result.aborted || rawStatus === 'cancelled') return 'cancelled';
+  if (result.errored) return 'error';
+  if (rawStatus === 'success' || rawStatus === 'error'
+      || rawStatus === 'waiting_input') return rawStatus;
+  // Legacy callers used `failure`/`success:false` for a definite failed run.
+  // There is no longer a model-authored semantic-failure bucket; both map to
+  // the host-observed execution-error counter.
+  if (rawStatus === 'failure' || result.success === false) return 'error';
   return 'success';
 }
 
@@ -171,6 +183,7 @@ export function materializeAgentRuntimeStatsFile(
     attempts: totals.attempts,
     successes: totals.successes,
     deliveries: totals.deliveries,
+    execution_failures: totals.execution_failures,
     failures: totals.failures,
     errors: totals.errors,
     total_duration_ms: totals.total_duration_ms,
@@ -191,13 +204,15 @@ export function recordAgentRuntimeStatsForDevice(
   const durationMs = coerceCounter(result.duration_ms ?? result.durationMs);
   const status = normalizeRunStatus(result);
   const success = status === 'success';
-  const failure = status === 'failure';
   const error = status === 'error';
   const nextDevice: AgentRuntimeStatsBucket = {
     attempts: device.attempts + 1,
     successes: device.successes + (success ? 1 : 0),
     deliveries: device.deliveries + (success ? 1 : 0),
-    failures: device.failures + (failure ? 1 : 0),
+    execution_failures: device.execution_failures + (error ? 1 : 0),
+    // Kept for persisted v2 compatibility only. New runs classify only
+    // host-observed execution errors; model self-reported failures are gone.
+    failures: device.failures,
     errors: device.errors + (error ? 1 : 0),
     total_duration_ms: device.total_duration_ms + durationMs,
     successful_duration_ms: device.successful_duration_ms + (success ? durationMs : 0),

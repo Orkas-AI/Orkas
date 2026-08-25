@@ -316,6 +316,15 @@ describe('produced.readText › size cap', () => {
 });
 
 describe('produced.readText › inferred visual HTML layout', () => {
+  it('keeps layout inference bounded on a long brace-free HTML body', async () => {
+    const { _inferHtmlPreviewLayoutFromCssForTest } = await import('../../../src/main/ipc/index');
+    const html = `<style>main { color: #123456; }</style><main>${'preview '.repeat(32_000)}</main>`;
+    const startedAt = performance.now();
+
+    expect(_inferHtmlPreviewLayoutFromCssForTest(html)).toBeNull();
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('recognizes the legacy responsive-poster canvas contract', async () => {
     const { _inferHtmlPreviewLayoutFromCssForTest } = await import('../../../src/main/ipc/index');
     const html = `<style>

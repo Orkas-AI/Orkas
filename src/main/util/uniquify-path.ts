@@ -1,7 +1,7 @@
 /**
  * Path-uniquify helper for write-style tools.
  *
- * `write_file / markdown_to_pdf / html_to_pdf / generate_image` all funnel
+ * `write_file / create_pdf / generate_image` all funnel
  * the resolved absolute output path through `uniquifyPath` so that:
  *
  *   • non-conflicting writes go to the model-given path verbatim — the

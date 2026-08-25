@@ -242,7 +242,7 @@ export { _msgText as readMsgText };
 // ── Contexts (shared knowledge base) ─────────────────────────────────────
 // Content is NOT indexed — only the relPath (directory segments + filename)
 // is tokenized. Full-text content lookup goes through the vector KB
-// (kb_search tool); BM25 here is for path/name navigation only.
+// (`library` search action); BM25 here is for path/name navigation only.
 
 interface ContextFileInfo { rel: string; mtime: number; size: number }
 

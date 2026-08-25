@@ -38,6 +38,22 @@ describe('paths › roots', () => {
     const p = await import('../../src/main/paths');
     expect(p.WS_ROOT).toBe(tmpDir);
   });
+
+  it('isolates global Skill roots during tests', async () => {
+    const previousTestGlobalRoot = process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
+    const isolatedGlobalRoot = path.join(tmpDir, 'test-global-skills');
+    try {
+      process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = isolatedGlobalRoot;
+      const p = await import('../../src/main/paths');
+      expect(p.globalSkillRoots()).toEqual([isolatedGlobalRoot]);
+    } finally {
+      if (previousTestGlobalRoot === undefined) {
+        delete process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
+      } else {
+        process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT = previousTestGlobalRoot;
+      }
+    }
+  });
 });
 
 describe('paths › top-level (users.json / device.json / logs / venv)', () => {

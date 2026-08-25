@@ -58,6 +58,15 @@ function _uiRestoreDialogFocus(previousFocus) {
   }
 }
 
+function _uiKeepDialogFocus(overlay, preferredFocus) {
+  const onFocusIn = (event) => {
+    if (!_uiIsTopDialogOverlay(overlay) || overlay.contains(event.target)) return;
+    if (preferredFocus && typeof preferredFocus.focus === 'function') preferredFocus.focus();
+  };
+  document.addEventListener('focusin', onFocusIn, true);
+  return () => document.removeEventListener('focusin', onFocusIn, true);
+}
+
 function _uiShowDialog({ message, showCancel, okLabel, cancelLabel, signal }) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
@@ -85,6 +94,7 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel, signal }) {
 
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, okBtn);
     let finished = false;
     const onKey = (e) => {
       // IME guard (CLAUDE.md §8) — Enter while composing should commit
@@ -111,6 +121,7 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel, signal }) {
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
       if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
@@ -231,6 +242,7 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, cancelBtn);
     let finished = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
@@ -248,6 +260,7 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);
@@ -308,6 +321,7 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
     document.body.appendChild(overlay);
 
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, cancelBtn);
     let finished = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
@@ -323,6 +337,7 @@ function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLab
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
       if (signal) signal.removeEventListener('abort', onAbort);
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
@@ -374,6 +389,7 @@ function uiPrompt(message, defaultValue = '', options = {}) {
     }
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const releaseFocusGuard = _uiKeepDialogFocus(overlay, input);
     let finished = false;
     const onKey = (e) => {
       // IME guard (CLAUDE.md §8) — Enter while composing in the prompt
@@ -393,6 +409,7 @@ function uiPrompt(message, defaultValue = '', options = {}) {
       if (finished) return;
       finished = true;
       document.removeEventListener('keydown', onKey, true);
+      releaseFocusGuard();
       overlay.remove();
       _uiRestoreDialogFocus(previousFocus);
       resolve(val);

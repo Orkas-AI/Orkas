@@ -73,9 +73,9 @@ class FakeElement {
     this.listeners.set(type, arr);
   }
 
-  dispatch(type: string, ev: any = {}) {
+  async dispatch(type: string, ev: any = {}) {
     if (this.disabled && type === 'click') return;
-    for (const fn of this.listeners.get(type) || []) fn(ev);
+    await Promise.all((this.listeners.get(type) || []).map((fn) => fn(ev)));
   }
 
   querySelectorAll(selector: string): FakeElement[] {
@@ -190,6 +190,40 @@ describe('chat input form widget', () => {
     expect(submissions).toHaveLength(1);
     expect(submissions[0].values).toEqual({ topic: 'growth review' });
     expect(submissions[0].encoded).toContain('<agent-input-submission form_id="abc12345" agent_id="agent-a">');
+  });
+
+  it('unlocks after an async rejection and allows the corrected form to be retried', async () => {
+    const context = loadFormModule();
+    const container = new FakeElement('div');
+    let attempts = 0;
+
+    context.window.renderChatInputForm(container, baseMessage, {
+      cid: 'c1',
+      onSubmit: async () => {
+        attempts += 1;
+        if (attempts === 1) throw new Error('Directory does not exist');
+      },
+    });
+
+    const input = container.querySelectorAll('input')[0];
+    const buttons = container.querySelectorAll('button');
+    const submit = buttons.find((btn) => btn.textContent === 'Submit')!;
+    const reset = buttons.find((btn) => btn.textContent === 'Reset')!;
+    input.value = 'relative/project';
+
+    await submit.dispatch('click');
+
+    expect(attempts).toBe(1);
+    expect(submit.disabled).toBe(false);
+    expect(reset.disabled).toBe(false);
+    expect(input.disabled).toBe(false);
+    expect(container.innerHTML).toContain('Directory does not exist');
+
+    input.value = '/tmp/existing-project';
+    await submit.dispatch('click');
+
+    expect(attempts).toBe(2);
+    expect(submit.disabled).toBe(true);
   });
 
   it('leaves optional blank fields empty in the visible submission summary', () => {

@@ -56,7 +56,7 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
   },
   'src/main/index.ts': {
     suite: 'test/main/index-process.test.ts',
-    evidence: 'spawn',
+    evidence: 'ORKAS_RELAUNCH_OWNER_PID',
   },
   'src/main/features/video_studio.ts': {
     suite: 'test/main/features/video_studio_native_qa.test.ts',

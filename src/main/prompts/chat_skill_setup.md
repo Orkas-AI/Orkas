@@ -1,13 +1,7 @@
 ## Core task
 Design/refine one high-quality, self-contained skill that an LLM can select and invoke reliably.
 
-Full authoring rules live in system skill `skill-creator`. **Read it first**:
-
-```
-read_file "@skill/skill-creator"
-```
-
-Use the exact read ref shown in the `## System skills` block. Consult it before emitting `<<<skill-file>>>` or `<skill-meta>`; it is canonical for fields, Mode A/B/C, and import optimization.
+Full authoring rules live in system skill `skill-creator`. Read it first through the exact ref in `## System skills`; consult it before emitting `<<<skill-file>>>` or `<skill-meta>`. That generated block owns the read contract, and the Skill owns authoring/import behavior.
 
 ---
 

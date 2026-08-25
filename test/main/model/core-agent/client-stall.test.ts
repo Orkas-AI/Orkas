@@ -30,17 +30,28 @@ vi.mock('electron', () => ({
 // `h.makeStream` — read at runStream() call time, so no module reset is needed.
 vi.mock('../../../../src/main/model/core-agent/runner', () => ({
   buildRunner: async (params: Record<string, unknown>) => ({
-    runner: { runStream: () => {
+    runner: { runStream: (runParams: Record<string, unknown>) => {
       h.runStreamCalls += 1;
       h.lastBuildRunnerParams = params;
+      h.lastRunStreamParams = runParams;
       return h.makeStream!();
     } },
+    failureTrackingScope: {},
     resolvedSystemPrompt: 'sys',
     entryId: 'e1',
     profileId: 'p1',
     providerId: 'mock-provider',
     modelId: 'mock-model',
     toolDefs: [],
+    toolSurfaceTelemetry: () => ({
+      mode: 'fixed',
+      peakToolCount: 0,
+      loadCallCount: 0,
+      loadedGroupCount: 0,
+      loadedSchemaChars: 0,
+      loadedUnusedGroupCount: 0,
+      webToolUsed: false,
+    }),
     skillDisplayNameById: {},
     agentDisplayNameById: {},
   }),
@@ -336,6 +347,18 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
       hasAttachments: true,
       attachmentTypes: ['image'],
     });
+  }, 8000);
+
+  it('forwards the host-owned system skill allowlist to buildRunner', async () => {
+    h.makeStream = () => (async function* () { yield { type: 'text_delta', text: 'ok' }; })();
+    h.lastBuildRunnerParams = null;
+
+    await drain({ systemSkillList: ['skill-creator', 'package-installer'] });
+
+    expect(h.lastBuildRunnerParams?.systemSkillList).toEqual([
+      'skill-creator',
+      'package-installer',
+    ]);
   }, 8000);
 
   it('does not serialize identical session ids that belong to different accounts', async () => {

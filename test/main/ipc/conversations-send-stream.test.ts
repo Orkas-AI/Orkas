@@ -12,9 +12,14 @@ type StreamCancelFn = (
   event: { sender: { getURL: () => string } },
   requestId: unknown,
 ) => void;
+type InvokeFn = (
+  event: { sender: { getURL: () => string } },
+  req: { channel: string; payload?: unknown },
+) => Promise<Record<string, unknown>>;
 
 let streamStartHandler: StreamStartFn | null = null;
 let streamCancelHandler: StreamCancelFn | null = null;
+let invokeHandler: InvokeFn | null = null;
 
 const groupChatMock = vi.hoisted(() => ({
   subscribers: new Set<(ev: unknown) => void>(),
@@ -30,7 +35,9 @@ const groupChatMock = vi.hoisted(() => ({
 
 vi.mock('electron', () => ({
   ipcMain: {
-    handle: vi.fn(),
+    handle: (channel: string, fn: InvokeFn) => {
+      if (channel === 'orkas.invoke') invokeHandler = fn;
+    },
     on: (channel: string, fn: StreamStartFn | StreamCancelFn) => {
       if (channel === 'orkas.streamStart') streamStartHandler = fn as StreamStartFn;
       if (channel === 'orkas.streamCancel') streamCancelHandler = fn as StreamCancelFn;
@@ -74,6 +81,7 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   streamStartHandler = null;
   streamCancelHandler = null;
+  invokeHandler = null;
   groupChatMock.subscribers.clear();
   groupChatMock.quiescent = false;
   groupChatMock.releaseSend = null;
@@ -92,6 +100,55 @@ beforeEach(async () => {
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+async function callGroupChatSend(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (!invokeHandler) throw new Error('invoke handler not registered');
+  return invokeHandler(
+    { sender: trustedIpcSender() },
+    { channel: 'groupChat.send', payload },
+  );
+}
+
+describe('ipc › groupChat.send active-turn control', () => {
+  it('forwards explicit active-turn authorization', async () => {
+    const run = callGroupChatSend({
+      cid: 'c123abc',
+      content: 'Apply this constraint now',
+      steer_active_turn: true,
+    });
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      text: 'Apply this constraint now',
+      steerActiveTurn: true,
+    }]);
+    groupChatMock.releaseSend?.();
+    await expect(run).resolves.toMatchObject({ ok: true });
+  });
+
+  it.each([
+    ['a missing control', {}],
+    ['an explicit false control', { steer_active_turn: false }],
+    ['a string lookalike', { steer_active_turn: 'true' }],
+  ])('requires an explicit true control for %s', async (_label, control) => {
+    const run = callGroupChatSend({
+      cid: 'c123abc',
+      content: 'Keep this queued',
+      ...control,
+    });
+
+    await groupChatMock.sendStarted;
+    expect(groupChatMock.sendCalls).toEqual([{
+      userId: TEST_UID,
+      cid: 'c123abc',
+      text: 'Keep this queued',
+    }]);
+    groupChatMock.releaseSend?.();
+    await expect(run).resolves.toMatchObject({ ok: true });
+  });
 });
 
 describe('ipc › conversations.sendStream', () => {

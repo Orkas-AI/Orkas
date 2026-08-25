@@ -76,10 +76,13 @@ function allFilesExist(files) {
 function extractTarballInTarget(targetDir, tarball, deps = {}) {
   const fsImpl = deps.fsImpl || fs;
   const runImpl = deps.runImpl || run;
-  // This helper always prepares a Windows target, including when its behavior
-  // is validated from a non-Windows host.
-  const archiveName = path.win32.basename(tarball);
-  const localTarball = path.win32.join(targetDir, archiveName);
+  // Cross-builds use host-native paths even though the extracted package is a
+  // Windows target. Keep Windows-shaped paths testable from a non-Windows host.
+  const pathImpl = path.win32.isAbsolute(targetDir) && !path.posix.isAbsolute(targetDir)
+    ? path.win32
+    : path.posix.isAbsolute(targetDir) ? path.posix : path;
+  const archiveName = pathImpl.basename(tarball);
+  const localTarball = pathImpl.join(targetDir, archiveName);
   fsImpl.copyFileSync(tarball, localTarball);
   try {
     // GNU tar treats a Windows absolute archive path (`C:\...`) as a remote

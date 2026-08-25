@@ -39,7 +39,8 @@ import {
 import { nowIso, genUserId, safeId, readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 import { notifyUserSwitch } from './user-switch-hooks';
-import { sweepToolResults } from '../util/tool-result-cap';
+import { sweepExpiredCloudToolResults, sweepToolResults } from '../util/tool-result-cap';
+import { listCloudSessionToolResultsDirs } from '../util/project-layout';
 import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateChatsGhostCleanup } from '../util/migrate-chats-ghost-cleanup';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
@@ -345,10 +346,19 @@ function activateUserInternal(uid: string, switchCleanupComplete: boolean): void
   // Bound the machine-local Result Store on user activation: purge entries
   // older than 7 days, then evict oldest remaining session entries above the
   // default 1GB quota. Best-effort; failure must not block activation. These
-  // are CLI/local-agent outputs. Resumable core-agent refs live beside their
-  // cloud session and are deleted with that conversation's lifecycle.
+  // are CLI/local-agent outputs.
   try { sweepToolResults(userToolResultsDir(uid), 7); }
   catch (err) { log.warn('sweepToolResults failed', { uid: maskId(uid), error: (err as Error).message }); }
+
+  // Resumable core-agent refs live beside their cloud session, sync to the
+  // server and every device, and used to be reclaimed only with their
+  // conversation — a long-lived chat grew without bound. Expire individual
+  // files at 30 days, capped per activation so one sync pass stays under the
+  // engine's mass-delete confirmation; the sync reconcile turns these local
+  // removals into ordinary delete ops. E_RESULT_REF_MISSING tells the model
+  // the retention window and to re-run the tool.
+  try { sweepExpiredCloudToolResults(listCloudSessionToolResultsDirs(uid)); }
+  catch (err) { log.warn('cloud tool-results sweep failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Strip legacy session_id prefixes (aiteam- / orkas-) once.
   // Idempotent: after the stamp lands, subsequent startups are no-ops.

@@ -220,7 +220,22 @@ function checkHtml(entryPath, html) {
     })
     .filter((error) => error.id && /(?:^|[\s_-])(?:error|invalid)(?:[\s_-]|$)|\balert\b/i.test(error.semantic));
 
+  // Which control an error id conventionally belongs to, when exactly one claims
+  // it. Used below to tell "this field's error" from "another field's error".
+  const errorById = new Map(fieldErrors.map((error) => [error.id, error]));
+  const conventionalOwner = new Map();
+  for (const error of fieldErrors) {
+    const owners = formControls.filter((control) => control.id && [
+      `${control.id}-error`,
+      `${control.id}_error`,
+      `${control.id}-invalid`,
+      `${control.id}_invalid`,
+    ].includes(error.id));
+    if (owners.length === 1) conventionalOwner.set(error.id, owners[0]);
+  }
+
   const inaccessibleFieldErrors = [];
+  const overreachingFieldErrors = [];
   for (const control of formControls) {
     for (const targetId of control.describedBy) {
       if (!/(?:^|[-_])(?:error|invalid)(?:[-_]|$)/i.test(targetId)) continue;
@@ -234,6 +249,29 @@ function checkHtml(entryPath, html) {
         warn(
           'form-error-accessibility',
           `${control.id || control.name} -> ${targetId} has an ambiguous aria-describedby target (${targetCount} matching ids)`,
+        );
+      }
+      // The check used to run one way only, counting errors a control failed to
+      // reference. Referencing every error id on the page satisfied that
+      // unconditionally, and a 2026-08-09 artifact did exactly it: all eight
+      // inputs across sign-in, register and recovery carried all eight error
+      // ids, so focusing the sign-in email announced the register terms error
+      // and the recovery email error, from forms that were not even on screen.
+      const target = errorById.get(targetId);
+      if (!target) continue;
+      if (target.formIndex !== control.formIndex) {
+        overreachingFieldErrors.push(
+          `${control.id || control.name} -> ${targetId} belongs to another form`,
+        );
+        continue;
+      }
+      // Inside one form, a shared container every control points at is a
+      // legitimate pattern, so only an id another field conventionally owns
+      // counts as reaching across.
+      const owner = conventionalOwner.get(targetId);
+      if (owner && owner !== control) {
+        overreachingFieldErrors.push(
+          `${control.id || control.name} -> ${targetId} belongs to ${owner.id}`,
         );
       }
     }
@@ -279,6 +317,12 @@ function checkHtml(entryPath, html) {
     fail(
       'form-error-accessibility',
       `custom field errors must be linked to their controls: ${inaccessibleFieldErrors.join('; ')}`,
+    );
+  } else if (overreachingFieldErrors.length) {
+    fail(
+      'form-error-accessibility',
+      'a control may only describe its own errors; a screen reader reads every '
+      + `referenced id aloud: ${overreachingFieldErrors.join('; ')}`,
     );
   } else {
     pass('form-error-accessibility');

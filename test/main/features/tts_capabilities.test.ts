@@ -145,7 +145,7 @@ describe('TTS runtime capabilities', () => {
     });
   });
 
-  it('rejects a signed language that the configured voice does not support', async () => {
+  it('resolves a signed language when the configured voice declares no language', async () => {
     process.env.ORKAS_TTS_BASE_URL = 'https://example.invalid/v1';
     process.env.ORKAS_TTS_API_KEY = 'secret';
     process.env.ORKAS_TTS_MODEL = 'tts-model';
@@ -157,8 +157,33 @@ describe('TTS runtime capabilities', () => {
       voiceRef: route.defaultVoiceRef,
       language: 'zh-CN',
     })).resolves.toMatchObject({
-      ok: false,
-      errorCode: 'E_TTS_LANGUAGE_UNSUPPORTED',
+      ok: true,
+      selection: {
+        routeRef: 'env:tts',
+        providerVoiceId: 'configured-voice',
+        language: 'zh-CN',
+      },
+    });
+  });
+
+  it('uses the configured default voice when only its language is signed', async () => {
+    process.env.ORKAS_TTS_BASE_URL = 'https://example.invalid/v1';
+    process.env.ORKAS_TTS_API_KEY = 'secret';
+    process.env.ORKAS_TTS_MODEL = 'tts-model';
+    process.env.ORKAS_TTS_VOICE = 'configured-voice';
+
+    const [route] = await listTtsCapabilities();
+    await expect(resolveTtsSelection({
+      routeRef: route.routeRef,
+      language: 'zh-CN',
+    })).resolves.toMatchObject({
+      ok: true,
+      selection: {
+        routeRef: 'env:tts',
+        voiceRef: route.defaultVoiceRef,
+        providerVoiceId: 'configured-voice',
+        language: 'zh-CN',
+      },
     });
   });
 });

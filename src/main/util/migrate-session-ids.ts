@@ -50,9 +50,9 @@ const MIGRATION_TAG = 'drop-session-id-uid-prefix-v2';
  *  succeed. Order in the alternation: longest first so `extract-img` matches whole, not as
  *  `extract` + leftover. */
 const FILENAME_PREFIX_RE =
-  /^.+?-(?=(?:gmember|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli|sub|organizer|conv)(?:-|\.jsonl$))/;
+  /^.+?-(?=(?:gmember|gconv|extract-img|reflect|skill|agent|anon|cli|sub|organizer|conv)(?:-|\.jsonl$))/;
 const SID_PREFIX_RE =
-  /^.+?-(?=(?:gmember|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli|sub|organizer|conv)(?:-|$))/;
+  /^.+?-(?=(?:gmember|gconv|extract-img|reflect|skill|agent|anon|cli|sub|organizer|conv)(?:-|$))/;
 
 function migrationsFile(uid: string): string {
   // userLocalConfigDir = <uid>/local/config; up one to <uid>/local/

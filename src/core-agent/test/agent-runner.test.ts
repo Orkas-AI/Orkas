@@ -5,6 +5,7 @@ import path from "node:path";
 import { Mutex } from "async-mutex";
 import {
   AgentRunner,
+  CONTEXT_COMPACTION_EMPTY_SUMMARY_CODE,
   CONTEXT_COMPACTION_FIRST_EVENT_TIMEOUT_MS,
   CONTEXT_COMPACTION_IDLE_TIMEOUT_CODE,
   CONTEXT_COMPACTION_IDLE_TIMEOUT_MS,
@@ -13,51 +14,28 @@ import {
   CONTEXT_COMPACTION_TIMEOUT_MS,
   LOOP_HARD,
   NEAR_DUP_LOOP_WARN,
-  NEAR_DUP_LOOP_HARD,
   RUN_DISCOVERY_NUDGE_ROUNDS,
   RUN_DISCOVERY_STOP_ROUNDS,
   RUN_NO_PROGRESS_NUDGE_ROUNDS,
   RUN_NO_PROGRESS_STOP_ROUNDS,
   toolResultLedgerSummary,
-  MAX_INLINE_TOOL_RESULT_TOKENS_PER_ROUND,
   MAX_CONSECUTIVE_COMPACTION_FAILURES,
   calculateToolResultInlineBudget,
   errorCodeForMeta,
   runConvergenceSoftToolLoopThreshold,
 } from "../src/agent/runner.js";
-import type {
-  SharedHistorySummaryCache,
-  SharedHistorySummaryCheckpoint,
-} from "../src/agent/runner.js";
+import { MAX_INLINE_TOOL_RESULT_TOKENS_PER_ROUND } from "../src/agent/context-budget.js";
 import { createConfig } from "../src/config/loader.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
-import { defineTool } from "../src/tools/base.js";
+import { defineTool, type ToolContext, type ToolResult } from "../src/tools/base.js";
 import type { AgentRunEvent } from "../src/agent/types.js";
 import type { LLMProvider, CompletionParams, CompletionResult } from "../src/providers/base.js";
 import type { Message, MessageContent, StreamEvent } from "../src/shared/types.js";
 import { ContextOverflowError, RateLimitError, StorageFullError } from "../src/shared/errors.js";
 import { buildProgressStopFallback, recordToolObservation } from "../src/agent/runner.js";
-import { ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING, Session } from "../src/agent/session.js";
+import { ACTIVE_CHECKPOINT_EXACT_FACTS_HEADING, HISTORY_EXACT_FACTS_HEADING, Session } from "../src/agent/session.js";
 import { PersistentSession } from "../src/agent/persistent-session.js";
-
-function canonicalHistorySession(source = "group-main-v1:shared-history-test"): Session {
-  const session = new Session();
-  const messages: Message[] = [];
-  for (let turnId = 1; turnId <= 15; turnId++) {
-    messages.push({
-      role: "user",
-      turnId,
-      content: [{ type: "text", text: `Canonical user ${turnId} ${"request ".repeat(400)}` }],
-    });
-    messages.push({
-      role: "assistant",
-      turnId,
-      content: [{ type: "text", text: `Canonical answer ${turnId} ${"response ".repeat(400)}` }],
-    });
-  }
-  session.replaceConversationHistory(messages, source);
-  return session;
-}
+import { LoopGuards } from "../src/agent/loop-guards.js";
 
 async function collectRunEvents(
   runner: AgentRunner,
@@ -104,7 +82,10 @@ describe("runner error metadata", () => {
 });
 
 /** Create a mock LLM provider that returns predefined responses. */
-function createMockProvider(responses: CompletionResult[], onStream?: (params: CompletionParams) => void): LLMProvider {
+function createMockProvider(
+  responses: Array<CompletionResult & { effectiveMaxTokens?: number }>,
+  onStream?: (params: CompletionParams) => void,
+): LLMProvider {
   let callIdx = 0;
   const pick = () =>
     callIdx >= responses.length ? responses[responses.length - 1] : responses[callIdx++];
@@ -133,6 +114,7 @@ function createMockProvider(responses: CompletionResult[], onStream?: (params: C
         usage: r.usage,
         content: r.content,
         model: r.model,
+        ...(r.effectiveMaxTokens !== undefined ? { effectiveMaxTokens: r.effectiveMaxTokens } : {}),
       };
     },
     async validateAuth() {
@@ -164,7 +146,91 @@ describe("tool-result inline budget", () => {
   });
 });
 
+describe("estimator calibration wiring", () => {
+  // The ratio itself is unit-tested in session.test.ts; these pin the runner's
+  // anchor block as the single production writer.
+  it("feeds the anchored real/estimated pair into session calibration after a completed call", async () => {
+    const provider = createMockProvider([{
+      content: [{ type: "text", text: "done" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 200, outputTokens: 10, totalTokens: 210 },
+      model: "mock-model",
+    }]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    // ~40K chars of user text estimate to ~10K tokens while the provider
+    // reports a 210-token real footprint: the observed ratio clamps at the
+    // 0.5 floor, which is only reachable through the anchor wiring.
+    await collectRunEvents(runner, `analyze this\n${"z".repeat(40_000)}`);
+    expect(session.getEstimatorCalibration()).toBe(0.5);
+  });
+
+  it("keeps calibration untouched when a call reports no usable prompt accounting", async () => {
+    const provider = createMockProvider([{
+      content: [{ type: "text", text: "done" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 0, outputTokens: 10, totalTokens: 10 },
+      model: "mock-model",
+    }]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    session.setEstimatorCalibration(7, 10);
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    await collectRunEvents(runner, "quick question");
+    expect(session.getEstimatorCalibration()).toBe(0.7);
+  });
+});
+
 describe("AgentRunner", () => {
+  it("forwards structured reasoning fragments as process events", async () => {
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock Provider",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("unexpected complete call");
+      },
+      async *stream(): AsyncIterable<StreamEvent> {
+        yield { type: "message_start" };
+        yield { type: "thinking_start" };
+        yield { type: "thinking_delta", chars: 21, text: "reviewing constraints" };
+        yield { type: "thinking_end" };
+        yield { type: "text_delta", text: "final answer" };
+        yield {
+          type: "message_end",
+          stopReason: "end_turn",
+          usage: { inputTokens: 5, outputTokens: 8, totalTokens: 13 },
+          content: [
+            { type: "thinking", thinking: "private chain of thought" },
+            { type: "text", text: "final answer" },
+          ],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session: new Session() });
+
+    const events = await collectRunEvents(runner, "solve it");
+    expect(events.filter((event) => event.type === "thinking")).toEqual([
+      { type: "thinking", phase: "start", chars: 0 },
+      { type: "thinking", phase: "progress", chars: 21, text: "reviewing constraints" },
+      { type: "thinking", phase: "end", chars: 21 },
+    ]);
+    expect(JSON.stringify(events.filter((event) => event.type === "thinking")))
+      .not.toContain("private chain of thought");
+    expect(events).toContainEqual({ type: "text_delta", text: "final answer" });
+  });
+
   it("resumes a verified active turn without projecting away its tool state", async () => {
     let modelMessages: Message[] = [];
     const mockProvider = createMockProvider([{
@@ -199,6 +265,88 @@ describe("AgentRunner", () => {
     expect(JSON.stringify(modelMessages)).toContain("Continue from durable state");
     expect(session.getMessages().every((message) => message.turnId === originalTurnId)).toBe(true);
     expect(session.getSerializedContextState()?.completedTurns.map((turn) => turn.id)).toEqual([originalTurnId]);
+  });
+
+  it("does not re-commit the identical message a transparent retry resumes with", async () => {
+    const mockProvider = createMockProvider([{
+      content: [{ type: "text", text: "finished on retry" }],
+      stopReason: "end_turn",
+      usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+      model: "mock-model",
+    }]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    // Attempt 0 committed the user's message and failed before any reply.
+    session.beginUserTurn([{ type: "text", text: "把 PPT 做完" }]);
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    // The bus's in-turn channel retry passes the original message verbatim.
+    const result = await runner.run({ message: "把 PPT 做完", resumeActiveTurn: true });
+
+    expect(result.text).toBe("finished on retry");
+    const userCopies = session.getMessages().filter((m) =>
+      m.role === "user"
+      && m.content.some((c) => c.type === "text" && c.text === "把 PPT 做完"));
+    // One copy in the turn: the retry resumed it instead of re-billing it
+    // on every remaining request round.
+    expect(userCopies).toHaveLength(1);
+  });
+
+  it("keeps accumulated cache usage in a failed run's result meta", async () => {
+    let calls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock Provider",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("unexpected complete call");
+      },
+      async *stream() {
+        if (calls++ > 0) throw new Error("provider disconnected");
+        const content: CompletionResult["content"] = [{
+          type: "tool_use",
+          id: "cache-usage-call",
+          name: "noop_tool",
+          input: {},
+        }];
+        yield { type: "message_start" as const };
+        yield {
+          type: "message_end" as const,
+          stopReason: "tool_use" as const,
+          usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 4000, cacheWriteTokens: 900, totalTokens: 5020 },
+          content,
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const noop = defineTool({
+      name: "noop_tool",
+      description: "No-op",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 0 },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
+
+    const failed = await runner.run({ message: "run one tool round then fail" });
+
+    expect(failed.meta.error?.kind).toBe("provider_error");
+    // A failed run's cache spend is still billed spend: the host's cost
+    // telemetry chokepoint reads meta.usage verbatim, so the cache components
+    // accumulated before the failure must survive the error path.
+    expect(failed.meta.usage).toMatchObject({
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 4000,
+      cacheWriteTokens: 900,
+      totalTokens: 5020,
+    });
   });
 
   it("restores a failed tool turn from disk and executes only its remaining work", async () => {
@@ -298,13 +446,12 @@ describe("AgentRunner", () => {
           resumedRequests.push(params);
           const context = JSON.stringify(params.messages);
           const hasDurablePhaseA = context.includes("phase A complete; artifact=report-outline.md")
-            && context.includes("Completed work ledger")
-            && context.includes("[succeeded] phase_a");
+            && !context.includes("Completed work ledger");
           const response: CompletionResult = resumedProviderCalls++ === 0
             ? {
-                // Make the next action depend on recovered state. Without both
-                // the raw result and ledger, this fixture deliberately repeats
-                // phase A and the assertions below fail.
+                // Make the next action depend on recovered state. The raw
+                // tool_result is authoritative while visible, so a duplicate
+                // ledger projection deliberately fails this fixture.
                 content: [{
                   type: "tool_use",
                   id: hasDurablePhaseA ? "phase-b-call" : "phase-a-repeat-call",
@@ -358,7 +505,7 @@ describe("AgentRunner", () => {
       const firstResumedContext = JSON.stringify(resumedRequests[0].messages);
       expect(firstResumedContext).toContain("Complete phases A and B");
       expect(firstResumedContext).toContain("phase A complete; artifact=report-outline.md");
-      expect(firstResumedContext).toContain("Completed work ledger");
+      expect(firstResumedContext).not.toContain("Completed work ledger");
       expect(firstResumedContext).toContain("Continue from the durable failed-turn state");
       expect(resumed.text).toBe("Both phases are complete.");
       expect(phaseACalls).toBe(1);
@@ -459,7 +606,7 @@ describe("AgentRunner", () => {
     expect(done?.type === "done" ? done.result.text : null).toBe("continued");
   });
 
-  it("continues a text-only max_tokens response once and persists one merged assistant reply", async () => {
+  it("continues a text-only max_tokens response and persists one merged assistant reply", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -467,12 +614,14 @@ describe("AgentRunner", () => {
         stopReason: "max_tokens",
         usage: { inputTokens: 80, outputTokens: 4096, totalTokens: 4176 },
         model: "mock-model",
+        effectiveMaxTokens: 3_584,
       },
       {
         content: [{ type: "text", text: "Shared bridge\nSection two complete." }],
         stopReason: "end_turn",
         usage: { inputTokens: 95, outputTokens: 8, totalTokens: 103 },
         model: "mock-model",
+        effectiveMaxTokens: 3_000,
       },
     ], (params) => requests.push(params));
 
@@ -495,7 +644,18 @@ describe("AgentRunner", () => {
     const session = new Session();
     const runner = new AgentRunner({ config, providers: registry, tools: [], session });
     const events: AgentRunEvent[] = [];
-    for await (const event of runner.runStream({ message: "write a large file" })) events.push(event);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const info = vi.spyOn(console, "info").mockImplementation(() => {});
+    let warningCalls: unknown[][] = [];
+    let infoCalls: unknown[][] = [];
+    try {
+      for await (const event of runner.runStream({ message: "write a large file" })) events.push(event);
+    } finally {
+      warningCalls = warning.mock.calls.map((call) => [...call]);
+      infoCalls = info.mock.calls.map((call) => [...call]);
+      warning.mockRestore();
+      info.mockRestore();
+    }
     const done = events.find((event) => event.type === "done");
     expect(done?.type).toBe("done");
     if (done?.type !== "done") throw new Error("missing done event");
@@ -505,6 +665,14 @@ describe("AgentRunner", () => {
     expect(done.result.meta.stopReason).toBe("end_turn");
     expect(done.result.meta.usage).toMatchObject({ inputTokens: 175, outputTokens: 4104, totalTokens: 4279 });
     expect(done.result.meta.convergenceSignals).toContain("output_limit_continuation");
+    expect(warningCalls.find((call) => call[1] === "output_limit_detected")?.[2]).toMatchObject({
+      effectiveMaxTokens: 3_584,
+      recoveryPath: "text_continuation_scheduled",
+    });
+    expect(infoCalls.find((call) => call[1] === "output_limit_recovered")?.[2]).toMatchObject({
+      effectiveMaxTokens: 3_000,
+      recoveryPath: "text_continuation_recovered",
+    });
     expect(events.filter((event) => event.type === "text_delta")).toEqual([
       { type: "text_delta", text: "Section one.\nShared bridge" },
       { type: "text_delta", text: "\nSection two complete." },
@@ -514,7 +682,9 @@ describe("AgentRunner", () => {
     expect(requests[0].tools?.length).toBeGreaterThan(0);
     expect(requests[1].tools).toBeUndefined();
     expect(JSON.stringify(requests[1].messages)).toContain("Section one.\\nShared bridge");
-    expect(JSON.stringify(requests[1].messages)).toContain("Continue only the unfinished final answer");
+    const continuationMessages = JSON.stringify(requests[1].messages);
+    expect(continuationMessages).toContain("Continue from the exact stopping point");
+    expect(continuationMessages).not.toContain("during reasoning before producing a final answer");
     const persisted = session.getMessages();
     expect(persisted.filter((message) => message.role === "assistant")).toEqual([{
       role: "assistant",
@@ -569,6 +739,85 @@ describe("AgentRunner", () => {
     });
   });
 
+  it("turns a thinking-only max_tokens response into a final answer without lowering reasoning", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "thinking", thinking: "Completed reasoning", thinkingSignature: "reasoning_content" },
+        ],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 20, outputTokens: 100, totalTokens: 120 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Final answer from the completed reasoning." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 30, outputTokens: 10, totalTokens: 40 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [], session })
+      .run({ message: "analyze and answer", thinkingLevel: "high" });
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.reasoning)).toEqual(["high", "high"]);
+    expect(requests[1].tools).toBeUndefined();
+    expect(requests[1].messages.at(-2)?.content).toEqual([
+      expect.objectContaining({ type: "thinking", thinking: "Completed reasoning" }),
+    ]);
+    const recoveryMessages = JSON.stringify(requests[1].messages);
+    expect(recoveryMessages).toContain("Use the reasoning already completed");
+    expect(recoveryMessages).not.toContain("Continue from the exact stopping point");
+    expect(result.text).toBe("Final answer from the completed reasoning.");
+    expect(result.meta.stopReason).toBe("end_turn");
+    expect(result.meta.error).toBeUndefined();
+    expect(session.getMessages().filter((message) => message.role === "assistant")).toEqual([{
+      role: "assistant",
+      turnId: expect.any(Number),
+      content: [
+        expect.objectContaining({ type: "thinking", thinking: "Completed reasoning" }),
+        { type: "text", text: "Final answer from the completed reasoning." },
+      ],
+    }]);
+  });
+
+  it("stops after one thinking recovery when the model still produces no final answer", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "thinking", thinking: "First long reasoning" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 10, outputTokens: 100, totalTokens: 110 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "thinking", thinking: "More long reasoning" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 20, outputTokens: 100, totalTokens: 120 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [], session })
+      .run({ message: "analyze and answer", thinkingLevel: "high" });
+
+    expect(requests).toHaveLength(2);
+    expect(requests.map((request) => request.reasoning)).toEqual(["high", "high"]);
+    expect(result.meta.error).toMatchObject({ kind: "provider_error", code: "OUTPUT_LIMIT" });
+    expect(result.meta.error?.message).toContain("while reasoning");
+    expect(session.getMessages().filter((message) => message.role === "assistant")).toEqual([]);
+  });
+
   it("does not delete new continuation text for a coincidental short boundary match", async () => {
     const mockProvider = createMockProvider([
       {
@@ -594,7 +843,7 @@ describe("AgentRunner", () => {
     expect(result.text).toBe('{"value":"xx"}');
   });
 
-  it("keeps the merged text visible and marks the run incomplete when the one continuation also reaches max_tokens", async () => {
+  it("keeps all merged text visible and marks the run incomplete after three continuations reach max_tokens", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -609,6 +858,18 @@ describe("AgentRunner", () => {
         usage: { inputTokens: 30, outputTokens: 100, totalTokens: 130 },
         model: "mock-model",
       },
+      {
+        content: [{ type: "text", text: ". Part C is still being written" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 40, outputTokens: 100, totalTokens: 140 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: ". Part D is still incomplete" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 50, outputTokens: 100, totalTokens: 150 },
+        model: "mock-model",
+      },
     ], (params) => requests.push(params));
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => mockProvider);
@@ -618,20 +879,94 @@ describe("AgentRunner", () => {
     const result = await new AgentRunner({ config, providers: registry, tools: [], session })
       .run({ message: "write a very long report" });
 
-    expect(requests).toHaveLength(2);
-    expect(result.text).toBe("Part A complete.\nPart B is still being written");
+    expect(requests).toHaveLength(4);
+    expect(result.text).toBe(
+      "Part A complete.\nPart B is still being written. Part C is still being written. Part D is still incomplete",
+    );
     expect(result.meta.error).toBeUndefined();
     expect(result.meta.stopReason).toBe("max_tokens");
     expect(result.meta.convergenceSignals).toEqual(expect.arrayContaining([
       "output_limit_continuation",
       "output_limit_unrecovered",
     ]));
-    expect(result.meta.usage).toMatchObject({ inputTokens: 50, outputTokens: 200, totalTokens: 250 });
+    expect(result.meta.usage).toMatchObject({ inputTokens: 140, outputTokens: 400, totalTokens: 540 });
     expect(session.getMessages().filter((message) => message.role === "assistant")).toHaveLength(1);
-    expect(JSON.stringify(session.getMessages())).toContain("Part B is still being written");
+    expect(JSON.stringify(session.getMessages())).toContain("Part D is still incomplete");
   });
 
-  it("does not let an unfinished execution plan trigger a third request after continuation is exhausted", async () => {
+  it("recovers successfully when the third continuation completes the answer", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "text", text: "Part A. " }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 10, outputTokens: 100, totalTokens: 110 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Part B. " }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 20, outputTokens: 100, totalTokens: 120 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Part C. " }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 30, outputTokens: 100, totalTokens: 130 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Part D complete." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [] })
+      .run({ message: "write a long answer" });
+
+    expect(requests).toHaveLength(4);
+    expect(requests.slice(1).every((request) => request.tools === undefined)).toBe(true);
+    expect(result.text).toBe("Part A. Part B. Part C. Part D complete.");
+    expect(result.meta.stopReason).toBe("end_turn");
+    expect(result.meta.convergenceSignals).toContain("output_limit_continuation");
+    expect(result.meta.convergenceSignals).not.toContain("output_limit_unrecovered");
+  });
+
+  it("stops continuation retries immediately when the model adds no new text", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "text", text: "Stable partial text" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 10, outputTokens: 100, totalTokens: 110 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Stable partial text" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 20, outputTokens: 100, totalTokens: 120 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [] })
+      .run({ message: "write a long answer" });
+
+    expect(requests).toHaveLength(2);
+    expect(result.text).toBe("Stable partial text");
+    expect(result.meta.stopReason).toBe("max_tokens");
+    expect(result.meta.convergenceSignals).toContain("output_limit_unrecovered");
+  });
+
+  it("does not let an unfinished execution plan trigger a fifth request after three continuations are exhausted", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -641,9 +976,21 @@ describe("AgentRunner", () => {
         model: "mock-model",
       },
       {
-        content: [{ type: "text", text: "Remaining analysis is incomplete" }],
+        content: [{ type: "text", text: "Remaining analysis part one. " }],
         stopReason: "max_tokens",
         usage: { inputTokens: 30, outputTokens: 100, totalTokens: 130 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Part two. " }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 40, outputTokens: 100, totalTokens: 140 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Still incomplete" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 50, outputTokens: 100, totalTokens: 150 },
         model: "mock-model",
       },
     ], (params) => requests.push(params));
@@ -662,8 +1009,8 @@ describe("AgentRunner", () => {
     const result = await new AgentRunner({ config, providers: registry, tools: [], session })
       .run({ message: "Continue", resumeActiveTurn: true });
 
-    expect(requests).toHaveLength(2);
-    expect(result.text).toBe("Verified findings.\nRemaining analysis is incomplete");
+    expect(requests).toHaveLength(4);
+    expect(result.text).toBe("Verified findings.\nRemaining analysis part one. Part two. Still incomplete");
     expect(result.meta.stopReason).toBe("max_tokens");
     expect(result.meta.convergenceSignals).toContain("output_limit_unrecovered");
   });
@@ -726,6 +1073,54 @@ describe("AgentRunner", () => {
     expect(JSON.stringify(session.getMessages())).not.toContain("I will write the file.");
     expect(JSON.stringify(session.getMessages())).not.toContain("partial-write");
     expect(JSON.stringify(session.getMessages())).toContain("complete-write");
+  });
+
+  it("commits salvaged text to the session when tool-call retries exhaust the output limit", async () => {
+    // W2-3 (weekly review): exhausting the bounded tool retries used to throw
+    // with NOTHING committed — the user's screen kept the streamed partial,
+    // but a follow-up "continue" regenerated the whole turn from the
+    // pre-overrun state. The session must keep the final attempt's complete
+    // text parts plus an explicit marker that the dropped tool call did NOT
+    // run; the incomplete tool_use itself must never be committed.
+    const truncated = (attempt: number) => ({
+      content: [
+        { type: "text" as const, text: `Attempt ${attempt}: analysis so far — the report needs three sections.` },
+        { type: "tool_use" as const, id: `partial-${attempt}`, name: "write_file", input: { path: "report.md" } },
+      ],
+      stopReason: "max_tokens" as const,
+      usage: { inputTokens: 40, outputTokens: 80, totalTokens: 120 },
+      model: "mock-model",
+    });
+    const mockProvider = createMockProvider([truncated(1), truncated(2), truncated(3)]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    const writes: unknown[] = [];
+    const writeFile = defineTool({
+      name: "write_file",
+      description: "Write a bounded file chunk",
+      inputSchema: { type: "object", properties: {} },
+      async execute(input) {
+        writes.push(input);
+        return { content: "written" };
+      },
+    });
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [writeFile], session })
+      .run({ message: "write the report" });
+
+    expect(result.meta.error?.kind).toBe("provider_error");
+    expect(result.meta.error?.code).toBe("OUTPUT_LIMIT");
+    expect(writes).toEqual([]);
+    const persisted = JSON.stringify(session.getMessages());
+    // The final attempt's complete text survives with the truncation marker…
+    expect(persisted).toContain("Attempt 3: analysis so far");
+    expect(persisted).toContain("that tool call was NOT executed");
+    // …while no incomplete tool_use ever enters the session.
+    expect(persisted).not.toContain("partial-1");
+    expect(persisted).not.toContain("partial-2");
+    expect(persisted).not.toContain("partial-3");
   });
 
   it("executes complete calls above retry guidance and regenerates only the truncated append", async () => {
@@ -996,7 +1391,157 @@ describe("AgentRunner", () => {
     expect(runner.getSession().getExecutionPlan()).toBeUndefined();
   });
 
-  it("registers manage_execution_plan and injects its durable anchor on the next model loop", async () => {
+  it("refreshes provider schemas after a runtime tool activates another tool", async () => {
+    const requests: CompletionParams[] = [];
+    const active = new Set(["tool_load"]);
+    const provider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "load-1", name: "tool_load", input: { groups: ["web"] } }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "tool_use", id: "web-1", name: "web_search", input: { query: "Orkas" } }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 6, outputTokens: 1, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const loadTool = defineTool({
+      name: "tool_load",
+      description: "Load a tool group",
+      inputSchema: { type: "object", properties: { groups: { type: "array" } } },
+      async execute() {
+        active.add("web_search");
+        return { content: "loaded" };
+      },
+    });
+    const webTool = defineTool({
+      name: "web_search",
+      description: "Search the web",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      async execute() { return { content: "result" }; },
+    });
+
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [loadTool, webTool],
+      isToolActive: (name) => active.has(name),
+    });
+    expect(runner.getActiveToolDefinitions().map((tool) => tool.name)).toEqual(["tool_load"]);
+
+    const result = await runner.run({ message: "search" });
+
+    expect(result.text).toBe("done");
+    expect(requests[0].tools?.map((tool) => tool.name)).toEqual(["tool_load"]);
+    expect(new Set(requests[1].tools?.map((tool) => tool.name)))
+      .toEqual(new Set(["tool_load", "web_search"]));
+    const loadResult = requests[1].messages
+      .flatMap((message) => message.content)
+      .find((content) => content.type === "tool_result" && content.toolUseId === "load-1");
+    expect(loadResult).toMatchObject({
+      type: "tool_result",
+      toolUseId: "load-1",
+      addedToolNames: ["web_search"],
+    });
+    expect(new Set(runner.getActiveToolDefinitions().map((tool) => tool.name)))
+      .toEqual(new Set(["tool_load", "web_search"]));
+  });
+
+  it("rejects a direct call to an available but inactive tool", async () => {
+    const execute = vi.fn(async () => ({ content: "should not run" }));
+    const provider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "web-1", name: "web_search", input: { query: "Orkas" } }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "load it first" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const webTool = defineTool({
+      name: "web_search",
+      description: "Search the web",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      execute,
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [webTool],
+      isToolActive: () => false,
+      toolLoadGroups: (name) => (name === "web_search" ? ["web"] : undefined),
+    });
+
+    await runner.run({ message: "search" });
+
+    expect(execute).not.toHaveBeenCalled();
+    const persisted = JSON.stringify(runner.getSession().getMessages());
+    expect(persisted).toContain("E_TOOL_NOT_LOADED");
+    // The refusal carries the value the model needs to comply — the exact
+    // group to load — not just "the matching group".
+    expect(persisted).toContain('Call tool_load with group \\"web\\"');
+  });
+
+  it("keeps the generic refusal wording when no group resolver is wired", async () => {
+    const execute = vi.fn(async () => ({ content: "should not run" }));
+    const provider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "web-2", name: "web_search", input: { query: "Orkas" } }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 4, outputTokens: 2, totalTokens: 6 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "ok" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const webTool = defineTool({
+      name: "web_search",
+      description: "Search the web",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } },
+      execute,
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [webTool],
+      isToolActive: () => false,
+    });
+
+    await runner.run({ message: "search" });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(JSON.stringify(runner.getSession().getMessages()))
+      .toContain("Use tool_load with the matching group");
+  });
+
+  it("registers manage_execution_plan, injects its anchor, and accepts a no-tool reply with pending milestones", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -1036,6 +1581,7 @@ describe("AgentRunner", () => {
     const result = await runner.run({
       message: "Complete the exact long-running migration goal",
       requestMetadata: {
+        routingRunId: "run-plan-lifecycle",
         routeContext: { sessionKind: "gmember", hasWorkingDir: true },
       },
     });
@@ -1043,12 +1589,23 @@ describe("AgentRunner", () => {
     expect(result.text).toBe("Continuing from the anchored plan.");
     const planTool = requests[0].tools?.find((tool) => tool.name === "manage_execution_plan");
     expect(planTool).toBeDefined();
-    expect(JSON.stringify(planTool?.inputSchema)).toContain("plain string, never an object");
+    expect(planTool?.inputSchema).toMatchObject({
+      properties: {
+        plan: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { step: { type: "string" } },
+          },
+        },
+      },
+    });
     const secondContext = JSON.stringify(requests[1].messages);
     expect(secondContext).toContain("Execution plan anchor");
     expect(secondContext).toContain("Complete the exact long-running migration goal");
     expect(secondContext).toContain("Implement change");
     expect(requests[0].requestMetadata).toMatchObject({
+      routingRunId: "run-plan-lifecycle",
       outputLimitSource: "model_default",
       routeContext: {
         sessionKind: "gmember",
@@ -1057,23 +1614,64 @@ describe("AgentRunner", () => {
         transientToolErrors: 0,
         permanentToolErrors: 0,
         planStepCount: 0,
+        noProgressRounds: 0,
       },
     });
     expect(requests[1].requestMetadata).toMatchObject({
+      routingRunId: "run-plan-lifecycle",
       outputLimitSource: "model_default",
       routeContext: {
         sessionKind: "gmember",
         toolLoops: 1,
         planStepCount: 4,
+        noProgressRounds: 1,
       },
     });
-    expect(requests).toHaveLength(3);
-    expect(JSON.stringify(requests[2].messages)).toContain("premature completion");
+    expect(requests.every((request) => (
+      request.requestMetadata?.routingRunId === "run-plan-lifecycle"
+    ))).toBe(true);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1].messages)).not.toContain("premature completion");
     expect(runner.getSession().getExecutionPlan()?.objective)
       .toBe("Complete the exact long-running migration goal");
   });
 
-  it("asks a guarded Commander run to establish milestones after repeated file mutations", async () => {
+  it("treats an existing unfinished Plan as advisory when the model returns a final no-tool reply", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [{
+          type: "text",
+          text: 'Could not finish.\n<agent-result status="failure" />',
+        }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete every plan step" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Inspect inputs", status: "completed" },
+        { step: "Verify the result", status: "in_progress" },
+      ],
+    });
+
+    const result = await new AgentRunner({ config, providers: registry, tools: [], session })
+      .run({ message: "Continue", resumeActiveTurn: true });
+
+    expect(requests).toHaveLength(1);
+    expect(result.text).toBe('Could not finish.\n<agent-result status="failure" />');
+    expect(session.getExecutionPlan()?.steps).toContainEqual(
+      expect.objectContaining({ step: "Verify the result", status: "in_progress" }),
+    );
+  });
+
+  it("does not force an explicit plan for a bounded multi-file workflow", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -1089,24 +1687,7 @@ describe("AgentRunner", () => {
         model: "mock-model",
       },
       {
-        content: [{
-          type: "tool_use",
-          id: "establish-plan",
-          name: "manage_execution_plan",
-          input: {
-            action: "update",
-            plan: [
-              { step: "Apply the requested repository changes", status: "completed" },
-              { step: "Verify the completed work", status: "completed" },
-            ],
-          },
-        }],
-        stopReason: "tool_use",
-        usage: { inputTokens: 20, outputTokens: 8, totalTokens: 28 },
-        model: "mock-model",
-      },
-      {
-        content: [{ type: "text", text: "Completed with a durable plan." }],
+        content: [{ type: "text", text: "Completed both requested files." }],
         stopReason: "end_turn",
         usage: { inputTokens: 20, outputTokens: 6, totalTokens: 26 },
         model: "mock-model",
@@ -1141,18 +1722,16 @@ describe("AgentRunner", () => {
       providers: registry,
       session,
       tools: [changeTool("change_a", "a.ts"), changeTool("change_b", "b.ts")],
-      requirePlanForRepeatedMutations: true,
     });
 
-    const result = await runner.run({ message: "Complete the multi-file repository plan" });
+    const result = await runner.run({ message: "Create the two fixed output files" });
 
-    expect(result.text).toBe("Completed with a durable plan.");
-    expect(requests).toHaveLength(4);
-    expect(JSON.stringify(requests[1].messages)).not.toContain("committed file changes");
-    expect(JSON.stringify(requests[2].messages)).toContain("observed 2 committed file changes");
-    expect(JSON.stringify(requests[2].messages)).toContain("call manage_execution_plan once");
+    expect(result.text).toBe("Completed both requested files.");
+    expect(requests).toHaveLength(3);
+    expect(JSON.stringify(requests)).not.toContain("committed file changes");
+    expect(JSON.stringify(requests)).not.toContain("call manage_execution_plan once");
     expect(JSON.stringify(session.getMessages())).not.toContain("observed 2 committed file changes");
-    expect(session.getExecutionPlan()?.steps).toHaveLength(2);
+    expect(session.getExecutionPlan()?.steps ?? []).toHaveLength(0);
   });
 
   it("can hide manage_execution_plan for bounded host workflows", async () => {
@@ -1437,6 +2016,156 @@ describe("AgentRunner", () => {
     expect(streamSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("treats a legacy Plan finish as an ordinary tool call before the final no-tool reply", async () => {
+    const requests: CompletionParams[] = [];
+    const provider = createMockProvider([
+      {
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-create",
+            name: "manage_execution_plan",
+            input: {
+              action: "update",
+              plan: [{ step: "Produce and verify the artifact", status: "in_progress" }],
+            },
+          },
+          { type: "tool_use", id: "business-work", name: "produce_artifact", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+      {
+        content: [
+          { type: "text", text: "Artifact produced and verified." },
+          {
+            type: "tool_use",
+            id: "plan-finish",
+            name: "manage_execution_plan",
+            input: {
+              action: "set_status",
+              step_id: 1,
+              status: "completed",
+              finish: "completed",
+            },
+          },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 12, outputTokens: 6, totalTokens: 18 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Artifact produced and verified." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "must not be reached" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    let businessExecutions = 0;
+    const businessTool = defineTool({
+      name: "produce_artifact",
+      description: "Produce and verify one artifact",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        businessExecutions += 1;
+        return { content: "artifact verified" };
+      },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [businessTool] });
+
+    const result = await runner.run({ message: "Track progress while producing and verifying the artifact" });
+
+    expect(result.text).toBe("Artifact produced and verified.");
+    expect(result.text).not.toContain("must not be reached");
+    expect(requests).toHaveLength(3);
+    expect(requests[2].tools?.some((tool) => tool.name === "manage_execution_plan")).toBe(true);
+    expect(JSON.stringify(requests[2].messages)).not.toContain("prior response contained no user-facing text");
+    expect(businessExecutions).toBe(1);
+    expect(runner.getSession().getExecutionPlan()?.steps.map((step) => step.status))
+      .toEqual(["completed"]);
+  });
+
+  it("keeps the normal active tool surface after a legacy Plan finish without reply text", async () => {
+    const requests: CompletionParams[] = [];
+    const provider = createMockProvider([
+      {
+        content: [
+          {
+            type: "tool_use",
+            id: "plan-create",
+            name: "manage_execution_plan",
+            input: {
+              action: "update",
+              plan: [{ step: "Finish the verified work", status: "in_progress" }],
+            },
+          },
+          { type: "tool_use", id: "finish-work", name: "finish_work", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+      {
+        content: [{
+          type: "tool_use",
+          id: "plan-finish-without-text",
+          name: "manage_execution_plan",
+          input: {
+            action: "set_status",
+            step_id: 1,
+            status: "completed",
+            finish: "completed",
+          },
+        }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "Verified work is complete." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 12, outputTokens: 5, totalTokens: 17 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "must not be reached" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 12, outputTokens: 4, totalTokens: 16 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const finishWork = defineTool({
+      name: "finish_work",
+      description: "Finish and verify the work",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        return { content: "work finished and verified" };
+      },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [finishWork] });
+
+    const result = await runner.run({ message: "Track progress while finishing the verified work" });
+
+    expect(result.text).toBe("Verified work is complete.");
+    expect(result.text).not.toContain("must not be reached");
+    expect(requests).toHaveLength(3);
+    expect(requests[2].tools?.some((tool) => tool.name === "manage_execution_plan")).toBe(true);
+    expect(JSON.stringify(requests[2].messages)).not.toContain("prior response contained no user-facing text");
+  });
+
   it("endTurn terminal tool skips later sibling tool calls in the same assistant turn", async () => {
     const mockProvider = createMockProvider([
       {
@@ -1498,7 +2227,7 @@ describe("AgentRunner", () => {
     expect(done?.result.text).not.toContain("must not be reached");
   });
 
-  it("synthesizeAndEndTurn allows one tool-free reply and bypasses unfinished-plan suppression", async () => {
+  it("synthesizeAndEndTurn remains terminal when a Plan still has pending milestones", async () => {
     const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
@@ -1675,6 +2404,7 @@ describe("AgentRunner", () => {
   });
 
   it("handles tool execution errors", async () => {
+    const requests: CompletionParams[] = [];
     const mockProvider = createMockProvider([
       {
         content: [
@@ -1690,7 +2420,7 @@ describe("AgentRunner", () => {
         usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
         model: "mock-model",
       },
-    ]);
+    ], (params) => requests.push(params));
 
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => mockProvider);
@@ -1700,7 +2430,7 @@ describe("AgentRunner", () => {
       description: "A tool that always fails",
       inputSchema: { type: "object" },
       async execute() {
-        throw new Error("Intentional failure");
+        throw new Error(`PRIVATE_EXECUTION_DETAIL:${"x".repeat(30_000)}`);
       },
     });
 
@@ -1708,9 +2438,25 @@ describe("AgentRunner", () => {
       agent: { defaultProvider: "mock", defaultModel: "mock-model" },
     });
 
-    const runner = new AgentRunner({ config, providers: registry, tools: [failingTool] });
+    const transformToolResult = vi.fn((_toolName: string, result: { content: string; isError?: boolean }) => ({
+      content: `transformed:${result.content}`,
+    }));
+    const capturedErrors: string[] = [];
+    const consoleError = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      capturedErrors.push(args.map(String).join(" "));
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [failingTool],
+      transformToolResult,
+    });
     const events: AgentRunEvent[] = [];
-    for await (const event of runner.runStream({ message: "Run the failing tool" })) events.push(event);
+    try {
+      for await (const event of runner.runStream({ message: "Run the failing tool" })) events.push(event);
+    } finally {
+      consoleError.mockRestore();
+    }
     const toolEnd = events.find((event) => event.type === "tool_end");
     const done = events.findLast((event) => event.type === "done");
 
@@ -1721,7 +2467,86 @@ describe("AgentRunner", () => {
       errorCode: "tool_execution_exception",
       errorSeverity: "error",
     });
+    expect(toolEnd && toolEnd.type === "tool_end" ? toolEnd.result : "")
+      .toBe("transformed:The tool failed unexpectedly. Retry once; if it fails again, use another available approach or report the failure.");
+    expect(transformToolResult).toHaveBeenCalledWith(
+      "failing_tool",
+      expect.objectContaining({ isError: true }),
+      expect.any(Object),
+    );
+    const providerContext = JSON.stringify(requests[1]?.messages);
+    expect(providerContext).toContain("transformed:The tool failed unexpectedly");
+    expect(providerContext).not.toContain("PRIVATE_EXECUTION_DETAIL");
+    expect(capturedErrors.join("\n")).not.toContain("PRIVATE_EXECUTION_DETAIL");
     expect(done && done.type === "done" ? done.result.text : "").toBe("The tool failed, but I handled it.");
+  });
+
+  it("uses a bounded safe result when final tool-result processing throws", async () => {
+    const requests: CompletionParams[] = [];
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "call_1", name: "sensitive_tool", input: {} }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 10, totalTokens: 20 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "I recovered from the processing failure." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const sensitiveTool = defineTool({
+      name: "sensitive_tool",
+      description: "Returns a value that must pass final result processing",
+      inputSchema: { type: "object" },
+      async execute() {
+        return { content: `PRIVATE_RAW_RESULT:${"x".repeat(30_000)}` };
+      },
+    });
+    const capturedErrors: string[] = [];
+    const consoleError = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+      capturedErrors.push(args.map(String).join(" "));
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [sensitiveTool],
+      transformToolResult() {
+        throw new Error(`PRIVATE_PROCESSOR_DETAIL:${"y".repeat(30_000)}`);
+      },
+    });
+    const events: AgentRunEvent[] = [];
+    try {
+      for await (const event of runner.runStream({ message: "Run the sensitive tool" })) events.push(event);
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    const toolEnd = events.find((event) => event.type === "tool_end");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      name: "sensitive_tool",
+      result: "The tool result could not be processed safely. Retry with a narrower request or use another available approach.",
+      isError: true,
+      errorCode: "tool_result_processing_exception",
+      errorSeverity: "error",
+    });
+    const providerContext = JSON.stringify(requests[1]?.messages);
+    expect(providerContext).toContain("could not be processed safely");
+    expect(providerContext).not.toContain("PRIVATE_RAW_RESULT");
+    expect(providerContext).not.toContain("PRIVATE_PROCESSOR_DETAIL");
+    expect(capturedErrors.join("\n")).not.toContain("PRIVATE_RAW_RESULT");
+    expect(capturedErrors.join("\n")).not.toContain("PRIVATE_PROCESSOR_DETAIL");
+    const done = events.findLast((event) => event.type === "done");
+    expect(done && done.type === "done" ? done.result.text : "")
+      .toBe("I recovered from the processing failure.");
   });
 
   it("returns error when no provider is found", async () => {
@@ -2079,6 +2904,11 @@ describe("AgentRunner", () => {
         }
         const call = streamCalls++;
         capturedRequests.push([...params.messages]);
+        // Report usage consistent with the request actually received, like a
+        // real provider: request-level decisions anchor on this real usage,
+        // so a fixed tiny count would (correctly) read as a small request and
+        // keep the floor from ever engaging.
+        const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
         yield { type: "message_start" as const };
         if (call < 24) {
           const id = `big-${call}`;
@@ -2088,7 +2918,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
             content: [{ type: "tool_use" as const, id, name: "bulk", input: { i: call } }],
             model: "mock-model",
           };
@@ -2098,7 +2928,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
           content: [{ type: "text" as const, text: "done" }],
           model: "mock-model",
         };
@@ -2196,6 +3026,8 @@ describe("AgentRunner", () => {
         }
         const call = streamCalls++;
         capturedRequests.push([...params.messages]);
+        // Request-consistent usage — see the sibling emergency-floor test.
+        const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
         yield { type: "message_start" as const };
         if (call < 24) {
           const id = `big-${call}`;
@@ -2205,7 +3037,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
             content: [{ type: "tool_use" as const, id, name: "bulk", input: { i: call } }],
             model: "mock-model",
           };
@@ -2215,7 +3047,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
           content: [{ type: "text" as const, text: "done" }],
           model: "mock-model",
         };
@@ -2258,6 +3090,594 @@ describe("AgentRunner", () => {
     // prove nothing here. The prose is what the plain path drops.
     expect(lastRequest).toContain(EARLIER_PROSE);
     expect(lastRequest).toContain("RX-7");
+  });
+
+  // Request-level decisions anchor on the provider's real usage; the local
+  // estimator prices only what changed since the last completed call. The
+  // estimator weighs CJK at 1.5 tokens/char against real tokenizers' ~0.6-1.0,
+  // so before the anchor a Chinese-heavy session crossed the emergency line
+  // while its real request was far under it — paying a hole-with-no-summary
+  // for a request that fit. `reportUsage: false` is the negative control: with
+  // no usable usage the estimator still rules alone and the floor still
+  // engages, so a pass here cannot come from the reduction silently dying.
+  it("does not emergency-fold a CJK-heavy session whose real usage is under the line", async () => {
+    const runWith = async (reportUsage: boolean) => {
+      let streamCalls = 0;
+      const provider: LLMProvider = {
+        id: "mock",
+        name: "Mock",
+        async complete(): Promise<CompletionResult> {
+          throw new Error("summary service unavailable");
+        },
+        async *stream(params: CompletionParams) {
+          if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+            yield* streamCompletionResult(await this.complete(params));
+            return;
+          }
+          const call = streamCalls++;
+          // Real tokenizers price these CJK payloads far below the local
+          // estimate; JSON length/4 stands in for that truth.
+          const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
+          yield { type: "message_start" as const };
+          if (call < 5) {
+            const id = `cjk-${call}`;
+            yield {
+              type: "message_end" as const,
+              stopReason: "tool_use" as const,
+              usage: reportUsage
+                ? { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 }
+                : { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+              content: [{ type: "tool_use" as const, id, name: "cjk_read", input: { i: call } }],
+              model: "mock-model",
+            };
+            return;
+          }
+          yield { type: "text_delta" as const, text: "完成" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: reportUsage
+              ? { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 }
+              : { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+            content: [{ type: "text" as const, text: "完成" }],
+            model: "mock-model",
+          };
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const cjkRead = defineTool({
+        name: "cjk_read",
+        description: "returns a Chinese document section",
+        inputSchema: { type: "object", properties: { i: { type: "number" } } },
+        // 4,000 CJK chars: estimator prices each result at ~6K tokens, so five
+        // results cross the 32K window's 0.82 line by round four on estimates
+        // alone, while the reported real usage stays far under it.
+        async execute() { return { content: "汉".repeat(4_000) }; },
+      });
+      const config = createConfig({
+        agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 30 },
+        models: {
+          catalog: {
+            "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+          },
+        },
+      });
+      const runner = new AgentRunner({ config, providers: registry, tools: [cjkRead] });
+      const events: AgentRunEvent[] = [];
+      for await (const event of runner.runStream({ message: "读取五段中文文档" })) events.push(event);
+      return events.filter(
+        (e): e is Extract<AgentRunEvent, { type: "context_status" }> =>
+          e.type === "context_status" && e.phase === "emergency_reduction",
+      );
+    };
+
+    expect((await runWith(true)).length).toBe(0);
+    expect((await runWith(false)).length).toBeGreaterThan(0);
+  });
+
+  // The opposite direction: prompt weight the estimator cannot see (images,
+  // provider-side expansion) puts the real request over the line while the
+  // estimate stays small. Before the anchor this request sailed into a
+  // provider overflow; anchored, the floor engages. The applied event's
+  // `requestTokensBefore` documents the anchored measurement, and the small
+  // `requestTokensAfter` proves the fold invalidated the anchor and fell back
+  // to the estimator — an anchored after-reading would still sit near 30K.
+  it("emergency-folds on real usage the estimator cannot see", async () => {
+    const LINE = Math.floor((32_000 - 4_096 - 2_048) * 0.82);
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("summary service unavailable");
+      },
+      async *stream(params: CompletionParams) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          yield* streamCompletionResult(await this.complete(params));
+          return;
+        }
+        const call = streamCalls++;
+        yield { type: "message_start" as const };
+        if (call === 0) {
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 30_000, outputTokens: 5, totalTokens: 30_005 },
+            content: [{ type: "tool_use" as const, id: "t-0", name: "peek", input: {} }],
+            model: "mock-model",
+          };
+          return;
+        }
+        yield { type: "text_delta" as const, text: "done" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 30_000, outputTokens: 5, totalTokens: 30_005 },
+          content: [{ type: "text" as const, text: "done" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const peek = defineTool({
+      name: "peek",
+      description: "small result",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+      models: {
+        catalog: {
+          "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+        },
+      },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [peek] });
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "peek" })) events.push(event);
+
+    const applied = events.filter(
+      (e): e is Extract<AgentRunEvent, { type: "context_status" }> =>
+        e.type === "context_status" && e.phase === "emergency_reduction" && e.data?.result === "applied",
+    );
+    expect(applied.length).toBeGreaterThan(0);
+    expect(Number(applied[0].data?.requestTokensBefore)).toBeGreaterThan(LINE);
+    expect(Number(applied[0].data?.requestTokensAfter)).toBeLessThan(LINE);
+  });
+
+  // The per-round inline allowance derives its headroom from the same anchored
+  // measurement: a request the provider says is already near the ceiling must
+  // spill every result to disk even when the estimator sees almost nothing.
+  // The zero-usage control keeps the estimator's own behavior pinned.
+  it("collapses the inline result allowance when real usage is near the ceiling", async () => {
+    const initialAllowance = async (reportUsage: boolean) => {
+      let streamCalls = 0;
+      const provider: LLMProvider = {
+        id: "mock",
+        name: "Mock",
+        async complete(): Promise<CompletionResult> {
+          throw new Error("unused");
+        },
+        async *stream(_params: CompletionParams) {
+          const call = streamCalls++;
+          yield { type: "message_start" as const };
+          if (call === 0) {
+            yield {
+              type: "message_end" as const,
+              stopReason: "tool_use" as const,
+              usage: reportUsage
+                ? { inputTokens: 24_000, outputTokens: 5, totalTokens: 24_005 }
+                : { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+              content: [{ type: "tool_use" as const, id: "t-0", name: "peek", input: {} }],
+              model: "mock-model",
+            };
+            return;
+          }
+          yield { type: "text_delta" as const, text: "done" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            content: [{ type: "text" as const, text: "done" }],
+            model: "mock-model",
+          };
+        },
+        async validateAuth() { return true; },
+      };
+      const registry = new ProviderRegistry();
+      registry.registerFactory("mock", () => provider);
+      const peek = defineTool({
+        name: "peek",
+        description: "small result",
+        inputSchema: { type: "object", properties: {} },
+        async execute() { return { content: "ok" }; },
+      });
+      const config = createConfig({
+        agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+        models: {
+          catalog: {
+            "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+          },
+        },
+      });
+      let observed = -1;
+      const runner = new AgentRunner({
+        config,
+        providers: registry,
+        tools: [peek],
+        transformToolResult(_toolName, result, ctx) {
+          const ledger = ctx.state.toolResultInlineLedger as { initialTokens: number } | undefined;
+          if (ledger && observed < 0) observed = ledger.initialTokens;
+          return result;
+        },
+      });
+      for await (const _ of runner.runStream({ message: "peek" })) { /* drain */ }
+      return observed;
+    };
+
+    expect(await initialAllowance(true)).toBe(0);
+    expect(await initialAllowance(false)).toBeGreaterThan(0);
+  });
+
+  // Reactive overflow recovery (G.9). The provider's refusal is the first
+  // true measurement when the pre-call checks under-priced a request; the
+  // recovery folds deterministically and retries the same request exactly
+  // once. Before this path existed, a tracked session's overflow was a
+  // terminal error — the one hole every peer product had covered.
+  it("recovers from a provider context overflow by folding and retrying once", async () => {
+    let streamCalls = 0;
+    let summaryCalls = 0;
+    const capturedRequests: Message[][] = [];
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> {
+        summaryCalls++;
+        throw new Error("recovery must not need a summary model");
+      },
+      async *stream(params: CompletionParams) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          summaryCalls++;
+          throw new Error("recovery must not need a summary model");
+        }
+        const call = streamCalls++;
+        capturedRequests.push([...params.messages]);
+        const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
+        yield { type: "message_start" as const };
+        if (call === 0) {
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
+            content: [{ type: "tool_use" as const, id: "t-0", name: "bulk", input: {} }],
+            model: "mock-model",
+          };
+          return;
+        }
+        if (call === 1) throw new ContextOverflowError("request exceeds context window");
+        yield { type: "text_delta" as const, text: "done" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
+          content: [{ type: "text" as const, text: "done" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    // Modest by the estimator's measure — under every layered trigger — yet
+    // the provider still refuses: exactly the blind-spot shape (image bytes,
+    // a first call with no anchor) this recovery exists for.
+    const bulk = defineTool({
+      name: "bulk",
+      description: "emits a large observation",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: `bulk\n${"z".repeat(20_000)}` }; },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+      models: {
+        catalog: {
+          "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+        },
+      },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [bulk] });
+
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "recover from overflow" })) events.push(event);
+
+    const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+    expect(done?.result.meta.error).toBeUndefined();
+    expect(done?.result.text).toBe("done");
+
+    const recoveries = events.filter(
+      (e): e is Extract<AgentRunEvent, { type: "context_status" }> =>
+        e.type === "context_status" && e.phase === "overflow_recovery",
+    );
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0].data?.result).toBe("retried");
+    expect(Number(recoveries[0].data?.foldedGroups)).toBeGreaterThan(0);
+    // Deterministic recovery: no summary model call was needed or made.
+    expect(summaryCalls).toBe(0);
+    expect(done?.result.meta.compactionCount).toBe(1);
+
+    // The retried request carries the honest fold notice, not the raw bytes,
+    // and commits the user's message exactly once.
+    const retried = JSON.stringify(capturedRequests[2]);
+    expect(retried).toContain("Context reduced without summarization");
+    expect(retried).not.toContain("z".repeat(1_000));
+    // The user's message is committed exactly once as message text — the
+    // second textual occurrence in a request is the plan anchor's
+    // deterministically derived objective, which is projection, not a
+    // re-committed (and re-billed) message.
+    expect(retried.split('"text":"recover from overflow"').length - 1).toBe(1);
+    expect(runner.getSession().hasTurnTracking()).toBe(true);
+  });
+
+  // Narrow-window persistent floor: when the overflow leaves nothing foldable,
+  // what remains is the summary/facts blocks themselves — the recovery's
+  // bounded shrink rewrite is the only lever that can reduce them, and it
+  // must REPLACE the pool rather than merge into it.
+  it("shrinks the persistent history blocks when overflow leaves nothing to fold", async () => {
+    let streamCalls = 0;
+    let shrinkCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("unused");
+      },
+      async *stream(params: CompletionParams) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          shrinkCalls++;
+          yield { type: "message_start" as const };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: { inputTokens: 100, outputTokens: 30, totalTokens: 130 },
+            content: [{
+              type: "text" as const,
+              text: `Shrunk overview of the long project.\n${HISTORY_EXACT_FACTS_HEADING}\n- kept_fact: run id RX-7`,
+            }],
+            model: "mock-model",
+          };
+          return;
+        }
+        const call = streamCalls++;
+        yield { type: "message_start" as const };
+        if (call === 0) throw new ContextOverflowError("request exceeds context window");
+        yield { type: "text_delta" as const, text: "done" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 500, outputTokens: 5, totalTokens: 505 },
+          content: [{ type: "text" as const, text: "done" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+      models: {
+        catalog: {
+          "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+        },
+      },
+    });
+    // A session whose archived history left large persistent blocks behind:
+    // prose alone estimates ~6K tokens, over the shrink-worthiness threshold.
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "earlier project turn" }]);
+    session.addAssistantMessage([{ type: "text", text: "earlier answer" }]);
+    session.completeActiveTurn();
+    session.applyHistorySummary(
+      `Huge prose carried from a wide window. ${"p".repeat(24_000)}\n${HISTORY_EXACT_FACTS_HEADING}\n- stale_fact: superseded value`,
+      [1],
+    );
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "next task" })) events.push(event);
+
+    const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+    expect(done?.result.meta.error).toBeUndefined();
+    expect(shrinkCalls).toBe(1);
+
+    const recoveries = events.filter(
+      (e): e is Extract<AgentRunEvent, { type: "context_status" }> =>
+        e.type === "context_status" && e.phase === "overflow_recovery",
+    );
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0].data?.result).toBe("retried");
+    expect(recoveries[0].data?.persistentShrink).toBe(true);
+
+    const restored = session.getSerializedContextState();
+    expect(restored?.historySummary).toContain("Shrunk overview");
+    expect(restored?.historySummary).not.toContain("Huge prose");
+    expect(JSON.stringify(restored?.historyExactFacts ?? [])).not.toContain("stale_fact");
+  });
+
+  it("declines a consecutive overflow after recovery with no completed call between", async () => {
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("summary service unavailable");
+      },
+      async *stream(params: CompletionParams) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          throw new Error("summary service unavailable");
+        }
+        const call = streamCalls++;
+        const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
+        yield { type: "message_start" as const };
+        if (call === 0) {
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
+            content: [{ type: "tool_use" as const, id: "t-0", name: "bulk", input: {} }],
+            model: "mock-model",
+          };
+          return;
+        }
+        throw new ContextOverflowError("request exceeds context window");
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const bulk = defineTool({
+      name: "bulk",
+      description: "emits a large observation",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: `bulk\n${"z".repeat(60_000)}` }; },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+      models: {
+        catalog: {
+          "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+        },
+      },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [bulk] });
+
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "spin guard" })) events.push(event);
+
+    const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+    expect(done?.result.meta.error?.kind).toBe("context_overflow");
+    expect(done?.result.meta.error?.message).toContain("recovery");
+    // Initial tool round + the overflowing call + exactly one retry — no spin.
+    expect(streamCalls).toBe(3);
+    const retriedRecoveries = events.filter(
+      (e) => e.type === "context_status" && e.phase === "overflow_recovery"
+        && (e as { data?: Record<string, unknown> }).data?.result === "retried",
+    );
+    expect(retriedRecoveries).toHaveLength(1);
+  });
+
+  // A completed call re-arms the recovery: the request demonstrably fit, so a
+  // LATER overflow is new growth with fresh foldable content. Under the old
+  // once-per-run flag this run died at the second overflow even though the
+  // recovery between them had worked.
+  it("recovers again from a later overflow after an intervening completed call", async () => {
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> {
+        throw new Error("summary service unavailable");
+      },
+      async *stream(params: CompletionParams) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          throw new Error("summary service unavailable");
+        }
+        const call = streamCalls++;
+        const promptTokens = Math.ceil(JSON.stringify(params.messages).length / 4);
+        yield { type: "message_start" as const };
+        // call 0: tool round; call 1: overflow; call 2 (retry): tool round —
+        // the completed call that re-arms; call 3: overflow again; call 4
+        // (retry): final answer.
+        if (call === 1 || call === 3) {
+          throw new ContextOverflowError("request exceeds context window");
+        }
+        if (call === 0 || call === 2) {
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: promptTokens, outputTokens: 5, totalTokens: promptTokens + 5 },
+            content: [{ type: "tool_use" as const, id: `t-${call}`, name: "bulk", input: { round: call } }],
+            model: "mock-model",
+          };
+          return;
+        }
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: promptTokens, outputTokens: 4, totalTokens: promptTokens + 4 },
+          content: [{ type: "text" as const, text: "both overflows recovered" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const bulk = defineTool({
+      name: "bulk",
+      description: "emits a large observation",
+      inputSchema: { type: "object", properties: { round: { type: "number" } } },
+      async execute() { return { content: `bulk\n${"z".repeat(60_000)}` }; },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
+      models: {
+        catalog: {
+          "mock-model": { provider: "mock", model: "mock-model", contextWindow: 32_000, maxOutputTokens: 4_096 },
+        },
+      },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [bulk] });
+
+    const events: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "survive two overflows" })) events.push(event);
+
+    const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+    expect(done?.result.meta.error).toBeUndefined();
+    expect(done?.result.text).toBe("both overflows recovered");
+    expect(streamCalls).toBe(5);
+    const retriedRecoveries = events.filter(
+      (e) => e.type === "context_status" && e.phase === "overflow_recovery"
+        && (e as { data?: Record<string, unknown> }).data?.result === "retried",
+    );
+    expect(retriedRecoveries).toHaveLength(2);
+  });
+
+  // The migration that made the legacy whole-session compactor removable:
+  // a pre-turn-tracking session (raw messages, no turnState) is rebuilt into
+  // completed turns on the next run's beginUserTurn, so the layered policy
+  // owns it from that point on.
+  it("adopts a pre-turn-tracking session into the layered policy on the next run", async () => {
+    const session = new Session();
+    session.addUserMessage("old request from before turn tracking");
+    session.addAssistantMessage([{ type: "text", text: "old answer" }]);
+    expect(session.hasTurnTracking()).toBe(false);
+
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "text", text: "hello again" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 },
+        model: "mock-model",
+      },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    const events = await collectRunEvents(runner, "new request");
+    const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
+    expect(done?.result.meta.error).toBeUndefined();
+    expect(session.hasTurnTracking()).toBe(true);
+    // The old raw dialogue was reconstructed as completed turns the layered
+    // history compaction can archive.
+    expect(session.getArchivableHistoryTurns().length).toBeGreaterThan(0);
   });
 
   it("summarizes tracked completed history before the next model call", async () => {
@@ -2350,411 +3770,7 @@ describe("AgentRunner", () => {
     expect(serialized).toContain("fresh");
   });
 
-  it("does not query the shared summary cache before compaction is needed", async () => {
-    let cacheAcquires = 0;
-    let cacheReads = 0;
-    const provider: LLMProvider = {
-      id: "mock",
-      name: "Mock",
-      async complete() { throw new Error("unexpected summary call"); },
-      async *stream(params) {
-        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
-          yield* streamCompletionResult(await this.complete(params));
-          return;
-        }
-        yield { type: "message_start" as const };
-        yield { type: "text_delta" as const, text: "ordinary response" };
-        yield {
-          type: "message_end" as const,
-          stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-          content: [{ type: "text" as const, text: "ordinary response" }],
-          model: "mock-model",
-        };
-      },
-      async validateAuth() { return true; },
-    };
-    const registry = new ProviderRegistry();
-    registry.registerFactory("mock", () => provider);
-    const source = "group-main-v1:below-summary-threshold";
-    const session = new Session();
-    session.replaceConversationHistory([
-      { role: "user", turnId: 1, content: [{ type: "text", text: "short request" }] },
-      { role: "assistant", turnId: 1, content: [{ type: "text", text: "short response" }] },
-    ], source);
-    const cache: SharedHistorySummaryCache = {
-      source,
-      async acquire() {
-        cacheAcquires++;
-        return () => {};
-      },
-      async read() {
-        cacheReads++;
-        return null;
-      },
-      async write(input) {
-        return { ...input, throughMessageId: "unused" };
-      },
-    };
-    const runner = new AgentRunner({
-      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
-      providers: registry,
-      session,
-      tools: [],
-      sharedHistorySummaryCache: cache,
-    });
-
-    await collectRunEvents(runner, "next short request");
-
-    expect(cacheAcquires).toBe(0);
-    expect(cacheReads).toBe(0);
-  });
-
-  it("adopts a reusable cache checkpoint that covers the pending history archive", async () => {
-    let completeCalls = 0;
-    let readCalls = 0;
-    let writeCalls = 0;
-    let streamMessages: Message[] = [];
-    const provider: LLMProvider = {
-      id: "mock",
-      name: "Mock",
-      async complete() {
-        completeCalls++;
-        throw new Error("summary model must not run on a cache hit");
-      },
-      async *stream(params) {
-        streamMessages = params.messages;
-        yield { type: "message_start" as const };
-        yield { type: "text_delta" as const, text: "used shared summary" };
-        yield {
-          type: "message_end" as const,
-          stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-          content: [{ type: "text" as const, text: "used shared summary" }],
-          model: "mock-model",
-        };
-      },
-      async validateAuth() { return true; },
-    };
-    const registry = new ProviderRegistry();
-    registry.registerFactory("mock", () => provider);
-    const source = "group-main-v1:shared-history-test";
-    const lock = new Mutex();
-    const cache: SharedHistorySummaryCache = {
-      source,
-      acquire: () => lock.acquire(),
-      async read() {
-        readCalls++;
-        return {
-          summary: "conversation-owned cached summary",
-          throughTurnId: 15,
-          throughMessageId: "canonical-message-15",
-        };
-      },
-      async write(input) {
-        writeCalls++;
-        return {
-          ...input,
-          throughMessageId: `canonical-message-${input.throughTurnId}`,
-        };
-      },
-    };
-    const runner = new AgentRunner({
-      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
-      providers: registry,
-      session: canonicalHistorySession(source),
-      tools: [],
-      sharedHistorySummaryCache: cache,
-    });
-
-    const events = await collectRunEvents(runner, "fresh request");
-
-    expect(readCalls).toBe(1);
-    expect(writeCalls).toBe(0);
-    expect(completeCalls).toBe(0);
-    expect(events.filter((event) => event.type === "compaction")).toHaveLength(0);
-    expect(events.some((event) => (
-      event.type === "context_status"
-      && event.phase === "history_summary_done"
-      && event.data?.reused === true
-    ))).toBe(true);
-    expect(JSON.stringify(streamMessages)).toContain("conversation-owned cached summary");
-    expect(JSON.stringify(streamMessages)).not.toContain("Canonical user 1 request ");
-    expect(runner.getSession().getSerializedContextState()).toMatchObject({
-      summaryThroughTurnId: 15,
-      summaryThroughMessageId: "canonical-message-15",
-    });
-  });
-
-  it("extends an older shared summary from only the uncovered canonical turns", async () => {
-    let completeCalls = 0;
-    let summaryModelInput = "";
-    let written: { summary: string; throughTurnId: number } | null = null;
-    const provider: LLMProvider = {
-      id: "mock",
-      name: "Mock",
-      async complete(params) {
-        completeCalls++;
-        summaryModelInput = JSON.stringify(params.messages);
-        return {
-          content: [{ type: "text", text: "extended shared canonical summary" }],
-          stopReason: "end_turn",
-          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
-          model: "mock-model",
-        };
-      },
-      async *stream(params) {
-        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
-          yield* streamCompletionResult(await this.complete(params));
-          return;
-        }
-        yield { type: "message_start" as const };
-        yield { type: "text_delta" as const, text: "continued after extension" };
-        yield {
-          type: "message_end" as const,
-          stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-          content: [{ type: "text" as const, text: "continued after extension" }],
-          model: "mock-model",
-        };
-      },
-      async validateAuth() { return true; },
-    };
-    const registry = new ProviderRegistry();
-    registry.registerFactory("mock", () => provider);
-    const source = "group-main-v1:shared-history-test";
-    const lock = new Mutex();
-    const cache: SharedHistorySummaryCache = {
-      source,
-      acquire: () => lock.acquire(),
-      async read() {
-        return {
-          summary: "shared summary through turn five",
-          throughTurnId: 5,
-          throughMessageId: "canonical-message-5",
-        };
-      },
-      async write(input) {
-        written = input;
-        return {
-          ...input,
-          throughMessageId: `canonical-message-${input.throughTurnId}`,
-        };
-      },
-    };
-    const runner = new AgentRunner({
-      config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
-      providers: registry,
-      session: canonicalHistorySession(source),
-      tools: [],
-      sharedHistorySummaryCache: cache,
-    });
-
-    const events = await collectRunEvents(runner, "extend cached history");
-
-    expect(completeCalls).toBe(1);
-    expect(written).not.toBeNull();
-    const saved = written as unknown as { summary: string; throughTurnId: number };
-    expect(saved.summary).toBe("extended shared canonical summary");
-    expect(saved.throughTurnId).toBeGreaterThan(5);
-    expect(summaryModelInput).toContain("shared summary through turn five");
-    expect(summaryModelInput).toContain("Canonical user 6 request ");
-    expect(summaryModelInput).not.toContain("Canonical user 5 request ");
-    expect(events.filter((event) => event.type === "compaction")).toHaveLength(1);
-    expect(events.some((event) => (
-      event.type === "context_status"
-      && event.phase === "history_summary_done"
-      && event.data?.reused === true
-    ))).toBe(false);
-    expect(runner.getSession().getSerializedContextState()).toMatchObject({
-      summaryThroughTurnId: saved.throughTurnId,
-      summaryThroughMessageId: `canonical-message-${saved.throughTurnId}`,
-    });
-  });
-
-  it.each(["read", "write"] as const)(
-    "continues with local history compaction when shared cache $failure fails",
-    async (failure) => {
-      let completeCalls = 0;
-      let releases = 0;
-      const provider: LLMProvider = {
-        id: "mock",
-        name: "Mock",
-        async complete() {
-          completeCalls++;
-          return {
-            content: [{ type: "text", text: `local summary after ${failure} failure` }],
-            stopReason: "end_turn",
-            usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
-            model: "mock-model",
-          };
-        },
-        async *stream(params) {
-          if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
-            yield* streamCompletionResult(await this.complete(params));
-            return;
-          }
-          yield { type: "message_start" as const };
-          yield { type: "text_delta" as const, text: "normal response survived" };
-          yield {
-            type: "message_end" as const,
-            stopReason: "end_turn" as const,
-            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-            content: [{ type: "text" as const, text: "normal response survived" }],
-            model: "mock-model",
-          };
-        },
-        async validateAuth() { return true; },
-      };
-      const registry = new ProviderRegistry();
-      registry.registerFactory("mock", () => provider);
-      const source = "group-main-v1:shared-history-test";
-      const cache: SharedHistorySummaryCache = {
-        source,
-        async acquire() {
-          return () => { releases++; };
-        },
-        async read() {
-          if (failure === "read") throw new Error("cache read unavailable");
-          return null;
-        },
-        async write(input) {
-          if (failure === "write") throw new Error("cache write unavailable");
-          return { ...input, throughMessageId: `canonical-message-${input.throughTurnId}` };
-        },
-      };
-      const runner = new AgentRunner({
-        config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }),
-        providers: registry,
-        session: canonicalHistorySession(source),
-        tools: [],
-        sharedHistorySummaryCache: cache,
-      });
-
-      const events = await collectRunEvents(runner, `continue after cache ${failure} failure`);
-
-      expect(completeCalls).toBe(1);
-      expect(releases).toBe(1);
-      expect(events.filter((event) => event.type === "compaction")).toHaveLength(1);
-      expect(events.some((event) => (
-        event.type === "done"
-        && event.result.text === "normal response survived"
-      ))).toBe(true);
-      expect(runner.getSession().getSerializedContextState()?.historySummary)
-        .toContain(`local summary after ${failure} failure`);
-    },
-  );
-
-  it("single-flights concurrent Agent history compaction and makes one summary model call", async () => {
-    let completeCalls = 0;
-    let streamCalls = 0;
-    let summaryModelInput = "";
-    const provider: LLMProvider = {
-      id: "mock",
-      name: "Mock",
-      async complete(params) {
-        completeCalls++;
-        summaryModelInput = JSON.stringify(params.messages);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-        return {
-          content: [{ type: "text", text: "shared canonical model summary" }],
-          stopReason: "end_turn",
-          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
-          model: "mock-model",
-        };
-      },
-      async *stream(params) {
-        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
-          yield* streamCompletionResult(await this.complete(params));
-          return;
-        }
-        streamCalls++;
-        yield { type: "message_start" as const };
-        yield { type: "text_delta" as const, text: "done" };
-        yield {
-          type: "message_end" as const,
-          stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-          content: [{ type: "text" as const, text: "done" }],
-          model: "mock-model",
-        };
-      },
-      async validateAuth() { return true; },
-    };
-    const registry = new ProviderRegistry();
-    registry.registerFactory("mock", () => provider);
-    const source = "group-main-v1:shared-history-test";
-    const lock = new Mutex();
-    let checkpoint: SharedHistorySummaryCheckpoint | null = null;
-    const cache: SharedHistorySummaryCache = {
-      source,
-      acquire: () => lock.acquire(),
-      async read() { return checkpoint; },
-      async write(input) {
-        checkpoint = {
-          ...input,
-          throughMessageId: `canonical-message-${input.throughTurnId}`,
-        };
-        return checkpoint;
-      },
-    };
-    const sessionA = canonicalHistorySession(source);
-    const sessionB = canonicalHistorySession(source);
-    sessionA.addHistoryResource({
-      kind: "final_output",
-      path: "/private/agent-a.txt",
-      name: "PRIVATE_AGENT_A_RESOURCE",
-    });
-    sessionB.addHistoryResource({
-      kind: "final_output",
-      path: "/private/agent-b.txt",
-      name: "PRIVATE_AGENT_B_RESOURCE",
-    });
-    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
-    const runnerA = new AgentRunner({
-      config,
-      providers: registry,
-      session: sessionA,
-      tools: [],
-      sharedHistorySummaryCache: cache,
-    });
-    const runnerB = new AgentRunner({
-      config,
-      providers: registry,
-      session: sessionB,
-      tools: [],
-      sharedHistorySummaryCache: cache,
-    });
-
-    const [eventsA, eventsB] = await Promise.all([
-      collectRunEvents(runnerA, "agent A request"),
-      collectRunEvents(runnerB, "agent B request"),
-    ]);
-
-    expect(completeCalls).toBe(1);
-    expect(streamCalls).toBe(2);
-    expect([...eventsA, ...eventsB].filter((event) => event.type === "compaction"))
-      .toHaveLength(1);
-    expect([...eventsA, ...eventsB].filter((event) => (
-      event.type === "context_status"
-      && event.phase === "history_summary_done"
-      && event.data?.reused === true
-    ))).toHaveLength(1);
-    expect(summaryModelInput).toContain("Canonical user 1");
-    expect(summaryModelInput).not.toContain("PRIVATE_AGENT_A_RESOURCE");
-    expect(summaryModelInput).not.toContain("PRIVATE_AGENT_B_RESOURCE");
-    expect(checkpoint).not.toBeNull();
-    const saved = checkpoint as unknown as SharedHistorySummaryCheckpoint;
-    expect(saved.summary).toBe("shared canonical model summary");
-    expect(saved.throughTurnId).toBeGreaterThan(0);
-    expect(saved.throughMessageId).toBe(`canonical-message-${saved.throughTurnId}`);
-    expect(sessionA.getSerializedContextState()?.summaryThroughMessageId)
-      .toBe(saved.throughMessageId);
-    expect(sessionB.getSerializedContextState()?.summaryThroughMessageId)
-      .toBe(saved.throughMessageId);
-  });
-
-  it("does not retry an unchanged history compaction candidate after summary failure", async () => {
+  it("does not retry an unchanged history compaction candidate after an empty summary", async () => {
     let completeCalls = 0;
     let streamCalls = 0;
     const mockProvider: LLMProvider = {
@@ -2762,7 +3778,12 @@ describe("AgentRunner", () => {
       name: "Mock",
       async complete() {
         completeCalls++;
-        throw new Error("summary backend unavailable");
+        return {
+          content: [],
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          model: "mock-model",
+        };
       },
       async *stream(params) {
         if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
@@ -2817,7 +3838,15 @@ describe("AgentRunner", () => {
     for await (const event of runner.runStream({ message: "continue" })) events.push(event);
 
     expect(completeCalls).toBe(1);
-    expect(events.filter((event) => event.type === "context_status" && event.phase === "history_summary_failed")).toHaveLength(1);
+    const failures = events.filter(
+      (event): event is Extract<AgentRunEvent, { type: "context_status" }> =>
+        event.type === "context_status" && event.phase === "history_summary_failed",
+    );
+    expect(failures).toHaveLength(1);
+    expect(failures[0]?.data).toMatchObject({
+      error: "history summary was empty",
+      errorCode: CONTEXT_COMPACTION_EMPTY_SUMMARY_CODE,
+    });
     expect(events.some((event) => event.type === "done")).toBe(true);
   });
 
@@ -3335,6 +4364,12 @@ describe("AgentRunner", () => {
   // clear the count. Without this, an intermittently failing summary service
   // would still permanently disable compaction on a long run — the exact
   // failure the removed per-run ceiling used to cause.
+  // The compaction scenarios below run their main-loop mocks with
+  // `inputTokens: 0` — a provider with no usable prompt accounting. That keeps
+  // them purely estimator-driven: a nonzero prompt side would anchor estimator
+  // calibration to the mock's synthetic footprint (real fixtures here are
+  // orders of magnitude below the content estimate, which no honest provider
+  // reports) and defer the very triggers these tests exercise.
   it("resumes compacting after an intermittent summary failure", async () => {
     let completeCalls = 0;
     let streamCalls = 0;
@@ -3348,7 +4383,7 @@ describe("AgentRunner", () => {
         return {
           content: [{ type: "text", text: "[checkpoint summary]" }],
           stopReason: "end_turn",
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           model: "mock-model",
         };
       },
@@ -3367,7 +4402,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
             content: [{ type: "tool_use" as const, id, name: "large_result", input: { call } }],
             model: "mock-model",
           };
@@ -3377,7 +4412,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           content: [{ type: "text" as const, text: "done" }],
           model: "mock-model",
         };
@@ -3405,7 +4440,7 @@ describe("AgentRunner", () => {
     expect(result.meta.error?.kind).not.toBe("context_overflow");
   });
 
-  it("caps changing compaction failures at three attempts in one run", async () => {
+  it("caps classified changing compaction empties at three attempts in one run", async () => {
     let completeCalls = 0;
     let streamCalls = 0;
     const mockProvider: LLMProvider = {
@@ -3413,10 +4448,21 @@ describe("AgentRunner", () => {
       name: "Mock",
       async complete() {
         completeCalls++;
-        throw new Error("summary service remains unavailable");
+        throw Object.assign(new Error("empty response"), { code: "PROVIDER_EMPTY_NORMAL" });
       },
       async *stream(params) {
         if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          for (let emptyAttempt = 0; emptyAttempt < 2; emptyAttempt++) {
+            yield {
+              type: "provider_empty" as const,
+              kind: "normal_end_empty" as const,
+              providerId: "mock",
+              candidateIndex: 1,
+              candidateCount: 1,
+              terminalEventSeen: true,
+              terminationCategory: "normal" as const,
+            };
+          }
           yield* streamCompletionResult(await this.complete(params));
           return;
         }
@@ -3431,7 +4477,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+            usage: { inputTokens: 0, outputTokens: 2, totalTokens: 2 },
             content,
             model: "mock-model",
           };
@@ -3441,7 +4487,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+          usage: { inputTokens: 0, outputTokens: 2, totalTokens: 2 },
           content: [{ type: "text" as const, text: "finished after bounded summary failures" }],
           model: "mock-model",
         };
@@ -3466,7 +4512,19 @@ describe("AgentRunner", () => {
     for await (const event of runner.runStream({ message: "keep working through a summary outage" })) events.push(event);
 
     expect(completeCalls).toBe(attemptCap);
-    expect(events.filter((event) => event.type === "context_status" && event.phase === "active_process_compaction_failed")).toHaveLength(attemptCap);
+    const failures = events.filter(
+      (event): event is Extract<AgentRunEvent, { type: "context_status" }> =>
+        event.type === "context_status" && event.phase === "active_process_compaction_failed",
+    );
+    expect(failures).toHaveLength(attemptCap);
+    for (const failure of failures) {
+      expect(failure.data).toMatchObject({
+        errorCode: "PROVIDER_EMPTY_NORMAL",
+        providerEmptyCount: 2,
+        providerEmptyKind: "normal_end_empty",
+        providerTerminationCategory: "normal",
+      });
+    }
     expect(events.some((event) => event.type === "done")).toBe(true);
   });
 
@@ -3493,10 +4551,10 @@ describe("AgentRunner", () => {
           yield { type: "tool_use_start" as const, id, name: "large_result" };
           yield { type: "tool_use_delta" as const, id, input: JSON.stringify({ call }) };
           yield { type: "tool_use_end" as const, id };
-          yield { type: "message_end" as const, stopReason: "tool_use" as const, usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 }, content, model: "mock-model" };
+          yield { type: "message_end" as const, stopReason: "tool_use" as const, usage: { inputTokens: 0, outputTokens: 2, totalTokens: 2 }, content, model: "mock-model" };
           return;
         }
-        yield { type: "message_end" as const, stopReason: "end_turn" as const, usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 }, content: [{ type: "text" as const, text: "done" }], model: "mock-model" };
+        yield { type: "message_end" as const, stopReason: "end_turn" as const, usage: { inputTokens: 0, outputTokens: 2, totalTokens: 2 }, content: [{ type: "text" as const, text: "done" }], model: "mock-model" };
       },
       async validateAuth() { return true; },
     };
@@ -3543,6 +4601,15 @@ describe("AgentRunner", () => {
       },
       async *stream(params) {
         if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          yield {
+            type: "provider_empty" as const,
+            kind: "normal_end_empty" as const,
+            providerId: "mock",
+            candidateIndex: 1,
+            candidateCount: 1,
+            terminalEventSeen: true,
+            terminationCategory: "normal" as const,
+          };
           yield* streamCompletionResult(await this.complete(params));
           return;
         }
@@ -3556,7 +4623,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
             content,
             model: "mock-model",
           };
@@ -3568,7 +4635,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           content: [{ type: "text" as const, text: "final after checkpoint" }],
           model: "mock-model",
         };
@@ -3625,14 +4692,19 @@ describe("AgentRunner", () => {
       modelViewTokensAfter: expect.any(Number),
       summaryTextTokens: expect.any(Number),
       appliedCheckpointTokens: expect.any(Number),
-      shrinkApplied: false,
+      providerEmptyCount: 1,
+      providerEmptyKind: "normal_end_empty",
+      providerTerminationCategory: "normal",
     });
     const compaction = events.find((e): e is Extract<AgentRunEvent, { type: "compaction" }> => e.type === "compaction");
     expect(compaction?.usage).toMatchObject({ inputTokens: 100, outputTokens: 20, totalTokens: 120 });
     const done = events.find((e): e is Extract<AgentRunEvent, { type: "done" }> => e.type === "done");
-    expect(done?.result.meta.usage.inputTokens).toBe(160);
+    // Main-loop calls report inputTokens: 0 (see the persona note above), so
+    // the aggregated input can only come from the compaction call — a direct
+    // signal that compaction usage is folded into the run meta.
+    expect(done?.result.meta.usage.inputTokens).toBe(100);
     expect(done?.result.meta.usage.outputTokens).toBe(50);
-    expect(done?.result.meta.usage.totalTokens).toBe(210);
+    expect(done?.result.meta.usage.totalTokens).toBe(150);
     const serialized = JSON.stringify(finalStreamMessages);
     expect(serialized).toContain("active checkpoint summary");
     expect(serialized).not.toContain("call-0");
@@ -3647,11 +4719,98 @@ describe("AgentRunner", () => {
     expect(serialized).toContain("result-4");
   });
 
-  it("performs at most one bounded rewrite when an active checkpoint exceeds the hard target", async () => {
+  // Compaction start events carry the per-span re-read accounting from the
+  // second compaction on (the first has no measured span). The host sums
+  // these into fleet telemetry to calibrate the derived-budget ceilings;
+  // dropping the fields would silently read as "no re-reading in the field".
+  it("reports re-read accounting on compaction start events once a span is measurable", async () => {
+    let streamCalls = 0;
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete() {
+        return {
+          content: [{ type: "text", text: "checkpoint summary" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+          model: "mock-model",
+        };
+      },
+      async *stream(params) {
+        if (params.systemPrompt === CONTEXT_COMPACTION_SYSTEM_PROMPT) {
+          yield* streamCompletionResult(await this.complete(params));
+          return;
+        }
+        const n = streamCalls++;
+        if (n < 12) {
+          const content = [{ type: "tool_use" as const, id: `call-${n}`, name: "big", input: { n } }];
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id: `call-${n}`, name: "big" };
+          yield { type: "tool_use_delta" as const, id: `call-${n}`, input: JSON.stringify({ n }) };
+          yield { type: "tool_use_end" as const, id: `call-${n}` };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
+            content,
+            model: "mock-model",
+          };
+          return;
+        }
+        yield { type: "message_start" as const };
+        yield { type: "text_delta" as const, text: "final" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
+          content: [{ type: "text" as const, text: "final" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const bigTool = defineTool({
+      name: "big",
+      description: "Return medium-large text",
+      inputSchema: { type: "object", properties: { n: { type: "number" } } },
+      async execute(input) {
+        return { content: `result-${input.n}\n${"x".repeat(15_000)}` };
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [bigTool] });
+
+    const events: AgentRunEvent[] = [];
+    for await (const ev of runner.runStream({ message: "keep working" })) events.push(ev);
+
+    const starts = events.filter(
+      (e): e is Extract<AgentRunEvent, { type: "context_status" }> =>
+        e.type === "context_status" && e.phase === "active_process_compaction_start",
+    );
+    expect(starts.length).toBeGreaterThanOrEqual(2);
+    // First compaction: no prior span boundary, so no re-read fields.
+    expect((starts[0].data as Record<string, unknown>).readsSinceLastCompaction).toBeUndefined();
+    // Later compactions measure the span since the previous one.
+    expect(starts[starts.length - 1].data).toMatchObject({
+      readsSinceLastCompaction: expect.any(Number),
+      rereadPaths: expect.any(Number),
+      rereadIdenticalContent: expect.any(Number),
+    });
+  });
+
+  // The provider maxTokens on the summarizer call is the only output bound.
+  // An over-ESTIMATE (the CJK-inflation corridor) is warned and applied
+  // as-is: the rewrite retry that once guarded it measured 0 fires in 84
+  // checkpoints across 8 days and no peer product carries one. This pins
+  // exactly one summary call so the retry cannot silently return.
+  it("applies an over-estimate checkpoint as-is with a single summary call", async () => {
     let completeCalls = 0;
     let streamCalls = 0;
-    const summaryParams: CompletionParams[] = [];
-    const compactSummary = [
+    const oversizedSummary = [
       "Important observations and decisions:",
       "- retained decision",
       "Exact facts and identifiers required for continuation/final output (cumulative):",
@@ -3662,24 +4821,17 @@ describe("AgentRunner", () => {
       "- finish",
       "Exact data that must be re-read before editing/quoting:",
       "- none",
+      `oversized checkpoint filler ${"负载很重的中文检查点内容".repeat(400)}`,
     ].join("\n");
     const mockProvider: LLMProvider = {
       id: "mock",
       name: "Mock",
-      async complete(params) {
-        summaryParams.push(params);
-        const index = completeCalls++;
+      async complete() {
+        completeCalls++;
         return {
-          content: [{
-            type: "text",
-            text: index === 0
-              ? `${compactSummary}\n${"oversized checkpoint filler ".repeat(500)}`
-              : compactSummary,
-          }],
+          content: [{ type: "text", text: oversizedSummary }],
           stopReason: "end_turn",
-          usage: index === 0
-            ? { inputTokens: 100, outputTokens: 20, totalTokens: 120 }
-            : { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
           model: "mock-model",
         };
       },
@@ -3690,27 +4842,23 @@ describe("AgentRunner", () => {
         }
         const n = streamCalls++;
         if (n < 5) {
-          const content = [{ type: "tool_use" as const, id: `shrink-${n}`, name: "big", input: { n } }];
           yield { type: "message_start" as const };
-          yield { type: "tool_use_start" as const, id: `shrink-${n}`, name: "big" };
-          yield { type: "tool_use_delta" as const, id: `shrink-${n}`, input: JSON.stringify({ n }) };
-          yield { type: "tool_use_end" as const, id: `shrink-${n}` };
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-            content,
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
+            content: [{ type: "tool_use" as const, id: `big-${n}`, name: "big", input: { n } }],
             model: "mock-model",
           };
           return;
         }
         yield { type: "message_start" as const };
-        yield { type: "text_delta" as const, text: "final after shrink" };
+        yield { type: "text_delta" as const, text: "final" };
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
-          content: [{ type: "text" as const, text: "final after shrink" }],
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
+          content: [{ type: "text" as const, text: "final" }],
           model: "mock-model",
         };
       },
@@ -3731,17 +4879,18 @@ describe("AgentRunner", () => {
     });
 
     const events: AgentRunEvent[] = [];
-    for await (const event of runner.runStream({ message: "shrink an oversized checkpoint" })) events.push(event);
+    for await (const event of runner.runStream({ message: "oversized checkpoint applies" })) events.push(event);
 
-    expect(completeCalls).toBe(2);
-    expect(summaryParams.map((params) => params.reasoning)).toEqual(["off", "off"]);
-    expect(JSON.stringify(summaryParams[1].messages)).toContain("Oversized generated checkpoint to rewrite");
-    expect(JSON.stringify(summaryParams[1].messages)).not.toContain("result-0");
-    const compaction = events.find((event): event is Extract<AgentRunEvent, { type: "compaction" }> => event.type === "compaction");
-    expect(compaction?.summary).toBe(compactSummary);
-    expect(compaction?.usage).toMatchObject({ inputTokens: 110, outputTokens: 25, totalTokens: 135 });
+    // Every checkpoint pass costs exactly one summary call — never a retry.
+    const compactions = events.filter(
+      (event): event is Extract<AgentRunEvent, { type: "compaction" }> => event.type === "compaction",
+    );
+    expect(compactions.length).toBeGreaterThan(0);
+    expect(completeCalls).toBe(compactions.length);
+    // The over-estimate summary is applied verbatim, filler included.
+    expect(compactions[0]?.summary).toContain("oversized checkpoint filler");
     const done = events.find((event): event is Extract<AgentRunEvent, { type: "done" }> => event.type === "done");
-    expect(done?.result.meta.usage).toMatchObject({ inputTokens: 170, outputTokens: 55, totalTokens: 225 });
+    expect(done?.result.meta.error).toBeUndefined();
   });
 
   it("streams events via runStream", async () => {
@@ -3853,8 +5002,16 @@ describe("AgentRunner", () => {
     expect(iEnd).toBeGreaterThan(iStart);
     expect(iDone).toBeGreaterThan(iEnd);
     expect(collected.filter((event) => event.type === "provider_call")).toEqual([
-      expect.objectContaining({ outcome: "completed", model: "mock-model" }),
-      expect.objectContaining({ outcome: "completed", model: "mock-model" }),
+      expect.objectContaining({
+        outcome: "completed",
+        model: "mock-model",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+      }),
+      expect.objectContaining({
+        outcome: "completed",
+        model: "mock-model",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+      }),
     ]);
 
     // tool_start must carry the tool's input so downstream UIs can render
@@ -3883,8 +5040,8 @@ describe("AgentRunner", () => {
 
     expect(requests).toHaveLength(2);
     const secondRequest = JSON.stringify(requests[1].messages);
-    expect(secondRequest).toContain("Completed work ledger");
-    expect(secondRequest).toContain("[succeeded] echo");
+    expect(secondRequest).not.toContain("Completed work ledger");
+    expect(secondRequest.match(/\"content\":\"ping\"/g)).toHaveLength(1);
     expect(secondRequest).not.toContain("Echo Service");
     expect(runner.getSession().getCompletedWorkLedger()).toEqual([
       expect.objectContaining({ tool: "echo", status: "succeeded" }),
@@ -3997,7 +5154,7 @@ describe("AgentRunner", () => {
     expect(iEnd).toBeGreaterThan(iFirstProgress);
   });
 
-  it("runStream stops waiting when a tool ignores abort", async () => {
+  it("runStream still honors user abort when an executor-owned tool ignores abort", async () => {
     const mockProvider = createMockProvider([
       {
         content: [
@@ -4017,6 +5174,7 @@ describe("AgentRunner", () => {
       name: "wedged_tool",
       description: "Never resolves",
       inputSchema: { type: "object", properties: {} },
+      executionTimeoutOwner: "executor",
       async execute() {
         toolStarted();
         return new Promise(() => undefined);
@@ -4043,6 +5201,9 @@ describe("AgentRunner", () => {
     ]);
 
     expect(settled).toBe(true);
+    expect(collected.find((event) => event.type === "tool_start")).toMatchObject({
+      executionTimeoutOwner: "executor",
+    });
     const done = collected[collected.length - 1] as { type: string; result?: { meta?: { aborted?: boolean } } };
     expect(done.type).toBe("done");
     expect(done.result?.meta?.aborted).toBe(true);
@@ -4209,6 +5370,64 @@ describe("AgentRunner", () => {
     expect(done.result?.meta?.permanentToolErrors).toBeUndefined();
   });
 
+  it("runStream lets an executor-owned delegation outlive the runner tool-idle window", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "dispatch_to", input: { to: "agent" } },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "continued with child result" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const dispatchTool = defineTool({
+      name: "dispatch_to",
+      description: "Return one bounded child executor result",
+      inputSchema: { type: "object", properties: { to: { type: "string" } } },
+      executionTimeoutOwner: "executor",
+      async execute() {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return { content: "child completed" };
+      },
+    });
+    const config = createConfig({
+      agent: {
+        defaultProvider: "mock",
+        defaultModel: "mock-model",
+        toolIdleTimeoutMs: 30,
+      },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [dispatchTool] });
+    const collected: AgentRunEvent[] = [];
+    for await (const event of runner.runStream({ message: "go" })) collected.push(event);
+
+    expect(collected.find((event) => event.type === "tool_start")).toMatchObject({
+      name: "dispatch_to",
+      executionTimeoutOwner: "executor",
+    });
+    expect(collected.find((event) => event.type === "tool_end")).toMatchObject({
+      name: "dispatch_to",
+      result: "child completed",
+      isError: undefined,
+    });
+    expect(collected.some((event) => (
+      event.type === "tool_end" && event.errorCode === "tool_execution_stalled"
+    ))).toBe(false);
+    const done = collected.at(-1) as Extract<AgentRunEvent, { type: "done" }>;
+    expect(done.result.text).toBe("continued with child result");
+  });
+
   it("runReflection converts a wedged tool into an error result and continues", async () => {
     const seenMessages: Message[][] = [];
     const mockProvider: LLMProvider = {
@@ -4303,6 +5522,158 @@ describe("AgentRunner", () => {
       content: "Tool execution stalled after 30ms without substantive progress",
       isError: true,
     });
+  });
+
+  it("runReflection applies the final tool-result transformer before model history", async () => {
+    const seenMessages: Message[][] = [];
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock Provider",
+      async complete(params) {
+        seenMessages.push(params.messages);
+        if (seenMessages.length === 1) {
+          return {
+            content: [
+              { type: "tool_use", id: "meta_1", name: "metacognition", input: { action: "read" } },
+            ],
+            stopReason: "tool_use",
+            usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+            model: "mock-model",
+          };
+        }
+        return {
+          content: [{ type: "text", text: "reflection complete" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+          model: "mock-model",
+        };
+      },
+      async *stream() { throw new Error("stream not used"); },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const metacognitionTool = defineTool({
+      name: "metacognition",
+      description: "Return a deliberately oversized reflection result",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "unbounded".repeat(2_000) }; },
+    });
+    const transformToolResult = vi.fn(async (
+      toolName: string,
+      result: ToolResult,
+      ctx: ToolContext,
+    ) => ({
+      ...result,
+      content: `bounded:${toolName}:${String(ctx.state.reflectionBoundary)}`,
+    }));
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+      evolution: { enabled: false },
+    });
+    const runner = new AgentRunner({
+      config,
+      providers: registry,
+      tools: [metacognitionTool],
+      transformToolResult,
+      toolContextState: { reflectionBoundary: "present" },
+    });
+
+    const text = await runner.runReflection("reflect");
+
+    expect(text).toBe("reflection complete");
+    expect(transformToolResult).toHaveBeenCalledOnce();
+    expect(transformToolResult).toHaveBeenCalledWith(
+      "metacognition",
+      expect.objectContaining({ content: expect.stringContaining("unbounded") }),
+      expect.objectContaining({ state: expect.objectContaining({ reflectionBoundary: "present" }) }),
+    );
+    const toolResults = seenMessages[1].flatMap((message) => (
+      message.content.filter((content) => content.type === "tool_result")
+    ));
+    expect(toolResults).toEqual([
+      expect.objectContaining({
+        type: "tool_result",
+        toolUseId: "meta_1",
+        content: "bounded:metacognition:present",
+      }),
+    ]);
+    expect(JSON.stringify(seenMessages[1])).not.toContain("unboundedunbounded");
+  });
+
+  it("runReflection reports only tool calls that leave something behind", async () => {
+    // The review prompt tells the model to answer "nothing to save" when a
+    // window holds no new lesson, so the returned text cannot tell the host
+    // whether anything was written. Reads are how a reflection gathers its
+    // context, and a failed write left nothing behind — neither counts.
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock Provider",
+      async complete(params) {
+        if (params.messages.length === 1) {
+          return {
+            content: [
+              { type: "tool_use", id: "c1", name: "metacognition", input: { action: "read", target: "competence" } },
+              { type: "tool_use", id: "c2", name: "metacognition", input: { action: "write", target: "competence" } },
+              { type: "tool_use", id: "c3", name: "skill_manage", input: { action: "create", id: "s1" } },
+              { type: "tool_use", id: "c4", name: "skill_manage", input: { action: "list" } },
+              { type: "tool_use", id: "c5", name: "metacognition", input: { action: "write", target: "strategies" } },
+            ],
+            stopReason: "tool_use",
+            usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+            model: "mock-model",
+          };
+        }
+        return {
+          content: [{ type: "text", text: "nothing to save" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+          model: "mock-model",
+        };
+      },
+      async *stream() { throw new Error("stream not used"); },
+      async validateAuth() { return true; },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const metacognitionTool = defineTool({
+      name: "metacognition",
+      description: "Read or update competence and strategies",
+      inputSchema: { type: "object", properties: {} },
+      async execute(input: Record<string, unknown>) {
+        // The strategies write fails; only the competence write survives.
+        return input.target === "strategies"
+          ? { content: "disk full", isError: true }
+          : { content: "ok" };
+      },
+    });
+    const skillTool = defineTool({
+      name: "skill_manage",
+      description: "Manage a learned skill",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+      // Otherwise the constructor builds a real SkillStore and its own
+      // `skill_manage` shadows the stub below (evolution tools register last).
+      evolution: { enabled: false },
+    });
+    const runner = new AgentRunner({
+      config, providers: registry, tools: [metacognitionTool, skillTool],
+    });
+
+    let writes = 0;
+    const text = await runner.runReflection(
+      "reflect", undefined, undefined, undefined, () => { writes += 1; },
+    );
+
+    // metacognition(write, competence) + skill_manage(create). Not the read,
+    // not the list, not the write that returned an error.
+    expect(writes).toBe(2);
+    expect(text).toBe("nothing to save");
   });
 
   it("runStream forwards tool input deltas before tool execution", async () => {
@@ -4586,11 +5957,19 @@ describe("AgentRunner", () => {
     expect(JSON.stringify(runner.getSession().getMessages())).not.toContain("effectively the same arguments");
   });
 
-  it("loop_detection: hard-stops an ignored near-duplicate warning", async () => {
-    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
+  it("loop_detection: an ignored near-duplicate warning nudges once and never hard-stops", async () => {
+    // The near-duplicate tier shipped WARN-only on purpose (71d4552bf):
+    // normalized matching is fuzzier than the exact tier, so a false positive
+    // must stay a benign nudge. A hard stop was later added silently by an
+    // unrelated grab-bag commit (49f5bbeba) with no recorded rationale and was
+    // removed again. This pin keeps the WARN-only contract from being
+    // re-reversed the same way: any future hard stop must first turn this red.
+    const ROUNDS = NEAR_DUP_LOOP_WARN * 2; // 12 — the removed hard threshold
+    const requests: CompletionParams[] = [];
+    const toolRounds: CompletionResult[] = Array.from({ length: ROUNDS }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
-        id: `near-dup-hard-${index}`,
+        id: `near-dup-ignored-${index}`,
         name: "web_fetch",
         input: { url: "https://example.test/report", request_id: `request-${index}` },
       }],
@@ -4598,7 +5977,15 @@ describe("AgentRunner", () => {
       usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
       model: "mock-model",
     }));
-    const provider = createMockProvider(toolRounds);
+    const provider = createMockProvider([
+      ...toolRounds,
+      {
+        content: [{ type: "text", text: "Finished after the fetch spin." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+    ], (params) => requests.push(params));
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
     let executions = 0;
@@ -4615,14 +6002,22 @@ describe("AgentRunner", () => {
 
     const result = await runner.run({ message: "fetch the report without spinning" });
 
-    expect(result.text).toContain("Stopped");
-    expect(executions).toBe(NEAR_DUP_LOOP_HARD - 1);
+    // Every proposed call executed — the tier warned but blocked nothing.
+    expect(executions).toBe(ROUNDS);
+    expect(result.text).toBe("Finished after the fetch spin.");
+    expect(result.meta.toolLoops).toBe(ROUNDS);
+    // The nudge fired exactly once for the streak, and is flagged in meta.
+    const controls = requests.flatMap((request) => request.messages)
+      .flatMap((message) => message.content)
+      .filter((content) => content.type === "text" && content.text.includes("effectively the same arguments"));
+    expect(controls).toHaveLength(1);
     expect(result.meta.convergenceSignals).toContain("repetitive_tool_calls");
   });
 
-  it("loop_detection: legitimate pagination can cross the hard threshold without a false stop", async () => {
+  it("loop_detection: legitimate pagination stays distinct far past the warn threshold", async () => {
+    const PAGES = NEAR_DUP_LOOP_WARN * 2; // well past warn — must never even nudge
     const requests: CompletionParams[] = [];
-    const toolRounds: CompletionResult[] = Array.from({ length: NEAR_DUP_LOOP_HARD }, (_, index) => ({
+    const toolRounds: CompletionResult[] = Array.from({ length: PAGES }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
         id: `page-${index}`,
@@ -4658,7 +6053,7 @@ describe("AgentRunner", () => {
     const result = await runner.run({ message: "read every page" });
 
     expect(result.text).toBe("All distinct pages were read.");
-    expect(result.meta.toolLoops).toBe(NEAR_DUP_LOOP_HARD);
+    expect(result.meta.toolLoops).toBe(PAGES);
     expect(JSON.stringify(requests)).not.toContain("effectively the same arguments");
   });
 
@@ -4712,8 +6107,8 @@ describe("AgentRunner", () => {
       "no_progress_stop",
     ]));
     const nudge = JSON.stringify(requests);
-    expect(nudge).toContain(`${RUN_NO_PROGRESS_NUDGE_ROUNDS} consecutive tool rounds`);
-    expect(JSON.stringify(runner.getSession().getMessages())).not.toContain("consecutive tool rounds have produced no successful work");
+    expect(nudge).toContain(`Since the last productive result, ${RUN_NO_PROGRESS_NUDGE_ROUNDS} tool rounds`);
+    expect(JSON.stringify(runner.getSession().getMessages())).not.toContain("Since the last productive result");
   });
 
   it("progress governor: empty and byte-identical writes do not manufacture progress", async () => {
@@ -4849,7 +6244,7 @@ describe("AgentRunner", () => {
     expect(result.meta.convergenceSignals ?? []).not.toContain("no_progress_stop");
   });
 
-  it("progress governor: completed execution-plan milestones reset the stall window", async () => {
+  it("progress governor: completed plan milestones do not count as business progress", async () => {
     const requests: CompletionParams[] = [];
     const planCall = (
       id: string,
@@ -4887,10 +6282,14 @@ describe("AgentRunner", () => {
 
     const result = await runner.run({ message: "Implement and verify the planned change" });
 
-    expect(result.text).toBe('{"plan":"complete"}');
+    expect(result.text).toContain("no successful work");
+    expect(result.text).not.toContain('{"plan":"complete"}');
     expect(result.meta.toolLoops).toBe(4);
-    expect(result.meta.convergenceSignals ?? []).not.toContain("no_progress_stop");
-    expect(requests).toHaveLength(5);
+    expect(result.meta.convergenceSignals ?? []).toEqual(expect.arrayContaining([
+      "no_progress_nudge",
+      "no_progress_stop",
+    ]));
+    expect(requests).toHaveLength(4);
     expect(runner.getSession().getExecutionPlan()?.steps.map((step) => step.status))
       .toEqual(["completed", "completed"]);
   });
@@ -4944,14 +6343,36 @@ describe("AgentRunner", () => {
       .toBe(false);
   });
 
-  it("progress governor: bounds varied read/search-only rounds that evade duplicate detection", async () => {
+  it("progress governor: alternating bookkeeping and discovery cannot reset both stall windows", () => {
+    const guards = new LoopGuards();
+    let verdict = guards.observeRoundOutcome({ progress: "none", freshEpisode: false });
+
+    for (let index = 0; index < RUN_NO_PROGRESS_STOP_ROUNDS - 1; index++) {
+      verdict = guards.observeRoundOutcome({ progress: "discovery", freshEpisode: false });
+      expect(verdict.stop).toBeNull();
+      verdict = guards.observeRoundOutcome({ progress: "none", freshEpisode: false });
+    }
+
+    expect(verdict.stop).toEqual({
+      kind: "no_progress",
+      stalledRounds: RUN_NO_PROGRESS_STOP_ROUNDS,
+    });
+
+    const resetVerdict = guards.observeRoundOutcome({ progress: "productive", freshEpisode: false });
+    expect(resetVerdict).toEqual({ nudge: null, stop: null });
+    expect(guards.consecutiveNoProgressRounds).toBe(0);
+  });
+
+  it("progress governor: bounds varied web discovery rounds that evade duplicate detection", async () => {
     const requests: CompletionParams[] = [];
     const toolRounds: CompletionResult[] = Array.from({ length: RUN_DISCOVERY_STOP_ROUNDS }, (_, index) => ({
       content: [{
         type: "tool_use" as const,
-        id: `result-search-${index}`,
-        name: "tool_result_search",
-        input: { ref: "bash.1111111111111111", query: `different-query-${index}` },
+        id: `web-discovery-${index}`,
+        name: index % 2 === 0 ? "web_search" : "web_fetch",
+        input: index % 2 === 0
+          ? { query: `different-query-${index}` }
+          : { url: `https://example.com/source-${index}` },
       }],
       stopReason: "tool_use" as const,
       usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
@@ -4969,21 +6390,30 @@ describe("AgentRunner", () => {
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
     let executions = 0;
-    const resultSearch = defineTool({
-      name: "tool_result_search",
-      description: "synthetic persisted-result search",
+    const webSearch = defineTool({
+      name: "web_search",
+      description: "synthetic web search",
       inputSchema: { type: "object", properties: { query: { type: "string" } } },
       async execute(input) {
         executions++;
-        return { content: `excerpt for ${(input as { query?: unknown }).query}` };
+        return { content: `results for ${(input as { query?: unknown }).query}` };
+      },
+    });
+    const webFetch = defineTool({
+      name: "web_fetch",
+      description: "synthetic web fetch",
+      inputSchema: { type: "object", properties: { url: { type: "string" } } },
+      async execute(input) {
+        executions++;
+        return { content: `page for ${(input as { url?: unknown }).url}` };
       },
     });
     const config = createConfig({
       agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: RUN_DISCOVERY_STOP_ROUNDS + 10 },
     });
-    const runner = new AgentRunner({ config, providers: registry, tools: [resultSearch] });
+    const runner = new AgentRunner({ config, providers: registry, tools: [webSearch, webFetch] });
 
-    const result = await runner.run({ message: "inspect the persisted result" });
+    const result = await runner.run({ message: "research a complex question" });
 
     expect(executions).toBe(RUN_DISCOVERY_STOP_ROUNDS);
     expect(requests).toHaveLength(RUN_DISCOVERY_STOP_ROUNDS);
@@ -4992,10 +6422,10 @@ describe("AgentRunner", () => {
       "discovery_stall_nudge",
       "discovery_stall_stop",
     ]));
-    expect(JSON.stringify(requests)).toContain(`${RUN_DISCOVERY_NUDGE_ROUNDS} consecutive read/search-only tool rounds`);
+    expect(JSON.stringify(requests)).toContain(`Since the last productive result, ${RUN_DISCOVERY_NUDGE_ROUNDS} read/search-only tool rounds`);
   });
 
-  it("progress governor: productive evidence resets a long discovery streak", async () => {
+  it("progress governor: a durable evidence update resets a long discovery streak", async () => {
     const requests: CompletionParams[] = [];
     const responses: CompletionResult[] = [];
     for (let index = 0; index < RUN_DISCOVERY_STOP_ROUNDS + 2; index++) {
@@ -5004,9 +6434,9 @@ describe("AgentRunner", () => {
         content: [{
           type: "tool_use" as const,
           id: `mixed-progress-${index}`,
-          name: evidenceRound ? "web_search" : "tool_result_search",
+          name: evidenceRound ? "append_file" : "tool_result",
           input: evidenceRound
-            ? { query: "authoritative source" }
+            ? { path: "evidence-ledger.jsonl", content: "{\"claim\":\"supported\"}\n" }
             : { ref: "bash.1111111111111111", query: `section-${index}` },
         }],
         stopReason: "tool_use",
@@ -5024,16 +6454,16 @@ describe("AgentRunner", () => {
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => provider);
     const discovery = defineTool({
-      name: "tool_result_search",
+      name: "tool_result",
       description: "synthetic discovery",
       inputSchema: { type: "object", properties: {} },
       async execute() { return { content: "bounded excerpt" }; },
     });
     const evidence = defineTool({
-      name: "web_search",
-      description: "synthetic evidence",
+      name: "append_file",
+      description: "synthetic durable evidence update",
       inputSchema: { type: "object", properties: {} },
-      async execute() { return { content: "new authoritative evidence" }; },
+      async execute() { return { content: "evidence ledger updated" }; },
     });
     const config = createConfig({
       agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: RUN_DISCOVERY_STOP_ROUNDS + 10 },
@@ -5168,6 +6598,16 @@ describe("AgentRunner", () => {
       msgs.some((m) => m.role === "user"
         && m.content.some((c) => c.type === "text" && c.text.includes("approaching the tool loop round limit"))));
     expect(nudged).toBe(true);
+    const nudgeText = capturedStreamMessages
+      .flatMap((messages) => messages)
+      .filter((message) => message.role === "user")
+      .flatMap((message) => message.content)
+      .find((content) => content.type === "text"
+        && content.text.includes("approaching the tool loop round limit"));
+    expect(nudgeText?.type === "text" ? nudgeText.text : "")
+      .toContain("verify it once, and then respond");
+    expect(nudgeText?.type === "text" ? nudgeText.text : "")
+      .not.toContain("update the execution plan");
     expect(completeMessages.some((m) => m.role === "user"
       && m.content.some((c) => c.type === "text" && c.text.includes("No more tool calls are available")))).toBe(true);
     expect(completeMessages.some((m) => m.role === "user"
@@ -5256,7 +6696,7 @@ describe("AgentRunner", () => {
         return {
           content: [{ type: "text", text: "[checkpoint summary of prior tool work]" }],
           stopReason: "end_turn",
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           model: "mock-model",
         };
       },
@@ -5278,7 +6718,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
             content: [{ type: "tool_use" as const, id, name: "step", input: { i: call } }],
             model: "mock-model",
           };
@@ -5288,7 +6728,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           content: [{ type: "text" as const, text: "done after re-anchoring" }],
           model: "mock-model",
         };
@@ -5344,7 +6784,7 @@ describe("AgentRunner", () => {
         return {
           content: [{ type: "text", text: "[checkpoint summary]" }],
           stopReason: "end_turn",
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           model: "mock-model",
         };
       },
@@ -5363,7 +6803,7 @@ describe("AgentRunner", () => {
           yield {
             type: "message_end" as const,
             stopReason: "tool_use" as const,
-            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
             content: [{ type: "tool_use" as const, id, name: "step", input: { i: call } }],
             model: "mock-model",
           };
@@ -5373,7 +6813,7 @@ describe("AgentRunner", () => {
         yield {
           type: "message_end" as const,
           stopReason: "end_turn" as const,
-          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          usage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 },
           content: [{ type: "text" as const, text: "done" }],
           model: "mock-model",
         };
@@ -5849,10 +7289,11 @@ describe("AgentRunner", () => {
     await runner.run({ message: "do the task", drainSteer: () => [] });
 
     expect(streamCalls).toBe(2);
-    // No steer is folded. The second round adds only deterministic, view-only
-    // host state: the completed-work ledger and execution objective anchor.
+    // No steer is folded. The visible tool_result is not duplicated into the
+    // completed-work projection, so the only added user-text block is the
+    // deterministic execution objective anchor.
     expect(userTextCounts[0]).toBe(1);
-    expect(userTextCounts[1]).toBe(3);
+    expect(userTextCounts[1]).toBe(2);
   });
 
   it("injects run-scoped Maps shared across tool rounds", async () => {
@@ -5996,6 +7437,42 @@ describe("terminal text guard", () => {
     // One turn, two model calls: the user never sees the rejected answer.
     expect(result.text).toBe("bound form");
     expect(seen).toEqual(["unbound form", "bound form"]);
+  });
+
+  it("lets the explicit terminal guard reject once even when the advisory Plan is unfinished", async () => {
+    const requests: CompletionParams[] = [];
+    const provider = createMockProvider(
+      [textResponse("unbound form"), textResponse("bound form")],
+      (params) => requests.push(params),
+    );
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Complete the staged task" }]);
+    session.updateExecutionPlan({
+      steps: [
+        { step: "Prepare the result", status: "completed" },
+        { step: "Deliver the result", status: "in_progress" },
+      ],
+    });
+    const seen: string[] = [];
+    const runner = new AgentRunner({ config, providers: registry, tools: [], session });
+
+    const result = await runner.run({
+      message: "Continue",
+      resumeActiveTurn: true,
+      terminalTextGuard: (text) => {
+        seen.push(text);
+        return text === "unbound form" ? "bind the form" : null;
+      },
+    });
+
+    expect(result.text).toBe("bound form");
+    expect(seen).toEqual(["unbound form", "bound form"]);
+    expect(requests).toHaveLength(2);
+    expect(JSON.stringify(requests[1].messages)).toContain("bind the form");
+    expect(JSON.stringify(requests[1].messages)).not.toContain("premature completion");
   });
 
   it("rejects at most once so an always-failing guard cannot spin the turn", async () => {

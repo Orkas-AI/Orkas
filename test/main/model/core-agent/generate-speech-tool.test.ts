@@ -10,10 +10,6 @@ const speechMock = vi.hoisted(() => ({
   recordVideoProductionNarrationLine: vi.fn(),
 }));
 
-vi.mock('../../../../src/main/features/permissions', () => ({
-  getLocalExecGranted: () => true,
-}));
-
 vi.mock('../../../../src/main/features/tts', () => ({
   hasConfiguredTtsProvider: () => true,
   generateSpeech: speechMock.generateSpeech,

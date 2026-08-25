@@ -1,6 +1,9 @@
 #!/bin/bash
 # Orkas PC launcher. Lives under PC/; the script's own directory is the PC root.
-# Behavior: kills any prior instance, then starts a new one in the foreground.
+# Behavior: an in-app relaunch waits for its exact owner process to exit, then
+# starts a new instance in the foreground. It never kills Electron processes
+# by image name or install-directory prefix because other tasks can share the
+# same bundled runtime.
 #
 # Usage:
 #   ./run.sh
@@ -39,6 +42,33 @@ fi
 
 echo "[Orkas] Starting Orkas (global prod)"
 
+wait_for_relaunch_owner() {
+  local owner_pid="${ORKAS_RELAUNCH_OWNER_PID:-}"
+  [ -n "$owner_pid" ] || return 0
+  case "$owner_pid" in
+    *[!0-9]*|'')
+      echo "[Orkas] Invalid relaunch owner PID; refusing to start." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$owner_pid" -eq "$$" ]; then
+    echo "[Orkas] Relaunch owner PID resolves to the launcher itself; refusing to start." >&2
+    exit 1
+  fi
+  local attempt=0
+  while kill -0 "$owner_pid" >/dev/null 2>&1 && [ "$attempt" -lt 150 ]; do
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  if kill -0 "$owner_pid" >/dev/null 2>&1; then
+    echo "[Orkas] Relaunch owner PID $owner_pid did not exit within 15 seconds; refusing to terminate unrelated processes." >&2
+    exit 1
+  fi
+  unset ORKAS_RELAUNCH_OWNER_PID
+}
+
+wait_for_relaunch_owner
+
 node "$APP_DIR/scripts/ensure-deps.cjs"
 node "$APP_DIR/scripts/ensure-dev-dependencies.cjs"
 # macOS source runs need the same connector callback declaration that electron-builder adds to
@@ -46,8 +76,6 @@ node "$APP_DIR/scripts/ensure-dev-dependencies.cjs"
 node "$APP_DIR/scripts/prepare-source-protocol.cjs" || true
 
 cd "$APP_DIR"
-pkill -9 -f "$APP_DIR/node_modules/electron/dist" >/dev/null 2>&1 || true
-sleep 0.3
 
 if [ "$(uname -s)" = "Darwin" ]; then
   APP_BUNDLE="$APP_DIR/node_modules/electron/dist/Orkas.app"

@@ -1,6 +1,7 @@
 {
-  "version": "1.0.3",
-  "updated_at": "2026-08-02T09:34:40.000Z",
+  "version": "1.0.7",
+  "updated_at": "2026-08-23T09:48:36.000Z",
+  "category": "office",
   "min_app_version": "1.6.1",
   "reseed_if_deleted_before": "2026-07-21T12:34:01Z"
 }

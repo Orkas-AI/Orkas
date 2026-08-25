@@ -517,8 +517,52 @@ export const processStopTool: AgentTool = defineTool({
   },
 });
 
+/** Public lifecycle umbrella. The action discriminator removes three repeated
+ * tool definitions while the operation implementations above keep their
+ * focused validation and observations. The legacy exports remain available to
+ * non-model callers, but only this tool is advertised by the builtin registry. */
+export const processSessionTool: AgentTool = defineTool({
+  name: "process_session",
+  description:
+    "Manage a persistent shell process for long builds, tests, watchers, servers, or later stdin. Use bash for one-shot commands and interactive_cli when the user must enter secrets or complete OAuth.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      action: {
+        type: "string",
+        enum: ["start", "read", "write", "stop"],
+        description: "Lifecycle operation.",
+      },
+      command: { type: "string", description: "Required for start. Shell command to launch." },
+      max_lifetime_ms: {
+        type: "number",
+        description: "Start only. Default 6 hours; minimum 1 minute; maximum 24 hours.",
+      },
+      session_id: { type: "string", description: "Required for read, write, and stop." },
+      cursor: { type: "number", description: "Read only. Previous next_cursor." },
+      max_chars: { type: "number", description: "Read only. Default 32000; maximum 64000." },
+      chars: { type: "string", description: "Write only. Known non-secret characters for stdin." },
+      add_newline: { type: "boolean", description: "Write only. Append a newline; default false." },
+    },
+    required: ["action"],
+  },
+  executionMode: "parallel",
+  async execute(input, ctx) {
+    const action = String(input.action ?? "");
+    if (action === "start") return processStartTool.execute(input, ctx);
+    if (action === "read") return processReadTool.execute(input, ctx);
+    if (action === "write") return processWriteTool.execute(input, ctx);
+    if (action === "stop") return processStopTool.execute(input, ctx);
+    return {
+      content: "E_BAD_INPUT: `action` must be start, read, write, or stop",
+      isError: true,
+    };
+  },
+});
+
 export function getProcessSessionTools(): AgentTool[] {
-  return [processStartTool, processReadTool, processWriteTool, processStopTool];
+  return [processSessionTool];
 }
 
 /** Test-only cleanup; production sessions are retained by their lifecycle. */

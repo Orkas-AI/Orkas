@@ -36,6 +36,32 @@ type AttachmentItem = {
 
 type OpenPreview = (cid: string, item: AttachmentItem | null) => Promise<void>;
 
+function renderMessageAttachments(names: string[], cid: string): string {
+  const context = vm.createContext({
+    _chatAttachExtOf: (name: string) => name.split('.').pop()?.toLowerCase() || '',
+    _chatAttachKindFromExt: (ext: string) => ({
+      png: 'image',
+      mp4: 'video',
+      mp3: 'audio',
+      pdf: 'pdf',
+    }[ext] || 'file'),
+    _chatFileIconHtml: (name: string, kind: string) => `<svg data-name="${name}" data-kind="${kind}"></svg>`,
+    _chatMediaUrl: (attachmentCid: string, name: string) => `chat-media://cid/${attachmentCid}/${name}`,
+    escapeHtml: (value: unknown) => String(value)
+      .replaceAll('&', '&amp;')
+      .replaceAll('"', '&quot;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;'),
+  });
+  vm.runInContext(`
+    ${extractFunction('_renderMessageAttachmentsHtml')}
+    globalThis.renderMessageAttachments = _renderMessageAttachmentsHtml;
+  `, context);
+  return (context as typeof context & {
+    renderMessageAttachments: (items: string[], attachmentCid: string) => string;
+  }).renderMessageAttachments(names, cid);
+}
+
 function createPreviewHarness(
   invokeResult: unknown = { ok: true, path: '/safe/draft-note.md' },
   options: { viewerAvailable?: boolean } = {},
@@ -222,5 +248,23 @@ describe('pending attachment preview', () => {
     expect(removeStop).toHaveBeenCalledOnce();
     expect(removeAttachment).toHaveBeenCalledWith('main_chat', 0);
     expect(openPreview).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('sent message attachment presentation', () => {
+  it('reuses the compact composer chip for every file kind without inline media expansion', () => {
+    const html = renderMessageAttachments(
+      ['reference image.png', 'demo.mp4', 'voice.mp3', 'brief.pdf'],
+      'conversation-a',
+    );
+
+    expect(html.match(/class="chat-attach-chip chat-msg-attach"/g)).toHaveLength(4);
+    expect(html.match(/class="chat-attach-preview"/g)).toHaveLength(4);
+    expect(html.match(/class="chat-attach-thumb"/g)).toHaveLength(1);
+    expect(html).toContain('chat-media://cid/conversation-a/reference image.png');
+    expect(html).not.toContain('<video');
+    expect(html).not.toContain('<audio');
+    expect(html).not.toContain('chat-msg-attach-thumb-shell');
+    expect(html).not.toContain('data-chat-video-playback-surface');
   });
 });

@@ -184,13 +184,13 @@ describe('external-agent unavailable status copy', () => {
     });
   });
 
-  it('limits project-directory controls to Claude Code and Codex', () => {
+  it('exposes project-directory controls for every coding CLI', () => {
     const { isCodingAgent } = loadStatusHint();
 
     expect(isCodingAgent('claude')).toBe(true);
     expect(isCodingAgent('codex')).toBe(true);
     expect(isCodingAgent('openclaw')).toBe(false);
-    expect(isCodingAgent('opencode')).toBe(false);
+    expect(isCodingAgent('opencode')).toBe(true);
     expect(isCodingAgent('hermes')).toBe(false);
   });
 

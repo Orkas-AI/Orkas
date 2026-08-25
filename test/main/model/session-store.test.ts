@@ -6,8 +6,8 @@ import * as path from 'node:path';
 // Session-store path routing — no LLM calls here, just `sessionFileFor` plumbing. The format
 // is now `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id, since the path root
 // `<activeUid>/{cloud,local}/sessions/<sid>.jsonl` already scopes by user). The router picks
-// cloud vs local based on whether the kind is ephemeral (extract-img / reflect / memory-extract
-// / anon → local; gconv / gmember / skill / agent → cloud).
+// cloud vs local based on whether the kind is ephemeral (extract-img / reflect / anon → local;
+// gconv / gmember / skill / agent → cloud). Retired or unknown kinds are rejected.
 //
 // CRITICAL: this file previously called `activateUser(uid)` in `beforeAll` WITHOUT setting
 // ORKAS_WORKSPACE_ROOT first, so the real `PC/data/` received a `data/<uid>/` skeleton + a
@@ -79,12 +79,11 @@ describe('session-store.sessionFileFor', () => {
     expect(sessionFileFor(id)).toBe(path.join(cloudDir, `${id}.jsonl`));
   });
 
-  it('routes ephemeral kinds (extract-img / reflect / memory-extract / anon) → <uid>/local/sessions/', async () => {
+  it('routes ephemeral kinds (extract-img / reflect / anon) → <uid>/local/sessions/', async () => {
     const { sessionFileFor, toolResultsDirForSession, localDir, localToolResultsDir } = await loadRouting();
     for (const id of [
       'extract-img-077355b2',
       'reflect-abc123',
-      'memory-extract-1234567890',
       'anon-12345678',
     ]) {
       expect(sessionFileFor(id)).toBe(path.join(localDir, `${id}.jsonl`));
@@ -124,6 +123,8 @@ describe('session-store.sessionFileFor', () => {
     expect(() => sessionFileFor('hello-world'))
       .toThrow(/invalid session id/);
     expect(() => sessionFileFor('garbage'))
+      .toThrow(/invalid session id/);
+    expect(() => sessionFileFor('memory-extract-retired'))
       .toThrow(/invalid session id/);
   });
 
@@ -170,7 +171,7 @@ describe('memoryScopeForSession (per-agent memory eligibility)', () => {
     const { sessionKindOf } = await import('../../../src/main/model/core-agent/session-store');
     expect(sessionKindOf('gconv-abc')).toBe('gconv');
     expect(sessionKindOf('gmember-cid-video-studio')).toBe('gmember');
-    expect(sessionKindOf('memory-extract-x')).toBe('memory-extract');
+    expect(sessionKindOf('memory-extract-x')).toBeNull();
     expect(sessionKindOf('extract-img-x')).toBe('extract-img');
     expect(sessionKindOf('agent-x')).toBe('agent');
     expect(sessionKindOf('skill-x')).toBe('skill');
@@ -191,8 +192,43 @@ describe('memoryScopeForSession (per-agent memory eligibility)', () => {
 
   it('authoring + ephemeral sessions are NOT memory-eligible (null = no tool, no injection)', async () => {
     const { memoryScopeForSession } = await import('../../../src/main/model/core-agent/session-store');
-    for (const sid of ['agent-edit-1', 'skill-edit-1', 'extract-img-1', 'anon-1', 'reflect-1', 'memory-extract-1']) {
+    for (const sid of ['agent-edit-1', 'skill-edit-1', 'extract-img-1', 'anon-1', 'reflect-1']) {
       expect(memoryScopeForSession(sid, 'video-studio'), sid).toBeNull();
     }
+  });
+});
+
+describe('metacognitionAllowedForSession (write eligibility)', () => {
+  it('allows sessions that also receive the metacognition block', async () => {
+    const { metacognitionAllowedForSession } = await import('../../../src/main/model/core-agent/session-store');
+    // Read and write must travel together: revising a self-assessment the
+    // session cannot see is a blind write.
+    expect(metacognitionAllowedForSession('gconv-abc', '')).toBe(true);
+    expect(metacognitionAllowedForSession('gmember-cid-video-studio', 'video-studio')).toBe(true);
+    expect(metacognitionAllowedForSession('gworker-x', 'seo-geo')).toBe(true);
+    expect(metacognitionAllowedForSession('cli-x', 'video-studio')).toBe(true);
+  });
+
+  it('allows reflection as the one deliberate write-only session', async () => {
+    const { metacognitionAllowedForSession } = await import('../../../src/main/model/core-agent/session-store');
+    // Persisting the assessment is the point of the session; the current
+    // content reaches it through the review prompt, not the system block.
+    expect(metacognitionAllowedForSession('reflect-abc', 'video-studio')).toBe(true);
+    expect(metacognitionAllowedForSession('reflect-abc', '')).toBe(true);
+  });
+
+  it('refuses authoring and one-shot sessions, which would write to _default', async () => {
+    const { metacognitionAllowedForSession } = await import('../../../src/main/model/core-agent/session-store');
+    // These carry no agent id, so a write normalizes to `_default` — the
+    // commander's own file, injected into every commander turn. An
+    // observation made while editing one agent would land in the commander's
+    // self-assessment and stay there.
+    for (const sid of ['agent-x', 'skill-x', 'extract-img-1', 'anon-1']) {
+      expect(metacognitionAllowedForSession(sid, ''), sid).toBe(false);
+    }
+    // Even with an agent id in hand, authoring sessions stay out.
+    expect(metacognitionAllowedForSession('agent-x', 'video-studio')).toBe(false);
+    // A malformed worker without an agent id has no scope to write into.
+    expect(metacognitionAllowedForSession('gmember-cid-x', '')).toBe(false);
   });
 });

@@ -164,9 +164,7 @@ export interface Conversation {
 export type MessageRecord = GroupMessage;
 
 function _messageForDisplay(message: MessageRecord): MessageRecord {
-  if (message.from === 'user' || !String(message.text || '').includes('chat-media://local/')) {
-    return message;
-  }
+  if (message.from === 'user') return message;
   const text = versionChatMediaLocalUrlsInText(message.text);
   return text === message.text ? message : { ...message, text };
 }
@@ -1891,6 +1889,17 @@ function purgeSession(userId: string, sessionId: string): void {
 }
 
 async function _purgeDeletedConversationFiles(userId: string, cid: string, removed?: Conversation): Promise<void> {
+  // A completed turn may still be materializing remote image/video output in
+  // the background. Abort it before removing the message file; attachment
+  // purge also holds the writer lock so a response already past abort cannot
+  // recreate the deleted conversation's media directory.
+  try {
+    const runner = require('./local_agents/runner') as typeof import('./local_agents/runner');
+    runner.cancelBackgroundMediaForConversation(userId, cid);
+  } catch (err) {
+    log.warn(`background media cancel failed user=${userId} cid=${cid}: ${(err as Error).message}`);
+  }
+
   // Purge group dir (members.json / state.json / plan.md / visibility/) + bus state.
   // CJS require (same reason as listConversations above) — dynamic `import()`
   // would load bus.ts as a second ESM module and dropConv would clear the

@@ -112,6 +112,31 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
     expect((r?.event as any).output).toBe('line1\nline2');
   });
 
+  it('preserves tool text and emits base64/URL image blocks as media output', () => {
+    const r = mapClaudeEvent({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'image-1', content: [
+        { type: 'text', text: 'created' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+        { type: 'image', source: { type: 'url', url: 'https://cdn.example/image.webp' } },
+      ] }] },
+    }, 'sess');
+    expect(r?.events).toEqual([
+      {
+        type: 'tool-event', tool: 'tool_result', callId: 'image-1', phase: 'result', output: 'created',
+      },
+      {
+        type: 'media-output',
+        source: 'claude',
+        callId: 'image-1',
+        items: [
+          { data: 'AAAA', mediaType: 'image/png' },
+          { uri: 'https://cdn.example/image.webp' },
+        ],
+      },
+    ]);
+  });
+
   it('keeps every tool result in a multi-result user message', () => {
     const r = mapClaudeEvent({
       type: 'user',
@@ -304,7 +329,7 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
     });
   });
 
-  it('maps auth, rate-limit, and local command output records', () => {
+  it('maps auth, blocking rate-limit, and local command output records', () => {
     expect(mapClaudeEvent({
       type: 'auth_status',
       isAuthenticating: true,
@@ -325,7 +350,7 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
     expect(mapClaudeEvent({
       type: 'rate_limit_event',
       rate_limit_info: {
-        status: 'rejected',
+        status: ' ReJeCtEd ',
         resetsAt: 12345,
         utilization: 0.9,
       },
@@ -343,6 +368,28 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
     }, 'sess')?.event).toEqual({
       type: 'text-delta',
       text: 'command output\n',
+    });
+  });
+
+  it.each([
+    ['allowed', 'allowed'],
+    ['early warning', 'allowed_warning'],
+    ['unknown provider state', 'unexpected'],
+    ['missing provider state', undefined],
+  ])('keeps non-blocking rate-limit update: %s in the hidden usage stream', (_label, status) => {
+    expect(mapClaudeEvent({
+      type: 'rate_limit_event',
+      rate_limit_info: {
+        status,
+        resetsAt: 12345,
+        utilization: 0.9,
+      },
+    }, 'sess')?.event).toEqual({
+      type: 'status',
+      status: 'usage',
+      rateLimitStatus: status || '',
+      resetsAt: 12345,
+      utilization: 0.9,
     });
   });
 

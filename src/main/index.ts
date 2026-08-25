@@ -38,6 +38,7 @@ import { app, BrowserWindow, Menu, Notification, ipcMain, nativeImage, net, prot
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
+import { resolveCliCommand } from './features/local_agents/spawn-command';
 import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
 import {
   hardenedWebPreferences,
@@ -123,6 +124,7 @@ import {
   noteBootUserActivity,
   registerDeferred,
   runBootPhases,
+  scheduleBootBackground,
 } from './util/boot_init';
 import { getBootDeviceProfile } from './util/boot-device-profile';
 
@@ -182,7 +184,7 @@ import * as appConfig from './features/config';
 import { getRendererBootTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
-import * as systemSkills from './features/system_skills';
+import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
 import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
 import * as chatAttachments from './features/chat_attachments';
@@ -416,23 +418,32 @@ function registerIpc(): void {
     // The relaunch button shells out to run.sh / run.cmd instead of using
     // `app.relaunch()` so we can reuse `scripts/ensure-deps.cjs` for
     // dependency self-healing — otherwise pulling new code + relaunching
-    // crashes immediately due to missing packages. The shell script handles
-    // ensure-deps + killing the old electron + npm start; here we just
-    // detach-spawn it and call `app.exit(0)`.
+    // crashes immediately due to missing packages. The shell script receives
+    // this process as its explicit owner, waits for it to exit, then starts the
+    // replacement without touching any other Electron process.
     ipcMain.handle('orkas.relaunch', () => {
-      const isWin = process.platform === 'win32';
-      const script = path.join(paths.PC_ROOT, isWin ? 'run.cmd' : 'run.sh');
-      const [cmd, args] = isWin
-        ? ['cmd.exe', ['/c', script]] as const
-        : ['bash',    [script]]       as const;
-      const child = spawn(cmd, args, {
+      const isWindows = process.platform === 'win32';
+      const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
+      const resolved = isWindows
+        ? resolveCliCommand(script, [], process.platform, process.env)
+        : { command: 'bash', args: [script], windowsVerbatimArguments: undefined };
+      // install-data-root.cjs must resolve the workspace again in the
+      // replacement process. Inheriting the current resolved roots would
+      // short-circuit that boot decision.
+      const childEnv = { ...process.env };
+      delete childEnv.ORKAS_WORKSPACE_ROOT;
+      delete childEnv.CORE_AGENT_AUTH_DIR;
+      childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid);
+      const child = spawn(resolved.command, resolved.args, {
         cwd: paths.PC_ROOT,
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
+        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+        env: childEnv,
       });
       child.unref();
-      log.info('relaunch via shell script', { script });
+      log.info('relaunch via shell script');
       app.exit(0);
       return { ok: true };
     });
@@ -474,7 +485,8 @@ function registerIpc(): void {
       builtin_agents_dir: 'X', custom_agents_dir: 'X',
       builtin_skills_dir: 'X', custom_skills_dir: 'X',
       agents_index: '', plan_state: '',
-      os: 'X', working_dir: 'X', shell_hint: '', local_exec_state: 'X',
+      project_tasks_rules: '',
+      os: 'X', working_dir: 'X', shell_hint: '',
       output_format_hint: 'X',
       project_files_block: '',
     });
@@ -800,24 +812,131 @@ const _KB_FILE_MIME: Record<string, string> = {
   '.json': 'application/json',
 };
 
-// Thin wrapper over `util/http-range.serveFileRange` that injects this
-// module's logger for the (best-effort) mid-stream read-error warning. The
-// Range/cache/ETag/304 logic + its fixtures live in the util module so they're
-// unit-testable without booting Electron.
+type MediaProtocolSource = 'kb' | 'chat_attachment' | 'chat_local' | 'chat_app_saved' | 'chat_app_artifact';
+
+let pdfProtocolRequestSeq = 0;
+let htmlProtocolRequestSeq = 0;
+
+function _mediaKindForContentType(contentType: string): string {
+  const mime = String(contentType || '').split(';', 1)[0].trim().toLowerCase();
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime === 'text/html') return 'html';
+  if (mime.startsWith('text/')) return 'text';
+  return 'binary';
+}
+
+function _mediaStreamErrorCode(err: Error): string {
+  const code = String((err as NodeJS.ErrnoException).code || '').toUpperCase();
+  if (err.name === 'AbortError' || code === 'ABORT_ERR' || code === 'ERR_STREAM_PREMATURE_CLOSE'
+      || code === 'ECONNRESET') return 'client_aborted';
+  if (code === 'ENOENT') return 'source_not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'permission_denied';
+  return 'read_failed';
+}
+
+function _protocolServeFailureCode(err: unknown): string {
+  const code = String((err as NodeJS.ErrnoException | undefined)?.code || '').toUpperCase();
+  if (code === 'ENOENT') return 'source_not_found';
+  if (code === 'EACCES' || code === 'EPERM') return 'permission_denied';
+  if (err instanceof URIError) return 'invalid_url_encoding';
+  return 'serve_failed';
+}
+
+// Thin wrapper over `util/http-range.serveFileRange` that emits bounded,
+// privacy-safe protocol diagnostics. The Range/cache/ETag/304 logic + its
+// fixtures live in the util module so they're unit-testable without Electron.
 function serveFileRange(
   request: Request,
   absPath: string,
   contentType: string,
   totalSize: number,
   mtimeMs?: number,
+  source: MediaProtocolSource = 'chat_local',
 ): Response {
+  const mediaKind = _mediaKindForContentType(contentType);
+  const pdfRequestId = mediaKind === 'pdf' ? ++pdfProtocolRequestSeq : null;
+  const htmlRequestId = mediaKind === 'html' ? ++htmlProtocolRequestSeq : null;
+  const responsePrepared = mediaKind === 'pdf'
+    ? (diagnostic: import('./util/http-range').FileRangeResponseDiagnostic) => {
+      log.info('pdf preview response prepared', {
+        request_id: pdfRequestId,
+        source,
+        method: diagnostic.requestMethod,
+        range_header: diagnostic.rangeHeaderKind,
+        status: diagnostic.status,
+        total_bytes: diagnostic.totalBytes,
+        response_bytes: diagnostic.responseBytes,
+        ...(diagnostic.rangeStart !== undefined ? { range_start: diagnostic.rangeStart } : {}),
+        ...(diagnostic.rangeEnd !== undefined ? { range_end: diagnostic.rangeEnd } : {}),
+        cache_revalidated: diagnostic.cacheRevalidated,
+        prepare_duration_ms: diagnostic.prepareDurationMs,
+      });
+    }
+    : mediaKind === 'html'
+      ? (diagnostic: import('./util/http-range').FileRangeResponseDiagnostic) => {
+        log.info('html preview response prepared', {
+          request_id: htmlRequestId,
+          source,
+          delivery_mode: 'streamed',
+          method: diagnostic.requestMethod,
+          range_header: diagnostic.rangeHeaderKind,
+          status: diagnostic.status,
+          total_bytes: diagnostic.totalBytes,
+          response_bytes: diagnostic.responseBytes,
+          cache_revalidated: diagnostic.cacheRevalidated,
+          prepare_duration_ms: diagnostic.prepareDurationMs,
+        });
+      }
+      : undefined;
+  const streamFinished = mediaKind === 'pdf'
+    ? (diagnostic: import('./util/http-range').FileRangeStreamDiagnostic) => {
+      log.info('pdf preview stream finished', {
+        request_id: pdfRequestId,
+        source,
+        outcome: diagnostic.outcome,
+        bytes_read: diagnostic.bytesRead,
+        stream_duration_ms: diagnostic.durationMs,
+      });
+    }
+    : mediaKind === 'html'
+      ? (diagnostic: import('./util/http-range').FileRangeStreamDiagnostic) => {
+        log.info('html preview stream finished', {
+          request_id: htmlRequestId,
+          source,
+          delivery_mode: 'streamed',
+          outcome: diagnostic.outcome,
+          bytes_read: diagnostic.bytesRead,
+          stream_duration_ms: diagnostic.durationMs,
+        });
+      }
+      : undefined;
   return serveFileRangeCore(
     request,
     absPath,
     contentType,
     totalSize,
     mtimeMs,
-    (err) => { log.warn('media stream error', { absPath, error: err.message }); },
+    (err, streamDiagnostic) => {
+      const errorCode = _mediaStreamErrorCode(err);
+      const details = {
+        source,
+        media_kind: mediaKind,
+        error_code: errorCode,
+        total_bytes: totalSize,
+        bytes_read: streamDiagnostic.bytesRead,
+        stream_duration_ms: streamDiagnostic.durationMs,
+        ...(pdfRequestId !== null || htmlRequestId !== null
+          ? { request_id: pdfRequestId ?? htmlRequestId }
+          : {}),
+      };
+      if (errorCode === 'client_aborted') log.info('media stream ended', details);
+      else log.warn('media stream error', details);
+    },
+    responsePrepared,
+    streamFinished,
   );
 }
 
@@ -834,16 +953,16 @@ function registerKbFileProtocol(): void {
       const root = path.resolve(paths.userContextsDir(uid));
       const resolved = resolveContainedProtocolFile(reqUrl, 'kb-file', root);
       if (resolved.ok === false) {
-        log.warn('kb-file: rejected', { reqUrl, code: resolved.error });
+        log.warn('kb-file: rejected', { error_code: resolved.error });
         return new Response(resolved.error.replace('_', ' '), { status: resolved.status });
       }
       const { absPath: abs, stat: st } = resolved;
-      log.info('kb-file: serving', { reqUrl, abs, bytes: st.size });
       const ext = path.extname(abs).toLowerCase();
       const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
-      return serveFileRange(request, abs, contentType, st.size, st.mtimeMs);
+      log.info('kb-file: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+      return serveFileRange(request, abs, contentType, st.size, st.mtimeMs, 'kb');
     } catch (err) {
-      log.warn('kb-file serve failed', { reqUrl, error: (err as Error).message });
+      log.warn('kb-file serve failed', { error_code: _protocolServeFailureCode(err) });
       return new Response('error', { status: 500 });
     }
   });
@@ -890,7 +1009,7 @@ function registerChatMediaProtocol(): void {
       let u: URL;
       try { u = new URL(reqUrl); }
       catch {
-        log.warn('chat-media: unparseable URL', { reqUrl });
+        log.warn('chat-media: unparseable URL', { error_code: 'invalid_url' });
         return new Response('bad request', { status: 400 });
       }
       const host = u.host.toLowerCase();
@@ -902,19 +1021,20 @@ function registerChatMediaProtocol(): void {
         const cid = segs[0] || '';
         const name = segs.slice(1).join('/');
         if (!cid || !name) {
-          log.warn('chat-media/cid: bad URL', { reqUrl });
+          log.warn('chat-media/cid: bad URL', { error_code: 'invalid_route' });
           return new Response('bad request', { status: 400 });
         }
         const uid = users.getActiveUserId();
         const resolved = chatAttachments.resolveAttachmentAbsPath(uid, cid, name);
         if (!resolved.ok) {
           const code = (resolved as { code?: string }).code;
-          log.warn('chat-media/cid: reject', { reqUrl, code, error: (resolved as { error?: string }).error });
+          log.warn('chat-media/cid: reject', { error_code: code || 'rejected' });
           return new Response(String((resolved as { error?: string }).error || code || 'error'), { status: _statusFor(code) });
         }
         const st = fs.statSync(resolved.absPath);
-        log.info('chat-media/cid: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
-        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(name), st.size, st.mtimeMs);
+        const contentType = chatAttachments.mediaMimeFor(name);
+        log.info('chat-media/cid: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
+        return serveFileRange(request, resolved.absPath, contentType, st.size, st.mtimeMs, 'chat_attachment');
       }
 
       if (host === 'local') {
@@ -939,16 +1059,17 @@ function registerChatMediaProtocol(): void {
           // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
           // error-branch fields here, so go through the type-assertion escape hatch.
           const err = resolved as { code?: string; error?: string };
-          log.warn('chat-media/local: reject', { reqUrl, code: err.code, error: err.error });
+          log.warn('chat-media/local: reject', { error_code: err.code || 'rejected' });
           return new Response(String(err.error || ''), { status: _statusFor(err.code) });
         }
         const st = fs.statSync(resolved.absPath);
-        log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
+        const contentType = chatAttachments.localMediaMimeFor(resolved.absPath);
+        log.info('chat-media/local: serving', { media_kind: _mediaKindForContentType(contentType), bytes: st.size });
         if (path.extname(resolved.absPath).toLowerCase() === '.svg') {
           const materialized = chatAttachments.materializeLocalDisplaySvg(resolved.absPath);
           if (!materialized.ok) {
             const err = materialized as { code?: string; error?: string };
-            log.warn('chat-media/local: SVG materialize rejected', { reqUrl, code: err.code, error: err.error });
+            log.warn('chat-media/local: SVG materialize rejected', { error_code: err.code || 'rejected' });
             return new Response(String(err.error || ''), { status: _statusFor(err.code) });
           }
           const bytes = Buffer.byteLength(materialized.body, 'utf8');
@@ -963,19 +1084,20 @@ function registerChatMediaProtocol(): void {
         const response = serveFileRange(
           request,
           resolved.absPath,
-          chatAttachments.localMediaMimeFor(resolved.absPath),
+          contentType,
           st.size,
           st.mtimeMs,
+          'chat_local',
         );
         return resolved.kind === 'html'
           ? withOfflineHtmlPreviewPolicy(response)
           : response;
       }
 
-      log.warn('chat-media: unknown host', { reqUrl, host });
+      log.warn('chat-media: unknown host', { error_code: 'invalid_route' });
       return new Response('bad request', { status: 400 });
     } catch (err) {
-      log.warn('chat-media serve failed', { reqUrl, error: (err as Error).message });
+      log.warn('chat-media serve failed', { error_code: _protocolServeFailureCode(err) });
       return new Response('error', { status: 500 });
     }
   });
@@ -1006,7 +1128,7 @@ function registerChatAppProtocol(): void {
       let u: URL;
       try { u = new URL(reqUrl); }
       catch {
-        log.warn('chat-app: unparseable URL', { reqUrl });
+        log.warn('chat-app: unparseable URL', { error_code: 'invalid_url' });
         return new Response('bad request', { status: 400 });
       }
       const host = u.host.toLowerCase();
@@ -1025,7 +1147,7 @@ function registerChatAppProtocol(): void {
         const appId = cid;
         const savedRelPath = rawSegs.slice(1).map((s) => (s ? decodeURIComponent(s) : '')).join('/');
         if (!appId) {
-          log.warn('chat-app/saved: bad URL (need appId)', { reqUrl });
+          log.warn('chat-app/saved: bad URL (need appId)', { error_code: 'invalid_route' });
           return new Response('bad request', { status: 400 });
         }
         if (savedRelPath === chatArtifacts.BRIDGE_RELPATH) {
@@ -1038,20 +1160,22 @@ function registerChatAppProtocol(): void {
         if (!resolved.ok) {
           const code = (resolved as { code?: string }).code;
           const errMsg = (resolved as { error?: string }).error;
-          log.warn('chat-app/saved: reject', { reqUrl, code, error: errMsg });
+          log.warn('chat-app/saved: reject', { error_code: code || 'rejected' });
           return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
         }
         const st = fs.statSync(resolved.absPath);
-        log.info('chat-app/saved: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
-        return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size, st.mtimeMs));
+        log.info('chat-app/saved: serving', { media_kind: _mediaKindForContentType(resolved.mime), bytes: st.size });
+        return _withArtifactCors(serveFileRange(
+          request, resolved.absPath, resolved.mime, st.size, st.mtimeMs, 'chat_app_saved',
+        ));
       }
 
       if (host !== 'cid') {
-        log.warn('chat-app: unknown host', { reqUrl, host: u.host });
+        log.warn('chat-app: unknown host', { error_code: 'invalid_route' });
         return new Response('bad request', { status: 400 });
       }
       if (!cid || !artifactId) {
-        log.warn('chat-app: bad URL (need cid + artifactId)', { reqUrl });
+        log.warn('chat-app: bad URL (need cid + artifactId)', { error_code: 'invalid_route' });
         return new Response('bad request', { status: 400 });
       }
 
@@ -1069,14 +1193,16 @@ function registerChatAppProtocol(): void {
         // whole union here (same workaround as the chat-media handler above).
         const code = (resolved as { code?: string }).code;
         const errMsg = (resolved as { error?: string }).error;
-        log.warn('chat-app: reject', { reqUrl, code, error: errMsg });
+        log.warn('chat-app: reject', { error_code: code || 'rejected' });
         return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
       }
       const st = fs.statSync(resolved.absPath);
-      log.info('chat-app: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
-      return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size, st.mtimeMs));
+      log.info('chat-app: serving', { media_kind: _mediaKindForContentType(resolved.mime), bytes: st.size });
+      return _withArtifactCors(serveFileRange(
+        request, resolved.absPath, resolved.mime, st.size, st.mtimeMs, 'chat_app_artifact',
+      ));
     } catch (err) {
-      log.warn('chat-app serve failed', { reqUrl, error: (err as Error).message });
+      log.warn('chat-app serve failed', { error_code: _protocolServeFailureCode(err) });
       return new Response('error', { status: 500 });
     }
   });
@@ -1092,6 +1218,24 @@ if (!gotLock) {
   registerConnectorProtocol();
   app.whenReady().then(async () => {
     await runBootSelfCheck();
+    // Publish packaged, local-only content before the first window so the
+    // first task can see every shipped System Skill and Marketplace resource.
+    // The open build has no account bootstrap that can provide this boundary,
+    // so keep the shared publication step explicitly wired here.
+    const initialBundledContentUid = users.getActiveUserId();
+    const initialBundledContent = scheduleBootBackground(
+      'bundled-content:first-window',
+      (signal) => bundledContentStartup.syncBundledContentForUser(initialBundledContentUid, {
+        reason: 'first-window',
+        shouldContinue: () => (
+          !signal?.aborted && users.getActiveUserId() === initialBundledContentUid
+        ),
+        onMarketplaceChanged: broadcastBuiltinMarketplaceSeedChanged,
+      }),
+      0,
+      { resourceClass: 'disk', maxSliceMs: 5_000 },
+    );
+    await initialBundledContent.promise;
     // Source-run macOS uses Electron.app's own Info.plist, so set the dock
     // icon at runtime. Packaged builds still pick up the configured icns.
     if (process.platform === 'darwin' && app.dock) {
@@ -1237,14 +1381,9 @@ if (!gotLock) {
       preferIdle: true,
       maxSliceMs: 15_000,
     };
-    const idleProcess = {
-      resourceClass: 'process' as const,
-      preferIdle: true,
-      maxSliceMs: 20_000,
-    };
     // Small schedulers/cache reads may share the first deferred cohort. Disk
     // walkers below are serial barriers so low-end devices do not receive a
-    // simultaneous search + KB + marketplace + system-skill I/O burst.
+    // simultaneous search + KB + marketplace I/O burst.
     registerDeferred('marketplace:prime-cache', async () => {
       // Primes the in-memory category cache from disk/fallback only; the lazy
       // path in features/marketplace_biz.ts refreshes from Server when needed.
@@ -1262,14 +1401,6 @@ if (!gotLock) {
       const { reconcile } = await import('./features/kb_indexer');
       await reconcile(users.getActiveUserId(), signal);
     }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
-    registerDeferred(
-      'system-skills:reconcile',
-      () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }),
-      'serial',
-      BOOT_HEAVY_DISK_DELAY_MS,
-      idleProcess,
-    );
-
     // Maintenance that can scan hundreds of sessions or invoke model-backed
     // reflection starts after the measured 30-second startup window. The two
     // tasks share a serial cohort so their disk walks cannot overlap.
@@ -1283,7 +1414,6 @@ if (!gotLock) {
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
-    registerDeferred('builtin-marketplace:seed', () => seedBuiltinMarketplaceForCurrentUser('startup'));
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 
     // Drive the immediate batch + schedule the deferred one.

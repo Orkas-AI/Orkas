@@ -1,17 +1,12 @@
 /**
  * File-scoped tools injected into every main-conv runner.
  *
- *   - `read_file`     — read a slice of a file's text through an optional
- *                       tagged line/character range. The executor retains the
- *                       legacy flat range fields for conversation compatibility;
- *                       the server does not truncate. Text works as-is; rich
- *                       document kinds require a prior `stat_file` call so this tool
- *                       never triggers extract side-effects. Image returns an
- *                       inline compressed grayscale JPEG (no range).
- *                       Overrides core-agent's builtin of the same name.
- *   - `stat_file`     — extract (if needed) and return `total_chars` for a
- *                       file. The only tool that triggers pdfjs / mammoth /
- *                       OOXML extraction.
+ *   - `read_files`    — read one or more files through a `paths` array. Each
+ *                       item may carry an exact tagged line/character range;
+ *                       `metadata_only` prepares rich-document extraction and
+ *                       returns metadata for every path without file bodies.
+ *                       Ordinary unbounded reads are token-budgeted and return
+ *                       a continuation range instead of spilling to Result Store.
  *   - `search_files`  — locate files by name/glob across the current
  *                       conversation's attachment dir + active workspace.
  *                       Never triggers extract; `total_chars` is included
@@ -43,7 +38,6 @@ import {
   getExtractedText,
   getCachedMeta,
   kindOf,
-  NeedStatError,
   NoTextError,
   UnsupportedFileKindError,
 } from '../../features/file_indexer';
@@ -61,7 +55,17 @@ import { isSkillEnabled } from '../../features/component_enabled';
 import { recordRead } from './read-tracker';
 import { issueFileRevision } from './file-revision';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
-import type { SkillRuntimeBinding } from './skill-registry';
+import {
+  DEFAULT_INLINE_RESULT_TOKENS,
+  TOOL_RESULT_INLINE_LEDGER_STATE_KEY,
+  estimateToolResultTokens,
+  type ToolResultInlineLedger,
+} from '../../util/tool-result-cap';
+import {
+  openSkillReadRoots,
+  SKILL_RUNTIME_REQUIREMENTS_READ_PRELUDE,
+  type SkillRuntimeBinding,
+} from './skill-registry';
 import {
   fallbackDirectoryExcluded,
   fallbackFileExcluded,
@@ -118,9 +122,9 @@ export interface FileToolsOpts {
    *  Read AND write are permitted under these roots — used by per-skill edit
    *  chats to expose the skill dir for the `<<<skill-file>>>` tooling. */
   extraRoots?: readonly string[];
-  /** Read-only extra roots: path-taking file tools (read_file / stat_file)
+  /** Read-only extra roots: path-taking file tools (read_files)
    *  can see these, but write-side tools (edit_file / write_file
-   *  / bash / markdown_to_pdf / html_to_pdf / generate_image) cannot mutate
+   *  / bash / create_pdf / generate_image) cannot mutate
    *  paths inside. Used by the group-chat commander to inspect agent.json /
    *  built-in agents / skill specs without giving direct-write access — the
    *  `<agent>` / `<skill>` containers are the only sanctioned mutation
@@ -135,15 +139,15 @@ export interface FileToolsOpts {
    * `@skill/<ref>` or `@skill/<ref>/<relative-path>`. */
   skillRuntimeBindings?: ReadonlyMap<string, SkillRuntimeBinding>;
   /** Session-scoped persisted tool-result root. It is visible for path scope
-   *  checks but generic read_file must never use it; retrieval is only through
-   *  tool_result_search / tool_result_read_chunk. */
+   *  checks but generic read_files must never use it; retrieval is only through
+   *  tool_result. */
   toolResultsRoot?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat at runTurn so workspace resolution
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
    *  Empty / missing → default-scope workspace. */
   projectId?: string;
-  /** Fires when `read_file` resolves to a SKILL.md path under one of the
+  /** Fires when `read_files` resolves to a SKILL.md path under one of the
    *  three skill roots (System A.custom / A.platform / B). Bus collects
    *  per turn for the `skill_invoked` signal. Pure callback — exceptions
    *  swallowed, never blocks the tool result. */
@@ -344,7 +348,7 @@ async function gateSensitivePathAccess(
   ctx?: ToolContext,
 ): Promise<string | null> {
   if (!localAccessRequiresSensitiveApproval()) return null;
-  const reasons = sensitivePathReasons(abs, 'read');
+  const reasons = sensitivePathReasons(abs, 'read', { trustedRoots: allowedRoots(opts) });
   if (!reasons.length) return null;
   const decision = await requestBashDecision({
     uid: opts.userId,
@@ -378,10 +382,12 @@ async function gatePathAccess(
   return gateSensitivePathAccess(opts, abs, operation, ctx);
 }
 
-function disabledSystemASkillIdForPath(opts: FileToolsOpts, abs: string): string | null {
+function disabledSkillIdForPath(opts: FileToolsOpts, abs: string): string | null {
   const uid = opts.userId;
   if (!uid) return null;
   const roots = [userSkillsDir(uid), userMarketplaceSkillsDir(uid)];
+  try { roots.push(...openSkillReadRoots(uid)); }
+  catch { /* unavailable OPEN registry roots cannot be admitted for reading */ }
   for (const root of roots) {
     const rel = path.relative(path.resolve(root), path.resolve(abs));
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
@@ -392,7 +398,7 @@ function disabledSystemASkillIdForPath(opts: FileToolsOpts, abs: string): string
 }
 
 function guardDisabledSkillAccess(opts: FileToolsOpts, abs: string): string | null {
-  const skillId = disabledSystemASkillIdForPath(opts, abs);
+  const skillId = disabledSkillIdForPath(opts, abs);
   if (!skillId) return null;
   return errText(
     'E_SKILL_DISABLED',
@@ -486,17 +492,19 @@ function parseReadAddress(input: Record<string, unknown>): ReadAddressResult {
   };
 }
 
-// ── read_file ─────────────────────────────────────────────────────────────
+// ── read_files item executor ──────────────────────────────────────────────
 
 function createReadFileTool(
   opts: FileToolsOpts,
   behavior: { defaultCharLimit?: number } = {},
 ): AgentTool {
   return {
-    name: 'read_file',
+    // Internal-only executor. The host exposes the aggregate read_files tool,
+    // not this compatibility-shaped single-item implementation.
+    name: 'read_files',
     executionMode: 'parallel',
     description:
-      'Read a whole file or an exact range: {unit:"line",start,end} is 1-based/inclusive; {unit:"char",start,end} is 0-based/end-exclusive. Text results include an opaque revision token for exact follow-up file mutations; copy it instead of converting character counts to byte offsets. Text lines are returned as "<line>\\t<text>"; do not include that prefix in edits. For new PDF/Office files, stat_file may be required first; images return an inline preview.',
+      'Read one visible file or exact tagged range as part of read_files.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -522,21 +530,21 @@ function createReadFileTool(
       const { address } = parsedAddress;
       const hasLineRange = address.lineStart !== undefined || address.lineEnd !== undefined;
 
-      const scopeErr = await gatePathAccess(opts, abs, 'read_file', ctx);
+      const scopeErr = await gatePathAccess(opts, abs, 'read_files', ctx);
       if (scopeErr) {
-        log.warn('read_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+        log.warn('read_files scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
       if (disabledSkillErr) {
-        log.warn('read_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+        log.warn('read_files disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
       }
       if (opts.toolResultsRoot && isInsideRoot(opts.toolResultsRoot, abs)) {
         return {
           content: errText(
             'E_TOOL_RESULT_REF_REQUIRED',
-            'Persisted tool results cannot be read by path. Use the ref from <persisted-output> with tool_result_search or tool_result_read_chunk.',
+            'Persisted tool results cannot be read by path. Use the ref from <persisted-output> with tool_result action="search" or action="read".',
           ),
           isError: true,
         };
@@ -546,13 +554,18 @@ function createReadFileTool(
       try { sourceStat = fs.statSync(abs); }
       catch (err) {
         const siblings = findUniquifySiblings(abs);
-        log.warn('read_file not found', {
+        log.warn('read_files not found', {
           user_id: maskId(opts.userId),
           path: logPathRef(abs),
           sibling_count: siblings.length,
           error: logErrorRef(err),
         });
         let content = errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`);
+        content +=
+          '\n\n<missing-file-recovery>\n'
+          + 'Do not infer this file\'s contents. If the user supplied this exact path, ask for the correct accessible path or an attachment. '
+          + 'If you inferred the path, use search_files to locate the source before asking the user.\n'
+          + '</missing-file-recovery>';
         if (siblings.length) {
           content +=
             '\n\n<file-renamed-earlier>\n'
@@ -567,10 +580,34 @@ function createReadFileTool(
       const kind = kindOf(abs);
       const portableSkillDocument = isPortableSkillDocumentPath(abs);
       try {
+        if (input.metadataOnly === true) {
+          const meta = kind === 'image'
+            ? null
+            : kind === 'text'
+              ? await statFile(opts.userId, abs)
+              : await withReadFilesExtractionSlot(() => statFile(opts.userId, abs));
+          const attrs = [
+            `path="${displayPath}"`,
+            `kind="${kind}"`,
+            `bytes="${sourceStat.size}"`,
+            ...(meta?.totalChars !== undefined ? [`total_chars="${meta.totalChars}"`] : []),
+            ...(meta?.extractionEmpty ? ['extraction="empty_pages"'] : []),
+          ];
+          log.info('read_files metadata loaded', {
+            user_id: maskId(opts.userId),
+            path: logPathRef(abs),
+            kind,
+            bytes: sourceStat.size,
+            total_chars: meta?.totalChars,
+            extraction_empty: !!meta?.extractionEmpty,
+          });
+          return { content: `<file ${attrs.join(' ')}/>` };
+        }
+
         if (kind === 'image') {
           const img = await readImageAsGrayJpeg(opts.userId, abs);
           const header = `<file path="${displayPath}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} gray JPEG q=70"/>`;
-          log.info('read_file image loaded', {
+          log.info('read_files image loaded', {
             user_id: maskId(opts.userId),
             path: logPathRef(abs),
             kind: 'image',
@@ -587,39 +624,50 @@ function createReadFileTool(
           && address.charEnd === undefined
           && behavior.defaultCharLimit !== undefined
           && !portableSkillDocument;
+        // A first rich-document read prepares the extraction cache in this
+        // same tool call. This removes the model-visible stat/read handshake
+        // while retaining file_indexer's cache and extraction implementation.
+        if (kind !== 'text') {
+          await withReadFilesExtractionSlot(() => statFile(opts.userId, abs));
+        }
         let result = await readRange(opts.userId, abs, {
-          ...(address.charStart !== undefined ? { charStart: address.charStart } : {}),
-          ...(address.charEnd !== undefined
-            ? { charEnd: address.charEnd }
-            : appliesDefaultCharLimit
-              ? { charEnd: behavior.defaultCharLimit }
-              : {}),
-        });
-        if (hasLineRange) {
-          const full = result.content;
-          const requestedStart = Math.max(1, Math.trunc(Number(address.lineStart) || 1));
-          const requestedEnd = Math.max(
-            requestedStart,
-            Math.trunc(Number(address.lineEnd) || requestedStart + 399),
-          );
-          let currentLine = 1;
-          let startChar = requestedStart === 1 ? 0 : full.length;
-          let endChar = full.length;
-          for (let index = 0; index < full.length; index++) {
-            if (full.charCodeAt(index) !== 10) continue;
-            currentLine++;
-            if (currentLine === requestedStart) startChar = index + 1;
-            if (currentLine === requestedEnd + 1) {
-              endChar = index;
-              break;
+          ...(hasLineRange
+            ? {
+              ...(address.lineStart !== undefined ? { lineStart: address.lineStart } : {}),
+              ...(address.lineEnd !== undefined ? { lineEnd: address.lineEnd } : {}),
             }
+            : {
+              ...(address.charStart !== undefined ? { charStart: address.charStart } : {}),
+              ...(address.charEnd !== undefined
+                ? { charEnd: address.charEnd }
+                : appliesDefaultCharLimit
+                  ? { charEnd: behavior.defaultCharLimit }
+                  : {}),
+            }),
+        });
+
+        const maxContentTokens = Number(input.maxContentTokens);
+        if (
+          !portableSkillDocument
+          && Number.isFinite(maxContentTokens)
+          && maxContentTokens > 0
+          && estimateToolResultTokens(addLineNumbers(result.content, result.startLine).text) > maxContentTokens
+        ) {
+          let low = 0;
+          let high = result.content.length;
+          while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            const candidate = addLineNumbers(result.content.slice(0, mid), result.startLine).text;
+            if (estimateToolResultTokens(candidate) <= maxContentTokens) low = mid;
+            else high = mid - 1;
           }
-          if (requestedStart > currentLine) startChar = full.length;
           result = {
             ...result,
-            content: full.slice(startChar, endChar),
-            range: { charStart: startChar, charEnd: endChar },
-            startLine: Math.min(requestedStart, currentLine),
+            content: result.content.slice(0, low),
+            range: {
+              charStart: result.range.charStart,
+              charEnd: result.range.charStart + low,
+            },
           };
         }
 
@@ -638,12 +686,16 @@ function createReadFileTool(
           `total_chars="${total}"`,
           `covered="${cs}-${ce}"`,
           `lines="${result.startLine}-${lastLine}"`,
+          ...(ce < total ? [
+            'has_more="true"',
+            `next_range="char:${ce}-${Math.min(total, ce + READ_FILES_DEFAULT_SLICE_CHARS)}"`,
+          ] : ['has_more="false"']),
           ...(result.sourceHash ? [`file_hash="${result.sourceHash}"`] : []),
           ...(revision ? [`revision="${revision}"`] : []),
           ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
-        log.info('read_file loaded', {
+        log.info('read_files loaded', {
           user_id: maskId(opts.userId),
           path: logPathRef(abs),
           kind,
@@ -653,18 +705,39 @@ function createReadFileTool(
           start_line: result.startLine,
           end_line: lastLine,
         });
-        // skill_invoked attribution: when the LLM read_file's a SKILL.md
-        // body, the body is the progressive-disclosure "use this skill"
+        const runtimeBinding = resolvedPath.skillRef
+          ? opts.skillRuntimeBindings?.get(resolvedPath.skillRef)
+          : undefined;
+        const isRuntimeSkillEntry = !!runtimeBinding
+          && path.resolve(abs) === path.resolve(runtimeBinding.entry);
+        const entryReadPrelude = isRuntimeSkillEntry
+          ? String(runtimeBinding.entryReadPrelude || '').trim()
+          : '';
+        const runtimeRequirementsPrelude = isRuntimeSkillEntry
+          && runtimeBinding.source !== 'system'
+          ? SKILL_RUNTIME_REQUIREMENTS_READ_PRELUDE
+          : '';
+        const executionReadPrelude = isRuntimeSkillEntry
+          && resolvedPath.skillRef
+          && (() => {
+            try { return fs.statSync(path.join(runtimeBinding!.root, 'scripts')).isDirectory(); }
+            catch { return false; }
+          })()
+          ? `<skill-runtime execution_ref="${resolvedPath.skillRef}">For run-skill.cjs commands, use this exact ref; the host has already bound it to this Skill for the current run.</skill-runtime>`
+          : '';
+        const entryPrelude = [
+          entryReadPrelude,
+          runtimeRequirementsPrelude,
+          executionReadPrelude,
+        ].filter(Boolean).join('\n\n');
+        // skill_invoked attribution: when the LLM reads a SKILL.md body through
+        // read_files, the body is the progressive-disclosure "use this skill"
         // signal (per Claude Code conventions). Emit AFTER the successful
         // text read — image / rich-document SKILL.md is not a real shape.
         if (opts.onSkillInvoked) {
-          const runtimeBinding = resolvedPath.skillRef
-            ? opts.skillRuntimeBindings?.get(resolvedPath.skillRef)
-            : undefined;
-          const runtimeParsed = runtimeBinding
-            && path.resolve(abs) === path.resolve(runtimeBinding.entry)
+          const runtimeParsed = isRuntimeSkillEntry
             ? {
-              skill_id: runtimeBinding.id,
+              skill_id: runtimeBinding!.id,
               system: runtimeBinding.source === 'custom'
                 ? 'A.custom' as const
                 : runtimeBinding.source === 'builtin' || runtimeBinding.source === 'platform'
@@ -682,8 +755,9 @@ function createReadFileTool(
         // built on these bytes (read-before-edit) and rejects it if the file
         // changed since (OCC). See read-tracker.ts.
         recordRead(ctx, abs, undefined, result.sourceHash);
+        const fileBlock = `${header}\n${numberedContent}\n</file>`;
         return {
-          content: `${header}\n${numberedContent}\n</file>`,
+          content: entryPrelude ? `${entryPrelude}\n\n${fileBlock}` : fileBlock,
           // A skill body or its reference is a document the model was told to
           // read whole. Spilled, it comes back as a stub the model keyword-
           // searches, and whatever the search misses goes unread — so the
@@ -699,22 +773,12 @@ function createReadFileTool(
           },
         };
       } catch (err) {
-        if (err instanceof NeedStatError) {
-          log.warn('read_file need stat', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
-          return {
-            content: errText(
-              'E_NEED_STAT',
-              `${displayPath}: ${err.kind} has not been extracted yet. Call stat_file(path=...) first to get total_chars, then call read_file with charStart/charEnd.`,
-            ),
-            isError: true,
-          };
-        }
         if (err instanceof NoTextError) {
-          log.warn('read_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+          log.warn('read_files no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
           return { content: errText('E_NO_TEXT', `${displayPath}: image has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
-          log.warn('read_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
+          log.warn('read_files unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_UNSUPPORTED_FILE',
@@ -724,7 +788,7 @@ function createReadFileTool(
           };
         }
         const msg = displayErrorMessage(err, abs, displayPath);
-        log.warn('read_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
+        log.warn('read_files failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_READ_FAILED', msg), isError: true };
       }
     },
@@ -732,15 +796,47 @@ function createReadFileTool(
 }
 
 const READ_FILES_MAX_ITEMS = 12;
-const READ_FILES_MAX_OUTPUT_CHARS = 160_000;
 const READ_FILES_DEFAULT_SLICE_CHARS = 24_000;
+const READ_FILES_EXTRACT_CONCURRENCY = 2;
+let readFilesActiveExtractions = 0;
+const readFilesExtractionWaiters: Array<() => void> = [];
 
-/** Bounded batch companion to read_file. It deliberately delegates every
- * request to the normal read tool so scope checks, rich-file handling,
+async function withReadFilesExtractionSlot<T>(work: () => Promise<T>): Promise<T> {
+  if (readFilesActiveExtractions >= READ_FILES_EXTRACT_CONCURRENCY) {
+    await new Promise<void>((resolve) => readFilesExtractionWaiters.push(resolve));
+  } else {
+    readFilesActiveExtractions++;
+  }
+  try {
+    return await work();
+  } finally {
+    const next = readFilesExtractionWaiters.shift();
+    if (next) next();
+    else readFilesActiveExtractions--;
+  }
+}
+
+function readFilesInlineTokenBudget(ctx: ToolContext): number {
+  const value = ctx.state?.[TOOL_RESULT_INLINE_LEDGER_STATE_KEY];
+  const ledger = value && typeof value === 'object'
+    ? value as Partial<ToolResultInlineLedger>
+    : undefined;
+  const candidates = [DEFAULT_INLINE_RESULT_TOKENS];
+  if (Number.isFinite(ledger?.perResultTokens)) {
+    candidates.push(Math.max(0, ledger!.perResultTokens!));
+  }
+  if (Number.isFinite(ledger?.remainingTokens)) {
+    candidates.push(Math.max(0, ledger!.remainingTokens!));
+  }
+  return Math.max(0, Math.floor(Math.min(...candidates)));
+}
+
+/** Unified one-or-many reader. It deliberately delegates every item to the
+ * same internal reader so scope checks, rich-file handling,
  * line-number rendering, skill attribution, and OCC stamps stay identical. */
 function createReadFilesTool(opts: FileToolsOpts): AgentTool {
   // Ordinary batch reads default to a bounded slice. Portable skill documents
-  // are the exception: the delegated read_file classifies them only after its
+  // are the exception: the delegated item reader classifies them only after its
   // normal access gate and reads them whole, so a skill never silently becomes
   // a valid-looking prefix.
   const readFile = createReadFileTool(opts, { defaultCharLimit: READ_FILES_DEFAULT_SLICE_CHARS });
@@ -748,12 +844,12 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'read_files',
     executionMode: 'parallel',
     description:
-      'Read several related files or bounded exact tagged ranges after search/grep. Each request accepts path plus optional range {unit:"line"|"char",start,end}. Results retain line numbers, hashes, scope checks, and rich-file behavior.',
+      'Read one or more visible files in one call. Use one paths item for a single file; add an exact range for paging. PDF and Office files are prepared automatically. Set metadata_only to inspect several files without returning bodies.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        files: {
+        paths: {
           type: 'array',
           minItems: 1,
           maxItems: READ_FILES_MAX_ITEMS,
@@ -767,27 +863,31 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
             required: ['path'],
           },
         },
+        metadata_only: {
+          type: 'boolean',
+          description: 'Prepare document extraction and return metadata for every path without file or image bodies.',
+        },
       },
-      required: ['files'],
+      required: ['paths'],
     },
     async execute(input, ctx) {
-      if (!Array.isArray(input.files) || input.files.length === 0) {
-        return { content: errText('E_BAD_INPUT', '`files` must be a non-empty array'), isError: true };
+      if (!Array.isArray(input.paths) || input.paths.length === 0) {
+        return { content: errText('E_BAD_INPUT', '`paths` must be a non-empty array'), isError: true };
       }
-      if (input.files.length > READ_FILES_MAX_ITEMS) {
+      if (input.paths.length > READ_FILES_MAX_ITEMS) {
         return {
           content: errText('E_BAD_INPUT', `read_files accepts at most ${READ_FILES_MAX_ITEMS} files per call`),
           isError: true,
         };
       }
-      const requests = input.files.map((entry) => (
+      const requests = input.paths.map((entry) => (
         entry && typeof entry === 'object' && !Array.isArray(entry)
           ? entry as Record<string, unknown>
           : {}
       ));
       if (requests.some((entry) => typeof entry.path !== 'string' || !entry.path)) {
         return {
-          content: errText('E_BAD_INPUT', 'every read_files item requires a non-empty `path`'),
+          content: errText('E_BAD_INPUT', 'every read_files paths item requires a non-empty `path`'),
           isError: true,
         };
       }
@@ -829,34 +929,38 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
           charEnd: explicitEnd ?? start + READ_FILES_DEFAULT_SLICE_CHARS,
         };
       });
-      const results = await Promise.all(normalized.map((request) => readFile.execute(request, ctx)));
+      const inlineBudget = readFilesInlineTokenBudget(ctx);
+      const emptyEnvelope =
+        `<read-files count="${normalized.length}" errors="0">\n`
+        + normalized.map((request, index) => (
+          `<read-result index="${index}" ok="true">\nrequested_path=${String(request.path)}\n\n</read-result>`
+        )).join('\n')
+        + '\n</read-files>';
+      const envelopeTokens = estimateToolResultTokens(emptyEnvelope) + 64;
+      const bodyTokensPerItem = Math.max(
+        8,
+        Math.floor(Math.max(0, inlineBudget - envelopeTokens) * 0.8 / normalized.length),
+      );
+      const results = await Promise.all(normalized.map((request) => (
+        readFile.execute({
+          ...request,
+          metadataOnly: input.metadata_only === true,
+          maxContentTokens: bodyTokensPerItem,
+        }, ctx)
+      )));
       const images = results.flatMap((result) => result.images || []);
       const includesVerbatimDocument = results.some((result) => !result.isError && result.verbatimDocument);
-      // Skill documents must remain lossless. AgentRunner's final result cap
-      // persists an oversized aggregate and charges the round ledger; applying
-      // this older character truncation first would destroy the omitted bytes
-      // before that policy can act.
-      let remaining = includesVerbatimDocument ? Number.POSITIVE_INFINITY : READ_FILES_MAX_OUTPUT_CHARS;
-      let truncated = false;
       const blocks = results.map((result, index) => {
         const prefix =
           `<read-result index="${index}" ok="${result.isError ? 'false' : 'true'}">\n`
           + `requested_path=${String(normalized[index].path)}\n`;
         const suffix = '\n</read-result>';
-        const available = Math.max(0, remaining - prefix.length - suffix.length);
-        let body = result.content;
-        if (body.length > available) {
-          body = `${body.slice(0, Math.max(0, available - 80))}\n...[batch output limit reached]`;
-          truncated = true;
-        }
-        const block = `${prefix}${body}${suffix}`;
-        remaining = Math.max(0, remaining - block.length);
-        return block;
+        return `${prefix}${result.content}${suffix}`;
       });
       const errors = results.filter((result) => result.isError).length;
       return {
         content:
-          `<read-files count="${results.length}" errors="${errors}" truncated="${truncated}">\n`
+          `<read-files count="${results.length}" errors="${errors}" metadata_only="${input.metadata_only === true}">\n`
           + `${blocks.join('\n')}\n</read-files>`,
         ...(images.length ? { images } : {}),
         ...(errors === results.length ? { isError: true } : {}),
@@ -869,82 +973,6 @@ function createReadFilesTool(opts: FileToolsOpts): AgentTool {
   };
 }
 
-// ── stat_file ────────────────────────────────────────────────────────────
-
-function createStatFileTool(opts: FileToolsOpts): AgentTool {
-  return {
-    name: 'stat_file',
-    description:
-      'Extract/cache readable text metadata and return total_chars for a visible file. Use before first read_file when attachments/search_files did not provide total_chars, especially for PDF/Office. Skip when total_chars is already known. Images return E_NO_TEXT; use read_file for image previews.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Visible absolute path, or @skill/<read-ref>[/relative-path] for a Skill advertised in this run.' },
-      },
-      required: ['path'],
-    },
-    async execute(input, ctx) {
-      const raw = String(input.path ?? '');
-      if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
-      const resolvedPath = resolveRequestedPath(opts, ctx, raw);
-      if (resolvedPath.error) return { content: resolvedPath.error, isError: true };
-      const { abs, displayPath } = resolvedPath;
-
-      const scopeErr = await gatePathAccess(opts, abs, 'stat_file', ctx);
-      if (scopeErr) {
-        log.warn('stat_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-        return { content: scopeErr, isError: true };
-      }
-      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
-      if (disabledSkillErr) {
-        log.warn('stat_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-        return { content: disabledSkillErr, isError: true };
-      }
-
-      try { fs.statSync(abs); }
-      catch (err) {
-        log.warn('stat_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_NOT_FOUND', `${displayPath}: ${displayErrorMessage(err, abs, displayPath)}`), isError: true };
-      }
-
-      const kind = kindOf(abs);
-      try {
-        const meta = await statFile(opts.userId, abs);
-        const total = meta.totalChars ?? 0;
-        const emptyAttr = meta.extractionEmpty ? ' extraction="empty_pages"' : '';
-        log.info('stat_file loaded', {
-          user_id: maskId(opts.userId),
-          path: logPathRef(abs),
-          kind,
-          total_chars: total,
-          extraction_empty: !!meta.extractionEmpty,
-        });
-        return {
-          content: `<file path="${displayPath}" kind="${kind}" total_chars="${total}"${emptyAttr}/>`,
-        };
-      } catch (err) {
-        if (err instanceof NoTextError) {
-          log.warn('stat_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
-          return { content: errText('E_NO_TEXT', `${displayPath}: image has no text representation`), isError: true };
-        }
-        if (err instanceof UnsupportedFileKindError) {
-          log.warn('stat_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
-          return {
-            content: errText(
-              'E_UNSUPPORTED_FILE',
-              `${displayPath}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
-            ),
-            isError: true,
-          };
-        }
-        const msg = displayErrorMessage(err, abs, displayPath);
-        log.warn('stat_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
-        return { content: errText('E_STAT_FAILED', msg), isError: true };
-      }
-    },
-  };
-}
-
 // ── ocr_file ─────────────────────────────────────────────────────────────
 
 function createOcrFileTool(opts: FileToolsOpts): AgentTool {
@@ -952,7 +980,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
     name: 'ocr_file',
     executionMode: 'sequential',
     description:
-      'Run local OCR on scanned/image-only PDFs or images when exact text recognition is required and read_file/stat_file cannot recover it. Do not use this for ordinary image understanding when the image is already visible to the model. For normal text PDFs/Office, use stat_file/read_file first. Never repair OCR with shell package installs.',
+      'Run local OCR on scanned PDFs or images when exact text is needed and read_files returns empty extraction. For ordinary visual understanding use the image preview; read_files handles text-bearing PDF and Office files directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -989,7 +1017,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
         return {
           content: errText(
             'E_OCR_UNSUPPORTED_FILE',
-            `ocr_file currently supports PDF and image files only; got kind=${kind}. Use read_file/stat_file for normal text or Office files.`,
+            `ocr_file currently supports PDF and image files only; got kind=${kind}. Use read_files for normal text or Office files.`,
           ),
           isError: true,
         };
@@ -1153,7 +1181,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'search_files',
     executionMode: 'parallel',
     description:
-      'Find files by substring or glob when the path is unknown. Repository scans respect ignore files and avoid dependency/build trees; exact read_file paths remain available. Returns path/name/size/mtime/source without extracting content.',
+      'Find files by substring or glob when the path is unknown. Repository scans respect ignore files and avoid dependency/build trees; exact read_files paths remain available. Returns path/name/size/mtime/source without extracting content.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1255,7 +1283,8 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
             source,
           };
           // Only include total_chars when a cache entry already exists — never
-          // trigger extract from a search. Model can call stat_file if needed.
+          // trigger extract from a search. Model can call read_files with
+          // metadata_only when it needs prepared document metadata.
           const cached = getCachedMeta(opts.userId, abs);
           if (cached?.totalChars !== undefined) hit.totalChars = cached.totalChars;
           hits.push(hit);
@@ -1265,7 +1294,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
       if (!hits.length) {
         if (skippedScans.length) {
           return {
-            content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_file/stat_file, or ask the user to attach the file.',
+            content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.',
           };
         }
         return { content: query ? `No matches for "${query}".` : 'No files found.' };
@@ -1421,14 +1450,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'grep_files',
     executionMode: 'parallel',
     description:
-      'Search for a pattern across files visible to this conversation (workspace + attachment dir).\n'
-      + 'File type handling:\n'
-      + '  • text / md / csv / code → searched directly on the source file\n'
-      + '  • PDF / modern Office → extracted to text (cached) and searched\n'
-      + '  • images / legacy Office / binaries → skipped\n'
-      + 'First cross-file grep on a fresh set of rich documents may be slow (parallel extract);\n'
-      + 'subsequent calls in the same session are cached. On a large project, pass `glob` to\n'
-      + 'scope the files and `output_mode:"files"` when you only need to know WHICH files match.',
+      'Search text across visible files; PDF and modern Office content is extracted and cached, while images, legacy Office, and other binaries are skipped.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1542,7 +1564,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       }
       if (!targets.length && skippedScans.length) {
         return {
-          content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_file/stat_file, or ask the user to attach the file.',
+          content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_files, or ask the user to attach the file.',
         };
       }
 
@@ -1725,7 +1747,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
 /** Scan `path.parse(absPath).dir` for siblings matching `<name>-N<ext>` —
  *  the shape produced by `util/uniquify-path.uniquifyPath` when an earlier
  *  write hit a collision. Returned newest-first by N. Tolerates a missing
- *  parent dir (returns []). Used by `read_file`'s ENOENT branch as a hint
+ *  parent dir (returns []). Used by `read_files`' ENOENT branch as a hint
  *  signal so the LLM is reminded of the rename without having to grep its
  *  own tool history. */
 function findUniquifySiblings(absPath: string): string[] {
@@ -1761,7 +1783,7 @@ function snippetFromLine(line: string, matcher: RegExp): string {
 // Overrides core-agent's builtin `list_files`, which does an unguarded
 // `fs.readdir` and would let the model enumerate any directory on disk
 // (e.g. ~/.ssh, other users' chat dirs) — bypassing the sandbox every other
-// file tool enforces. This override applies the same scope gate as read_file.
+// file tool enforces. This override applies the same scope gate as read_files.
 function createListFilesTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'list_files',
@@ -1820,9 +1842,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
 
 export function createFileTools(opts: FileToolsOpts): AgentTool[] {
   return [
-    createReadFileTool(opts),
     createReadFilesTool(opts),
-    createStatFileTool(opts),
     ...(opts.includeOcrFile ? [createOcrFileTool(opts)] : []),
     createSearchFilesTool(opts),
     createGrepFilesTool(opts),

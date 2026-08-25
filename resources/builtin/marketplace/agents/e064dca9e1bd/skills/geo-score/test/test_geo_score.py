@@ -99,15 +99,35 @@ class StructureSkipTest(unittest.TestCase):
 
 
 class TechnicalDefaultsTest(unittest.TestCase):
-    def test_missing_optional_fields_defaults(self):
-        # Drop https + is_indexable: https missing reads falsy (-20), is_indexable defaults True (no -50).
-        page = dict(STRONG)
-        del page["https"]
-        del page["is_indexable"]
-        r = score_geo(crawl(page))
-        self.assertEqual(r["geo_dimensions"]["technical"], 80)  # 100 - 20 (https only)
-        self.assertTrue(any("https" in rec["title"].lower() for rec in r["geo_recommendations"]))
-        self.assertFalse(any("indexable" in rec["title"].lower() for rec in r["geo_recommendations"]))
+    def test_unobserved_response_facts_are_unscored_not_assumed(self):
+        # These two facts come from a response. Absent, they used to be guessed
+        # in opposite directions — a missing https deducted 20 as though the page
+        # had been seen on plain http, while a missing is_indexable defaulted to
+        # True and passed. A local-file crawl now reports both as None, and
+        # neither a deduction nor a pass is honest about a page never contacted.
+        for page in (
+            {k: v for k, v in STRONG.items() if k not in ("https", "is_indexable")},
+            dict(STRONG, https=None, is_indexable=None),
+        ):
+            r = score_geo(crawl(page))
+            self.assertIsNone(r["geo_dimensions"]["technical"])
+            self.assertEqual(
+                sorted(e["check"] for e in r["not_assessed"]),
+                ["https", "is_indexable"],
+            )
+            titles = " ".join(rec["title"].lower() for rec in r["geo_recommendations"])
+            self.assertNotIn("https", titles)
+            self.assertNotIn("indexable", titles)
+
+    def test_observed_response_facts_still_deduct(self):
+        # The negative control: when the crawl really did see http and a
+        # non-indexable page, both deductions stand and nothing is unassessed.
+        r = score_geo(crawl(dict(STRONG, https=False, is_indexable=False)))
+        self.assertEqual(r["geo_dimensions"]["technical"], 30)  # 100 - 50 - 20
+        self.assertEqual(r["not_assessed"], [])
+        titles = " ".join(rec["title"].lower() for rec in r["geo_recommendations"])
+        self.assertIn("https", titles)
+        self.assertIn("indexable", titles)
 
     def test_technical_clamps_at_zero(self):
         # WEAK + AI-block: deductions 50+20+30+20=120 exceed 100; per-deduct max(0,...) clamps to 0.

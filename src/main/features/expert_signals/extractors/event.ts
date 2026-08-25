@@ -1,5 +1,7 @@
 /**
- * T0 event extractors: retry / skip / form_left_blank / tool_failure.
+ * T0 event extractors: form_left_blank / tool_failure / skill_* attribution.
+ * (The plan-rail retry / skip / agent_dispatched builders were deleted
+ * 2026-08-16 — their emitting UI went with the G8b plan-rail removal.)
  *
  * Pure builders — each function takes the structured event payload and
  * returns one (or more) `SignalInput`. The caller (IPC handler / bus
@@ -13,48 +15,6 @@
 
 import type { SignalInput, SkillSystem, SkillInvokeTrigger } from '../types';
 import { EXTRACTOR_VERSION } from '../types';
-
-// ── retry / skip ────────────────────────────────────────────────────────
-
-/** User clicked the plan rail "Retry" button on a failed step. */
-export function buildRetrySignal(args: {
-  cid: string;
-  aid: string;
-  turn_id: string;
-  step_index: number;
-  msg_ids?: string[];
-}): SignalInput {
-  return {
-    type: 'retry',
-    source: 'event',
-    cid: args.cid,
-    aid: args.aid,
-    turn_id: args.turn_id,
-    context_ref: { msg_ids: args.msg_ids || [] },
-    extractor_version: EXTRACTOR_VERSION.event,
-    metadata: { step_index: args.step_index },
-  };
-}
-
-/** User clicked plan rail "Skip" — a weaker form of retry. */
-export function buildSkipSignal(args: {
-  cid: string;
-  aid: string;
-  turn_id: string;
-  step_index: number;
-  msg_ids?: string[];
-}): SignalInput {
-  return {
-    type: 'skip',
-    source: 'event',
-    cid: args.cid,
-    aid: args.aid,
-    turn_id: args.turn_id,
-    context_ref: { msg_ids: args.msg_ids || [] },
-    extractor_version: EXTRACTOR_VERSION.event,
-    metadata: { step_index: args.step_index },
-  };
-}
 
 // ── form_left_blank ─────────────────────────────────────────────────────
 
@@ -212,37 +172,6 @@ export function buildSkillInvokedSignal(args: {
     context_ref: { msg_ids: args.msg_ids || [] },
     extractor_version: EXTRACTOR_VERSION.skill_attribution,
     delta: { system: args.system, skill_id: args.skill_id, trigger: args.trigger },
-  };
-}
-
-// ── agent_dispatched ────────────────────────────────────────────────────
-
-/** Commander's dispatch decision for a single ready-group: which agent ids
- *  were considered (`candidates`) and which got woken (`dispatched`). In the
- *  current plan executor model the two are identical (plan_set already
- *  filtered) — kept distinct in schema so phase 1 commander LLM can record
- *  "considered but rejected" without a schema migration. */
-export function buildAgentDispatchedSignal(args: {
-  cid: string;
-  turn_id: string;
-  candidates: string[];
-  dispatched: string[];
-  parallel_group: string | null;
-  msg_ids?: string[];
-}): SignalInput {
-  return {
-    type: 'agent_dispatched',
-    source: 'event',
-    cid: args.cid,
-    aid: null,
-    turn_id: args.turn_id,
-    context_ref: { msg_ids: args.msg_ids || [] },
-    extractor_version: EXTRACTOR_VERSION.agent_dispatch,
-    delta: {
-      candidates: args.candidates.slice(),
-      dispatched: args.dispatched.slice(),
-      parallel_group: args.parallel_group,
-    },
   };
 }
 

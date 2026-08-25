@@ -1,7 +1,7 @@
 ---
 name: package-installer
-description_zh: 安装用户给出的 GitHub 仓库或本地 git 目录作为 Orkas 外部包，并接入其中的技能或命令行工具；适合"安装这个 GitHub 项目""把 /path/to/repo 接入 Orkas 外部包""更新或移除已安装的外部包"；触发词：外部包、安装包、GitHub 项目、本地 repo、更新包、移除包、package installer
-description_en: Install a user-supplied GitHub repository or local git directory as an Orkas external package and wire up its skills or CLI tools; For: "install this GitHub project", "connect /path/to/repo as an Orkas external package", "update or remove an installed external package"; Triggers: external package, install package, GitHub project, local repo, update package, remove package, package installer
+description_zh: "把用户提供的 GitHub 仓库或本地 Git 目录安装、更新或移除为 Orkas 外部包，并接入其中的 Skill 或命令行工具；用于安装或连接项目/包，不用于创建或导入自定义 Skill。"
+description_en: "Install, update, or remove a user-supplied GitHub repository or local Git directory as an Orkas external package, exposing its Skills or CLI tools. Use for installing or connecting a project or package; not for creating or importing a custom Skill."
 category: "general"
 ---
 
@@ -89,7 +89,7 @@ a successful CLI install — the user already approved installing it. Skip for
 - Ask before installing anything the user did not explicitly request.
 - Do not start OAuth/login flows that require the user to paste a verification
   code back into chat later (for example `gcloud auth login --no-launch-browser`).
-  Chat messages are not stdin for background processes. Use `interactive_cli_start`
+  Chat messages are not stdin for background processes. Use `interactive_cli` with `action:"start"`
   for commands that genuinely need live user input, use an auth flow with a
   browser callback that completes on its own, or stop and tell the user the
   one-time terminal/app authorization step.

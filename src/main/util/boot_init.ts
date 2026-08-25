@@ -97,6 +97,21 @@ export function noteBootUserActivity(at = Date.now()): void {
   _lastUserActivityAt = Math.max(_lastUserActivityAt, Number(at) || Date.now());
 }
 
+/**
+ * Is the machine idle enough to admit background work right now?
+ *
+ * `maxSliceMs` bounds a task once it is running, but a multi-item task wants
+ * the finer question between items: "is the user back?" Answering it here —
+ * rather than letting callers reimplement the condition — keeps one
+ * definition of idle, the same one `_waitForAdmission` admits on.
+ */
+export function isBootAdmissionIdle(recentActivityMs = 2_000): boolean {
+  let runtimeBusy = false;
+  try { runtimeBusy = _isRuntimeBusy(); } catch { runtimeBusy = false; }
+  if (runtimeBusy) return false;
+  return (Date.now() - _lastUserActivityAt) >= Math.max(0, recentActivityMs);
+}
+
 export interface ScheduledBootBackgroundTask {
   cancel(): void;
   promise: Promise<void>;

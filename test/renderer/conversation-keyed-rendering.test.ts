@@ -548,3 +548,93 @@ describe('keyed rendering › records with no live row', () => {
     expect(commanderRows(container)).toHaveLength(1);
   });
 });
+
+/**
+ * The invariant the row-identity refactor (`648e61ed4`) set out to establish,
+ * asserted directly instead of through a per-shape row count.
+ *
+ * Counting commander rows only catches the sequences someone thought to
+ * enumerate. The 2026-08-19 duplicate came from a sequence nobody had: the
+ * send path leaves a streaming row created before any turn id exists — so it
+ * carries no render key — and a keyed record that cannot find its row appends
+ * beside it rather than adopting it. Both bubbles then show the same text and
+ * the same process rail, and both survive until reload.
+ */
+function assertRowIdentityInvariant(container: FakeContainer) {
+  const keys = container.rows.map((row) => row.dataset.renderKey || '').filter(Boolean);
+  expect(new Set(keys).size, 'two rows must never share one render key').toBe(keys.length);
+  const orphans = container.rows.filter((row) => !row.dataset.renderKey && (
+    row.dataset.msgId || row.dataset.fromActor || row.bodies.final.textContent
+  ));
+  expect(
+    orphans.map((row) => row.bodies.final.textContent || row.dataset.msgId || row.dataset.fromActor),
+    'a row carrying content must be reachable by its render key',
+  ).toEqual([]);
+}
+
+/** What `createChatController` puts on screen the moment the user sends: a
+ *  streaming row opened before any turn id or actor is known. */
+function sendPathPlaceholder(container: FakeContainer, text: string) {
+  const node = new FakeNode();
+  node.bodies.final.textContent = text;
+  container.appendChild(node);
+  return node;
+}
+
+describe('keyed rendering › row identity invariant', () => {
+  it('adopts the send-path row instead of appending its twin', () => {
+    const { context, container, appended } = loadRenderer(CID);
+    const placeholder = sendPathPlaceholder(container, 'Handing this to the researcher.');
+
+    // The narration segment persists without its stream ever opening a keyed
+    // row — the shape the hand-off floor guard produces when the commander
+    // dispatches in the same turn it narrates.
+    context._handleGroupBusEvent(
+      CID, placeholder, segMessage(0, 'Handing this to the researcher.', 'msg-0'),
+    );
+
+    expect(container.rows, 'the record belongs in the row already on screen').toHaveLength(1);
+    expect(appended, 'appending beside an unkeyed content row IS the duplicate').toHaveLength(0);
+    assertRowIdentityInvariant(container);
+  });
+
+  it('holds across a streamed segment, its record, and a second segment', () => {
+    const { context, container } = loadRenderer(CID);
+    const placeholder = sendPathPlaceholder(container, '');
+
+    context._handleGroupBusEvent(CID, placeholder, delta(0, 'narration'));
+    context._handleGroupBusEvent(CID, placeholder, segMessage(0, 'narration', 'msg-0'));
+    context._handleGroupBusEvent(CID, placeholder, delta(1, 'synthesis'));
+    context._handleGroupBusEvent(CID, placeholder, segMessage(1, 'synthesis', 'msg-1'));
+
+    assertRowIdentityInvariant(container);
+    expect(commanderRows(container)).toHaveLength(2);
+  });
+
+  // Adoption must refuse a row that already carries a key. Once segment 0 has
+  // adopted the controller's row, segment 1 has to open its own; stealing it
+  // would re-key segment 0's live text as segment 1 and lose one of them. The
+  // existing per-segment test passes no fallback row, so only this one has a
+  // row available to steal.
+  it('refuses to adopt a row that already carries a key', () => {
+    const { context, container } = loadRenderer(CID);
+    const placeholder = sendPathPlaceholder(container, '');
+
+    context._handleGroupBusEvent(CID, placeholder, delta(0, 'narration'));
+    expect(placeholder.dataset.renderKey, 'the first segment adopts it').toBe('s:turn-1:0');
+
+    context._handleGroupBusEvent(CID, placeholder, delta(1, 'synthesis'));
+
+    expect(placeholder.dataset.renderKey, 'segment 0 keeps the row it adopted').toBe('s:turn-1:0');
+    expect(commanderRows(container), 'segment 1 opens its own row').toHaveLength(2);
+    assertRowIdentityInvariant(container);
+  });
+
+  it('holds when a record arrives with no live row at all', () => {
+    const { context, container } = loadRenderer(CID);
+
+    context._handleGroupBusEvent(CID, null, segMessage(0, 'instant reply', 'msg-0'));
+
+    assertRowIdentityInvariant(container);
+  });
+});

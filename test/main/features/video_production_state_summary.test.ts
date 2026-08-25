@@ -84,18 +84,28 @@ describe('production state summary payload', () => {
   it('keeps the newest journal entries, not the oldest', () => {
     // The journal appends at the end, so the tail is the recent end. Slicing
     // the wrong end would silently hand the model operations it has already
-    // moved past — a stale-evidence bug no size assertion would catch.
-    const summary = summarizeVideoProductionState(stateWith(15, 100)) as Record<string, any>;
+    // moved past — a stale-evidence bug no size assertion would catch. The
+    // probe rides error_code because the second harvest (2026-08-23) dropped
+    // per-entry timestamps from the echo.
+    const state = stateWith(15, 100);
+    state.operation_journal = state.operation_journal!.map((entry, index) => ({
+      ...entry,
+      error_code: `E_${index}`,
+    }));
+    const summary = summarizeVideoProductionState(state) as Record<string, any>;
 
-    expect(summary.operation_journal.at(-1).recorded_at).toBe('2026-08-04T10:99:00.000Z');
-    expect(summary.operation_journal[0].recorded_at).toBe('2026-08-04T10:90:00.000Z');
+    expect(summary.operation_journal[0].error_code).toBe('E_90');
+    expect(summary.operation_journal.at(-1).error_code).toBe('E_99');
   });
 
-  it('drops only the journal fields a reader cannot act on', () => {
-    // `operation_id` is a uuid and `input_hash` is a content address: a model
-    // can compute neither, and the repeated-input question they would answer is
-    // decided host-side and returned as `same_input_attempts` by the operation
-    // that needs it. Everything an entry says about what happened stays.
+  it('keeps the verdict fields and drops the ledger bookkeeping', () => {
+    // First pass (2026-08-08) dropped `operation_id`/`input_hash`. The second
+    // harvest (2026-08-23, synced from release_1.7.0) also drops turn ids,
+    // per-entry paths, and timestamps: re-measured on live runs they were 37%
+    // of every state echo with zero prompt/skill readers, and the newest
+    // failure's findings_path rides the result top level. What an entry still
+    // says: which operation, how it ended, and whether a crashed attempt
+    // burns the same-input budget.
     const state = stateWith(1, 1);
     state.operation_journal[0] = {
       ...state.operation_journal[0],
@@ -103,16 +113,16 @@ describe('production state summary payload', () => {
       input_hash: 'e'.repeat(64),
       turn_id: 'turn-7',
       findings_path: '/w/project/composition/qa/snapshot.json',
+      error_code: 'E_SNAPSHOT_FAILED',
+      consumes_same_input_attempt: false,
     } as typeof state.operation_journal[0];
     const [entry] = (summarizeVideoProductionState(state) as Record<string, any>).operation_journal;
 
-    expect(entry).not.toHaveProperty('operation_id');
-    expect(entry).not.toHaveProperty('input_hash');
-    expect(entry).toMatchObject({
+    expect(entry).toEqual({
       op: 'composition.snapshot',
       status: 'passed',
-      turn_id: 'turn-7',
-      findings_path: '/w/project/composition/qa/snapshot.json',
+      error_code: 'E_SNAPSHOT_FAILED',
+      consumes_same_input_attempt: false,
     });
   });
 

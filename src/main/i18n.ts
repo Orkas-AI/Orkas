@@ -16,6 +16,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import { SRC_ROOT } from './paths';
+import { buildLanguageDirectiveText } from './prompts/chat_prompt_composer';
 
 export type Lang = 'zh' | 'en' | 'ja' | 'pt';
 
@@ -218,21 +219,13 @@ export function getCurrentLang(): Lang {
 }
 
 // ── LLM language directive ───────────────────────────────────────────────
-// Prompt composers place this after role/workflow/runtime context, and the
-// runner preserves it as the final system instruction. That keeps English-
-// authored internal material from becoming the user-visible reply language.
+// Prompt composers place this after host-owned role/workflow/runtime context.
+// The host runner keeps it last in its base prompt; learned-Skill guidance and
+// repository instructions may be appended later by core-agent.
 
 export function buildLanguageDirective(lang: Lang = _current): string {
   const name = getLocaleMeta(lang).llmName;
-  return [
-    '## User language',
-    '',
-    `User UI language: **${name}**. Write all human-readable prose in ${name}, including replies, status text, form labels, plan titles/inputs, and natural-language text inside XML/JSON fields.`,
-    '',
-    'Keep protocol tokens unchanged: XML tag names, JSON keys, tool/skill ids or names, file paths, code, and `select` / `multiselect` `value` strings.',
-    '',
-    '`description_zh` is always Chinese and `description_en` is always English; examples show shape only, not output language.',
-  ].join('\n');
+  return buildLanguageDirectiveText(name);
 }
 
 // ── Lookup ───────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 ---
 name: swiftui-dev
-description: Use for SwiftUI development work: review and refactor SwiftUI view structure, Observation usage, MV patterns, dependency boundaries, and ViewModel choices; audit SwiftUI rendering, state updates, scrolling, layout, and Instruments evidence; or use xctrace/Time Profiler CLI scripts to record, export, symbolicate, and rank macOS/iOS native hotspots. Use when the user mentions SwiftUI architecture, SwiftUI refactor, Observation, MV, ViewModel boundaries, SwiftUI performance, Instruments, Time Profiler, xctrace, native app hotspots, scrolling jank, hangs, hitches, or body updates.
+description_zh: "评审和重构 SwiftUI 架构、Observation/MV 状态边界、渲染、滚动与布局，或用 Instruments、xctrace 和 Time Profiler 证据分析 macOS/iOS 原生热点；用于 SwiftUI 设计与性能工作，不用于 Web 或服务端分析。"
+description_en: "Review and refactor SwiftUI architecture, Observation/MV state boundaries, rendering, scrolling, and layout, or analyze native macOS/iOS hotspots with Instruments, xctrace, and Time Profiler evidence. Use for SwiftUI design and performance work, not web or server profiling."
 ---
 
 # SwiftUI Dev
@@ -17,10 +18,13 @@ Do not use this skill for web performance, server profiling, generic PR review, 
 
 | User intent | Read |
 |---|---|
-| Refactor SwiftUI View structure, split large `body`, review Observation / MV / ViewModel boundaries | `references/swiftui-refactor.md` |
-| SwiftUI page is slow, scrolling janks, body updates too often, Instruments trace needs interpretation | `references/swiftui-performance.md` |
-| Record/analyze macOS or iOS native Time Profiler traces from CLI, symbolicate and rank hotspots through the standard Orkas Skill Runner | `references/native-trace.md` |
-| Need deeper Apple/WWDC context for SwiftUI update causes, hangs, Instruments lanes | Read the specific Apple summary files listed in the relevant reference |
+| Refactor SwiftUI View structure, split large `body`, review Observation boundaries | [SwiftUI refactor](references/swiftui-refactor.md) |
+| Decide whether MV, framework-native state, or a ViewModel is justified | [MV patterns](references/mv-patterns.md) |
+| SwiftUI page is slow, scrolling janks, or body updates too often | [SwiftUI performance](references/swiftui-performance.md) |
+| Build a dependency/update mental model before deeper profiling | [WWDC23 performance model](references/demystify-swiftui-performance-wwdc23.md) |
+| Inspect current SwiftUI Instrument lanes or Cause & Effect evidence | [SwiftUI Instruments workflow](references/optimizing-swiftui-performance-instruments.md) and [SwiftUI timeline guide](references/understanding-improving-swiftui-performance.md) |
+| Diagnose a main-thread hang or run-loop stall | [App hangs guide](references/understanding-hangs-in-your-app.md) |
+| Record/analyze macOS or iOS native Time Profiler traces from CLI, symbolicate and rank hotspots through the standard Orkas Skill Runner | [Native trace workflow](references/native-trace.md) |
 
 If the user provides only symptoms, start with code-first SwiftUI review. Ask for trace/screenshots only when code review is inconclusive or the user explicitly wants trace analysis.
 
@@ -82,7 +86,7 @@ Use this concise structure unless a reference template is more specific:
 ## Handoff To Next Stage
 ```
 
-For native trace analysis, use the report structure in `references/native-trace.md`.
+For native trace analysis, use the report structure in the [native trace workflow](references/native-trace.md).
 
 ## Quality Checklist
 

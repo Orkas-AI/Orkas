@@ -1,14 +1,13 @@
 // Pin the `agents_index` block format used by `buildCommanderSystemPrompt`.
 //
 // Format (one entry per agent, ordered by insertion):
-//   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:`
+//   `\`read_files({"paths":[{"path":"<ROOT>/<id>/agent.json"}]})\` — ROOT by Source:`
 //   `- builtin: <abs path>`
 //   `- platform: <abs path>`
 //   `- custom:  <abs path>`
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.`
 //   ``
 //   `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc`
-//   `  inputs: read agent.json before dispatch`   ← optional, only when inputs[] non-empty
 //   `  interactive: true`                         ← optional, only when interactive=true
 //
 // Why these fixtures matter (added 2026-05): the prior format hid agent_id
@@ -78,7 +77,7 @@ describe('agents_index block — header + per-entry shape', () => {
     writeAgent(customAgentsDir(), 'a1b2c3d4', { name: 'Alpha', description_zh: 'A', description_en: 'A' });
     writeAgent(builtinAgentsDir(), 'e5f6a7b8', { name: 'Beta', description_zh: 'B', description_en: 'B' });
     const text = await buildBlock(TEST_UID);
-    expect(text).toContain('`read_file(<ROOT>/<id>/agent.json)`');
+    expect(text).toContain('`read_files({"paths":[{"path":"<ROOT>/<id>/agent.json"}]})`');
     expect(text).toContain(`- builtin: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain(`- platform: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain(`- custom:  ${path.resolve(customAgentsDir())}`);
@@ -100,7 +99,7 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).toContain('@Reviewer (Source: custom, id: a1b2c3d4e5f6)');
   });
 
-  it('marks agents with inputs so commander reads agent.json before dispatch', async () => {
+  it('keeps declared inputs private to the target agent instead of requiring a commander pre-read', async () => {
     writeAgent(customAgentsDir(), 'agent-with-inputs', {
       name: 'WithInputs',
       description_zh: 'I',
@@ -119,7 +118,7 @@ describe('agents_index block — header + per-entry shape', () => {
     });
     const text = await buildBlock(TEST_UID);
     expect(text).toContain('@WithInputs (Source: custom, id: agent-with-inputs) — I');
-    expect(text).toContain('inputs: read agent.json before dispatch');
+    expect(text).not.toContain('inputs: read agent.json before dispatch');
     expect(text).not.toContain('inputs_schema:');
     expect(text).not.toContain('"topic"');
     expect(text).not.toContain('"should be stripped"');
@@ -130,7 +129,7 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).not.toContain('"max"');
   });
 
-  it('does not mark agents without inputs, so commander can dispatch directly', async () => {
+  it('allows agents without inputs to use the same direct-dispatch roster shape', async () => {
     writeAgent(customAgentsDir(), 'agent-no-inputs', {
       name: 'NoInputs',
       description_zh: 'N',
@@ -166,33 +165,79 @@ describe('agents_index block — header + per-entry shape', () => {
     expect(text).not.toContain('inputs: read agent.json');
   });
 
-  it('renders compact agent descriptions in the index', async () => {
+  it('preserves Chinese routing clauses that fit the roster budget', async () => {
     writeAgent(customAgentsDir(), 'long-desc', {
       name: 'LongDesc',
       description_zh: '整理市场资料并输出摘要；适合竞品分析；触发词：市场、竞品',
       description_en: '',
     });
     const text = await buildBlock(TEST_UID);
-    expect(text).toContain('@LongDesc (Source: custom, id: long-desc) — 整理市场资料并输出摘要');
-    expect(text).not.toContain('竞品分析');
-    expect(text).not.toContain('触发词');
+    expect(text).toContain(
+      '@LongDesc (Source: custom, id: long-desc) — 整理市场资料并输出摘要；适合竞品分析；触发词：市场、竞品',
+    );
   });
 
-  it('renders compact English agent descriptions in the index', async () => {
+  it('preserves English routing clauses that fit the roster budget', async () => {
     writeAgent(customAgentsDir(), 'english-desc', {
       name: 'EnglishDesc',
       description_zh: '',
       description_en: 'Review pull requests. Suitable for static analysis and regression checks. Triggers: PR, review.',
     });
     const text = await buildBlock(TEST_UID);
-    expect(text).toContain('@EnglishDesc (Source: custom, id: english-desc) — Review pull requests.');
-    expect(text).not.toContain('Suitable for static analysis');
-    expect(text).not.toContain('Triggers: PR');
+    expect(text).toContain(
+      '@EnglishDesc (Source: custom, id: english-desc) — Review pull requests. Suitable for static analysis and regression checks. Triggers: PR, review.',
+    );
+  });
+
+  it('uses English for the internal roster under a Chinese UI and falls back to Chinese', async () => {
+    writeAgent(customAgentsDir(), 'bilingual-desc', {
+      name: 'BilingualDesc',
+      description_zh: '中文路由说明不应进入内部索引',
+      description_en: 'English routing description.',
+    });
+    writeAgent(customAgentsDir(), 'zh-fallback', {
+      name: 'ZhFallback',
+      description_zh: '只有中文时保留此说明',
+      description_en: '',
+    });
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const text = await bus._buildAgentsIndexBlockForTest(TEST_UID, 'zh');
+
+    expect(text).toContain('@BilingualDesc (Source: custom, id: bilingual-desc) — English routing description.');
+    expect(text).not.toContain('中文路由说明不应进入内部索引');
+    expect(text).toContain('@ZhFallback (Source: custom, id: zh-fallback) — 只有中文时保留此说明');
   });
 
   it('returns header + (no agents) when no agents are present', async () => {
     const text = await buildBlock(TEST_UID);
-    expect(text).toContain('`read_file(<ROOT>/<id>/agent.json)`');
+    expect(text).toContain('`read_files({"paths":[{"path":"<ROOT>/<id>/agent.json"}]})`');
     expect(text).toContain('(no agents)');
+  });
+});
+
+describe('Commander project-task prompt gating', () => {
+  it('keeps project rules static and omits them entirely outside a project', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const nonProject = await bus._buildCommanderSystemPromptForTest(
+      TEST_UID,
+      'non-project-conversation',
+      undefined,
+      'en',
+    );
+    const project = await bus._buildCommanderSystemPromptForTest(
+      TEST_UID,
+      'project-conversation',
+      'project-a',
+      'en',
+    );
+
+    expect(nonProject).not.toContain('### Project tasks (the work backlog)');
+    expect(nonProject).not.toContain('$project_tasks_rules');
+    expect(project).toContain('### Project tasks (the work backlog)');
+    expect(project).not.toContain('$project_tasks_rules');
+    expect(project.indexOf('### Project tasks (the work backlog)'))
+      .toBeLessThan(project.indexOf('## Orchestration continuity'));
+    expect(project.indexOf('## Orchestration continuity'))
+      .toBeLessThan(project.indexOf('## Runtime injection'));
   });
 });

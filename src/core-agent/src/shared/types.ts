@@ -27,6 +27,13 @@ export type ToolResultContent = {
   toolUseId: string;
   content: string;
   isError?: boolean;
+  /**
+   * Tool definitions that became active as a consequence of this result.
+   * Native deferred-tool providers use this result as the insertion point;
+   * providers without that capability safely ignore the field and continue
+   * receiving the ordinary current `tools` snapshot.
+   */
+  addedToolNames?: string[];
 };
 
 /** Reasoning / chain-of-thought block emitted by reasoning models.
@@ -110,7 +117,20 @@ export type ServerModelFallbackReason =
 /** Streaming event types. */
 export type StreamEvent =
   | { type: "text_delta"; text: string }
+  /** Provider reasoning activity. `text` remains internal to the core-agent
+   * pipeline and must be sanitized before it reaches UI or persistence. */
+  | { type: "thinking_start" }
+  | { type: "thinking_delta"; chars: number; text?: string }
+  | { type: "thinking_end" }
   | { type: "retry"; attempt: number; reason: string }
+  | {
+      /** The committed candidate accepts no image input, so every attached
+       * image was omitted from the request. Hosts surface this so a
+       * text-only model "not seeing" an attachment is never silent. */
+      type: "images_omitted";
+      count: number;
+      providerId: string;
+    }
   | {
       type: "provider_fallback";
       reason: "auth" | "no_first_event_timeout" | "server_model_fallback";
@@ -129,6 +149,8 @@ export type StreamEvent =
       candidateCount: number;
       /** Whether a provider terminal event was observed before emptiness. */
       terminalEventSeen: boolean;
+      /** Native terminal category when the provider emitted an end event. */
+      terminationCategory?: ProviderTerminationCategory;
       /** Usage charged by a terminal empty request, when reported upstream. */
       usage?: Partial<Usage>;
     }
@@ -149,6 +171,12 @@ export type StreamEvent =
       content?: MessageContent[];
       /** Model id echoed back so CompletionResult callers can record it. */
       model?: string;
+      /**
+       * Positive output-token ceiling present in the final provider payload.
+       * Omitted when the upstream owns the limit and no explicit wire value
+       * exists, rather than reporting a local catalog value as effective.
+       */
+      effectiveMaxTokens?: number;
       /** Bounded Orkas Server fallback reason recovered from response metadata. */
       serverFallbackReason?: ServerModelFallbackReason;
       /** Provider-native terminal classification for empty-response recovery. */

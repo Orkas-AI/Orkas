@@ -1,10 +1,8 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-edit
-min_app_version: "1.5.1"
 description_zh: 真实素材的智能编辑知识——先用转写/OCR/镜头/静音/质量/视觉证据理解视频，再选择确定性时间线编辑或受约束的语义 AI 编辑；clip-factory、蒙太奇、二创和局部内容修改的核心。
 description_en: Intelligent editing knowledge for real footage: understand it through transcript/OCR/scene/silence/quality/vision evidence, then choose deterministic timeline editing or constrained semantic AI editing; core of repurpose, montage, cleanup, and local content changes.
-category: creation
 ---
 
 # stage-edit
@@ -25,7 +23,7 @@ never a single sentence. `objectives` is the one most often written as prose;
 the validator rejects a bare string with `E_EDIT_STRATEGY_BOUNDARY`.
 
 - `objectives`: the exact editorial or pixel-level changes requested, one per entry.
-- `decision_signals`: only evidence actually used (`timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model`).
+- `decision_signals`: the provenance list of evidence actually used (`timecode`, `transcript`, `ocr`, `scene`, `silence`, `quality`, `vision`, `semantic_model`). Include each supplied or analyzed signal that supports the decision, not only the signal used to execute it.
 - `preserve` and `may_change`: non-overlapping boundaries. `may_change` must name every class of change the user authorized — omitting one silently narrows the plan's declared authority below what they asked for.
 
 Declare every source/reference image or video in top-level `references` with `media_type`, reproduce/edit/guide intent, `intent_basis`, roles, required state, preserve/may-change, and target segment ids. This applies to deterministic trims/highlights as well as semantic edits: `spec.input_id` and `edit_strategy` do not replace the top-level source contract. User-declared requirements override defaults; only an unspecified reference defaults to guide/inferred. Video reproduce/edit/motion/timing contracts need one `{source_start_sec,source_end_sec,target_segment_id}` temporal anchor for every targeted segment. A semantic video edit is represented as `source:"generate"`, `media_kind:"video"`, `operation:"edit"`, with the original in `reference_video_paths`/`reference_video_urls`; it still belongs to the EDIT workflow and its count enters Gate C.
@@ -102,37 +100,13 @@ next action instead of a generic recovery form.
    - If an overlay (logo / lower-third image / PiP): `overlay` it at the planned position.
 4. **Publish** the final file.
 
-## Transcription-driven selection & localization
+## Conditional transcript, localization, and screen-grounded narration
 
-When the user wants highlights / clips "about X" or a localized version, transcribe first with `video_studio` `op: "speech.transcribe"` and `timestamps: "word"`:
-
-- **Highlight / clip selection:** read the transcript, choose the time ranges whose words match the requested topic/moment, and feed those `start`/`duration` into the `edit_decisions` segments. Now the timecodes are evidence-based, not guessed.
-- **Auto-captions:** turn the transcript into an `.srt`, then `burnsubs` it onto the video.
-- **Localization / dubbing:** transcribe → translate the text → synthesize the translated narration (the host's text-to-speech step) → `stage-edit edit_video --op mix` with `--on-existing-audio replace` (the dub REPLACES the original voice — do not stack it on top), and `burnsubs` translated captions.
-
-## Grounding narration on on-screen text (silent / screen-recording footage)
-
-**HARD RULE — adding narration to ANY existing video. Plan-first, IN ORDER. The plan.json is authored BEFORE any speech is generated and DRIVES the generation; do not synthesize a blob first and describe it after. Skipping a step is the #1 failure (a voiceover "about the right topic" that does not track the screen, crammed into half the runtime):**
-
-1. **Analyze the video FIRST — never narrate from topic knowledge.** Probe duration, then: `stage-edit analyze_media --op ocr` for on-screen text AND `video_studio` `op: "speech.transcribe"` for spoken audio. A title-card / slideshow / screen-recording is the on-screen-text case → OCR is **mandatory, not the fallback**. Do NOT jump to reading frames-as-vision while OCR is available, and do NOT describe the product from memory.
-2. **Author `project/plan.json` NOW (plan-first, not at the end) as the segments EDL** (copy `stage-plan`'s exact JSON skeleton — `source` is the method enum `edit`, NOT a file path (the clip goes in `spec.input_id`); use `target_sec`; `tracks` is an object), carrying ONLY what the user asked for — keep the picture, add narration — and nothing else:
-   - one **primary `edit` segment** for the source spanning the whole timeline (`source:"edit"`, `layer:"primary"`, `target_sec` = clip length, `spec.input_id`/`in_sec`/`out_sec` covering the clip). Source-led keep — do NOT add crop/scale/reframe; you weren't asked to.
-   - a **`tracks.narration`** track whose `synthesis:{route_ref,voice_ref,display_name,language,speed}` is copied from `video_studio speech.capabilities` called with the deliverable's exact BCP-47 `language`, with ONE LINE per on-screen beat: `{ text, start_sec, target_sec }`. Derive every window and line from the OCR/transcript table before any TTS. Never invent a voice id and never use one paragraph for the whole clip.
-   - `delivery_promise:{ type:"source_led", source_required:true }`; set `aspect` from the SOURCE's real probed dimensions (a landscape source is `16:9`, not the portrait default).
-   Each narration line stays its own entry, so a later edit can re-voice ONE line without touching the rest.
-3. **Generate each beat FROM the plan, then record its `produced_path`.** `generate_speech` per narration line with `target_duration` = its `target_sec`; save the mp3 and write that line's `produced_path`. If the words don't fit at a natural pace, SHORTEN that line in the plan — never speed up past natural or let it run long/short. Coverage must span ~0→clip-end, not stop at the halfway mark.
-   - Save each line under `project/assets/narration/line-XX.mp3` (or another `project/...` path) so the audio stays in the workspace and can be mixed later. Do not leave generated line audio under `cloud/chat_attachments/...`.
-   - Do not use repeated TTS calls as a duration search loop. Estimate words/characters from the target window first, generate once, and if the tool reports a poor fit, shorten that line and retry once. Small residual timing differences should be handled in deterministic assembly, not by synthesizing many alternatives.
-4. **Assemble with `stage-edit edit_video` — keep the picture untouched.** Pass the source video through (`-c:v copy`) and place the narration lines at their `start_sec` in ONE `stage-edit edit_video --op mix` call via `--audio-segments` (one entry per line — that is HOW per-line `start_sec` alignment happens), then run `--op normalize_loudness` to write the deliverable and return measured loudness in the same step; burn captions from `tracks.captions.lines` (.srt → `burnsubs`) if present. The source footage usually already HAS audio, so `mix` rejects by default — choose `--on-existing-audio mix` to keep the original sound under the voiceover, or `replace` to drop it. Write each line's `produced_path` + `status` and the top-level `draft` / `video` paths back to plan.json so the record matches the result. Never pre-bake one big narration file — that destroys per-line separability.
-5. **Self-check before presenting:** `project/plan.json` validates (`"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op validate --plan project/plan.json`); every narration line has a `produced_path` and a window matching its OCR/transcript text; total coverage ≈ full clip length; `project/render/video.mp4` exists. Then tell the user the draft is ready and they can ask for follow-up tweaks (re-voice a line, fix a caption) and you'll change only that.
-
-When the clip has NO spoken audio, or its meaning lives in ON-SCREEN TEXT (a screen-recording, a slideshow, a captioned montage), transcription returns nothing — the content is in the pixels, not the audio. An empty audio track does NOT mean an empty screen. Read what is on screen instead of guessing, in this strict order (cost-first):
-
-1. **OCR the on-screen text — preferred, cheapest, no extra cost.** `stage-edit analyze_media --op ocr` samples frames across the clip and returns a per-timecode table of `{startSec, endSec, text}` segments. Write the script / narration so EACH segment matches the on-screen text in its own `[startSec, endSec]` window. This is what keeps the voiceover aligned to the picture instead of drifting into a generic pitch about the topic.
-2. **Only if OCR is unavailable** (its runtime could not install): fall back to your OWN vision — if you can read images yourself, extract frames across the whole clip and read them directly to build the same table.
-3. **If you cannot see images either:** STOP and ask the user for the on-screen beats (a short outline of what each part shows). Never write narration from prior knowledge of the topic alone, and never escalate to a separate paid vision model.
-
-This is the difference between "a voiceover that happens to be about the right product" and "a voiceover that tracks what is actually on screen at each moment" — the latter is the bar. As a final check before the draft, confirm each narration segment matches the OCR text for its window.
+For topic-based highlight selection, automatic captions, localization/dubbing,
+or narration added to existing footage, read
+[transcript-and-screen-grounded-editing.md](references/transcript-and-screen-grounded-editing.md)
+before authoring the EDL or generating speech. Ordinary known-timecode trim,
+concat, overlay, and audio-only operations do not load this branch.
 
 ## Director judgment (editing line)
 

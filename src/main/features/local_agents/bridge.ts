@@ -21,11 +21,12 @@
  *     group-chat Agent connector policy resolves at least one user-connected,
  *     enabled connector; every CLI call is additionally gated by bridge
  *     permissions.
- *   - kb.list / kb.search / kb.read — reuses the in-process KB AgentTools
- *     verbatim, scoped to global + current project when the conversation
- *     belongs to a project.
- *   - chat.search / chat.read — reuses the in-process conversation-history
- *     tools with a host-bound current-only scope and triggering-message bound.
+ *   - library — reuses the in-process Library tool's list/search/read actions,
+ *     scoped to global + current project when the conversation belongs to a
+ *     project.
+ *   - chat_history — reuses the in-process conversation-history tool's
+ *     search/read actions with a host-bound current-only scope and
+ *     triggering-message bound.
  *   - commander.handoff — records one bounded, run-local request for the bus;
  *     it does not expose any Commander mutation or orchestration method.
  *
@@ -46,8 +47,8 @@ import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { resolveBackgroundNodeRuntime, withBackgroundNodeEnv } from '../../util/background-node';
 import { listSkillsForBridge, type BridgeSkillRow } from '../../model/core-agent/skill-registry';
 import { readDisabledSets } from '../component_enabled';
-import { createKbTools } from '../../model/core-agent/kb-tools';
-import { createChatHistoryTools } from '../../model/core-agent/chat-history-tools';
+import { createLibraryTool } from '../../model/core-agent/kb-tools';
+import { createChatHistoryTool } from '../../model/core-agent/chat-history-tools';
 import * as connectors from '../connectors';
 import * as bridgePermissions from './bridge_permissions';
 
@@ -79,6 +80,13 @@ export interface BridgeHandle {
   capabilities: readonly BridgeCapability[];
   /** First accepted Commander handoff request, if the CLI made one. */
   getCommanderHandoff(): CommanderHandoffRequest | null;
+  /** UI-only display metadata for a Skill already admitted to this run's
+   * source/enablement scope. The runner uses it to keep internal ids out of
+   * persisted process labels without rescanning Skill roots. */
+  getSkillDisplayName(ref: string): string | null;
+  /** UI-only display metadata for a Connector already admitted by the same
+   * connected + enabled policy that grants this run connector capability. */
+  getConnectorDisplayName(id: string): string | null;
   close(): Promise<void>;
 }
 
@@ -113,6 +121,10 @@ export interface StartBridgeOpts {
    *  Electron-flavoured ORKAS_NODE with ORKAS_BUNDLED_NODE so headless helper
    *  launches never inherit the macOS GUI application identity. */
   sandboxEnv: Record<string, string>;
+  /** A resumed CLI may call a Skill id learned in an earlier turn before
+   * invoking skills.list in this host. Prime display metadata only for that
+   * path; fresh runs keep Skill discovery lazy. */
+  preloadSkillDisplayNames?: boolean;
 }
 
 function _socketPath(runId: string): string {
@@ -132,14 +144,21 @@ const BASE_CAPABILITIES: readonly BridgeCapability[] = [
   'commander.handoff',
 ];
 
-async function _capabilitiesForRun(opts: StartBridgeOpts): Promise<BridgeCapability[]> {
+async function _capabilitiesForRun(
+  opts: StartBridgeOpts,
+  recordConnectorDisplayName: (id: string, name: string) => void,
+): Promise<BridgeCapability[]> {
   const capabilities = [...BASE_CAPABILITIES];
   try {
     // Match the ordinary gmember path in core-agent/runner: group-chat Agents
-    // share the user's connected + enabled connector set. `enabled_connectors`
-    // is authoring/UI metadata and is deliberately not a runtime allowlist.
-    const visible = await connectors.resolveVisibleConnectors(opts.uid, undefined);
-    if (visible.length) capabilities.push('connectors');
+    // share the user's connected + enabled connector set.
+    const visible = await connectors.resolveVisibleConnectors(opts.uid);
+    if (visible.length) {
+      capabilities.push('connectors');
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
+    }
   } catch (err) {
     // Connector discovery is optional for the CLI bridge. Fail this category
     // closed without taking away skills, Library, chat, or handback.
@@ -155,14 +174,19 @@ function _buildMethods(
   opts: StartBridgeOpts,
   capabilities: ReadonlySet<BridgeCapability>,
   recordCommanderHandoff: (request: CommanderHandoffRequest) => boolean,
-): Record<string, BridgeMethod> {
+  recordConnectorDisplayName: (id: string, name: string) => void,
+): {
+  methods: Record<string, BridgeMethod>;
+  preloadSkillDisplayNames(): Promise<void>;
+  getSkillDisplayName(ref: string): string | null;
+} {
   // Read-only model tools are reused as-is; map by tool name for dispatch.
   const readTools = new Map([
-    ...createKbTools({
+    createLibraryTool({
       userId: opts.uid,
       ...(opts.projectId ? { projectId: opts.projectId } : {}),
     }),
-    ...createChatHistoryTools({
+    createChatHistoryTool({
       userId: opts.uid,
       currentCid: opts.cid,
       currentMessageId: opts.currentMessageId,
@@ -204,6 +228,13 @@ function _buildMethods(
     skillRowsCache = rows;
     return rows;
   };
+  const getSkillDisplayName = (ref: string): string | null => {
+    const normalized = String(ref || '').trim();
+    if (!normalized || !skillRowsCache) return null;
+    const row = skillRowsCache.find((candidate) => candidate.id === normalized)
+      || skillRowsCache.find((candidate) => candidate.name === normalized);
+    return row?.name || null;
+  };
 
   const methods: Record<string, BridgeMethod> = {};
 
@@ -241,7 +272,10 @@ function _buildMethods(
 
   if (capabilities.has('connectors')) Object.assign(methods, {
     'connectors.list': async () => {
-      const visible = await connectors.resolveVisibleConnectors(opts.uid, undefined);
+      const visible = await connectors.resolveVisibleConnectors(opts.uid);
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
       return {
         connectors: visible.map(({ instance, tools }) => ({
           id: instance.id,
@@ -256,7 +290,10 @@ function _buildMethods(
       const toolName = String(params.tool_name || '');
       const args = (params.args && typeof params.args === 'object') ? params.args as Record<string, unknown> : {};
       if (!connectorId || !toolName) throw new Error('connector_id and tool_name required');
-      const visible = await connectors.resolveVisibleConnectors(opts.uid, undefined);
+      const visible = await connectors.resolveVisibleConnectors(opts.uid);
+      for (const { instance } of visible) {
+        recordConnectorDisplayName(instance.id, instance.display_name);
+      }
       const target = visible.find((v) => v.instance.id === connectorId);
       if (!target) throw new Error(`connector not available: ${connectorId}`);
       if (!target.tools.some((t) => t.name === toolName)) {
@@ -286,14 +323,11 @@ function _buildMethods(
   });
 
   if (capabilities.has('kb.read')) Object.assign(methods, {
-    'kb.search': async (params) => runReadTool('kb_search', params),
-    'kb.read': async (params) => runReadTool('kb_read', params),
-    'kb.list': async (params) => runReadTool('kb_list', params),
+    library: async (params) => runReadTool('library', params),
   });
 
   if (capabilities.has('chat.read')) Object.assign(methods, {
-    'chat.search': async (params) => runReadTool('chat_search', params),
-    'chat.read': async (params) => runReadTool('chat_read', params),
+    chat_history: async (params) => runReadTool('chat_history', params),
   });
 
   if (capabilities.has('commander.handoff')) Object.assign(methods, {
@@ -313,7 +347,15 @@ function _buildMethods(
     },
   });
 
-  return methods;
+  return {
+    methods,
+    preloadSkillDisplayNames: async () => {
+      if (capabilities.has('skills.read') || capabilities.has('skills.run')) {
+        await listSkills();
+      }
+    },
+    getSkillDisplayName,
+  };
 }
 
 export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> {
@@ -324,14 +366,42 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
   const backgroundNode = resolveBackgroundNodeRuntime({
     bundledNode: opts.sandboxEnv.ORKAS_BUNDLED_NODE,
   });
-  const capabilities = await _capabilitiesForRun(opts);
+  const connectorDisplayNameById = new Map<string, string>();
+  const recordConnectorDisplayName = (id: string, name: string): void => {
+    const normalizedId = String(id || '').trim();
+    const normalizedName = String(name || '').trim();
+    if (normalizedId && normalizedName) connectorDisplayNameById.set(normalizedId, normalizedName);
+  };
+  const capabilities = await _capabilitiesForRun(opts, recordConnectorDisplayName);
   const capabilitySet = new Set(capabilities);
   let commanderHandoff: CommanderHandoffRequest | null = null;
-  const methods = _buildMethods(opts, capabilitySet, (request) => {
-    if (commanderHandoff) return false;
-    commanderHandoff = request;
-    return true;
-  });
+  const {
+    methods,
+    preloadSkillDisplayNames,
+    getSkillDisplayName,
+  } = _buildMethods(
+    opts,
+    capabilitySet,
+    (request) => {
+      if (commanderHandoff) return false;
+      commanderHandoff = request;
+      return true;
+    },
+    recordConnectorDisplayName,
+  );
+  if (opts.preloadSkillDisplayNames) {
+    try {
+      // Prime the same scoped registry before the resumed backend starts so
+      // its first Skill event has a stable display name. A failed scan leaves
+      // the bridge available and can still recover through a later list/read.
+      await preloadSkillDisplayNames();
+    } catch (err) {
+      log.warn('bridge skill display-name preload failed', {
+        ...bridgeLogContext(opts),
+        error: logErrorRef(err),
+      });
+    }
+  }
 
   const sockets = new Set<net.Socket>();
   const server = net.createServer((socket) => {
@@ -394,6 +464,17 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     try { fs.chmodSync(socketPath, 0o600); } catch { /* best effort */ }
   }
 
+  fs.mkdirSync(opts.configDir, { recursive: true });
+  const skillOutputDir = capabilities.includes('skills.run')
+    ? path.join(opts.configDir, '.orkas-bridge-skill-output')
+    : null;
+  if (skillOutputDir) {
+    fs.mkdirSync(skillOutputDir, { recursive: true, mode: 0o700 });
+    if (process.platform !== 'win32') {
+      try { fs.chmodSync(skillOutputDir, 0o700); } catch { /* best effort */ }
+    }
+  }
+
   // Secret-bearing env lives in a separate 0600 file so Codex `-c`
   // overrides and process-info events never need to serialize it.
   const secretServerEnv: Record<string, string> = withBackgroundNodeEnv({
@@ -403,6 +484,7 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     ORKAS_BRIDGE_SOCKET: socketPath,
     ORKAS_BRIDGE_TOKEN: token,
     ORKAS_BRIDGE_CAPABILITIES: capabilities.join(','),
+    ...(skillOutputDir ? { ORKAS_BRIDGE_SKILL_OUTPUT_DIR: skillOutputDir } : {}),
   }, backgroundNode);
   const serverEnvFilePath = path.join(opts.configDir, 'orkas-bridge-env.json');
   const serverEnv: Record<string, string> = withBackgroundNodeEnv({
@@ -422,7 +504,6 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     },
   };
   const mcpConfigPath = path.join(opts.configDir, 'orkas-mcp-config.json');
-  fs.mkdirSync(opts.configDir, { recursive: true });
   fs.writeFileSync(serverEnvFilePath, JSON.stringify(secretServerEnv, null, 2), { mode: 0o600 });
   if (process.platform !== 'win32') {
     try { fs.chmodSync(serverEnvFilePath, 0o600); } catch { /* best effort */ }
@@ -444,6 +525,8 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     getCommanderHandoff: () => commanderHandoff
       ? { ...commanderHandoff }
       : null,
+    getSkillDisplayName,
+    getConnectorDisplayName: (id) => connectorDisplayNameById.get(String(id || '').trim()) || null,
     close: async () => {
       bridgePermissions.cancelForCid(opts.cid);
       for (const s of sockets) { try { s.destroy(); } catch { /* gone */ } }
@@ -452,6 +535,9 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
         try { fs.unlinkSync(socketPath); } catch { /* gone */ }
       }
       try { fs.unlinkSync(serverEnvFilePath); } catch { /* gone */ }
+      if (skillOutputDir) {
+        try { fs.rmSync(skillOutputDir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
       log.info('bridge closed', bridgeLogContext(opts, socketPath));
     },
   };

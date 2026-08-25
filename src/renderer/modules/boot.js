@@ -284,6 +284,7 @@ function _lazyFeaturePanel(view) {
     : view === 'contexts' ? 'panel-contexts'
     : view === 'apps' ? 'panel-apps'
     : view === 'settings' ? 'panel-settings'
+    : view === 'announcements' ? 'panel-announcements'
     : view === 'project' ? 'panel-project'
     : view === 'auto' ? 'panel-auto'
     : view === 'marketplace' ? 'panel-marketplace'

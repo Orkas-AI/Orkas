@@ -1,6 +1,7 @@
 ---
 name: product-ui
-description: Use to design and implement product UI from PRD, product goals, user flows, or existing app context. Use when the user asks to build or improve a UI, frontend screen, landing page, dashboard, component set, design-system-based interface, Figma-style brief plus implementation, brand-inspired UI, responsive layout, accessibility pass, or visual polish.
+description_zh: "根据 PRD、产品目标、用户流程、设计来源或现有应用上下文设计并实现产品 UI，覆盖响应式行为、可访问性、视觉方向与渲染验证；用于页面、落地页、仪表盘、组件、设计系统和 UI 打磨。"
+description_en: "Design and implement product UI from a PRD, product goal, user flow, design source, or existing app context, with responsive behavior, accessibility, visual direction, and rendered verification. Use for screens, landing pages, dashboards, components, design systems, and UI polish."
 ---
 
 # Product UI
@@ -19,9 +20,9 @@ Do not use this skill to write a PRD, create product test scenarios, split backe
 
 | Situation | Read |
 |---|---|
-| Need to build or improve UI in an app | `references/ui-implementation.md` |
-| User asks for a known brand/style, DESIGN.md, or "make it look like X" | `references/design-style-index.md`, then one matching file under `references/design-styles/` |
-| Need a design brief before coding, or the user asks for JSON/Markdown handoff | `references/ui-brief-template.md` |
+| Need to build or improve UI in an app | [UI implementation](references/ui-implementation.md) |
+| User asks for a known brand/style, DESIGN.md, or "make it look like X" | [Design style index](references/design-style-index.md), then one matching file under `references/design-styles/` |
+| Need a design brief before coding, or the user asks for JSON/Markdown handoff | [UI brief template](references/ui-brief-template.md) |
 
 Read only the relevant style reference. Do not load all design style files at once.
 
@@ -32,8 +33,9 @@ Read only the relevant style reference. Do not load all design style files at on
 3. Choose a UI direction: existing product style first; external style reference only when requested or useful.
 4. Define the screen structure, states, interactions, requested viewport behavior, and accessibility requirements. Add responsive behavior only when the user asks for multi-device or narrow-screen support.
 5. Implement using the app's existing framework and component patterns.
-6. For runnable local HTML, call `html_preview` on the actual entry before completion. `screenshots` defaults to false for audit-only results; set `screenshots:true` only for the final visual review. Pass `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit target for desktop or use mobile for an explicitly mobile artifact. Source inspection, media-query checks, a local server, PID, or HTTP response do not replace rendered evidence.
-7. Summarize what changed, what visual behavior was verified, and any remaining design questions.
+6. When multiple inspectable source screens define the requested scope, inventory all of them and keep one source-to-target row per screen with must-preserve anchors plus `inspected`, `implemented`, and post-implementation `compared` status. Do not claim all screens complete from shared tokens, a successful build, working routes/links, no overflow, or spot checks. A partial result names every remaining screen; a user fidelity contradiction reopens the full ledger before asking for an example already available in the sources.
+7. For runnable local HTML, call `html_preview` on the actual entry before completion. `screenshots` defaults to false for audit-only results; set `screenshots:true` only for the final visual review. Pass `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit target for desktop or use mobile for an explicitly mobile artifact. Source inspection, media-query checks, a local server, PID, or HTTP response do not replace rendered evidence.
+8. Summarize what changed, what visual behavior was verified, and any remaining design questions.
 
 For a standalone greenfield UI with a clear audience, deliverable, and required sections, the absence of an existing app is not a blocker. Choose the smallest self-contained implementation, use clearly labeled editable sample content when authorized, and produce the complete artifact. Do not replace implementation with a handoff plan merely because no repository, brand system, personal assets, or deployment target was supplied.
 
